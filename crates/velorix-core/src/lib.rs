@@ -3,3 +3,4 @@
 #![forbid(unsafe_code)]
 
 pub mod delta;
+pub mod operator;
