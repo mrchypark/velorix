@@ -62,9 +62,9 @@ packages already fit the problem:
   circuit semantics, and long-term execution design. This includes the Feldera
   project and the Rust `dbsp` crate, but direct crate integration is gated on
   embedded API fit, Rust/toolchain compatibility, checkpoint and state
-  integration, and cost/resource impact. Velorix may first use DBSP semantics as
-  a reference model or keep an adapter boundary before adopting the crate
-  directly.
+  integration, and cost/resource impact. Velorix currently uses a DBSP-shaped
+  `IncrementalEngine` adapter boundary backed by prototype operators before any
+  direct crate adoption.
 
 Foyer and SlateDB have separate cache boundaries. Velorix uses its Foyer wrapper
 for runtime object-store fetch-through. SlateDB may use Foyer internally for its
@@ -113,9 +113,10 @@ or where SlateDB and Feldera/DBSP are planned to provide the right substrate.
    adapter that behaves like object storage, then add S3-compatible storage.
 4. **Implement the ingest log:** persist ordered input delta batches and expose
    replay from a checkpoint.
-5. **Add an incremental engine boundary:** keep current map/filter/join/aggregate
-   work as prototype scaffolding behind an `IncrementalEngine` adapter, then
-   migrate toward DBSP/Feldera-shaped operators.
+5. **Keep the incremental engine boundary current:** keep current
+   map/filter/join/aggregate work as prototype scaffolding behind the
+   `IncrementalEngine` adapter, then migrate toward DBSP/Feldera-shaped
+   operators after direct integration gates are satisfied.
 6. **Extend the SlateDB state-store boundary:** keep the current minimal
    checkpoint-versioned path package-backed, and defer broader durable state
    layout, LSM/SST, compaction, and lifecycle work until the integration shape is

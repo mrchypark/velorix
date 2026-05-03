@@ -9,9 +9,10 @@ This note distinguishes current implementation from target direction. The
 runtime object cache is currently Foyer-backed after the recent cache work,
 SQL/query planning and execution currently use DataFusion for the minimal
 `DeltaBatch` query boundary, and SlateDB now backs a minimal experimental
-checkpoint-versioned state-store path. Direct Feldera DBSP/dbsp integration
-remains a planned migration direction unless matching code exists in the
-repository.
+checkpoint-versioned state-store path. Incremental execution now has a
+DBSP-shaped `IncrementalEngine` boundary backed by prototype operators. Direct
+Feldera DBSP/dbsp integration remains a planned migration direction unless
+matching code exists in the repository.
 
 ## Package Ownership
 
@@ -20,7 +21,7 @@ repository.
 | Durable LSM/SST/state substrate | Current minimal experimental state-store implementation | SlateDB | Object key policy, stream progress, exactly-once manifests, recovery orchestration |
 | Runtime object-store fetch-through cache | Current implementation | Foyer | Object-store authority checks, cache namespace policy, cache-as-non-durable invariant |
 | SQL/DataFrame/query planning and Arrow execution | Current minimal implementation | Apache DataFusion | Runtime integration, checkpoint-aware inputs/outputs, cost/resource policy |
-| Incremental algebra, operators, and circuit semantics | Planned target, with adoption gates | Feldera project semantics and/or Rust `dbsp` crate | `IncrementalEngine` adapter, object-backed persistence, moderate-performance cost optimizations |
+| Incremental algebra, operators, and circuit semantics | Current adapter boundary; direct DBSP crate integration remains gated | Feldera project semantics and/or Rust `dbsp` crate | `IncrementalEngine` adapter, object-backed persistence, moderate-performance cost optimizations |
 
 ## Cache Boundary
 
@@ -58,14 +59,15 @@ integration as already complete. Adoption is gated on:
 - Cost and resource impact relative to Velorix's moderate-performance,
   low-cost goal.
 
-Before direct `dbsp` crate integration, Velorix may use DBSP semantics as the
-reference model or keep incremental execution behind an adapter boundary.
+Before direct `dbsp` crate integration, Velorix uses DBSP semantics as the
+reference model through the current `IncrementalEngine` adapter boundary.
 
 ## Migration Sequence
 
 1. Keep current hand-written delta/operator logic as prototype scaffolding only.
-2. Introduce an `IncrementalEngine` boundary so operator internals can be swapped
-   without changing storage, manifests, or runtime recovery.
+2. Route runtime incremental execution through the current `IncrementalEngine`
+   boundary so operator internals can be swapped without changing storage,
+   manifests, or runtime recovery.
 3. Keep runtime object-store fetch-through caching behind the current Foyer
    wrapper while preserving object storage as the only source of durable truth.
 4. Continue moving durable state layout and compaction responsibilities to

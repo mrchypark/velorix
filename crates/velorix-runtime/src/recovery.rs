@@ -4,7 +4,7 @@ use object_store::ObjectStore;
 use thiserror::Error;
 use velorix_core::{
     delta::DeltaBatch,
-    operator::{KeyedSumCountAggregate, OperatorError},
+    engine::{EngineCheckpoint, EngineError, IncrementalEngine, PrototypeIncrementalEngine},
 };
 use velorix_storage::{
     log::{IngestLog, IngestLogError, ReplayCheckpoint},
@@ -16,7 +16,7 @@ pub const ORDERS_SUM_COUNT_OWNER: &str = "orders_sum_count";
 
 #[derive(Clone, Debug)]
 pub struct RecoveredRuntime {
-    materialized: KeyedSumCountAggregate,
+    materialized: PrototypeIncrementalEngine,
     replay_checkpoints: Vec<ReplayCheckpoint>,
     replayed_batch_count: usize,
     latest_checkpoint_version: Option<u64>,
@@ -29,11 +29,13 @@ pub enum RecoveryError {
     #[error(transparent)]
     Ingest(#[from] IngestLogError),
     #[error(transparent)]
-    Operator(#[from] OperatorError),
+    Engine(#[from] EngineError),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error("unexpected state object owner `{actual}`, expected `{expected}`")]
     UnexpectedStateOwner { actual: String, expected: String },
+    #[error("logical epoch overflowed during recovery replay")]
+    LogicalEpochOverflow,
 }
 
 impl RecoveredRuntime {
@@ -47,7 +49,7 @@ impl RecoveredRuntime {
     ) -> Result<Self, RecoveryError> {
         let publisher = CheckpointPublisher::new(Arc::clone(&store));
         let latest_manifest = publisher.latest_manifest().await?;
-        let mut materialized = KeyedSumCountAggregate::new();
+        let mut materialized = PrototypeIncrementalEngine::new();
 
         if let Some(manifest) = latest_manifest.as_ref() {
             let mut checkpointed_state = DeltaBatch::default();
@@ -63,17 +65,24 @@ impl RecoveredRuntime {
                 let state = serde_json::from_slice::<DeltaBatch>(&bytes)?;
                 checkpointed_state = checkpointed_state.combine(&state);
             }
-            materialized = KeyedSumCountAggregate::from_state(&checkpointed_state)?;
+            materialized = PrototypeIncrementalEngine::from_checkpoint(EngineCheckpoint::new(
+                manifest.checkpoint_version,
+                checkpointed_state,
+            ))?;
         }
 
         let replay_checkpoints = replay_checkpoints(latest_manifest.as_ref());
         let ingest_log = IngestLog::new(store);
         let replayed = ingest_log.replay_from(&replay_checkpoints).await?;
         let replayed_batch_count = replayed.len();
+        let mut logical_epoch = materialized.logical_epoch();
 
         for batch in replayed {
             let input = serde_json::from_slice::<DeltaBatch>(batch.payload())?;
-            materialized.apply(&input)?;
+            logical_epoch = logical_epoch
+                .checked_add(1)
+                .ok_or(RecoveryError::LogicalEpochOverflow)?;
+            materialized.push_changes(logical_epoch, &input)?;
         }
 
         Ok(Self {
@@ -85,7 +94,7 @@ impl RecoveredRuntime {
     }
 
     pub fn materialized_state(&self) -> DeltaBatch {
-        self.materialized.state()
+        self.materialized.materialized_state()
     }
 
     pub fn replay_checkpoints(&self) -> &[ReplayCheckpoint] {
