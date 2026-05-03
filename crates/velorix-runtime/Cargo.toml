@@ -15,6 +15,11 @@ velorix-storage = { path = "../velorix-storage" }
 name = "local_recovery"
 path = "../../tests/e2e/local_recovery.rs"
 
+[[bench]]
+name = "local_incremental"
+path = "../../benches/local_incremental.rs"
+harness = false
+
 [dev-dependencies]
 async-trait = { workspace = true }
 bytes = { workspace = true }
