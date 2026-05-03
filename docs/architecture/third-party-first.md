@@ -9,10 +9,11 @@ This note distinguishes current implementation from target direction. The
 runtime object cache is currently Foyer-backed, ad hoc SQL/query planning and
 execution currently use DataFusion for the minimal `DeltaBatch`, validation,
 and recovered materialized-state query boundaries, and persisted query service
-v0 stores validated JSON query specs in object storage. SlateDB now backs a
-minimal experimental checkpoint-versioned state-store path. Incremental
-execution now has a DBSP-shaped `IncrementalEngine` boundary backed by
-prototype operators.
+v0 stores validated JSON query specs in object storage. Persisted table catalog
+v0 stores Parquet scan URL specs for the direct object-backed scan path. SlateDB
+now backs a minimal experimental checkpoint-versioned state-store path.
+Incremental execution now has a DBSP-shaped `IncrementalEngine` boundary backed
+by prototype operators.
 Feldera SQL-to-DBSP standing-view compilation now has a phase-0 artifact
 metadata/spec contract. Direct runtime Feldera DBSP/dbsp integration remains
 gated unless matching code exists in the repository.
@@ -65,15 +66,23 @@ deterministic `v1/queries/{query_id}.query.json` keys. Query ids use the shared
 `input` table before a create-only catalog write, and execution loads the stored
 SQL/policy before calling the recovered materialized-state query boundary.
 
+Persisted table catalog v0 stores `PersistedTableSpec` JSON objects under
+deterministic `v1/tables/{table_id}.table.json` keys for the direct Parquet scan
+path. Table ids use the shared `ObjectKey` segment rules, create validates the
+URL shape and format enum, and execution loads the stored URL before delegating
+to the existing direct DataFusion Parquet scan helper. It does not scan or list
+table contents at create time.
+
 The query boundary also exposes a minimal Velorix-owned policy for SQL text
 size, output row caps, DataFusion batch size, and target partitions. Output row
 caps are enforced by applying a DataFusion `DataFrame` limit before collection,
 not by parsing or planning SQL inside Velorix.
 
 This is an ad hoc SQL/query surface, not standing-view compilation. Direct
-Parquet object-backed scans now exist as a minimal boundary. Broader table
-layout, query scheduling/versioning, broader persisted view access, and
-memory-pool/disk-spill runtime resource policy remain future integration work.
+Parquet object-backed scans and a small object-backed table catalog now exist as
+a minimal boundary. Broader table layout, query scheduling/versioning,
+permissions, broader persisted view access, and memory-pool/disk-spill runtime
+resource policy remain future integration work.
 
 ## Feldera Standing-View Compile Contract
 
@@ -134,8 +143,10 @@ epoch fallback for those old payloads.
    custom planner or expression engine. This DataFusion path is for ad hoc SQL
    over in-memory `DeltaBatch` input, runtime-recovered materialized state, and
    minimal direct Parquet object-backed `input` scans; persisted query service
-   v0 only catalogs validated SQL/policy specs in object storage. Broader table
-   layout, scheduling, versioning, and persisted view access remain future work.
+   v0 catalogs validated SQL/policy specs in object storage, and persisted table
+   catalog v0 catalogs Parquet scan URLs for the direct scan path. Broader table
+   layout, scheduling, versioning, permissions, and persisted view access remain
+   future work.
 6. Use Feldera's SQL-to-DBSP compiler for standing-view SQL through validated
    external compiler artifacts. Do not hand-build Velorix circuits for standing
    views in this phase.

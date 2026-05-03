@@ -22,6 +22,8 @@ segment.
 | State object | `v1/state/{owner}/p={partition_id:010}/chk={checkpoint_version:020}/{object_id}.state` | Checkpoint-referenced state payload |
 | Temporary publish object | `v1/tmp/{checkpoint_version:020}/{attempt_or_object_id}/{kind}` | Non-authoritative staging location |
 | Checkpoint manifest | `v1/checkpoints/{checkpoint_version:020}.manifest` | Authoritative progress marker |
+| Persisted query spec | `v1/queries/{query_id}.query.json` | Create-only query SQL/policy catalog object |
+| Persisted table spec | `v1/tables/{table_id}.table.json` | Create-only Parquet scan URL catalog object |
 
 Structured constructors in `crates/velorix-storage/src/object_key.rs` own these
 formats. Call sites should not assemble storage paths with ad hoc string
@@ -104,9 +106,12 @@ query service v0 writes validated JSON specs to object storage under
 policy now covers SQL text size, output row caps, DataFusion batch size, and
 target partitions. Runtime also has a minimal direct Parquet object-backed scan
 boundary that registers caller-provided object storage and Parquet object URLs
-as DataFusion's `input` table. Broader table layout, persisted view access,
-query scheduling/versioning, and broader runtime resource policy remain future
-work.
+as DataFusion's `input` table. Persisted table catalog v0 writes JSON Parquet
+scan URL specs to `v1/tables/{table_id}.table.json` using create-only
+semantics; create validates the catalog id and URL shape but does not scan table
+contents. Broader table layout, persisted view access, query
+scheduling/versioning, permissions, and broader runtime resource policy remain
+future work.
 
 Foyer owns the runtime local memory/disk object-cache internals behind the
 Velorix cache wrapper. Cache reads verify object-store authority first, and

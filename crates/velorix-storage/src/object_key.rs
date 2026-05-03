@@ -90,6 +90,12 @@ impl ObjectKey {
         Ok(Self(format!("v1/queries/{query_id}.query.json")))
     }
 
+    pub fn query_table(table_id: &str) -> Result<Self, ObjectKeyError> {
+        validate_segment("table_id", table_id)?;
+
+        Ok(Self(format!("v1/tables/{table_id}.table.json")))
+    }
+
     pub fn parse(value: impl Into<String>) -> Result<Self, ObjectKeyError> {
         let value = value.into();
         if value.starts_with('/')
@@ -168,6 +174,12 @@ fn validate_known_layout(value: &str) -> Result<(), ObjectKeyError> {
                 .strip_suffix(".query.json")
                 .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
             validate_segment("query_id", query_id)?;
+        }
+        ["v1", "tables", table_file] => {
+            let table_id = table_file
+                .strip_suffix(".table.json")
+                .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+            validate_segment("table_id", table_id)?;
         }
         _ => return Err(ObjectKeyError::InvalidExternalKey(value.to_string())),
     }
@@ -385,6 +397,26 @@ mod tests {
     }
 
     #[test]
+    fn query_table_key_is_deterministic() {
+        let key = ObjectKey::query_table("orders-current").unwrap();
+        let restarted = ObjectKey::query_table("orders-current").unwrap();
+
+        assert_eq!(key.as_str(), "v1/tables/orders-current.table.json");
+        assert_eq!(key, restarted);
+        assert_eq!(ObjectKey::parse(key.as_str()).unwrap(), key);
+    }
+
+    #[test]
+    fn query_table_key_rejects_path_unsafe_table_ids() {
+        for table_id in ["", ".", "..", "orders/current", "orders current"] {
+            assert!(
+                ObjectKey::query_table(table_id).is_err(),
+                "accepted invalid table id: {table_id}"
+            );
+        }
+    }
+
+    #[test]
     fn parse_rejects_invalid_or_unrecognized_external_keys() {
         for invalid in [
             "v1/ingest/./p=0000000000/00000000000000000000-00000000000000000001.batch",
@@ -396,6 +428,8 @@ mod tests {
             "v1/unknown/orders/p=0000000000/object",
             "v1/queries/../orders.query.json",
             "v1/queries/orders.txt",
+            "v1/tables/../orders.table.json",
+            "v1/tables/orders.txt",
         ] {
             assert!(
                 ObjectKey::parse(invalid).is_err(),

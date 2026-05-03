@@ -4,5 +4,6 @@
 
 pub mod cache;
 pub mod persisted_query;
+pub mod persisted_table;
 pub mod query;
 pub mod recovery;
