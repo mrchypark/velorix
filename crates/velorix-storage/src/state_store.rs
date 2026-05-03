@@ -3,6 +3,7 @@ use std::{fmt, sync::Arc};
 use async_trait::async_trait;
 use bytes::Bytes;
 use object_store::{path::Path, ObjectStore, PutMode};
+use slatedb::{ErrorKind, IsolationLevel};
 
 use crate::{
     manifest::StateObjectRef,
@@ -124,15 +125,21 @@ impl StateObjectStore for SlateDbStateStore {
         state: &StateObjectWrite,
     ) -> Result<StateObjectRef, CheckpointPublishError> {
         let key = state.object_key().as_str().as_bytes();
-        if self.db.get(key).await?.is_some() {
+        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+        if txn.get(key).await?.is_some() {
             return Err(CheckpointPublishError::StateObjectAlreadyExists(
                 state.object_key().clone(),
             ));
         }
 
-        self.db.put(key, state.bytes().as_ref()).await?;
-
-        Ok(state.object_ref())
+        txn.put(key, state.bytes().as_ref())?;
+        match txn.commit().await {
+            Ok(_) => Ok(state.object_ref()),
+            Err(err) if err.kind() == ErrorKind::Transaction => Err(
+                CheckpointPublishError::StateObjectAlreadyExists(state.object_key().clone()),
+            ),
+            Err(err) => Err(err.into()),
+        }
     }
 
     async fn read_state_object(

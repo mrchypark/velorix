@@ -48,10 +48,12 @@ packages already fit the problem:
 - **Foyer** currently owns the runtime local memory/disk object cache through a
   Velorix wrapper that enforces object-store authority, cache invalidation
   boundaries, and the `ObjectKey` policy.
-- **SlateDB** now backs the minimal experimental state-store path for
+- **SlateDB** backs the current minimal experimental state-store path for
   checkpoint-versioned state payloads. SlateDB owns the package-backed key/value
   persistence for that path, while Velorix owns stream progress, exactly-once
   manifest semantics, and runtime recovery orchestration around the substrate.
+  Broader durable state layout, LSM/SST policy, compaction tuning, and state
+  lifecycle design remain future work.
 - **Apache DataFusion** currently owns the minimal SQL/query planning and
   execution boundary. Velorix converts `DeltaBatch` records into an in-memory
   Arrow/DataFusion table and returns Arrow `RecordBatch` output. Object-backed
@@ -84,9 +86,10 @@ The intended system shape is:
    in-memory Arrow table built from `DeltaBatch` input and returns Arrow
    `RecordBatch` output. Object-backed and checkpoint-aware query services are
    still future work.
-4. **State layout:** SlateDB is the current experimental durable state-store
-   substrate over object storage, while manifests describe Velorix progress and
-   publication state.
+4. **State store:** SlateDB is the current minimal experimental durable
+   state-store path over object storage for checkpoint-versioned payloads, while
+   manifests describe Velorix progress and publication state. Broader state
+   layout, LSM/SST, compaction, and lifecycle policy remain future work.
 5. **Checkpoint protocol:** exactly-once progress is represented by versioned
    manifests that bind input offsets, state objects, and output commits.
 6. **Disposable compute:** workers recover by loading the latest manifest and
@@ -113,8 +116,10 @@ or where SlateDB and Feldera/DBSP are planned to provide the right substrate.
 5. **Add an incremental engine boundary:** keep current map/filter/join/aggregate
    work as prototype scaffolding behind an `IncrementalEngine` adapter, then
    migrate toward DBSP/Feldera-shaped operators.
-6. **Plan materialized state persistence through SlateDB:** avoid building a
-   separate durable LSM/compaction engine in Velorix.
+6. **Extend the SlateDB state-store boundary:** keep the current minimal
+   checkpoint-versioned path package-backed, and defer broader durable state
+   layout, LSM/SST, compaction, and lifecycle work until the integration shape is
+   clearer.
 7. **Add checkpointed manifests:** make recovery deterministic by binding input
    progress, state files, and output commits into one manifest version.
 8. **Validate exactly-once behavior:** test crashes before, during, and after

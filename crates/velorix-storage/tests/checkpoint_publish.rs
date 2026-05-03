@@ -3,6 +3,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use object_store::{local::LocalFileSystem, path::Path, ObjectStore};
 use tempfile::TempDir;
+use tokio::sync::Barrier;
 use velorix_storage::{
     manifest::{CheckpointManifest, InputRange, StateObjectRef},
     object_key::ObjectKey,
@@ -27,12 +28,16 @@ fn input_range() -> InputRange {
 }
 
 fn state_write(checkpoint_version: u64, object_id: &str, bytes: &'static [u8]) -> StateObjectWrite {
+    state_write_bytes(checkpoint_version, object_id, Bytes::from_static(bytes))
+}
+
+fn state_write_bytes(checkpoint_version: u64, object_id: &str, bytes: Bytes) -> StateObjectWrite {
     StateObjectWrite::new(
         "balances_by_account",
         0,
         checkpoint_version,
         object_id,
-        Bytes::from_static(bytes),
+        bytes,
     )
     .unwrap()
 }
@@ -274,4 +279,97 @@ async fn checkpoint_publish_slatedb_state_store_keeps_manifests_authoritative() 
             .unwrap(),
         Bytes::from_static(b"published-state")
     );
+}
+
+#[tokio::test]
+async fn checkpoint_publish_slatedb_state_store_rejects_duplicate_state_object_write() {
+    let (_temp_dir, store) = temp_store();
+    let publisher =
+        CheckpointPublisher::with_slatedb_state_store(Arc::clone(&store), "v1/slatedb/state")
+            .await
+            .unwrap();
+    let state = state_write(0, "state-0001", b"first");
+
+    publisher.write_state_object(&state).await.unwrap();
+    let duplicate = state_write(0, "state-0001", b"second");
+    let err = publisher.write_state_object(&duplicate).await.unwrap_err();
+
+    assert!(err.to_string().contains("already exists"));
+    assert_eq!(
+        publisher
+            .read_state_object(&state_ref(&state))
+            .await
+            .unwrap(),
+        Bytes::from_static(b"first")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn checkpoint_publish_slatedb_state_store_rejects_concurrent_duplicate_state_object_writes() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = Arc::new(
+        CheckpointPublisher::with_slatedb_state_store(Arc::clone(&store), "v1/slatedb/state")
+            .await
+            .unwrap(),
+    );
+    let barrier = Arc::new(Barrier::new(16));
+
+    let handles = (0..16)
+        .map(|attempt| {
+            let publisher = Arc::clone(&publisher);
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                let state =
+                    state_write_bytes(0, "state-0001", Bytes::from(format!("payload-{attempt}")));
+                barrier.wait().await;
+                let result = publisher.write_state_object(&state).await;
+                (state, result)
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let results = futures::future::try_join_all(handles).await.unwrap();
+    let successes = results
+        .iter()
+        .filter(|(_, result)| result.is_ok())
+        .collect::<Vec<_>>();
+    let duplicates = results
+        .iter()
+        .filter(|(_, result)| {
+            result
+                .as_ref()
+                .is_err_and(|err| err.to_string().contains("already exists"))
+        })
+        .count();
+
+    assert_eq!(successes.len(), 1);
+    assert_eq!(duplicates, 15);
+
+    let (winning_state, winning_ref) = successes[0];
+    assert_eq!(winning_ref.as_ref().unwrap(), &state_ref(winning_state));
+    assert_eq!(
+        publisher
+            .read_state_object(winning_ref.as_ref().unwrap())
+            .await
+            .unwrap(),
+        winning_state.bytes().clone()
+    );
+}
+
+#[tokio::test]
+async fn checkpoint_publish_slatedb_state_store_rejects_manifest_that_references_missing_state_object(
+) {
+    let (_temp_dir, store) = temp_store();
+    let publisher =
+        CheckpointPublisher::with_slatedb_state_store(Arc::clone(&store), "v1/slatedb/state")
+            .await
+            .unwrap();
+    let missing_state = state_write(0, "missing-state", b"not-written");
+    let manifest = manifest(0, state_ref(&missing_state));
+
+    let err = publisher.publish_manifest(&manifest).await.unwrap_err();
+
+    assert!(err.to_string().contains("referenced state object"));
+    let manifest_path = Path::from(manifest.object_key().as_str());
+    assert!(store.head(&manifest_path).await.is_err());
 }
