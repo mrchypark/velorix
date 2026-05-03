@@ -4,9 +4,9 @@
 
 **Goal:** Build a minimal Velorix prototype that proves an object-storage-first, stateless, incremental streaming database can ingest deltas, maintain a materialized view, checkpoint progress, and recover without local durable state. Velorix is third-party-first: do not expand direct hand-written implementations where SlateDB, Foyer, Apache DataFusion, or Feldera DBSP fit the problem.
 
-**Architecture:** Start with a single-process prototype whose only durable authority is object storage. Represent input and checkpoints as immutable objects plus versioned manifests, add package boundaries before scaling workers, and migrate prototype internals behind mature substrates: SlateDB for durable LSM/SST/state, Foyer for local memory/disk cache, DataFusion for SQL/DataFrame/query planning and Arrow execution, and Feldera DBSP for incremental algebra/operators/circuit semantics.
+**Architecture:** Start with a single-process prototype whose only durable authority is object storage. Represent input and checkpoints as immutable objects plus versioned manifests, add package boundaries before scaling workers, and migrate prototype internals behind mature substrates. Foyer is current for runtime object-store fetch-through caching. SlateDB for durable LSM/SST/state, DataFusion for SQL/DataFrame/query planning and Arrow execution, and Feldera DBSP/dbsp for incremental algebra/operators/circuit semantics remain planned target directions unless matching code exists.
 
-**Tech Stack:** Rust is the assumed implementation language for the core engine because Velorix needs low overhead, predictable performance, async I/O, and deployable static binaries. Use `tokio` for async execution, `serde` for schemas, `object_store` for filesystem/S3-compatible storage, `proptest` for invariant-heavy delta and manifest tests, and third-party data packages where they fit. The planned package direction is SlateDB for object-storage-first durable state, Foyer for hybrid cache internals, Apache DataFusion for query planning/execution, and Feldera DBSP as the reference model or backing engine for incremental computation.
+**Tech Stack:** Rust is the assumed implementation language for the core engine because Velorix needs low overhead, predictable performance, async I/O, and deployable static binaries. Use `tokio` for async execution, `serde` for schemas, `object_store` for filesystem/S3-compatible storage, `proptest` for invariant-heavy delta and manifest tests, and third-party data packages where they fit. Foyer is current for runtime hybrid object-cache internals. The planned package direction is SlateDB for object-storage-first durable state, Apache DataFusion for query planning/execution, and Feldera DBSP semantics or the Rust `dbsp` crate as the reference model or backing engine for incremental computation after embedded API, toolchain, checkpoint/state integration, and cost/resource gates are satisfied.
 
 **Third-party-first directive:** Velorix-specific code should remain glue and policy: object-storage authority, deterministic `ObjectKey` rules, checkpoint manifests, stateless recovery orchestration, resource/cost policy, and integration boundaries. Current hand-written delta/operator/state/cache code is prototype scaffolding unless the plan explicitly says a Velorix-owned boundary is required.
 
@@ -26,7 +26,7 @@
 - Create: `crates/velorix-cli/src/main.rs` for local prototype commands.
 - Create: `tests/e2e/local_recovery.rs` for crash and recovery behavior.
 - Modify: `README.md` as implementation status changes.
-- Create: `docs/architecture/third-party-first.md` for package ownership and migration order.
+- Modify/keep current: `docs/architecture/third-party-first.md` for package ownership and migration order.
 
 ## Task 1: Workspace Scaffold
 
@@ -296,7 +296,7 @@ Cover memory hits, disk spill, eviction, restart with empty cache, and correctne
 
 - [ ] **Step 2: Integrate or wrap Foyer for cache internals**
 
-Use Foyer as the planned owner of bounded memory and disk cache behavior. If a Foyer replacement is already in progress, coordinate with that work and avoid adding parallel custom cache internals.
+Use Foyer as the current owner of bounded runtime memory and disk object-cache behavior. Keep this cache scoped to object-store fetch-through and never treat it as durable authority. If SlateDB later uses Foyer internally for its own block/object cache, keep that policy separate from Velorix's runtime object cache instead of adding duplicate cache ownership.
 
 - [ ] **Step 3: Enforce Velorix cache policy**
 
@@ -348,7 +348,7 @@ git commit -m "feat: add datafusion query boundary"
 **Files:**
 - Create: `benches/local_incremental.rs`
 - Create: `docs/architecture/storage-contract.md`
-- Create: `docs/architecture/third-party-first.md`
+- Modify/keep current: `docs/architecture/third-party-first.md`
 - Modify: `README.md`
 
 - [ ] **Step 1: Add a local incremental benchmark**

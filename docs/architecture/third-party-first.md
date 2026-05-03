@@ -5,29 +5,60 @@ already fit the job. The project should integrate proven substrates and keep
 Velorix-specific code focused on object-storage authority, checkpoint manifests,
 stateless recovery, resource/cost policy, and package boundaries.
 
+This note distinguishes current implementation from target direction. The
+runtime object cache is currently Foyer-backed after the recent cache work.
+SlateDB, DataFusion, and direct Feldera DBSP/dbsp integration are planned
+migration directions unless matching code exists in the repository.
+
 ## Package Ownership
 
-| Area | Preferred owner | Velorix-owned boundary |
-| --- | --- | --- |
-| Durable LSM/SST/state substrate | SlateDB | Object key policy, stream progress, exactly-once manifests, recovery orchestration |
-| Local memory/disk cache | Foyer | Object-store authority checks, cache namespace policy, cache-as-non-durable invariant |
-| SQL/DataFrame/query planning and Arrow execution | Apache DataFusion | Runtime integration, checkpoint-aware inputs/outputs, cost/resource policy |
-| Incremental algebra, operators, and circuit semantics | Feldera DBSP | `IncrementalEngine` adapter, object-backed persistence, moderate-performance cost optimizations |
+| Area | Status | Preferred owner | Velorix-owned boundary |
+| --- | --- | --- | --- |
+| Durable LSM/SST/state substrate | Planned target | SlateDB | Object key policy, stream progress, exactly-once manifests, recovery orchestration |
+| Runtime object-store fetch-through cache | Current implementation | Foyer | Object-store authority checks, cache namespace policy, cache-as-non-durable invariant |
+| SQL/DataFrame/query planning and Arrow execution | Planned target | Apache DataFusion | Runtime integration, checkpoint-aware inputs/outputs, cost/resource policy |
+| Incremental algebra, operators, and circuit semantics | Planned target, with adoption gates | Feldera project semantics and/or Rust `dbsp` crate | `IncrementalEngine` adapter, object-backed persistence, moderate-performance cost optimizations |
+
+## Cache Boundary
+
+Velorix runtime code uses a Foyer wrapper for local memory/disk caching of
+object-store fetch-through reads. The cache is never durable authority; object
+storage and checkpoint manifests remain authoritative for recovery and progress.
+
+SlateDB may use Foyer internally for its own block or object cache once SlateDB
+is integrated. That cache belongs to SlateDB's state substrate internals. Velorix
+should keep the runtime object cache policy separate from any SlateDB-internal
+cache policy to avoid duplicate eviction, durability, or authority rules.
+
+## DBSP Adoption Gate
+
+Feldera DBSP can mean the Feldera project and its DBSP model, or the Rust
+`dbsp` crate as a direct dependency. Velorix should not treat direct crate
+integration as already complete. Adoption is gated on:
+
+- Embedded API fit for a stateless object-storage-first runtime.
+- Rust and toolchain compatibility with the Velorix workspace.
+- Checkpoint, state, and recovery integration with object-backed manifests.
+- Cost and resource impact relative to Velorix's moderate-performance,
+  low-cost goal.
+
+Before direct `dbsp` crate integration, Velorix may use DBSP semantics as the
+reference model or keep incremental execution behind an adapter boundary.
 
 ## Migration Sequence
 
 1. Keep current hand-written delta/operator logic as prototype scaffolding only.
 2. Introduce an `IncrementalEngine` boundary so operator internals can be swapped
    without changing storage, manifests, or runtime recovery.
-3. Move local cache internals behind Foyer while preserving object storage as the
-   only source of durable truth.
+3. Keep runtime object-store fetch-through caching behind the current Foyer
+   wrapper while preserving object storage as the only source of durable truth.
 4. Move durable state layout and compaction responsibilities to SlateDB, leaving
    Velorix manifests responsible for stream progress and exactly-once commits.
 5. Route SQL/DataFrame/query surfaces through DataFusion instead of creating a
-   custom planner or expression engine.
-6. Use Feldera DBSP as the reference model for incremental operators and circuit
-   semantics, while allowing Velorix to optimize more aggressively for lower
-   resource cost and accept moderate performance where that improves economics.
+   custom planner or expression engine once the integration is implemented.
+6. Use Feldera DBSP semantics as the reference model for incremental operators
+   and circuit semantics. Consider direct Rust `dbsp` crate integration only
+   after the adoption gates are satisfied; otherwise keep an adapter boundary.
 
 ## Non-Goals
 
@@ -35,4 +66,5 @@ stateless recovery, resource/cost policy, and package boundaries.
 - Do not build a separate durable LSM/compaction engine when SlateDB fits.
 - Do not build custom memory/disk cache internals when Foyer fits.
 - Do not keep expanding prototype delta/operator code as the long-term execution
-  engine when Feldera DBSP semantics or adapters can own the model.
+  engine when Feldera DBSP semantics, adapters, or a gated `dbsp` crate
+  integration can own the model.
