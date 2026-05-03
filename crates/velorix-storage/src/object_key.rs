@@ -1,13 +1,13 @@
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
-const PARTITION_WIDTH: usize = 6;
+const PARTITION_WIDTH: usize = 10;
 const CHECKPOINT_WIDTH: usize = 20;
 const OFFSET_WIDTH: usize = 20;
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
 pub struct ObjectKey(String);
 
@@ -85,6 +85,8 @@ impl ObjectKey {
             return Err(ObjectKeyError::InvalidExternalKey(value));
         }
 
+        validate_known_layout(&value)?;
+
         Ok(Self(value))
     }
 
@@ -97,6 +99,115 @@ impl fmt::Display for ObjectKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+impl<'de> Deserialize<'de> for ObjectKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(value).map_err(de::Error::custom)
+    }
+}
+
+fn validate_known_layout(value: &str) -> Result<(), ObjectKeyError> {
+    let segments: Vec<_> = value.split('/').collect();
+
+    match segments.as_slice() {
+        ["v1", "ingest", stream_id, partition, range] => {
+            validate_segment("stream_id", stream_id)?;
+            parse_prefixed_u32("partition_id", partition, "p=", PARTITION_WIDTH)?;
+
+            let range = range
+                .strip_suffix(".batch")
+                .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+            let (start, end) = range
+                .split_once('-')
+                .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+            let start = parse_fixed_u64("start_offset_inclusive", start, OFFSET_WIDTH)?;
+            let end = parse_fixed_u64("end_offset_exclusive", end, OFFSET_WIDTH)?;
+            validate_offset_range(start, end)?;
+        }
+        ["v1", "state", owner, partition, checkpoint, object_file] => {
+            validate_segment("owner", owner)?;
+            parse_prefixed_u32("partition_id", partition, "p=", PARTITION_WIDTH)?;
+            parse_prefixed_u64("checkpoint_version", checkpoint, "chk=", CHECKPOINT_WIDTH)?;
+
+            let object_id = object_file
+                .strip_suffix(".state")
+                .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+            validate_segment("object_id", object_id)?;
+        }
+        ["v1", "tmp", checkpoint, attempt_or_object_id, kind] => {
+            parse_fixed_u64("checkpoint_version", checkpoint, CHECKPOINT_WIDTH)?;
+            validate_segment("attempt_or_object_id", attempt_or_object_id)?;
+            validate_segment("kind", kind)?;
+        }
+        ["v1", "checkpoints", manifest_file] => {
+            let checkpoint = manifest_file
+                .strip_suffix(".manifest")
+                .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+            parse_fixed_u64("checkpoint_version", checkpoint, CHECKPOINT_WIDTH)?;
+        }
+        _ => return Err(ObjectKeyError::InvalidExternalKey(value.to_string())),
+    }
+
+    Ok(())
+}
+
+fn parse_prefixed_u32(
+    name: &'static str,
+    value: &str,
+    prefix: &str,
+    width: usize,
+) -> Result<u32, ObjectKeyError> {
+    let value = value
+        .strip_prefix(prefix)
+        .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+    parse_fixed_u32(name, value, width)
+}
+
+fn parse_prefixed_u64(
+    name: &'static str,
+    value: &str,
+    prefix: &str,
+    width: usize,
+) -> Result<u64, ObjectKeyError> {
+    let value = value
+        .strip_prefix(prefix)
+        .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+    parse_fixed_u64(name, value, width)
+}
+
+fn parse_fixed_u32(name: &'static str, value: &str, width: usize) -> Result<u32, ObjectKeyError> {
+    if !is_fixed_width_digits(value, width) {
+        return Err(ObjectKeyError::UnsafeSegment {
+            name,
+            value: value.to_string(),
+        });
+    }
+
+    value
+        .parse()
+        .map_err(|_| ObjectKeyError::InvalidExternalKey(value.to_string()))
+}
+
+fn parse_fixed_u64(name: &'static str, value: &str, width: usize) -> Result<u64, ObjectKeyError> {
+    if !is_fixed_width_digits(value, width) {
+        return Err(ObjectKeyError::UnsafeSegment {
+            name,
+            value: value.to_string(),
+        });
+    }
+
+    value
+        .parse()
+        .map_err(|_| ObjectKeyError::InvalidExternalKey(value.to_string()))
+}
+
+fn is_fixed_width_digits(value: &str, width: usize) -> bool {
+    value.len() == width && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn validate_offset_range(
@@ -144,10 +255,23 @@ mod tests {
 
         assert_eq!(
             key.as_str(),
-            "v1/ingest/orders/p=000007/00000000000000000042-00000000000000000100.batch"
+            "v1/ingest/orders/p=0000000007/00000000000000000042-00000000000000000100.batch"
         );
         assert_eq!(key, restarted);
         assert_eq!(key.to_string(), key.as_str());
+    }
+
+    #[test]
+    fn partition_key_width_preserves_full_u32_lexicographic_order() {
+        let before = ObjectKey::ingest_batch("orders", 999_999, 0, 1).unwrap();
+        let after = ObjectKey::ingest_batch("orders", 1_000_000, 0, 1).unwrap();
+        let max = ObjectKey::ingest_batch("orders", u32::MAX, 0, 1).unwrap();
+
+        assert!(before < after);
+        assert!(after < max);
+        assert!(before.as_str().contains("/p=0000999999/"));
+        assert!(after.as_str().contains("/p=0001000000/"));
+        assert!(max.as_str().contains("/p=4294967295/"));
     }
 
     #[test]
@@ -158,7 +282,7 @@ mod tests {
 
         assert_eq!(
             key.as_str(),
-            "v1/state/balances_by_account/p=000012/chk=00000000000000000009/state-0001.state"
+            "v1/state/balances_by_account/p=0000000012/chk=00000000000000000009/state-0001.state"
         );
         assert_eq!(key, restarted);
     }
@@ -182,5 +306,30 @@ mod tests {
 
         assert_eq!(key.as_str(), "v1/checkpoints/00000000000000000009.manifest");
         assert_eq!(key, restarted);
+    }
+
+    #[test]
+    fn parse_rejects_invalid_or_unrecognized_external_keys() {
+        for invalid in [
+            "v1/ingest/./p=0000000000/00000000000000000000-00000000000000000001.batch",
+            "v1/ingest/../p=0000000000/00000000000000000000-00000000000000000001.batch",
+            "v1/ingest/orders!/p=0000000000/00000000000000000000-00000000000000000001.batch",
+            "v1/ingest/orders//00000000000000000000-00000000000000000001.batch",
+            "/v1/checkpoints/00000000000000000001.manifest",
+            "v2/checkpoints/00000000000000000001.manifest",
+            "v1/unknown/orders/p=0000000000/object",
+        ] {
+            assert!(
+                ObjectKey::parse(invalid).is_err(),
+                "accepted invalid key: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn deserialize_rejects_invalid_key_strings() {
+        assert!(
+            serde_json::from_str::<ObjectKey>("\"v1/unknown/orders/p=0000000000/object\"").is_err()
+        );
     }
 }

@@ -80,11 +80,23 @@ pub enum ManifestError {
         state_checkpoint_version: u64,
         manifest_checkpoint_version: u64,
     },
+    #[error("state object `{object_id}` key does not match its metadata: expected `{expected}`, actual `{actual}`")]
+    StateObjectKeyMismatch {
+        object_id: String,
+        expected: ObjectKey,
+        actual: ObjectKey,
+    },
     #[error("output object range for {object_id} must be nonempty: start={start_offset_inclusive}, end={end_offset_exclusive}")]
     InvalidOutputRange {
         object_id: String,
         start_offset_inclusive: u64,
         end_offset_exclusive: u64,
+    },
+    #[error("output object `{object_id}` key does not match its metadata: expected `{expected}`, actual `{actual}`")]
+    OutputObjectKeyMismatch {
+        object_id: String,
+        expected: ObjectKey,
+        actual: ObjectKey,
     },
     #[error("duplicate object id `{0}`")]
     DuplicateObjectId(String),
@@ -107,8 +119,8 @@ impl CheckpointManifest {
         self.validate_parent_checkpoint()?;
         self.validate_input_ranges()?;
         self.validate_state_objects()?;
-        self.validate_output_objects()?;
         self.validate_unique_object_refs()?;
+        self.validate_output_objects()?;
 
         Ok(())
     }
@@ -186,6 +198,26 @@ impl CheckpointManifest {
                     manifest_checkpoint_version: self.checkpoint_version,
                 });
             }
+
+            let expected = ObjectKey::state_object(
+                &state_object.owner,
+                state_object.partition_id,
+                state_object.checkpoint_version,
+                &state_object.object_id,
+            )
+            .map_err(|_| ManifestError::StateObjectKeyMismatch {
+                object_id: state_object.object_id.clone(),
+                expected: state_object.object_key.clone(),
+                actual: state_object.object_key.clone(),
+            })?;
+
+            if state_object.object_key != expected {
+                return Err(ManifestError::StateObjectKeyMismatch {
+                    object_id: state_object.object_id.clone(),
+                    expected,
+                    actual: state_object.object_key.clone(),
+                });
+            }
         }
 
         Ok(())
@@ -198,6 +230,26 @@ impl CheckpointManifest {
                     object_id: output_object.object_id.clone(),
                     start_offset_inclusive: output_object.start_offset_inclusive,
                     end_offset_exclusive: output_object.end_offset_exclusive,
+                });
+            }
+
+            let expected = ObjectKey::ingest_batch(
+                &output_object.stream_id,
+                output_object.partition_id,
+                output_object.start_offset_inclusive,
+                output_object.end_offset_exclusive,
+            )
+            .map_err(|_| ManifestError::OutputObjectKeyMismatch {
+                object_id: output_object.object_id.clone(),
+                expected: output_object.object_key.clone(),
+                actual: output_object.object_key.clone(),
+            })?;
+
+            if output_object.object_key != expected {
+                return Err(ManifestError::OutputObjectKeyMismatch {
+                    object_id: output_object.object_id.clone(),
+                    expected,
+                    actual: output_object.object_key.clone(),
                 });
             }
         }
@@ -326,6 +378,39 @@ mod tests {
         manifest.state_objects.clear();
 
         assert_eq!(manifest.validate(), Err(ManifestError::MissingStateObjects));
+    }
+
+    #[test]
+    fn checkpoint_manifest_rejects_state_ref_object_key_mismatch() {
+        let mut manifest = valid_manifest();
+        manifest.state_objects[0].object_key =
+            ObjectKey::state_object("other_owner", 0, 1, "state-0001").unwrap();
+
+        assert_eq!(
+            manifest.validate(),
+            Err(ManifestError::StateObjectKeyMismatch {
+                object_id: "state-0001".to_string(),
+                expected: ObjectKey::state_object("balances_by_account", 0, 1, "state-0001")
+                    .unwrap(),
+                actual: ObjectKey::state_object("other_owner", 0, 1, "state-0001").unwrap(),
+            })
+        );
+    }
+
+    #[test]
+    fn checkpoint_manifest_rejects_output_ref_object_key_mismatch() {
+        let mut manifest = valid_manifest();
+        manifest.output_objects[0].object_key =
+            ObjectKey::ingest_batch("settlements", 1, 20, 25).unwrap();
+
+        assert_eq!(
+            manifest.validate(),
+            Err(ManifestError::OutputObjectKeyMismatch {
+                object_id: "out-0001".to_string(),
+                expected: ObjectKey::ingest_batch("settlements", 0, 20, 25).unwrap(),
+                actual: ObjectKey::ingest_batch("settlements", 1, 20, 25).unwrap(),
+            })
+        );
     }
 
     #[test]
