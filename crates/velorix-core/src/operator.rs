@@ -74,7 +74,7 @@ where
 
     pub fn apply_left(&mut self, input: &DeltaBatch) -> Result<DeltaBatch, OperatorError> {
         let output = join_against(input, &self.right, &mut self.join_values)?;
-        self.left.apply(input);
+        self.left = self.left.applied(input)?;
         Ok(output)
     }
 
@@ -89,7 +89,7 @@ where
             }
         }
 
-        self.right.apply(input);
+        self.right = self.right.applied(input)?;
         Ok(DeltaBatch::from_records(output))
     }
 
@@ -190,21 +190,54 @@ where
 
 #[derive(Clone, Debug, Default)]
 struct SideState {
-    records_by_key: BTreeMap<String, Vec<DeltaRecord>>,
+    records_by_key: BTreeMap<String, BTreeMap<String, SideStateRecord>>,
 }
 
 impl SideState {
-    fn apply(&mut self, input: &DeltaBatch) {
+    fn applied(&self, input: &DeltaBatch) -> Result<Self, OperatorError> {
+        let mut next = self.clone();
+
         for record in input.records() {
-            self.records_by_key
-                .entry(canonical_json(record.key.as_json()))
-                .or_default()
-                .push(record.clone());
+            let key = canonical_json(record.key.as_json());
+            let value = canonical_json(record.value.as_json());
+            let values = next.records_by_key.entry(key.clone()).or_default();
+            let weight = i128::from(values.get(&value).map_or(0, |entry| entry.weight))
+                .checked_add(i128::from(record.weight))
+                .ok_or(OperatorError::WeightOverflow)?;
+            let weight: DeltaWeight = weight
+                .try_into()
+                .map_err(|_| OperatorError::WeightOverflow)?;
+
+            if weight == 0 {
+                values.remove(&value);
+            } else {
+                values.insert(
+                    value,
+                    SideStateRecord {
+                        key: record.key.clone(),
+                        value: record.value.clone(),
+                        weight,
+                    },
+                );
+            }
+
+            if values.is_empty() {
+                next.records_by_key.remove(&key);
+            }
         }
+
+        Ok(next)
     }
 
     fn batch(&self) -> DeltaBatch {
-        DeltaBatch::from_records(self.records_by_key.values().flatten().cloned())
+        DeltaBatch::from_records(
+            self.records_by_key
+                .values()
+                .flat_map(|values| values.values())
+                .map(SideStateRecord::to_record)
+                .collect::<Result<Vec<_>, _>>()
+                .expect("stored join side state must fit delta records"),
+        )
     }
 
     fn net_records_for_key(&self, key: &DeltaKey) -> Result<Vec<DeltaRecord>, OperatorError> {
@@ -212,7 +245,27 @@ impl SideState {
             return Ok(Vec::new());
         };
 
-        Ok(DeltaBatch::from_records(records.iter().cloned()).net_rows()?)
+        records
+            .values()
+            .map(SideStateRecord::to_record)
+            .collect::<Result<Vec<_>, _>>()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SideStateRecord {
+    key: DeltaKey,
+    value: DeltaValue,
+    weight: DeltaWeight,
+}
+
+impl SideStateRecord {
+    fn to_record(&self) -> Result<DeltaRecord, OperatorError> {
+        Ok(DeltaRecord::new(
+            self.key.clone(),
+            self.value.clone(),
+            self.weight,
+        ))
     }
 }
 
@@ -289,7 +342,7 @@ impl AggregateChange {
             .checked_add(self.count_delta)
             .ok_or(OperatorError::WeightOverflow)?;
 
-        if count == 0 {
+        if sum == 0 && count == 0 {
             Ok(None)
         } else {
             Ok(Some(AggregateEntry {
