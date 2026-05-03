@@ -84,6 +84,12 @@ impl ObjectKey {
         ))
     }
 
+    pub fn persisted_query(query_id: &str) -> Result<Self, ObjectKeyError> {
+        validate_segment("query_id", query_id)?;
+
+        Ok(Self(format!("v1/queries/{query_id}.query.json")))
+    }
+
     pub fn parse(value: impl Into<String>) -> Result<Self, ObjectKeyError> {
         let value = value.into();
         if value.starts_with('/')
@@ -156,6 +162,12 @@ fn validate_known_layout(value: &str) -> Result<(), ObjectKeyError> {
                 .strip_suffix(".manifest")
                 .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
             parse_fixed_u64("checkpoint_version", checkpoint, CHECKPOINT_WIDTH)?;
+        }
+        ["v1", "queries", query_file] => {
+            let query_id = query_file
+                .strip_suffix(".query.json")
+                .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+            validate_segment("query_id", query_id)?;
         }
         _ => return Err(ObjectKeyError::InvalidExternalKey(value.to_string())),
     }
@@ -353,6 +365,26 @@ mod tests {
     }
 
     #[test]
+    fn persisted_query_key_is_deterministic() {
+        let key = ObjectKey::persisted_query("orders-by-account").unwrap();
+        let restarted = ObjectKey::persisted_query("orders-by-account").unwrap();
+
+        assert_eq!(key.as_str(), "v1/queries/orders-by-account.query.json");
+        assert_eq!(key, restarted);
+        assert_eq!(ObjectKey::parse(key.as_str()).unwrap(), key);
+    }
+
+    #[test]
+    fn persisted_query_key_rejects_path_unsafe_query_ids() {
+        for query_id in ["", ".", "..", "orders/by-account", "orders by account"] {
+            assert!(
+                ObjectKey::persisted_query(query_id).is_err(),
+                "accepted invalid query id: {query_id}"
+            );
+        }
+    }
+
+    #[test]
     fn parse_rejects_invalid_or_unrecognized_external_keys() {
         for invalid in [
             "v1/ingest/./p=0000000000/00000000000000000000-00000000000000000001.batch",
@@ -362,6 +394,8 @@ mod tests {
             "/v1/checkpoints/00000000000000000001.manifest",
             "v2/checkpoints/00000000000000000001.manifest",
             "v1/unknown/orders/p=0000000000/object",
+            "v1/queries/../orders.query.json",
+            "v1/queries/orders.txt",
         ] {
             assert!(
                 ObjectKey::parse(invalid).is_err(),

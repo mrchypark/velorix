@@ -31,6 +31,8 @@ disposable, scaling horizontally without state migration as the runtime matures.
 - Minimal DataFusion SQL/query planning and execution over in-memory Arrow
   batches for ad hoc `DeltaBatch` query input and recovered materialized
   runtime state
+- Persisted query service v0 for object-backed query specs, with DataFusion
+  validation before create-only catalog writes
 - Feldera SQL-to-DBSP standing-view compile artifact contract for validating
   externally compiled standing-view artifacts; direct runtime Feldera/dbsp
   integration remains gated
@@ -61,10 +63,11 @@ packages already fit the problem:
   in-memory Arrow/DataFusion table and returns Arrow `RecordBatch` output.
   Runtime code can now recover the latest object-backed checkpoint state,
   replay uncovered ingest batches, and query that recovered materialized state
-  through the same DataFusion boundary. The boundary now includes a minimal
-  policy for SQL text size, output row caps, DataFusion batch size, and target
-  partitions. A persisted query service, direct object-backed table scans, and
-  broader cost/resource policy remain future work.
+  through the same DataFusion boundary. Persisted query service v0 stores
+  validated query specs in object storage with create-only writes. The boundary
+  includes a minimal policy for SQL text size, output row caps, DataFusion
+  batch size, and target partitions. Direct object-backed table scans,
+  scheduling/versioning, and broader cost/resource policy remain future work.
 - **Feldera SQL-to-DBSP** owns standing-view SQL compilation. Velorix now has a
   phase-0 compile artifact contract that validates Feldera standing-view specs
   and externally produced artifact metadata. Direct runtime Feldera/dbsp crate
@@ -101,7 +104,9 @@ The intended system shape is:
    object-backed checkpoint, replay uncovered ingest batches, and query the
    recovered materialized state. Minimal policy covers SQL text size, output
    row caps, DataFusion batch size, and target partitions. Persisted query
-   services and direct object-backed DataFusion table integration are still
+   service v0 stores JSON query specs under deterministic object keys after
+   DataFusion validation. Direct object-backed DataFusion table integration,
+   schedulers, query versioning, and broader runtime resource policy are still
    future work.
 4. **State store:** SlateDB is the current minimal experimental durable
    state-store path over object storage for checkpoint-versioned payloads, while
@@ -159,8 +164,11 @@ SlateDB layout, compaction, and lifecycle work remain gated follow-on work.
     and Arrow execution routed through DataFusion. The current implementation
     runs SQL over an in-memory `MemTable` built from `DeltaBatch` input, and the
     runtime exposes a recovered-state query boundary that first rebuilds
-    materialized state from object-backed checkpoints and replay. Future work is
-    to add a persisted query service and direct object-backed table access.
+    materialized state from object-backed checkpoints and replay. Persisted
+    query service v0 adds create/read JSON specs in object storage and executes
+    stored SQL through the recovered-state boundary. Future work is direct
+    object-backed table access plus scheduler/versioning and broader resource
+    policy.
 11. **Use Feldera for standing-view SQL compilation:** validate Feldera
     SQL-to-DBSP compile artifacts before any future `FelderaPipelineEngine`
     consumes release-built generated code. The v1 spec hash is

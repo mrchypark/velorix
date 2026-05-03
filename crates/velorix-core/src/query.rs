@@ -7,6 +7,7 @@ use arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
 use datafusion::error::DataFusionError;
 use datafusion::prelude::{SessionConfig, SessionContext};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::delta::DeltaBatch;
@@ -23,7 +24,7 @@ pub enum QueryError {
     Policy(#[from] QueryPolicyError),
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct QueryPolicy {
     pub max_sql_bytes: Option<usize>,
     pub max_output_rows: Option<usize>,
@@ -66,24 +67,10 @@ pub async fn query_delta_batch_with_policy(
     sql: &str,
     policy: QueryPolicy,
 ) -> Result<Vec<RecordBatch>, QueryError> {
-    if let Some(max_bytes) = policy.max_sql_bytes {
-        let actual_bytes = sql.len();
-        if actual_bytes > max_bytes {
-            return Err(QueryPolicyError::SqlTextTooLarge {
-                actual_bytes,
-                max_bytes,
-            }
-            .into());
-        }
-    }
+    validate_sql_text_policy(sql, policy)?;
 
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("key_json", DataType::Utf8, false),
-        Field::new("value_json", DataType::Utf8, false),
-        Field::new("weight", DataType::Int64, false),
-    ]));
     let input = RecordBatch::try_new(
-        Arc::clone(&schema),
+        input_schema(),
         vec![
             Arc::new(StringArray::from(
                 batch
@@ -108,17 +95,7 @@ pub async fn query_delta_batch_with_policy(
             )) as ArrayRef,
         ],
     )?;
-    let table = MemTable::try_new(schema, vec![vec![input]])?;
-    let mut config = SessionConfig::new();
-    if let Some(batch_size) = policy.batch_size {
-        config = config.with_batch_size(batch_size.get());
-    }
-    if let Some(target_partitions) = policy.target_partitions {
-        config = config.with_target_partitions(target_partitions.get());
-    }
-    let context = SessionContext::new_with_config(config);
-
-    context.register_table(INPUT_TABLE_NAME, Arc::new(table))?;
+    let context = input_context(vec![input], policy)?;
 
     let dataframe = context.sql(sql).await?;
     if let Some(max_rows) = policy.max_output_rows {
@@ -140,4 +117,59 @@ pub async fn query_delta_batch_with_policy(
     }
 
     Ok(dataframe.collect().await?)
+}
+
+pub async fn validate_input_query_with_policy(
+    sql: &str,
+    policy: QueryPolicy,
+) -> Result<(), QueryError> {
+    validate_sql_text_policy(sql, policy)?;
+
+    let input = RecordBatch::new_empty(input_schema());
+    let context = input_context(vec![input], policy)?;
+    let dataframe = context.sql(sql).await?;
+    dataframe.into_optimized_plan()?;
+
+    Ok(())
+}
+
+fn validate_sql_text_policy(sql: &str, policy: QueryPolicy) -> Result<(), QueryPolicyError> {
+    if let Some(max_bytes) = policy.max_sql_bytes {
+        let actual_bytes = sql.len();
+        if actual_bytes > max_bytes {
+            return Err(QueryPolicyError::SqlTextTooLarge {
+                actual_bytes,
+                max_bytes,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn input_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("key_json", DataType::Utf8, false),
+        Field::new("value_json", DataType::Utf8, false),
+        Field::new("weight", DataType::Int64, false),
+    ]))
+}
+
+fn input_context(
+    input_batches: Vec<RecordBatch>,
+    policy: QueryPolicy,
+) -> Result<SessionContext, QueryError> {
+    let table = MemTable::try_new(input_schema(), vec![input_batches])?;
+    let mut config = SessionConfig::new();
+    if let Some(batch_size) = policy.batch_size {
+        config = config.with_batch_size(batch_size.get());
+    }
+    if let Some(target_partitions) = policy.target_partitions {
+        config = config.with_target_partitions(target_partitions.get());
+    }
+    let context = SessionContext::new_with_config(config);
+
+    context.register_table(INPUT_TABLE_NAME, Arc::new(table))?;
+
+    Ok(context)
 }

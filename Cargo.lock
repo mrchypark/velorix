@@ -3432,6 +3432,7 @@ dependencies = [
  "foyer",
  "futures",
  "object_store 0.12.5",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",

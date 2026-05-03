@@ -4,7 +4,8 @@ use std::num::NonZeroUsize;
 use velorix_core::delta::{DeltaBatch, DeltaKey, DeltaRecord, DeltaValue};
 
 use velorix_core::query::{
-    query_delta_batch, query_delta_batch_with_policy, QueryError, QueryPolicy, QueryPolicyError,
+    query_delta_batch, query_delta_batch_with_policy, validate_input_query_with_policy, QueryError,
+    QueryPolicy, QueryPolicyError,
 };
 
 #[tokio::test]
@@ -180,6 +181,50 @@ async fn query_delta_batch_returns_a_typed_error_when_datafusion_rejects_sql() {
         .unwrap_err();
 
     assert!(error.to_string().contains("missing_column"));
+}
+
+#[tokio::test]
+async fn validate_input_query_accepts_valid_select_over_empty_input() {
+    validate_input_query_with_policy(
+        "select key_json, value_json, weight from input where weight >= 0",
+        QueryPolicy::default(),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn validate_input_query_rejects_missing_input_column() {
+    let error = validate_input_query_with_policy(
+        "select missing_column from input",
+        QueryPolicy::default(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("missing_column"));
+}
+
+#[tokio::test]
+async fn validate_input_query_rejects_sql_text_above_policy_limit() {
+    let sql = "select * from input";
+    let error = validate_input_query_with_policy(
+        sql,
+        QueryPolicy {
+            max_sql_bytes: Some(sql.len() - 1),
+            ..QueryPolicy::default()
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        QueryError::Policy(QueryPolicyError::SqlTextTooLarge {
+            actual_bytes,
+            max_bytes
+        }) if actual_bytes == sql.len() && max_bytes == sql.len() - 1
+    ));
 }
 
 fn record(key: &str, value: serde_json::Value, weight: i64) -> DeltaRecord {

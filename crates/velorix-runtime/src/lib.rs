@@ -3,5 +3,6 @@
 #![forbid(unsafe_code)]
 
 pub mod cache;
+pub mod persisted_query;
 pub mod query;
 pub mod recovery;

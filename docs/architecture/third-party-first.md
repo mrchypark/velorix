@@ -6,12 +6,13 @@ Velorix-specific code focused on object-storage authority, checkpoint manifests,
 stateless recovery, resource/cost policy, and package boundaries.
 
 This note distinguishes current implementation from target direction. The
-runtime object cache is currently Foyer-backed after the recent cache work,
-ad hoc SQL/query planning and execution currently use DataFusion for the
-minimal `DeltaBatch` and recovered materialized-state query boundaries, and
-SlateDB now backs a minimal experimental checkpoint-versioned state-store path.
-Incremental execution now has a DBSP-shaped `IncrementalEngine` boundary backed
-by prototype operators.
+runtime object cache is currently Foyer-backed, ad hoc SQL/query planning and
+execution currently use DataFusion for the minimal `DeltaBatch`, validation,
+and recovered materialized-state query boundaries, and persisted query service
+v0 stores validated JSON query specs in object storage. SlateDB now backs a
+minimal experimental checkpoint-versioned state-store path. Incremental
+execution now has a DBSP-shaped `IncrementalEngine` boundary backed by
+prototype operators.
 Feldera SQL-to-DBSP standing-view compilation now has a phase-0 artifact
 metadata/spec contract. Direct runtime Feldera DBSP/dbsp integration remains
 gated unless matching code exists in the repository.
@@ -22,7 +23,7 @@ gated unless matching code exists in the repository.
 | --- | --- | --- | --- |
 | Durable LSM/SST/state substrate | Current minimal experimental state-store implementation | SlateDB | Object key policy, stream progress, exactly-once manifests, recovery orchestration |
 | Runtime object-store fetch-through cache | Current implementation | Foyer | Object-store authority checks, cache namespace policy, cache-as-non-durable invariant |
-| Ad hoc SQL/DataFrame/query planning and Arrow execution | Current minimal implementation | Apache DataFusion | Runtime integration, checkpoint-aware inputs/outputs, cost/resource policy |
+| Ad hoc SQL/DataFrame/query planning, validation, and Arrow execution | Current minimal implementation | Apache DataFusion | Runtime integration, checkpoint-aware inputs/outputs, persisted query catalog specs, cost/resource policy |
 | Standing-view SQL-to-DBSP compilation | Current phase-0 artifact contract | Feldera SQL-to-DBSP compiler and pipeline tooling | Spec/artifact validation, release artifact selection, object-backed state and manifests |
 | Incremental algebra, operators, and circuit semantics | Current adapter boundary; direct DBSP crate integration remains gated | Feldera project semantics and/or Rust `dbsp` crate | `IncrementalEngine` adapter, object-backed persistence, moderate-performance cost optimizations |
 
@@ -52,13 +53,19 @@ querying the recovered materialized `DeltaBatch` through that same DataFusion
 path. This keeps object storage as durable authority and avoids a custom query
 planner.
 
+Persisted query service v0 stores `PersistedQuerySpec` JSON objects under
+deterministic `v1/queries/{query_id}.query.json` keys. Query ids use the shared
+`ObjectKey` segment rules, SQL is validated by DataFusion against an empty
+`input` table before a create-only catalog write, and execution loads the stored
+SQL/policy before calling the recovered materialized-state query boundary.
+
 The query boundary also exposes a minimal Velorix-owned policy for SQL text
 size, output row caps, DataFusion batch size, and target partitions. Output row
 caps are enforced by applying a DataFusion `DataFrame` limit before collection,
 not by parsing or planning SQL inside Velorix.
 
-This is an ad hoc SQL/query surface, not standing-view compilation. Persisted
-query-service APIs, direct object-backed table scans, broader persisted view
+This is an ad hoc SQL/query surface, not standing-view compilation. Direct
+object-backed table scans, query scheduling/versioning, broader persisted view
 access, and memory-pool/disk-spill runtime resource policy remain future
 integration work.
 
@@ -120,8 +127,9 @@ epoch fallback for those old payloads.
 5. Keep SQL/query surfaces routed through DataFusion instead of creating a
    custom planner or expression engine. This DataFusion path is for ad hoc SQL
    over in-memory `DeltaBatch` input and runtime-recovered materialized state;
-   persisted query services and direct object-backed table scans remain future
-   work.
+   persisted query service v0 only catalogs validated SQL/policy specs in
+   object storage. Direct object-backed table scans, scheduling, and versioning
+   remain future work.
 6. Use Feldera's SQL-to-DBSP compiler for standing-view SQL through validated
    external compiler artifacts. Do not hand-build Velorix circuits for standing
    views in this phase.
