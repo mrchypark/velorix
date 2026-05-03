@@ -13,6 +13,10 @@ fn load_artifact(name: &str) -> FelderaCompileArtifactMetadata {
     serde_json::from_str(&std::fs::read_to_string(fixture_path(name)).unwrap()).unwrap()
 }
 
+fn parse_artifact(name: &str) -> Result<FelderaCompileArtifactMetadata, serde_json::Error> {
+    serde_json::from_str(&std::fs::read_to_string(fixture_path(name)).unwrap())
+}
+
 fn fixture_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -28,7 +32,7 @@ fn feldera_artifact_accepts_valid_single_input_output_standing_view() {
 
     assert_eq!(
         feldera_spec_hash(&spec).unwrap(),
-        "velorix-feldera-spec-fnv1a64-v1:df13f7387d35c9e1"
+        "velorix-feldera-spec-sha256-v1:52bf5460d5c587c5cf67058fa68cf3d4c6d873ee97be70e7ef331bd531cae45f"
     );
     validate_feldera_compile_artifact(&spec, &artifact).unwrap();
 }
@@ -126,6 +130,55 @@ fn feldera_artifact_rejects_unsupported_epoch_policy() {
         error,
         FelderaArtifactError::UnsupportedEpochPolicy { .. }
     ));
+}
+
+#[test]
+fn feldera_artifact_rejects_unsupported_generated_rust_abi() {
+    let spec = load_spec("standing_view_spec_valid");
+    let artifact = load_artifact("compile_artifact_unsupported_generated_rust_abi");
+
+    let error = validate_feldera_compile_artifact(&spec, &artifact).unwrap_err();
+
+    assert!(matches!(
+        error,
+        FelderaArtifactError::UnsupportedGeneratedRustAbi { .. }
+    ));
+}
+
+#[test]
+fn feldera_artifact_rejects_input_schema_mismatch() {
+    let spec = load_spec("standing_view_spec_valid");
+    let artifact = load_artifact("compile_artifact_schema_mismatch");
+
+    let error = validate_feldera_compile_artifact(&spec, &artifact).unwrap_err();
+
+    assert!(matches!(
+        error,
+        FelderaArtifactError::SchemaMismatch {
+            field: "input_schemas"
+        }
+    ));
+}
+
+#[test]
+fn feldera_artifact_rejects_unknown_wire_fields() {
+    let error = parse_artifact("compile_artifact_unknown_field").unwrap_err();
+
+    assert!(error.to_string().contains("unknown field"));
+}
+
+#[test]
+fn feldera_artifact_rejects_missing_required_wire_fields() {
+    let error = parse_artifact("compile_artifact_missing_required_field").unwrap_err();
+
+    assert!(error.to_string().contains("missing field"));
+}
+
+#[test]
+fn feldera_artifact_rejects_malformed_wire_json() {
+    let error = parse_artifact("compile_artifact_malformed_json").unwrap_err();
+
+    assert!(!error.is_data());
 }
 
 #[test]

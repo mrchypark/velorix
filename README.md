@@ -152,8 +152,10 @@ SlateDB layout, compaction, and lifecycle work remain gated follow-on work.
     work is to make that service object-backed and checkpoint-aware.
 11. **Use Feldera for standing-view SQL compilation:** validate Feldera
     SQL-to-DBSP compile artifacts before any future `FelderaPipelineEngine`
-    consumes release-built generated code. Do not hand-build Velorix circuits or
-    load arbitrary generated Rust from object storage.
+    consumes release-built generated code. The v1 spec hash is
+    `velorix-feldera-spec-sha256-v1:<hex>`, computed as SHA-256 over canonical
+    compact serde JSON bytes for the typed `StandingViewSpec`. Do not hand-build
+    Velorix circuits or load arbitrary generated Rust from object storage.
 12. **Scale out workers:** partition streams and views so additional disposable
     workers increase throughput without state migration.
 13. **Benchmark and harden:** measure cost, recovery time, throughput, and view

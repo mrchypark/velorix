@@ -1,7 +1,7 @@
 {
   "metadata_version": 1,
   "view_id": "other_view",
-  "spec_hash": "velorix-feldera-spec-fnv1a64-v1:df13f7387d35c9e1",
+  "spec_hash": "velorix-feldera-spec-sha256-v1:52bf5460d5c587c5cf67058fa68cf3d4c6d873ee97be70e7ef331bd531cae45f",
   "artifact_id": "feldera-artifact-orders-by-region-20260503",
   "artifact_hash": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
   "compiler": { "name": "feldera-sql-to-dbsp", "version": "0.42.0", "source": "sql-to-dbsp-compiler/SQL-compiler" },

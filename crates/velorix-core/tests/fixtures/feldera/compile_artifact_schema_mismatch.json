@@ -1,11 +1,18 @@
 {
   "metadata_version": 1,
   "view_id": "standing_view_orders_by_region",
-  "spec_hash": "velorix-feldera-spec-sha256-v1:0000000000000000000000000000000000000000000000000000000000000000",
+  "spec_hash": "velorix-feldera-spec-sha256-v1:52bf5460d5c587c5cf67058fa68cf3d4c6d873ee97be70e7ef331bd531cae45f",
   "artifact_id": "feldera-artifact-orders-by-region-20260503",
   "artifact_hash": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-  "compiler": { "name": "feldera-sql-to-dbsp", "version": "0.42.0", "source": "sql-to-dbsp-compiler/SQL-compiler" },
-  "generated_rust": { "abi_version": "feldera-generated-rust-abi-v1", "crate_name": "orders_by_region_pipeline" },
+  "compiler": {
+    "name": "feldera-sql-to-dbsp",
+    "version": "0.42.0",
+    "source": "sql-to-dbsp-compiler/SQL-compiler"
+  },
+  "generated_rust": {
+    "abi_version": "feldera-generated-rust-abi-v1",
+    "crate_name": "orders_by_region_pipeline"
+  },
   "input_schemas": [
     {
       "relation_id": "orders",
@@ -13,7 +20,7 @@
       "columns": [
         { "name": "order_id", "data_type": { "kind": "utf8" }, "nullable": false },
         { "name": "region", "data_type": { "kind": "utf8" }, "nullable": false },
-        { "name": "amount", "data_type": { "kind": "decimal", "precision": 18, "scale": 2 }, "nullable": false }
+        { "name": "amount", "data_type": { "kind": "decimal", "precision": 18, "scale": 2 }, "nullable": true }
       ],
       "primary_key": ["order_id"]
     }

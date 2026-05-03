@@ -19,12 +19,23 @@ generated Rust at runtime.
   identity, generated Rust ABI identity, input/output schemas, state codec,
   state schema version, and epoch policy.
 
+The v1 `spec_hash` format is
+`velorix-feldera-spec-sha256-v1:<hex>`. The digest is SHA-256 over the
+canonical serde JSON bytes produced by compact `serde_json` serialization of
+the typed `StandingViewSpec` after deserialization. Struct field order is the
+Rust wire-struct declaration order, enum names use the documented serde names,
+arrays keep their declared order, and there is no pretty-printing or trailing
+newline. This keeps the hash independent of source-file whitespace while
+pinning the exact spec contract Velorix validated.
+
 Validation is intentionally fail-closed. Velorix rejects unsupported metadata
-versions, blank identity fields, missing schemas, unknown state codecs,
-unsupported epoch policies, generated Rust ABI versions outside the phase-0
-contract, view id or spec hash mismatches, schema mismatches, and multi-input or
-multi-output standing-view shapes. Phase 0 supports one input relation and one
-output relation only.
+versions, missing or blank required identity fields, missing schemas, unknown
+JSON fields, malformed JSON, unknown state codecs, unsupported epoch policies,
+generated Rust ABI versions outside the phase-0 contract, view id or spec hash
+mismatches, schema mismatches, and multi-input or multi-output standing-view
+shapes. Phase 0 supports one input relation and one output relation only.
+Required wire fields do not receive serde defaults; JSON must declare them
+explicitly.
 
 The relation schemas are SQL-facing contracts. They describe relation ids,
 relation names, typed columns, nullability, and primary keys. They are not the
@@ -36,9 +47,9 @@ DataFusion `DeltaBatch` ad hoc query table with `key_json`, `value_json`, and
 Generated Rust is trusted only as a build/release artifact. A future release
 pipeline can compile Feldera-generated Rust into a Velorix engine package after
 reviewing the metadata, pinning compiler identity, and verifying the artifact
-hash. The running Velorix process should select among already-built,
-release-trusted artifacts; it should not compile or dynamically load arbitrary
-generated source from object storage.
+hash and the SHA-256 `spec_hash`. The running Velorix process should select
+among already-built, release-trusted artifacts; it should not compile or
+dynamically load arbitrary generated source from object storage.
 
 Object storage manifests remain durable data and progress authority. They may
 reference a validated artifact id/hash, but they cannot make code executable by

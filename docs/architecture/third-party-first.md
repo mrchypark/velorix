@@ -58,10 +58,15 @@ records compiler identity, generated Rust ABI identity, artifact id/hash,
 typed input/output relation schemas, state codec, state schema version, and
 epoch policy.
 
+The v1 spec hash is
+`velorix-feldera-spec-sha256-v1:<hex>`, where `<hex>` is SHA-256 over the
+canonical compact serde JSON bytes for the typed `StandingViewSpec`.
+
 Validation fails closed on unsupported metadata versions, blank identity fields,
-missing schemas, unsupported state codec or epoch policy, mismatched view id or
-spec hash, schema mismatch, and unsupported multi-input or multi-output shapes.
-Phase 0 supports one input relation and one output relation.
+missing schemas, malformed or unknown-field JSON, unsupported state codec or
+epoch policy, mismatched view id or spec hash, schema mismatch, and unsupported
+multi-input or multi-output shapes. Phase 0 supports one input relation and one
+output relation.
 
 Generated Rust is trusted only at build/release time. Object storage manifests
 may reference a previously built artifact id/hash, but manifests cannot load

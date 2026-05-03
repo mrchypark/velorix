@@ -1,15 +1,17 @@
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub const FELDERA_ARTIFACT_METADATA_VERSION: u32 = 1;
-pub const FELDERA_SPEC_HASH_PREFIX: &str = "velorix-feldera-spec-fnv1a64-v1";
+pub const FELDERA_SPEC_HASH_PREFIX: &str = "velorix-feldera-spec-sha256-v1";
 pub const SUPPORTED_STATE_CODEC: &str = "feldera-dbsp-state-v1";
 pub const SUPPORTED_EPOCH_POLICY: &str = "monotonic-logical-epoch-v1";
 pub const SUPPORTED_GENERATED_RUST_ABI_VERSION: &str = "feldera-generated-rust-abi-v1";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct StandingViewSpec {
     pub view_id: String,
     pub sql: String,
@@ -21,39 +23,38 @@ pub struct StandingViewSpec {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 #[serde(rename_all = "snake_case")]
 pub enum SqlDialect {
     FelderaSql,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 #[serde(rename_all = "snake_case")]
 pub enum SqlSourceKind {
     StandingView,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct StandingViewShape {
     pub is_materialized: bool,
-    #[serde(default)]
     pub multi_input: bool,
-    #[serde(default)]
     pub multi_output: bool,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RelationSchema {
-    #[serde(default)]
     pub relation_id: String,
-    #[serde(default)]
     pub relation_name: String,
-    #[serde(default)]
     pub columns: Vec<ColumnSchema>,
-    #[serde(default)]
     pub primary_key: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ColumnSchema {
     pub name: String,
     pub data_type: SqlDataType,
@@ -61,6 +62,7 @@ pub struct ColumnSchema {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SqlDataType {
     Bool,
@@ -73,49 +75,35 @@ pub enum SqlDataType {
     Json,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct FelderaCompileArtifactMetadata {
-    #[serde(default)]
     pub metadata_version: u32,
-    #[serde(default)]
     pub view_id: String,
-    #[serde(default)]
     pub spec_hash: String,
-    #[serde(default)]
     pub artifact_id: String,
-    #[serde(default)]
     pub artifact_hash: String,
-    #[serde(default)]
     pub compiler: FelderaCompilerIdentity,
-    #[serde(default)]
     pub generated_rust: GeneratedRustIdentity,
-    #[serde(default)]
     pub input_schemas: Vec<RelationSchema>,
-    #[serde(default)]
     pub output_schemas: Vec<RelationSchema>,
-    #[serde(default)]
     pub state_codec: String,
-    #[serde(default)]
     pub state_schema_version: u32,
-    #[serde(default)]
     pub epoch_policy: String,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct FelderaCompilerIdentity {
-    #[serde(default)]
     pub name: String,
-    #[serde(default)]
     pub version: String,
-    #[serde(default)]
     pub source: String,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct GeneratedRustIdentity {
-    #[serde(default)]
     pub abi_version: String,
-    #[serde(default)]
     pub crate_name: String,
 }
 
@@ -282,12 +270,12 @@ pub fn validate_feldera_compile_artifact(
     Ok(())
 }
 
+/// Hashes the v1 standing-view spec contract as SHA-256 over the compact
+/// `serde_json::to_vec` serialization of `StandingViewSpec`.
 pub fn feldera_spec_hash(spec: &StandingViewSpec) -> Result<String, FelderaArtifactError> {
     let encoded = serde_json::to_vec(spec).map_err(SerdeJsonError)?;
-    Ok(format!(
-        "{FELDERA_SPEC_HASH_PREFIX}:{:016x}",
-        fnv1a64(&encoded)
-    ))
+    let digest = Sha256::digest(&encoded);
+    Ok(format!("{FELDERA_SPEC_HASH_PREFIX}:{digest:x}"))
 }
 
 fn require_non_empty(field: &'static str, value: &str) -> Result<(), FelderaArtifactError> {
@@ -373,14 +361,4 @@ fn validate_sql_data_type(data_type: &SqlDataType) -> Result<(), FelderaArtifact
     }
 
     Ok(())
-}
-
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-
-    hash
 }
