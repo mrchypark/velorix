@@ -44,8 +44,27 @@ pub enum IngestLogError {
     AlreadyExists(ObjectKey),
     #[error("malformed ingest batch key `{key}`: {source}")]
     MalformedIngestKey { key: String, source: ObjectKeyError },
-    #[error("malformed ingest batch key `{0}`")]
-    MalformedIngestKeyShape(String),
+    #[error(
+        "overlapping committed ingest ranges for {stream_id}/p={partition_id}: `{previous}` overlaps `{current}`"
+    )]
+    OverlappingCommittedRange {
+        stream_id: String,
+        partition_id: u32,
+        previous: ObjectKey,
+        current: ObjectKey,
+    },
+    #[error(
+        "checkpoint boundary {checkpoint_end_offset_exclusive} falls inside committed batch `{object_key}`"
+    )]
+    CheckpointInsideBatch {
+        checkpoint_end_offset_exclusive: u64,
+        object_key: ObjectKey,
+    },
+    #[error("duplicate replay checkpoint for {stream_id}/p={partition_id}")]
+    DuplicateReplayCheckpoint {
+        stream_id: String,
+        partition_id: u32,
+    },
     #[error(transparent)]
     ObjectStore(#[from] object_store::Error),
 }
@@ -80,35 +99,40 @@ impl IngestLog {
 
         objects.sort_by(|left, right| left.location.cmp(&right.location));
 
-        objects
+        let descriptors = objects
             .into_iter()
             .map(|object| parse_ingest_descriptor(object.location.as_ref()))
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+
+        validate_non_overlapping_ranges(&descriptors)?;
+
+        Ok(descriptors)
     }
 
     pub async fn replay_from(
         &self,
         checkpoints: &[ReplayCheckpoint],
     ) -> Result<Vec<IngestBatch>, IngestLogError> {
-        let checkpoint_offsets = checkpoints
-            .iter()
-            .map(|checkpoint| {
-                (
-                    (checkpoint.stream_id.as_str(), checkpoint.partition_id),
-                    checkpoint.end_offset_exclusive,
-                )
-            })
-            .collect::<HashMap<_, _>>();
+        let checkpoint_offsets = validate_checkpoints(checkpoints)?;
 
         let mut batches = Vec::new();
         for descriptor in self.list_committed().await? {
             let checkpoint_end = checkpoint_offsets
-                .get(&(descriptor.stream_id.as_str(), descriptor.partition_id))
+                .get(&(descriptor.stream_id.clone(), descriptor.partition_id))
                 .copied()
                 .unwrap_or(0);
 
             if descriptor.end_offset_exclusive <= checkpoint_end {
                 continue;
+            }
+
+            if descriptor.start_offset_inclusive < checkpoint_end
+                && checkpoint_end < descriptor.end_offset_exclusive
+            {
+                return Err(IngestLogError::CheckpointInsideBatch {
+                    checkpoint_end_offset_exclusive: checkpoint_end,
+                    object_key: descriptor.object_key,
+                });
             }
 
             let bytes = self
@@ -184,40 +208,63 @@ impl ReplayCheckpoint {
 }
 
 fn parse_ingest_descriptor(value: &str) -> Result<IngestBatchDescriptor, IngestLogError> {
-    let object_key = ObjectKey::parse(value.to_string()).map_err(|source| {
-        IngestLogError::MalformedIngestKey {
-            key: value.to_string(),
-            source,
-        }
-    })?;
-
-    let ["v1", "ingest", stream_id, partition, range] = value.split('/').collect::<Vec<_>>()[..]
-    else {
-        return Err(IngestLogError::MalformedIngestKeyShape(value.to_string()));
-    };
-    let partition_id = partition
-        .strip_prefix("p=")
-        .ok_or_else(|| IngestLogError::MalformedIngestKeyShape(value.to_string()))?
-        .parse()
-        .map_err(|_| IngestLogError::MalformedIngestKeyShape(value.to_string()))?;
-    let range = range
-        .strip_suffix(".batch")
-        .ok_or_else(|| IngestLogError::MalformedIngestKeyShape(value.to_string()))?;
-    let (start, end) = range
-        .split_once('-')
-        .ok_or_else(|| IngestLogError::MalformedIngestKeyShape(value.to_string()))?;
-    let start_offset_inclusive = start
-        .parse()
-        .map_err(|_| IngestLogError::MalformedIngestKeyShape(value.to_string()))?;
-    let end_offset_exclusive = end
-        .parse()
-        .map_err(|_| IngestLogError::MalformedIngestKeyShape(value.to_string()))?;
+    let (object_key, parts) =
+        ObjectKey::parse_ingest_batch(value.to_string()).map_err(|source| {
+            IngestLogError::MalformedIngestKey {
+                key: value.to_string(),
+                source,
+            }
+        })?;
 
     Ok(IngestBatchDescriptor {
-        stream_id: stream_id.to_string(),
-        partition_id,
-        start_offset_inclusive,
-        end_offset_exclusive,
+        stream_id: parts.stream_id,
+        partition_id: parts.partition_id,
+        start_offset_inclusive: parts.start_offset_inclusive,
+        end_offset_exclusive: parts.end_offset_exclusive,
         object_key,
     })
+}
+
+fn validate_non_overlapping_ranges(
+    descriptors: &[IngestBatchDescriptor],
+) -> Result<(), IngestLogError> {
+    for pair in descriptors.windows(2) {
+        let previous = &pair[0];
+        let current = &pair[1];
+
+        if previous.stream_id == current.stream_id
+            && previous.partition_id == current.partition_id
+            && current.start_offset_inclusive < previous.end_offset_exclusive
+        {
+            return Err(IngestLogError::OverlappingCommittedRange {
+                stream_id: current.stream_id.clone(),
+                partition_id: current.partition_id,
+                previous: previous.object_key.clone(),
+                current: current.object_key.clone(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_checkpoints(
+    checkpoints: &[ReplayCheckpoint],
+) -> Result<HashMap<(String, u32), u64>, IngestLogError> {
+    let mut checkpoint_offsets = HashMap::new();
+
+    for checkpoint in checkpoints {
+        let key = (checkpoint.stream_id.clone(), checkpoint.partition_id);
+        if checkpoint_offsets
+            .insert(key.clone(), checkpoint.end_offset_exclusive)
+            .is_some()
+        {
+            return Err(IngestLogError::DuplicateReplayCheckpoint {
+                stream_id: key.0,
+                partition_id: key.1,
+            });
+        }
+    }
+
+    Ok(checkpoint_offsets)
 }

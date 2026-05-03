@@ -11,6 +11,14 @@ const OFFSET_WIDTH: usize = 20;
 #[serde(transparent)]
 pub struct ObjectKey(String);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IngestBatchKeyParts {
+    pub stream_id: String,
+    pub partition_id: u32,
+    pub start_offset_inclusive: u64,
+    pub end_offset_exclusive: u64,
+}
+
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum ObjectKeyError {
     #[error("object key segment `{0}` is empty")]
@@ -90,6 +98,16 @@ impl ObjectKey {
         Ok(Self(value))
     }
 
+    pub fn parse_ingest_batch(
+        value: impl Into<String>,
+    ) -> Result<(Self, IngestBatchKeyParts), ObjectKeyError> {
+        let value = value.into();
+        let key = Self::parse(value.clone())?;
+        let parts = parse_ingest_batch_layout(&value)?;
+
+        Ok((key, parts))
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -116,18 +134,7 @@ fn validate_known_layout(value: &str) -> Result<(), ObjectKeyError> {
 
     match segments.as_slice() {
         ["v1", "ingest", stream_id, partition, range] => {
-            validate_segment("stream_id", stream_id)?;
-            parse_prefixed_u32("partition_id", partition, "p=", PARTITION_WIDTH)?;
-
-            let range = range
-                .strip_suffix(".batch")
-                .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
-            let (start, end) = range
-                .split_once('-')
-                .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
-            let start = parse_fixed_u64("start_offset_inclusive", start, OFFSET_WIDTH)?;
-            let end = parse_fixed_u64("end_offset_exclusive", end, OFFSET_WIDTH)?;
-            validate_offset_range(start, end)?;
+            parse_ingest_batch_parts(value, stream_id, partition, range)?;
         }
         ["v1", "state", owner, partition, checkpoint, object_file] => {
             validate_segment("owner", owner)?;
@@ -154,6 +161,43 @@ fn validate_known_layout(value: &str) -> Result<(), ObjectKeyError> {
     }
 
     Ok(())
+}
+
+fn parse_ingest_batch_layout(value: &str) -> Result<IngestBatchKeyParts, ObjectKeyError> {
+    let segments: Vec<_> = value.split('/').collect();
+
+    let ["v1", "ingest", stream_id, partition, range] = segments.as_slice() else {
+        return Err(ObjectKeyError::InvalidExternalKey(value.to_string()));
+    };
+
+    parse_ingest_batch_parts(value, stream_id, partition, range)
+}
+
+fn parse_ingest_batch_parts(
+    value: &str,
+    stream_id: &str,
+    partition: &str,
+    range: &str,
+) -> Result<IngestBatchKeyParts, ObjectKeyError> {
+    validate_segment("stream_id", stream_id)?;
+    let partition_id = parse_prefixed_u32("partition_id", partition, "p=", PARTITION_WIDTH)?;
+
+    let range = range
+        .strip_suffix(".batch")
+        .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+    let (start, end) = range
+        .split_once('-')
+        .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+    let start_offset_inclusive = parse_fixed_u64("start_offset_inclusive", start, OFFSET_WIDTH)?;
+    let end_offset_exclusive = parse_fixed_u64("end_offset_exclusive", end, OFFSET_WIDTH)?;
+    validate_offset_range(start_offset_inclusive, end_offset_exclusive)?;
+
+    Ok(IngestBatchKeyParts {
+        stream_id: stream_id.to_string(),
+        partition_id,
+        start_offset_inclusive,
+        end_offset_exclusive,
+    })
 }
 
 fn parse_prefixed_u32(

@@ -76,6 +76,55 @@ async fn log_replay_skips_batches_covered_by_checkpoint_boundary() {
 }
 
 #[tokio::test]
+async fn log_replay_rejects_checkpoint_inside_committed_batch() {
+    let (_temp_dir, store) = temp_store();
+    let log = IngestLog::new(store);
+    let batch = IngestBatch::new("orders", 0, 5, 15, Bytes::from_static(b"opaque")).unwrap();
+
+    log.append(&batch).await.unwrap();
+
+    let err = log
+        .replay_from(&[ReplayCheckpoint::new("orders", 0, 10)])
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("checkpoint boundary"));
+}
+
+#[tokio::test]
+async fn log_replay_rejects_overlapping_committed_ranges_for_same_stream_partition() {
+    let (_temp_dir, store) = temp_store();
+    let log = IngestLog::new(store);
+    let first = IngestBatch::new("orders", 0, 0, 10, Bytes::from_static(b"first")).unwrap();
+    let overlapping = IngestBatch::new("orders", 0, 5, 15, Bytes::from_static(b"overlap")).unwrap();
+
+    log.append(&first).await.unwrap();
+    log.append(&overlapping).await.unwrap();
+
+    let err = log.list_committed().await.unwrap_err();
+
+    assert!(err
+        .to_string()
+        .contains("overlapping committed ingest ranges"));
+}
+
+#[tokio::test]
+async fn log_replay_rejects_duplicate_checkpoints_for_same_stream_partition() {
+    let (_temp_dir, store) = temp_store();
+    let log = IngestLog::new(store);
+
+    let err = log
+        .replay_from(&[
+            ReplayCheckpoint::new("orders", 0, 10),
+            ReplayCheckpoint::new("orders", 0, 20),
+        ])
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("duplicate replay checkpoint"));
+}
+
+#[tokio::test]
 async fn log_replay_rejects_overwrites_and_invalid_ranges() {
     let (_temp_dir, store) = temp_store();
     let log = IngestLog::new(store);
