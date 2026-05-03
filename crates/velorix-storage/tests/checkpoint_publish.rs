@@ -4,7 +4,8 @@ use bytes::Bytes;
 use object_store::{local::LocalFileSystem, path::Path, ObjectStore};
 use tempfile::TempDir;
 use velorix_storage::{
-    manifest::{CheckpointManifest, InputRange},
+    manifest::{CheckpointManifest, InputRange, StateObjectRef},
+    object_key::ObjectKey,
     state::{CheckpointPublisher, StateObjectWrite},
 };
 
@@ -35,6 +36,28 @@ fn state_write(checkpoint_version: u64, object_id: &str, bytes: &'static [u8]) -
     .unwrap()
 }
 
+fn state_ref(state: &StateObjectWrite) -> StateObjectRef {
+    StateObjectRef {
+        object_id: state.object_id().to_string(),
+        object_key: state.object_key().clone(),
+        owner: state.owner().to_string(),
+        partition_id: state.partition_id(),
+        checkpoint_version: state.checkpoint_version(),
+    }
+}
+
+fn manifest(checkpoint_version: u64, state_ref: StateObjectRef) -> CheckpointManifest {
+    CheckpointManifest {
+        schema_version: 1,
+        checkpoint_version,
+        input_ranges: vec![input_range()],
+        state_objects: vec![state_ref],
+        output_objects: vec![],
+        parent_checkpoint: checkpoint_version.checked_sub(1),
+        created_at: "2026-05-03T00:00:00Z".to_string(),
+    }
+}
+
 #[tokio::test]
 async fn checkpoint_publish_makes_valid_manifest_visible_after_state_write() {
     let (_temp_dir, store) = temp_store();
@@ -42,21 +65,13 @@ async fn checkpoint_publish_makes_valid_manifest_visible_after_state_write() {
     let state = state_write(0, "state-0001", b"state-bytes");
 
     let state_ref = publisher.write_state_object(&state).await.unwrap();
-    let manifest = CheckpointManifest {
-        schema_version: 1,
-        checkpoint_version: 0,
-        input_ranges: vec![input_range()],
-        state_objects: vec![state_ref.clone()],
-        output_objects: vec![],
-        parent_checkpoint: None,
-        created_at: "2026-05-03T00:00:00Z".to_string(),
-    };
+    let manifest = manifest(0, state_ref.clone());
 
     publisher.publish_manifest(&manifest).await.unwrap();
 
     assert_eq!(
         publisher.read_state_object(&state_ref).await.unwrap(),
-        state.bytes
+        state.bytes().clone()
     );
     assert_eq!(publisher.latest_manifest().await.unwrap(), Some(manifest));
 }
@@ -101,15 +116,7 @@ async fn checkpoint_publish_rejects_duplicate_manifest_publication() {
     let publisher = CheckpointPublisher::new(store);
     let state = state_write(0, "state-0001", b"state-bytes");
     let state_ref = publisher.write_state_object(&state).await.unwrap();
-    let manifest = CheckpointManifest {
-        schema_version: 1,
-        checkpoint_version: 0,
-        input_ranges: vec![input_range()],
-        state_objects: vec![state_ref],
-        output_objects: vec![],
-        parent_checkpoint: None,
-        created_at: "2026-05-03T00:00:00Z".to_string(),
-    };
+    let manifest = manifest(0, state_ref);
 
     publisher.publish_manifest(&manifest).await.unwrap();
     let err = publisher.publish_manifest(&manifest).await.unwrap_err();
@@ -155,5 +162,60 @@ async fn checkpoint_publish_rejects_invalid_manifest_before_writing() {
         .to_string()
         .contains("manifest must include at least one input range"));
     let manifest_path = Path::from(invalid_manifest.object_key().as_str());
+    assert!(store.head(&manifest_path).await.is_err());
+}
+
+#[tokio::test]
+async fn checkpoint_publish_rejects_manifest_body_that_does_not_match_object_key() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let state = state_write(0, "state-0001", b"state-bytes");
+    let state_ref = publisher.write_state_object(&state).await.unwrap();
+    let manifest = manifest(0, state_ref);
+    let wrong_key = ObjectKey::checkpoint_manifest(99);
+
+    store
+        .put(
+            &Path::from(wrong_key.as_str()),
+            Bytes::from(serde_json::to_vec(&manifest).unwrap()).into(),
+        )
+        .await
+        .unwrap();
+
+    let err = publisher.list_published_manifests().await.unwrap_err();
+
+    assert!(err.to_string().contains("does not match manifest body"));
+}
+
+#[tokio::test]
+async fn checkpoint_publish_latest_manifest_uses_numerically_latest_valid_checkpoint() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(store);
+    let state_0 = state_write(0, "state-0001", b"state-0");
+    let state_1 = state_write(1, "state-0002", b"state-1");
+    let manifest_0 = manifest(0, publisher.write_state_object(&state_0).await.unwrap());
+    let manifest_1 = manifest(1, publisher.write_state_object(&state_1).await.unwrap());
+
+    publisher.publish_manifest(&manifest_1).await.unwrap();
+    publisher.publish_manifest(&manifest_0).await.unwrap();
+
+    assert_eq!(
+        publisher.list_published_manifests().await.unwrap(),
+        vec![manifest_0, manifest_1.clone()]
+    );
+    assert_eq!(publisher.latest_manifest().await.unwrap(), Some(manifest_1));
+}
+
+#[tokio::test]
+async fn checkpoint_publish_rejects_manifest_that_references_missing_state_object() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let missing_state = state_write(0, "missing-state", b"not-written");
+    let manifest = manifest(0, state_ref(&missing_state));
+
+    let err = publisher.publish_manifest(&manifest).await.unwrap_err();
+
+    assert!(err.to_string().contains("referenced state object"));
+    let manifest_path = Path::from(manifest.object_key().as_str());
     assert!(store.head(&manifest_path).await.is_err());
 }

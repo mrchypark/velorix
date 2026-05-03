@@ -19,11 +19,11 @@ pub struct CheckpointPublisher {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StateObjectWrite {
-    pub owner: String,
-    pub partition_id: u32,
-    pub checkpoint_version: u64,
-    pub object_id: String,
-    pub bytes: Bytes,
+    owner: String,
+    partition_id: u32,
+    checkpoint_version: u64,
+    object_id: String,
+    bytes: Bytes,
     object_key: ObjectKey,
 }
 
@@ -37,6 +37,15 @@ pub enum CheckpointPublishError {
     StateObjectAlreadyExists(ObjectKey),
     #[error("checkpoint manifest `{0}` already exists")]
     ManifestAlreadyExists(ObjectKey),
+    #[error(
+        "checkpoint manifest key `{object_key}` does not match manifest body key `{body_key}`"
+    )]
+    ManifestKeyMismatch {
+        object_key: ObjectKey,
+        body_key: ObjectKey,
+    },
+    #[error("referenced state object `{0}` is missing")]
+    MissingStateObject(ObjectKey),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
@@ -72,6 +81,7 @@ impl CheckpointPublisher {
         manifest: &CheckpointManifest,
     ) -> Result<(), CheckpointPublishError> {
         manifest.validate()?;
+        self.validate_state_objects_exist(manifest).await?;
 
         let object_key = manifest.object_key();
         let path = Path::from(object_key.as_str());
@@ -93,21 +103,28 @@ impl CheckpointPublisher {
     pub async fn list_published_manifests(
         &self,
     ) -> Result<Vec<CheckpointManifest>, CheckpointPublishError> {
-        let mut objects = self
+        let objects = self
             .store
             .list(Some(&Path::from(CHECKPOINT_PREFIX)))
             .try_collect::<Vec<_>>()
             .await?;
 
-        objects.sort_by(|left, right| left.location.cmp(&right.location));
-
         let mut manifests = Vec::with_capacity(objects.len());
         for object in objects {
+            let object_key = ObjectKey::parse(object.location.to_string())?;
             let bytes = self.store.get(&object.location).await?.bytes().await?;
             let manifest = serde_json::from_slice::<CheckpointManifest>(&bytes)?;
             manifest.validate()?;
+            let body_key = manifest.object_key();
+            if object_key != body_key {
+                return Err(CheckpointPublishError::ManifestKeyMismatch {
+                    object_key,
+                    body_key,
+                });
+            }
             manifests.push(manifest);
         }
+        manifests.sort_by_key(|manifest| manifest.checkpoint_version);
 
         Ok(manifests)
     }
@@ -115,7 +132,11 @@ impl CheckpointPublisher {
     pub async fn latest_manifest(
         &self,
     ) -> Result<Option<CheckpointManifest>, CheckpointPublishError> {
-        Ok(self.list_published_manifests().await?.pop())
+        Ok(self
+            .list_published_manifests()
+            .await?
+            .into_iter()
+            .max_by_key(|manifest| manifest.checkpoint_version))
     }
 
     pub async fn read_state_object(
@@ -128,6 +149,26 @@ impl CheckpointPublisher {
             .await?
             .bytes()
             .await?)
+    }
+
+    async fn validate_state_objects_exist(
+        &self,
+        manifest: &CheckpointManifest,
+    ) -> Result<(), CheckpointPublishError> {
+        for state_ref in &manifest.state_objects {
+            let path = Path::from(state_ref.object_key.as_str());
+            match self.store.head(&path).await {
+                Ok(_) => {}
+                Err(object_store::Error::NotFound { .. }) => {
+                    return Err(CheckpointPublishError::MissingStateObject(
+                        state_ref.object_key.clone(),
+                    ));
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -156,6 +197,26 @@ impl StateObjectWrite {
 
     pub fn object_key(&self) -> &ObjectKey {
         &self.object_key
+    }
+
+    pub fn owner(&self) -> &str {
+        &self.owner
+    }
+
+    pub fn partition_id(&self) -> u32 {
+        self.partition_id
+    }
+
+    pub fn checkpoint_version(&self) -> u64 {
+        self.checkpoint_version
+    }
+
+    pub fn object_id(&self) -> &str {
+        &self.object_id
+    }
+
+    pub fn bytes(&self) -> &Bytes {
+        &self.bytes
     }
 
     fn object_ref(&self) -> StateObjectRef {
