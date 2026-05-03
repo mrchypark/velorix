@@ -4,11 +4,13 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+async-trait = { workspace = true }
 bytes = { workspace = true }
 futures = "0.3"
 object_store = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+slatedb = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

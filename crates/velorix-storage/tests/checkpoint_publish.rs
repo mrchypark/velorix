@@ -7,6 +7,7 @@ use velorix_storage::{
     manifest::{CheckpointManifest, InputRange, StateObjectRef},
     object_key::ObjectKey,
     state::{CheckpointPublisher, StateObjectWrite},
+    state_store::{SlateDbStateStore, StateObjectStore},
 };
 
 fn temp_store() -> (TempDir, Arc<dyn ObjectStore>) {
@@ -218,4 +219,59 @@ async fn checkpoint_publish_rejects_manifest_that_references_missing_state_objec
     assert!(err.to_string().contains("referenced state object"));
     let manifest_path = Path::from(manifest.object_key().as_str());
     assert!(store.head(&manifest_path).await.is_err());
+}
+
+#[tokio::test]
+async fn slatedb_state_store_reads_checkpoint_versioned_state_payloads() {
+    let (_temp_dir, store) = temp_store();
+    let state_store = SlateDbStateStore::open("v1/slatedb/state", Arc::clone(&store))
+        .await
+        .unwrap();
+    let state = state_write(7, "state-0007", b"slatedb-state");
+    let written_ref = state_store.write_state_object(&state).await.unwrap();
+
+    assert_eq!(written_ref, state_ref(&state));
+    assert!(state_store.state_object_exists(&written_ref).await.unwrap());
+    assert_eq!(
+        state_store.read_state_object(&written_ref).await.unwrap(),
+        Bytes::from_static(b"slatedb-state")
+    );
+}
+
+#[tokio::test]
+async fn checkpoint_publish_slatedb_state_store_keeps_manifests_authoritative() {
+    let (_temp_dir, store) = temp_store();
+    let publisher =
+        CheckpointPublisher::with_slatedb_state_store(Arc::clone(&store), "v1/slatedb/state")
+            .await
+            .unwrap();
+    let published_state = state_write(0, "state-0001", b"published-state");
+    let published_ref = publisher
+        .write_state_object(&published_state)
+        .await
+        .unwrap();
+    let published_manifest = manifest(0, published_ref.clone());
+    publisher
+        .publish_manifest(&published_manifest)
+        .await
+        .unwrap();
+
+    let orphan_state = state_write(1, "state-0002", b"orphan-state");
+    let orphan_ref = publisher.write_state_object(&orphan_state).await.unwrap();
+
+    assert_eq!(
+        publisher.read_state_object(&orphan_ref).await.unwrap(),
+        Bytes::from_static(b"orphan-state")
+    );
+    assert_eq!(
+        publisher.latest_manifest().await.unwrap(),
+        Some(published_manifest.clone())
+    );
+    assert_eq!(
+        publisher
+            .read_state_object(&published_manifest.state_objects[0])
+            .await
+            .unwrap(),
+        Bytes::from_static(b"published-state")
+    );
 }

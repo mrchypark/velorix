@@ -8,6 +8,7 @@ use thiserror::Error;
 use crate::{
     manifest::{CheckpointManifest, ManifestError, StateObjectRef},
     object_key::{ObjectKey, ObjectKeyError},
+    state_store::{RawObjectStateStore, SlateDbStateStore, StateObjectStore},
 };
 
 const CHECKPOINT_PREFIX: &str = "v1/checkpoints";
@@ -15,6 +16,7 @@ const CHECKPOINT_PREFIX: &str = "v1/checkpoints";
 #[derive(Clone, Debug)]
 pub struct CheckpointPublisher {
     store: Arc<dyn ObjectStore>,
+    state_store: Arc<dyn StateObjectStore>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,30 +52,37 @@ pub enum CheckpointPublishError {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     ObjectStore(#[from] object_store::Error),
+    #[error(transparent)]
+    SlateDb(#[from] slatedb::Error),
 }
 
 impl CheckpointPublisher {
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
-        Self { store }
+        let state_store = Arc::new(RawObjectStateStore::new(Arc::clone(&store)));
+        Self { store, state_store }
+    }
+
+    pub fn with_state_store(
+        store: Arc<dyn ObjectStore>,
+        state_store: Arc<dyn StateObjectStore>,
+    ) -> Self {
+        Self { store, state_store }
+    }
+
+    pub async fn with_slatedb_state_store(
+        store: Arc<dyn ObjectStore>,
+        db_path: impl Into<Path>,
+    ) -> Result<Self, CheckpointPublishError> {
+        let state_store = SlateDbStateStore::open(db_path, Arc::clone(&store)).await?;
+
+        Ok(Self::with_state_store(store, Arc::new(state_store)))
     }
 
     pub async fn write_state_object(
         &self,
         state: &StateObjectWrite,
     ) -> Result<StateObjectRef, CheckpointPublishError> {
-        let path = Path::from(state.object_key.as_str());
-        let result = self
-            .store
-            .put_opts(&path, state.bytes.clone().into(), PutMode::Create.into())
-            .await;
-
-        match result {
-            Ok(_) => Ok(state.object_ref()),
-            Err(object_store::Error::AlreadyExists { .. }) => Err(
-                CheckpointPublishError::StateObjectAlreadyExists(state.object_key.clone()),
-            ),
-            Err(err) => Err(err.into()),
-        }
+        self.state_store.write_state_object(state).await
     }
 
     pub async fn publish_manifest(
@@ -143,12 +152,7 @@ impl CheckpointPublisher {
         &self,
         state_ref: &StateObjectRef,
     ) -> Result<Bytes, CheckpointPublishError> {
-        Ok(self
-            .store
-            .get(&Path::from(state_ref.object_key.as_str()))
-            .await?
-            .bytes()
-            .await?)
+        self.state_store.read_state_object(state_ref).await
     }
 
     async fn validate_state_objects_exist(
@@ -156,15 +160,10 @@ impl CheckpointPublisher {
         manifest: &CheckpointManifest,
     ) -> Result<(), CheckpointPublishError> {
         for state_ref in &manifest.state_objects {
-            let path = Path::from(state_ref.object_key.as_str());
-            match self.store.head(&path).await {
-                Ok(_) => {}
-                Err(object_store::Error::NotFound { .. }) => {
-                    return Err(CheckpointPublishError::MissingStateObject(
-                        state_ref.object_key.clone(),
-                    ));
-                }
-                Err(err) => return Err(err.into()),
+            if !self.state_store.state_object_exists(state_ref).await? {
+                return Err(CheckpointPublishError::MissingStateObject(
+                    state_ref.object_key.clone(),
+                ));
             }
         }
 
@@ -219,7 +218,7 @@ impl StateObjectWrite {
         &self.bytes
     }
 
-    fn object_ref(&self) -> StateObjectRef {
+    pub(crate) fn object_ref(&self) -> StateObjectRef {
         StateObjectRef {
             object_id: self.object_id.clone(),
             object_key: self.object_key.clone(),

@@ -6,17 +6,18 @@ Velorix-specific code focused on object-storage authority, checkpoint manifests,
 stateless recovery, resource/cost policy, and package boundaries.
 
 This note distinguishes current implementation from target direction. The
-runtime object cache is currently Foyer-backed after the recent cache work, and
+runtime object cache is currently Foyer-backed after the recent cache work,
 SQL/query planning and execution currently use DataFusion for the minimal
-`DeltaBatch` query boundary. SlateDB and direct Feldera DBSP/dbsp integration
-remain planned migration directions unless matching code exists in the
+`DeltaBatch` query boundary, and SlateDB now backs a minimal experimental
+checkpoint-versioned state-store path. Direct Feldera DBSP/dbsp integration
+remains a planned migration direction unless matching code exists in the
 repository.
 
 ## Package Ownership
 
 | Area | Status | Preferred owner | Velorix-owned boundary |
 | --- | --- | --- | --- |
-| Durable LSM/SST/state substrate | Planned target | SlateDB | Object key policy, stream progress, exactly-once manifests, recovery orchestration |
+| Durable LSM/SST/state substrate | Current minimal experimental state-store implementation | SlateDB | Object key policy, stream progress, exactly-once manifests, recovery orchestration |
 | Runtime object-store fetch-through cache | Current implementation | Foyer | Object-store authority checks, cache namespace policy, cache-as-non-durable invariant |
 | SQL/DataFrame/query planning and Arrow execution | Current minimal implementation | Apache DataFusion | Runtime integration, checkpoint-aware inputs/outputs, cost/resource policy |
 | Incremental algebra, operators, and circuit semantics | Planned target, with adoption gates | Feldera project semantics and/or Rust `dbsp` crate | `IncrementalEngine` adapter, object-backed persistence, moderate-performance cost optimizations |
@@ -27,10 +28,11 @@ Velorix runtime code uses a Foyer wrapper for local memory/disk caching of
 object-store fetch-through reads. The cache is never durable authority; object
 storage and checkpoint manifests remain authoritative for recovery and progress.
 
-SlateDB may use Foyer internally for its own block or object cache once SlateDB
-is integrated. That cache belongs to SlateDB's state substrate internals. Velorix
-should keep the runtime object cache policy separate from any SlateDB-internal
-cache policy to avoid duplicate eviction, durability, or authority rules.
+SlateDB may use Foyer internally for its own block or object cache as the
+SlateDB integration grows. That cache belongs to SlateDB's state substrate
+internals. Velorix should keep the runtime object cache policy separate from any
+SlateDB-internal cache policy to avoid duplicate eviction, durability, or
+authority rules.
 
 ## Query Boundary
 
@@ -66,8 +68,9 @@ reference model or keep incremental execution behind an adapter boundary.
    without changing storage, manifests, or runtime recovery.
 3. Keep runtime object-store fetch-through caching behind the current Foyer
    wrapper while preserving object storage as the only source of durable truth.
-4. Move durable state layout and compaction responsibilities to SlateDB, leaving
-   Velorix manifests responsible for stream progress and exactly-once commits.
+4. Continue moving durable state layout and compaction responsibilities to
+   SlateDB, leaving Velorix manifests responsible for stream progress and
+   exactly-once commits.
 5. Keep SQL/query surfaces routed through DataFusion instead of creating a
    custom planner or expression engine. The current implementation covers
    in-memory `DeltaBatch` input; object-backed and checkpoint-aware query

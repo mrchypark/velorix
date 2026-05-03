@@ -26,7 +26,8 @@ disposable, scaling horizontally without state migration as the runtime matures.
 - Object-storage-backed log, checkpoint, and state authority
 - Foyer-backed hybrid local memory/disk runtime object cache for object-store
   fetch-through
-- Planned SlateDB durable LSM/SST/state substrate where it fits
+- Experimental SlateDB-backed state store for checkpoint-versioned state
+  payloads, with Velorix manifests still owning publication and progress
 - Minimal DataFusion SQL/query planning and execution over in-memory Arrow
   batches for current `DeltaBatch` query input
 - Planned Feldera DBSP/dbsp-shaped execution path after integration gates are
@@ -47,10 +48,10 @@ packages already fit the problem:
 - **Foyer** currently owns the runtime local memory/disk object cache through a
   Velorix wrapper that enforces object-store authority, cache invalidation
   boundaries, and the `ObjectKey` policy.
-- **SlateDB** is the planned owner for durable object-storage-first
-  LSM/SST/compaction and state substrate behavior where the integration fits.
-  Velorix owns stream progress, exactly-once manifest semantics, and runtime
-  recovery orchestration around that substrate.
+- **SlateDB** now backs the minimal experimental state-store path for
+  checkpoint-versioned state payloads. SlateDB owns the package-backed key/value
+  persistence for that path, while Velorix owns stream progress, exactly-once
+  manifest semantics, and runtime recovery orchestration around the substrate.
 - **Apache DataFusion** currently owns the minimal SQL/query planning and
   execution boundary. Velorix converts `DeltaBatch` records into an in-memory
   Arrow/DataFusion table and returns Arrow `RecordBatch` output. Object-backed
@@ -83,9 +84,9 @@ The intended system shape is:
    in-memory Arrow table built from `DeltaBatch` input and returns Arrow
    `RecordBatch` output. Object-backed and checkpoint-aware query services are
    still future work.
-4. **State layout:** SlateDB is the planned durable LSM/SST/state substrate over
-   object storage, while manifests describe Velorix progress and publication
-   state.
+4. **State layout:** SlateDB is the current experimental durable state-store
+   substrate over object storage, while manifests describe Velorix progress and
+   publication state.
 5. **Checkpoint protocol:** exactly-once progress is represented by versioned
    manifests that bind input offsets, state objects, and output commits.
 6. **Disposable compute:** workers recover by loading the latest manifest and
