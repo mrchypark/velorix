@@ -4,3 +4,4 @@
 
 pub mod delta;
 pub mod operator;
+pub mod query;
