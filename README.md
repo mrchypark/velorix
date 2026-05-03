@@ -68,8 +68,9 @@ packages already fit the problem:
 
 Foyer and SlateDB have separate cache boundaries. Velorix uses its Foyer wrapper
 for runtime object-store fetch-through. SlateDB may use Foyer internally for its
-own block or object cache after SlateDB is integrated; Velorix should keep those
-policies separate instead of layering duplicate cache ownership.
+own block or object cache as its state-store integration broadens; Velorix
+should keep those policies separate instead of layering duplicate cache
+ownership.
 
 Velorix-specific code remains valuable at the integration boundaries: object
 storage authority, deterministic object keys, checkpoint manifests,
@@ -104,15 +105,20 @@ The intended system shape is:
 The immediate goal is to prove that Velorix can run an end-to-end incremental
 streaming workload while keeping object storage as the only durable database
 and avoiding custom implementations where Foyer already provides the runtime
-cache substrate, where DataFusion already owns the minimal SQL/query boundary,
-or where SlateDB and Feldera/DBSP are planned to provide the right substrate.
+cache substrate, DataFusion already owns the minimal SQL/query boundary, SlateDB
+already owns the minimal experimental checkpoint-versioned state-store path, or
+the current DBSP-shaped adapter boundary keeps prototype operators replaceable.
+Future direct Feldera DBSP/dbsp integration and broader SlateDB layout,
+compaction, and lifecycle work remain gated follow-on work.
 
 1. **Define the storage contract:** specify object keys, immutable batch files,
    state files, manifest schema, and atomic publication rules.
 2. **Define package ownership:** document where Foyer owns current cache
    behavior, where DataFusion currently owns minimal SQL/query behavior, where
-   SlateDB and Feldera/DBSP are planned to own behavior, and keep Velorix code
-   at the integration boundary.
+   SlateDB currently owns the minimal experimental state-store path, where the
+   current DBSP-shaped adapter boundary contains prototype operators, and which
+   direct Feldera DBSP/dbsp and broader SlateDB ownership remains future gated
+   work. Keep Velorix code at the integration boundary.
 3. **Build the minimal object store layer:** start with a local filesystem
    adapter that behaves like object storage, then add S3-compatible storage.
 4. **Implement the ingest log:** persist ordered input delta batches and expose

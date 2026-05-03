@@ -4,9 +4,9 @@
 
 **Goal:** Build a minimal Velorix prototype that proves an object-storage-first, stateless, incremental streaming database can ingest deltas, maintain a materialized view, checkpoint progress, and recover without local durable state. Velorix is third-party-first: do not expand direct hand-written implementations where SlateDB, Foyer, Apache DataFusion, or Feldera DBSP fit the problem.
 
-**Architecture:** Start with a single-process prototype whose only durable authority is object storage. Represent input and checkpoints as immutable objects plus versioned manifests, add package boundaries before scaling workers, and migrate prototype internals behind mature substrates. Foyer is current for runtime object-store fetch-through caching. SlateDB for durable LSM/SST/state, DataFusion for SQL/DataFrame/query planning and Arrow execution, and Feldera DBSP/dbsp for incremental algebra/operators/circuit semantics remain planned target directions unless matching code exists.
+**Architecture:** Start with a single-process prototype whose only durable authority is object storage. Represent input and checkpoints as immutable objects plus versioned manifests, add package boundaries before scaling workers, and migrate prototype internals behind mature substrates. Current minimal integrations are Foyer for runtime object-store fetch-through caching, SlateDB for experimental checkpoint-versioned state-store payloads, and DataFusion for the minimal SQL/query boundary over in-memory Arrow batches. Incremental execution currently remains behind a DBSP-shaped `IncrementalEngine` adapter backed by prototype operators. Future direct Feldera DBSP/dbsp integration and broader SlateDB durable layout, LSM/SST, compaction, and lifecycle work are gated follow-on directions.
 
-**Tech Stack:** Rust is the assumed implementation language for the core engine because Velorix needs low overhead, predictable performance, async I/O, and deployable static binaries. Use `tokio` for async execution, `serde` for schemas, `object_store` for filesystem/S3-compatible storage, `proptest` for invariant-heavy delta and manifest tests, and third-party data packages where they fit. Foyer is current for runtime hybrid object-cache internals. The planned package direction is SlateDB for object-storage-first durable state, Apache DataFusion for query planning/execution, and Feldera DBSP semantics or the Rust `dbsp` crate as the reference model or backing engine for incremental computation after embedded API, toolchain, checkpoint/state integration, and cost/resource gates are satisfied.
+**Tech Stack:** Rust is the assumed implementation language for the core engine because Velorix needs low overhead, predictable performance, async I/O, and deployable static binaries. Use `tokio` for async execution, `serde` for schemas, `object_store` for filesystem/S3-compatible storage, `proptest` for invariant-heavy delta and manifest tests, and third-party data packages where they fit. Foyer is current for runtime hybrid object-cache internals, SlateDB is current for the minimal experimental state-store path, and Apache DataFusion is current for query planning/execution at the minimal boundary. Feldera DBSP semantics or the Rust `dbsp` crate remain the reference model or future backing engine for incremental computation after embedded API, toolchain, checkpoint/state integration, and cost/resource gates are satisfied.
 
 **Third-party-first directive:** Velorix-specific code should remain glue and policy: object-storage authority, deterministic `ObjectKey` rules, checkpoint manifests, stateless recovery orchestration, resource/cost policy, and integration boundaries. Current hand-written delta/operator/state/cache code is prototype scaffolding unless the plan explicitly says a Velorix-owned boundary is required.
 
@@ -233,7 +233,7 @@ Define the interface Velorix needs from durable state: object-store authority, r
 
 - [ ] **Step 3: Implement immutable state object writes through the current substrate**
 
-Write state objects before publishing the manifest. State objects without a manifest reference are recoverable garbage. If SlateDB is not yet integrated, keep this implementation narrow and migration-friendly rather than expanding a custom LSM layout.
+Write state objects before publishing the manifest. State objects without a manifest reference are recoverable garbage. Keep the current SlateDB-backed path narrow and migration-friendly rather than expanding Velorix-owned LSM layout, compaction, or lifecycle policy.
 
 - [ ] **Step 4: Implement manifest publication**
 
@@ -265,7 +265,7 @@ Use a temporary object-store directory. Ingest deltas, process a view, publish a
 
 - [ ] **Step 2: Implement runtime startup from manifest**
 
-Startup should load the latest manifest, fetch referenced state objects through the current state substrate, and resume replay from the manifest input boundary. Velorix owns recovery orchestration; SlateDB owns durable state internals once integrated.
+Startup should load the latest manifest, fetch referenced state objects through the current state substrate, and resume replay from the manifest input boundary. Velorix owns recovery orchestration; SlateDB owns the current minimal state-store internals for checkpoint-versioned payloads, with broader durable layout and compaction policy still gated.
 
 - [ ] **Step 3: Implement one local CLI recovery command**
 
@@ -357,7 +357,7 @@ Measure ingest throughput, checkpoint latency, recovery latency, and materialize
 
 - [ ] **Step 2: Document the storage contract**
 
-Describe object key layout, manifest atomicity requirements, crash windows, and garbage collection rules. Clarify that SlateDB owns durable LSM/SST/state internals once integrated, while Velorix owns checkpoint manifest authority and recovery semantics.
+Describe object key layout, manifest atomicity requirements, crash windows, and garbage collection rules. Clarify that SlateDB owns the current minimal experimental state-store path, broader SlateDB durable LSM/SST/layout and compaction work remains gated, and Velorix owns checkpoint manifest authority and recovery semantics.
 
 - [ ] **Step 3: Document package ownership**
 
