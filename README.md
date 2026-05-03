@@ -91,7 +91,11 @@ The intended system shape is:
    manifests describe Velorix progress and publication state. Broader state
    layout, LSM/SST, compaction, and lifecycle policy remain future work.
 5. **Checkpoint protocol:** exactly-once progress is represented by versioned
-   manifests that bind input offsets, state objects, and output commits.
+   manifests that bind input offsets, state objects, and output commits. Engine
+   checkpoint state objects use a versioned payload that carries the engine
+   logical epoch separately from the manifest publication version; legacy raw
+   `DeltaBatch` payloads are read with the manifest version as their best-effort
+   epoch fallback.
 6. **Disposable compute:** workers recover by loading the latest manifest and
    warming the current Foyer-backed runtime object cache from object storage.
 

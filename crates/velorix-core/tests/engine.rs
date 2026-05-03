@@ -1,7 +1,10 @@
 use serde_json::json;
 use velorix_core::{
     delta::{DeltaBatch, DeltaKey, DeltaRecord, DeltaValue},
-    engine::{EngineCheckpoint, IncrementalEngine, PrototypeIncrementalEngine},
+    engine::{
+        EngineCheckpoint, EngineCheckpointPayload, IncrementalEngine, PrototypeIncrementalEngine,
+        ENGINE_CHECKPOINT_PAYLOAD_SCHEMA_VERSION,
+    },
 };
 
 fn input_delta(account: &str, amount: i64, weight: i64) -> DeltaRecord {
@@ -120,4 +123,21 @@ fn prototype_incremental_engine_rejects_malformed_checkpoint_state() {
     let err = PrototypeIncrementalEngine::from_checkpoint(malformed).unwrap_err();
 
     assert!(err.to_string().contains("aggregate state value"));
+}
+
+#[test]
+fn engine_checkpoint_payload_preserves_logical_epoch_and_state_when_serialized() {
+    let checkpoint =
+        EngineCheckpoint::new(3, batch([state_delta("account-a", json!(10), json!(1))]));
+
+    let encoded = serde_json::to_vec(&checkpoint.to_payload()).unwrap();
+    let decoded = serde_json::from_slice::<EngineCheckpointPayload>(&encoded).unwrap();
+    let restored = decoded.into_checkpoint();
+
+    assert_eq!(restored.logical_epoch(), 3);
+    assert_eq!(restored.state(), checkpoint.state());
+    assert_eq!(
+        checkpoint.to_payload().schema_version(),
+        ENGINE_CHECKPOINT_PAYLOAD_SCHEMA_VERSION
+    );
 }

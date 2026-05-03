@@ -6,6 +6,7 @@ use serde_json::json;
 use tempfile::TempDir;
 use velorix_core::{
     delta::{DeltaBatch, DeltaKey, DeltaRecord, DeltaValue},
+    engine::EngineCheckpoint,
     operator::KeyedSumCountAggregate,
 };
 use velorix_runtime::recovery::RecoveredRuntime;
@@ -38,6 +39,10 @@ fn batch(records: impl IntoIterator<Item = DeltaRecord>) -> DeltaBatch {
 
 fn batch_bytes(batch: &DeltaBatch) -> Bytes {
     Bytes::from(serde_json::to_vec(batch).unwrap())
+}
+
+fn checkpoint_bytes(checkpoint: &EngineCheckpoint) -> Bytes {
+    Bytes::from(serde_json::to_vec(&checkpoint.to_payload()).unwrap())
 }
 
 fn manifest(input_end: u64, state_ref: StateObjectRef) -> CheckpointManifest {
@@ -105,6 +110,24 @@ async fn write_checkpoint_state_for_owner(
 ) -> StateObjectRef {
     let state =
         StateObjectWrite::new(owner, 0, checkpoint_version, object_id, batch_bytes(state)).unwrap();
+
+    publisher.write_state_object(&state).await.unwrap()
+}
+
+async fn write_engine_checkpoint_state(
+    publisher: &CheckpointPublisher,
+    checkpoint_version: u64,
+    object_id: &str,
+    checkpoint: &EngineCheckpoint,
+) -> StateObjectRef {
+    let state = StateObjectWrite::new(
+        RECOVERY_OWNER,
+        0,
+        checkpoint_version,
+        object_id,
+        checkpoint_bytes(checkpoint),
+    )
+    .unwrap();
 
     publisher.write_state_object(&state).await.unwrap()
 }
@@ -367,6 +390,44 @@ async fn local_recovery_preserves_signed_checkpoint_state_and_signed_replay() {
             DeltaValue::from_json(json!({ "sum": -10, "count": -2 })),
             1,
         )));
+}
+
+#[tokio::test]
+async fn local_recovery_resumes_from_checkpointed_engine_logical_epoch_not_manifest_version() {
+    let (_temp_dir, store) = temp_store();
+    let ingest_log = IngestLog::new(Arc::clone(&store));
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+
+    let first_input = batch([input_delta("account-a", 10, 1)]);
+    let second_input = batch([input_delta("account-a", 5, 1)]);
+
+    ingest_log
+        .append(&IngestBatch::new("orders", 0, 0, 1, batch_bytes(&first_input)).unwrap())
+        .await
+        .unwrap();
+    ingest_log
+        .append(&IngestBatch::new("orders", 0, 1, 2, batch_bytes(&second_input)).unwrap())
+        .await
+        .unwrap();
+
+    let mut checkpointed_view = KeyedSumCountAggregate::new();
+    checkpointed_view.apply(&first_input).unwrap();
+    let checkpoint = EngineCheckpoint::new(3, checkpointed_view.state());
+    let state_ref =
+        write_engine_checkpoint_state(&publisher, 0, "state-logical-epoch", &checkpoint).await;
+    publisher
+        .publish_manifest(&manifest_with_ranges(
+            0,
+            None,
+            vec![input_range("orders", 0, 0, 1)],
+            state_ref,
+        ))
+        .await
+        .unwrap();
+
+    let recovered = RecoveredRuntime::recover(Arc::clone(&store)).await.unwrap();
+
+    assert_eq!(recovered.logical_epoch(), 4);
 }
 
 #[tokio::test]

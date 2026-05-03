@@ -4,7 +4,10 @@ use object_store::ObjectStore;
 use thiserror::Error;
 use velorix_core::{
     delta::DeltaBatch,
-    engine::{EngineCheckpoint, EngineError, IncrementalEngine, PrototypeIncrementalEngine},
+    engine::{
+        EngineCheckpoint, EngineCheckpointPayload, EngineError, IncrementalEngine, LogicalEpoch,
+        PrototypeIncrementalEngine, ENGINE_CHECKPOINT_PAYLOAD_SCHEMA_VERSION,
+    },
 };
 use velorix_storage::{
     log::{IngestLog, IngestLogError, ReplayCheckpoint},
@@ -34,6 +37,15 @@ pub enum RecoveryError {
     Json(#[from] serde_json::Error),
     #[error("unexpected state object owner `{actual}`, expected `{expected}`")]
     UnexpectedStateOwner { actual: String, expected: String },
+    #[error("unsupported engine checkpoint payload schema version {0}")]
+    UnsupportedEngineCheckpointPayloadSchema(u32),
+    #[error(
+        "state objects disagree on checkpoint logical epoch: expected={expected}, actual={actual}"
+    )]
+    InconsistentCheckpointLogicalEpoch {
+        expected: LogicalEpoch,
+        actual: LogicalEpoch,
+    },
     #[error("logical epoch overflowed during recovery replay")]
     LogicalEpochOverflow,
 }
@@ -53,6 +65,7 @@ impl RecoveredRuntime {
 
         if let Some(manifest) = latest_manifest.as_ref() {
             let mut checkpointed_state = DeltaBatch::default();
+            let mut checkpoint_logical_epoch = None;
             for state_ref in &manifest.state_objects {
                 if state_ref.owner != expected_owner {
                     return Err(RecoveryError::UnexpectedStateOwner {
@@ -62,11 +75,30 @@ impl RecoveredRuntime {
                 }
 
                 let bytes = publisher.read_state_object(state_ref).await?;
-                let state = serde_json::from_slice::<DeltaBatch>(&bytes)?;
-                checkpointed_state = checkpointed_state.combine(&state);
+                match decode_checkpoint_state(&bytes)? {
+                    DecodedCheckpointState::Versioned(checkpoint) => {
+                        let logical_epoch = checkpoint.logical_epoch();
+                        if let Some(expected) = checkpoint_logical_epoch {
+                            if expected != logical_epoch {
+                                return Err(RecoveryError::InconsistentCheckpointLogicalEpoch {
+                                    expected,
+                                    actual: logical_epoch,
+                                });
+                            }
+                        } else {
+                            checkpoint_logical_epoch = Some(logical_epoch);
+                        }
+
+                        checkpointed_state = checkpointed_state.combine(checkpoint.state());
+                    }
+                    DecodedCheckpointState::Legacy(state) => {
+                        checkpointed_state = checkpointed_state.combine(&state);
+                    }
+                }
             }
+            let logical_epoch = checkpoint_logical_epoch.unwrap_or(manifest.checkpoint_version);
             materialized = PrototypeIncrementalEngine::from_checkpoint(EngineCheckpoint::new(
-                manifest.checkpoint_version,
+                logical_epoch,
                 checkpointed_state,
             ))?;
         }
@@ -97,6 +129,10 @@ impl RecoveredRuntime {
         self.materialized.materialized_state()
     }
 
+    pub fn logical_epoch(&self) -> LogicalEpoch {
+        self.materialized.logical_epoch()
+    }
+
     pub fn replay_checkpoints(&self) -> &[ReplayCheckpoint] {
         &self.replay_checkpoints
     }
@@ -107,6 +143,29 @@ impl RecoveredRuntime {
 
     pub fn latest_checkpoint_version(&self) -> Option<u64> {
         self.latest_checkpoint_version
+    }
+}
+
+enum DecodedCheckpointState {
+    Versioned(EngineCheckpoint),
+    Legacy(DeltaBatch),
+}
+
+fn decode_checkpoint_state(bytes: &[u8]) -> Result<DecodedCheckpointState, RecoveryError> {
+    match serde_json::from_slice::<EngineCheckpointPayload>(bytes) {
+        Ok(payload) => {
+            if payload.schema_version() != ENGINE_CHECKPOINT_PAYLOAD_SCHEMA_VERSION {
+                return Err(RecoveryError::UnsupportedEngineCheckpointPayloadSchema(
+                    payload.schema_version(),
+                ));
+            }
+
+            Ok(DecodedCheckpointState::Versioned(payload.into_checkpoint()))
+        }
+        Err(versioned_error) => match serde_json::from_slice::<DeltaBatch>(bytes) {
+            Ok(state) => Ok(DecodedCheckpointState::Legacy(state)),
+            Err(_) => Err(RecoveryError::Json(versioned_error)),
+        },
     }
 }
 

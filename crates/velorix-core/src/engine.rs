@@ -4,8 +4,10 @@ use crate::{
     delta::DeltaBatch,
     operator::{KeyedSumCountAggregate, OperatorError},
 };
+use serde::{Deserialize, Serialize};
 
 pub type LogicalEpoch = u64;
+pub const ENGINE_CHECKPOINT_PAYLOAD_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EngineCheckpoint {
@@ -27,6 +29,35 @@ impl EngineCheckpoint {
 
     pub fn state(&self) -> &DeltaBatch {
         &self.state
+    }
+
+    pub fn to_payload(&self) -> EngineCheckpointPayload {
+        EngineCheckpointPayload::from_checkpoint(self)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EngineCheckpointPayload {
+    schema_version: u32,
+    logical_epoch: LogicalEpoch,
+    state: DeltaBatch,
+}
+
+impl EngineCheckpointPayload {
+    pub fn from_checkpoint(checkpoint: &EngineCheckpoint) -> Self {
+        Self {
+            schema_version: ENGINE_CHECKPOINT_PAYLOAD_SCHEMA_VERSION,
+            logical_epoch: checkpoint.logical_epoch(),
+            state: checkpoint.state().clone(),
+        }
+    }
+
+    pub fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    pub fn into_checkpoint(self) -> EngineCheckpoint {
+        EngineCheckpoint::new(self.logical_epoch, self.state)
     }
 }
 

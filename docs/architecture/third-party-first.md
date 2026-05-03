@@ -61,6 +61,12 @@ integration as already complete. Adoption is gated on:
 
 Before direct `dbsp` crate integration, Velorix uses DBSP semantics as the
 reference model through the current `IncrementalEngine` adapter boundary.
+Checkpoint state for that boundary is serialized as a versioned engine payload
+containing `schema_version`, `logical_epoch`, and `state`. The manifest
+checkpoint version remains the publication/progress version and is not the
+engine logical epoch. Runtime recovery still accepts legacy raw `DeltaBatch`
+state objects by treating the manifest checkpoint version as the only available
+epoch fallback for those old payloads.
 
 ## Migration Sequence
 
