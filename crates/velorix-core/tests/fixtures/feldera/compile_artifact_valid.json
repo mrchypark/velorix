@@ -1,0 +1,42 @@
+{
+  "metadata_version": 1,
+  "view_id": "standing_view_orders_by_region",
+  "spec_hash": "velorix-feldera-spec-fnv1a64-v1:df13f7387d35c9e1",
+  "artifact_id": "feldera-artifact-orders-by-region-20260503",
+  "artifact_hash": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "compiler": {
+    "name": "feldera-sql-to-dbsp",
+    "version": "0.42.0",
+    "source": "sql-to-dbsp-compiler/SQL-compiler"
+  },
+  "generated_rust": {
+    "abi_version": "feldera-generated-rust-abi-v1",
+    "crate_name": "orders_by_region_pipeline"
+  },
+  "input_schemas": [
+    {
+      "relation_id": "orders",
+      "relation_name": "orders",
+      "columns": [
+        { "name": "order_id", "data_type": { "kind": "utf8" }, "nullable": false },
+        { "name": "region", "data_type": { "kind": "utf8" }, "nullable": false },
+        { "name": "amount", "data_type": { "kind": "decimal", "precision": 18, "scale": 2 }, "nullable": false }
+      ],
+      "primary_key": ["order_id"]
+    }
+  ],
+  "output_schemas": [
+    {
+      "relation_id": "orders_by_region",
+      "relation_name": "orders_by_region",
+      "columns": [
+        { "name": "region", "data_type": { "kind": "utf8" }, "nullable": false },
+        { "name": "total_amount", "data_type": { "kind": "decimal", "precision": 38, "scale": 2 }, "nullable": true }
+      ],
+      "primary_key": ["region"]
+    }
+  ],
+  "state_codec": "feldera-dbsp-state-v1",
+  "state_schema_version": 1,
+  "epoch_policy": "monotonic-logical-epoch-v1"
+}

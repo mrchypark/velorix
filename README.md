@@ -29,9 +29,10 @@ disposable, scaling horizontally without state migration as the runtime matures.
 - Experimental SlateDB-backed state store for checkpoint-versioned state
   payloads, with Velorix manifests still owning publication and progress
 - Minimal DataFusion SQL/query planning and execution over in-memory Arrow
-  batches for current `DeltaBatch` query input
-- Planned Feldera DBSP/dbsp-shaped execution path after integration gates are
-  satisfied
+  batches for current ad hoc `DeltaBatch` query input
+- Feldera SQL-to-DBSP standing-view compile artifact contract for validating
+  externally compiled standing-view artifacts; direct runtime Feldera/dbsp
+  integration remains gated
 - Exactly-once processing through checkpointed manifests
 
 ## Architecture Direction
@@ -54,17 +55,23 @@ packages already fit the problem:
   manifest semantics, and runtime recovery orchestration around the substrate.
   Broader durable state layout, LSM/SST policy, compaction tuning, and state
   lifecycle design remain future work.
-- **Apache DataFusion** currently owns the minimal SQL/query planning and
-  execution boundary. Velorix converts `DeltaBatch` records into an in-memory
-  Arrow/DataFusion table and returns Arrow `RecordBatch` output. Object-backed
-  and checkpoint-aware query service integration remains future work.
-- **Feldera DBSP** is the target direction for incremental algebra, operators,
-  circuit semantics, and long-term execution design. This includes the Feldera
-  project and the Rust `dbsp` crate, but direct crate integration is gated on
-  embedded API fit, Rust/toolchain compatibility, checkpoint and state
-  integration, and cost/resource impact. Velorix currently uses a DBSP-shaped
-  `IncrementalEngine` adapter boundary backed by prototype operators before any
-  direct crate adoption.
+- **Apache DataFusion** currently owns the minimal ad hoc SQL/query planning
+  and execution boundary. Velorix converts `DeltaBatch` records into an
+  in-memory Arrow/DataFusion table and returns Arrow `RecordBatch` output.
+  Object-backed and checkpoint-aware query service integration remains future
+  work.
+- **Feldera SQL-to-DBSP** owns standing-view SQL compilation. Velorix now has a
+  phase-0 compile artifact contract that validates Feldera standing-view specs
+  and externally produced artifact metadata. Direct runtime Feldera/dbsp crate
+  integration, Feldera compiler invocation, and generated Rust compilation
+  remain gated.
+- **Feldera DBSP** remains the target direction for incremental algebra,
+  operators, circuit semantics, and long-term execution design. This includes
+  the Feldera project and possibly the Rust `dbsp` crate, but direct crate
+  integration is gated on embedded API fit, Rust/toolchain compatibility,
+  checkpoint and state integration, and cost/resource impact. Velorix currently
+  uses a DBSP-shaped `IncrementalEngine` adapter boundary backed by prototype
+  operators before any direct crate adoption.
 
 Foyer and SlateDB have separate cache boundaries. Velorix uses its Foyer wrapper
 for runtime object-store fetch-through. SlateDB may use Foyer internally for its
@@ -83,8 +90,8 @@ The intended system shape is:
 2. **Incremental engine:** an `IncrementalEngine` boundary hides prototype
    operators today and allows DBSP/Feldera-shaped execution to replace them
    after the integration gates are cleared.
-3. **Query execution:** DataFusion currently plans and executes SQL over an
-   in-memory Arrow table built from `DeltaBatch` input and returns Arrow
+3. **Ad hoc query execution:** DataFusion currently plans and executes SQL over
+   an in-memory Arrow table built from `DeltaBatch` input and returns Arrow
    `RecordBatch` output. Object-backed and checkpoint-aware query services are
    still future work.
 4. **State store:** SlateDB is the current minimal experimental durable
@@ -105,11 +112,12 @@ The intended system shape is:
 The immediate goal is to prove that Velorix can run an end-to-end incremental
 streaming workload while keeping object storage as the only durable database
 and avoiding custom implementations where Foyer already provides the runtime
-cache substrate, DataFusion already owns the minimal SQL/query boundary, SlateDB
-already owns the minimal experimental checkpoint-versioned state-store path, or
-the current DBSP-shaped adapter boundary keeps prototype operators replaceable.
-Future direct Feldera DBSP/dbsp integration and broader SlateDB layout,
-compaction, and lifecycle work remain gated follow-on work.
+cache substrate, DataFusion already owns the minimal ad hoc SQL/query boundary,
+SlateDB already owns the minimal experimental checkpoint-versioned state-store
+path, Feldera owns standing-view SQL-to-DBSP compilation through external
+artifacts, or the current DBSP-shaped adapter boundary keeps prototype
+operators replaceable. Future direct Feldera DBSP/dbsp integration and broader
+SlateDB layout, compaction, and lifecycle work remain gated follow-on work.
 
 1. **Define the storage contract:** specify object keys, immutable batch files,
    state files, manifest schema, and atomic publication rules.
@@ -138,17 +146,23 @@ compaction, and lifecycle work remain gated follow-on work.
 9. **Keep the Foyer-backed hybrid local cache boundary current:** use Foyer for
    runtime object-cache memory/disk internals while preserving object storage as
    the authority.
-10. **Use DataFusion for query surfaces:** keep SQL/query planning and Arrow
-    execution routed through DataFusion. The current implementation runs SQL
-    over an in-memory `MemTable` built from `DeltaBatch` input; future work is
-    to make that service object-backed and checkpoint-aware.
-11. **Scale out workers:** partition streams and views so additional disposable
-   workers increase throughput without state migration.
-12. **Benchmark and harden:** measure cost, recovery time, throughput, and view
+10. **Use DataFusion for ad hoc query surfaces:** keep runtime query planning
+    and Arrow execution routed through DataFusion. The current implementation
+    runs SQL over an in-memory `MemTable` built from `DeltaBatch` input; future
+    work is to make that service object-backed and checkpoint-aware.
+11. **Use Feldera for standing-view SQL compilation:** validate Feldera
+    SQL-to-DBSP compile artifacts before any future `FelderaPipelineEngine`
+    consumes release-built generated code. Do not hand-build Velorix circuits or
+    load arbitrary generated Rust from object storage.
+12. **Scale out workers:** partition streams and views so additional disposable
+    workers increase throughput without state migration.
+13. **Benchmark and harden:** measure cost, recovery time, throughput, and view
     freshness on representative object-storage-backed workloads.
 
 See the detailed implementation plan in
 [`docs/superpowers/plans/2026-05-03-velorix-bootstrap.md`](docs/superpowers/plans/2026-05-03-velorix-bootstrap.md).
 See also
 [`docs/architecture/third-party-first.md`](docs/architecture/third-party-first.md)
-for the package ownership note.
+for the package ownership note and
+[`docs/architecture/feldera-artifact-contract.md`](docs/architecture/feldera-artifact-contract.md)
+for the Feldera standing-view artifact contract.
