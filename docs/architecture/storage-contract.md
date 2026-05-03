@@ -102,8 +102,11 @@ query that recovered state through the same DataFusion `input` table. Persisted
 query service v0 writes validated JSON specs to object storage under
 `v1/queries/{query_id}.query.json` using create-only semantics. Minimal query
 policy now covers SQL text size, output row caps, DataFusion batch size, and
-target partitions. Direct object-backed scans, query scheduling/versioning, and
-broader runtime resource policy remain future work.
+target partitions. Runtime also has a minimal direct Parquet object-backed scan
+boundary that registers caller-provided object storage and Parquet object URLs
+as DataFusion's `input` table. Broader table layout, persisted view access,
+query scheduling/versioning, and broader runtime resource policy remain future
+work.
 
 Foyer owns the runtime local memory/disk object-cache internals behind the
 Velorix cache wrapper. Cache reads verify object-store authority first, and

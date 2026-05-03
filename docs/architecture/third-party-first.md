@@ -53,6 +53,12 @@ querying the recovered materialized `DeltaBatch` through that same DataFusion
 path. This keeps object storage as durable authority and avoids a custom query
 planner.
 
+Velorix runtime also exposes the first direct object-backed DataFusion scan
+boundary for Parquet input. The runtime registers caller-provided object storage
+with DataFusion, registers the Parquet object URL as the `input` table, applies
+the existing `QueryPolicy`, and returns Arrow `RecordBatch` output. DataFusion
+owns SQL parsing, planning, execution, and Parquet object scanning.
+
 Persisted query service v0 stores `PersistedQuerySpec` JSON objects under
 deterministic `v1/queries/{query_id}.query.json` keys. Query ids use the shared
 `ObjectKey` segment rules, SQL is validated by DataFusion against an empty
@@ -65,9 +71,9 @@ caps are enforced by applying a DataFusion `DataFrame` limit before collection,
 not by parsing or planning SQL inside Velorix.
 
 This is an ad hoc SQL/query surface, not standing-view compilation. Direct
-object-backed table scans, query scheduling/versioning, broader persisted view
-access, and memory-pool/disk-spill runtime resource policy remain future
-integration work.
+Parquet object-backed scans now exist as a minimal boundary. Broader table
+layout, query scheduling/versioning, broader persisted view access, and
+memory-pool/disk-spill runtime resource policy remain future integration work.
 
 ## Feldera Standing-View Compile Contract
 
@@ -126,10 +132,10 @@ epoch fallback for those old payloads.
    exactly-once commits.
 5. Keep SQL/query surfaces routed through DataFusion instead of creating a
    custom planner or expression engine. This DataFusion path is for ad hoc SQL
-   over in-memory `DeltaBatch` input and runtime-recovered materialized state;
-   persisted query service v0 only catalogs validated SQL/policy specs in
-   object storage. Direct object-backed table scans, scheduling, and versioning
-   remain future work.
+   over in-memory `DeltaBatch` input, runtime-recovered materialized state, and
+   minimal direct Parquet object-backed `input` scans; persisted query service
+   v0 only catalogs validated SQL/policy specs in object storage. Broader table
+   layout, scheduling, versioning, and persisted view access remain future work.
 6. Use Feldera's SQL-to-DBSP compiler for standing-view SQL through validated
    external compiler artifacts. Do not hand-build Velorix circuits for standing
    views in this phase.

@@ -13,10 +13,11 @@ arrow = { version = "58.2.0", default-features = false }
 async-trait = "0.1"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
-datafusion = { version = "53.1.0", default-features = false, features = ["sql"] }
+datafusion = { version = "53.1.0", default-features = false, features = ["sql", "parquet"] }
 foyer = "0.22"
 futures = "0.3"
 object_store = "0.12"
+parquet = "58.2.0"
 proptest = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -25,4 +26,5 @@ slatedb = { version = "0.12.1", default-features = false }
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+url = "2"
 uuid = { version = "1", features = ["v7", "serde"] }
