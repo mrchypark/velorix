@@ -266,6 +266,65 @@ fn operators_keyed_sum_count_aggregate_preserves_negative_count_state() {
 }
 
 #[test]
+fn operators_keyed_sum_count_aggregate_hydrates_from_materialized_state() {
+    let checkpointed_state = DeltaBatch::from_records([
+        DeltaRecord::new(
+            DeltaKey::from_json(json!("acct:1")),
+            DeltaValue::from_json(json!({ "sum": 5, "count": 0 })),
+            1,
+        ),
+        DeltaRecord::new(
+            DeltaKey::from_json(json!("acct:2")),
+            DeltaValue::from_json(json!({ "sum": -7, "count": -1 })),
+            1,
+        ),
+    ]);
+
+    let mut aggregate = KeyedSumCountAggregate::from_state(&checkpointed_state).unwrap();
+    assert_eq!(
+        aggregate.state().net_rows().unwrap(),
+        checkpointed_state.net_rows().unwrap()
+    );
+
+    aggregate
+        .apply(&DeltaBatch::from_records([
+            record("acct:1", json!(2), 1),
+            record("acct:2", json!(3), -1),
+        ]))
+        .unwrap();
+
+    assert_eq!(
+        aggregate.state().net_rows().unwrap(),
+        vec![
+            DeltaRecord::new(
+                DeltaKey::from_json(json!("acct:1")),
+                DeltaValue::from_json(json!({ "sum": 7, "count": 1 })),
+                1,
+            ),
+            DeltaRecord::new(
+                DeltaKey::from_json(json!("acct:2")),
+                DeltaValue::from_json(json!({ "sum": -10, "count": -2 })),
+                1,
+            ),
+        ]
+    );
+}
+
+#[test]
+fn operators_keyed_sum_count_aggregate_rejects_malformed_materialized_state() {
+    let malformed = DeltaBatch::from_records([DeltaRecord::new(
+        DeltaKey::from_json(json!("acct:1")),
+        DeltaValue::from_json(json!({ "sum": 5, "missing_count": 1 })),
+        1,
+    )]);
+
+    assert_eq!(
+        KeyedSumCountAggregate::from_state(&malformed).unwrap_err(),
+        OperatorError::InvalidAggregateStateValue
+    );
+}
+
+#[test]
 fn operators_keyed_sum_count_aggregate_non_integer_input_preserves_prior_state() {
     let mut aggregate = KeyedSumCountAggregate::new();
     let initial_output = aggregate

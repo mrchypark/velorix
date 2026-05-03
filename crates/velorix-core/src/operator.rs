@@ -13,6 +13,8 @@ pub enum OperatorError {
     WeightOverflow,
     #[error("aggregate input value must be a signed integer")]
     NonIntegerAggregateValue,
+    #[error("aggregate state value must contain integer `sum` and `count` fields")]
+    InvalidAggregateStateValue,
 }
 
 pub fn map_delta_batch<F>(input: &DeltaBatch, mut transform: F) -> Result<DeltaBatch, OperatorError>
@@ -110,6 +112,30 @@ pub struct KeyedSumCountAggregate {
 impl KeyedSumCountAggregate {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn from_state(state: &DeltaBatch) -> Result<Self, OperatorError> {
+        let mut aggregate = Self::default();
+
+        for record in state.records() {
+            let (sum, count) = aggregate_state_sum_count(&record.value)?;
+            let key = canonical_json(record.key.as_json());
+            let entry = aggregate
+                .state
+                .entry(key.clone())
+                .or_insert_with(|| AggregateEntry {
+                    key: record.key.clone(),
+                    sum: 0,
+                    count: 0,
+                });
+
+            entry.add_weighted(sum, count, record.weight)?;
+            if entry.is_zero() {
+                aggregate.state.remove(&key);
+            }
+        }
+
+        Ok(aggregate)
     }
 
     pub fn apply(&mut self, input: &DeltaBatch) -> Result<DeltaBatch, OperatorError> {
@@ -277,6 +303,33 @@ struct AggregateEntry {
 }
 
 impl AggregateEntry {
+    fn add_weighted(
+        &mut self,
+        sum: i64,
+        count: i64,
+        weight: DeltaWeight,
+    ) -> Result<(), OperatorError> {
+        let sum_delta = i128::from(sum)
+            .checked_mul(i128::from(weight))
+            .ok_or(OperatorError::WeightOverflow)?;
+        let count_delta = i128::from(count)
+            .checked_mul(i128::from(weight))
+            .ok_or(OperatorError::WeightOverflow)?;
+        self.sum = self
+            .sum
+            .checked_add(sum_delta)
+            .ok_or(OperatorError::WeightOverflow)?;
+        self.count = self
+            .count
+            .checked_add(count_delta)
+            .ok_or(OperatorError::WeightOverflow)?;
+        Ok(())
+    }
+
+    fn is_zero(&self) -> bool {
+        self.sum == 0 && self.count == 0
+    }
+
     fn to_record(&self, weight: DeltaWeight) -> Result<DeltaRecord, OperatorError> {
         let sum: i64 = self
             .sum
@@ -296,6 +349,20 @@ impl AggregateEntry {
             weight,
         ))
     }
+}
+
+fn aggregate_state_sum_count(value: &DeltaValue) -> Result<(i64, i64), OperatorError> {
+    let value = value.as_json();
+    let sum = value
+        .get("sum")
+        .and_then(Value::as_i64)
+        .ok_or(OperatorError::InvalidAggregateStateValue)?;
+    let count = value
+        .get("count")
+        .and_then(Value::as_i64)
+        .ok_or(OperatorError::InvalidAggregateStateValue)?;
+
+    Ok((sum, count))
 }
 
 #[derive(Clone, Debug)]
