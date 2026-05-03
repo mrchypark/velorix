@@ -1,0 +1,382 @@
+use std::collections::HashSet;
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+use crate::object_key::ObjectKey;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointManifest {
+    pub schema_version: u16,
+    pub checkpoint_version: u64,
+    pub input_ranges: Vec<InputRange>,
+    pub state_objects: Vec<StateObjectRef>,
+    pub output_objects: Vec<OutputObjectRef>,
+    pub parent_checkpoint: Option<u64>,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputRange {
+    pub stream_id: String,
+    pub partition_id: u32,
+    pub start_offset_inclusive: u64,
+    pub end_offset_exclusive: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateObjectRef {
+    pub object_id: String,
+    pub object_key: ObjectKey,
+    pub owner: String,
+    pub partition_id: u32,
+    pub checkpoint_version: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputObjectRef {
+    pub object_id: String,
+    pub object_key: ObjectKey,
+    pub stream_id: String,
+    pub partition_id: u32,
+    pub start_offset_inclusive: u64,
+    pub end_offset_exclusive: u64,
+}
+
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum ManifestError {
+    #[error("unsupported manifest schema version {0}")]
+    UnsupportedSchemaVersion(u16),
+    #[error("manifest must include at least one input range")]
+    MissingInputProgress,
+    #[error("manifest must include at least one state object reference")]
+    MissingStateObjects,
+    #[error("input range for {stream_id}/p={partition_id} must be nonempty: start={start_offset_inclusive}, end={end_offset_exclusive}")]
+    InvalidInputRange {
+        stream_id: String,
+        partition_id: u32,
+        start_offset_inclusive: u64,
+        end_offset_exclusive: u64,
+    },
+    #[error("duplicate input range for {stream_id}/p={partition_id}")]
+    DuplicateInputRange {
+        stream_id: String,
+        partition_id: u32,
+    },
+    #[error("manifest input ranges must be ordered by stream and partition")]
+    InputRangesNotSorted,
+    #[error("invalid parent checkpoint {parent_checkpoint} for checkpoint {checkpoint_version}")]
+    InvalidParentCheckpoint {
+        parent_checkpoint: u64,
+        checkpoint_version: u64,
+    },
+    #[error("non-genesis checkpoint {0} must declare its parent checkpoint")]
+    MissingParentCheckpoint(u64),
+    #[error("genesis checkpoint must not declare a parent checkpoint")]
+    UnexpectedGenesisParent,
+    #[error("state object `{object_id}` belongs to checkpoint {state_checkpoint_version}, expected {manifest_checkpoint_version}")]
+    StateObjectCheckpointMismatch {
+        object_id: String,
+        state_checkpoint_version: u64,
+        manifest_checkpoint_version: u64,
+    },
+    #[error("output object range for {object_id} must be nonempty: start={start_offset_inclusive}, end={end_offset_exclusive}")]
+    InvalidOutputRange {
+        object_id: String,
+        start_offset_inclusive: u64,
+        end_offset_exclusive: u64,
+    },
+    #[error("duplicate object id `{0}`")]
+    DuplicateObjectId(String),
+    #[error("duplicate object key `{0}`")]
+    DuplicateObjectKey(ObjectKey),
+    #[error("manifest creation timestamp must be provided by the caller")]
+    MissingCreationTimestamp,
+}
+
+impl CheckpointManifest {
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        if self.schema_version != 1 {
+            return Err(ManifestError::UnsupportedSchemaVersion(self.schema_version));
+        }
+
+        if self.created_at.is_empty() {
+            return Err(ManifestError::MissingCreationTimestamp);
+        }
+
+        self.validate_parent_checkpoint()?;
+        self.validate_input_ranges()?;
+        self.validate_state_objects()?;
+        self.validate_output_objects()?;
+        self.validate_unique_object_refs()?;
+
+        Ok(())
+    }
+
+    fn validate_parent_checkpoint(&self) -> Result<(), ManifestError> {
+        match (self.checkpoint_version, self.parent_checkpoint) {
+            (0, None) => Ok(()),
+            (0, Some(_)) => Err(ManifestError::UnexpectedGenesisParent),
+            (checkpoint_version, Some(parent_checkpoint))
+                if checkpoint_version
+                    .checked_sub(1)
+                    .is_some_and(|expected_parent| expected_parent == parent_checkpoint) =>
+            {
+                Ok(())
+            }
+            (checkpoint_version, Some(parent_checkpoint)) => {
+                Err(ManifestError::InvalidParentCheckpoint {
+                    parent_checkpoint,
+                    checkpoint_version,
+                })
+            }
+            (checkpoint_version, None) => {
+                Err(ManifestError::MissingParentCheckpoint(checkpoint_version))
+            }
+        }
+    }
+
+    fn validate_input_ranges(&self) -> Result<(), ManifestError> {
+        if self.input_ranges.is_empty() {
+            return Err(ManifestError::MissingInputProgress);
+        }
+
+        let mut seen = HashSet::new();
+        let mut previous: Option<(&str, u32)> = None;
+
+        for range in &self.input_ranges {
+            if range.start_offset_inclusive >= range.end_offset_exclusive {
+                return Err(ManifestError::InvalidInputRange {
+                    stream_id: range.stream_id.clone(),
+                    partition_id: range.partition_id,
+                    start_offset_inclusive: range.start_offset_inclusive,
+                    end_offset_exclusive: range.end_offset_exclusive,
+                });
+            }
+
+            let current = (range.stream_id.as_str(), range.partition_id);
+            if let Some(previous) = previous {
+                if previous > current {
+                    return Err(ManifestError::InputRangesNotSorted);
+                }
+            }
+            previous = Some(current);
+
+            if !seen.insert((range.stream_id.as_str(), range.partition_id)) {
+                return Err(ManifestError::DuplicateInputRange {
+                    stream_id: range.stream_id.clone(),
+                    partition_id: range.partition_id,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_state_objects(&self) -> Result<(), ManifestError> {
+        if self.state_objects.is_empty() {
+            return Err(ManifestError::MissingStateObjects);
+        }
+
+        for state_object in &self.state_objects {
+            if state_object.checkpoint_version != self.checkpoint_version {
+                return Err(ManifestError::StateObjectCheckpointMismatch {
+                    object_id: state_object.object_id.clone(),
+                    state_checkpoint_version: state_object.checkpoint_version,
+                    manifest_checkpoint_version: self.checkpoint_version,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_output_objects(&self) -> Result<(), ManifestError> {
+        for output_object in &self.output_objects {
+            if output_object.start_offset_inclusive >= output_object.end_offset_exclusive {
+                return Err(ManifestError::InvalidOutputRange {
+                    object_id: output_object.object_id.clone(),
+                    start_offset_inclusive: output_object.start_offset_inclusive,
+                    end_offset_exclusive: output_object.end_offset_exclusive,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_unique_object_refs(&self) -> Result<(), ManifestError> {
+        let mut object_ids = HashSet::new();
+        let mut object_keys = HashSet::new();
+
+        for object_ref in self
+            .state_objects
+            .iter()
+            .map(ObjectRef::State)
+            .chain(self.output_objects.iter().map(ObjectRef::Output))
+        {
+            if !object_ids.insert(object_ref.object_id()) {
+                return Err(ManifestError::DuplicateObjectId(
+                    object_ref.object_id().to_string(),
+                ));
+            }
+
+            if !object_keys.insert(object_ref.object_key()) {
+                return Err(ManifestError::DuplicateObjectKey(
+                    object_ref.object_key().clone(),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+enum ObjectRef<'a> {
+    State(&'a StateObjectRef),
+    Output(&'a OutputObjectRef),
+}
+
+impl<'a> ObjectRef<'a> {
+    fn object_id(&self) -> &'a str {
+        match self {
+            Self::State(object_ref) => &object_ref.object_id,
+            Self::Output(object_ref) => &object_ref.object_id,
+        }
+    }
+
+    fn object_key(&self) -> &'a ObjectKey {
+        match self {
+            Self::State(object_ref) => &object_ref.object_key,
+            Self::Output(object_ref) => &object_ref.object_key,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CheckpointManifest, InputRange, ManifestError, OutputObjectRef, StateObjectRef};
+    use crate::object_key::ObjectKey;
+
+    fn state_ref(object_id: &str, object_key: ObjectKey) -> StateObjectRef {
+        StateObjectRef {
+            object_id: object_id.to_string(),
+            object_key,
+            owner: "balances_by_account".to_string(),
+            partition_id: 0,
+            checkpoint_version: 1,
+        }
+    }
+
+    fn output_ref(object_id: &str, object_key: ObjectKey) -> OutputObjectRef {
+        OutputObjectRef {
+            object_id: object_id.to_string(),
+            object_key,
+            stream_id: "settlements".to_string(),
+            partition_id: 0,
+            start_offset_inclusive: 20,
+            end_offset_exclusive: 25,
+        }
+    }
+
+    fn valid_manifest() -> CheckpointManifest {
+        CheckpointManifest {
+            schema_version: 1,
+            checkpoint_version: 1,
+            input_ranges: vec![InputRange {
+                stream_id: "orders".to_string(),
+                partition_id: 0,
+                start_offset_inclusive: 10,
+                end_offset_exclusive: 20,
+            }],
+            state_objects: vec![state_ref(
+                "state-0001",
+                ObjectKey::state_object("balances_by_account", 0, 1, "state-0001").unwrap(),
+            )],
+            output_objects: vec![output_ref(
+                "out-0001",
+                ObjectKey::ingest_batch("settlements", 0, 20, 25).unwrap(),
+            )],
+            parent_checkpoint: Some(0),
+            created_at: "2026-05-03T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn checkpoint_manifest_accepts_valid_structural_contract() {
+        let manifest = valid_manifest();
+
+        assert_eq!(manifest.validate(), Ok(()));
+    }
+
+    #[test]
+    fn checkpoint_manifest_rejects_missing_input_progress() {
+        let mut manifest = valid_manifest();
+        manifest.input_ranges.clear();
+
+        assert_eq!(
+            manifest.validate(),
+            Err(ManifestError::MissingInputProgress)
+        );
+    }
+
+    #[test]
+    fn checkpoint_manifest_rejects_missing_state_object_references() {
+        let mut manifest = valid_manifest();
+        manifest.state_objects.clear();
+
+        assert_eq!(manifest.validate(), Err(ManifestError::MissingStateObjects));
+    }
+
+    #[test]
+    fn checkpoint_manifest_rejects_duplicate_object_identifiers_across_refs() {
+        let mut manifest = valid_manifest();
+        manifest.output_objects[0].object_id = "state-0001".to_string();
+
+        assert_eq!(
+            manifest.validate(),
+            Err(ManifestError::DuplicateObjectId("state-0001".to_string()))
+        );
+    }
+
+    #[test]
+    fn checkpoint_manifest_rejects_duplicate_object_keys_across_refs() {
+        let mut manifest = valid_manifest();
+        manifest.output_objects[0].object_key = manifest.state_objects[0].object_key.clone();
+
+        assert_eq!(
+            manifest.validate(),
+            Err(ManifestError::DuplicateObjectKey(
+                manifest.state_objects[0].object_key.clone()
+            ))
+        );
+    }
+
+    #[test]
+    fn checkpoint_manifest_rejects_non_monotonic_checkpoint_versions() {
+        let mut manifest = valid_manifest();
+        manifest.parent_checkpoint = Some(1);
+
+        assert_eq!(
+            manifest.validate(),
+            Err(ManifestError::InvalidParentCheckpoint {
+                parent_checkpoint: 1,
+                checkpoint_version: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn checkpoint_manifest_rejects_overflowing_parent_checkpoint_without_panicking() {
+        let mut manifest = valid_manifest();
+        manifest.parent_checkpoint = Some(u64::MAX);
+
+        assert_eq!(
+            manifest.validate(),
+            Err(ManifestError::InvalidParentCheckpoint {
+                parent_checkpoint: u64::MAX,
+                checkpoint_version: 1,
+            })
+        );
+    }
+}

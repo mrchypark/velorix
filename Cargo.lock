@@ -465,6 +465,10 @@ version = "0.1.0"
 [[package]]
 name = "velorix-storage"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror",
+]
 
 [[package]]
 name = "wait-timeout"
