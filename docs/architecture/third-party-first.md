@@ -6,9 +6,11 @@ Velorix-specific code focused on object-storage authority, checkpoint manifests,
 stateless recovery, resource/cost policy, and package boundaries.
 
 This note distinguishes current implementation from target direction. The
-runtime object cache is currently Foyer-backed after the recent cache work.
-SlateDB, DataFusion, and direct Feldera DBSP/dbsp integration are planned
-migration directions unless matching code exists in the repository.
+runtime object cache is currently Foyer-backed after the recent cache work, and
+SQL/query planning and execution currently use DataFusion for the minimal
+`DeltaBatch` query boundary. SlateDB and direct Feldera DBSP/dbsp integration
+remain planned migration directions unless matching code exists in the
+repository.
 
 ## Package Ownership
 
@@ -16,7 +18,7 @@ migration directions unless matching code exists in the repository.
 | --- | --- | --- | --- |
 | Durable LSM/SST/state substrate | Planned target | SlateDB | Object key policy, stream progress, exactly-once manifests, recovery orchestration |
 | Runtime object-store fetch-through cache | Current implementation | Foyer | Object-store authority checks, cache namespace policy, cache-as-non-durable invariant |
-| SQL/DataFrame/query planning and Arrow execution | Planned target | Apache DataFusion | Runtime integration, checkpoint-aware inputs/outputs, cost/resource policy |
+| SQL/DataFrame/query planning and Arrow execution | Current minimal implementation | Apache DataFusion | Runtime integration, checkpoint-aware inputs/outputs, cost/resource policy |
 | Incremental algebra, operators, and circuit semantics | Planned target, with adoption gates | Feldera project semantics and/or Rust `dbsp` crate | `IncrementalEngine` adapter, object-backed persistence, moderate-performance cost optimizations |
 
 ## Cache Boundary
@@ -29,6 +31,18 @@ SlateDB may use Foyer internally for its own block or object cache once SlateDB
 is integrated. That cache belongs to SlateDB's state substrate internals. Velorix
 should keep the runtime object cache policy separate from any SlateDB-internal
 cache policy to avoid duplicate eviction, durability, or authority rules.
+
+## Query Boundary
+
+Velorix core currently exposes a minimal DataFusion-backed query boundary for
+SQL over `DeltaBatch` input. Delta records are converted into an in-memory
+Arrow/DataFusion table named `input`, with stable `key_json`, `value_json`, and
+`weight` columns. DataFusion owns SQL parsing, query planning, physical
+execution, and Arrow `RecordBatch` output.
+
+This is not yet the full query service. Object-backed inputs, checkpoint-aware
+query reads, persisted view access, and runtime cost/resource policy remain
+future integration work.
 
 ## DBSP Adoption Gate
 
@@ -54,8 +68,10 @@ reference model or keep incremental execution behind an adapter boundary.
    wrapper while preserving object storage as the only source of durable truth.
 4. Move durable state layout and compaction responsibilities to SlateDB, leaving
    Velorix manifests responsible for stream progress and exactly-once commits.
-5. Route SQL/DataFrame/query surfaces through DataFusion instead of creating a
-   custom planner or expression engine once the integration is implemented.
+5. Keep SQL/query surfaces routed through DataFusion instead of creating a
+   custom planner or expression engine. The current implementation covers
+   in-memory `DeltaBatch` input; object-backed and checkpoint-aware query
+   service integration remains future work.
 6. Use Feldera DBSP semantics as the reference model for incremental operators
    and circuit semantics. Consider direct Rust `dbsp` crate integration only
    after the adoption gates are satisfied; otherwise keep an adapter boundary.

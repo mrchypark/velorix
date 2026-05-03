@@ -27,8 +27,8 @@ disposable, scaling horizontally without state migration as the runtime matures.
 - Foyer-backed hybrid local memory/disk runtime object cache for object-store
   fetch-through
 - Planned SlateDB durable LSM/SST/state substrate where it fits
-- Planned DataFusion SQL/DataFrame planning and Arrow execution where
-  batch/query semantics apply
+- Minimal DataFusion SQL/query planning and execution over in-memory Arrow
+  batches for current `DeltaBatch` query input
 - Planned Feldera DBSP/dbsp-shaped execution path after integration gates are
   satisfied
 - Exactly-once processing through checkpointed manifests
@@ -51,9 +51,10 @@ packages already fit the problem:
   LSM/SST/compaction and state substrate behavior where the integration fits.
   Velorix owns stream progress, exactly-once manifest semantics, and runtime
   recovery orchestration around that substrate.
-- **Apache DataFusion** is the planned owner for SQL, DataFrame, query planning,
-  expression handling, and Arrow execution wherever Velorix has batch/query
-  semantics.
+- **Apache DataFusion** currently owns the minimal SQL/query planning and
+  execution boundary. Velorix converts `DeltaBatch` records into an in-memory
+  Arrow/DataFusion table and returns Arrow `RecordBatch` output. Object-backed
+  and checkpoint-aware query service integration remains future work.
 - **Feldera DBSP** is the target direction for incremental algebra, operators,
   circuit semantics, and long-term execution design. This includes the Feldera
   project and the Rust `dbsp` crate, but direct crate integration is gated on
@@ -78,8 +79,10 @@ The intended system shape is:
 2. **Incremental engine:** an `IncrementalEngine` boundary hides prototype
    operators today and allows DBSP/Feldera-shaped execution to replace them
    after the integration gates are cleared.
-3. **Query execution:** DataFusion is the planned path for SQL/DataFrame
-   planning and Arrow execution for batch/query surfaces.
+3. **Query execution:** DataFusion currently plans and executes SQL over an
+   in-memory Arrow table built from `DeltaBatch` input and returns Arrow
+   `RecordBatch` output. Object-backed and checkpoint-aware query services are
+   still future work.
 4. **State layout:** SlateDB is the planned durable LSM/SST/state substrate over
    object storage, while manifests describe Velorix progress and publication
    state.
@@ -93,14 +96,15 @@ The intended system shape is:
 The immediate goal is to prove that Velorix can run an end-to-end incremental
 streaming workload while keeping object storage as the only durable database
 and avoiding custom implementations where Foyer already provides the runtime
-cache substrate or where SlateDB, DataFusion, and Feldera/DBSP are planned to
-provide the right substrate.
+cache substrate, where DataFusion already owns the minimal SQL/query boundary,
+or where SlateDB and Feldera/DBSP are planned to provide the right substrate.
 
 1. **Define the storage contract:** specify object keys, immutable batch files,
    state files, manifest schema, and atomic publication rules.
 2. **Define package ownership:** document where Foyer owns current cache
-   behavior, where SlateDB, DataFusion, and Feldera/DBSP are planned to own
-   behavior, and keep Velorix code at the integration boundary.
+   behavior, where DataFusion currently owns minimal SQL/query behavior, where
+   SlateDB and Feldera/DBSP are planned to own behavior, and keep Velorix code
+   at the integration boundary.
 3. **Build the minimal object store layer:** start with a local filesystem
    adapter that behaves like object storage, then add S3-compatible storage.
 4. **Implement the ingest log:** persist ordered input delta batches and expose
@@ -117,9 +121,10 @@ provide the right substrate.
 9. **Keep the Foyer-backed hybrid local cache boundary current:** use Foyer for
    runtime object-cache memory/disk internals while preserving object storage as
    the authority.
-10. **Use DataFusion for query surfaces:** route SQL/DataFrame/query planning and
-    Arrow execution through DataFusion instead of building a custom planner once
-    that integration work exists.
+10. **Use DataFusion for query surfaces:** keep SQL/query planning and Arrow
+    execution routed through DataFusion. The current implementation runs SQL
+    over an in-memory `MemTable` built from `DeltaBatch` input; future work is
+    to make that service object-backed and checkpoint-aware.
 11. **Scale out workers:** partition streams and views so additional disposable
    workers increase throughput without state migration.
 12. **Benchmark and harden:** measure cost, recovery time, throughput, and view

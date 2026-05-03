@@ -9,11 +9,11 @@ resolver = "2"
 
 [workspace.dependencies]
 anyhow = "1"
-arrow = "58.2.0"
+arrow = { version = "58.2.0", default-features = false }
 async-trait = "0.1"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
-datafusion = "53.1.0"
+datafusion = { version = "53.1.0", default-features = false, features = ["sql"] }
 foyer = "0.22"
 futures = "0.3"
 object_store = "0.12"
