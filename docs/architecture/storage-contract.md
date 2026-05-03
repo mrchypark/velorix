@@ -98,9 +98,10 @@ remain future work.
 DataFusion owns the current SQL/query planning and Arrow execution boundary over
 in-memory `DeltaBatch` input. Runtime query calls can now recover materialized
 state from object-backed checkpoint manifests and replay, then query that
-recovered state through the same DataFusion `input` table. Persisted query
-services, direct object-backed scans, and broader query resource policy remain
-future work.
+recovered state through the same DataFusion `input` table. Minimal query policy
+now covers SQL text size, output row caps, DataFusion batch size, and target
+partitions. Persisted query services, direct object-backed scans, and broader
+runtime resource policy remain future work.
 
 Foyer owns the runtime local memory/disk object-cache internals behind the
 Velorix cache wrapper. Cache reads verify object-store authority first, and

@@ -52,9 +52,15 @@ querying the recovered materialized `DeltaBatch` through that same DataFusion
 path. This keeps object storage as durable authority and avoids a custom query
 planner.
 
+The query boundary also exposes a minimal Velorix-owned policy for SQL text
+size, output row caps, DataFusion batch size, and target partitions. Output row
+caps are enforced by applying a DataFusion `DataFrame` limit before collection,
+not by parsing or planning SQL inside Velorix.
+
 This is an ad hoc SQL/query surface, not standing-view compilation. Persisted
 query-service APIs, direct object-backed table scans, broader persisted view
-access, and runtime cost/resource policy remain future integration work.
+access, and memory-pool/disk-spill runtime resource policy remain future
+integration work.
 
 ## Feldera Standing-View Compile Contract
 

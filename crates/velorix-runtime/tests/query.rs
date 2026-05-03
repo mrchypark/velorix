@@ -9,8 +9,12 @@ use velorix_core::{
     delta::{DeltaBatch, DeltaKey, DeltaRecord, DeltaValue},
     engine::EngineCheckpoint,
     operator::KeyedSumCountAggregate,
+    query::{QueryError, QueryPolicy, QueryPolicyError},
 };
-use velorix_runtime::query::query_recovered_materialized_view;
+use velorix_runtime::query::{
+    query_recovered_materialized_view, query_recovered_materialized_view_with_policy,
+    RuntimeQueryError,
+};
 use velorix_storage::{
     log::{IngestBatch, IngestLog},
     manifest::{CheckpointManifest, InputRange, StateObjectRef},
@@ -130,6 +134,61 @@ async fn query_recovered_materialized_view_reads_checkpointed_state_and_replayed
     assert_eq!(string_value(&output[0], 0, 1), "\"account-b\"");
     assert_eq!(string_value(&output[0], 1, 1), "{\"count\":1,\"sum\":7}");
     assert_eq!(int64_value(&output[0], 2, 1), 1);
+}
+
+#[tokio::test]
+async fn query_recovered_materialized_view_with_policy_applies_row_limit_to_recovered_state() {
+    let (_temp_dir, store) = temp_store();
+    let ingest_log = IngestLog::new(Arc::clone(&store));
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+
+    let checkpoint_input = batch([
+        input_delta("account-a", 10, 1),
+        input_delta("account-a", 5, 1),
+    ]);
+    let replay_input = batch([input_delta("account-b", 7, 1)]);
+
+    ingest_log
+        .append(&IngestBatch::new("orders", 0, 0, 2, batch_bytes(&checkpoint_input)).unwrap())
+        .await
+        .unwrap();
+    ingest_log
+        .append(&IngestBatch::new("orders", 0, 2, 3, batch_bytes(&replay_input)).unwrap())
+        .await
+        .unwrap();
+
+    let mut checkpointed_view = KeyedSumCountAggregate::new();
+    checkpointed_view.apply(&checkpoint_input).unwrap();
+    let state_ref = write_checkpoint_state(
+        &publisher,
+        "state-query-policy",
+        2,
+        &checkpointed_view.state(),
+    )
+    .await;
+    publisher
+        .publish_manifest(&manifest(2, state_ref))
+        .await
+        .unwrap();
+
+    let error = query_recovered_materialized_view_with_policy(
+        Arc::clone(&store),
+        "select key_json, value_json, weight from input order by key_json",
+        QueryPolicy {
+            max_output_rows: Some(1),
+            ..QueryPolicy::default()
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RuntimeQueryError::Query(QueryError::Policy(QueryPolicyError::OutputRowsExceeded {
+            observed_rows: 2,
+            max_rows: 1
+        }))
+    ));
 }
 
 #[tokio::test]

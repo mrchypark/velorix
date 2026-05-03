@@ -1,7 +1,11 @@
-use arrow::array::{Int64Array, StringArray};
+use arrow::array::{Array, Int64Array, StringArray};
 use serde_json::json;
+use std::num::NonZeroUsize;
 use velorix_core::delta::{DeltaBatch, DeltaKey, DeltaRecord, DeltaValue};
-use velorix_core::query::query_delta_batch;
+
+use velorix_core::query::{
+    query_delta_batch, query_delta_batch_with_policy, QueryError, QueryPolicy, QueryPolicyError,
+};
 
 #[tokio::test]
 async fn query_delta_batch_returns_arrow_record_batches_when_sql_projects_input_columns() {
@@ -63,6 +67,111 @@ async fn query_delta_batch_lets_datafusion_own_sql_planning_and_aggregation() {
 }
 
 #[tokio::test]
+async fn query_delta_batch_with_policy_rejects_sql_text_above_byte_limit() {
+    let input = DeltaBatch::from_records([record("acct:1", json!({ "amount": 10 }), 1)]);
+    let policy = QueryPolicy {
+        max_sql_bytes: Some("select * from input".len() - 1),
+        ..QueryPolicy::default()
+    };
+
+    let error = query_delta_batch_with_policy(&input, "select * from input", policy)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        QueryError::Policy(QueryPolicyError::SqlTextTooLarge {
+            actual_bytes,
+            max_bytes
+        }) if actual_bytes == "select * from input".len() && max_bytes == "select * from input".len() - 1
+    ));
+}
+
+#[tokio::test]
+async fn query_delta_batch_with_policy_returns_results_at_row_limit() {
+    let input = DeltaBatch::from_records([
+        record("acct:1", json!({ "amount": 10 }), 1),
+        record("acct:2", json!({ "amount": 4 }), 1),
+    ]);
+    let policy = QueryPolicy {
+        max_output_rows: Some(2),
+        batch_size: NonZeroUsize::new(1),
+        target_partitions: NonZeroUsize::new(1),
+        ..QueryPolicy::default()
+    };
+
+    let output = query_delta_batch_with_policy(
+        &input,
+        "select key_json, value_json, weight from input order by key_json",
+        policy,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(num_rows(&output), 2);
+    assert_eq!(string_values(&output, 0), vec!["\"acct:1\"", "\"acct:2\""]);
+}
+
+#[tokio::test]
+async fn query_delta_batch_with_policy_rejects_results_above_row_limit() {
+    let input = DeltaBatch::from_records([
+        record("acct:1", json!({ "amount": 10 }), 1),
+        record("acct:2", json!({ "amount": 4 }), 1),
+        record("acct:3", json!({ "amount": 8 }), 1),
+    ]);
+    let policy = QueryPolicy {
+        max_output_rows: Some(2),
+        ..QueryPolicy::default()
+    };
+
+    let error = query_delta_batch_with_policy(
+        &input,
+        "select key_json, value_json, weight from input order by key_json",
+        policy,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        QueryError::Policy(QueryPolicyError::OutputRowsExceeded {
+            observed_rows,
+            max_rows: 2
+        }) if observed_rows == 3
+    ));
+}
+
+#[tokio::test]
+async fn query_delta_batch_with_policy_still_lets_datafusion_handle_aggregation_planning() {
+    let input = DeltaBatch::from_records([
+        record("acct:1", json!({ "amount": 10 }), 3),
+        record("acct:1", json!({ "amount": 10 }), -1),
+        record("acct:2", json!({ "amount": 4 }), 5),
+    ]);
+    let policy = QueryPolicy {
+        max_output_rows: Some(2),
+        batch_size: NonZeroUsize::new(1),
+        target_partitions: NonZeroUsize::new(1),
+        ..QueryPolicy::default()
+    };
+
+    let output = query_delta_batch_with_policy(
+        &input,
+        "select key_json, sum(weight) as net_weight \
+         from input \
+         group by key_json \
+         order by key_json",
+        policy,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(num_rows(&output), 2);
+    assert_eq!(string_values(&output, 0), vec!["\"acct:1\"", "\"acct:2\""]);
+    assert_eq!(int64_values(&output, 1), vec![2, 5]);
+}
+
+#[tokio::test]
 async fn query_delta_batch_returns_a_typed_error_when_datafusion_rejects_sql() {
     let input = DeltaBatch::from_records([record("acct:1", json!({ "amount": 10 }), 1)]);
 
@@ -97,4 +206,39 @@ fn int64_value(batch: &arrow::record_batch::RecordBatch, column: usize, row: usi
         .downcast_ref::<Int64Array>()
         .unwrap()
         .value(row)
+}
+
+fn num_rows(batches: &[arrow::record_batch::RecordBatch]) -> usize {
+    batches
+        .iter()
+        .map(arrow::record_batch::RecordBatch::num_rows)
+        .sum()
+}
+
+fn string_values(batches: &[arrow::record_batch::RecordBatch], column: usize) -> Vec<&str> {
+    batches
+        .iter()
+        .flat_map(|batch| {
+            let values = batch
+                .column(column)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            (0..values.len()).map(|row| values.value(row))
+        })
+        .collect()
+}
+
+fn int64_values(batches: &[arrow::record_batch::RecordBatch], column: usize) -> Vec<i64> {
+    batches
+        .iter()
+        .flat_map(|batch| {
+            let values = batch
+                .column(column)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            (0..values.len()).map(|row| values.value(row))
+        })
+        .collect()
 }

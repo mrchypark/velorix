@@ -61,9 +61,10 @@ packages already fit the problem:
   in-memory Arrow/DataFusion table and returns Arrow `RecordBatch` output.
   Runtime code can now recover the latest object-backed checkpoint state,
   replay uncovered ingest batches, and query that recovered materialized state
-  through the same DataFusion boundary. A persisted query service, direct
-  object-backed table scans, and broader cost/resource policy remain future
-  work.
+  through the same DataFusion boundary. The boundary now includes a minimal
+  policy for SQL text size, output row caps, DataFusion batch size, and target
+  partitions. A persisted query service, direct object-backed table scans, and
+  broader cost/resource policy remain future work.
 - **Feldera SQL-to-DBSP** owns standing-view SQL compilation. Velorix now has a
   phase-0 compile artifact contract that validates Feldera standing-view specs
   and externally produced artifact metadata. Direct runtime Feldera/dbsp crate
@@ -98,8 +99,10 @@ The intended system shape is:
    an in-memory Arrow table built from `DeltaBatch` input and returns Arrow
    `RecordBatch` output. Runtime query calls can recover the latest
    object-backed checkpoint, replay uncovered ingest batches, and query the
-   recovered materialized state. Persisted query services and direct
-   object-backed DataFusion table integration are still future work.
+   recovered materialized state. Minimal policy covers SQL text size, output
+   row caps, DataFusion batch size, and target partitions. Persisted query
+   services and direct object-backed DataFusion table integration are still
+   future work.
 4. **State store:** SlateDB is the current minimal experimental durable
    state-store path over object storage for checkpoint-versioned payloads, while
    manifests describe Velorix progress and publication state. Broader state
