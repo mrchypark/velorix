@@ -169,6 +169,51 @@ async fn persisted_table_store_rejects_malformed_json_from_object_storage() {
 }
 
 #[tokio::test]
+async fn persisted_table_store_rejects_unknown_spec_field_from_object_storage() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = PersistedTableStore::new(Arc::clone(&store));
+
+    write_table_catalog_object(
+        Arc::clone(&store),
+        "orders-current",
+        json!({
+            "schema_version": 1,
+            "table_id": "orders-current",
+            "table_url": "memory://velorix/input/",
+            "format": "Parquet",
+            "unexpected": true,
+        }),
+    )
+    .await;
+
+    let error = catalog.get("orders-current").await.unwrap_err();
+
+    assert!(matches!(error, PersistedTableError::Json(_)));
+}
+
+#[tokio::test]
+async fn persisted_table_store_rejects_unknown_format_from_object_storage() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = PersistedTableStore::new(Arc::clone(&store));
+
+    write_table_catalog_object(
+        Arc::clone(&store),
+        "orders-current",
+        json!({
+            "schema_version": 1,
+            "table_id": "orders-current",
+            "table_url": "memory://velorix/input/",
+            "format": "Csv",
+        }),
+    )
+    .await;
+
+    let error = catalog.get("orders-current").await.unwrap_err();
+
+    assert!(matches!(error, PersistedTableError::Json(_)));
+}
+
+#[tokio::test]
 async fn persisted_object_backed_table_query_loads_stored_parquet_url_and_scans_with_datafusion() {
     let (_temp_dir, catalog_store) = temp_store();
     let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());

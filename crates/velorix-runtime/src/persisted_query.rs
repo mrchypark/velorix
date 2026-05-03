@@ -13,6 +13,7 @@ use crate::query::{query_recovered_materialized_view_with_policy, RuntimeQueryEr
 pub const PERSISTED_QUERY_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PersistedQuerySpec {
     pub schema_version: u32,
     pub query_id: String,

@@ -20,6 +20,7 @@ pub enum PersistedTableFormat {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PersistedTableSpec {
     pub schema_version: u32,
     pub table_id: String,

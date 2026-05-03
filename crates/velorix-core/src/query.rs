@@ -25,6 +25,7 @@ pub enum QueryError {
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueryPolicy {
     pub max_sql_bytes: Option<usize>,
     pub max_output_rows: Option<usize>,

@@ -178,6 +178,57 @@ async fn persisted_query_store_rejects_malformed_json_from_object_storage() {
 }
 
 #[tokio::test]
+async fn persisted_query_store_rejects_unknown_spec_field_from_object_storage() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = PersistedQueryStore::new(Arc::clone(&store));
+
+    write_catalog_object(
+        Arc::clone(&store),
+        "orders-active",
+        json!({
+            "schema_version": 1,
+            "query_id": "orders-active",
+            "sql": "select key_json, value_json, weight from input",
+            "policy": QueryPolicy::default(),
+            "unexpected": true,
+        }),
+    )
+    .await;
+
+    let error = catalog.get("orders-active").await.unwrap_err();
+
+    assert!(matches!(error, PersistedQueryError::Json(_)));
+}
+
+#[tokio::test]
+async fn persisted_query_store_rejects_unknown_policy_field_from_object_storage() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = PersistedQueryStore::new(Arc::clone(&store));
+
+    write_catalog_object(
+        Arc::clone(&store),
+        "orders-active",
+        json!({
+            "schema_version": 1,
+            "query_id": "orders-active",
+            "sql": "select key_json, value_json, weight from input",
+            "policy": {
+                "max_sql_bytes": null,
+                "max_output_rows": null,
+                "batch_size": null,
+                "target_partitions": null,
+                "unexpected": true,
+            },
+        }),
+    )
+    .await;
+
+    let error = catalog.get("orders-active").await.unwrap_err();
+
+    assert!(matches!(error, PersistedQueryError::Json(_)));
+}
+
+#[tokio::test]
 async fn persisted_recovered_query_execution_uses_stored_sql_and_policy() {
     let (_temp_dir, store) = temp_store();
     let catalog = PersistedQueryStore::new(Arc::clone(&store));
