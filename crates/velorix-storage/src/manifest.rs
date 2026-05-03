@@ -107,6 +107,10 @@ pub enum ManifestError {
 }
 
 impl CheckpointManifest {
+    pub fn object_key(&self) -> ObjectKey {
+        ObjectKey::checkpoint_manifest(self.checkpoint_version)
+    }
+
     pub fn validate(&self) -> Result<(), ManifestError> {
         if self.schema_version != 1 {
             return Err(ManifestError::UnsupportedSchemaVersion(self.schema_version));

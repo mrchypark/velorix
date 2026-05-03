@@ -5,3 +5,4 @@
 pub mod log;
 pub mod manifest;
 pub mod object_key;
+pub mod state;
