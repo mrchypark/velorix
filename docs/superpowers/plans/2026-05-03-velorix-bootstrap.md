@@ -2,11 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a minimal Velorix prototype that proves an object-storage-first, stateless, incremental streaming database can ingest deltas, maintain a materialized view, checkpoint progress, and recover without local durable state.
+**Goal:** Build a minimal Velorix prototype that proves an object-storage-first, stateless, incremental streaming database can ingest deltas, maintain a materialized view, checkpoint progress, and recover without local durable state. Velorix is third-party-first: do not expand direct hand-written implementations where SlateDB, Foyer, Apache DataFusion, or Feldera DBSP fit the problem.
 
-**Architecture:** Start with a single-process prototype whose only durable layer is an object-store abstraction backed by the local filesystem. Represent input, state, and checkpoints as immutable objects plus versioned manifests, then add incremental operators and recovery semantics before scaling workers.
+**Architecture:** Start with a single-process prototype whose only durable authority is object storage. Represent input and checkpoints as immutable objects plus versioned manifests, add package boundaries before scaling workers, and migrate prototype internals behind mature substrates: SlateDB for durable LSM/SST/state, Foyer for local memory/disk cache, DataFusion for SQL/DataFrame/query planning and Arrow execution, and Feldera DBSP for incremental algebra/operators/circuit semantics.
 
-**Tech Stack:** Rust is the assumed implementation language for the core engine because Velorix needs low overhead, predictable performance, async I/O, and deployable static binaries. Use `tokio` for async execution, `serde` for schemas, `object_store` for filesystem/S3-compatible storage, and `proptest` for invariant-heavy delta and manifest tests.
+**Tech Stack:** Rust is the assumed implementation language for the core engine because Velorix needs low overhead, predictable performance, async I/O, and deployable static binaries. Use `tokio` for async execution, `serde` for schemas, `object_store` for filesystem/S3-compatible storage, `proptest` for invariant-heavy delta and manifest tests, and third-party data packages where they fit. The planned package direction is SlateDB for object-storage-first durable state, Foyer for hybrid cache internals, Apache DataFusion for query planning/execution, and Feldera DBSP as the reference model or backing engine for incremental computation.
+
+**Third-party-first directive:** Velorix-specific code should remain glue and policy: object-storage authority, deterministic `ObjectKey` rules, checkpoint manifests, stateless recovery orchestration, resource/cost policy, and integration boundaries. Current hand-written delta/operator/state/cache code is prototype scaffolding unless the plan explicitly says a Velorix-owned boundary is required.
 
 ---
 
@@ -15,7 +17,7 @@
 - Create: `Cargo.toml` for the Rust workspace and shared dependency versions.
 - Create: `crates/velorix-core/src/lib.rs` for the public core module boundary.
 - Create: `crates/velorix-core/src/delta.rs` for signed delta records and batches.
-- Create: `crates/velorix-core/src/operator.rs` for map, filter, join, and aggregate traits.
+- Create: `crates/velorix-core/src/operator.rs` for prototype map, filter, join, and aggregate traits behind a future `IncrementalEngine` boundary.
 - Create: `crates/velorix-storage/src/lib.rs` for the object-store-facing storage boundary.
 - Create: `crates/velorix-storage/src/object_key.rs` for deterministic object key construction.
 - Create: `crates/velorix-storage/src/manifest.rs` for checkpoint manifest schemas and validation.
@@ -24,6 +26,7 @@
 - Create: `crates/velorix-cli/src/main.rs` for local prototype commands.
 - Create: `tests/e2e/local_recovery.rs` for crash and recovery behavior.
 - Modify: `README.md` as implementation status changes.
+- Create: `docs/architecture/third-party-first.md` for package ownership and migration order.
 
 ## Task 1: Workspace Scaffold
 
@@ -88,9 +91,9 @@ git commit -m "chore: scaffold velorix workspace"
 
 Add tests that prove positive weights insert logical rows, negative weights retract them, and combining batches preserves net row weight.
 
-- [ ] **Step 2: Implement the minimal delta model**
+- [ ] **Step 2: Implement the minimal prototype delta model**
 
-Represent records as typed keys and values with a signed integer weight. Keep the first version intentionally simple: JSON-compatible values are acceptable until the execution format is finalized.
+Represent records as typed keys and values with a signed integer weight. Keep the first version intentionally simple and adapter-friendly: JSON-compatible values are acceptable until the execution format is finalized. Do not treat this as a long-term replacement for Feldera DBSP-shaped algebra or Arrow/DataFusion-compatible execution formats.
 
 - [ ] **Step 3: Add property-based tests**
 
@@ -177,39 +180,43 @@ git add crates/velorix-storage
 git commit -m "feat: add object-backed ingest log"
 ```
 
-## Task 5: First Incremental Operators
+## Task 5: First Incremental Engine Boundary and Prototype Operators
 
 **Files:**
 - Create: `crates/velorix-core/src/operator.rs`
 - Modify: `crates/velorix-core/src/lib.rs`
 - Create: `crates/velorix-core/tests/operators.rs`
 
-- [ ] **Step 1: Write behavior tests for map, filter, join, and aggregate**
+- [ ] **Step 1: Write behavior tests for an `IncrementalEngine` boundary and prototype map, filter, join, and aggregate behavior**
 
-Assert on output deltas and materialized state, not internal calls.
+Assert on output deltas and materialized state, not internal calls. The tests should allow replacing the prototype implementation with a DBSP-backed engine without rewriting storage or runtime callers.
 
-- [ ] **Step 2: Implement map and filter**
+- [ ] **Step 2: Implement the adapter boundary**
 
-Map and filter should transform input deltas without requiring persisted state.
+Introduce the smallest useful `IncrementalEngine` abstraction before adding more hand-written operators. Keep ownership of incremental algebra behind the boundary so Feldera DBSP semantics or a DBSP-backed engine can replace the prototype over time.
 
-- [ ] **Step 3: Implement join and aggregate**
+- [ ] **Step 3: Implement prototype map and filter**
 
-Join and aggregate may maintain in-memory state during a worker run, but durable recovery must come from checkpointed state objects in later tasks.
+Map and filter should transform input deltas without requiring persisted state. Do not create a custom expression engine; route future expression/query needs through DataFusion.
 
-- [ ] **Step 4: Verify**
+- [ ] **Step 4: Implement prototype join and aggregate**
+
+Join and aggregate may maintain in-memory state during a worker run, but durable recovery must come from checkpointed state objects in later tasks. Keep the implementation deliberately narrow and document it as scaffolding for a future DBSP/Feldera-shaped engine.
+
+- [ ] **Step 5: Verify**
 
 Run: `cargo test -p velorix-core operators`
 
-Expected: operator behavior tests pass.
+Expected: `IncrementalEngine` boundary and prototype operator behavior tests pass.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add crates/velorix-core
-git commit -m "feat: add initial incremental operators"
+git commit -m "feat: add initial incremental engine boundary"
 ```
 
-## Task 6: State Objects and Checkpoints
+## Task 6: State Substrate and Checkpoints
 
 **Files:**
 - Create: `crates/velorix-storage/src/state.rs`
@@ -220,21 +227,25 @@ git commit -m "feat: add initial incremental operators"
 
 Cover successful publication, crash before manifest publication, crash after state write but before manifest publication, and duplicate checkpoint publication.
 
-- [ ] **Step 2: Implement immutable state object writes**
+- [ ] **Step 2: Implement the Velorix state boundary**
 
-Write state objects before publishing the manifest. State objects without a manifest reference are recoverable garbage.
+Define the interface Velorix needs from durable state: object-store authority, referenced state objects, checkpoint binding, and recovery reads. Do not build a durable LSM/SST/compaction engine in Velorix when SlateDB can own that substrate.
 
-- [ ] **Step 3: Implement manifest publication**
+- [ ] **Step 3: Implement immutable state object writes through the current substrate**
+
+Write state objects before publishing the manifest. State objects without a manifest reference are recoverable garbage. If SlateDB is not yet integrated, keep this implementation narrow and migration-friendly rather than expanding a custom LSM layout.
+
+- [ ] **Step 4: Implement manifest publication**
 
 Publish manifests as the only authoritative checkpoint marker. Use object-store conditional writes where available and emulate the condition in local tests.
 
-- [ ] **Step 4: Verify**
+- [ ] **Step 5: Verify**
 
 Run: `cargo test -p velorix-storage checkpoint_publish`
 
 Expected: crash-window tests prove that only published manifests advance durable progress.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add crates/velorix-storage
@@ -254,7 +265,7 @@ Use a temporary object-store directory. Ingest deltas, process a view, publish a
 
 - [ ] **Step 2: Implement runtime startup from manifest**
 
-Startup should load the latest manifest, fetch referenced state objects, and resume replay from the manifest input boundary.
+Startup should load the latest manifest, fetch referenced state objects through the current state substrate, and resume replay from the manifest input boundary. Velorix owns recovery orchestration; SlateDB owns durable state internals once integrated.
 
 - [ ] **Step 3: Implement one local CLI recovery command**
 
@@ -273,7 +284,7 @@ git add crates/velorix-runtime crates/velorix-cli tests/e2e
 git commit -m "feat: recover stateless runtime from manifests"
 ```
 
-## Task 8: Hybrid Local Cache
+## Task 8: Foyer-Backed Hybrid Local Cache
 
 **Files:**
 - Create: `crates/velorix-runtime/src/cache.rs`
@@ -281,15 +292,15 @@ git commit -m "feat: recover stateless runtime from manifests"
 
 - [ ] **Step 1: Write cache behavior tests**
 
-Cover memory hits, disk spill, eviction, restart with empty cache, and correctness when cached objects are missing.
+Cover memory hits, disk spill, eviction, restart with empty cache, and correctness when cached objects are missing. Tests should prove the cache is never durable authority and should not depend on Foyer internals.
 
-- [ ] **Step 2: Implement memory cache**
+- [ ] **Step 2: Integrate or wrap Foyer for cache internals**
 
-Use bounded memory capacity and object-key-based lookup.
+Use Foyer as the planned owner of bounded memory and disk cache behavior. If a Foyer replacement is already in progress, coordinate with that work and avoid adding parallel custom cache internals.
 
-- [ ] **Step 3: Implement disk spill cache**
+- [ ] **Step 3: Enforce Velorix cache policy**
 
-Store cached objects under a runtime-local cache directory. Never use cache contents as proof of durable progress.
+Wrap cache access with deterministic `ObjectKey` rules and object-store authority checks. Store cached objects under a runtime-local cache directory. Never use cache contents as proof of durable progress.
 
 - [ ] **Step 4: Verify**
 
@@ -301,14 +312,43 @@ Expected: cache tests pass and restart behavior proves object storage remains au
 
 ```bash
 git add crates/velorix-runtime
-git commit -m "feat: add non-durable hybrid local cache"
+git commit -m "feat: add foyer-backed local cache boundary"
 ```
 
-## Task 9: Prototype Benchmark and Readiness Gate
+## Task 9: DataFusion Query Boundary
+
+**Files:**
+- Create: `crates/velorix-core/src/query.rs`
+- Modify: `crates/velorix-core/src/lib.rs`
+- Create: `crates/velorix-core/tests/query.rs`
+
+- [ ] **Step 1: Write query boundary tests**
+
+Cover SQL/DataFrame-style query input, Arrow-compatible output expectations, and the absence of a custom query planner in Velorix-owned code.
+
+- [ ] **Step 2: Integrate DataFusion at the boundary**
+
+Use Apache DataFusion for SQL/DataFrame planning, expression handling, optimization, and Arrow execution where batch/query semantics apply. Velorix should provide object-backed inputs, checkpoint-aware outputs, and resource/cost policy.
+
+- [ ] **Step 3: Verify**
+
+Run: `cargo test -p velorix-core query`
+
+Expected: query boundary tests pass without introducing a custom planner or expression engine.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add crates/velorix-core
+git commit -m "feat: add datafusion query boundary"
+```
+
+## Task 10: Prototype Benchmark and Readiness Gate
 
 **Files:**
 - Create: `benches/local_incremental.rs`
 - Create: `docs/architecture/storage-contract.md`
+- Create: `docs/architecture/third-party-first.md`
 - Modify: `README.md`
 
 - [ ] **Step 1: Add a local incremental benchmark**
@@ -317,19 +357,23 @@ Measure ingest throughput, checkpoint latency, recovery latency, and materialize
 
 - [ ] **Step 2: Document the storage contract**
 
-Describe object key layout, manifest atomicity requirements, crash windows, and garbage collection rules.
+Describe object key layout, manifest atomicity requirements, crash windows, and garbage collection rules. Clarify that SlateDB owns durable LSM/SST/state internals once integrated, while Velorix owns checkpoint manifest authority and recovery semantics.
 
-- [ ] **Step 3: Update README status**
+- [ ] **Step 3: Document package ownership**
+
+Keep `docs/architecture/third-party-first.md` current with ownership for SlateDB, Foyer, DataFusion, Feldera DBSP, and Velorix-specific glue.
+
+- [ ] **Step 4: Update README status**
 
 Replace the initial plan-only language with the exact prototype capabilities that are implemented.
 
-- [ ] **Step 4: Verify**
+- [ ] **Step 5: Verify**
 
 Run: `cargo test --workspace` and the local benchmark command selected for the final benchmark harness.
 
 Expected: all tests pass and benchmark output includes throughput, checkpoint latency, recovery latency, and freshness metrics.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add benches docs README.md
@@ -338,6 +382,6 @@ git commit -m "docs: define prototype readiness gate"
 
 ## Self-Review
 
-- Spec coverage: The plan covers object storage as the database, stateless compute, delta-based execution, DBSP-inspired operators, LSM-style state objects, local cache, exact-once manifests, and horizontal scaling prerequisites.
+- Spec coverage: The plan covers object storage as the database, stateless compute, package-first execution, DBSP/Feldera-shaped incremental semantics, SlateDB-owned durable state, Foyer-owned local cache, DataFusion-owned query planning/execution, exact-once manifests, and horizontal scaling prerequisites.
 - Placeholder scan: No task depends on undefined implementation details. The plan deliberately defers distributed scheduling until the single-process object-storage recovery invariant is proven.
-- Type consistency: The same object key, manifest, delta, storage, runtime, and cache boundaries are used across tasks.
+- Type consistency: The same object key, manifest, delta, storage, runtime, `IncrementalEngine`, query, and cache boundaries are used across tasks.
