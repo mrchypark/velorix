@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+foyer = { workspace = true }
 object_store = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -15,7 +16,9 @@ name = "local_recovery"
 path = "../../tests/e2e/local_recovery.rs"
 
 [dev-dependencies]
+async-trait = { workspace = true }
 bytes = { workspace = true }
+futures = { workspace = true }
 object_store = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
