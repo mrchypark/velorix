@@ -49,6 +49,8 @@ pub struct StandingViewShape {
 pub struct RelationSchema {
     pub relation_id: String,
     pub relation_name: String,
+    pub relation_version: String,
+    pub schema_fingerprint: String,
     pub columns: Vec<ColumnSchema>,
     pub primary_key: Vec<String>,
 }
@@ -132,6 +134,8 @@ pub enum FelderaArtifactError {
     UnsupportedShape { shape: &'static str },
     #[error("Feldera artifact schema mismatch: {field}")]
     SchemaMismatch { field: &'static str },
+    #[error("Feldera artifact schema fingerprint mismatch: {field}")]
+    SchemaFingerprintMismatch { field: &'static str },
     #[error("invalid Feldera relation schema: {field}")]
     InvalidRelationSchema { field: &'static str },
     #[error(transparent)]
@@ -256,6 +260,17 @@ pub fn validate_feldera_compile_artifact(
     validate_relation_schemas(&artifact.input_schemas)?;
     validate_relation_schemas(&artifact.output_schemas)?;
 
+    validate_relation_identity_matches(
+        "input_schemas",
+        &spec.input_relations[0],
+        &artifact.input_schemas[0],
+    )?;
+    validate_relation_identity_matches(
+        "output_schemas",
+        &spec.output_relations[0],
+        &artifact.output_schemas[0],
+    )?;
+
     if spec.input_relations != artifact.input_schemas {
         return Err(FelderaArtifactError::SchemaMismatch {
             field: "input_schemas",
@@ -305,6 +320,12 @@ fn validate_relation_schema(schema: &RelationSchema) -> Result<(), FelderaArtifa
             field: "relation_name",
         });
     }
+    if schema.relation_version.trim().is_empty() {
+        return Err(FelderaArtifactError::InvalidRelationSchema {
+            field: "relation_version",
+        });
+    }
+    validate_schema_fingerprint("schema_fingerprint", &schema.schema_fingerprint)?;
     if schema.columns.is_empty() {
         return Err(FelderaArtifactError::InvalidRelationSchema { field: "columns" });
     }
@@ -330,6 +351,40 @@ fn validate_relation_schema(schema: &RelationSchema) -> Result<(), FelderaArtifa
                 field: "primary_key",
             });
         }
+    }
+
+    Ok(())
+}
+
+fn validate_relation_identity_matches(
+    field: &'static str,
+    spec_schema: &RelationSchema,
+    artifact_schema: &RelationSchema,
+) -> Result<(), FelderaArtifactError> {
+    if spec_schema.relation_id != artifact_schema.relation_id
+        || spec_schema.relation_version != artifact_schema.relation_version
+    {
+        return Err(FelderaArtifactError::SchemaMismatch { field });
+    }
+    if spec_schema.schema_fingerprint != artifact_schema.schema_fingerprint {
+        return Err(FelderaArtifactError::SchemaFingerprintMismatch { field });
+    }
+
+    Ok(())
+}
+
+fn validate_schema_fingerprint(
+    field: &'static str,
+    fingerprint: &str,
+) -> Result<(), FelderaArtifactError> {
+    if fingerprint.trim().is_empty() {
+        return Err(FelderaArtifactError::InvalidRelationSchema { field });
+    }
+    let Some(hex) = fingerprint.strip_prefix("sha256:") else {
+        return Err(FelderaArtifactError::InvalidRelationSchema { field });
+    };
+    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(FelderaArtifactError::InvalidRelationSchema { field });
     }
 
     Ok(())

@@ -7,3 +7,4 @@ pub mod engine;
 pub mod feldera_artifact;
 pub mod operator;
 pub mod query;
+pub mod relation;

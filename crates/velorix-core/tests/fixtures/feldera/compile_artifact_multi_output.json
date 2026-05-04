@@ -1,7 +1,7 @@
 {
   "metadata_version": 1,
   "view_id": "standing_view_orders_by_region",
-  "spec_hash": "velorix-feldera-spec-sha256-v1:52bf5460d5c587c5cf67058fa68cf3d4c6d873ee97be70e7ef331bd531cae45f",
+  "spec_hash": "velorix-feldera-spec-sha256-v1:0e24cbe06543d735a6d62868f230c4610fb9139cb91e5e8f72042f17da0ecbea",
   "artifact_id": "feldera-artifact-orders-by-region-20260503",
   "artifact_hash": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
   "compiler": { "name": "feldera-sql-to-dbsp", "version": "0.42.0", "source": "sql-to-dbsp-compiler/SQL-compiler" },
@@ -10,6 +10,8 @@
     {
       "relation_id": "orders",
       "relation_name": "orders",
+      "relation_version": "2026-05-05.v1",
+      "schema_fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "columns": [
         { "name": "order_id", "data_type": { "kind": "utf8" }, "nullable": false },
         { "name": "region", "data_type": { "kind": "utf8" }, "nullable": false },
@@ -22,6 +24,8 @@
     {
       "relation_id": "orders_by_region",
       "relation_name": "orders_by_region",
+      "relation_version": "2026-05-05.v1",
+      "schema_fingerprint": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
       "columns": [
         { "name": "region", "data_type": { "kind": "utf8" }, "nullable": false },
         { "name": "total_amount", "data_type": { "kind": "decimal", "precision": 38, "scale": 2 }, "nullable": true }
@@ -31,6 +35,8 @@
     {
       "relation_id": "orders_by_region_count",
       "relation_name": "orders_by_region_count",
+      "relation_version": "2026-05-05.v1",
+      "schema_fingerprint": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
       "columns": [
         { "name": "region", "data_type": { "kind": "utf8" }, "nullable": false },
         { "name": "order_count", "data_type": { "kind": "int64" }, "nullable": false }

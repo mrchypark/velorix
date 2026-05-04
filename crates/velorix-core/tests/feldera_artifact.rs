@@ -32,7 +32,7 @@ fn feldera_artifact_accepts_valid_single_input_output_standing_view() {
 
     assert_eq!(
         feldera_spec_hash(&spec).unwrap(),
-        "velorix-feldera-spec-sha256-v1:52bf5460d5c587c5cf67058fa68cf3d4c6d873ee97be70e7ef331bd531cae45f"
+        "velorix-feldera-spec-sha256-v1:0e24cbe06543d735a6d62868f230c4610fb9139cb91e5e8f72042f17da0ecbea"
     );
     validate_feldera_compile_artifact(&spec, &artifact).unwrap();
 }
@@ -155,6 +155,34 @@ fn feldera_artifact_rejects_input_schema_mismatch() {
     assert!(matches!(
         error,
         FelderaArtifactError::SchemaMismatch {
+            field: "input_schemas"
+        }
+    ));
+}
+
+#[test]
+fn feldera_artifact_rejects_input_schema_fingerprint_mismatch() {
+    let mut spec = load_spec("standing_view_spec_valid");
+    let mut artifact = load_artifact("compile_artifact_valid");
+    artifact.input_schemas[0].schema_fingerprint = format!("sha256:{}", "1".repeat(64));
+
+    let error = validate_feldera_compile_artifact(&spec, &artifact).unwrap_err();
+
+    assert!(matches!(
+        error,
+        FelderaArtifactError::SchemaFingerprintMismatch {
+            field: "input_schemas"
+        }
+    ));
+
+    spec.input_relations[0].schema_fingerprint = format!("sha256:{}", "2".repeat(64));
+    let mut artifact = load_artifact("compile_artifact_valid");
+    artifact.spec_hash = feldera_spec_hash(&spec).unwrap();
+    let error = validate_feldera_compile_artifact(&spec, &artifact).unwrap_err();
+
+    assert!(matches!(
+        error,
+        FelderaArtifactError::SchemaFingerprintMismatch {
             field: "input_schemas"
         }
     ));

@@ -7,6 +7,8 @@
     {
       "relation_id": "orders",
       "relation_name": "orders",
+      "relation_version": "2026-05-05.v1",
+      "schema_fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "columns": [
         { "name": "order_id", "data_type": { "kind": "utf8" }, "nullable": false },
         { "name": "region", "data_type": { "kind": "utf8" }, "nullable": false },
@@ -19,6 +21,8 @@
     {
       "relation_id": "orders_by_region",
       "relation_name": "orders_by_region",
+      "relation_version": "2026-05-05.v1",
+      "schema_fingerprint": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
       "columns": [
         { "name": "region", "data_type": { "kind": "utf8" }, "nullable": false },
         { "name": "total_amount", "data_type": { "kind": "decimal", "precision": 38, "scale": 2 }, "nullable": true }
