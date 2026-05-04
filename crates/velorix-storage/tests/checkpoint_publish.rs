@@ -22,16 +22,41 @@ fn temp_store() -> (TempDir, Arc<dyn ObjectStore>) {
 }
 
 fn input_range() -> InputRange {
+    input_range_for("orders", 0, 0, 10)
+}
+
+fn input_range_for(
+    stream_id: &str,
+    partition_id: u32,
+    start_offset_inclusive: u64,
+    end_offset_exclusive: u64,
+) -> InputRange {
     InputRange {
-        stream_id: "orders".to_string(),
-        partition_id: 0,
-        start_offset_inclusive: 0,
-        end_offset_exclusive: 10,
+        stream_id: stream_id.to_string(),
+        partition_id,
+        start_offset_inclusive,
+        end_offset_exclusive,
     }
 }
 
 fn state_write(checkpoint_version: u64, object_id: &str, bytes: &'static [u8]) -> StateObjectWrite {
-    state_write_bytes(checkpoint_version, object_id, Bytes::from_static(bytes))
+    state_write_for_partition(0, checkpoint_version, object_id, bytes)
+}
+
+fn state_write_for_partition(
+    partition_id: u32,
+    checkpoint_version: u64,
+    object_id: &str,
+    bytes: &'static [u8],
+) -> StateObjectWrite {
+    StateObjectWrite::new(
+        "balances_by_account",
+        partition_id,
+        checkpoint_version,
+        object_id,
+        Bytes::from_static(bytes),
+    )
+    .unwrap()
 }
 
 fn state_write_bytes(checkpoint_version: u64, object_id: &str, bytes: Bytes) -> StateObjectWrite {
@@ -318,14 +343,129 @@ async fn checkpoint_publish_latest_manifest_uses_numerically_latest_valid_checkp
     let manifest_0 = manifest(0, publisher.write_state_object(&state_0).await.unwrap());
     let manifest_1 = manifest(1, publisher.write_state_object(&state_1).await.unwrap());
 
-    publisher.publish_manifest(&manifest_1).await.unwrap();
     publisher.publish_manifest(&manifest_0).await.unwrap();
+    publisher.publish_manifest(&manifest_1).await.unwrap();
 
     assert_eq!(
         publisher.list_published_manifests().await.unwrap(),
         vec![manifest_0, manifest_1.clone()]
     );
     assert_eq!(publisher.latest_manifest().await.unwrap(), Some(manifest_1));
+}
+
+#[tokio::test]
+async fn checkpoint_publish_rejects_child_manifest_when_parent_manifest_is_missing() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let state = state_write(1, "state-0002", b"state-1");
+    let state_ref = publisher.write_state_object(&state).await.unwrap();
+    let child = manifest(1, state_ref);
+
+    let err = publisher.publish_manifest(&child).await.unwrap_err();
+
+    assert!(err.to_string().contains("parent checkpoint manifest"));
+    assert!(store
+        .head(&Path::from(child.object_key().as_str()))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn checkpoint_publish_accepts_child_manifest_after_parent_manifest_is_visible() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(store);
+    let parent_state = state_write(0, "state-0001", b"state-0");
+    let child_state = state_write(1, "state-0002", b"state-1");
+    let parent = manifest(
+        0,
+        publisher.write_state_object(&parent_state).await.unwrap(),
+    );
+    let child = manifest(1, publisher.write_state_object(&child_state).await.unwrap());
+
+    publisher.publish_manifest(&parent).await.unwrap();
+    publisher.publish_manifest(&child).await.unwrap();
+
+    assert_eq!(publisher.latest_manifest().await.unwrap(), Some(child));
+}
+
+#[tokio::test]
+async fn checkpoint_publish_rejects_child_manifest_that_drops_parent_input_progress() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let parent_state = state_write(0, "state-0001", b"state-0");
+    let child_state = state_write(1, "state-0002", b"state-1");
+    let mut parent = manifest(
+        0,
+        publisher.write_state_object(&parent_state).await.unwrap(),
+    );
+    parent.input_ranges = vec![
+        input_range_for("orders", 0, 0, 10),
+        input_range_for("orders", 1, 0, 10),
+    ];
+    let mut child = manifest(1, publisher.write_state_object(&child_state).await.unwrap());
+    child.input_ranges = vec![input_range_for("orders", 0, 0, 12)];
+
+    publisher.publish_manifest(&parent).await.unwrap();
+    let err = publisher.publish_manifest(&child).await.unwrap_err();
+
+    assert!(err.to_string().contains("drops parent input progress"));
+    assert!(store
+        .head(&Path::from(child.object_key().as_str()))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn checkpoint_publish_rejects_child_manifest_that_regresses_parent_input_boundary() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let parent_state = state_write(0, "state-0001", b"state-0");
+    let child_state = state_write(1, "state-0002", b"state-1");
+    let parent = manifest(
+        0,
+        publisher.write_state_object(&parent_state).await.unwrap(),
+    );
+    let mut child = manifest(1, publisher.write_state_object(&child_state).await.unwrap());
+    child.input_ranges = vec![input_range_for("orders", 0, 0, 9)];
+
+    publisher.publish_manifest(&parent).await.unwrap();
+    let err = publisher.publish_manifest(&child).await.unwrap_err();
+
+    assert!(err.to_string().contains("regresses parent input boundary"));
+    assert!(store
+        .head(&Path::from(child.object_key().as_str()))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn checkpoint_publish_latest_and_listing_reject_out_of_band_orphan_checkpoint_manifest() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let parent_state = state_write(0, "state-0001", b"state-0");
+    let orphan_state = state_write_for_partition(0, 2, "state-0003", b"state-2");
+    let parent = manifest(
+        0,
+        publisher.write_state_object(&parent_state).await.unwrap(),
+    );
+    let orphan = manifest(2, state_ref(&orphan_state));
+
+    publisher.publish_manifest(&parent).await.unwrap();
+    store
+        .put(
+            &Path::from(orphan.object_key().as_str()),
+            Bytes::from(serde_json::to_vec(&orphan).unwrap()).into(),
+        )
+        .await
+        .unwrap();
+
+    let list_err = publisher.list_published_manifests().await.unwrap_err();
+    let latest_err = publisher.latest_manifest().await.unwrap_err();
+
+    assert!(list_err.to_string().contains("parent checkpoint manifest"));
+    assert!(latest_err
+        .to_string()
+        .contains("parent checkpoint manifest"));
 }
 
 #[tokio::test]

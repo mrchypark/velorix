@@ -55,6 +55,23 @@ Manifest validation currently requires schema version 1, at least one input
 range, at least one state object reference, monotonic parent linkage, nonempty
 input and output ranges, checkpoint-matching state and output object metadata,
 and unique object ids and object keys across state and output references.
+Genesis checkpoint 0 has no parent. Every non-genesis manifest must declare the
+immediately preceding checkpoint as its parent.
+
+Publication also validates the immediate parent lineage against durable object
+storage authority. Before a child checkpoint manifest is created, the declared
+parent manifest object must already be visible at its canonical checkpoint key,
+the parent body must validate under the same manifest rules, and the parent
+body key must match the object key that made it visible. The child must retain
+input progress for every stream/partition present in the parent and must not
+move either boundary behind the parent's covered range.
+
+Listing manifests and selecting the latest manifest use the same fail-closed
+lineage validation. An out-of-band manifest with a valid individual body but a
+missing parent, invalid parent body/key consistency, dropped parent input
+progress, or regressed input boundary is not skipped or treated as latest
+authority; listing/latest return an error so recovery does not advance from an
+invalid lineage.
 
 State object references may carry an `owner_claim` with `owner_id` and
 `owner_epoch`. This is distinct from the existing state ref `owner`, which
@@ -76,13 +93,17 @@ The publication order is:
 
 1. Write immutable ingest batches or output objects.
 2. Write checkpoint state objects.
-3. Validate that all manifest-referenced state and output objects exist.
-4. Publish the checkpoint manifest with create-only semantics.
+3. For non-genesis checkpoints, validate that the declared parent manifest is
+   durably visible and that the child preserves the parent's input progress.
+4. Validate that all manifest-referenced state and output objects exist.
+5. Publish the checkpoint manifest with create-only semantics.
 
 Manifest publication fails closed until every referenced state object is
 readable through the state-store boundary and every referenced output object is
-present in object storage. Only after those checks pass can the create-only
-manifest write make the checkpoint durable authority.
+present in object storage. Non-genesis publication also fails closed until the
+declared parent manifest is visible and valid as object-storage authority. Only
+after those checks pass can the create-only manifest write make the checkpoint
+durable authority.
 
 Fenced state write and manifest publication APIs accept the caller's current
 `owner_claim`. They require fenced state refs to carry one explicit claim for

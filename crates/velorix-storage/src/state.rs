@@ -1,4 +1,7 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use bytes::Bytes;
 use futures::TryStreamExt;
@@ -46,6 +49,35 @@ pub enum CheckpointPublishError {
     ManifestKeyMismatch {
         object_key: ObjectKey,
         body_key: ObjectKey,
+    },
+    #[error(
+        "parent checkpoint manifest {parent_checkpoint} for checkpoint {checkpoint_version} is not durably visible"
+    )]
+    MissingParentManifest {
+        checkpoint_version: u64,
+        parent_checkpoint: u64,
+    },
+    #[error(
+        "checkpoint {checkpoint_version} drops parent input progress for {stream_id}/p={partition_id} from parent checkpoint {parent_checkpoint}"
+    )]
+    DroppedParentInputProgress {
+        checkpoint_version: u64,
+        parent_checkpoint: u64,
+        stream_id: String,
+        partition_id: u32,
+    },
+    #[error(
+        "checkpoint {checkpoint_version} regresses parent input boundary for {stream_id}/p={partition_id} from parent checkpoint {parent_checkpoint}: parent {parent_start_offset_inclusive}..{parent_end_offset_exclusive}, child {child_start_offset_inclusive}..{child_end_offset_exclusive}"
+    )]
+    RegressedParentInputBoundary {
+        checkpoint_version: u64,
+        parent_checkpoint: u64,
+        stream_id: String,
+        partition_id: u32,
+        parent_start_offset_inclusive: u64,
+        parent_end_offset_exclusive: u64,
+        child_start_offset_inclusive: u64,
+        child_end_offset_exclusive: u64,
     },
     #[error("referenced state object `{0}` is missing")]
     MissingStateObject(ObjectKey),
@@ -125,6 +157,7 @@ impl CheckpointPublisher {
         manifest: &CheckpointManifest,
     ) -> Result<(), CheckpointPublishError> {
         manifest.validate()?;
+        self.validate_parent_manifest_visible(manifest).await?;
         self.validate_state_objects_exist(manifest).await?;
         self.validate_output_objects_exist(manifest).await?;
 
@@ -197,6 +230,7 @@ impl CheckpointPublisher {
             manifests.push(manifest);
         }
         manifests.sort_by_key(|manifest| manifest.checkpoint_version);
+        Self::validate_manifest_lineage(&manifests)?;
 
         Ok(manifests)
     }
@@ -227,6 +261,119 @@ impl CheckpointPublisher {
                 return Err(CheckpointPublishError::MissingStateObject(
                     state_ref.object_key.clone(),
                 ));
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn validate_parent_manifest_visible(
+        &self,
+        manifest: &CheckpointManifest,
+    ) -> Result<(), CheckpointPublishError> {
+        let Some(parent_checkpoint) = manifest.parent_checkpoint else {
+            return Ok(());
+        };
+
+        let parent = self
+            .read_parent_manifest(manifest.checkpoint_version, parent_checkpoint)
+            .await?;
+        Self::validate_child_input_progress(manifest, &parent)
+    }
+
+    async fn read_parent_manifest(
+        &self,
+        checkpoint_version: u64,
+        parent_checkpoint: u64,
+    ) -> Result<CheckpointManifest, CheckpointPublishError> {
+        let object_key = ObjectKey::checkpoint_manifest(parent_checkpoint);
+        let path = Path::from(object_key.as_str());
+        let bytes = match self.store.get(&path).await {
+            Ok(result) => result.bytes().await?,
+            Err(object_store::Error::NotFound { .. }) => {
+                return Err(CheckpointPublishError::MissingParentManifest {
+                    checkpoint_version,
+                    parent_checkpoint,
+                });
+            }
+            Err(err) => return Err(err.into()),
+        };
+
+        let manifest = serde_json::from_slice::<CheckpointManifest>(&bytes)?;
+        manifest.validate()?;
+        let body_key = manifest.object_key();
+        if object_key != body_key {
+            return Err(CheckpointPublishError::ManifestKeyMismatch {
+                object_key,
+                body_key,
+            });
+        }
+
+        Ok(manifest)
+    }
+
+    fn validate_manifest_lineage(
+        manifests: &[CheckpointManifest],
+    ) -> Result<(), CheckpointPublishError> {
+        let manifests_by_checkpoint = manifests
+            .iter()
+            .map(|manifest| (manifest.checkpoint_version, manifest))
+            .collect::<HashMap<_, _>>();
+
+        for manifest in manifests {
+            let Some(parent_checkpoint) = manifest.parent_checkpoint else {
+                continue;
+            };
+            let Some(parent) = manifests_by_checkpoint.get(&parent_checkpoint) else {
+                return Err(CheckpointPublishError::MissingParentManifest {
+                    checkpoint_version: manifest.checkpoint_version,
+                    parent_checkpoint,
+                });
+            };
+
+            Self::validate_child_input_progress(manifest, parent)?;
+        }
+
+        Ok(())
+    }
+
+    fn validate_child_input_progress(
+        child: &CheckpointManifest,
+        parent: &CheckpointManifest,
+    ) -> Result<(), CheckpointPublishError> {
+        let parent_checkpoint = parent.checkpoint_version;
+        let child_ranges = child
+            .input_ranges
+            .iter()
+            .map(|range| ((range.stream_id.as_str(), range.partition_id), range))
+            .collect::<HashMap<_, _>>();
+
+        for parent_range in &parent.input_ranges {
+            let Some(child_range) = child_ranges
+                .get(&(parent_range.stream_id.as_str(), parent_range.partition_id))
+                .copied()
+            else {
+                return Err(CheckpointPublishError::DroppedParentInputProgress {
+                    checkpoint_version: child.checkpoint_version,
+                    parent_checkpoint,
+                    stream_id: parent_range.stream_id.clone(),
+                    partition_id: parent_range.partition_id,
+                });
+            };
+
+            if child_range.start_offset_inclusive > parent_range.start_offset_inclusive
+                || child_range.end_offset_exclusive < parent_range.end_offset_exclusive
+            {
+                return Err(CheckpointPublishError::RegressedParentInputBoundary {
+                    checkpoint_version: child.checkpoint_version,
+                    parent_checkpoint,
+                    stream_id: parent_range.stream_id.clone(),
+                    partition_id: parent_range.partition_id,
+                    parent_start_offset_inclusive: parent_range.start_offset_inclusive,
+                    parent_end_offset_exclusive: parent_range.end_offset_exclusive,
+                    child_start_offset_inclusive: child_range.start_offset_inclusive,
+                    child_end_offset_exclusive: child_range.end_offset_exclusive,
+                });
             }
         }
 
