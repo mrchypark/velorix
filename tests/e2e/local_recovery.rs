@@ -1,5 +1,10 @@
 use std::sync::Arc;
 
+use arrow::{
+    array::{ArrayRef, Int64Array, StringArray},
+    datatypes::{DataType, Field, Schema},
+    record_batch::RecordBatch,
+};
 use bytes::Bytes;
 use object_store::{local::LocalFileSystem, path::Path, ObjectStore};
 use serde_json::json;
@@ -9,9 +14,13 @@ use velorix_core::{
     engine::EngineCheckpoint,
     operator::KeyedSumCountAggregate,
 };
-use velorix_runtime::recovery::RecoveredRuntime;
+use velorix_runtime::recovery::{
+    orders_sum_count_relation_catalog, RecoveredRuntime, ORDERS_SUM_COUNT_RELATION_ID,
+    ORDERS_SUM_COUNT_RELATION_VERSION,
+};
 use velorix_storage::{
-    log::{IngestBatch, IngestLog},
+    ingest_envelope::IngestEnvelope,
+    log::IngestLog,
     manifest::{CheckpointManifest, InputRange, OutputObjectRef, StateObjectRef},
     object_key::ObjectKey,
     state::{CheckpointPublisher, StateObjectWrite},
@@ -40,6 +49,62 @@ fn batch(records: impl IntoIterator<Item = DeltaRecord>) -> DeltaBatch {
 
 fn batch_bytes(batch: &DeltaBatch) -> Bytes {
     Bytes::from(serde_json::to_vec(batch).unwrap())
+}
+
+fn ingest_record_batch(input: &DeltaBatch) -> RecordBatch {
+    let keys = input
+        .records()
+        .iter()
+        .map(|record| record.key.as_json().as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    let values = input
+        .records()
+        .iter()
+        .map(|record| record.value.as_json().as_i64().unwrap())
+        .collect::<Vec<_>>();
+    let weights = input
+        .records()
+        .iter()
+        .map(|record| record.weight)
+        .collect::<Vec<_>>();
+
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("account_id", DataType::Utf8, false),
+            Field::new("amount", DataType::Int64, false),
+            Field::new("weight", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(keys)) as ArrayRef,
+            Arc::new(Int64Array::from(values)) as ArrayRef,
+            Arc::new(Int64Array::from(weights)) as ArrayRef,
+        ],
+    )
+    .unwrap()
+}
+
+async fn append_ingest_envelope(
+    ingest_log: &IngestLog,
+    stream_id: &str,
+    partition_id: u32,
+    start_offset_inclusive: u64,
+    end_offset_exclusive: u64,
+    input: &DeltaBatch,
+) {
+    let catalog = orders_sum_count_relation_catalog().unwrap();
+    let bytes = IngestEnvelope::encode_batches(
+        ORDERS_SUM_COUNT_RELATION_ID,
+        ORDERS_SUM_COUNT_RELATION_VERSION,
+        catalog.schema_fingerprint.as_str(),
+        stream_id,
+        partition_id,
+        start_offset_inclusive,
+        end_offset_exclusive,
+        &[ingest_record_batch(input)],
+    )
+    .unwrap();
+
+    ingest_log.append_validated_envelope(bytes).await.unwrap();
 }
 
 fn checkpoint_bytes(checkpoint: &EngineCheckpoint) -> Bytes {
@@ -178,14 +243,8 @@ async fn local_recovery_recovers_checkpointed_view_and_replays_only_later_ingest
         input_delta("account-c", 11, 1),
     ]);
 
-    ingest_log
-        .append(&IngestBatch::new("orders", 0, 0, 3, batch_bytes(&first_input)).unwrap())
-        .await
-        .unwrap();
-    ingest_log
-        .append(&IngestBatch::new("orders", 0, 3, 6, batch_bytes(&second_input)).unwrap())
-        .await
-        .unwrap();
+    append_ingest_envelope(&ingest_log, "orders", 0, 0, 3, &first_input).await;
+    append_ingest_envelope(&ingest_log, "orders", 0, 3, 6, &second_input).await;
 
     let mut checkpointed_view = KeyedSumCountAggregate::new();
     checkpointed_view.apply(&first_input).unwrap();
@@ -230,10 +289,7 @@ async fn local_recovery_without_manifest_starts_empty_and_replays_from_zero() {
     let ingest_log = IngestLog::new(Arc::clone(&store));
     let input = batch([input_delta("account-a", 4, 1)]);
 
-    ingest_log
-        .append(&IngestBatch::new("orders", 0, 0, 1, batch_bytes(&input)).unwrap())
-        .await
-        .unwrap();
+    append_ingest_envelope(&ingest_log, "orders", 0, 0, 1, &input).await;
 
     let recovered = RecoveredRuntime::recover(Arc::clone(&store)).await.unwrap();
     let mut expected_view = KeyedSumCountAggregate::new();
@@ -268,10 +324,7 @@ async fn local_recovery_uses_manifest_boundaries_per_stream_partition_range() {
         ("payments", 0, 0, 1, &covered_payments),
         ("payments", 0, 1, 2, &later_payments),
     ] {
-        ingest_log
-            .append(&IngestBatch::new(stream, partition, start, end, batch_bytes(input)).unwrap())
-            .await
-            .unwrap();
+        append_ingest_envelope(&ingest_log, stream, partition, start, end, input).await;
     }
 
     let mut checkpointed_view = KeyedSumCountAggregate::new();
@@ -330,10 +383,7 @@ async fn local_recovery_uses_latest_manifest_when_multiple_are_published() {
     let third = batch([input_delta("account-a", 3, 1)]);
 
     for (start, end, input) in [(0, 1, &first), (1, 2, &second), (2, 3, &third)] {
-        ingest_log
-            .append(&IngestBatch::new("orders", 0, start, end, batch_bytes(input)).unwrap())
-            .await
-            .unwrap();
+        append_ingest_envelope(&ingest_log, "orders", 0, start, end, input).await;
     }
 
     let mut older_view = KeyedSumCountAggregate::new();
@@ -393,14 +443,8 @@ async fn local_recovery_preserves_signed_checkpoint_state_and_signed_replay() {
         input_delta("account-b", 3, -1),
     ]);
 
-    ingest_log
-        .append(&IngestBatch::new("orders", 0, 0, 3, batch_bytes(&checkpoint_input)).unwrap())
-        .await
-        .unwrap();
-    ingest_log
-        .append(&IngestBatch::new("orders", 0, 3, 5, batch_bytes(&replay_input)).unwrap())
-        .await
-        .unwrap();
+    append_ingest_envelope(&ingest_log, "orders", 0, 0, 3, &checkpoint_input).await;
+    append_ingest_envelope(&ingest_log, "orders", 0, 3, 5, &replay_input).await;
 
     let mut checkpointed_view = KeyedSumCountAggregate::new();
     checkpointed_view.apply(&checkpoint_input).unwrap();
@@ -440,14 +484,8 @@ async fn local_recovery_resumes_from_checkpointed_engine_logical_epoch_not_manif
     let first_input = batch([input_delta("account-a", 10, 1)]);
     let second_input = batch([input_delta("account-a", 5, 1)]);
 
-    ingest_log
-        .append(&IngestBatch::new("orders", 0, 0, 1, batch_bytes(&first_input)).unwrap())
-        .await
-        .unwrap();
-    ingest_log
-        .append(&IngestBatch::new("orders", 0, 1, 2, batch_bytes(&second_input)).unwrap())
-        .await
-        .unwrap();
+    append_ingest_envelope(&ingest_log, "orders", 0, 0, 1, &first_input).await;
+    append_ingest_envelope(&ingest_log, "orders", 0, 1, 2, &second_input).await;
 
     let mut checkpointed_view = KeyedSumCountAggregate::new();
     checkpointed_view.apply(&first_input).unwrap();

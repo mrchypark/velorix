@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use arrow::{
     array::{ArrayRef, Int64Array, StringArray},
@@ -12,10 +12,11 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use velorix_storage::{
-    ingest_envelope::{
-        schema_fingerprint, IngestEnvelope, IngestEnvelopeError, INGEST_ENVELOPE_MAGIC,
+    ingest_envelope::{IngestEnvelope, IngestEnvelopeError, INGEST_ENVELOPE_MAGIC},
+    log::{
+        AppendValidatedEnvelopeOutcome, IngestBatch, IngestBatchDescriptor, IngestLog,
+        IngestLogError,
     },
-    log::{IngestBatch, IngestBatchDescriptor, IngestLog, IngestLogError},
     object_key::ObjectKey,
 };
 
@@ -94,7 +95,17 @@ fn batch_with_unsigned_weight() -> RecordBatch {
 }
 
 fn envelope_bytes() -> Bytes {
-    IngestEnvelope::encode_batches("orders", 7, 10, 12, &[valid_batch()]).unwrap()
+    IngestEnvelope::encode_batches(
+        "orders_relation",
+        "2026-05-05",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "orders",
+        7,
+        10,
+        12,
+        &[valid_batch()],
+    )
+    .unwrap()
 }
 
 async fn put_raw_ingest_object(
@@ -137,8 +148,20 @@ fn raw_envelope_with_payload(payload: &[u8]) -> Bytes {
         "partition_id": 7,
         "start_offset_inclusive": 10,
         "end_offset_exclusive": 12,
-        "schema_fingerprint": "sha256:placeholder",
-        "payload_digest": sha256_digest(payload),
+        "relation_id": "orders_relation",
+        "relation_version": "2026-05-05",
+        "schema_fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "payload_digest": sha256_digest_for_envelope_header(
+            "orders_relation",
+            "2026-05-05",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "orders",
+            7,
+            10,
+            12,
+            "none",
+            payload
+        ),
         "compression": "none"
     });
     let header = serde_json::to_vec(&header).unwrap();
@@ -149,6 +172,39 @@ fn raw_envelope_with_payload(payload: &[u8]) -> Bytes {
     bytes.extend_from_slice(payload);
 
     Bytes::from(bytes)
+}
+
+fn sha256_digest_for_envelope_header(
+    relation_id: &str,
+    relation_version: &str,
+    schema_fingerprint: &str,
+    stream_id: &str,
+    partition_id: u32,
+    start_offset_inclusive: u64,
+    end_offset_exclusive: u64,
+    compression: &str,
+    payload: &[u8],
+) -> String {
+    let header_without_digest = serde_json::json!({
+        "schema_version": 1,
+        "format": "ArrowIpcDeltaBatchV1",
+        "stream_id": stream_id,
+        "partition_id": partition_id,
+        "start_offset_inclusive": start_offset_inclusive,
+        "end_offset_exclusive": end_offset_exclusive,
+        "relation_id": relation_id,
+        "relation_version": relation_version,
+        "schema_fingerprint": schema_fingerprint,
+        "compression": compression
+    });
+    let canonical_header = serde_json::to_vec(&header_without_digest).unwrap();
+    let mut digest_input = Vec::new();
+    digest_input.extend_from_slice(b"velorix-ingest-envelope-v1\0");
+    digest_input.extend_from_slice(&canonical_header);
+    digest_input.push(0);
+    digest_input.extend_from_slice(payload);
+
+    sha256_digest(&digest_input)
 }
 
 fn mutate_header(bytes: &Bytes, mutate: impl FnOnce(&mut serde_json::Map<String, Value>)) -> Bytes {
@@ -186,6 +242,12 @@ fn ingest_envelope_round_trips_arrow_ipc_and_validates_matching_descriptor() {
     assert_eq!(envelope.header().partition_id, 7);
     assert_eq!(envelope.header().start_offset_inclusive, 10);
     assert_eq!(envelope.header().end_offset_exclusive, 12);
+    assert_eq!(envelope.header().relation_id, "orders_relation");
+    assert_eq!(envelope.header().relation_version, "2026-05-05");
+    assert_eq!(
+        envelope.header().schema_fingerprint,
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
     let batches = envelope.record_batches().unwrap();
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0].num_rows(), 2);
@@ -236,42 +298,81 @@ fn ingest_envelope_rejects_key_range_mismatch() {
 }
 
 #[test]
-fn ingest_envelope_rejects_unsupported_schema_version() {
+fn ingest_envelope_rejects_schema_version_header_mutation() {
     let bytes = mutate_header(&envelope_bytes(), |header| {
         header.insert("schema_version".to_string(), Value::from(2));
     });
     let err = IngestEnvelope::decode(bytes).unwrap_err();
 
-    assert!(matches!(
-        err,
-        IngestEnvelopeError::UnsupportedSchemaVersion { found: 2 }
-    ));
+    assert!(matches!(err, IngestEnvelopeError::DigestMismatch { .. }));
 }
 
 #[test]
-fn ingest_envelope_rejects_unsupported_format() {
+fn ingest_envelope_rejects_format_header_mutation() {
     let bytes = mutate_header(&envelope_bytes(), |header| {
         header.insert("format".to_string(), Value::from("JsonDeltaBatchV1"));
     });
     let err = IngestEnvelope::decode(bytes).unwrap_err();
 
-    assert!(matches!(
-        err,
-        IngestEnvelopeError::UnsupportedFormat { format } if format == "JsonDeltaBatchV1"
-    ));
+    assert!(matches!(err, IngestEnvelopeError::DigestMismatch { .. }));
 }
 
 #[test]
-fn ingest_envelope_rejects_unsupported_compression() {
+fn ingest_envelope_rejects_compression_header_mutation() {
     let bytes = mutate_header(&envelope_bytes(), |header| {
         header.insert("compression".to_string(), Value::from("zstd"));
     });
     let err = IngestEnvelope::decode(bytes).unwrap_err();
 
-    assert!(matches!(
-        err,
-        IngestEnvelopeError::UnsupportedCompression { compression } if compression == "zstd"
-    ));
+    assert!(matches!(err, IngestEnvelopeError::DigestMismatch { .. }));
+}
+
+#[test]
+fn ingest_envelope_rejects_missing_relation_identity() {
+    let err = IngestEnvelope::encode_batches(
+        "",
+        "2026-05-05",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "orders",
+        0,
+        0,
+        1,
+        &[valid_batch()],
+    )
+    .unwrap_err();
+
+    assert!(matches!(err, IngestEnvelopeError::MalformedEnvelope { .. }));
+
+    let err = IngestEnvelope::encode_batches(
+        "orders_relation",
+        " ",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "orders",
+        0,
+        0,
+        1,
+        &[valid_batch()],
+    )
+    .unwrap_err();
+
+    assert!(matches!(err, IngestEnvelopeError::MalformedEnvelope { .. }));
+}
+
+#[test]
+fn ingest_envelope_rejects_malformed_relation_schema_fingerprint() {
+    let err = IngestEnvelope::encode_batches(
+        "orders_relation",
+        "2026-05-05",
+        "sha256:not-a-v1-relation-fingerprint",
+        "orders",
+        0,
+        0,
+        1,
+        &[valid_batch()],
+    )
+    .unwrap_err();
+
+    assert!(matches!(err, IngestEnvelopeError::MalformedEnvelope { .. }));
 }
 
 #[test]
@@ -288,59 +389,63 @@ fn ingest_envelope_rejects_digest_mismatch() {
 }
 
 #[test]
-fn ingest_envelope_schema_fingerprint_ignores_metadata() {
-    let mut metadata = HashMap::new();
-    metadata.insert("source".to_string(), "ignored".to_string());
-    let schema_with_metadata = Arc::new(Schema::new_with_metadata(
-        vec![Field::new("weight", DataType::Int64, false).with_metadata(metadata.clone())],
-        metadata,
-    ));
-    let schema_without_metadata = Arc::new(Schema::new(vec![Field::new(
-        "weight",
-        DataType::Int64,
-        false,
-    )]));
+fn ingest_envelope_accepts_supplied_relation_schema_fingerprint_without_arrow_derivation() {
+    let supplied = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let bytes = IngestEnvelope::encode_batches(
+        "orders_relation",
+        "2026-05-05",
+        supplied,
+        "orders",
+        0,
+        0,
+        1,
+        &[valid_batch()],
+    )
+    .unwrap();
 
-    assert_eq!(
-        schema_fingerprint(&schema_with_metadata),
-        schema_fingerprint(&schema_without_metadata)
-    );
+    let envelope = IngestEnvelope::decode(bytes).unwrap();
+
+    assert_eq!(envelope.header().schema_fingerprint, supplied);
 }
 
 #[test]
-fn ingest_envelope_schema_fingerprint_changes_for_field_order_name_type_and_nullability() {
-    let baseline = Arc::new(Schema::new(vec![
-        Field::new("account_id", DataType::Utf8, false),
-        Field::new("weight", DataType::Int64, false),
-    ]));
-    let reordered = Arc::new(Schema::new(vec![
-        Field::new("weight", DataType::Int64, false),
-        Field::new("account_id", DataType::Utf8, false),
-    ]));
-    let renamed = Arc::new(Schema::new(vec![
-        Field::new("account", DataType::Utf8, false),
-        Field::new("weight", DataType::Int64, false),
-    ]));
-    let retyped = Arc::new(Schema::new(vec![
-        Field::new("account_id", DataType::LargeUtf8, false),
-        Field::new("weight", DataType::Int64, false),
-    ]));
-    let nullable = Arc::new(Schema::new(vec![
-        Field::new("account_id", DataType::Utf8, true),
-        Field::new("weight", DataType::Int64, false),
-    ]));
+fn ingest_envelope_digest_covers_canonical_header_without_payload_digest() {
+    for (field, value) in [
+        ("relation_id", Value::from("other_relation")),
+        ("relation_version", Value::from("2026-05-06")),
+        ("start_offset_inclusive", Value::from(9)),
+        ("end_offset_exclusive", Value::from(13)),
+        ("compression", Value::from("zstd")),
+        (
+            "schema_fingerprint",
+            Value::from("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        ),
+    ] {
+        let bytes = mutate_header(&envelope_bytes(), |header| {
+            header.insert(field.to_string(), value);
+        });
+        let err = IngestEnvelope::decode(bytes).unwrap_err();
 
-    let baseline = schema_fingerprint(&baseline);
-    assert_ne!(baseline, schema_fingerprint(&reordered));
-    assert_ne!(baseline, schema_fingerprint(&renamed));
-    assert_ne!(baseline, schema_fingerprint(&retyped));
-    assert_ne!(baseline, schema_fingerprint(&nullable));
+        assert!(
+            matches!(err, IngestEnvelopeError::DigestMismatch { .. }),
+            "expected digest mismatch for {field}, got {err:?}"
+        );
+    }
 }
 
 #[test]
 fn ingest_envelope_rejects_missing_weight_column() {
-    let err =
-        IngestEnvelope::encode_batches("orders", 0, 0, 1, &[batch_without_weight()]).unwrap_err();
+    let err = IngestEnvelope::encode_batches(
+        "orders_relation",
+        "2026-05-05",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "orders",
+        0,
+        0,
+        1,
+        &[batch_without_weight()],
+    )
+    .unwrap_err();
 
     assert!(matches!(err, IngestEnvelopeError::MissingWeightColumn));
 }
@@ -355,8 +460,17 @@ fn ingest_envelope_rejects_decoded_payload_missing_weight_column() {
 
 #[test]
 fn ingest_envelope_rejects_non_int64_weight_column() {
-    let err = IngestEnvelope::encode_batches("orders", 0, 0, 1, &[batch_with_unsigned_weight()])
-        .unwrap_err();
+    let err = IngestEnvelope::encode_batches(
+        "orders_relation",
+        "2026-05-05",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "orders",
+        0,
+        0,
+        1,
+        &[batch_with_unsigned_weight()],
+    )
+    .unwrap_err();
 
     assert!(matches!(
         err,
@@ -408,12 +522,15 @@ async fn validated_envelope_batch_appends_and_replays_envelope_bytes_unchanged()
 }
 
 #[tokio::test]
-async fn append_validated_envelope_writes_create_only_batch_and_rejects_duplicate() {
+async fn append_validated_envelope_writes_batch_and_admits_same_digest_retry() {
     let (_temp_dir, store) = temp_store();
     let log = IngestLog::new(store);
     let bytes = envelope_bytes();
 
-    let descriptor = log.append_validated_envelope(bytes.clone()).await.unwrap();
+    let outcome = log.append_validated_envelope(bytes.clone()).await.unwrap();
+    let AppendValidatedEnvelopeOutcome::Appended { descriptor } = outcome else {
+        panic!("expected appended outcome, got {outcome:?}");
+    };
     assert_eq!(descriptor, ingest_descriptor("orders", 7, 10, 12));
 
     let replayed = log.replay_validated_envelopes_from(&[]).await.unwrap();
@@ -421,8 +538,42 @@ async fn append_validated_envelope_writes_create_only_batch_and_rejects_duplicat
     assert_eq!(replayed[0].descriptor(), descriptor);
     assert_eq!(replayed[0].payload(), &bytes);
 
-    let err = log.append_validated_envelope(bytes).await.unwrap_err();
-    assert!(matches!(err, IngestLogError::AlreadyExists(_)));
+    let outcome = log.append_validated_envelope(bytes).await.unwrap();
+    assert_eq!(
+        outcome,
+        AppendValidatedEnvelopeOutcome::Duplicate { descriptor }
+    );
+}
+
+#[tokio::test]
+async fn append_validated_envelope_reports_same_key_different_digest_conflict() {
+    let (_temp_dir, store) = temp_store();
+    let log = IngestLog::new(store);
+    let bytes = envelope_bytes();
+    log.append_validated_envelope(bytes).await.unwrap();
+
+    let conflicting = IngestEnvelope::encode_batches(
+        "orders_relation",
+        "2026-05-05",
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "orders",
+        7,
+        10,
+        12,
+        &[valid_batch()],
+    )
+    .unwrap();
+
+    let outcome = log.append_validated_envelope(conflicting).await.unwrap();
+
+    assert_eq!(
+        outcome,
+        AppendValidatedEnvelopeOutcome::Conflict {
+            descriptor: ingest_descriptor("orders", 7, 10, 12),
+            object_key: ObjectKey::ingest_batch("orders", 7, 10, 12).unwrap(),
+            reason: "same_key_different_digest",
+        }
+    );
 }
 
 #[tokio::test]

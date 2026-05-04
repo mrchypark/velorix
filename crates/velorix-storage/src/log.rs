@@ -40,6 +40,21 @@ pub struct ReplayCheckpoint {
     pub end_offset_exclusive: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AppendValidatedEnvelopeOutcome {
+    Appended {
+        descriptor: IngestBatchDescriptor,
+    },
+    Duplicate {
+        descriptor: IngestBatchDescriptor,
+    },
+    Conflict {
+        descriptor: IngestBatchDescriptor,
+        object_key: ObjectKey,
+        reason: &'static str,
+    },
+}
+
 #[derive(Debug, Error)]
 pub enum IngestLogError {
     #[error(transparent)]
@@ -115,13 +130,33 @@ impl IngestLog {
     pub async fn append_validated_envelope(
         &self,
         payload: Bytes,
-    ) -> Result<IngestBatchDescriptor, IngestLogError> {
+    ) -> Result<AppendValidatedEnvelopeOutcome, IngestLogError> {
         let batch = IngestBatch::from_validated_envelope(payload)?;
         let descriptor = batch.descriptor();
 
-        self.append(&batch).await?;
-
-        Ok(descriptor)
+        match self.append(&batch).await {
+            Ok(()) => Ok(AppendValidatedEnvelopeOutcome::Appended { descriptor }),
+            Err(IngestLogError::AlreadyExists(object_key)) => {
+                let existing = self
+                    .store
+                    .get(&Path::from(object_key.as_str()))
+                    .await?
+                    .bytes()
+                    .await?;
+                let existing = IngestEnvelope::decode(existing)?;
+                let incoming = IngestEnvelope::decode(batch.payload.clone())?;
+                if existing.header().payload_digest == incoming.header().payload_digest {
+                    Ok(AppendValidatedEnvelopeOutcome::Duplicate { descriptor })
+                } else {
+                    Ok(AppendValidatedEnvelopeOutcome::Conflict {
+                        descriptor,
+                        reason: "same_key_different_digest",
+                        object_key,
+                    })
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub async fn list_committed(&self) -> Result<Vec<IngestBatchDescriptor>, IngestLogError> {

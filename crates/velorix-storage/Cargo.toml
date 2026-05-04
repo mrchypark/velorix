@@ -14,6 +14,7 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 slatedb = { workspace = true }
 thiserror = { workspace = true }
+velorix-core = { path = "../velorix-core" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

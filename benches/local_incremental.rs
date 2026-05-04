@@ -4,6 +4,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+use arrow::{
+    array::{ArrayRef, Int64Array, StringArray},
+    datatypes::{DataType, Field, Schema},
+    record_batch::RecordBatch,
+};
 use bytes::Bytes;
 use object_store::{local::LocalFileSystem, ObjectStore};
 use serde_json::json;
@@ -12,9 +17,13 @@ use velorix_core::{
     delta::{DeltaBatch, DeltaKey, DeltaRecord, DeltaValue},
     engine::{IncrementalEngine, PrototypeIncrementalEngine},
 };
-use velorix_runtime::recovery::{RecoveredRuntime, ORDERS_SUM_COUNT_OWNER};
+use velorix_runtime::recovery::{
+    orders_sum_count_relation_catalog, RecoveredRuntime, ORDERS_SUM_COUNT_OWNER,
+    ORDERS_SUM_COUNT_RELATION_ID, ORDERS_SUM_COUNT_RELATION_VERSION,
+};
 use velorix_storage::{
-    log::{IngestBatch, IngestLog},
+    ingest_envelope::IngestEnvelope,
+    log::IngestLog,
     manifest::{CheckpointManifest, InputRange},
     state::{CheckpointPublisher, StateObjectWrite},
 };
@@ -47,15 +56,7 @@ async fn run() -> BenchResult<()> {
         let start_offset = total_records;
         let end_offset = start_offset + RECORDS_PER_BATCH;
 
-        ingest_log
-            .append(&IngestBatch::new(
-                STREAM_ID,
-                PARTITION_ID,
-                start_offset,
-                end_offset,
-                batch_bytes(&input)?,
-            )?)
-            .await?;
+        append_ingest_envelope(&ingest_log, start_offset, end_offset, &input).await?;
         engine.push_changes(batch_index + 1, &input)?;
 
         max_view_freshness = max_view_freshness.max(batch_started.elapsed());
@@ -93,15 +94,13 @@ async fn run() -> BenchResult<()> {
     let checkpoint_elapsed = checkpoint_started.elapsed();
 
     let tail_input = workload_batch(BATCH_COUNT, RECORDS_PER_BATCH);
-    ingest_log
-        .append(&IngestBatch::new(
-            STREAM_ID,
-            PARTITION_ID,
-            total_records,
-            total_records + RECORDS_PER_BATCH,
-            batch_bytes(&tail_input)?,
-        )?)
-        .await?;
+    append_ingest_envelope(
+        &ingest_log,
+        total_records,
+        total_records + RECORDS_PER_BATCH,
+        &tail_input,
+    )
+    .await?;
 
     let recovery_started = Instant::now();
     let recovered = RecoveredRuntime::recover(Arc::clone(&store)).await?;
@@ -150,8 +149,71 @@ fn workload_batch(batch_index: u64, records: u64) -> DeltaBatch {
     }))
 }
 
-fn batch_bytes(batch: &DeltaBatch) -> BenchResult<Bytes> {
-    Ok(Bytes::from(serde_json::to_vec(batch)?))
+fn ingest_record_batch(input: &DeltaBatch) -> BenchResult<RecordBatch> {
+    let keys = input
+        .records()
+        .iter()
+        .map(|record| {
+            record
+                .key
+                .as_json()
+                .as_str()
+                .ok_or("prototype workload key must be a string")
+                .map(str::to_string)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let values = input
+        .records()
+        .iter()
+        .map(|record| {
+            record
+                .value
+                .as_json()
+                .as_i64()
+                .ok_or("prototype workload value must be an int64")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let weights = input
+        .records()
+        .iter()
+        .map(|record| record.weight)
+        .collect::<Vec<_>>();
+
+    Ok(RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("account_id", DataType::Utf8, false),
+            Field::new("amount", DataType::Int64, false),
+            Field::new("weight", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(keys)) as ArrayRef,
+            Arc::new(Int64Array::from(values)) as ArrayRef,
+            Arc::new(Int64Array::from(weights)) as ArrayRef,
+        ],
+    )?)
+}
+
+async fn append_ingest_envelope(
+    ingest_log: &IngestLog,
+    start_offset_inclusive: u64,
+    end_offset_exclusive: u64,
+    input: &DeltaBatch,
+) -> BenchResult<()> {
+    let batch = ingest_record_batch(input)?;
+    let catalog = orders_sum_count_relation_catalog()?;
+    let bytes = IngestEnvelope::encode_batches(
+        ORDERS_SUM_COUNT_RELATION_ID,
+        ORDERS_SUM_COUNT_RELATION_VERSION,
+        catalog.schema_fingerprint.as_str(),
+        STREAM_ID,
+        PARTITION_ID,
+        start_offset_inclusive,
+        end_offset_exclusive,
+        &[batch],
+    )?;
+
+    ingest_log.append_validated_envelope(bytes).await?;
+    Ok(())
 }
 
 fn millis(duration: Duration) -> f64 {

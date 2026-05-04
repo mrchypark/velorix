@@ -18,12 +18,19 @@ use velorix_core::{
     operator::KeyedSumCountAggregate,
     query::{QueryError, QueryPolicy, QueryPolicyError},
 };
-use velorix_runtime::query::{
-    query_object_backed_input_with_policy, query_recovered_materialized_view,
-    query_recovered_materialized_view_with_policy, RuntimeQueryError,
+use velorix_runtime::{
+    query::{
+        query_object_backed_input_with_policy, query_recovered_materialized_view,
+        query_recovered_materialized_view_with_policy, RuntimeQueryError,
+    },
+    recovery::{
+        orders_sum_count_relation_catalog, RecoveredRuntime, RecoveryError,
+        ORDERS_SUM_COUNT_RELATION_ID, ORDERS_SUM_COUNT_RELATION_VERSION,
+    },
 };
 use velorix_storage::{
-    log::{IngestBatch, IngestLog},
+    ingest_envelope::IngestEnvelope,
+    log::{IngestBatch, IngestLog, IngestLogError},
     manifest::{CheckpointManifest, InputRange, StateObjectRef},
     state::{CheckpointPublisher, StateObjectWrite},
 };
@@ -51,6 +58,101 @@ fn batch(records: impl IntoIterator<Item = DeltaRecord>) -> DeltaBatch {
 
 fn batch_bytes(batch: &DeltaBatch) -> Bytes {
     Bytes::from(serde_json::to_vec(batch).unwrap())
+}
+
+fn ingest_record_batch(input: &DeltaBatch) -> RecordBatch {
+    let keys = input
+        .records()
+        .iter()
+        .map(|record| record.key.as_json().as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    let values = input
+        .records()
+        .iter()
+        .map(|record| record.value.as_json().as_i64().unwrap())
+        .collect::<Vec<_>>();
+    let weights = input
+        .records()
+        .iter()
+        .map(|record| record.weight)
+        .collect::<Vec<_>>();
+
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("account_id", DataType::Utf8, false),
+            Field::new("amount", DataType::Int64, false),
+            Field::new("weight", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(keys)) as ArrayRef,
+            Arc::new(Int64Array::from(values)) as ArrayRef,
+            Arc::new(Int64Array::from(weights)) as ArrayRef,
+        ],
+    )
+    .unwrap()
+}
+
+fn ingest_envelope_bytes(
+    stream_id: &str,
+    partition_id: u32,
+    start_offset_inclusive: u64,
+    end_offset_exclusive: u64,
+    input: &DeltaBatch,
+) -> Bytes {
+    let catalog = orders_sum_count_relation_catalog().unwrap();
+    ingest_envelope_bytes_with_relation(
+        stream_id,
+        partition_id,
+        start_offset_inclusive,
+        end_offset_exclusive,
+        input,
+        ORDERS_SUM_COUNT_RELATION_ID,
+        ORDERS_SUM_COUNT_RELATION_VERSION,
+        catalog.schema_fingerprint.as_str(),
+    )
+}
+
+fn ingest_envelope_bytes_with_relation(
+    stream_id: &str,
+    partition_id: u32,
+    start_offset_inclusive: u64,
+    end_offset_exclusive: u64,
+    input: &DeltaBatch,
+    relation_id: &str,
+    relation_version: &str,
+    schema_fingerprint: &str,
+) -> Bytes {
+    IngestEnvelope::encode_batches(
+        relation_id,
+        relation_version,
+        schema_fingerprint,
+        stream_id,
+        partition_id,
+        start_offset_inclusive,
+        end_offset_exclusive,
+        &[ingest_record_batch(input)],
+    )
+    .unwrap()
+}
+
+async fn append_ingest_envelope(
+    ingest_log: &IngestLog,
+    stream_id: &str,
+    partition_id: u32,
+    start_offset_inclusive: u64,
+    end_offset_exclusive: u64,
+    input: &DeltaBatch,
+) {
+    ingest_log
+        .append_validated_envelope(ingest_envelope_bytes(
+            stream_id,
+            partition_id,
+            start_offset_inclusive,
+            end_offset_exclusive,
+            input,
+        ))
+        .await
+        .unwrap();
 }
 
 fn parquet_input_batch(keys: &[&str], values: &[&str], weights: &[i64]) -> RecordBatch {
@@ -145,14 +247,8 @@ async fn query_recovered_materialized_view_reads_checkpointed_state_and_replayed
         input_delta("account-b", 7, 1),
     ]);
 
-    ingest_log
-        .append(&IngestBatch::new("orders", 0, 0, 2, batch_bytes(&checkpoint_input)).unwrap())
-        .await
-        .unwrap();
-    ingest_log
-        .append(&IngestBatch::new("orders", 0, 2, 4, batch_bytes(&replay_input)).unwrap())
-        .await
-        .unwrap();
+    append_ingest_envelope(&ingest_log, "orders", 0, 0, 2, &checkpoint_input).await;
+    append_ingest_envelope(&ingest_log, "orders", 0, 2, 4, &replay_input).await;
 
     let mut checkpointed_view = KeyedSumCountAggregate::new();
     checkpointed_view.apply(&checkpoint_input).unwrap();
@@ -192,14 +288,8 @@ async fn query_recovered_materialized_view_with_policy_applies_row_limit_to_reco
     ]);
     let replay_input = batch([input_delta("account-b", 7, 1)]);
 
-    ingest_log
-        .append(&IngestBatch::new("orders", 0, 0, 2, batch_bytes(&checkpoint_input)).unwrap())
-        .await
-        .unwrap();
-    ingest_log
-        .append(&IngestBatch::new("orders", 0, 2, 3, batch_bytes(&replay_input)).unwrap())
-        .await
-        .unwrap();
+    append_ingest_envelope(&ingest_log, "orders", 0, 0, 2, &checkpoint_input).await;
+    append_ingest_envelope(&ingest_log, "orders", 0, 2, 3, &replay_input).await;
 
     let mut checkpointed_view = KeyedSumCountAggregate::new();
     checkpointed_view.apply(&checkpoint_input).unwrap();
@@ -236,7 +326,7 @@ async fn query_recovered_materialized_view_with_policy_applies_row_limit_to_reco
 }
 
 #[tokio::test]
-async fn query_recovered_materialized_view_propagates_datafusion_errors() {
+async fn recovery_rejects_json_bytes_under_valid_v1_ingest_key() {
     let (_temp_dir, store) = temp_store();
     let ingest_log = IngestLog::new(Arc::clone(&store));
     let input = batch([input_delta("account-a", 4, 1)]);
@@ -245,6 +335,87 @@ async fn query_recovered_materialized_view_propagates_datafusion_errors() {
         .append(&IngestBatch::new("orders", 0, 0, 1, batch_bytes(&input)).unwrap())
         .await
         .unwrap();
+
+    let error = RecoveredRuntime::recover(Arc::clone(&store))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RecoveryError::Ingest(IngestLogError::IngestEnvelope(_))
+    ));
+}
+
+#[tokio::test]
+async fn recovery_rejects_ingest_envelope_with_wrong_relation_version() {
+    let (_temp_dir, store) = temp_store();
+    let ingest_log = IngestLog::new(Arc::clone(&store));
+    let input = batch([input_delta("account-a", 4, 1)]);
+    let catalog = orders_sum_count_relation_catalog().unwrap();
+    let bytes = ingest_envelope_bytes_with_relation(
+        "orders",
+        0,
+        0,
+        1,
+        &input,
+        ORDERS_SUM_COUNT_RELATION_ID,
+        "2026-05-06.v1",
+        catalog.schema_fingerprint.as_str(),
+    );
+
+    ingest_log.append_validated_envelope(bytes).await.unwrap();
+
+    let error = RecoveredRuntime::recover(Arc::clone(&store))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RecoveryError::IngestRelationMismatch {
+            field: "relation_version",
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn recovery_rejects_ingest_envelope_with_wrong_schema_fingerprint() {
+    let (_temp_dir, store) = temp_store();
+    let ingest_log = IngestLog::new(Arc::clone(&store));
+    let input = batch([input_delta("account-a", 4, 1)]);
+    let bytes = ingest_envelope_bytes_with_relation(
+        "orders",
+        0,
+        0,
+        1,
+        &input,
+        ORDERS_SUM_COUNT_RELATION_ID,
+        ORDERS_SUM_COUNT_RELATION_VERSION,
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    );
+
+    ingest_log.append_validated_envelope(bytes).await.unwrap();
+
+    let error = RecoveredRuntime::recover(Arc::clone(&store))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RecoveryError::IngestRelationMismatch {
+            field: "schema_fingerprint",
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn query_recovered_materialized_view_propagates_datafusion_errors() {
+    let (_temp_dir, store) = temp_store();
+    let ingest_log = IngestLog::new(Arc::clone(&store));
+    let input = batch([input_delta("account-a", 4, 1)]);
+
+    append_ingest_envelope(&ingest_log, "orders", 0, 0, 1, &input).await;
 
     let error =
         query_recovered_materialized_view(Arc::clone(&store), "select missing_column from input")

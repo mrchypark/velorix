@@ -1,7 +1,7 @@
-use std::{fmt::Write as _, io::Cursor};
+use std::io::Cursor;
 
 use arrow::{
-    datatypes::{DataType, Field, FieldRef, IntervalUnit, SchemaRef, TimeUnit, UnionMode},
+    datatypes::DataType,
     error::ArrowError,
     ipc::{reader::StreamReader, writer::StreamWriter},
     record_batch::RecordBatch,
@@ -10,6 +10,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use velorix_core::relation::validate_schema_fingerprint;
 
 use crate::log::IngestBatchDescriptor;
 
@@ -19,6 +20,7 @@ const HEADER_LEN_BYTES: usize = 4;
 const SCHEMA_VERSION_V1: u32 = 1;
 const FORMAT_ARROW_IPC_DELTA_BATCH_V1: &str = "ArrowIpcDeltaBatchV1";
 const COMPRESSION_NONE: &str = "none";
+const PAYLOAD_DIGEST_DOMAIN: &[u8] = b"velorix-ingest-envelope-v1\0";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IngestEnvelopeHeader {
@@ -28,6 +30,8 @@ pub struct IngestEnvelopeHeader {
     pub partition_id: u32,
     pub start_offset_inclusive: u64,
     pub end_offset_exclusive: u64,
+    pub relation_id: String,
+    pub relation_version: String,
     pub schema_fingerprint: String,
     pub payload_digest: String,
     pub compression: String,
@@ -72,13 +76,13 @@ impl IngestEnvelope {
     /// magic bytes | little-endian u32 JSON header length | JSON header | Arrow IPC stream bytes
     /// ```
     ///
-    /// The JSON header is authoritative for stream, partition, offset range,
-    /// schema fingerprint, digest, format, version, and compression. The
-    /// payload digest covers only the Arrow IPC stream bytes. Schema
-    /// fingerprinting includes field order, names, Arrow data types, and
-    /// nullability; field/schema metadata is intentionally ignored for this
-    /// first storage boundary.
+    /// The payload digest covers a domain-separated canonical header without
+    /// `payload_digest` plus the stored body bytes, so replay fails closed on
+    /// header-only mutations as well as body mutations.
     pub fn encode_batches(
+        relation_id: impl Into<String>,
+        relation_version: impl Into<String>,
+        schema_fingerprint: impl Into<String>,
         stream_id: impl Into<String>,
         partition_id: u32,
         start_offset_inclusive: u64,
@@ -91,7 +95,7 @@ impl IngestEnvelope {
             }
         })?;
 
-        validate_weight_column(&schema)?;
+        validate_weight_column(schema.as_ref())?;
 
         for batch in batches {
             if batch.schema() != schema {
@@ -110,34 +114,40 @@ impl IngestEnvelope {
             });
         }
 
-        let payload = encode_arrow_ipc_stream(&schema, batches)?;
-        let header = IngestEnvelopeHeader {
+        let header_without_digest = IngestEnvelopeHeaderWithoutDigest {
             schema_version: SCHEMA_VERSION_V1,
             format: FORMAT_ARROW_IPC_DELTA_BATCH_V1.to_string(),
             stream_id: stream_id.into(),
             partition_id,
             start_offset_inclusive,
             end_offset_exclusive,
-            schema_fingerprint: schema_fingerprint(&schema),
-            payload_digest: sha256_digest(&payload),
+            relation_id: relation_id.into(),
+            relation_version: relation_version.into(),
+            schema_fingerprint: schema_fingerprint.into(),
             compression: COMPRESSION_NONE.to_string(),
         };
+        validate_header_without_digest(&header_without_digest)?;
+
+        let payload = encode_arrow_ipc_stream(schema.as_ref(), batches)?;
+        let payload_digest = payload_digest(&header_without_digest, &payload)?;
+        let header = header_without_digest.with_payload_digest(payload_digest);
 
         encode_envelope(header, &payload)
     }
 
     pub fn decode(bytes: Bytes) -> Result<Self, IngestEnvelopeError> {
         let (header, payload) = split_envelope(bytes)?;
+        let header_without_digest = IngestEnvelopeHeaderWithoutDigest::from(&header);
 
-        validate_header(&header)?;
-
-        let actual_digest = sha256_digest(&payload);
+        let actual_digest = payload_digest(&header_without_digest, &payload)?;
         if header.payload_digest != actual_digest {
             return Err(IngestEnvelopeError::DigestMismatch {
                 expected: header.payload_digest,
                 actual: actual_digest,
             });
         }
+
+        validate_header_without_digest(&header_without_digest)?;
 
         let (schema, batch_count) = validate_arrow_ipc_stream(&payload)?;
         if batch_count == 0 {
@@ -147,16 +157,7 @@ impl IngestEnvelope {
                 ),
             });
         }
-        validate_weight_column(&schema)?;
-
-        let actual_fingerprint = schema_fingerprint(&schema);
-        if header.schema_fingerprint != actual_fingerprint {
-            return Err(IngestEnvelopeError::DescriptorMismatch {
-                field: "schema_fingerprint",
-                expected: header.schema_fingerprint,
-                found: actual_fingerprint,
-            });
-        }
+        validate_weight_column(schema.as_ref())?;
 
         Ok(Self { header, payload })
     }
@@ -213,6 +214,55 @@ impl IngestEnvelope {
     }
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct IngestEnvelopeHeaderWithoutDigest {
+    schema_version: u32,
+    format: String,
+    stream_id: String,
+    partition_id: u32,
+    start_offset_inclusive: u64,
+    end_offset_exclusive: u64,
+    relation_id: String,
+    relation_version: String,
+    schema_fingerprint: String,
+    compression: String,
+}
+
+impl IngestEnvelopeHeaderWithoutDigest {
+    fn with_payload_digest(self, payload_digest: String) -> IngestEnvelopeHeader {
+        IngestEnvelopeHeader {
+            schema_version: self.schema_version,
+            format: self.format,
+            stream_id: self.stream_id,
+            partition_id: self.partition_id,
+            start_offset_inclusive: self.start_offset_inclusive,
+            end_offset_exclusive: self.end_offset_exclusive,
+            relation_id: self.relation_id,
+            relation_version: self.relation_version,
+            schema_fingerprint: self.schema_fingerprint,
+            payload_digest,
+            compression: self.compression,
+        }
+    }
+}
+
+impl From<&IngestEnvelopeHeader> for IngestEnvelopeHeaderWithoutDigest {
+    fn from(header: &IngestEnvelopeHeader) -> Self {
+        Self {
+            schema_version: header.schema_version,
+            format: header.format.clone(),
+            stream_id: header.stream_id.clone(),
+            partition_id: header.partition_id,
+            start_offset_inclusive: header.start_offset_inclusive,
+            end_offset_exclusive: header.end_offset_exclusive,
+            relation_id: header.relation_id.clone(),
+            relation_version: header.relation_version.clone(),
+            schema_fingerprint: header.schema_fingerprint.clone(),
+            compression: header.compression.clone(),
+        }
+    }
+}
+
 fn encode_envelope(
     header: IngestEnvelopeHeader,
     payload: &[u8],
@@ -226,8 +276,9 @@ fn encode_envelope(
             reason: "JSON header exceeds u32 length limit".to_string(),
         })?;
 
-    let mut bytes =
-        Vec::with_capacity(INGEST_ENVELOPE_MAGIC.len() + HEADER_LEN_BYTES + header_bytes.len());
+    let mut bytes = Vec::with_capacity(
+        INGEST_ENVELOPE_MAGIC.len() + HEADER_LEN_BYTES + header_bytes.len() + payload.len(),
+    );
     bytes.extend_from_slice(INGEST_ENVELOPE_MAGIC);
     bytes.extend_from_slice(&header_len.to_le_bytes());
     bytes.extend_from_slice(&header_bytes);
@@ -276,7 +327,9 @@ fn split_envelope(bytes: Bytes) -> Result<(IngestEnvelopeHeader, Bytes), IngestE
     Ok((header, payload))
 }
 
-fn validate_header(header: &IngestEnvelopeHeader) -> Result<(), IngestEnvelopeError> {
+fn validate_header_without_digest(
+    header: &IngestEnvelopeHeaderWithoutDigest,
+) -> Result<(), IngestEnvelopeError> {
     if header.schema_version != SCHEMA_VERSION_V1 {
         return Err(IngestEnvelopeError::UnsupportedSchemaVersion {
             found: header.schema_version,
@@ -295,7 +348,23 @@ fn validate_header(header: &IngestEnvelopeHeader) -> Result<(), IngestEnvelopeEr
         });
     }
 
-    if start_not_before_end(header.start_offset_inclusive, header.end_offset_exclusive) {
+    if header.relation_id.trim().is_empty() {
+        return Err(IngestEnvelopeError::MalformedEnvelope {
+            reason: "relation_id must be nonempty".to_string(),
+        });
+    }
+    if header.relation_version.trim().is_empty() {
+        return Err(IngestEnvelopeError::MalformedEnvelope {
+            reason: "relation_version must be nonempty".to_string(),
+        });
+    }
+    validate_schema_fingerprint("schema_fingerprint", &header.schema_fingerprint).map_err(
+        |source| IngestEnvelopeError::MalformedEnvelope {
+            reason: source.to_string(),
+        },
+    )?;
+
+    if header.start_offset_inclusive >= header.end_offset_exclusive {
         return Err(IngestEnvelopeError::MalformedEnvelope {
             reason: format!(
                 "offset range must be nonempty: start={}, end={}",
@@ -307,17 +376,43 @@ fn validate_header(header: &IngestEnvelopeHeader) -> Result<(), IngestEnvelopeEr
     Ok(())
 }
 
-fn start_not_before_end(start_offset_inclusive: u64, end_offset_exclusive: u64) -> bool {
-    start_offset_inclusive >= end_offset_exclusive
+fn payload_digest(
+    header: &IngestEnvelopeHeaderWithoutDigest,
+    payload: &[u8],
+) -> Result<String, IngestEnvelopeError> {
+    let canonical_header = serde_json::json!({
+        "schema_version": header.schema_version,
+        "format": header.format,
+        "stream_id": header.stream_id,
+        "partition_id": header.partition_id,
+        "start_offset_inclusive": header.start_offset_inclusive,
+        "end_offset_exclusive": header.end_offset_exclusive,
+        "relation_id": header.relation_id,
+        "relation_version": header.relation_version,
+        "schema_fingerprint": header.schema_fingerprint,
+        "compression": header.compression,
+    });
+    let canonical_header = serde_json::to_vec(&canonical_header).map_err(|source| {
+        IngestEnvelopeError::MalformedEnvelope {
+            reason: format!("could not encode canonical digest header: {source}"),
+        }
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(PAYLOAD_DIGEST_DOMAIN);
+    hasher.update(canonical_header);
+    hasher.update([0]);
+    hasher.update(payload);
+
+    Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
 fn encode_arrow_ipc_stream(
-    schema: &SchemaRef,
+    schema: &arrow::datatypes::Schema,
     batches: &[RecordBatch],
 ) -> Result<Vec<u8>, IngestEnvelopeError> {
     let mut payload = Vec::new();
     {
-        let mut writer = StreamWriter::try_new(&mut payload, schema.as_ref())
+        let mut writer = StreamWriter::try_new(&mut payload, schema)
             .map_err(|source| IngestEnvelopeError::MalformedArrowIpc { source })?;
         for batch in batches {
             writer
@@ -340,7 +435,9 @@ fn decode_arrow_ipc_stream(payload: &Bytes) -> Result<Vec<RecordBatch>, IngestEn
         .map_err(|source| IngestEnvelopeError::MalformedArrowIpc { source })
 }
 
-fn validate_arrow_ipc_stream(payload: &Bytes) -> Result<(SchemaRef, usize), IngestEnvelopeError> {
+fn validate_arrow_ipc_stream(
+    payload: &Bytes,
+) -> Result<(arrow::datatypes::SchemaRef, usize), IngestEnvelopeError> {
     let reader = StreamReader::try_new(Cursor::new(payload.clone()), None)
         .map_err(|source| IngestEnvelopeError::MalformedArrowIpc { source })?;
     let schema = reader.schema();
@@ -354,7 +451,7 @@ fn validate_arrow_ipc_stream(payload: &Bytes) -> Result<(SchemaRef, usize), Inge
     Ok((schema, batch_count))
 }
 
-fn validate_weight_column(schema: &SchemaRef) -> Result<(), IngestEnvelopeError> {
+fn validate_weight_column(schema: &arrow::datatypes::Schema) -> Result<(), IngestEnvelopeError> {
     let field = schema
         .field_with_name("weight")
         .map_err(|_| IngestEnvelopeError::MissingWeightColumn)?;
@@ -365,211 +462,4 @@ fn validate_weight_column(schema: &SchemaRef) -> Result<(), IngestEnvelopeError>
     }
 
     Ok(())
-}
-
-/// Returns the deterministic V1 fingerprint for an Arrow schema.
-///
-/// The canonical input includes field order, field names, Arrow data types,
-/// and nullability. Schema and field metadata are ignored.
-pub fn schema_fingerprint(schema: &SchemaRef) -> String {
-    let mut canonical = String::new();
-
-    canonical.push_str("velorix-arrow-schema-v1;");
-    for field in schema.fields() {
-        encode_field(field.as_ref(), &mut canonical);
-    }
-
-    sha256_digest(canonical.as_bytes())
-}
-
-fn encode_field(field: &Field, out: &mut String) {
-    out.push_str("field(");
-    encode_string(field.name(), out);
-    out.push_str(",nullable=");
-    out.push_str(if field.is_nullable() { "1" } else { "0" });
-    out.push_str(",type=");
-    encode_data_type(field.data_type(), out);
-    out.push(')');
-}
-
-fn encode_fields(fields: &[FieldRef], out: &mut String) {
-    let _ = write!(out, "{}[", fields.len());
-    for field in fields {
-        encode_field(field.as_ref(), out);
-        out.push(';');
-    }
-    out.push(']');
-}
-
-fn encode_data_type(data_type: &DataType, out: &mut String) {
-    match data_type {
-        DataType::Null => out.push_str("Null"),
-        DataType::Boolean => out.push_str("Boolean"),
-        DataType::Int8 => out.push_str("Int8"),
-        DataType::Int16 => out.push_str("Int16"),
-        DataType::Int32 => out.push_str("Int32"),
-        DataType::Int64 => out.push_str("Int64"),
-        DataType::UInt8 => out.push_str("UInt8"),
-        DataType::UInt16 => out.push_str("UInt16"),
-        DataType::UInt32 => out.push_str("UInt32"),
-        DataType::UInt64 => out.push_str("UInt64"),
-        DataType::Float16 => out.push_str("Float16"),
-        DataType::Float32 => out.push_str("Float32"),
-        DataType::Float64 => out.push_str("Float64"),
-        DataType::Timestamp(unit, timezone) => {
-            out.push_str("Timestamp(");
-            encode_time_unit(*unit, out);
-            out.push(',');
-            match timezone {
-                Some(timezone) => encode_string(timezone.as_ref(), out),
-                None => out.push_str("none"),
-            }
-            out.push(')');
-        }
-        DataType::Date32 => out.push_str("Date32"),
-        DataType::Date64 => out.push_str("Date64"),
-        DataType::Time32(unit) => {
-            out.push_str("Time32(");
-            encode_time_unit(*unit, out);
-            out.push(')');
-        }
-        DataType::Time64(unit) => {
-            out.push_str("Time64(");
-            encode_time_unit(*unit, out);
-            out.push(')');
-        }
-        DataType::Duration(unit) => {
-            out.push_str("Duration(");
-            encode_time_unit(*unit, out);
-            out.push(')');
-        }
-        DataType::Interval(unit) => {
-            out.push_str("Interval(");
-            encode_interval_unit(*unit, out);
-            out.push(')');
-        }
-        DataType::Binary => out.push_str("Binary"),
-        DataType::FixedSizeBinary(size) => {
-            let _ = write!(out, "FixedSizeBinary({size})");
-        }
-        DataType::LargeBinary => out.push_str("LargeBinary"),
-        DataType::BinaryView => out.push_str("BinaryView"),
-        DataType::Utf8 => out.push_str("Utf8"),
-        DataType::LargeUtf8 => out.push_str("LargeUtf8"),
-        DataType::Utf8View => out.push_str("Utf8View"),
-        DataType::List(field) => {
-            out.push_str("List(");
-            encode_field(field.as_ref(), out);
-            out.push(')');
-        }
-        DataType::ListView(field) => {
-            out.push_str("ListView(");
-            encode_field(field.as_ref(), out);
-            out.push(')');
-        }
-        DataType::FixedSizeList(field, size) => {
-            let _ = write!(out, "FixedSizeList({size},");
-            encode_field(field.as_ref(), out);
-            out.push(')');
-        }
-        DataType::LargeList(field) => {
-            out.push_str("LargeList(");
-            encode_field(field.as_ref(), out);
-            out.push(')');
-        }
-        DataType::LargeListView(field) => {
-            out.push_str("LargeListView(");
-            encode_field(field.as_ref(), out);
-            out.push(')');
-        }
-        DataType::Struct(fields) => {
-            out.push_str("Struct(");
-            encode_fields(fields.as_ref(), out);
-            out.push(')');
-        }
-        DataType::Union(fields, mode) => {
-            out.push_str("Union(");
-            encode_union_mode(*mode, out);
-            out.push(',');
-            let _ = write!(out, "{}[", fields.len());
-            for (type_id, field) in fields.iter() {
-                let _ = write!(out, "{type_id}:");
-                encode_field(field.as_ref(), out);
-                out.push(';');
-            }
-            out.push_str("])");
-        }
-        DataType::Dictionary(key_type, value_type) => {
-            out.push_str("Dictionary(");
-            encode_data_type(key_type, out);
-            out.push(',');
-            encode_data_type(value_type, out);
-            out.push(')');
-        }
-        DataType::Decimal32(precision, scale) => {
-            let _ = write!(out, "Decimal32({precision},{scale})");
-        }
-        DataType::Decimal64(precision, scale) => {
-            let _ = write!(out, "Decimal64({precision},{scale})");
-        }
-        DataType::Decimal128(precision, scale) => {
-            let _ = write!(out, "Decimal128({precision},{scale})");
-        }
-        DataType::Decimal256(precision, scale) => {
-            let _ = write!(out, "Decimal256({precision},{scale})");
-        }
-        DataType::Map(field, sorted) => {
-            out.push_str("Map(sorted=");
-            out.push_str(if *sorted { "1" } else { "0" });
-            out.push(',');
-            encode_field(field.as_ref(), out);
-            out.push(')');
-        }
-        DataType::RunEndEncoded(run_ends, values) => {
-            out.push_str("RunEndEncoded(");
-            encode_field(run_ends.as_ref(), out);
-            out.push(',');
-            encode_field(values.as_ref(), out);
-            out.push(')');
-        }
-    }
-}
-
-fn encode_string(value: &str, out: &mut String) {
-    let _ = write!(out, "{}:", value.len());
-    out.push_str(value);
-}
-
-fn encode_time_unit(unit: TimeUnit, out: &mut String) {
-    out.push_str(match unit {
-        TimeUnit::Second => "Second",
-        TimeUnit::Millisecond => "Millisecond",
-        TimeUnit::Microsecond => "Microsecond",
-        TimeUnit::Nanosecond => "Nanosecond",
-    });
-}
-
-fn encode_interval_unit(unit: IntervalUnit, out: &mut String) {
-    out.push_str(match unit {
-        IntervalUnit::YearMonth => "YearMonth",
-        IntervalUnit::DayTime => "DayTime",
-        IntervalUnit::MonthDayNano => "MonthDayNano",
-    });
-}
-
-fn encode_union_mode(mode: UnionMode, out: &mut String) {
-    out.push_str(match mode {
-        UnionMode::Sparse => "Sparse",
-        UnionMode::Dense => "Dense",
-    });
-}
-
-fn sha256_digest(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let hex = digest
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-
-    format!("sha256:{hex}")
 }

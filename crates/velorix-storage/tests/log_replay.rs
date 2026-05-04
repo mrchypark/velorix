@@ -1,9 +1,15 @@
 use std::sync::Arc;
 
+use arrow::{
+    array::{ArrayRef, Int64Array, StringArray},
+    datatypes::{DataType, Field, Schema},
+    record_batch::RecordBatch,
+};
 use bytes::Bytes;
 use object_store::{local::LocalFileSystem, path::Path, ObjectStore};
 use tempfile::TempDir;
 use velorix_storage::{
+    ingest_envelope::IngestEnvelope,
     log::{IngestBatch, IngestLog, ReplayCheckpoint},
     object_key::ObjectKey,
 };
@@ -13,6 +19,42 @@ fn temp_store() -> (TempDir, Arc<dyn ObjectStore>) {
     let store = LocalFileSystem::new_with_prefix(temp_dir.path()).unwrap();
 
     (temp_dir, Arc::new(store))
+}
+
+fn envelope_bytes(
+    stream_id: &str,
+    partition_id: u32,
+    start_offset_inclusive: u64,
+    end_offset_exclusive: u64,
+    account: &str,
+    amount: i64,
+) -> Bytes {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("account_id", DataType::Utf8, false),
+        Field::new("amount", DataType::Int64, false),
+        Field::new("weight", DataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec![account.to_string()])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![amount])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+
+    IngestEnvelope::encode_batches(
+        "orders_relation",
+        "2026-05-05",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        stream_id,
+        partition_id,
+        start_offset_inclusive,
+        end_offset_exclusive,
+        &[batch],
+    )
+    .unwrap()
 }
 
 #[tokio::test]
@@ -106,12 +148,13 @@ async fn log_replay_ignores_output_namespace_objects_with_matching_ranges() {
 async fn log_replay_rejects_checkpoint_inside_committed_batch() {
     let (_temp_dir, store) = temp_store();
     let log = IngestLog::new(store);
-    let batch = IngestBatch::new("orders", 0, 5, 15, Bytes::from_static(b"opaque")).unwrap();
+    let batch =
+        IngestBatch::from_validated_envelope(envelope_bytes("orders", 0, 5, 15, "a", 10)).unwrap();
 
     log.append(&batch).await.unwrap();
 
     let err = log
-        .replay_from(&[ReplayCheckpoint::new("orders", 0, 10)])
+        .replay_validated_envelopes_from(&[ReplayCheckpoint::new("orders", 0, 10)])
         .await
         .unwrap_err();
 
@@ -122,8 +165,10 @@ async fn log_replay_rejects_checkpoint_inside_committed_batch() {
 async fn log_replay_rejects_overlapping_committed_ranges_for_same_stream_partition() {
     let (_temp_dir, store) = temp_store();
     let log = IngestLog::new(store);
-    let first = IngestBatch::new("orders", 0, 0, 10, Bytes::from_static(b"first")).unwrap();
-    let overlapping = IngestBatch::new("orders", 0, 5, 15, Bytes::from_static(b"overlap")).unwrap();
+    let first =
+        IngestBatch::from_validated_envelope(envelope_bytes("orders", 0, 0, 10, "a", 10)).unwrap();
+    let overlapping =
+        IngestBatch::from_validated_envelope(envelope_bytes("orders", 0, 5, 15, "b", 20)).unwrap();
 
     log.append(&first).await.unwrap();
     log.append(&overlapping).await.unwrap();
