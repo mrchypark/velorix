@@ -1,0 +1,15 @@
+[package]
+name = "velorix-control"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+velorix-storage = { path = "../velorix-storage" }
+
+[dev-dependencies]
+bytes = { workspace = true }
+object_store = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }

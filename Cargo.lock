@@ -3590,6 +3590,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "velorix-control"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "object_store 0.12.5",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "velorix-storage",
+]
+
+[[package]]
 name = "velorix-core"
 version = "0.1.0"
 dependencies = [

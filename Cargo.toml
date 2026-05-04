@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/velorix-core",
+  "crates/velorix-control",
   "crates/velorix-storage",
   "crates/velorix-runtime",
   "crates/velorix-cli",
