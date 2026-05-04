@@ -1,5 +1,9 @@
 use std::{
     error::Error,
+    fmt,
+    ops::Range,
+    process::Command,
+    sync::atomic::{AtomicU64, Ordering},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -10,12 +14,21 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use bytes::Bytes;
-use object_store::{local::LocalFileSystem, ObjectStore};
+use futures::stream::BoxStream;
+use object_store::{
+    local::LocalFileSystem, path::Path, GetOptions, GetRange, GetResult, ListResult,
+    MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload,
+    PutResult,
+};
 use serde_json::json;
 use tempfile::TempDir;
 use velorix_core::{
     delta::{DeltaBatch, DeltaKey, DeltaRecord, DeltaValue},
     engine::{IncrementalEngine, PrototypeIncrementalEngine},
+};
+use velorix_runtime::benchmark_gate::{
+    BenchmarkBackend, BenchmarkGateLevel, BenchmarkGateResultV1, BenchmarkMetricsV1,
+    ObjectRequestMetricsV1,
 };
 use velorix_runtime::recovery::{
     orders_sum_count_relation_catalog, RecoveredRuntime, ORDERS_SUM_COUNT_OWNER,
@@ -41,17 +54,15 @@ fn main() -> BenchResult<()> {
 }
 
 async fn run() -> BenchResult<()> {
-    let (_temp_dir, store) = temp_store()?;
+    let (_temp_dir, metered_store, store) = temp_store()?;
     let ingest_log = IngestLog::new(Arc::clone(&store));
     let publisher = CheckpointPublisher::new(Arc::clone(&store));
     let mut engine = PrototypeIncrementalEngine::new();
 
     let mut total_records = 0;
-    let mut max_view_freshness = Duration::ZERO;
     let ingest_started = Instant::now();
 
     for batch_index in 0..BATCH_COUNT {
-        let batch_started = Instant::now();
         let input = workload_batch(batch_index, RECORDS_PER_BATCH);
         let start_offset = total_records;
         let end_offset = start_offset + RECORDS_PER_BATCH;
@@ -59,7 +70,6 @@ async fn run() -> BenchResult<()> {
         append_ingest_envelope(&ingest_log, start_offset, end_offset, &input).await?;
         engine.push_changes(batch_index + 1, &input)?;
 
-        max_view_freshness = max_view_freshness.max(batch_started.elapsed());
         total_records = end_offset;
     }
 
@@ -115,25 +125,40 @@ async fn run() -> BenchResult<()> {
     assert!(!recovered_rows.is_empty());
 
     let records_per_second = total_records as f64 / ingest_elapsed.as_secs_f64();
-    println!("local_incremental_records={total_records}");
-    println!("local_incremental_batches={BATCH_COUNT}");
-    println!("ingest_throughput_records_per_sec={records_per_second:.2}");
-    println!("checkpoint_latency_ms={:.3}", millis(checkpoint_elapsed));
-    println!("recovery_latency_ms={:.3}", millis(recovery_elapsed));
-    println!(
-        "materialized_view_freshness_max_ms={:.3}",
-        millis(max_view_freshness)
-    );
-    println!("recovered_materialized_rows={}", recovered_rows.len());
+    let object_requests = metered_store.snapshot();
+    let result = BenchmarkGateResultV1 {
+        schema_version: 1,
+        commit: git_commit(),
+        gate_level: BenchmarkGateLevel::PrSmoke,
+        backend: BenchmarkBackend::Local,
+        workload: "local_incremental".to_string(),
+        metrics: BenchmarkMetricsV1 {
+            rows_per_second: records_per_second,
+            bytes_per_row: bytes_per_row(object_requests.bytes_written, total_records),
+            put_per_gib: put_per_gib(object_requests.put_count, object_requests.bytes_written),
+            object_requests,
+            checkpoint_p50_ms: millis(checkpoint_elapsed),
+            checkpoint_p95_ms: millis(checkpoint_elapsed),
+            recovery_p95_ms: millis(recovery_elapsed),
+            peak_rss_bytes: current_rss_bytes().unwrap_or(0),
+            spill_bytes: 0,
+            scan_bytes: 0,
+        },
+    };
+    result.validate()?;
+
+    println!("{}", serde_json::to_string(&result)?);
 
     Ok(())
 }
 
-fn temp_store() -> BenchResult<(TempDir, Arc<dyn ObjectStore>)> {
+fn temp_store() -> BenchResult<(TempDir, Arc<MeteredObjectStore>, Arc<dyn ObjectStore>)> {
     let temp_dir = tempfile::tempdir()?;
-    let store = LocalFileSystem::new_with_prefix(temp_dir.path())?;
+    let inner = Arc::new(LocalFileSystem::new_with_prefix(temp_dir.path())?);
+    let metered_store = Arc::new(MeteredObjectStore::new(inner));
+    let store: Arc<dyn ObjectStore> = metered_store.clone();
 
-    Ok((temp_dir, Arc::new(store)))
+    Ok((temp_dir, metered_store, store))
 }
 
 fn workload_batch(batch_index: u64, records: u64) -> DeltaBatch {
@@ -218,4 +243,205 @@ async fn append_ingest_envelope(
 
 fn millis(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
+}
+
+#[derive(Debug)]
+struct MeteredObjectStore {
+    inner: Arc<dyn ObjectStore>,
+    put_count: AtomicU64,
+    get_count: AtomicU64,
+    list_count: AtomicU64,
+    range_read_count: AtomicU64,
+    bytes_written: AtomicU64,
+    bytes_read: AtomicU64,
+}
+
+impl MeteredObjectStore {
+    fn new(inner: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            inner,
+            put_count: AtomicU64::new(0),
+            get_count: AtomicU64::new(0),
+            list_count: AtomicU64::new(0),
+            range_read_count: AtomicU64::new(0),
+            bytes_written: AtomicU64::new(0),
+            bytes_read: AtomicU64::new(0),
+        }
+    }
+
+    fn snapshot(&self) -> ObjectRequestMetricsV1 {
+        ObjectRequestMetricsV1 {
+            put_count: self.put_count.load(Ordering::SeqCst),
+            get_count: self.get_count.load(Ordering::SeqCst),
+            list_count: self.list_count.load(Ordering::SeqCst),
+            range_read_count: self.range_read_count.load(Ordering::SeqCst),
+            bytes_written: self.bytes_written.load(Ordering::SeqCst),
+            bytes_read: self.bytes_read.load(Ordering::SeqCst),
+        }
+    }
+
+    fn record_put(&self, payload: &PutPayload) {
+        self.put_count.fetch_add(1, Ordering::SeqCst);
+        self.bytes_written
+            .fetch_add(payload.content_length() as u64, Ordering::SeqCst);
+    }
+
+    fn record_get(&self, options: &GetOptions, result: &GetResult) {
+        if options.head {
+            return;
+        }
+
+        if let Some(range) = &options.range {
+            self.range_read_count.fetch_add(1, Ordering::SeqCst);
+            self.bytes_read
+                .fetch_add(range_len(range, result.meta.size), Ordering::SeqCst);
+        } else {
+            self.get_count.fetch_add(1, Ordering::SeqCst);
+            self.bytes_read
+                .fetch_add(result.meta.size, Ordering::SeqCst);
+        }
+    }
+}
+
+impl fmt::Display for MeteredObjectStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "metered({})", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for MeteredObjectStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.record_put(&payload);
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.put_count.fetch_add(1, Ordering::SeqCst);
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        let result = self.inner.get_opts(location, options.clone()).await?;
+        self.record_get(&options, &result);
+        Ok(result)
+    }
+
+    async fn get_range(&self, location: &Path, range: Range<u64>) -> object_store::Result<Bytes> {
+        let bytes = self.inner.get_range(location, range).await?;
+        self.range_read_count.fetch_add(1, Ordering::SeqCst);
+        self.bytes_read
+            .fetch_add(bytes.len() as u64, Ordering::SeqCst);
+        Ok(bytes)
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &Path,
+        ranges: &[Range<u64>],
+    ) -> object_store::Result<Vec<Bytes>> {
+        let bytes = self.inner.get_ranges(location, ranges).await?;
+        self.range_read_count
+            .fetch_add(ranges.len() as u64, Ordering::SeqCst);
+        self.bytes_read.fetch_add(
+            bytes.iter().map(|chunk| chunk.len() as u64).sum(),
+            Ordering::SeqCst,
+        );
+        Ok(bytes)
+    }
+
+    async fn delete(&self, location: &Path) -> object_store::Result<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.list_count.fetch_add(1, Ordering::SeqCst);
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.list_count.fetch_add(1, Ordering::SeqCst);
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.list_count.fetch_add(1, Ordering::SeqCst);
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
+fn range_len(range: &GetRange, object_size: u64) -> u64 {
+    match range {
+        GetRange::Bounded(range) => range.end.min(object_size).saturating_sub(range.start),
+        GetRange::Offset(offset) => object_size.saturating_sub(*offset),
+        GetRange::Suffix(bytes) => object_size.min(*bytes),
+    }
+}
+
+fn bytes_per_row(bytes_written: u64, rows: u64) -> f64 {
+    if rows == 0 {
+        0.0
+    } else {
+        bytes_written as f64 / rows as f64
+    }
+}
+
+fn put_per_gib(put_count: u64, bytes_written: u64) -> f64 {
+    if bytes_written == 0 {
+        0.0
+    } else {
+        put_count as f64 / (bytes_written as f64 / 1_073_741_824.0)
+    }
+}
+
+fn git_commit() -> String {
+    Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|commit| !commit.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn current_rss_bytes() -> Option<u64> {
+    let output = Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let rss_kib = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    Some(rss_kib * 1024)
 }

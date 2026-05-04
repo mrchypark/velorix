@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod benchmark_gate;
 pub mod cache;
 pub mod leased_checkpoint;
 pub mod persisted_query;
