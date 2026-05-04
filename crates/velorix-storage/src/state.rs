@@ -206,12 +206,21 @@ impl CheckpointPublisher {
         self.write_output_object(output).await
     }
 
-    pub async fn publish_manifest(
+    /// Runs manifest publication checks that do not depend on newly written
+    /// state or output objects.
+    pub async fn preflight_manifest_publication(
         &self,
         manifest: &CheckpointManifest,
     ) -> Result<(), CheckpointPublishError> {
         manifest.validate()?;
-        self.validate_parent_manifest_visible(manifest).await?;
+        self.validate_parent_manifest_visible(manifest).await
+    }
+
+    pub async fn publish_manifest(
+        &self,
+        manifest: &CheckpointManifest,
+    ) -> Result<(), CheckpointPublishError> {
+        self.preflight_manifest_publication(manifest).await?;
         self.validate_state_objects_exist(manifest).await?;
         self.validate_output_objects_exist(manifest).await?;
 

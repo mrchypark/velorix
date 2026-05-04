@@ -3634,6 +3634,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "url",
+ "velorix-control",
  "velorix-core",
  "velorix-storage",
 ]

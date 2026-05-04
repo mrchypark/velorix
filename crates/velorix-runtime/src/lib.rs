@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod cache;
+pub mod leased_checkpoint;
 pub mod persisted_query;
 pub mod persisted_table;
 pub mod persisted_view;

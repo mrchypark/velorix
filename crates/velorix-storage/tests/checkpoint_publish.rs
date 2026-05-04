@@ -410,6 +410,35 @@ async fn checkpoint_publish_rejects_child_manifest_when_parent_manifest_is_missi
 }
 
 #[tokio::test]
+async fn checkpoint_publish_preflight_rejects_missing_parent_without_child_objects() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let child_state = state_write(1, "state-0002", b"state-1");
+    let child = manifest(1, state_ref(&child_state));
+
+    let err = publisher
+        .preflight_manifest_publication(&child)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        CheckpointPublishError::MissingParentManifest {
+            checkpoint_version: 1,
+            parent_checkpoint: 0
+        }
+    ));
+    assert!(store
+        .head(&Path::from(child_state.object_key().as_str()))
+        .await
+        .is_err());
+    assert!(store
+        .head(&Path::from(child.object_key().as_str()))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
 async fn checkpoint_publish_accepts_child_manifest_after_parent_manifest_is_visible() {
     let (_temp_dir, store) = temp_store();
     let publisher = CheckpointPublisher::new(store);
@@ -471,6 +500,48 @@ async fn checkpoint_publish_rejects_child_manifest_that_regresses_parent_input_b
     let err = publisher.publish_manifest(&child).await.unwrap_err();
 
     assert!(err.to_string().contains("regresses parent input boundary"));
+    assert!(store
+        .head(&Path::from(child.object_key().as_str()))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn checkpoint_publish_preflight_rejects_regressed_parent_input_without_child_objects() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let parent_state = state_write(0, "state-0001", b"state-0");
+    let child_state = state_write(1, "state-0002", b"state-1");
+    let parent = manifest(
+        0,
+        publisher.write_state_object(&parent_state).await.unwrap(),
+    );
+    let mut child = manifest(1, state_ref(&child_state));
+    child.input_ranges = vec![input_range_for("orders", 0, 0, 9)];
+
+    publisher.publish_manifest(&parent).await.unwrap();
+    let err = publisher
+        .preflight_manifest_publication(&child)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        CheckpointPublishError::RegressedParentInputBoundary {
+            checkpoint_version: 1,
+            parent_checkpoint: 0,
+            stream_id,
+            partition_id: 0,
+            parent_start_offset_inclusive: 0,
+            parent_end_offset_exclusive: 10,
+            child_start_offset_inclusive: 0,
+            child_end_offset_exclusive: 9,
+        } if stream_id == "orders"
+    ));
+    assert!(store
+        .head(&Path::from(child_state.object_key().as_str()))
+        .await
+        .is_err());
     assert!(store
         .head(&Path::from(child.object_key().as_str()))
         .await
