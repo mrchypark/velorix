@@ -91,6 +91,7 @@ materialized outputs, not a batch warehouse table format as the core authority.
 
 ## Document Set
 
+- [Ingest Storage Format Decision](ingest-storage-format-decision.md)
 - [OpenData Package Review](package-review-opendata.md)
 - [Arroyo Package Review](package-review-arroyo.md)
 - [Feldera and Core Package Review](package-review-feldera-and-core-packages.md)

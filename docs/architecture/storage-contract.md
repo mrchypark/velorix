@@ -41,6 +41,78 @@ For v1 read compatibility, manifests whose output refs omit
 the missing metadata as authority. Legacy output refs that point at `v1/ingest`
 are rejected as output key mismatches under the new contract.
 
+The ingest object key layout remains stable. Current bootstrap code still
+replays JSON `DeltaBatch` ingest payloads, but that durable payload shape is
+deprecated by the accepted breaking direction: versioned Arrow IPC ingest
+envelopes; see
+[Ingest Storage Format Decision](ingest-storage-format-decision.md).
+
+## Ingest API Acknowledgement Semantics
+
+Ingest acknowledgement is scoped to durable input admission only. It must not
+claim that SQL processing, materialized view updates, output publication, or
+checkpoint publication has completed. View freshness and checkpoint progress
+belong to separate status surfaces over checkpoint manifests.
+
+A synchronous ingest API should use these meanings:
+
+| Response | Meaning | Durability claim |
+| --- | --- | --- |
+| `201 Created` | A new canonical ingest batch object was created with create-only semantics. | The input batch is durable in object storage. |
+| `200 OK` | A retry found the same canonical ingest batch identity with the same payload digest. | The input batch was already durable in object storage. |
+| `409 Conflict` | The requested identity conflicts with an existing key, digest, idempotency mapping, or committed range. | No new durability claim. |
+| `202 Accepted` | Future async admission only, before final batch object creation. | Not durable unless a separate durable admission record says so. |
+
+`201 Created` is allowed only after the canonical `v1/ingest/...batch` object
+write succeeds through the object-store create-only path. A crash before that
+write commits must yield no successful durable acknowledgement. A crash after
+the object write succeeds but before the client receives the response must be
+recoverable through retry: if the retry presents the same batch identity and
+payload digest, the API should return `200 OK`.
+
+Idempotency must bind to the canonical ingest identity, not just to an opaque
+request token. For the current deterministic batch-key path, the identity is
+`stream_id`, `partition_id`, half-open offset range `[start, end)`, and payload
+digest. Reusing the same idempotency key for a different stream, partition,
+range, or digest is a conflict. Reusing the same object key with a different
+payload digest is also a conflict.
+
+Committed ingest ranges are half-open intervals. Adjacent ranges such as
+`[0, 10)` and `[10, 20)` are allowed. Overlapping ranges for the same
+stream/partition are rejected. Ingest admission must evaluate overlap against
+committed `v1/ingest` batch objects, not against checkpoint manifests, because
+manifests are processing progress authority rather than ingest admission
+authority.
+
+Every successful ingest response should include an explicit status body rather
+than relying on the HTTP code alone. The durable synchronous shape is:
+
+```json
+{
+  "ingest_status": "created",
+  "durability": "object_created",
+  "batch_key": "v1/ingest/orders/p=0000000000/00000000000000000000-00000000000000000100.batch",
+  "stream_id": "orders",
+  "partition_id": 0,
+  "start_offset_inclusive": 0,
+  "end_offset_exclusive": 100,
+  "digest": "sha256:<hex>",
+  "materialization_status": "pending",
+  "checkpoint_version": null
+}
+```
+
+`materialization_status` is advisory in the ingest response. It must not be the
+source of truth for view freshness. A separate view or checkpoint status API
+should report whether a view has processed a given stream/partition offset.
+
+`202 Accepted` should remain future work until Velorix has a write buffer or
+coordinator with a clear status endpoint and final states such as `created`,
+`duplicate`, `conflict`, `failed`, and `expired`. If the accepted record itself
+is not durable, the response body must say `durability: not_durable`. Foyer,
+process memory, and worker-local files must never be used as the basis for a
+persistent ingest acknowledgement.
+
 ## Manifest Semantics
 
 A `CheckpointManifest` is the only durable authority for stream progress. The
