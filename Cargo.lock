@@ -3643,12 +3643,14 @@ dependencies = [
 name = "velorix-storage"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "async-trait",
  "bytes",
  "futures",
  "object_store 0.12.5",
  "serde",
  "serde_json",
+ "sha2",
  "slatedb",
  "tempfile",
  "thiserror 2.0.18",

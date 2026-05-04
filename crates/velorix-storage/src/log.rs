@@ -7,6 +7,7 @@ use thiserror::Error;
 
 use crate::{
     capability::{ObjectStoreCapabilityError, ObjectStoreCapabilityProfile},
+    ingest_envelope::{IngestEnvelope, IngestEnvelopeError},
     object_key::{ObjectKey, ObjectKeyError},
 };
 
@@ -69,6 +70,8 @@ pub enum IngestLogError {
         partition_id: u32,
     },
     #[error(transparent)]
+    IngestEnvelope(#[from] IngestEnvelopeError),
+    #[error(transparent)]
     ObjectStore(#[from] object_store::Error),
 }
 
@@ -106,6 +109,21 @@ impl IngestLog {
         }
     }
 
+    /// Validates an Arrow IPC ingest envelope and appends it as a create-only
+    /// durable ingest object. Production ingest callers should use this path
+    /// instead of constructing unchecked [`IngestBatch`] values directly.
+    pub async fn append_validated_envelope(
+        &self,
+        payload: Bytes,
+    ) -> Result<IngestBatchDescriptor, IngestLogError> {
+        let batch = IngestBatch::from_validated_envelope(payload)?;
+        let descriptor = batch.descriptor();
+
+        self.append(&batch).await?;
+
+        Ok(descriptor)
+    }
+
     pub async fn list_committed(&self) -> Result<Vec<IngestBatchDescriptor>, IngestLogError> {
         let mut objects = self
             .store
@@ -125,6 +143,12 @@ impl IngestLog {
         Ok(descriptors)
     }
 
+    /// Replays committed batches without validating payload bytes.
+    ///
+    /// This remains for bootstrap/local compatibility while runtime replay is
+    /// still migrating off the pre-envelope JSON path. Production envelope
+    /// callers should use [`Self::replay_validated_envelopes_from`] so corrupt
+    /// or mismatched committed objects fail closed before replay.
     pub async fn replay_from(
         &self,
         checkpoints: &[ReplayCheckpoint],
@@ -162,9 +186,57 @@ impl IngestLog {
 
         Ok(batches)
     }
+
+    /// Replays committed batches only after validating each object body as a
+    /// V1 Arrow IPC ingest envelope and matching its authoritative header
+    /// against the deterministic object key descriptor.
+    pub async fn replay_validated_envelopes_from(
+        &self,
+        checkpoints: &[ReplayCheckpoint],
+    ) -> Result<Vec<IngestBatch>, IngestLogError> {
+        let checkpoint_offsets = validate_checkpoints(checkpoints)?;
+
+        let mut batches = Vec::new();
+        for descriptor in self.list_committed().await? {
+            let checkpoint_end = checkpoint_offsets
+                .get(&(descriptor.stream_id.clone(), descriptor.partition_id))
+                .copied()
+                .unwrap_or(0);
+
+            if descriptor.end_offset_exclusive <= checkpoint_end {
+                continue;
+            }
+
+            if descriptor.start_offset_inclusive < checkpoint_end
+                && checkpoint_end < descriptor.end_offset_exclusive
+            {
+                return Err(IngestLogError::CheckpointInsideBatch {
+                    checkpoint_end_offset_exclusive: checkpoint_end,
+                    object_key: descriptor.object_key,
+                });
+            }
+
+            let bytes = self
+                .store
+                .get(&Path::from(descriptor.object_key.as_str()))
+                .await?
+                .bytes()
+                .await?;
+            let envelope = IngestEnvelope::decode(bytes.clone())?;
+            envelope.validate_descriptor(&descriptor)?;
+            batches.push(IngestBatch::from_descriptor(descriptor, bytes));
+        }
+
+        Ok(batches)
+    }
 }
 
 impl IngestBatch {
+    /// Constructs an ingest batch from unchecked opaque bytes.
+    ///
+    /// This remains for bootstrap/local compatibility while runtime replay
+    /// still supports the pre-envelope JSON path. Production durable ingest
+    /// callers should use [`Self::from_validated_envelope`] instead.
     pub fn new(
         stream_id: impl Into<String>,
         partition_id: u32,
@@ -186,6 +258,37 @@ impl IngestBatch {
             end_offset_exclusive,
             object_key,
         };
+
+        Ok(Self {
+            descriptor,
+            payload,
+        })
+    }
+
+    /// Constructs an appendable ingest batch from a validated V1 Arrow IPC
+    /// envelope. Production durable ingest callers should use this boundary.
+    ///
+    /// [`Self::new`] remains available only for bootstrap/local compatibility
+    /// paths that still need to pass unchecked opaque bytes through the storage
+    /// log while runtime replay is being rewritten.
+    pub fn from_validated_envelope(payload: Bytes) -> Result<Self, IngestLogError> {
+        let envelope = IngestEnvelope::decode(payload.clone())?;
+        let header = envelope.header();
+        let object_key = ObjectKey::ingest_batch(
+            &header.stream_id,
+            header.partition_id,
+            header.start_offset_inclusive,
+            header.end_offset_exclusive,
+        )?;
+        let descriptor = IngestBatchDescriptor {
+            stream_id: header.stream_id.clone(),
+            partition_id: header.partition_id,
+            start_offset_inclusive: header.start_offset_inclusive,
+            end_offset_exclusive: header.end_offset_exclusive,
+            object_key,
+        };
+
+        envelope.validate_descriptor(&descriptor)?;
 
         Ok(Self {
             descriptor,

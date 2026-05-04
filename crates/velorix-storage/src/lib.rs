@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod capability;
+pub mod ingest_envelope;
 pub mod log;
 pub mod manifest;
 pub mod object_key;
