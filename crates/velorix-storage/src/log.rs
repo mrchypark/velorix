@@ -5,7 +5,10 @@ use futures::TryStreamExt;
 use object_store::{path::Path, ObjectStore, PutMode};
 use thiserror::Error;
 
-use crate::object_key::{ObjectKey, ObjectKeyError};
+use crate::{
+    capability::{ObjectStoreCapabilityError, ObjectStoreCapabilityProfile},
+    object_key::{ObjectKey, ObjectKeyError},
+};
 
 const INGEST_PREFIX: &str = "v1/ingest";
 
@@ -70,8 +73,21 @@ pub enum IngestLogError {
 }
 
 impl IngestLog {
+    /// Constructs an ingest log without object-store capability validation.
+    /// Production/durable callers should use [`Self::new_checked`].
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
         Self { store }
+    }
+
+    /// Constructs an ingest log after validating the supplied object-store
+    /// profile has the capabilities required by Velorix durability.
+    pub fn new_checked(
+        store: Arc<dyn ObjectStore>,
+        profile: &ObjectStoreCapabilityProfile,
+    ) -> Result<Self, ObjectStoreCapabilityError> {
+        profile.validate_for_velorix_durability()?;
+
+        Ok(Self::new(store))
     }
 
     pub async fn append(&self, batch: &IngestBatch) -> Result<(), IngestLogError> {

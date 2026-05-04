@@ -9,6 +9,7 @@ use object_store::{path::Path, ObjectStore, PutMode};
 use thiserror::Error;
 
 use crate::{
+    capability::{ObjectStoreCapabilityError, ObjectStoreCapabilityProfile},
     manifest::{
         CheckpointManifest, ManifestError, OutputObjectRef, PartitionOwnerClaim, StateObjectRef,
     },
@@ -54,6 +55,8 @@ pub enum CheckpointPublishError {
     ObjectKey(#[from] ObjectKeyError),
     #[error(transparent)]
     Manifest(#[from] ManifestError),
+    #[error(transparent)]
+    ObjectStoreCapability(#[from] ObjectStoreCapabilityError),
     #[error("state object `{0}` already exists")]
     StateObjectAlreadyExists(ObjectKey),
     #[error("output object `{0}` already exists")]
@@ -135,11 +138,28 @@ pub enum CheckpointPublishError {
 }
 
 impl CheckpointPublisher {
+    /// Constructs a checkpoint publisher without object-store capability
+    /// validation. Production/durable callers should use [`Self::new_checked`].
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
         let state_store = Arc::new(RawObjectStateStore::new(Arc::clone(&store)));
         Self { store, state_store }
     }
 
+    /// Constructs a checkpoint publisher after validating the supplied
+    /// object-store profile has the capabilities required by Velorix
+    /// durability.
+    pub fn new_checked(
+        store: Arc<dyn ObjectStore>,
+        profile: &ObjectStoreCapabilityProfile,
+    ) -> Result<Self, ObjectStoreCapabilityError> {
+        profile.validate_for_velorix_durability()?;
+
+        Ok(Self::new(store))
+    }
+
+    /// Constructs a checkpoint publisher with a caller-supplied state store
+    /// without object-store capability validation. Production/durable callers
+    /// should use [`Self::with_state_store_checked`].
     pub fn with_state_store(
         store: Arc<dyn ObjectStore>,
         state_store: Arc<dyn StateObjectStore>,
@@ -147,6 +167,23 @@ impl CheckpointPublisher {
         Self { store, state_store }
     }
 
+    /// Constructs a checkpoint publisher with a caller-supplied state store
+    /// after validating the object-store profile. Production/durable callers
+    /// that do not use the raw object state store should use this checked
+    /// variant.
+    pub fn with_state_store_checked(
+        store: Arc<dyn ObjectStore>,
+        state_store: Arc<dyn StateObjectStore>,
+        profile: &ObjectStoreCapabilityProfile,
+    ) -> Result<Self, ObjectStoreCapabilityError> {
+        profile.validate_for_velorix_durability()?;
+
+        Ok(Self::with_state_store(store, state_store))
+    }
+
+    /// Constructs a checkpoint publisher with a SlateDB state store without
+    /// object-store capability validation. Production/durable callers should
+    /// use [`Self::with_slatedb_state_store_checked`].
     pub async fn with_slatedb_state_store(
         store: Arc<dyn ObjectStore>,
         db_path: impl Into<Path>,
@@ -154,6 +191,19 @@ impl CheckpointPublisher {
         let state_store = SlateDbStateStore::open(db_path, Arc::clone(&store)).await?;
 
         Ok(Self::with_state_store(store, Arc::new(state_store)))
+    }
+
+    /// Constructs a checkpoint publisher with a SlateDB state store after
+    /// validating the supplied object-store profile has the capabilities
+    /// required by Velorix durability.
+    pub async fn with_slatedb_state_store_checked(
+        store: Arc<dyn ObjectStore>,
+        db_path: impl Into<Path>,
+        profile: &ObjectStoreCapabilityProfile,
+    ) -> Result<Self, CheckpointPublishError> {
+        profile.validate_for_velorix_durability()?;
+
+        Self::with_slatedb_state_store(store, db_path).await
     }
 
     pub async fn write_state_object(

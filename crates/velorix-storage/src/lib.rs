@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod capability;
 pub mod log;
 pub mod manifest;
 pub mod object_key;
