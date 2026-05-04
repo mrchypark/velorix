@@ -227,6 +227,10 @@ impl CheckpointPublisher {
         self.state_store.write_state_object(state).await
     }
 
+    pub fn produced_state_ref_type(&self) -> StateRefType {
+        self.state_store.produced_state_ref_type()
+    }
+
     pub async fn write_state_object_fenced(
         &self,
         state: &StateObjectWrite,

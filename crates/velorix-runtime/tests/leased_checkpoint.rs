@@ -10,6 +10,7 @@ use velorix_storage::{
         CheckpointManifest, InputRange, OutputObjectRef, PartitionOwnerClaim, StateObjectRef,
         StateRefType,
     },
+    ownership::OwnershipEpochRecord,
     state::{CheckpointPublishError, CheckpointPublisher, OutputObjectWrite, StateObjectWrite},
 };
 
@@ -91,6 +92,12 @@ fn state_ref(state: &StateObjectWrite) -> StateObjectRef {
     }
 }
 
+fn slatedb_state_ref(state: &StateObjectWrite) -> StateObjectRef {
+    let mut state_ref = state_ref(state);
+    state_ref.ref_type = StateRefType::SlateDbCheckpoint;
+    state_ref
+}
+
 fn output_ref(output: &OutputObjectWrite) -> OutputObjectRef {
     OutputObjectRef {
         object_id: output.object_id().to_string(),
@@ -101,6 +108,24 @@ fn output_ref(output: &OutputObjectWrite) -> OutputObjectRef {
         start_offset_inclusive: output.start_offset_inclusive(),
         end_offset_exclusive: output.end_offset_exclusive(),
         owner_claim: output.owner_claim().cloned(),
+    }
+}
+
+fn ownership_record(
+    stream_id: &str,
+    partition_id: u32,
+    owner_id: &str,
+    owner_epoch: u64,
+) -> OwnershipEpochRecord {
+    OwnershipEpochRecord {
+        stream_id: stream_id.to_string(),
+        partition_id,
+        owner_id: owner_id.to_string(),
+        owner_epoch,
+        lease_identity: format!("{owner_id}-lease"),
+        created_at: "2026-05-05T00:00:00Z".to_string(),
+        previous_epoch: owner_epoch.checked_sub(1),
+        previous_checkpoint_version: owner_epoch.checked_sub(1),
     }
 }
 
@@ -537,4 +562,186 @@ async fn leased_checkpoint_rejects_stale_lower_epoch_grant_through_storage_fence
         .head(&Path::from(stale_state.object_key().as_str()))
         .await
         .is_err());
+}
+
+#[tokio::test]
+async fn leased_checkpoint_production_rejects_missing_ownership_record_before_durable_writes() {
+    let (_temp_dir, store) = temp_store();
+    let publisher =
+        CheckpointPublisher::with_slatedb_state_store(Arc::clone(&store), "v1/slatedb/state")
+            .await
+            .unwrap();
+    let leased = LeasedCheckpointPublisher::new(publisher.clone());
+    let grant = grant("worker-a", 7, 2_000);
+    let claim = owner_claim("worker-a", 7);
+    let state = state_write(0, 0, "state-0001", claim.clone(), b"state");
+    let output = output_write(0, 0, "out-0001", claim, b"output");
+    let manifest = manifest(
+        0,
+        vec![input_range("orders", 0)],
+        vec![slatedb_state_ref(&state)],
+        vec![output_ref(&output)],
+    );
+
+    let err = leased
+        .publish_production(
+            grant,
+            1_000,
+            vec![state.clone()],
+            vec![output.clone()],
+            manifest.clone(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        LeasedCheckpointError::Publish(CheckpointPublishError::MissingOwnershipEpochRecord(_))
+    ));
+    assert_eq!(publisher.latest_manifest().await.unwrap(), None);
+    assert!(publisher
+        .read_state_object(&manifest.state_objects[0])
+        .await
+        .is_err());
+    assert!(store
+        .head(&Path::from(output.object_key().as_str()))
+        .await
+        .is_err());
+    assert!(store
+        .head(&Path::from(manifest.object_key().as_str()))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn leased_checkpoint_production_rejects_raw_state_store_before_durable_writes() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let leased = LeasedCheckpointPublisher::new(publisher.clone());
+    let grant = grant("worker-a", 7, 2_000);
+    let claim = owner_claim("worker-a", 7);
+    publisher
+        .create_ownership_epoch_record(&ownership_record("orders", 0, "worker-a", 7))
+        .await
+        .unwrap();
+    publisher
+        .create_ownership_epoch_record(&ownership_record("settlements", 0, "worker-a", 7))
+        .await
+        .unwrap();
+    let state = state_write(0, 0, "state-0001", claim.clone(), b"state");
+    let output = output_write(0, 0, "out-0001", claim, b"output");
+    let manifest = manifest(
+        0,
+        vec![input_range("orders", 0)],
+        vec![slatedb_state_ref(&state)],
+        vec![output_ref(&output)],
+    );
+
+    let err = leased
+        .publish_production(
+            grant,
+            1_000,
+            vec![state.clone()],
+            vec![output.clone()],
+            manifest.clone(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        LeasedCheckpointError::ProductionStateStoreRefTypeMismatch {
+            expected: StateRefType::SlateDbCheckpoint,
+            actual: StateRefType::RawObject
+        }
+    ));
+    assert_eq!(publisher.latest_manifest().await.unwrap(), None);
+    assert!(store
+        .head(&Path::from(state.object_key().as_str()))
+        .await
+        .is_err());
+    assert!(store
+        .head(&Path::from(output.object_key().as_str()))
+        .await
+        .is_err());
+    assert!(store
+        .head(&Path::from(manifest.object_key().as_str()))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn leased_checkpoint_production_publishes_with_slatedb_refs_and_ownership_records() {
+    let (_temp_dir, store) = temp_store();
+    let publisher =
+        CheckpointPublisher::with_slatedb_state_store(Arc::clone(&store), "v1/slatedb/state")
+            .await
+            .unwrap();
+    let leased = LeasedCheckpointPublisher::new(publisher.clone());
+    let grant = grant("worker-a", 7, 2_000);
+    let claim = owner_claim("worker-a", 7);
+    publisher
+        .create_ownership_epoch_record(&ownership_record("orders", 0, "worker-a", 7))
+        .await
+        .unwrap();
+    publisher
+        .create_ownership_epoch_record(&ownership_record("settlements", 0, "worker-a", 7))
+        .await
+        .unwrap();
+    let state = state_write(0, 0, "state-0001", claim.clone(), b"state");
+    let output = output_write(0, 0, "out-0001", claim.clone(), b"output");
+    let manifest = manifest(
+        0,
+        vec![input_range("orders", 0)],
+        vec![slatedb_state_ref(&state)],
+        vec![output_ref(&output)],
+    );
+
+    leased
+        .publish_production(
+            grant,
+            1_000,
+            vec![state.clone()],
+            vec![output],
+            manifest.clone(),
+        )
+        .await
+        .unwrap();
+
+    let latest = publisher.latest_manifest().await.unwrap().unwrap();
+    assert_eq!(latest, manifest);
+    assert_eq!(
+        latest.state_objects[0].ref_type,
+        StateRefType::SlateDbCheckpoint
+    );
+    assert_eq!(
+        publisher
+            .read_state_object(&latest.state_objects[0])
+            .await
+            .unwrap(),
+        state.bytes().clone()
+    );
+}
+
+#[tokio::test]
+async fn leased_checkpoint_bootstrap_publish_still_accepts_raw_state_refs() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let leased = LeasedCheckpointPublisher::new(publisher.clone());
+    let grant = grant("worker-a", 7, 2_000);
+    let claim = owner_claim("worker-a", 7);
+    let state = state_write(0, 0, "state-0001", claim.clone(), b"state");
+    let manifest = manifest(
+        0,
+        vec![input_range("orders", 0)],
+        vec![state_ref(&state)],
+        vec![],
+    );
+
+    leased
+        .publish(grant, 1_000, vec![state], vec![], manifest.clone())
+        .await
+        .unwrap();
+
+    assert_eq!(publisher.latest_manifest().await.unwrap(), Some(manifest));
 }

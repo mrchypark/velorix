@@ -58,6 +58,11 @@ pub enum LeasedCheckpointError {
         expected: Vec<OutputObjectRef>,
         actual: Vec<OutputObjectRef>,
     },
+    #[error("production state store produces `{actual:?}` state refs, expected `{expected:?}`")]
+    ProductionStateStoreRefTypeMismatch {
+        expected: StateRefType,
+        actual: StateRefType,
+    },
     #[error(transparent)]
     Publish(#[from] CheckpointPublishError),
 }
@@ -102,6 +107,52 @@ impl LeasedCheckpointPublisher {
 
         self.publisher
             .publish_manifest_fenced(&manifest, &owner_claim)
+            .await?;
+
+        Ok(())
+    }
+
+    pub async fn publish_production(
+        &self,
+        grant: PartitionLeaseGrant,
+        now_unix_ms: u64,
+        state_objects: Vec<StateObjectWrite>,
+        output_objects: Vec<OutputObjectWrite>,
+        manifest: CheckpointManifest,
+    ) -> Result<(), LeasedCheckpointError> {
+        validate_grant_unexpired(&grant, now_unix_ms)?;
+        manifest.validate()?;
+
+        let owner_claim = PartitionOwnerClaim::from(grant.clone());
+        validate_single_grant_partition(&grant, &manifest)?;
+        validate_input_stream(&grant, &manifest)?;
+        validate_state_writes(&grant, &owner_claim, &state_objects)?;
+        validate_output_writes(&grant, &owner_claim, &output_objects)?;
+        validate_production_state_store_ref_type(self.publisher.produced_state_ref_type())?;
+        validate_manifest_refs_match_writes_with_state_ref_type(
+            &manifest,
+            &state_objects,
+            &output_objects,
+            StateRefType::SlateDbCheckpoint,
+        )?;
+        self.publisher
+            .preflight_manifest_publication(&manifest)
+            .await?;
+
+        for state in &state_objects {
+            self.publisher
+                .write_state_object_fenced_production(state, &grant.key.stream_id, &owner_claim)
+                .await?;
+        }
+
+        for output in &output_objects {
+            self.publisher
+                .write_output_object_fenced_production(output, &owner_claim)
+                .await?;
+        }
+
+        self.publisher
+            .publish_manifest_fenced_production(&manifest, &owner_claim)
             .await?;
 
         Ok(())
@@ -239,9 +290,23 @@ fn validate_manifest_refs_match_writes(
     state_objects: &[StateObjectWrite],
     output_objects: &[OutputObjectWrite],
 ) -> Result<(), LeasedCheckpointError> {
+    validate_manifest_refs_match_writes_with_state_ref_type(
+        manifest,
+        state_objects,
+        output_objects,
+        StateRefType::RawObject,
+    )
+}
+
+fn validate_manifest_refs_match_writes_with_state_ref_type(
+    manifest: &CheckpointManifest,
+    state_objects: &[StateObjectWrite],
+    output_objects: &[OutputObjectWrite],
+    state_ref_type: StateRefType,
+) -> Result<(), LeasedCheckpointError> {
     let expected_state_refs = state_objects
         .iter()
-        .map(state_object_ref)
+        .map(|state| state_object_ref(state, state_ref_type))
         .collect::<Vec<_>>();
     if manifest.state_objects != expected_state_refs {
         return Err(LeasedCheckpointError::StateRefsMismatch {
@@ -264,14 +329,28 @@ fn validate_manifest_refs_match_writes(
     Ok(())
 }
 
-fn state_object_ref(state: &StateObjectWrite) -> StateObjectRef {
+fn validate_production_state_store_ref_type(
+    actual: StateRefType,
+) -> Result<(), LeasedCheckpointError> {
+    let expected = StateRefType::SlateDbCheckpoint;
+    if actual != expected {
+        return Err(LeasedCheckpointError::ProductionStateStoreRefTypeMismatch {
+            expected,
+            actual,
+        });
+    }
+
+    Ok(())
+}
+
+fn state_object_ref(state: &StateObjectWrite, ref_type: StateRefType) -> StateObjectRef {
     StateObjectRef {
         object_id: state.object_id().to_string(),
         object_key: state.object_key().clone(),
         owner: state.owner().to_string(),
         partition_id: state.partition_id(),
         checkpoint_version: state.checkpoint_version(),
-        ref_type: StateRefType::RawObject,
+        ref_type,
         owner_claim: state.owner_claim().cloned(),
     }
 }

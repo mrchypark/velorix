@@ -12,6 +12,8 @@ use crate::{
 
 #[async_trait]
 pub trait StateObjectStore: fmt::Debug + Send + Sync {
+    fn produced_state_ref_type(&self) -> StateRefType;
+
     async fn write_state_object(
         &self,
         state: &StateObjectWrite,
@@ -71,6 +73,10 @@ impl fmt::Debug for SlateDbStateStore {
 
 #[async_trait]
 impl StateObjectStore for RawObjectStateStore {
+    fn produced_state_ref_type(&self) -> StateRefType {
+        StateRefType::RawObject
+    }
+
     async fn write_state_object(
         &self,
         state: &StateObjectWrite,
@@ -130,6 +136,10 @@ impl StateObjectStore for RawObjectStateStore {
 
 #[async_trait]
 impl StateObjectStore for SlateDbStateStore {
+    fn produced_state_ref_type(&self) -> StateRefType {
+        StateRefType::SlateDbCheckpoint
+    }
+
     async fn write_state_object(
         &self,
         state: &StateObjectWrite,
