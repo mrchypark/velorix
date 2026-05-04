@@ -47,6 +47,8 @@ pub struct OutputObjectRef {
     pub object_key: ObjectKey,
     pub stream_id: String,
     pub partition_id: u32,
+    #[serde(default = "legacy_missing_output_checkpoint_version")]
+    pub checkpoint_version: u64,
     pub start_offset_inclusive: u64,
     pub end_offset_exclusive: u64,
 }
@@ -109,6 +111,12 @@ pub enum ManifestError {
         object_id: String,
         start_offset_inclusive: u64,
         end_offset_exclusive: u64,
+    },
+    #[error("output object `{object_id}` belongs to checkpoint {output_checkpoint_version}, expected {manifest_checkpoint_version}")]
+    OutputObjectCheckpointMismatch {
+        object_id: String,
+        output_checkpoint_version: u64,
+        manifest_checkpoint_version: u64,
     },
     #[error("output object `{object_id}` key does not match its metadata: expected `{expected}`, actual `{actual}`")]
     OutputObjectKeyMismatch {
@@ -286,11 +294,13 @@ impl CheckpointManifest {
                 });
             }
 
-            let expected = ObjectKey::ingest_batch(
+            let expected = ObjectKey::output_object(
                 &output_object.stream_id,
                 output_object.partition_id,
+                output_object.checkpoint_version,
                 output_object.start_offset_inclusive,
                 output_object.end_offset_exclusive,
+                &output_object.object_id,
             )
             .map_err(|_| ManifestError::OutputObjectKeyMismatch {
                 object_id: output_object.object_id.clone(),
@@ -303,6 +313,14 @@ impl CheckpointManifest {
                     object_id: output_object.object_id.clone(),
                     expected,
                     actual: output_object.object_key.clone(),
+                });
+            }
+
+            if output_object.checkpoint_version != self.checkpoint_version {
+                return Err(ManifestError::OutputObjectCheckpointMismatch {
+                    object_id: output_object.object_id.clone(),
+                    output_checkpoint_version: output_object.checkpoint_version,
+                    manifest_checkpoint_version: self.checkpoint_version,
                 });
             }
         }
@@ -335,6 +353,10 @@ impl CheckpointManifest {
 
         Ok(())
     }
+}
+
+fn legacy_missing_output_checkpoint_version() -> u64 {
+    u64::MAX
 }
 
 enum ObjectRef<'a> {
@@ -383,6 +405,7 @@ mod tests {
             object_key,
             stream_id: "settlements".to_string(),
             partition_id: 0,
+            checkpoint_version: 1,
             start_offset_inclusive: 20,
             end_offset_exclusive: 25,
         }
@@ -404,7 +427,7 @@ mod tests {
             )],
             output_objects: vec![output_ref(
                 "out-0001",
-                ObjectKey::ingest_batch("settlements", 0, 20, 25).unwrap(),
+                ObjectKey::output_object("settlements", 0, 1, 20, 25, "out-0001").unwrap(),
             )],
             parent_checkpoint: Some(0),
             created_at: "2026-05-03T00:00:00Z".to_string(),
@@ -465,14 +488,100 @@ mod tests {
     fn checkpoint_manifest_rejects_output_ref_object_key_mismatch() {
         let mut manifest = valid_manifest();
         manifest.output_objects[0].object_key =
-            ObjectKey::ingest_batch("settlements", 1, 20, 25).unwrap();
+            ObjectKey::output_object("settlements", 1, 1, 20, 25, "out-0001").unwrap();
 
         assert_eq!(
             manifest.validate(),
             Err(ManifestError::OutputObjectKeyMismatch {
                 object_id: "out-0001".to_string(),
-                expected: ObjectKey::ingest_batch("settlements", 0, 20, 25).unwrap(),
-                actual: ObjectKey::ingest_batch("settlements", 1, 20, 25).unwrap(),
+                expected: ObjectKey::output_object("settlements", 0, 1, 20, 25, "out-0001")
+                    .unwrap(),
+                actual: ObjectKey::output_object("settlements", 1, 1, 20, 25, "out-0001").unwrap(),
+            })
+        );
+    }
+
+    #[test]
+    fn checkpoint_manifest_rejects_output_ref_in_ingest_namespace() {
+        let mut manifest = valid_manifest();
+        manifest.output_objects[0].object_key =
+            ObjectKey::ingest_batch("settlements", 0, 20, 25).unwrap();
+
+        assert_eq!(
+            manifest.validate(),
+            Err(ManifestError::OutputObjectKeyMismatch {
+                object_id: "out-0001".to_string(),
+                expected: ObjectKey::output_object("settlements", 0, 1, 20, 25, "out-0001")
+                    .unwrap(),
+                actual: ObjectKey::ingest_batch("settlements", 0, 20, 25).unwrap(),
+            })
+        );
+    }
+
+    #[test]
+    fn checkpoint_manifest_deserializes_old_output_ref_without_checkpoint_version_then_rejects_ingest_key(
+    ) {
+        let value = serde_json::json!({
+            "schema_version": 1,
+            "checkpoint_version": 1,
+            "input_ranges": [{
+                "stream_id": "orders",
+                "partition_id": 0,
+                "start_offset_inclusive": 10,
+                "end_offset_exclusive": 20
+            }],
+            "state_objects": [{
+                "object_id": "state-0001",
+                "object_key": "v1/state/balances_by_account/p=0000000000/chk=00000000000000000001/state-0001.state",
+                "owner": "balances_by_account",
+                "partition_id": 0,
+                "checkpoint_version": 1
+            }],
+            "output_objects": [{
+                "object_id": "out-0001",
+                "object_key": "v1/ingest/settlements/p=0000000000/00000000000000000020-00000000000000000025.batch",
+                "stream_id": "settlements",
+                "partition_id": 0,
+                "start_offset_inclusive": 20,
+                "end_offset_exclusive": 25
+            }],
+            "parent_checkpoint": 0,
+            "created_at": "2026-05-03T00:00:00Z"
+        });
+
+        let manifest: CheckpointManifest = serde_json::from_value(value).unwrap();
+
+        assert_eq!(
+            manifest.validate(),
+            Err(ManifestError::OutputObjectKeyMismatch {
+                object_id: "out-0001".to_string(),
+                expected: ObjectKey::output_object(
+                    "settlements",
+                    0,
+                    manifest.output_objects[0].checkpoint_version,
+                    20,
+                    25,
+                    "out-0001"
+                )
+                .unwrap(),
+                actual: ObjectKey::ingest_batch("settlements", 0, 20, 25).unwrap(),
+            })
+        );
+    }
+
+    #[test]
+    fn checkpoint_manifest_rejects_output_ref_from_different_checkpoint() {
+        let mut manifest = valid_manifest();
+        manifest.output_objects[0].checkpoint_version = 2;
+        manifest.output_objects[0].object_key =
+            ObjectKey::output_object("settlements", 0, 2, 20, 25, "out-0001").unwrap();
+
+        assert_eq!(
+            manifest.validate(),
+            Err(ManifestError::OutputObjectCheckpointMismatch {
+                object_id: "out-0001".to_string(),
+                output_checkpoint_version: 2,
+                manifest_checkpoint_version: 1,
             })
         );
     }

@@ -19,6 +19,16 @@ pub struct IngestBatchKeyParts {
     pub end_offset_exclusive: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutputObjectKeyParts {
+    pub stream_id: String,
+    pub partition_id: u32,
+    pub checkpoint_version: u64,
+    pub start_offset_inclusive: u64,
+    pub end_offset_exclusive: u64,
+    pub object_id: String,
+}
+
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum ObjectKeyError {
     #[error("object key segment `{0}` is empty")]
@@ -62,6 +72,23 @@ impl ObjectKey {
 
         Ok(Self(format!(
             "v1/state/{owner}/p={partition_id:0PARTITION_WIDTH$}/chk={checkpoint_version:0CHECKPOINT_WIDTH$}/{object_id}.state"
+        )))
+    }
+
+    pub fn output_object(
+        stream_id: &str,
+        partition_id: u32,
+        checkpoint_version: u64,
+        start_offset_inclusive: u64,
+        end_offset_exclusive: u64,
+        object_id: &str,
+    ) -> Result<Self, ObjectKeyError> {
+        validate_segment("stream_id", stream_id)?;
+        validate_segment("object_id", object_id)?;
+        validate_offset_range(start_offset_inclusive, end_offset_exclusive)?;
+
+        Ok(Self(format!(
+            "v1/outputs/{stream_id}/p={partition_id:0PARTITION_WIDTH$}/chk={checkpoint_version:0CHECKPOINT_WIDTH$}/{start_offset_inclusive:0OFFSET_WIDTH$}-{end_offset_exclusive:0OFFSET_WIDTH$}/{object_id}.output"
         )))
     }
 
@@ -120,6 +147,16 @@ impl ObjectKey {
         Ok((key, parts))
     }
 
+    pub fn parse_output_object(
+        value: impl Into<String>,
+    ) -> Result<(Self, OutputObjectKeyParts), ObjectKeyError> {
+        let value = value.into();
+        let key = Self::parse(value.clone())?;
+        let parts = parse_output_object_layout(&value)?;
+
+        Ok((key, parts))
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -157,6 +194,9 @@ fn validate_known_layout(value: &str) -> Result<(), ObjectKeyError> {
                 .strip_suffix(".state")
                 .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
             validate_segment("object_id", object_id)?;
+        }
+        ["v1", "outputs", stream_id, partition, checkpoint, range, object_file] => {
+            parse_output_object_parts(value, stream_id, partition, checkpoint, range, object_file)?;
         }
         ["v1", "tmp", checkpoint, attempt_or_object_id, kind] => {
             parse_fixed_u64("checkpoint_version", checkpoint, CHECKPOINT_WIDTH)?;
@@ -197,6 +237,18 @@ fn parse_ingest_batch_layout(value: &str) -> Result<IngestBatchKeyParts, ObjectK
     parse_ingest_batch_parts(value, stream_id, partition, range)
 }
 
+fn parse_output_object_layout(value: &str) -> Result<OutputObjectKeyParts, ObjectKeyError> {
+    let segments: Vec<_> = value.split('/').collect();
+
+    let ["v1", "outputs", stream_id, partition, checkpoint, range, object_file] =
+        segments.as_slice()
+    else {
+        return Err(ObjectKeyError::InvalidExternalKey(value.to_string()));
+    };
+
+    parse_output_object_parts(value, stream_id, partition, checkpoint, range, object_file)
+}
+
 fn parse_ingest_batch_parts(
     value: &str,
     stream_id: &str,
@@ -209,12 +261,7 @@ fn parse_ingest_batch_parts(
     let range = range
         .strip_suffix(".batch")
         .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
-    let (start, end) = range
-        .split_once('-')
-        .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
-    let start_offset_inclusive = parse_fixed_u64("start_offset_inclusive", start, OFFSET_WIDTH)?;
-    let end_offset_exclusive = parse_fixed_u64("end_offset_exclusive", end, OFFSET_WIDTH)?;
-    validate_offset_range(start_offset_inclusive, end_offset_exclusive)?;
+    let (start_offset_inclusive, end_offset_exclusive) = parse_offset_range(value, range)?;
 
     Ok(IngestBatchKeyParts {
         stream_id: stream_id.to_string(),
@@ -222,6 +269,45 @@ fn parse_ingest_batch_parts(
         start_offset_inclusive,
         end_offset_exclusive,
     })
+}
+
+fn parse_output_object_parts(
+    value: &str,
+    stream_id: &str,
+    partition: &str,
+    checkpoint: &str,
+    range: &str,
+    object_file: &str,
+) -> Result<OutputObjectKeyParts, ObjectKeyError> {
+    validate_segment("stream_id", stream_id)?;
+    let partition_id = parse_prefixed_u32("partition_id", partition, "p=", PARTITION_WIDTH)?;
+    let checkpoint_version =
+        parse_prefixed_u64("checkpoint_version", checkpoint, "chk=", CHECKPOINT_WIDTH)?;
+    let (start_offset_inclusive, end_offset_exclusive) = parse_offset_range(value, range)?;
+    let object_id = object_file
+        .strip_suffix(".output")
+        .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+    validate_segment("object_id", object_id)?;
+
+    Ok(OutputObjectKeyParts {
+        stream_id: stream_id.to_string(),
+        partition_id,
+        checkpoint_version,
+        start_offset_inclusive,
+        end_offset_exclusive,
+        object_id: object_id.to_string(),
+    })
+}
+
+fn parse_offset_range(value: &str, range: &str) -> Result<(u64, u64), ObjectKeyError> {
+    let (start, end) = range
+        .split_once('-')
+        .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+    let start_offset_inclusive = parse_fixed_u64("start_offset_inclusive", start, OFFSET_WIDTH)?;
+    let end_offset_exclusive = parse_fixed_u64("end_offset_exclusive", end, OFFSET_WIDTH)?;
+    validate_offset_range(start_offset_inclusive, end_offset_exclusive)?;
+
+    Ok((start_offset_inclusive, end_offset_exclusive))
 }
 
 fn parse_prefixed_u32(
@@ -353,6 +439,35 @@ mod tests {
             "v1/state/balances_by_account/p=0000000012/chk=00000000000000000009/state-0001.state"
         );
         assert_eq!(key, restarted);
+    }
+
+    #[test]
+    fn output_object_key_is_deterministic_and_checkpoint_scoped() {
+        let key = ObjectKey::output_object("settlements", 7, 9, 20, 25, "out-0001").unwrap();
+        let restarted = ObjectKey::output_object("settlements", 7, 9, 20, 25, "out-0001").unwrap();
+
+        assert_eq!(
+            key.as_str(),
+            "v1/outputs/settlements/p=0000000007/chk=00000000000000000009/00000000000000000020-00000000000000000025/out-0001.output"
+        );
+        assert_eq!(key, restarted);
+        assert_eq!(ObjectKey::parse(key.as_str()).unwrap(), key);
+
+        let (parsed_key, parts) = ObjectKey::parse_output_object(key.as_str()).unwrap();
+        assert_eq!(parsed_key, key);
+        assert_eq!(parts.stream_id, "settlements");
+        assert_eq!(parts.partition_id, 7);
+        assert_eq!(parts.checkpoint_version, 9);
+        assert_eq!(parts.start_offset_inclusive, 20);
+        assert_eq!(parts.end_offset_exclusive, 25);
+        assert_eq!(parts.object_id, "out-0001");
+    }
+
+    #[test]
+    fn parse_ingest_batch_rejects_output_object_keys() {
+        let output_key = ObjectKey::output_object("orders", 0, 1, 0, 10, "out-0001").unwrap();
+
+        assert!(ObjectKey::parse_ingest_batch(output_key.as_str()).is_err());
     }
 
     #[test]

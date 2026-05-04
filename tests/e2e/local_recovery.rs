@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use object_store::{local::LocalFileSystem, ObjectStore};
+use object_store::{local::LocalFileSystem, path::Path, ObjectStore};
 use serde_json::json;
 use tempfile::TempDir;
 use velorix_core::{
@@ -12,7 +12,8 @@ use velorix_core::{
 use velorix_runtime::recovery::RecoveredRuntime;
 use velorix_storage::{
     log::{IngestBatch, IngestLog},
-    manifest::{CheckpointManifest, InputRange, StateObjectRef},
+    manifest::{CheckpointManifest, InputRange, OutputObjectRef, StateObjectRef},
+    object_key::ObjectKey,
     state::{CheckpointPublisher, StateObjectWrite},
 };
 
@@ -80,6 +81,33 @@ fn input_range(
     InputRange {
         stream_id: stream_id.to_string(),
         partition_id,
+        start_offset_inclusive,
+        end_offset_exclusive,
+    }
+}
+
+fn output_ref(
+    stream_id: &str,
+    partition_id: u32,
+    checkpoint_version: u64,
+    start_offset_inclusive: u64,
+    end_offset_exclusive: u64,
+    object_id: &str,
+) -> OutputObjectRef {
+    OutputObjectRef {
+        object_id: object_id.to_string(),
+        object_key: ObjectKey::output_object(
+            stream_id,
+            partition_id,
+            checkpoint_version,
+            start_offset_inclusive,
+            end_offset_exclusive,
+            object_id,
+        )
+        .unwrap(),
+        stream_id: stream_id.to_string(),
+        partition_id,
+        checkpoint_version,
         start_offset_inclusive,
         end_offset_exclusive,
     }
@@ -162,8 +190,18 @@ async fn local_recovery_recovers_checkpointed_view_and_replays_only_later_ingest
     checkpointed_view.apply(&first_input).unwrap();
     let checkpointed_state = checkpointed_view.state();
     let state_ref = write_checkpoint_state(&publisher, 0, "state-0001", &checkpointed_state).await;
+    let output_ref = output_ref("orders", 0, 0, 3, 6, "materialized-out-0001");
+    store
+        .put(
+            &Path::from(output_ref.object_key.as_str()),
+            batch_bytes(&batch([input_delta("account-z", 99, 1)])).into(),
+        )
+        .await
+        .unwrap();
+    let mut checkpoint_manifest = manifest(3, state_ref);
+    checkpoint_manifest.output_objects = vec![output_ref];
     publisher
-        .publish_manifest(&manifest(3, state_ref))
+        .publish_manifest(&checkpoint_manifest)
         .await
         .unwrap();
 

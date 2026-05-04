@@ -3,7 +3,10 @@ use std::sync::Arc;
 use bytes::Bytes;
 use object_store::{local::LocalFileSystem, path::Path, ObjectStore};
 use tempfile::TempDir;
-use velorix_storage::log::{IngestBatch, IngestLog, ReplayCheckpoint};
+use velorix_storage::{
+    log::{IngestBatch, IngestLog, ReplayCheckpoint},
+    object_key::ObjectKey,
+};
 
 fn temp_store() -> (TempDir, Arc<dyn ObjectStore>) {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -73,6 +76,30 @@ async fn log_replay_skips_batches_covered_by_checkpoint_boundary() {
         .unwrap();
 
     assert_eq!(replayed, vec![next, other_partition, other_stream]);
+}
+
+#[tokio::test]
+async fn log_replay_ignores_output_namespace_objects_with_matching_ranges() {
+    let (_temp_dir, store) = temp_store();
+    let log = IngestLog::new(Arc::clone(&store));
+
+    let input = IngestBatch::new("orders", 0, 0, 10, Bytes::from_static(b"input")).unwrap();
+    let output_key = ObjectKey::output_object("orders", 0, 0, 10, 20, "out-0001").unwrap();
+
+    log.append(&input).await.unwrap();
+    store
+        .put(
+            &Path::from(output_key.as_str()),
+            Bytes::from_static(b"output").into(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        log.list_committed().await.unwrap(),
+        vec![input.descriptor()]
+    );
+    assert_eq!(log.replay_from(&[]).await.unwrap(), vec![input]);
 }
 
 #[tokio::test]

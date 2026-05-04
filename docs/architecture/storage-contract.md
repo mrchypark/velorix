@@ -18,8 +18,9 @@ segment.
 
 | Object | Key form | Authority |
 | --- | --- | --- |
-| Ingest batch | `v1/ingest/{stream_id}/p={partition_id:010}/{start:020}-{end:020}.batch` | Immutable input delta object |
+| Ingest batch | `v1/ingest/{stream_id}/p={partition_id:010}/{start:020}-{end:020}.batch` | Immutable input delta object; input-only namespace |
 | State object | `v1/state/{owner}/p={partition_id:010}/chk={checkpoint_version:020}/{object_id}.state` | Checkpoint-referenced state payload |
+| Output object | `v1/outputs/{stream_id}/p={partition_id:010}/chk={checkpoint_version:020}/{start:020}-{end:020}/{object_id}.output` | Manifest-referenced internal materialized output |
 | Temporary publish object | `v1/tmp/{checkpoint_version:020}/{attempt_or_object_id}/{kind}` | Non-authoritative staging location |
 | Checkpoint manifest | `v1/checkpoints/{checkpoint_version:020}.manifest` | Authoritative progress marker |
 | Persisted query spec | `v1/queries/{query_id}.query.json` | Create-only query SQL/policy catalog object |
@@ -28,6 +29,14 @@ segment.
 Structured constructors in `crates/velorix-storage/src/object_key.rs` own these
 formats. Call sites should not assemble storage paths with ad hoc string
 formatting.
+
+`v1/ingest` is reserved for committed input batches only. Internal
+materialized outputs must use `v1/outputs`, carry the manifest checkpoint
+version in both the key and `OutputObjectRef`, and are not replay candidates.
+For v1 read compatibility, manifests whose output refs omit
+`checkpoint_version` can still be deserialized, but validation does not treat
+the missing metadata as authority. Legacy output refs that point at `v1/ingest`
+are rejected as output key mismatches under the new contract.
 
 ## Manifest Semantics
 
@@ -44,8 +53,8 @@ current schema includes:
 
 Manifest validation currently requires schema version 1, at least one input
 range, at least one state object reference, monotonic parent linkage, nonempty
-input and output ranges, checkpoint-matching state object metadata, and unique
-object ids and object keys across state and output references.
+input and output ranges, checkpoint-matching state and output object metadata,
+and unique object ids and object keys across state and output references.
 
 State object references may carry an `owner_claim` with `owner_id` and
 `owner_epoch`. This is distinct from the existing state ref `owner`, which
@@ -112,7 +121,8 @@ storage layer verifies.
 Recovery loads the latest valid manifest, reads its state objects through the
 current state-store boundary, reconstructs the `IncrementalEngine`, and replays
 committed ingest batches whose offsets are not covered by the manifest input
-ranges.
+ranges. Replay lists only the `v1/ingest` namespace; manifest-referenced
+`v1/outputs` objects are durable output payloads, not committed input.
 
 Replay boundaries are per stream and partition. If a manifest boundary falls
 inside a committed batch range, replay fails instead of partially applying an

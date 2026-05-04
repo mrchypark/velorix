@@ -112,7 +112,8 @@ Velorix must not duplicate SlateDB's LSM, SST, compaction, or cache internals.
 Velorix garbage collection must never delete SlateDB-internal objects by prefix
 walking; it may retain or release SlateDB state only through a SlateDB-owned
 checkpoint/root handle or API. Internal materialized outputs should be
-Velorix-manifest-backed object-storage objects by default. Parquet and Iceberg
+Velorix-manifest-backed object-storage objects under the `v1/outputs` namespace
+by default, while `v1/ingest` remains committed input-only. Parquet and Iceberg
 surfaces are external scan, import, export, or interoperability contracts unless
 a future adoption RFC assigns one of them a narrower authority boundary.
 

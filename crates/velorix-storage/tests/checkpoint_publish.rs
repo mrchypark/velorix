@@ -6,7 +6,8 @@ use tempfile::TempDir;
 use tokio::sync::Barrier;
 use velorix_storage::{
     manifest::{
-        CheckpointManifest, InputRange, OutputObjectRef, PartitionOwnerClaim, StateObjectRef,
+        CheckpointManifest, InputRange, ManifestError, OutputObjectRef, PartitionOwnerClaim,
+        StateObjectRef,
     },
     object_key::ObjectKey,
     state::{CheckpointPublishError, CheckpointPublisher, StateObjectWrite},
@@ -89,9 +90,18 @@ fn owner_claim(owner_id: &str, owner_epoch: u64) -> PartitionOwnerClaim {
 fn output_ref_for_partition(partition_id: u32) -> OutputObjectRef {
     OutputObjectRef {
         object_id: format!("out-p{partition_id}"),
-        object_key: ObjectKey::ingest_batch("settlements", partition_id, 20, 25).unwrap(),
+        object_key: ObjectKey::output_object(
+            "settlements",
+            partition_id,
+            0,
+            20,
+            25,
+            &format!("out-p{partition_id}"),
+        )
+        .unwrap(),
         stream_id: "settlements".to_string(),
         partition_id,
+        checkpoint_version: 0,
         start_offset_inclusive: 20,
         end_offset_exclusive: 25,
     }
@@ -247,6 +257,56 @@ async fn checkpoint_publish_rejects_manifest_body_that_does_not_match_object_key
     let err = publisher.list_published_manifests().await.unwrap_err();
 
     assert!(err.to_string().contains("does not match manifest body"));
+}
+
+#[tokio::test]
+async fn checkpoint_publish_listing_rejects_old_output_ref_without_checkpoint_version_as_manifest_validation_error(
+) {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let manifest_key = ObjectKey::checkpoint_manifest(1);
+    let old_manifest = serde_json::json!({
+        "schema_version": 1,
+        "checkpoint_version": 1,
+        "input_ranges": [{
+            "stream_id": "orders",
+            "partition_id": 0,
+            "start_offset_inclusive": 0,
+            "end_offset_exclusive": 10
+        }],
+        "state_objects": [{
+            "object_id": "state-0001",
+            "object_key": "v1/state/balances_by_account/p=0000000000/chk=00000000000000000001/state-0001.state",
+            "owner": "balances_by_account",
+            "partition_id": 0,
+            "checkpoint_version": 1
+        }],
+        "output_objects": [{
+            "object_id": "out-0001",
+            "object_key": "v1/ingest/settlements/p=0000000000/00000000000000000020-00000000000000000025.batch",
+            "stream_id": "settlements",
+            "partition_id": 0,
+            "start_offset_inclusive": 20,
+            "end_offset_exclusive": 25
+        }],
+        "parent_checkpoint": 0,
+        "created_at": "2026-05-03T00:00:00Z"
+    });
+
+    store
+        .put(
+            &Path::from(manifest_key.as_str()),
+            Bytes::from(serde_json::to_vec(&old_manifest).unwrap()).into(),
+        )
+        .await
+        .unwrap();
+
+    let err = publisher.list_published_manifests().await.unwrap_err();
+
+    assert!(matches!(
+        err,
+        CheckpointPublishError::Manifest(ManifestError::OutputObjectKeyMismatch { .. })
+    ));
 }
 
 #[tokio::test]
