@@ -109,9 +109,10 @@ boundary that registers caller-provided object storage and Parquet object URLs
 as DataFusion's `input` table. Persisted table catalog v0 writes JSON Parquet
 scan URL specs to `v1/tables/{table_id}.table.json` using create-only
 semantics; create validates the catalog id and URL shape but does not scan table
-contents. Broader table layout, persisted view access, query
-scheduling/versioning, permissions, and broader runtime resource policy remain
-future work.
+contents. Persisted view access v0 loads a stored query spec and a stored
+object-backed Parquet table spec, then delegates SQL and Parquet execution to
+DataFusion. Broader table layout, query scheduling/versioning, permissions, and
+broader runtime resource policy remain future work.
 
 Foyer owns the runtime local memory/disk object-cache internals behind the
 Velorix cache wrapper. Cache reads verify object-store authority first, and

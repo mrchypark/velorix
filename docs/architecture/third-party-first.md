@@ -10,8 +10,10 @@ runtime object cache is currently Foyer-backed, ad hoc SQL/query planning and
 execution currently use DataFusion for the minimal `DeltaBatch`, validation,
 and recovered materialized-state query boundaries, and persisted query service
 v0 stores validated JSON query specs in object storage. Persisted table catalog
-v0 stores Parquet scan URL specs for the direct object-backed scan path. SlateDB
-now backs a minimal experimental checkpoint-versioned state-store path.
+v0 stores Parquet scan URL specs for the direct object-backed scan path.
+Persisted view access v0 composes stored query specs with stored object-backed
+Parquet table specs. SlateDB now backs a minimal experimental
+checkpoint-versioned state-store path.
 Incremental execution now has a DBSP-shaped `IncrementalEngine` boundary backed
 by prototype operators.
 Feldera SQL-to-DBSP standing-view compilation now has a phase-0 artifact
@@ -73,6 +75,12 @@ URL shape and format enum, and execution loads the stored URL before delegating
 to the existing direct DataFusion Parquet scan helper. It does not scan or list
 table contents at create time.
 
+Persisted view access v0 is composition only: it loads one `PersistedQuerySpec`
+and one `PersistedTableSpec` from object storage, then executes the stored SQL
+over the stored object-backed Parquet table URL through the existing DataFusion
+scan helper. Velorix does not add custom scanning, table listing, scheduling,
+versioning, permissions, or Feldera execution in this boundary.
+
 The query boundary also exposes a minimal Velorix-owned policy for SQL text
 size, output row caps, DataFusion batch size, and target partitions. Output row
 caps are enforced by applying a DataFusion `DataFrame` limit before collection,
@@ -80,9 +88,10 @@ not by parsing or planning SQL inside Velorix.
 
 This is an ad hoc SQL/query surface, not standing-view compilation. Direct
 Parquet object-backed scans and a small object-backed table catalog now exist as
-a minimal boundary. Broader table layout, query scheduling/versioning,
-permissions, broader persisted view access, and memory-pool/disk-spill runtime
-resource policy remain future integration work.
+a minimal boundary, with persisted view access v0 limited to a stored query over
+a stored object-backed Parquet table. Broader table layout, query
+scheduling/versioning, permissions, and memory-pool/disk-spill runtime resource
+policy remain future integration work.
 
 ## Feldera Standing-View Compile Contract
 
@@ -144,8 +153,9 @@ epoch fallback for those old payloads.
    over in-memory `DeltaBatch` input, runtime-recovered materialized state, and
    minimal direct Parquet object-backed `input` scans; persisted query service
    v0 catalogs validated SQL/policy specs in object storage, and persisted table
-   catalog v0 catalogs Parquet scan URLs for the direct scan path. Broader table
-   layout, scheduling, versioning, permissions, and persisted view access remain
+   catalog v0 catalogs Parquet scan URLs for the direct scan path. Persisted
+   view access v0 composes those specs as stored query over stored Parquet
+   input. Broader table layout, scheduling, versioning, and permissions remain
    future work.
 6. Use Feldera's SQL-to-DBSP compiler for standing-view SQL through validated
    external compiler artifacts. Do not hand-build Velorix circuits for standing

@@ -34,6 +34,8 @@ disposable, scaling horizontally without state migration as the runtime matures.
 - Persisted query service v0 for object-backed query specs, with DataFusion
   validation before create-only catalog writes
 - Persisted table catalog v0 for deterministic object-backed Parquet scan URLs
+- Persisted view access v0 for executing stored query specs over stored
+  object-backed Parquet table specs
 - Feldera SQL-to-DBSP standing-view compile artifact contract for validating
   externally compiled standing-view artifacts; direct runtime Feldera/dbsp
   integration remains gated
@@ -70,10 +72,12 @@ packages already fit the problem:
   validated query specs in object storage with create-only writes. Persisted
   table catalog v0 stores deterministic Parquet scan URL specs under object
   keys and composes them with the direct scan path without validating table
-  contents at create time. The boundary includes a minimal policy for SQL text
-  size, output row caps, DataFusion batch size, and target partitions. Broader
-  table layout, persisted view access, scheduling/versioning, permissions, and
-  broader cost/resource policy remain future work.
+  contents at create time. Persisted view access v0 loads one stored query spec
+  and one stored object-backed Parquet table spec, then delegates SQL and
+  Parquet execution to DataFusion. The boundary includes a minimal policy for
+  SQL text size, output row caps, DataFusion batch size, and target partitions.
+  Broader table layout, scheduling/versioning, permissions, and broader
+  cost/resource policy remain future work.
 - **Feldera SQL-to-DBSP** owns standing-view SQL compilation. Velorix now has a
   phase-0 compile artifact contract that validates Feldera standing-view specs
   and externally produced artifact metadata. Direct runtime Feldera/dbsp crate
@@ -115,9 +119,10 @@ The intended system shape is:
    Persisted query service v0 stores JSON query specs under deterministic
    object keys after DataFusion validation. Persisted table catalog v0 stores
    JSON Parquet scan URL specs under deterministic `v1/tables/...` object keys
-   and lets DataFusion perform scans during execution. Broader table layout,
-   persisted view access, schedulers, query versioning, permissions, and
-   broader runtime resource policy are still future work.
+   and lets DataFusion perform scans during execution. Persisted view access v0
+   composes those stored specs into a stored query over a stored object-backed
+   Parquet table. Broader table layout, schedulers, query versioning,
+   permissions, and broader runtime resource policy are still future work.
 4. **State store:** SlateDB is the current minimal experimental durable
    state-store path over object storage for checkpoint-versioned payloads, while
    manifests describe Velorix progress and publication state. Broader state
@@ -179,7 +184,8 @@ SlateDB layout, compaction, and lifecycle work remain gated follow-on work.
     create/read JSON specs in object storage and executes stored SQL through the
     recovered-state boundary. Persisted table catalog v0 adds create/read JSON
     specs for Parquet scan URLs and composes them with the direct scan boundary.
-    Future work is broader table layout, persisted view access,
+    Persisted view access v0 composes stored query specs with stored
+    object-backed Parquet table specs. Future work is broader table layout,
     scheduler/versioning, permissions, and broader resource policy.
 11. **Use Feldera for standing-view SQL compilation:** validate Feldera
     SQL-to-DBSP compile artifacts before any future `FelderaPipelineEngine`
