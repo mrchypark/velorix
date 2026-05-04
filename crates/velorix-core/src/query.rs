@@ -29,6 +29,8 @@ pub enum QueryError {
 pub struct QueryPolicy {
     pub max_sql_bytes: Option<usize>,
     pub max_output_rows: Option<usize>,
+    pub max_scan_files: Option<usize>,
+    pub max_scan_bytes: Option<u64>,
     pub batch_size: Option<std::num::NonZeroUsize>,
     pub target_partitions: Option<std::num::NonZeroUsize>,
 }
@@ -47,6 +49,17 @@ pub enum QueryPolicyError {
         observed_rows: usize,
         max_rows: usize,
     },
+    #[error(
+        "query would scan {observed_files} files, above query policy limit of {max_files} files"
+    )]
+    ScanFilesExceeded {
+        observed_files: usize,
+        max_files: usize,
+    },
+    #[error(
+        "query would scan {observed_bytes} bytes, above query policy limit of {max_bytes} bytes"
+    )]
+    ScanBytesExceeded { observed_bytes: u64, max_bytes: u64 },
 }
 
 /// Runs caller SQL over a delta batch through DataFusion.

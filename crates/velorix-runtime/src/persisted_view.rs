@@ -7,8 +7,12 @@ use thiserror::Error;
 
 use crate::{
     persisted_query::{PersistedQueryError, PersistedQueryStore},
-    persisted_table::{PersistedTableError, PersistedTableFormat, PersistedTableStore},
+    persisted_table::{
+        query_production_persisted_object_backed_input_with_policy, PersistedTableError,
+        PersistedTableFormat, PersistedTableStore,
+    },
     query::{query_object_backed_input_with_policy, RuntimeQueryError},
+    storage_registry::StorageRegistry,
 };
 
 #[derive(Debug, Error)]
@@ -49,4 +53,32 @@ pub async fn query_persisted_object_backed_view(
         .await
         .map_err(PersistedViewError::RuntimeQuery),
     }
+}
+
+pub async fn query_production_persisted_object_backed_view(
+    catalog_store: Arc<dyn ObjectStore>,
+    registry: &StorageRegistry,
+    tenant_id: &str,
+    table_id: &str,
+    query_id: &str,
+) -> Result<Vec<RecordBatch>, PersistedViewError> {
+    let query_catalog = PersistedQueryStore::new(Arc::clone(&catalog_store));
+    let query = query_catalog
+        .get(query_id)
+        .await
+        .map_err(PersistedViewError::QueryCatalog)?;
+
+    query_production_persisted_object_backed_input_with_policy(
+        catalog_store,
+        registry,
+        tenant_id,
+        table_id,
+        &query.sql,
+        query.policy,
+    )
+    .await
+    .map_err(|error| match error {
+        PersistedTableError::RuntimeQuery(error) => PersistedViewError::RuntimeQuery(error),
+        error => PersistedViewError::TableCatalog(error),
+    })
 }

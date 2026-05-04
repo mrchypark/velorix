@@ -7,10 +7,11 @@ use object_store::{path::Path, ObjectStore, PutMode};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
-use velorix_core::query::QueryPolicy;
+use velorix_core::{query::QueryPolicy, relation::validate_schema_fingerprint};
 use velorix_storage::object_key::{ObjectKey, ObjectKeyError};
 
 use crate::query::{query_object_backed_input_with_policy, RuntimeQueryError};
+use crate::storage_registry::{validate_tenant_prefix, StorageRegistry, StorageRegistryError};
 
 pub const PERSISTED_TABLE_SCHEMA_VERSION: u32 = 1;
 
@@ -28,6 +29,26 @@ pub struct PersistedTableSpec {
     pub format: PersistedTableFormat,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum ProductionPersistedTableFormat {
+    #[serde(rename = "parquet")]
+    Parquet,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductionPersistedTableSpec {
+    pub schema_version: u32,
+    pub table_id: String,
+    pub tenant_id: String,
+    pub store_id: String,
+    pub object_key_prefix: String,
+    pub snapshot_ref: String,
+    pub format: ProductionPersistedTableFormat,
+    pub schema_fingerprint: String,
+    pub query_policy_id: String,
+}
+
 #[derive(Debug, Error)]
 pub enum PersistedTableError {
     #[error(transparent)]
@@ -38,8 +59,19 @@ pub enum PersistedTableError {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     RuntimeQuery(#[from] RuntimeQueryError),
+    #[error(transparent)]
+    StorageRegistry(#[from] StorageRegistryError),
     #[error("malformed table url: {0}")]
     MalformedTableUrl(url::ParseError),
+    #[error("raw URL table spec is not allowed for production table scans")]
+    RawUrlProductionSpec,
+    #[error("cross-tenant object key prefix for tenant {tenant_id}: {object_key_prefix}")]
+    CrossTenantPrefix {
+        tenant_id: String,
+        object_key_prefix: String,
+    },
+    #[error("invalid production persisted table field {field}")]
+    InvalidProductionField { field: &'static str },
     #[error("unsupported persisted table schema version {schema_version}")]
     UnsupportedSchemaVersion { schema_version: u32 },
     #[error("persisted table id mismatch: expected {expected}, got {actual}")]
@@ -108,6 +140,93 @@ impl PersistedTableStore {
 
         Ok(spec)
     }
+
+    pub async fn create_production(
+        &self,
+        table_id: &str,
+        tenant_id: &str,
+        store_id: &str,
+        object_key_prefix: &str,
+        snapshot_ref: &str,
+        format: ProductionPersistedTableFormat,
+        schema_fingerprint: &str,
+        query_policy_id: &str,
+    ) -> Result<ProductionPersistedTableSpec, PersistedTableError> {
+        let object_key = ObjectKey::query_table(table_id)?;
+        validate_production_table_fields(
+            table_id,
+            tenant_id,
+            store_id,
+            object_key_prefix,
+            snapshot_ref,
+            schema_fingerprint,
+            query_policy_id,
+        )?;
+
+        let spec = ProductionPersistedTableSpec {
+            schema_version: PERSISTED_TABLE_SCHEMA_VERSION,
+            table_id: table_id.to_string(),
+            tenant_id: tenant_id.to_string(),
+            store_id: store_id.to_string(),
+            object_key_prefix: object_key_prefix.to_string(),
+            snapshot_ref: snapshot_ref.to_string(),
+            format,
+            schema_fingerprint: schema_fingerprint.to_string(),
+            query_policy_id: query_policy_id.to_string(),
+        };
+        let bytes = serde_json::to_vec(&spec)?;
+        self.store
+            .put_opts(
+                &Path::from(object_key.as_str()),
+                Bytes::from(bytes).into(),
+                PutMode::Create.into(),
+            )
+            .await?;
+
+        Ok(spec)
+    }
+
+    pub async fn get_production(
+        &self,
+        table_id: &str,
+    ) -> Result<ProductionPersistedTableSpec, PersistedTableError> {
+        let object_key = ObjectKey::query_table(table_id)?;
+        let bytes = self
+            .store
+            .get(&Path::from(object_key.as_str()))
+            .await?
+            .bytes()
+            .await?;
+
+        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        if value.get("table_url").is_some() {
+            return Err(PersistedTableError::RawUrlProductionSpec);
+        }
+
+        let spec: ProductionPersistedTableSpec = serde_json::from_value(value)?;
+        if spec.schema_version != PERSISTED_TABLE_SCHEMA_VERSION {
+            return Err(PersistedTableError::UnsupportedSchemaVersion {
+                schema_version: spec.schema_version,
+            });
+        }
+        if spec.table_id != table_id {
+            return Err(PersistedTableError::TableIdMismatch {
+                expected: table_id.to_string(),
+                actual: spec.table_id,
+            });
+        }
+        validate_production_table_fields(
+            &spec.table_id,
+            &spec.tenant_id,
+            &spec.store_id,
+            &spec.object_key_prefix,
+            &spec.snapshot_ref,
+            &spec.schema_fingerprint,
+            &spec.query_policy_id,
+        )?;
+
+        Ok(spec)
+    }
 }
 
 pub async fn query_persisted_object_backed_input_with_policy(
@@ -130,8 +249,85 @@ pub async fn query_persisted_object_backed_input_with_policy(
     }
 }
 
+pub async fn query_production_persisted_object_backed_input_with_policy(
+    catalog_store: Arc<dyn ObjectStore>,
+    registry: &StorageRegistry,
+    tenant_id: &str,
+    table_id: &str,
+    sql: &str,
+    policy: QueryPolicy,
+) -> Result<Vec<RecordBatch>, PersistedTableError> {
+    let catalog = PersistedTableStore::new(catalog_store);
+    let spec = catalog.get_production(table_id).await?;
+    if spec.tenant_id != tenant_id {
+        return Err(PersistedTableError::CrossTenantPrefix {
+            tenant_id: tenant_id.to_string(),
+            object_key_prefix: spec.object_key_prefix,
+        });
+    }
+
+    let location = registry.resolve_table_location(
+        &spec.store_id,
+        &spec.tenant_id,
+        &spec.object_key_prefix,
+        &spec.snapshot_ref,
+    )?;
+
+    match spec.format {
+        ProductionPersistedTableFormat::Parquet => Ok(query_object_backed_input_with_policy(
+            location.store,
+            &location.table_url,
+            sql,
+            policy,
+        )
+        .await?),
+    }
+}
+
 fn validate_table_url(table_url: &str) -> Result<(), PersistedTableError> {
     Url::parse(table_url).map_err(PersistedTableError::MalformedTableUrl)?;
+
+    Ok(())
+}
+
+fn validate_production_table_fields(
+    table_id: &str,
+    tenant_id: &str,
+    store_id: &str,
+    object_key_prefix: &str,
+    snapshot_ref: &str,
+    schema_fingerprint: &str,
+    query_policy_id: &str,
+) -> Result<(), PersistedTableError> {
+    require_non_empty("table_id", table_id)?;
+    require_non_empty("store_id", store_id)?;
+    require_non_empty("snapshot_ref", snapshot_ref)?;
+    require_non_empty("query_policy_id", query_policy_id)?;
+    validate_schema_fingerprint("schema_fingerprint", schema_fingerprint).map_err(|_| {
+        PersistedTableError::InvalidProductionField {
+            field: "schema_fingerprint",
+        }
+    })?;
+    validate_tenant_prefix(tenant_id, object_key_prefix).map_err(|error| match error {
+        StorageRegistryError::CrossTenantPrefix {
+            tenant_id,
+            object_key_prefix,
+        } => PersistedTableError::CrossTenantPrefix {
+            tenant_id,
+            object_key_prefix,
+        },
+        _ => PersistedTableError::InvalidProductionField {
+            field: "object_key_prefix",
+        },
+    })?;
+
+    Ok(())
+}
+
+fn require_non_empty(field: &'static str, value: &str) -> Result<(), PersistedTableError> {
+    if value.is_empty() {
+        return Err(PersistedTableError::InvalidProductionField { field });
+    }
 
     Ok(())
 }

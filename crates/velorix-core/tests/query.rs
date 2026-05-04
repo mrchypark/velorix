@@ -142,6 +142,32 @@ async fn query_delta_batch_with_policy_rejects_results_above_row_limit() {
     ));
 }
 
+#[test]
+fn query_policy_scan_file_limit_has_typed_error() {
+    let error = QueryPolicyError::ScanFilesExceeded {
+        observed_files: 2,
+        max_files: 1,
+    };
+
+    assert_eq!(
+        error.to_string(),
+        "query would scan 2 files, above query policy limit of 1 files"
+    );
+}
+
+#[test]
+fn query_policy_scan_byte_limit_has_typed_error() {
+    let error = QueryPolicyError::ScanBytesExceeded {
+        observed_bytes: 2048,
+        max_bytes: 1024,
+    };
+
+    assert_eq!(
+        error.to_string(),
+        "query would scan 2048 bytes, above query policy limit of 1024 bytes"
+    );
+}
+
 #[tokio::test]
 async fn query_delta_batch_with_policy_still_lets_datafusion_handle_aggregation_planning() {
     let input = DeltaBatch::from_records([

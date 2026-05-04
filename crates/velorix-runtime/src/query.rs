@@ -4,9 +4,11 @@ use arrow::record_batch::RecordBatch;
 use datafusion::{
     error::DataFusionError,
     execution::object_store::ObjectStoreUrl,
+    object_store::path::Path as DataFusionPath,
     object_store::ObjectStore as DataFusionObjectStore,
     prelude::{ParquetReadOptions, SessionConfig, SessionContext},
 };
+use futures::TryStreamExt;
 use object_store::ObjectStore;
 use thiserror::Error;
 use url::Url;
@@ -49,6 +51,7 @@ pub async fn query_object_backed_input_with_policy(
     policy: QueryPolicy,
 ) -> Result<Vec<RecordBatch>, RuntimeQueryError> {
     validate_sql_text_policy(sql, policy).map_err(QueryError::from)?;
+    validate_scan_policy(store.as_ref(), table_url, policy).await?;
 
     let mut config = SessionConfig::new();
     if let Some(batch_size) = policy.batch_size {
@@ -107,6 +110,51 @@ fn validate_sql_text_policy(sql: &str, policy: QueryPolicy) -> Result<(), QueryP
     Ok(())
 }
 
+async fn validate_scan_policy(
+    store: &dyn DataFusionObjectStore,
+    table_url: &str,
+    policy: QueryPolicy,
+) -> Result<(), QueryError> {
+    if policy.max_scan_files.is_none() && policy.max_scan_bytes.is_none() {
+        return Ok(());
+    }
+
+    let prefix = object_path_for_table_url(table_url)?;
+    let mut observed_files = 0usize;
+    let mut observed_bytes = 0u64;
+    let mut objects = store.list(Some(&prefix));
+
+    while let Some(object) = objects
+        .try_next()
+        .await
+        .map_err(|error| DataFusionError::ObjectStore(Box::new(error)))?
+    {
+        observed_files = observed_files.saturating_add(1);
+        observed_bytes = observed_bytes.saturating_add(object.size);
+
+        if let Some(max_files) = policy.max_scan_files {
+            if observed_files > max_files {
+                return Err(QueryPolicyError::ScanFilesExceeded {
+                    observed_files,
+                    max_files,
+                }
+                .into());
+            }
+        }
+        if let Some(max_bytes) = policy.max_scan_bytes {
+            if observed_bytes > max_bytes {
+                return Err(QueryPolicyError::ScanBytesExceeded {
+                    observed_bytes,
+                    max_bytes,
+                }
+                .into());
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn object_store_url_for_table(table_url: &str) -> Result<ObjectStoreUrl, QueryError> {
     let mut url =
         Url::parse(table_url).map_err(|error| DataFusionError::External(Box::new(error)))?;
@@ -115,4 +163,11 @@ fn object_store_url_for_table(table_url: &str) -> Result<ObjectStoreUrl, QueryEr
     url.set_fragment(None);
 
     Ok(ObjectStoreUrl::parse(url.as_str())?)
+}
+
+fn object_path_for_table_url(table_url: &str) -> Result<DataFusionPath, QueryError> {
+    let url = Url::parse(table_url).map_err(|error| DataFusionError::External(Box::new(error)))?;
+    let path = url.path().trim_start_matches('/').trim_end_matches('/');
+
+    Ok(DataFusionPath::from(path))
 }

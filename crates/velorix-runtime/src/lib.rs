@@ -9,3 +9,4 @@ pub mod persisted_table;
 pub mod persisted_view;
 pub mod query;
 pub mod recovery;
+pub mod storage_registry;
