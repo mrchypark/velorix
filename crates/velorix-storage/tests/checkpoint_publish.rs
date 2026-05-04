@@ -10,7 +10,7 @@ use velorix_storage::{
         StateObjectRef,
     },
     object_key::ObjectKey,
-    state::{CheckpointPublishError, CheckpointPublisher, StateObjectWrite},
+    state::{CheckpointPublishError, CheckpointPublisher, OutputObjectWrite, StateObjectWrite},
     state_store::{SlateDbStateStore, StateObjectStore},
 };
 
@@ -129,7 +129,46 @@ fn output_ref_for_partition(partition_id: u32) -> OutputObjectRef {
         checkpoint_version: 0,
         start_offset_inclusive: 20,
         end_offset_exclusive: 25,
+        owner_claim: None,
     }
+}
+
+fn output_write(
+    partition_id: u32,
+    checkpoint_version: u64,
+    object_id: &str,
+    bytes: &'static [u8],
+) -> OutputObjectWrite {
+    OutputObjectWrite::new(
+        "settlements",
+        partition_id,
+        checkpoint_version,
+        20,
+        25,
+        object_id,
+        Bytes::from_static(bytes),
+    )
+    .unwrap()
+}
+
+fn fenced_output_write(
+    partition_id: u32,
+    checkpoint_version: u64,
+    object_id: &str,
+    owner_claim: PartitionOwnerClaim,
+    bytes: &'static [u8],
+) -> OutputObjectWrite {
+    OutputObjectWrite::new_fenced(
+        "settlements",
+        partition_id,
+        checkpoint_version,
+        20,
+        25,
+        object_id,
+        owner_claim,
+        Bytes::from_static(bytes),
+    )
+    .unwrap()
 }
 
 fn state_ref(state: &StateObjectWrite) -> StateObjectRef {
@@ -523,6 +562,211 @@ async fn checkpoint_publish_accepts_manifest_after_referenced_output_object_exis
     publisher.publish_manifest(&manifest).await.unwrap();
 
     assert_eq!(publisher.latest_manifest().await.unwrap(), Some(manifest));
+}
+
+#[tokio::test]
+async fn checkpoint_publish_rejects_duplicate_output_object_write() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(store);
+    let output = output_write(0, 0, "out-0001", b"first");
+
+    publisher.write_output_object(&output).await.unwrap();
+    let duplicate = output_write(0, 0, "out-0001", b"second");
+    let err = publisher.write_output_object(&duplicate).await.unwrap_err();
+
+    assert!(matches!(
+        err,
+        CheckpointPublishError::OutputObjectAlreadyExists(object_key)
+            if object_key == *output.object_key()
+    ));
+}
+
+#[tokio::test]
+async fn checkpoint_publish_rejects_fenced_output_write_without_requested_owner_claim() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let claim = owner_claim("worker-a", 1);
+    let output = output_write(0, 0, "out-0001", b"output");
+
+    let err = publisher
+        .write_output_object_fenced(&output, &claim)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        CheckpointPublishError::OutputOwnerClaimMismatch {
+            object_key,
+            expected,
+            actual
+        } if object_key == *output.object_key() && expected == claim && actual.is_none()
+    ));
+    assert!(store
+        .head(&Path::from(output.object_key().as_str()))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn checkpoint_publish_rejects_fenced_output_write_with_mismatched_owner_claim() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let requested_claim = owner_claim("worker-a", 1);
+    let other_claim = owner_claim("worker-b", 1);
+    let output = fenced_output_write(0, 0, "out-0001", other_claim.clone(), b"output");
+
+    let err = publisher
+        .write_output_object_fenced(&output, &requested_claim)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        CheckpointPublishError::OutputOwnerClaimMismatch {
+            object_key,
+            expected,
+            actual
+        } if object_key == *output.object_key()
+            && expected == requested_claim
+            && actual == Some(other_claim)
+    ));
+    assert!(store
+        .head(&Path::from(output.object_key().as_str()))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn checkpoint_publish_rejects_fenced_manifest_with_output_ref_without_owner_claim() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let claim = owner_claim("worker-a", 1);
+    let state = fenced_state_write(0, "state-0001", claim.clone(), b"state");
+    let state_ref = publisher
+        .write_state_object_fenced(&state, &claim)
+        .await
+        .unwrap();
+    let output = output_write(0, 0, "out-0001", b"output");
+    let output_ref = publisher.write_output_object(&output).await.unwrap();
+    let mut manifest = manifest(0, state_ref);
+    manifest.output_objects = vec![output_ref.clone()];
+
+    let err = publisher
+        .publish_manifest_fenced(&manifest, &claim)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        CheckpointPublishError::Manifest(ManifestError::MissingOutputOwnerClaim { object_id })
+            if object_id == output_ref.object_id
+    ));
+    assert!(store
+        .head(&Path::from(manifest.object_key().as_str()))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn checkpoint_publish_rejects_fenced_manifest_with_output_ref_from_different_owner_claim() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let requested_claim = owner_claim("worker-a", 1);
+    let other_claim = owner_claim("worker-b", 1);
+    let state = fenced_state_write(0, "state-0001", requested_claim.clone(), b"state");
+    let state_ref = publisher
+        .write_state_object_fenced(&state, &requested_claim)
+        .await
+        .unwrap();
+    let output = fenced_output_write(0, 0, "out-0001", other_claim.clone(), b"output");
+    let output_ref = publisher
+        .write_output_object_fenced(&output, &other_claim)
+        .await
+        .unwrap();
+    let mut manifest = manifest(0, state_ref);
+    manifest.output_objects = vec![output_ref];
+
+    let err = publisher
+        .publish_manifest_fenced(&manifest, &requested_claim)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        CheckpointPublishError::Manifest(ManifestError::OutputOwnerClaimMismatch {
+            object_id,
+            expected,
+            actual
+        }) if object_id == "out-0001" && expected == requested_claim && actual == other_claim
+    ));
+    assert!(store
+        .head(&Path::from(manifest.object_key().as_str()))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn checkpoint_publish_accepts_fenced_manifest_with_matching_state_and_output_owner_claims() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(store);
+    let claim = owner_claim("worker-a", 1);
+    let state = fenced_state_write(0, "state-0001", claim.clone(), b"state");
+    let output = fenced_output_write(0, 0, "out-0001", claim.clone(), b"output");
+    let state_ref = publisher
+        .write_state_object_fenced(&state, &claim)
+        .await
+        .unwrap();
+    let output_ref = publisher
+        .write_output_object_fenced(&output, &claim)
+        .await
+        .unwrap();
+    let mut manifest = manifest(0, state_ref);
+    manifest.output_objects = vec![output_ref];
+
+    publisher
+        .publish_manifest_fenced(&manifest, &claim)
+        .await
+        .unwrap();
+
+    assert_eq!(publisher.latest_manifest().await.unwrap(), Some(manifest));
+}
+
+#[tokio::test]
+async fn checkpoint_publish_rejects_stale_owner_when_newer_output_owner_claim_is_published() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let stale_claim = owner_claim("worker-a", 1);
+    let current_claim = owner_claim("worker-b", 2);
+
+    let current_state = state_write(0, "state-0001", b"state");
+    let current_output = fenced_output_write(0, 0, "out-0001", current_claim.clone(), b"output");
+    let current_ref = publisher.write_state_object(&current_state).await.unwrap();
+    let current_output_ref = publisher
+        .write_output_object_fenced(&current_output, &current_claim)
+        .await
+        .unwrap();
+    let mut current_manifest = manifest(0, current_ref);
+    current_manifest.output_objects = vec![current_output_ref];
+    publisher.publish_manifest(&current_manifest).await.unwrap();
+
+    let stale_output = fenced_output_write(0, 1, "out-0002", stale_claim.clone(), b"stale");
+    let err = publisher
+        .write_output_object_fenced(&stale_output, &stale_claim)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        CheckpointPublishError::StaleOwnerClaim {
+            partition_id: 0,
+            current,
+            attempted
+        } if current == current_claim && attempted == stale_claim
+    ));
+    assert!(store
+        .head(&Path::from(stale_output.object_key().as_str()))
+        .await
+        .is_err());
 }
 
 #[tokio::test]

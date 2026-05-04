@@ -9,7 +9,9 @@ use object_store::{path::Path, ObjectStore, PutMode};
 use thiserror::Error;
 
 use crate::{
-    manifest::{CheckpointManifest, ManifestError, PartitionOwnerClaim, StateObjectRef},
+    manifest::{
+        CheckpointManifest, ManifestError, OutputObjectRef, PartitionOwnerClaim, StateObjectRef,
+    },
     object_key::{ObjectKey, ObjectKeyError},
     state_store::{RawObjectStateStore, SlateDbStateStore, StateObjectStore},
 };
@@ -33,6 +35,19 @@ pub struct StateObjectWrite {
     owner_claim: Option<PartitionOwnerClaim>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutputObjectWrite {
+    stream_id: String,
+    partition_id: u32,
+    checkpoint_version: u64,
+    start_offset_inclusive: u64,
+    end_offset_exclusive: u64,
+    object_id: String,
+    bytes: Bytes,
+    object_key: ObjectKey,
+    owner_claim: Option<PartitionOwnerClaim>,
+}
+
 #[derive(Debug, Error)]
 pub enum CheckpointPublishError {
     #[error(transparent)]
@@ -41,6 +56,8 @@ pub enum CheckpointPublishError {
     Manifest(#[from] ManifestError),
     #[error("state object `{0}` already exists")]
     StateObjectAlreadyExists(ObjectKey),
+    #[error("output object `{0}` already exists")]
+    OutputObjectAlreadyExists(ObjectKey),
     #[error("checkpoint manifest `{0}` already exists")]
     ManifestAlreadyExists(ObjectKey),
     #[error(
@@ -85,6 +102,12 @@ pub enum CheckpointPublishError {
     MissingOutputObject(ObjectKey),
     #[error("state object `{object_key}` owner claim mismatch: expected `{expected}`, actual `{actual:?}`")]
     StateOwnerClaimMismatch {
+        object_key: ObjectKey,
+        expected: PartitionOwnerClaim,
+        actual: Option<PartitionOwnerClaim>,
+    },
+    #[error("output object `{object_key}` owner claim mismatch: expected `{expected}`, actual `{actual:?}`")]
+    OutputOwnerClaimMismatch {
         object_key: ObjectKey,
         expected: PartitionOwnerClaim,
         actual: Option<PartitionOwnerClaim>,
@@ -150,6 +173,37 @@ impl CheckpointPublisher {
             .await?;
 
         self.write_state_object(state).await
+    }
+
+    pub async fn write_output_object(
+        &self,
+        output: &OutputObjectWrite,
+    ) -> Result<OutputObjectRef, CheckpointPublishError> {
+        let path = Path::from(output.object_key().as_str());
+        let result = self
+            .store
+            .put_opts(&path, output.bytes().clone().into(), PutMode::Create.into())
+            .await;
+
+        match result {
+            Ok(_) => Ok(output.object_ref()),
+            Err(object_store::Error::AlreadyExists { .. }) => Err(
+                CheckpointPublishError::OutputObjectAlreadyExists(output.object_key().clone()),
+            ),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    pub async fn write_output_object_fenced(
+        &self,
+        output: &OutputObjectWrite,
+        owner_claim: &PartitionOwnerClaim,
+    ) -> Result<OutputObjectRef, CheckpointPublishError> {
+        self.validate_output_write_owner_claim(output, owner_claim)?;
+        self.validate_owner_claim_current([output.partition_id()], owner_claim)
+            .await?;
+
+        self.write_output_object(output).await
     }
 
     pub async fn publish_manifest(
@@ -451,6 +505,22 @@ impl CheckpointPublisher {
         }
     }
 
+    fn validate_output_write_owner_claim(
+        &self,
+        output: &OutputObjectWrite,
+        owner_claim: &PartitionOwnerClaim,
+    ) -> Result<(), CheckpointPublishError> {
+        if output.owner_claim() == Some(owner_claim) {
+            Ok(())
+        } else {
+            Err(CheckpointPublishError::OutputOwnerClaimMismatch {
+                object_key: output.object_key().clone(),
+                expected: owner_claim.clone(),
+                actual: output.owner_claim().cloned(),
+            })
+        }
+    }
+
     async fn validate_owner_claim_current(
         &self,
         partitions: impl IntoIterator<Item = u32>,
@@ -467,12 +537,27 @@ impl CheckpointPublisher {
                     continue;
                 };
 
-                if current.owner_epoch > owner_claim.owner_epoch
-                    || (current.owner_epoch == owner_claim.owner_epoch
-                        && current.owner_id != owner_claim.owner_id)
-                {
+                if Self::is_current_claim_newer_or_conflicting(&current, owner_claim) {
                     return Err(CheckpointPublishError::StaleOwnerClaim {
                         partition_id: state_ref.partition_id,
+                        current,
+                        attempted: owner_claim.clone(),
+                    });
+                }
+            }
+
+            for output_ref in manifest.output_objects {
+                if !partitions.contains(&output_ref.partition_id) {
+                    continue;
+                }
+
+                let Some(current) = output_ref.owner_claim else {
+                    continue;
+                };
+
+                if Self::is_current_claim_newer_or_conflicting(&current, owner_claim) {
+                    return Err(CheckpointPublishError::StaleOwnerClaim {
+                        partition_id: output_ref.partition_id,
                         current,
                         attempted: owner_claim.clone(),
                     });
@@ -481,6 +566,15 @@ impl CheckpointPublisher {
         }
 
         Ok(())
+    }
+
+    fn is_current_claim_newer_or_conflicting(
+        current: &PartitionOwnerClaim,
+        attempted: &PartitionOwnerClaim,
+    ) -> bool {
+        current.owner_epoch > attempted.owner_epoch
+            || (current.owner_epoch == attempted.owner_epoch
+                && current.owner_id != attempted.owner_id)
     }
 }
 
@@ -557,6 +651,114 @@ impl StateObjectWrite {
             owner: self.owner.clone(),
             partition_id: self.partition_id,
             checkpoint_version: self.checkpoint_version,
+            owner_claim: self.owner_claim.clone(),
+        }
+    }
+}
+
+impl OutputObjectWrite {
+    pub fn new(
+        stream_id: impl Into<String>,
+        partition_id: u32,
+        checkpoint_version: u64,
+        start_offset_inclusive: u64,
+        end_offset_exclusive: u64,
+        object_id: impl Into<String>,
+        bytes: Bytes,
+    ) -> Result<Self, CheckpointPublishError> {
+        let stream_id = stream_id.into();
+        let object_id = object_id.into();
+        let object_key = ObjectKey::output_object(
+            &stream_id,
+            partition_id,
+            checkpoint_version,
+            start_offset_inclusive,
+            end_offset_exclusive,
+            &object_id,
+        )?;
+
+        Ok(Self {
+            stream_id,
+            partition_id,
+            checkpoint_version,
+            start_offset_inclusive,
+            end_offset_exclusive,
+            object_id,
+            bytes,
+            object_key,
+            owner_claim: None,
+        })
+    }
+
+    pub fn new_fenced(
+        stream_id: impl Into<String>,
+        partition_id: u32,
+        checkpoint_version: u64,
+        start_offset_inclusive: u64,
+        end_offset_exclusive: u64,
+        object_id: impl Into<String>,
+        owner_claim: PartitionOwnerClaim,
+        bytes: Bytes,
+    ) -> Result<Self, CheckpointPublishError> {
+        let mut output = Self::new(
+            stream_id,
+            partition_id,
+            checkpoint_version,
+            start_offset_inclusive,
+            end_offset_exclusive,
+            object_id,
+            bytes,
+        )?;
+        output.owner_claim = Some(owner_claim);
+
+        Ok(output)
+    }
+
+    pub fn object_key(&self) -> &ObjectKey {
+        &self.object_key
+    }
+
+    pub fn stream_id(&self) -> &str {
+        &self.stream_id
+    }
+
+    pub fn partition_id(&self) -> u32 {
+        self.partition_id
+    }
+
+    pub fn checkpoint_version(&self) -> u64 {
+        self.checkpoint_version
+    }
+
+    pub fn start_offset_inclusive(&self) -> u64 {
+        self.start_offset_inclusive
+    }
+
+    pub fn end_offset_exclusive(&self) -> u64 {
+        self.end_offset_exclusive
+    }
+
+    pub fn object_id(&self) -> &str {
+        &self.object_id
+    }
+
+    pub fn bytes(&self) -> &Bytes {
+        &self.bytes
+    }
+
+    pub fn owner_claim(&self) -> Option<&PartitionOwnerClaim> {
+        self.owner_claim.as_ref()
+    }
+
+    pub(crate) fn object_ref(&self) -> OutputObjectRef {
+        OutputObjectRef {
+            object_id: self.object_id.clone(),
+            object_key: self.object_key.clone(),
+            stream_id: self.stream_id.clone(),
+            partition_id: self.partition_id,
+            checkpoint_version: self.checkpoint_version,
+            start_offset_inclusive: self.start_offset_inclusive,
+            end_offset_exclusive: self.end_offset_exclusive,
             owner_claim: self.owner_claim.clone(),
         }
     }

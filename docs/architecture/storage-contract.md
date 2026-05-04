@@ -33,6 +33,9 @@ formatting.
 `v1/ingest` is reserved for committed input batches only. Internal
 materialized outputs must use `v1/outputs`, carry the manifest checkpoint
 version in both the key and `OutputObjectRef`, and are not replay candidates.
+Fenced output refs may also carry the same optional `owner_claim` metadata used
+for state refs. The field is omitted when absent so existing v1 refs remain
+readable.
 For v1 read compatibility, manifests whose output refs omit
 `checkpoint_version` can still be deserialized, but validation does not treat
 the missing metadata as authority. Legacy output refs that point at `v1/ingest`
@@ -80,6 +83,10 @@ The claim metadata is the storage-side contract for stale-worker detection and
 structural progress authorization; it does not change `ObjectKey::state_object`
 layout.
 
+Output object references may also carry `owner_claim`. For unfenced and legacy
+bootstrap publication the field remains optional, but fenced publication treats
+missing or mismatched output claims as typed validation errors.
+
 The manifest checkpoint version is a publication/progress version. It is
 separate from the incremental engine logical epoch. Current engine checkpoint
 state is serialized as a versioned payload with `schema_version`,
@@ -105,15 +112,22 @@ declared parent manifest is visible and valid as object-storage authority. Only
 after those checks pass can the create-only manifest write make the checkpoint
 durable authority.
 
-Fenced state write and manifest publication APIs accept the caller's current
-`owner_claim`. They require fenced state refs to carry one explicit claim for
-the manifest. `publish_manifest_fenced` rejects state refs with a different
-claim, and rejects input or output progress for any partition absent from the
-set of state refs carrying the requested claim. It also rejects a stale claim
-before creating the state object or checkpoint manifest when an already
-published manifest for the same partition carries a higher `owner_epoch` or the
-same epoch with a different `owner_id`. Existing unfenced local/bootstrap paths
-remain available for compatibility.
+State and output objects are written with create-only semantics. Duplicate
+state or output object writes fail instead of overwriting a previously durable
+payload.
+
+Fenced state write, fenced output write, and fenced manifest publication APIs
+accept the caller's current `owner_claim`. Fenced writes reject objects whose
+embedded claim is missing or different from the requested claim before creating
+the object. `publish_manifest_fenced` requires every state ref and every output
+ref to carry the requested claim. It rejects input or output progress for any
+partition absent from the set of state refs carrying that claim. It also
+rejects a stale claim before creating a state object, output object, or
+checkpoint manifest when an already published manifest for the same partition
+carries a higher `owner_epoch` or the same epoch with a different `owner_id`.
+Stale-owner detection considers both published state refs and published output
+refs, so a newer output owner claim can fence older writers. Existing unfenced
+local/bootstrap paths remain available for compatibility.
 
 These checks are non-atomic storage-side stale-owner detection and structurally
 unauthorized progress rejection. They are not production linearizable fencing.

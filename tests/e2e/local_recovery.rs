@@ -110,6 +110,7 @@ fn output_ref(
         checkpoint_version,
         start_offset_inclusive,
         end_offset_exclusive,
+        owner_claim: None,
     }
 }
 

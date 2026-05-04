@@ -51,6 +51,8 @@ pub struct OutputObjectRef {
     pub checkpoint_version: u64,
     pub start_offset_inclusive: u64,
     pub end_offset_exclusive: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_claim: Option<PartitionOwnerClaim>,
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -102,6 +104,16 @@ pub enum ManifestError {
         "state object `{object_id}` owner claim mismatch: expected `{expected}`, actual `{actual}`"
     )]
     OwnerClaimMismatch {
+        object_id: String,
+        expected: PartitionOwnerClaim,
+        actual: PartitionOwnerClaim,
+    },
+    #[error("output object `{object_id}` must carry an owner claim")]
+    MissingOutputOwnerClaim { object_id: String },
+    #[error(
+        "output object `{object_id}` owner claim mismatch: expected `{expected}`, actual `{actual}`"
+    )]
+    OutputOwnerClaimMismatch {
         object_id: String,
         expected: PartitionOwnerClaim,
         actual: PartitionOwnerClaim,
@@ -178,6 +190,24 @@ impl CheckpointManifest {
                 None => {
                     return Err(ManifestError::MissingOwnerClaim {
                         object_id: state_object.object_id.clone(),
+                    });
+                }
+            }
+        }
+
+        for output_object in &self.output_objects {
+            match &output_object.owner_claim {
+                Some(actual) if actual == owner_claim => {}
+                Some(actual) => {
+                    return Err(ManifestError::OutputOwnerClaimMismatch {
+                        object_id: output_object.object_id.clone(),
+                        expected: owner_claim.clone(),
+                        actual: actual.clone(),
+                    });
+                }
+                None => {
+                    return Err(ManifestError::MissingOutputOwnerClaim {
+                        object_id: output_object.object_id.clone(),
                     });
                 }
             }
@@ -408,6 +438,7 @@ mod tests {
             checkpoint_version: 1,
             start_offset_inclusive: 20,
             end_offset_exclusive: 25,
+            owner_claim: None,
         }
     }
 
