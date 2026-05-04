@@ -15,6 +15,7 @@ use velorix_storage::{
         StateObjectRef,
     },
     object_key::ObjectKey,
+    ownership::OwnershipEpochRecord,
     state::{CheckpointPublishError, CheckpointPublisher, OutputObjectWrite, StateObjectWrite},
     state_store::{SlateDbStateStore, StateObjectStore},
 };
@@ -198,6 +199,24 @@ fn owner_claim(owner_id: &str, owner_epoch: u64) -> PartitionOwnerClaim {
     PartitionOwnerClaim {
         owner_id: owner_id.to_string(),
         owner_epoch,
+    }
+}
+
+fn ownership_record(
+    stream_id: &str,
+    partition_id: u32,
+    owner_id: &str,
+    owner_epoch: u64,
+) -> OwnershipEpochRecord {
+    OwnershipEpochRecord {
+        stream_id: stream_id.to_string(),
+        partition_id,
+        owner_id: owner_id.to_string(),
+        owner_epoch,
+        lease_identity: format!("{owner_id}-lease"),
+        created_at: "2026-05-03T00:00:00Z".to_string(),
+        previous_epoch: owner_epoch.checked_sub(1),
+        previous_checkpoint_version: owner_epoch.checked_sub(1),
     }
 }
 
@@ -992,6 +1011,174 @@ async fn checkpoint_publish_accepts_fenced_manifest_with_matching_state_and_outp
 
     publisher
         .publish_manifest_fenced(&manifest, &claim)
+        .await
+        .unwrap();
+
+    assert_eq!(publisher.latest_manifest().await.unwrap(), Some(manifest));
+}
+
+#[tokio::test]
+async fn checkpoint_publish_creates_ownership_epoch_records_create_only_and_idempotently() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(store);
+    let record = ownership_record("orders", 0, "worker-a", 7);
+
+    let created_key = publisher
+        .create_ownership_epoch_record(&record)
+        .await
+        .unwrap();
+    let duplicate_key = publisher
+        .create_ownership_epoch_record(&record)
+        .await
+        .unwrap();
+    let read_back = publisher
+        .read_ownership_epoch_record("orders", 0, 7)
+        .await
+        .unwrap();
+
+    assert_eq!(created_key, record.object_key().unwrap());
+    assert_eq!(duplicate_key, created_key);
+    assert_eq!(read_back, record);
+
+    let conflicting_record = ownership_record("orders", 0, "worker-b", 7);
+    let err = publisher
+        .create_ownership_epoch_record(&conflicting_record)
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("ownership epoch record conflict"));
+}
+
+#[tokio::test]
+async fn checkpoint_publish_production_fenced_state_write_rejects_missing_ownership_record_before_write(
+) {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let claim = owner_claim("worker-a", 1);
+    let state = fenced_state_write(0, "state-0001", claim.clone(), b"state");
+
+    let err = publisher
+        .write_state_object_fenced_production(&state, "orders", &claim)
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("ownership epoch record"));
+    assert!(store
+        .head(&Path::from(state.object_key().as_str()))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn checkpoint_publish_production_fenced_output_write_rejects_missing_ownership_record_before_write(
+) {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let claim = owner_claim("worker-a", 1);
+    let output = fenced_output_write(0, 0, "out-0001", claim.clone(), b"output");
+
+    let err = publisher
+        .write_output_object_fenced_production(&output, &claim)
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("ownership epoch record"));
+    assert!(store
+        .head(&Path::from(output.object_key().as_str()))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn checkpoint_publish_production_fenced_manifest_rejects_missing_ownership_record_before_write(
+) {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let claim = owner_claim("worker-a", 1);
+    let state = fenced_state_write(0, "state-0001", claim.clone(), b"state");
+    let state_ref = publisher
+        .write_state_object_fenced(&state, &claim)
+        .await
+        .unwrap();
+    let manifest = manifest(0, state_ref);
+
+    let err = publisher
+        .publish_manifest_fenced_production(&manifest, &claim)
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("ownership epoch record"));
+    assert!(store
+        .head(&Path::from(manifest.object_key().as_str()))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn checkpoint_publish_production_state_write_rejects_lower_epoch_after_higher_epoch_record_without_manifest(
+) {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let stale_claim = owner_claim("worker-a", 1);
+    let current_claim = owner_claim("worker-b", 2);
+    publisher
+        .create_ownership_epoch_record(&ownership_record("orders", 0, "worker-a", 1))
+        .await
+        .unwrap();
+    publisher
+        .create_ownership_epoch_record(&ownership_record("orders", 0, "worker-b", 2))
+        .await
+        .unwrap();
+
+    let stale_state = fenced_state_write(0, "state-0001", stale_claim.clone(), b"stale");
+    let err = publisher
+        .write_state_object_fenced_production(&stale_state, "orders", &stale_claim)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        CheckpointPublishError::StaleOwnerClaim {
+            partition_id: 0,
+            current,
+            attempted
+        } if current == current_claim && attempted == stale_claim
+    ));
+    assert!(store
+        .head(&Path::from(stale_state.object_key().as_str()))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn checkpoint_publish_production_fenced_publish_succeeds_with_matching_ownership_records() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(store);
+    let claim = owner_claim("worker-a", 1);
+    publisher
+        .create_ownership_epoch_record(&ownership_record("orders", 0, "worker-a", 1))
+        .await
+        .unwrap();
+    publisher
+        .create_ownership_epoch_record(&ownership_record("settlements", 0, "worker-a", 1))
+        .await
+        .unwrap();
+
+    let state = fenced_state_write(0, "state-0001", claim.clone(), b"state");
+    let output = fenced_output_write(0, 0, "out-0001", claim.clone(), b"output");
+    let state_ref = publisher
+        .write_state_object_fenced_production(&state, "orders", &claim)
+        .await
+        .unwrap();
+    let output_ref = publisher
+        .write_output_object_fenced_production(&output, &claim)
+        .await
+        .unwrap();
+    let mut manifest = manifest(0, state_ref);
+    manifest.output_objects = vec![output_ref];
+
+    publisher
+        .publish_manifest_fenced_production(&manifest, &claim)
         .await
         .unwrap();
 

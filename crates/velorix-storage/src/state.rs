@@ -15,6 +15,7 @@ use crate::{
         CheckpointManifest, ManifestError, OutputObjectRef, PartitionOwnerClaim, StateObjectRef,
     },
     object_key::{ObjectKey, ObjectKeyError},
+    ownership::{OwnershipEpochRecord, OwnershipEpochRecordError},
     state_store::{RawObjectStateStore, SlateDbStateStore, StateObjectStore},
 };
 
@@ -57,6 +58,8 @@ pub enum CheckpointPublishError {
     #[error(transparent)]
     Manifest(#[from] ManifestError),
     #[error(transparent)]
+    OwnershipEpochRecord(#[from] OwnershipEpochRecordError),
+    #[error(transparent)]
     ObjectStoreCapability(#[from] ObjectStoreCapabilityError),
     #[error("state object `{0}` already exists")]
     StateObjectAlreadyExists(ObjectKey),
@@ -64,6 +67,10 @@ pub enum CheckpointPublishError {
     OutputObjectAlreadyExists(ObjectKey),
     #[error("checkpoint manifest `{0}` already exists")]
     ManifestAlreadyExists(ObjectKey),
+    #[error("ownership epoch record `{0}` is missing")]
+    MissingOwnershipEpochRecord(ObjectKey),
+    #[error("ownership epoch record conflict at `{object_key}`")]
+    OwnershipEpochRecordConflict { object_key: ObjectKey },
     #[error(
         "checkpoint manifest key `{object_key}` does not match manifest body key `{body_key}`"
     )]
@@ -226,6 +233,19 @@ impl CheckpointPublisher {
         self.write_state_object(state).await
     }
 
+    pub async fn write_state_object_fenced_production(
+        &self,
+        state: &StateObjectWrite,
+        stream_id: &str,
+        owner_claim: &PartitionOwnerClaim,
+    ) -> Result<StateObjectRef, CheckpointPublishError> {
+        self.validate_state_write_owner_claim(state, owner_claim)?;
+        self.validate_production_owner_claim_current(stream_id, state.partition_id(), owner_claim)
+            .await?;
+
+        self.write_state_object(state).await
+    }
+
     pub async fn write_output_object(
         &self,
         output: &OutputObjectWrite,
@@ -253,6 +273,22 @@ impl CheckpointPublisher {
         self.validate_output_write_owner_claim(output, owner_claim)?;
         self.validate_owner_claim_current([output.partition_id()], owner_claim)
             .await?;
+
+        self.write_output_object(output).await
+    }
+
+    pub async fn write_output_object_fenced_production(
+        &self,
+        output: &OutputObjectWrite,
+        owner_claim: &PartitionOwnerClaim,
+    ) -> Result<OutputObjectRef, CheckpointPublishError> {
+        self.validate_output_write_owner_claim(output, owner_claim)?;
+        self.validate_production_owner_claim_current(
+            output.stream_id(),
+            output.partition_id(),
+            owner_claim,
+        )
+        .await?;
 
         self.write_output_object(output).await
     }
@@ -325,6 +361,57 @@ impl CheckpointPublisher {
             .await?;
 
         self.publish_manifest(manifest).await
+    }
+
+    pub async fn publish_manifest_fenced_production(
+        &self,
+        manifest: &CheckpointManifest,
+        owner_claim: &PartitionOwnerClaim,
+    ) -> Result<(), CheckpointPublishError> {
+        manifest.validate()?;
+        manifest.validate_owner_claim(owner_claim)?;
+        self.validate_fenced_manifest_progress_claimed(manifest, owner_claim)?;
+        self.validate_manifest_production_owner_claims_current(manifest, owner_claim)
+            .await?;
+
+        self.publish_manifest(manifest).await
+    }
+
+    pub async fn create_ownership_epoch_record(
+        &self,
+        record: &OwnershipEpochRecord,
+    ) -> Result<ObjectKey, CheckpointPublishError> {
+        record.validate()?;
+        let object_key = record.object_key()?;
+        let path = Path::from(object_key.as_str());
+        let bytes = serde_json::to_vec(record)?;
+        let result = self
+            .store
+            .put_opts(&path, Bytes::from(bytes).into(), PutMode::Create.into())
+            .await;
+
+        match result {
+            Ok(_) => Ok(object_key),
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                let existing = self.read_ownership_epoch_record_object(&object_key).await?;
+                if existing == *record {
+                    Ok(object_key)
+                } else {
+                    Err(CheckpointPublishError::OwnershipEpochRecordConflict { object_key })
+                }
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    pub async fn read_ownership_epoch_record(
+        &self,
+        stream_id: &str,
+        partition_id: u32,
+        owner_epoch: u64,
+    ) -> Result<OwnershipEpochRecord, CheckpointPublishError> {
+        let object_key = ObjectKey::ownership_epoch_record(stream_id, partition_id, owner_epoch)?;
+        self.read_ownership_epoch_record_object(&object_key).await
     }
 
     pub async fn list_published_manifests(
@@ -619,6 +706,143 @@ impl CheckpointPublisher {
         }
 
         Ok(())
+    }
+
+    async fn validate_manifest_production_owner_claims_current(
+        &self,
+        manifest: &CheckpointManifest,
+        owner_claim: &PartitionOwnerClaim,
+    ) -> Result<(), CheckpointPublishError> {
+        let mut checked = HashSet::new();
+
+        for input_range in &manifest.input_ranges {
+            if checked.insert((input_range.stream_id.as_str(), input_range.partition_id)) {
+                self.validate_production_owner_claim_current(
+                    &input_range.stream_id,
+                    input_range.partition_id,
+                    owner_claim,
+                )
+                .await?;
+            }
+        }
+
+        for output_object in &manifest.output_objects {
+            if checked.insert((output_object.stream_id.as_str(), output_object.partition_id)) {
+                self.validate_production_owner_claim_current(
+                    &output_object.stream_id,
+                    output_object.partition_id,
+                    owner_claim,
+                )
+                .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn validate_production_owner_claim_current(
+        &self,
+        stream_id: &str,
+        partition_id: u32,
+        owner_claim: &PartitionOwnerClaim,
+    ) -> Result<(), CheckpointPublishError> {
+        self.validate_matching_ownership_epoch_record_visible(stream_id, partition_id, owner_claim)
+            .await?;
+        self.validate_owner_claim_current([partition_id], owner_claim)
+            .await?;
+        self.validate_no_newer_visible_ownership_epoch_record(stream_id, partition_id, owner_claim)
+            .await
+    }
+
+    async fn validate_matching_ownership_epoch_record_visible(
+        &self,
+        stream_id: &str,
+        partition_id: u32,
+        owner_claim: &PartitionOwnerClaim,
+    ) -> Result<(), CheckpointPublishError> {
+        let object_key =
+            ObjectKey::ownership_epoch_record(stream_id, partition_id, owner_claim.owner_epoch)?;
+        let record = match self.read_ownership_epoch_record_object(&object_key).await {
+            Ok(record) => record,
+            Err(CheckpointPublishError::ObjectStore(object_store::Error::NotFound { .. })) => {
+                return Err(CheckpointPublishError::MissingOwnershipEpochRecord(
+                    object_key,
+                ));
+            }
+            Err(err) => return Err(err),
+        };
+
+        record.validate_owner_claim(&object_key, &owner_claim.owner_id, owner_claim.owner_epoch)?;
+
+        Ok(())
+    }
+
+    async fn validate_no_newer_visible_ownership_epoch_record(
+        &self,
+        stream_id: &str,
+        partition_id: u32,
+        owner_claim: &PartitionOwnerClaim,
+    ) -> Result<(), CheckpointPublishError> {
+        for record in self
+            .list_ownership_epoch_records(stream_id, partition_id)
+            .await?
+        {
+            let current = PartitionOwnerClaim {
+                owner_id: record.owner_id,
+                owner_epoch: record.owner_epoch,
+            };
+            if Self::is_current_claim_newer_or_conflicting(&current, owner_claim) {
+                return Err(CheckpointPublishError::StaleOwnerClaim {
+                    partition_id,
+                    current,
+                    attempted: owner_claim.clone(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn list_ownership_epoch_records(
+        &self,
+        stream_id: &str,
+        partition_id: u32,
+    ) -> Result<Vec<OwnershipEpochRecord>, CheckpointPublishError> {
+        let prefix_key = ObjectKey::ownership_epoch_record(stream_id, partition_id, 0)?;
+        let prefix = prefix_key
+            .as_str()
+            .strip_suffix("epoch=00000000000000000000.claim")
+            .ok_or_else(|| ObjectKeyError::InvalidExternalKey(prefix_key.to_string()))?;
+        let objects = self
+            .store
+            .list(Some(&Path::from(prefix)))
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let mut records = Vec::with_capacity(objects.len());
+        for object in objects {
+            let object_key = ObjectKey::parse(object.location.to_string())?;
+            let (_, key_parts) = ObjectKey::parse_ownership_epoch_record(object_key.as_str())?;
+            if key_parts.stream_id != stream_id || key_parts.partition_id != partition_id {
+                continue;
+            }
+
+            records.push(self.read_ownership_epoch_record_object(&object_key).await?);
+        }
+
+        Ok(records)
+    }
+
+    async fn read_ownership_epoch_record_object(
+        &self,
+        object_key: &ObjectKey,
+    ) -> Result<OwnershipEpochRecord, CheckpointPublishError> {
+        let path = Path::from(object_key.as_str());
+        let bytes = self.store.get(&path).await?.bytes().await?;
+        let record = serde_json::from_slice::<OwnershipEpochRecord>(&bytes)?;
+        record.validate_object_key(object_key)?;
+
+        Ok(record)
     }
 
     fn validate_fenced_manifest_progress_claimed(

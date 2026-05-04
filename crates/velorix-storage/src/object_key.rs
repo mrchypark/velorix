@@ -29,6 +29,13 @@ pub struct OutputObjectKeyParts {
     pub object_id: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnershipEpochRecordKeyParts {
+    pub stream_id: String,
+    pub partition_id: u32,
+    pub owner_epoch: u64,
+}
+
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum ObjectKeyError {
     #[error("object key segment `{0}` is empty")]
@@ -115,6 +122,18 @@ impl ObjectKey {
         Self("v1/checkpoint-index/latest-candidate.json".to_string())
     }
 
+    pub fn ownership_epoch_record(
+        stream_id: &str,
+        partition_id: u32,
+        owner_epoch: u64,
+    ) -> Result<Self, ObjectKeyError> {
+        validate_segment("stream_id", stream_id)?;
+
+        Ok(Self(format!(
+            "v1/ownership/{stream_id}/p={partition_id:0PARTITION_WIDTH$}/epoch={owner_epoch:0CHECKPOINT_WIDTH$}.claim"
+        )))
+    }
+
     pub fn persisted_query(query_id: &str) -> Result<Self, ObjectKeyError> {
         validate_segment("query_id", query_id)?;
 
@@ -157,6 +176,16 @@ impl ObjectKey {
         let value = value.into();
         let key = Self::parse(value.clone())?;
         let parts = parse_output_object_layout(&value)?;
+
+        Ok((key, parts))
+    }
+
+    pub fn parse_ownership_epoch_record(
+        value: impl Into<String>,
+    ) -> Result<(Self, OwnershipEpochRecordKeyParts), ObjectKeyError> {
+        let value = value.into();
+        let key = Self::parse(value.clone())?;
+        let parts = parse_ownership_epoch_record_layout(&value)?;
 
         Ok((key, parts))
     }
@@ -214,6 +243,9 @@ fn validate_known_layout(value: &str) -> Result<(), ObjectKeyError> {
             parse_fixed_u64("checkpoint_version", checkpoint, CHECKPOINT_WIDTH)?;
         }
         ["v1", "checkpoint-index", "latest-candidate.json"] => {}
+        ["v1", "ownership", stream_id, partition, epoch_file] => {
+            parse_ownership_epoch_record_parts(value, stream_id, partition, epoch_file)?;
+        }
         ["v1", "queries", query_file] => {
             let query_id = query_file
                 .strip_suffix(".query.json")
@@ -252,6 +284,18 @@ fn parse_output_object_layout(value: &str) -> Result<OutputObjectKeyParts, Objec
     };
 
     parse_output_object_parts(value, stream_id, partition, checkpoint, range, object_file)
+}
+
+fn parse_ownership_epoch_record_layout(
+    value: &str,
+) -> Result<OwnershipEpochRecordKeyParts, ObjectKeyError> {
+    let segments: Vec<_> = value.split('/').collect();
+
+    let ["v1", "ownership", stream_id, partition, epoch_file] = segments.as_slice() else {
+        return Err(ObjectKeyError::InvalidExternalKey(value.to_string()));
+    };
+
+    parse_ownership_epoch_record_parts(value, stream_id, partition, epoch_file)
 }
 
 fn parse_ingest_batch_parts(
@@ -301,6 +345,26 @@ fn parse_output_object_parts(
         start_offset_inclusive,
         end_offset_exclusive,
         object_id: object_id.to_string(),
+    })
+}
+
+fn parse_ownership_epoch_record_parts(
+    value: &str,
+    stream_id: &str,
+    partition: &str,
+    epoch_file: &str,
+) -> Result<OwnershipEpochRecordKeyParts, ObjectKeyError> {
+    validate_segment("stream_id", stream_id)?;
+    let partition_id = parse_prefixed_u32("partition_id", partition, "p=", PARTITION_WIDTH)?;
+    let owner_epoch = epoch_file
+        .strip_suffix(".claim")
+        .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+    let owner_epoch = parse_prefixed_u64("owner_epoch", owner_epoch, "epoch=", CHECKPOINT_WIDTH)?;
+
+    Ok(OwnershipEpochRecordKeyParts {
+        stream_id: stream_id.to_string(),
+        partition_id,
+        owner_epoch,
     })
 }
 
@@ -507,6 +571,25 @@ mod tests {
     }
 
     #[test]
+    fn ownership_epoch_record_key_is_deterministic_and_parseable() {
+        let key = ObjectKey::ownership_epoch_record("orders", 7, 42).unwrap();
+        let restarted = ObjectKey::ownership_epoch_record("orders", 7, 42).unwrap();
+
+        assert_eq!(
+            key.as_str(),
+            "v1/ownership/orders/p=0000000007/epoch=00000000000000000042.claim"
+        );
+        assert_eq!(key, restarted);
+        assert_eq!(ObjectKey::parse(key.as_str()).unwrap(), key);
+
+        let (parsed_key, parts) = ObjectKey::parse_ownership_epoch_record(key.as_str()).unwrap();
+        assert_eq!(parsed_key, key);
+        assert_eq!(parts.stream_id, "orders");
+        assert_eq!(parts.partition_id, 7);
+        assert_eq!(parts.owner_epoch, 42);
+    }
+
+    #[test]
     fn persisted_query_key_is_deterministic() {
         let key = ObjectKey::persisted_query("orders-by-account").unwrap();
         let restarted = ObjectKey::persisted_query("orders-by-account").unwrap();
@@ -556,6 +639,8 @@ mod tests {
             "/v1/checkpoints/00000000000000000001.manifest",
             "v2/checkpoints/00000000000000000001.manifest",
             "v1/unknown/orders/p=0000000000/object",
+            "v1/ownership/orders/p=0000000000/epoch=1.claim",
+            "v1/ownership/orders/p=0000000000/epoch=00000000000000000001.json",
             "v1/queries/../orders.query.json",
             "v1/queries/orders.txt",
             "v1/tables/../orders.table.json",
