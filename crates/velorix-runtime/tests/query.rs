@@ -519,6 +519,45 @@ async fn query_object_backed_input_rejects_scan_above_byte_limit() {
 }
 
 #[tokio::test]
+async fn query_object_backed_input_rejects_object_requests_above_limit_before_limit_sql_scan() {
+    let store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
+    put_parquet_input(
+        &store,
+        "input/part-000.parquet",
+        &parquet_input_batch(&["\"account-a\""], &["10"], &[1]),
+    )
+    .await;
+    put_parquet_input(
+        &store,
+        "input/part-001.parquet",
+        &parquet_input_batch(&["\"account-b\""], &["7"], &[1]),
+    )
+    .await;
+
+    let error = query_object_backed_input_with_policy(
+        Arc::clone(&store),
+        "memory://velorix/input/",
+        "select key_json, value_json, weight from input limit 1",
+        QueryPolicy {
+            max_object_requests: Some(2),
+            ..QueryPolicy::default()
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RuntimeQueryError::Query(QueryError::Policy(
+            QueryPolicyError::ObjectRequestsExceeded {
+                observed_requests: 3,
+                max_requests: 2,
+            }
+        ))
+    ));
+}
+
+#[tokio::test]
 async fn query_object_backed_input_propagates_datafusion_scan_errors() {
     let store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
 

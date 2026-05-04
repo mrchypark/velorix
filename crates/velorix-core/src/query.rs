@@ -31,6 +31,7 @@ pub struct QueryPolicy {
     pub max_output_rows: Option<usize>,
     pub max_scan_files: Option<usize>,
     pub max_scan_bytes: Option<u64>,
+    pub max_object_requests: Option<usize>,
     pub batch_size: Option<std::num::NonZeroUsize>,
     pub target_partitions: Option<std::num::NonZeroUsize>,
 }
@@ -60,6 +61,13 @@ pub enum QueryPolicyError {
         "query would scan {observed_bytes} bytes, above query policy limit of {max_bytes} bytes"
     )]
     ScanBytesExceeded { observed_bytes: u64, max_bytes: u64 },
+    #[error(
+        "query would issue at least {observed_requests} object requests, above query policy limit of {max_requests} object requests"
+    )]
+    ObjectRequestsExceeded {
+        observed_requests: usize,
+        max_requests: usize,
+    },
 }
 
 /// Runs caller SQL over a delta batch through DataFusion.

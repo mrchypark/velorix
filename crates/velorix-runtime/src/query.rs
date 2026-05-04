@@ -115,13 +115,27 @@ async fn validate_scan_policy(
     table_url: &str,
     policy: QueryPolicy,
 ) -> Result<(), QueryError> {
-    if policy.max_scan_files.is_none() && policy.max_scan_bytes.is_none() {
+    if policy.max_scan_files.is_none()
+        && policy.max_scan_bytes.is_none()
+        && policy.max_object_requests.is_none()
+    {
         return Ok(());
     }
 
     let prefix = object_path_for_table_url(table_url)?;
     let mut observed_files = 0usize;
     let mut observed_bytes = 0u64;
+    let mut observed_requests = 1usize;
+    if let Some(max_requests) = policy.max_object_requests {
+        if observed_requests > max_requests {
+            return Err(QueryPolicyError::ObjectRequestsExceeded {
+                observed_requests,
+                max_requests,
+            }
+            .into());
+        }
+    }
+
     let mut objects = store.list(Some(&prefix));
 
     while let Some(object) = objects
@@ -131,6 +145,7 @@ async fn validate_scan_policy(
     {
         observed_files = observed_files.saturating_add(1);
         observed_bytes = observed_bytes.saturating_add(object.size);
+        observed_requests = observed_requests.saturating_add(1);
 
         if let Some(max_files) = policy.max_scan_files {
             if observed_files > max_files {
@@ -146,6 +161,15 @@ async fn validate_scan_policy(
                 return Err(QueryPolicyError::ScanBytesExceeded {
                     observed_bytes,
                     max_bytes,
+                }
+                .into());
+            }
+        }
+        if let Some(max_requests) = policy.max_object_requests {
+            if observed_requests > max_requests {
+                return Err(QueryPolicyError::ObjectRequestsExceeded {
+                    observed_requests,
+                    max_requests,
                 }
                 .into());
             }

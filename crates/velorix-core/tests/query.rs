@@ -168,6 +168,19 @@ fn query_policy_scan_byte_limit_has_typed_error() {
     );
 }
 
+#[test]
+fn query_policy_object_request_limit_has_typed_error() {
+    let error = QueryPolicyError::ObjectRequestsExceeded {
+        observed_requests: 3,
+        max_requests: 2,
+    };
+
+    assert_eq!(
+        error.to_string(),
+        "query would issue at least 3 object requests, above query policy limit of 2 object requests"
+    );
+}
+
 #[tokio::test]
 async fn query_delta_batch_with_policy_still_lets_datafusion_handle_aggregation_planning() {
     let input = DeltaBatch::from_records([

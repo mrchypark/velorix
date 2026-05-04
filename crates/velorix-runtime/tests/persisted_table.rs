@@ -12,7 +12,7 @@ use object_store::{local::LocalFileSystem, path::Path, ObjectStore};
 use parquet::arrow::ArrowWriter;
 use serde_json::json;
 use tempfile::TempDir;
-use velorix_core::query::{QueryError, QueryPolicy};
+use velorix_core::query::{QueryError, QueryPolicy, QueryPolicyError};
 use velorix_runtime::{
     persisted_table::{
         query_persisted_object_backed_input_with_policy,
@@ -442,6 +442,66 @@ async fn production_object_backed_table_query_rejects_scan_above_file_count_limi
             velorix_core::query::QueryPolicyError::ScanFilesExceeded {
                 observed_files: 2,
                 max_files: 1,
+            }
+        )))
+    ));
+}
+
+#[tokio::test]
+async fn production_object_backed_table_query_rejects_object_requests_above_limit() {
+    let (_temp_dir, catalog_store) = temp_store();
+    let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
+    put_parquet_input(
+        &scan_store,
+        "tenants/tenant-a/tables/orders/snapshots/0001/part-000.parquet",
+        &parquet_input_batch(&["\"account-a\""], &["10"], &[1]),
+    )
+    .await;
+    put_parquet_input(
+        &scan_store,
+        "tenants/tenant-a/tables/orders/snapshots/0001/part-001.parquet",
+        &parquet_input_batch(&["\"account-b\""], &["7"], &[1]),
+    )
+    .await;
+    let mut registry = StorageRegistry::new();
+    registry
+        .register("primary", "memory://velorix/", Arc::clone(&scan_store))
+        .unwrap();
+
+    PersistedTableStore::new(Arc::clone(&catalog_store))
+        .create_production(
+            "orders-current",
+            "tenant-a",
+            "primary",
+            "tenants/tenant-a/tables/orders",
+            "snapshots/0001",
+            ProductionPersistedTableFormat::Parquet,
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "standard",
+        )
+        .await
+        .unwrap();
+
+    let error = query_production_persisted_object_backed_input_with_policy(
+        Arc::clone(&catalog_store),
+        &registry,
+        "tenant-a",
+        "orders-current",
+        "select key_json, value_json, weight from input limit 1",
+        QueryPolicy {
+            max_object_requests: Some(2),
+            ..QueryPolicy::default()
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        PersistedTableError::RuntimeQuery(RuntimeQueryError::Query(QueryError::Policy(
+            QueryPolicyError::ObjectRequestsExceeded {
+                observed_requests: 3,
+                max_requests: 2,
             }
         )))
     ));
