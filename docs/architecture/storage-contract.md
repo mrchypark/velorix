@@ -47,6 +47,13 @@ range, at least one state object reference, monotonic parent linkage, nonempty
 input and output ranges, checkpoint-matching state object metadata, and unique
 object ids and object keys across state and output references.
 
+State object references may carry an `owner_claim` with `owner_id` and
+`owner_epoch`. This is distinct from the existing state ref `owner`, which
+continues to mean the logical state/view owner used in the state object key.
+The claim metadata is the storage-side contract for stale-worker detection and
+structural progress authorization; it does not change `ObjectKey::state_object`
+layout.
+
 The manifest checkpoint version is a publication/progress version. It is
 separate from the incremental engine logical epoch. Current engine checkpoint
 state is serialized as a versioned payload with `schema_version`,
@@ -63,6 +70,20 @@ The publication order is:
 3. Validate that all manifest-referenced state objects exist.
 4. Publish the checkpoint manifest with create-only semantics.
 
+Fenced state write and manifest publication APIs accept the caller's current
+`owner_claim`. They require fenced state refs to carry one explicit claim for
+the manifest. `publish_manifest_fenced` rejects state refs with a different
+claim, and rejects input or output progress for any partition absent from the
+set of state refs carrying the requested claim. It also rejects a stale claim
+before creating the state object or checkpoint manifest when an already
+published manifest for the same partition carries a higher `owner_epoch` or the
+same epoch with a different `owner_id`. Existing unfenced local/bootstrap paths
+remain available for compatibility.
+
+These checks are non-atomic storage-side stale-owner detection and structurally
+unauthorized progress rejection. They are not production linearizable fencing.
+A production fencing or marker-index commit protocol remains future design.
+
 Crash behavior follows from that order:
 
 - Crash before state object write: no new manifest exists, so durable progress
@@ -75,6 +96,11 @@ Crash behavior follows from that order:
 
 Object-store conditional create is used where the adapter supports it. Local
 filesystem tests exercise the same create-only behavior.
+
+Kubernetes `Lease` acquisition, renewal, and `owner_epoch` assignment remain
+future control-plane work. Kubernetes and etcd are not treated as the durable
+database authority; object storage manifests remain the durable record that the
+storage layer verifies.
 
 ## Replay and Recovery
 

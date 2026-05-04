@@ -190,7 +190,13 @@ epoch fallback for those old payloads.
    lifecycle with CRDs and an operator, and use Kubernetes `Lease` or an
    equivalent K8s-native primitive for partition ownership and `owner_epoch`.
    Keep object storage, not Kubernetes or etcd, as the durable database
-   authority.
+   authority. The current storage slice carries and verifies plain
+   `owner_id`/`owner_epoch` claim metadata on fenced state writes and checkpoint
+   manifest publication, but those checks are non-atomic stale-owner detection
+   and structurally unauthorized progress rejection, not production
+   linearizable fencing. Actual Kubernetes Lease acquisition and any production
+   fencing or marker-index commit protocol remain future control-plane/storage
+   design work.
 7. Use Feldera's SQL-to-DBSP compiler for standing-view SQL through validated
    external compiler artifacts. Do not hand-build Velorix circuits for standing
    views in this phase.

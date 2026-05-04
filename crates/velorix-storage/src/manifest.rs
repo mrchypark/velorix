@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, fmt};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -17,6 +17,12 @@ pub struct CheckpointManifest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartitionOwnerClaim {
+    pub owner_id: String,
+    pub owner_epoch: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputRange {
     pub stream_id: String,
     pub partition_id: u32,
@@ -31,6 +37,8 @@ pub struct StateObjectRef {
     pub owner: String,
     pub partition_id: u32,
     pub checkpoint_version: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_claim: Option<PartitionOwnerClaim>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,6 +94,16 @@ pub enum ManifestError {
         expected: ObjectKey,
         actual: ObjectKey,
     },
+    #[error("state object `{object_id}` must carry an owner claim")]
+    MissingOwnerClaim { object_id: String },
+    #[error(
+        "state object `{object_id}` owner claim mismatch: expected `{expected}`, actual `{actual}`"
+    )]
+    OwnerClaimMismatch {
+        object_id: String,
+        expected: PartitionOwnerClaim,
+        actual: PartitionOwnerClaim,
+    },
     #[error("output object range for {object_id} must be nonempty: start={start_offset_inclusive}, end={end_offset_exclusive}")]
     InvalidOutputRange {
         object_id: String,
@@ -104,6 +122,12 @@ pub enum ManifestError {
     DuplicateObjectKey(ObjectKey),
     #[error("manifest creation timestamp must be provided by the caller")]
     MissingCreationTimestamp,
+}
+
+impl fmt::Display for PartitionOwnerClaim {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}@{}", self.owner_id, self.owner_epoch)
+    }
 }
 
 impl CheckpointManifest {
@@ -125,6 +149,31 @@ impl CheckpointManifest {
         self.validate_state_objects()?;
         self.validate_unique_object_refs()?;
         self.validate_output_objects()?;
+
+        Ok(())
+    }
+
+    pub fn validate_owner_claim(
+        &self,
+        owner_claim: &PartitionOwnerClaim,
+    ) -> Result<(), ManifestError> {
+        for state_object in &self.state_objects {
+            match &state_object.owner_claim {
+                Some(actual) if actual == owner_claim => {}
+                Some(actual) => {
+                    return Err(ManifestError::OwnerClaimMismatch {
+                        object_id: state_object.object_id.clone(),
+                        expected: owner_claim.clone(),
+                        actual: actual.clone(),
+                    });
+                }
+                None => {
+                    return Err(ManifestError::MissingOwnerClaim {
+                        object_id: state_object.object_id.clone(),
+                    });
+                }
+            }
+        }
 
         Ok(())
     }
@@ -311,7 +360,10 @@ impl<'a> ObjectRef<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CheckpointManifest, InputRange, ManifestError, OutputObjectRef, StateObjectRef};
+    use super::{
+        CheckpointManifest, InputRange, ManifestError, OutputObjectRef, PartitionOwnerClaim,
+        StateObjectRef,
+    };
     use crate::object_key::ObjectKey;
 
     fn state_ref(object_id: &str, object_key: ObjectKey) -> StateObjectRef {
@@ -321,6 +373,7 @@ mod tests {
             owner: "balances_by_account".to_string(),
             partition_id: 0,
             checkpoint_version: 1,
+            owner_claim: None,
         }
     }
 
@@ -355,6 +408,13 @@ mod tests {
             )],
             parent_checkpoint: Some(0),
             created_at: "2026-05-03T00:00:00Z".to_string(),
+        }
+    }
+
+    fn owner_claim(owner_id: &str, owner_epoch: u64) -> PartitionOwnerClaim {
+        PartitionOwnerClaim {
+            owner_id: owner_id.to_string(),
+            owner_epoch,
         }
     }
 
@@ -465,6 +525,22 @@ mod tests {
             Err(ManifestError::InvalidParentCheckpoint {
                 parent_checkpoint: u64::MAX,
                 checkpoint_version: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn checkpoint_manifest_rejects_state_ref_with_mismatched_owner_claim() {
+        let expected_claim = owner_claim("worker-a", 7);
+        let mut manifest = valid_manifest();
+        manifest.state_objects[0].owner_claim = Some(owner_claim("worker-b", 7));
+
+        assert_eq!(
+            manifest.validate_owner_claim(&expected_claim),
+            Err(ManifestError::OwnerClaimMismatch {
+                object_id: "state-0001".to_string(),
+                expected: expected_claim,
+                actual: owner_claim("worker-b", 7),
             })
         );
     }

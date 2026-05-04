@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use bytes::Bytes;
 use futures::TryStreamExt;
@@ -6,7 +6,7 @@ use object_store::{path::Path, ObjectStore, PutMode};
 use thiserror::Error;
 
 use crate::{
-    manifest::{CheckpointManifest, ManifestError, StateObjectRef},
+    manifest::{CheckpointManifest, ManifestError, PartitionOwnerClaim, StateObjectRef},
     object_key::{ObjectKey, ObjectKeyError},
     state_store::{RawObjectStateStore, SlateDbStateStore, StateObjectStore},
 };
@@ -27,6 +27,7 @@ pub struct StateObjectWrite {
     object_id: String,
     bytes: Bytes,
     object_key: ObjectKey,
+    owner_claim: Option<PartitionOwnerClaim>,
 }
 
 #[derive(Debug, Error)]
@@ -48,6 +49,26 @@ pub enum CheckpointPublishError {
     },
     #[error("referenced state object `{0}` is missing")]
     MissingStateObject(ObjectKey),
+    #[error("state object `{object_key}` owner claim mismatch: expected `{expected}`, actual `{actual:?}`")]
+    StateOwnerClaimMismatch {
+        object_key: ObjectKey,
+        expected: PartitionOwnerClaim,
+        actual: Option<PartitionOwnerClaim>,
+    },
+    #[error("stale owner claim for partition {partition_id}: current `{current}`, attempted `{attempted}`")]
+    StaleOwnerClaim {
+        partition_id: u32,
+        current: PartitionOwnerClaim,
+        attempted: PartitionOwnerClaim,
+    },
+    #[error(
+        "fenced manifest {progress_kind} partition {partition_id} is not covered by state objects for owner claim `{owner_claim}`"
+    )]
+    FencedManifestPartitionNotClaimed {
+        progress_kind: &'static str,
+        partition_id: u32,
+        owner_claim: PartitionOwnerClaim,
+    },
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
@@ -85,6 +106,18 @@ impl CheckpointPublisher {
         self.state_store.write_state_object(state).await
     }
 
+    pub async fn write_state_object_fenced(
+        &self,
+        state: &StateObjectWrite,
+        owner_claim: &PartitionOwnerClaim,
+    ) -> Result<StateObjectRef, CheckpointPublishError> {
+        self.validate_state_write_owner_claim(state, owner_claim)?;
+        self.validate_owner_claim_current([state.partition_id()], owner_claim)
+            .await?;
+
+        self.write_state_object(state).await
+    }
+
     pub async fn publish_manifest(
         &self,
         manifest: &CheckpointManifest,
@@ -107,6 +140,33 @@ impl CheckpointPublisher {
             }
             Err(err) => Err(err.into()),
         }
+    }
+
+    /// Publishes one checkpoint manifest for a single owner claim.
+    ///
+    /// This is a non-atomic storage-side stale-owner detection and structural
+    /// authorization check. It rejects state refs that do not carry the
+    /// requested claim, and rejects input/output progress for partitions not
+    /// represented by state refs carrying that exact claim. Production
+    /// linearizable fencing remains a future control-plane/commit protocol.
+    pub async fn publish_manifest_fenced(
+        &self,
+        manifest: &CheckpointManifest,
+        owner_claim: &PartitionOwnerClaim,
+    ) -> Result<(), CheckpointPublishError> {
+        manifest.validate()?;
+        manifest.validate_owner_claim(owner_claim)?;
+        self.validate_fenced_manifest_progress_claimed(manifest, owner_claim)?;
+
+        let partitions = manifest
+            .state_objects
+            .iter()
+            .map(|state_ref| state_ref.partition_id)
+            .collect::<HashSet<_>>();
+        self.validate_owner_claim_current(partitions, owner_claim)
+            .await?;
+
+        self.publish_manifest(manifest).await
     }
 
     pub async fn list_published_manifests(
@@ -169,6 +229,89 @@ impl CheckpointPublisher {
 
         Ok(())
     }
+
+    fn validate_fenced_manifest_progress_claimed(
+        &self,
+        manifest: &CheckpointManifest,
+        owner_claim: &PartitionOwnerClaim,
+    ) -> Result<(), CheckpointPublishError> {
+        let claimed_partitions = manifest
+            .state_objects
+            .iter()
+            .filter(|state_ref| state_ref.owner_claim.as_ref() == Some(owner_claim))
+            .map(|state_ref| state_ref.partition_id)
+            .collect::<HashSet<_>>();
+
+        for input_range in &manifest.input_ranges {
+            if !claimed_partitions.contains(&input_range.partition_id) {
+                return Err(CheckpointPublishError::FencedManifestPartitionNotClaimed {
+                    progress_kind: "input",
+                    partition_id: input_range.partition_id,
+                    owner_claim: owner_claim.clone(),
+                });
+            }
+        }
+
+        for output_object in &manifest.output_objects {
+            if !claimed_partitions.contains(&output_object.partition_id) {
+                return Err(CheckpointPublishError::FencedManifestPartitionNotClaimed {
+                    progress_kind: "output",
+                    partition_id: output_object.partition_id,
+                    owner_claim: owner_claim.clone(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_state_write_owner_claim(
+        &self,
+        state: &StateObjectWrite,
+        owner_claim: &PartitionOwnerClaim,
+    ) -> Result<(), CheckpointPublishError> {
+        if state.owner_claim() == Some(owner_claim) {
+            Ok(())
+        } else {
+            Err(CheckpointPublishError::StateOwnerClaimMismatch {
+                object_key: state.object_key().clone(),
+                expected: owner_claim.clone(),
+                actual: state.owner_claim().cloned(),
+            })
+        }
+    }
+
+    async fn validate_owner_claim_current(
+        &self,
+        partitions: impl IntoIterator<Item = u32>,
+        owner_claim: &PartitionOwnerClaim,
+    ) -> Result<(), CheckpointPublishError> {
+        let partitions = partitions.into_iter().collect::<HashSet<_>>();
+        for manifest in self.list_published_manifests().await? {
+            for state_ref in manifest.state_objects {
+                if !partitions.contains(&state_ref.partition_id) {
+                    continue;
+                }
+
+                let Some(current) = state_ref.owner_claim else {
+                    continue;
+                };
+
+                if current.owner_epoch > owner_claim.owner_epoch
+                    || (current.owner_epoch == owner_claim.owner_epoch
+                        && current.owner_id != owner_claim.owner_id)
+                {
+                    return Err(CheckpointPublishError::StaleOwnerClaim {
+                        partition_id: state_ref.partition_id,
+                        current,
+                        attempted: owner_claim.clone(),
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl StateObjectWrite {
@@ -191,7 +334,22 @@ impl StateObjectWrite {
             object_id,
             bytes,
             object_key,
+            owner_claim: None,
         })
+    }
+
+    pub fn new_fenced(
+        owner: impl Into<String>,
+        partition_id: u32,
+        checkpoint_version: u64,
+        object_id: impl Into<String>,
+        owner_claim: PartitionOwnerClaim,
+        bytes: Bytes,
+    ) -> Result<Self, CheckpointPublishError> {
+        let mut state = Self::new(owner, partition_id, checkpoint_version, object_id, bytes)?;
+        state.owner_claim = Some(owner_claim);
+
+        Ok(state)
     }
 
     pub fn object_key(&self) -> &ObjectKey {
@@ -218,6 +376,10 @@ impl StateObjectWrite {
         &self.bytes
     }
 
+    pub fn owner_claim(&self) -> Option<&PartitionOwnerClaim> {
+        self.owner_claim.as_ref()
+    }
+
     pub(crate) fn object_ref(&self) -> StateObjectRef {
         StateObjectRef {
             object_id: self.object_id.clone(),
@@ -225,6 +387,7 @@ impl StateObjectWrite {
             owner: self.owner.clone(),
             partition_id: self.partition_id,
             checkpoint_version: self.checkpoint_version,
+            owner_claim: self.owner_claim.clone(),
         }
     }
 }
