@@ -5,6 +5,18 @@ already fit the job. The project should integrate proven substrates and keep
 Velorix-specific code focused on object-storage authority, checkpoint manifests,
 stateless recovery, resource/cost policy, and package boundaries.
 
+Production Velorix should be Kubernetes-native for control plane and
+orchestration, while remaining object-storage-authoritative for database state.
+Kubernetes CRDs, an operator, and `Lease` objects may coordinate lifecycle,
+scheduling, worker ownership, and `owner_epoch`, but Kubernetes and etcd are not
+the database authority. Velorix-owned object-storage manifests for input
+batches, checkpointed state refs, and materialized output objects are the
+default internal table/state authority. The design is Databend-like in being
+object-storage-first with disposable stateless compute, but Velorix is
+streaming/incremental-first with DBSP-shaped standing views and checkpoint
+manifests. Iceberg is optional external interoperability, export, or import
+work only after a narrow adoption RFC.
+
 This note distinguishes current implementation from target direction. The
 runtime object cache is currently Foyer-backed, ad hoc SQL/query planning and
 execution currently use DataFusion for the minimal `DeltaBatch`, validation,
@@ -20,15 +32,27 @@ Feldera SQL-to-DBSP standing-view compilation now has a phase-0 artifact
 metadata/spec contract. Direct runtime Feldera DBSP/dbsp integration remains
 gated unless matching code exists in the repository.
 
+See the package review notes for the current production-readiness package
+strategy:
+
+- [Package Review Index](package-review-index.md)
+- [OpenData Package Review](package-review-opendata.md)
+- [Arroyo Package Review](package-review-arroyo.md)
+- [Feldera and Core Package Review](package-review-feldera-and-core-packages.md)
+
 ## Package Ownership
 
 | Area | Status | Preferred owner | Velorix-owned boundary |
 | --- | --- | --- | --- |
+| Object storage API and adapter capabilities | Current implementation dependency; production capability gates still needed | Apache `object_store` crate plus backend-specific adapters | Backend allowlists, conditional-create/CAS requirements, credentials policy, shared registry, telemetry, fail-closed startup |
 | Durable LSM/SST/state substrate | Current minimal experimental state-store implementation | SlateDB | Object key policy, stream progress, exactly-once manifests, recovery orchestration |
 | Runtime object-store fetch-through cache | Current implementation | Foyer | Object-store authority checks, cache namespace policy, cache-as-non-durable invariant |
 | Ad hoc SQL/DataFrame/query planning, validation, and Arrow execution | Current minimal implementation | Apache DataFusion | Runtime integration, checkpoint-aware inputs/outputs, persisted query catalog specs, cost/resource policy |
+| Internal materialized table/state authority | Target direction; current manifests and checkpoint refs already define the recovery boundary | Velorix-owned object-storage manifests and objects | Input/state/output manifest schemas, exactly-once publication, checkpoint binding, recovery, GC |
+| External table interoperability | Future RFC only; raw Parquet URL specs are phase-0 only | Apache Iceberg or another table format, only for import/export/interop surfaces | Table/catalog authorization, snapshot selection, table lifecycle policy, manifest binding when crossing the internal boundary |
 | Standing-view SQL-to-DBSP compilation | Current phase-0 artifact contract | Feldera SQL-to-DBSP compiler and pipeline tooling | Spec/artifact validation, release artifact selection, object-backed state and manifests |
 | Incremental algebra, operators, and circuit semantics | Current adapter boundary; direct DBSP crate integration remains gated | Feldera project semantics and/or Rust `dbsp` crate | `IncrementalEngine` adapter, object-backed persistence, moderate-performance cost optimizations |
+| Kubernetes-native control plane/orchestration | Target production direction | Kubernetes CRDs, operator, and Lease or equivalent K8s-native lease primitive | Catalog/view lifecycle intent, status, scheduling policy, owner epoch in writes/manifests, stale-worker rejection, recovery handoff rules |
 
 ## Cache Boundary
 
@@ -92,6 +116,11 @@ a minimal boundary, with persisted view access v0 limited to a stored query over
 a stored object-backed Parquet table. Broader table layout, query
 scheduling/versioning, permissions, and memory-pool/disk-spill runtime resource
 policy remain future integration work.
+
+Apache Iceberg is not the default internal Velorix table format. It is an
+optional candidate for future import, export, or interoperability surfaces if an
+adoption RFC proves a narrow ownership boundary. Internal materialized outputs
+remain Velorix manifest-backed object-storage objects by default.
 
 ## Feldera Standing-View Compile Contract
 
@@ -157,12 +186,19 @@ epoch fallback for those old payloads.
    view access v0 composes those specs as stored query over stored Parquet
    input. Broader table layout, scheduling, versioning, and permissions remain
    future work.
-6. Use Feldera's SQL-to-DBSP compiler for standing-view SQL through validated
+6. Make the production control plane Kubernetes-native: model catalog/view
+   lifecycle with CRDs and an operator, and use Kubernetes `Lease` or an
+   equivalent K8s-native primitive for partition ownership and `owner_epoch`.
+   Keep object storage, not Kubernetes or etcd, as the durable database
+   authority.
+7. Use Feldera's SQL-to-DBSP compiler for standing-view SQL through validated
    external compiler artifacts. Do not hand-build Velorix circuits for standing
    views in this phase.
-7. Use Feldera DBSP semantics as the reference model for incremental operators
+8. Use Feldera DBSP semantics as the reference model for incremental operators
    and circuit semantics. Consider direct Rust `dbsp` crate integration only
    after the adoption gates are satisfied; otherwise keep an adapter boundary.
+9. Treat Iceberg as optional external table interoperability, export, or import
+   work until a future RFC assigns it a specific surface.
 
 ## Non-Goals
 
@@ -174,3 +210,6 @@ epoch fallback for those old payloads.
   integration can own the model.
 - Do not vendor Feldera, add Java/Maven compiler builds, or load generated Rust
   from object storage at runtime as part of the phase-0 artifact contract.
+- Do not treat Kubernetes, etcd, Iceberg, OpenData, or Arroyo as the durable
+  internal database authority without a narrow adoption RFC. Object storage and
+  Velorix manifests remain authoritative by default.
