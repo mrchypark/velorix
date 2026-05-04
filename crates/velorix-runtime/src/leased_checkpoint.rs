@@ -3,6 +3,7 @@ use velorix_control::lease::PartitionLeaseGrant;
 use velorix_storage::{
     manifest::{
         CheckpointManifest, ManifestError, OutputObjectRef, PartitionOwnerClaim, StateObjectRef,
+        StateRefType,
     },
     object_key::ObjectKey,
     state::{CheckpointPublishError, CheckpointPublisher, OutputObjectWrite, StateObjectWrite},
@@ -270,6 +271,7 @@ fn state_object_ref(state: &StateObjectWrite) -> StateObjectRef {
         owner: state.owner().to_string(),
         partition_id: state.partition_id(),
         checkpoint_version: state.checkpoint_version(),
+        ref_type: StateRefType::RawObject,
         owner_claim: state.owner_claim().cloned(),
     }
 }

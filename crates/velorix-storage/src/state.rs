@@ -13,6 +13,7 @@ use crate::{
     checkpoint_index::{manifest_digest, marker_updated_at_now, LatestCandidateMarker},
     manifest::{
         CheckpointManifest, ManifestError, OutputObjectRef, PartitionOwnerClaim, StateObjectRef,
+        StateRefType,
     },
     object_key::{ObjectKey, ObjectKeyError},
     ownership::{OwnershipEpochRecord, OwnershipEpochRecordError},
@@ -109,6 +110,11 @@ pub enum CheckpointPublishError {
     },
     #[error("referenced state object `{0}` is missing")]
     MissingStateObject(ObjectKey),
+    #[error("production manifest state object `{object_id}` must reference a SlateDB checkpoint, found `{ref_type:?}`")]
+    ProductionStateRefNotSlateDbCheckpoint {
+        object_id: String,
+        ref_type: StateRefType,
+    },
     #[error("referenced output object `{0}` is missing")]
     MissingOutputObject(ObjectKey),
     #[error("state object `{object_key}` owner claim mismatch: expected `{expected}`, actual `{actual:?}`")]
@@ -373,6 +379,7 @@ impl CheckpointPublisher {
         self.validate_fenced_manifest_progress_claimed(manifest, owner_claim)?;
         self.validate_manifest_production_owner_claims_current(manifest, owner_claim)
             .await?;
+        self.validate_production_state_refs_are_slatedb_checkpoints(manifest)?;
 
         self.publish_manifest(manifest).await
     }
@@ -480,6 +487,24 @@ impl CheckpointPublisher {
                 return Err(CheckpointPublishError::MissingStateObject(
                     state_ref.object_key.clone(),
                 ));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_production_state_refs_are_slatedb_checkpoints(
+        &self,
+        manifest: &CheckpointManifest,
+    ) -> Result<(), CheckpointPublishError> {
+        for state_ref in &manifest.state_objects {
+            if state_ref.ref_type != StateRefType::SlateDbCheckpoint {
+                return Err(
+                    CheckpointPublishError::ProductionStateRefNotSlateDbCheckpoint {
+                        object_id: state_ref.object_id.clone(),
+                        ref_type: state_ref.ref_type,
+                    },
+                );
             }
         }
 
@@ -1042,6 +1067,7 @@ impl StateObjectWrite {
             owner: self.owner.clone(),
             partition_id: self.partition_id,
             checkpoint_version: self.checkpoint_version,
+            ref_type: StateRefType::RawObject,
             owner_claim: self.owner_claim.clone(),
         }
     }

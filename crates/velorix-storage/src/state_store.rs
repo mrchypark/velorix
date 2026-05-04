@@ -6,7 +6,7 @@ use object_store::{path::Path, ObjectStore, PutMode};
 use slatedb::{ErrorKind, IsolationLevel};
 
 use crate::{
-    manifest::StateObjectRef,
+    manifest::{StateObjectRef, StateRefType},
     state::{CheckpointPublishError, StateObjectWrite},
 };
 
@@ -94,6 +94,12 @@ impl StateObjectStore for RawObjectStateStore {
         &self,
         state_ref: &StateObjectRef,
     ) -> Result<Bytes, CheckpointPublishError> {
+        if state_ref.ref_type == StateRefType::SlateDbCheckpoint {
+            return Err(CheckpointPublishError::MissingStateObject(
+                state_ref.object_key.clone(),
+            ));
+        }
+
         Ok(self
             .store
             .get(&Path::from(state_ref.object_key.as_str()))
@@ -106,6 +112,10 @@ impl StateObjectStore for RawObjectStateStore {
         &self,
         state_ref: &StateObjectRef,
     ) -> Result<bool, CheckpointPublishError> {
+        if state_ref.ref_type == StateRefType::SlateDbCheckpoint {
+            return Ok(false);
+        }
+
         match self
             .store
             .head(&Path::from(state_ref.object_key.as_str()))
@@ -134,7 +144,11 @@ impl StateObjectStore for SlateDbStateStore {
 
         txn.put(key, state.bytes().as_ref())?;
         match txn.commit().await {
-            Ok(_) => Ok(state.object_ref()),
+            Ok(_) => {
+                let mut state_ref = state.object_ref();
+                state_ref.ref_type = StateRefType::SlateDbCheckpoint;
+                Ok(state_ref)
+            }
             Err(err) if err.kind() == ErrorKind::Transaction => Err(
                 CheckpointPublishError::StateObjectAlreadyExists(state.object_key().clone()),
             ),

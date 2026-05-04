@@ -8,6 +8,7 @@ use velorix_runtime::leased_checkpoint::{LeasedCheckpointError, LeasedCheckpoint
 use velorix_storage::{
     manifest::{
         CheckpointManifest, InputRange, OutputObjectRef, PartitionOwnerClaim, StateObjectRef,
+        StateRefType,
     },
     state::{CheckpointPublishError, CheckpointPublisher, OutputObjectWrite, StateObjectWrite},
 };
@@ -85,6 +86,7 @@ fn state_ref(state: &StateObjectWrite) -> StateObjectRef {
         owner: state.owner().to_string(),
         partition_id: state.partition_id(),
         checkpoint_version: state.checkpoint_version(),
+        ref_type: StateRefType::RawObject,
         owner_claim: state.owner_claim().cloned(),
     }
 }

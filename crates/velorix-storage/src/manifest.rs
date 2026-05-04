@@ -37,8 +37,18 @@ pub struct StateObjectRef {
     pub owner: String,
     pub partition_id: u32,
     pub checkpoint_version: u64,
+    #[serde(default = "legacy_raw_state_ref_type")]
+    pub ref_type: StateRefType,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_claim: Option<PartitionOwnerClaim>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StateRefType {
+    LegacyRawObject,
+    RawObject,
+    SlateDbCheckpoint,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -389,6 +399,10 @@ fn legacy_missing_output_checkpoint_version() -> u64 {
     u64::MAX
 }
 
+fn legacy_raw_state_ref_type() -> StateRefType {
+    StateRefType::LegacyRawObject
+}
+
 enum ObjectRef<'a> {
     State(&'a StateObjectRef),
     Output(&'a OutputObjectRef),
@@ -414,7 +428,7 @@ impl<'a> ObjectRef<'a> {
 mod tests {
     use super::{
         CheckpointManifest, InputRange, ManifestError, OutputObjectRef, PartitionOwnerClaim,
-        StateObjectRef,
+        StateObjectRef, StateRefType,
     };
     use crate::object_key::ObjectKey;
 
@@ -425,6 +439,7 @@ mod tests {
             owner: "balances_by_account".to_string(),
             partition_id: 0,
             checkpoint_version: 1,
+            ref_type: StateRefType::LegacyRawObject,
             owner_claim: None,
         }
     }

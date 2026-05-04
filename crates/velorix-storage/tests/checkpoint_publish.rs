@@ -12,12 +12,12 @@ use velorix_storage::{
     checkpoint_index::LatestCandidateMarker,
     manifest::{
         CheckpointManifest, InputRange, ManifestError, OutputObjectRef, PartitionOwnerClaim,
-        StateObjectRef,
+        StateObjectRef, StateRefType,
     },
     object_key::ObjectKey,
     ownership::OwnershipEpochRecord,
     state::{CheckpointPublishError, CheckpointPublisher, OutputObjectWrite, StateObjectWrite},
-    state_store::{SlateDbStateStore, StateObjectStore},
+    state_store::{RawObjectStateStore, SlateDbStateStore, StateObjectStore},
 };
 
 #[derive(Debug)]
@@ -286,8 +286,15 @@ fn state_ref(state: &StateObjectWrite) -> StateObjectRef {
         owner: state.owner().to_string(),
         partition_id: state.partition_id(),
         checkpoint_version: state.checkpoint_version(),
+        ref_type: StateRefType::RawObject,
         owner_claim: state.owner_claim().cloned(),
     }
+}
+
+fn slatedb_state_ref(state: &StateObjectWrite) -> StateObjectRef {
+    let mut state_ref = state_ref(state);
+    state_ref.ref_type = StateRefType::SlateDbCheckpoint;
+    state_ref
 }
 
 fn manifest(checkpoint_version: u64, state_ref: StateObjectRef) -> CheckpointManifest {
@@ -1115,6 +1122,99 @@ async fn checkpoint_publish_production_fenced_manifest_rejects_missing_ownership
 }
 
 #[tokio::test]
+async fn checkpoint_publish_production_fenced_manifest_rejects_legacy_state_ref_before_write() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let claim = owner_claim("worker-a", 1);
+    publisher
+        .create_ownership_epoch_record(&ownership_record("orders", 0, "worker-a", 1))
+        .await
+        .unwrap();
+    let state = fenced_state_write(0, "state-0001", claim.clone(), b"state");
+    let mut state_ref = publisher
+        .write_state_object_fenced(&state, &claim)
+        .await
+        .unwrap();
+    let legacy_ref = serde_json::json!({
+        "object_id": state_ref.object_id,
+        "object_key": state_ref.object_key,
+        "owner": state_ref.owner,
+        "partition_id": state_ref.partition_id,
+        "checkpoint_version": state_ref.checkpoint_version,
+        "owner_claim": state_ref.owner_claim
+    });
+    state_ref = serde_json::from_value(legacy_ref).unwrap();
+    let manifest = manifest(0, state_ref);
+
+    let err = publisher
+        .publish_manifest_fenced_production(&manifest, &claim)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        CheckpointPublishError::ProductionStateRefNotSlateDbCheckpoint { .. }
+    ));
+    assert!(store
+        .head(&Path::from(manifest.object_key().as_str()))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn checkpoint_publish_production_fenced_manifest_rejects_explicit_raw_state_ref_before_write()
+{
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let claim = owner_claim("worker-a", 1);
+    publisher
+        .create_ownership_epoch_record(&ownership_record("orders", 0, "worker-a", 1))
+        .await
+        .unwrap();
+    let state = fenced_state_write(0, "state-0001", claim.clone(), b"state");
+    let mut state_ref = publisher
+        .write_state_object_fenced(&state, &claim)
+        .await
+        .unwrap();
+    state_ref.ref_type = StateRefType::RawObject;
+    let manifest = manifest(0, state_ref);
+
+    let err = publisher
+        .publish_manifest_fenced_production(&manifest, &claim)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        CheckpointPublishError::ProductionStateRefNotSlateDbCheckpoint { .. }
+    ));
+    assert!(store
+        .head(&Path::from(manifest.object_key().as_str()))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn checkpoint_publish_bootstrap_publish_accepts_legacy_raw_state_ref() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let state = state_write(0, "state-0001", b"state");
+    let state_ref = publisher.write_state_object(&state).await.unwrap();
+    let legacy_ref = serde_json::json!({
+        "object_id": state_ref.object_id,
+        "object_key": state_ref.object_key,
+        "owner": state_ref.owner,
+        "partition_id": state_ref.partition_id,
+        "checkpoint_version": state_ref.checkpoint_version
+    });
+    let manifest = manifest(0, serde_json::from_value(legacy_ref).unwrap());
+
+    publisher.publish_manifest(&manifest).await.unwrap();
+
+    assert_eq!(publisher.latest_manifest().await.unwrap(), Some(manifest));
+}
+
+#[tokio::test]
 async fn checkpoint_publish_production_state_write_rejects_lower_epoch_after_higher_epoch_record_without_manifest(
 ) {
     let (_temp_dir, store) = temp_store();
@@ -1151,9 +1251,10 @@ async fn checkpoint_publish_production_state_write_rejects_lower_epoch_after_hig
 }
 
 #[tokio::test]
-async fn checkpoint_publish_production_fenced_publish_succeeds_with_matching_ownership_records() {
+async fn checkpoint_publish_production_fenced_publish_rejects_raw_state_ref_with_matching_ownership_records(
+) {
     let (_temp_dir, store) = temp_store();
-    let publisher = CheckpointPublisher::new(store);
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
     let claim = owner_claim("worker-a", 1);
     publisher
         .create_ownership_epoch_record(&ownership_record("orders", 0, "worker-a", 1))
@@ -1176,6 +1277,38 @@ async fn checkpoint_publish_production_fenced_publish_succeeds_with_matching_own
         .unwrap();
     let mut manifest = manifest(0, state_ref);
     manifest.output_objects = vec![output_ref];
+
+    publisher
+        .publish_manifest_fenced_production(&manifest, &claim)
+        .await
+        .unwrap_err();
+
+    assert!(store
+        .head(&Path::from(manifest.object_key().as_str()))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn checkpoint_publish_production_fenced_publish_succeeds_with_slatedb_state_ref() {
+    let (_temp_dir, store) = temp_store();
+    let publisher =
+        CheckpointPublisher::with_slatedb_state_store(Arc::clone(&store), "v1/slatedb/state")
+            .await
+            .unwrap();
+    let claim = owner_claim("worker-a", 1);
+    publisher
+        .create_ownership_epoch_record(&ownership_record("orders", 0, "worker-a", 1))
+        .await
+        .unwrap();
+
+    let state = fenced_state_write(0, "state-0001", claim.clone(), b"state");
+    let state_ref = publisher
+        .write_state_object_fenced_production(&state, "orders", &claim)
+        .await
+        .unwrap();
+    assert_eq!(state_ref.ref_type, StateRefType::SlateDbCheckpoint);
+    let manifest = manifest(0, state_ref);
 
     publisher
         .publish_manifest_fenced_production(&manifest, &claim)
@@ -1475,6 +1608,26 @@ async fn checkpoint_publish_rejects_fenced_manifest_with_state_refs_from_differe
 }
 
 #[tokio::test]
+async fn raw_state_store_fails_closed_for_slatedb_state_store_refs() {
+    let (_temp_dir, store) = temp_store();
+    let state_store = RawObjectStateStore::new(Arc::clone(&store));
+    let state = state_write(0, "state-0001", b"raw-state");
+    let mut written_ref = state_store.write_state_object(&state).await.unwrap();
+    written_ref.ref_type = StateRefType::SlateDbCheckpoint;
+
+    assert!(!state_store.state_object_exists(&written_ref).await.unwrap());
+    let err = state_store
+        .read_state_object(&written_ref)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        CheckpointPublishError::MissingStateObject(object_key)
+            if object_key == *state.object_key()
+    ));
+}
+
+#[tokio::test]
 async fn slatedb_state_store_reads_checkpoint_versioned_state_payloads() {
     let (_temp_dir, store) = temp_store();
     let state_store = SlateDbStateStore::open("v1/slatedb/state", Arc::clone(&store))
@@ -1483,7 +1636,7 @@ async fn slatedb_state_store_reads_checkpoint_versioned_state_payloads() {
     let state = state_write(7, "state-0007", b"slatedb-state");
     let written_ref = state_store.write_state_object(&state).await.unwrap();
 
-    assert_eq!(written_ref, state_ref(&state));
+    assert_eq!(written_ref, slatedb_state_ref(&state));
     assert!(state_store.state_object_exists(&written_ref).await.unwrap());
     assert_eq!(
         state_store.read_state_object(&written_ref).await.unwrap(),
@@ -1594,7 +1747,10 @@ async fn checkpoint_publish_slatedb_state_store_rejects_concurrent_duplicate_sta
     assert_eq!(duplicates, 15);
 
     let (winning_state, winning_ref) = successes[0];
-    assert_eq!(winning_ref.as_ref().unwrap(), &state_ref(winning_state));
+    assert_eq!(
+        winning_ref.as_ref().unwrap(),
+        &slatedb_state_ref(winning_state)
+    );
     assert_eq!(
         publisher
             .read_state_object(winning_ref.as_ref().unwrap())
