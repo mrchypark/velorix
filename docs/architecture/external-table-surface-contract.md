@@ -1,0 +1,37 @@
+# External Table Surface Contract
+
+Status: Accepted
+Applies to: persisted table specs and DataFusion object-backed scans.
+
+Raw caller-provided Parquet URLs are phase-0/dev-only. They are not production
+authority and must not be exposed as a multi-tenant public surface.
+
+## Production Table Spec
+
+Production table specs use registry-backed storage identity:
+
+- `table_id`.
+- `tenant_id`.
+- `store_id`.
+- `object_key_prefix`.
+- `snapshot_ref`.
+- `format`, currently `parquet`.
+- `schema_fingerprint`.
+- `query_policy_id`.
+
+The `store_id` refers to an allowlisted object-store registry entry. Raw
+`s3://`, `http://`, or `file://` URLs are not stored as production catalog
+authority. Prefixes must pass tenant namespace policy.
+
+## Cost and Security Boundaries
+
+Output row caps are not scan cost controls. Production scans require limits for
+scan bytes, object requests, file count, row groups, timeout, memory, and spill.
+DataFusion must register object stores through the shared registry only.
+
+## Verification
+
+- Raw URL table specs fail in production mode.
+- Unregistered store id and cross-tenant prefixes are rejected.
+- Large scans are stopped by scan-byte limits before output collection.
+- Many-small-file scans are stopped by file or object request limits.

@@ -57,7 +57,9 @@ Each committed ingest object body must be a `VelorixIngestEnvelopeV1`:
 
 The envelope header is authoritative. Object metadata may duplicate digest,
 format, or schema information for faster inspection, but replay and
-idempotency must be correct from the object body alone.
+idempotency must be correct from the object body alone. The concrete digest,
+framing, and fail-closed validation rules are defined in
+[Ingest Envelope V1](ingest-envelope-v1.md).
 
 The object key remains deterministic:
 
@@ -91,8 +93,11 @@ The ingest acknowledgement contract in `storage-contract.md` remains in force:
 - `202 Accepted` is future async admission only and cannot claim persistence
   without a separate durable admission record.
 
-The digest used for idempotency must cover the canonical envelope bytes or a
-documented canonical digest input that includes the envelope header and body.
+`schema_fingerprint` is not a hash of raw Arrow IPC schema bytes. It is a hash
+of `VelorixRelationSchemaV1` as defined in
+[Schema Fingerprint V1](schema-fingerprint-v1.md). The digest used for
+idempotency is defined by [Ingest Envelope V1](ingest-envelope-v1.md) and
+excludes the `payload_digest` field from its own digest input.
 
 ## Breaking Impact
 
@@ -133,7 +138,12 @@ The implementation should land as a single coherent breaking slice:
 
 ## Benchmark Gates
 
-Before calling the new ingest format production-ready, benchmark at least:
+Before merging or releasing the new ingest format as a production path, the
+relevant [Benchmark Gate V1](benchmark-gate-v1.md) workload must pass. The
+benchmark must emit machine-readable JSON and compare against an approved
+baseline. Local filesystem benchmark results and S3-compatible benchmark
+results are recorded separately and are not interchangeable. Benchmark at
+least:
 
 - ingest rows per second
 - encode CPU per row

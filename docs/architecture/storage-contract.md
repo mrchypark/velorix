@@ -24,7 +24,9 @@ segment.
 | Temporary publish object | `v1/tmp/{checkpoint_version:020}/{attempt_or_object_id}/{kind}` | Non-authoritative staging location |
 | Checkpoint manifest | `v1/checkpoints/{checkpoint_version:020}.manifest` | Authoritative progress marker |
 | Persisted query spec | `v1/queries/{query_id}.query.json` | Create-only query SQL/policy catalog object |
-| Persisted table spec | `v1/tables/{table_id}.table.json` | Create-only Parquet scan URL catalog object |
+| Persisted table spec | `v1/tables/{table_id}.table.json` | Create-only registry-backed table spec; raw Parquet URL specs are phase-0/dev-only |
+| Relation spec | `v1/relations/{relation_id}/versions/{relation_version}.relation.json` | Create-only relation catalog object |
+| Ownership claim | `v1/ownership/{stream_id}/p={partition_id:010}/epoch={owner_epoch:020}.claim` | Production distributed-writer epoch record |
 
 Structured constructors in `crates/velorix-storage/src/object_key.rs` own these
 formats. Call sites should not assemble storage paths with ad hoc string
@@ -41,11 +43,14 @@ For v1 read compatibility, manifests whose output refs omit
 the missing metadata as authority. Legacy output refs that point at `v1/ingest`
 are rejected as output key mismatches under the new contract.
 
-The ingest object key layout remains stable. Current bootstrap code still
-replays JSON `DeltaBatch` ingest payloads, but that durable payload shape is
-deprecated by the accepted breaking direction: versioned Arrow IPC ingest
-envelopes; see
-[Ingest Storage Format Decision](ingest-storage-format-decision.md).
+The ingest object key layout remains stable. Current bootstrap code paths that
+replay JSON `DeltaBatch` ingest payloads are known violations of the accepted
+ingest contract and must be removed by the Arrow IPC envelope breaking slice.
+No new durable ingest, recovery, query, or standing-view code may depend on JSON
+`DeltaBatch` as an accepted storage format. See
+[Ingest Storage Format Decision](ingest-storage-format-decision.md),
+[Ingest Envelope V1](ingest-envelope-v1.md), and
+[Legacy JSON DeltaBatch Removal](legacy-json-deltabatch-removal.md).
 
 ## Ingest API Acknowledgement Semantics
 
@@ -79,10 +84,13 @@ payload digest is also a conflict.
 
 Committed ingest ranges are half-open intervals. Adjacent ranges such as
 `[0, 10)` and `[10, 20)` are allowed. Overlapping ranges for the same
-stream/partition are rejected. Ingest admission must evaluate overlap against
-committed `v1/ingest` batch objects, not against checkpoint manifests, because
-manifests are processing progress authority rather than ingest admission
-authority.
+stream/partition are rejected only in modes where admission is serialized by a
+single writer, durable admission index, or write coordinator. Deterministic
+create-only object keys reject identical-key conflicts, but they do not
+atomically reject different-key overlapping ranges. Production multi-writer
+ingest must not advertise range-overlap `409 Conflict` until
+`RangeAdmissionIndexV1` or an equivalent write coordinator is implemented. See
+[Ingest Admission Contract](ingest-admission-contract.md).
 
 Every successful ingest response should include an explicit status body rather
 than relying on the HTTP code alone. The durable synchronous shape is:
@@ -157,14 +165,20 @@ layout.
 
 Output object references may also carry `owner_claim`. For unfenced and legacy
 bootstrap publication the field remains optional, but fenced publication treats
-missing or mismatched output claims as typed validation errors.
+missing or mismatched output claims as typed validation errors. Production
+distributed writes require
+[Partition Ownership Protocol V1](partition-ownership-protocol-v1.md);
+Kubernetes Lease acquisition alone is not sufficient to make `owner_epoch`
+durable or monotonic.
 
 The manifest checkpoint version is a publication/progress version. It is
 separate from the incremental engine logical epoch. Current engine checkpoint
 state is serialized as a versioned payload with `schema_version`,
-`logical_epoch`, and `state`. Recovery still accepts legacy raw `DeltaBatch`
-state objects by using the manifest checkpoint version as the best available
-epoch fallback for those old payloads.
+`logical_epoch`, and `state`. Any remaining recovery path for legacy raw
+`DeltaBatch` state objects is bootstrap-only disposable scaffolding, not a
+production compatibility promise. The SlateDB/raw-state breaking slice must
+delete that fallback or hide it behind an explicit migration flag before
+production publication.
 
 ## Publication and Crash Windows
 
@@ -203,7 +217,8 @@ local/bootstrap paths remain available for compatibility.
 
 These checks are non-atomic storage-side stale-owner detection and structurally
 unauthorized progress rejection. They are not production linearizable fencing.
-A production fencing or marker-index commit protocol remains future design.
+Production distributed writes require a durable epoch record reference in every
+fenced state write, output write, and manifest publication.
 
 Crash behavior follows from that order:
 
@@ -215,8 +230,13 @@ Crash behavior follows from that order:
   manifest or the fully written new manifest.
 - Duplicate checkpoint publication is rejected by create-only manifest writes.
 
-Object-store conditional create is used where the adapter supports it. Local
-filesystem tests exercise the same create-only behavior.
+Production Velorix requires create-only or equivalent conditional write
+semantics for every authoritative namespace. "Where the adapter supports it" is
+not sufficient for production. If the configured backend cannot prove the
+required capability set, startup must fail closed. Local filesystem emulation is
+dev/test-only and must not be used as evidence that an S3-compatible backend
+satisfies the contract. See
+[Object Store Capabilities V1](object-store-capabilities-v1.md).
 
 Kubernetes `Lease` acquisition, renewal, and `owner_epoch` assignment remain
 future control-plane work. Kubernetes and etcd are not treated as the durable
@@ -230,6 +250,8 @@ current state-store boundary, reconstructs the `IncrementalEngine`, and replays
 committed ingest batches whose offsets are not covered by the manifest input
 ranges. Replay lists only the `v1/ingest` namespace; manifest-referenced
 `v1/outputs` objects are durable output payloads, not committed input.
+`CheckpointRecoveryIndexV1` may accelerate latest lookup, but it is advisory and
+must be validated against immutable checkpoint manifests before use.
 
 Replay boundaries are per stream and partition. If a manifest boundary falls
 inside a committed batch range, replay fails instead of partially applying an
@@ -241,26 +263,20 @@ Velorix owns object key policy, manifest validation, exactly-once publication,
 stream progress, and stateless recovery orchestration.
 
 SlateDB backs the current minimal experimental state-store path for
-checkpoint-versioned payloads. Broader SlateDB durable layout, LSM/SST policy,
-compaction tuning, garbage collection integration, and state lifecycle design
-remain future work.
+checkpoint-versioned payloads. Production state references must distinguish
+bootstrap raw state objects from SlateDB checkpoint/root handles. Velorix GC
+must not delete SlateDB internal objects by prefix walking. See
+[State Substrate Contract](state-substrate-contract.md).
 
-DataFusion owns the current SQL/query planning, validation, and Arrow execution
-boundary over in-memory `DeltaBatch` input. Runtime query calls can now recover
-materialized state from object-backed checkpoint manifests and replay, then
-query that recovered state through the same DataFusion `input` table. Persisted
-query service v0 writes validated JSON specs to object storage under
-`v1/queries/{query_id}.query.json` using create-only semantics. Minimal query
-policy now covers SQL text size, output row caps, DataFusion batch size, and
-target partitions. Runtime also has a minimal direct Parquet object-backed scan
-boundary that registers caller-provided object storage and Parquet object URLs
-as DataFusion's `input` table. Persisted table catalog v0 writes JSON Parquet
-scan URL specs to `v1/tables/{table_id}.table.json` using create-only
-semantics; create validates the catalog id and URL shape but does not scan table
-contents. Persisted view access v0 loads a stored query spec and a stored
-object-backed Parquet table spec, then delegates SQL and Parquet execution to
-DataFusion. Broader table layout, query scheduling/versioning, permissions, and
-broader runtime resource policy remain future work.
+DataFusion owns SQL/query planning, validation, and Arrow execution. The
+existing DataFusion-over-`DeltaBatch` path is bootstrap-only and scheduled for
+removal from durable ingest/replay. The accepted production boundary is typed
+Arrow relation input driven by [Relation Contract V1](relation-contract-v1.md).
+Persisted query/table/view execution requires
+[DataFusion Resource Policy V1](datafusion-resource-policy-v1.md). Raw
+caller-provided Parquet URLs are phase-0/dev-only; production external table
+surfaces use registry-backed table specs described in
+[External Table Surface Contract](external-table-surface-contract.md).
 
 Foyer owns the runtime local memory/disk object-cache internals behind the
 Velorix cache wrapper. Cache reads verify object-store authority first, and

@@ -19,12 +19,15 @@ work only after a narrow adoption RFC.
 
 This note distinguishes current implementation from target direction. The
 runtime object cache is currently Foyer-backed, ad hoc SQL/query planning and
-execution currently use DataFusion for the minimal `DeltaBatch`, validation,
-and recovered materialized-state query boundaries, and persisted query service
-v0 stores validated JSON query specs in object storage. Persisted table catalog
-v0 stores Parquet scan URL specs for the direct object-backed scan path.
-Persisted view access v0 composes stored query specs with stored object-backed
-Parquet table specs. SlateDB now backs a minimal experimental
+execution currently use DataFusion for bootstrap `DeltaBatch` validation and
+recovered materialized-state query boundaries, and persisted query service v0
+stores validated JSON query specs in object storage. The accepted production
+query/input direction is typed Arrow relations driven by
+[Relation Contract V1](relation-contract-v1.md), with execution guarded by
+[DataFusion Resource Policy V1](datafusion-resource-policy-v1.md). Persisted
+table catalog v0 raw Parquet URL specs are phase-0/dev-only; production table
+surfaces use [External Table Surface Contract](external-table-surface-contract.md).
+SlateDB now backs a minimal experimental
 checkpoint-versioned state-store path.
 Incremental execution now has a DBSP-shaped `IncrementalEngine` boundary backed
 by prototype operators.
@@ -75,23 +78,21 @@ authority rules.
 
 ## DataFusion Query Boundary
 
-Velorix core currently exposes a minimal DataFusion-backed query boundary for
-SQL over `DeltaBatch` input. Delta records are converted into an in-memory
-Arrow/DataFusion table named `input`, with stable `key_json`, `value_json`, and
-`weight` columns. DataFusion owns SQL parsing, query planning, physical
-execution, and Arrow `RecordBatch` output.
+Velorix core currently exposes a minimal DataFusion-backed bootstrap query
+boundary for SQL over `DeltaBatch` input. That path is scheduled for removal
+from durable ingest/replay and must not define the production relation
+contract. The accepted boundary is cataloged typed Arrow relation input derived
+from [Relation Contract V1](relation-contract-v1.md). DataFusion owns SQL
+parsing, query planning, physical execution, and Arrow `RecordBatch` output.
 
-Velorix runtime now adds the smallest object-backed, checkpoint-aware query
-boundary by first running stateless recovery against object storage and then
-querying the recovered materialized `DeltaBatch` through that same DataFusion
-path. This keeps object storage as durable authority and avoids a custom query
-planner.
+Velorix runtime's recovered-state query path is a bootstrap bridge. Production
+query registration must be driven by cataloged relation schemas rather than
+`key_json`/`value_json` inference.
 
-Velorix runtime also exposes the first direct object-backed DataFusion scan
-boundary for Parquet input. The runtime registers caller-provided object storage
-with DataFusion, registers the Parquet object URL as the `input` table, applies
-the existing `QueryPolicy`, and returns Arrow `RecordBatch` output. DataFusion
-owns SQL parsing, planning, execution, and Parquet object scanning.
+Velorix runtime also exposes a phase-0 direct object-backed DataFusion scan
+boundary for Parquet input. Caller-provided Parquet URLs are dev-only. Production
+external table scans must use registry-backed table specs and bounded execution
+policy.
 
 Persisted query service v0 stores `PersistedQuerySpec` JSON objects under
 deterministic `v1/queries/{query_id}.query.json` keys. Query ids use the shared
@@ -112,10 +113,12 @@ over the stored object-backed Parquet table URL through the existing DataFusion
 scan helper. Velorix does not add custom scanning, table listing, scheduling,
 versioning, permissions, or Feldera execution in this boundary.
 
-The query boundary also exposes a minimal Velorix-owned policy for SQL text
-size, output row caps, DataFusion batch size, and target partitions. Output row
-caps are enforced by applying a DataFusion `DataFrame` limit before collection,
-not by parsing or planning SQL inside Velorix.
+The current query boundary exposes a minimal Velorix-owned policy for SQL text
+size, output row caps, DataFusion batch size, and target partitions. That policy
+is bootstrap-only. Production query execution requires
+[DataFusion Resource Policy V1](datafusion-resource-policy-v1.md), including
+planning timeout, execution timeout, shared memory pool, spill quota, scan byte
+limit, object request/file limits, concurrency limits, and cancellation.
 
 This is an ad hoc SQL/query surface, not standing-view compilation. Direct
 Parquet object-backed scans and a small object-backed table catalog now exist as
@@ -169,9 +172,10 @@ reference model through the current `IncrementalEngine` adapter boundary.
 Checkpoint state for that boundary is serialized as a versioned engine payload
 containing `schema_version`, `logical_epoch`, and `state`. The manifest
 checkpoint version remains the publication/progress version and is not the
-engine logical epoch. Runtime recovery still accepts legacy raw `DeltaBatch`
-state objects by treating the manifest checkpoint version as the only available
-epoch fallback for those old payloads.
+engine logical epoch. Any remaining legacy raw `DeltaBatch` state recovery is
+bootstrap-only disposable scaffolding, not a production compatibility path. The
+SlateDB/raw-state breaking slice must remove that fallback or require an
+explicit migration flag before production publication.
 
 ## Migration Sequence
 
@@ -185,14 +189,10 @@ epoch fallback for those old payloads.
    SlateDB, leaving Velorix manifests responsible for stream progress and
    exactly-once commits.
 5. Keep SQL/query surfaces routed through DataFusion instead of creating a
-   custom planner or expression engine. This DataFusion path is for ad hoc SQL
-   over in-memory `DeltaBatch` input, runtime-recovered materialized state, and
-   minimal direct Parquet object-backed `input` scans; persisted query service
-   v0 catalogs validated SQL/policy specs in object storage, and persisted table
-   catalog v0 catalogs Parquet scan URLs for the direct scan path. Persisted
-   view access v0 composes those specs as stored query over stored Parquet
-   input. Broader table layout, scheduling, versioning, and permissions remain
-   future work.
+   custom planner or expression engine. The bootstrap `DeltaBatch` query path
+   must give way to cataloged typed Arrow relations. Raw Parquet URL scans stay
+   phase-0/dev-only; production scans use registry-backed table specs and
+   `QueryExecutionPolicyV1`.
 6. Make the production control plane Kubernetes-native: model catalog/view
    lifecycle with CRDs and an operator, and use Kubernetes `Lease` or an
    equivalent K8s-native primitive for partition ownership and `owner_epoch`.

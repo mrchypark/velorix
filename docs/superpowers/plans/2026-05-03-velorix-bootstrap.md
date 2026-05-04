@@ -393,6 +393,12 @@ cargo bench -p velorix-runtime --bench local_incremental
 The harness intentionally avoids Criterion and does not run during
 `cargo test --workspace`.
 
+This harness is bootstrap evidence only. It is not a merge or release gate and
+must not be cited as production readiness evidence. Production readiness
+requires [Benchmark Gate V1](../../architecture/benchmark-gate-v1.md) with
+stable workloads, JSON output, baseline comparison, and S3-compatible backend
+runs.
+
 - [x] **Step 2: Document the storage contract**
 
 Describe object key layout, manifest atomicity requirements, crash windows, and garbage collection rules. Clarify that SlateDB owns the current minimal experimental state-store path, broader SlateDB durable LSM/SST/layout and compaction work remains gated, and Velorix owns checkpoint manifest authority and recovery semantics.
@@ -432,7 +438,7 @@ scope:
 - Direct Feldera DBSP or Rust `dbsp` crate integration after embedded API,
   toolchain, checkpoint/state, and cost/resource gates are cleared.
 - Object-backed and checkpoint-aware query service integration beyond the
-  current in-memory DataFusion `DeltaBatch` query boundary.
+  temporary bootstrap DataFusion `DeltaBatch` query boundary.
 - Broader SlateDB durable layout, LSM/SST policy, compaction tuning, garbage
   collection integration, and lifecycle management.
 - S3-compatible storage validation and distributed worker partitioning.

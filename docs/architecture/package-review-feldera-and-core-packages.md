@@ -72,7 +72,8 @@ The existing `feldera_artifact` phase-0 contract remains the right boundary.
 DataFusion should continue to own ad hoc SQL and Arrow execution. Velorix
 already uses it for:
 
-- SQL over in-memory `DeltaBatch` input.
+- Bootstrap SQL over in-memory `DeltaBatch` input, scheduled to give way to
+  cataloged typed Arrow relations.
 - recovered materialized state query surfaces.
 - direct object-backed Parquet scans.
 - persisted query validation and execution.
@@ -82,7 +83,7 @@ replace it:
 
 - Add tenant-scoped `SessionConfig`, shared memory pool, bounded disk spill
   manager, and spill directory quotas.
-- Add table/provider layout beyond single Parquet object URLs.
+- Add registry-backed table/provider layout beyond single Parquet object URLs.
 - Add query cancellation, timeout policy, scan-byte limits, object-store request
   limits, and concurrency limits.
 - Add metrics around planning time, scan bytes, output rows, and spill.
@@ -244,7 +245,7 @@ affect correctness and supply-chain risk.
 | Standing-view SQL compilation | Feldera SQL-to-DBSP | Contract only | Current artifact validation is correct; direct runtime integration remains gated |
 | Incremental semantics | Feldera DBSP / `dbsp` | Gate | Use as model until embedded API/state/resource proof exists |
 | Ad hoc SQL | DataFusion | Yes | Keep narrow, add resource policy |
-| Object-backed table scans | DataFusion + Parquet + `object_store` | Yes | Expand from single URL to table layout later |
+| Object-backed table scans | DataFusion + Parquet + `object_store` | Yes | Keep raw URL specs dev-only; production needs registry-backed table layout |
 | Internal materialized table/state authority | Velorix object-storage manifests | Yes | Default for input/state/output manifests and checkpoint publication |
 | External table interoperability | Apache Iceberg or another table format | RFC only | Import/export/interop candidate, not core internal state |
 | Durable state substrate | SlateDB | Yes, narrow | Define layout, compaction, GC, S3 assumptions |

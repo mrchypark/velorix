@@ -40,7 +40,12 @@ explicitly.
 The relation schemas are SQL-facing contracts. They describe relation ids,
 relation names, typed columns, nullability, and primary keys. They are not the
 DataFusion `DeltaBatch` ad hoc query table with `key_json`, `value_json`, and
-`weight`.
+`weight`. Every Feldera input/output relation schema must carry the same
+`relation_id`, `relation_version`, and `schema_fingerprint` used by ingest and
+DataFusion registration. Artifact activation fails closed if the artifact
+relation fingerprint differs from the cataloged input relation fingerprint. See
+[Relation Contract V1](relation-contract-v1.md) and
+[Schema Fingerprint V1](schema-fingerprint-v1.md).
 
 ## Trust Boundary
 
@@ -58,9 +63,10 @@ loading path.
 
 ## Runtime Direction
 
-DataFusion remains the current ad hoc SQL/query engine over Arrow-backed
-`DeltaBatch` input. It is for query surfaces where callers submit SQL against
-the current in-memory `input` table.
+DataFusion remains the ad hoc SQL/query engine, but the accepted target input is
+cataloged typed Arrow relations, not durable JSON `DeltaBatch`. Any remaining
+`DeltaBatch` query path is bootstrap-only and must not define Feldera artifact
+compatibility.
 
 Feldera owns standing-view SQL compilation. The phase-0 artifact contract gives
 Velorix a stable handoff point for future `FelderaPipelineEngine` work:

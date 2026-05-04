@@ -91,7 +91,19 @@ materialized outputs, not a batch warehouse table format as the core authority.
 
 ## Document Set
 
+- [Benchmark Gate V1](benchmark-gate-v1.md)
+- [Checkpoint Recovery Index V1](checkpoint-recovery-index-v1.md)
+- [DataFusion Resource Policy V1](datafusion-resource-policy-v1.md)
+- [External Table Surface Contract](external-table-surface-contract.md)
+- [Ingest Admission Contract](ingest-admission-contract.md)
+- [Ingest Envelope V1](ingest-envelope-v1.md)
 - [Ingest Storage Format Decision](ingest-storage-format-decision.md)
+- [Legacy JSON DeltaBatch Removal](legacy-json-deltabatch-removal.md)
+- [Object Store Capabilities V1](object-store-capabilities-v1.md)
+- [Partition Ownership Protocol V1](partition-ownership-protocol-v1.md)
+- [Relation Contract V1](relation-contract-v1.md)
+- [Schema Fingerprint V1](schema-fingerprint-v1.md)
+- [State Substrate Contract](state-substrate-contract.md)
 - [OpenData Package Review](package-review-opendata.md)
 - [Arroyo Package Review](package-review-arroyo.md)
 - [Feldera and Core Package Review](package-review-feldera-and-core-packages.md)

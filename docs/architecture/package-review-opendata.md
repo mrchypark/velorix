@@ -113,6 +113,9 @@ copy that shape for production readiness:
 - Workload definitions stay near the runtime or storage component under test.
 - Output includes commit metadata and stable metric names.
 - Regression analysis can be external; Velorix only needs consistent data.
+- Production readiness now requires [Benchmark Gate V1](benchmark-gate-v1.md):
+  machine-readable output, approved baselines, regression budgets, and separate
+  local versus S3-compatible backend gates.
 
 ## Risks and Non-Fit
 
