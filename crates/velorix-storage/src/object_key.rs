@@ -111,6 +111,10 @@ impl ObjectKey {
         ))
     }
 
+    pub fn checkpoint_latest_candidate_marker() -> Self {
+        Self("v1/checkpoint-index/latest-candidate.json".to_string())
+    }
+
     pub fn persisted_query(query_id: &str) -> Result<Self, ObjectKeyError> {
         validate_segment("query_id", query_id)?;
 
@@ -209,6 +213,7 @@ fn validate_known_layout(value: &str) -> Result<(), ObjectKeyError> {
                 .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
             parse_fixed_u64("checkpoint_version", checkpoint, CHECKPOINT_WIDTH)?;
         }
+        ["v1", "checkpoint-index", "latest-candidate.json"] => {}
         ["v1", "queries", query_file] => {
             let query_id = query_file
                 .strip_suffix(".query.json")
@@ -489,6 +494,16 @@ mod tests {
 
         assert_eq!(key.as_str(), "v1/checkpoints/00000000000000000009.manifest");
         assert_eq!(key, restarted);
+    }
+
+    #[test]
+    fn checkpoint_latest_candidate_marker_key_is_deterministic() {
+        let key = ObjectKey::checkpoint_latest_candidate_marker();
+        let restarted = ObjectKey::checkpoint_latest_candidate_marker();
+
+        assert_eq!(key.as_str(), "v1/checkpoint-index/latest-candidate.json");
+        assert_eq!(key, restarted);
+        assert_eq!(ObjectKey::parse(key.as_str()).unwrap(), key);
     }
 
     #[test]

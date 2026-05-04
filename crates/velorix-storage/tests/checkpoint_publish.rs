@@ -1,10 +1,15 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use object_store::{local::LocalFileSystem, path::Path, ObjectStore};
+use futures::{stream, StreamExt};
+use object_store::{
+    local::LocalFileSystem, path::Path, GetOptions, GetResult, ListResult, MultipartUpload,
+    ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+};
 use tempfile::TempDir;
 use tokio::sync::Barrier;
 use velorix_storage::{
+    checkpoint_index::LatestCandidateMarker,
     manifest::{
         CheckpointManifest, InputRange, ManifestError, OutputObjectRef, PartitionOwnerClaim,
         StateObjectRef,
@@ -13,6 +18,90 @@ use velorix_storage::{
     state::{CheckpointPublishError, CheckpointPublisher, OutputObjectWrite, StateObjectWrite},
     state_store::{SlateDbStateStore, StateObjectStore},
 };
+
+#[derive(Debug)]
+struct FullListingFailsStore {
+    inner: Arc<dyn ObjectStore>,
+}
+
+impl FullListingFailsStore {
+    fn new(inner: Arc<dyn ObjectStore>) -> Self {
+        Self { inner }
+    }
+}
+
+impl std::fmt::Display for FullListingFailsStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "full-listing-fails({})", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for FullListingFailsStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn delete(&self, location: &Path) -> object_store::Result<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(
+        &self,
+        _prefix: Option<&Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+        stream::once(async {
+            Err(object_store::Error::Generic {
+                store: "full-listing-fails",
+                source: Box::new(std::io::Error::other(
+                    "latest_manifest should use the marker fast path",
+                )),
+            })
+        })
+        .boxed()
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
 
 fn temp_store() -> (TempDir, Arc<dyn ObjectStore>) {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -390,6 +479,113 @@ async fn checkpoint_publish_latest_manifest_uses_numerically_latest_valid_checkp
         vec![manifest_0, manifest_1.clone()]
     );
     assert_eq!(publisher.latest_manifest().await.unwrap(), Some(manifest_1));
+}
+
+#[tokio::test]
+async fn checkpoint_publish_latest_manifest_uses_valid_marker_without_full_listing() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let state = state_write(0, "state-0001", b"state-0");
+    let manifest = manifest(0, publisher.write_state_object(&state).await.unwrap());
+
+    publisher.publish_manifest(&manifest).await.unwrap();
+
+    let listing_fails_store = Arc::new(FullListingFailsStore::new(store));
+    let marker_reader = CheckpointPublisher::new(listing_fails_store);
+
+    assert_eq!(
+        marker_reader.latest_manifest().await.unwrap(),
+        Some(manifest)
+    );
+}
+
+#[tokio::test]
+async fn checkpoint_publish_latest_manifest_falls_back_when_marker_is_corrupt() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let state = state_write(0, "state-0001", b"state-0");
+    let manifest = manifest(0, publisher.write_state_object(&state).await.unwrap());
+
+    publisher.publish_manifest(&manifest).await.unwrap();
+    store
+        .put(
+            &Path::from(ObjectKey::checkpoint_latest_candidate_marker().as_str()),
+            Bytes::from_static(b"{not valid json").into(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(publisher.latest_manifest().await.unwrap(), Some(manifest));
+}
+
+#[tokio::test]
+async fn checkpoint_publish_latest_manifest_falls_back_when_marker_is_stale() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let state_0 = state_write(0, "state-0001", b"state-0");
+    let state_1 = state_write(1, "state-0002", b"state-1");
+    let manifest_0 = manifest(0, publisher.write_state_object(&state_0).await.unwrap());
+    let manifest_1 = manifest(1, publisher.write_state_object(&state_1).await.unwrap());
+
+    publisher.publish_manifest(&manifest_0).await.unwrap();
+    let stale_marker = LatestCandidateMarker::for_manifest(
+        &manifest_0,
+        &serde_json::to_vec(&manifest_0).unwrap(),
+        "2026-05-03T00:00:01Z".to_string(),
+    );
+    publisher.publish_manifest(&manifest_1).await.unwrap();
+    store
+        .put(
+            &Path::from(ObjectKey::checkpoint_latest_candidate_marker().as_str()),
+            Bytes::from(serde_json::to_vec(&stale_marker).unwrap()).into(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(publisher.latest_manifest().await.unwrap(), Some(manifest_1));
+}
+
+#[tokio::test]
+async fn checkpoint_publish_latest_manifest_does_not_return_marker_manifest_with_missing_state() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let parent_state = state_write(0, "state-0001", b"state-0");
+    let missing_child_state = state_write(1, "state-0002", b"missing-state");
+    let parent = manifest(
+        0,
+        publisher.write_state_object(&parent_state).await.unwrap(),
+    );
+    let invalid_child = manifest(1, state_ref(&missing_child_state));
+
+    publisher.publish_manifest(&parent).await.unwrap();
+    let invalid_child_bytes = serde_json::to_vec(&invalid_child).unwrap();
+    store
+        .put(
+            &Path::from(invalid_child.object_key().as_str()),
+            Bytes::from(invalid_child_bytes.clone()).into(),
+        )
+        .await
+        .unwrap();
+    let marker = LatestCandidateMarker::for_manifest(
+        &invalid_child,
+        &invalid_child_bytes,
+        "2026-05-03T00:00:01Z".to_string(),
+    );
+    store
+        .put(
+            &Path::from(ObjectKey::checkpoint_latest_candidate_marker().as_str()),
+            Bytes::from(serde_json::to_vec(&marker).unwrap()).into(),
+        )
+        .await
+        .unwrap();
+
+    let err = publisher.latest_manifest().await.unwrap_err();
+
+    assert!(matches!(
+        err,
+        CheckpointPublishError::MissingStateObject(object_key)
+            if object_key == *missing_child_state.object_key()
+    ));
 }
 
 #[tokio::test]

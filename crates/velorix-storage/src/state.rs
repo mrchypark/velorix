@@ -10,6 +10,7 @@ use thiserror::Error;
 
 use crate::{
     capability::{ObjectStoreCapabilityError, ObjectStoreCapabilityProfile},
+    checkpoint_index::{manifest_digest, marker_updated_at_now, LatestCandidateMarker},
     manifest::{
         CheckpointManifest, ManifestError, OutputObjectRef, PartitionOwnerClaim, StateObjectRef,
     },
@@ -279,11 +280,19 @@ impl CheckpointPublisher {
         let bytes = serde_json::to_vec(manifest)?;
         let result = self
             .store
-            .put_opts(&path, Bytes::from(bytes).into(), PutMode::Create.into())
+            .put_opts(
+                &path,
+                Bytes::from(bytes.clone()).into(),
+                PutMode::Create.into(),
+            )
             .await;
 
         match result {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                self.best_effort_publish_latest_candidate_marker(manifest, &bytes)
+                    .await;
+                Ok(())
+            }
             Err(object_store::Error::AlreadyExists { .. }) => {
                 Err(CheckpointPublishError::ManifestAlreadyExists(object_key))
             }
@@ -351,11 +360,21 @@ impl CheckpointPublisher {
     pub async fn latest_manifest(
         &self,
     ) -> Result<Option<CheckpointManifest>, CheckpointPublishError> {
-        Ok(self
+        if let Some(manifest) = self.latest_manifest_from_candidate_marker().await? {
+            return Ok(Some(manifest));
+        }
+
+        let latest = self
             .list_published_manifests()
             .await?
             .into_iter()
-            .max_by_key(|manifest| manifest.checkpoint_version))
+            .max_by_key(|manifest| manifest.checkpoint_version);
+        if let Some(manifest) = &latest {
+            self.validate_state_objects_exist(manifest).await?;
+            self.validate_output_objects_exist(manifest).await?;
+        }
+
+        Ok(latest)
     }
 
     pub async fn read_state_object(
@@ -378,6 +397,95 @@ impl CheckpointPublisher {
         }
 
         Ok(())
+    }
+
+    async fn best_effort_publish_latest_candidate_marker(
+        &self,
+        manifest: &CheckpointManifest,
+        manifest_bytes: &[u8],
+    ) {
+        let marker =
+            LatestCandidateMarker::for_manifest(manifest, manifest_bytes, marker_updated_at_now());
+        let Ok(bytes) = serde_json::to_vec(&marker) else {
+            return;
+        };
+
+        let marker_key = ObjectKey::checkpoint_latest_candidate_marker();
+        let marker_path = Path::from(marker_key.as_str());
+        let _ = self
+            .store
+            .put(&marker_path, Bytes::from(bytes).into())
+            .await;
+    }
+
+    async fn latest_manifest_from_candidate_marker(
+        &self,
+    ) -> Result<Option<CheckpointManifest>, CheckpointPublishError> {
+        match self.try_latest_manifest_from_candidate_marker().await {
+            Ok(manifest) => Ok(manifest),
+            Err(_) => Ok(None),
+        }
+    }
+
+    async fn try_latest_manifest_from_candidate_marker(
+        &self,
+    ) -> Result<Option<CheckpointManifest>, CheckpointPublishError> {
+        let marker_key = ObjectKey::checkpoint_latest_candidate_marker();
+        let marker_path = Path::from(marker_key.as_str());
+        let marker_bytes = match self.store.get(&marker_path).await {
+            Ok(result) => result.bytes().await?,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+        let marker = serde_json::from_slice::<LatestCandidateMarker>(&marker_bytes)?;
+        if !marker.validate_schema() {
+            return Ok(None);
+        }
+
+        let expected_manifest_key = ObjectKey::checkpoint_manifest(marker.checkpoint_version);
+        if marker.manifest_key != expected_manifest_key {
+            return Ok(None);
+        }
+
+        let manifest_path = Path::from(marker.manifest_key.as_str());
+        let manifest_bytes = self.store.get(&manifest_path).await?.bytes().await?;
+        if marker.manifest_digest != manifest_digest(&manifest_bytes) {
+            return Ok(None);
+        }
+
+        let manifest = serde_json::from_slice::<CheckpointManifest>(&manifest_bytes)?;
+        manifest.validate()?;
+        let body_key = manifest.object_key();
+        if marker.manifest_key != body_key {
+            return Ok(None);
+        }
+        if marker.validated_parent_checkpoint != manifest.parent_checkpoint {
+            return Ok(None);
+        }
+
+        self.validate_parent_manifest_visible(&manifest).await?;
+        self.validate_state_objects_exist(&manifest).await?;
+        self.validate_output_objects_exist(&manifest).await?;
+        if self
+            .future_checkpoint_manifest_exists(&marker.manifest_key)
+            .await?
+        {
+            return Ok(None);
+        }
+
+        Ok(Some(manifest))
+    }
+
+    async fn future_checkpoint_manifest_exists(
+        &self,
+        manifest_key: &ObjectKey,
+    ) -> Result<bool, CheckpointPublishError> {
+        let mut future_objects = self.store.list_with_offset(
+            Some(&Path::from(CHECKPOINT_PREFIX)),
+            &Path::from(manifest_key.as_str()),
+        );
+
+        Ok(future_objects.try_next().await?.is_some())
     }
 
     async fn validate_parent_manifest_visible(
