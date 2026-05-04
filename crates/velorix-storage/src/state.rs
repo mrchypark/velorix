@@ -49,6 +49,8 @@ pub enum CheckpointPublishError {
     },
     #[error("referenced state object `{0}` is missing")]
     MissingStateObject(ObjectKey),
+    #[error("referenced output object `{0}` is missing")]
+    MissingOutputObject(ObjectKey),
     #[error("state object `{object_key}` owner claim mismatch: expected `{expected}`, actual `{actual:?}`")]
     StateOwnerClaimMismatch {
         object_key: ObjectKey,
@@ -124,6 +126,7 @@ impl CheckpointPublisher {
     ) -> Result<(), CheckpointPublishError> {
         manifest.validate()?;
         self.validate_state_objects_exist(manifest).await?;
+        self.validate_output_objects_exist(manifest).await?;
 
         let object_key = manifest.object_key();
         let path = Path::from(object_key.as_str());
@@ -224,6 +227,26 @@ impl CheckpointPublisher {
                 return Err(CheckpointPublishError::MissingStateObject(
                     state_ref.object_key.clone(),
                 ));
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn validate_output_objects_exist(
+        &self,
+        manifest: &CheckpointManifest,
+    ) -> Result<(), CheckpointPublishError> {
+        for output_object in &manifest.output_objects {
+            let path = Path::from(output_object.object_key.as_str());
+            match self.store.head(&path).await {
+                Ok(_) => {}
+                Err(object_store::Error::NotFound { .. }) => {
+                    return Err(CheckpointPublishError::MissingOutputObject(
+                        output_object.object_key.clone(),
+                    ));
+                }
+                Err(err) => return Err(err.into()),
             }
         }
 

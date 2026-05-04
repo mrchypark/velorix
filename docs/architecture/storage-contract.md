@@ -67,8 +67,13 @@ The publication order is:
 
 1. Write immutable ingest batches or output objects.
 2. Write checkpoint state objects.
-3. Validate that all manifest-referenced state objects exist.
+3. Validate that all manifest-referenced state and output objects exist.
 4. Publish the checkpoint manifest with create-only semantics.
+
+Manifest publication fails closed until every referenced state object is
+readable through the state-store boundary and every referenced output object is
+present in object storage. Only after those checks pass can the create-only
+manifest write make the checkpoint durable authority.
 
 Fenced state write and manifest publication APIs accept the caller's current
 `owner_claim`. They require fenced state refs to carry one explicit claim for

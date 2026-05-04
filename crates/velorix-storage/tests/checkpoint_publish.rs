@@ -9,7 +9,7 @@ use velorix_storage::{
         CheckpointManifest, InputRange, OutputObjectRef, PartitionOwnerClaim, StateObjectRef,
     },
     object_key::ObjectKey,
-    state::{CheckpointPublisher, StateObjectWrite},
+    state::{CheckpointPublishError, CheckpointPublisher, StateObjectWrite},
     state_store::{SlateDbStateStore, StateObjectStore},
 };
 
@@ -280,6 +280,49 @@ async fn checkpoint_publish_rejects_manifest_that_references_missing_state_objec
     assert!(err.to_string().contains("referenced state object"));
     let manifest_path = Path::from(manifest.object_key().as_str());
     assert!(store.head(&manifest_path).await.is_err());
+}
+
+#[tokio::test]
+async fn checkpoint_publish_rejects_manifest_that_references_missing_output_object() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let state = state_write(0, "state-0001", b"state-bytes");
+    let state_ref = publisher.write_state_object(&state).await.unwrap();
+    let missing_output = output_ref_for_partition(0);
+    let mut manifest = manifest(0, state_ref);
+    manifest.output_objects = vec![missing_output.clone()];
+
+    let err = publisher.publish_manifest(&manifest).await.unwrap_err();
+
+    assert!(matches!(
+        err,
+        CheckpointPublishError::MissingOutputObject(object_key)
+            if object_key == missing_output.object_key
+    ));
+    let manifest_path = Path::from(manifest.object_key().as_str());
+    assert!(store.head(&manifest_path).await.is_err());
+}
+
+#[tokio::test]
+async fn checkpoint_publish_accepts_manifest_after_referenced_output_object_exists() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let state = state_write(0, "state-0001", b"state-bytes");
+    let state_ref = publisher.write_state_object(&state).await.unwrap();
+    let output = output_ref_for_partition(0);
+    store
+        .put(
+            &Path::from(output.object_key.as_str()),
+            Bytes::from_static(b"output-bytes").into(),
+        )
+        .await
+        .unwrap();
+    let mut manifest = manifest(0, state_ref);
+    manifest.output_objects = vec![output];
+
+    publisher.publish_manifest(&manifest).await.unwrap();
+
+    assert_eq!(publisher.latest_manifest().await.unwrap(), Some(manifest));
 }
 
 #[tokio::test]
