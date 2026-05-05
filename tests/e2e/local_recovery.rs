@@ -20,7 +20,7 @@ use velorix_runtime::recovery::{
 };
 use velorix_storage::{
     ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
-    log::IngestLog,
+    log::{IngestBatch, IngestLog},
     manifest::{CheckpointManifest, InputRange, OutputObjectRef, StateObjectRef},
     object_key::ObjectKey,
     state::{CheckpointPublisher, StateObjectWrite},
@@ -303,6 +303,22 @@ async fn local_recovery_without_manifest_starts_empty_and_replays_from_zero() {
     );
     assert_eq!(recovered.replayed_batch_count(), 1);
     assert_eq!(recovered.latest_checkpoint_version(), None);
+}
+
+#[tokio::test]
+async fn local_recovery_rejects_json_deltabatch_ingest_object() {
+    let (_temp_dir, store) = temp_store();
+    let ingest_log = IngestLog::new(Arc::clone(&store));
+    let input = batch([input_delta("account-a", 4, 1)]);
+    let legacy_batch = IngestBatch::new("orders", 0, 0, 1, batch_bytes(&input)).unwrap();
+
+    ingest_log.append(&legacy_batch).await.unwrap();
+
+    let error = RecoveredRuntime::recover(Arc::clone(&store))
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("malformed ingest envelope"));
 }
 
 #[tokio::test]
