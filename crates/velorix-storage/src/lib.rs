@@ -11,5 +11,6 @@ pub mod log;
 pub mod manifest;
 pub mod object_key;
 pub mod ownership;
+pub mod relation_catalog_registry;
 pub mod state;
 pub mod state_store;

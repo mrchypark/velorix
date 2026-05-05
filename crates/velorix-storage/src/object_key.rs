@@ -164,6 +164,18 @@ impl ObjectKey {
         )))
     }
 
+    pub fn relation_catalog(
+        relation_id: &str,
+        relation_version: &str,
+    ) -> Result<Self, ObjectKeyError> {
+        validate_segment("relation_id", relation_id)?;
+        validate_segment("relation_version", relation_version)?;
+
+        Ok(Self(format!(
+            "v1/relations/{relation_id}/versions/{relation_version}.relation.json"
+        )))
+    }
+
     pub fn parse(value: impl Into<String>) -> Result<Self, ObjectKeyError> {
         let value = value.into();
         if value.starts_with('/')
@@ -289,6 +301,13 @@ fn validate_known_layout(value: &str) -> Result<(), ObjectKeyError> {
                 .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
             validate_sha256_hex(hash)
                 .map_err(|_| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+        }
+        ["v1", "relations", relation_id, "versions", relation_file] => {
+            validate_segment("relation_id", relation_id)?;
+            let relation_version = relation_file
+                .strip_suffix(".relation.json")
+                .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+            validate_segment("relation_version", relation_version)?;
         }
         _ => return Err(ObjectKeyError::InvalidExternalKey(value.to_string())),
     }
@@ -723,6 +742,34 @@ mod tests {
     }
 
     #[test]
+    fn relation_catalog_key_is_deterministic_and_parseable() {
+        let key = ObjectKey::relation_catalog("orders", "2026-05-05.v1").unwrap();
+        let restarted = ObjectKey::relation_catalog("orders", "2026-05-05.v1").unwrap();
+
+        assert_eq!(
+            key.as_str(),
+            "v1/relations/orders/versions/2026-05-05.v1.relation.json"
+        );
+        assert_eq!(key, restarted);
+        assert_eq!(ObjectKey::parse(key.as_str()).unwrap(), key);
+    }
+
+    #[test]
+    fn relation_catalog_key_rejects_unsafe_identity() {
+        for (relation_id, relation_version) in [
+            ("", "2026-05-05.v1"),
+            ("orders/current", "2026-05-05.v1"),
+            ("orders", ""),
+            ("orders", "2026/05/05"),
+        ] {
+            assert!(
+                ObjectKey::relation_catalog(relation_id, relation_version).is_err(),
+                "accepted invalid relation identity: {relation_id}/{relation_version}"
+            );
+        }
+    }
+
+    #[test]
     fn parse_rejects_invalid_or_unrecognized_external_keys() {
         for invalid in [
             "v1/ingest/./p=0000000000/00000000000000000000-00000000000000000001.batch",
@@ -740,6 +787,9 @@ mod tests {
             "v1/tables/orders.txt",
             "v1/feldera-artifacts/orders/sha256/not-hex.artifact.json",
             "v1/feldera-artifacts/orders/sha512/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.artifact.json",
+            "v1/relations/orders/versions/.relation.json",
+            "v1/relations/orders/versions/2026/05/05.relation.json",
+            "v1/relations/orders/versions/2026-05-05.v1.json",
         ] {
             assert!(
                 ObjectKey::parse(invalid).is_err(),

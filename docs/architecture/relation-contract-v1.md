@@ -15,6 +15,11 @@ registration, standing-view artifacts, and incremental execution.
 v1/relations/{relation_id}/versions/{relation_version}.relation.json
 ```
 
+The storage registry is create-only by `(relation_id, relation_version)`.
+Duplicate creates with the same stored body are idempotent; duplicate creates
+with a different body fail as conflicts. Reads must re-validate the catalog
+body and reject records whose stored relation identity does not match the key.
+
 Required fields:
 
 - `schema_version`.
