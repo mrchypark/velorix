@@ -10,6 +10,7 @@ clap = { workspace = true }
 object_store = { workspace = true }
 tokio = { workspace = true }
 velorix-runtime = { path = "../velorix-runtime" }
+velorix-storage = { path = "../velorix-storage" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

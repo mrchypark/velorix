@@ -7,6 +7,12 @@ use clap::{CommandFactory, Parser, Subcommand};
 use object_store::{local::LocalFileSystem, ObjectStore};
 use velorix_runtime::benchmark_gate::{BenchmarkBudgetV1, BenchmarkGateResultV1};
 use velorix_runtime::recovery::RecoveredRuntime;
+use velorix_storage::{
+    checkpoint_index::{
+        CheckpointAdminInspection, CheckpointLifecycleStatus, CheckpointManifestInspectionStatus,
+    },
+    state::CheckpointPublisher,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "velorix-cli")]
@@ -19,6 +25,10 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     RecoverLocal {
+        #[arg(long)]
+        object_store_dir: PathBuf,
+    },
+    CheckpointInspectLocal {
         #[arg(long)]
         object_store_dir: PathBuf,
     },
@@ -42,13 +52,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Some(Command::RecoverLocal { object_store_dir }) => {
-            let store = LocalFileSystem::new_with_prefix(&object_store_dir).with_context(|| {
-                format!(
-                    "failed to open local object store at {}",
-                    object_store_dir.display()
-                )
-            })?;
-            let recovered = RecoveredRuntime::recover(Arc::new(store) as Arc<dyn ObjectStore>)
+            let recovered = RecoveredRuntime::recover(local_object_store(&object_store_dir)?)
                 .await
                 .context("failed to recover local runtime")?;
             let materialized_records = recovered.materialized_state().records().len();
@@ -59,6 +63,15 @@ async fn main() -> anyhow::Result<()> {
                 recovered.replayed_batch_count(),
                 materialized_records
             );
+        }
+        Some(Command::CheckpointInspectLocal { object_store_dir }) => {
+            let store = local_object_store(&object_store_dir)?;
+            let inspection = CheckpointPublisher::new(store)
+                .inspect_checkpoints()
+                .await
+                .context("failed to inspect local checkpoints")?;
+
+            print!("{}", format_checkpoint_inspection(&inspection));
         }
         Some(Command::BenchmarkValidate { result }) => {
             run_benchmark_gate(None, &result, None)?;
@@ -79,6 +92,52 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn local_object_store(object_store_dir: &Path) -> anyhow::Result<Arc<dyn ObjectStore>> {
+    let store = LocalFileSystem::new_with_prefix(object_store_dir).with_context(|| {
+        format!(
+            "failed to open local object store at {}",
+            object_store_dir.display()
+        )
+    })?;
+
+    Ok(Arc::new(store) as Arc<dyn ObjectStore>)
+}
+
+fn format_checkpoint_inspection(inspection: &CheckpointAdminInspection) -> String {
+    let latest = inspection
+        .latest_valid_checkpoint
+        .map_or_else(|| "none".to_string(), |checkpoint| checkpoint.to_string());
+    let mut output = format!("latest_valid_checkpoint={latest}\nmanifests:\n");
+
+    for manifest in &inspection.manifests {
+        output.push_str(&format!(
+            "checkpoint={} key={} lifecycle={} status={}\n",
+            manifest.checkpoint_version,
+            manifest.manifest_key,
+            format_lifecycle_status(manifest.lifecycle_status),
+            format_manifest_status(&manifest.status),
+        ));
+    }
+
+    output
+}
+
+fn format_lifecycle_status(status: Option<CheckpointLifecycleStatus>) -> &'static str {
+    match status {
+        Some(CheckpointLifecycleStatus::Published) => "published",
+        None => "none",
+    }
+}
+
+fn format_manifest_status(status: &CheckpointManifestInspectionStatus) -> String {
+    match status {
+        CheckpointManifestInspectionStatus::Valid => "valid".to_string(),
+        CheckpointManifestInspectionStatus::Invalid { reason } => {
+            format!("invalid reason={}", reason.replace('\n', " "))
+        }
+    }
 }
 
 fn run_benchmark_gate(
@@ -137,6 +196,13 @@ mod tests {
 
     use super::*;
     use tempfile::tempdir;
+    use velorix_storage::{
+        checkpoint_index::{
+            CheckpointAdminInspection, CheckpointLifecycleStatus, CheckpointManifestInspection,
+            CheckpointManifestInspectionStatus,
+        },
+        object_key::ObjectKey,
+    };
 
     #[test]
     fn benchmark_result_parser_accepts_pretty_json() {
@@ -193,6 +259,39 @@ mod tests {
         let error_chain = format!("{error:#}");
 
         assert!(error_chain.contains("regressed"));
+    }
+
+    #[test]
+    fn checkpoint_inspection_formatter_prints_stable_operator_summary() {
+        let summary = CheckpointAdminInspection {
+            latest_valid_checkpoint: Some(7),
+            manifests: vec![
+                CheckpointManifestInspection {
+                    checkpoint_version: 3,
+                    manifest_key: ObjectKey::checkpoint_manifest(3),
+                    lifecycle_status: Some(CheckpointLifecycleStatus::Published),
+                    status: CheckpointManifestInspectionStatus::Valid,
+                },
+                CheckpointManifestInspection {
+                    checkpoint_version: 8,
+                    manifest_key: ObjectKey::checkpoint_manifest(8),
+                    lifecycle_status: None,
+                    status: CheckpointManifestInspectionStatus::Invalid {
+                        reason: "missing visible parent checkpoint\n7".to_string(),
+                    },
+                },
+            ],
+        };
+
+        assert_eq!(
+            format_checkpoint_inspection(&summary),
+            concat!(
+                "latest_valid_checkpoint=7\n",
+                "manifests:\n",
+                "checkpoint=3 key=v1/checkpoints/00000000000000000003.manifest lifecycle=published status=valid\n",
+                "checkpoint=8 key=v1/checkpoints/00000000000000000008.manifest lifecycle=none status=invalid reason=missing visible parent checkpoint 7\n",
+            )
+        );
     }
 
     const VALID_RESULT_JSON: &str = r#"{

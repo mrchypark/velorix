@@ -4098,6 +4098,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "velorix-runtime",
+ "velorix-storage",
 ]
 
 [[package]]
