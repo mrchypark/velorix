@@ -41,10 +41,20 @@ Current DataFusion 53 wiring:
 
 DataFusion documents that its memory limit is not respected in all cases.
 Velorix therefore treats this as a centralized DataFusion configuration
-boundary, not complete memory or spill enforcement. Exact object-store request
-metering, version-specific memory/spill failure tests, tenant/global shared
-runtime semantics, and Velorix-owned typed memory/spill errors remain future
-work.
+boundary, not complete memory or spill enforcement.
+
+Object-backed query execution uses one small metered DataFusion object-store
+wrapper for the whole query when `max_object_requests` is set. Scan preflight
+and DataFusion execution share that same meter, so preflight list operations
+debit the same request budget used by runtime file access. The wrapper counts
+trait-level object-store operations before delegation and rejects the next
+operation that would exceed the request budget. It also records bytes from
+successful `get_opts` ranges and `get_ranges` results without wrapping response
+streams; exact consumed-byte metering remains future work if DataFusion needs
+that distinction.
+
+Version-specific memory/spill failure tests, tenant/global shared runtime
+semantics, and Velorix-owned typed memory/spill errors remain future work.
 
 ## Typed Errors
 

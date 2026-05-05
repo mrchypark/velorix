@@ -5,6 +5,7 @@
 pub mod benchmark_gate;
 pub mod cache;
 pub mod leased_checkpoint;
+mod object_meter;
 pub mod persisted_query;
 pub mod persisted_table;
 pub mod persisted_view;

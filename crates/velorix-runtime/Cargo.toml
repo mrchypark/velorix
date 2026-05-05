@@ -6,6 +6,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 arrow = { workspace = true }
+async-trait = { workspace = true }
 bytes = { workspace = true }
 datafusion = { workspace = true }
 foyer = { workspace = true }

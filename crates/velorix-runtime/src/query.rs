@@ -19,6 +19,7 @@ use thiserror::Error;
 use url::Url;
 use velorix_core::query::{QueryError, QueryPolicy, QueryPolicyError, INPUT_TABLE_NAME};
 
+use crate::object_meter::{object_request_policy_error, MeteredObjectStore};
 pub use crate::query_runtime::QueryExecutionLimiter;
 use crate::query_runtime::{DataFusionSessionFactory, QueryRuntimeLimits};
 use crate::recovery::{RecoveredRuntime, RecoveryError};
@@ -116,25 +117,36 @@ pub async fn query_object_backed_input_with_policy_and_limiter(
     policy.validate().map_err(QueryError::from)?;
     validate_sql_text_policy(sql, policy).map_err(QueryError::from)?;
     let _permit = acquire_query_permit(policy, limiter.as_ref())?;
-    validate_scan_policy(store.as_ref(), table_url, policy).await?;
+    let query_store = query_execution_store(store, policy);
+    validate_scan_policy(query_store.as_ref(), table_url, policy).await?;
 
     let context = session_context(policy)?;
 
     let object_store_url = object_store_url_for_table(table_url)?;
-    context.register_object_store(object_store_url.as_ref(), store);
+    context.register_object_store(object_store_url.as_ref(), query_store);
     context
         .register_parquet(INPUT_TABLE_NAME, table_url, ParquetReadOptions::default())
         .await
-        .map_err(QueryError::from)?;
+        .map_err(map_datafusion_error)?;
 
     let limits = QueryRuntimeLimits::from_policy(policy);
     let dataframe = limits
-        .run_planning(async { context.sql(sql).await.map_err(QueryError::from) })
+        .run_planning(async { context.sql(sql).await.map_err(map_datafusion_error) })
         .await?;
 
     collect_with_policy(dataframe, policy, limits)
         .await
         .map_err(Into::into)
+}
+
+fn query_execution_store(
+    store: Arc<dyn DataFusionObjectStore>,
+    policy: QueryPolicy,
+) -> Arc<dyn DataFusionObjectStore> {
+    match policy.max_object_requests {
+        Some(max_requests) => Arc::new(MeteredObjectStore::new(store, Some(max_requests))),
+        None => store,
+    }
 }
 
 fn acquire_query_permit(
@@ -160,7 +172,9 @@ async fn collect_with_policy(
         .max_output_rows
         .and_then(|max_rows| max_rows.checked_add(1))
     {
-        Some(fetch) => dataframe.limit(0, Some(fetch)).map_err(QueryError::from)?,
+        Some(fetch) => dataframe
+            .limit(0, Some(fetch))
+            .map_err(map_datafusion_error)?,
         None => dataframe,
     };
 
@@ -176,9 +190,12 @@ async fn collect_record_batches(
     let mut output = Vec::new();
     let mut observed_rows = 0usize;
     let mut observed_bytes = 0u64;
-    let mut stream = dataframe.execute_stream().await.map_err(QueryError::from)?;
+    let mut stream = dataframe
+        .execute_stream()
+        .await
+        .map_err(map_datafusion_error)?;
 
-    while let Some(batch) = stream.try_next().await.map_err(QueryError::from)? {
+    while let Some(batch) = stream.try_next().await.map_err(map_datafusion_error)? {
         observed_rows = observed_rows.saturating_add(batch.num_rows());
         observed_bytes = observed_bytes.saturating_add(record_batch_memory_size(&batch));
 
@@ -264,27 +281,12 @@ async fn validate_scan_policy(
     let prefix = object_path_for_table_url(table_url)?;
     let mut observed_files = 0usize;
     let mut observed_bytes = 0u64;
-    let mut observed_requests = 1usize;
-    if let Some(max_requests) = policy.max_object_requests {
-        if observed_requests > max_requests {
-            return Err(QueryPolicyError::ObjectRequestsExceeded {
-                observed_requests,
-                max_requests,
-            }
-            .into());
-        }
-    }
 
     let mut objects = store.list(Some(&prefix));
 
-    while let Some(object) = objects
-        .try_next()
-        .await
-        .map_err(|error| DataFusionError::ObjectStore(Box::new(error)))?
-    {
+    while let Some(object) = objects.try_next().await.map_err(map_object_store_error)? {
         observed_files = observed_files.saturating_add(1);
         observed_bytes = observed_bytes.saturating_add(object.size);
-        observed_requests = observed_requests.saturating_add(1);
 
         if let Some(max_files) = policy.max_scan_files {
             if observed_files > max_files {
@@ -304,18 +306,46 @@ async fn validate_scan_policy(
                 .into());
             }
         }
-        if let Some(max_requests) = policy.max_object_requests {
-            if observed_requests > max_requests {
-                return Err(QueryPolicyError::ObjectRequestsExceeded {
-                    observed_requests,
-                    max_requests,
-                }
-                .into());
-            }
-        }
     }
 
     Ok(())
+}
+
+fn map_object_store_error(error: datafusion::object_store::Error) -> QueryError {
+    match query_policy_error_from_source(&error) {
+        Some(error) => error.into(),
+        None => DataFusionError::ObjectStore(Box::new(error)).into(),
+    }
+}
+
+fn map_datafusion_error(error: DataFusionError) -> QueryError {
+    match query_policy_error_from_source(&error) {
+        Some(error) => error.into(),
+        None => error.into(),
+    }
+}
+
+fn query_policy_error_from_source(
+    error: &(dyn std::error::Error + 'static),
+) -> Option<QueryPolicyError> {
+    if let Some(error) = error.downcast_ref::<datafusion::object_store::Error>() {
+        if let Some(error) = object_request_policy_error(error) {
+            return Some(error);
+        }
+    }
+
+    if let Some(QueryPolicyError::ObjectRequestsExceeded {
+        observed_requests,
+        max_requests,
+    }) = error.downcast_ref::<QueryPolicyError>()
+    {
+        return Some(QueryPolicyError::ObjectRequestsExceeded {
+            observed_requests: *observed_requests,
+            max_requests: *max_requests,
+        });
+    }
+
+    error.source().and_then(query_policy_error_from_source)
 }
 
 fn object_store_url_for_table(table_url: &str) -> Result<ObjectStoreUrl, QueryError> {
