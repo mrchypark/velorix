@@ -1,5 +1,10 @@
 use std::{future::Future, sync::Arc, time::Duration};
 
+use datafusion::{
+    error::DataFusionError,
+    execution::runtime_env::RuntimeEnvBuilder,
+    prelude::{SessionConfig, SessionContext},
+};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use velorix_core::query::{QueryError, QueryPolicy, QueryPolicyError};
 
@@ -50,6 +55,56 @@ impl QueryRuntimeLimits {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DataFusionSessionFactory {
+    batch_size: Option<usize>,
+    target_partitions: Option<usize>,
+    memory_limit_bytes: Option<u64>,
+    spill_limit_bytes: Option<u64>,
+}
+
+impl DataFusionSessionFactory {
+    pub(crate) fn from_policy(policy: QueryPolicy) -> Self {
+        Self {
+            batch_size: policy.batch_size.map(|batch_size| batch_size.get()),
+            target_partitions: policy
+                .target_partitions
+                .map(|target_partitions| target_partitions.get()),
+            memory_limit_bytes: policy.memory_limit_bytes,
+            spill_limit_bytes: policy.spill_limit_bytes,
+        }
+    }
+
+    pub(crate) fn session_context(self) -> Result<SessionContext, QueryError> {
+        let mut config = SessionConfig::new();
+        if let Some(batch_size) = self.batch_size {
+            config = config.with_batch_size(batch_size);
+        }
+        if let Some(target_partitions) = self.target_partitions {
+            config = config.with_target_partitions(target_partitions);
+        }
+
+        let mut runtime = RuntimeEnvBuilder::new();
+        if let Some(memory_limit_bytes) = self.memory_limit_bytes {
+            runtime = runtime.with_memory_limit(memory_limit_usize(memory_limit_bytes)?, 1.0);
+        }
+        if let Some(spill_limit_bytes) = self.spill_limit_bytes {
+            runtime = runtime.with_max_temp_directory_size(spill_limit_bytes);
+        }
+
+        Ok(SessionContext::new_with_config_rt(
+            config,
+            runtime.build_arc()?,
+        ))
+    }
+}
+
+fn memory_limit_usize(memory_limit_bytes: u64) -> Result<usize, QueryError> {
+    usize::try_from(memory_limit_bytes)
+        .map_err(|_| DataFusionError::Configuration("memory_limit_bytes exceeds usize".into()))
+        .map_err(QueryError::from)
+}
+
 #[derive(Clone, Debug)]
 pub struct QueryExecutionLimiter {
     permits: Arc<Semaphore>,
@@ -91,6 +146,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::execution::memory_pool::MemoryLimit;
+    use std::num::NonZeroUsize;
 
     #[tokio::test]
     async fn query_runtime_limits_returns_planning_timeout_when_planning_does_not_finish() {
@@ -124,5 +181,33 @@ mod tests {
             error,
             QueryError::Policy(QueryPolicyError::ExecutionTimeout { timeout_ms: 1 })
         ));
+    }
+
+    #[test]
+    fn datafusion_session_factory_captures_policy_config() {
+        let policy = QueryPolicy {
+            batch_size: Some(NonZeroUsize::new(7).unwrap()),
+            target_partitions: Some(NonZeroUsize::new(3).unwrap()),
+            memory_limit_bytes: Some(64 * 1024 * 1024),
+            spill_limit_bytes: Some(32 * 1024 * 1024),
+            ..QueryPolicy::default()
+        };
+
+        let context = DataFusionSessionFactory::from_policy(policy)
+            .session_context()
+            .unwrap();
+        let config = context.copied_config();
+        let runtime = context.runtime_env();
+
+        assert_eq!(config.batch_size(), 7);
+        assert_eq!(config.target_partitions(), 3);
+        assert!(matches!(
+            runtime.memory_pool.memory_limit(),
+            MemoryLimit::Finite(limit) if limit == 64 * 1024 * 1024
+        ));
+        assert_eq!(
+            runtime.disk_manager.max_temp_directory_size(),
+            32 * 1024 * 1024
+        );
     }
 }

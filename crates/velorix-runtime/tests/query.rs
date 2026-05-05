@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{num::NonZeroUsize, sync::Arc};
 
 use arrow::array::{ArrayRef, Int64Array, StringArray, StringViewArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -554,6 +554,37 @@ async fn query_object_backed_input_applies_byte_limit_under_row_limit() {
             max_bytes: 1,
         })) if observed_bytes > 1
     ));
+}
+
+#[tokio::test]
+async fn query_object_backed_input_with_memory_and_spill_policy_still_runs() {
+    let store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
+    put_parquet_input(
+        &store,
+        "input/part-000.parquet",
+        &parquet_input_batch(&["\"account-a\"", "\"account-b\""], &["10", "7"], &[1, 1]),
+    )
+    .await;
+
+    let output = query_object_backed_input_with_policy(
+        Arc::clone(&store),
+        "memory://velorix/input/",
+        "select key_json, value_json, weight from input order by key_json",
+        QueryPolicy {
+            memory_limit_bytes: Some(64 * 1024 * 1024),
+            spill_limit_bytes: Some(32 * 1024 * 1024),
+            batch_size: Some(NonZeroUsize::new(2).unwrap()),
+            target_partitions: Some(NonZeroUsize::new(1).unwrap()),
+            ..QueryPolicy::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].num_rows(), 2);
+    assert_eq!(string_value(&output[0], 0, 0), "\"account-a\"");
+    assert_eq!(string_value(&output[0], 0, 1), "\"account-b\"");
 }
 
 #[tokio::test]

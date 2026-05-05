@@ -24,19 +24,41 @@ Production query admission requires:
 - optional join and cross-join policy.
 
 Policy is an execution admission contract, not just metadata stored with a
-query spec. DataFusion `SessionConfig`, memory pool, spill manager,
-cancellation, object-store scan instrumentation, and timeout handling must be
-connected to this policy.
+query spec. Runtime query paths build `SessionContext` instances through the
+Velorix DataFusion session factory so `batch_size`, `target_partitions`,
+`memory_limit_bytes`, and `spill_limit_bytes` have one mapping point.
+
+Current DataFusion 53 wiring:
+
+- `batch_size` maps to `SessionConfig::with_batch_size`.
+- `target_partitions` maps to `SessionConfig::with_target_partitions`.
+- `memory_limit_bytes` maps to
+  `RuntimeEnvBuilder::with_memory_limit(max_memory, 1.0)`.
+- `spill_limit_bytes` maps to
+  `RuntimeEnvBuilder::with_max_temp_directory_size`.
+- Runtime environment build failures are returned through the existing
+  DataFusion query error path.
+
+DataFusion documents that its memory limit is not respected in all cases.
+Velorix therefore treats this as a centralized DataFusion configuration
+boundary, not complete memory or spill enforcement. Exact object-store request
+metering, version-specific memory/spill failure tests, tenant/global shared
+runtime semantics, and Velorix-owned typed memory/spill errors remain future
+work.
 
 ## Typed Errors
 
-Policy violations should return typed errors such as `PlanningTimeout`,
-`ExecutionTimeout`, `MemoryLimitExceeded`, `SpillLimitExceeded`,
-`ScanBytesExceeded`, `ObjectRequestLimitExceeded`, and `FileCountLimitExceeded`.
+Policy violations should return typed errors where Velorix enforces the limit
+directly, such as `PlanningTimeout`, `ExecutionTimeout`, `ScanBytesExceeded`,
+`ObjectRequestLimitExceeded`, and `FileCountLimitExceeded`. Memory and spill
+limits currently flow through DataFusion runtime configuration, so their exact
+error shape is DataFusion-version-dependent.
 
 ## Verification
 
 - Large joins, sorts, high-cardinality aggregations, many-file scans, and large
-  Parquet scans are bounded by policy.
+  Parquet scans are bounded by policy where the current DataFusion version
+  honors the configured memory and spill limits.
 - `LIMIT 1` does not bypass scan byte or object request limits.
-- Concurrent queries cannot exceed shared memory or concurrency pools.
+- Concurrent queries cannot exceed concurrency pools; shared memory semantics
+  require a future shared runtime boundary.

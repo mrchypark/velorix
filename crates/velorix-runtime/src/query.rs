@@ -11,7 +11,7 @@ use datafusion::{
     execution::object_store::ObjectStoreUrl,
     object_store::path::Path as DataFusionPath,
     object_store::ObjectStore as DataFusionObjectStore,
-    prelude::{ParquetReadOptions, SessionConfig, SessionContext},
+    prelude::{ParquetReadOptions, SessionContext},
 };
 use futures::TryStreamExt;
 use object_store::ObjectStore;
@@ -20,7 +20,7 @@ use url::Url;
 use velorix_core::query::{QueryError, QueryPolicy, QueryPolicyError, INPUT_TABLE_NAME};
 
 pub use crate::query_runtime::QueryExecutionLimiter;
-use crate::query_runtime::QueryRuntimeLimits;
+use crate::query_runtime::{DataFusionSessionFactory, QueryRuntimeLimits};
 use crate::recovery::{RecoveredRuntime, RecoveryError};
 
 #[derive(Debug, Error)]
@@ -118,7 +118,7 @@ pub async fn query_object_backed_input_with_policy_and_limiter(
     let _permit = acquire_query_permit(policy, limiter.as_ref())?;
     validate_scan_policy(store.as_ref(), table_url, policy).await?;
 
-    let context = session_context(policy);
+    let context = session_context(policy)?;
 
     let object_store_url = object_store_url_for_table(table_url)?;
     context.register_object_store(object_store_url.as_ref(), store);
@@ -239,22 +239,14 @@ fn input_context(
     policy: QueryPolicy,
 ) -> Result<SessionContext, QueryError> {
     let table = MemTable::try_new(input_schema(), vec![input_batches])?;
-    let context = session_context(policy);
+    let context = session_context(policy)?;
     context.register_table(INPUT_TABLE_NAME, Arc::new(table))?;
 
     Ok(context)
 }
 
-fn session_context(policy: QueryPolicy) -> SessionContext {
-    let mut config = SessionConfig::new();
-    if let Some(batch_size) = policy.batch_size {
-        config = config.with_batch_size(batch_size.get());
-    }
-    if let Some(target_partitions) = policy.target_partitions {
-        config = config.with_target_partitions(target_partitions.get());
-    }
-
-    SessionContext::new_with_config(config)
+fn session_context(policy: QueryPolicy) -> Result<SessionContext, QueryError> {
+    DataFusionSessionFactory::from_policy(policy).session_context()
 }
 
 async fn validate_scan_policy(
