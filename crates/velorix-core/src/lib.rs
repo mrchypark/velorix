@@ -8,3 +8,4 @@ pub mod feldera_artifact;
 pub mod operator;
 pub mod query;
 pub mod relation;
+pub mod resource_policy;

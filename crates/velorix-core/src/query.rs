@@ -7,10 +7,11 @@ use arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
 use datafusion::error::DataFusionError;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::delta::DeltaBatch;
+
+pub use crate::resource_policy::{QueryExecutionPolicyV1, QueryPolicy, QueryPolicyError};
 
 pub const INPUT_TABLE_NAME: &str = "input";
 
@@ -22,52 +23,6 @@ pub enum QueryError {
     DataFusion(#[from] DataFusionError),
     #[error(transparent)]
     Policy(#[from] QueryPolicyError),
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct QueryPolicy {
-    pub max_sql_bytes: Option<usize>,
-    pub max_output_rows: Option<usize>,
-    pub max_scan_files: Option<usize>,
-    pub max_scan_bytes: Option<u64>,
-    pub max_object_requests: Option<usize>,
-    pub batch_size: Option<std::num::NonZeroUsize>,
-    pub target_partitions: Option<std::num::NonZeroUsize>,
-}
-
-#[derive(Debug, Error, Eq, PartialEq)]
-pub enum QueryPolicyError {
-    #[error("SQL text is {actual_bytes} bytes, above query policy limit of {max_bytes} bytes")]
-    SqlTextTooLarge {
-        actual_bytes: usize,
-        max_bytes: usize,
-    },
-    #[error(
-        "query returned at least {observed_rows} rows, above query policy limit of {max_rows} rows"
-    )]
-    OutputRowsExceeded {
-        observed_rows: usize,
-        max_rows: usize,
-    },
-    #[error(
-        "query would scan {observed_files} files, above query policy limit of {max_files} files"
-    )]
-    ScanFilesExceeded {
-        observed_files: usize,
-        max_files: usize,
-    },
-    #[error(
-        "query would scan {observed_bytes} bytes, above query policy limit of {max_bytes} bytes"
-    )]
-    ScanBytesExceeded { observed_bytes: u64, max_bytes: u64 },
-    #[error(
-        "query would issue at least {observed_requests} object requests, above query policy limit of {max_requests} object requests"
-    )]
-    ObjectRequestsExceeded {
-        observed_requests: usize,
-        max_requests: usize,
-    },
 }
 
 /// Runs caller SQL over a delta batch through DataFusion.
@@ -89,6 +44,7 @@ pub async fn query_delta_batch_with_policy(
     sql: &str,
     policy: QueryPolicy,
 ) -> Result<Vec<RecordBatch>, QueryError> {
+    policy.validate()?;
     validate_sql_text_policy(sql, policy)?;
 
     let input = RecordBatch::try_new(
@@ -145,6 +101,7 @@ pub async fn validate_input_query_with_policy(
     sql: &str,
     policy: QueryPolicy,
 ) -> Result<(), QueryError> {
+    policy.validate()?;
     validate_sql_text_policy(sql, policy)?;
 
     let input = RecordBatch::new_empty(input_schema());
