@@ -30,7 +30,7 @@ use velorix_storage::{
     checkpoint_index::{
         CheckpointAdminInspection, CheckpointLifecycleStatus, CheckpointManifestInspectionStatus,
     },
-    gc::{GarbageCollectionPlan, GarbageCollectionPolicy},
+    gc::{GarbageCollectionPlan, GarbageCollectionPolicy, GarbageCollectionRunV1},
     state::CheckpointPublisher,
 };
 
@@ -59,6 +59,16 @@ enum Command {
         object_store_dir: PathBuf,
         #[arg(long)]
         retain_latest_manifests: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    GcExecuteLocal {
+        #[arg(long)]
+        object_store_dir: PathBuf,
+        #[arg(long)]
+        retain_latest_manifests: usize,
+        #[arg(long)]
+        run_id: String,
         #[arg(long)]
         json: bool,
     },
@@ -141,6 +151,32 @@ async fn main() -> anyhow::Result<()> {
                 println!("{}", format_gc_plan_json(&plan)?);
             } else {
                 print!("{}", format_gc_plan(&plan));
+            }
+        }
+        Some(Command::GcExecuteLocal {
+            object_store_dir,
+            retain_latest_manifests,
+            run_id,
+            json,
+        }) => {
+            let store = local_object_store(&object_store_dir)?;
+            let publisher = CheckpointPublisher::new(store);
+            let policy = GarbageCollectionPolicy {
+                retain_latest_manifests,
+            };
+            let plan = publisher
+                .plan_garbage_collection(policy)
+                .await
+                .context("failed to plan local garbage collection")?;
+            let run = publisher
+                .execute_garbage_collection_plan_with_evidence(&run_id, policy, &plan)
+                .await
+                .context("failed to execute local garbage collection")?;
+
+            if json {
+                println!("{}", format_gc_run_json(&run)?);
+            } else {
+                print!("{}", format_gc_run(&run));
             }
         }
         Some(Command::BenchmarkValidate { result }) => {
@@ -495,6 +531,20 @@ fn format_gc_plan_json(plan: &GarbageCollectionPlan) -> anyhow::Result<String> {
     .context("failed to serialize garbage collection plan")
 }
 
+fn format_gc_run(run: &GarbageCollectionRunV1) -> String {
+    format!(
+        "run_id={}\nretained_manifest_versions={:?}\ndeleted={}\nskipped={}\n",
+        run.run_id,
+        run.plan.retained_manifest_versions,
+        run.report.deleted.len(),
+        run.report.skipped.len()
+    )
+}
+
+fn format_gc_run_json(run: &GarbageCollectionRunV1) -> anyhow::Result<String> {
+    serde_json::to_string_pretty(run).context("failed to serialize garbage collection run")
+}
+
 fn format_lifecycle_status(status: Option<CheckpointLifecycleStatus>) -> &'static str {
     match status {
         Some(CheckpointLifecycleStatus::Published) => "published",
@@ -637,7 +687,7 @@ mod tests {
             CheckpointAdminInspection, CheckpointLifecycleStatus, CheckpointManifestInspection,
             CheckpointManifestInspectionStatus,
         },
-        gc::{GarbageCollectionCandidate, GarbageCollectionCandidateKind},
+        gc::{GarbageCollectionCandidate, GarbageCollectionCandidateKind, GarbageCollectionReport},
         object_key::ObjectKey,
     };
 
@@ -761,6 +811,37 @@ mod tests {
 
         assert_eq!(object_store_dir, PathBuf::from("/tmp/velorix"));
         assert_eq!(retain_latest_manifests, 2);
+        assert!(json);
+    }
+
+    #[test]
+    fn gc_execute_cli_parses_local_json_command() {
+        let cli = Cli::try_parse_from([
+            "velorix-cli",
+            "gc-execute-local",
+            "--object-store-dir",
+            "/tmp/velorix",
+            "--retain-latest-manifests",
+            "2",
+            "--run-id",
+            "run-0001",
+            "--json",
+        ])
+        .unwrap();
+
+        let Some(Command::GcExecuteLocal {
+            object_store_dir,
+            retain_latest_manifests,
+            run_id,
+            json,
+        }) = cli.command
+        else {
+            panic!("expected gc-execute-local command");
+        };
+
+        assert_eq!(object_store_dir, PathBuf::from("/tmp/velorix"));
+        assert_eq!(retain_latest_manifests, 2);
+        assert_eq!(run_id, "run-0001");
         assert!(json);
     }
 
@@ -1050,6 +1131,44 @@ mod tests {
             serde_json::json!([7, 8])
         );
         assert_eq!(value["candidates"][0]["kind"], "output_object");
+    }
+
+    #[test]
+    fn gc_execute_json_is_the_stored_run_evidence() {
+        let candidate = GarbageCollectionCandidate {
+            object_key: ObjectKey::parse(
+                "v1/state/orders/p=0000000000/chk=00000000000000000001/state-0001.state",
+            )
+            .unwrap(),
+            kind: GarbageCollectionCandidateKind::RawStateObject,
+        };
+        let run = GarbageCollectionRunV1 {
+            schema_version: 1,
+            run_id: "run-0001".to_string(),
+            policy: GarbageCollectionPolicy {
+                retain_latest_manifests: 2,
+            },
+            plan: GarbageCollectionPlan {
+                retained_manifest_versions: vec![7, 8],
+                candidates: vec![candidate.clone()],
+            },
+            report: GarbageCollectionReport {
+                deleted: vec![candidate],
+                skipped: vec![],
+            },
+        };
+
+        let json = format_gc_run_json(&run).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["run_id"], "run-0001");
+        assert_eq!(value["policy"]["retain_latest_manifests"], 2);
+        assert_eq!(
+            value["plan"]["retained_manifest_versions"],
+            serde_json::json!([7, 8])
+        );
+        assert_eq!(value["report"]["deleted"][0]["kind"], "raw_state_object");
     }
 
     fn valid_result_json() -> String {
