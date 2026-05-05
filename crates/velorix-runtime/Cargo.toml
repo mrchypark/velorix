@@ -12,6 +12,7 @@ datafusion = { workspace = true }
 foyer = { workspace = true }
 futures = { workspace = true }
 object_store = { workspace = true }
+object_store_13 = { package = "object_store", version = "0.13.2", default-features = false, features = ["aws"], optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -21,9 +22,17 @@ velorix-core = { path = "../velorix-core" }
 velorix-control = { path = "../velorix-control" }
 velorix-storage = { path = "../velorix-storage" }
 
+[features]
+s3-compat-tests = ["object_store/aws", "object_store_13"]
+
 [[test]]
 name = "local_recovery"
 path = "../../tests/e2e/local_recovery.rs"
+
+[[test]]
+name = "s3_compat_query"
+path = "tests/s3_compat_query.rs"
+required-features = ["s3-compat-tests"]
 
 [[bench]]
 name = "local_incremental"

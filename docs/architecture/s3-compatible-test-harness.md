@@ -16,6 +16,7 @@ enabled:
 
 ```bash
 cargo test -p velorix-storage --test s3_compat --features s3-compat-tests
+cargo test -p velorix-runtime --test s3_compat_query --features s3-compat-tests
 ```
 
 When that target is enabled, the test still skips unless:
@@ -54,19 +55,34 @@ behaviors:
 These are capability checks for production assumptions, not replacements for
 Velorix checkpoint, ingest, output, or catalog manifests.
 
+## Runtime Query Harness
+
+`crates/velorix-runtime/tests/s3_compat_query.rs` is also feature-gated and
+skipped by default. When enabled, it builds both object-store clients used by
+the runtime boundary:
+
+- `object_store` 0.12 for Velorix authority/catalog/probe writes.
+- `object_store` 0.13 for DataFusion 53 Parquet scans.
+
+The test writes Parquet under the configured S3-compatible prefix, registers a
+production table through the storage registry's authority-store probe path,
+stores the relation catalog and query policy in object storage, and verifies a
+DataFusion aggregate query over the registered table. This proves the current
+two-version object-store boundary without adding an adapter or changing
+SlateDB/DataFusion dependency versions.
+
 ## Skip Behavior
 
 Without `--features s3-compat-tests`, default storage test builds do not compile
-the live S3 harness or enable the `object_store/aws` HTTP/TLS stack. Without
-`VELORIX_S3_COMPAT=1`, the explicitly enabled test returns early and prints a
+the live S3 harnesses or enable the S3 HTTP/TLS stacks. Without
+`VELORIX_S3_COMPAT=1`, the explicitly enabled tests return early and print a
 skip message. This keeps normal local and PR runs deterministic and avoids
 accidental writes to shared MinIO or S3 buckets.
 
 ## Out Of Scope
 
-The current slice intentionally does not validate DataFusion S3 scans, SlateDB,
-Foyer, benchmark artifacts, Kubernetes coordination, or end-to-end recovery on
-S3-compatible storage. DataFusion 53 uses `object_store` 0.13 while Velorix
-storage uses `object_store` 0.12; runtime S3 query coverage should be added only
-when the dependency path stays small and does not require an adapter between
-those versions.
+The current slice intentionally does not validate SlateDB, Foyer, benchmark
+artifacts, Kubernetes coordination, or end-to-end recovery on S3-compatible
+storage. DataFusion 53 uses `object_store` 0.13 while Velorix storage uses
+`object_store` 0.12; the runtime query harness keeps those clients explicit
+instead of adding an adapter between the versions.

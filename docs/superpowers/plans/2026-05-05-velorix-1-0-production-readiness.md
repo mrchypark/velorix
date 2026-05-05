@@ -314,11 +314,11 @@ pub struct QueryExecutionLimiter {
 - `VELORIX_S3_BUCKET`
 - `VELORIX_S3_PREFIX`
 
-- [ ] Tests must skip with a clear message unless `VELORIX_S3_COMPAT=1`.
-- [ ] Storage tests must prove create-only put conflict, read-after-write, list-after-write, range read, and delete behavior.
-- [ ] Runtime tests must write Parquet under the S3 prefix and query through the production table registry.
-- [ ] Capability tests must reject a profile where conditional create or list-after-write is false.
-- [ ] Run without env and confirm tests skip cleanly.
+- [x] Tests must skip with a clear message unless `VELORIX_S3_COMPAT=1`.
+- [x] Storage tests must prove create-only put conflict, read-after-write, list-after-write, range read, and delete behavior.
+- [x] Runtime tests must write Parquet under the S3 prefix and query through the production table registry.
+- [x] Capability tests must reject a profile where conditional create or list-after-write is false.
+- [x] Run without env and confirm tests skip cleanly.
 - [ ] Run with MinIO or an S3-compatible endpoint and confirm tests pass.
 - [ ] Commit: `test: add s3-compatible production storage harness`.
 
