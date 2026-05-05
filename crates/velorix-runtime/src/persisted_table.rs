@@ -8,7 +8,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
 use velorix_core::{query::QueryPolicy, relation::validate_schema_fingerprint};
-use velorix_storage::object_key::{ObjectKey, ObjectKeyError};
+use velorix_storage::{
+    object_key::{ObjectKey, ObjectKeyError},
+    relation_catalog_registry::{RelationCatalogRegistry, RelationCatalogRegistryError},
+};
 
 use crate::query::{query_object_backed_input_with_policy, RuntimeQueryError};
 use crate::query_policy_catalog::{QueryPolicyCatalogError, QueryPolicyCatalogStore};
@@ -46,6 +49,8 @@ pub struct ProductionPersistedTableSpec {
     pub object_key_prefix: String,
     pub snapshot_ref: String,
     pub format: ProductionPersistedTableFormat,
+    pub relation_id: String,
+    pub relation_version: String,
     pub schema_fingerprint: String,
     pub query_policy_id: String,
 }
@@ -58,6 +63,8 @@ pub struct CreateProductionPersistedTableSpecRequest {
     pub object_key_prefix: String,
     pub snapshot_ref: String,
     pub format: ProductionPersistedTableFormat,
+    pub relation_id: String,
+    pub relation_version: String,
     pub schema_fingerprint: String,
     pub query_policy_id: String,
 }
@@ -75,6 +82,8 @@ pub enum PersistedTableError {
     #[error(transparent)]
     QueryPolicyCatalog(#[from] QueryPolicyCatalogError),
     #[error(transparent)]
+    RelationCatalogRegistry(#[from] RelationCatalogRegistryError),
+    #[error(transparent)]
     StorageRegistry(#[from] StorageRegistryError),
     #[error("malformed table url: {0}")]
     MalformedTableUrl(url::ParseError),
@@ -91,6 +100,15 @@ pub enum PersistedTableError {
     UnsupportedSchemaVersion { schema_version: u32 },
     #[error("persisted table id mismatch: expected {expected}, got {actual}")]
     TableIdMismatch { expected: String, actual: String },
+    #[error(
+        "relation catalog fingerprint mismatch for {relation_id}/{relation_version}: expected {expected}, got {actual}"
+    )]
+    RelationCatalogFingerprintMismatch {
+        relation_id: String,
+        relation_version: String,
+        expected: String,
+        actual: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -158,19 +176,9 @@ impl PersistedTableStore {
 
     pub async fn create_production(
         &self,
+        relation_catalog_store: Arc<dyn ObjectStore>,
         request: CreateProductionPersistedTableSpecRequest,
     ) -> Result<ProductionPersistedTableSpec, PersistedTableError> {
-        let object_key = ObjectKey::query_table(&request.table_id)?;
-        validate_production_table_fields(
-            &request.table_id,
-            &request.tenant_id,
-            &request.store_id,
-            &request.object_key_prefix,
-            &request.snapshot_ref,
-            &request.schema_fingerprint,
-            &request.query_policy_id,
-        )?;
-
         let spec = ProductionPersistedTableSpec {
             schema_version: PERSISTED_TABLE_SCHEMA_VERSION,
             table_id: request.table_id,
@@ -179,9 +187,21 @@ impl PersistedTableStore {
             object_key_prefix: request.object_key_prefix,
             snapshot_ref: request.snapshot_ref,
             format: request.format,
+            relation_id: request.relation_id,
+            relation_version: request.relation_version,
             schema_fingerprint: request.schema_fingerprint,
             query_policy_id: request.query_policy_id,
         };
+        let object_key = ObjectKey::query_table(&spec.table_id)?;
+        validate_production_table_fields(&spec)?;
+        require_matching_relation_catalog_fingerprint(
+            relation_catalog_store,
+            &spec.relation_id,
+            &spec.relation_version,
+            &spec.schema_fingerprint,
+        )
+        .await?;
+
         let bytes = serde_json::to_vec(&spec)?;
         self.store
             .put_opts(
@@ -223,15 +243,7 @@ impl PersistedTableStore {
                 actual: spec.table_id,
             });
         }
-        validate_production_table_fields(
-            &spec.table_id,
-            &spec.tenant_id,
-            &spec.store_id,
-            &spec.object_key_prefix,
-            &spec.snapshot_ref,
-            &spec.schema_fingerprint,
-            &spec.query_policy_id,
-        )?;
+        validate_production_table_fields(&spec)?;
 
         Ok(spec)
     }
@@ -259,6 +271,7 @@ pub async fn query_persisted_object_backed_input_with_policy(
 
 pub async fn query_production_persisted_object_backed_input(
     catalog_store: Arc<dyn ObjectStore>,
+    relation_catalog_store: Arc<dyn ObjectStore>,
     policy_catalog_store: Arc<dyn ObjectStore>,
     registry: &StorageRegistry,
     tenant_id: &str,
@@ -268,6 +281,13 @@ pub async fn query_production_persisted_object_backed_input(
     let catalog = PersistedTableStore::new(catalog_store);
     let spec = catalog.get_production(table_id).await?;
     reject_cross_tenant_production_query(tenant_id, &spec)?;
+    require_matching_relation_catalog_fingerprint(
+        relation_catalog_store,
+        &spec.relation_id,
+        &spec.relation_version,
+        &spec.schema_fingerprint,
+    )
+    .await?;
     let policy = QueryPolicyCatalogStore::new(policy_catalog_store)
         .get(&spec.tenant_id, &spec.query_policy_id)
         .await?
@@ -324,39 +344,62 @@ fn validate_table_url(table_url: &str) -> Result<(), PersistedTableError> {
 }
 
 fn validate_production_table_fields(
-    table_id: &str,
-    tenant_id: &str,
-    store_id: &str,
-    object_key_prefix: &str,
-    snapshot_ref: &str,
-    schema_fingerprint: &str,
-    query_policy_id: &str,
+    spec: &ProductionPersistedTableSpec,
 ) -> Result<(), PersistedTableError> {
-    require_non_empty("table_id", table_id)?;
-    require_non_empty("store_id", store_id)?;
-    require_non_empty("snapshot_ref", snapshot_ref)?;
-    ObjectKey::query_policy(tenant_id, query_policy_id).map_err(|_| {
+    require_non_empty("table_id", &spec.table_id)?;
+    require_non_empty("store_id", &spec.store_id)?;
+    require_non_empty("snapshot_ref", &spec.snapshot_ref)?;
+    ObjectKey::relation_catalog(&spec.relation_id, &spec.relation_version).map_err(|_| {
+        PersistedTableError::InvalidProductionField {
+            field: "relation_catalog",
+        }
+    })?;
+    ObjectKey::query_policy(&spec.tenant_id, &spec.query_policy_id).map_err(|_| {
         PersistedTableError::InvalidProductionField {
             field: "query_policy_id",
         }
     })?;
-    validate_schema_fingerprint("schema_fingerprint", schema_fingerprint).map_err(|_| {
+    validate_schema_fingerprint("schema_fingerprint", &spec.schema_fingerprint).map_err(|_| {
         PersistedTableError::InvalidProductionField {
             field: "schema_fingerprint",
         }
     })?;
-    validate_tenant_prefix(tenant_id, object_key_prefix).map_err(|error| match error {
-        StorageRegistryError::CrossTenantPrefix {
-            tenant_id,
-            object_key_prefix,
-        } => PersistedTableError::CrossTenantPrefix {
-            tenant_id,
-            object_key_prefix,
+    validate_tenant_prefix(&spec.tenant_id, &spec.object_key_prefix).map_err(
+        |error| match error {
+            StorageRegistryError::CrossTenantPrefix {
+                tenant_id,
+                object_key_prefix,
+            } => PersistedTableError::CrossTenantPrefix {
+                tenant_id,
+                object_key_prefix,
+            },
+            _ => PersistedTableError::InvalidProductionField {
+                field: "object_key_prefix",
+            },
         },
-        _ => PersistedTableError::InvalidProductionField {
-            field: "object_key_prefix",
-        },
-    })?;
+    )?;
+
+    Ok(())
+}
+
+async fn require_matching_relation_catalog_fingerprint(
+    relation_catalog_store: Arc<dyn ObjectStore>,
+    relation_id: &str,
+    relation_version: &str,
+    schema_fingerprint: &str,
+) -> Result<(), PersistedTableError> {
+    let relation_catalog = RelationCatalogRegistry::new(relation_catalog_store)
+        .read(relation_id, relation_version)
+        .await?;
+    let catalog_fingerprint = relation_catalog.schema_fingerprint.as_str();
+    if catalog_fingerprint != schema_fingerprint {
+        return Err(PersistedTableError::RelationCatalogFingerprintMismatch {
+            relation_id: relation_id.to_string(),
+            relation_version: relation_version.to_string(),
+            expected: catalog_fingerprint.to_string(),
+            actual: schema_fingerprint.to_string(),
+        });
+    }
 
     Ok(())
 }

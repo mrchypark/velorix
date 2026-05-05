@@ -57,6 +57,7 @@ pub async fn query_persisted_object_backed_view(
 
 pub async fn query_production_persisted_object_backed_view(
     catalog_store: Arc<dyn ObjectStore>,
+    relation_catalog_store: Arc<dyn ObjectStore>,
     policy_catalog_store: Arc<dyn ObjectStore>,
     registry: &StorageRegistry,
     tenant_id: &str,
@@ -71,6 +72,7 @@ pub async fn query_production_persisted_object_backed_view(
 
     query_production_persisted_object_backed_input(
         catalog_store,
+        relation_catalog_store,
         policy_catalog_store,
         registry,
         tenant_id,

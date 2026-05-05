@@ -12,7 +12,15 @@ use object_store::{local::LocalFileSystem, path::Path, ObjectStore};
 use parquet::arrow::ArrowWriter;
 use serde_json::json;
 use tempfile::TempDir;
-use velorix_core::query::{QueryError, QueryExecutionPolicyV1, QueryPolicy, QueryPolicyError};
+use velorix_core::{
+    query::{QueryError, QueryExecutionPolicyV1, QueryPolicy, QueryPolicyError},
+    relation::{
+        ArrowPhysicalTypeV1, DataFusionRegistrationModeV1, DataFusionRegistrationV1,
+        FelderaRelationBindingV1, IncrementalAdapterBindingV1, RelationColumnV1,
+        RelationOperationV1, RelationSemanticRoleV1, SchemaFingerprintV1, VelorixLogicalTypeV1,
+        VelorixRelationCatalogV1, VelorixRelationSchemaV1, RELATION_SCHEMA_VERSION_V1,
+    },
+};
 use velorix_runtime::{
     persisted_table::{
         query_persisted_object_backed_input_with_policy,
@@ -30,6 +38,7 @@ use velorix_storage::{
         ObjectStoreCapabilityProfile,
     },
     object_key::ObjectKey,
+    relation_catalog_registry::RelationCatalogRegistry,
 };
 
 fn temp_store() -> (TempDir, Arc<dyn ObjectStore>) {
@@ -50,8 +59,12 @@ fn production_request(
         object_key_prefix: object_key_prefix.to_string(),
         snapshot_ref: "snapshots/0001".to_string(),
         format: ProductionPersistedTableFormat::Parquet,
-        schema_fingerprint:
-            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        relation_id: "orders".to_string(),
+        relation_version: "2026-05-05.v1".to_string(),
+        schema_fingerprint: orders_relation_catalog()
+            .schema_fingerprint
+            .as_str()
+            .to_string(),
         query_policy_id: "standard".to_string(),
     }
 }
@@ -219,6 +232,34 @@ async fn persisted_table_store_rejects_malformed_json_from_object_storage() {
 }
 
 #[tokio::test]
+async fn production_persisted_table_store_rejects_old_spec_without_relation_catalog_reference_as_json(
+) {
+    let (_temp_dir, store) = temp_store();
+    let catalog = PersistedTableStore::new(Arc::clone(&store));
+
+    write_table_catalog_object(
+        Arc::clone(&store),
+        "orders-current",
+        json!({
+            "schema_version": 1,
+            "table_id": "orders-current",
+            "tenant_id": "tenant-a",
+            "store_id": "primary",
+            "object_key_prefix": "tenants/tenant-a/tables/orders",
+            "snapshot_ref": "snapshots/0001",
+            "format": "parquet",
+            "schema_fingerprint": orders_relation_catalog().schema_fingerprint.as_str(),
+            "query_policy_id": "standard",
+        }),
+    )
+    .await;
+
+    let error = catalog.get_production("orders-current").await.unwrap_err();
+
+    assert!(matches!(error, PersistedTableError::Json(_)));
+}
+
+#[tokio::test]
 async fn persisted_table_store_rejects_unknown_spec_field_from_object_storage() {
     let (_temp_dir, store) = temp_store();
     let catalog = PersistedTableStore::new(Arc::clone(&store));
@@ -343,10 +384,14 @@ async fn production_persisted_table_store_rejects_missing_query_policy_id_as_jso
 async fn production_persisted_table_store_rejects_unsafe_query_policy_id() {
     let (_temp_dir, store) = temp_store();
     let catalog = PersistedTableStore::new(Arc::clone(&store));
+    create_orders_relation_catalog(&store).await;
     let mut request = production_request("primary", "tenants/tenant-a/tables/orders");
     request.query_policy_id = "standard/base".to_string();
 
-    let error = catalog.create_production(request).await.unwrap_err();
+    let error = catalog
+        .create_production(Arc::clone(&store), request)
+        .await
+        .unwrap_err();
 
     assert!(matches!(
         error,
@@ -360,12 +405,13 @@ async fn production_persisted_table_store_rejects_unsafe_query_policy_id() {
 async fn production_persisted_table_store_rejects_cross_tenant_prefix() {
     let (_temp_dir, store) = temp_store();
     let catalog = PersistedTableStore::new(Arc::clone(&store));
+    create_orders_relation_catalog(&store).await;
 
     let error = catalog
-        .create_production(production_request(
-            "primary",
-            "tenants/tenant-b/tables/orders",
-        ))
+        .create_production(
+            Arc::clone(&store),
+            production_request("primary", "tenants/tenant-b/tables/orders"),
+        )
         .await
         .unwrap_err();
 
@@ -380,22 +426,67 @@ async fn production_persisted_table_store_rejects_cross_tenant_prefix() {
 }
 
 #[tokio::test]
+async fn production_persisted_table_store_creates_spec_when_relation_catalog_fingerprint_matches() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = PersistedTableStore::new(Arc::clone(&store));
+    let relation_catalog = create_orders_relation_catalog(&store).await;
+
+    let spec = catalog
+        .create_production(
+            Arc::clone(&store),
+            production_request("primary", "tenants/tenant-a/tables/orders"),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(spec.relation_id, "orders");
+    assert_eq!(spec.relation_version, "2026-05-05.v1");
+    assert_eq!(
+        spec.schema_fingerprint,
+        relation_catalog.schema_fingerprint.as_str()
+    );
+}
+
+#[tokio::test]
+async fn production_persisted_table_store_rejects_relation_catalog_fingerprint_mismatch_before_writing(
+) {
+    let (_temp_dir, store) = temp_store();
+    let catalog = PersistedTableStore::new(Arc::clone(&store));
+    create_orders_relation_catalog(&store).await;
+    let mut request = production_request("primary", "tenants/tenant-a/tables/orders");
+    request.schema_fingerprint = format!("sha256:{}", "1".repeat(64));
+
+    let error = catalog
+        .create_production(Arc::clone(&store), request)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        PersistedTableError::RelationCatalogFingerprintMismatch { .. }
+    ));
+    let key = ObjectKey::query_table("orders-current").unwrap();
+    assert!(matches!(
+        store.head(&Path::from(key.as_str())).await,
+        Err(object_store::Error::NotFound { .. })
+    ));
+}
+
+#[tokio::test]
 async fn production_object_backed_table_query_rejects_unregistered_store_id() {
     let (_temp_dir, catalog_store) = temp_store();
     let registry = StorageRegistry::new();
 
-    PersistedTableStore::new(Arc::clone(&catalog_store))
-        .create_production(production_request(
-            "missing-store",
-            "tenants/tenant-a/tables/orders",
-        ))
-        .await
-        .unwrap();
+    create_production_table(
+        &catalog_store,
+        "missing-store",
+        "tenants/tenant-a/tables/orders",
+    )
+    .await;
     create_standard_policy(&catalog_store, QueryPolicy::default()).await;
 
-    let error = query_production_persisted_object_backed_input(
-        Arc::clone(&catalog_store),
-        Arc::clone(&catalog_store),
+    let error = query_production_table(
+        &catalog_store,
         &registry,
         "tenant-a",
         "orders-current",
@@ -423,18 +514,11 @@ async fn production_object_backed_table_query_rejects_store_registered_without_c
         .register("primary", "memory://velorix/", Arc::clone(&scan_store))
         .unwrap();
 
-    PersistedTableStore::new(Arc::clone(&catalog_store))
-        .create_production(production_request(
-            "primary",
-            "tenants/tenant-a/tables/orders",
-        ))
-        .await
-        .unwrap();
+    create_production_table(&catalog_store, "primary", "tenants/tenant-a/tables/orders").await;
     create_standard_policy(&catalog_store, QueryPolicy::default()).await;
 
-    let error = query_production_persisted_object_backed_input(
-        Arc::clone(&catalog_store),
-        Arc::clone(&catalog_store),
+    let error = query_production_table(
+        &catalog_store,
         &registry,
         "tenant-a",
         "orders-current",
@@ -471,18 +555,11 @@ async fn production_object_backed_table_query_accepts_capability_registered_stor
     let mut registry = StorageRegistry::new();
     register_production_scan_store(&mut registry, Arc::clone(&scan_store));
 
-    PersistedTableStore::new(Arc::clone(&catalog_store))
-        .create_production(production_request(
-            "primary",
-            "tenants/tenant-a/tables/orders",
-        ))
-        .await
-        .unwrap();
+    create_production_table(&catalog_store, "primary", "tenants/tenant-a/tables/orders").await;
     create_standard_policy(&catalog_store, QueryPolicy::default()).await;
 
-    let output = query_production_persisted_object_backed_input(
-        Arc::clone(&catalog_store),
-        Arc::clone(&catalog_store),
+    let output = query_production_table(
+        &catalog_store,
         &registry,
         "tenant-a",
         "orders-current",
@@ -500,23 +577,43 @@ async fn production_object_backed_table_query_accepts_capability_registered_stor
 }
 
 #[tokio::test]
+async fn production_object_backed_table_query_rejects_stale_relation_catalog_fingerprint() {
+    let (_temp_dir, catalog_store) = temp_store();
+    let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
+    let mut registry = StorageRegistry::new();
+    register_production_scan_store(&mut registry, Arc::clone(&scan_store));
+
+    create_production_table(&catalog_store, "primary", "tenants/tenant-a/tables/orders").await;
+    create_standard_policy(&catalog_store, QueryPolicy::default()).await;
+    overwrite_orders_relation_catalog(&catalog_store, mutated_orders_relation_catalog()).await;
+
+    let error = query_production_table(
+        &catalog_store,
+        &registry,
+        "tenant-a",
+        "orders-current",
+        "select key_json, value_json, weight from input",
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        PersistedTableError::RelationCatalogFingerprintMismatch { .. }
+    ));
+}
+
+#[tokio::test]
 async fn production_object_backed_table_query_rejects_missing_catalog_policy() {
     let (_temp_dir, catalog_store) = temp_store();
     let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
     let mut registry = StorageRegistry::new();
     register_production_scan_store(&mut registry, Arc::clone(&scan_store));
 
-    PersistedTableStore::new(Arc::clone(&catalog_store))
-        .create_production(production_request(
-            "primary",
-            "tenants/tenant-a/tables/orders",
-        ))
-        .await
-        .unwrap();
+    create_production_table(&catalog_store, "primary", "tenants/tenant-a/tables/orders").await;
 
-    let error = query_production_persisted_object_backed_input(
-        Arc::clone(&catalog_store),
-        Arc::clone(&catalog_store),
+    let error = query_production_table(
+        &catalog_store,
         &registry,
         "tenant-a",
         "orders-current",
@@ -546,13 +643,7 @@ async fn production_object_backed_table_query_applies_catalog_policy_id() {
     let mut registry = StorageRegistry::new();
     register_production_scan_store(&mut registry, Arc::clone(&scan_store));
 
-    PersistedTableStore::new(Arc::clone(&catalog_store))
-        .create_production(production_request(
-            "primary",
-            "tenants/tenant-a/tables/orders",
-        ))
-        .await
-        .unwrap();
+    create_production_table(&catalog_store, "primary", "tenants/tenant-a/tables/orders").await;
     QueryPolicyCatalogStore::new(Arc::clone(&catalog_store))
         .create(
             "tenant-a",
@@ -565,9 +656,8 @@ async fn production_object_backed_table_query_applies_catalog_policy_id() {
         .await
         .unwrap();
 
-    let error = query_production_persisted_object_backed_input(
-        Arc::clone(&catalog_store),
-        Arc::clone(&catalog_store),
+    let error = query_production_table(
+        &catalog_store,
         &registry,
         "tenant-a",
         "orders-current",
@@ -594,21 +684,15 @@ async fn production_object_backed_table_query_rejects_cross_tenant_catalog_polic
     let mut registry = StorageRegistry::new();
     register_production_scan_store(&mut registry, Arc::clone(&scan_store));
 
-    PersistedTableStore::new(Arc::clone(&catalog_store))
-        .create_production(production_request(
-            "primary",
-            "tenants/tenant-a/tables/orders",
-        ))
-        .await
-        .unwrap();
+    create_production_table(&catalog_store, "primary", "tenants/tenant-a/tables/orders").await;
     QueryPolicyCatalogStore::new(Arc::clone(&catalog_store))
         .create("tenant-b", "standard", QueryExecutionPolicyV1::default())
         .await
         .unwrap();
+    delete_orders_relation_catalog(&catalog_store).await;
 
-    let error = query_production_persisted_object_backed_input(
-        Arc::clone(&catalog_store),
-        Arc::clone(&catalog_store),
+    let error = query_production_table(
+        &catalog_store,
         &registry,
         "tenant-b",
         "orders-current",
@@ -646,13 +730,7 @@ async fn production_object_backed_table_query_rejects_scan_above_file_count_limi
     let mut registry = StorageRegistry::new();
     register_production_scan_store(&mut registry, Arc::clone(&scan_store));
 
-    PersistedTableStore::new(Arc::clone(&catalog_store))
-        .create_production(production_request(
-            "primary",
-            "tenants/tenant-a/tables/orders",
-        ))
-        .await
-        .unwrap();
+    create_production_table(&catalog_store, "primary", "tenants/tenant-a/tables/orders").await;
     create_standard_policy(
         &catalog_store,
         QueryPolicy {
@@ -662,9 +740,8 @@ async fn production_object_backed_table_query_rejects_scan_above_file_count_limi
     )
     .await;
 
-    let error = query_production_persisted_object_backed_input(
-        Arc::clone(&catalog_store),
-        Arc::clone(&catalog_store),
+    let error = query_production_table(
+        &catalog_store,
         &registry,
         "tenant-a",
         "orders-current",
@@ -703,13 +780,7 @@ async fn production_object_backed_table_query_rejects_object_requests_above_limi
     let mut registry = StorageRegistry::new();
     register_production_scan_store(&mut registry, Arc::clone(&scan_store));
 
-    PersistedTableStore::new(Arc::clone(&catalog_store))
-        .create_production(production_request(
-            "primary",
-            "tenants/tenant-a/tables/orders",
-        ))
-        .await
-        .unwrap();
+    create_production_table(&catalog_store, "primary", "tenants/tenant-a/tables/orders").await;
     create_standard_policy(
         &catalog_store,
         QueryPolicy {
@@ -719,9 +790,8 @@ async fn production_object_backed_table_query_rejects_object_requests_above_limi
     )
     .await;
 
-    let error = query_production_persisted_object_backed_input(
-        Arc::clone(&catalog_store),
-        Arc::clone(&catalog_store),
+    let error = query_production_table(
+        &catalog_store,
         &registry,
         "tenant-a",
         "orders-current",
@@ -754,13 +824,7 @@ async fn production_object_backed_table_query_still_applies_output_row_limit() {
     let mut registry = StorageRegistry::new();
     register_production_scan_store(&mut registry, Arc::clone(&scan_store));
 
-    PersistedTableStore::new(Arc::clone(&catalog_store))
-        .create_production(production_request(
-            "primary",
-            "tenants/tenant-a/tables/orders",
-        ))
-        .await
-        .unwrap();
+    create_production_table(&catalog_store, "primary", "tenants/tenant-a/tables/orders").await;
     create_standard_policy(
         &catalog_store,
         QueryPolicy {
@@ -770,9 +834,8 @@ async fn production_object_backed_table_query_still_applies_output_row_limit() {
     )
     .await;
 
-    let error = query_production_persisted_object_backed_input(
-        Arc::clone(&catalog_store),
-        Arc::clone(&catalog_store),
+    let error = query_production_table(
+        &catalog_store,
         &registry,
         "tenant-a",
         "orders-current",
@@ -862,6 +925,150 @@ async fn persisted_object_backed_table_query_propagates_datafusion_errors() {
         error,
         PersistedTableError::RuntimeQuery(RuntimeQueryError::Query(QueryError::DataFusion(_)))
     ));
+}
+
+async fn create_production_table(
+    catalog_store: &Arc<dyn ObjectStore>,
+    store_id: &str,
+    object_key_prefix: &str,
+) {
+    create_orders_relation_catalog(catalog_store).await;
+    PersistedTableStore::new(Arc::clone(catalog_store))
+        .create_production(
+            Arc::clone(catalog_store),
+            production_request(store_id, object_key_prefix),
+        )
+        .await
+        .unwrap();
+}
+
+async fn query_production_table(
+    catalog_store: &Arc<dyn ObjectStore>,
+    registry: &StorageRegistry,
+    tenant_id: &str,
+    table_id: &str,
+    sql: &str,
+) -> Result<Vec<RecordBatch>, PersistedTableError> {
+    query_production_persisted_object_backed_input(
+        Arc::clone(catalog_store),
+        Arc::clone(catalog_store),
+        Arc::clone(catalog_store),
+        registry,
+        tenant_id,
+        table_id,
+        sql,
+    )
+    .await
+}
+
+async fn create_orders_relation_catalog(store: &Arc<dyn ObjectStore>) -> VelorixRelationCatalogV1 {
+    let catalog = orders_relation_catalog();
+    RelationCatalogRegistry::new(Arc::clone(store))
+        .create(&catalog)
+        .await
+        .unwrap();
+
+    catalog
+}
+
+async fn overwrite_orders_relation_catalog(
+    store: &Arc<dyn ObjectStore>,
+    catalog: VelorixRelationCatalogV1,
+) {
+    let key = RelationCatalogRegistry::new(Arc::clone(store))
+        .object_key(
+            &catalog.relation_schema.relation_id,
+            &catalog.relation_schema.relation_version,
+        )
+        .unwrap();
+    store
+        .put(
+            &Path::from(key.as_str()),
+            Bytes::from(serde_json::to_vec(&catalog).unwrap()).into(),
+        )
+        .await
+        .unwrap();
+}
+
+async fn delete_orders_relation_catalog(store: &Arc<dyn ObjectStore>) {
+    let catalog = orders_relation_catalog();
+    let key = RelationCatalogRegistry::new(Arc::clone(store))
+        .object_key(
+            &catalog.relation_schema.relation_id,
+            &catalog.relation_schema.relation_version,
+        )
+        .unwrap();
+    store.delete(&Path::from(key.as_str())).await.unwrap();
+}
+
+fn orders_relation_catalog() -> VelorixRelationCatalogV1 {
+    let relation_schema = VelorixRelationSchemaV1 {
+        relation_id: "orders".to_string(),
+        relation_name: "orders".to_string(),
+        relation_version: "2026-05-05.v1".to_string(),
+        columns: vec![
+            RelationColumnV1 {
+                column_id: "key_json".to_string(),
+                name: "key_json".to_string(),
+                logical_type: VelorixLogicalTypeV1::Json,
+                physical_arrow_type: ArrowPhysicalTypeV1::JsonUtf8,
+                nullable: false,
+                ordinal: 0,
+                semantic_role: RelationSemanticRoleV1::PrimaryKey,
+            },
+            RelationColumnV1 {
+                column_id: "value_json".to_string(),
+                name: "value_json".to_string(),
+                logical_type: VelorixLogicalTypeV1::Json,
+                physical_arrow_type: ArrowPhysicalTypeV1::JsonUtf8,
+                nullable: false,
+                ordinal: 1,
+                semantic_role: RelationSemanticRoleV1::Value,
+            },
+            RelationColumnV1 {
+                column_id: "weight".to_string(),
+                name: "weight".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 2,
+                semantic_role: RelationSemanticRoleV1::Weight,
+            },
+        ],
+        primary_key_column_ids: vec!["key_json".to_string()],
+        weight_column_id: "weight".to_string(),
+        allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+        event_time_column_id: None,
+    };
+    let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
+
+    VelorixRelationCatalogV1 {
+        schema_version: RELATION_SCHEMA_VERSION_V1,
+        relation_schema,
+        schema_fingerprint: schema_fingerprint.clone(),
+        datafusion_registration: DataFusionRegistrationV1 {
+            name: "orders".to_string(),
+            mode: DataFusionRegistrationModeV1::Table,
+        },
+        feldera_relation: FelderaRelationBindingV1 {
+            relation_id: "orders".to_string(),
+            schema_fingerprint,
+        },
+        incremental_adapter: IncrementalAdapterBindingV1 {
+            adapter_id: "incremental-adapter-orders-v1".to_string(),
+        },
+    }
+}
+
+fn mutated_orders_relation_catalog() -> VelorixRelationCatalogV1 {
+    let mut catalog = orders_relation_catalog();
+    catalog.relation_schema.relation_name = "orders_mutated".to_string();
+    let schema_fingerprint =
+        SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema).unwrap();
+    catalog.schema_fingerprint = schema_fingerprint.clone();
+    catalog.feldera_relation.schema_fingerprint = schema_fingerprint;
+
+    catalog
 }
 
 async fn write_table_catalog_object(
