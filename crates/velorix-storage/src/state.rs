@@ -17,7 +17,8 @@ use crate::{
     },
     gc::{
         GarbageCollectionCandidate, GarbageCollectionCandidateKind, GarbageCollectionPlan,
-        GarbageCollectionPolicy, GarbageCollectionReport,
+        GarbageCollectionPolicy, GarbageCollectionReport, GarbageCollectionRunV1,
+        GC_RUN_SCHEMA_VERSION,
     },
     manifest::{
         CheckpointManifest, ManifestError, OutputObjectRef, PartitionOwnerClaim, StateObjectRef,
@@ -656,21 +657,50 @@ impl CheckpointPublisher {
         }
 
         let mut deleted = Vec::new();
+        let mut skipped = Vec::new();
 
         for candidate in &plan.candidates {
             if !candidate.kind.matches_key(&candidate.object_key) {
+                skipped.push(candidate.clone());
                 continue;
             }
 
             let path = Path::from(candidate.object_key.as_str());
             match self.store.delete(&path).await {
                 Ok(()) => deleted.push(candidate.clone()),
-                Err(object_store::Error::NotFound { .. }) => {}
+                Err(object_store::Error::NotFound { .. }) => skipped.push(candidate.clone()),
                 Err(err) => return Err(err.into()),
             }
         }
 
-        Ok(GarbageCollectionReport { deleted })
+        Ok(GarbageCollectionReport { deleted, skipped })
+    }
+
+    pub async fn execute_garbage_collection_plan_with_evidence(
+        &self,
+        run_id: &str,
+        policy: GarbageCollectionPolicy,
+        plan: &GarbageCollectionPlan,
+    ) -> Result<GarbageCollectionRunV1, CheckpointPublishError> {
+        let report = self.execute_garbage_collection_plan(plan).await?;
+        let run = GarbageCollectionRunV1 {
+            schema_version: GC_RUN_SCHEMA_VERSION,
+            run_id: run_id.to_string(),
+            policy,
+            plan: plan.clone(),
+            report,
+        };
+        let object_key = ObjectKey::garbage_collection_run(run_id)?;
+        let bytes = serde_json::to_vec(&run)?;
+        self.store
+            .put_opts(
+                &Path::from(object_key.as_str()),
+                Bytes::from(bytes).into(),
+                PutMode::Create.into(),
+            )
+            .await?;
+
+        Ok(run)
     }
 
     async fn referenced_garbage_collection_candidates_for_plan(

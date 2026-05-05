@@ -128,6 +128,12 @@ impl ObjectKey {
         ))
     }
 
+    pub fn garbage_collection_run(run_id: &str) -> Result<Self, ObjectKeyError> {
+        validate_segment("run_id", run_id)?;
+
+        Ok(Self(format!("v1/gc-runs/{run_id}.run.json")))
+    }
+
     pub fn ownership_epoch_record(
         stream_id: &str,
         partition_id: u32,
@@ -287,6 +293,12 @@ fn validate_known_layout(value: &str) -> Result<(), ObjectKeyError> {
                 .strip_suffix(".status.json")
                 .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
             parse_fixed_u64("checkpoint_version", checkpoint, CHECKPOINT_WIDTH)?;
+        }
+        ["v1", "gc-runs", run_file] => {
+            let run_id = run_file
+                .strip_suffix(".run.json")
+                .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+            validate_segment("run_id", run_id)?;
         }
         ["v1", "ownership", stream_id, partition, epoch_file] => {
             parse_ownership_epoch_record_parts(value, stream_id, partition, epoch_file)?;
@@ -656,6 +668,16 @@ mod tests {
         let restarted = ObjectKey::checkpoint_latest_candidate_marker();
 
         assert_eq!(key.as_str(), "v1/checkpoint-index/latest-candidate.json");
+        assert_eq!(key, restarted);
+        assert_eq!(ObjectKey::parse(key.as_str()).unwrap(), key);
+    }
+
+    #[test]
+    fn garbage_collection_run_key_is_deterministic_and_parseable() {
+        let key = ObjectKey::garbage_collection_run("run-0001").unwrap();
+        let restarted = ObjectKey::garbage_collection_run("run-0001").unwrap();
+
+        assert_eq!(key.as_str(), "v1/gc-runs/run-0001.run.json");
         assert_eq!(key, restarted);
         assert_eq!(ObjectKey::parse(key.as_str()).unwrap(), key);
     }

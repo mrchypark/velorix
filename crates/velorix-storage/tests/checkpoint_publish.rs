@@ -16,7 +16,7 @@ use velorix_storage::{
     },
     gc::{
         GarbageCollectionCandidate, GarbageCollectionCandidateKind, GarbageCollectionPlan,
-        GarbageCollectionPolicy,
+        GarbageCollectionPolicy, GarbageCollectionRunV1,
     },
     manifest::{
         CheckpointManifest, InputRange, ManifestError, OutputObjectRef, PartitionOwnerClaim,
@@ -513,6 +513,48 @@ async fn gc_execution_deletes_only_velorix_owned_candidates() {
     assert!(!object_exists(store.as_ref(), orphan_output.object_key()).await);
     assert!(object_exists(store.as_ref(), retained_state.object_key()).await);
     assert!(store.head(&slatedb_internal_path).await.is_ok());
+}
+
+#[tokio::test]
+async fn gc_execution_writes_stable_run_evidence() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let policy = GarbageCollectionPolicy {
+        retain_latest_manifests: 1,
+    };
+    let retained_state = state_write(0, "state-retained", b"retained-state");
+    let orphan_state = state_write(0, "state-orphan", b"orphan-state");
+
+    let retained_state_ref = publisher.write_state_object(&retained_state).await.unwrap();
+    publisher.write_state_object(&orphan_state).await.unwrap();
+    publisher
+        .publish_manifest(&manifest(0, retained_state_ref))
+        .await
+        .unwrap();
+
+    let plan = publisher.plan_garbage_collection(policy).await.unwrap();
+    let run = publisher
+        .execute_garbage_collection_plan_with_evidence("run-0001", policy, &plan)
+        .await
+        .unwrap();
+
+    assert_eq!(run.schema_version, 1);
+    assert_eq!(run.run_id, "run-0001");
+    assert_eq!(run.policy, policy);
+    assert_eq!(run.plan, plan);
+    assert_eq!(run.report.deleted.len(), 1);
+    assert_eq!(run.report.skipped, Vec::new());
+
+    let evidence_key = ObjectKey::garbage_collection_run("run-0001").unwrap();
+    let evidence_bytes = store
+        .get(&Path::from(evidence_key.as_str()))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let restored: GarbageCollectionRunV1 = serde_json::from_slice(&evidence_bytes).unwrap();
+    assert_eq!(restored, run);
 }
 
 #[tokio::test]

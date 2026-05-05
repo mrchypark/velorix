@@ -1,7 +1,10 @@
 use crate::object_key::ObjectKey;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub const GC_RUN_SCHEMA_VERSION: u16 = 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GarbageCollectionPolicy {
     pub retain_latest_manifests: usize,
 }
@@ -17,6 +20,17 @@ pub struct GarbageCollectionPlan {
 #[serde(deny_unknown_fields)]
 pub struct GarbageCollectionReport {
     pub deleted: Vec<GarbageCollectionCandidate>,
+    pub skipped: Vec<GarbageCollectionCandidate>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GarbageCollectionRunV1 {
+    pub schema_version: u16,
+    pub run_id: String,
+    pub policy: GarbageCollectionPolicy,
+    pub plan: GarbageCollectionPlan,
+    pub report: GarbageCollectionReport,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

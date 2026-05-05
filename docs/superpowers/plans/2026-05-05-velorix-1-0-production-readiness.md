@@ -434,7 +434,7 @@ pub enum AuthoritativeNamespace {
 - [ ] Add tests for unreferenced raw output deletion.
 - [ ] Add tests for referenced output retention.
 - [ ] Add tests proving SlateDB prefixes are skipped even when unreferenced.
-- [ ] Add tests for dry-run plan and executed run evidence.
+- [x] Add tests for dry-run plan and executed run evidence.
 - [ ] Commit: `feat: add manifest-aware production gc`.
 
 ### Task 3.4: Deepen SlateDB State References
