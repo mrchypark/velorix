@@ -40,12 +40,34 @@ telemetry.
 - Diagnostics expose backend, namespace, and capability status.
 - Directly constructed storage clients are rejected outside tests.
 
-## Verification
+## Current Minimal Model
 
-- Fake backend without create-only support fails production startup.
-- Fake overwrite-permitting backend is rejected for authoritative writes.
-- Ingest, state, output, checkpoint, query, table, relation, and ownership
-  namespaces are all exercised by capability tests.
+Phase 2.3 records declared capability profiles as
+`AuthoritativeObjectStoreCapabilitiesV1`, keyed by these authoritative
+namespaces: ingest, state, output, checkpoint, ownership, table catalog,
+artifact catalog, and benchmark evidence.
+
+Startup validation rejects a missing namespace profile and rejects any namespace
+whose `ObjectStoreCapabilityProfile` is missing a required durability
+capability. Runtime probes and real S3-compatible checks are intentionally left
+for the later evidence slice.
+
+## Current Verification
+
+- Missing namespace declarations fail validation.
+- Weak namespace declarations fail validation and report the namespace plus the
+  missing durability capability.
+- Complete namespace declarations pass validation.
+- Production persisted table scans reject stores registered without production
+  capabilities.
+- Production persisted table scans accept stores registered with complete
+  declared namespace capabilities.
+
+## Future Verification
+
+- Runtime probes reject backends without create-only support.
+- Runtime probes reject overwrite-permitting backends for authoritative writes.
 - Local emulation cannot run under production configuration.
 - Shared registry tests prove DataFusion, SlateDB, Foyer, and Velorix storage use
   the same configured store identity.
+- S3-compatible evidence covers every authoritative namespace.

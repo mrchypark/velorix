@@ -5,7 +5,9 @@ use object_store::{local::LocalFileSystem, path::Path, ObjectStore};
 use tempfile::TempDir;
 use velorix_storage::{
     capability::{
-        ObjectStoreCapabilityError, ObjectStoreCapabilityProfile, RequiredObjectStoreCapability,
+        AuthoritativeNamespace, AuthoritativeObjectStoreCapabilitiesV1,
+        AuthoritativeObjectStoreCapabilityError, ObjectStoreCapabilityError,
+        ObjectStoreCapabilityProfile, RequiredObjectStoreCapability,
     },
     log::{IngestBatch, IngestLog, IngestLogError},
     manifest::{CheckpointManifest, InputRange, StateObjectRef},
@@ -28,6 +30,19 @@ fn complete_profile(backend_name: &str) -> ObjectStoreCapabilityProfile {
         list_after_write: true,
         read_after_write: true,
     }
+}
+
+fn all_namespace_profiles(
+) -> std::collections::BTreeMap<AuthoritativeNamespace, ObjectStoreCapabilityProfile> {
+    AuthoritativeNamespace::all()
+        .into_iter()
+        .map(|namespace| {
+            (
+                namespace,
+                complete_profile(&format!("complete-{namespace}")),
+            )
+        })
+        .collect()
 }
 
 fn profile_missing(
@@ -69,6 +84,51 @@ fn manifest_for(state_ref: StateObjectRef) -> CheckpointManifest {
         parent_checkpoint: None,
         created_at: "2026-05-04T00:00:00Z".to_string(),
     }
+}
+
+#[test]
+fn authoritative_capabilities_reject_missing_namespace() {
+    let mut profiles = all_namespace_profiles();
+    profiles.remove(&AuthoritativeNamespace::TableCatalog);
+    let capabilities = AuthoritativeObjectStoreCapabilitiesV1::new(profiles);
+
+    let error = capabilities.validate_for_startup().unwrap_err();
+
+    assert!(matches!(
+        error,
+        AuthoritativeObjectStoreCapabilityError::MissingNamespace {
+            namespace: AuthoritativeNamespace::TableCatalog
+        }
+    ));
+}
+
+#[test]
+fn authoritative_capabilities_report_weak_namespace_profile() {
+    let mut profiles = all_namespace_profiles();
+    let profile = profile_missing(RequiredObjectStoreCapability::ConditionalCreate);
+    profiles.insert(AuthoritativeNamespace::Output, profile.clone());
+    let capabilities = AuthoritativeObjectStoreCapabilitiesV1::new(profiles);
+
+    let error = capabilities.validate_for_startup().unwrap_err();
+
+    match error {
+        AuthoritativeObjectStoreCapabilityError::NamespaceProfile { namespace, source } => {
+            assert_eq!(namespace, AuthoritativeNamespace::Output);
+            assert_capability_error(
+                source,
+                &profile,
+                RequiredObjectStoreCapability::ConditionalCreate,
+            );
+        }
+        other => panic!("expected namespace profile error, got {other:?}"),
+    }
+}
+
+#[test]
+fn authoritative_capabilities_accept_all_valid_namespaces() {
+    let capabilities = AuthoritativeObjectStoreCapabilitiesV1::new(all_namespace_profiles());
+
+    capabilities.validate_for_startup().unwrap();
 }
 
 #[test]

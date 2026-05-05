@@ -7,6 +7,9 @@ use datafusion::{
 };
 use thiserror::Error;
 use url::Url;
+use velorix_storage::capability::{
+    AuthoritativeObjectStoreCapabilitiesV1, AuthoritativeObjectStoreCapabilityError,
+};
 
 #[derive(Clone, Debug, Default)]
 pub struct StorageRegistry {
@@ -17,6 +20,7 @@ pub struct StorageRegistry {
 pub struct RegisteredObjectStore {
     pub store: Arc<dyn DataFusionObjectStore>,
     pub base_url: ObjectStoreUrl,
+    pub production_capabilities: Option<AuthoritativeObjectStoreCapabilitiesV1>,
 }
 
 #[derive(Clone, Debug)]
@@ -40,6 +44,10 @@ pub enum StorageRegistryError {
     },
     #[error("unregistered object store id {store_id}")]
     UnregisteredStoreId { store_id: String },
+    #[error("object store id {store_id} is not registered with production capabilities")]
+    MissingProductionCapabilities { store_id: String },
+    #[error(transparent)]
+    ObjectStoreCapabilities(#[from] AuthoritativeObjectStoreCapabilityError),
     #[error("malformed object store base url {base_url}: {source}")]
     MalformedBaseUrl {
         base_url: String,
@@ -70,13 +78,51 @@ impl StorageRegistry {
             }
         })?;
 
-        self.entries
-            .insert(store_id, RegisteredObjectStore { store, base_url });
+        self.entries.insert(
+            store_id,
+            RegisteredObjectStore {
+                store,
+                base_url,
+                production_capabilities: None,
+            },
+        );
 
         Ok(())
     }
 
-    pub fn resolve_table_location(
+    pub fn register_production(
+        &mut self,
+        store_id: impl Into<String>,
+        base_url: &str,
+        store: Arc<dyn DataFusionObjectStore>,
+        production_capabilities: AuthoritativeObjectStoreCapabilitiesV1,
+    ) -> Result<(), StorageRegistryError> {
+        production_capabilities.validate_for_startup()?;
+
+        let store_id = store_id.into();
+        if store_id.is_empty() {
+            return Err(StorageRegistryError::InvalidStoreId);
+        }
+        let base_url = ObjectStoreUrl::parse(base_url).map_err(|source| {
+            StorageRegistryError::MalformedBaseUrl {
+                base_url: base_url.to_string(),
+                source,
+            }
+        })?;
+
+        self.entries.insert(
+            store_id,
+            RegisteredObjectStore {
+                store,
+                base_url,
+                production_capabilities: Some(production_capabilities),
+            },
+        );
+
+        Ok(())
+    }
+
+    pub fn resolve_unchecked_table_location(
         &self,
         store_id: &str,
         tenant_id: &str,
@@ -100,6 +146,27 @@ impl StorageRegistry {
             object_path: Path::from(object_path),
             table_url,
         })
+    }
+
+    pub fn resolve_production_table_location(
+        &self,
+        store_id: &str,
+        tenant_id: &str,
+        object_key_prefix: &str,
+        snapshot_ref: &str,
+    ) -> Result<RegisteredTableLocation, StorageRegistryError> {
+        let entry = self.entries.get(store_id).ok_or_else(|| {
+            StorageRegistryError::UnregisteredStoreId {
+                store_id: store_id.to_string(),
+            }
+        })?;
+        if entry.production_capabilities.is_none() {
+            return Err(StorageRegistryError::MissingProductionCapabilities {
+                store_id: store_id.to_string(),
+            });
+        }
+
+        self.resolve_unchecked_table_location(store_id, tenant_id, object_key_prefix, snapshot_ref)
     }
 }
 

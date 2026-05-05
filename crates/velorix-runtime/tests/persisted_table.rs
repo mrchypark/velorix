@@ -23,7 +23,13 @@ use velorix_runtime::{
     query::RuntimeQueryError,
     storage_registry::StorageRegistry,
 };
-use velorix_storage::object_key::ObjectKey;
+use velorix_storage::{
+    capability::{
+        AuthoritativeNamespace, AuthoritativeObjectStoreCapabilitiesV1,
+        ObjectStoreCapabilityProfile,
+    },
+    object_key::ObjectKey,
+};
 
 fn temp_store() -> (TempDir, Arc<dyn ObjectStore>) {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -47,6 +53,29 @@ fn production_request(
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
         query_policy_id: "standard".to_string(),
     }
+}
+
+fn production_capabilities() -> AuthoritativeObjectStoreCapabilitiesV1 {
+    let profiles = AuthoritativeNamespace::all()
+        .into_iter()
+        .map(|namespace| (namespace, ObjectStoreCapabilityProfile::local_development()))
+        .collect();
+
+    AuthoritativeObjectStoreCapabilitiesV1::new(profiles)
+}
+
+fn register_production_scan_store(
+    registry: &mut StorageRegistry,
+    scan_store: Arc<dyn DataFusionObjectStore>,
+) {
+    registry
+        .register_production(
+            "primary",
+            "memory://velorix/",
+            scan_store,
+            production_capabilities(),
+        )
+        .unwrap();
 }
 
 #[tokio::test]
@@ -341,8 +370,46 @@ async fn production_object_backed_table_query_rejects_unregistered_store_id() {
 }
 
 #[tokio::test]
-async fn production_object_backed_table_query_resolves_registered_store_and_scans_parquet_snapshot()
-{
+async fn production_object_backed_table_query_rejects_store_registered_without_capabilities() {
+    let (_temp_dir, catalog_store) = temp_store();
+    let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
+    let mut registry = StorageRegistry::new();
+    registry
+        .register("primary", "memory://velorix/", Arc::clone(&scan_store))
+        .unwrap();
+
+    PersistedTableStore::new(Arc::clone(&catalog_store))
+        .create_production(production_request(
+            "primary",
+            "tenants/tenant-a/tables/orders",
+        ))
+        .await
+        .unwrap();
+
+    let error = query_production_persisted_object_backed_input_with_policy(
+        Arc::clone(&catalog_store),
+        &registry,
+        "tenant-a",
+        "orders-current",
+        "select key_json, value_json, weight from input",
+        QueryPolicy::default(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        PersistedTableError::StorageRegistry(
+            velorix_runtime::storage_registry::StorageRegistryError::MissingProductionCapabilities {
+                store_id,
+            }
+        ) if store_id == "primary"
+    ));
+}
+
+#[tokio::test]
+async fn production_object_backed_table_query_accepts_capability_registered_store_and_scans_parquet_snapshot(
+) {
     let (_temp_dir, catalog_store) = temp_store();
     let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
     put_parquet_input(
@@ -356,9 +423,7 @@ async fn production_object_backed_table_query_resolves_registered_store_and_scan
     )
     .await;
     let mut registry = StorageRegistry::new();
-    registry
-        .register("primary", "memory://velorix/", Arc::clone(&scan_store))
-        .unwrap();
+    register_production_scan_store(&mut registry, Arc::clone(&scan_store));
 
     PersistedTableStore::new(Arc::clone(&catalog_store))
         .create_production(production_request(
@@ -404,9 +469,7 @@ async fn production_object_backed_table_query_rejects_scan_above_file_count_limi
     )
     .await;
     let mut registry = StorageRegistry::new();
-    registry
-        .register("primary", "memory://velorix/", Arc::clone(&scan_store))
-        .unwrap();
+    register_production_scan_store(&mut registry, Arc::clone(&scan_store));
 
     PersistedTableStore::new(Arc::clone(&catalog_store))
         .create_production(production_request(
@@ -458,9 +521,7 @@ async fn production_object_backed_table_query_rejects_object_requests_above_limi
     )
     .await;
     let mut registry = StorageRegistry::new();
-    registry
-        .register("primary", "memory://velorix/", Arc::clone(&scan_store))
-        .unwrap();
+    register_production_scan_store(&mut registry, Arc::clone(&scan_store));
 
     PersistedTableStore::new(Arc::clone(&catalog_store))
         .create_production(production_request(
@@ -506,9 +567,7 @@ async fn production_object_backed_table_query_still_applies_output_row_limit() {
     )
     .await;
     let mut registry = StorageRegistry::new();
-    registry
-        .register("primary", "memory://velorix/", Arc::clone(&scan_store))
-        .unwrap();
+    register_production_scan_store(&mut registry, Arc::clone(&scan_store));
 
     PersistedTableStore::new(Arc::clone(&catalog_store))
         .create_production(production_request(

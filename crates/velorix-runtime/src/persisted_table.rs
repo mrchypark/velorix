@@ -271,7 +271,7 @@ pub async fn query_production_persisted_object_backed_input_with_policy(
         });
     }
 
-    let location = registry.resolve_table_location(
+    let location = registry.resolve_production_table_location(
         &spec.store_id,
         &spec.tenant_id,
         &spec.object_key_prefix,
