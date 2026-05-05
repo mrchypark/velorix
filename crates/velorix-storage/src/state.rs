@@ -10,7 +10,11 @@ use thiserror::Error;
 
 use crate::{
     capability::{ObjectStoreCapabilityError, ObjectStoreCapabilityProfile},
-    checkpoint_index::{manifest_digest, marker_updated_at_now, LatestCandidateMarker},
+    checkpoint_index::{
+        manifest_digest, marker_updated_at_now, CheckpointAdminInspection,
+        CheckpointLifecycleRecord, CheckpointLifecycleStatus, CheckpointManifestInspection,
+        CheckpointManifestInspectionStatus, LatestCandidateMarker,
+    },
     gc::{
         GarbageCollectionCandidate, GarbageCollectionCandidateKind, GarbageCollectionPlan,
         GarbageCollectionPolicy, GarbageCollectionReport,
@@ -364,6 +368,8 @@ impl CheckpointPublisher {
 
         match result {
             Ok(_) => {
+                self.best_effort_publish_lifecycle_record(manifest, &bytes)
+                    .await;
                 self.best_effort_publish_latest_candidate_marker(manifest, &bytes)
                     .await;
                 Ok(())
@@ -482,6 +488,82 @@ impl CheckpointPublisher {
         Self::validate_manifest_lineage(&manifests)?;
 
         Ok(manifests)
+    }
+
+    pub async fn read_checkpoint_lifecycle_record(
+        &self,
+        checkpoint_version: u64,
+    ) -> Result<CheckpointLifecycleRecord, CheckpointPublishError> {
+        let object_key = ObjectKey::checkpoint_lifecycle_record(checkpoint_version);
+        let bytes = self
+            .store
+            .get(&Path::from(object_key.as_str()))
+            .await?
+            .bytes()
+            .await?;
+        let record = serde_json::from_slice::<CheckpointLifecycleRecord>(&bytes)?;
+        self.validate_lifecycle_record(&object_key, &record)?;
+
+        Ok(record)
+    }
+
+    pub async fn inspect_checkpoints(
+        &self,
+    ) -> Result<CheckpointAdminInspection, CheckpointPublishError> {
+        let objects = self
+            .store
+            .list(Some(&Path::from(CHECKPOINT_PREFIX)))
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let mut manifest_objects = objects
+            .into_iter()
+            .map(|object| {
+                let object_key = ObjectKey::parse(object.location.to_string())?;
+                let checkpoint_version = checkpoint_version_from_manifest_key(&object_key)?;
+                Ok((checkpoint_version, object_key, object.location))
+            })
+            .collect::<Result<Vec<_>, CheckpointPublishError>>()?;
+        manifest_objects.sort_by_key(|(checkpoint_version, _, _)| *checkpoint_version);
+
+        let mut valid_manifests = HashMap::new();
+        let mut inspections = Vec::with_capacity(manifest_objects.len());
+        let mut latest_valid_checkpoint = None;
+
+        for (checkpoint_version, manifest_key, location) in manifest_objects {
+            let inspection = match self
+                .inspect_checkpoint_manifest(
+                    checkpoint_version,
+                    manifest_key.clone(),
+                    &location,
+                    &valid_manifests,
+                )
+                .await
+            {
+                Ok((manifest, lifecycle_status)) => {
+                    latest_valid_checkpoint = Some(manifest.checkpoint_version);
+                    valid_manifests.insert(manifest.checkpoint_version, manifest);
+                    CheckpointManifestInspection {
+                        checkpoint_version,
+                        manifest_key,
+                        lifecycle_status,
+                        status: CheckpointManifestInspectionStatus::Valid,
+                    }
+                }
+                Err(reason) => CheckpointManifestInspection {
+                    checkpoint_version,
+                    manifest_key,
+                    lifecycle_status: None,
+                    status: CheckpointManifestInspectionStatus::Invalid { reason },
+                },
+            };
+            inspections.push(inspection);
+        }
+
+        Ok(CheckpointAdminInspection {
+            latest_valid_checkpoint,
+            manifests: inspections,
+        })
     }
 
     pub async fn plan_garbage_collection(
@@ -728,6 +810,124 @@ impl CheckpointPublisher {
             .store
             .put(&marker_path, Bytes::from(bytes).into())
             .await;
+    }
+
+    async fn best_effort_publish_lifecycle_record(
+        &self,
+        manifest: &CheckpointManifest,
+        manifest_bytes: &[u8],
+    ) {
+        let record =
+            CheckpointLifecycleRecord::published(manifest, manifest_bytes, marker_updated_at_now());
+        let Ok(bytes) = serde_json::to_vec(&record) else {
+            return;
+        };
+
+        let object_key = ObjectKey::checkpoint_lifecycle_record(manifest.checkpoint_version);
+        let path = Path::from(object_key.as_str());
+        let _ = self
+            .store
+            .put_opts(
+                &path,
+                Bytes::from(bytes.clone()).into(),
+                PutMode::Create.into(),
+            )
+            .await;
+    }
+
+    async fn inspect_checkpoint_manifest(
+        &self,
+        checkpoint_version: u64,
+        manifest_key: ObjectKey,
+        location: &Path,
+        valid_manifests: &HashMap<u64, CheckpointManifest>,
+    ) -> Result<(CheckpointManifest, Option<CheckpointLifecycleStatus>), String> {
+        let bytes = self
+            .store
+            .get(location)
+            .await
+            .map_err(|err| err.to_string())?
+            .bytes()
+            .await
+            .map_err(|err| err.to_string())?;
+        let manifest =
+            serde_json::from_slice::<CheckpointManifest>(&bytes).map_err(|err| err.to_string())?;
+        manifest.validate().map_err(|err| err.to_string())?;
+
+        let body_key = manifest.object_key();
+        if manifest_key != body_key {
+            return Err(CheckpointPublishError::ManifestKeyMismatch {
+                object_key: manifest_key,
+                body_key,
+            }
+            .to_string());
+        }
+        if manifest.checkpoint_version != checkpoint_version {
+            return Err(format!(
+                "checkpoint manifest key version {checkpoint_version} does not match body version {}",
+                manifest.checkpoint_version
+            ));
+        }
+        if let Some(parent_checkpoint) = manifest.parent_checkpoint {
+            let parent = valid_manifests.get(&parent_checkpoint).ok_or_else(|| {
+                CheckpointPublishError::MissingParentManifest {
+                    checkpoint_version: manifest.checkpoint_version,
+                    parent_checkpoint,
+                }
+                .to_string()
+            })?;
+            Self::validate_child_input_progress(&manifest, parent)
+                .map_err(|err| err.to_string())?;
+        }
+        self.validate_state_objects_exist(&manifest)
+            .await
+            .map_err(|err| err.to_string())?;
+        self.validate_output_objects_exist(&manifest)
+            .await
+            .map_err(|err| err.to_string())?;
+
+        let lifecycle_status = self
+            .read_checkpoint_lifecycle_record(checkpoint_version)
+            .await
+            .ok()
+            .and_then(|record| {
+                (record.manifest_digest == manifest_digest(&bytes)).then_some(record.status)
+            });
+
+        Ok((manifest, lifecycle_status))
+    }
+
+    fn validate_lifecycle_record(
+        &self,
+        object_key: &ObjectKey,
+        record: &CheckpointLifecycleRecord,
+    ) -> Result<(), CheckpointPublishError> {
+        if !record.validate_schema() {
+            return Err(CheckpointPublishError::ObjectKey(
+                ObjectKeyError::InvalidExternalKey(format!(
+                    "unsupported checkpoint lifecycle schema version {}",
+                    record.schema_version
+                )),
+            ));
+        }
+        if *object_key != ObjectKey::checkpoint_lifecycle_record(record.checkpoint_version) {
+            return Err(CheckpointPublishError::ObjectKey(
+                ObjectKeyError::InvalidExternalKey(format!(
+                    "checkpoint lifecycle key `{object_key}` does not match body checkpoint {}",
+                    record.checkpoint_version
+                )),
+            ));
+        }
+        if record.manifest_key != ObjectKey::checkpoint_manifest(record.checkpoint_version) {
+            return Err(CheckpointPublishError::ObjectKey(
+                ObjectKeyError::InvalidExternalKey(format!(
+                    "checkpoint lifecycle manifest key `{}` does not match checkpoint {}",
+                    record.manifest_key, record.checkpoint_version
+                )),
+            ));
+        }
+
+        Ok(())
     }
 
     async fn latest_manifest_from_candidate_marker(
@@ -1192,6 +1392,20 @@ impl CheckpointPublisher {
             || (current.owner_epoch == attempted.owner_epoch
                 && current.owner_id != attempted.owner_id)
     }
+}
+
+fn checkpoint_version_from_manifest_key(object_key: &ObjectKey) -> Result<u64, ObjectKeyError> {
+    let value = object_key.as_str();
+    let Some(version) = value
+        .strip_prefix("v1/checkpoints/")
+        .and_then(|value| value.strip_suffix(".manifest"))
+    else {
+        return Err(ObjectKeyError::InvalidExternalKey(value.to_string()));
+    };
+
+    version
+        .parse()
+        .map_err(|_| ObjectKeyError::InvalidExternalKey(value.to_string()))
 }
 
 impl StateObjectWrite {

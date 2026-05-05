@@ -156,6 +156,25 @@ progress, or regressed input boundary is not skipped or treated as latest
 authority; listing/latest return an error so recovery does not advance from an
 invalid lineage.
 
+Successful manifest publication also writes a best-effort checkpoint lifecycle
+status record:
+
+```text
+v1/checkpoint-lifecycle/{checkpoint_version:020}.status.json
+```
+
+The current record is intentionally small: schema version, checkpoint version,
+manifest key, manifest digest, `published` status, and status update time. The
+checkpoint manifest remains the durable authority; the lifecycle record is an
+admin/status surface and must match the manifest digest before readers attach it
+to a checkpoint inspection result.
+
+Admin inspection can list checkpoint manifests, validate each manifest body,
+key, lineage, referenced state, and referenced outputs, report invalid future
+manifests with reasons, and return the latest valid checkpoint for repair or
+read-only diagnosis. It does not yet implement lifecycle transitions beyond
+`published`, retention tombstones, compaction state, or recovery-mode writes.
+
 State object references may carry an `owner_claim` with `owner_id` and
 `owner_epoch`. This is distinct from the existing state ref `owner`, which
 continues to mean the logical state/view owner used in the state object key.

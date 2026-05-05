@@ -122,6 +122,12 @@ impl ObjectKey {
         Self("v1/checkpoint-index/latest-candidate.json".to_string())
     }
 
+    pub fn checkpoint_lifecycle_record(checkpoint_version: u64) -> Self {
+        Self(format!(
+            "v1/checkpoint-lifecycle/{checkpoint_version:0CHECKPOINT_WIDTH$}.status.json"
+        ))
+    }
+
     pub fn ownership_epoch_record(
         stream_id: &str,
         partition_id: u32,
@@ -243,6 +249,12 @@ fn validate_known_layout(value: &str) -> Result<(), ObjectKeyError> {
             parse_fixed_u64("checkpoint_version", checkpoint, CHECKPOINT_WIDTH)?;
         }
         ["v1", "checkpoint-index", "latest-candidate.json"] => {}
+        ["v1", "checkpoint-lifecycle", status_file] => {
+            let checkpoint = status_file
+                .strip_suffix(".status.json")
+                .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+            parse_fixed_u64("checkpoint_version", checkpoint, CHECKPOINT_WIDTH)?;
+        }
         ["v1", "ownership", stream_id, partition, epoch_file] => {
             parse_ownership_epoch_record_parts(value, stream_id, partition, epoch_file)?;
         }

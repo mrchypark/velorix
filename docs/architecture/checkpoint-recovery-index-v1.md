@@ -35,6 +35,20 @@ hide the last known good checkpoint.
 - `last_known_good_read_only`: allow read-only recovery from an admin-selected
   valid checkpoint.
 
+## Lifecycle Status
+
+Published checkpoints may have a companion lifecycle record:
+
+```text
+v1/checkpoint-lifecycle/{checkpoint_version:020}.status.json
+```
+
+The current implementation writes `published` lifecycle records after manifest
+publication and treats them as status metadata, not authority. Admin inspection
+attaches the lifecycle status only when the record validates and its manifest
+digest matches the inspected manifest. Missing, corrupt, or mismatched lifecycle
+records do not make a valid manifest invalid.
+
 ## Verification
 
 - Valid marker fast path avoids full listing after manifest validation.
@@ -42,4 +56,5 @@ hide the last known good checkpoint.
 - Strict mode fails on invalid lineage.
 - Admin inspect identifies last known good checkpoint when a future manifest is
   corrupt.
+- Published lifecycle records are readable and digest-bound to their manifest.
 - Large-manifest-count benchmark records lookup memory and latency.

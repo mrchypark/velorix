@@ -9,7 +9,10 @@ use object_store::{
 use tempfile::TempDir;
 use tokio::sync::Barrier;
 use velorix_storage::{
-    checkpoint_index::LatestCandidateMarker,
+    checkpoint_index::{
+        CheckpointLifecycleRecord, CheckpointLifecycleStatus, CheckpointManifestInspectionStatus,
+        LatestCandidateMarker,
+    },
     gc::{
         GarbageCollectionCandidate, GarbageCollectionCandidateKind, GarbageCollectionPlan,
         GarbageCollectionPolicy,
@@ -733,6 +736,66 @@ async fn checkpoint_publish_latest_manifest_uses_numerically_latest_valid_checkp
         vec![manifest_0, manifest_1.clone()]
     );
     assert_eq!(publisher.latest_manifest().await.unwrap(), Some(manifest_1));
+}
+
+#[tokio::test]
+async fn checkpoint_publish_writes_lifecycle_status_after_manifest_publication() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(store);
+    let state = state_write(0, "state-0001", b"state-0");
+    let manifest = manifest(0, publisher.write_state_object(&state).await.unwrap());
+    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+
+    publisher.publish_manifest(&manifest).await.unwrap();
+
+    let record = publisher.read_checkpoint_lifecycle_record(0).await.unwrap();
+
+    assert_eq!(
+        record,
+        CheckpointLifecycleRecord::published(
+            &manifest,
+            &manifest_bytes,
+            record.status_updated_at.clone()
+        )
+    );
+    assert_eq!(record.status, CheckpointLifecycleStatus::Published);
+}
+
+#[tokio::test]
+async fn checkpoint_admin_inspect_reports_last_known_good_when_future_manifest_is_corrupt() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let state = state_write(0, "state-0001", b"state-0");
+    let manifest = manifest(0, publisher.write_state_object(&state).await.unwrap());
+
+    publisher.publish_manifest(&manifest).await.unwrap();
+    store
+        .put(
+            &Path::from(ObjectKey::checkpoint_manifest(1).as_str()),
+            Bytes::from_static(b"{not valid json").into(),
+        )
+        .await
+        .unwrap();
+
+    let report = publisher.inspect_checkpoints().await.unwrap();
+
+    assert_eq!(report.latest_valid_checkpoint, Some(0));
+    assert_eq!(report.manifests.len(), 2);
+    assert_eq!(report.manifests[0].checkpoint_version, 0);
+    assert_eq!(
+        report.manifests[0].lifecycle_status,
+        Some(CheckpointLifecycleStatus::Published)
+    );
+    assert!(matches!(
+        report.manifests[0].status,
+        CheckpointManifestInspectionStatus::Valid
+    ));
+    assert_eq!(report.manifests[1].checkpoint_version, 1);
+    assert!(matches!(
+        report.manifests[1].status,
+        CheckpointManifestInspectionStatus::Invalid { .. }
+    ));
+    assert!(!report.manifests[1].status.reason().unwrap().is_empty());
 }
 
 #[tokio::test]
