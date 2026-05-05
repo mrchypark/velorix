@@ -81,13 +81,13 @@ The remaining work is not cosmetic. It is the difference between "strong bootstr
 - `crates/velorix-storage/tests/checkpoint_lifecycle.rs`: checkpoint status transitions.
 - `crates/velorix-storage/tests/gc.rs`: GC mark/sweep behavior.
 - `crates/velorix-storage/tests/s3_compat.rs`: env-gated S3-compatible object-store tests.
-- `crates/velorix-control/src/kubernetes.rs`: Kubernetes Lease-backed implementation.
-- `crates/velorix-control/tests/kubernetes_lease.rs`: env-gated Kubernetes Lease tests.
 - `crates/velorix-k8s/Cargo.toml`: Kubernetes operator/CRD crate.
 - `crates/velorix-k8s/src/lib.rs`: CRD type exports.
 - `crates/velorix-k8s/src/crd.rs`: CRD specs and status types.
-- `crates/velorix-k8s/src/controller.rs`: reconciliation skeleton and status writer.
+- `crates/velorix-k8s/src/controller.rs`: pure reconciliation skeleton.
+- `crates/velorix-k8s/src/lease.rs`: Kubernetes Lease-backed partition lease adapter.
 - `crates/velorix-k8s/tests/crd_schema.rs`: CRD schema tests.
+- `crates/velorix-k8s/tests/lease.rs`: fake-client Kubernetes Lease adapter tests.
 - `crates/velorix-k8s/tests/reconcile.rs`: pure reconcile-core tests.
 - `crates/velorix-runtime/src/feldera_registry.rs`: persisted Feldera artifact registry.
 - `crates/velorix-runtime/tests/feldera_registry.rs`: artifact registry and fingerprint tests.
@@ -468,11 +468,10 @@ pub enum AuthoritativeNamespace {
 **Purpose:** In-memory leases are useful tests, but production writer ownership needs a Kubernetes-native client.
 
 **Files:**
-- Modify: `Cargo.toml`
-- Create: `crates/velorix-k8s/Cargo.toml`
-- Create: `crates/velorix-k8s/src/lib.rs`
+- Modify: `crates/velorix-k8s/Cargo.toml`
+- Modify: `crates/velorix-k8s/src/lib.rs`
 - Create: `crates/velorix-k8s/src/lease.rs`
-- Create: `crates/velorix-k8s/tests/kubernetes_lease.rs`
+- Create: `crates/velorix-k8s/tests/lease.rs`
 
 **Dependencies:**
 
@@ -490,7 +489,7 @@ pub enum AuthoritativeNamespace {
 - Fail closed when lease renew fails.
 - Preserve the rule that Kubernetes lease alone is not enough; durable epoch record is still required before production publication.
 
-- [ ] Unit tests use a fake Kubernetes client or serialized Lease objects.
+- [x] Unit tests use a fake Kubernetes client or serialized Lease objects.
 - [ ] Integration tests run only when `VELORIX_K8S_INTEGRATION=1`.
 - [ ] Commit: `feat: add kubernetes lease client`.
 

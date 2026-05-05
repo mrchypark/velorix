@@ -5,8 +5,15 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+async-trait = { workspace = true }
 k8s-openapi = { workspace = true, features = ["v1_35", "schemars"] }
-kube = { workspace = true, features = ["derive"] }
+kube = { workspace = true, features = ["client", "derive", "ring", "rustls-tls"] }
 schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
+velorix-control = { path = "../velorix-control" }
+velorix-storage = { path = "../velorix-storage" }
+
+[dev-dependencies]
+tokio = { workspace = true }
