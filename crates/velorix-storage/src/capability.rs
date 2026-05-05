@@ -19,6 +19,7 @@ pub enum AuthoritativeNamespace {
     Checkpoint,
     Ownership,
     TableCatalog,
+    RelationCatalog,
     ArtifactCatalog,
     BenchmarkEvidence,
 }
@@ -146,7 +147,7 @@ impl ObjectStoreCapabilityError {
 }
 
 impl AuthoritativeNamespace {
-    pub fn all() -> [Self; 8] {
+    pub fn all() -> [Self; 9] {
         [
             Self::Ingest,
             Self::State,
@@ -154,6 +155,7 @@ impl AuthoritativeNamespace {
             Self::Checkpoint,
             Self::Ownership,
             Self::TableCatalog,
+            Self::RelationCatalog,
             Self::ArtifactCatalog,
             Self::BenchmarkEvidence,
         ]
@@ -180,6 +182,7 @@ impl fmt::Display for AuthoritativeNamespace {
             Self::Checkpoint => write!(f, "checkpoint"),
             Self::Ownership => write!(f, "ownership"),
             Self::TableCatalog => write!(f, "table_catalog"),
+            Self::RelationCatalog => write!(f, "relation_catalog"),
             Self::ArtifactCatalog => write!(f, "artifact_catalog"),
             Self::BenchmarkEvidence => write!(f, "benchmark_evidence"),
         }

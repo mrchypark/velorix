@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::relation::{
+    RelationColumnV1, RelationSchemaError, VelorixLogicalTypeV1, VelorixRelationCatalogV1,
+};
+
 pub const FELDERA_ARTIFACT_METADATA_VERSION: u32 = 1;
 pub const FELDERA_SPEC_HASH_PREFIX: &str = "velorix-feldera-spec-sha256-v1";
 pub const SUPPORTED_STATE_CODEC: &str = "feldera-dbsp-state-v1";
@@ -285,12 +289,112 @@ pub fn validate_feldera_compile_artifact(
     Ok(())
 }
 
+pub fn catalog_input_relation_schema(
+    catalog: &VelorixRelationCatalogV1,
+) -> Result<RelationSchema, FelderaArtifactError> {
+    catalog.validate().map_err(catalog_relation_error)?;
+
+    Ok(RelationSchema {
+        relation_id: catalog.relation_schema.relation_id.clone(),
+        relation_name: catalog.relation_schema.relation_name.clone(),
+        relation_version: catalog.relation_schema.relation_version.clone(),
+        schema_fingerprint: catalog.schema_fingerprint.to_string(),
+        columns: catalog
+            .relation_schema
+            .columns
+            .iter()
+            .map(catalog_column_schema)
+            .collect::<Result<Vec<_>, FelderaArtifactError>>()?,
+        primary_key: catalog_primary_key_columns(catalog)?,
+    })
+}
+
+pub fn validate_feldera_compile_artifact_for_catalog(
+    catalog: &VelorixRelationCatalogV1,
+    spec: &StandingViewSpec,
+    artifact: &FelderaCompileArtifactMetadata,
+) -> Result<(), FelderaArtifactError> {
+    let catalog_schema = catalog_input_relation_schema(catalog)?;
+    let Some(spec_input) = spec.input_relations.first() else {
+        return Err(FelderaArtifactError::MissingSchema {
+            field: "spec.input_relations",
+        });
+    };
+
+    validate_relation_identity_matches("spec.input_relations", &catalog_schema, spec_input)?;
+    if &catalog_schema != spec_input {
+        return Err(FelderaArtifactError::SchemaMismatch {
+            field: "spec.input_relations",
+        });
+    }
+
+    validate_feldera_compile_artifact(spec, artifact)
+}
+
 /// Hashes the v1 standing-view spec contract as SHA-256 over the compact
 /// `serde_json::to_vec` serialization of `StandingViewSpec`.
 pub fn feldera_spec_hash(spec: &StandingViewSpec) -> Result<String, FelderaArtifactError> {
     let encoded = serde_json::to_vec(spec).map_err(SerdeJsonError)?;
     let digest = Sha256::digest(&encoded);
     Ok(format!("{FELDERA_SPEC_HASH_PREFIX}:{digest:x}"))
+}
+
+fn catalog_column_schema(column: &RelationColumnV1) -> Result<ColumnSchema, FelderaArtifactError> {
+    Ok(ColumnSchema {
+        name: column.name.clone(),
+        data_type: sql_data_type_for_logical_type(&column.logical_type)?,
+        nullable: column.nullable,
+    })
+}
+
+fn catalog_primary_key_columns(
+    catalog: &VelorixRelationCatalogV1,
+) -> Result<Vec<String>, FelderaArtifactError> {
+    catalog
+        .relation_schema
+        .primary_key_column_ids
+        .iter()
+        .map(|column_id| {
+            catalog
+                .relation_schema
+                .columns
+                .iter()
+                .find(|column| &column.column_id == column_id)
+                .map(|column| column.name.clone())
+                .ok_or(FelderaArtifactError::InvalidRelationSchema {
+                    field: "primary_key",
+                })
+        })
+        .collect()
+}
+
+fn sql_data_type_for_logical_type(
+    logical_type: &VelorixLogicalTypeV1,
+) -> Result<SqlDataType, FelderaArtifactError> {
+    Ok(match logical_type {
+        VelorixLogicalTypeV1::Bool => SqlDataType::Bool,
+        VelorixLogicalTypeV1::Int64 => SqlDataType::Int64,
+        VelorixLogicalTypeV1::Float64 => SqlDataType::Float64,
+        VelorixLogicalTypeV1::Decimal { precision, scale } => SqlDataType::Decimal {
+            precision: *precision,
+            scale: *scale,
+        },
+        VelorixLogicalTypeV1::Utf8 => SqlDataType::Utf8,
+        VelorixLogicalTypeV1::Date => SqlDataType::Date,
+        VelorixLogicalTypeV1::Timestamp { timezone } => SqlDataType::Timestamp {
+            timezone: timezone.clone(),
+        },
+        VelorixLogicalTypeV1::Json => SqlDataType::Json,
+    })
+}
+
+fn catalog_relation_error(error: RelationSchemaError) -> FelderaArtifactError {
+    match error {
+        RelationSchemaError::SchemaFingerprintMismatch { .. } => {
+            FelderaArtifactError::SchemaFingerprintMismatch { field: "catalog" }
+        }
+        _ => FelderaArtifactError::InvalidRelationSchema { field: "catalog" },
+    }
 }
 
 fn require_non_empty(field: &'static str, value: &str) -> Result<(), FelderaArtifactError> {

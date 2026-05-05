@@ -89,7 +89,7 @@ fn manifest_for(state_ref: StateObjectRef) -> CheckpointManifest {
 #[test]
 fn authoritative_capabilities_reject_missing_namespace() {
     let mut profiles = all_namespace_profiles();
-    profiles.remove(&AuthoritativeNamespace::TableCatalog);
+    profiles.remove(&AuthoritativeNamespace::RelationCatalog);
     let capabilities = AuthoritativeObjectStoreCapabilitiesV1::new(profiles);
 
     let error = capabilities.validate_for_startup().unwrap_err();
@@ -97,7 +97,7 @@ fn authoritative_capabilities_reject_missing_namespace() {
     assert!(matches!(
         error,
         AuthoritativeObjectStoreCapabilityError::MissingNamespace {
-            namespace: AuthoritativeNamespace::TableCatalog
+            namespace: AuthoritativeNamespace::RelationCatalog
         }
     ));
 }
@@ -132,14 +132,14 @@ fn authoritative_capabilities_reject_weak_production_namespace_profiles() {
     ] {
         let mut profiles = all_namespace_profiles();
         let profile = profile_missing(required_capability);
-        profiles.insert(AuthoritativeNamespace::TableCatalog, profile.clone());
+        profiles.insert(AuthoritativeNamespace::RelationCatalog, profile.clone());
         let capabilities = AuthoritativeObjectStoreCapabilitiesV1::new(profiles);
 
         let error = capabilities.validate_for_startup().unwrap_err();
 
         match error {
             AuthoritativeObjectStoreCapabilityError::NamespaceProfile { namespace, source } => {
-                assert_eq!(namespace, AuthoritativeNamespace::TableCatalog);
+                assert_eq!(namespace, AuthoritativeNamespace::RelationCatalog);
                 assert_capability_error(source, &profile, required_capability);
             }
             other => panic!("expected namespace profile error, got {other:?}"),

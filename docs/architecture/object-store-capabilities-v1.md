@@ -45,7 +45,7 @@ telemetry.
 Phase 2.3 records declared capability profiles as
 `AuthoritativeObjectStoreCapabilitiesV1`, keyed by these authoritative
 namespaces: ingest, state, output, checkpoint, ownership, table catalog,
-artifact catalog, and benchmark evidence.
+relation catalog, artifact catalog, and benchmark evidence.
 
 Startup validation rejects a missing namespace profile and rejects any namespace
 whose `ObjectStoreCapabilityProfile` is missing a required durability

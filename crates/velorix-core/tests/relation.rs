@@ -1,8 +1,18 @@
+use std::sync::Arc;
+
+use arrow::{
+    array::{ArrayRef, Int64Array, StringArray},
+    datatypes::{DataType, Field, Schema},
+    record_batch::RecordBatch,
+};
+use datafusion::prelude::SessionContext;
 use velorix_core::relation::{
-    ArrowPhysicalTypeV1, DataFusionRegistrationModeV1, DataFusionRegistrationV1,
-    FelderaRelationBindingV1, IncrementalAdapterBindingV1, RelationColumnV1, RelationOperationV1,
-    RelationSchemaError, RelationSemanticRoleV1, SchemaFingerprintV1, VelorixLogicalTypeV1,
-    VelorixRelationCatalogV1, VelorixRelationSchemaV1, RELATION_SCHEMA_VERSION_V1,
+    datafusion_schema_from_catalog, register_datafusion_catalog_batches,
+    validate_record_batch_matches_catalog, ArrowPhysicalTypeV1, DataFusionRegistrationModeV1,
+    DataFusionRegistrationV1, FelderaRelationBindingV1, IncrementalAdapterBindingV1,
+    RelationColumnV1, RelationOperationV1, RelationSchemaError, RelationSemanticRoleV1,
+    SchemaFingerprintV1, VelorixLogicalTypeV1, VelorixRelationCatalogV1, VelorixRelationSchemaV1,
+    RELATION_SCHEMA_VERSION_V1,
 };
 
 const ORDERS_RELATION_SCHEMA_FINGERPRINT: &str =
@@ -102,6 +112,7 @@ fn relation_schema_fingerprint_changes_when_contract_fields_change() {
 
     let mut logical_type_changed = orders_relation_schema();
     logical_type_changed.columns[1].logical_type = VelorixLogicalTypeV1::Float64;
+    logical_type_changed.columns[1].physical_arrow_type = ArrowPhysicalTypeV1::Float64;
     assert_ne!(
         baseline,
         SchemaFingerprintV1::for_relation_schema(&logical_type_changed).unwrap()
@@ -126,6 +137,21 @@ fn relation_schema_fingerprint_rejects_invalid_relation_identity() {
         error,
         RelationSchemaError::MissingIdentityField {
             field: "relation_id"
+        }
+    ));
+}
+
+#[test]
+fn relation_schema_validation_rejects_logical_physical_type_mismatch() {
+    let mut schema = orders_relation_schema();
+    schema.columns[1].logical_type = VelorixLogicalTypeV1::Float64;
+
+    let error = schema.validate().unwrap_err();
+
+    assert!(matches!(
+        error,
+        RelationSchemaError::InvalidRelationSchema {
+            field: "logical_physical_type"
         }
     ));
 }
@@ -170,4 +196,168 @@ fn relation_catalog_validation_requires_cataloged_schema_fingerprint() {
             field: "feldera_relation.relation_id"
         }
     ));
+}
+
+#[tokio::test]
+async fn datafusion_registration_from_catalog_exposes_typed_columns() {
+    let catalog = orders_relation_catalog();
+    let batch = orders_input_batch(&["order-a"], &[42], &[1]);
+    let context = SessionContext::new();
+
+    register_datafusion_catalog_batches(&context, &catalog, vec![batch]).unwrap();
+
+    let output = context
+        .sql("select order_id, amount, weight from orders")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        output[0]
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name())
+            .collect::<Vec<_>>(),
+        vec!["order_id", "amount", "weight"]
+    );
+    assert_eq!(output[0].schema().field(1).data_type(), &DataType::Int64);
+
+    let error = context
+        .sql("select key_json, value_json from orders")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("key_json"));
+}
+
+#[test]
+fn datafusion_registration_rejects_unsupported_view_mode() {
+    let mut catalog = orders_relation_catalog();
+    catalog.datafusion_registration.mode = DataFusionRegistrationModeV1::View;
+    let batch = orders_input_batch(&["order-a"], &[42], &[1]);
+    let context = SessionContext::new();
+
+    let error = register_datafusion_catalog_batches(&context, &catalog, vec![batch]).unwrap_err();
+
+    assert!(
+        error.to_string().contains("datafusion_registration.mode"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn datafusion_registration_rejects_batch_schema_that_differs_from_catalog() {
+    let catalog = orders_relation_catalog();
+    let wrong_batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("key_json", DataType::Utf8, false),
+            Field::new("value_json", DataType::Utf8, false),
+            Field::new("weight", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["\"order-a\""])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["42"])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+
+    let error = validate_record_batch_matches_catalog(&catalog, &wrong_batch).unwrap_err();
+
+    assert!(matches!(
+        error,
+        RelationSchemaError::InvalidRelationSchema {
+            field: "batch_schema"
+        }
+    ));
+}
+
+#[test]
+fn datafusion_schema_from_catalog_rejects_stale_catalog_fingerprint() {
+    let mut catalog = orders_relation_catalog();
+    catalog.schema_fingerprint = SchemaFingerprintV1::new(format!("sha256:{}", "0".repeat(64)));
+
+    let error = datafusion_schema_from_catalog(&catalog).unwrap_err();
+
+    assert!(matches!(
+        error,
+        RelationSchemaError::SchemaFingerprintMismatch { field: "catalog" }
+    ));
+}
+
+fn orders_relation_catalog() -> VelorixRelationCatalogV1 {
+    let relation_schema = VelorixRelationSchemaV1 {
+        relation_id: "orders".to_string(),
+        relation_name: "orders".to_string(),
+        relation_version: "2026-05-05.v1".to_string(),
+        columns: vec![
+            RelationColumnV1 {
+                column_id: "order_id".to_string(),
+                name: "order_id".to_string(),
+                logical_type: VelorixLogicalTypeV1::Utf8,
+                physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+                nullable: false,
+                ordinal: 0,
+                semantic_role: RelationSemanticRoleV1::PrimaryKey,
+            },
+            RelationColumnV1 {
+                column_id: "amount".to_string(),
+                name: "amount".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 1,
+                semantic_role: RelationSemanticRoleV1::Value,
+            },
+            RelationColumnV1 {
+                column_id: "weight".to_string(),
+                name: "weight".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 2,
+                semantic_role: RelationSemanticRoleV1::Weight,
+            },
+        ],
+        primary_key_column_ids: vec!["order_id".to_string()],
+        weight_column_id: "weight".to_string(),
+        allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+        event_time_column_id: None,
+    };
+    let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
+
+    VelorixRelationCatalogV1 {
+        schema_version: RELATION_SCHEMA_VERSION_V1,
+        relation_schema,
+        schema_fingerprint: schema_fingerprint.clone(),
+        datafusion_registration: DataFusionRegistrationV1 {
+            name: "orders".to_string(),
+            mode: DataFusionRegistrationModeV1::Table,
+        },
+        feldera_relation: FelderaRelationBindingV1 {
+            relation_id: "orders".to_string(),
+            schema_fingerprint,
+        },
+        incremental_adapter: IncrementalAdapterBindingV1 {
+            adapter_id: "incremental-adapter-orders-v1".to_string(),
+        },
+    }
+}
+
+fn orders_input_batch(order_ids: &[&str], amounts: &[i64], weights: &[i64]) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("order_id", DataType::Utf8, false),
+            Field::new("amount", DataType::Int64, false),
+            Field::new("weight", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(order_ids.to_vec())) as ArrayRef,
+            Arc::new(Int64Array::from(amounts.to_vec())) as ArrayRef,
+            Arc::new(Int64Array::from(weights.to_vec())) as ArrayRef,
+        ],
+    )
+    .unwrap()
 }

@@ -15,8 +15,13 @@ use tempfile::TempDir;
 use velorix_core::{
     delta::{DeltaBatch, DeltaKey, DeltaRecord, DeltaValue},
     engine::EngineCheckpoint,
+    feldera_artifact::catalog_input_relation_schema,
     operator::KeyedSumCountAggregate,
     query::{QueryError, QueryPolicy, QueryPolicyError},
+    relation::{
+        datafusion_schema_from_catalog, DATAFUSION_RELATION_ID_METADATA_KEY,
+        DATAFUSION_RELATION_VERSION_METADATA_KEY, DATAFUSION_SCHEMA_FINGERPRINT_METADATA_KEY,
+    },
 };
 use velorix_runtime::{
     query::{
@@ -444,6 +449,59 @@ async fn recovery_rejects_ingest_envelope_with_wrong_schema_fingerprint() {
             ..
         }
     ));
+}
+
+#[tokio::test]
+async fn arrow_ingest_datafusion_and_feldera_use_the_same_catalog_identity() {
+    let (_temp_dir, store) = temp_store();
+    let ingest_log = IngestLog::new(Arc::clone(&store));
+    let input = batch([input_delta("account-a", 4, 1)]);
+    let catalog = orders_sum_count_relation_catalog().unwrap();
+    let bytes = ingest_envelope_bytes("orders", 0, 0, 1, &input);
+    let envelope = IngestEnvelope::decode(bytes.clone()).unwrap();
+
+    ingest_log.append_validated_envelope(bytes).await.unwrap();
+    let recovered = RecoveredRuntime::recover(Arc::clone(&store)).await.unwrap();
+    let datafusion_schema = datafusion_schema_from_catalog(&catalog).unwrap();
+    let feldera_schema = catalog_input_relation_schema(&catalog).unwrap();
+
+    assert_eq!(recovered.replayed_batch_count(), 1);
+    assert_eq!(
+        envelope.header().relation_id,
+        catalog.relation_schema.relation_id
+    );
+    assert_eq!(
+        envelope.header().relation_version,
+        catalog.relation_schema.relation_version
+    );
+    assert_eq!(
+        envelope.header().schema_fingerprint,
+        catalog.schema_fingerprint.as_str()
+    );
+    assert_eq!(
+        datafusion_schema.metadata()[DATAFUSION_RELATION_ID_METADATA_KEY],
+        catalog.relation_schema.relation_id
+    );
+    assert_eq!(
+        datafusion_schema.metadata()[DATAFUSION_RELATION_VERSION_METADATA_KEY],
+        catalog.relation_schema.relation_version
+    );
+    assert_eq!(
+        datafusion_schema.metadata()[DATAFUSION_SCHEMA_FINGERPRINT_METADATA_KEY],
+        catalog.schema_fingerprint.as_str()
+    );
+    assert_eq!(
+        feldera_schema.relation_id,
+        catalog.relation_schema.relation_id
+    );
+    assert_eq!(
+        feldera_schema.relation_version,
+        catalog.relation_schema.relation_version
+    );
+    assert_eq!(
+        feldera_schema.schema_fingerprint,
+        catalog.schema_fingerprint.as_str()
+    );
 }
 
 #[tokio::test]

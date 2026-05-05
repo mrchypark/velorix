@@ -1,12 +1,21 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
+use std::sync::Arc;
 
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::record_batch::RecordBatch;
+use datafusion::datasource::MemTable;
+use datafusion::error::DataFusionError;
+use datafusion::prelude::SessionContext;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub const RELATION_SCHEMA_VERSION_V1: u32 = 1;
 pub const SCHEMA_FINGERPRINT_V1_DOMAIN: &[u8] = b"velorix-relation-schema-v1\0";
+pub const DATAFUSION_RELATION_ID_METADATA_KEY: &str = "velorix.relation_id";
+pub const DATAFUSION_RELATION_VERSION_METADATA_KEY: &str = "velorix.relation_version";
+pub const DATAFUSION_SCHEMA_FINGERPRINT_METADATA_KEY: &str = "velorix.schema_fingerprint";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -167,6 +176,7 @@ impl RelationColumnV1 {
         require_non_empty("column.name", &self.name)?;
         self.logical_type.validate()?;
         self.physical_arrow_type.validate()?;
+        validate_logical_physical_type_pair(&self.logical_type, &self.physical_arrow_type)?;
 
         Ok(())
     }
@@ -360,6 +370,155 @@ pub fn validate_schema_fingerprint(
     }
 
     Ok(())
+}
+
+pub fn datafusion_schema_from_catalog(
+    catalog: &VelorixRelationCatalogV1,
+) -> Result<Arc<Schema>, RelationSchemaError> {
+    catalog.validate()?;
+
+    let fields = catalog
+        .relation_schema
+        .columns
+        .iter()
+        .map(|column| {
+            Ok(Field::new(
+                column.name.as_str(),
+                data_type_for_arrow_physical_type(&column.physical_arrow_type)?,
+                column.nullable,
+            ))
+        })
+        .collect::<Result<Vec<_>, RelationSchemaError>>()?;
+
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        DATAFUSION_RELATION_ID_METADATA_KEY.to_string(),
+        catalog.relation_schema.relation_id.clone(),
+    );
+    metadata.insert(
+        DATAFUSION_RELATION_VERSION_METADATA_KEY.to_string(),
+        catalog.relation_schema.relation_version.clone(),
+    );
+    metadata.insert(
+        DATAFUSION_SCHEMA_FINGERPRINT_METADATA_KEY.to_string(),
+        catalog.schema_fingerprint.to_string(),
+    );
+
+    Ok(Arc::new(Schema::new_with_metadata(fields, metadata)))
+}
+
+pub fn validate_record_batch_matches_catalog(
+    catalog: &VelorixRelationCatalogV1,
+    batch: &RecordBatch,
+) -> Result<(), RelationSchemaError> {
+    let expected = datafusion_schema_from_catalog(catalog)?;
+    if batch.schema().fields() != expected.fields() {
+        return Err(RelationSchemaError::InvalidRelationSchema {
+            field: "batch_schema",
+        });
+    }
+
+    Ok(())
+}
+
+pub fn register_datafusion_catalog_batches(
+    context: &SessionContext,
+    catalog: &VelorixRelationCatalogV1,
+    batches: Vec<RecordBatch>,
+) -> Result<(), DataFusionError> {
+    if catalog.datafusion_registration.mode != DataFusionRegistrationModeV1::Table {
+        return Err(relation_datafusion_error(
+            RelationSchemaError::InvalidRelationSchema {
+                field: "datafusion_registration.mode",
+            },
+        ));
+    }
+
+    for batch in &batches {
+        validate_record_batch_matches_catalog(catalog, batch).map_err(relation_datafusion_error)?;
+    }
+
+    let schema = datafusion_schema_from_catalog(catalog).map_err(relation_datafusion_error)?;
+    let table = MemTable::try_new(schema, vec![batches])?;
+    context.register_table(
+        catalog.datafusion_registration.name.as_str(),
+        Arc::new(table),
+    )?;
+
+    Ok(())
+}
+
+fn data_type_for_arrow_physical_type(
+    physical_type: &ArrowPhysicalTypeV1,
+) -> Result<DataType, RelationSchemaError> {
+    Ok(match physical_type {
+        ArrowPhysicalTypeV1::Boolean => DataType::Boolean,
+        ArrowPhysicalTypeV1::Int64 => DataType::Int64,
+        ArrowPhysicalTypeV1::Float64 => DataType::Float64,
+        ArrowPhysicalTypeV1::Decimal128 { precision, scale } => {
+            let scale =
+                i8::try_from(*scale).map_err(|_| RelationSchemaError::InvalidRelationSchema {
+                    field: "unsupported_arrow_physical_type",
+                })?;
+            DataType::Decimal128(*precision, scale)
+        }
+        ArrowPhysicalTypeV1::Utf8 | ArrowPhysicalTypeV1::JsonUtf8 => DataType::Utf8,
+        ArrowPhysicalTypeV1::Date32 => DataType::Date32,
+        ArrowPhysicalTypeV1::TimestampNanosecond { timezone } => {
+            DataType::Timestamp(TimeUnit::Nanosecond, timezone.clone().map(Into::into))
+        }
+        ArrowPhysicalTypeV1::DictionaryUtf8 { .. } => {
+            return Err(RelationSchemaError::InvalidRelationSchema {
+                field: "unsupported_arrow_physical_type",
+            });
+        }
+    })
+}
+
+fn relation_datafusion_error(error: RelationSchemaError) -> DataFusionError {
+    DataFusionError::External(Box::new(error))
+}
+
+fn validate_logical_physical_type_pair(
+    logical_type: &VelorixLogicalTypeV1,
+    physical_type: &ArrowPhysicalTypeV1,
+) -> Result<(), RelationSchemaError> {
+    let matches = match (logical_type, physical_type) {
+        (VelorixLogicalTypeV1::Bool, ArrowPhysicalTypeV1::Boolean) => true,
+        (VelorixLogicalTypeV1::Int64, ArrowPhysicalTypeV1::Int64) => true,
+        (VelorixLogicalTypeV1::Float64, ArrowPhysicalTypeV1::Float64) => true,
+        (
+            VelorixLogicalTypeV1::Decimal {
+                precision: logical_precision,
+                scale: logical_scale,
+            },
+            ArrowPhysicalTypeV1::Decimal128 {
+                precision: physical_precision,
+                scale: physical_scale,
+            },
+        ) => logical_precision == physical_precision && logical_scale == physical_scale,
+        (VelorixLogicalTypeV1::Utf8, ArrowPhysicalTypeV1::Utf8) => true,
+        (VelorixLogicalTypeV1::Utf8, ArrowPhysicalTypeV1::DictionaryUtf8 { .. }) => true,
+        (VelorixLogicalTypeV1::Date, ArrowPhysicalTypeV1::Date32) => true,
+        (
+            VelorixLogicalTypeV1::Timestamp {
+                timezone: logical_timezone,
+            },
+            ArrowPhysicalTypeV1::TimestampNanosecond {
+                timezone: physical_timezone,
+            },
+        ) => logical_timezone == physical_timezone,
+        (VelorixLogicalTypeV1::Json, ArrowPhysicalTypeV1::JsonUtf8) => true,
+        _ => false,
+    };
+
+    if matches {
+        Ok(())
+    } else {
+        Err(RelationSchemaError::InvalidRelationSchema {
+            field: "logical_physical_type",
+        })
+    }
 }
 
 fn require_non_empty(field: &'static str, value: &str) -> Result<(), RelationSchemaError> {
