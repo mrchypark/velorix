@@ -125,6 +125,29 @@ fn authoritative_capabilities_report_weak_namespace_profile() {
 }
 
 #[test]
+fn authoritative_capabilities_reject_weak_production_namespace_profiles() {
+    for required_capability in [
+        RequiredObjectStoreCapability::ConditionalCreate,
+        RequiredObjectStoreCapability::ListAfterWrite,
+    ] {
+        let mut profiles = all_namespace_profiles();
+        let profile = profile_missing(required_capability);
+        profiles.insert(AuthoritativeNamespace::TableCatalog, profile.clone());
+        let capabilities = AuthoritativeObjectStoreCapabilitiesV1::new(profiles);
+
+        let error = capabilities.validate_for_startup().unwrap_err();
+
+        match error {
+            AuthoritativeObjectStoreCapabilityError::NamespaceProfile { namespace, source } => {
+                assert_eq!(namespace, AuthoritativeNamespace::TableCatalog);
+                assert_capability_error(source, &profile, required_capability);
+            }
+            other => panic!("expected namespace profile error, got {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn authoritative_capabilities_accept_all_valid_namespaces() {
     let capabilities = AuthoritativeObjectStoreCapabilitiesV1::new(all_namespace_profiles());
 

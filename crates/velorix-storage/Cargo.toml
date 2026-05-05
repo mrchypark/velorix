@@ -17,6 +17,14 @@ slatedb = { workspace = true }
 thiserror = { workspace = true }
 velorix-core = { path = "../velorix-core" }
 
+[features]
+s3-compat-tests = ["object_store/aws"]
+
+[[test]]
+name = "s3_compat"
+path = "tests/s3_compat.rs"
+required-features = ["s3-compat-tests"]
+
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true }

@@ -49,8 +49,9 @@ artifact catalog, and benchmark evidence.
 
 Startup validation rejects a missing namespace profile and rejects any namespace
 whose `ObjectStoreCapabilityProfile` is missing a required durability
-capability. Runtime probes and real S3-compatible checks are intentionally left
-for the later evidence slice.
+capability. A minimal S3-compatible storage harness now validates create-only,
+read-after-write, list-after-write, and range-read behavior when explicitly
+enabled. Broader runtime probes remain later evidence.
 
 ## Current Verification
 
@@ -62,6 +63,8 @@ for the later evidence slice.
   capabilities.
 - Production persisted table scans accept stores registered with complete
   declared namespace capabilities.
+- Env-gated S3-compatible storage evidence validates create-only conflict,
+  read-after-write, list-after-write, and range-read behavior.
 
 ## Future Verification
 
