@@ -790,9 +790,9 @@ implementation.
 - `velorix-cli table inspect --tenant-id <id> --table-id <id>`
 - `velorix-cli benchmark-gate --gate-level <level> --backend <backend>`
 
-- [ ] Commands read from object storage only.
-- [ ] Commands never repair or mutate state unless the subcommand name is explicitly mutating.
-- [ ] JSON output uses stable `schema_version`.
+- [x] `checkpoint-inspect-local --json` reads from object storage only.
+- [x] `checkpoint-inspect-local --json` never repairs or mutates state.
+- [x] Checkpoint inspection JSON output uses stable `schema_version`.
 - [ ] Commit: `feat: add production admin inspection commands`.
 
 ## Phase 8: Dependency Governance and Release Cut

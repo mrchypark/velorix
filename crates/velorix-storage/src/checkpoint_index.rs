@@ -36,13 +36,15 @@ pub enum CheckpointLifecycleStatus {
     Published,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CheckpointAdminInspection {
     pub latest_valid_checkpoint: Option<u64>,
     pub manifests: Vec<CheckpointManifestInspection>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CheckpointManifestInspection {
     pub checkpoint_version: u64,
     pub manifest_key: ObjectKey,
@@ -50,7 +52,8 @@ pub struct CheckpointManifestInspection {
     pub status: CheckpointManifestInspectionStatus,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CheckpointManifestInspectionStatus {
     Valid,
     Invalid { reason: String },

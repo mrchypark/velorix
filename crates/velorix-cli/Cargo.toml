@@ -8,10 +8,11 @@ license = "MIT OR Apache-2.0"
 anyhow = { workspace = true }
 clap = { workspace = true }
 object_store = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
 velorix-runtime = { path = "../velorix-runtime" }
 velorix-storage = { path = "../velorix-storage" }
 
 [dev-dependencies]
-serde_json = { workspace = true }
 tempfile = { workspace = true }

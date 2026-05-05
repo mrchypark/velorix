@@ -5,6 +5,7 @@ use std::{fs, path::Path, path::PathBuf, sync::Arc};
 use anyhow::{bail, Context};
 use clap::{CommandFactory, Parser, Subcommand};
 use object_store::{local::LocalFileSystem, ObjectStore};
+use serde::Serialize;
 use velorix_runtime::benchmark_gate::{
     BenchmarkBackend, BenchmarkBudgetV1, BenchmarkGateLevel, BenchmarkGateResultV1,
 };
@@ -43,6 +44,8 @@ enum Command {
     CheckpointInspectLocal {
         #[arg(long)]
         object_store_dir: PathBuf,
+        #[arg(long)]
+        json: bool,
     },
     BenchmarkValidate {
         #[arg(long)]
@@ -86,14 +89,21 @@ async fn main() -> anyhow::Result<()> {
                 materialized_records
             );
         }
-        Some(Command::CheckpointInspectLocal { object_store_dir }) => {
+        Some(Command::CheckpointInspectLocal {
+            object_store_dir,
+            json,
+        }) => {
             let store = local_object_store(&object_store_dir)?;
             let inspection = CheckpointPublisher::new(store)
                 .inspect_checkpoints()
                 .await
                 .context("failed to inspect local checkpoints")?;
 
-            print!("{}", format_checkpoint_inspection(&inspection));
+            if json {
+                println!("{}", format_checkpoint_inspection_json(&inspection)?);
+            } else {
+                print!("{}", format_checkpoint_inspection(&inspection));
+            }
         }
         Some(Command::BenchmarkValidate { result }) => {
             run_benchmark_gate(None, &result, None, None, None)?;
@@ -182,6 +192,23 @@ fn format_checkpoint_inspection(inspection: &CheckpointAdminInspection) -> Strin
     }
 
     output
+}
+
+fn format_checkpoint_inspection_json(
+    inspection: &CheckpointAdminInspection,
+) -> anyhow::Result<String> {
+    #[derive(Serialize)]
+    struct CheckpointInspectionReport<'a> {
+        schema_version: u16,
+        #[serde(flatten)]
+        inspection: &'a CheckpointAdminInspection,
+    }
+
+    serde_json::to_string_pretty(&CheckpointInspectionReport {
+        schema_version: 1,
+        inspection,
+    })
+    .context("failed to serialize checkpoint inspection")
 }
 
 fn format_lifecycle_status(status: Option<CheckpointLifecycleStatus>) -> &'static str {
@@ -535,7 +562,47 @@ mod tests {
 
     #[test]
     fn checkpoint_inspection_formatter_prints_stable_operator_summary() {
-        let summary = CheckpointAdminInspection {
+        let summary = checkpoint_inspection_summary();
+
+        assert_eq!(
+            format_checkpoint_inspection(&summary),
+            concat!(
+                "latest_valid_checkpoint=7\n",
+                "manifests:\n",
+                "checkpoint=3 key=v1/checkpoints/00000000000000000003.manifest lifecycle=published status=valid\n",
+                "checkpoint=8 key=v1/checkpoints/00000000000000000008.manifest lifecycle=none status=invalid reason=missing visible parent checkpoint 7\n",
+            )
+        );
+    }
+
+    #[test]
+    fn checkpoint_inspection_json_uses_stable_schema_version() {
+        let json = format_checkpoint_inspection_json(&checkpoint_inspection_summary()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["latest_valid_checkpoint"], 7);
+        assert_eq!(value["manifests"][0]["status"], "valid");
+        assert_eq!(
+            value["manifests"][1]["status"]["invalid"]["reason"],
+            "missing visible parent checkpoint\n7"
+        );
+    }
+
+    fn valid_result_json() -> String {
+        serde_json::to_string_pretty(&normal_result(
+            "abc123",
+            "pr_smoke",
+            "local",
+            "local_incremental",
+            1000.0,
+            workload_metrics(),
+        ))
+        .unwrap()
+    }
+
+    fn checkpoint_inspection_summary() -> CheckpointAdminInspection {
+        CheckpointAdminInspection {
             latest_valid_checkpoint: Some(7),
             manifests: vec![
                 CheckpointManifestInspection {
@@ -553,29 +620,7 @@ mod tests {
                     },
                 },
             ],
-        };
-
-        assert_eq!(
-            format_checkpoint_inspection(&summary),
-            concat!(
-                "latest_valid_checkpoint=7\n",
-                "manifests:\n",
-                "checkpoint=3 key=v1/checkpoints/00000000000000000003.manifest lifecycle=published status=valid\n",
-                "checkpoint=8 key=v1/checkpoints/00000000000000000008.manifest lifecycle=none status=invalid reason=missing visible parent checkpoint 7\n",
-            )
-        );
-    }
-
-    fn valid_result_json() -> String {
-        serde_json::to_string_pretty(&normal_result(
-            "abc123",
-            "pr_smoke",
-            "local",
-            "local_incremental",
-            1000.0,
-            workload_metrics(),
-        ))
-        .unwrap()
+        }
     }
 
     fn readiness_json() -> String {

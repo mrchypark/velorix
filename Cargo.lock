@@ -4466,6 +4466,7 @@ dependencies = [
  "anyhow",
  "clap",
  "object_store 0.12.5",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
