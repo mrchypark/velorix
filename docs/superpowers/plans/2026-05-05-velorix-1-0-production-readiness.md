@@ -465,10 +465,10 @@ pub enum AuthoritativeNamespace {
 
 **Files:**
 - Modify: `Cargo.toml`
-- Modify: `crates/velorix-control/Cargo.toml`
-- Create: `crates/velorix-control/src/kubernetes.rs`
-- Modify: `crates/velorix-control/src/lib.rs`
-- Create: `crates/velorix-control/tests/kubernetes_lease.rs`
+- Create: `crates/velorix-k8s/Cargo.toml`
+- Create: `crates/velorix-k8s/src/lib.rs`
+- Create: `crates/velorix-k8s/src/lease.rs`
+- Create: `crates/velorix-k8s/tests/kubernetes_lease.rs`
 
 **Dependencies:**
 
@@ -478,6 +478,8 @@ pub enum AuthoritativeNamespace {
 
 **Required behavior:**
 
+- Keep `crates/velorix-control` permanently kube-free; live Kubernetes
+  dependencies belong in `crates/velorix-k8s`.
 - Acquire or renew a Kubernetes `Lease`.
 - Convert the Kubernetes lease identity into a storage `OwnershipEpochRecord`.
 - Fail closed when the Kubernetes lease holder identity does not match the worker.
@@ -487,6 +489,40 @@ pub enum AuthoritativeNamespace {
 - [ ] Unit tests use a fake Kubernetes client or serialized Lease objects.
 - [ ] Integration tests run only when `VELORIX_K8S_INTEGRATION=1`.
 - [ ] Commit: `feat: add kubernetes lease client`.
+
+### Task 4.2a: Add Kube-Free Control-Plane Contract Skeleton
+
+**Purpose:** Fix the `missing` Kubernetes direction with a minimal contract
+skeleton without pretending that a live operator exists.
+
+**Files:**
+- Modify: `crates/velorix-control/Cargo.toml`
+- Modify: `crates/velorix-control/src/lib.rs`
+- Create: `crates/velorix-control/src/control_plane_contract.rs`
+- Create: `crates/velorix-control/src/reconcile_plan.rs`
+- Create: `crates/velorix-control/tests/control_plane_contract.rs`
+- Modify: `docs/architecture/production-readiness-status.md`
+
+**Required behavior:**
+
+- Keep `velorix-control` free of `kube`, `k8s-openapi`, `schemars`, and live
+  client dependencies.
+- Use plain serde wire contracts with explicit `api_version`, `kind`,
+  `spec_version`, minimal metadata, and `deny_unknown_fields`.
+- Keep status observed-only; status must not become checkpoint or ownership
+  authority.
+- Reconcile planning is side-effect-free and requires matching durable epoch
+  record evidence before worker start.
+- Lease-only ownership, status-only progress, conflicting lease owners, and
+  conflicting epoch records fail closed.
+
+- [x] Add stable serde contract and unknown-field tests.
+- [x] Add side-effect-free reconcile plan tests for status-only progress,
+  lease-only ownership, missing durable epoch record, matching epoch record,
+  stale worker replacement, lease-owner conflict, and epoch-record conflict.
+- [x] Keep production readiness status honest: contract skeleton exists, but
+  live Kubernetes operator/client evidence remains missing.
+- [ ] Commit: `feat: add kubernetes control-plane contract skeleton`.
 
 ### Task 4.2: Add Kubernetes CRD Crate
 
