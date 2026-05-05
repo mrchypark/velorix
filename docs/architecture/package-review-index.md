@@ -94,6 +94,7 @@ materialized outputs, not a batch warehouse table format as the core authority.
 - [Benchmark Gate V1](benchmark-gate-v1.md)
 - [Checkpoint Recovery Index V1](checkpoint-recovery-index-v1.md)
 - [DataFusion Resource Policy V1](datafusion-resource-policy-v1.md)
+- [Dependency Governance](dependency-governance.md)
 - [External Table Surface Contract](external-table-surface-contract.md)
 - [Ingest Admission Contract](ingest-admission-contract.md)
 - [Ingest Envelope V1](ingest-envelope-v1.md)
