@@ -1,11 +1,17 @@
 #![forbid(unsafe_code)]
 
-use std::{fs, path::Path, path::PathBuf, sync::Arc};
+use std::{
+    fs,
+    path::Path,
+    path::PathBuf,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{bail, Context};
 use clap::{CommandFactory, Parser, Subcommand};
 use object_store::{local::LocalFileSystem, ObjectStore};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use velorix_runtime::benchmark_gate::{
     BenchmarkBackend, BenchmarkBudgetV1, BenchmarkGateLevel, BenchmarkGateResultV1,
 };
@@ -77,6 +83,10 @@ enum Command {
         evidence: PathBuf,
         #[arg(long)]
         json: bool,
+    },
+    DependencyGovernanceValidate {
+        #[arg(long)]
+        manifest: PathBuf,
     },
 }
 
@@ -161,6 +171,10 @@ async fn main() -> anyhow::Result<()> {
                 print!("{}", format_readiness_report(&report));
             }
         }
+        Some(Command::DependencyGovernanceValidate { manifest }) => {
+            validate_dependency_governance_file(&manifest)?;
+            println!("dependency governance manifest valid");
+        }
         None => {
             Cli::command().print_help()?;
             println!();
@@ -190,6 +204,219 @@ fn format_readiness_report(report: &ProductionReadinessReportV1) -> String {
         }
     }
     output
+}
+
+fn validate_dependency_governance_file(path: &Path) -> anyhow::Result<()> {
+    let contents = fs::read_to_string(path).with_context(|| {
+        format!(
+            "failed to read dependency governance manifest from {}",
+            path.display()
+        )
+    })?;
+    validate_dependency_governance_manifest_text(&contents, &today_utc_string()?)
+        .with_context(|| format!("invalid dependency governance manifest {}", path.display()))
+}
+
+fn validate_dependency_governance_manifest_text(contents: &str, today: &str) -> anyhow::Result<()> {
+    let manifest: DependencyGovernanceManifestV1 =
+        serde_json::from_str(contents).context("failed to parse dependency governance JSON")?;
+    manifest.validate(today)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DependencyGovernanceManifestV1 {
+    schema_version: u16,
+    msrv: DependencyGovernanceMsrvV1,
+    exceptions: Vec<DependencyGovernanceExceptionV1>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DependencyGovernanceMsrvV1 {
+    minimum_rust_version: String,
+    policy: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DependencyGovernanceExceptionV1 {
+    kind: DependencyGovernanceExceptionKind,
+    #[serde(rename = "crate")]
+    crate_name: String,
+    owner: Option<String>,
+    expires_on: Option<String>,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DependencyGovernanceExceptionKind {
+    Duplicate,
+    Unmaintained,
+    Advisory,
+}
+
+impl DependencyGovernanceManifestV1 {
+    fn validate(&self, today: &str) -> anyhow::Result<()> {
+        if self.schema_version != 1 {
+            bail!(
+                "unsupported dependency governance schema_version {}, expected 1",
+                self.schema_version
+            );
+        }
+        self.msrv.validate()?;
+        validate_date(today).context("validator today must use YYYY-MM-DD")?;
+
+        for exception in &self.exceptions {
+            exception.validate(today)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl DependencyGovernanceMsrvV1 {
+    fn validate(&self) -> anyhow::Result<()> {
+        if !is_rust_version(&self.minimum_rust_version) {
+            bail!(
+                "msrv.minimum_rust_version must use Rust version form MAJOR.MINOR.PATCH, got {}",
+                self.minimum_rust_version
+            );
+        }
+        if self.policy.trim().is_empty() {
+            bail!("msrv.policy must be non-empty");
+        }
+        Ok(())
+    }
+}
+
+impl DependencyGovernanceExceptionV1 {
+    fn validate(&self, today: &str) -> anyhow::Result<()> {
+        if self.crate_name.trim().is_empty() {
+            bail!("dependency governance exception is missing crate");
+        }
+
+        require_non_empty(self.owner.as_deref(), "owner", &self.crate_name, &self.kind)?;
+        require_non_empty(
+            self.reason.as_deref(),
+            "reason",
+            &self.crate_name,
+            &self.kind,
+        )?;
+        let expires_on = require_non_empty(
+            self.expires_on.as_deref(),
+            "expires_on",
+            &self.crate_name,
+            &self.kind,
+        )?;
+        validate_date(expires_on).with_context(|| {
+            format!(
+                "{:?} exception for {} has invalid expires_on",
+                self.kind, self.crate_name
+            )
+        })?;
+        if expires_on < today {
+            bail!(
+                "{:?} exception for {} expired on {}",
+                self.kind,
+                self.crate_name,
+                expires_on
+            );
+        }
+
+        Ok(())
+    }
+}
+
+fn require_non_empty<'a>(
+    value: Option<&'a str>,
+    field: &str,
+    crate_name: &str,
+    kind: &DependencyGovernanceExceptionKind,
+) -> anyhow::Result<&'a str> {
+    match value.map(str::trim) {
+        Some(value) if !value.is_empty() => Ok(value),
+        _ => bail!("{kind:?} exception for {crate_name} is missing {field}"),
+    }
+}
+
+fn is_rust_version(version: &str) -> bool {
+    let mut parts = version.split('.');
+    let Some(major) = parts.next() else {
+        return false;
+    };
+    let Some(minor) = parts.next() else {
+        return false;
+    };
+    let Some(patch) = parts.next() else {
+        return false;
+    };
+    parts.next().is_none()
+        && [major, minor, patch]
+            .iter()
+            .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
+}
+
+fn validate_date(date: &str) -> anyhow::Result<()> {
+    let bytes = date.as_bytes();
+    let shape_valid = bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit());
+    if !shape_valid {
+        bail!("expected YYYY-MM-DD");
+    }
+
+    let year: u32 = date[0..4].parse().context("invalid year")?;
+    let month: u32 = date[5..7].parse().context("invalid month")?;
+    let day: u32 = date[8..10].parse().context("invalid day")?;
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => bail!("month must be 01 through 12"),
+    };
+    if day == 0 || day > max_day {
+        bail!("day is out of range for month");
+    }
+    Ok(())
+}
+
+#[allow(clippy::manual_is_multiple_of)]
+fn is_leap_year(year: u32) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+}
+
+fn today_utc_string() -> anyhow::Result<String> {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system time is before Unix epoch")?
+        .as_secs();
+    let days = (seconds / 86_400) as i64;
+    let (year, month, day) = civil_from_days(days);
+
+    Ok(format!("{year:04}-{month:02}-{day:02}"))
+}
+
+fn civil_from_days(days_since_unix_epoch: i64) -> (i32, u32, u32) {
+    // Howard Hinnant's civil calendar conversion; avoids a runtime date crate for one CLI check.
+    let z = days_since_unix_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if month <= 2 { 1 } else { 0 };
+
+    (year as i32, month as u32, day as u32)
 }
 
 fn local_object_store(object_store_dir: &Path) -> anyhow::Result<Arc<dyn ObjectStore>> {
@@ -547,6 +774,133 @@ mod tests {
     }
 
     #[test]
+    fn dependency_governance_validator_accepts_valid_manifest() {
+        validate_dependency_governance_manifest_text(
+            &valid_dependency_governance_json(),
+            "2026-05-06",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn dependency_governance_validator_rejects_missing_owner() {
+        let manifest = serde_json::json!({
+            "schema_version": 1,
+            "msrv": {
+                "minimum_rust_version": "1.85.0",
+                "policy": "CI and package updates keep the workspace buildable on the declared MSRV."
+            },
+            "exceptions": [
+                {
+                    "kind": "duplicate",
+                    "crate": "hashbrown",
+                    "expires_on": "2026-06-30",
+                    "reason": "Await upstream convergence."
+                }
+            ]
+        })
+        .to_string();
+
+        let error =
+            validate_dependency_governance_manifest_text(&manifest, "2026-05-06").unwrap_err();
+
+        assert!(format!("{error:#}").contains("missing owner"));
+    }
+
+    #[test]
+    fn dependency_governance_validator_rejects_expired_exception() {
+        let manifest = serde_json::json!({
+            "schema_version": 1,
+            "msrv": {
+                "minimum_rust_version": "1.85.0",
+                "policy": "CI and package updates keep the workspace buildable on the declared MSRV."
+            },
+            "exceptions": [
+                {
+                    "kind": "unmaintained",
+                    "crate": "paste",
+                    "owner": "runtime",
+                    "expires_on": "2026-05-05",
+                    "reason": "Temporary allowance while replacing the transitive dependency."
+                }
+            ]
+        })
+        .to_string();
+
+        let error =
+            validate_dependency_governance_manifest_text(&manifest, "2026-05-06").unwrap_err();
+
+        assert!(format!("{error:#}").contains("expired"));
+    }
+
+    #[test]
+    fn dependency_governance_validator_rejects_invalid_expiry_date() {
+        let manifest = serde_json::json!({
+            "schema_version": 1,
+            "msrv": {
+                "minimum_rust_version": "1.85.0",
+                "policy": "CI and package updates keep the workspace buildable on the declared MSRV."
+            },
+            "exceptions": [
+                {
+                    "kind": "advisory",
+                    "crate": "example",
+                    "owner": "security",
+                    "expires_on": "2026-02-30",
+                    "reason": "Temporary advisory exception."
+                }
+            ]
+        })
+        .to_string();
+
+        let error =
+            validate_dependency_governance_manifest_text(&manifest, "2026-02-01").unwrap_err();
+
+        assert!(format!("{error:#}").contains("day is out of range"));
+    }
+
+    #[test]
+    fn dependency_governance_validator_rejects_misspelled_exceptions_key() {
+        let manifest = serde_json::json!({
+            "schema_version": 1,
+            "msrv": {
+                "minimum_rust_version": "1.85.0",
+                "policy": "CI and package updates keep the workspace buildable on the declared MSRV."
+            },
+            "exception": []
+        })
+        .to_string();
+
+        let error =
+            validate_dependency_governance_manifest_text(&manifest, "2026-05-06").unwrap_err();
+
+        assert!(format!("{error:#}").contains("unknown field"));
+    }
+
+    #[test]
+    fn dependency_governance_validator_accepts_leap_day() {
+        let manifest = serde_json::json!({
+            "schema_version": 1,
+            "msrv": {
+                "minimum_rust_version": "1.85.0",
+                "policy": "CI and package updates keep the workspace buildable on the declared MSRV."
+            },
+            "exceptions": [
+                {
+                    "kind": "advisory",
+                    "crate": "example",
+                    "owner": "security",
+                    "expires_on": "2028-02-29",
+                    "reason": "Temporary advisory exception."
+                }
+            ]
+        })
+        .to_string();
+
+        validate_dependency_governance_manifest_text(&manifest, "2028-02-01").unwrap();
+    }
+
+    #[test]
     fn benchmark_gate_comparison_accepts_result_within_budget() {
         let dir = tempdir().unwrap();
         let baseline = dir.path().join("baseline.json");
@@ -754,6 +1108,40 @@ mod tests {
                 "evidence": "Kubernetes Lease client",
                 "evidence_kind": ["kubernetes_lease_client"]
             }
+        })
+        .to_string()
+    }
+
+    fn valid_dependency_governance_json() -> String {
+        serde_json::json!({
+            "schema_version": 1,
+            "msrv": {
+                "minimum_rust_version": "1.85.0",
+                "policy": "CI and package updates keep the workspace buildable on the declared MSRV."
+            },
+            "exceptions": [
+                {
+                    "kind": "duplicate",
+                    "crate": "hashbrown",
+                    "owner": "runtime",
+                    "expires_on": "2026-06-30",
+                    "reason": "Await upstream convergence in the DataFusion dependency graph."
+                },
+                {
+                    "kind": "unmaintained",
+                    "crate": "paste",
+                    "owner": "runtime",
+                    "expires_on": "2026-06-30",
+                    "reason": "Temporary allowance while replacing the transitive dependency."
+                },
+                {
+                    "kind": "advisory",
+                    "crate": "example",
+                    "owner": "security",
+                    "expires_on": "2026-06-30",
+                    "reason": "Advisory does not affect the enabled feature set."
+                }
+            ]
         })
         .to_string()
     }

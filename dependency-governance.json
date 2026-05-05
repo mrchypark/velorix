@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "msrv": {
+    "minimum_rust_version": "1.85.0",
+    "policy": "CI and package updates keep the workspace buildable on the declared MSRV."
+  },
+  "exceptions": [
+    {
+      "kind": "duplicate",
+      "crate": "datafusion-family",
+      "owner": "runtime",
+      "expires_on": "2026-08-31",
+      "reason": "Duplicate versions remain warning-only while the DataFusion dependency graph stabilizes."
+    },
+    {
+      "kind": "unmaintained",
+      "crate": "paste",
+      "owner": "runtime",
+      "expires_on": "2026-08-31",
+      "reason": "Temporary allowance for a transitive unmaintained advisory while upstream replacement options are tracked."
+    }
+  ]
+}
