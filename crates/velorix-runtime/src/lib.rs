@@ -4,6 +4,7 @@
 
 pub mod benchmark_gate;
 pub mod cache;
+pub mod feldera_registry;
 pub mod leased_checkpoint;
 mod object_meter;
 pub mod persisted_query;

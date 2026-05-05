@@ -599,16 +599,16 @@ pub enum AuthoritativeNamespace {
 
 **Required behavior:**
 
-- Create-only artifact object key: `v1/feldera-artifacts/{tenant_id}/{artifact_id}.json`.
+- Create-only artifact object key remains the storage-owned `v1/feldera-artifacts/{artifact_id}/sha256/{artifact_hash_hex}.artifact.json`; tenant/artifact-id lookup is deferred to a separate create-only index only if product semantics require it.
 - Artifact body includes relation ids, schema fingerprints, artifact digest, compile timestamp, compiler identity, and accepted runtime ABI.
 - Artifact registry validates through `velorix-core::feldera_artifact`.
 - Fingerprint mismatch fails closed.
 - Unknown generated Rust ABI fails closed.
 - Direct runtime execution remains disabled until a separate DBSP runtime adoption gate passes.
 
-- [ ] Add tests using existing Feldera fixture JSON.
-- [ ] Add tests for mismatch, duplicate, unknown ABI, and valid artifact retrieval.
-- [ ] Commit: `feat: add durable feldera artifact registry`.
+- [x] Add tests using existing Feldera fixture JSON.
+- [x] Add tests for mismatch, duplicate, unknown ABI, valid artifact retrieval, and select-time catalog drift rejection.
+- [x] Commit: `feat: add durable feldera artifact registry`.
 
 ## Phase 6: Benchmark Gates and Release Evidence
 

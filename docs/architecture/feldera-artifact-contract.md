@@ -81,6 +81,16 @@ from the core wire type and reject a stored body whose artifact identity does
 not match the requested key. This registry does not compile, load, or execute
 Feldera/DBSP artifacts.
 
+The runtime facade in `velorix-runtime::feldera_registry` delegates durable
+storage to that registry and does not define another object-key scheme.
+Registering or selecting an artifact validates the metadata against the
+provided `VelorixRelationCatalogV1` with
+`validate_feldera_compile_artifact_for_catalog`, then returns only trusted
+metadata plus a disabled direct-execution status. A tenant/artifact-id lookup
+index remains deferred; if product semantics later require one, it should be a
+separate create-only index object rather than replacing the artifact id/hash
+registry key.
+
 ## Runtime Direction
 
 DataFusion remains the ad hoc SQL/query engine, but the accepted target input is
