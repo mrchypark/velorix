@@ -16,4 +16,6 @@ velorix-control = { path = "../velorix-control" }
 velorix-storage = { path = "../velorix-storage" }
 
 [dev-dependencies]
+object_store = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true }

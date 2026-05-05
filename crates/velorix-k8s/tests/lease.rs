@@ -6,13 +6,16 @@ use k8s_openapi::{
     apimachinery::pkg::apis::meta::v1::{MicroTime, ObjectMeta},
     jiff::Timestamp,
 };
+use object_store::{local::LocalFileSystem, ObjectStore};
+use tempfile::TempDir;
 use velorix_control::lease::{
     LeaseAcquireRequest, LeaseError, PartitionLeaseClient, PartitionLeaseGrant, PartitionLeaseKey,
 };
 use velorix_k8s::lease::{
-    ownership_epoch_record_from_grant, KubernetesLeaseError, KubernetesPartitionLeaseClient,
-    LeaseApi,
+    ownership_epoch_record_from_grant, persist_ownership_epoch_record_from_grant,
+    KubernetesLeaseError, KubernetesPartitionLeaseClient, LeaseApi,
 };
+use velorix_storage::state::CheckpointPublisher;
 
 #[tokio::test]
 async fn kubernetes_lease_acquires_renews_and_reads_current_grant() {
@@ -182,6 +185,50 @@ fn ownership_epoch_record_helper_is_pure_and_does_not_publish() {
     record.validate().unwrap();
 }
 
+#[tokio::test]
+async fn kubernetes_lease_grant_persists_durable_epoch_record_create_only() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(store);
+    let grant = PartitionLeaseGrant {
+        key: lease_key(),
+        owner_id: "worker-a".to_string(),
+        owner_epoch: 3,
+        expires_at_unix_ms: 4_000,
+    };
+
+    let created_key = persist_ownership_epoch_record_from_grant(
+        &publisher,
+        &grant,
+        "coordination.k8s.io/v1/namespaces/default/leases/lease-a",
+        "2026-05-06T00:00:00Z",
+        Some(8),
+    )
+    .await
+    .unwrap();
+    let duplicate_key = persist_ownership_epoch_record_from_grant(
+        &publisher,
+        &grant,
+        "coordination.k8s.io/v1/namespaces/default/leases/lease-a",
+        "2026-05-06T00:00:00Z",
+        Some(8),
+    )
+    .await
+    .unwrap();
+    let stored = publisher
+        .read_ownership_epoch_record("orders", 0, 3)
+        .await
+        .unwrap();
+
+    assert_eq!(duplicate_key, created_key);
+    assert_eq!(stored.owner_id, "worker-a");
+    assert_eq!(stored.owner_epoch, 3);
+    assert_eq!(
+        stored.lease_identity,
+        "coordination.k8s.io/v1/namespaces/default/leases/lease-a"
+    );
+    assert_eq!(stored.previous_checkpoint_version, Some(8));
+}
+
 #[derive(Clone, Default)]
 struct FakeLeaseApi {
     lease: Arc<Mutex<Option<Lease>>>,
@@ -312,4 +359,10 @@ fn lease_with_spec(spec: LeaseSpec) -> Lease {
 
 fn micro_time(unix_ms: i64) -> MicroTime {
     MicroTime(Timestamp::from_millisecond(unix_ms).unwrap())
+}
+
+fn temp_store() -> (TempDir, Arc<dyn ObjectStore>) {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let store = LocalFileSystem::new_with_prefix(temp_dir.path()).unwrap();
+    (temp_dir, Arc::new(store))
 }

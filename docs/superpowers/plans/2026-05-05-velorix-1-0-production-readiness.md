@@ -485,13 +485,14 @@ pub enum AuthoritativeNamespace {
   dependencies belong in `crates/velorix-k8s`.
 - Acquire or renew a Kubernetes `Lease`.
 - Convert the Kubernetes lease identity into a storage `OwnershipEpochRecord`.
+- Persist the lease-derived `OwnershipEpochRecord` through the storage create-only API.
 - Fail closed when the Kubernetes lease holder identity does not match the worker.
 - Fail closed when lease renew fails.
 - Preserve the rule that Kubernetes lease alone is not enough; durable epoch record is still required before production publication.
 
-- [x] Unit tests use a fake Kubernetes client or serialized Lease objects.
+- [x] Unit tests use a fake Kubernetes client or serialized Lease objects and persist lease-derived epoch records through storage create-only semantics.
 - [ ] Integration tests run only when `VELORIX_K8S_INTEGRATION=1`.
-- [ ] Commit: `feat: add kubernetes lease client`.
+- [x] Commit: `feat: add kubernetes lease client`.
 
 ### Task 4.2a: Add Kube-Free Control-Plane Contract Skeleton
 
