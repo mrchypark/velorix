@@ -120,36 +120,60 @@ async fn collect_with_policy(
     policy: QueryPolicy,
     limits: QueryRuntimeLimits,
 ) -> Result<Vec<RecordBatch>, QueryError> {
-    if let Some(max_rows) = policy.max_output_rows {
-        let fetch = max_rows.checked_add(1);
-        let output = match fetch {
-            Some(fetch) => {
-                let limited = dataframe.limit(0, Some(fetch)).map_err(QueryError::from)?;
-                limits
-                    .run_execution(async { limited.collect().await.map_err(QueryError::from) })
-                    .await?
-            }
-            None => {
-                limits
-                    .run_execution(async { dataframe.collect().await.map_err(QueryError::from) })
-                    .await?
-            }
-        };
-        let observed_rows = output.iter().map(RecordBatch::num_rows).sum();
-        if observed_rows > max_rows {
-            return Err(QueryPolicyError::OutputRowsExceeded {
-                observed_rows,
-                max_rows,
-            }
-            .into());
-        }
-
-        return Ok(output);
-    }
+    let dataframe = match policy
+        .max_output_rows
+        .and_then(|max_rows| max_rows.checked_add(1))
+    {
+        Some(fetch) => dataframe.limit(0, Some(fetch)).map_err(QueryError::from)?,
+        None => dataframe,
+    };
 
     limits
-        .run_execution(async { dataframe.collect().await.map_err(QueryError::from) })
+        .run_execution(async { collect_record_batches(dataframe, policy).await })
         .await
+}
+
+async fn collect_record_batches(
+    dataframe: datafusion::dataframe::DataFrame,
+    policy: QueryPolicy,
+) -> Result<Vec<RecordBatch>, QueryError> {
+    let mut output = Vec::new();
+    let mut observed_rows = 0usize;
+    let mut observed_bytes = 0u64;
+    let mut stream = dataframe.execute_stream().await.map_err(QueryError::from)?;
+
+    while let Some(batch) = stream.try_next().await.map_err(QueryError::from)? {
+        observed_rows = observed_rows.saturating_add(batch.num_rows());
+        observed_bytes = observed_bytes.saturating_add(record_batch_memory_size(&batch));
+
+        if let Some(max_rows) = policy.max_output_rows {
+            if observed_rows > max_rows {
+                return Err(QueryPolicyError::OutputRowsExceeded {
+                    observed_rows,
+                    max_rows,
+                }
+                .into());
+            }
+        }
+
+        if let Some(max_bytes) = policy.max_output_bytes {
+            if observed_bytes > max_bytes {
+                return Err(QueryPolicyError::OutputBytesExceeded {
+                    observed_bytes,
+                    max_bytes,
+                }
+                .into());
+            }
+        }
+
+        output.push(batch);
+    }
+
+    Ok(output)
+}
+
+fn record_batch_memory_size(batch: &RecordBatch) -> u64 {
+    u64::try_from(batch.get_array_memory_size()).unwrap_or(u64::MAX)
 }
 
 fn validate_sql_text_policy(sql: &str, policy: QueryPolicy) -> Result<(), QueryPolicyError> {

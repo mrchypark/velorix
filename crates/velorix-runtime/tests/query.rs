@@ -312,6 +312,51 @@ async fn query_recovered_materialized_view_with_policy_applies_row_limit_to_reco
 }
 
 #[tokio::test]
+async fn query_recovered_materialized_view_with_policy_applies_byte_limit_under_row_limit() {
+    let (_temp_dir, store) = temp_store();
+    let ingest_log = IngestLog::new(Arc::clone(&store));
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+
+    let checkpoint_input = batch([input_delta("account-with-wide-output", 10, 1)]);
+
+    append_ingest_envelope(&ingest_log, "orders", 0, 0, 1, &checkpoint_input).await;
+
+    let mut checkpointed_view = KeyedSumCountAggregate::new();
+    checkpointed_view.apply(&checkpoint_input).unwrap();
+    let state_ref = write_checkpoint_state(
+        &publisher,
+        "state-query-byte-policy",
+        1,
+        &checkpointed_view.state(),
+    )
+    .await;
+    publisher
+        .publish_manifest(&manifest(1, state_ref))
+        .await
+        .unwrap();
+
+    let error = query_recovered_materialized_view_with_policy(
+        Arc::clone(&store),
+        "select key_json, value_json, weight from input",
+        QueryPolicy {
+            max_output_rows: Some(10),
+            max_output_bytes: Some(1),
+            ..QueryPolicy::default()
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RuntimeQueryError::Query(QueryError::Policy(QueryPolicyError::OutputBytesExceeded {
+            observed_bytes,
+            max_bytes: 1,
+        })) if observed_bytes > 1
+    ));
+}
+
+#[tokio::test]
 async fn recovery_rejects_json_bytes_under_valid_v1_ingest_key() {
     let (_temp_dir, store) = temp_store();
     let ingest_log = IngestLog::new(Arc::clone(&store));
@@ -476,6 +521,38 @@ async fn query_object_backed_input_applies_policy_row_limit() {
             observed_rows: 2,
             max_rows: 1
         }))
+    ));
+}
+
+#[tokio::test]
+async fn query_object_backed_input_applies_byte_limit_under_row_limit() {
+    let store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
+    put_parquet_input(
+        &store,
+        "input/part-000.parquet",
+        &parquet_input_batch(&["\"account-with-wide-output\""], &["10"], &[1]),
+    )
+    .await;
+
+    let error = query_object_backed_input_with_policy(
+        Arc::clone(&store),
+        "memory://velorix/input/",
+        "select key_json, value_json, weight from input",
+        QueryPolicy {
+            max_output_rows: Some(10),
+            max_output_bytes: Some(1),
+            ..QueryPolicy::default()
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RuntimeQueryError::Query(QueryError::Policy(QueryPolicyError::OutputBytesExceeded {
+            observed_bytes,
+            max_bytes: 1,
+        })) if observed_bytes > 1
     ));
 }
 
