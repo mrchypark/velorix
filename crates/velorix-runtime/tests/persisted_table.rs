@@ -16,8 +16,9 @@ use velorix_core::query::{QueryError, QueryPolicy, QueryPolicyError};
 use velorix_runtime::{
     persisted_table::{
         query_persisted_object_backed_input_with_policy,
-        query_production_persisted_object_backed_input_with_policy, PersistedTableError,
-        PersistedTableFormat, PersistedTableStore, ProductionPersistedTableFormat,
+        query_production_persisted_object_backed_input_with_policy,
+        CreateProductionPersistedTableSpecRequest, PersistedTableError, PersistedTableFormat,
+        PersistedTableStore, ProductionPersistedTableFormat,
     },
     query::RuntimeQueryError,
     storage_registry::StorageRegistry,
@@ -29,6 +30,23 @@ fn temp_store() -> (TempDir, Arc<dyn ObjectStore>) {
     let store = LocalFileSystem::new_with_prefix(temp_dir.path()).unwrap();
 
     (temp_dir, Arc::new(store))
+}
+
+fn production_request(
+    store_id: &str,
+    object_key_prefix: &str,
+) -> CreateProductionPersistedTableSpecRequest {
+    CreateProductionPersistedTableSpecRequest {
+        table_id: "orders-current".to_string(),
+        tenant_id: "tenant-a".to_string(),
+        store_id: store_id.to_string(),
+        object_key_prefix: object_key_prefix.to_string(),
+        snapshot_ref: "snapshots/0001".to_string(),
+        format: ProductionPersistedTableFormat::Parquet,
+        schema_fingerprint:
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        query_policy_id: "standard".to_string(),
+    }
 }
 
 #[tokio::test]
@@ -271,16 +289,10 @@ async fn production_persisted_table_store_rejects_cross_tenant_prefix() {
     let catalog = PersistedTableStore::new(Arc::clone(&store));
 
     let error = catalog
-        .create_production(
-            "orders-current",
-            "tenant-a",
+        .create_production(production_request(
             "primary",
             "tenants/tenant-b/tables/orders",
-            "snapshots/0001",
-            ProductionPersistedTableFormat::Parquet,
-            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "standard",
-        )
+        ))
         .await
         .unwrap_err();
 
@@ -300,16 +312,10 @@ async fn production_object_backed_table_query_rejects_unregistered_store_id() {
     let registry = StorageRegistry::new();
 
     PersistedTableStore::new(Arc::clone(&catalog_store))
-        .create_production(
-            "orders-current",
-            "tenant-a",
+        .create_production(production_request(
             "missing-store",
             "tenants/tenant-a/tables/orders",
-            "snapshots/0001",
-            ProductionPersistedTableFormat::Parquet,
-            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "standard",
-        )
+        ))
         .await
         .unwrap();
 
@@ -355,16 +361,10 @@ async fn production_object_backed_table_query_resolves_registered_store_and_scan
         .unwrap();
 
     PersistedTableStore::new(Arc::clone(&catalog_store))
-        .create_production(
-            "orders-current",
-            "tenant-a",
+        .create_production(production_request(
             "primary",
             "tenants/tenant-a/tables/orders",
-            "snapshots/0001",
-            ProductionPersistedTableFormat::Parquet,
-            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "standard",
-        )
+        ))
         .await
         .unwrap();
 
@@ -409,16 +409,10 @@ async fn production_object_backed_table_query_rejects_scan_above_file_count_limi
         .unwrap();
 
     PersistedTableStore::new(Arc::clone(&catalog_store))
-        .create_production(
-            "orders-current",
-            "tenant-a",
+        .create_production(production_request(
             "primary",
             "tenants/tenant-a/tables/orders",
-            "snapshots/0001",
-            ProductionPersistedTableFormat::Parquet,
-            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "standard",
-        )
+        ))
         .await
         .unwrap();
 
@@ -469,16 +463,10 @@ async fn production_object_backed_table_query_rejects_object_requests_above_limi
         .unwrap();
 
     PersistedTableStore::new(Arc::clone(&catalog_store))
-        .create_production(
-            "orders-current",
-            "tenant-a",
+        .create_production(production_request(
             "primary",
             "tenants/tenant-a/tables/orders",
-            "snapshots/0001",
-            ProductionPersistedTableFormat::Parquet,
-            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "standard",
-        )
+        ))
         .await
         .unwrap();
 
@@ -523,16 +511,10 @@ async fn production_object_backed_table_query_still_applies_output_row_limit() {
         .unwrap();
 
     PersistedTableStore::new(Arc::clone(&catalog_store))
-        .create_production(
-            "orders-current",
-            "tenant-a",
+        .create_production(production_request(
             "primary",
             "tenants/tenant-a/tables/orders",
-            "snapshots/0001",
-            ProductionPersistedTableFormat::Parquet,
-            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "standard",
-        )
+        ))
         .await
         .unwrap();
 

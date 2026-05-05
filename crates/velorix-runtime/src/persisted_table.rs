@@ -49,6 +49,18 @@ pub struct ProductionPersistedTableSpec {
     pub query_policy_id: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateProductionPersistedTableSpecRequest {
+    pub table_id: String,
+    pub tenant_id: String,
+    pub store_id: String,
+    pub object_key_prefix: String,
+    pub snapshot_ref: String,
+    pub format: ProductionPersistedTableFormat,
+    pub schema_fingerprint: String,
+    pub query_policy_id: String,
+}
+
 #[derive(Debug, Error)]
 pub enum PersistedTableError {
     #[error(transparent)]
@@ -143,36 +155,29 @@ impl PersistedTableStore {
 
     pub async fn create_production(
         &self,
-        table_id: &str,
-        tenant_id: &str,
-        store_id: &str,
-        object_key_prefix: &str,
-        snapshot_ref: &str,
-        format: ProductionPersistedTableFormat,
-        schema_fingerprint: &str,
-        query_policy_id: &str,
+        request: CreateProductionPersistedTableSpecRequest,
     ) -> Result<ProductionPersistedTableSpec, PersistedTableError> {
-        let object_key = ObjectKey::query_table(table_id)?;
+        let object_key = ObjectKey::query_table(&request.table_id)?;
         validate_production_table_fields(
-            table_id,
-            tenant_id,
-            store_id,
-            object_key_prefix,
-            snapshot_ref,
-            schema_fingerprint,
-            query_policy_id,
+            &request.table_id,
+            &request.tenant_id,
+            &request.store_id,
+            &request.object_key_prefix,
+            &request.snapshot_ref,
+            &request.schema_fingerprint,
+            &request.query_policy_id,
         )?;
 
         let spec = ProductionPersistedTableSpec {
             schema_version: PERSISTED_TABLE_SCHEMA_VERSION,
-            table_id: table_id.to_string(),
-            tenant_id: tenant_id.to_string(),
-            store_id: store_id.to_string(),
-            object_key_prefix: object_key_prefix.to_string(),
-            snapshot_ref: snapshot_ref.to_string(),
-            format,
-            schema_fingerprint: schema_fingerprint.to_string(),
-            query_policy_id: query_policy_id.to_string(),
+            table_id: request.table_id,
+            tenant_id: request.tenant_id,
+            store_id: request.store_id,
+            object_key_prefix: request.object_key_prefix,
+            snapshot_ref: request.snapshot_ref,
+            format: request.format,
+            schema_fingerprint: request.schema_fingerprint,
+            query_policy_id: request.query_policy_id,
         };
         let bytes = serde_json::to_vec(&spec)?;
         self.store
