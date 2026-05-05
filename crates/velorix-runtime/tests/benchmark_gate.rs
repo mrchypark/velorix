@@ -1,6 +1,6 @@
 use velorix_runtime::benchmark_gate::{
     BenchmarkBackend, BenchmarkBudgetV1, BenchmarkGateError, BenchmarkGateLevel,
-    BenchmarkGateResultV1, BenchmarkMetricsV1, ObjectRequestMetricsV1,
+    BenchmarkGateResultV1, BenchmarkMetricsV1, BenchmarkWorkloadMetricsV1, ObjectRequestMetricsV1,
 };
 
 #[test]
@@ -35,6 +35,73 @@ fn local_smoke_result_validation_fails_when_object_request_metrics_are_missing()
     .unwrap_err();
 
     assert!(matches!(error, BenchmarkGateError::Json(_)));
+}
+
+#[test]
+fn benchmark_result_validation_fails_when_workload_metrics_are_empty() {
+    let mut result = local_smoke_result();
+    result.workload_metrics.clear();
+
+    let error = result.validate().unwrap_err();
+
+    assert!(error.to_string().contains("workload_metrics"));
+}
+
+#[test]
+fn benchmark_result_validation_fails_when_workload_metric_names_repeat() {
+    let mut result = local_smoke_result();
+    result
+        .workload_metrics
+        .push(result.workload_metrics[0].clone());
+
+    let error = result.validate().unwrap_err();
+
+    assert!(error.to_string().contains("duplicate workload metric"));
+}
+
+#[test]
+fn benchmark_result_validation_fails_when_workload_p95_is_below_p50() {
+    let mut result = local_smoke_result();
+    result.workload_metrics[0].p50_ms = 5.0;
+    result.workload_metrics[0].p95_ms = 4.0;
+
+    let error = result.validate().unwrap_err();
+
+    assert!(error.to_string().contains("p95_ms"));
+}
+
+#[test]
+fn benchmark_result_validation_fails_when_object_backed_workload_has_no_requests() {
+    let mut result = local_smoke_result();
+    result.workload_metrics[0].object_requests = None;
+
+    let error = result.validate().unwrap_err();
+
+    assert!(error.to_string().contains("object_requests"));
+}
+
+#[test]
+fn benchmark_gate_can_require_specific_workload_names() {
+    let result = local_smoke_result();
+
+    result
+        .require_workloads(&[
+            "ingest_envelope_validation",
+            "checkpoint_publish",
+            "checkpoint_recovery",
+        ])
+        .unwrap();
+}
+
+#[test]
+fn benchmark_gate_rejects_missing_required_workload_name() {
+    let result = local_smoke_result();
+
+    let error = result
+        .require_workloads(&["ingest_envelope_validation", "datafusion_table_scan"])
+        .unwrap_err();
+
+    assert!(error.to_string().contains("datafusion_table_scan"));
 }
 
 #[test]
@@ -79,6 +146,58 @@ fn benchmark_comparison_fails_when_synthetic_regression_exceeds_budget() {
 }
 
 #[test]
+fn benchmark_comparison_fails_when_workload_latency_regresses_over_budget() {
+    let mut current = local_smoke_result();
+    let baseline = local_smoke_result();
+    current.workload_metrics[0].p95_ms = baseline.workload_metrics[0].p95_ms * 1.20;
+
+    let error = current
+        .compare_against(&baseline, BenchmarkBudgetV1::relative(0.10))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        BenchmarkGateError::WorkloadRegression {
+            workload,
+            metric: "p95_ms",
+            ..
+        } if workload == "ingest_envelope_validation"
+    ));
+}
+
+#[test]
+fn benchmark_comparison_fails_when_baseline_lacks_workload_metric() {
+    let current = local_smoke_result();
+    let mut baseline = local_smoke_result();
+    baseline.workload_metrics.pop();
+
+    let error = current
+        .compare_against(&baseline, BenchmarkBudgetV1::relative(0.10))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        BenchmarkGateError::MissingBaselineWorkload { name } if name == "checkpoint_recovery"
+    ));
+}
+
+#[test]
+fn benchmark_comparison_fails_when_current_lacks_baseline_workload_metric() {
+    let mut current = local_smoke_result();
+    let baseline = local_smoke_result();
+    current.workload_metrics.pop();
+
+    let error = current
+        .compare_against(&baseline, BenchmarkBudgetV1::relative(0.10))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        BenchmarkGateError::MissingCurrentWorkload { name } if name == "checkpoint_recovery"
+    ));
+}
+
+#[test]
 fn benchmark_comparison_passes_when_synthetic_regression_is_within_budget() {
     let mut current = local_smoke_result();
     let baseline = local_smoke_result();
@@ -115,7 +234,55 @@ fn local_smoke_result() -> BenchmarkGateResultV1 {
             spill_bytes: 0,
             scan_bytes: 0,
         },
+        workload_metrics: local_workload_metrics(),
     }
+}
+
+fn local_workload_metrics() -> Vec<BenchmarkWorkloadMetricsV1> {
+    vec![
+        BenchmarkWorkloadMetricsV1 {
+            name: "ingest_envelope_validation".to_string(),
+            p50_ms: 2.0,
+            p95_ms: 3.0,
+            object_requests: Some(ObjectRequestMetricsV1 {
+                put_count: 4,
+                get_count: 0,
+                list_count: 0,
+                range_read_count: 0,
+                bytes_written: 1024,
+                bytes_read: 0,
+            }),
+            scan_bytes: 0,
+        },
+        BenchmarkWorkloadMetricsV1 {
+            name: "checkpoint_publish".to_string(),
+            p50_ms: 3.0,
+            p95_ms: 4.0,
+            object_requests: Some(ObjectRequestMetricsV1 {
+                put_count: 2,
+                get_count: 0,
+                list_count: 0,
+                range_read_count: 0,
+                bytes_written: 512,
+                bytes_read: 0,
+            }),
+            scan_bytes: 0,
+        },
+        BenchmarkWorkloadMetricsV1 {
+            name: "checkpoint_recovery".to_string(),
+            p50_ms: 7.0,
+            p95_ms: 7.0,
+            object_requests: Some(ObjectRequestMetricsV1 {
+                put_count: 0,
+                get_count: 2,
+                list_count: 1,
+                range_read_count: 0,
+                bytes_written: 0,
+                bytes_read: 512,
+            }),
+            scan_bytes: 0,
+        },
+    ]
 }
 
 const VALID_LOCAL_SMOKE_JSON: &str = r#"{
@@ -142,5 +309,49 @@ const VALID_LOCAL_SMOKE_JSON: &str = r#"{
         "peak_rss_bytes": 0,
         "spill_bytes": 0,
         "scan_bytes": 0
-    }
+    },
+    "workload_metrics": [
+        {
+            "name": "ingest_envelope_validation",
+            "p50_ms": 2.0,
+            "p95_ms": 3.0,
+            "object_requests": {
+                "put_count": 4,
+                "get_count": 0,
+                "list_count": 0,
+                "range_read_count": 0,
+                "bytes_written": 1024,
+                "bytes_read": 0
+            },
+            "scan_bytes": 0
+        },
+        {
+            "name": "checkpoint_publish",
+            "p50_ms": 3.0,
+            "p95_ms": 4.0,
+            "object_requests": {
+                "put_count": 2,
+                "get_count": 0,
+                "list_count": 0,
+                "range_read_count": 0,
+                "bytes_written": 512,
+                "bytes_read": 0
+            },
+            "scan_bytes": 0
+        },
+        {
+            "name": "checkpoint_recovery",
+            "p50_ms": 7.0,
+            "p95_ms": 7.0,
+            "object_requests": {
+                "put_count": 0,
+                "get_count": 2,
+                "list_count": 1,
+                "range_read_count": 0,
+                "bytes_written": 0,
+                "bytes_read": 512
+            },
+            "scan_bytes": 0
+        }
+    ]
 }"#;

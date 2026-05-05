@@ -13,4 +13,5 @@ velorix-runtime = { path = "../velorix-runtime" }
 velorix-storage = { path = "../velorix-storage" }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 tempfile = { workspace = true }

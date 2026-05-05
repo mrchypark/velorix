@@ -1,5 +1,7 @@
 //! Machine-readable benchmark gate results and regression checks.
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 
 const V1_SCHEMA_VERSION: u8 = 1;
@@ -28,6 +30,7 @@ pub struct BenchmarkGateResultV1 {
     pub backend: BenchmarkBackend,
     pub workload: String,
     pub metrics: BenchmarkMetricsV1,
+    pub workload_metrics: Vec<BenchmarkWorkloadMetricsV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -42,6 +45,16 @@ pub struct BenchmarkMetricsV1 {
     pub recovery_p95_ms: f64,
     pub peak_rss_bytes: u64,
     pub spill_bytes: u64,
+    pub scan_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BenchmarkWorkloadMetricsV1 {
+    pub name: String,
+    pub p50_ms: f64,
+    pub p95_ms: f64,
+    pub object_requests: Option<ObjectRequestMetricsV1>,
     pub scan_bytes: u64,
 }
 
@@ -79,6 +92,26 @@ pub enum BenchmarkGateError {
     MissingRequiredField { field: &'static str },
     #[error("benchmark metric {metric} must be finite and non-negative, got {value}")]
     InvalidMetric { metric: &'static str, value: f64 },
+    #[error("benchmark workload_metrics must be non-empty")]
+    MissingWorkloadMetrics,
+    #[error("benchmark workload_metrics contains duplicate workload metric {name}")]
+    DuplicateWorkloadMetric { name: String },
+    #[error(
+        "benchmark workload metric {name} has invalid latency order: p95_ms {p95_ms} is below p50_ms {p50_ms}"
+    )]
+    InvalidWorkloadLatencyOrder {
+        name: String,
+        p50_ms: f64,
+        p95_ms: f64,
+    },
+    #[error("benchmark workload metric {name} requires object_requests")]
+    MissingWorkloadObjectRequests { name: String },
+    #[error("benchmark result is missing required workload metric {name}")]
+    MissingRequiredWorkload { name: String },
+    #[error("benchmark baseline is missing workload metric {name}")]
+    MissingBaselineWorkload { name: String },
+    #[error("benchmark result is missing baseline workload metric {name}")]
+    MissingCurrentWorkload { name: String },
     #[error("benchmark budget must be finite and non-negative, got {value}")]
     InvalidBudget { value: f64 },
     #[error(
@@ -109,6 +142,15 @@ pub enum BenchmarkGateError {
         regression_fraction: f64,
         budget_fraction: f64,
     },
+    #[error(
+        "benchmark workload {workload} metric {metric} regressed by {regression_fraction:.3}, over budget {budget_fraction:.3}"
+    )]
+    WorkloadRegression {
+        workload: String,
+        metric: &'static str,
+        regression_fraction: f64,
+        budget_fraction: f64,
+    },
 }
 
 impl BenchmarkGateResultV1 {
@@ -130,7 +172,8 @@ impl BenchmarkGateResultV1 {
         if self.workload.trim().is_empty() {
             return Err(BenchmarkGateError::MissingRequiredField { field: "workload" });
         }
-        self.metrics.validate()
+        self.metrics.validate()?;
+        validate_workload_metrics(&self.workload_metrics)
     }
 
     pub fn expect_gate(
@@ -250,7 +293,30 @@ impl BenchmarkGateResultV1 {
             self.metrics.scan_bytes as f64,
             baseline.metrics.scan_bytes as f64,
             budget.max_regression_fraction,
+        )?;
+        compare_workload_metrics(
+            &self.workload_metrics,
+            &baseline.workload_metrics,
+            budget.max_regression_fraction,
         )
+    }
+
+    pub fn require_workloads(&self, required: &[&str]) -> Result<(), BenchmarkGateError> {
+        let present = self
+            .workload_metrics
+            .iter()
+            .map(|workload| workload.name.as_str())
+            .collect::<HashSet<_>>();
+
+        for name in required {
+            if !present.contains(name) {
+                return Err(BenchmarkGateError::MissingRequiredWorkload {
+                    name: (*name).to_string(),
+                });
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -278,6 +344,120 @@ impl BenchmarkBudgetV1 {
     }
 }
 
+fn compare_workload_metrics(
+    current: &[BenchmarkWorkloadMetricsV1],
+    baseline: &[BenchmarkWorkloadMetricsV1],
+    budget_fraction: f64,
+) -> Result<(), BenchmarkGateError> {
+    for baseline_workload in baseline {
+        if !current
+            .iter()
+            .any(|workload| workload.name == baseline_workload.name)
+        {
+            return Err(BenchmarkGateError::MissingCurrentWorkload {
+                name: baseline_workload.name.clone(),
+            });
+        }
+    }
+
+    for current_workload in current {
+        let Some(baseline_workload) = baseline
+            .iter()
+            .find(|workload| workload.name == current_workload.name)
+        else {
+            return Err(BenchmarkGateError::MissingBaselineWorkload {
+                name: current_workload.name.clone(),
+            });
+        };
+
+        compare_lower_workload_metric(
+            &current_workload.name,
+            "p50_ms",
+            current_workload.p50_ms,
+            baseline_workload.p50_ms,
+            budget_fraction,
+        )?;
+        compare_lower_workload_metric(
+            &current_workload.name,
+            "p95_ms",
+            current_workload.p95_ms,
+            baseline_workload.p95_ms,
+            budget_fraction,
+        )?;
+        compare_lower_workload_metric(
+            &current_workload.name,
+            "scan_bytes",
+            current_workload.scan_bytes as f64,
+            baseline_workload.scan_bytes as f64,
+            budget_fraction,
+        )?;
+
+        if let (Some(current_requests), Some(baseline_requests)) = (
+            &current_workload.object_requests,
+            &baseline_workload.object_requests,
+        ) {
+            compare_workload_object_requests(
+                &current_workload.name,
+                current_requests,
+                baseline_requests,
+                budget_fraction,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn compare_workload_object_requests(
+    workload: &str,
+    current: &ObjectRequestMetricsV1,
+    baseline: &ObjectRequestMetricsV1,
+    budget_fraction: f64,
+) -> Result<(), BenchmarkGateError> {
+    compare_lower_workload_metric(
+        workload,
+        "put_count",
+        current.put_count as f64,
+        baseline.put_count as f64,
+        budget_fraction,
+    )?;
+    compare_lower_workload_metric(
+        workload,
+        "get_count",
+        current.get_count as f64,
+        baseline.get_count as f64,
+        budget_fraction,
+    )?;
+    compare_lower_workload_metric(
+        workload,
+        "list_count",
+        current.list_count as f64,
+        baseline.list_count as f64,
+        budget_fraction,
+    )?;
+    compare_lower_workload_metric(
+        workload,
+        "range_read_count",
+        current.range_read_count as f64,
+        baseline.range_read_count as f64,
+        budget_fraction,
+    )?;
+    compare_lower_workload_metric(
+        workload,
+        "bytes_written",
+        current.bytes_written as f64,
+        baseline.bytes_written as f64,
+        budget_fraction,
+    )?;
+    compare_lower_workload_metric(
+        workload,
+        "bytes_read",
+        current.bytes_read as f64,
+        baseline.bytes_read as f64,
+        budget_fraction,
+    )
+}
+
 fn validate_finite_non_negative(
     metric: &'static str,
     value: f64,
@@ -287,6 +467,58 @@ fn validate_finite_non_negative(
     } else {
         Err(BenchmarkGateError::InvalidMetric { metric, value })
     }
+}
+
+fn validate_workload_metrics(
+    workloads: &[BenchmarkWorkloadMetricsV1],
+) -> Result<(), BenchmarkGateError> {
+    if workloads.is_empty() {
+        return Err(BenchmarkGateError::MissingWorkloadMetrics);
+    }
+
+    let mut names = HashSet::new();
+    for workload in workloads {
+        let name = workload.name.trim();
+        if name.is_empty() {
+            return Err(BenchmarkGateError::MissingRequiredField {
+                field: "workload_metrics.name",
+            });
+        }
+        if !names.insert(name) {
+            return Err(BenchmarkGateError::DuplicateWorkloadMetric {
+                name: name.to_string(),
+            });
+        }
+
+        validate_finite_non_negative("workload_metrics.p50_ms", workload.p50_ms)?;
+        validate_finite_non_negative("workload_metrics.p95_ms", workload.p95_ms)?;
+        if workload.p95_ms < workload.p50_ms {
+            return Err(BenchmarkGateError::InvalidWorkloadLatencyOrder {
+                name: name.to_string(),
+                p50_ms: workload.p50_ms,
+                p95_ms: workload.p95_ms,
+            });
+        }
+        if workload.object_requests.is_none() && is_object_backed_workload(name) {
+            return Err(BenchmarkGateError::MissingWorkloadObjectRequests {
+                name: name.to_string(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn is_object_backed_workload(name: &str) -> bool {
+    matches!(
+        name,
+        "ingest_envelope_validation"
+            | "checkpoint_publish"
+            | "checkpoint_recovery"
+            | "datafusion_table_scan"
+            | "slatedb_state_reopen"
+            | "gc_dry_run_planning"
+    )
 }
 
 fn compare_higher_is_better(
@@ -319,6 +551,35 @@ fn compare_lower_is_better(
         (current - baseline) / baseline
     };
     fail_if_over_budget(metric, regression_fraction, budget_fraction)
+}
+
+fn compare_lower_workload_metric(
+    workload: &str,
+    metric: &'static str,
+    current: f64,
+    baseline: f64,
+    budget_fraction: f64,
+) -> Result<(), BenchmarkGateError> {
+    let regression_fraction = if baseline == 0.0 {
+        if current > 0.0 {
+            f64::INFINITY
+        } else {
+            0.0
+        }
+    } else {
+        (current - baseline) / baseline
+    };
+
+    if regression_fraction > budget_fraction {
+        Err(BenchmarkGateError::WorkloadRegression {
+            workload: workload.to_string(),
+            metric,
+            regression_fraction,
+            budget_fraction,
+        })
+    } else {
+        Ok(())
+    }
 }
 
 fn fail_if_over_budget(

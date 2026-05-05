@@ -682,8 +682,15 @@ cargo run -p velorix-cli -- benchmark-gate \
 
 - [ ] Each workload emits p50 and p95 latency.
 - [ ] Each workload emits object requests and scan bytes where object storage is used.
-- [ ] S3-compatible benchmark requires `VELORIX_S3_COMPAT=1`.
+- [x] S3-compatible benchmark requires `VELORIX_S3_COMPAT=1`.
 - [ ] Commit: `bench: add production readiness workloads`.
+
+Progress note: this slice adds strict V1 workload detail schema and real
+`local_incremental` workload details for ingest envelope validation,
+checkpoint publication, and checkpoint recovery. DataFusion table scan,
+SlateDB state write/read/reopen, and GC dry-run planning remain pending until
+the benchmark harness measures those paths directly. `s3_incremental` is
+fail-closed and does not emit benchmark JSON without a live implementation.
 
 ## Phase 7: Admin Readiness and Product Surface
 

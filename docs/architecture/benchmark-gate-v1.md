@@ -20,6 +20,9 @@ machine-readable benchmark regression checks.
 Benchmark output must be JSON and include commit, backend, workload,
 rows/second, bytes/row, PUT per GiB, GET/list/range-read counts, checkpoint p50
 and p95 latency, recovery p95 latency, peak RSS, spill bytes, and scan bytes.
+It must also include a non-empty `workload_metrics` array. Each entry names a
+measured production-readiness workload and records p50/p95 latency, scan bytes,
+and object request metrics for object-backed workloads.
 
 Initial gates should use regression budgets rather than absolute targets. Local
 filesystem and S3-compatible baselines are separate and not interchangeable.
@@ -27,6 +30,10 @@ The initial committed baselines are conservative placeholders for wiring the
 gate; they are not production performance claims.
 
 `local_incremental` is a bootstrap harness, not production readiness evidence.
+It currently emits real workload details for ingest envelope validation,
+checkpoint publication, and checkpoint recovery only. DataFusion table scan,
+SlateDB state reopen, and GC dry-run planning workload details remain pending
+until those paths are measured directly.
 
 ## Required Workloads
 
@@ -48,7 +55,7 @@ gate; they are not production performance claims.
 - `velorix-cli benchmark-validate` validates a single benchmark output file.
 - `velorix-cli benchmark-gate --gate-level <level> --backend <backend>`
   compares a result against a matching baseline with a caller-supplied
-  regression budget.
+  regression budget and requires the current V1 workload detail names.
 - Synthetic regression over budget fails the gate.
 - Local and S3 baselines cannot be mixed.
 - Missing object request metrics invalidates the result.
@@ -58,3 +65,6 @@ gate; they are not production performance claims.
   configured.
 - Release gating fails closed when no S3-compatible result path is provided or
   when the release baseline is still a placeholder.
+- `s3_incremental` fails closed unless `VELORIX_S3_COMPAT=1` is set. With the
+  flag set, it still requires real S3-compatible object-store configuration and
+  refuses to emit benchmark JSON until the live workload is implemented.

@@ -30,6 +30,11 @@ name = "local_incremental"
 path = "../../benches/local_incremental.rs"
 harness = false
 
+[[bench]]
+name = "s3_incremental"
+path = "../../benches/s3_incremental.rs"
+harness = false
+
 [dev-dependencies]
 async-trait = { workspace = true }
 bytes = { workspace = true }

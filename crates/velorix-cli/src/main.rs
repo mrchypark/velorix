@@ -8,6 +8,12 @@ use object_store::{local::LocalFileSystem, ObjectStore};
 use velorix_runtime::benchmark_gate::{
     BenchmarkBackend, BenchmarkBudgetV1, BenchmarkGateLevel, BenchmarkGateResultV1,
 };
+
+const BENCHMARK_GATE_WORKLOADS: &[&str] = &[
+    "ingest_envelope_validation",
+    "checkpoint_publish",
+    "checkpoint_recovery",
+];
 use velorix_runtime::recovery::RecoveredRuntime;
 use velorix_storage::{
     checkpoint_index::{
@@ -172,6 +178,14 @@ fn run_benchmark_gate(
                     result.display()
                 )
             })?;
+        current_result
+            .require_workloads(BENCHMARK_GATE_WORKLOADS)
+            .with_context(|| {
+                format!(
+                    "benchmark result {} is missing required workload metrics",
+                    result.display()
+                )
+            })?;
     }
 
     let Some(baseline) = baseline else {
@@ -190,6 +204,14 @@ fn run_benchmark_gate(
             .with_context(|| {
                 format!(
                     "benchmark baseline {} does not match CLI gate",
+                    baseline.display()
+                )
+            })?;
+        baseline_result
+            .require_workloads(BENCHMARK_GATE_WORKLOADS)
+            .with_context(|| {
+                format!(
+                    "benchmark baseline {} is missing required workload metrics",
                     baseline.display()
                 )
             })?;
@@ -269,19 +291,19 @@ mod tests {
 
     #[test]
     fn benchmark_result_parser_accepts_pretty_json() {
-        parse_benchmark_result_text(VALID_RESULT_JSON).unwrap();
+        parse_benchmark_result_text(&valid_result_json()).unwrap();
     }
 
     #[test]
     fn benchmark_result_parser_accepts_jsonl_last_line() {
-        parse_benchmark_result_text(&format!("ignored status line\n{VALID_RESULT_JSONL}\n"))
-            .unwrap();
+        let jsonl = valid_result_json_compact();
+        parse_benchmark_result_text(&format!("ignored status line\n{jsonl}\n")).unwrap();
     }
 
     #[test]
     fn benchmark_gate_comparison_rejects_mismatched_backend() {
-        let baseline = parse_benchmark_result_text(VALID_RESULT_JSON).unwrap();
-        let current = parse_benchmark_result_text(S3_RESULT_JSON).unwrap();
+        let baseline = parse_benchmark_result_text(&valid_result_json()).unwrap();
+        let current = parse_benchmark_result_text(&s3_result_json()).unwrap();
 
         let error = current
             .compare_against(&baseline, BenchmarkBudgetV1::relative(0.10))
@@ -294,7 +316,7 @@ mod tests {
     fn benchmark_gate_validate_only_accepts_valid_result() {
         let dir = tempdir().unwrap();
         let result = dir.path().join("result.json");
-        fs::write(&result, VALID_RESULT_JSON).unwrap();
+        fs::write(&result, valid_result_json()).unwrap();
 
         run_benchmark_gate(None, &result, None, None, None).unwrap();
     }
@@ -349,8 +371,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let baseline = dir.path().join("baseline.json");
         let result = dir.path().join("result.json");
-        fs::write(&baseline, VALID_RESULT_JSON).unwrap();
-        fs::write(&result, VALID_RESULT_JSON).unwrap();
+        fs::write(&baseline, valid_result_json()).unwrap();
+        fs::write(&result, valid_result_json()).unwrap();
 
         run_benchmark_gate(
             Some(&baseline),
@@ -367,8 +389,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let baseline = dir.path().join("baseline.json");
         let result = dir.path().join("result.json");
-        fs::write(&baseline, VALID_RESULT_JSON).unwrap();
-        fs::write(&result, REGRESSED_RESULT_JSON).unwrap();
+        fs::write(&baseline, valid_result_json()).unwrap();
+        fs::write(&result, regressed_result_json()).unwrap();
 
         let error = run_benchmark_gate(
             Some(&baseline),
@@ -388,8 +410,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let baseline = dir.path().join("baseline.json");
         let result = dir.path().join("result.json");
-        fs::write(&baseline, VALID_RESULT_JSON).unwrap();
-        fs::write(&result, VALID_RESULT_JSON).unwrap();
+        fs::write(&baseline, valid_result_json()).unwrap();
+        fs::write(&result, valid_result_json()).unwrap();
 
         let error = run_benchmark_gate(
             Some(&baseline),
@@ -408,8 +430,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let baseline = dir.path().join("baseline.json");
         let result = dir.path().join("result.json");
-        fs::write(&baseline, PLACEHOLDER_RELEASE_BASELINE_JSON).unwrap();
-        fs::write(&result, RELEASE_RESULT_JSON).unwrap();
+        fs::write(&baseline, placeholder_release_baseline_json()).unwrap();
+        fs::write(&result, release_result_json()).unwrap();
 
         let error = run_benchmark_gate(
             Some(&baseline),
@@ -421,6 +443,26 @@ mod tests {
         .unwrap_err();
 
         assert!(format!("{error:#}").contains("requires a real S3-compatible baseline"));
+    }
+
+    #[test]
+    fn benchmark_gate_comparison_rejects_missing_required_workload_metric() {
+        let dir = tempdir().unwrap();
+        let baseline = dir.path().join("baseline.json");
+        let result = dir.path().join("result.json");
+        fs::write(&baseline, valid_result_json()).unwrap();
+        fs::write(&result, missing_required_workload_json()).unwrap();
+
+        let error = run_benchmark_gate(
+            Some(&baseline),
+            &result,
+            Some(BenchmarkGateLevel::PrSmoke),
+            Some(BenchmarkBackend::Local),
+            Some(0.10),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("checkpoint_recovery"));
     }
 
     #[test]
@@ -456,140 +498,190 @@ mod tests {
         );
     }
 
-    const VALID_RESULT_JSON: &str = r#"{
-        "schema_version": 1,
-        "commit": "abc123",
-        "gate_level": "pr_smoke",
-        "backend": "local",
-        "workload": "local_incremental",
-        "metrics": {
-            "rows_per_second": 1000.0,
-            "bytes_per_row": 128.0,
-            "put_per_gib": 8.0,
-            "object_requests": {
-                "put_count": 8,
-                "get_count": 3,
-                "list_count": 2,
-                "range_read_count": 0,
-                "bytes_written": 1024,
-                "bytes_read": 512
-            },
-            "checkpoint_p50_ms": 3.0,
-            "checkpoint_p95_ms": 4.0,
-            "recovery_p95_ms": 7.0,
-            "peak_rss_bytes": 0,
-            "spill_bytes": 0,
-            "scan_bytes": 0
-        }
-    }"#;
+    fn valid_result_json() -> String {
+        serde_json::to_string_pretty(&normal_result(
+            "abc123",
+            "pr_smoke",
+            "local",
+            "local_incremental",
+            1000.0,
+            workload_metrics(),
+        ))
+        .unwrap()
+    }
 
-    const VALID_RESULT_JSONL: &str = r#"{"schema_version":1,"commit":"abc123","gate_level":"pr_smoke","backend":"local","workload":"local_incremental","metrics":{"rows_per_second":1000.0,"bytes_per_row":128.0,"put_per_gib":8.0,"object_requests":{"put_count":8,"get_count":3,"list_count":2,"range_read_count":0,"bytes_written":1024,"bytes_read":512},"checkpoint_p50_ms":3.0,"checkpoint_p95_ms":4.0,"recovery_p95_ms":7.0,"peak_rss_bytes":0,"spill_bytes":0,"scan_bytes":0}}"#;
+    fn valid_result_json_compact() -> String {
+        serde_json::to_string(&normal_result(
+            "abc123",
+            "pr_smoke",
+            "local",
+            "local_incremental",
+            1000.0,
+            workload_metrics(),
+        ))
+        .unwrap()
+    }
 
-    const S3_RESULT_JSON: &str = r#"{
-        "schema_version": 1,
-        "commit": "abc123",
-        "gate_level": "pr_smoke",
-        "backend": "s3_compatible",
-        "workload": "local_incremental",
-        "metrics": {
-            "rows_per_second": 1000.0,
-            "bytes_per_row": 128.0,
-            "put_per_gib": 8.0,
-            "object_requests": {
-                "put_count": 8,
-                "get_count": 3,
-                "list_count": 2,
-                "range_read_count": 0,
-                "bytes_written": 1024,
-                "bytes_read": 512
-            },
-            "checkpoint_p50_ms": 3.0,
-            "checkpoint_p95_ms": 4.0,
-            "recovery_p95_ms": 7.0,
-            "peak_rss_bytes": 0,
-            "spill_bytes": 0,
-            "scan_bytes": 0
-        }
-    }"#;
+    fn s3_result_json() -> String {
+        serde_json::to_string_pretty(&normal_result(
+            "abc123",
+            "pr_smoke",
+            "s3_compatible",
+            "local_incremental",
+            1000.0,
+            workload_metrics(),
+        ))
+        .unwrap()
+    }
 
-    const RELEASE_RESULT_JSON: &str = r#"{
-        "schema_version": 1,
-        "commit": "abc123",
-        "gate_level": "release",
-        "backend": "s3_compatible",
-        "workload": "s3_incremental",
-        "metrics": {
-            "rows_per_second": 1000.0,
-            "bytes_per_row": 128.0,
-            "put_per_gib": 8.0,
-            "object_requests": {
-                "put_count": 8,
-                "get_count": 3,
-                "list_count": 2,
-                "range_read_count": 0,
-                "bytes_written": 1024,
-                "bytes_read": 512
-            },
-            "checkpoint_p50_ms": 3.0,
-            "checkpoint_p95_ms": 4.0,
-            "recovery_p95_ms": 7.0,
-            "peak_rss_bytes": 0,
-            "spill_bytes": 0,
-            "scan_bytes": 0
-        }
-    }"#;
+    fn release_result_json() -> String {
+        serde_json::to_string_pretty(&normal_result(
+            "abc123",
+            "release",
+            "s3_compatible",
+            "s3_incremental",
+            1000.0,
+            workload_metrics(),
+        ))
+        .unwrap()
+    }
 
-    const PLACEHOLDER_RELEASE_BASELINE_JSON: &str = r#"{
-        "schema_version": 1,
-        "commit": "placeholder-s3-release-baseline",
-        "gate_level": "release",
-        "backend": "s3_compatible",
-        "workload": "s3_incremental",
-        "metrics": {
-            "rows_per_second": 1.0,
-            "bytes_per_row": 1000000000.0,
-            "put_per_gib": 1000000000.0,
-            "object_requests": {
-                "put_count": 1000000,
-                "get_count": 1000000,
-                "list_count": 1000000,
-                "range_read_count": 1000000,
-                "bytes_written": 1000000000000,
-                "bytes_read": 1000000000000
-            },
-            "checkpoint_p50_ms": 600000.0,
-            "checkpoint_p95_ms": 600000.0,
-            "recovery_p95_ms": 600000.0,
-            "peak_rss_bytes": 1099511627776,
-            "spill_bytes": 1099511627776,
-            "scan_bytes": 1099511627776
-        }
-    }"#;
+    fn regressed_result_json() -> String {
+        serde_json::to_string_pretty(&normal_result(
+            "def456",
+            "pr_smoke",
+            "local",
+            "local_incremental",
+            800.0,
+            workload_metrics(),
+        ))
+        .unwrap()
+    }
 
-    const REGRESSED_RESULT_JSON: &str = r#"{
-        "schema_version": 1,
-        "commit": "def456",
-        "gate_level": "pr_smoke",
-        "backend": "local",
-        "workload": "local_incremental",
-        "metrics": {
-            "rows_per_second": 800.0,
-            "bytes_per_row": 128.0,
-            "put_per_gib": 8.0,
-            "object_requests": {
-                "put_count": 8,
-                "get_count": 3,
-                "list_count": 2,
-                "range_read_count": 0,
-                "bytes_written": 1024,
-                "bytes_read": 512
+    fn missing_required_workload_json() -> String {
+        serde_json::to_string_pretty(&normal_result(
+            "def456",
+            "pr_smoke",
+            "local",
+            "local_incremental",
+            1000.0,
+            serde_json::json!([workload_metrics()[0], workload_metrics()[1]]),
+        ))
+        .unwrap()
+    }
+
+    fn placeholder_release_baseline_json() -> String {
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "commit": "placeholder-s3-release-baseline",
+            "gate_level": "release",
+            "backend": "s3_compatible",
+            "workload": "s3_incremental",
+            "metrics": {
+                "rows_per_second": 1.0,
+                "bytes_per_row": 1000000000.0,
+                "put_per_gib": 1000000000.0,
+                "object_requests": {
+                    "put_count": 1000000,
+                    "get_count": 1000000,
+                    "list_count": 1000000,
+                    "range_read_count": 1000000,
+                    "bytes_written": 1000000000000_u64,
+                    "bytes_read": 1000000000000_u64,
+                },
+                "checkpoint_p50_ms": 600000.0,
+                "checkpoint_p95_ms": 600000.0,
+                "recovery_p95_ms": 600000.0,
+                "peak_rss_bytes": 1099511627776_u64,
+                "spill_bytes": 1099511627776_u64,
+                "scan_bytes": 1099511627776_u64,
             },
-            "checkpoint_p50_ms": 3.0,
-            "checkpoint_p95_ms": 4.0,
-            "recovery_p95_ms": 7.0,
-            "peak_rss_bytes": 0,
-            "spill_bytes": 0,
-            "scan_bytes": 0
-        }
-    }"#;
+            "workload_metrics": workload_metrics(),
+        }))
+        .unwrap()
+    }
+
+    fn normal_result(
+        commit: &str,
+        gate_level: &str,
+        backend: &str,
+        workload: &str,
+        rows_per_second: f64,
+        workload_metrics: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "commit": commit,
+            "gate_level": gate_level,
+            "backend": backend,
+            "workload": workload,
+            "metrics": {
+                "rows_per_second": rows_per_second,
+                "bytes_per_row": 128.0,
+                "put_per_gib": 8.0,
+                "object_requests": {
+                    "put_count": 8,
+                    "get_count": 3,
+                    "list_count": 2,
+                    "range_read_count": 0,
+                    "bytes_written": 1024,
+                    "bytes_read": 512,
+                },
+                "checkpoint_p50_ms": 3.0,
+                "checkpoint_p95_ms": 4.0,
+                "recovery_p95_ms": 7.0,
+                "peak_rss_bytes": 0,
+                "spill_bytes": 0,
+                "scan_bytes": 0,
+            },
+            "workload_metrics": workload_metrics,
+        })
+    }
+
+    fn workload_metrics() -> serde_json::Value {
+        serde_json::json!([
+            {
+                "name": "ingest_envelope_validation",
+                "p50_ms": 2.0,
+                "p95_ms": 3.0,
+                "object_requests": {
+                    "put_count": 4,
+                    "get_count": 0,
+                    "list_count": 0,
+                    "range_read_count": 0,
+                    "bytes_written": 1024,
+                    "bytes_read": 0,
+                },
+                "scan_bytes": 0,
+            },
+            {
+                "name": "checkpoint_publish",
+                "p50_ms": 3.0,
+                "p95_ms": 4.0,
+                "object_requests": {
+                    "put_count": 2,
+                    "get_count": 0,
+                    "list_count": 0,
+                    "range_read_count": 0,
+                    "bytes_written": 512,
+                    "bytes_read": 0,
+                },
+                "scan_bytes": 0,
+            },
+            {
+                "name": "checkpoint_recovery",
+                "p50_ms": 7.0,
+                "p95_ms": 7.0,
+                "object_requests": {
+                    "put_count": 0,
+                    "get_count": 2,
+                    "list_count": 1,
+                    "range_read_count": 0,
+                    "bytes_written": 0,
+                    "bytes_read": 512,
+                },
+                "scan_bytes": 0,
+            },
+        ])
+    }
 }

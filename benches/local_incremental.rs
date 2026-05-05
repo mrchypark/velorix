@@ -28,7 +28,7 @@ use velorix_core::{
 };
 use velorix_runtime::benchmark_gate::{
     BenchmarkBackend, BenchmarkGateLevel, BenchmarkGateResultV1, BenchmarkMetricsV1,
-    ObjectRequestMetricsV1,
+    BenchmarkWorkloadMetricsV1, ObjectRequestMetricsV1,
 };
 use velorix_runtime::recovery::{
     orders_sum_count_relation_catalog, RecoveredRuntime, ORDERS_SUM_COUNT_OWNER,
@@ -60,6 +60,8 @@ async fn run() -> BenchResult<()> {
     let mut engine = PrototypeIncrementalEngine::new();
 
     let mut total_records = 0;
+    let mut ingest_samples = Vec::new();
+    let mut ingest_requests = empty_object_requests();
     let ingest_started = Instant::now();
 
     for batch_index in 0..BATCH_COUNT {
@@ -67,13 +69,22 @@ async fn run() -> BenchResult<()> {
         let start_offset = total_records;
         let end_offset = start_offset + RECORDS_PER_BATCH;
 
+        let requests_before = metered_store.snapshot();
+        let validation_started = Instant::now();
         append_ingest_envelope(&ingest_log, start_offset, end_offset, &input).await?;
+        ingest_samples.push(validation_started.elapsed());
+        add_request_delta(
+            &mut ingest_requests,
+            &metered_store.snapshot(),
+            &requests_before,
+        );
         engine.push_changes(batch_index + 1, &input)?;
 
         total_records = end_offset;
     }
 
     let ingest_elapsed = ingest_started.elapsed();
+    let checkpoint_requests_before = metered_store.snapshot();
     let checkpoint_started = Instant::now();
     let checkpoint = engine.checkpoint_state();
     let state_ref = publisher
@@ -102,8 +113,11 @@ async fn run() -> BenchResult<()> {
         })
         .await?;
     let checkpoint_elapsed = checkpoint_started.elapsed();
+    let checkpoint_requests = request_delta(&metered_store.snapshot(), &checkpoint_requests_before);
 
     let tail_input = workload_batch(BATCH_COUNT, RECORDS_PER_BATCH);
+    let requests_before = metered_store.snapshot();
+    let validation_started = Instant::now();
     append_ingest_envelope(
         &ingest_log,
         total_records,
@@ -111,10 +125,18 @@ async fn run() -> BenchResult<()> {
         &tail_input,
     )
     .await?;
+    ingest_samples.push(validation_started.elapsed());
+    add_request_delta(
+        &mut ingest_requests,
+        &metered_store.snapshot(),
+        &requests_before,
+    );
 
+    let recovery_requests_before = metered_store.snapshot();
     let recovery_started = Instant::now();
     let recovered = RecoveredRuntime::recover(Arc::clone(&store)).await?;
     let recovery_elapsed = recovery_started.elapsed();
+    let recovery_requests = request_delta(&metered_store.snapshot(), &recovery_requests_before);
     let recovered_rows = recovered.materialized_state().net_rows()?;
 
     assert_eq!(
@@ -144,6 +166,26 @@ async fn run() -> BenchResult<()> {
             spill_bytes: 0,
             scan_bytes: 0,
         },
+        workload_metrics: vec![
+            workload_metric(
+                "ingest_envelope_validation",
+                &ingest_samples,
+                ingest_requests,
+                0,
+            ),
+            workload_metric(
+                "checkpoint_publish",
+                &[checkpoint_elapsed],
+                checkpoint_requests,
+                0,
+            ),
+            workload_metric(
+                "checkpoint_recovery",
+                &[recovery_elapsed],
+                recovery_requests,
+                0,
+            ),
+        ],
     };
     result.validate()?;
 
@@ -245,6 +287,69 @@ async fn append_ingest_envelope(
 
 fn millis(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
+}
+
+fn workload_metric(
+    name: &str,
+    samples: &[Duration],
+    object_requests: ObjectRequestMetricsV1,
+    scan_bytes: u64,
+) -> BenchmarkWorkloadMetricsV1 {
+    BenchmarkWorkloadMetricsV1 {
+        name: name.to_string(),
+        p50_ms: percentile_ms(samples, 0.50),
+        p95_ms: percentile_ms(samples, 0.95),
+        object_requests: Some(object_requests),
+        scan_bytes,
+    }
+}
+
+fn percentile_ms(samples: &[Duration], percentile: f64) -> f64 {
+    let mut samples = samples.to_vec();
+    samples.sort_unstable();
+    let index = ((samples.len().saturating_sub(1)) as f64 * percentile).ceil() as usize;
+    millis(samples[index])
+}
+
+fn empty_object_requests() -> ObjectRequestMetricsV1 {
+    ObjectRequestMetricsV1 {
+        put_count: 0,
+        get_count: 0,
+        list_count: 0,
+        range_read_count: 0,
+        bytes_written: 0,
+        bytes_read: 0,
+    }
+}
+
+fn add_request_delta(
+    target: &mut ObjectRequestMetricsV1,
+    after: &ObjectRequestMetricsV1,
+    before: &ObjectRequestMetricsV1,
+) {
+    let delta = request_delta(after, before);
+    target.put_count += delta.put_count;
+    target.get_count += delta.get_count;
+    target.list_count += delta.list_count;
+    target.range_read_count += delta.range_read_count;
+    target.bytes_written += delta.bytes_written;
+    target.bytes_read += delta.bytes_read;
+}
+
+fn request_delta(
+    after: &ObjectRequestMetricsV1,
+    before: &ObjectRequestMetricsV1,
+) -> ObjectRequestMetricsV1 {
+    ObjectRequestMetricsV1 {
+        put_count: after.put_count.saturating_sub(before.put_count),
+        get_count: after.get_count.saturating_sub(before.get_count),
+        list_count: after.list_count.saturating_sub(before.list_count),
+        range_read_count: after
+            .range_read_count
+            .saturating_sub(before.range_read_count),
+        bytes_written: after.bytes_written.saturating_sub(before.bytes_written),
+        bytes_read: after.bytes_read.saturating_sub(before.bytes_read),
+    }
 }
 
 #[derive(Debug)]
