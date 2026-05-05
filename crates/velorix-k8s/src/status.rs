@@ -78,7 +78,7 @@ impl StreamStatusApi for KubeStreamStatusApi {
     }
 }
 
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum KubernetesStatusError {
     #[error("missing kubernetes stream object field `{field}`")]
     MissingObjectField { field: &'static str },

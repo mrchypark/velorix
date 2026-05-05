@@ -6,8 +6,9 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 async-trait = { workspace = true }
+futures = { workspace = true }
 k8s-openapi = { workspace = true, features = ["v1_35", "schemars"] }
-kube = { workspace = true, features = ["client", "derive", "ring", "rustls-tls"] }
+kube = { workspace = true, features = ["client", "derive", "ring", "runtime", "rustls-tls"] }
 schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
