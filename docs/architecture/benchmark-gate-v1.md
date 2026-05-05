@@ -43,6 +43,9 @@ filesystem and S3-compatible baselines are separate and not interchangeable.
 ## Verification
 
 - Benchmark JSON validates against schema.
+- `velorix-cli benchmark-validate` validates a single benchmark output file.
+- `velorix-cli benchmark-gate` compares a result against a matching baseline
+  with a caller-supplied regression budget.
 - Synthetic regression over budget fails the gate.
 - Local and S3 baselines cannot be mixed.
 - Missing object request metrics invalidates the result.

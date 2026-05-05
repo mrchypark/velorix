@@ -4095,6 +4095,7 @@ dependencies = [
  "anyhow",
  "clap",
  "object_store 0.12.5",
+ "tempfile",
  "tokio",
  "velorix-runtime",
 ]
