@@ -101,6 +101,7 @@ materialized outputs, not a batch warehouse table format as the core authority.
 - [Legacy JSON DeltaBatch Removal](legacy-json-deltabatch-removal.md)
 - [Object Store Capabilities V1](object-store-capabilities-v1.md)
 - [Partition Ownership Protocol V1](partition-ownership-protocol-v1.md)
+- [Production Readiness Status Matrix](production-readiness-status.md)
 - [Relation Contract V1](relation-contract-v1.md)
 - [Schema Fingerprint V1](schema-fingerprint-v1.md)
 - [State Substrate Contract](state-substrate-contract.md)
