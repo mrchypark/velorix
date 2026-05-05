@@ -5,14 +5,16 @@ use serde::{Deserialize, Serialize};
 const API_GROUP: &str = "control.velorix.io";
 const API_VERSION: &str = "v1alpha1";
 
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[derive(
+    Clone, Debug, Default, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
 #[serde(deny_unknown_fields)]
 pub struct ObjectStoreAuthorityRef {
     pub store_id: String,
     pub namespace: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelationVersionRef {
     pub relation_id: String,
@@ -20,7 +22,7 @@ pub struct RelationVersionRef {
     pub schema_fingerprint: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CheckpointRef {
     pub checkpoint_version: u64,

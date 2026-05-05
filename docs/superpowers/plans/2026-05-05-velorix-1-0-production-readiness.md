@@ -88,7 +88,7 @@ The remaining work is not cosmetic. It is the difference between "strong bootstr
 - `crates/velorix-k8s/src/crd.rs`: CRD specs and status types.
 - `crates/velorix-k8s/src/controller.rs`: reconciliation skeleton and status writer.
 - `crates/velorix-k8s/tests/crd_schema.rs`: CRD schema tests.
-- `crates/velorix-k8s/tests/reconcile.rs`: fake-client reconciliation tests.
+- `crates/velorix-k8s/tests/reconcile.rs`: pure reconcile-core tests.
 - `crates/velorix-runtime/src/feldera_registry.rs`: persisted Feldera artifact registry.
 - `crates/velorix-runtime/tests/feldera_registry.rs`: artifact registry and fingerprint tests.
 - `baselines/benchmark/local/pr-smoke.json`: local PR-smoke baseline.
@@ -580,7 +580,7 @@ skeleton without pretending that a live operator exists.
 - Reconcile never writes checkpoint manifests directly from Kubernetes state.
 - Missing object-store authority produces `Ready=False` with reason `MissingAuthorityRecord`.
 
-- [ ] Add fake-client tests for missing capability, valid capability, stale checkpoint, and ready stream.
+- [x] Add pure reconcile-core tests for missing authority, relation mismatch, stale checkpoint status, ready stream, and cross-authority evidence isolation.
 - [ ] Commit: `feat: add kubernetes controller readiness reconciliation`.
 
 ## Phase 5: Production Catalogs for Query Policy, Tables, and Feldera Artifacts
