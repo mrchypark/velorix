@@ -288,8 +288,21 @@ operators until direct integration gates are satisfied.
 
 ## Garbage Collection
 
-The current bootstrap implementation classifies unreferenced state and temporary
-objects as recoverable garbage, but it does not implement production garbage
-collection. A future collector must retain objects referenced by live manifests,
-respect object-store listing consistency, and avoid deleting staging objects
-that may still belong to an active publication attempt.
+The current implementation can build a deterministic manifest-aware GC plan and
+execute that plan for Velorix-owned raw state objects under `v1/state/...` and
+output objects under `v1/outputs/...`. The plan retains objects referenced by
+the latest N published manifests, where N must be at least one, and classifies
+only unreferenced raw state/output objects as candidates.
+
+Manifest objects outside the latest-N retention set can remain listed and
+readable after GC, but their Velorix-owned raw state and output payloads are not
+part of the retained recovery set. Operators and recovery code must treat those
+older manifests as historical metadata only unless their referenced payloads are
+still available for some other reason. Broad manifest lifecycle retirement and
+retention tombstoning remain future work.
+
+This is not a broad production GC service. It does not collect staging
+`v1/tmp/...` objects, does not add object-store listing-consistency controls,
+and does not delete SlateDB internal objects by prefix walking. SlateDB
+retention and release remain future integration through SlateDB-owned APIs or
+handles.

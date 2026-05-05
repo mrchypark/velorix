@@ -11,6 +11,10 @@ use thiserror::Error;
 use crate::{
     capability::{ObjectStoreCapabilityError, ObjectStoreCapabilityProfile},
     checkpoint_index::{manifest_digest, marker_updated_at_now, LatestCandidateMarker},
+    gc::{
+        GarbageCollectionCandidate, GarbageCollectionCandidateKind, GarbageCollectionPlan,
+        GarbageCollectionPolicy, GarbageCollectionReport,
+    },
     manifest::{
         CheckpointManifest, ManifestError, OutputObjectRef, PartitionOwnerClaim, StateObjectRef,
         StateRefType,
@@ -21,6 +25,8 @@ use crate::{
 };
 
 const CHECKPOINT_PREFIX: &str = "v1/checkpoints";
+const STATE_PREFIX: &str = "v1/state";
+const OUTPUT_PREFIX: &str = "v1/outputs";
 
 #[derive(Clone, Debug)]
 pub struct CheckpointPublisher {
@@ -80,6 +86,17 @@ pub enum CheckpointPublishError {
     OutputObjectAlreadyExists(ObjectKey),
     #[error("checkpoint manifest `{0}` already exists")]
     ManifestAlreadyExists(ObjectKey),
+    #[error("garbage collection must retain at least one manifest")]
+    InvalidGarbageCollectionPolicy,
+    #[error("garbage collection retained manifest {0} is missing")]
+    MissingGarbageCollectionRetainedManifest(u64),
+    #[error(
+        "garbage collection candidate `{object_key}` is still referenced by manifest {checkpoint_version}"
+    )]
+    GarbageCollectionCandidateStillReferenced {
+        object_key: ObjectKey,
+        checkpoint_version: u64,
+    },
     #[error("ownership epoch record `{0}` is missing")]
     MissingOwnershipEpochRecord(ObjectKey),
     #[error("ownership epoch record conflict at `{object_key}`")]
@@ -467,6 +484,148 @@ impl CheckpointPublisher {
         Ok(manifests)
     }
 
+    pub async fn plan_garbage_collection(
+        &self,
+        policy: GarbageCollectionPolicy,
+    ) -> Result<GarbageCollectionPlan, CheckpointPublishError> {
+        if policy.retain_latest_manifests == 0 {
+            return Err(CheckpointPublishError::InvalidGarbageCollectionPolicy);
+        }
+
+        let manifests = self.list_published_manifests().await?;
+        let retained_from = manifests
+            .len()
+            .saturating_sub(policy.retain_latest_manifests);
+        let retained_manifests = &manifests[retained_from..];
+
+        let mut referenced = HashSet::new();
+        let mut retained_manifest_versions = Vec::with_capacity(retained_manifests.len());
+        for manifest in retained_manifests {
+            retained_manifest_versions.push(manifest.checkpoint_version);
+            referenced.extend(
+                manifest
+                    .state_objects
+                    .iter()
+                    .map(|state_ref| state_ref.object_key.clone()),
+            );
+            referenced.extend(
+                manifest
+                    .output_objects
+                    .iter()
+                    .map(|output_ref| output_ref.object_key.clone()),
+            );
+        }
+
+        let mut candidates = Vec::new();
+        self.add_unreferenced_candidates(
+            STATE_PREFIX,
+            GarbageCollectionCandidateKind::RawStateObject,
+            &referenced,
+            &mut candidates,
+        )
+        .await?;
+        self.add_unreferenced_candidates(
+            OUTPUT_PREFIX,
+            GarbageCollectionCandidateKind::OutputObject,
+            &referenced,
+            &mut candidates,
+        )
+        .await?;
+        candidates.sort();
+
+        Ok(GarbageCollectionPlan {
+            retained_manifest_versions,
+            candidates,
+        })
+    }
+
+    pub async fn execute_garbage_collection_plan(
+        &self,
+        plan: &GarbageCollectionPlan,
+    ) -> Result<GarbageCollectionReport, CheckpointPublishError> {
+        let referenced = self
+            .referenced_garbage_collection_candidates_for_plan(plan)
+            .await?;
+        for candidate in &plan.candidates {
+            if !candidate.kind.matches_key(&candidate.object_key) {
+                continue;
+            }
+            if let Some(checkpoint_version) = referenced.get(&candidate.object_key) {
+                return Err(
+                    CheckpointPublishError::GarbageCollectionCandidateStillReferenced {
+                        object_key: candidate.object_key.clone(),
+                        checkpoint_version: *checkpoint_version,
+                    },
+                );
+            }
+        }
+
+        let mut deleted = Vec::new();
+
+        for candidate in &plan.candidates {
+            if !candidate.kind.matches_key(&candidate.object_key) {
+                continue;
+            }
+
+            let path = Path::from(candidate.object_key.as_str());
+            match self.store.delete(&path).await {
+                Ok(()) => deleted.push(candidate.clone()),
+                Err(object_store::Error::NotFound { .. }) => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        Ok(GarbageCollectionReport { deleted })
+    }
+
+    async fn referenced_garbage_collection_candidates_for_plan(
+        &self,
+        plan: &GarbageCollectionPlan,
+    ) -> Result<HashMap<ObjectKey, u64>, CheckpointPublishError> {
+        let manifests = self.list_published_manifests().await?;
+        let manifests_by_version = manifests
+            .iter()
+            .map(|manifest| (manifest.checkpoint_version, manifest))
+            .collect::<HashMap<_, _>>();
+        let mut referenced = HashMap::new();
+
+        for checkpoint_version in &plan.retained_manifest_versions {
+            let manifest = manifests_by_version.get(checkpoint_version).ok_or(
+                CheckpointPublishError::MissingGarbageCollectionRetainedManifest(
+                    *checkpoint_version,
+                ),
+            )?;
+            Self::add_manifest_referenced_gc_keys(manifest, &mut referenced);
+        }
+
+        let newest_plan_retained = plan.retained_manifest_versions.iter().copied().max();
+        for manifest in manifests {
+            if newest_plan_retained.is_none_or(|version| manifest.checkpoint_version > version) {
+                Self::add_manifest_referenced_gc_keys(&manifest, &mut referenced);
+            }
+        }
+
+        Ok(referenced)
+    }
+
+    fn add_manifest_referenced_gc_keys(
+        manifest: &CheckpointManifest,
+        referenced: &mut HashMap<ObjectKey, u64>,
+    ) {
+        referenced.extend(
+            manifest
+                .state_objects
+                .iter()
+                .map(|state_ref| (state_ref.object_key.clone(), manifest.checkpoint_version)),
+        );
+        referenced.extend(
+            manifest
+                .output_objects
+                .iter()
+                .map(|output_ref| (output_ref.object_key.clone(), manifest.checkpoint_version)),
+        );
+    }
+
     pub async fn latest_manifest(
         &self,
     ) -> Result<Option<CheckpointManifest>, CheckpointPublishError> {
@@ -503,6 +662,31 @@ impl CheckpointPublisher {
                 return Err(CheckpointPublishError::MissingStateObject(
                     state_ref.object_key.clone(),
                 ));
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn add_unreferenced_candidates(
+        &self,
+        prefix: &str,
+        kind: GarbageCollectionCandidateKind,
+        referenced: &HashSet<ObjectKey>,
+        candidates: &mut Vec<GarbageCollectionCandidate>,
+    ) -> Result<(), CheckpointPublishError> {
+        let objects = self
+            .store
+            .list(Some(&Path::from(prefix)))
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        for object in objects {
+            let Ok(object_key) = ObjectKey::parse(object.location.to_string()) else {
+                continue;
+            };
+            if kind.matches_key(&object_key) && !referenced.contains(&object_key) {
+                candidates.push(GarbageCollectionCandidate { object_key, kind });
             }
         }
 

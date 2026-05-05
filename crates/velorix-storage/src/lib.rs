@@ -4,6 +4,7 @@
 
 pub mod capability;
 pub mod checkpoint_index;
+pub mod gc;
 pub mod ingest_envelope;
 pub mod log;
 pub mod manifest;

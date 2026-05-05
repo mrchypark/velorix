@@ -27,6 +27,9 @@ version, owner, partition, and checkpoint version.
 
 - Manifest `state_objects` must become a tagged reference type.
 - Recovery dispatches by state reference type.
+- Current Velorix GC planning/execution is limited to Velorix-owned raw
+  `v1/state/...` objects and `v1/outputs/...` objects not referenced by retained
+  manifests.
 - Velorix GC must never delete SlateDB internal objects by prefix walking.
 - SlateDB state retention and release must use SlateDB-owned APIs or handles.
 - Mixed raw-to-SlateDB lineage must be explicit and tested.
@@ -34,6 +37,8 @@ version, owner, partition, and checkpoint version.
 ## Verification
 
 - A manifest containing only `SlateDbCheckpointRefV1` can recover state.
-- GC does not issue direct deletes for SlateDB internal prefixes.
+- GC does not issue direct deletes for SlateDB internal prefixes; current tests
+  cover an internal-looking non-Velorix prefix remaining untouched by plan
+  execution.
 - Production publication rejects raw state refs without a bootstrap flag.
 - `ref_type` is required outside migration mode.

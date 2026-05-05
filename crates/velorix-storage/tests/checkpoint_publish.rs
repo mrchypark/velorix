@@ -10,6 +10,10 @@ use tempfile::TempDir;
 use tokio::sync::Barrier;
 use velorix_storage::{
     checkpoint_index::LatestCandidateMarker,
+    gc::{
+        GarbageCollectionCandidate, GarbageCollectionCandidateKind, GarbageCollectionPlan,
+        GarbageCollectionPolicy,
+    },
     manifest::{
         CheckpointManifest, InputRange, ManifestError, OutputObjectRef, PartitionOwnerClaim,
         StateObjectRef, StateRefType,
@@ -112,6 +116,10 @@ fn temp_store() -> (TempDir, Arc<dyn ObjectStore>) {
     let store = LocalFileSystem::new_with_prefix(temp_dir.path()).unwrap();
 
     (temp_dir, Arc::new(store))
+}
+
+async fn object_exists(store: &dyn ObjectStore, object_key: &ObjectKey) -> bool {
+    store.head(&Path::from(object_key.as_str())).await.is_ok()
 }
 
 fn input_range() -> InputRange {
@@ -362,6 +370,223 @@ async fn checkpoint_publish_orphan_state_object_does_not_advance_checkpoint_visi
 
     let state_path = Path::from(state_ref.object_key.as_str());
     assert!(store.head(&state_path).await.is_ok());
+}
+
+#[tokio::test]
+async fn gc_plan_marks_orphan_raw_state_and_retains_manifest_referenced_objects() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let retained_state = state_write(0, "state-retained", b"retained-state");
+    let orphan_state = state_write(0, "state-orphan", b"orphan-state");
+    let retained_output = output_write(0, 0, "out-retained", b"retained-output");
+
+    let retained_state_ref = publisher.write_state_object(&retained_state).await.unwrap();
+    publisher.write_state_object(&orphan_state).await.unwrap();
+    let retained_output_ref = publisher
+        .write_output_object(&retained_output)
+        .await
+        .unwrap();
+    let mut manifest = manifest(0, retained_state_ref);
+    manifest.output_objects = vec![retained_output_ref];
+    publisher.publish_manifest(&manifest).await.unwrap();
+
+    let plan = publisher
+        .plan_garbage_collection(GarbageCollectionPolicy {
+            retain_latest_manifests: 1,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(plan.retained_manifest_versions, vec![0]);
+    assert_eq!(
+        plan.candidates,
+        vec![GarbageCollectionCandidate {
+            object_key: orphan_state.object_key().clone(),
+            kind: GarbageCollectionCandidateKind::RawStateObject,
+        }]
+    );
+    assert!(object_exists(store.as_ref(), retained_state.object_key()).await);
+    assert!(object_exists(store.as_ref(), retained_output.object_key()).await);
+}
+
+#[tokio::test]
+async fn gc_plan_marks_unreferenced_output_object() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let retained_state = state_write(0, "state-retained", b"retained-state");
+    let orphan_output = output_write(0, 0, "out-orphan", b"orphan-output");
+
+    let retained_state_ref = publisher.write_state_object(&retained_state).await.unwrap();
+    publisher.write_output_object(&orphan_output).await.unwrap();
+    publisher
+        .publish_manifest(&manifest(0, retained_state_ref))
+        .await
+        .unwrap();
+
+    let plan = publisher
+        .plan_garbage_collection(GarbageCollectionPolicy {
+            retain_latest_manifests: 1,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        plan.candidates,
+        vec![GarbageCollectionCandidate {
+            object_key: orphan_output.object_key().clone(),
+            kind: GarbageCollectionCandidateKind::OutputObject,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn gc_plan_rejects_zero_retained_manifests() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(store);
+
+    let err = publisher
+        .plan_garbage_collection(GarbageCollectionPolicy {
+            retain_latest_manifests: 0,
+        })
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        CheckpointPublishError::InvalidGarbageCollectionPolicy
+    ));
+}
+
+#[tokio::test]
+async fn gc_execution_deletes_only_velorix_owned_candidates() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let retained_state = state_write(0, "state-retained", b"retained-state");
+    let orphan_state = state_write(0, "state-orphan", b"orphan-state");
+    let orphan_output = output_write(0, 0, "out-orphan", b"orphan-output");
+    let slatedb_internal_path = Path::from("v1/slatedb/000000.sst");
+
+    let retained_state_ref = publisher.write_state_object(&retained_state).await.unwrap();
+    publisher.write_state_object(&orphan_state).await.unwrap();
+    publisher.write_output_object(&orphan_output).await.unwrap();
+    store
+        .put(
+            &slatedb_internal_path,
+            Bytes::from_static(b"slatedb").into(),
+        )
+        .await
+        .unwrap();
+    publisher
+        .publish_manifest(&manifest(0, retained_state_ref))
+        .await
+        .unwrap();
+
+    let plan = publisher
+        .plan_garbage_collection(GarbageCollectionPolicy {
+            retain_latest_manifests: 1,
+        })
+        .await
+        .unwrap();
+    let report = publisher
+        .execute_garbage_collection_plan(&plan)
+        .await
+        .unwrap();
+
+    assert_eq!(report.deleted, plan.candidates);
+    assert!(!object_exists(store.as_ref(), orphan_state.object_key()).await);
+    assert!(!object_exists(store.as_ref(), orphan_output.object_key()).await);
+    assert!(object_exists(store.as_ref(), retained_state.object_key()).await);
+    assert!(store.head(&slatedb_internal_path).await.is_ok());
+}
+
+#[tokio::test]
+async fn gc_execution_rejects_caller_plan_that_targets_manifest_referenced_objects() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let retained_state = state_write(0, "state-retained", b"retained-state");
+    let orphan_state = state_write(0, "state-orphan", b"orphan-state");
+    let retained_output = output_write(0, 0, "out-retained", b"retained-output");
+
+    let retained_state_ref = publisher.write_state_object(&retained_state).await.unwrap();
+    publisher.write_state_object(&orphan_state).await.unwrap();
+    let retained_output_ref = publisher
+        .write_output_object(&retained_output)
+        .await
+        .unwrap();
+    let mut manifest = manifest(0, retained_state_ref);
+    manifest.output_objects = vec![retained_output_ref];
+    publisher.publish_manifest(&manifest).await.unwrap();
+
+    let plan = GarbageCollectionPlan {
+        retained_manifest_versions: vec![0],
+        candidates: vec![
+            GarbageCollectionCandidate {
+                object_key: orphan_state.object_key().clone(),
+                kind: GarbageCollectionCandidateKind::RawStateObject,
+            },
+            GarbageCollectionCandidate {
+                object_key: retained_state.object_key().clone(),
+                kind: GarbageCollectionCandidateKind::RawStateObject,
+            },
+            GarbageCollectionCandidate {
+                object_key: retained_output.object_key().clone(),
+                kind: GarbageCollectionCandidateKind::OutputObject,
+            },
+        ],
+    };
+
+    let err = publisher
+        .execute_garbage_collection_plan(&plan)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        CheckpointPublishError::GarbageCollectionCandidateStillReferenced { .. }
+    ));
+    assert!(object_exists(store.as_ref(), orphan_state.object_key()).await);
+    assert!(object_exists(store.as_ref(), retained_state.object_key()).await);
+    assert!(object_exists(store.as_ref(), retained_output.object_key()).await);
+}
+
+#[tokio::test]
+async fn gc_execution_rejects_stale_plan_when_new_manifest_references_candidate() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let retained_state = state_write(0, "state-retained", b"retained-state");
+    let stale_candidate_state = state_write(1, "state-later-retained", b"later-retained-state");
+
+    let retained_state_ref = publisher.write_state_object(&retained_state).await.unwrap();
+    let stale_candidate_state_ref = publisher
+        .write_state_object(&stale_candidate_state)
+        .await
+        .unwrap();
+    publisher
+        .publish_manifest(&manifest(0, retained_state_ref))
+        .await
+        .unwrap();
+
+    let plan = publisher
+        .plan_garbage_collection(GarbageCollectionPolicy {
+            retain_latest_manifests: 1,
+        })
+        .await
+        .unwrap();
+
+    publisher
+        .publish_manifest(&manifest(1, stale_candidate_state_ref))
+        .await
+        .unwrap();
+    let err = publisher
+        .execute_garbage_collection_plan(&plan)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        CheckpointPublishError::GarbageCollectionCandidateStillReferenced { .. }
+    ));
+    assert!(object_exists(store.as_ref(), stale_candidate_state.object_key()).await);
 }
 
 #[tokio::test]
