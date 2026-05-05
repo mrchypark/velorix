@@ -40,7 +40,19 @@ pub struct StateObjectRef {
     #[serde(default = "legacy_raw_state_ref_type")]
     pub ref_type: StateRefType,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slatedb: Option<SlateDbCheckpointRefV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_claim: Option<PartitionOwnerClaim>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SlateDbCheckpointRefV1 {
+    pub db_path: String,
+    pub state_key: String,
+    pub state_digest: String,
+    pub state_bytes: u64,
+    pub created_by_checkpoint_version: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -440,6 +452,7 @@ mod tests {
             partition_id: 0,
             checkpoint_version: 1,
             ref_type: StateRefType::LegacyRawObject,
+            slatedb: None,
             owner_claim: None,
         }
     }

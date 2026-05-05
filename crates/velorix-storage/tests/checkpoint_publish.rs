@@ -6,6 +6,7 @@ use object_store::{
     local::LocalFileSystem, path::Path, GetOptions, GetResult, ListResult, MultipartUpload,
     ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tokio::sync::Barrier;
 use velorix_storage::{
@@ -19,7 +20,7 @@ use velorix_storage::{
     },
     manifest::{
         CheckpointManifest, InputRange, ManifestError, OutputObjectRef, PartitionOwnerClaim,
-        StateObjectRef, StateRefType,
+        SlateDbCheckpointRefV1, StateObjectRef, StateRefType,
     },
     object_key::ObjectKey,
     ownership::OwnershipEpochRecord,
@@ -301,6 +302,7 @@ fn state_ref(state: &StateObjectWrite) -> StateObjectRef {
         partition_id: state.partition_id(),
         checkpoint_version: state.checkpoint_version(),
         ref_type: StateRefType::RawObject,
+        slatedb: None,
         owner_claim: state.owner_claim().cloned(),
     }
 }
@@ -308,7 +310,18 @@ fn state_ref(state: &StateObjectWrite) -> StateObjectRef {
 fn slatedb_state_ref(state: &StateObjectWrite) -> StateObjectRef {
     let mut state_ref = state_ref(state);
     state_ref.ref_type = StateRefType::SlateDbCheckpoint;
+    state_ref.slatedb = Some(SlateDbCheckpointRefV1 {
+        db_path: "v1/slatedb/state".to_string(),
+        state_key: state.object_key().as_str().to_string(),
+        state_digest: state_digest(state.bytes()),
+        state_bytes: state.bytes().len() as u64,
+        created_by_checkpoint_version: state.checkpoint_version(),
+    });
     state_ref
+}
+
+fn state_digest(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
 fn manifest(checkpoint_version: u64, state_ref: StateObjectRef) -> CheckpointManifest {
@@ -2035,16 +2048,13 @@ async fn checkpoint_publish_slatedb_state_store_rejects_duplicate_state_object_w
             .unwrap();
     let state = state_write(0, "state-0001", b"first");
 
-    publisher.write_state_object(&state).await.unwrap();
+    let written_ref = publisher.write_state_object(&state).await.unwrap();
     let duplicate = state_write(0, "state-0001", b"second");
     let err = publisher.write_state_object(&duplicate).await.unwrap_err();
 
     assert!(err.to_string().contains("already exists"));
     assert_eq!(
-        publisher
-            .read_state_object(&state_ref(&state))
-            .await
-            .unwrap(),
+        publisher.read_state_object(&written_ref).await.unwrap(),
         Bytes::from_static(b"first")
     );
 }

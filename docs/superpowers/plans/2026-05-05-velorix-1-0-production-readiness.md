@@ -450,11 +450,15 @@ pub enum AuthoritativeNamespace {
 - Reading a SlateDB ref through a raw object store fails closed.
 - Reading a raw ref through a production SlateDB-only recovery path fails closed.
 - State digest is verified on read.
+- Publication validates the same-transaction SlateDB marker and payload-key
+  readability without hashing the full state payload on the manifest publish
+  path.
 - Closing/reopening the SlateDB store can recover the written state.
 - GC retains SlateDB state by retaining root references, not by deleting internal objects.
 
-- [ ] Add reopen recovery tests using a real temp object store.
-- [ ] Add digest mismatch tests.
+- [x] Add reopen recovery tests using a real temp object store.
+- [x] Add digest mismatch tests.
+- [x] Add marker mismatch and marker-plus-payload existence tests.
 - [ ] Commit: `feat: add recoverable slatedb checkpoint refs`.
 
 ## Phase 4: Kubernetes-Native Control Plane

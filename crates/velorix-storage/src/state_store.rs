@@ -3,12 +3,16 @@ use std::{fmt, sync::Arc};
 use async_trait::async_trait;
 use bytes::Bytes;
 use object_store::{path::Path, ObjectStore, PutMode};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use slatedb::{ErrorKind, IsolationLevel};
 
 use crate::{
-    manifest::{StateObjectRef, StateRefType},
+    manifest::{SlateDbCheckpointRefV1, StateObjectRef, StateRefType},
     state::{CheckpointPublishError, StateObjectWrite},
 };
+
+const SLATEDB_STATE_MARKER_PREFIX: &str = "__velorix_state_ref_v1";
 
 #[async_trait]
 pub trait StateObjectStore: fmt::Debug + Send + Sync {
@@ -152,11 +156,25 @@ impl StateObjectStore for SlateDbStateStore {
             ));
         }
 
+        let metadata = SlateDbCheckpointRefV1 {
+            db_path: self.db_path.to_string(),
+            state_key: state.object_key().as_str().to_string(),
+            state_digest: state_digest(state.bytes()),
+            state_bytes: state.bytes().len() as u64,
+            created_by_checkpoint_version: state.checkpoint_version(),
+        };
+        let marker = SlateDbStateMarkerV1::from(metadata.clone());
+
         txn.put(key, state.bytes().as_ref())?;
+        txn.put(
+            state_marker_key(&metadata.state_key),
+            serde_json::to_vec(&marker)?,
+        )?;
         match txn.commit().await {
             Ok(_) => {
                 let mut state_ref = state.object_ref();
                 state_ref.ref_type = StateRefType::SlateDbCheckpoint;
+                state_ref.slatedb = Some(metadata);
                 Ok(state_ref)
             }
             Err(err) if err.kind() == ErrorKind::Transaction => Err(
@@ -170,20 +188,117 @@ impl StateObjectStore for SlateDbStateStore {
         &self,
         state_ref: &StateObjectRef,
     ) -> Result<Bytes, CheckpointPublishError> {
-        self.db
-            .get(state_ref.object_key.as_str().as_bytes())
+        let metadata = self.validate_state_ref_metadata(state_ref)?;
+        let bytes = self
+            .db
+            .get(metadata.state_key.as_bytes())
             .await?
-            .ok_or_else(|| CheckpointPublishError::MissingStateObject(state_ref.object_key.clone()))
+            .ok_or_else(|| {
+                CheckpointPublishError::MissingStateObject(state_ref.object_key.clone())
+            })?;
+
+        let actual_bytes = bytes.len() as u64;
+        let actual_digest = state_digest(&bytes);
+        if actual_bytes != metadata.state_bytes || actual_digest != metadata.state_digest {
+            return Err(CheckpointPublishError::SlateDbStatePayloadMismatch {
+                object_key: state_ref.object_key.clone(),
+                expected_digest: metadata.state_digest.clone(),
+                actual_digest,
+                expected_bytes: metadata.state_bytes,
+                actual_bytes,
+            });
+        }
+
+        Ok(bytes)
     }
 
     async fn state_object_exists(
         &self,
         state_ref: &StateObjectRef,
     ) -> Result<bool, CheckpointPublishError> {
-        Ok(self
-            .db
-            .get(state_ref.object_key.as_str().as_bytes())
-            .await?
-            .is_some())
+        let metadata = match self.validate_state_ref_metadata(state_ref) {
+            Ok(metadata) => metadata,
+            Err(CheckpointPublishError::InvalidSlateDbStateRef { .. }) => return Ok(false),
+            Err(err) => return Err(err),
+        };
+
+        let Some(marker_bytes) = self.db.get(state_marker_key(&metadata.state_key)).await? else {
+            return Ok(false);
+        };
+        let marker: SlateDbStateMarkerV1 = serde_json::from_slice(&marker_bytes)?;
+        if marker != SlateDbStateMarkerV1::from(metadata.clone()) {
+            return Err(CheckpointPublishError::InvalidSlateDbStateRef {
+                object_key: state_ref.object_key.clone(),
+                reason: "SlateDB state marker does not match state ref",
+            });
+        }
+
+        Ok(self.db.get(metadata.state_key.as_bytes()).await?.is_some())
+    }
+}
+
+impl SlateDbStateStore {
+    fn validate_state_ref_metadata<'a>(
+        &self,
+        state_ref: &'a StateObjectRef,
+    ) -> Result<&'a SlateDbCheckpointRefV1, CheckpointPublishError> {
+        if state_ref.ref_type != StateRefType::SlateDbCheckpoint {
+            return Err(CheckpointPublishError::InvalidSlateDbStateRef {
+                object_key: state_ref.object_key.clone(),
+                reason: "state ref type is not SlateDB checkpoint",
+            });
+        }
+
+        let Some(metadata) = state_ref.slatedb.as_ref() else {
+            return Err(CheckpointPublishError::InvalidSlateDbStateRef {
+                object_key: state_ref.object_key.clone(),
+                reason: "missing SlateDB checkpoint metadata",
+            });
+        };
+
+        if metadata.db_path != self.db_path.to_string()
+            || metadata.state_key != state_ref.object_key.as_str()
+            || metadata.created_by_checkpoint_version != state_ref.checkpoint_version
+        {
+            return Err(CheckpointPublishError::InvalidSlateDbStateRef {
+                object_key: state_ref.object_key.clone(),
+                reason: "SlateDB checkpoint metadata does not match state ref",
+            });
+        }
+
+        Ok(metadata)
+    }
+}
+
+fn state_digest(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+fn state_marker_key(state_key: &str) -> String {
+    format!(
+        "{SLATEDB_STATE_MARKER_PREFIX}/{}",
+        state_digest(state_key.as_bytes())
+    )
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SlateDbStateMarkerV1 {
+    db_path: String,
+    state_key: String,
+    state_digest: String,
+    state_bytes: u64,
+    created_by_checkpoint_version: u64,
+}
+
+impl From<SlateDbCheckpointRefV1> for SlateDbStateMarkerV1 {
+    fn from(value: SlateDbCheckpointRefV1) -> Self {
+        Self {
+            db_path: value.db_path,
+            state_key: value.state_key,
+            state_digest: value.state_digest,
+            state_bytes: value.state_bytes,
+            created_by_checkpoint_version: value.created_by_checkpoint_version,
+        }
     }
 }

@@ -143,6 +143,19 @@ pub enum CheckpointPublishError {
     },
     #[error("referenced state object `{0}` is missing")]
     MissingStateObject(ObjectKey),
+    #[error("invalid SlateDB state reference `{object_key}`: {reason}")]
+    InvalidSlateDbStateRef {
+        object_key: ObjectKey,
+        reason: &'static str,
+    },
+    #[error("SlateDB state payload mismatch for `{object_key}`: expected {expected_bytes} bytes/{expected_digest}, actual {actual_bytes} bytes/{actual_digest}")]
+    SlateDbStatePayloadMismatch {
+        object_key: ObjectKey,
+        expected_digest: String,
+        actual_digest: String,
+        expected_bytes: u64,
+        actual_bytes: u64,
+    },
     #[error("production manifest state object `{object_id}` must reference a SlateDB checkpoint, found `{ref_type:?}`")]
     ProductionStateRefNotSlateDbCheckpoint {
         object_id: String,
@@ -1482,6 +1495,7 @@ impl StateObjectWrite {
             partition_id: self.partition_id,
             checkpoint_version: self.checkpoint_version,
             ref_type: StateRefType::RawObject,
+            slatedb: None,
             owner_claim: self.owner_claim.clone(),
         }
     }
