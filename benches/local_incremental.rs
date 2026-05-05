@@ -42,10 +42,11 @@ use velorix_runtime::recovery::{
     ORDERS_SUM_COUNT_RELATION_ID, ORDERS_SUM_COUNT_RELATION_VERSION,
 };
 use velorix_storage::{
+    gc::GarbageCollectionPolicy,
     ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
     log::IngestLog,
     manifest::{CheckpointManifest, InputRange},
-    state::{CheckpointPublisher, StateObjectWrite},
+    state::{CheckpointPublisher, OutputObjectWrite, StateObjectWrite},
     state_store::{SlateDbStateStore, StateObjectStore},
 };
 
@@ -110,6 +111,7 @@ async fn run() -> BenchResult<()> {
             Bytes::from(serde_json::to_vec(&checkpoint.to_payload())?),
         )?)
         .await?;
+    let checkpoint_state_key = state_ref.object_key.as_str().to_string();
     publisher
         .publish_manifest(&CheckpointManifest {
             schema_version: 1,
@@ -160,6 +162,13 @@ async fn run() -> BenchResult<()> {
     assert_eq!(recovered.replayed_batch_count(), 1);
     assert!(!recovered_rows.is_empty());
 
+    let gc_dry_run_planning = gc_dry_run_planning(
+        &publisher,
+        &metered_store,
+        &checkpoint_state_key,
+        total_records,
+    )
+    .await?;
     let slatedb_state_reopen =
         slatedb_state_reopen(Arc::clone(&store), Arc::clone(&metered_store)).await?;
     let datafusion_scan = datafusion_table_scan().await?;
@@ -220,6 +229,12 @@ async fn run() -> BenchResult<()> {
                 slatedb_state_reopen.object_requests,
                 slatedb_state_reopen.scan_bytes,
             ),
+            workload_metric(
+                "gc_dry_run_planning",
+                &gc_dry_run_planning.samples,
+                gc_dry_run_planning.object_requests,
+                gc_dry_run_planning.scan_bytes,
+            ),
         ],
     };
     result.validate()?;
@@ -227,6 +242,96 @@ async fn run() -> BenchResult<()> {
     println!("{}", serde_json::to_string(&result)?);
 
     Ok(())
+}
+
+async fn gc_dry_run_planning(
+    publisher: &CheckpointPublisher,
+    metered_store: &MeteredObjectStore,
+    previous_state_key: &str,
+    parent_end_offset_exclusive: u64,
+) -> BenchResult<MeasuredWorkload> {
+    let retained_state = StateObjectWrite::new(
+        ORDERS_SUM_COUNT_OWNER,
+        PARTITION_ID,
+        CHECKPOINT_VERSION + 1,
+        "gc-retained-state",
+        Bytes::from_static(b"gc-retained-state"),
+    )?;
+    let orphan_state = StateObjectWrite::new(
+        ORDERS_SUM_COUNT_OWNER,
+        PARTITION_ID,
+        CHECKPOINT_VERSION + 1,
+        "gc-orphan-state",
+        Bytes::from_static(b"gc-orphan-state"),
+    )?;
+    let retained_output = OutputObjectWrite::new(
+        "settlements",
+        PARTITION_ID,
+        CHECKPOINT_VERSION + 1,
+        0,
+        RECORDS_PER_BATCH,
+        "gc-retained-output",
+        Bytes::from_static(b"gc-retained-output"),
+    )?;
+    let orphan_output = OutputObjectWrite::new(
+        "settlements",
+        PARTITION_ID,
+        CHECKPOINT_VERSION + 1,
+        RECORDS_PER_BATCH,
+        RECORDS_PER_BATCH * 2,
+        "gc-orphan-output",
+        Bytes::from_static(b"gc-orphan-output"),
+    )?;
+
+    let retained_state_ref = publisher.write_state_object(&retained_state).await?;
+    publisher.write_state_object(&orphan_state).await?;
+    let retained_output_ref = publisher.write_output_object(&retained_output).await?;
+    publisher.write_output_object(&orphan_output).await?;
+    publisher
+        .publish_manifest(&CheckpointManifest {
+            schema_version: 1,
+            checkpoint_version: CHECKPOINT_VERSION + 1,
+            input_ranges: vec![InputRange {
+                stream_id: STREAM_ID.to_string(),
+                partition_id: PARTITION_ID,
+                start_offset_inclusive: 0,
+                end_offset_exclusive: parent_end_offset_exclusive + RECORDS_PER_BATCH,
+            }],
+            state_objects: vec![retained_state_ref],
+            output_objects: vec![retained_output_ref],
+            parent_checkpoint: Some(CHECKPOINT_VERSION),
+            created_at: "2026-05-03T00:01:00Z".to_string(),
+        })
+        .await?;
+
+    let requests_before = metered_store.snapshot();
+    let started = Instant::now();
+    let plan = publisher
+        .plan_garbage_collection(GarbageCollectionPolicy {
+            retain_latest_manifests: 1,
+        })
+        .await?;
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        plan.retained_manifest_versions,
+        vec![CHECKPOINT_VERSION + 1]
+    );
+    let candidate_keys = plan
+        .candidates
+        .iter()
+        .map(|candidate| candidate.object_key.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(candidate_keys.len(), 3);
+    assert!(candidate_keys.contains(&previous_state_key));
+    assert!(candidate_keys.contains(&orphan_state.object_key().as_str()));
+    assert!(candidate_keys.contains(&orphan_output.object_key().as_str()));
+
+    Ok(MeasuredWorkload {
+        samples: vec![elapsed],
+        object_requests: request_delta(&metered_store.snapshot(), &requests_before),
+        scan_bytes: 0,
+    })
 }
 
 async fn datafusion_table_scan() -> BenchResult<MeasuredWorkload> {

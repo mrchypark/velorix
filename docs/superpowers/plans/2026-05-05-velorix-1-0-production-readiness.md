@@ -691,8 +691,10 @@ checkpoint publication, checkpoint recovery, and bounded DataFusion Parquet
 table scan instrumentation. This slice adds real local SlateDB state
 write/read/reopen instrumentation through `SlateDbStateStore` without exposing
 state-store internals; object request counts come from the benchmark harness
-metered object-store wrapper. GC dry-run planning remains pending until the
-benchmark harness measures that path directly.
+metered object-store wrapper. This slice also adds local GC dry-run planning
+instrumentation through `CheckpointPublisher::plan_garbage_collection`; GC
+execution, listing-consistency failure modes, and S3-compatible evidence remain
+pending.
 `s3_incremental` is fail-closed and does not emit benchmark JSON without a live
 implementation.
 

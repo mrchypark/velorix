@@ -91,6 +91,7 @@ fn benchmark_gate_can_require_specific_workload_names() {
             "checkpoint_recovery",
             "datafusion_table_scan",
             "slatedb_state_reopen",
+            "gc_dry_run_planning",
         ])
         .unwrap();
 }
@@ -100,10 +101,10 @@ fn benchmark_gate_rejects_missing_required_workload_name() {
     let result = local_smoke_result();
 
     let error = result
-        .require_workloads(&["ingest_envelope_validation", "gc_dry_run_planning"])
+        .require_workloads(&["ingest_envelope_validation", "future_live_s3_workload"])
         .unwrap_err();
 
-    assert!(error.to_string().contains("gc_dry_run_planning"));
+    assert!(error.to_string().contains("future_live_s3_workload"));
 }
 
 #[test]
@@ -179,7 +180,7 @@ fn benchmark_comparison_fails_when_baseline_lacks_workload_metric() {
 
     assert!(matches!(
         error,
-        BenchmarkGateError::MissingBaselineWorkload { name } if name == "slatedb_state_reopen"
+        BenchmarkGateError::MissingBaselineWorkload { name } if name == "gc_dry_run_planning"
     ));
 }
 
@@ -195,7 +196,7 @@ fn benchmark_comparison_fails_when_current_lacks_baseline_workload_metric() {
 
     assert!(matches!(
         error,
-        BenchmarkGateError::MissingCurrentWorkload { name } if name == "slatedb_state_reopen"
+        BenchmarkGateError::MissingCurrentWorkload { name } if name == "gc_dry_run_planning"
     ));
 }
 
@@ -312,6 +313,20 @@ fn local_workload_metrics() -> Vec<BenchmarkWorkloadMetricsV1> {
             }),
             scan_bytes: 0,
         },
+        BenchmarkWorkloadMetricsV1 {
+            name: "gc_dry_run_planning".to_string(),
+            p50_ms: 4.0,
+            p95_ms: 5.0,
+            object_requests: Some(ObjectRequestMetricsV1 {
+                put_count: 0,
+                get_count: 2,
+                list_count: 3,
+                range_read_count: 0,
+                bytes_written: 0,
+                bytes_read: 1024,
+            }),
+            scan_bytes: 0,
+        },
     ]
 }
 
@@ -408,6 +423,20 @@ const VALID_LOCAL_SMOKE_JSON: &str = r#"{
                 "range_read_count": 0,
                 "bytes_written": 256,
                 "bytes_read": 256
+            },
+            "scan_bytes": 0
+        },
+        {
+            "name": "gc_dry_run_planning",
+            "p50_ms": 4.0,
+            "p95_ms": 5.0,
+            "object_requests": {
+                "put_count": 0,
+                "get_count": 2,
+                "list_count": 3,
+                "range_read_count": 0,
+                "bytes_written": 0,
+                "bytes_read": 1024
             },
             "scan_bytes": 0
         }

@@ -39,8 +39,11 @@ payload through `SlateDbStateStore`, closes and drops the store, reopens the
 same object-store path, reads the state back, and records elapsed latency plus
 the local metered object-store requests visible through the harness wrapper.
 This does not expose SlateDB internals or make object-request metering part of
-the state-store API. GC dry-run planning workload details remain pending until
-that path is measured directly.
+the state-store API. The GC dry-run workload prepares a small retained/orphan
+state-output set, calls `CheckpointPublisher::plan_garbage_collection`, asserts
+the retained checkpoint and candidates, and records local metered object-store
+requests. It does not execute deletion, test listing-consistency failure modes,
+or provide S3-compatible evidence.
 
 ## Required Workloads
 
@@ -52,6 +55,7 @@ that path is measured directly.
 - Checkpoint publication latency.
 - DataFusion bounded Parquet scan.
 - SlateDB state write/read/reopen latency.
+- GC dry-run planning latency.
 - Many-small-file scan.
 - Duplicate retry latency.
 - Corrupt payload detection.

@@ -93,6 +93,20 @@
         "bytes_read": 1000000000000
       },
       "scan_bytes": 0
+    },
+    {
+      "name": "gc_dry_run_planning",
+      "p50_ms": 600000.0,
+      "p95_ms": 600000.0,
+      "object_requests": {
+        "put_count": 1000000,
+        "get_count": 1000000,
+        "list_count": 1000000,
+        "range_read_count": 1000000,
+        "bytes_written": 1000000000000,
+        "bytes_read": 1000000000000
+      },
+      "scan_bytes": 0
     }
   ]
 }
