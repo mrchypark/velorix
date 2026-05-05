@@ -11,6 +11,7 @@ use velorix_core::{query::QueryPolicy, relation::validate_schema_fingerprint};
 use velorix_storage::object_key::{ObjectKey, ObjectKeyError};
 
 use crate::query::{query_object_backed_input_with_policy, RuntimeQueryError};
+use crate::query_policy_catalog::{QueryPolicyCatalogError, QueryPolicyCatalogStore};
 use crate::storage_registry::{validate_tenant_prefix, StorageRegistry, StorageRegistryError};
 
 pub const PERSISTED_TABLE_SCHEMA_VERSION: u32 = 1;
@@ -71,6 +72,8 @@ pub enum PersistedTableError {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     RuntimeQuery(#[from] RuntimeQueryError),
+    #[error(transparent)]
+    QueryPolicyCatalog(#[from] QueryPolicyCatalogError),
     #[error(transparent)]
     StorageRegistry(#[from] StorageRegistryError),
     #[error("malformed table url: {0}")]
@@ -254,22 +257,33 @@ pub async fn query_persisted_object_backed_input_with_policy(
     }
 }
 
-pub async fn query_production_persisted_object_backed_input_with_policy(
+pub async fn query_production_persisted_object_backed_input(
     catalog_store: Arc<dyn ObjectStore>,
+    policy_catalog_store: Arc<dyn ObjectStore>,
     registry: &StorageRegistry,
     tenant_id: &str,
     table_id: &str,
     sql: &str,
-    policy: QueryPolicy,
 ) -> Result<Vec<RecordBatch>, PersistedTableError> {
     let catalog = PersistedTableStore::new(catalog_store);
     let spec = catalog.get_production(table_id).await?;
-    if spec.tenant_id != tenant_id {
-        return Err(PersistedTableError::CrossTenantPrefix {
-            tenant_id: tenant_id.to_string(),
-            object_key_prefix: spec.object_key_prefix,
-        });
-    }
+    reject_cross_tenant_production_query(tenant_id, &spec)?;
+    let policy = QueryPolicyCatalogStore::new(policy_catalog_store)
+        .get(&spec.tenant_id, &spec.query_policy_id)
+        .await?
+        .policy;
+
+    query_production_spec_with_policy(registry, tenant_id, spec, sql, policy).await
+}
+
+async fn query_production_spec_with_policy(
+    registry: &StorageRegistry,
+    tenant_id: &str,
+    spec: ProductionPersistedTableSpec,
+    sql: &str,
+    policy: QueryPolicy,
+) -> Result<Vec<RecordBatch>, PersistedTableError> {
+    reject_cross_tenant_production_query(tenant_id, &spec)?;
 
     let location = registry.resolve_production_table_location(
         &spec.store_id,
@@ -287,6 +301,20 @@ pub async fn query_production_persisted_object_backed_input_with_policy(
         )
         .await?),
     }
+}
+
+fn reject_cross_tenant_production_query(
+    tenant_id: &str,
+    spec: &ProductionPersistedTableSpec,
+) -> Result<(), PersistedTableError> {
+    if spec.tenant_id != tenant_id {
+        return Err(PersistedTableError::CrossTenantPrefix {
+            tenant_id: tenant_id.to_string(),
+            object_key_prefix: spec.object_key_prefix.clone(),
+        });
+    }
+
+    Ok(())
 }
 
 fn validate_table_url(table_url: &str) -> Result<(), PersistedTableError> {
@@ -307,7 +335,11 @@ fn validate_production_table_fields(
     require_non_empty("table_id", table_id)?;
     require_non_empty("store_id", store_id)?;
     require_non_empty("snapshot_ref", snapshot_ref)?;
-    require_non_empty("query_policy_id", query_policy_id)?;
+    ObjectKey::query_policy(tenant_id, query_policy_id).map_err(|_| {
+        PersistedTableError::InvalidProductionField {
+            field: "query_policy_id",
+        }
+    })?;
     validate_schema_fingerprint("schema_fingerprint", schema_fingerprint).map_err(|_| {
         PersistedTableError::InvalidProductionField {
             field: "schema_fingerprint",

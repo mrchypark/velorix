@@ -12,15 +12,16 @@ use object_store::{local::LocalFileSystem, path::Path, ObjectStore};
 use parquet::arrow::ArrowWriter;
 use serde_json::json;
 use tempfile::TempDir;
-use velorix_core::query::{QueryError, QueryPolicy, QueryPolicyError};
+use velorix_core::query::{QueryError, QueryExecutionPolicyV1, QueryPolicy, QueryPolicyError};
 use velorix_runtime::{
     persisted_table::{
         query_persisted_object_backed_input_with_policy,
-        query_production_persisted_object_backed_input_with_policy,
-        CreateProductionPersistedTableSpecRequest, PersistedTableError, PersistedTableFormat,
-        PersistedTableStore, ProductionPersistedTableFormat,
+        query_production_persisted_object_backed_input, CreateProductionPersistedTableSpecRequest,
+        PersistedTableError, PersistedTableFormat, PersistedTableStore,
+        ProductionPersistedTableFormat,
     },
     query::RuntimeQueryError,
+    query_policy_catalog::{QueryPolicyCatalogError, QueryPolicyCatalogStore},
     storage_registry::StorageRegistry,
 };
 use velorix_storage::{
@@ -313,6 +314,49 @@ async fn production_persisted_table_store_rejects_unknown_spec_field_from_object
 }
 
 #[tokio::test]
+async fn production_persisted_table_store_rejects_missing_query_policy_id_as_json() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = PersistedTableStore::new(Arc::clone(&store));
+
+    write_table_catalog_object(
+        Arc::clone(&store),
+        "orders-current",
+        json!({
+            "schema_version": 1,
+            "table_id": "orders-current",
+            "tenant_id": "tenant-a",
+            "store_id": "primary",
+            "object_key_prefix": "tenants/tenant-a/tables/orders",
+            "snapshot_ref": "snapshots/0001",
+            "format": "parquet",
+            "schema_fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        }),
+    )
+    .await;
+
+    let error = catalog.get_production("orders-current").await.unwrap_err();
+
+    assert!(matches!(error, PersistedTableError::Json(_)));
+}
+
+#[tokio::test]
+async fn production_persisted_table_store_rejects_unsafe_query_policy_id() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = PersistedTableStore::new(Arc::clone(&store));
+    let mut request = production_request("primary", "tenants/tenant-a/tables/orders");
+    request.query_policy_id = "standard/base".to_string();
+
+    let error = catalog.create_production(request).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        PersistedTableError::InvalidProductionField {
+            field: "query_policy_id"
+        }
+    ));
+}
+
+#[tokio::test]
 async fn production_persisted_table_store_rejects_cross_tenant_prefix() {
     let (_temp_dir, store) = temp_store();
     let catalog = PersistedTableStore::new(Arc::clone(&store));
@@ -347,14 +391,15 @@ async fn production_object_backed_table_query_rejects_unregistered_store_id() {
         ))
         .await
         .unwrap();
+    create_standard_policy(&catalog_store, QueryPolicy::default()).await;
 
-    let error = query_production_persisted_object_backed_input_with_policy(
+    let error = query_production_persisted_object_backed_input(
+        Arc::clone(&catalog_store),
         Arc::clone(&catalog_store),
         &registry,
         "tenant-a",
         "orders-current",
         "select key_json, value_json, weight from input",
-        QueryPolicy::default(),
     )
     .await
     .unwrap_err();
@@ -385,14 +430,15 @@ async fn production_object_backed_table_query_rejects_store_registered_without_c
         ))
         .await
         .unwrap();
+    create_standard_policy(&catalog_store, QueryPolicy::default()).await;
 
-    let error = query_production_persisted_object_backed_input_with_policy(
+    let error = query_production_persisted_object_backed_input(
+        Arc::clone(&catalog_store),
         Arc::clone(&catalog_store),
         &registry,
         "tenant-a",
         "orders-current",
         "select key_json, value_json, weight from input",
-        QueryPolicy::default(),
     )
     .await
     .unwrap_err();
@@ -432,15 +478,16 @@ async fn production_object_backed_table_query_accepts_capability_registered_stor
         ))
         .await
         .unwrap();
+    create_standard_policy(&catalog_store, QueryPolicy::default()).await;
 
-    let output = query_production_persisted_object_backed_input_with_policy(
+    let output = query_production_persisted_object_backed_input(
+        Arc::clone(&catalog_store),
         Arc::clone(&catalog_store),
         &registry,
         "tenant-a",
         "orders-current",
         "select key_json, sum(cast(value_json as int)) as total_value, sum(weight) as total_weight \
          from input where weight > 0 group by key_json order by key_json",
-        QueryPolicy::default(),
     )
     .await
     .unwrap();
@@ -450,6 +497,134 @@ async fn production_object_backed_table_query_accepts_capability_registered_stor
     assert_eq!(string_value(&output[0], 0, 0), "\"account-a\"");
     assert_eq!(int64_value(&output[0], 1, 0), 15);
     assert_eq!(int64_value(&output[0], 2, 0), 2);
+}
+
+#[tokio::test]
+async fn production_object_backed_table_query_rejects_missing_catalog_policy() {
+    let (_temp_dir, catalog_store) = temp_store();
+    let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
+    let mut registry = StorageRegistry::new();
+    register_production_scan_store(&mut registry, Arc::clone(&scan_store));
+
+    PersistedTableStore::new(Arc::clone(&catalog_store))
+        .create_production(production_request(
+            "primary",
+            "tenants/tenant-a/tables/orders",
+        ))
+        .await
+        .unwrap();
+
+    let error = query_production_persisted_object_backed_input(
+        Arc::clone(&catalog_store),
+        Arc::clone(&catalog_store),
+        &registry,
+        "tenant-a",
+        "orders-current",
+        "select key_json, value_json, weight from input",
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        PersistedTableError::QueryPolicyCatalog(QueryPolicyCatalogError::ObjectStore(
+            object_store::Error::NotFound { .. }
+        ))
+    ));
+}
+
+#[tokio::test]
+async fn production_object_backed_table_query_applies_catalog_policy_id() {
+    let (_temp_dir, catalog_store) = temp_store();
+    let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
+    put_parquet_input(
+        &scan_store,
+        "tenants/tenant-a/tables/orders/snapshots/0001/part-000.parquet",
+        &parquet_input_batch(&["\"account-a\"", "\"account-b\""], &["10", "7"], &[1, 1]),
+    )
+    .await;
+    let mut registry = StorageRegistry::new();
+    register_production_scan_store(&mut registry, Arc::clone(&scan_store));
+
+    PersistedTableStore::new(Arc::clone(&catalog_store))
+        .create_production(production_request(
+            "primary",
+            "tenants/tenant-a/tables/orders",
+        ))
+        .await
+        .unwrap();
+    QueryPolicyCatalogStore::new(Arc::clone(&catalog_store))
+        .create(
+            "tenant-a",
+            "standard",
+            QueryExecutionPolicyV1 {
+                max_output_rows: Some(1),
+                ..QueryExecutionPolicyV1::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let error = query_production_persisted_object_backed_input(
+        Arc::clone(&catalog_store),
+        Arc::clone(&catalog_store),
+        &registry,
+        "tenant-a",
+        "orders-current",
+        "select key_json, value_json, weight from input order by key_json",
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        PersistedTableError::RuntimeQuery(RuntimeQueryError::Query(QueryError::Policy(
+            QueryPolicyError::OutputRowsExceeded {
+                observed_rows: 2,
+                max_rows: 1,
+            }
+        )))
+    ));
+}
+
+#[tokio::test]
+async fn production_object_backed_table_query_rejects_cross_tenant_catalog_policy_use() {
+    let (_temp_dir, catalog_store) = temp_store();
+    let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
+    let mut registry = StorageRegistry::new();
+    register_production_scan_store(&mut registry, Arc::clone(&scan_store));
+
+    PersistedTableStore::new(Arc::clone(&catalog_store))
+        .create_production(production_request(
+            "primary",
+            "tenants/tenant-a/tables/orders",
+        ))
+        .await
+        .unwrap();
+    QueryPolicyCatalogStore::new(Arc::clone(&catalog_store))
+        .create("tenant-b", "standard", QueryExecutionPolicyV1::default())
+        .await
+        .unwrap();
+
+    let error = query_production_persisted_object_backed_input(
+        Arc::clone(&catalog_store),
+        Arc::clone(&catalog_store),
+        &registry,
+        "tenant-b",
+        "orders-current",
+        "select key_json, value_json, weight from input",
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        PersistedTableError::CrossTenantPrefix {
+            tenant_id,
+            object_key_prefix,
+        } if tenant_id == "tenant-b"
+            && object_key_prefix == "tenants/tenant-a/tables/orders"
+    ));
 }
 
 #[tokio::test]
@@ -478,17 +653,22 @@ async fn production_object_backed_table_query_rejects_scan_above_file_count_limi
         ))
         .await
         .unwrap();
+    create_standard_policy(
+        &catalog_store,
+        QueryPolicy {
+            max_scan_files: Some(1),
+            ..QueryPolicy::default()
+        },
+    )
+    .await;
 
-    let error = query_production_persisted_object_backed_input_with_policy(
+    let error = query_production_persisted_object_backed_input(
+        Arc::clone(&catalog_store),
         Arc::clone(&catalog_store),
         &registry,
         "tenant-a",
         "orders-current",
         "select key_json, value_json, weight from input",
-        QueryPolicy {
-            max_scan_files: Some(1),
-            ..QueryPolicy::default()
-        },
     )
     .await
     .unwrap_err();
@@ -530,17 +710,22 @@ async fn production_object_backed_table_query_rejects_object_requests_above_limi
         ))
         .await
         .unwrap();
+    create_standard_policy(
+        &catalog_store,
+        QueryPolicy {
+            max_object_requests: Some(2),
+            ..QueryPolicy::default()
+        },
+    )
+    .await;
 
-    let error = query_production_persisted_object_backed_input_with_policy(
+    let error = query_production_persisted_object_backed_input(
+        Arc::clone(&catalog_store),
         Arc::clone(&catalog_store),
         &registry,
         "tenant-a",
         "orders-current",
         "select key_json, value_json, weight from input limit 1",
-        QueryPolicy {
-            max_object_requests: Some(2),
-            ..QueryPolicy::default()
-        },
     )
     .await
     .unwrap_err();
@@ -576,17 +761,22 @@ async fn production_object_backed_table_query_still_applies_output_row_limit() {
         ))
         .await
         .unwrap();
+    create_standard_policy(
+        &catalog_store,
+        QueryPolicy {
+            max_output_rows: Some(1),
+            ..QueryPolicy::default()
+        },
+    )
+    .await;
 
-    let error = query_production_persisted_object_backed_input_with_policy(
+    let error = query_production_persisted_object_backed_input(
+        Arc::clone(&catalog_store),
         Arc::clone(&catalog_store),
         &registry,
         "tenant-a",
         "orders-current",
         "select key_json, value_json, weight from input order by key_json",
-        QueryPolicy {
-            max_output_rows: Some(1),
-            ..QueryPolicy::default()
-        },
     )
     .await
     .unwrap_err();
@@ -685,6 +875,13 @@ async fn write_table_catalog_object(
             &Path::from(key.as_str()),
             Bytes::from(serde_json::to_vec(&catalog).unwrap()).into(),
         )
+        .await
+        .unwrap();
+}
+
+async fn create_standard_policy(store: &Arc<dyn ObjectStore>, policy: QueryPolicy) {
+    QueryPolicyCatalogStore::new(Arc::clone(store))
+        .create("tenant-a", "standard", policy)
         .await
         .unwrap();
 }

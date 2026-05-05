@@ -152,6 +152,15 @@ impl ObjectKey {
         Ok(Self(format!("v1/tables/{table_id}.table.json")))
     }
 
+    pub fn query_policy(tenant_id: &str, query_policy_id: &str) -> Result<Self, ObjectKeyError> {
+        validate_segment("tenant_id", tenant_id)?;
+        validate_segment("query_policy_id", query_policy_id)?;
+
+        Ok(Self(format!(
+            "v1/query-policy/{tenant_id}/{query_policy_id}.json"
+        )))
+    }
+
     pub fn feldera_artifact(
         artifact_id: &str,
         artifact_hash: &str,
@@ -293,6 +302,13 @@ fn validate_known_layout(value: &str) -> Result<(), ObjectKeyError> {
                 .strip_suffix(".table.json")
                 .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
             validate_segment("table_id", table_id)?;
+        }
+        ["v1", "query-policy", tenant_id, policy_file] => {
+            validate_segment("tenant_id", tenant_id)?;
+            let query_policy_id = policy_file
+                .strip_suffix(".json")
+                .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+            validate_segment("query_policy_id", query_policy_id)?;
         }
         ["v1", "feldera-artifacts", artifact_id, "sha256", artifact_file] => {
             validate_segment("artifact_id", artifact_id)?;
@@ -770,6 +786,31 @@ mod tests {
     }
 
     #[test]
+    fn query_policy_key_is_deterministic_and_parseable() {
+        let key = ObjectKey::query_policy("tenant-a", "standard").unwrap();
+        let restarted = ObjectKey::query_policy("tenant-a", "standard").unwrap();
+
+        assert_eq!(key.as_str(), "v1/query-policy/tenant-a/standard.json");
+        assert_eq!(key, restarted);
+        assert_eq!(ObjectKey::parse(key.as_str()).unwrap(), key);
+    }
+
+    #[test]
+    fn query_policy_key_rejects_unsafe_identity() {
+        for (tenant_id, query_policy_id) in [
+            ("", "standard"),
+            ("tenant/a", "standard"),
+            ("tenant-a", ""),
+            ("tenant-a", "standard/base"),
+        ] {
+            assert!(
+                ObjectKey::query_policy(tenant_id, query_policy_id).is_err(),
+                "accepted invalid policy identity: {tenant_id}/{query_policy_id}"
+            );
+        }
+    }
+
+    #[test]
     fn parse_rejects_invalid_or_unrecognized_external_keys() {
         for invalid in [
             "v1/ingest/./p=0000000000/00000000000000000000-00000000000000000001.batch",
@@ -785,6 +826,8 @@ mod tests {
             "v1/queries/orders.txt",
             "v1/tables/../orders.table.json",
             "v1/tables/orders.txt",
+            "v1/query-policy/tenant-a/.json",
+            "v1/query-policy/tenant-a/standard/base.json",
             "v1/feldera-artifacts/orders/sha256/not-hex.artifact.json",
             "v1/feldera-artifacts/orders/sha512/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.artifact.json",
             "v1/relations/orders/versions/.relation.json",

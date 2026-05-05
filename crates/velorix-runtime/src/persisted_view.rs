@@ -8,8 +8,8 @@ use thiserror::Error;
 use crate::{
     persisted_query::{PersistedQueryError, PersistedQueryStore},
     persisted_table::{
-        query_production_persisted_object_backed_input_with_policy, PersistedTableError,
-        PersistedTableFormat, PersistedTableStore,
+        query_production_persisted_object_backed_input, PersistedTableError, PersistedTableFormat,
+        PersistedTableStore,
     },
     query::{query_object_backed_input_with_policy, RuntimeQueryError},
     storage_registry::StorageRegistry,
@@ -57,6 +57,7 @@ pub async fn query_persisted_object_backed_view(
 
 pub async fn query_production_persisted_object_backed_view(
     catalog_store: Arc<dyn ObjectStore>,
+    policy_catalog_store: Arc<dyn ObjectStore>,
     registry: &StorageRegistry,
     tenant_id: &str,
     table_id: &str,
@@ -68,13 +69,13 @@ pub async fn query_production_persisted_object_backed_view(
         .await
         .map_err(PersistedViewError::QueryCatalog)?;
 
-    query_production_persisted_object_backed_input_with_policy(
+    query_production_persisted_object_backed_input(
         catalog_store,
+        policy_catalog_store,
         registry,
         tenant_id,
         table_id,
         &query.sql,
-        query.policy,
     )
     .await
     .map_err(|error| match error {
