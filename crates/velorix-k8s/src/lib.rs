@@ -10,3 +10,4 @@
 pub mod controller;
 pub mod crd;
 pub mod lease;
+pub mod status;
