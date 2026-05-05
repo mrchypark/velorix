@@ -8,6 +8,11 @@ Kubernetes Lease coordinates worker ownership. Kubernetes and etcd are not the
 durable database authority. Production fencing requires an object-storage-backed
 epoch record combined with storage-side commit checks.
 
+Current implementation evidence is intentionally narrow: `velorix-control`
+defines a pure production ownership backend gate that rejects in-memory/dev
+leases and rejects backends without durable epoch record support. It does not
+implement a Kubernetes adapter, operator, CRDs, or reconciliation.
+
 ## Durable Epoch Record
 
 After acquiring a Kubernetes Lease, a production worker creates a durable epoch
@@ -41,3 +46,5 @@ not enough to make `owner_epoch` durable or monotonic.
 - Same epoch/different owner fails closed.
 - Lower epoch writes fail after higher epoch record creation.
 - In-memory/fake lease clients cannot enable production distributed writer mode.
+- Production ownership backend validation accepts a Kubernetes lease backend
+  only when durable epoch records are supported.

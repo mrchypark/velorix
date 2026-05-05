@@ -37,10 +37,13 @@ gated unless matching code exists in the repository.
 The current `velorix-control` crate defines a pure lease-domain boundary for
 partition ownership. It issues storage-compatible `owner_id`/`owner_epoch`
 claims through explicit-clock domain types and an in-memory fake/test client,
-without a Kubernetes dependency. A real Kubernetes `Lease` adapter, CRDs,
-operator reconciliation, and any production linearizable fencing or commit
-protocol remain future work. Object storage remains the durable database
-authority; Kubernetes/control leases coordinate ownership epochs only.
+without a Kubernetes dependency. It also has a pure fail-closed production
+ownership backend gate: in-memory/dev leases cannot enable production writer
+mode, and any production backend must advertise durable epoch record support.
+A real Kubernetes `Lease` adapter, CRDs, operator reconciliation, and any
+production linearizable fencing or commit protocol remain future work. Object
+storage remains the durable database authority; Kubernetes/control leases
+coordinate ownership epochs only.
 
 See the package review notes for the current production-readiness package
 strategy:
@@ -62,7 +65,7 @@ strategy:
 | External table interoperability | Future RFC only; raw Parquet URL specs are phase-0 only | Apache Iceberg or another table format, only for import/export/interop surfaces | Table/catalog authorization, snapshot selection, table lifecycle policy, manifest binding when crossing the internal boundary |
 | Standing-view SQL-to-DBSP compilation | Current phase-0 artifact contract | Feldera SQL-to-DBSP compiler and pipeline tooling | Spec/artifact validation, release artifact selection, object-backed state and manifests |
 | Incremental algebra, operators, and circuit semantics | Current adapter boundary; direct DBSP crate integration remains gated | Feldera project semantics and/or Rust `dbsp` crate | `IncrementalEngine` adapter, object-backed persistence, moderate-performance cost optimizations |
-| Kubernetes-native control plane/orchestration | Current pure `velorix-control` lease-domain boundary; target production Kubernetes adapter/operator direction | Current Velorix domain crate and in-memory fake; future Kubernetes CRDs, operator, and Lease or equivalent K8s-native lease primitive | Storage-compatible owner claims, owner epoch in writes/manifests, stale-worker rejection, recovery handoff rules; future catalog/view lifecycle intent, status, scheduling policy, and real Kubernetes acquisition |
+| Kubernetes-native control plane/orchestration | Current pure `velorix-control` lease-domain boundary and fail-closed production backend gate; target production Kubernetes adapter/operator direction | Current Velorix domain crate and in-memory fake; future Kubernetes CRDs, operator, and Lease or equivalent K8s-native lease primitive | Storage-compatible owner claims, owner epoch in writes/manifests, stale-worker rejection, recovery handoff rules; future catalog/view lifecycle intent, status, scheduling policy, and real Kubernetes acquisition |
 
 ## Cache Boundary
 
@@ -198,14 +201,16 @@ explicit migration flag before production publication.
    equivalent K8s-native primitive for partition ownership and `owner_epoch`.
    Keep object storage, not Kubernetes or etcd, as the durable database
    authority. The current `velorix-control` slice is only a pure lease-domain
-   API plus in-memory fake that issues storage-compatible owner claims; it has
-   no Kubernetes dependency. The current storage slice carries and verifies
-   plain `owner_id`/`owner_epoch` claim metadata on fenced state writes and
-   checkpoint manifest publication, but those checks are non-atomic stale-owner
-   detection and structurally unauthorized progress rejection, not production
-   linearizable fencing. Actual Kubernetes Lease acquisition and any production
-   fencing or marker-index commit protocol remain future control-plane/storage
-   design work.
+   API plus in-memory fake that issues storage-compatible owner claims, with a
+   pure fail-closed production backend gate requiring a non-dev lease backend
+   and durable epoch records; it has no Kubernetes dependency. The current
+   storage slice carries and verifies plain `owner_id`/`owner_epoch` claim
+   metadata on fenced state writes and checkpoint manifest publication, but
+   those checks are non-atomic stale-owner detection and structurally
+   unauthorized progress rejection, not production linearizable fencing. Actual
+   Kubernetes Lease acquisition, operator code, CRDs, and any production fencing
+   or marker-index commit protocol remain future control-plane/storage design
+   work.
 7. Use Feldera's SQL-to-DBSP compiler for standing-view SQL through validated
    external compiler artifacts. Do not hand-build Velorix circuits for standing
    views in this phase.

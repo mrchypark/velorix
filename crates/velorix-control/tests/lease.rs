@@ -4,8 +4,9 @@ use bytes::Bytes;
 use object_store::{local::LocalFileSystem, ObjectStore};
 use tempfile::TempDir;
 use velorix_control::lease::{
-    InMemoryPartitionLeaseClient, LeaseAcquireRequest, LeaseError, PartitionLeaseClient,
-    PartitionLeaseGrant, PartitionLeaseKey,
+    validate_production_ownership_backend, InMemoryPartitionLeaseClient, LeaseAcquireRequest,
+    LeaseBackendKind, LeaseError, PartitionLeaseClient, PartitionLeaseGrant, PartitionLeaseKey,
+    ProductionOwnershipBackendConfig,
 };
 use velorix_storage::{
     manifest::{CheckpointManifest, InputRange, PartitionOwnerClaim},
@@ -230,8 +231,7 @@ async fn partition_lease_rejects_invalid_ttl_owner_and_key_fields() {
 }
 
 #[tokio::test]
-async fn partition_lease_grant_owner_claim_fences_storage_publication_when_used_with_checkpoint_publisher(
-) {
+async fn in_memory_lease_grant_can_drive_bootstrap_fenced_publication() {
     let client = InMemoryPartitionLeaseClient::default();
     let grant = client
         .acquire_or_renew(acquire_request("worker-a", 1_000, 500))
@@ -292,6 +292,45 @@ async fn partition_lease_grant_owner_claim_fences_storage_publication_when_used_
     assert_eq!(owner_claim.owner_id, grant.owner_id);
     assert_eq!(owner_claim.owner_epoch, grant.owner_epoch);
     assert_eq!(publisher.latest_manifest().await.unwrap(), Some(manifest));
+}
+
+#[test]
+fn production_ownership_backend_rejects_in_memory_dev_lease_backend() {
+    let err = validate_production_ownership_backend(&ProductionOwnershipBackendConfig {
+        lease_backend: LeaseBackendKind::InMemoryDev,
+        supports_durable_epoch_records: true,
+    })
+    .unwrap_err();
+
+    assert!(matches!(
+        err,
+        LeaseError::ProductionLeaseBackendNotDurable {
+            lease_backend: LeaseBackendKind::InMemoryDev
+        }
+    ));
+}
+
+#[test]
+fn production_ownership_backend_rejects_missing_durable_epoch_record_support() {
+    let err = validate_production_ownership_backend(&ProductionOwnershipBackendConfig {
+        lease_backend: LeaseBackendKind::KubernetesLease,
+        supports_durable_epoch_records: false,
+    })
+    .unwrap_err();
+
+    assert!(matches!(
+        err,
+        LeaseError::ProductionOwnershipMissingDurableEpochRecords
+    ));
+}
+
+#[test]
+fn production_ownership_backend_accepts_kubernetes_lease_with_durable_epoch_records() {
+    validate_production_ownership_backend(&ProductionOwnershipBackendConfig {
+        lease_backend: LeaseBackendKind::KubernetesLease,
+        supports_durable_epoch_records: true,
+    })
+    .unwrap();
 }
 
 #[allow(dead_code)]

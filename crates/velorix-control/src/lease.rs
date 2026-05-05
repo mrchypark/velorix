@@ -27,8 +27,24 @@ pub struct PartitionLeaseGrant {
 pub struct LeaseAcquireRequest {
     pub key: PartitionLeaseKey,
     pub owner_id: String,
+    /// Caller-supplied time is for domain tests and dev adapters.
+    ///
+    /// A production lease adapter must not treat a local caller clock alone as
+    /// ownership authority.
     pub now_unix_ms: u64,
     pub ttl_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeaseBackendKind {
+    InMemoryDev,
+    KubernetesLease,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProductionOwnershipBackendConfig {
+    pub lease_backend: LeaseBackendKind,
+    pub supports_durable_epoch_records: bool,
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -49,6 +65,26 @@ pub enum LeaseError {
     NotLeaseHolder { current: PartitionLeaseGrant },
     #[error("lease is not currently held")]
     LeaseNotHeld,
+    #[error("production ownership requires durable lease backend, got {lease_backend:?}")]
+    ProductionLeaseBackendNotDurable { lease_backend: LeaseBackendKind },
+    #[error("production ownership requires durable epoch record support")]
+    ProductionOwnershipMissingDurableEpochRecords,
+}
+
+pub fn validate_production_ownership_backend(
+    config: &ProductionOwnershipBackendConfig,
+) -> Result<(), LeaseError> {
+    if config.lease_backend == LeaseBackendKind::InMemoryDev {
+        return Err(LeaseError::ProductionLeaseBackendNotDurable {
+            lease_backend: config.lease_backend,
+        });
+    }
+
+    if !config.supports_durable_epoch_records {
+        return Err(LeaseError::ProductionOwnershipMissingDurableEpochRecords);
+    }
+
+    Ok(())
 }
 
 #[async_trait]
@@ -63,6 +99,10 @@ pub trait PartitionLeaseClient: Send + Sync {
     ) -> Result<PartitionLeaseGrant, LeaseError>;
 
     /// Returns the current unexpired grant at the caller-supplied time.
+    ///
+    /// Caller-supplied time is only a domain boundary input. A production
+    /// Kubernetes adapter must not use the local caller clock alone as
+    /// ownership authority.
     async fn current(
         &self,
         key: &PartitionLeaseKey,
@@ -83,6 +123,11 @@ pub trait PartitionLeaseClient: Send + Sync {
     ) -> Result<(), LeaseError>;
 }
 
+/// In-memory lease client for tests, bootstrap flows, and local development.
+///
+/// This client is not a production ownership backend. Its caller-supplied clock
+/// and process-local state do not provide Kubernetes adapter semantics or
+/// durable fencing authority.
 #[derive(Debug, Default)]
 pub struct InMemoryPartitionLeaseClient {
     leases: Mutex<HashMap<PartitionLeaseKey, PartitionLeaseGrant>>,
