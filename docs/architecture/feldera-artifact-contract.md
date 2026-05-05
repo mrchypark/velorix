@@ -61,6 +61,26 @@ reference a validated artifact id/hash, but they cannot make code executable by
 themselves. This prevents a checkpoint or manifest write from becoming a code
 loading path.
 
+## Artifact Registry
+
+Velorix persists accepted phase-0 artifact metadata in the object store under
+`v1/feldera-artifacts/{artifact_id}/sha256/{artifact_hash_hex}.artifact.json`.
+Registration is create-only. Re-registering the exact same metadata is
+idempotent, while reusing the same object key for different metadata fails
+closed. The registry identity is the `(artifact_id, artifact_hash)` pair; if a
+future product contract requires globally unique artifact ids, it must use a
+separate create-only index object rather than a prefix scan.
+
+The storage registry only stores and retrieves
+`FelderaCompileArtifactMetadata`. Every registration validates the metadata
+against the supplied `StandingViewSpec` with
+`validate_feldera_compile_artifact`, so spec hash, view id, relation schemas,
+schema fingerprints, state codec, epoch policy, and generated Rust ABI checks
+remain owned by `velorix-core`. Reads deserialize with unknown-field rejection
+from the core wire type and reject a stored body whose artifact identity does
+not match the requested key. This registry does not compile, load, or execute
+Feldera/DBSP artifacts.
+
 ## Runtime Direction
 
 DataFusion remains the ad hoc SQL/query engine, but the accepted target input is

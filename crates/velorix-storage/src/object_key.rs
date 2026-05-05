@@ -152,6 +152,18 @@ impl ObjectKey {
         Ok(Self(format!("v1/tables/{table_id}.table.json")))
     }
 
+    pub fn feldera_artifact(
+        artifact_id: &str,
+        artifact_hash: &str,
+    ) -> Result<Self, ObjectKeyError> {
+        validate_segment("artifact_id", artifact_id)?;
+        let hash = parse_sha256_hash_segment(artifact_hash)?;
+
+        Ok(Self(format!(
+            "v1/feldera-artifacts/{artifact_id}/sha256/{hash}.artifact.json"
+        )))
+    }
+
     pub fn parse(value: impl Into<String>) -> Result<Self, ObjectKeyError> {
         let value = value.into();
         if value.starts_with('/')
@@ -269,6 +281,14 @@ fn validate_known_layout(value: &str) -> Result<(), ObjectKeyError> {
                 .strip_suffix(".table.json")
                 .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
             validate_segment("table_id", table_id)?;
+        }
+        ["v1", "feldera-artifacts", artifact_id, "sha256", artifact_file] => {
+            validate_segment("artifact_id", artifact_id)?;
+            let hash = artifact_file
+                .strip_suffix(".artifact.json")
+                .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+            validate_sha256_hex(hash)
+                .map_err(|_| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
         }
         _ => return Err(ObjectKeyError::InvalidExternalKey(value.to_string())),
     }
@@ -479,6 +499,29 @@ fn validate_segment(name: &'static str, value: &str) -> Result<(), ObjectKeyErro
     Ok(())
 }
 
+fn parse_sha256_hash_segment(artifact_hash: &str) -> Result<&str, ObjectKeyError> {
+    let Some(hash) = artifact_hash.strip_prefix("sha256:") else {
+        return Err(ObjectKeyError::UnsafeSegment {
+            name: "artifact_hash",
+            value: artifact_hash.to_string(),
+        });
+    };
+    validate_sha256_hex(hash)?;
+
+    Ok(hash)
+}
+
+fn validate_sha256_hex(hash: &str) -> Result<(), ObjectKeyError> {
+    if hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(ObjectKeyError::UnsafeSegment {
+            name: "artifact_hash",
+            value: hash.to_string(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::ObjectKey;
@@ -642,6 +685,44 @@ mod tests {
     }
 
     #[test]
+    fn feldera_artifact_key_is_deterministic_and_parseable() {
+        let hash = format!("sha256:{}", "a".repeat(64));
+        let key = ObjectKey::feldera_artifact("orders-by-region", &hash).unwrap();
+        let restarted = ObjectKey::feldera_artifact("orders-by-region", &hash).unwrap();
+
+        assert_eq!(
+            key.as_str(),
+            "v1/feldera-artifacts/orders-by-region/sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.artifact.json"
+        );
+        assert_eq!(key, restarted);
+        assert_eq!(ObjectKey::parse(key.as_str()).unwrap(), key);
+    }
+
+    #[test]
+    fn feldera_artifact_key_rejects_unsafe_identity() {
+        for (artifact_id, artifact_hash) in [
+            (
+                "",
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            (
+                "orders/current",
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            (
+                "orders",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            ("orders", "sha256:not-hex"),
+        ] {
+            assert!(
+                ObjectKey::feldera_artifact(artifact_id, artifact_hash).is_err(),
+                "accepted invalid artifact identity: {artifact_id}/{artifact_hash}"
+            );
+        }
+    }
+
+    #[test]
     fn parse_rejects_invalid_or_unrecognized_external_keys() {
         for invalid in [
             "v1/ingest/./p=0000000000/00000000000000000000-00000000000000000001.batch",
@@ -657,6 +738,8 @@ mod tests {
             "v1/queries/orders.txt",
             "v1/tables/../orders.table.json",
             "v1/tables/orders.txt",
+            "v1/feldera-artifacts/orders/sha256/not-hex.artifact.json",
+            "v1/feldera-artifacts/orders/sha512/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.artifact.json",
         ] {
             assert!(
                 ObjectKey::parse(invalid).is_err(),
