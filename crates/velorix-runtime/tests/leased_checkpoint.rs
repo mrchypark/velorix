@@ -91,6 +91,7 @@ fn state_ref(state: &StateObjectWrite) -> StateObjectRef {
         partition_id: state.partition_id(),
         checkpoint_version: state.checkpoint_version(),
         ref_type: StateRefType::RawObject,
+        slatedb: None,
         owner_claim: state.owner_claim().cloned(),
     }
 }
@@ -195,7 +196,9 @@ async fn leased_checkpoint_publishes_fenced_objects_and_manifest_when_grant_is_v
         .unwrap();
 
     let latest = publisher.latest_manifest().await.unwrap().unwrap();
-    assert_eq!(latest, manifest);
+    assert_eq!(latest.checkpoint_version, manifest.checkpoint_version);
+    assert_eq!(latest.input_ranges, manifest.input_ranges);
+    assert_eq!(latest.output_objects, manifest.output_objects);
     assert!(latest
         .state_objects
         .iter()
@@ -712,7 +715,9 @@ async fn leased_checkpoint_production_publishes_with_slatedb_refs_and_ownership_
         .unwrap();
 
     let latest = publisher.latest_manifest().await.unwrap().unwrap();
-    assert_eq!(latest, manifest);
+    assert_eq!(latest.checkpoint_version, manifest.checkpoint_version);
+    assert_eq!(latest.input_ranges, manifest.input_ranges);
+    assert_eq!(latest.output_objects, manifest.output_objects);
     assert_eq!(
         latest.state_objects[0].ref_type,
         StateRefType::SlateDbCheckpoint

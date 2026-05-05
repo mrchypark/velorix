@@ -13,5 +13,6 @@ pub mod persisted_view;
 pub mod query;
 pub mod query_policy_catalog;
 mod query_runtime;
+pub mod readiness;
 pub mod recovery;
 pub mod storage_registry;

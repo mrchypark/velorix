@@ -8,6 +8,7 @@ use object_store::{local::LocalFileSystem, ObjectStore};
 use velorix_runtime::benchmark_gate::{
     BenchmarkBackend, BenchmarkBudgetV1, BenchmarkGateLevel, BenchmarkGateResultV1,
 };
+use velorix_runtime::readiness::{ProductionReadinessEvidenceV1, ProductionReadinessReportV1};
 
 const BENCHMARK_GATE_WORKLOADS: &[&str] = &[
     "ingest_envelope_validation",
@@ -59,6 +60,12 @@ enum Command {
         #[arg(long, default_value_t = 0.10)]
         max_regression_fraction: f64,
     },
+    ReadinessReport {
+        #[arg(long)]
+        evidence: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main]
@@ -108,6 +115,14 @@ async fn main() -> anyhow::Result<()> {
             )?;
             println!("benchmark gate passed");
         }
+        Some(Command::ReadinessReport { evidence, json }) => {
+            let report = read_readiness_report(&evidence)?;
+            if json {
+                println!("{}", report.to_json_pretty()?);
+            } else {
+                print!("{}", format_readiness_report(&report));
+            }
+        }
         None => {
             Cli::command().print_help()?;
             println!();
@@ -115,6 +130,28 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn read_readiness_report(path: &Path) -> anyhow::Result<ProductionReadinessReportV1> {
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("failed to read readiness evidence from {}", path.display()))?;
+    let evidence = ProductionReadinessEvidenceV1::from_json_str(&contents)
+        .with_context(|| format!("failed to parse readiness evidence {}", path.display()))?;
+    evidence.try_into_report().map_err(anyhow::Error::msg)
+}
+
+fn format_readiness_report(report: &ProductionReadinessReportV1) -> String {
+    let mut output = format!(
+        "production_ready={}\ndeployment_id={}\nauthority_store_id={}\n",
+        report.production_ready, report.deployment_id, report.authority_store_id
+    );
+    if !report.blocking_reasons.is_empty() {
+        output.push_str("blocking_reasons:\n");
+        for reason in &report.blocking_reasons {
+            output.push_str(&format!("- {reason}\n"));
+        }
+    }
+    output
 }
 
 fn local_object_store(object_store_dir: &Path) -> anyhow::Result<Arc<dyn ObjectStore>> {
@@ -370,6 +407,34 @@ mod tests {
     }
 
     #[test]
+    fn readiness_report_cli_parses_json_flag() {
+        let cli = Cli::try_parse_from([
+            "velorix-cli",
+            "readiness-report",
+            "--evidence",
+            "readiness.json",
+            "--json",
+        ])
+        .unwrap();
+
+        let Some(Command::ReadinessReport { evidence, json }) = cli.command else {
+            panic!("expected readiness-report command");
+        };
+
+        assert_eq!(evidence, PathBuf::from("readiness.json"));
+        assert!(json);
+    }
+
+    #[test]
+    fn readiness_report_formatter_is_not_json() {
+        let report = ProductionReadinessEvidenceV1::from_json_str(&readiness_json()).unwrap();
+        let summary = format_readiness_report(&report.try_into_report().unwrap());
+
+        assert!(summary.starts_with("production_ready=true\n"));
+        assert!(!summary.trim_start().starts_with('{'));
+    }
+
+    #[test]
     fn benchmark_gate_comparison_accepts_result_within_budget() {
         let dir = tempdir().unwrap();
         let baseline = dir.path().join("baseline.json");
@@ -511,6 +576,32 @@ mod tests {
             workload_metrics(),
         ))
         .unwrap()
+    }
+
+    fn readiness_json() -> String {
+        serde_json::json!({
+            "schema_version": 1,
+            "deployment_id": "prod-a",
+            "authority_store_id": "s3://velorix-prod",
+            "capability_status": {
+                "status": "pass",
+                "evidence": "s3-compatible capability probe",
+                "evidence_kind": ["s3_compatible"]
+            },
+            "ownership_status": { "status": "pass", "evidence": "durable epoch record" },
+            "checkpoint_status": { "status": "pass", "evidence": "published checkpoint lifecycle" },
+            "state_status": { "status": "pass", "evidence": "SlateDB checkpoint ref" },
+            "query_policy_status": { "status": "pass", "evidence": "bounded DataFusion policy" },
+            "table_catalog_status": { "status": "pass", "evidence": "registry-backed table catalog" },
+            "feldera_artifact_status": { "status": "pass", "evidence": "trusted artifact metadata" },
+            "benchmark_gate_status": { "status": "pass", "evidence": "S3-compatible benchmark gate" },
+            "kubernetes_status": {
+                "status": "pass",
+                "evidence": "Kubernetes Lease client",
+                "evidence_kind": ["kubernetes_lease_client"]
+            }
+        })
+        .to_string()
     }
 
     fn valid_result_json_compact() -> String {

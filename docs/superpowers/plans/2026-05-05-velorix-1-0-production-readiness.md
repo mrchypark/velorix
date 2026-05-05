@@ -767,11 +767,11 @@ implementation.
 - `production_ready`
 - `blocking_reasons`
 
-- [ ] Missing S3-compatible evidence sets `production_ready=false`.
-- [ ] Missing Kubernetes Lease client evidence sets `production_ready=false`.
-- [ ] Bootstrap raw state path sets `production_ready=false`.
-- [ ] Valid evidence across all gates sets `production_ready=true`.
-- [ ] CLI prints JSON only when `--json` is passed.
+- [x] Missing S3-compatible evidence sets `production_ready=false`.
+- [x] Missing Kubernetes Lease client evidence sets `production_ready=false`.
+- [x] Bootstrap raw state path sets `production_ready=false`.
+- [x] Valid evidence across all gates sets `production_ready=true`.
+- [x] CLI prints JSON only when `--json` is passed.
 - [ ] Commit: `feat: add production readiness report`.
 
 ### Task 7.2: Add Admin Inspection Commands

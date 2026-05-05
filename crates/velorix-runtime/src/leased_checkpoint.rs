@@ -139,10 +139,13 @@ impl LeasedCheckpointPublisher {
             .preflight_manifest_publication(&manifest)
             .await?;
 
+        let mut produced_state_refs = Vec::with_capacity(state_objects.len());
         for state in &state_objects {
-            self.publisher
+            let state_ref = self
+                .publisher
                 .write_state_object_fenced_production(state, &grant.key.stream_id, &owner_claim)
                 .await?;
+            produced_state_refs.push(state_ref);
         }
 
         for output in &output_objects {
@@ -151,8 +154,10 @@ impl LeasedCheckpointPublisher {
                 .await?;
         }
 
+        let mut published_manifest = manifest;
+        published_manifest.state_objects = produced_state_refs;
         self.publisher
-            .publish_manifest_fenced_production(&manifest, &owner_claim)
+            .publish_manifest_fenced_production(&published_manifest, &owner_claim)
             .await?;
 
         Ok(())
@@ -351,6 +356,7 @@ fn state_object_ref(state: &StateObjectWrite, ref_type: StateRefType) -> StateOb
         partition_id: state.partition_id(),
         checkpoint_version: state.checkpoint_version(),
         ref_type,
+        slatedb: None,
         owner_claim: state.owner_claim().cloned(),
     }
 }
