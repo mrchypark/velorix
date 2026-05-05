@@ -5,10 +5,12 @@ use datafusion::{
     execution::object_store::ObjectStoreUrl,
     object_store::{path::Path, ObjectStore as DataFusionObjectStore},
 };
+use object_store::ObjectStore as AuthorityObjectStore;
 use thiserror::Error;
 use url::Url;
 use velorix_storage::capability::{
-    AuthoritativeObjectStoreCapabilitiesV1, AuthoritativeObjectStoreCapabilityError,
+    probe_authoritative_object_store_capabilities, AuthoritativeObjectStoreCapabilitiesV1,
+    AuthoritativeObjectStoreCapabilityError, AuthoritativeObjectStoreCapabilityProbeError,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -48,6 +50,8 @@ pub enum StorageRegistryError {
     MissingProductionCapabilities { store_id: String },
     #[error(transparent)]
     ObjectStoreCapabilities(#[from] AuthoritativeObjectStoreCapabilityError),
+    #[error(transparent)]
+    ObjectStoreCapabilityProbe(#[from] AuthoritativeObjectStoreCapabilityProbeError),
     #[error("malformed object store base url {base_url}: {source}")]
     MalformedBaseUrl {
         base_url: String,
@@ -67,16 +71,8 @@ impl StorageRegistry {
         base_url: &str,
         store: Arc<dyn DataFusionObjectStore>,
     ) -> Result<(), StorageRegistryError> {
-        let store_id = store_id.into();
-        if store_id.is_empty() {
-            return Err(StorageRegistryError::InvalidStoreId);
-        }
-        let base_url = ObjectStoreUrl::parse(base_url).map_err(|source| {
-            StorageRegistryError::MalformedBaseUrl {
-                base_url: base_url.to_string(),
-                source,
-            }
-        })?;
+        let store_id = validate_store_id(store_id.into())?;
+        let base_url = parse_base_url(base_url)?;
 
         self.entries.insert(
             store_id,
@@ -98,22 +94,43 @@ impl StorageRegistry {
         production_capabilities: AuthoritativeObjectStoreCapabilitiesV1,
     ) -> Result<(), StorageRegistryError> {
         production_capabilities.validate_for_startup()?;
-
-        let store_id = store_id.into();
-        if store_id.is_empty() {
-            return Err(StorageRegistryError::InvalidStoreId);
-        }
-        let base_url = ObjectStoreUrl::parse(base_url).map_err(|source| {
-            StorageRegistryError::MalformedBaseUrl {
-                base_url: base_url.to_string(),
-                source,
-            }
-        })?;
+        let store_id = validate_store_id(store_id.into())?;
+        let base_url = parse_base_url(base_url)?;
 
         self.entries.insert(
             store_id,
             RegisteredObjectStore {
                 store,
+                base_url,
+                production_capabilities: Some(production_capabilities),
+            },
+        );
+
+        Ok(())
+    }
+
+    pub async fn register_production_with_probe(
+        &mut self,
+        store_id: impl Into<String>,
+        base_url: &str,
+        scan_store: Arc<dyn DataFusionObjectStore>,
+        authority_store: Arc<dyn AuthorityObjectStore>,
+        backend_name: impl AsRef<str>,
+        probe_prefix: impl AsRef<str>,
+    ) -> Result<(), StorageRegistryError> {
+        let store_id = validate_store_id(store_id.into())?;
+        let base_url = parse_base_url(base_url)?;
+        let production_capabilities = probe_authoritative_object_store_capabilities(
+            authority_store.as_ref(),
+            backend_name.as_ref(),
+            probe_prefix,
+        )
+        .await?;
+
+        self.entries.insert(
+            store_id,
+            RegisteredObjectStore {
+                store: scan_store,
                 base_url,
                 production_capabilities: Some(production_capabilities),
             },
@@ -168,6 +185,21 @@ impl StorageRegistry {
 
         self.resolve_unchecked_table_location(store_id, tenant_id, object_key_prefix, snapshot_ref)
     }
+}
+
+fn validate_store_id(store_id: String) -> Result<String, StorageRegistryError> {
+    if store_id.is_empty() {
+        return Err(StorageRegistryError::InvalidStoreId);
+    }
+
+    Ok(store_id)
+}
+
+fn parse_base_url(base_url: &str) -> Result<ObjectStoreUrl, StorageRegistryError> {
+    ObjectStoreUrl::parse(base_url).map_err(|source| StorageRegistryError::MalformedBaseUrl {
+        base_url: base_url.to_string(),
+        source,
+    })
 }
 
 pub fn validate_tenant_prefix(
