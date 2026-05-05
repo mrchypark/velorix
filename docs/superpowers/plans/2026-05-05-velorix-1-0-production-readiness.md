@@ -686,11 +686,12 @@ cargo run -p velorix-cli -- benchmark-gate \
 - [ ] Commit: `bench: add production readiness workloads`.
 
 Progress note: this slice adds strict V1 workload detail schema and real
-`local_incremental` workload details for ingest envelope validation,
-checkpoint publication, and checkpoint recovery. DataFusion table scan,
-SlateDB state write/read/reopen, and GC dry-run planning remain pending until
-the benchmark harness measures those paths directly. `s3_incremental` is
-fail-closed and does not emit benchmark JSON without a live implementation.
+local `local_incremental` workload details for ingest envelope validation,
+checkpoint publication, checkpoint recovery, and bounded DataFusion Parquet
+table scan instrumentation. SlateDB state write/read/reopen and GC dry-run
+planning remain pending until the benchmark harness measures those paths directly.
+`s3_incremental` is fail-closed and does not emit benchmark JSON without a live
+implementation.
 
 ## Phase 7: Admin Readiness and Product Surface
 

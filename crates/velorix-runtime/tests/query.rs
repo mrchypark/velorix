@@ -25,8 +25,9 @@ use velorix_core::{
 };
 use velorix_runtime::{
     query::{
-        query_object_backed_input_with_policy, query_recovered_materialized_view,
-        query_recovered_materialized_view_with_policy, RuntimeQueryError,
+        query_object_backed_input_with_policy, query_object_backed_input_with_policy_and_metrics,
+        query_recovered_materialized_view, query_recovered_materialized_view_with_policy,
+        RuntimeQueryError,
     },
     recovery::{
         orders_sum_count_relation_catalog, RecoveredRuntime, RecoveryError,
@@ -549,6 +550,39 @@ async fn query_object_backed_input_scans_parquet_objects_without_materializing_d
     assert_eq!(string_value(&output[0], 0, 0), "\"account-a\"");
     assert_eq!(int64_value(&output[0], 1, 0), 15);
     assert_eq!(int64_value(&output[0], 2, 0), 2);
+}
+
+#[tokio::test]
+async fn query_object_backed_input_reports_object_request_metrics_when_requested() {
+    let store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
+    put_parquet_input(
+        &store,
+        "input/part-000.parquet",
+        &parquet_input_batch(&["\"account-a\"", "\"account-b\""], &["10", "7"], &[1, 1]),
+    )
+    .await;
+
+    let output = query_object_backed_input_with_policy_and_metrics(
+        Arc::clone(&store),
+        "memory://velorix/input/",
+        "select key_json, value_json, weight from input order by key_json",
+        QueryPolicy {
+            max_scan_files: Some(1),
+            max_output_rows: Some(4),
+            ..QueryPolicy::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(output.batches.len(), 1);
+    assert_eq!(output.batches[0].num_rows(), 2);
+    assert!(output.object_requests.list_count > 0);
+    assert!(
+        output.object_requests.get_count + output.object_requests.range_read_count > 0,
+        "expected DataFusion to read the Parquet object"
+    );
+    assert!(output.object_requests.bytes_read > 0);
 }
 
 #[tokio::test]

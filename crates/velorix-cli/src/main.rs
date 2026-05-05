@@ -13,6 +13,7 @@ const BENCHMARK_GATE_WORKLOADS: &[&str] = &[
     "ingest_envelope_validation",
     "checkpoint_publish",
     "checkpoint_recovery",
+    "datafusion_table_scan",
 ];
 use velorix_runtime::recovery::RecoveredRuntime;
 use velorix_storage::{
@@ -462,7 +463,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(format!("{error:#}").contains("checkpoint_recovery"));
+        assert!(format!("{error:#}").contains("datafusion_table_scan"));
     }
 
     #[test]
@@ -565,7 +566,11 @@ mod tests {
             "local",
             "local_incremental",
             1000.0,
-            serde_json::json!([workload_metrics()[0], workload_metrics()[1]]),
+            serde_json::json!([
+                workload_metrics()[0],
+                workload_metrics()[1],
+                workload_metrics()[2]
+            ]),
         ))
         .unwrap()
     }
@@ -681,6 +686,20 @@ mod tests {
                     "bytes_read": 512,
                 },
                 "scan_bytes": 0,
+            },
+            {
+                "name": "datafusion_table_scan",
+                "p50_ms": 5.0,
+                "p95_ms": 6.0,
+                "object_requests": {
+                    "put_count": 0,
+                    "get_count": 1,
+                    "list_count": 1,
+                    "range_read_count": 2,
+                    "bytes_written": 0,
+                    "bytes_read": 2048,
+                },
+                "scan_bytes": 1024,
             },
         ])
     }

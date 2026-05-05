@@ -30,10 +30,12 @@ The initial committed baselines are conservative placeholders for wiring the
 gate; they are not production performance claims.
 
 `local_incremental` is a bootstrap harness, not production readiness evidence.
-It currently emits real workload details for ingest envelope validation,
-checkpoint publication, and checkpoint recovery only. DataFusion table scan,
-SlateDB state reopen, and GC dry-run planning workload details remain pending
-until those paths are measured directly.
+It currently emits real local workload details for ingest envelope validation,
+checkpoint publication, checkpoint recovery, and a bounded DataFusion Parquet
+table scan. The DataFusion workload is instrumentation evidence that the local
+query path lists and reads Parquet objects under policy; it is not production
+scan latency evidence. SlateDB state reopen and GC dry-run planning workload
+details remain pending until those paths are measured directly.
 
 ## Required Workloads
 

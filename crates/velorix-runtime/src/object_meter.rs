@@ -17,6 +17,8 @@ use datafusion::object_store::{
 use futures::{stream, StreamExt};
 use velorix_core::query::QueryPolicyError;
 
+use crate::benchmark_gate::ObjectRequestMetricsV1;
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ObjectStoreMeter {
     state: Arc<ObjectStoreMeterState>,
@@ -60,6 +62,34 @@ impl ObjectStoreMeter {
 
     fn add_bytes_returned(&self, bytes: u64) {
         self.state.bytes_returned.fetch_add(bytes, Ordering::SeqCst);
+    }
+
+    pub(crate) fn snapshot(&self) -> ObjectRequestMetricsV1 {
+        ObjectRequestMetricsV1 {
+            put_count: self
+                .state
+                .put_opts_requests
+                .load(Ordering::SeqCst)
+                .saturating_add(
+                    self.state
+                        .put_multipart_opts_requests
+                        .load(Ordering::SeqCst),
+                ) as u64,
+            get_count: self.state.get_opts_requests.load(Ordering::SeqCst) as u64,
+            list_count: self
+                .state
+                .list_requests
+                .load(Ordering::SeqCst)
+                .saturating_add(self.state.list_with_offset_requests.load(Ordering::SeqCst))
+                .saturating_add(
+                    self.state
+                        .list_with_delimiter_requests
+                        .load(Ordering::SeqCst),
+                ) as u64,
+            range_read_count: self.state.get_ranges_requests.load(Ordering::SeqCst) as u64,
+            bytes_written: 0,
+            bytes_read: self.state.bytes_returned.load(Ordering::SeqCst),
+        }
     }
 }
 

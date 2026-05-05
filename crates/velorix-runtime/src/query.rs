@@ -19,7 +19,8 @@ use thiserror::Error;
 use url::Url;
 use velorix_core::query::{QueryError, QueryPolicy, QueryPolicyError, INPUT_TABLE_NAME};
 
-use crate::object_meter::{object_request_policy_error, MeteredObjectStore};
+use crate::benchmark_gate::ObjectRequestMetricsV1;
+use crate::object_meter::{object_request_policy_error, MeteredObjectStore, ObjectStoreMeter};
 pub use crate::query_runtime::QueryExecutionLimiter;
 use crate::query_runtime::{DataFusionSessionFactory, QueryRuntimeLimits};
 use crate::recovery::{RecoveredRuntime, RecoveryError};
@@ -107,6 +108,35 @@ pub async fn query_object_backed_input_with_policy(
     query_object_backed_input_with_policy_and_limiter(store, table_url, sql, policy, None).await
 }
 
+#[derive(Debug)]
+pub struct ObjectBackedQueryResult {
+    pub batches: Vec<RecordBatch>,
+    pub object_requests: ObjectRequestMetricsV1,
+}
+
+pub async fn query_object_backed_input_with_policy_and_metrics(
+    store: Arc<dyn DataFusionObjectStore>,
+    table_url: &str,
+    sql: &str,
+    policy: QueryPolicy,
+) -> Result<ObjectBackedQueryResult, RuntimeQueryError> {
+    let meter = ObjectStoreMeter::default();
+    let batches = query_object_backed_input_with_policy_and_limiter_and_meter(
+        store,
+        table_url,
+        sql,
+        policy,
+        None,
+        Some(meter.clone()),
+    )
+    .await?;
+
+    Ok(ObjectBackedQueryResult {
+        batches,
+        object_requests: meter.snapshot(),
+    })
+}
+
 pub async fn query_object_backed_input_with_policy_and_limiter(
     store: Arc<dyn DataFusionObjectStore>,
     table_url: &str,
@@ -114,10 +144,24 @@ pub async fn query_object_backed_input_with_policy_and_limiter(
     policy: QueryPolicy,
     limiter: Option<QueryExecutionLimiter>,
 ) -> Result<Vec<RecordBatch>, RuntimeQueryError> {
+    query_object_backed_input_with_policy_and_limiter_and_meter(
+        store, table_url, sql, policy, limiter, None,
+    )
+    .await
+}
+
+async fn query_object_backed_input_with_policy_and_limiter_and_meter(
+    store: Arc<dyn DataFusionObjectStore>,
+    table_url: &str,
+    sql: &str,
+    policy: QueryPolicy,
+    limiter: Option<QueryExecutionLimiter>,
+    meter: Option<ObjectStoreMeter>,
+) -> Result<Vec<RecordBatch>, RuntimeQueryError> {
     policy.validate().map_err(QueryError::from)?;
     validate_sql_text_policy(sql, policy).map_err(QueryError::from)?;
     let _permit = acquire_query_permit(policy, limiter.as_ref())?;
-    let query_store = query_execution_store(store, policy);
+    let query_store = query_execution_store(store, policy, meter);
     validate_scan_policy(query_store.as_ref(), table_url, policy).await?;
 
     let context = session_context(policy)?;
@@ -142,10 +186,17 @@ pub async fn query_object_backed_input_with_policy_and_limiter(
 fn query_execution_store(
     store: Arc<dyn DataFusionObjectStore>,
     policy: QueryPolicy,
+    meter: Option<ObjectStoreMeter>,
 ) -> Arc<dyn DataFusionObjectStore> {
-    match policy.max_object_requests {
-        Some(max_requests) => Arc::new(MeteredObjectStore::new(store, Some(max_requests))),
-        None => store,
+    match (policy.max_object_requests, meter) {
+        (Some(max_requests), Some(meter)) => Arc::new(MeteredObjectStore::with_meter(
+            store,
+            meter,
+            Some(max_requests),
+        )),
+        (Some(max_requests), None) => Arc::new(MeteredObjectStore::new(store, Some(max_requests))),
+        (None, Some(meter)) => Arc::new(MeteredObjectStore::with_meter(store, meter, None)),
+        (None, None) => store,
     }
 }
 

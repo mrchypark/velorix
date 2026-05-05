@@ -14,22 +14,29 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use bytes::Bytes;
+use datafusion::object_store::{
+    memory::InMemory as DataFusionInMemory, path::Path as DataFusionPath,
+    ObjectStore as DataFusionObjectStore, PutOptions as DataFusionPutOptions,
+};
 use futures::stream::BoxStream;
 use object_store::{
     local::LocalFileSystem, path::Path, GetOptions, GetRange, GetResult, ListResult,
     MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload,
     PutResult,
 };
+use parquet::arrow::ArrowWriter;
 use serde_json::json;
 use tempfile::TempDir;
 use velorix_core::{
     delta::{DeltaBatch, DeltaKey, DeltaRecord, DeltaValue},
     engine::{IncrementalEngine, PrototypeIncrementalEngine},
+    query::QueryPolicy,
 };
 use velorix_runtime::benchmark_gate::{
     BenchmarkBackend, BenchmarkGateLevel, BenchmarkGateResultV1, BenchmarkMetricsV1,
     BenchmarkWorkloadMetricsV1, ObjectRequestMetricsV1,
 };
+use velorix_runtime::query::query_object_backed_input_with_policy_and_metrics;
 use velorix_runtime::recovery::{
     orders_sum_count_relation_catalog, RecoveredRuntime, ORDERS_SUM_COUNT_OWNER,
     ORDERS_SUM_COUNT_RELATION_ID, ORDERS_SUM_COUNT_RELATION_VERSION,
@@ -48,6 +55,12 @@ const RECORDS_PER_BATCH: u64 = 16;
 const CHECKPOINT_VERSION: u64 = 0;
 
 type BenchResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
+
+struct MeasuredWorkload {
+    samples: Vec<Duration>,
+    object_requests: ObjectRequestMetricsV1,
+    scan_bytes: u64,
+}
 
 fn main() -> BenchResult<()> {
     tokio::runtime::Runtime::new()?.block_on(run())
@@ -146,8 +159,15 @@ async fn run() -> BenchResult<()> {
     assert_eq!(recovered.replayed_batch_count(), 1);
     assert!(!recovered_rows.is_empty());
 
+    let datafusion_scan = datafusion_table_scan().await?;
+
     let records_per_second = total_records as f64 / ingest_elapsed.as_secs_f64();
-    let object_requests = metered_store.snapshot();
+    let mut object_requests = metered_store.snapshot();
+    add_request_delta(
+        &mut object_requests,
+        &datafusion_scan.object_requests,
+        &empty_object_requests(),
+    );
     let result = BenchmarkGateResultV1 {
         schema_version: 1,
         commit: git_commit(),
@@ -164,7 +184,7 @@ async fn run() -> BenchResult<()> {
             recovery_p95_ms: millis(recovery_elapsed),
             peak_rss_bytes: current_rss_bytes().unwrap_or(0),
             spill_bytes: 0,
-            scan_bytes: 0,
+            scan_bytes: datafusion_scan.scan_bytes,
         },
         workload_metrics: vec![
             workload_metric(
@@ -185,6 +205,12 @@ async fn run() -> BenchResult<()> {
                 recovery_requests,
                 0,
             ),
+            workload_metric(
+                "datafusion_table_scan",
+                &datafusion_scan.samples,
+                datafusion_scan.object_requests,
+                datafusion_scan.scan_bytes,
+            ),
         ],
     };
     result.validate()?;
@@ -192,6 +218,48 @@ async fn run() -> BenchResult<()> {
     println!("{}", serde_json::to_string(&result)?);
 
     Ok(())
+}
+
+async fn datafusion_table_scan() -> BenchResult<MeasuredWorkload> {
+    let inner: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
+    let input = parquet_input_batch()?;
+    let input_bytes = parquet_bytes(&input)?;
+    let scan_bytes = input_bytes.len() as u64;
+
+    inner
+        .put_opts(
+            &DataFusionPath::from("input/part-000.parquet"),
+            input_bytes.into(),
+            DataFusionPutOptions::default(),
+        )
+        .await?;
+
+    let started = Instant::now();
+    let output = query_object_backed_input_with_policy_and_metrics(
+        inner,
+        "memory://velorix/input/",
+        "select key_json, sum(cast(value_json as int)) as total_value, sum(weight) as total_weight \
+         from input where weight > 0 group by key_json order by key_json",
+        QueryPolicy {
+            max_scan_files: Some(1),
+            max_scan_bytes: Some(scan_bytes),
+            max_object_requests: Some(100),
+            max_output_rows: Some(8),
+            max_output_bytes: Some(64 * 1024),
+            ..QueryPolicy::default()
+        },
+    )
+    .await?;
+    let elapsed = started.elapsed();
+
+    assert_eq!(output.batches.len(), 1);
+    assert_eq!(output.batches[0].num_rows(), 2);
+
+    Ok(MeasuredWorkload {
+        samples: vec![elapsed],
+        object_requests: output.object_requests,
+        scan_bytes,
+    })
 }
 
 fn temp_store() -> BenchResult<(TempDir, Arc<MeteredObjectStore>, Arc<dyn ObjectStore>)> {
@@ -214,6 +282,35 @@ fn workload_batch(batch_index: u64, records: u64) -> DeltaBatch {
             1,
         )
     }))
+}
+
+fn parquet_input_batch() -> BenchResult<RecordBatch> {
+    Ok(RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("key_json", DataType::Utf8, false),
+            Field::new("value_json", DataType::Utf8, false),
+            Field::new("weight", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec![
+                "\"account-a\"",
+                "\"account-a\"",
+                "\"account-b\"",
+            ])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["10", "5", "7"])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![1, 1, 1])) as ArrayRef,
+        ],
+    )?)
+}
+
+fn parquet_bytes(batch: &RecordBatch) -> BenchResult<Bytes> {
+    let mut bytes = Vec::new();
+    {
+        let mut writer = ArrowWriter::try_new(&mut bytes, batch.schema(), None)?;
+        writer.write(batch)?;
+        writer.close()?;
+    }
+    Ok(Bytes::from(bytes))
 }
 
 fn ingest_record_batch(input: &DeltaBatch) -> BenchResult<RecordBatch> {
