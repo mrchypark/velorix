@@ -132,6 +132,39 @@ impl IngestLog {
         payload: Bytes,
     ) -> Result<AppendValidatedEnvelopeOutcome, IngestLogError> {
         let batch = IngestBatch::from_validated_envelope(payload)?;
+        self.append_validated_batch(batch).await
+    }
+
+    /// Validates and appends an Arrow IPC ingest envelope in single-writer
+    /// admission mode. This rejects overlaps visible in already committed
+    /// ranges before writing, but it is not a distributed multi-writer range
+    /// admission guarantee.
+    pub async fn append_validated_envelope_single_writer(
+        &self,
+        payload: Bytes,
+    ) -> Result<AppendValidatedEnvelopeOutcome, IngestLogError> {
+        let batch = IngestBatch::from_validated_envelope(payload)?;
+        let descriptor = batch.descriptor();
+        if let Some(committed) = self
+            .list_committed()
+            .await?
+            .into_iter()
+            .find(|committed| ranges_overlap(committed, &descriptor))
+        {
+            return Ok(AppendValidatedEnvelopeOutcome::Conflict {
+                descriptor,
+                object_key: committed.object_key,
+                reason: "range_overlap_committed",
+            });
+        }
+
+        self.append_validated_batch(batch).await
+    }
+
+    async fn append_validated_batch(
+        &self,
+        batch: IngestBatch,
+    ) -> Result<AppendValidatedEnvelopeOutcome, IngestLogError> {
         let descriptor = batch.descriptor();
 
         match self.append(&batch).await {
@@ -264,6 +297,14 @@ impl IngestLog {
 
         Ok(batches)
     }
+}
+
+fn ranges_overlap(previous: &IngestBatchDescriptor, current: &IngestBatchDescriptor) -> bool {
+    previous.stream_id == current.stream_id
+        && previous.partition_id == current.partition_id
+        && previous.start_offset_inclusive < current.end_offset_exclusive
+        && current.start_offset_inclusive < previous.end_offset_exclusive
+        && previous.object_key != current.object_key
 }
 
 impl IngestBatch {

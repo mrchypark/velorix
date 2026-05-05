@@ -97,6 +97,15 @@ fn batch_with_unsigned_weight() -> RecordBatch {
 }
 
 fn envelope_bytes() -> Bytes {
+    envelope_bytes_for("orders", 7, 10, 12)
+}
+
+fn envelope_bytes_for(
+    stream_id: &str,
+    partition_id: u32,
+    start_offset_inclusive: u64,
+    end_offset_exclusive: u64,
+) -> Bytes {
     IngestEnvelope::encode_batches(
         IngestEnvelopeEncodeRequest {
             relation_id: "orders_relation".to_string(),
@@ -104,10 +113,10 @@ fn envelope_bytes() -> Bytes {
             schema_fingerprint:
                 "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                     .to_string(),
-            stream_id: "orders".to_string(),
-            partition_id: 7,
-            start_offset_inclusive: 10,
-            end_offset_exclusive: 12,
+            stream_id: stream_id.to_string(),
+            partition_id,
+            start_offset_inclusive,
+            end_offset_exclusive,
         },
         &[valid_batch()],
     )
@@ -598,6 +607,62 @@ async fn append_validated_envelope_reports_same_key_different_digest_conflict() 
             reason: "same_key_different_digest",
         }
     );
+}
+
+#[tokio::test]
+async fn append_validated_envelope_single_writer_reports_committed_range_overlap_conflict() {
+    let (_temp_dir, store) = temp_store();
+    let log = IngestLog::new(store);
+
+    let first = envelope_bytes_for("orders", 7, 10, 20);
+    let overlapping = envelope_bytes_for("orders", 7, 15, 25);
+
+    let outcome = log
+        .append_validated_envelope_single_writer(first)
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        AppendValidatedEnvelopeOutcome::Appended { .. }
+    ));
+
+    let outcome = log
+        .append_validated_envelope_single_writer(overlapping)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        AppendValidatedEnvelopeOutcome::Conflict {
+            descriptor: ingest_descriptor("orders", 7, 15, 25),
+            object_key: ObjectKey::ingest_batch("orders", 7, 10, 20).unwrap(),
+            reason: "range_overlap_committed",
+        }
+    );
+}
+
+#[tokio::test]
+async fn append_validated_envelope_single_writer_allows_adjacent_ranges() {
+    let (_temp_dir, store) = temp_store();
+    let log = IngestLog::new(store);
+
+    let first = envelope_bytes_for("orders", 7, 10, 20);
+    let adjacent = envelope_bytes_for("orders", 7, 20, 25);
+
+    log.append_validated_envelope_single_writer(first)
+        .await
+        .unwrap();
+    let outcome = log
+        .append_validated_envelope_single_writer(adjacent)
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        outcome,
+        AppendValidatedEnvelopeOutcome::Appended {
+            descriptor
+        } if descriptor == ingest_descriptor("orders", 7, 20, 25)
+    ));
 }
 
 #[tokio::test]

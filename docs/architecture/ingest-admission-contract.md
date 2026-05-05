@@ -13,6 +13,10 @@ publication has completed.
 `SingleWriter` mode assumes one writer or external coordinator serializes
 admission for each stream/partition. In this mode Velorix may reject overlaps by
 checking committed ranges, but the guarantee depends on serialized admission.
+`IngestLog::append_validated_envelope_single_writer` implements this narrow
+single-writer admission path for validated Arrow envelopes: adjacent ranges are
+allowed, same-key retries remain idempotent, and visible committed range
+overlaps return `range_overlap_committed`.
 
 `Coordinated` mode uses a durable admission index or write coordinator. This is
 required before Velorix advertises production multi-writer range-overlap
