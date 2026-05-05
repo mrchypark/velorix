@@ -7,10 +7,87 @@
   "exceptions": [
     {
       "kind": "duplicate",
-      "crate": "datafusion-family",
+      "crate": "cpufeatures",
       "owner": "runtime",
       "expires_on": "2026-08-31",
-      "reason": "Duplicate versions remain warning-only while the DataFusion dependency graph stabilizes."
+      "reason": "Duplicate versions are introduced by sha2 and DataFusion/object_store transitive dependencies while upstream graphs converge."
+    },
+    {
+      "kind": "duplicate",
+      "crate": "foldhash",
+      "owner": "runtime",
+      "expires_on": "2026-08-31",
+      "reason": "Duplicate versions are introduced by hashbrown and DataFusion transitive dependencies while upstream graphs converge."
+    },
+    {
+      "kind": "duplicate",
+      "crate": "getrandom",
+      "owner": "runtime",
+      "expires_on": "2026-08-31",
+      "reason": "Duplicate versions are introduced by current random/crypto dependency families while upstream graphs converge."
+    },
+    {
+      "kind": "duplicate",
+      "crate": "hashbrown",
+      "owner": "runtime",
+      "expires_on": "2026-08-31",
+      "reason": "Duplicate versions are introduced by DataFusion, kube-runtime, and related transitive dependency families while upstream graphs converge."
+    },
+    {
+      "kind": "duplicate",
+      "crate": "heck",
+      "owner": "runtime",
+      "expires_on": "2026-08-31",
+      "reason": "Duplicate versions are introduced by code-generation transitive dependencies while upstream graphs converge."
+    },
+    {
+      "kind": "duplicate",
+      "crate": "object_store",
+      "owner": "runtime",
+      "expires_on": "2026-08-31",
+      "reason": "Velorix intentionally carries object_store 0.12 for authority paths and DataFusion's object_store 0.13 for scan paths until the version boundary can be unified."
+    },
+    {
+      "kind": "duplicate",
+      "crate": "quick-xml",
+      "owner": "runtime",
+      "expires_on": "2026-08-31",
+      "reason": "Duplicate versions are introduced by Kubernetes/DataFusion transitive dependencies while upstream graphs converge."
+    },
+    {
+      "kind": "duplicate",
+      "crate": "rand",
+      "owner": "runtime",
+      "expires_on": "2026-08-31",
+      "reason": "Duplicate versions are introduced by current random/crypto dependency families while upstream graphs converge."
+    },
+    {
+      "kind": "duplicate",
+      "crate": "rand_core",
+      "owner": "runtime",
+      "expires_on": "2026-08-31",
+      "reason": "Duplicate versions are introduced by current random/crypto dependency families while upstream graphs converge."
+    },
+    {
+      "kind": "duplicate",
+      "crate": "thiserror",
+      "owner": "runtime",
+      "expires_on": "2026-08-31",
+      "reason": "Duplicate versions are introduced by mixed upstream crates while their dependency ranges converge."
+    },
+    {
+      "kind": "duplicate",
+      "crate": "thiserror-impl",
+      "owner": "runtime",
+      "expires_on": "2026-08-31",
+      "reason": "Duplicate versions follow the thiserror duplicate and will converge with upstream dependency ranges."
+    },
+    {
+      "kind": "duplicate",
+      "crate": "winnow",
+      "owner": "runtime",
+      "expires_on": "2026-08-31",
+      "reason": "Duplicate versions are introduced by SlateDB/figment/toml transitive dependencies while upstream graphs converge."
     },
     {
       "kind": "unmaintained",
