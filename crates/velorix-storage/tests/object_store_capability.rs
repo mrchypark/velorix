@@ -11,9 +11,10 @@ use object_store::{
 use tempfile::TempDir;
 use velorix_storage::{
     capability::{
-        probe_object_store_capabilities, probe_production_object_store_profile,
-        AuthoritativeNamespace, AuthoritativeObjectStoreCapabilitiesV1,
-        AuthoritativeObjectStoreCapabilityError, ObjectStoreCapabilityError,
+        probe_authoritative_object_store_capabilities, probe_object_store_capabilities,
+        probe_production_object_store_profile, AuthoritativeNamespace,
+        AuthoritativeObjectStoreCapabilitiesV1, AuthoritativeObjectStoreCapabilityError,
+        AuthoritativeObjectStoreCapabilityProbeError, ObjectStoreCapabilityError,
         ObjectStoreCapabilityProbeError, ObjectStoreCapabilityProfile,
         RequiredObjectStoreCapability,
     },
@@ -191,6 +192,48 @@ async fn production_capability_probe_rejects_store_without_create_only_behavior(
             );
         }
         other => panic!("expected capability error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn authoritative_capability_probe_covers_every_namespace() {
+    let (_temp_dir, store) = temp_store();
+
+    let capabilities =
+        probe_authoritative_object_store_capabilities(store.as_ref(), "local-test", "v1/probes")
+            .await
+            .unwrap();
+
+    capabilities.validate_for_startup().unwrap();
+    for namespace in AuthoritativeNamespace::all() {
+        let profile = capabilities.profiles.get(&namespace).unwrap();
+        assert_eq!(profile.backend_name, "local-test");
+    }
+}
+
+#[tokio::test]
+async fn authoritative_capability_probe_reports_namespace_for_create_only_failure() {
+    let (_temp_dir, inner) = temp_store();
+    let store = OverwriteCreateStore { inner };
+
+    let err =
+        probe_authoritative_object_store_capabilities(&store, "overwrite-create", "v1/probes")
+            .await
+            .unwrap_err();
+
+    match err {
+        AuthoritativeObjectStoreCapabilityProbeError::Namespace { namespace, source } => {
+            assert_eq!(namespace, AuthoritativeNamespace::Ingest);
+            match source {
+                ObjectStoreCapabilityProbeError::Capability(err) => {
+                    assert_eq!(
+                        err.required_capability(),
+                        RequiredObjectStoreCapability::ConditionalCreate
+                    );
+                }
+                other => panic!("expected capability error, got {other:?}"),
+            }
+        }
     }
 }
 

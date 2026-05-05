@@ -353,6 +353,7 @@ pub enum AuthoritativeNamespace {
 - [ ] Add tests for missing namespace, weak namespace, and all-namespaces-valid startup.
 - [x] Add a runtime object-store capability probe for create-only, read-after-write, list-after-write, and complete-payload visibility.
 - [x] Add fake-backend rejection coverage for stores that overwrite `PutMode::Create` requests.
+- [x] Add an authoritative namespace probe helper that builds `AuthoritativeObjectStoreCapabilitiesV1` and reports the failing namespace.
 - [ ] Commit: `feat: validate object store capabilities by namespace`.
 
 ## Phase 3: Checkpoint Lifecycle, Recovery, and GC

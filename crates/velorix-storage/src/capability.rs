@@ -108,6 +108,18 @@ pub enum ObjectStoreCapabilityProbeError {
     Capability(#[from] ObjectStoreCapabilityError),
 }
 
+#[derive(Debug, Error)]
+pub enum AuthoritativeObjectStoreCapabilityProbeError {
+    #[error(
+        "authoritative object-store namespace `{namespace}` failed capability probe: {source}"
+    )]
+    Namespace {
+        namespace: AuthoritativeNamespace,
+        #[source]
+        source: ObjectStoreCapabilityProbeError,
+    },
+}
+
 impl ObjectStoreCapabilityProfile {
     pub fn local_development() -> Self {
         Self {
@@ -301,6 +313,31 @@ pub async fn probe_production_object_store_profile(
     profile.validate_for_velorix_durability()?;
 
     Ok(profile)
+}
+
+pub async fn probe_authoritative_object_store_capabilities(
+    store: &dyn ObjectStore,
+    backend_name: impl AsRef<str>,
+    probe_prefix: impl AsRef<str>,
+) -> Result<AuthoritativeObjectStoreCapabilitiesV1, AuthoritativeObjectStoreCapabilityProbeError> {
+    let mut profiles = BTreeMap::new();
+    let probe_prefix = normalize_probe_prefix(probe_prefix.as_ref());
+
+    for namespace in AuthoritativeNamespace::all() {
+        let namespace_prefix = format!("{probe_prefix}/{namespace}");
+        let profile = probe_production_object_store_profile(
+            store,
+            backend_name.as_ref().to_string(),
+            namespace_prefix,
+        )
+        .await
+        .map_err(
+            |source| AuthoritativeObjectStoreCapabilityProbeError::Namespace { namespace, source },
+        )?;
+        profiles.insert(namespace, profile);
+    }
+
+    Ok(AuthoritativeObjectStoreCapabilitiesV1::new(profiles))
 }
 
 impl ObjectStoreCapabilityError {
