@@ -46,6 +46,7 @@ use velorix_storage::{
     log::IngestLog,
     manifest::{CheckpointManifest, InputRange},
     state::{CheckpointPublisher, StateObjectWrite},
+    state_store::{SlateDbStateStore, StateObjectStore},
 };
 
 const STREAM_ID: &str = "orders";
@@ -159,6 +160,8 @@ async fn run() -> BenchResult<()> {
     assert_eq!(recovered.replayed_batch_count(), 1);
     assert!(!recovered_rows.is_empty());
 
+    let slatedb_state_reopen =
+        slatedb_state_reopen(Arc::clone(&store), Arc::clone(&metered_store)).await?;
     let datafusion_scan = datafusion_table_scan().await?;
 
     let records_per_second = total_records as f64 / ingest_elapsed.as_secs_f64();
@@ -211,6 +214,12 @@ async fn run() -> BenchResult<()> {
                 datafusion_scan.object_requests,
                 datafusion_scan.scan_bytes,
             ),
+            workload_metric(
+                "slatedb_state_reopen",
+                &slatedb_state_reopen.samples,
+                slatedb_state_reopen.object_requests,
+                slatedb_state_reopen.scan_bytes,
+            ),
         ],
     };
     result.validate()?;
@@ -259,6 +268,45 @@ async fn datafusion_table_scan() -> BenchResult<MeasuredWorkload> {
         samples: vec![elapsed],
         object_requests: output.object_requests,
         scan_bytes,
+    })
+}
+
+async fn slatedb_state_reopen(
+    object_store: Arc<dyn ObjectStore>,
+    metered_store: Arc<MeteredObjectStore>,
+) -> BenchResult<MeasuredWorkload> {
+    let payload = Bytes::from_static(br#"{"state":"slatedb-reopen-smoke","version":1}"#);
+    let state = StateObjectWrite::new(
+        ORDERS_SUM_COUNT_OWNER,
+        PARTITION_ID,
+        CHECKPOINT_VERSION + 1,
+        "slatedb-state-reopen",
+        payload.clone(),
+    )?;
+    let requests_before = metered_store.snapshot();
+    let started = Instant::now();
+
+    let state_ref = {
+        let state_store =
+            SlateDbStateStore::open("v1/slatedb/benchmark-state", Arc::clone(&object_store))
+                .await?;
+        let state_ref = state_store.write_state_object(&state).await?;
+        state_store.close().await?;
+        state_ref
+    };
+
+    let reopened =
+        SlateDbStateStore::open("v1/slatedb/benchmark-state", Arc::clone(&object_store)).await?;
+    let recovered = reopened.read_state_object(&state_ref).await?;
+    reopened.close().await?;
+    let elapsed = started.elapsed();
+
+    assert_eq!(recovered, payload);
+
+    Ok(MeasuredWorkload {
+        samples: vec![elapsed],
+        object_requests: request_delta(&metered_store.snapshot(), &requests_before),
+        scan_bytes: 0,
     })
 }
 

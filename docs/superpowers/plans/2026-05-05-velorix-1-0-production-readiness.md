@@ -685,11 +685,14 @@ cargo run -p velorix-cli -- benchmark-gate \
 - [x] S3-compatible benchmark requires `VELORIX_S3_COMPAT=1`.
 - [ ] Commit: `bench: add production readiness workloads`.
 
-Progress note: this slice adds strict V1 workload detail schema and real
+Progress note: this task now has strict V1 workload detail schema and real
 local `local_incremental` workload details for ingest envelope validation,
 checkpoint publication, checkpoint recovery, and bounded DataFusion Parquet
-table scan instrumentation. SlateDB state write/read/reopen and GC dry-run
-planning remain pending until the benchmark harness measures those paths directly.
+table scan instrumentation. This slice adds real local SlateDB state
+write/read/reopen instrumentation through `SlateDbStateStore` without exposing
+state-store internals; object request counts come from the benchmark harness
+metered object-store wrapper. GC dry-run planning remains pending until the
+benchmark harness measures that path directly.
 `s3_incremental` is fail-closed and does not emit benchmark JSON without a live
 implementation.
 

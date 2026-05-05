@@ -14,6 +14,7 @@ const BENCHMARK_GATE_WORKLOADS: &[&str] = &[
     "checkpoint_publish",
     "checkpoint_recovery",
     "datafusion_table_scan",
+    "slatedb_state_reopen",
 ];
 use velorix_runtime::recovery::RecoveredRuntime;
 use velorix_storage::{
@@ -463,7 +464,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(format!("{error:#}").contains("datafusion_table_scan"));
+        assert!(format!("{error:#}").contains("slatedb_state_reopen"));
     }
 
     #[test]
@@ -569,7 +570,8 @@ mod tests {
             serde_json::json!([
                 workload_metrics()[0],
                 workload_metrics()[1],
-                workload_metrics()[2]
+                workload_metrics()[2],
+                workload_metrics()[3]
             ]),
         ))
         .unwrap()
@@ -700,6 +702,20 @@ mod tests {
                     "bytes_read": 2048,
                 },
                 "scan_bytes": 1024,
+            },
+            {
+                "name": "slatedb_state_reopen",
+                "p50_ms": 8.0,
+                "p95_ms": 9.0,
+                "object_requests": {
+                    "put_count": 1,
+                    "get_count": 1,
+                    "list_count": 1,
+                    "range_read_count": 0,
+                    "bytes_written": 256,
+                    "bytes_read": 256,
+                },
+                "scan_bytes": 0,
             },
         ])
     }

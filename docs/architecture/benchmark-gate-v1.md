@@ -34,8 +34,13 @@ It currently emits real local workload details for ingest envelope validation,
 checkpoint publication, checkpoint recovery, and a bounded DataFusion Parquet
 table scan. The DataFusion workload is instrumentation evidence that the local
 query path lists and reads Parquet objects under policy; it is not production
-scan latency evidence. SlateDB state reopen and GC dry-run planning workload
-details remain pending until those paths are measured directly.
+scan latency evidence. The SlateDB workload writes a small checkpoint state
+payload through `SlateDbStateStore`, closes and drops the store, reopens the
+same object-store path, reads the state back, and records elapsed latency plus
+the local metered object-store requests visible through the harness wrapper.
+This does not expose SlateDB internals or make object-request metering part of
+the state-store API. GC dry-run planning workload details remain pending until
+that path is measured directly.
 
 ## Required Workloads
 
@@ -46,6 +51,7 @@ details remain pending until those paths are measured directly.
 - Recovery after many checkpoints.
 - Checkpoint publication latency.
 - DataFusion bounded Parquet scan.
+- SlateDB state write/read/reopen latency.
 - Many-small-file scan.
 - Duplicate retry latency.
 - Corrupt payload detection.
