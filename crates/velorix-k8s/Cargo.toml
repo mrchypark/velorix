@@ -1,0 +1,12 @@
+[package]
+name = "velorix-k8s"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+k8s-openapi = { workspace = true, features = ["v1_35", "schemars"] }
+kube = { workspace = true, features = ["derive"] }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

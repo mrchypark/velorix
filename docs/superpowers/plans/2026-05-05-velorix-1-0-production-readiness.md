@@ -558,9 +558,9 @@ skeleton without pretending that a live operator exists.
 - readiness condition with `True`, `False`, `Unknown`.
 - reason and message fields for fail-closed status.
 
-- [ ] Generate OpenAPI schemas through `kube::CustomResource`.
-- [ ] Add schema tests that required spec fields are present.
-- [ ] Add serde round-trip tests for all CRDs.
+- [x] Generate OpenAPI schemas through `kube::CustomResource`.
+- [x] Add schema tests that required spec fields are present.
+- [x] Add serde round-trip tests for all CRDs.
 - [ ] Commit: `feat: add velorix kubernetes crds`.
 
 ### Task 4.3: Add Controller Reconciliation Skeleton
