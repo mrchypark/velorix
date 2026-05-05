@@ -24,6 +24,7 @@ use velorix_storage::{
     checkpoint_index::{
         CheckpointAdminInspection, CheckpointLifecycleStatus, CheckpointManifestInspectionStatus,
     },
+    gc::{GarbageCollectionPlan, GarbageCollectionPolicy},
     state::CheckpointPublisher,
 };
 
@@ -44,6 +45,14 @@ enum Command {
     CheckpointInspectLocal {
         #[arg(long)]
         object_store_dir: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    GcPlanLocal {
+        #[arg(long)]
+        object_store_dir: PathBuf,
+        #[arg(long)]
+        retain_latest_manifests: usize,
         #[arg(long)]
         json: bool,
     },
@@ -103,6 +112,25 @@ async fn main() -> anyhow::Result<()> {
                 println!("{}", format_checkpoint_inspection_json(&inspection)?);
             } else {
                 print!("{}", format_checkpoint_inspection(&inspection));
+            }
+        }
+        Some(Command::GcPlanLocal {
+            object_store_dir,
+            retain_latest_manifests,
+            json,
+        }) => {
+            let store = local_object_store(&object_store_dir)?;
+            let plan = CheckpointPublisher::new(store)
+                .plan_garbage_collection(GarbageCollectionPolicy {
+                    retain_latest_manifests,
+                })
+                .await
+                .context("failed to plan local garbage collection")?;
+
+            if json {
+                println!("{}", format_gc_plan_json(&plan)?);
+            } else {
+                print!("{}", format_gc_plan(&plan));
             }
         }
         Some(Command::BenchmarkValidate { result }) => {
@@ -209,6 +237,35 @@ fn format_checkpoint_inspection_json(
         inspection,
     })
     .context("failed to serialize checkpoint inspection")
+}
+
+fn format_gc_plan(plan: &GarbageCollectionPlan) -> String {
+    let mut output = format!(
+        "retained_manifest_versions={:?}\ncandidates:\n",
+        plan.retained_manifest_versions
+    );
+    for candidate in &plan.candidates {
+        output.push_str(&format!(
+            "kind={:?} key={}\n",
+            candidate.kind, candidate.object_key
+        ));
+    }
+    output
+}
+
+fn format_gc_plan_json(plan: &GarbageCollectionPlan) -> anyhow::Result<String> {
+    #[derive(Serialize)]
+    struct GarbageCollectionPlanReport<'a> {
+        schema_version: u16,
+        #[serde(flatten)]
+        plan: &'a GarbageCollectionPlan,
+    }
+
+    serde_json::to_string_pretty(&GarbageCollectionPlanReport {
+        schema_version: 1,
+        plan,
+    })
+    .context("failed to serialize garbage collection plan")
 }
 
 fn format_lifecycle_status(status: Option<CheckpointLifecycleStatus>) -> &'static str {
@@ -353,6 +410,7 @@ mod tests {
             CheckpointAdminInspection, CheckpointLifecycleStatus, CheckpointManifestInspection,
             CheckpointManifestInspectionStatus,
         },
+        gc::{GarbageCollectionCandidate, GarbageCollectionCandidateKind},
         object_key::ObjectKey,
     };
 
@@ -449,6 +507,33 @@ mod tests {
         };
 
         assert_eq!(evidence, PathBuf::from("readiness.json"));
+        assert!(json);
+    }
+
+    #[test]
+    fn gc_plan_cli_parses_dry_run_json_command() {
+        let cli = Cli::try_parse_from([
+            "velorix-cli",
+            "gc-plan-local",
+            "--object-store-dir",
+            "/tmp/velorix",
+            "--retain-latest-manifests",
+            "2",
+            "--json",
+        ])
+        .unwrap();
+
+        let Some(Command::GcPlanLocal {
+            object_store_dir,
+            retain_latest_manifests,
+            json,
+        }) = cli.command
+        else {
+            panic!("expected gc-plan-local command");
+        };
+
+        assert_eq!(object_store_dir, PathBuf::from("/tmp/velorix"));
+        assert_eq!(retain_latest_manifests, 2);
         assert!(json);
     }
 
@@ -587,6 +672,30 @@ mod tests {
             value["manifests"][1]["status"]["invalid"]["reason"],
             "missing visible parent checkpoint\n7"
         );
+    }
+
+    #[test]
+    fn gc_plan_json_uses_stable_schema_version() {
+        let plan = GarbageCollectionPlan {
+            retained_manifest_versions: vec![7, 8],
+            candidates: vec![GarbageCollectionCandidate {
+                object_key: ObjectKey::parse(
+                    "v1/outputs/orders/p=0000000000/chk=00000000000000000001/00000000000000000000-00000000000000000010/out.output",
+                )
+                .unwrap(),
+                kind: GarbageCollectionCandidateKind::OutputObject,
+            }],
+        };
+
+        let json = format_gc_plan_json(&plan).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(
+            value["retained_manifest_versions"],
+            serde_json::json!([7, 8])
+        );
+        assert_eq!(value["candidates"][0]["kind"], "output_object");
     }
 
     fn valid_result_json() -> String {

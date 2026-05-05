@@ -793,6 +793,8 @@ implementation.
 - [x] `checkpoint-inspect-local --json` reads from object storage only.
 - [x] `checkpoint-inspect-local --json` never repairs or mutates state.
 - [x] Checkpoint inspection JSON output uses stable `schema_version`.
+- [x] `gc-plan-local --json` reads from object storage only and does not execute deletion.
+- [x] GC plan JSON output uses stable `schema_version`.
 - [ ] Commit: `feat: add production admin inspection commands`.
 
 ## Phase 8: Dependency Governance and Release Cut
