@@ -51,13 +51,17 @@ Startup validation rejects a missing namespace profile and rejects any namespace
 whose `ObjectStoreCapabilityProfile` is missing a required durability
 capability. A minimal S3-compatible storage harness now validates create-only,
 read-after-write, list-after-write, and range-read behavior when explicitly
-enabled. Broader runtime probes remain later evidence.
+enabled. Capability diagnostics expose the backend name, namespace, and missing
+durability capabilities for every authoritative namespace. Broader runtime
+probes remain later evidence.
 
 ## Current Verification
 
 - Missing namespace declarations fail validation.
 - Weak namespace declarations fail validation and report the namespace plus the
   missing durability capability.
+- Diagnostics report backend, namespace, and missing capability status for every
+  authoritative namespace.
 - Complete namespace declarations pass validation.
 - Production persisted table scans reject stores registered without production
   capabilities.

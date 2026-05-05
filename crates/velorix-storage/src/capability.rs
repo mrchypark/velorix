@@ -29,6 +29,13 @@ pub struct AuthoritativeObjectStoreCapabilitiesV1 {
     pub profiles: BTreeMap<AuthoritativeNamespace, ObjectStoreCapabilityProfile>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObjectStoreCapabilityDiagnostic {
+    pub namespace: AuthoritativeNamespace,
+    pub backend_name: Option<String>,
+    pub missing_capabilities: Vec<RequiredObjectStoreCapability>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RequiredObjectStoreCapability {
     ConditionalCreate,
@@ -109,6 +116,13 @@ impl ObjectStoreCapabilityProfile {
             RequiredObjectStoreCapability::ReadAfterWrite => self.read_after_write,
         }
     }
+
+    fn missing_capabilities(&self) -> Vec<RequiredObjectStoreCapability> {
+        RequiredObjectStoreCapability::all()
+            .into_iter()
+            .filter(|capability| !self.has(*capability))
+            .collect()
+    }
 }
 
 impl AuthoritativeObjectStoreCapabilitiesV1 {
@@ -133,6 +147,24 @@ impl AuthoritativeObjectStoreCapabilitiesV1 {
         }
 
         Ok(())
+    }
+
+    pub fn diagnostics(&self) -> Vec<ObjectStoreCapabilityDiagnostic> {
+        AuthoritativeNamespace::all()
+            .into_iter()
+            .map(|namespace| match self.profiles.get(&namespace) {
+                Some(profile) => ObjectStoreCapabilityDiagnostic {
+                    namespace,
+                    backend_name: Some(profile.backend_name.clone()),
+                    missing_capabilities: profile.missing_capabilities(),
+                },
+                None => ObjectStoreCapabilityDiagnostic {
+                    namespace,
+                    backend_name: None,
+                    missing_capabilities: RequiredObjectStoreCapability::all().to_vec(),
+                },
+            })
+            .collect()
     }
 }
 

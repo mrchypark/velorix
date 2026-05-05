@@ -155,6 +155,45 @@ fn authoritative_capabilities_accept_all_valid_namespaces() {
 }
 
 #[test]
+fn authoritative_capabilities_diagnostics_report_backend_namespace_and_missing_capabilities() {
+    let mut profiles = all_namespace_profiles();
+    let weak_profile = profile_missing(RequiredObjectStoreCapability::ConditionalCreate);
+    profiles.insert(AuthoritativeNamespace::Output, weak_profile.clone());
+    profiles.remove(&AuthoritativeNamespace::BenchmarkEvidence);
+    let capabilities = AuthoritativeObjectStoreCapabilitiesV1::new(profiles);
+
+    let diagnostics = capabilities.diagnostics();
+
+    let output = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.namespace == AuthoritativeNamespace::Output)
+        .unwrap();
+    assert_eq!(
+        output.backend_name.as_deref(),
+        Some(weak_profile.backend_name.as_str())
+    );
+    assert_eq!(
+        output.missing_capabilities,
+        vec![RequiredObjectStoreCapability::ConditionalCreate]
+    );
+
+    let benchmark = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.namespace == AuthoritativeNamespace::BenchmarkEvidence)
+        .unwrap();
+    assert_eq!(benchmark.backend_name, None);
+    assert_eq!(
+        benchmark.missing_capabilities,
+        vec![
+            RequiredObjectStoreCapability::ConditionalCreate,
+            RequiredObjectStoreCapability::AtomicVisibility,
+            RequiredObjectStoreCapability::ListAfterWrite,
+            RequiredObjectStoreCapability::ReadAfterWrite,
+        ]
+    );
+}
+
+#[test]
 fn capability_profile_validation_reports_each_missing_required_capability() {
     for required_capability in [
         RequiredObjectStoreCapability::ConditionalCreate,
