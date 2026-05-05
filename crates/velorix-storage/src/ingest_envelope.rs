@@ -43,6 +43,17 @@ pub struct IngestEnvelope {
     payload: Bytes,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IngestEnvelopeEncodeRequest {
+    pub relation_id: String,
+    pub relation_version: String,
+    pub schema_fingerprint: String,
+    pub stream_id: String,
+    pub partition_id: u32,
+    pub start_offset_inclusive: u64,
+    pub end_offset_exclusive: u64,
+}
+
 #[derive(Debug, Error)]
 pub enum IngestEnvelopeError {
     #[error("malformed ingest envelope: {reason}")]
@@ -80,13 +91,7 @@ impl IngestEnvelope {
     /// `payload_digest` plus the stored body bytes, so replay fails closed on
     /// header-only mutations as well as body mutations.
     pub fn encode_batches(
-        relation_id: impl Into<String>,
-        relation_version: impl Into<String>,
-        schema_fingerprint: impl Into<String>,
-        stream_id: impl Into<String>,
-        partition_id: u32,
-        start_offset_inclusive: u64,
-        end_offset_exclusive: u64,
+        request: IngestEnvelopeEncodeRequest,
         batches: &[RecordBatch],
     ) -> Result<Bytes, IngestEnvelopeError> {
         let schema = batches.first().map(RecordBatch::schema).ok_or_else(|| {
@@ -106,10 +111,11 @@ impl IngestEnvelope {
             }
         }
 
-        if start_offset_inclusive >= end_offset_exclusive {
+        if request.start_offset_inclusive >= request.end_offset_exclusive {
             return Err(IngestEnvelopeError::MalformedEnvelope {
                 reason: format!(
-                    "offset range must be nonempty: start={start_offset_inclusive}, end={end_offset_exclusive}"
+                    "offset range must be nonempty: start={}, end={}",
+                    request.start_offset_inclusive, request.end_offset_exclusive
                 ),
             });
         }
@@ -117,13 +123,13 @@ impl IngestEnvelope {
         let header_without_digest = IngestEnvelopeHeaderWithoutDigest {
             schema_version: SCHEMA_VERSION_V1,
             format: FORMAT_ARROW_IPC_DELTA_BATCH_V1.to_string(),
-            stream_id: stream_id.into(),
-            partition_id,
-            start_offset_inclusive,
-            end_offset_exclusive,
-            relation_id: relation_id.into(),
-            relation_version: relation_version.into(),
-            schema_fingerprint: schema_fingerprint.into(),
+            stream_id: request.stream_id,
+            partition_id: request.partition_id,
+            start_offset_inclusive: request.start_offset_inclusive,
+            end_offset_exclusive: request.end_offset_exclusive,
+            relation_id: request.relation_id,
+            relation_version: request.relation_version,
+            schema_fingerprint: request.schema_fingerprint,
             compression: COMPRESSION_NONE.to_string(),
         };
         validate_header_without_digest(&header_without_digest)?;

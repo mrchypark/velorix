@@ -52,6 +52,18 @@ pub struct OutputObjectWrite {
     owner_claim: Option<PartitionOwnerClaim>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FencedOutputObjectWriteRequest {
+    pub stream_id: String,
+    pub partition_id: u32,
+    pub checkpoint_version: u64,
+    pub start_offset_inclusive: u64,
+    pub end_offset_exclusive: u64,
+    pub object_id: String,
+    pub owner_claim: PartitionOwnerClaim,
+    pub bytes: Bytes,
+}
+
 #[derive(Debug, Error)]
 pub enum CheckpointPublishError {
     #[error(transparent)]
@@ -1112,25 +1124,18 @@ impl OutputObjectWrite {
     }
 
     pub fn new_fenced(
-        stream_id: impl Into<String>,
-        partition_id: u32,
-        checkpoint_version: u64,
-        start_offset_inclusive: u64,
-        end_offset_exclusive: u64,
-        object_id: impl Into<String>,
-        owner_claim: PartitionOwnerClaim,
-        bytes: Bytes,
+        request: FencedOutputObjectWriteRequest,
     ) -> Result<Self, CheckpointPublishError> {
         let mut output = Self::new(
-            stream_id,
-            partition_id,
-            checkpoint_version,
-            start_offset_inclusive,
-            end_offset_exclusive,
-            object_id,
-            bytes,
+            request.stream_id,
+            request.partition_id,
+            request.checkpoint_version,
+            request.start_offset_inclusive,
+            request.end_offset_exclusive,
+            request.object_id,
+            request.bytes,
         )?;
-        output.owner_claim = Some(owner_claim);
+        output.owner_claim = Some(request.owner_claim);
 
         Ok(output)
     }

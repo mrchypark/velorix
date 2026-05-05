@@ -29,7 +29,7 @@ use velorix_runtime::{
     },
 };
 use velorix_storage::{
-    ingest_envelope::IngestEnvelope,
+    ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
     log::{IngestBatch, IngestLog, IngestLogError},
     manifest::{CheckpointManifest, InputRange, StateObjectRef},
     state::{CheckpointPublisher, StateObjectWrite},
@@ -101,38 +101,24 @@ fn ingest_envelope_bytes(
 ) -> Bytes {
     let catalog = orders_sum_count_relation_catalog().unwrap();
     ingest_envelope_bytes_with_relation(
-        stream_id,
-        partition_id,
-        start_offset_inclusive,
-        end_offset_exclusive,
+        IngestEnvelopeEncodeRequest {
+            relation_id: ORDERS_SUM_COUNT_RELATION_ID.to_string(),
+            relation_version: ORDERS_SUM_COUNT_RELATION_VERSION.to_string(),
+            schema_fingerprint: catalog.schema_fingerprint.as_str().to_string(),
+            stream_id: stream_id.to_string(),
+            partition_id,
+            start_offset_inclusive,
+            end_offset_exclusive,
+        },
         input,
-        ORDERS_SUM_COUNT_RELATION_ID,
-        ORDERS_SUM_COUNT_RELATION_VERSION,
-        catalog.schema_fingerprint.as_str(),
     )
 }
 
 fn ingest_envelope_bytes_with_relation(
-    stream_id: &str,
-    partition_id: u32,
-    start_offset_inclusive: u64,
-    end_offset_exclusive: u64,
+    request: IngestEnvelopeEncodeRequest,
     input: &DeltaBatch,
-    relation_id: &str,
-    relation_version: &str,
-    schema_fingerprint: &str,
 ) -> Bytes {
-    IngestEnvelope::encode_batches(
-        relation_id,
-        relation_version,
-        schema_fingerprint,
-        stream_id,
-        partition_id,
-        start_offset_inclusive,
-        end_offset_exclusive,
-        &[ingest_record_batch(input)],
-    )
-    .unwrap()
+    IngestEnvelope::encode_batches(request, &[ingest_record_batch(input)]).unwrap()
 }
 
 async fn append_ingest_envelope(
@@ -353,14 +339,16 @@ async fn recovery_rejects_ingest_envelope_with_wrong_relation_version() {
     let input = batch([input_delta("account-a", 4, 1)]);
     let catalog = orders_sum_count_relation_catalog().unwrap();
     let bytes = ingest_envelope_bytes_with_relation(
-        "orders",
-        0,
-        0,
-        1,
+        IngestEnvelopeEncodeRequest {
+            relation_id: ORDERS_SUM_COUNT_RELATION_ID.to_string(),
+            relation_version: "2026-05-06.v1".to_string(),
+            schema_fingerprint: catalog.schema_fingerprint.as_str().to_string(),
+            stream_id: "orders".to_string(),
+            partition_id: 0,
+            start_offset_inclusive: 0,
+            end_offset_exclusive: 1,
+        },
         &input,
-        ORDERS_SUM_COUNT_RELATION_ID,
-        "2026-05-06.v1",
-        catalog.schema_fingerprint.as_str(),
     );
 
     ingest_log.append_validated_envelope(bytes).await.unwrap();
@@ -384,14 +372,18 @@ async fn recovery_rejects_ingest_envelope_with_wrong_schema_fingerprint() {
     let ingest_log = IngestLog::new(Arc::clone(&store));
     let input = batch([input_delta("account-a", 4, 1)]);
     let bytes = ingest_envelope_bytes_with_relation(
-        "orders",
-        0,
-        0,
-        1,
+        IngestEnvelopeEncodeRequest {
+            relation_id: ORDERS_SUM_COUNT_RELATION_ID.to_string(),
+            relation_version: ORDERS_SUM_COUNT_RELATION_VERSION.to_string(),
+            schema_fingerprint:
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .to_string(),
+            stream_id: "orders".to_string(),
+            partition_id: 0,
+            start_offset_inclusive: 0,
+            end_offset_exclusive: 1,
+        },
         &input,
-        ORDERS_SUM_COUNT_RELATION_ID,
-        ORDERS_SUM_COUNT_RELATION_VERSION,
-        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     );
 
     ingest_log.append_validated_envelope(bytes).await.unwrap();

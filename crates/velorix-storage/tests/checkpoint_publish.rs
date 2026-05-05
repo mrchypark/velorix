@@ -16,7 +16,10 @@ use velorix_storage::{
     },
     object_key::ObjectKey,
     ownership::OwnershipEpochRecord,
-    state::{CheckpointPublishError, CheckpointPublisher, OutputObjectWrite, StateObjectWrite},
+    state::{
+        CheckpointPublishError, CheckpointPublisher, FencedOutputObjectWriteRequest,
+        OutputObjectWrite, StateObjectWrite,
+    },
     state_store::{RawObjectStateStore, SlateDbStateStore, StateObjectStore},
 };
 
@@ -266,16 +269,16 @@ fn fenced_output_write(
     owner_claim: PartitionOwnerClaim,
     bytes: &'static [u8],
 ) -> OutputObjectWrite {
-    OutputObjectWrite::new_fenced(
-        "settlements",
+    OutputObjectWrite::new_fenced(FencedOutputObjectWriteRequest {
+        stream_id: "settlements".to_string(),
         partition_id,
         checkpoint_version,
-        20,
-        25,
-        object_id,
+        start_offset_inclusive: 20,
+        end_offset_exclusive: 25,
+        object_id: object_id.to_string(),
         owner_claim,
-        Bytes::from_static(bytes),
-    )
+        bytes: Bytes::from_static(bytes),
+    })
     .unwrap()
 }
 

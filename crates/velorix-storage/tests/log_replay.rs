@@ -9,7 +9,7 @@ use bytes::Bytes;
 use object_store::{local::LocalFileSystem, path::Path, ObjectStore};
 use tempfile::TempDir;
 use velorix_storage::{
-    ingest_envelope::IngestEnvelope,
+    ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
     log::{IngestBatch, IngestLog, ReplayCheckpoint},
     object_key::ObjectKey,
 };
@@ -45,13 +45,17 @@ fn envelope_bytes(
     .unwrap();
 
     IngestEnvelope::encode_batches(
-        "orders_relation",
-        "2026-05-05",
-        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        stream_id,
-        partition_id,
-        start_offset_inclusive,
-        end_offset_exclusive,
+        IngestEnvelopeEncodeRequest {
+            relation_id: "orders_relation".to_string(),
+            relation_version: "2026-05-05".to_string(),
+            schema_fingerprint:
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+            stream_id: stream_id.to_string(),
+            partition_id,
+            start_offset_inclusive,
+            end_offset_exclusive,
+        },
         &[batch],
     )
     .unwrap()

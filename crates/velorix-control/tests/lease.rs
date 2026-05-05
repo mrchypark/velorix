@@ -9,7 +9,9 @@ use velorix_control::lease::{
 };
 use velorix_storage::{
     manifest::{CheckpointManifest, InputRange, PartitionOwnerClaim},
-    state::{CheckpointPublisher, OutputObjectWrite, StateObjectWrite},
+    state::{
+        CheckpointPublisher, FencedOutputObjectWriteRequest, OutputObjectWrite, StateObjectWrite,
+    },
 };
 
 fn lease_key() -> PartitionLeaseKey {
@@ -247,16 +249,16 @@ async fn partition_lease_grant_owner_claim_fences_storage_publication_when_used_
         Bytes::from_static(b"state"),
     )
     .unwrap();
-    let output = OutputObjectWrite::new_fenced(
-        "settlements",
-        0,
-        0,
-        20,
-        25,
-        "out-0001",
-        owner_claim.clone(),
-        Bytes::from_static(b"output"),
-    )
+    let output = OutputObjectWrite::new_fenced(FencedOutputObjectWriteRequest {
+        stream_id: "settlements".to_string(),
+        partition_id: 0,
+        checkpoint_version: 0,
+        start_offset_inclusive: 20,
+        end_offset_exclusive: 25,
+        object_id: "out-0001".to_string(),
+        owner_claim: owner_claim.clone(),
+        bytes: Bytes::from_static(b"output"),
+    })
     .unwrap();
 
     let state_ref = publisher

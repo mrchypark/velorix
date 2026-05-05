@@ -12,7 +12,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use velorix_storage::{
-    ingest_envelope::{IngestEnvelope, IngestEnvelopeError, INGEST_ENVELOPE_MAGIC},
+    ingest_envelope::{
+        IngestEnvelope, IngestEnvelopeEncodeRequest, IngestEnvelopeError, INGEST_ENVELOPE_MAGIC,
+    },
     log::{
         AppendValidatedEnvelopeOutcome, IngestBatch, IngestBatchDescriptor, IngestLog,
         IngestLogError,
@@ -96,13 +98,17 @@ fn batch_with_unsigned_weight() -> RecordBatch {
 
 fn envelope_bytes() -> Bytes {
     IngestEnvelope::encode_batches(
-        "orders_relation",
-        "2026-05-05",
-        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "orders",
-        7,
-        10,
-        12,
+        IngestEnvelopeEncodeRequest {
+            relation_id: "orders_relation".to_string(),
+            relation_version: "2026-05-05".to_string(),
+            schema_fingerprint:
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+            stream_id: "orders".to_string(),
+            partition_id: 7,
+            start_offset_inclusive: 10,
+            end_offset_exclusive: 12,
+        },
         &[valid_batch()],
     )
     .unwrap()
@@ -141,27 +147,27 @@ fn sha256_digest(bytes: &[u8]) -> String {
 }
 
 fn raw_envelope_with_payload(payload: &[u8]) -> Bytes {
+    let request = IngestEnvelopeEncodeRequest {
+        relation_id: "orders_relation".to_string(),
+        relation_version: "2026-05-05".to_string(),
+        schema_fingerprint:
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        stream_id: "orders".to_string(),
+        partition_id: 7,
+        start_offset_inclusive: 10,
+        end_offset_exclusive: 12,
+    };
     let header = serde_json::json!({
         "schema_version": 1,
         "format": "ArrowIpcDeltaBatchV1",
-        "stream_id": "orders",
-        "partition_id": 7,
-        "start_offset_inclusive": 10,
-        "end_offset_exclusive": 12,
-        "relation_id": "orders_relation",
-        "relation_version": "2026-05-05",
-        "schema_fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "payload_digest": sha256_digest_for_envelope_header(
-            "orders_relation",
-            "2026-05-05",
-            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "orders",
-            7,
-            10,
-            12,
-            "none",
-            payload
-        ),
+        "stream_id": request.stream_id.as_str(),
+        "partition_id": request.partition_id,
+        "start_offset_inclusive": request.start_offset_inclusive,
+        "end_offset_exclusive": request.end_offset_exclusive,
+        "relation_id": request.relation_id.as_str(),
+        "relation_version": request.relation_version.as_str(),
+        "schema_fingerprint": request.schema_fingerprint.as_str(),
+        "payload_digest": sha256_digest_for_envelope_header(&request, "none", payload),
         "compression": "none"
     });
     let header = serde_json::to_vec(&header).unwrap();
@@ -175,26 +181,20 @@ fn raw_envelope_with_payload(payload: &[u8]) -> Bytes {
 }
 
 fn sha256_digest_for_envelope_header(
-    relation_id: &str,
-    relation_version: &str,
-    schema_fingerprint: &str,
-    stream_id: &str,
-    partition_id: u32,
-    start_offset_inclusive: u64,
-    end_offset_exclusive: u64,
+    request: &IngestEnvelopeEncodeRequest,
     compression: &str,
     payload: &[u8],
 ) -> String {
     let header_without_digest = serde_json::json!({
         "schema_version": 1,
         "format": "ArrowIpcDeltaBatchV1",
-        "stream_id": stream_id,
-        "partition_id": partition_id,
-        "start_offset_inclusive": start_offset_inclusive,
-        "end_offset_exclusive": end_offset_exclusive,
-        "relation_id": relation_id,
-        "relation_version": relation_version,
-        "schema_fingerprint": schema_fingerprint,
+        "stream_id": request.stream_id.as_str(),
+        "partition_id": request.partition_id,
+        "start_offset_inclusive": request.start_offset_inclusive,
+        "end_offset_exclusive": request.end_offset_exclusive,
+        "relation_id": request.relation_id.as_str(),
+        "relation_version": request.relation_version.as_str(),
+        "schema_fingerprint": request.schema_fingerprint.as_str(),
         "compression": compression
     });
     let canonical_header = serde_json::to_vec(&header_without_digest).unwrap();
@@ -330,13 +330,17 @@ fn ingest_envelope_rejects_compression_header_mutation() {
 #[test]
 fn ingest_envelope_rejects_missing_relation_identity() {
     let err = IngestEnvelope::encode_batches(
-        "",
-        "2026-05-05",
-        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "orders",
-        0,
-        0,
-        1,
+        IngestEnvelopeEncodeRequest {
+            relation_id: "".to_string(),
+            relation_version: "2026-05-05".to_string(),
+            schema_fingerprint:
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+            stream_id: "orders".to_string(),
+            partition_id: 0,
+            start_offset_inclusive: 0,
+            end_offset_exclusive: 1,
+        },
         &[valid_batch()],
     )
     .unwrap_err();
@@ -344,13 +348,17 @@ fn ingest_envelope_rejects_missing_relation_identity() {
     assert!(matches!(err, IngestEnvelopeError::MalformedEnvelope { .. }));
 
     let err = IngestEnvelope::encode_batches(
-        "orders_relation",
-        " ",
-        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "orders",
-        0,
-        0,
-        1,
+        IngestEnvelopeEncodeRequest {
+            relation_id: "orders_relation".to_string(),
+            relation_version: " ".to_string(),
+            schema_fingerprint:
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+            stream_id: "orders".to_string(),
+            partition_id: 0,
+            start_offset_inclusive: 0,
+            end_offset_exclusive: 1,
+        },
         &[valid_batch()],
     )
     .unwrap_err();
@@ -361,13 +369,15 @@ fn ingest_envelope_rejects_missing_relation_identity() {
 #[test]
 fn ingest_envelope_rejects_malformed_relation_schema_fingerprint() {
     let err = IngestEnvelope::encode_batches(
-        "orders_relation",
-        "2026-05-05",
-        "sha256:not-a-v1-relation-fingerprint",
-        "orders",
-        0,
-        0,
-        1,
+        IngestEnvelopeEncodeRequest {
+            relation_id: "orders_relation".to_string(),
+            relation_version: "2026-05-05".to_string(),
+            schema_fingerprint: "sha256:not-a-v1-relation-fingerprint".to_string(),
+            stream_id: "orders".to_string(),
+            partition_id: 0,
+            start_offset_inclusive: 0,
+            end_offset_exclusive: 1,
+        },
         &[valid_batch()],
     )
     .unwrap_err();
@@ -392,13 +402,15 @@ fn ingest_envelope_rejects_digest_mismatch() {
 fn ingest_envelope_accepts_supplied_relation_schema_fingerprint_without_arrow_derivation() {
     let supplied = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     let bytes = IngestEnvelope::encode_batches(
-        "orders_relation",
-        "2026-05-05",
-        supplied,
-        "orders",
-        0,
-        0,
-        1,
+        IngestEnvelopeEncodeRequest {
+            relation_id: "orders_relation".to_string(),
+            relation_version: "2026-05-05".to_string(),
+            schema_fingerprint: supplied.to_string(),
+            stream_id: "orders".to_string(),
+            partition_id: 0,
+            start_offset_inclusive: 0,
+            end_offset_exclusive: 1,
+        },
         &[valid_batch()],
     )
     .unwrap();
@@ -436,13 +448,17 @@ fn ingest_envelope_digest_covers_canonical_header_without_payload_digest() {
 #[test]
 fn ingest_envelope_rejects_missing_weight_column() {
     let err = IngestEnvelope::encode_batches(
-        "orders_relation",
-        "2026-05-05",
-        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "orders",
-        0,
-        0,
-        1,
+        IngestEnvelopeEncodeRequest {
+            relation_id: "orders_relation".to_string(),
+            relation_version: "2026-05-05".to_string(),
+            schema_fingerprint:
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+            stream_id: "orders".to_string(),
+            partition_id: 0,
+            start_offset_inclusive: 0,
+            end_offset_exclusive: 1,
+        },
         &[batch_without_weight()],
     )
     .unwrap_err();
@@ -461,13 +477,17 @@ fn ingest_envelope_rejects_decoded_payload_missing_weight_column() {
 #[test]
 fn ingest_envelope_rejects_non_int64_weight_column() {
     let err = IngestEnvelope::encode_batches(
-        "orders_relation",
-        "2026-05-05",
-        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "orders",
-        0,
-        0,
-        1,
+        IngestEnvelopeEncodeRequest {
+            relation_id: "orders_relation".to_string(),
+            relation_version: "2026-05-05".to_string(),
+            schema_fingerprint:
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+            stream_id: "orders".to_string(),
+            partition_id: 0,
+            start_offset_inclusive: 0,
+            end_offset_exclusive: 1,
+        },
         &[batch_with_unsigned_weight()],
     )
     .unwrap_err();
@@ -553,13 +573,17 @@ async fn append_validated_envelope_reports_same_key_different_digest_conflict() 
     log.append_validated_envelope(bytes).await.unwrap();
 
     let conflicting = IngestEnvelope::encode_batches(
-        "orders_relation",
-        "2026-05-05",
-        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        "orders",
-        7,
-        10,
-        12,
+        IngestEnvelopeEncodeRequest {
+            relation_id: "orders_relation".to_string(),
+            relation_version: "2026-05-05".to_string(),
+            schema_fingerprint:
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .to_string(),
+            stream_id: "orders".to_string(),
+            partition_id: 7,
+            start_offset_inclusive: 10,
+            end_offset_exclusive: 12,
+        },
         &[valid_batch()],
     )
     .unwrap();

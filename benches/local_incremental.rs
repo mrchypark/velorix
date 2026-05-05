@@ -35,7 +35,7 @@ use velorix_runtime::recovery::{
     ORDERS_SUM_COUNT_RELATION_ID, ORDERS_SUM_COUNT_RELATION_VERSION,
 };
 use velorix_storage::{
-    ingest_envelope::IngestEnvelope,
+    ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
     log::IngestLog,
     manifest::{CheckpointManifest, InputRange},
     state::{CheckpointPublisher, StateObjectWrite},
@@ -227,13 +227,15 @@ async fn append_ingest_envelope(
     let batch = ingest_record_batch(input)?;
     let catalog = orders_sum_count_relation_catalog()?;
     let bytes = IngestEnvelope::encode_batches(
-        ORDERS_SUM_COUNT_RELATION_ID,
-        ORDERS_SUM_COUNT_RELATION_VERSION,
-        catalog.schema_fingerprint.as_str(),
-        STREAM_ID,
-        PARTITION_ID,
-        start_offset_inclusive,
-        end_offset_exclusive,
+        IngestEnvelopeEncodeRequest {
+            relation_id: ORDERS_SUM_COUNT_RELATION_ID.to_string(),
+            relation_version: ORDERS_SUM_COUNT_RELATION_VERSION.to_string(),
+            schema_fingerprint: catalog.schema_fingerprint.as_str().to_string(),
+            stream_id: STREAM_ID.to_string(),
+            partition_id: PARTITION_ID,
+            start_offset_inclusive,
+            end_offset_exclusive,
+        },
         &[batch],
     )?;
 
