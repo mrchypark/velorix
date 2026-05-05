@@ -93,6 +93,15 @@ pub enum BenchmarkGateError {
         baseline_workload: String,
     },
     #[error(
+        "benchmark expectation mismatch: expected {expected_gate:?}/{expected_backend:?}, got {actual_gate:?}/{actual_backend:?}"
+    )]
+    ExpectationMismatch {
+        expected_gate: BenchmarkGateLevel,
+        expected_backend: BenchmarkBackend,
+        actual_gate: BenchmarkGateLevel,
+        actual_backend: BenchmarkBackend,
+    },
+    #[error(
         "benchmark metric {metric} regressed by {regression_fraction:.3}, over budget {budget_fraction:.3}"
     )]
     Regression {
@@ -122,6 +131,23 @@ impl BenchmarkGateResultV1 {
             return Err(BenchmarkGateError::MissingRequiredField { field: "workload" });
         }
         self.metrics.validate()
+    }
+
+    pub fn expect_gate(
+        &self,
+        expected_gate: BenchmarkGateLevel,
+        expected_backend: BenchmarkBackend,
+    ) -> Result<(), BenchmarkGateError> {
+        if self.gate_level == expected_gate && self.backend == expected_backend {
+            Ok(())
+        } else {
+            Err(BenchmarkGateError::ExpectationMismatch {
+                expected_gate,
+                expected_backend,
+                actual_gate: self.gate_level,
+                actual_backend: self.backend,
+            })
+        }
     }
 
     pub fn compare_against(

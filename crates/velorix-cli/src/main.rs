@@ -2,10 +2,12 @@
 
 use std::{fs, path::Path, path::PathBuf, sync::Arc};
 
-use anyhow::Context;
+use anyhow::{bail, Context};
 use clap::{CommandFactory, Parser, Subcommand};
 use object_store::{local::LocalFileSystem, ObjectStore};
-use velorix_runtime::benchmark_gate::{BenchmarkBudgetV1, BenchmarkGateResultV1};
+use velorix_runtime::benchmark_gate::{
+    BenchmarkBackend, BenchmarkBudgetV1, BenchmarkGateLevel, BenchmarkGateResultV1,
+};
 use velorix_runtime::recovery::RecoveredRuntime;
 use velorix_storage::{
     checkpoint_index::{
@@ -37,6 +39,10 @@ enum Command {
         result: PathBuf,
     },
     BenchmarkGate {
+        #[arg(long, value_parser = parse_benchmark_gate_level)]
+        gate_level: BenchmarkGateLevel,
+        #[arg(long, value_parser = parse_benchmark_backend)]
+        backend: BenchmarkBackend,
         #[arg(long)]
         baseline: PathBuf,
         #[arg(long)]
@@ -74,15 +80,23 @@ async fn main() -> anyhow::Result<()> {
             print!("{}", format_checkpoint_inspection(&inspection));
         }
         Some(Command::BenchmarkValidate { result }) => {
-            run_benchmark_gate(None, &result, None)?;
+            run_benchmark_gate(None, &result, None, None, None)?;
             println!("benchmark result valid");
         }
         Some(Command::BenchmarkGate {
+            gate_level,
+            backend,
             baseline,
             result,
             max_regression_fraction,
         }) => {
-            run_benchmark_gate(Some(&baseline), &result, Some(max_regression_fraction))?;
+            run_benchmark_gate(
+                Some(&baseline),
+                &result,
+                Some(gate_level),
+                Some(backend),
+                Some(max_regression_fraction),
+            )?;
             println!("benchmark gate passed");
         }
         None => {
@@ -143,10 +157,22 @@ fn format_manifest_status(status: &CheckpointManifestInspectionStatus) -> String
 fn run_benchmark_gate(
     baseline: Option<&Path>,
     result: &Path,
+    gate_level: Option<BenchmarkGateLevel>,
+    backend: Option<BenchmarkBackend>,
     max_regression_fraction: Option<f64>,
 ) -> anyhow::Result<()> {
     let current_result = read_benchmark_result(result)
         .with_context(|| format!("failed to validate benchmark result {}", result.display()))?;
+    if let (Some(gate_level), Some(backend)) = (gate_level, backend) {
+        current_result
+            .expect_gate(gate_level, backend)
+            .with_context(|| {
+                format!(
+                    "benchmark result {} does not match CLI gate",
+                    result.display()
+                )
+            })?;
+    }
 
     let Some(baseline) = baseline else {
         return Ok(());
@@ -158,6 +184,22 @@ fn run_benchmark_gate(
             baseline.display()
         )
     })?;
+    if let (Some(gate_level), Some(backend)) = (gate_level, backend) {
+        baseline_result
+            .expect_gate(gate_level, backend)
+            .with_context(|| {
+                format!(
+                    "benchmark baseline {} does not match CLI gate",
+                    baseline.display()
+                )
+            })?;
+        if gate_level == BenchmarkGateLevel::Release && is_placeholder_baseline(&baseline_result) {
+            bail!(
+                "release benchmark gate requires a real S3-compatible baseline, got placeholder {}",
+                baseline.display()
+            );
+        }
+    }
     let max_regression_fraction =
         max_regression_fraction.context("benchmark gate requires --max-regression-fraction")?;
 
@@ -167,6 +209,27 @@ fn run_benchmark_gate(
             BenchmarkBudgetV1::relative(max_regression_fraction),
         )
         .context("benchmark result exceeds gate")
+}
+
+fn is_placeholder_baseline(result: &BenchmarkGateResultV1) -> bool {
+    result.commit.starts_with("placeholder-")
+}
+
+fn parse_benchmark_gate_level(value: &str) -> Result<BenchmarkGateLevel, String> {
+    match value {
+        "pr-smoke" | "pr_smoke" => Ok(BenchmarkGateLevel::PrSmoke),
+        "nightly-integration" | "nightly_integration" => Ok(BenchmarkGateLevel::NightlyIntegration),
+        "release" => Ok(BenchmarkGateLevel::Release),
+        _ => Err("expected pr-smoke, nightly-integration, or release".to_string()),
+    }
+}
+
+fn parse_benchmark_backend(value: &str) -> Result<BenchmarkBackend, String> {
+    match value {
+        "local" => Ok(BenchmarkBackend::Local),
+        "s3-compatible" | "s3_compatible" => Ok(BenchmarkBackend::S3Compatible),
+        _ => Err("expected local or s3-compatible".to_string()),
+    }
 }
 
 fn read_benchmark_result(path: &Path) -> anyhow::Result<BenchmarkGateResultV1> {
@@ -233,7 +296,52 @@ mod tests {
         let result = dir.path().join("result.json");
         fs::write(&result, VALID_RESULT_JSON).unwrap();
 
-        run_benchmark_gate(None, &result, None).unwrap();
+        run_benchmark_gate(None, &result, None, None, None).unwrap();
+    }
+
+    #[test]
+    fn benchmark_gate_cli_requires_gate_level_and_backend() {
+        let error = Cli::try_parse_from([
+            "velorix-cli",
+            "benchmark-gate",
+            "--baseline",
+            "baseline.json",
+            "--result",
+            "result.json",
+        ])
+        .unwrap_err();
+
+        assert!(error.to_string().contains("--gate-level"));
+        assert!(error.to_string().contains("--backend"));
+    }
+
+    #[test]
+    fn benchmark_gate_cli_parses_expected_gate_level_and_backend() {
+        let cli = Cli::try_parse_from([
+            "velorix-cli",
+            "benchmark-gate",
+            "--gate-level",
+            "pr-smoke",
+            "--backend",
+            "local",
+            "--baseline",
+            "baseline.json",
+            "--result",
+            "result.json",
+        ])
+        .unwrap();
+
+        let Some(Command::BenchmarkGate {
+            gate_level,
+            backend,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected benchmark-gate command");
+        };
+
+        assert_eq!(gate_level, BenchmarkGateLevel::PrSmoke);
+        assert_eq!(backend, BenchmarkBackend::Local);
     }
 
     #[test]
@@ -244,7 +352,14 @@ mod tests {
         fs::write(&baseline, VALID_RESULT_JSON).unwrap();
         fs::write(&result, VALID_RESULT_JSON).unwrap();
 
-        run_benchmark_gate(Some(&baseline), &result, Some(0.10)).unwrap();
+        run_benchmark_gate(
+            Some(&baseline),
+            &result,
+            Some(BenchmarkGateLevel::PrSmoke),
+            Some(BenchmarkBackend::Local),
+            Some(0.10),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -255,10 +370,57 @@ mod tests {
         fs::write(&baseline, VALID_RESULT_JSON).unwrap();
         fs::write(&result, REGRESSED_RESULT_JSON).unwrap();
 
-        let error = run_benchmark_gate(Some(&baseline), &result, Some(0.10)).unwrap_err();
+        let error = run_benchmark_gate(
+            Some(&baseline),
+            &result,
+            Some(BenchmarkGateLevel::PrSmoke),
+            Some(BenchmarkBackend::Local),
+            Some(0.10),
+        )
+        .unwrap_err();
         let error_chain = format!("{error:#}");
 
         assert!(error_chain.contains("regressed"));
+    }
+
+    #[test]
+    fn benchmark_gate_comparison_rejects_unexpected_backend() {
+        let dir = tempdir().unwrap();
+        let baseline = dir.path().join("baseline.json");
+        let result = dir.path().join("result.json");
+        fs::write(&baseline, VALID_RESULT_JSON).unwrap();
+        fs::write(&result, VALID_RESULT_JSON).unwrap();
+
+        let error = run_benchmark_gate(
+            Some(&baseline),
+            &result,
+            Some(BenchmarkGateLevel::PrSmoke),
+            Some(BenchmarkBackend::S3Compatible),
+            Some(0.10),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("benchmark expectation mismatch"));
+    }
+
+    #[test]
+    fn benchmark_gate_comparison_rejects_placeholder_release_baseline() {
+        let dir = tempdir().unwrap();
+        let baseline = dir.path().join("baseline.json");
+        let result = dir.path().join("result.json");
+        fs::write(&baseline, PLACEHOLDER_RELEASE_BASELINE_JSON).unwrap();
+        fs::write(&result, RELEASE_RESULT_JSON).unwrap();
+
+        let error = run_benchmark_gate(
+            Some(&baseline),
+            &result,
+            Some(BenchmarkGateLevel::Release),
+            Some(BenchmarkBackend::S3Compatible),
+            Some(0.10),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("requires a real S3-compatible baseline"));
     }
 
     #[test]
@@ -347,6 +509,60 @@ mod tests {
             "peak_rss_bytes": 0,
             "spill_bytes": 0,
             "scan_bytes": 0
+        }
+    }"#;
+
+    const RELEASE_RESULT_JSON: &str = r#"{
+        "schema_version": 1,
+        "commit": "abc123",
+        "gate_level": "release",
+        "backend": "s3_compatible",
+        "workload": "s3_incremental",
+        "metrics": {
+            "rows_per_second": 1000.0,
+            "bytes_per_row": 128.0,
+            "put_per_gib": 8.0,
+            "object_requests": {
+                "put_count": 8,
+                "get_count": 3,
+                "list_count": 2,
+                "range_read_count": 0,
+                "bytes_written": 1024,
+                "bytes_read": 512
+            },
+            "checkpoint_p50_ms": 3.0,
+            "checkpoint_p95_ms": 4.0,
+            "recovery_p95_ms": 7.0,
+            "peak_rss_bytes": 0,
+            "spill_bytes": 0,
+            "scan_bytes": 0
+        }
+    }"#;
+
+    const PLACEHOLDER_RELEASE_BASELINE_JSON: &str = r#"{
+        "schema_version": 1,
+        "commit": "placeholder-s3-release-baseline",
+        "gate_level": "release",
+        "backend": "s3_compatible",
+        "workload": "s3_incremental",
+        "metrics": {
+            "rows_per_second": 1.0,
+            "bytes_per_row": 1000000000.0,
+            "put_per_gib": 1000000000.0,
+            "object_requests": {
+                "put_count": 1000000,
+                "get_count": 1000000,
+                "list_count": 1000000,
+                "range_read_count": 1000000,
+                "bytes_written": 1000000000000,
+                "bytes_read": 1000000000000
+            },
+            "checkpoint_p50_ms": 600000.0,
+            "checkpoint_p95_ms": 600000.0,
+            "recovery_p95_ms": 600000.0,
+            "peak_rss_bytes": 1099511627776,
+            "spill_bytes": 1099511627776,
+            "scan_bytes": 1099511627776
         }
     }"#;
 

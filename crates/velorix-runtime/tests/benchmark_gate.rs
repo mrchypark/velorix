@@ -52,6 +52,20 @@ fn benchmark_comparison_rejects_local_smoke_against_s3_baseline() {
 }
 
 #[test]
+fn benchmark_result_rejects_unexpected_gate_or_backend() {
+    let result = local_smoke_result();
+
+    let error = result
+        .expect_gate(BenchmarkGateLevel::Release, BenchmarkBackend::Local)
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        BenchmarkGateError::ExpectationMismatch { .. }
+    ));
+}
+
+#[test]
 fn benchmark_comparison_fails_when_synthetic_regression_exceeds_budget() {
     let mut current = local_smoke_result();
     let baseline = local_smoke_result();

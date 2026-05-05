@@ -78,7 +78,7 @@ jobs:
         run: cargo deny check -W unmaintained
 
   benchmark-smoke:
-    name: benchmark JSON smoke
+    name: benchmark PR smoke gate
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -91,7 +91,23 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run local benchmark
-        run: cargo bench --bench local_incremental > benchmark-output.jsonl
+        run: |
+          mkdir -p target/velorix-bench
+          cargo bench --bench local_incremental > target/velorix-bench/local-pr-smoke.json
 
       - name: Validate benchmark JSON
-        run: cargo run -p velorix-cli -- benchmark-validate --result benchmark-output.jsonl
+        run: cargo run -p velorix-cli -- benchmark-validate --result target/velorix-bench/local-pr-smoke.json
+
+      - name: Run benchmark gate
+        run: |
+          cargo run -p velorix-cli -- benchmark-gate \
+            --gate-level pr-smoke \
+            --backend local \
+            --baseline baselines/benchmark/local/pr-smoke.json \
+            --result target/velorix-bench/local-pr-smoke.json
+
+      - name: Upload benchmark result
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-pr-smoke-benchmark
+          path: target/velorix-bench/local-pr-smoke.json

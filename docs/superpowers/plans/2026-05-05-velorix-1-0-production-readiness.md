@@ -634,11 +634,11 @@ cargo run -p velorix-cli -- benchmark-gate \
   --result target/velorix-bench/local-pr-smoke.json
 ```
 
-- [ ] CLI exits 0 when result is within baseline.
-- [ ] CLI exits non-zero when backend mismatches baseline.
-- [ ] CLI exits non-zero when object request metrics are missing.
-- [ ] CLI exits non-zero when any budget regression exceeds threshold.
-- [ ] Commit: `feat: add benchmark gate comparator cli`.
+- [x] CLI exits 0 when result is within baseline.
+- [x] CLI exits non-zero when backend mismatches baseline.
+- [x] CLI exits non-zero when object request metrics are missing.
+- [x] CLI exits non-zero when any budget regression exceeds threshold.
+- [x] Commit: `feat: add benchmark gate comparator cli`.
 
 ### Task 6.2: Split PR, Nightly, and Release Benchmark Workflows
 
@@ -657,9 +657,9 @@ cargo run -p velorix-cli -- benchmark-gate \
 - Release gate requires S3-compatible result artifact and matching S3 baseline.
 - Local and S3 baselines are not interchangeable.
 
-- [ ] Add artifact upload for benchmark JSON results.
-- [ ] Add explicit workflow failure when release gate has no S3 result artifact.
-- [ ] Commit: `ci: split benchmark smoke nightly and release gates`.
+- [x] Add artifact upload for benchmark JSON results.
+- [x] Add explicit workflow failure when release gate has no S3 result artifact.
+- [x] Commit: `ci: split benchmark smoke nightly and release gates`.
 
 ### Task 6.3: Extend Benchmark Workloads
 

@@ -23,6 +23,8 @@ and p95 latency, recovery p95 latency, peak RSS, spill bytes, and scan bytes.
 
 Initial gates should use regression budgets rather than absolute targets. Local
 filesystem and S3-compatible baselines are separate and not interchangeable.
+The initial committed baselines are conservative placeholders for wiring the
+gate; they are not production performance claims.
 
 `local_incremental` is a bootstrap harness, not production readiness evidence.
 
@@ -44,9 +46,15 @@ filesystem and S3-compatible baselines are separate and not interchangeable.
 
 - Benchmark JSON validates against schema.
 - `velorix-cli benchmark-validate` validates a single benchmark output file.
-- `velorix-cli benchmark-gate` compares a result against a matching baseline
-  with a caller-supplied regression budget.
+- `velorix-cli benchmark-gate --gate-level <level> --backend <backend>`
+  compares a result against a matching baseline with a caller-supplied
+  regression budget.
 - Synthetic regression over budget fails the gate.
 - Local and S3 baselines cannot be mixed.
 - Missing object request metrics invalidates the result.
-- Release workflow requires S3-compatible benchmark artifacts.
+- PR smoke writes `target/velorix-bench/local-pr-smoke.json`, gates it against
+  `baselines/benchmark/local/pr-smoke.json`, and uploads the result artifact.
+- Nightly S3-compatible gating fails closed when no S3-compatible result path is
+  configured.
+- Release gating fails closed when no S3-compatible result path is provided or
+  when the release baseline is still a placeholder.

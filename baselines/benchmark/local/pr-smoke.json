@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "commit": "placeholder-local-pr-smoke-baseline",
+  "gate_level": "pr_smoke",
+  "backend": "local",
+  "workload": "local_incremental",
+  "metrics": {
+    "rows_per_second": 1.0,
+    "bytes_per_row": 1000000000.0,
+    "put_per_gib": 1000000000.0,
+    "object_requests": {
+      "put_count": 1000000,
+      "get_count": 1000000,
+      "list_count": 1000000,
+      "range_read_count": 1000000,
+      "bytes_written": 1000000000000,
+      "bytes_read": 1000000000000
+    },
+    "checkpoint_p50_ms": 600000.0,
+    "checkpoint_p95_ms": 600000.0,
+    "recovery_p95_ms": 600000.0,
+    "peak_rss_bytes": 1099511627776,
+    "spill_bytes": 1099511627776,
+    "scan_bytes": 1099511627776
+  }
+}
