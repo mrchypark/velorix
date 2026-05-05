@@ -503,6 +503,59 @@ async fn gc_execution_deletes_only_velorix_owned_candidates() {
 }
 
 #[tokio::test]
+async fn gc_ignores_publish_temp_attempt_objects() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let retained_state = state_write(0, "state-retained", b"retained-state");
+    let orphan_state = state_write(0, "state-orphan", b"orphan-state");
+    let temp_attempt = ObjectKey::temp_publish(0, "attempt-0001", "manifest").unwrap();
+
+    let retained_state_ref = publisher.write_state_object(&retained_state).await.unwrap();
+    publisher.write_state_object(&orphan_state).await.unwrap();
+    store
+        .put(
+            &Path::from(temp_attempt.as_str()),
+            Bytes::from_static(b"staged-manifest").into(),
+        )
+        .await
+        .unwrap();
+    publisher
+        .publish_manifest(&manifest(0, retained_state_ref))
+        .await
+        .unwrap();
+
+    let plan = publisher
+        .plan_garbage_collection(GarbageCollectionPolicy {
+            retain_latest_manifests: 1,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        plan.candidates,
+        vec![GarbageCollectionCandidate {
+            object_key: orphan_state.object_key().clone(),
+            kind: GarbageCollectionCandidateKind::RawStateObject,
+        }]
+    );
+
+    let unsafe_plan = GarbageCollectionPlan {
+        retained_manifest_versions: plan.retained_manifest_versions,
+        candidates: vec![GarbageCollectionCandidate {
+            object_key: temp_attempt.clone(),
+            kind: GarbageCollectionCandidateKind::RawStateObject,
+        }],
+    };
+    let report = publisher
+        .execute_garbage_collection_plan(&unsafe_plan)
+        .await
+        .unwrap();
+
+    assert_eq!(report.deleted, Vec::new());
+    assert!(object_exists(store.as_ref(), &temp_attempt).await);
+}
+
+#[tokio::test]
 async fn gc_execution_rejects_caller_plan_that_targets_manifest_referenced_objects() {
     let (_temp_dir, store) = temp_store();
     let publisher = CheckpointPublisher::new(Arc::clone(&store));
