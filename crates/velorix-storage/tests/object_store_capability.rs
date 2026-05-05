@@ -1,13 +1,21 @@
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 
+use async_trait::async_trait;
 use bytes::Bytes;
-use object_store::{local::LocalFileSystem, path::Path, ObjectStore};
+use futures::stream::BoxStream;
+use object_store::{
+    local::LocalFileSystem, path::Path, GetOptions, GetResult, ListResult, MultipartUpload,
+    ObjectMeta, ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    Result as ObjectStoreResult,
+};
 use tempfile::TempDir;
 use velorix_storage::{
     capability::{
+        probe_object_store_capabilities, probe_production_object_store_profile,
         AuthoritativeNamespace, AuthoritativeObjectStoreCapabilitiesV1,
         AuthoritativeObjectStoreCapabilityError, ObjectStoreCapabilityError,
-        ObjectStoreCapabilityProfile, RequiredObjectStoreCapability,
+        ObjectStoreCapabilityProbeError, ObjectStoreCapabilityProfile,
+        RequiredObjectStoreCapability,
     },
     log::{IngestBatch, IngestLog, IngestLogError},
     manifest::{CheckpointManifest, InputRange, StateObjectRef},
@@ -69,6 +77,64 @@ fn assert_capability_error(
     assert_eq!(err.required_capability(), expected);
 }
 
+#[derive(Debug)]
+struct OverwriteCreateStore {
+    inner: Arc<dyn ObjectStore>,
+}
+
+impl fmt::Display for OverwriteCreateStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "OverwriteCreateStore")
+    }
+}
+
+#[async_trait]
+impl ObjectStore for OverwriteCreateStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        mut opts: PutOptions,
+    ) -> ObjectStoreResult<PutResult> {
+        if matches!(opts.mode, PutMode::Create) {
+            opts.mode = PutMode::Overwrite;
+        }
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> ObjectStoreResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn delete(&self, location: &Path) -> ObjectStoreResult<()> {
+        self.inner.delete(location).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
 fn manifest_for(state_ref: StateObjectRef) -> CheckpointManifest {
     CheckpointManifest {
         schema_version: 1,
@@ -83,6 +149,48 @@ fn manifest_for(state_ref: StateObjectRef) -> CheckpointManifest {
         output_objects: vec![],
         parent_checkpoint: None,
         created_at: "2026-05-04T00:00:00Z".to_string(),
+    }
+}
+
+#[tokio::test]
+async fn object_store_capability_probe_observes_create_read_and_list_behavior() {
+    let (_temp_dir, store) = temp_store();
+
+    let report =
+        probe_object_store_capabilities(store.as_ref(), "local-test", "v1/capability-probes")
+            .await
+            .unwrap();
+
+    assert_eq!(report.backend_name, "local-test");
+    assert!(report.probe_key.starts_with("v1/capability-probes/"));
+    assert!(report.conditional_create);
+    assert!(report.atomic_visibility);
+    assert!(report.list_after_write);
+    assert!(report.read_after_write);
+    report
+        .observed_profile()
+        .validate_for_velorix_durability()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn production_capability_probe_rejects_store_without_create_only_behavior() {
+    let (_temp_dir, inner) = temp_store();
+    let store = OverwriteCreateStore { inner };
+
+    let err = probe_production_object_store_profile(&store, "overwrite-create", "v1/probes")
+        .await
+        .unwrap_err();
+
+    match err {
+        ObjectStoreCapabilityProbeError::Capability(err) => {
+            assert_eq!(err.backend_name(), "overwrite-create");
+            assert_eq!(
+                err.required_capability(),
+                RequiredObjectStoreCapability::ConditionalCreate
+            );
+        }
+        other => panic!("expected capability error, got {other:?}"),
     }
 }
 

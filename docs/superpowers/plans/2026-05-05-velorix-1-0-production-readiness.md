@@ -351,6 +351,8 @@ pub enum AuthoritativeNamespace {
 - [ ] Startup validation must require every namespace.
 - [ ] Production table registry must require a registered store identity with capabilities, not only a DataFusion object store pointer.
 - [ ] Add tests for missing namespace, weak namespace, and all-namespaces-valid startup.
+- [x] Add a runtime object-store capability probe for create-only, read-after-write, list-after-write, and complete-payload visibility.
+- [x] Add fake-backend rejection coverage for stores that overwrite `PutMode::Create` requests.
 - [ ] Commit: `feat: validate object store capabilities by namespace`.
 
 ## Phase 3: Checkpoint Lifecycle, Recovery, and GC

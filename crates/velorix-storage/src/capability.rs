@@ -1,5 +1,12 @@
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
+use bytes::Bytes;
+use futures::TryStreamExt;
+use object_store::{path::Path, ObjectStore, PutMode};
 use thiserror::Error;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,6 +43,16 @@ pub struct ObjectStoreCapabilityDiagnostic {
     pub missing_capabilities: Vec<RequiredObjectStoreCapability>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObjectStoreCapabilityProbeReport {
+    pub backend_name: String,
+    pub probe_key: String,
+    pub conditional_create: bool,
+    pub atomic_visibility: bool,
+    pub list_after_write: bool,
+    pub read_after_write: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RequiredObjectStoreCapability {
     ConditionalCreate,
@@ -63,6 +80,32 @@ pub enum AuthoritativeObjectStoreCapabilityError {
         #[source]
         source: ObjectStoreCapabilityError,
     },
+}
+
+#[derive(Debug, Error)]
+pub enum ObjectStoreCapabilityProbeError {
+    #[error("object-store capability probe write failed for `{probe_key}`: {source}")]
+    Write {
+        probe_key: String,
+        #[source]
+        source: object_store::Error,
+    },
+    #[error("object-store capability probe read failed for `{probe_key}`: {source}")]
+    Read {
+        probe_key: String,
+        #[source]
+        source: object_store::Error,
+    },
+    #[error("object-store capability probe list failed for `{probe_prefix}`: {source}")]
+    List {
+        probe_prefix: String,
+        #[source]
+        source: object_store::Error,
+    },
+    #[error("object-store capability probe `{probe_key}` returned different bytes after create")]
+    ReadMismatch { probe_key: String },
+    #[error(transparent)]
+    Capability(#[from] ObjectStoreCapabilityError),
 }
 
 impl ObjectStoreCapabilityProfile {
@@ -168,6 +211,98 @@ impl AuthoritativeObjectStoreCapabilitiesV1 {
     }
 }
 
+impl ObjectStoreCapabilityProbeReport {
+    pub fn observed_profile(&self) -> ObjectStoreCapabilityProfile {
+        ObjectStoreCapabilityProfile {
+            backend_name: self.backend_name.clone(),
+            conditional_create: self.conditional_create,
+            atomic_visibility: self.atomic_visibility,
+            list_after_write: self.list_after_write,
+            read_after_write: self.read_after_write,
+        }
+    }
+}
+
+pub async fn probe_object_store_capabilities(
+    store: &dyn ObjectStore,
+    backend_name: impl Into<String>,
+    probe_prefix: impl AsRef<str>,
+) -> Result<ObjectStoreCapabilityProbeReport, ObjectStoreCapabilityProbeError> {
+    let backend_name = backend_name.into();
+    let probe_prefix = normalize_probe_prefix(probe_prefix.as_ref());
+    let probe_key = unique_probe_key(&probe_prefix);
+    let path = Path::from(probe_key.as_str());
+    let payload = Bytes::from_static(b"velorix-object-store-capability-probe-v1");
+
+    store
+        .put_opts(&path, payload.clone().into(), PutMode::Create.into())
+        .await
+        .map_err(|source| ObjectStoreCapabilityProbeError::Write {
+            probe_key: probe_key.clone(),
+            source,
+        })?;
+
+    let read_bytes = store
+        .get(&path)
+        .await
+        .map_err(|source| ObjectStoreCapabilityProbeError::Read {
+            probe_key: probe_key.clone(),
+            source,
+        })?
+        .bytes()
+        .await
+        .map_err(|source| ObjectStoreCapabilityProbeError::Read {
+            probe_key: probe_key.clone(),
+            source,
+        })?;
+
+    let read_after_write = read_bytes == payload;
+    if !read_after_write {
+        let _ = store.delete(&path).await;
+        return Err(ObjectStoreCapabilityProbeError::ReadMismatch { probe_key });
+    }
+
+    let duplicate_create = store
+        .put_opts(&path, payload.clone().into(), PutMode::Create.into())
+        .await;
+    let conditional_create = duplicate_create.is_err();
+
+    let listed = store
+        .list(Some(&Path::from(probe_prefix.as_str())))
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|source| ObjectStoreCapabilityProbeError::List {
+            probe_prefix: probe_prefix.clone(),
+            source,
+        })?
+        .into_iter()
+        .any(|meta| meta.location == path);
+
+    let _ = store.delete(&path).await;
+
+    Ok(ObjectStoreCapabilityProbeReport {
+        backend_name,
+        probe_key,
+        conditional_create,
+        atomic_visibility: read_after_write,
+        list_after_write: listed,
+        read_after_write,
+    })
+}
+
+pub async fn probe_production_object_store_profile(
+    store: &dyn ObjectStore,
+    backend_name: impl Into<String>,
+    probe_prefix: impl AsRef<str>,
+) -> Result<ObjectStoreCapabilityProfile, ObjectStoreCapabilityProbeError> {
+    let profile = probe_object_store_capabilities(store, backend_name, probe_prefix)
+        .await?
+        .observed_profile();
+    profile.validate_for_velorix_durability()?;
+
+    Ok(profile)
+}
+
 impl ObjectStoreCapabilityError {
     pub fn backend_name(&self) -> &str {
         &self.backend_name
@@ -176,6 +311,23 @@ impl ObjectStoreCapabilityError {
     pub fn required_capability(&self) -> RequiredObjectStoreCapability {
         self.required_capability
     }
+}
+
+fn normalize_probe_prefix(prefix: &str) -> String {
+    let prefix = prefix.trim_matches('/');
+    if prefix.is_empty() {
+        "v1/capability-probes".to_string()
+    } else {
+        prefix.to_string()
+    }
+}
+
+fn unique_probe_key(prefix: &str) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("{prefix}/pid={}/nanos={nanos}.probe", std::process::id())
 }
 
 impl AuthoritativeNamespace {
