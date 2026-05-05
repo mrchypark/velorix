@@ -1,5 +1,6 @@
-use std::{future::Future, time::Duration};
+use std::{future::Future, sync::Arc, time::Duration};
 
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use velorix_core::query::{QueryError, QueryPolicy, QueryPolicyError};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -46,6 +47,31 @@ impl QueryRuntimeLimits {
             operation,
         )
         .await
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct QueryExecutionLimiter {
+    permits: Arc<Semaphore>,
+    max_concurrent_queries: usize,
+}
+
+impl QueryExecutionLimiter {
+    pub fn from_policy(policy: QueryPolicy) -> Option<Self> {
+        policy
+            .max_concurrent_queries
+            .map(|max_concurrent_queries| Self {
+                permits: Arc::new(Semaphore::new(max_concurrent_queries)),
+                max_concurrent_queries,
+            })
+    }
+
+    pub(crate) fn try_acquire(&self) -> Result<OwnedSemaphorePermit, QueryPolicyError> {
+        self.permits.clone().try_acquire_owned().map_err(|_| {
+            QueryPolicyError::ConcurrencyLimitExceeded {
+                max_concurrent_queries: self.max_concurrent_queries,
+            }
+        })
     }
 }
 

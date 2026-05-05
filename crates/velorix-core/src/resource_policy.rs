@@ -81,6 +81,14 @@ pub enum QueryPolicyError {
     PlanningTimeout { timeout_ms: u64 },
     #[error("query execution exceeded query policy timeout of {timeout_ms} ms")]
     ExecutionTimeout { timeout_ms: u64 },
+    #[error(
+        "query concurrency limit of {max_concurrent_queries} concurrent queries is already in use"
+    )]
+    ConcurrencyLimitExceeded { max_concurrent_queries: usize },
+    #[error(
+        "query policy requires a shared concurrency limiter for {max_concurrent_queries} concurrent queries"
+    )]
+    ConcurrencyLimiterRequired { max_concurrent_queries: usize },
     #[error("query policy field {field} must be greater than zero when set")]
     InvalidZeroTimeout { field: &'static str },
     #[error("query policy field {field} must be greater than zero when set")]

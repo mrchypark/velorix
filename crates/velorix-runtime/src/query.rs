@@ -19,6 +19,7 @@ use thiserror::Error;
 use url::Url;
 use velorix_core::query::{QueryError, QueryPolicy, QueryPolicyError, INPUT_TABLE_NAME};
 
+pub use crate::query_runtime::QueryExecutionLimiter;
 use crate::query_runtime::QueryRuntimeLimits;
 use crate::recovery::{RecoveredRuntime, RecoveryError};
 
@@ -42,9 +43,19 @@ pub async fn query_recovered_materialized_view_with_policy(
     sql: &str,
     policy: QueryPolicy,
 ) -> Result<Vec<RecordBatch>, RuntimeQueryError> {
+    query_recovered_materialized_view_with_policy_and_limiter(store, sql, policy, None).await
+}
+
+pub async fn query_recovered_materialized_view_with_policy_and_limiter(
+    store: Arc<dyn ObjectStore>,
+    sql: &str,
+    policy: QueryPolicy,
+    limiter: Option<QueryExecutionLimiter>,
+) -> Result<Vec<RecordBatch>, RuntimeQueryError> {
     policy.validate().map_err(QueryError::from)?;
     validate_sql_text_policy(sql, policy).map_err(QueryError::from)?;
 
+    let _permit = acquire_query_permit(policy, limiter.as_ref())?;
     let recovered = RecoveredRuntime::recover(store).await?;
     let materialized = recovered.materialized_state();
 
@@ -92,8 +103,19 @@ pub async fn query_object_backed_input_with_policy(
     sql: &str,
     policy: QueryPolicy,
 ) -> Result<Vec<RecordBatch>, RuntimeQueryError> {
+    query_object_backed_input_with_policy_and_limiter(store, table_url, sql, policy, None).await
+}
+
+pub async fn query_object_backed_input_with_policy_and_limiter(
+    store: Arc<dyn DataFusionObjectStore>,
+    table_url: &str,
+    sql: &str,
+    policy: QueryPolicy,
+    limiter: Option<QueryExecutionLimiter>,
+) -> Result<Vec<RecordBatch>, RuntimeQueryError> {
     policy.validate().map_err(QueryError::from)?;
     validate_sql_text_policy(sql, policy).map_err(QueryError::from)?;
+    let _permit = acquire_query_permit(policy, limiter.as_ref())?;
     validate_scan_policy(store.as_ref(), table_url, policy).await?;
 
     let context = session_context(policy);
@@ -113,6 +135,20 @@ pub async fn query_object_backed_input_with_policy(
     collect_with_policy(dataframe, policy, limits)
         .await
         .map_err(Into::into)
+}
+
+fn acquire_query_permit(
+    policy: QueryPolicy,
+    limiter: Option<&QueryExecutionLimiter>,
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, QueryError> {
+    match (policy.max_concurrent_queries, limiter) {
+        (Some(max_concurrent_queries), None) => Err(QueryPolicyError::ConcurrencyLimiterRequired {
+            max_concurrent_queries,
+        }
+        .into()),
+        (_, Some(limiter)) => limiter.try_acquire().map(Some).map_err(QueryError::from),
+        (None, None) => Ok(None),
+    }
 }
 
 async fn collect_with_policy(
