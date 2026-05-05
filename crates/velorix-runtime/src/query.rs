@@ -1,7 +1,12 @@
 use std::sync::Arc;
 
-use arrow::record_batch::RecordBatch;
+use arrow::{
+    array::{ArrayRef, Int64Array, StringArray},
+    datatypes::{DataType, Field, Schema},
+    record_batch::RecordBatch,
+};
 use datafusion::{
+    datasource::MemTable,
     error::DataFusionError,
     execution::object_store::ObjectStoreUrl,
     object_store::path::Path as DataFusionPath,
@@ -12,10 +17,9 @@ use futures::TryStreamExt;
 use object_store::ObjectStore;
 use thiserror::Error;
 use url::Url;
-use velorix_core::query::{
-    query_delta_batch_with_policy, QueryError, QueryPolicy, QueryPolicyError, INPUT_TABLE_NAME,
-};
+use velorix_core::query::{QueryError, QueryPolicy, QueryPolicyError, INPUT_TABLE_NAME};
 
+use crate::query_runtime::QueryRuntimeLimits;
 use crate::recovery::{RecoveredRuntime, RecoveryError};
 
 #[derive(Debug, Error)]
@@ -38,10 +42,48 @@ pub async fn query_recovered_materialized_view_with_policy(
     sql: &str,
     policy: QueryPolicy,
 ) -> Result<Vec<RecordBatch>, RuntimeQueryError> {
+    policy.validate().map_err(QueryError::from)?;
+    validate_sql_text_policy(sql, policy).map_err(QueryError::from)?;
+
     let recovered = RecoveredRuntime::recover(store).await?;
     let materialized = recovered.materialized_state();
 
-    Ok(query_delta_batch_with_policy(&materialized, sql, policy).await?)
+    let input = RecordBatch::try_new(
+        input_schema(),
+        vec![
+            Arc::new(StringArray::from(
+                materialized
+                    .records()
+                    .iter()
+                    .map(|record| record.key.as_json().to_string())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(StringArray::from(
+                materialized
+                    .records()
+                    .iter()
+                    .map(|record| record.value.as_json().to_string())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Int64Array::from(
+                materialized
+                    .records()
+                    .iter()
+                    .map(|record| record.weight)
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+        ],
+    )
+    .map_err(QueryError::from)?;
+    let context = input_context(vec![input], policy)?;
+    let limits = QueryRuntimeLimits::from_policy(policy);
+    let dataframe = limits
+        .run_planning(async { context.sql(sql).await.map_err(QueryError::from) })
+        .await?;
+
+    collect_with_policy(dataframe, policy, limits)
+        .await
+        .map_err(Into::into)
 }
 
 pub async fn query_object_backed_input_with_policy(
@@ -50,17 +92,11 @@ pub async fn query_object_backed_input_with_policy(
     sql: &str,
     policy: QueryPolicy,
 ) -> Result<Vec<RecordBatch>, RuntimeQueryError> {
+    policy.validate().map_err(QueryError::from)?;
     validate_sql_text_policy(sql, policy).map_err(QueryError::from)?;
     validate_scan_policy(store.as_ref(), table_url, policy).await?;
 
-    let mut config = SessionConfig::new();
-    if let Some(batch_size) = policy.batch_size {
-        config = config.with_batch_size(batch_size.get());
-    }
-    if let Some(target_partitions) = policy.target_partitions {
-        config = config.with_target_partitions(target_partitions.get());
-    }
-    let context = SessionContext::new_with_config(config);
+    let context = session_context(policy);
 
     let object_store_url = object_store_url_for_table(table_url)?;
     context.register_object_store(object_store_url.as_ref(), store);
@@ -69,31 +105,51 @@ pub async fn query_object_backed_input_with_policy(
         .await
         .map_err(QueryError::from)?;
 
-    let dataframe = context.sql(sql).await.map_err(QueryError::from)?;
+    let limits = QueryRuntimeLimits::from_policy(policy);
+    let dataframe = limits
+        .run_planning(async { context.sql(sql).await.map_err(QueryError::from) })
+        .await?;
+
+    collect_with_policy(dataframe, policy, limits)
+        .await
+        .map_err(Into::into)
+}
+
+async fn collect_with_policy(
+    dataframe: datafusion::dataframe::DataFrame,
+    policy: QueryPolicy,
+    limits: QueryRuntimeLimits,
+) -> Result<Vec<RecordBatch>, QueryError> {
     if let Some(max_rows) = policy.max_output_rows {
         let fetch = max_rows.checked_add(1);
         let output = match fetch {
-            Some(fetch) => dataframe
-                .limit(0, Some(fetch))
-                .map_err(QueryError::from)?
-                .collect()
-                .await
-                .map_err(QueryError::from)?,
-            None => dataframe.collect().await.map_err(QueryError::from)?,
+            Some(fetch) => {
+                let limited = dataframe.limit(0, Some(fetch)).map_err(QueryError::from)?;
+                limits
+                    .run_execution(async { limited.collect().await.map_err(QueryError::from) })
+                    .await?
+            }
+            None => {
+                limits
+                    .run_execution(async { dataframe.collect().await.map_err(QueryError::from) })
+                    .await?
+            }
         };
         let observed_rows = output.iter().map(RecordBatch::num_rows).sum();
         if observed_rows > max_rows {
-            return Err(QueryError::from(QueryPolicyError::OutputRowsExceeded {
+            return Err(QueryPolicyError::OutputRowsExceeded {
                 observed_rows,
                 max_rows,
-            })
+            }
             .into());
         }
 
         return Ok(output);
     }
 
-    Ok(dataframe.collect().await.map_err(QueryError::from)?)
+    limits
+        .run_execution(async { dataframe.collect().await.map_err(QueryError::from) })
+        .await
 }
 
 fn validate_sql_text_policy(sql: &str, policy: QueryPolicy) -> Result<(), QueryPolicyError> {
@@ -108,6 +164,37 @@ fn validate_sql_text_policy(sql: &str, policy: QueryPolicy) -> Result<(), QueryP
     }
 
     Ok(())
+}
+
+fn input_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("key_json", DataType::Utf8, false),
+        Field::new("value_json", DataType::Utf8, false),
+        Field::new("weight", DataType::Int64, false),
+    ]))
+}
+
+fn input_context(
+    input_batches: Vec<RecordBatch>,
+    policy: QueryPolicy,
+) -> Result<SessionContext, QueryError> {
+    let table = MemTable::try_new(input_schema(), vec![input_batches])?;
+    let context = session_context(policy);
+    context.register_table(INPUT_TABLE_NAME, Arc::new(table))?;
+
+    Ok(context)
+}
+
+fn session_context(policy: QueryPolicy) -> SessionContext {
+    let mut config = SessionConfig::new();
+    if let Some(batch_size) = policy.batch_size {
+        config = config.with_batch_size(batch_size.get());
+    }
+    if let Some(target_partitions) = policy.target_partitions {
+        config = config.with_target_partitions(target_partitions.get());
+    }
+
+    SessionContext::new_with_config(config)
 }
 
 async fn validate_scan_policy(

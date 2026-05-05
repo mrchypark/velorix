@@ -77,6 +77,10 @@ pub enum QueryPolicyError {
         observed_requests: usize,
         max_requests: usize,
     },
+    #[error("query planning exceeded query policy timeout of {timeout_ms} ms")]
+    PlanningTimeout { timeout_ms: u64 },
+    #[error("query execution exceeded query policy timeout of {timeout_ms} ms")]
+    ExecutionTimeout { timeout_ms: u64 },
     #[error("query policy field {field} must be greater than zero when set")]
     InvalidZeroTimeout { field: &'static str },
     #[error("query policy field {field} must be greater than zero when set")]

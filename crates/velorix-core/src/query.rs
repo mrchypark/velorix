@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{future::Future, sync::Arc, time::Duration};
 
 use arrow::array::{ArrayRef, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -106,10 +106,26 @@ pub async fn validate_input_query_with_policy(
 
     let input = RecordBatch::new_empty(input_schema());
     let context = input_context(vec![input], policy)?;
-    let dataframe = context.sql(sql).await?;
-    dataframe.into_optimized_plan()?;
 
-    Ok(())
+    run_planning_with_policy(policy, async {
+        let dataframe = context.sql(sql).await?;
+        dataframe.into_optimized_plan()?;
+        Ok(())
+    })
+    .await
+}
+
+async fn run_planning_with_policy<T, F>(policy: QueryPolicy, operation: F) -> Result<T, QueryError>
+where
+    F: Future<Output = Result<T, QueryError>>,
+{
+    let Some(timeout_ms) = policy.planning_timeout_ms else {
+        return operation.await;
+    };
+
+    tokio::time::timeout(Duration::from_millis(timeout_ms), operation)
+        .await
+        .map_err(|_| QueryError::from(QueryPolicyError::PlanningTimeout { timeout_ms }))?
 }
 
 fn validate_sql_text_policy(sql: &str, policy: QueryPolicy) -> Result<(), QueryPolicyError> {
