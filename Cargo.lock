@@ -4653,6 +4653,7 @@ name = "velorix-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "object_store 0.12.5",
  "serde",

@@ -29,7 +29,9 @@ const BENCHMARK_GATE_WORKLOADS: &[&str] = &[
     "slatedb_state_reopen",
     "gc_dry_run_planning",
 ];
-use velorix_runtime::recovery::RecoveredRuntime;
+use velorix_runtime::recovery::{
+    orders_sum_count_relation_catalog, RecoveredRuntime, ORDERS_SUM_COUNT_OWNER,
+};
 use velorix_storage::{
     checkpoint_index::{
         CheckpointAdminInspection, CheckpointLifecycleStatus, CheckpointManifestInspectionStatus,
@@ -51,6 +53,11 @@ enum Command {
     RecoverLocal {
         #[arg(long)]
         object_store_dir: PathBuf,
+        #[arg(
+            long,
+            help = "Open checkpoint state through this SlateDB database path"
+        )]
+        slatedb_state_path: Option<String>,
         #[arg(
             long,
             help = "Start recovery from this published checkpoint, then replay later ingest"
@@ -128,20 +135,13 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Some(Command::RecoverLocal {
             object_store_dir,
+            slatedb_state_path,
             checkpoint_version,
         }) => {
             let store = local_object_store(&object_store_dir)?;
-            let recovered = match checkpoint_version {
-                Some(checkpoint_version) => {
-                    RecoveredRuntime::recover_from_published_checkpoint_version(
-                        store,
-                        checkpoint_version,
-                    )
-                    .await
-                }
-                None => RecoveredRuntime::recover(store).await,
-            }
-            .context("failed to recover local runtime")?;
+            let recovered = recover_local_runtime(store, slatedb_state_path, checkpoint_version)
+                .await
+                .context("failed to recover local runtime")?;
             let materialized_records = recovered.materialized_state().records().len();
 
             println!(
@@ -746,6 +746,39 @@ fn local_object_store(object_store_dir: &Path) -> anyhow::Result<Arc<dyn ObjectS
     Ok(Arc::new(store) as Arc<dyn ObjectStore>)
 }
 
+async fn recover_local_runtime(
+    store: Arc<dyn ObjectStore>,
+    slatedb_state_path: Option<String>,
+    checkpoint_version: Option<u64>,
+) -> Result<RecoveredRuntime, velorix_runtime::recovery::RecoveryError> {
+    match (slatedb_state_path, checkpoint_version) {
+        (Some(db_path), Some(checkpoint_version)) => {
+            RecoveredRuntime::recover_from_published_checkpoint_version_with_slatedb_state_store_and_relation_catalog(
+                store,
+                db_path,
+                checkpoint_version,
+                ORDERS_SUM_COUNT_OWNER,
+                orders_sum_count_relation_catalog()?,
+            )
+            .await
+        }
+        (Some(db_path), None) => {
+            RecoveredRuntime::recover_with_slatedb_state_store_and_relation_catalog(
+                store,
+                db_path,
+                ORDERS_SUM_COUNT_OWNER,
+                orders_sum_count_relation_catalog()?,
+            )
+            .await
+        }
+        (None, Some(checkpoint_version)) => {
+            RecoveredRuntime::recover_from_published_checkpoint_version(store, checkpoint_version)
+                .await
+        }
+        (None, None) => RecoveredRuntime::recover(store).await,
+    }
+}
+
 fn format_checkpoint_inspection(inspection: &CheckpointAdminInspection) -> String {
     let latest = inspection
         .latest_valid_checkpoint
@@ -966,9 +999,10 @@ fn parse_benchmark_result_text(contents: &str) -> anyhow::Result<BenchmarkGateRe
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, sync::Arc};
 
     use super::*;
+    use bytes::Bytes;
     use tempfile::tempdir;
     use velorix_storage::{
         checkpoint_index::{
@@ -976,7 +1010,9 @@ mod tests {
             CheckpointManifestInspectionStatus,
         },
         gc::{GarbageCollectionCandidate, GarbageCollectionCandidateKind, GarbageCollectionReport},
+        manifest::{CheckpointManifest, InputRange},
         object_key::ObjectKey,
+        state::{CheckpointPublisher, StateObjectWrite},
     };
 
     #[test]
@@ -1070,6 +1106,7 @@ mod tests {
 
         let Some(Command::RecoverLocal {
             object_store_dir,
+            slatedb_state_path,
             checkpoint_version,
         }) = cli.command
         else {
@@ -1077,7 +1114,80 @@ mod tests {
         };
 
         assert_eq!(object_store_dir, PathBuf::from("/tmp/velorix"));
+        assert_eq!(slatedb_state_path, None);
         assert_eq!(checkpoint_version, Some(7));
+    }
+
+    #[test]
+    fn recover_local_cli_parses_slatedb_state_path() {
+        let cli = Cli::try_parse_from([
+            "velorix-cli",
+            "recover-local",
+            "--object-store-dir",
+            "/tmp/velorix",
+            "--slatedb-state-path",
+            "v1/slatedb/state",
+            "--checkpoint-version",
+            "7",
+        ])
+        .unwrap();
+
+        let Some(Command::RecoverLocal {
+            object_store_dir,
+            slatedb_state_path,
+            checkpoint_version,
+        }) = cli.command
+        else {
+            panic!("expected recover-local command");
+        };
+
+        assert_eq!(object_store_dir, PathBuf::from("/tmp/velorix"));
+        assert_eq!(slatedb_state_path, Some("v1/slatedb/state".to_string()));
+        assert_eq!(checkpoint_version, Some(7));
+    }
+
+    #[tokio::test]
+    async fn recover_local_runtime_uses_slatedb_state_store_for_selected_checkpoint() {
+        let dir = tempdir().unwrap();
+        let store = local_object_store(dir.path()).unwrap();
+        let publisher =
+            CheckpointPublisher::with_slatedb_state_store(Arc::clone(&store), "v1/slatedb/state")
+                .await
+                .unwrap();
+        let state = StateObjectWrite::new(
+            ORDERS_SUM_COUNT_OWNER,
+            0,
+            0,
+            "state-0000",
+            Bytes::from_static(br#"{"records":[]}"#),
+        )
+        .unwrap();
+        let state_ref = publisher.write_state_object(&state).await.unwrap();
+        publisher
+            .publish_manifest(&CheckpointManifest {
+                schema_version: 1,
+                checkpoint_version: 0,
+                input_ranges: vec![InputRange {
+                    stream_id: "orders".to_string(),
+                    partition_id: 0,
+                    start_offset_inclusive: 0,
+                    end_offset_exclusive: 1,
+                }],
+                state_objects: vec![state_ref],
+                output_objects: vec![],
+                parent_checkpoint: None,
+                created_at: "2026-05-06T00:00:00Z".to_string(),
+            })
+            .await
+            .unwrap();
+        drop(publisher);
+
+        let recovered = recover_local_runtime(store, Some("v1/slatedb/state".to_string()), Some(0))
+            .await
+            .unwrap();
+
+        assert_eq!(recovered.latest_checkpoint_version(), Some(0));
+        assert_eq!(recovered.replayed_batch_count(), 0);
     }
 
     #[test]
