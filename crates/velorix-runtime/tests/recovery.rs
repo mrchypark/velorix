@@ -76,7 +76,7 @@ fn ingest_envelope_bytes(
     schema_fingerprint: &str,
     input: &DeltaBatch,
 ) -> Bytes {
-    IngestEnvelope::encode_batches(
+    ingest_envelope_bytes_with_batches(
         IngestEnvelopeEncodeRequest {
             relation_id: ORDERS_SUM_COUNT_RELATION_ID.to_string(),
             relation_version: relation_version.to_string(),
@@ -88,7 +88,13 @@ fn ingest_envelope_bytes(
         },
         &[ingest_record_batch(input)],
     )
-    .unwrap()
+}
+
+fn ingest_envelope_bytes_with_batches(
+    request: IngestEnvelopeEncodeRequest,
+    batches: &[RecordBatch],
+) -> Bytes {
+    IngestEnvelope::encode_batches(request, batches).unwrap()
 }
 
 #[tokio::test]
@@ -184,5 +190,58 @@ async fn catalog_backed_recovery_rejects_replayed_ingest_relation_drift() {
             field: "relation_version",
             ..
         }
+    ));
+}
+
+#[tokio::test]
+async fn catalog_backed_recovery_reports_malformed_ingest_when_batch_schema_differs_from_catalog() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = orders_sum_count_relation_catalog().unwrap();
+    RelationCatalogRegistry::new(Arc::clone(&store))
+        .create(&catalog)
+        .await
+        .unwrap();
+    let wrong_batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("key_json", DataType::Utf8, false),
+            Field::new("value_json", DataType::Utf8, false),
+            Field::new("weight", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["account-a"])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["4"])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    IngestLog::new(Arc::clone(&store))
+        .append_validated_envelope(ingest_envelope_bytes_with_batches(
+            IngestEnvelopeEncodeRequest {
+                relation_id: ORDERS_SUM_COUNT_RELATION_ID.to_string(),
+                relation_version: ORDERS_SUM_COUNT_RELATION_VERSION.to_string(),
+                schema_fingerprint: catalog.schema_fingerprint.as_str().to_string(),
+                stream_id: "orders".to_string(),
+                partition_id: 0,
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 1,
+            },
+            &[wrong_batch],
+        ))
+        .await
+        .unwrap();
+
+    let error = RecoveredRuntime::recover_with_owner_and_relation_catalog_record(
+        Arc::clone(&store),
+        ORDERS_SUM_COUNT_OWNER,
+        ORDERS_SUM_COUNT_RELATION_ID,
+        ORDERS_SUM_COUNT_RELATION_VERSION,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RecoveryError::MalformedPrototypeArrowIngest { reason }
+            if reason.contains("schema")
     ));
 }

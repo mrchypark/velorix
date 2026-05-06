@@ -506,7 +506,8 @@ pub fn arrow_record_batches_to_orders_sum_count_delta_batch(
     let mut records = Vec::new();
 
     for batch in batches {
-        validate_record_batch_matches_catalog(catalog, batch)?;
+        validate_record_batch_matches_catalog(catalog, batch)
+            .map_err(incremental_input_batch_schema_error)?;
         let key = string_column(batch, key_column.name.as_str())?;
         let value = int64_column(batch, value_column.name.as_str())?;
         let weight = int64_column(batch, weight_column.name.as_str())?;
@@ -527,6 +528,19 @@ pub fn arrow_record_batches_to_orders_sum_count_delta_batch(
     }
 
     Ok(DeltaBatch::from_records(records))
+}
+
+fn incremental_input_batch_schema_error(
+    error: RelationSchemaError,
+) -> IncrementalInputAdapterError {
+    match error {
+        RelationSchemaError::InvalidRelationSchema {
+            field: "batch_schema",
+        } => IncrementalInputAdapterError::MalformedArrowInput {
+            reason: "relation batch schema does not match catalog".to_string(),
+        },
+        error => IncrementalInputAdapterError::RelationCatalog(error),
+    }
 }
 
 pub fn register_datafusion_catalog_batches(
