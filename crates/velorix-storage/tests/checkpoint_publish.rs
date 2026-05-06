@@ -36,15 +36,40 @@ struct FullListingFailsStore {
     inner: Arc<dyn ObjectStore>,
 }
 
+#[derive(Debug)]
+struct PrefixListingFailsStore {
+    inner: Arc<dyn ObjectStore>,
+    failing_prefix: &'static str,
+}
+
 impl FullListingFailsStore {
     fn new(inner: Arc<dyn ObjectStore>) -> Self {
         Self { inner }
     }
 }
 
+impl PrefixListingFailsStore {
+    fn new(inner: Arc<dyn ObjectStore>, failing_prefix: &'static str) -> Self {
+        Self {
+            inner,
+            failing_prefix,
+        }
+    }
+}
+
 impl std::fmt::Display for FullListingFailsStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "full-listing-fails({})", self.inner)
+    }
+}
+
+impl std::fmt::Display for PrefixListingFailsStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "prefix-listing-fails({}, {})",
+            self.failing_prefix, self.inner
+        )
     }
 }
 
@@ -92,6 +117,81 @@ impl ObjectStore for FullListingFailsStore {
             })
         })
         .boxed()
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for PrefixListingFailsStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn delete(&self, location: &Path) -> object_store::Result<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+        if prefix
+            .map(|prefix| prefix.as_ref() == self.failing_prefix)
+            .unwrap_or(false)
+        {
+            let failing_prefix = self.failing_prefix;
+            return stream::once(async move {
+                Err(object_store::Error::Generic {
+                    store: "prefix-listing-fails",
+                    source: Box::new(std::io::Error::other(format!(
+                        "listing failed for {failing_prefix}/"
+                    ))),
+                })
+            })
+            .boxed();
+        }
+
+        self.inner.list(prefix)
     }
 
     fn list_with_offset(
@@ -423,6 +523,37 @@ async fn gc_plan_marks_orphan_raw_state_and_retains_manifest_referenced_objects(
     );
     assert!(object_exists(store.as_ref(), retained_state.object_key()).await);
     assert!(object_exists(store.as_ref(), retained_output.object_key()).await);
+}
+
+#[tokio::test]
+async fn gc_plan_fails_closed_when_state_listing_fails() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let retained_state = state_write(0, "state-retained", b"retained-state");
+    let orphan_state = state_write(0, "state-orphan", b"orphan-state");
+
+    let retained_state_ref = publisher.write_state_object(&retained_state).await.unwrap();
+    publisher.write_state_object(&orphan_state).await.unwrap();
+    publisher
+        .publish_manifest(&manifest(0, retained_state_ref))
+        .await
+        .unwrap();
+
+    let listing_fails_store =
+        Arc::new(PrefixListingFailsStore::new(Arc::clone(&store), "v1/state"));
+    let listing_fails_publisher = CheckpointPublisher::new(listing_fails_store);
+    let err = listing_fails_publisher
+        .plan_garbage_collection(GarbageCollectionPolicy {
+            retain_latest_manifests: 1,
+        })
+        .await
+        .unwrap_err();
+
+    let err = err.to_string();
+    assert!(err.contains("prefix-listing-fails"));
+    assert!(err.contains("listing failed for v1/state/"));
+    assert!(object_exists(store.as_ref(), retained_state.object_key()).await);
+    assert!(object_exists(store.as_ref(), orphan_state.object_key()).await);
 }
 
 #[tokio::test]
