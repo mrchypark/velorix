@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use object_store::{memory::InMemory, ObjectStore};
 use serde_json::{json, Value};
 use velorix_k8s::{
     controller::AuthoritySnapshot,
@@ -10,9 +11,11 @@ use velorix_k8s::{
     },
     status::{KubernetesStatusError, StreamStatusApi, StreamStatusWriter},
     stream_watch::{
-        handle_stream_event, AuthoritySnapshotProvider, StreamWatchError, StreamWatchEvent,
+        handle_stream_event, AuthoritySnapshotProvider, RelationCatalogSnapshotProvider,
+        StreamWatchError, StreamWatchEvent,
     },
 };
+use velorix_storage::relation_catalog_registry::RelationCatalogRegistry;
 
 #[tokio::test]
 async fn stream_watch_handler_writes_reconcile_output_for_applied_stream() {
@@ -102,6 +105,108 @@ async fn stream_watch_handler_returns_snapshot_error_without_status_write() {
     assert!(api.writes().is_empty());
 }
 
+#[tokio::test]
+async fn relation_catalog_snapshot_provider_reports_ready_when_catalog_exists() {
+    let store = memory_store();
+    create_relation_catalog(&store).await;
+    let api = FakeStatusApi::default();
+    let writer = StreamStatusWriter::new(api.clone());
+    let provider = RelationCatalogSnapshotProvider::new(authority(), store);
+
+    handle_stream_event(StreamWatchEvent::Applied(stream()), &provider, &writer)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        api.writes(),
+        vec![StatusWrite {
+            namespace: "analytics".to_string(),
+            name: "deposits".to_string(),
+            patch: json!({
+                "status": StreamStatus {
+                    observed_generation: Some(1),
+                    last_accepted_relation_schema_fingerprint: Some(relation().schema_fingerprint),
+                    latest_published_checkpoint: None,
+                    readiness: Some(ready_condition()),
+                }
+            }),
+        }]
+    );
+}
+
+#[tokio::test]
+async fn relation_catalog_snapshot_provider_reports_missing_relation_without_catalog() {
+    let store = memory_store();
+    let api = FakeStatusApi::default();
+    let writer = StreamStatusWriter::new(api.clone());
+    let provider = RelationCatalogSnapshotProvider::new(authority(), store);
+
+    handle_stream_event(StreamWatchEvent::Applied(stream()), &provider, &writer)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        api.writes(),
+        vec![StatusWrite {
+            namespace: "analytics".to_string(),
+            name: "deposits".to_string(),
+            patch: json!({
+                "status": StreamStatus {
+                    observed_generation: Some(1),
+                    last_accepted_relation_schema_fingerprint: None,
+                    latest_published_checkpoint: None,
+                    readiness: Some(VelorixCondition {
+                        type_: "Ready".to_string(),
+                        status: ConditionState::False,
+                        reason: "MissingRelationCatalogRecord".to_string(),
+                        message: "relation catalog record is not visible".to_string(),
+                    }),
+                }
+            }),
+        }]
+    );
+}
+
+#[tokio::test]
+async fn relation_catalog_snapshot_provider_ignores_unconfigured_authority() {
+    let store = memory_store();
+    create_relation_catalog(&store).await;
+    let api = FakeStatusApi::default();
+    let writer = StreamStatusWriter::new(api.clone());
+    let provider = RelationCatalogSnapshotProvider::new(
+        ObjectStoreAuthorityRef {
+            store_id: "secondary".to_string(),
+            namespace: "analytics".to_string(),
+        },
+        store,
+    );
+
+    handle_stream_event(StreamWatchEvent::Applied(stream()), &provider, &writer)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        api.writes(),
+        vec![StatusWrite {
+            namespace: "analytics".to_string(),
+            name: "deposits".to_string(),
+            patch: json!({
+                "status": StreamStatus {
+                    observed_generation: Some(1),
+                    last_accepted_relation_schema_fingerprint: None,
+                    latest_published_checkpoint: None,
+                    readiness: Some(VelorixCondition {
+                        type_: "Ready".to_string(),
+                        status: ConditionState::False,
+                        reason: "MissingAuthorityRecord".to_string(),
+                        message: "object-store authority record is not visible".to_string(),
+                    }),
+                }
+            }),
+        }]
+    );
+}
+
 #[derive(Clone)]
 struct StaticSnapshotProvider(Result<AuthoritySnapshot, StreamWatchError>);
 
@@ -188,7 +293,8 @@ fn relation() -> RelationVersionRef {
     RelationVersionRef {
         relation_id: "deposits".to_string(),
         relation_version: 1,
-        schema_fingerprint: format!("sha256:{}", "1".repeat(64)),
+        schema_fingerprint:
+            "sha256:9b09fa82241fce3bb9025911ed78168799ad384fe68f065258afe09eca6ede62".to_string(),
     }
 }
 
@@ -199,4 +305,72 @@ fn ready_condition() -> VelorixCondition {
         reason: "AuthorityValidated".to_string(),
         message: "object-store authority and relation catalog records validated".to_string(),
     }
+}
+
+fn memory_store() -> Arc<dyn ObjectStore> {
+    Arc::new(InMemory::new())
+}
+
+async fn create_relation_catalog(store: &Arc<dyn ObjectStore>) {
+    let catalog = serde_json::from_value(relation_catalog_json()).unwrap();
+    RelationCatalogRegistry::new(Arc::clone(store))
+        .create(&catalog)
+        .await
+        .unwrap();
+}
+
+fn relation_catalog_json() -> Value {
+    json!({
+        "schema_version": 1,
+        "relation_schema": {
+            "relation_id": "deposits",
+            "relation_name": "deposits",
+            "relation_version": "1",
+            "columns": [
+                {
+                    "column_id": "deposit_id",
+                    "name": "deposit_id",
+                    "logical_type": { "kind": "utf8" },
+                    "physical_arrow_type": { "kind": "utf8" },
+                    "nullable": false,
+                    "ordinal": 0,
+                    "semantic_role": "primary_key",
+                },
+                {
+                    "column_id": "amount",
+                    "name": "amount",
+                    "logical_type": { "kind": "int64" },
+                    "physical_arrow_type": { "kind": "int64" },
+                    "nullable": false,
+                    "ordinal": 1,
+                    "semantic_role": "value",
+                },
+                {
+                    "column_id": "weight",
+                    "name": "weight",
+                    "logical_type": { "kind": "int64" },
+                    "physical_arrow_type": { "kind": "int64" },
+                    "nullable": false,
+                    "ordinal": 2,
+                    "semantic_role": "weight",
+                },
+            ],
+            "primary_key_column_ids": ["deposit_id"],
+            "weight_column_id": "weight",
+            "allowed_operations": ["insert", "delete"],
+            "event_time_column_id": null,
+        },
+        "schema_fingerprint": relation().schema_fingerprint,
+        "datafusion_registration": {
+            "name": "deposits",
+            "mode": "table",
+        },
+        "feldera_relation": {
+            "relation_id": "deposits",
+            "schema_fingerprint": relation().schema_fingerprint,
+        },
+        "incremental_adapter": {
+            "adapter_id": "incremental-adapter-deposits-v1",
+        },
+    })
 }

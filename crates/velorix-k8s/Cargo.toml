@@ -9,6 +9,7 @@ async-trait = { workspace = true }
 futures = { workspace = true }
 k8s-openapi = { workspace = true, features = ["v1_35", "schemars"] }
 kube = { workspace = true, features = ["client", "derive", "ring", "runtime", "rustls-tls"] }
+object_store = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -17,6 +18,5 @@ velorix-control = { path = "../velorix-control" }
 velorix-storage = { path = "../velorix-storage" }
 
 [dev-dependencies]
-object_store = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }

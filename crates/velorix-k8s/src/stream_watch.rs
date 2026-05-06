@@ -5,11 +5,15 @@ use kube::{
     runtime::watcher::{self, Event},
     Client,
 };
+use std::sync::Arc;
 use thiserror::Error;
+use velorix_storage::relation_catalog_registry::{
+    RelationCatalogRegistry, RelationCatalogRegistryError,
+};
 
 use crate::{
     controller::{reconcile_stream, AuthoritySnapshot, ControllerAction},
-    crd::VelorixStream,
+    crd::{ObjectStoreAuthorityRef, RelationVersionRef, VelorixStream},
     status::{KubernetesStatusError, StreamStatusApi, StreamStatusWriter},
 };
 
@@ -25,6 +29,55 @@ pub trait AuthoritySnapshotProvider: Clone + Send + Sync + 'static {
         &self,
         stream: &VelorixStream,
     ) -> Result<AuthoritySnapshot, StreamWatchError>;
+}
+
+#[derive(Clone, Debug)]
+pub struct RelationCatalogSnapshotProvider {
+    authority: ObjectStoreAuthorityRef,
+    store: Arc<dyn object_store::ObjectStore>,
+}
+
+impl RelationCatalogSnapshotProvider {
+    pub fn new(
+        authority: ObjectStoreAuthorityRef,
+        store: Arc<dyn object_store::ObjectStore>,
+    ) -> Self {
+        Self { authority, store }
+    }
+}
+
+#[async_trait]
+impl AuthoritySnapshotProvider for RelationCatalogSnapshotProvider {
+    async fn snapshot_for_stream(
+        &self,
+        stream: &VelorixStream,
+    ) -> Result<AuthoritySnapshot, StreamWatchError> {
+        if stream.spec.authority != self.authority {
+            return Ok(AuthoritySnapshot::default());
+        }
+
+        let snapshot = AuthoritySnapshot::default().with_authority(self.authority.clone());
+        match RelationCatalogRegistry::new(Arc::clone(&self.store))
+            .read(
+                &stream.spec.relation.relation_id,
+                &stream.spec.relation.relation_version.to_string(),
+            )
+            .await
+        {
+            Ok(catalog) => {
+                let catalog_relation = RelationVersionRef {
+                    relation_id: stream.spec.relation.relation_id.clone(),
+                    relation_version: stream.spec.relation.relation_version,
+                    schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                };
+                Ok(snapshot.with_relation_for_authority(&self.authority, &catalog_relation))
+            }
+            Err(RelationCatalogRegistryError::ObjectStore(object_store::Error::NotFound {
+                ..
+            })) => Ok(snapshot),
+            Err(error) => Err(StreamWatchError::snapshot(error.to_string())),
+        }
+    }
 }
 
 pub async fn handle_stream_event<P, A>(
