@@ -134,6 +134,8 @@ pub enum FelderaArtifactError {
     },
     #[error("Feldera artifact spec hash mismatch: expected={expected}, actual={actual}")]
     MismatchedSpecHash { expected: String, actual: String },
+    #[error("Feldera artifact bytes hash mismatch: expected={expected}, actual={actual}")]
+    MismatchedArtifactHash { expected: String, actual: String },
     #[error("unsupported Feldera standing view shape: {shape}")]
     UnsupportedShape { shape: &'static str },
     #[error("Feldera artifact schema mismatch: {field}")]
@@ -334,12 +336,51 @@ pub fn validate_feldera_compile_artifact_for_catalog(
     validate_feldera_compile_artifact(spec, artifact)
 }
 
+pub fn validate_feldera_compile_artifact_hash(
+    spec: &StandingViewSpec,
+    artifact: &FelderaCompileArtifactMetadata,
+    artifact_bytes: &[u8],
+) -> Result<(), FelderaArtifactError> {
+    validate_feldera_compile_artifact(spec, artifact)?;
+    validate_artifact_bytes_hash(artifact, artifact_bytes)
+}
+
+pub fn validate_feldera_compile_artifact_hash_for_catalog(
+    catalog: &VelorixRelationCatalogV1,
+    spec: &StandingViewSpec,
+    artifact: &FelderaCompileArtifactMetadata,
+    artifact_bytes: &[u8],
+) -> Result<(), FelderaArtifactError> {
+    validate_feldera_compile_artifact_for_catalog(catalog, spec, artifact)?;
+    validate_artifact_bytes_hash(artifact, artifact_bytes)
+}
+
 /// Hashes the v1 standing-view spec contract as SHA-256 over the compact
 /// `serde_json::to_vec` serialization of `StandingViewSpec`.
 pub fn feldera_spec_hash(spec: &StandingViewSpec) -> Result<String, FelderaArtifactError> {
     let encoded = serde_json::to_vec(spec).map_err(SerdeJsonError)?;
     let digest = Sha256::digest(&encoded);
     Ok(format!("{FELDERA_SPEC_HASH_PREFIX}:{digest:x}"))
+}
+
+pub fn feldera_artifact_bytes_hash(artifact_bytes: &[u8]) -> String {
+    let digest = Sha256::digest(artifact_bytes);
+    format!("sha256:{digest:x}")
+}
+
+fn validate_artifact_bytes_hash(
+    artifact: &FelderaCompileArtifactMetadata,
+    artifact_bytes: &[u8],
+) -> Result<(), FelderaArtifactError> {
+    let actual = feldera_artifact_bytes_hash(artifact_bytes);
+    if actual == artifact.artifact_hash {
+        Ok(())
+    } else {
+        Err(FelderaArtifactError::MismatchedArtifactHash {
+            expected: artifact.artifact_hash.clone(),
+            actual,
+        })
+    }
 }
 
 fn catalog_column_schema(column: &RelationColumnV1) -> Result<ColumnSchema, FelderaArtifactError> {

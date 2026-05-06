@@ -4,7 +4,8 @@ use object_store::ObjectStore;
 use thiserror::Error;
 use velorix_core::{
     feldera_artifact::{
-        validate_feldera_compile_artifact_for_catalog, FelderaArtifactError,
+        validate_feldera_compile_artifact_for_catalog,
+        validate_feldera_compile_artifact_hash_for_catalog, FelderaArtifactError,
         FelderaCompileArtifactMetadata, StandingViewSpec,
     },
     relation::VelorixRelationCatalogV1,
@@ -72,6 +73,29 @@ impl RuntimeFelderaArtifactRegistry {
         artifact: &FelderaCompileArtifactMetadata,
     ) -> Result<RegisteredRuntimeFelderaArtifact, RuntimeFelderaArtifactError> {
         validate_feldera_compile_artifact_for_catalog(catalog, spec, artifact)?;
+
+        let register_outcome = self.storage.register(spec, artifact).await?;
+
+        Ok(RegisteredRuntimeFelderaArtifact {
+            metadata: artifact.clone(),
+            status: RuntimeFelderaArtifactSelectionStatus::DirectExecutionDisabled,
+            register_outcome,
+        })
+    }
+
+    pub async fn register_hash_verified_artifact(
+        &self,
+        catalog: &VelorixRelationCatalogV1,
+        spec: &StandingViewSpec,
+        artifact: &FelderaCompileArtifactMetadata,
+        artifact_bytes: &[u8],
+    ) -> Result<RegisteredRuntimeFelderaArtifact, RuntimeFelderaArtifactError> {
+        validate_feldera_compile_artifact_hash_for_catalog(
+            catalog,
+            spec,
+            artifact,
+            artifact_bytes,
+        )?;
 
         let register_outcome = self.storage.register(spec, artifact).await?;
 

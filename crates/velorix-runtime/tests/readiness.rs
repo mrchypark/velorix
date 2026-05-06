@@ -158,6 +158,7 @@ fn readiness_report_blocks_when_catalog_evidence_is_missing() {
             "query_policy_catalog",
             "registry_backed_table_catalog",
             "feldera_artifact_registry",
+            "feldera_artifact_hash_verified",
         ],
         false,
         &[],
@@ -173,7 +174,26 @@ fn readiness_report_blocks_when_catalog_evidence_is_missing() {
             "query_policy_status missing query_policy_catalog evidence",
             "table_catalog_status missing registry_backed_table_catalog evidence",
             "feldera_artifact_status missing feldera_artifact_registry evidence",
+            "feldera_artifact_status missing feldera_artifact_hash_verified evidence",
         ]
+    );
+}
+
+#[test]
+fn readiness_report_blocks_when_feldera_artifact_hash_verified_evidence_is_missing() {
+    let report = ProductionReadinessEvidenceV1::from_json_str(&readiness_json(
+        &["feldera_artifact_hash_verified"],
+        false,
+        &[],
+    ))
+    .unwrap()
+    .try_into_report()
+    .unwrap();
+
+    assert!(!report.production_ready);
+    assert_eq!(
+        report.blocking_reasons,
+        vec!["feldera_artifact_status missing feldera_artifact_hash_verified evidence"]
     );
 }
 
@@ -190,7 +210,7 @@ fn readiness_evidence_rejects_unknown_json_fields() {
             "state_status": { "status": "pass", "evidence": "SlateDB checkpoint ref", "evidence_kind": ["slate_db_checkpoint_ref"] },
             "query_policy_status": { "status": "pass", "evidence": "bounded DataFusion policy", "evidence_kind": ["query_policy_catalog"] },
             "table_catalog_status": { "status": "pass", "evidence": "registry-backed table catalog", "evidence_kind": ["registry_backed_table_catalog"] },
-            "feldera_artifact_status": { "status": "pass", "evidence": "trusted artifact metadata", "evidence_kind": ["feldera_artifact_registry"] },
+            "feldera_artifact_status": { "status": "pass", "evidence": "trusted artifact metadata", "evidence_kind": ["feldera_artifact_registry", "feldera_artifact_hash_verified"] },
             "benchmark_gate_status": { "status": "pass", "evidence": "S3-compatible benchmark gate", "evidence_kind": ["s3_compatible_benchmark_gate"] },
             "kubernetes_status": { "status": "pass", "evidence": "Kubernetes Lease client", "evidence_kind": ["kubernetes_lease_client"] },
             "surprise": true
@@ -260,10 +280,17 @@ fn readiness_json(
     } else {
         ""
     };
-    let feldera_artifact_kind = if !missing_evidence.contains(&"feldera_artifact_registry") {
-        r#", "evidence_kind": ["feldera_artifact_registry"]"#
+    let mut feldera_artifact_evidence_kind = Vec::new();
+    if !missing_evidence.contains(&"feldera_artifact_registry") {
+        feldera_artifact_evidence_kind.push("feldera_artifact_registry");
+    }
+    if !missing_evidence.contains(&"feldera_artifact_hash_verified") {
+        feldera_artifact_evidence_kind.push("feldera_artifact_hash_verified");
+    }
+    let feldera_artifact_kind = if feldera_artifact_evidence_kind.is_empty() {
+        String::new()
     } else {
-        ""
+        format!(r#", "evidence_kind": {:?}"#, feldera_artifact_evidence_kind)
     };
     let benchmark_gate_kind = if !missing_evidence.contains(&"s3_compatible_benchmark_gate") {
         r#", "evidence_kind": ["s3_compatible_benchmark_gate"]"#

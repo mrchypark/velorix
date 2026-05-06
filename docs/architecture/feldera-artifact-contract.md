@@ -55,6 +55,12 @@ reviewing the metadata, pinning compiler identity, and verifying the artifact
 hash and the SHA-256 `spec_hash`. The running Velorix process should select
 among already-built, release-trusted artifacts; it should not compile or
 dynamically load arbitrary generated source from object storage.
+`velorix-core::feldera_artifact` exposes artifact hash verification helpers
+that reuse the metadata/spec validation and compare supplied artifact bytes
+against `FelderaCompileArtifactMetadata.artifact_hash`; they do not invoke
+Feldera, DBSP, Java/Maven, dynamic loading, or generated Rust execution. This is
+byte-integrity evidence, not proof that a trusted release pipeline produced the
+artifact.
 
 Object storage manifests remain durable data and progress authority. They may
 reference a validated artifact id/hash, but they cannot make code executable by
@@ -90,6 +96,8 @@ metadata plus a disabled direct-execution status. A tenant/artifact-id lookup
 index remains deferred; if product semantics later require one, it should be a
 separate create-only index object rather than replacing the artifact id/hash
 registry key.
+Runtime hash-verified registration can require matching artifact bytes before
+persisting metadata, but it still returns direct execution disabled.
 
 ## Runtime Direction
 

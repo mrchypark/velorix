@@ -1,4 +1,7 @@
 use serde::{Deserialize, Serialize};
+use velorix_core::feldera_artifact::{
+    validate_feldera_compile_artifact_hash, FelderaCompileArtifactMetadata, StandingViewSpec,
+};
 
 const SCHEMA_VERSION: u16 = 1;
 
@@ -47,7 +50,21 @@ pub enum ReadinessEvidenceKind {
     QueryPolicyCatalog,
     RegistryBackedTableCatalog,
     FelderaArtifactRegistry,
+    FelderaArtifactHashVerified,
     S3CompatibleBenchmarkGate,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FelderaArtifactHashVerifiedEvidenceV1 {
+    pub schema_version: u16,
+    pub status: ReadinessStatus,
+    pub evidence_kind: ReadinessEvidenceKind,
+    pub view_id: String,
+    pub artifact_id: String,
+    pub artifact_hash: String,
+    pub spec_hash: String,
+    pub generated_rust_abi_version: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -191,6 +208,15 @@ impl ProductionReadinessEvidenceV1 {
             );
         }
         if !self
+            .feldera_artifact_status
+            .has_evidence(ReadinessEvidenceKind::FelderaArtifactHashVerified)
+        {
+            blocking_reasons.push(
+                "feldera_artifact_status missing feldera_artifact_hash_verified evidence"
+                    .to_string(),
+            );
+        }
+        if !self
             .benchmark_gate_status
             .has_evidence(ReadinessEvidenceKind::S3CompatibleBenchmarkGate)
         {
@@ -224,10 +250,41 @@ impl ProductionReadinessReportV1 {
     }
 }
 
+impl FelderaArtifactHashVerifiedEvidenceV1 {
+    pub fn to_json_pretty(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+}
+
 impl ReadinessCheck {
     fn has_evidence(&self, kind: ReadinessEvidenceKind) -> bool {
         self.evidence_kind.contains(&kind)
     }
+}
+
+pub fn verify_feldera_artifact_hash_evidence(
+    spec_json: &str,
+    metadata_json: &str,
+    artifact_bytes: &[u8],
+) -> Result<FelderaArtifactHashVerifiedEvidenceV1, String> {
+    let spec: StandingViewSpec = serde_json::from_str(spec_json)
+        .map_err(|error| format!("failed to parse Feldera standing view spec JSON: {error}"))?;
+    let artifact: FelderaCompileArtifactMetadata = serde_json::from_str(metadata_json)
+        .map_err(|error| format!("failed to parse Feldera artifact metadata JSON: {error}"))?;
+
+    validate_feldera_compile_artifact_hash(&spec, &artifact, artifact_bytes)
+        .map_err(|error| error.to_string())?;
+
+    Ok(FelderaArtifactHashVerifiedEvidenceV1 {
+        schema_version: SCHEMA_VERSION,
+        status: ReadinessStatus::Pass,
+        evidence_kind: ReadinessEvidenceKind::FelderaArtifactHashVerified,
+        view_id: artifact.view_id,
+        artifact_id: artifact.artifact_id,
+        artifact_hash: artifact.artifact_hash,
+        spec_hash: artifact.spec_hash,
+        generated_rust_abi_version: artifact.generated_rust.abi_version,
+    })
 }
 
 fn push_failed_check(blocking_reasons: &mut Vec<String>, field: &str, check: &ReadinessCheck) {

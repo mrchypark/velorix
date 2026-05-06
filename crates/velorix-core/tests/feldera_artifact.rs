@@ -1,9 +1,10 @@
 use std::path::PathBuf;
 
 use velorix_core::feldera_artifact::{
-    catalog_input_relation_schema, feldera_spec_hash, validate_feldera_compile_artifact,
-    validate_feldera_compile_artifact_for_catalog, FelderaArtifactError,
-    FelderaCompileArtifactMetadata, StandingViewSpec,
+    catalog_input_relation_schema, feldera_artifact_bytes_hash, feldera_spec_hash,
+    validate_feldera_compile_artifact, validate_feldera_compile_artifact_for_catalog,
+    validate_feldera_compile_artifact_hash, FelderaArtifactError, FelderaCompileArtifactMetadata,
+    StandingViewSpec,
 };
 use velorix_core::relation::{
     ArrowPhysicalTypeV1, DataFusionRegistrationModeV1, DataFusionRegistrationV1,
@@ -42,6 +43,31 @@ fn feldera_artifact_accepts_valid_single_input_output_standing_view() {
         "velorix-feldera-spec-sha256-v1:0e24cbe06543d735a6d62868f230c4610fb9139cb91e5e8f72042f17da0ecbea"
     );
     validate_feldera_compile_artifact(&spec, &artifact).unwrap();
+}
+
+#[test]
+fn feldera_artifact_hash_verification_accepts_matching_artifact_bytes() {
+    let spec = load_spec("standing_view_spec_valid");
+    let mut artifact = load_artifact("compile_artifact_valid");
+    let artifact_bytes = b"compiled Feldera artifact bytes";
+    artifact.artifact_hash = feldera_artifact_bytes_hash(artifact_bytes);
+
+    validate_feldera_compile_artifact_hash(&spec, &artifact, artifact_bytes).unwrap();
+}
+
+#[test]
+fn feldera_artifact_hash_verification_rejects_mismatched_artifact_bytes() {
+    let spec = load_spec("standing_view_spec_valid");
+    let mut artifact = load_artifact("compile_artifact_valid");
+    artifact.artifact_hash = feldera_artifact_bytes_hash(b"release artifact bytes");
+
+    let error =
+        validate_feldera_compile_artifact_hash(&spec, &artifact, b"different bytes").unwrap_err();
+
+    assert!(matches!(
+        error,
+        FelderaArtifactError::MismatchedArtifactHash { .. }
+    ));
 }
 
 #[test]

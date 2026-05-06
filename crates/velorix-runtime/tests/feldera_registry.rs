@@ -4,8 +4,8 @@ use object_store::{local::LocalFileSystem, ObjectStore};
 use tempfile::TempDir;
 use velorix_core::{
     feldera_artifact::{
-        feldera_spec_hash, FelderaArtifactError, FelderaCompileArtifactMetadata, RelationSchema,
-        StandingViewSpec,
+        feldera_artifact_bytes_hash, feldera_spec_hash, FelderaArtifactError,
+        FelderaCompileArtifactMetadata, RelationSchema, StandingViewSpec,
     },
     relation::{
         ArrowPhysicalTypeV1, DataFusionRegistrationModeV1, DataFusionRegistrationV1,
@@ -18,7 +18,9 @@ use velorix_runtime::feldera_registry::{
     RuntimeFelderaArtifactError, RuntimeFelderaArtifactRegistry,
     RuntimeFelderaArtifactSelectionStatus,
 };
-use velorix_storage::feldera_artifact_registry::RegisterFelderaArtifactOutcome;
+use velorix_storage::feldera_artifact_registry::{
+    FelderaArtifactRegistryError, RegisterFelderaArtifactOutcome,
+};
 
 fn temp_store() -> (TempDir, Arc<dyn ObjectStore>) {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -286,4 +288,62 @@ async fn feldera_runtime_registry_keeps_direct_execution_disabled() {
         selected.status,
         RuntimeFelderaArtifactSelectionStatus::DirectExecutionDisabled
     );
+}
+
+#[tokio::test]
+async fn feldera_runtime_registry_admits_hash_verified_artifact_without_direct_execution() {
+    let (_temp_dir, store) = temp_store();
+    let registry = RuntimeFelderaArtifactRegistry::new(store);
+    let (catalog, spec, mut artifact) = catalog_valid_fixture_parts();
+    let artifact_bytes = b"compiled artifact bytes";
+    artifact.artifact_hash = feldera_artifact_bytes_hash(artifact_bytes);
+
+    let registered = registry
+        .register_hash_verified_artifact(&catalog, &spec, &artifact, artifact_bytes)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        registered.status,
+        RuntimeFelderaArtifactSelectionStatus::DirectExecutionDisabled
+    );
+    assert_eq!(
+        registered.register_outcome,
+        RegisterFelderaArtifactOutcome::Created
+    );
+}
+
+#[tokio::test]
+async fn feldera_runtime_registry_rejects_hash_mismatch_without_persisting_artifact() {
+    let (_temp_dir, store) = temp_store();
+    let registry = RuntimeFelderaArtifactRegistry::new(store);
+    let (catalog, spec, mut artifact) = catalog_valid_fixture_parts();
+    artifact.artifact_hash = feldera_artifact_bytes_hash(b"expected artifact bytes");
+
+    let error = registry
+        .register_hash_verified_artifact(&catalog, &spec, &artifact, b"different artifact bytes")
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RuntimeFelderaArtifactError::Validation(
+            FelderaArtifactError::MismatchedArtifactHash { .. }
+        )
+    ));
+    let error = registry
+        .select_trusted_artifact(
+            &catalog,
+            &spec,
+            &artifact.artifact_id,
+            &artifact.artifact_hash,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        RuntimeFelderaArtifactError::Storage(FelderaArtifactRegistryError::ObjectStore(
+            object_store::Error::NotFound { .. }
+        ))
+    ));
 }
