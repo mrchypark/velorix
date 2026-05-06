@@ -1706,6 +1706,16 @@ mod tests {
     }
 
     #[test]
+    fn release_status_validator_rejects_unexpected_row() {
+        let mut matrix = release_status_matrix("complete", &[], &[]);
+        matrix.push_str("\n| extra contract | evidence | required evidence | complete | none |\n");
+
+        let error = validate_release_status_text(&matrix).unwrap_err();
+
+        assert!(format!("{error:#}").contains("unexpected release status row: extra contract"));
+    }
+
+    #[test]
     fn release_status_validator_rejects_malformed_rows() {
         let mut matrix = release_status_matrix("complete", &[], &[]);
         matrix.push_str(

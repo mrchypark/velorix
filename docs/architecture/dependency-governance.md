@@ -1,6 +1,9 @@
 # Dependency Governance
 
 Velorix runs `cargo deny check -W unmaintained` in CI.
+CI also installs Rust `1.88.0` and runs
+`cargo check --workspace --all-targets --locked` to enforce the declared MSRV
+against the locked dependency graph.
 
 Machine-readable local policy lives in `dependency-governance.json`. Validate it
 with:
@@ -27,5 +30,6 @@ enough to promote them without blocking routine upstream movement.
 Unmaintained advisories are also warnings today. Each allowed exception is
 tracked in the governance manifest with an owner, expiry, and reason.
 
-Remaining gaps for 1.0 are a `cargo-vet` or equivalent audit process and an
-MSRV enforcement beyond the declared local policy.
+Remaining gaps for 1.0 are a `cargo-vet` or equivalent audit process and
+promotion rules for advisories or selected duplicate-version warnings when the
+current exceptions expire.
