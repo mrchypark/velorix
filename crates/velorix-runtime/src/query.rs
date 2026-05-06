@@ -15,6 +15,11 @@ use datafusion::{
 };
 use futures::TryStreamExt;
 use object_store::ObjectStore;
+use parquet::arrow::{
+    arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions},
+    async_reader::ParquetObjectReader,
+};
+use parquet::errors::ParquetError;
 use thiserror::Error;
 use url::Url;
 use velorix_core::query::{QueryError, QueryPolicy, QueryPolicyError, INPUT_TABLE_NAME};
@@ -108,6 +113,29 @@ pub async fn query_object_backed_input_with_policy(
     query_object_backed_input_with_policy_and_limiter(store, table_url, sql, policy, None).await
 }
 
+pub(crate) async fn query_object_backed_relation_with_policy(
+    store: Arc<dyn DataFusionObjectStore>,
+    table_url: &str,
+    table_name: &str,
+    table_schema: Arc<Schema>,
+    sql: &str,
+    policy: QueryPolicy,
+) -> Result<Vec<RecordBatch>, RuntimeQueryError> {
+    query_object_backed_table_with_policy_and_limiter_and_meter(
+        store,
+        table_url,
+        ObjectBackedTableRegistration {
+            table_name,
+            table_schema: Some(table_schema),
+        },
+        sql,
+        policy,
+        None,
+        None,
+    )
+    .await
+}
+
 #[derive(Debug)]
 pub struct ObjectBackedQueryResult {
     pub batches: Vec<RecordBatch>,
@@ -158,6 +186,35 @@ async fn query_object_backed_input_with_policy_and_limiter_and_meter(
     limiter: Option<QueryExecutionLimiter>,
     meter: Option<ObjectStoreMeter>,
 ) -> Result<Vec<RecordBatch>, RuntimeQueryError> {
+    query_object_backed_table_with_policy_and_limiter_and_meter(
+        store,
+        table_url,
+        ObjectBackedTableRegistration {
+            table_name: INPUT_TABLE_NAME,
+            table_schema: None,
+        },
+        sql,
+        policy,
+        limiter,
+        meter,
+    )
+    .await
+}
+
+struct ObjectBackedTableRegistration<'a> {
+    table_name: &'a str,
+    table_schema: Option<Arc<Schema>>,
+}
+
+async fn query_object_backed_table_with_policy_and_limiter_and_meter(
+    store: Arc<dyn DataFusionObjectStore>,
+    table_url: &str,
+    registration: ObjectBackedTableRegistration<'_>,
+    sql: &str,
+    policy: QueryPolicy,
+    limiter: Option<QueryExecutionLimiter>,
+    meter: Option<ObjectStoreMeter>,
+) -> Result<Vec<RecordBatch>, RuntimeQueryError> {
     policy.validate().map_err(QueryError::from)?;
     validate_sql_text_policy(sql, policy).map_err(QueryError::from)?;
     let _permit = acquire_query_permit(policy, limiter.as_ref())?;
@@ -168,6 +225,13 @@ async fn query_object_backed_input_with_policy_and_limiter_and_meter(
             validate_scan_policy(query_store.as_ref(), table_url, policy).await
         })
         .await?;
+    if let Some(schema) = registration.table_schema.as_ref() {
+        limits
+            .run_execution(async {
+                validate_parquet_table_schema(Arc::clone(&query_store), table_url, schema).await
+            })
+            .await?;
+    }
 
     let context = session_context(policy)?;
 
@@ -175,8 +239,12 @@ async fn query_object_backed_input_with_policy_and_limiter_and_meter(
     context.register_object_store(object_store_url.as_ref(), query_store);
     let dataframe = limits
         .run_planning(async {
+            let options = match registration.table_schema.as_deref() {
+                Some(schema) => ParquetReadOptions::default().schema(schema),
+                None => ParquetReadOptions::default(),
+            };
             context
-                .register_parquet(INPUT_TABLE_NAME, table_url, ParquetReadOptions::default())
+                .register_parquet(registration.table_name, table_url, options)
                 .await
                 .map_err(map_datafusion_error)?;
             context.sql(sql).await.map_err(map_datafusion_error)
@@ -365,6 +433,47 @@ async fn validate_scan_policy(
     }
 
     Ok(())
+}
+
+async fn validate_parquet_table_schema(
+    store: Arc<dyn DataFusionObjectStore>,
+    table_url: &str,
+    expected_schema: &Arc<Schema>,
+) -> Result<(), QueryError> {
+    let prefix = object_path_for_table_url(table_url)?;
+    let mut objects = store.list(Some(&prefix));
+
+    while let Some(object) = objects.try_next().await.map_err(map_object_store_error)? {
+        if !is_parquet_data_file(&object.location) {
+            continue;
+        }
+
+        let mut reader = ParquetObjectReader::new(Arc::clone(&store), object.location)
+            .with_file_size(object.size);
+        let metadata = ArrowReaderMetadata::load_async(&mut reader, ArrowReaderOptions::new())
+            .await
+            .map_err(map_parquet_error)?;
+
+        if metadata.schema().fields() != expected_schema.fields() {
+            return Err(DataFusionError::Plan(
+                "parquet file schema does not match relation catalog schema".to_string(),
+            )
+            .into());
+        }
+    }
+
+    Ok(())
+}
+
+fn map_parquet_error(error: ParquetError) -> QueryError {
+    match query_policy_error_from_source(&error) {
+        Some(error) => error.into(),
+        None => DataFusionError::External(Box::new(error)).into(),
+    }
+}
+
+fn is_parquet_data_file(path: &DataFusionPath) -> bool {
+    path.as_ref().ends_with(".parquet")
 }
 
 fn map_object_store_error(error: datafusion::object_store::Error) -> QueryError {

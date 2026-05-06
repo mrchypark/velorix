@@ -46,6 +46,7 @@ impl VelorixRelationCatalogV1 {
             "datafusion_registration.name",
             &self.datafusion_registration.name,
         )?;
+        validate_datafusion_registration_name(&self.datafusion_registration.name)?;
         require_non_empty(
             "feldera_relation.relation_id",
             &self.feldera_relation.relation_id,
@@ -367,6 +368,33 @@ pub fn validate_schema_fingerprint(
     };
     if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(RelationSchemaError::InvalidRelationSchema { field });
+    }
+
+    Ok(())
+}
+
+fn validate_datafusion_registration_name(name: &str) -> Result<(), RelationSchemaError> {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return Err(RelationSchemaError::MissingIdentityField {
+            field: "datafusion_registration.name",
+        });
+    };
+    if !(first.is_ascii_alphabetic() || first == '_')
+        || !chars.all(|char| char.is_ascii_alphanumeric() || char == '_')
+    {
+        return Err(RelationSchemaError::InvalidRelationSchema {
+            field: "datafusion_registration.name",
+        });
+    }
+
+    if matches!(
+        name.to_ascii_lowercase().as_str(),
+        "input" | "information_schema" | "datafusion"
+    ) {
+        return Err(RelationSchemaError::InvalidRelationSchema {
+            field: "datafusion_registration.name",
+        });
     }
 
     Ok(())

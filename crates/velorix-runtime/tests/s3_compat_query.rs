@@ -74,9 +74,9 @@ async fn s3_compatible_production_table_query_scans_parquet_through_registry() -
     scan_store
         .put(
             &DataFusionPath::from(parquet_path.as_str()),
-            parquet_bytes(&parquet_input_batch(
-                &["\"account-a\"", "\"account-a\"", "\"account-b\""],
-                &["10", "5", "7"],
+            parquet_bytes(&parquet_orders_batch(
+                &["account-a", "account-a", "account-b"],
+                &[10, 5, 7],
                 &[1, 1, -1],
             ))
             .into(),
@@ -114,19 +114,21 @@ async fn s3_compatible_production_table_query_scans_parquet_through_registry() -
             &registry,
             "tenant-a",
             "orders-current",
-            "select key_json, sum(cast(value_json as int)) as total_value, sum(weight) as total_weight \
-             from input where weight > 0 group by key_json order by key_json",
+            "select account_id, sum(value) as total_value, sum(weight) as total_weight \
+             from orders where weight > 0 group by account_id order by account_id",
         )
         .await?;
 
         if batches.len() != 1 || batches[0].num_rows() != 1 {
             return Err(test_error("expected one aggregated output row"));
         }
-        if string_value(&batches[0], 0, 0) != "\"account-a\"" {
+        if string_value(&batches[0], 0, 0) != "account-a" {
             return Err(test_error("unexpected grouped key from S3-backed query"));
         }
         if int64_value(&batches[0], 1, 0) != 15 || int64_value(&batches[0], 2, 0) != 2 {
-            return Err(test_error("unexpected aggregate values from S3-backed query"));
+            return Err(test_error(
+                "unexpected aggregate values from S3-backed query",
+            ));
         }
 
         Ok(())
@@ -300,16 +302,16 @@ fn orders_relation_catalog() -> VelorixRelationCatalogV1 {
         relation_version: "2026-05-05.v1".to_string(),
         columns: vec![
             relation_column(
-                "key_json",
-                VelorixLogicalTypeV1::Json,
-                ArrowPhysicalTypeV1::JsonUtf8,
+                "account_id",
+                VelorixLogicalTypeV1::Utf8,
+                ArrowPhysicalTypeV1::Utf8,
                 RelationSemanticRoleV1::PrimaryKey,
                 0,
             ),
             relation_column(
-                "value_json",
-                VelorixLogicalTypeV1::Json,
-                ArrowPhysicalTypeV1::JsonUtf8,
+                "value",
+                VelorixLogicalTypeV1::Int64,
+                ArrowPhysicalTypeV1::Int64,
                 RelationSemanticRoleV1::Value,
                 1,
             ),
@@ -321,7 +323,7 @@ fn orders_relation_catalog() -> VelorixRelationCatalogV1 {
                 2,
             ),
         ],
-        primary_key_column_ids: vec!["key_json".to_string()],
+        primary_key_column_ids: vec!["account_id".to_string()],
         weight_column_id: "weight".to_string(),
         allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
         event_time_column_id: None,
@@ -364,16 +366,16 @@ fn relation_column(
     }
 }
 
-fn parquet_input_batch(keys: &[&str], values: &[&str], weights: &[i64]) -> RecordBatch {
+fn parquet_orders_batch(account_ids: &[&str], values: &[i64], weights: &[i64]) -> RecordBatch {
     RecordBatch::try_new(
         Arc::new(Schema::new(vec![
-            Field::new("key_json", DataType::Utf8, false),
-            Field::new("value_json", DataType::Utf8, false),
+            Field::new("account_id", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, false),
             Field::new("weight", DataType::Int64, false),
         ])),
         vec![
-            Arc::new(StringArray::from(keys.to_vec())) as ArrayRef,
-            Arc::new(StringArray::from(values.to_vec())) as ArrayRef,
+            Arc::new(StringArray::from(account_ids.to_vec())) as ArrayRef,
+            Arc::new(Int64Array::from(values.to_vec())) as ArrayRef,
             Arc::new(Int64Array::from(weights.to_vec())) as ArrayRef,
         ],
     )

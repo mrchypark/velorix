@@ -473,6 +473,30 @@ async fn production_persisted_table_store_rejects_relation_catalog_fingerprint_m
 }
 
 #[tokio::test]
+async fn production_persisted_table_store_rejects_non_table_relation_registration_before_writing() {
+    let (_temp_dir, store) = temp_store();
+    let mut catalog = orders_relation_catalog();
+    catalog.datafusion_registration.mode = DataFusionRegistrationModeV1::View;
+    RelationCatalogRegistry::new(Arc::clone(&store))
+        .create(&catalog)
+        .await
+        .unwrap();
+
+    let error = PersistedTableStore::new(Arc::clone(&store))
+        .create_production(
+            Arc::clone(&store),
+            production_request("primary", "tenants/tenant-a/tables/orders"),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, PersistedTableError::RelationSchema(_)));
+    let key = ObjectKey::query_table("orders-current").unwrap();
+    let missing = store.get(&Path::from(key.as_str())).await.unwrap_err();
+    assert!(matches!(missing, object_store::Error::NotFound { .. }));
+}
+
+#[tokio::test]
 async fn production_object_backed_table_query_rejects_unregistered_store_id() {
     let (_temp_dir, catalog_store) = temp_store();
     let registry = StorageRegistry::new();
@@ -545,9 +569,9 @@ async fn production_object_backed_table_query_accepts_capability_registered_stor
     put_parquet_input(
         &scan_store,
         "tenants/tenant-a/tables/orders/snapshots/0001/part-000.parquet",
-        &parquet_input_batch(
-            &["\"account-a\"", "\"account-a\"", "\"account-b\""],
-            &["10", "5", "7"],
+        &parquet_orders_batch(
+            &["account-a", "account-a", "account-b"],
+            &[10, 5, 7],
             &[1, 1, -1],
         ),
     )
@@ -563,17 +587,82 @@ async fn production_object_backed_table_query_accepts_capability_registered_stor
         &registry,
         "tenant-a",
         "orders-current",
-        "select key_json, sum(cast(value_json as int)) as total_value, sum(weight) as total_weight \
-         from input where weight > 0 group by key_json order by key_json",
+        "select account_id, sum(value) as total_value, sum(weight) as total_weight \
+         from orders where weight > 0 group by account_id order by account_id",
     )
     .await
     .unwrap();
 
     assert_eq!(output.len(), 1);
     assert_eq!(output[0].num_rows(), 1);
-    assert_eq!(string_value(&output[0], 0, 0), "\"account-a\"");
+    assert_eq!(string_value(&output[0], 0, 0), "account-a");
     assert_eq!(int64_value(&output[0], 1, 0), 15);
     assert_eq!(int64_value(&output[0], 2, 0), 2);
+}
+
+#[tokio::test]
+async fn production_object_backed_table_query_rejects_parquet_schema_not_matching_relation_catalog()
+{
+    let (_temp_dir, catalog_store) = temp_store();
+    let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
+    put_parquet_input(
+        &scan_store,
+        "tenants/tenant-a/tables/orders/snapshots/0001/part-000.parquet",
+        &parquet_orders_value_as_text_batch(&["account-a"], &["10"], &[1]),
+    )
+    .await;
+    let mut registry = StorageRegistry::new();
+    register_production_scan_store(&mut registry, Arc::clone(&scan_store));
+
+    create_production_table(&catalog_store, "primary", "tenants/tenant-a/tables/orders").await;
+    create_standard_policy(&catalog_store, QueryPolicy::default()).await;
+
+    let error = query_production_table(
+        &catalog_store,
+        &registry,
+        "tenant-a",
+        "orders-current",
+        "select account_id, value, weight from orders",
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        PersistedTableError::RuntimeQuery(RuntimeQueryError::Query(_))
+    ));
+}
+
+#[tokio::test]
+async fn production_object_backed_table_query_does_not_register_legacy_input_table_name() {
+    let (_temp_dir, catalog_store) = temp_store();
+    let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
+    put_parquet_input(
+        &scan_store,
+        "tenants/tenant-a/tables/orders/snapshots/0001/part-000.parquet",
+        &parquet_orders_batch(&["account-a"], &[10], &[1]),
+    )
+    .await;
+    let mut registry = StorageRegistry::new();
+    register_production_scan_store(&mut registry, Arc::clone(&scan_store));
+
+    create_production_table(&catalog_store, "primary", "tenants/tenant-a/tables/orders").await;
+    create_standard_policy(&catalog_store, QueryPolicy::default()).await;
+
+    let error = query_production_table(
+        &catalog_store,
+        &registry,
+        "tenant-a",
+        "orders-current",
+        "select key_json, value_json, weight from input",
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        PersistedTableError::RuntimeQuery(RuntimeQueryError::Query(_))
+    ));
 }
 
 #[tokio::test]
@@ -592,7 +681,7 @@ async fn production_object_backed_table_query_rejects_stale_relation_catalog_fin
         &registry,
         "tenant-a",
         "orders-current",
-        "select key_json, value_json, weight from input",
+        "select account_id, value, weight from orders",
     )
     .await
     .unwrap_err();
@@ -601,6 +690,38 @@ async fn production_object_backed_table_query_rejects_stale_relation_catalog_fin
         error,
         PersistedTableError::RelationCatalogFingerprintMismatch { .. }
     ));
+}
+
+#[tokio::test]
+async fn production_object_backed_table_query_rejects_non_table_relation_registration_mode() {
+    let (_temp_dir, catalog_store) = temp_store();
+    let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
+    put_parquet_input(
+        &scan_store,
+        "tenants/tenant-a/tables/orders/snapshots/0001/part-000.parquet",
+        &parquet_orders_batch(&["account-a"], &[10], &[1]),
+    )
+    .await;
+    let mut registry = StorageRegistry::new();
+    register_production_scan_store(&mut registry, Arc::clone(&scan_store));
+
+    create_production_table(&catalog_store, "primary", "tenants/tenant-a/tables/orders").await;
+    create_standard_policy(&catalog_store, QueryPolicy::default()).await;
+    let mut catalog = orders_relation_catalog();
+    catalog.datafusion_registration.mode = DataFusionRegistrationModeV1::View;
+    overwrite_orders_relation_catalog(&catalog_store, catalog).await;
+
+    let error = query_production_table(
+        &catalog_store,
+        &registry,
+        "tenant-a",
+        "orders-current",
+        "select account_id, value, weight from orders",
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(error, PersistedTableError::RelationSchema(_)));
 }
 
 #[tokio::test]
@@ -617,7 +738,7 @@ async fn production_object_backed_table_query_rejects_missing_catalog_policy() {
         &registry,
         "tenant-a",
         "orders-current",
-        "select key_json, value_json, weight from input",
+        "select account_id, value, weight from orders",
     )
     .await
     .unwrap_err();
@@ -637,7 +758,7 @@ async fn production_object_backed_table_query_applies_catalog_policy_id() {
     put_parquet_input(
         &scan_store,
         "tenants/tenant-a/tables/orders/snapshots/0001/part-000.parquet",
-        &parquet_input_batch(&["\"account-a\"", "\"account-b\""], &["10", "7"], &[1, 1]),
+        &parquet_orders_batch(&["account-a", "account-b"], &[10, 7], &[1, 1]),
     )
     .await;
     let mut registry = StorageRegistry::new();
@@ -661,7 +782,7 @@ async fn production_object_backed_table_query_applies_catalog_policy_id() {
         &registry,
         "tenant-a",
         "orders-current",
-        "select key_json, value_json, weight from input order by key_json",
+        "select account_id, value, weight from orders order by account_id",
     )
     .await
     .unwrap_err();
@@ -696,7 +817,7 @@ async fn production_object_backed_table_query_rejects_cross_tenant_catalog_polic
         &registry,
         "tenant-b",
         "orders-current",
-        "select key_json, value_json, weight from input",
+        "select account_id, value, weight from orders",
     )
     .await
     .unwrap_err();
@@ -718,13 +839,13 @@ async fn production_object_backed_table_query_rejects_scan_above_file_count_limi
     put_parquet_input(
         &scan_store,
         "tenants/tenant-a/tables/orders/snapshots/0001/part-000.parquet",
-        &parquet_input_batch(&["\"account-a\""], &["10"], &[1]),
+        &parquet_orders_batch(&["account-a"], &[10], &[1]),
     )
     .await;
     put_parquet_input(
         &scan_store,
         "tenants/tenant-a/tables/orders/snapshots/0001/part-001.parquet",
-        &parquet_input_batch(&["\"account-b\""], &["7"], &[1]),
+        &parquet_orders_batch(&["account-b"], &[7], &[1]),
     )
     .await;
     let mut registry = StorageRegistry::new();
@@ -745,7 +866,7 @@ async fn production_object_backed_table_query_rejects_scan_above_file_count_limi
         &registry,
         "tenant-a",
         "orders-current",
-        "select key_json, value_json, weight from input",
+        "select account_id, value, weight from orders",
     )
     .await
     .unwrap_err();
@@ -768,13 +889,13 @@ async fn production_object_backed_table_query_rejects_object_requests_above_limi
     put_parquet_input(
         &scan_store,
         "tenants/tenant-a/tables/orders/snapshots/0001/part-000.parquet",
-        &parquet_input_batch(&["\"account-a\""], &["10"], &[1]),
+        &parquet_orders_batch(&["account-a"], &[10], &[1]),
     )
     .await;
     put_parquet_input(
         &scan_store,
         "tenants/tenant-a/tables/orders/snapshots/0001/part-001.parquet",
-        &parquet_input_batch(&["\"account-b\""], &["7"], &[1]),
+        &parquet_orders_batch(&["account-b"], &[7], &[1]),
     )
     .await;
     let mut registry = StorageRegistry::new();
@@ -795,20 +916,22 @@ async fn production_object_backed_table_query_rejects_object_requests_above_limi
         &registry,
         "tenant-a",
         "orders-current",
-        "select key_json, value_json, weight from input limit 1",
+        "select account_id, value, weight from orders limit 1",
     )
     .await
     .unwrap_err();
 
-    assert!(matches!(
-        error,
-        PersistedTableError::RuntimeQuery(RuntimeQueryError::Query(QueryError::Policy(
-            QueryPolicyError::ObjectRequestsExceeded {
-                observed_requests: 3,
-                max_requests: 2,
-            }
-        )))
-    ));
+    let PersistedTableError::RuntimeQuery(RuntimeQueryError::Query(QueryError::Policy(
+        QueryPolicyError::ObjectRequestsExceeded {
+            observed_requests,
+            max_requests,
+        },
+    ))) = error
+    else {
+        panic!("expected object request policy error, got {error:?}");
+    };
+    assert!(observed_requests > max_requests);
+    assert_eq!(max_requests, 2);
 }
 
 #[tokio::test]
@@ -818,7 +941,7 @@ async fn production_object_backed_table_query_still_applies_output_row_limit() {
     put_parquet_input(
         &scan_store,
         "tenants/tenant-a/tables/orders/snapshots/0001/part-000.parquet",
-        &parquet_input_batch(&["\"account-a\"", "\"account-b\""], &["10", "7"], &[1, 1]),
+        &parquet_orders_batch(&["account-a", "account-b"], &[10, 7], &[1, 1]),
     )
     .await;
     let mut registry = StorageRegistry::new();
@@ -839,7 +962,7 @@ async fn production_object_backed_table_query_still_applies_output_row_limit() {
         &registry,
         "tenant-a",
         "orders-current",
-        "select key_json, value_json, weight from input order by key_json",
+        "select account_id, value, weight from orders order by account_id",
     )
     .await
     .unwrap_err();
@@ -1008,19 +1131,19 @@ fn orders_relation_catalog() -> VelorixRelationCatalogV1 {
         relation_version: "2026-05-05.v1".to_string(),
         columns: vec![
             RelationColumnV1 {
-                column_id: "key_json".to_string(),
-                name: "key_json".to_string(),
-                logical_type: VelorixLogicalTypeV1::Json,
-                physical_arrow_type: ArrowPhysicalTypeV1::JsonUtf8,
+                column_id: "account_id".to_string(),
+                name: "account_id".to_string(),
+                logical_type: VelorixLogicalTypeV1::Utf8,
+                physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
                 nullable: false,
                 ordinal: 0,
                 semantic_role: RelationSemanticRoleV1::PrimaryKey,
             },
             RelationColumnV1 {
-                column_id: "value_json".to_string(),
-                name: "value_json".to_string(),
-                logical_type: VelorixLogicalTypeV1::Json,
-                physical_arrow_type: ArrowPhysicalTypeV1::JsonUtf8,
+                column_id: "value".to_string(),
+                name: "value".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
                 nullable: false,
                 ordinal: 1,
                 semantic_role: RelationSemanticRoleV1::Value,
@@ -1035,7 +1158,7 @@ fn orders_relation_catalog() -> VelorixRelationCatalogV1 {
                 semantic_role: RelationSemanticRoleV1::Weight,
             },
         ],
-        primary_key_column_ids: vec!["key_json".to_string()],
+        primary_key_column_ids: vec!["account_id".to_string()],
         weight_column_id: "weight".to_string(),
         allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
         event_time_column_id: None,
@@ -1102,6 +1225,42 @@ fn parquet_input_batch(keys: &[&str], values: &[&str], weights: &[i64]) -> Recor
         ])),
         vec![
             Arc::new(StringArray::from(keys.to_vec())) as ArrayRef,
+            Arc::new(StringArray::from(values.to_vec())) as ArrayRef,
+            Arc::new(Int64Array::from(weights.to_vec())) as ArrayRef,
+        ],
+    )
+    .unwrap()
+}
+
+fn parquet_orders_batch(account_ids: &[&str], values: &[i64], weights: &[i64]) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("account_id", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, false),
+            Field::new("weight", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(account_ids.to_vec())) as ArrayRef,
+            Arc::new(Int64Array::from(values.to_vec())) as ArrayRef,
+            Arc::new(Int64Array::from(weights.to_vec())) as ArrayRef,
+        ],
+    )
+    .unwrap()
+}
+
+fn parquet_orders_value_as_text_batch(
+    account_ids: &[&str],
+    values: &[&str],
+    weights: &[i64],
+) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("account_id", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, false),
+            Field::new("weight", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(account_ids.to_vec())) as ArrayRef,
             Arc::new(StringArray::from(values.to_vec())) as ArrayRef,
             Arc::new(Int64Array::from(weights.to_vec())) as ArrayRef,
         ],

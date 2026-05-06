@@ -287,6 +287,33 @@ fn datafusion_schema_from_catalog_rejects_stale_catalog_fingerprint() {
     ));
 }
 
+#[test]
+fn relation_catalog_rejects_reserved_datafusion_registration_name() {
+    for name in [
+        "input",
+        "information_schema",
+        "datafusion",
+        "orders.v1",
+        "\"orders\"",
+        "1orders",
+    ] {
+        let mut catalog = orders_relation_catalog();
+        catalog.datafusion_registration.name = name.to_string();
+
+        let error = catalog.validate().unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                RelationSchemaError::InvalidRelationSchema {
+                    field: "datafusion_registration.name"
+                }
+            ),
+            "accepted invalid DataFusion registration name: {name}"
+        );
+    }
+}
+
 fn orders_relation_catalog() -> VelorixRelationCatalogV1 {
     let relation_schema = VelorixRelationSchemaV1 {
         relation_id: "orders".to_string(),

@@ -16,6 +16,8 @@ Production table specs use registry-backed storage identity:
 - `object_key_prefix`.
 - `snapshot_ref`.
 - `format`, currently `parquet`.
+- `relation_id`.
+- `relation_version`.
 - `schema_fingerprint`.
 - `query_policy_id`.
 
@@ -28,10 +30,15 @@ authority. Prefixes must pass tenant namespace policy.
 Output row caps are not scan cost controls. Production scans require limits for
 scan bytes, object requests, file count, row groups, timeout, memory, and spill.
 DataFusion must register object stores through the shared registry only.
+Production Parquet scans register the table using the relation catalog
+DataFusion registration name and catalog-derived Arrow schema. The bootstrap
+`input` table alias is not registered for production persisted table scans.
 
 ## Verification
 
 - Raw URL table specs fail in production mode.
 - Unregistered store id and cross-tenant prefixes are rejected.
+- Production SQL sees the relation catalog table name and not the bootstrap
+  `input` alias.
 - Large scans are stopped by scan-byte limits before output collection.
 - Many-small-file scans are stopped by file or object request limits.

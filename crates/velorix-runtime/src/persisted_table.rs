@@ -7,13 +7,22 @@ use object_store::{path::Path, ObjectStore, PutMode};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
-use velorix_core::{query::QueryPolicy, relation::validate_schema_fingerprint};
+use velorix_core::{
+    query::QueryPolicy,
+    relation::{
+        datafusion_schema_from_catalog, validate_schema_fingerprint, DataFusionRegistrationModeV1,
+        RelationSchemaError, VelorixRelationCatalogV1,
+    },
+};
 use velorix_storage::{
     object_key::{ObjectKey, ObjectKeyError},
     relation_catalog_registry::{RelationCatalogRegistry, RelationCatalogRegistryError},
 };
 
-use crate::query::{query_object_backed_input_with_policy, RuntimeQueryError};
+use crate::query::{
+    query_object_backed_input_with_policy, query_object_backed_relation_with_policy,
+    RuntimeQueryError,
+};
 use crate::query_policy_catalog::{QueryPolicyCatalogError, QueryPolicyCatalogStore};
 use crate::storage_registry::{validate_tenant_prefix, StorageRegistry, StorageRegistryError};
 
@@ -81,6 +90,8 @@ pub enum PersistedTableError {
     RuntimeQuery(#[from] RuntimeQueryError),
     #[error(transparent)]
     QueryPolicyCatalog(#[from] QueryPolicyCatalogError),
+    #[error(transparent)]
+    RelationSchema(#[from] RelationSchemaError),
     #[error(transparent)]
     RelationCatalogRegistry(#[from] RelationCatalogRegistryError),
     #[error(transparent)]
@@ -194,13 +205,14 @@ impl PersistedTableStore {
         };
         let object_key = ObjectKey::query_table(&spec.table_id)?;
         validate_production_table_fields(&spec)?;
-        require_matching_relation_catalog_fingerprint(
+        let relation_catalog = read_matching_relation_catalog(
             relation_catalog_store,
             &spec.relation_id,
             &spec.relation_version,
             &spec.schema_fingerprint,
         )
         .await?;
+        require_table_relation_registration(&relation_catalog)?;
 
         let bytes = serde_json::to_vec(&spec)?;
         self.store
@@ -281,7 +293,7 @@ pub async fn query_production_persisted_object_backed_input(
     let catalog = PersistedTableStore::new(catalog_store);
     let spec = catalog.get_production(table_id).await?;
     reject_cross_tenant_production_query(tenant_id, &spec)?;
-    require_matching_relation_catalog_fingerprint(
+    let relation_catalog = read_matching_relation_catalog(
         relation_catalog_store,
         &spec.relation_id,
         &spec.relation_version,
@@ -293,13 +305,15 @@ pub async fn query_production_persisted_object_backed_input(
         .await?
         .policy;
 
-    query_production_spec_with_policy(registry, tenant_id, spec, sql, policy).await
+    query_production_spec_with_policy(registry, tenant_id, spec, relation_catalog, sql, policy)
+        .await
 }
 
 async fn query_production_spec_with_policy(
     registry: &StorageRegistry,
     tenant_id: &str,
     spec: ProductionPersistedTableSpec,
+    relation_catalog: VelorixRelationCatalogV1,
     sql: &str,
     policy: QueryPolicy,
 ) -> Result<Vec<RecordBatch>, PersistedTableError> {
@@ -313,14 +327,37 @@ async fn query_production_spec_with_policy(
     )?;
 
     match spec.format {
-        ProductionPersistedTableFormat::Parquet => Ok(query_object_backed_input_with_policy(
-            location.store,
-            &location.table_url,
-            sql,
-            policy,
-        )
-        .await?),
+        ProductionPersistedTableFormat::Parquet => {
+            query_relation_backed_parquet_with_policy(
+                location.store,
+                &location.table_url,
+                &relation_catalog,
+                sql,
+                policy,
+            )
+            .await
+        }
     }
+}
+
+async fn query_relation_backed_parquet_with_policy(
+    store: Arc<dyn DataFusionObjectStore>,
+    table_url: &str,
+    relation_catalog: &VelorixRelationCatalogV1,
+    sql: &str,
+    policy: QueryPolicy,
+) -> Result<Vec<RecordBatch>, PersistedTableError> {
+    require_table_relation_registration(relation_catalog)?;
+    let catalog_schema = datafusion_schema_from_catalog(relation_catalog)?;
+    Ok(query_object_backed_relation_with_policy(
+        store,
+        table_url,
+        relation_catalog.datafusion_registration.name.as_str(),
+        catalog_schema,
+        sql,
+        policy,
+    )
+    .await?)
 }
 
 fn reject_cross_tenant_production_query(
@@ -382,12 +419,12 @@ fn validate_production_table_fields(
     Ok(())
 }
 
-async fn require_matching_relation_catalog_fingerprint(
+async fn read_matching_relation_catalog(
     relation_catalog_store: Arc<dyn ObjectStore>,
     relation_id: &str,
     relation_version: &str,
     schema_fingerprint: &str,
-) -> Result<(), PersistedTableError> {
+) -> Result<VelorixRelationCatalogV1, PersistedTableError> {
     let relation_catalog = RelationCatalogRegistry::new(relation_catalog_store)
         .read(relation_id, relation_version)
         .await?;
@@ -401,7 +438,20 @@ async fn require_matching_relation_catalog_fingerprint(
         });
     }
 
-    Ok(())
+    Ok(relation_catalog)
+}
+
+fn require_table_relation_registration(
+    relation_catalog: &VelorixRelationCatalogV1,
+) -> Result<(), PersistedTableError> {
+    if relation_catalog.datafusion_registration.mode == DataFusionRegistrationModeV1::Table {
+        Ok(())
+    } else {
+        Err(RelationSchemaError::InvalidRelationSchema {
+            field: "datafusion_registration.mode",
+        }
+        .into())
+    }
 }
 
 fn require_non_empty(field: &'static str, value: &str) -> Result<(), PersistedTableError> {
