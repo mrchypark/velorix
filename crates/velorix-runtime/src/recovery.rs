@@ -4,7 +4,7 @@ use arrow::{
     array::{Array, Int64Array, StringArray, StringViewArray},
     datatypes::DataType,
 };
-use object_store::ObjectStore;
+use object_store::{path::Path, ObjectStore};
 use serde_json::json;
 use thiserror::Error;
 use velorix_core::{
@@ -116,8 +116,42 @@ impl RecoveredRuntime {
         expected_owner: &str,
         relation_catalog: VelorixRelationCatalogV1,
     ) -> Result<Self, RecoveryError> {
-        relation_catalog.validate()?;
         let publisher = CheckpointPublisher::new(Arc::clone(&store));
+
+        Self::recover_with_publisher_and_relation_catalog(
+            store,
+            publisher,
+            expected_owner,
+            relation_catalog,
+        )
+        .await
+    }
+
+    pub async fn recover_with_slatedb_state_store_and_relation_catalog(
+        store: Arc<dyn ObjectStore>,
+        db_path: impl Into<Path>,
+        expected_owner: &str,
+        relation_catalog: VelorixRelationCatalogV1,
+    ) -> Result<Self, RecoveryError> {
+        let publisher =
+            CheckpointPublisher::with_slatedb_state_store(Arc::clone(&store), db_path).await?;
+
+        Self::recover_with_publisher_and_relation_catalog(
+            store,
+            publisher,
+            expected_owner,
+            relation_catalog,
+        )
+        .await
+    }
+
+    async fn recover_with_publisher_and_relation_catalog(
+        store: Arc<dyn ObjectStore>,
+        publisher: CheckpointPublisher,
+        expected_owner: &str,
+        relation_catalog: VelorixRelationCatalogV1,
+    ) -> Result<Self, RecoveryError> {
+        relation_catalog.validate()?;
         let latest_manifest = publisher.latest_manifest().await?;
         let mut materialized = PrototypeIncrementalEngine::new();
 

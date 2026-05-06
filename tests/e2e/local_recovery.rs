@@ -15,15 +15,15 @@ use velorix_core::{
     operator::KeyedSumCountAggregate,
 };
 use velorix_runtime::recovery::{
-    orders_sum_count_relation_catalog, RecoveredRuntime, ORDERS_SUM_COUNT_RELATION_ID,
-    ORDERS_SUM_COUNT_RELATION_VERSION,
+    orders_sum_count_relation_catalog, RecoveredRuntime, RecoveryError,
+    ORDERS_SUM_COUNT_RELATION_ID, ORDERS_SUM_COUNT_RELATION_VERSION,
 };
 use velorix_storage::{
     ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
     log::{IngestBatch, IngestLog},
-    manifest::{CheckpointManifest, InputRange, OutputObjectRef, StateObjectRef},
+    manifest::{CheckpointManifest, InputRange, OutputObjectRef, StateObjectRef, StateRefType},
     object_key::ObjectKey,
-    state::{CheckpointPublisher, StateObjectWrite},
+    state::{CheckpointPublishError, CheckpointPublisher, StateObjectWrite},
 };
 
 const RECOVERY_OWNER: &str = "orders_sum_count";
@@ -283,6 +283,108 @@ async fn local_recovery_recovers_checkpointed_view_and_replays_only_later_ingest
     );
     assert_eq!(recovered.replayed_batch_count(), 1);
     assert_eq!(recovered.latest_checkpoint_version(), Some(0));
+}
+
+#[tokio::test]
+async fn slatedb_local_recovery_recovers_reopened_checkpoint_state_and_replays_only_later_ingest_batches(
+) {
+    let (_temp_dir, store) = temp_store();
+    let ingest_log = IngestLog::new(Arc::clone(&store));
+    let publisher =
+        CheckpointPublisher::with_slatedb_state_store(Arc::clone(&store), "v1/slatedb/state")
+            .await
+            .unwrap();
+
+    let checkpointed_input = batch([
+        input_delta("account-a", 10, 1),
+        input_delta("account-b", 6, 1),
+    ]);
+    let replayed_input = batch([
+        input_delta("account-a", 4, 1),
+        input_delta("account-c", 8, 1),
+    ]);
+
+    append_ingest_envelope(&ingest_log, "orders", 0, 0, 2, &checkpointed_input).await;
+    append_ingest_envelope(&ingest_log, "orders", 0, 2, 4, &replayed_input).await;
+
+    let mut checkpointed_view = KeyedSumCountAggregate::new();
+    checkpointed_view.apply(&checkpointed_input).unwrap();
+    let state_ref = write_checkpoint_state(
+        &publisher,
+        0,
+        "state-slatedb-reopened",
+        &checkpointed_view.state(),
+    )
+    .await;
+    assert_eq!(state_ref.ref_type, StateRefType::SlateDbCheckpoint);
+
+    publisher
+        .publish_manifest(&manifest_with_ranges(
+            0,
+            None,
+            vec![input_range("orders", 0, 0, 2)],
+            state_ref,
+        ))
+        .await
+        .unwrap();
+
+    drop(checkpointed_view);
+    drop(ingest_log);
+    drop(publisher);
+
+    let recovered = RecoveredRuntime::recover_with_slatedb_state_store_and_relation_catalog(
+        Arc::clone(&store),
+        "v1/slatedb/state",
+        RECOVERY_OWNER,
+        orders_sum_count_relation_catalog().unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let mut expected_view = KeyedSumCountAggregate::new();
+    expected_view.apply(&checkpointed_input).unwrap();
+    expected_view.apply(&replayed_input).unwrap();
+
+    assert_eq!(
+        recovered.materialized_state().net_rows().unwrap(),
+        expected_view.state().net_rows().unwrap()
+    );
+    assert_eq!(recovered.replayed_batch_count(), 1);
+    assert_eq!(recovered.latest_checkpoint_version(), Some(0));
+}
+
+#[tokio::test]
+async fn slatedb_local_recovery_rejects_raw_state_manifest() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let state_ref = write_checkpoint_state(
+        &publisher,
+        0,
+        "state-raw-for-slatedb",
+        &DeltaBatch::default(),
+    )
+    .await;
+    assert_eq!(state_ref.ref_type, StateRefType::RawObject);
+    let raw_state_key = state_ref.object_key.clone();
+    publisher
+        .publish_manifest(&manifest(1, state_ref))
+        .await
+        .unwrap();
+
+    let error = RecoveredRuntime::recover_with_slatedb_state_store_and_relation_catalog(
+        Arc::clone(&store),
+        "v1/slatedb/state",
+        RECOVERY_OWNER,
+        orders_sum_count_relation_catalog().unwrap(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RecoveryError::Checkpoint(CheckpointPublishError::MissingStateObject(object_key))
+            if object_key == raw_state_key
+    ));
 }
 
 #[tokio::test]
