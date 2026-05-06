@@ -79,6 +79,27 @@ the live S3 harnesses or enable the S3 HTTP/TLS stacks. Without
 skip message. This keeps normal local and PR runs deterministic and avoids
 accidental writes to shared MinIO or S3 buckets.
 
+## Nightly Workflow Gate
+
+`.github/workflows/nightly.yml` keeps benchmark evidence and live backend
+evidence independent:
+
+- `S3_BENCHMARK_RESULT_PATH` may be omitted only when live S3-compatible tests
+  are explicitly requested. When set, the workflow validates that existing JSON
+  against `baselines/benchmark/s3/nightly.json`.
+- Live S3-compatible tests run only after explicit opt-in. Manual runs use the
+  `run-live-s3-compat` input. Scheduled runs require the repository variable
+  `VELORIX_RUN_LIVE_S3_COMPAT` set to `1`, `true`, or `yes`.
+- If live tests are requested, the workflow fails before running tests unless
+  `AWS_ENDPOINT_URL`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+  `AWS_REGION`, and `VELORIX_S3_BUCKET` are present. `VELORIX_S3_PREFIX` remains
+  optional.
+- If live tests are not requested, the workflow does not set
+  `VELORIX_S3_COMPAT=1`, so scheduled runs cannot write to S3-compatible storage
+  only because credentials happen to exist.
+- If neither benchmark JSON nor live S3-compatible tests are configured, the
+  nightly gate fails closed instead of passing without S3 evidence.
+
 ## Out Of Scope
 
 The current slice intentionally does not validate SlateDB, Foyer, benchmark

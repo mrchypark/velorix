@@ -557,6 +557,43 @@ async fn gc_plan_fails_closed_when_state_listing_fails() {
 }
 
 #[tokio::test]
+async fn gc_plan_fails_closed_when_output_listing_fails() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let retained_state = state_write(0, "state-retained", b"retained-state");
+    let retained_output = output_write(0, 0, "out-retained", b"retained-output");
+    let orphan_output = output_write(0, 0, "out-orphan", b"orphan-output");
+
+    let retained_state_ref = publisher.write_state_object(&retained_state).await.unwrap();
+    let retained_output_ref = publisher
+        .write_output_object(&retained_output)
+        .await
+        .unwrap();
+    publisher.write_output_object(&orphan_output).await.unwrap();
+    let mut manifest = manifest(0, retained_state_ref);
+    manifest.output_objects = vec![retained_output_ref];
+    publisher.publish_manifest(&manifest).await.unwrap();
+
+    let listing_fails_store = Arc::new(PrefixListingFailsStore::new(
+        Arc::clone(&store),
+        "v1/outputs",
+    ));
+    let listing_fails_publisher = CheckpointPublisher::new(listing_fails_store);
+    let err = listing_fails_publisher
+        .plan_garbage_collection(GarbageCollectionPolicy {
+            retain_latest_manifests: 1,
+        })
+        .await
+        .unwrap_err();
+
+    let err = err.to_string();
+    assert!(err.contains("prefix-listing-fails"));
+    assert!(err.contains("listing failed for v1/outputs/"));
+    assert!(object_exists(store.as_ref(), retained_output.object_key()).await);
+    assert!(object_exists(store.as_ref(), orphan_output.object_key()).await);
+}
+
+#[tokio::test]
 async fn gc_plan_marks_unreferenced_output_object() {
     let (_temp_dir, store) = temp_store();
     let publisher = CheckpointPublisher::new(Arc::clone(&store));
@@ -829,6 +866,42 @@ async fn gc_execution_rejects_stale_plan_when_new_manifest_references_candidate(
         CheckpointPublishError::GarbageCollectionCandidateStillReferenced { .. }
     ));
     assert!(object_exists(store.as_ref(), stale_candidate_state.object_key()).await);
+}
+
+#[tokio::test]
+async fn gc_execution_fails_closed_when_manifest_revalidation_listing_fails() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let retained_state = state_write(0, "state-retained", b"retained-state");
+    let orphan_output = output_write(0, 0, "out-orphan", b"orphan-output");
+
+    let retained_state_ref = publisher.write_state_object(&retained_state).await.unwrap();
+    publisher.write_output_object(&orphan_output).await.unwrap();
+    publisher
+        .publish_manifest(&manifest(0, retained_state_ref))
+        .await
+        .unwrap();
+
+    let plan = publisher
+        .plan_garbage_collection(GarbageCollectionPolicy {
+            retain_latest_manifests: 1,
+        })
+        .await
+        .unwrap();
+    let listing_fails_store = Arc::new(PrefixListingFailsStore::new(
+        Arc::clone(&store),
+        "v1/checkpoints",
+    ));
+    let listing_fails_publisher = CheckpointPublisher::new(listing_fails_store);
+    let err = listing_fails_publisher
+        .execute_garbage_collection_plan(&plan)
+        .await
+        .unwrap_err();
+
+    let err = err.to_string();
+    assert!(err.contains("prefix-listing-fails"));
+    assert!(err.contains("listing failed for v1/checkpoints/"));
+    assert!(object_exists(store.as_ref(), orphan_output.object_key()).await);
 }
 
 #[tokio::test]
