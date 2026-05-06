@@ -110,12 +110,16 @@ impl CheckpointManifestInspectionStatus {
     }
 }
 
-pub(crate) fn manifest_digest(manifest_bytes: &[u8]) -> String {
+pub fn manifest_body_digest(manifest_bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"velorix.checkpoint-manifest.v1\0");
     hasher.update(manifest_bytes);
 
     format!("sha256:{:x}", hasher.finalize())
+}
+
+pub(crate) fn manifest_digest(manifest_bytes: &[u8]) -> String {
+    manifest_body_digest(manifest_bytes)
 }
 
 pub(crate) fn marker_updated_at_now() -> String {

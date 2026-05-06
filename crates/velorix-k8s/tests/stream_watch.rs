@@ -1,12 +1,12 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use object_store::{memory::InMemory, ObjectStore};
+use object_store::{memory::InMemory, path::Path, ObjectStore};
 use serde_json::{json, Value};
 use velorix_k8s::{
     controller::AuthoritySnapshot,
     crd::{
-        ConditionState, ObjectStoreAuthorityRef, RelationVersionRef, StreamStatus,
+        CheckpointRef, ConditionState, ObjectStoreAuthorityRef, RelationVersionRef, StreamStatus,
         VelorixCondition, VelorixStream, VelorixStreamSpec,
     },
     status::{KubernetesStatusError, StreamStatusApi, StreamStatusWriter},
@@ -15,7 +15,13 @@ use velorix_k8s::{
         StreamWatchError, StreamWatchEvent,
     },
 };
-use velorix_storage::relation_catalog_registry::RelationCatalogRegistry;
+use velorix_storage::{
+    checkpoint_index::CheckpointLifecycleRecord,
+    manifest::{CheckpointManifest, InputRange, StateObjectRef},
+    object_key::ObjectKey,
+    relation_catalog_registry::RelationCatalogRegistry,
+    state::{CheckpointPublisher, StateObjectWrite},
+};
 
 #[tokio::test]
 async fn stream_watch_handler_writes_reconcile_output_for_applied_stream() {
@@ -131,6 +137,104 @@ async fn relation_catalog_snapshot_provider_reports_ready_when_catalog_exists() 
                 }
             }),
         }]
+    );
+}
+
+#[tokio::test]
+async fn relation_catalog_snapshot_provider_reports_latest_stream_checkpoint_from_object_store() {
+    let store = memory_store();
+    create_relation_catalog(&store).await;
+    let manifest_digest = publish_checkpoint(&store, 0, "deposits").await;
+    let api = FakeStatusApi::default();
+    let writer = StreamStatusWriter::new(api.clone());
+    let provider = RelationCatalogSnapshotProvider::new(authority(), store);
+
+    handle_stream_event(StreamWatchEvent::Applied(stream()), &provider, &writer)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        api.writes(),
+        vec![StatusWrite {
+            namespace: "analytics".to_string(),
+            name: "deposits".to_string(),
+            patch: json!({
+                "status": StreamStatus {
+                    observed_generation: Some(1),
+                    last_accepted_relation_schema_fingerprint: Some(relation().schema_fingerprint),
+                    latest_published_checkpoint: Some(CheckpointRef {
+                        checkpoint_version: 0,
+                        manifest_digest,
+                    }),
+                    readiness: Some(ready_condition()),
+                }
+            }),
+        }]
+    );
+}
+
+#[tokio::test]
+async fn relation_catalog_snapshot_provider_does_not_report_another_stream_checkpoint() {
+    let store = memory_store();
+    create_relation_catalog(&store).await;
+    publish_checkpoint(&store, 0, "other-stream").await;
+    let api = FakeStatusApi::default();
+    let writer = StreamStatusWriter::new(api.clone());
+    let provider = RelationCatalogSnapshotProvider::new(authority(), store);
+
+    handle_stream_event(StreamWatchEvent::Applied(stream()), &provider, &writer)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        api.writes()[0].patch["status"]["latest_published_checkpoint"],
+        Value::Null
+    );
+}
+
+#[tokio::test]
+async fn relation_catalog_snapshot_provider_does_not_report_checkpoint_without_lifecycle_digest() {
+    let store = memory_store();
+    create_relation_catalog(&store).await;
+    publish_checkpoint(&store, 0, "deposits").await;
+    store
+        .delete(&Path::from(
+            ObjectKey::checkpoint_lifecycle_record(0).as_str(),
+        ))
+        .await
+        .unwrap();
+    let api = FakeStatusApi::default();
+    let writer = StreamStatusWriter::new(api.clone());
+    let provider = RelationCatalogSnapshotProvider::new(authority(), store);
+
+    handle_stream_event(StreamWatchEvent::Applied(stream()), &provider, &writer)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        api.writes()[0].patch["status"]["latest_published_checkpoint"],
+        Value::Null
+    );
+}
+
+#[tokio::test]
+async fn relation_catalog_snapshot_provider_does_not_report_checkpoint_with_stale_lifecycle_digest()
+{
+    let store = memory_store();
+    create_relation_catalog(&store).await;
+    publish_checkpoint(&store, 0, "deposits").await;
+    overwrite_lifecycle_digest(&store, 0, "sha256:bad").await;
+    let api = FakeStatusApi::default();
+    let writer = StreamStatusWriter::new(api.clone());
+    let provider = RelationCatalogSnapshotProvider::new(authority(), store);
+
+    handle_stream_event(StreamWatchEvent::Applied(stream()), &provider, &writer)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        api.writes()[0].patch["status"]["latest_published_checkpoint"],
+        Value::Null
     );
 }
 
@@ -317,6 +421,83 @@ async fn create_relation_catalog(store: &Arc<dyn ObjectStore>) {
         .create(&catalog)
         .await
         .unwrap();
+}
+
+async fn publish_checkpoint(
+    store: &Arc<dyn ObjectStore>,
+    checkpoint_version: u64,
+    stream_id: &str,
+) -> String {
+    let publisher = CheckpointPublisher::new(Arc::clone(store));
+    let state = StateObjectWrite::new(
+        "deposits",
+        0,
+        checkpoint_version,
+        format!("state-{checkpoint_version}"),
+        format!("state-{checkpoint_version}").into_bytes().into(),
+    )
+    .unwrap();
+    let state_ref = publisher.write_state_object(&state).await.unwrap();
+    let manifest = checkpoint_manifest(checkpoint_version, stream_id, state_ref);
+
+    publisher.publish_manifest(&manifest).await.unwrap();
+
+    publisher
+        .read_checkpoint_lifecycle_record(checkpoint_version)
+        .await
+        .unwrap()
+        .manifest_digest
+}
+
+async fn overwrite_lifecycle_digest(
+    store: &Arc<dyn ObjectStore>,
+    checkpoint_version: u64,
+    manifest_digest: &str,
+) {
+    let lifecycle_key = ObjectKey::checkpoint_lifecycle_record(checkpoint_version);
+    let mut record: CheckpointLifecycleRecord = serde_json::from_slice(
+        &store
+            .get(&Path::from(lifecycle_key.as_str()))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    record.manifest_digest = manifest_digest.to_string();
+    store
+        .delete(&Path::from(lifecycle_key.as_str()))
+        .await
+        .unwrap();
+    store
+        .put(
+            &Path::from(lifecycle_key.as_str()),
+            serde_json::to_vec(&record).unwrap().into(),
+        )
+        .await
+        .unwrap();
+}
+
+fn checkpoint_manifest(
+    checkpoint_version: u64,
+    stream_id: &str,
+    state_ref: StateObjectRef,
+) -> CheckpointManifest {
+    CheckpointManifest {
+        schema_version: 1,
+        checkpoint_version,
+        input_ranges: vec![InputRange {
+            stream_id: stream_id.to_string(),
+            partition_id: 0,
+            start_offset_inclusive: 0,
+            end_offset_exclusive: 10,
+        }],
+        state_objects: vec![state_ref],
+        output_objects: Vec::new(),
+        parent_checkpoint: None,
+        created_at: "2026-05-03T00:00:00Z".to_string(),
+    }
 }
 
 fn relation_catalog_json() -> Value {

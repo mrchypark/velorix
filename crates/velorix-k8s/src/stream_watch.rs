@@ -7,13 +7,15 @@ use kube::{
 };
 use std::sync::Arc;
 use thiserror::Error;
-use velorix_storage::relation_catalog_registry::{
-    RelationCatalogRegistry, RelationCatalogRegistryError,
+use velorix_storage::{
+    checkpoint_index::manifest_body_digest,
+    relation_catalog_registry::{RelationCatalogRegistry, RelationCatalogRegistryError},
+    state::{CheckpointPublishError, CheckpointPublisher},
 };
 
 use crate::{
     controller::{reconcile_stream, AuthoritySnapshot, ControllerAction},
-    crd::{ObjectStoreAuthorityRef, RelationVersionRef, VelorixStream},
+    crd::{CheckpointRef, ObjectStoreAuthorityRef, RelationVersionRef, VelorixStream},
     status::{KubernetesStatusError, StreamStatusApi, StreamStatusWriter},
 };
 
@@ -56,7 +58,7 @@ impl AuthoritySnapshotProvider for RelationCatalogSnapshotProvider {
             return Ok(AuthoritySnapshot::default());
         }
 
-        let snapshot = AuthoritySnapshot::default().with_authority(self.authority.clone());
+        let mut snapshot = AuthoritySnapshot::default().with_authority(self.authority.clone());
         match RelationCatalogRegistry::new(Arc::clone(&self.store))
             .read(
                 &stream.spec.relation.relation_id,
@@ -70,14 +72,76 @@ impl AuthoritySnapshotProvider for RelationCatalogSnapshotProvider {
                     relation_version: stream.spec.relation.relation_version,
                     schema_fingerprint: catalog.schema_fingerprint.to_string(),
                 };
-                Ok(snapshot.with_relation_for_authority(&self.authority, &catalog_relation))
+                snapshot = snapshot.with_relation_for_authority(&self.authority, &catalog_relation);
             }
             Err(RelationCatalogRegistryError::ObjectStore(object_store::Error::NotFound {
                 ..
-            })) => Ok(snapshot),
-            Err(error) => Err(StreamWatchError::snapshot(error.to_string())),
+            })) => {}
+            Err(error) => return Err(StreamWatchError::snapshot(error.to_string())),
+        }
+
+        if let Some(checkpoint) = self.latest_checkpoint_for_stream(stream).await? {
+            snapshot = snapshot.with_latest_stream_checkpoint_for_authority(
+                &self.authority,
+                &stream.spec.stream_id,
+                checkpoint,
+            );
+        }
+
+        Ok(snapshot)
+    }
+}
+
+impl RelationCatalogSnapshotProvider {
+    async fn latest_checkpoint_for_stream(
+        &self,
+        stream: &VelorixStream,
+    ) -> Result<Option<CheckpointRef>, StreamWatchError> {
+        let publisher = CheckpointPublisher::new(Arc::clone(&self.store));
+        let selected_manifest = publisher
+            .list_published_manifests()
+            .await
+            .map_err(snapshot_error)?
+            .into_iter()
+            .filter(|manifest| {
+                manifest
+                    .input_ranges
+                    .iter()
+                    .any(|range| range.stream_id == stream.spec.stream_id)
+            })
+            .max_by_key(|manifest| manifest.checkpoint_version);
+
+        let Some(manifest) = selected_manifest else {
+            return Ok(None);
+        };
+
+        match publisher
+            .read_checkpoint_lifecycle_record(manifest.checkpoint_version)
+            .await
+        {
+            Ok(record) if record.manifest_digest != digest_manifest(&manifest)? => Ok(None),
+            Ok(record) => Ok(Some(CheckpointRef {
+                checkpoint_version: manifest.checkpoint_version,
+                manifest_digest: record.manifest_digest,
+            })),
+            Err(CheckpointPublishError::ObjectStore(object_store::Error::NotFound { .. })) => {
+                Ok(None)
+            }
+            Err(error) => Err(snapshot_error(error)),
         }
     }
+}
+
+fn snapshot_error(error: CheckpointPublishError) -> StreamWatchError {
+    StreamWatchError::snapshot(error.to_string())
+}
+
+fn digest_manifest(
+    manifest: &velorix_storage::manifest::CheckpointManifest,
+) -> Result<String, StreamWatchError> {
+    serde_json::to_vec(manifest)
+        .map(|bytes| manifest_body_digest(&bytes))
+        .map_err(|error| StreamWatchError::snapshot(error.to_string()))
 }
 
 pub async fn handle_stream_event<P, A>(
