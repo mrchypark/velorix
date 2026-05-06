@@ -162,20 +162,25 @@ async fn query_object_backed_input_with_policy_and_limiter_and_meter(
     validate_sql_text_policy(sql, policy).map_err(QueryError::from)?;
     let _permit = acquire_query_permit(policy, limiter.as_ref())?;
     let query_store = query_execution_store(store, policy, meter);
-    validate_scan_policy(query_store.as_ref(), table_url, policy).await?;
+    let limits = QueryRuntimeLimits::from_policy(policy);
+    limits
+        .run_execution(async {
+            validate_scan_policy(query_store.as_ref(), table_url, policy).await
+        })
+        .await?;
 
     let context = session_context(policy)?;
 
     let object_store_url = object_store_url_for_table(table_url)?;
     context.register_object_store(object_store_url.as_ref(), query_store);
-    context
-        .register_parquet(INPUT_TABLE_NAME, table_url, ParquetReadOptions::default())
-        .await
-        .map_err(map_datafusion_error)?;
-
-    let limits = QueryRuntimeLimits::from_policy(policy);
     let dataframe = limits
-        .run_planning(async { context.sql(sql).await.map_err(map_datafusion_error) })
+        .run_planning(async {
+            context
+                .register_parquet(INPUT_TABLE_NAME, table_url, ParquetReadOptions::default())
+                .await
+                .map_err(map_datafusion_error)?;
+            context.sql(sql).await.map_err(map_datafusion_error)
+        })
         .await?;
 
     collect_with_policy(dataframe, policy, limits)

@@ -5,6 +5,9 @@ use futures::TryStreamExt;
 use object_store::{
     aws::AmazonS3Builder, path::Path, Error as ObjectStoreError, ObjectStore, PutMode,
 };
+use velorix_storage::capability::{
+    probe_authoritative_object_store_capabilities, AuthoritativeNamespace,
+};
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 type TestResult = Result<(), TestError>;
@@ -16,14 +19,7 @@ async fn s3_compatible_store_supports_velorix_required_object_semantics() -> Tes
         return Ok(());
     };
 
-    let store = AmazonS3Builder::new()
-        .with_endpoint(config.endpoint)
-        .with_access_key_id(config.access_key_id)
-        .with_secret_access_key(config.secret_access_key)
-        .with_region(config.region)
-        .with_bucket_name(config.bucket)
-        .with_allow_http(config.allow_http)
-        .build()?;
+    let store = live_store(&config)?;
     let key = Path::from(format!("{}/object.bin", config.run_prefix));
     let prefix = Path::from(config.run_prefix);
     let payload = Bytes::from_static(b"velorix-s3-compatible-harness");
@@ -36,6 +32,39 @@ async fn s3_compatible_store_supports_velorix_required_object_semantics() -> Tes
 
     let _ = store.delete(&key).await;
     validation
+}
+
+#[tokio::test]
+async fn s3_compatible_store_supports_authoritative_namespace_startup_capabilities() -> TestResult {
+    let Some(config) = live_config() else {
+        println!("skipping S3 compatibility harness; set VELORIX_S3_COMPAT=1 to enable");
+        return Ok(());
+    };
+
+    let store = live_store(&config)?;
+    let capabilities = probe_authoritative_object_store_capabilities(
+        &store,
+        "s3-compatible",
+        format!("{}/authoritative-capabilities", config.run_prefix),
+    )
+    .await?;
+
+    capabilities.validate_for_startup()?;
+    for namespace in AuthoritativeNamespace::all() {
+        let profile = capabilities.profiles.get(&namespace).ok_or_else(|| {
+            test_error(format!(
+                "missing capability profile for authoritative namespace `{namespace}`"
+            ))
+        })?;
+        if profile.backend_name != "s3-compatible" {
+            return Err(test_error(format!(
+                "authoritative namespace `{namespace}` reported backend `{}`",
+                profile.backend_name
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 async fn validate_written_object(
@@ -81,6 +110,17 @@ async fn validate_written_object(
 
 fn test_error(message: impl Into<String>) -> TestError {
     Box::new(std::io::Error::other(message.into()))
+}
+
+fn live_store(config: &LiveConfig) -> object_store::Result<impl ObjectStore> {
+    AmazonS3Builder::new()
+        .with_endpoint(config.endpoint.clone())
+        .with_access_key_id(config.access_key_id.clone())
+        .with_secret_access_key(config.secret_access_key.clone())
+        .with_region(config.region.clone())
+        .with_bucket_name(config.bucket.clone())
+        .with_allow_http(config.allow_http)
+        .build()
 }
 
 struct LiveConfig {

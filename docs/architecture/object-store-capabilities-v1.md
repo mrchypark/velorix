@@ -50,10 +50,10 @@ relation catalog, artifact catalog, and benchmark evidence.
 Startup validation rejects a missing namespace profile and rejects any namespace
 whose `ObjectStoreCapabilityProfile` is missing a required durability
 capability. A minimal S3-compatible storage harness now validates create-only,
-read-after-write, list-after-write, and range-read behavior when explicitly
-enabled. Capability diagnostics expose the backend name, namespace, and missing
-durability capabilities for every authoritative namespace. Broader runtime
-probes remain later evidence.
+read-after-write, list-after-write, range-read behavior, and startup
+capabilities for every authoritative namespace when explicitly enabled.
+Capability diagnostics expose the backend name, namespace, and missing
+durability capabilities for every authoritative namespace.
 
 ## Current Verification
 
@@ -69,6 +69,8 @@ probes remain later evidence.
   declared namespace capabilities.
 - Env-gated S3-compatible storage evidence validates create-only conflict,
   read-after-write, list-after-write, and range-read behavior.
+- Env-gated S3-compatible capability evidence validates startup capabilities for
+  every authoritative namespace.
 
 ## Future Verification
 
@@ -77,4 +79,3 @@ probes remain later evidence.
 - Local emulation cannot run under production configuration.
 - Shared registry tests prove DataFusion, SlateDB, Foyer, and Velorix storage use
   the same configured store identity.
-- S3-compatible evidence covers every authoritative namespace.

@@ -156,6 +156,78 @@ async fn query_object_backed_input_runs_without_limiter_when_concurrency_limit_i
     assert_eq!(output[0].num_rows(), 1);
 }
 
+#[tokio::test]
+async fn query_object_backed_input_returns_planning_timeout_when_table_registration_stalls() {
+    let inner_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
+    put_parquet_input(
+        &inner_store,
+        "input/part-000.parquet",
+        &parquet_input_batch(&["\"account-a\""], &["10"], &[1]),
+    )
+    .await;
+
+    let first_query_reached_list = Arc::new(Barrier::new(2));
+    let blocking_store: Arc<dyn DataFusionObjectStore> = Arc::new(BlockingListStore {
+        inner: Arc::clone(&inner_store),
+        first_query_reached_list,
+    });
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        query_object_backed_input_with_policy(
+            Arc::clone(&blocking_store),
+            "memory://velorix/input/",
+            "select key_json, value_json, weight from input",
+            QueryPolicy {
+                planning_timeout_ms: Some(25),
+                ..QueryPolicy::default()
+            },
+        ),
+    )
+    .await
+    .expect("query policy timeout should complete before the test guard");
+
+    assert!(matches!(
+        result.unwrap_err(),
+        RuntimeQueryError::Query(QueryError::Policy(QueryPolicyError::PlanningTimeout {
+            timeout_ms: 25
+        }))
+    ));
+}
+
+#[tokio::test]
+async fn query_object_backed_input_returns_execution_timeout_when_scan_preflight_stalls() {
+    let inner_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
+    let first_query_reached_list = Arc::new(Barrier::new(2));
+    let blocking_store: Arc<dyn DataFusionObjectStore> = Arc::new(BlockingListStore {
+        inner: Arc::clone(&inner_store),
+        first_query_reached_list,
+    });
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        query_object_backed_input_with_policy(
+            Arc::clone(&blocking_store),
+            "memory://velorix/input/",
+            "select key_json, value_json, weight from input",
+            QueryPolicy {
+                execution_timeout_ms: Some(25),
+                max_scan_files: Some(usize::MAX),
+                ..QueryPolicy::default()
+            },
+        ),
+    )
+    .await
+    .expect("query policy timeout should complete before the test guard");
+
+    assert!(matches!(
+        result.unwrap_err(),
+        RuntimeQueryError::Query(QueryError::Policy(QueryPolicyError::ExecutionTimeout {
+            timeout_ms: 25
+        }))
+    ));
+}
+
 #[derive(Debug)]
 struct BlockingListStore {
     inner: Arc<dyn DataFusionObjectStore>,

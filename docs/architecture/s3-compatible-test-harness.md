@@ -11,7 +11,7 @@ prove.
 
 ## Environment Contract
 
-The live test target is compiled only when the explicit Cargo feature is
+The live storage test target is compiled only when the explicit Cargo feature is
 enabled:
 
 ```bash
@@ -50,6 +50,8 @@ behaviors:
 - `get` after `put` returns the exact bytes
 - `list` by prefix observes the written key
 - range read returns the expected bytes
+- the authoritative object-store capability probe validates startup
+  capabilities for every authoritative namespace under the configured prefix
 - cleanup deletes the written key on a best-effort basis
 
 These are capability checks for production assumptions, not replacements for
