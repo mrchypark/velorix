@@ -1511,9 +1511,21 @@ mod tests {
                 "evidence": "s3-compatible capability probe",
                 "evidence_kind": ["s3_compatible"]
             },
-            "ownership_status": { "status": "pass", "evidence": "durable epoch record" },
-            "checkpoint_status": { "status": "pass", "evidence": "published checkpoint lifecycle" },
-            "state_status": { "status": "pass", "evidence": "SlateDB checkpoint ref" },
+            "ownership_status": {
+                "status": "pass",
+                "evidence": "durable epoch record",
+                "evidence_kind": ["durable_ownership_epoch_record"]
+            },
+            "checkpoint_status": {
+                "status": "pass",
+                "evidence": "published checkpoint lifecycle",
+                "evidence_kind": ["published_checkpoint_lifecycle_record"]
+            },
+            "state_status": {
+                "status": "pass",
+                "evidence": "SlateDB checkpoint ref",
+                "evidence_kind": ["slate_db_checkpoint_ref"]
+            },
             "query_policy_status": {
                 "status": "pass",
                 "evidence": "bounded DataFusion policy",
@@ -1529,7 +1541,11 @@ mod tests {
                 "evidence": "trusted artifact metadata",
                 "evidence_kind": ["feldera_artifact_registry"]
             },
-            "benchmark_gate_status": { "status": "pass", "evidence": "S3-compatible benchmark gate" },
+            "benchmark_gate_status": {
+                "status": "pass",
+                "evidence": "S3-compatible benchmark gate",
+                "evidence_kind": ["s3_compatible_benchmark_gate"]
+            },
             "kubernetes_status": {
                 "status": "pass",
                 "evidence": "Kubernetes Lease client",

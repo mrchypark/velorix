@@ -41,9 +41,13 @@ pub enum ReadinessEvidenceKind {
     S3Compatible,
     KubernetesLeaseClient,
     BootstrapRawStatePath,
+    DurableOwnershipEpochRecord,
+    PublishedCheckpointLifecycleRecord,
+    SlateDbCheckpointRef,
     QueryPolicyCatalog,
     RegistryBackedTableCatalog,
     FelderaArtifactRegistry,
+    S3CompatibleBenchmarkGate,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,11 +137,35 @@ impl ProductionReadinessEvidenceV1 {
             blocking_reasons
                 .push("kubernetes_status missing kubernetes_lease_client evidence".to_string());
         }
+        if !self
+            .ownership_status
+            .has_evidence(ReadinessEvidenceKind::DurableOwnershipEpochRecord)
+        {
+            blocking_reasons.push(
+                "ownership_status missing durable_ownership_epoch_record evidence".to_string(),
+            );
+        }
+        if !self
+            .checkpoint_status
+            .has_evidence(ReadinessEvidenceKind::PublishedCheckpointLifecycleRecord)
+        {
+            blocking_reasons.push(
+                "checkpoint_status missing published_checkpoint_lifecycle_record evidence"
+                    .to_string(),
+            );
+        }
         if self
             .state_status
             .has_evidence(ReadinessEvidenceKind::BootstrapRawStatePath)
         {
             blocking_reasons.push("state_status uses bootstrap raw state path".to_string());
+        }
+        if !self
+            .state_status
+            .has_evidence(ReadinessEvidenceKind::SlateDbCheckpointRef)
+        {
+            blocking_reasons
+                .push("state_status missing slate_db_checkpoint_ref evidence".to_string());
         }
         if !self
             .query_policy_status
@@ -160,6 +188,14 @@ impl ProductionReadinessEvidenceV1 {
         {
             blocking_reasons.push(
                 "feldera_artifact_status missing feldera_artifact_registry evidence".to_string(),
+            );
+        }
+        if !self
+            .benchmark_gate_status
+            .has_evidence(ReadinessEvidenceKind::S3CompatibleBenchmarkGate)
+        {
+            blocking_reasons.push(
+                "benchmark_gate_status missing s3_compatible_benchmark_gate evidence".to_string(),
             );
         }
 
