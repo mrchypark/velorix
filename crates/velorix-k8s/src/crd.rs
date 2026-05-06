@@ -174,6 +174,7 @@ pub struct VelorixTableSpec {
 #[serde(deny_unknown_fields)]
 pub struct VelorixWorkerShardSpec {
     pub worker_id: String,
+    pub view_id: String,
     pub stream_id: String,
     pub partition_id: u32,
     pub desired_owner_id: String,

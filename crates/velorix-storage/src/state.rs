@@ -482,6 +482,19 @@ impl CheckpointPublisher {
         self.read_ownership_epoch_record_object(&object_key).await
     }
 
+    pub async fn has_newer_ownership_epoch_record(
+        &self,
+        stream_id: &str,
+        partition_id: u32,
+        owner_epoch: u64,
+    ) -> Result<bool, CheckpointPublishError> {
+        Ok(self
+            .list_ownership_epoch_records(stream_id, partition_id)
+            .await?
+            .into_iter()
+            .any(|record| record.owner_epoch > owner_epoch))
+    }
+
     pub async fn list_published_manifests(
         &self,
     ) -> Result<Vec<CheckpointManifest>, CheckpointPublishError> {

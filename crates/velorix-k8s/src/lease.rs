@@ -300,6 +300,14 @@ pub fn set_partition_annotations(lease: &mut Lease, key: &PartitionLeaseKey) {
     );
 }
 
+pub fn partition_lease_identity(key: &PartitionLeaseKey) -> String {
+    format!(
+        "coordination.k8s.io/v1/namespaces/{}/leases/{}",
+        key.namespace,
+        lease_name(key)
+    )
+}
+
 fn new_lease(request: &LeaseAcquireRequest, name: &str) -> Result<Lease, KubernetesLeaseError> {
     let ttl_seconds = ttl_seconds(request.ttl_ms)?;
     let mut lease = Lease {

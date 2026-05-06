@@ -29,6 +29,7 @@ fn crd_schemas_expose_required_spec_fields_for_operator_inputs() {
         "desired_owner_id",
         "partition_id",
         "stream_id",
+        "view_id",
         "worker_id",
     ]);
     assert_required_spec_fields::<VelorixCheckpointPolicy>(&[
@@ -123,6 +124,7 @@ fn crd_specs_round_trip_with_status_as_observed_state() {
         "deposits-p0",
         VelorixWorkerShardSpec {
             worker_id: "worker-a".to_string(),
+            view_id: "balances_by_account".to_string(),
             stream_id: "deposits".to_string(),
             partition_id: 0,
             desired_owner_id: "worker-a".to_string(),

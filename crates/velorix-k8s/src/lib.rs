@@ -13,3 +13,4 @@ pub mod lease;
 pub mod startup;
 pub mod status;
 pub mod stream_watch;
+pub mod worker_shard;
