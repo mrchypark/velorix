@@ -949,9 +949,9 @@ fn run_benchmark_gate(
                     baseline.display()
                 )
             })?;
-        if gate_level == BenchmarkGateLevel::Release && is_placeholder_baseline(&baseline_result) {
+        if backend == BenchmarkBackend::S3Compatible && is_placeholder_baseline(&baseline_result) {
             bail!(
-                "release benchmark gate requires a real S3-compatible baseline, got placeholder {}",
+                "S3-compatible benchmark gate requires a real baseline, got placeholder {}",
                 baseline.display()
             );
         }
@@ -1641,10 +1641,28 @@ mod tests {
         .unwrap_err();
 
         let message = format!("{error:#}");
-        assert!(
-            message.contains("requires a real S3-compatible baseline"),
-            "{message}"
-        );
+        assert!(message.contains("requires a real baseline"), "{message}");
+    }
+
+    #[test]
+    fn benchmark_gate_comparison_rejects_placeholder_s3_nightly_baseline() {
+        let dir = tempdir().unwrap();
+        let baseline = dir.path().join("baseline.json");
+        let result = dir.path().join("result.json");
+        fs::write(&baseline, placeholder_nightly_baseline_json()).unwrap();
+        fs::write(&result, nightly_result_json()).unwrap();
+
+        let error = run_benchmark_gate(
+            Some(&baseline),
+            &result,
+            Some(BenchmarkGateLevel::NightlyIntegration),
+            Some(BenchmarkBackend::S3Compatible),
+            Some(0.10),
+        )
+        .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("requires a real baseline"), "{message}");
     }
 
     #[test]
@@ -2015,6 +2033,18 @@ mod tests {
         .unwrap()
     }
 
+    fn nightly_result_json() -> String {
+        serde_json::to_string_pretty(&normal_result(
+            "abc123",
+            "nightly_integration",
+            "s3_compatible",
+            "s3_incremental",
+            1000.0,
+            workload_metrics(),
+        ))
+        .unwrap()
+    }
+
     fn regressed_result_json() -> String {
         serde_json::to_string_pretty(&normal_result(
             "def456",
@@ -2073,6 +2103,18 @@ mod tests {
             },
             "workload_metrics": workload_metrics(),
         }))
+        .unwrap()
+    }
+
+    fn placeholder_nightly_baseline_json() -> String {
+        serde_json::to_string_pretty(&normal_result(
+            "placeholder-s3-nightly-baseline",
+            "nightly_integration",
+            "s3_compatible",
+            "s3_incremental",
+            1.0,
+            workload_metrics(),
+        ))
         .unwrap()
     }
 

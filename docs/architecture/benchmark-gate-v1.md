@@ -74,9 +74,9 @@ or provide S3-compatible evidence.
 - PR smoke writes `target/velorix-bench/local-pr-smoke.json`, gates it against
   `baselines/benchmark/local/pr-smoke.json`, and uploads the result artifact.
 - Nightly S3-compatible gating fails closed when no S3-compatible result path is
-  configured.
+  configured or when the S3-compatible baseline is still a placeholder.
 - Release gating fails closed when no S3-compatible result path is provided or
-  when the release baseline is still a placeholder.
+  when the S3-compatible baseline is still a placeholder.
 - `s3_incremental` fails closed unless `VELORIX_S3_COMPAT=1` is set. With the
   flag set, it still requires real S3-compatible object-store configuration.
   When explicitly enabled, it emits S3-compatible benchmark JSON for ingest
