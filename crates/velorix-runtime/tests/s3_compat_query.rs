@@ -38,7 +38,10 @@ use velorix_runtime::{
         PersistedTableStore, ProductionPersistedTableFormat,
     },
     query_policy_catalog::QueryPolicyCatalogStore,
-    recovery::RecoveredRuntime,
+    recovery::{
+        RecoveredRuntime, ORDERS_SUM_COUNT_OWNER, ORDERS_SUM_COUNT_RELATION_ID,
+        ORDERS_SUM_COUNT_RELATION_VERSION,
+    },
     storage_registry::StorageRegistry,
 };
 use velorix_storage::{
@@ -157,6 +160,7 @@ async fn s3_compatible_runtime_recovery_reads_checkpoint_and_replays_validated_i
     ]);
 
     let validation = async {
+        create_recovery_relation_catalog(&store).await?;
         append_ingest_envelope(&ingest_log, 0, 2, &checkpoint_input).await?;
         append_ingest_envelope(&ingest_log, 2, 4, &replay_input).await?;
 
@@ -167,7 +171,13 @@ async fn s3_compatible_runtime_recovery_reads_checkpoint_and_replays_validated_i
             .publish_manifest(&recovery_manifest(2, state_ref))
             .await?;
 
-        let recovered = RecoveredRuntime::recover(Arc::clone(&store)).await?;
+        let recovered = RecoveredRuntime::recover_with_owner_and_relation_catalog_record(
+            Arc::clone(&store),
+            ORDERS_SUM_COUNT_OWNER,
+            ORDERS_SUM_COUNT_RELATION_ID,
+            ORDERS_SUM_COUNT_RELATION_VERSION,
+        )
+        .await?;
 
         if recovered.latest_checkpoint_version() != Some(0) {
             return Err(test_error(
@@ -248,6 +258,16 @@ async fn create_orders_relation_catalog(
 ) -> Result<(), TestError> {
     RelationCatalogRegistry::new(Arc::clone(store))
         .create(&orders_relation_catalog())
+        .await?;
+    Ok(())
+}
+
+async fn create_recovery_relation_catalog(
+    store: &Arc<dyn AuthorityObjectStore>,
+) -> Result<(), TestError> {
+    let catalog = velorix_runtime::recovery::orders_sum_count_relation_catalog()?;
+    RelationCatalogRegistry::new(Arc::clone(store))
+        .create(&catalog)
         .await?;
     Ok(())
 }

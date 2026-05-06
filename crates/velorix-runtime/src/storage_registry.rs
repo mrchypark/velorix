@@ -139,7 +139,7 @@ impl StorageRegistry {
         Ok(())
     }
 
-    pub fn resolve_unchecked_table_location(
+    fn resolve_unchecked_table_location(
         &self,
         store_id: &str,
         tenant_id: &str,
