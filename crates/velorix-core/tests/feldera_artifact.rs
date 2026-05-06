@@ -268,6 +268,29 @@ fn feldera_artifact_rejects_missing_artifact_id() {
 }
 
 #[test]
+fn feldera_artifact_rejects_invalid_artifact_hash() {
+    let spec = load_spec("standing_view_spec_valid");
+
+    for artifact_hash in [
+        "not-a-sha",
+        "sha256:not-hex",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ] {
+        let mut artifact = load_artifact("compile_artifact_valid");
+        artifact.artifact_hash = artifact_hash.to_string();
+
+        let error = validate_feldera_compile_artifact(&spec, &artifact).unwrap_err();
+
+        assert!(matches!(
+            error,
+            FelderaArtifactError::InvalidArtifactHash {
+                field: "artifact_hash"
+            }
+        ));
+    }
+}
+
+#[test]
 fn feldera_artifact_rejects_mismatched_spec_hash() {
     let spec = load_spec("standing_view_spec_valid");
     let artifact = load_artifact("compile_artifact_mismatched_spec_hash");

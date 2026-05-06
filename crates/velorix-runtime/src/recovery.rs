@@ -25,6 +25,7 @@ use velorix_storage::{
     ingest_envelope::IngestEnvelope,
     log::{IngestLog, IngestLogError, ReplayCheckpoint},
     manifest::CheckpointManifest,
+    relation_catalog_registry::{RelationCatalogRegistry, RelationCatalogRegistryError},
     state::{CheckpointPublishError, CheckpointPublisher},
 };
 
@@ -66,6 +67,8 @@ pub enum RecoveryError {
     LogicalEpochOverflow,
     #[error(transparent)]
     RelationCatalog(#[from] RelationSchemaError),
+    #[error(transparent)]
+    RelationCatalogRegistry(#[from] RelationCatalogRegistryError),
     #[error("ingest relation mismatch for {field}: expected `{expected}`, actual `{actual}`")]
     IngestRelationMismatch {
         field: &'static str,
@@ -93,6 +96,19 @@ impl RecoveredRuntime {
             orders_sum_count_relation_catalog()?,
         )
         .await
+    }
+
+    pub async fn recover_with_owner_and_relation_catalog_record(
+        store: Arc<dyn ObjectStore>,
+        expected_owner: &str,
+        relation_id: &str,
+        relation_version: &str,
+    ) -> Result<Self, RecoveryError> {
+        let relation_catalog = RelationCatalogRegistry::new(Arc::clone(&store))
+            .read(relation_id, relation_version)
+            .await?;
+
+        Self::recover_with_owner_and_relation_catalog(store, expected_owner, relation_catalog).await
     }
 
     pub async fn recover_with_owner_and_relation_catalog(

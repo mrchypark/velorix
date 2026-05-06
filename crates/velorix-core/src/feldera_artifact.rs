@@ -142,6 +142,8 @@ pub enum FelderaArtifactError {
     SchemaFingerprintMismatch { field: &'static str },
     #[error("invalid Feldera relation schema: {field}")]
     InvalidRelationSchema { field: &'static str },
+    #[error("invalid Feldera artifact hash: {field}")]
+    InvalidArtifactHash { field: &'static str },
     #[error(transparent)]
     Serialization(#[from] SerdeJsonError),
 }
@@ -172,6 +174,7 @@ pub fn validate_feldera_compile_artifact(
     require_non_empty("spec_hash", &artifact.spec_hash)?;
     require_non_empty("artifact_id", &artifact.artifact_id)?;
     require_non_empty("artifact_hash", &artifact.artifact_hash)?;
+    validate_artifact_hash("artifact_hash", &artifact.artifact_hash)?;
     require_non_empty("compiler.name", &artifact.compiler.name)?;
     require_non_empty("compiler.version", &artifact.compiler.version)?;
     require_non_empty("compiler.source", &artifact.compiler.source)?;
@@ -489,6 +492,20 @@ fn validate_schema_fingerprint(
     };
     if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(FelderaArtifactError::InvalidRelationSchema { field });
+    }
+
+    Ok(())
+}
+
+fn validate_artifact_hash(
+    field: &'static str,
+    artifact_hash: &str,
+) -> Result<(), FelderaArtifactError> {
+    let Some(hex) = artifact_hash.strip_prefix("sha256:") else {
+        return Err(FelderaArtifactError::InvalidArtifactHash { field });
+    };
+    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(FelderaArtifactError::InvalidArtifactHash { field });
     }
 
     Ok(())
