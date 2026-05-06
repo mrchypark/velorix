@@ -37,6 +37,7 @@ jobs:
         run: |
           if [ -n "$S3_BENCHMARK_RESULT_PATH" ]; then
             echo "benchmark_configured=true" >> "$GITHUB_OUTPUT"
+            echo "benchmark_result_path=$S3_BENCHMARK_RESULT_PATH" >> "$GITHUB_OUTPUT"
             echo "S3 benchmark gate configured"
           else
             echo "benchmark_configured=false" >> "$GITHUB_OUTPUT"
@@ -82,6 +83,9 @@ jobs:
           fi
 
           echo "live_s3_configured=true" >> "$GITHUB_OUTPUT"
+          if [ -z "$S3_BENCHMARK_RESULT_PATH" ]; then
+            echo "benchmark_result_path=target/velorix-bench/s3-nightly.json" >> "$GITHUB_OUTPUT"
+          fi
           echo "live S3-compatible tests configured"
 
       - name: Checkout
@@ -96,16 +100,6 @@ jobs:
         if: steps.config.outputs.benchmark_configured == 'true' || steps.config.outputs.live_s3_configured == 'true'
         uses: Swatinem/rust-cache@v2
 
-      - name: Run nightly benchmark gate
-        if: steps.config.outputs.benchmark_configured == 'true'
-        run: |
-          test -f "$S3_BENCHMARK_RESULT_PATH"
-          cargo run -p velorix-cli -- benchmark-gate \
-            --gate-level nightly-integration \
-            --backend s3-compatible \
-            --baseline baselines/benchmark/s3/nightly.json \
-            --result "$S3_BENCHMARK_RESULT_PATH"
-
       - name: Run live S3-compatible storage/runtime tests
         if: steps.config.outputs.live_s3_configured == 'true'
         env:
@@ -114,9 +108,29 @@ jobs:
           cargo test -p velorix-storage --test s3_compat --features s3-compat-tests
           cargo test -p velorix-runtime --test s3_compat_query --features s3-compat-tests
 
+      - name: Run live S3-compatible benchmark
+        if: steps.config.outputs.live_s3_configured == 'true' && steps.config.outputs.benchmark_configured != 'true'
+        env:
+          VELORIX_S3_COMPAT: "1"
+        run: |
+          mkdir -p "$(dirname "${{ steps.config.outputs.benchmark_result_path }}")"
+          cargo bench -p velorix-runtime --bench s3_incremental --features s3-compat-tests \
+            > "${{ steps.config.outputs.benchmark_result_path }}"
+
+      - name: Run nightly benchmark gate
+        if: steps.config.outputs.benchmark_configured == 'true' || steps.config.outputs.live_s3_configured == 'true'
+        run: |
+          test -f "${{ steps.config.outputs.benchmark_result_path }}"
+          cargo run -p velorix-cli -- benchmark-gate \
+            --gate-level nightly-integration \
+            --backend s3-compatible \
+            --baseline baselines/benchmark/s3/nightly.json \
+            --result "${{ steps.config.outputs.benchmark_result_path }}"
+
       - name: Upload nightly benchmark result
-        if: steps.config.outputs.benchmark_configured == 'true'
+        if: always() && (steps.config.outputs.benchmark_configured == 'true' || steps.config.outputs.live_s3_configured == 'true')
         uses: actions/upload-artifact@v4
         with:
           name: s3-nightly-benchmark
-          path: ${{ env.S3_BENCHMARK_RESULT_PATH }}
+          path: ${{ steps.config.outputs.benchmark_result_path }}
+          if-no-files-found: warn

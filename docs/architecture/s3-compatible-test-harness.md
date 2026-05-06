@@ -17,6 +17,7 @@ enabled:
 ```bash
 cargo test -p velorix-storage --test s3_compat --features s3-compat-tests
 cargo test -p velorix-runtime --test s3_compat_query --features s3-compat-tests
+cargo bench -p velorix-runtime --bench s3_incremental --features s3-compat-tests
 ```
 
 When that target is enabled, the test still skips unless:
@@ -88,10 +89,13 @@ evidence independent:
 
 - `S3_BENCHMARK_RESULT_PATH` may be omitted only when live S3-compatible tests
   are explicitly requested. When set, the workflow validates that existing JSON
-  against `baselines/benchmark/s3/nightly.json`.
-- Live S3-compatible tests run only after explicit opt-in. Manual runs use the
-  `run-live-s3-compat` input. Scheduled runs require the repository variable
-  `VELORIX_RUN_LIVE_S3_COMPAT` set to `1`, `true`, or `yes`.
+  against `baselines/benchmark/s3/nightly.json`. When omitted during explicit
+  live opt-in, the workflow generates a new S3-compatible benchmark JSON result
+  under `target/velorix-bench/s3-nightly.json`, gates it, and uploads it.
+- Live S3-compatible tests and benchmark generation run only after explicit
+  opt-in. Manual runs use the `run-live-s3-compat` input. Scheduled runs
+  require the repository variable `VELORIX_RUN_LIVE_S3_COMPAT` set to `1`,
+  `true`, or `yes`.
 - If live tests are requested, the workflow fails before running tests unless
   `AWS_ENDPOINT_URL`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
   `AWS_REGION`, and `VELORIX_S3_BUCKET` are present. `VELORIX_S3_PREFIX` remains
@@ -104,8 +108,8 @@ evidence independent:
 
 ## Out Of Scope
 
-The current slice intentionally does not validate SlateDB, Foyer, benchmark
-artifacts, Kubernetes coordination, or end-to-end recovery on S3-compatible
-storage. DataFusion 53 uses `object_store` 0.13 while Velorix storage uses
-`object_store` 0.12; the runtime query harness keeps those clients explicit
-instead of adding an adapter between the versions.
+The current slice intentionally does not validate Foyer, Kubernetes
+coordination, or release-quality S3-compatible baselines. DataFusion 53 uses
+`object_store` 0.13 while Velorix storage uses `object_store` 0.12; the runtime
+query harness and benchmark keep those clients explicit instead of adding an
+adapter between the versions.
