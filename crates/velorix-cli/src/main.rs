@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::Path,
     path::PathBuf,
@@ -28,6 +28,22 @@ const BENCHMARK_GATE_WORKLOADS: &[&str] = &[
     "datafusion_table_scan",
     "slatedb_state_reopen",
     "gc_dry_run_planning",
+];
+const REQUIRED_RELEASE_CONTRACTS: &[&str] = &[
+    "ingest",
+    "relation catalog",
+    "object-store capability",
+    "ownership",
+    "checkpoint lifecycle",
+    "state substrate",
+    "DataFusion policy",
+    "table registry",
+    "Feldera artifact registry",
+    "benchmark gate",
+    "S3-compatible tests",
+    "Kubernetes operator",
+    "GC",
+    "dependency governance",
 ];
 use velorix_runtime::recovery::{
     orders_sum_count_relation_catalog, RecoveredRuntime, ORDERS_SUM_COUNT_OWNER,
@@ -125,6 +141,10 @@ enum Command {
         manifest: PathBuf,
         #[arg(long = "cargo-deny-json")]
         cargo_deny_json: Option<PathBuf>,
+    },
+    ReleaseStatusValidate {
+        #[arg(long = "status-matrix")]
+        status_matrix: PathBuf,
     },
 }
 
@@ -265,6 +285,10 @@ async fn main() -> anyhow::Result<()> {
             validate_dependency_governance_file(&manifest, cargo_deny_json.as_deref())?;
             println!("dependency governance manifest valid");
         }
+        Some(Command::ReleaseStatusValidate { status_matrix }) => {
+            validate_release_status_file(&status_matrix)?;
+            println!("release status matrix valid");
+        }
         None => {
             Cli::command().print_help()?;
             println!();
@@ -280,6 +304,66 @@ fn read_readiness_report(path: &Path) -> anyhow::Result<ProductionReadinessRepor
     let evidence = ProductionReadinessEvidenceV1::from_json_str(&contents)
         .with_context(|| format!("failed to parse readiness evidence {}", path.display()))?;
     evidence.try_into_report().map_err(anyhow::Error::msg)
+}
+
+fn validate_release_status_file(path: &Path) -> anyhow::Result<()> {
+    let contents = fs::read_to_string(path).with_context(|| {
+        format!(
+            "failed to read release status matrix from {}",
+            path.display()
+        )
+    })?;
+    validate_release_status_text(&contents)
+}
+
+fn validate_release_status_text(contents: &str) -> anyhow::Result<()> {
+    let rows = parse_release_status_rows(contents)?;
+    let mut errors = Vec::new();
+
+    for required in REQUIRED_RELEASE_CONTRACTS {
+        match rows.get(*required) {
+            Some(status) if status == "complete" => {}
+            Some(status) => {
+                errors.push(format!("{required} status is {status}, expected complete"))
+            }
+            None => errors.push(format!("missing required release status row: {required}")),
+        }
+    }
+
+    for contract in rows.keys() {
+        if !REQUIRED_RELEASE_CONTRACTS.contains(&contract.as_str()) {
+            errors.push(format!("unexpected release status row: {contract}"));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        bail!("{}", errors.join("; "))
+    }
+}
+
+fn parse_release_status_rows(contents: &str) -> anyhow::Result<BTreeMap<String, String>> {
+    let mut rows = BTreeMap::new();
+
+    for line in contents.lines().filter(|line| line.starts_with('|')) {
+        let cells: Vec<&str> = line.trim_matches('|').split('|').map(str::trim).collect();
+
+        if cells.len() == 5 && (cells[0] == "Contract" || cells[0].starts_with("---")) {
+            continue;
+        }
+        if cells.len() != 5 {
+            bail!("malformed release status table row: {line}");
+        }
+
+        let contract = cells[0].to_string();
+        let status = cells[3].to_string();
+        if rows.insert(contract.clone(), status).is_some() {
+            bail!("duplicate release status row: {contract}");
+        }
+    }
+
+    Ok(rows)
 }
 
 fn read_feldera_artifact_hash_verified_evidence(
@@ -1222,6 +1306,26 @@ mod tests {
     }
 
     #[test]
+    fn release_status_validate_cli_parses_status_matrix_path() {
+        let cli = Cli::try_parse_from([
+            "velorix-cli",
+            "release-status-validate",
+            "--status-matrix",
+            "docs/architecture/production-readiness-status.md",
+        ])
+        .unwrap();
+
+        let Some(Command::ReleaseStatusValidate { status_matrix }) = cli.command else {
+            panic!("expected release-status-validate command");
+        };
+
+        assert_eq!(
+            status_matrix,
+            PathBuf::from("docs/architecture/production-readiness-status.md")
+        );
+    }
+
+    #[test]
     fn feldera_artifact_verify_cli_parses_json_command() {
         let cli = Cli::try_parse_from([
             "velorix-cli",
@@ -1562,6 +1666,55 @@ mod tests {
         .to_string();
 
         validate_dependency_governance_manifest_text(&manifest, "2028-02-01").unwrap();
+    }
+
+    #[test]
+    fn release_status_validator_accepts_complete_required_rows() {
+        validate_release_status_text(&release_status_matrix("complete", &[], &[])).unwrap();
+    }
+
+    #[test]
+    fn release_status_validator_rejects_partial_status() {
+        let error = validate_release_status_text(&release_status_matrix(
+            "complete",
+            &[],
+            &[("ingest", "partial")],
+        ))
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("ingest status is partial"));
+    }
+
+    #[test]
+    fn release_status_validator_rejects_missing_required_row() {
+        let error = validate_release_status_text(&release_status_matrix("complete", &["GC"], &[]))
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("missing required release status row: GC"));
+    }
+
+    #[test]
+    fn release_status_validator_rejects_duplicate_contract() {
+        let mut matrix = release_status_matrix("complete", &[], &[]);
+        matrix.push_str(
+            "\n| ingest | duplicate evidence | duplicate required evidence | complete | none |\n",
+        );
+
+        let error = validate_release_status_text(&matrix).unwrap_err();
+
+        assert!(format!("{error:#}").contains("duplicate release status row: ingest"));
+    }
+
+    #[test]
+    fn release_status_validator_rejects_malformed_rows() {
+        let mut matrix = release_status_matrix("complete", &[], &[]);
+        matrix.push_str(
+            "\n| unexpected | evidence with | extra pipe | complete | none | trailing |\n",
+        );
+
+        let error = validate_release_status_text(&matrix).unwrap_err();
+
+        assert!(format!("{error:#}").contains("malformed release status table row"));
     }
 
     #[test]
@@ -2128,6 +2281,32 @@ mod tests {
             workload_metrics(),
         ))
         .unwrap()
+    }
+
+    fn release_status_matrix(
+        default_status: &str,
+        omitted_contracts: &[&str],
+        overrides: &[(&str, &str)],
+    ) -> String {
+        let mut matrix = String::from(
+            "| Contract | Current Evidence | 1.0 Required Evidence | Status | Blocking Tasks |\n\
+             | --- | --- | --- | --- | --- |\n",
+        );
+
+        for contract in REQUIRED_RELEASE_CONTRACTS {
+            if omitted_contracts.contains(contract) {
+                continue;
+            }
+            let status = overrides
+                .iter()
+                .find_map(|(name, status)| (*name == *contract).then_some(*status))
+                .unwrap_or(default_status);
+            matrix.push_str(&format!(
+                "| {contract} | evidence | required evidence | {status} | none |\n"
+            ));
+        }
+
+        matrix
     }
 
     fn normal_result(
