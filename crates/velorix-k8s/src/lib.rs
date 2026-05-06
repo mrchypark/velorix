@@ -10,5 +10,6 @@
 pub mod controller;
 pub mod crd;
 pub mod lease;
+pub mod startup;
 pub mod status;
 pub mod stream_watch;
