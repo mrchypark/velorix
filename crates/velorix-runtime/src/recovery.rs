@@ -157,6 +157,29 @@ impl RecoveredRuntime {
         .await
     }
 
+    pub async fn recover_from_published_checkpoint_version_with_slatedb_state_store_and_relation_catalog(
+        store: Arc<dyn ObjectStore>,
+        db_path: impl Into<Path>,
+        checkpoint_version: u64,
+        expected_owner: &str,
+        relation_catalog: VelorixRelationCatalogV1,
+    ) -> Result<Self, RecoveryError> {
+        let publisher =
+            CheckpointPublisher::with_slatedb_state_store(Arc::clone(&store), db_path).await?;
+        let manifest = publisher
+            .read_published_checkpoint_manifest(checkpoint_version)
+            .await?;
+
+        Self::recover_with_selected_manifest_and_relation_catalog(
+            store,
+            publisher,
+            manifest,
+            expected_owner,
+            relation_catalog,
+        )
+        .await
+    }
+
     pub async fn recover_with_slatedb_state_store_and_relation_catalog(
         store: Arc<dyn ObjectStore>,
         db_path: impl Into<Path>,

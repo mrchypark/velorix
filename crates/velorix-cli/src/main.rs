@@ -51,7 +51,10 @@ enum Command {
     RecoverLocal {
         #[arg(long)]
         object_store_dir: PathBuf,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Start recovery from this published checkpoint, then replay later ingest"
+        )]
         checkpoint_version: Option<u64>,
     },
     CheckpointInspectLocal {

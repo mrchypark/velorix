@@ -354,6 +354,75 @@ async fn slatedb_local_recovery_recovers_reopened_checkpoint_state_and_replays_o
 }
 
 #[tokio::test]
+async fn slatedb_local_recovery_can_use_selected_published_checkpoint() {
+    let (_temp_dir, store) = temp_store();
+    let ingest_log = IngestLog::new(Arc::clone(&store));
+    let publisher =
+        CheckpointPublisher::with_slatedb_state_store(Arc::clone(&store), "v1/slatedb/state")
+            .await
+            .unwrap();
+
+    let checkpointed_input = batch([input_delta("account-a", 10, 1)]);
+    let replayed_input = batch([input_delta("account-a", 4, 1)]);
+
+    append_ingest_envelope(&ingest_log, "orders", 0, 0, 1, &checkpointed_input).await;
+    append_ingest_envelope(&ingest_log, "orders", 0, 1, 2, &replayed_input).await;
+
+    let mut checkpointed_view = KeyedSumCountAggregate::new();
+    checkpointed_view.apply(&checkpointed_input).unwrap();
+    let state_ref = write_checkpoint_state(
+        &publisher,
+        0,
+        "state-slatedb-selected",
+        &checkpointed_view.state(),
+    )
+    .await;
+    assert_eq!(state_ref.ref_type, StateRefType::SlateDbCheckpoint);
+
+    publisher
+        .publish_manifest(&manifest_with_ranges(
+            0,
+            None,
+            vec![input_range("orders", 0, 0, 1)],
+            state_ref,
+        ))
+        .await
+        .unwrap();
+
+    drop(publisher);
+
+    let raw_error =
+        RecoveredRuntime::recover_from_published_checkpoint_version(Arc::clone(&store), 0)
+            .await
+            .unwrap_err();
+    assert!(matches!(
+        raw_error,
+        RecoveryError::Checkpoint(CheckpointPublishError::MissingStateObject(_))
+    ));
+
+    let recovered =
+        RecoveredRuntime::recover_from_published_checkpoint_version_with_slatedb_state_store_and_relation_catalog(
+            Arc::clone(&store),
+            "v1/slatedb/state",
+            0,
+            RECOVERY_OWNER,
+            orders_sum_count_relation_catalog().unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut expected_view = KeyedSumCountAggregate::new();
+    expected_view.apply(&checkpointed_input).unwrap();
+    expected_view.apply(&replayed_input).unwrap();
+
+    assert_eq!(
+        recovered.materialized_state().net_rows().unwrap(),
+        expected_view.state().net_rows().unwrap()
+    );
+    assert_eq!(recovered.replayed_batch_count(), 1);
+    assert_eq!(recovered.latest_checkpoint_version(), Some(0));
+}
+
+#[tokio::test]
 async fn slatedb_local_recovery_rejects_raw_state_manifest() {
     let (_temp_dir, store) = temp_store();
     let publisher = CheckpointPublisher::new(Arc::clone(&store));
