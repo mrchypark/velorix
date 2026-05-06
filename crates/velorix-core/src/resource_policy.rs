@@ -39,6 +39,23 @@ impl QueryExecutionPolicyV1 {
 
         Ok(())
     }
+
+    pub fn validate_production_table_scan(self) -> Result<(), QueryPolicyError> {
+        self.validate()?;
+
+        require_production_limit("max_sql_bytes", self.max_sql_bytes.is_some())?;
+        require_production_limit("planning_timeout_ms", self.planning_timeout_ms.is_some())?;
+        require_production_limit("execution_timeout_ms", self.execution_timeout_ms.is_some())?;
+        require_production_limit("max_output_rows", self.max_output_rows.is_some())?;
+        require_production_limit("max_output_bytes", self.max_output_bytes.is_some())?;
+        require_production_limit("max_scan_files", self.max_scan_files.is_some())?;
+        require_production_limit("max_scan_bytes", self.max_scan_bytes.is_some())?;
+        require_production_limit("max_object_requests", self.max_object_requests.is_some())?;
+        require_production_limit("memory_limit_bytes", self.memory_limit_bytes.is_some())?;
+        require_production_limit("spill_limit_bytes", self.spill_limit_bytes.is_some())?;
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -95,6 +112,8 @@ pub enum QueryPolicyError {
     InvalidZeroConcurrency { field: &'static str },
     #[error("query policy field {field} must be greater than zero when set")]
     InvalidZeroBudget { field: &'static str },
+    #[error("production table scans require query policy field {field}")]
+    MissingProductionTableScanLimit { field: &'static str },
 }
 
 fn validate_non_zero_timeout(
@@ -114,6 +133,14 @@ fn validate_non_zero_budget(
 ) -> Result<(), QueryPolicyError> {
     if matches!(value, Some(0)) {
         return Err(QueryPolicyError::InvalidZeroBudget { field });
+    }
+
+    Ok(())
+}
+
+fn require_production_limit(field: &'static str, present: bool) -> Result<(), QueryPolicyError> {
+    if !present {
+        return Err(QueryPolicyError::MissingProductionTableScanLimit { field });
     }
 
     Ok(())

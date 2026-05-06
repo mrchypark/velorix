@@ -29,7 +29,10 @@ use velorix_runtime::{
         ProductionPersistedTableFormat,
     },
     query::RuntimeQueryError,
-    query_policy_catalog::{QueryPolicyCatalogError, QueryPolicyCatalogStore},
+    query_policy_catalog::{
+        QueryPolicyCatalogError, QueryPolicyCatalogRecord, QueryPolicyCatalogStore,
+        QUERY_POLICY_CATALOG_SCHEMA_VERSION,
+    },
     storage_registry::StorageRegistry,
 };
 use velorix_storage::{
@@ -389,7 +392,7 @@ async fn production_persisted_table_store_rejects_unsafe_query_policy_id() {
     request.query_policy_id = "standard/base".to_string();
 
     let error = catalog
-        .create_production(Arc::clone(&store), request)
+        .create_production(Arc::clone(&store), Arc::clone(&store), request)
         .await
         .unwrap_err();
 
@@ -409,6 +412,7 @@ async fn production_persisted_table_store_rejects_cross_tenant_prefix() {
 
     let error = catalog
         .create_production(
+            Arc::clone(&store),
             Arc::clone(&store),
             production_request("primary", "tenants/tenant-b/tables/orders"),
         )
@@ -430,9 +434,11 @@ async fn production_persisted_table_store_creates_spec_when_relation_catalog_fin
     let (_temp_dir, store) = temp_store();
     let catalog = PersistedTableStore::new(Arc::clone(&store));
     let relation_catalog = create_orders_relation_catalog(&store).await;
+    create_standard_policy(&store, QueryPolicy::default()).await;
 
     let spec = catalog
         .create_production(
+            Arc::clone(&store),
             Arc::clone(&store),
             production_request("primary", "tenants/tenant-a/tables/orders"),
         )
@@ -448,6 +454,68 @@ async fn production_persisted_table_store_creates_spec_when_relation_catalog_fin
 }
 
 #[tokio::test]
+async fn production_persisted_table_store_rejects_missing_policy_before_writing() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = PersistedTableStore::new(Arc::clone(&store));
+    create_orders_relation_catalog(&store).await;
+
+    let error = catalog
+        .create_production(
+            Arc::clone(&store),
+            Arc::clone(&store),
+            production_request("primary", "tenants/tenant-a/tables/orders"),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        PersistedTableError::QueryPolicyCatalog(QueryPolicyCatalogError::ObjectStore(
+            object_store::Error::NotFound { .. }
+        ))
+    ));
+    let key = ObjectKey::query_table("orders-current").unwrap();
+    assert!(matches!(
+        store.head(&Path::from(key.as_str())).await,
+        Err(object_store::Error::NotFound { .. })
+    ));
+}
+
+#[tokio::test]
+async fn production_persisted_table_store_rejects_unbounded_policy_before_writing() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = PersistedTableStore::new(Arc::clone(&store));
+    create_orders_relation_catalog(&store).await;
+    QueryPolicyCatalogStore::new(Arc::clone(&store))
+        .create("tenant-a", "standard", QueryPolicy::default())
+        .await
+        .unwrap();
+
+    let error = catalog
+        .create_production(
+            Arc::clone(&store),
+            Arc::clone(&store),
+            production_request("primary", "tenants/tenant-a/tables/orders"),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        PersistedTableError::QueryPolicyCatalog(QueryPolicyCatalogError::Policy(
+            QueryPolicyError::MissingProductionTableScanLimit {
+                field: "max_sql_bytes"
+            }
+        ))
+    ));
+    let key = ObjectKey::query_table("orders-current").unwrap();
+    assert!(matches!(
+        store.head(&Path::from(key.as_str())).await,
+        Err(object_store::Error::NotFound { .. })
+    ));
+}
+
+#[tokio::test]
 async fn production_persisted_table_store_rejects_relation_catalog_fingerprint_mismatch_before_writing(
 ) {
     let (_temp_dir, store) = temp_store();
@@ -457,7 +525,7 @@ async fn production_persisted_table_store_rejects_relation_catalog_fingerprint_m
     request.schema_fingerprint = format!("sha256:{}", "1".repeat(64));
 
     let error = catalog
-        .create_production(Arc::clone(&store), request)
+        .create_production(Arc::clone(&store), Arc::clone(&store), request)
         .await
         .unwrap_err();
 
@@ -485,6 +553,7 @@ async fn production_persisted_table_store_rejects_non_table_relation_registratio
     let error = PersistedTableStore::new(Arc::clone(&store))
         .create_production(
             Arc::clone(&store),
+            Arc::clone(&store),
             production_request("primary", "tenants/tenant-a/tables/orders"),
         )
         .await
@@ -507,7 +576,6 @@ async fn production_object_backed_table_query_rejects_unregistered_store_id() {
         "tenants/tenant-a/tables/orders",
     )
     .await;
-    create_standard_policy(&catalog_store, QueryPolicy::default()).await;
 
     let error = query_production_table(
         &catalog_store,
@@ -539,7 +607,6 @@ async fn production_object_backed_table_query_rejects_store_registered_without_c
         .unwrap();
 
     create_production_table(&catalog_store, "primary", "tenants/tenant-a/tables/orders").await;
-    create_standard_policy(&catalog_store, QueryPolicy::default()).await;
 
     let error = query_production_table(
         &catalog_store,
@@ -580,7 +647,6 @@ async fn production_object_backed_table_query_accepts_capability_registered_stor
     register_production_scan_store(&mut registry, Arc::clone(&scan_store));
 
     create_production_table(&catalog_store, "primary", "tenants/tenant-a/tables/orders").await;
-    create_standard_policy(&catalog_store, QueryPolicy::default()).await;
 
     let output = query_production_table(
         &catalog_store,
@@ -615,7 +681,6 @@ async fn production_object_backed_table_query_rejects_parquet_schema_not_matchin
     register_production_scan_store(&mut registry, Arc::clone(&scan_store));
 
     create_production_table(&catalog_store, "primary", "tenants/tenant-a/tables/orders").await;
-    create_standard_policy(&catalog_store, QueryPolicy::default()).await;
 
     let error = query_production_table(
         &catalog_store,
@@ -647,7 +712,6 @@ async fn production_object_backed_table_query_does_not_register_legacy_input_tab
     register_production_scan_store(&mut registry, Arc::clone(&scan_store));
 
     create_production_table(&catalog_store, "primary", "tenants/tenant-a/tables/orders").await;
-    create_standard_policy(&catalog_store, QueryPolicy::default()).await;
 
     let error = query_production_table(
         &catalog_store,
@@ -673,7 +737,6 @@ async fn production_object_backed_table_query_rejects_stale_relation_catalog_fin
     register_production_scan_store(&mut registry, Arc::clone(&scan_store));
 
     create_production_table(&catalog_store, "primary", "tenants/tenant-a/tables/orders").await;
-    create_standard_policy(&catalog_store, QueryPolicy::default()).await;
     overwrite_orders_relation_catalog(&catalog_store, mutated_orders_relation_catalog()).await;
 
     let error = query_production_table(
@@ -706,7 +769,6 @@ async fn production_object_backed_table_query_rejects_non_table_relation_registr
     register_production_scan_store(&mut registry, Arc::clone(&scan_store));
 
     create_production_table(&catalog_store, "primary", "tenants/tenant-a/tables/orders").await;
-    create_standard_policy(&catalog_store, QueryPolicy::default()).await;
     let mut catalog = orders_relation_catalog();
     catalog.datafusion_registration.mode = DataFusionRegistrationModeV1::View;
     overwrite_orders_relation_catalog(&catalog_store, catalog).await;
@@ -732,6 +794,11 @@ async fn production_object_backed_table_query_rejects_missing_catalog_policy() {
     register_production_scan_store(&mut registry, Arc::clone(&scan_store));
 
     create_production_table(&catalog_store, "primary", "tenants/tenant-a/tables/orders").await;
+    let policy_key = ObjectKey::query_policy("tenant-a", "standard").unwrap();
+    catalog_store
+        .delete(&Path::from(policy_key.as_str()))
+        .await
+        .unwrap();
 
     let error = query_production_table(
         &catalog_store,
@@ -752,6 +819,36 @@ async fn production_object_backed_table_query_rejects_missing_catalog_policy() {
 }
 
 #[tokio::test]
+async fn production_object_backed_table_query_rejects_unbounded_catalog_policy() {
+    let (_temp_dir, catalog_store) = temp_store();
+    let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
+    let mut registry = StorageRegistry::new();
+    register_production_scan_store(&mut registry, Arc::clone(&scan_store));
+
+    create_production_table(&catalog_store, "primary", "tenants/tenant-a/tables/orders").await;
+    overwrite_standard_policy(&catalog_store, QueryPolicy::default()).await;
+
+    let error = query_production_table(
+        &catalog_store,
+        &registry,
+        "tenant-a",
+        "orders-current",
+        "select account_id, value, weight from orders",
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        PersistedTableError::QueryPolicyCatalog(QueryPolicyCatalogError::Policy(
+            QueryPolicyError::MissingProductionTableScanLimit {
+                field: "max_sql_bytes"
+            }
+        ))
+    ));
+}
+
+#[tokio::test]
 async fn production_object_backed_table_query_applies_catalog_policy_id() {
     let (_temp_dir, catalog_store) = temp_store();
     let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
@@ -764,18 +861,16 @@ async fn production_object_backed_table_query_applies_catalog_policy_id() {
     let mut registry = StorageRegistry::new();
     register_production_scan_store(&mut registry, Arc::clone(&scan_store));
 
-    create_production_table(&catalog_store, "primary", "tenants/tenant-a/tables/orders").await;
-    QueryPolicyCatalogStore::new(Arc::clone(&catalog_store))
-        .create(
-            "tenant-a",
-            "standard",
-            QueryExecutionPolicyV1 {
-                max_output_rows: Some(1),
-                ..QueryExecutionPolicyV1::default()
-            },
-        )
-        .await
-        .unwrap();
+    create_production_table_with_policy(
+        &catalog_store,
+        "primary",
+        "tenants/tenant-a/tables/orders",
+        QueryExecutionPolicyV1 {
+            max_output_rows: Some(1),
+            ..QueryExecutionPolicyV1::default()
+        },
+    )
+    .await;
 
     let error = query_production_table(
         &catalog_store,
@@ -807,7 +902,11 @@ async fn production_object_backed_table_query_rejects_cross_tenant_catalog_polic
 
     create_production_table(&catalog_store, "primary", "tenants/tenant-a/tables/orders").await;
     QueryPolicyCatalogStore::new(Arc::clone(&catalog_store))
-        .create("tenant-b", "standard", QueryExecutionPolicyV1::default())
+        .create_for_production_table_scan(
+            "tenant-b",
+            "standard",
+            production_policy_with(QueryPolicy::default()),
+        )
         .await
         .unwrap();
     delete_orders_relation_catalog(&catalog_store).await;
@@ -851,9 +950,10 @@ async fn production_object_backed_table_query_rejects_scan_above_file_count_limi
     let mut registry = StorageRegistry::new();
     register_production_scan_store(&mut registry, Arc::clone(&scan_store));
 
-    create_production_table(&catalog_store, "primary", "tenants/tenant-a/tables/orders").await;
-    create_standard_policy(
+    create_production_table_with_policy(
         &catalog_store,
+        "primary",
+        "tenants/tenant-a/tables/orders",
         QueryPolicy {
             max_scan_files: Some(1),
             ..QueryPolicy::default()
@@ -901,9 +1001,10 @@ async fn production_object_backed_table_query_rejects_object_requests_above_limi
     let mut registry = StorageRegistry::new();
     register_production_scan_store(&mut registry, Arc::clone(&scan_store));
 
-    create_production_table(&catalog_store, "primary", "tenants/tenant-a/tables/orders").await;
-    create_standard_policy(
+    create_production_table_with_policy(
         &catalog_store,
+        "primary",
+        "tenants/tenant-a/tables/orders",
         QueryPolicy {
             max_object_requests: Some(2),
             ..QueryPolicy::default()
@@ -947,9 +1048,10 @@ async fn production_object_backed_table_query_still_applies_output_row_limit() {
     let mut registry = StorageRegistry::new();
     register_production_scan_store(&mut registry, Arc::clone(&scan_store));
 
-    create_production_table(&catalog_store, "primary", "tenants/tenant-a/tables/orders").await;
-    create_standard_policy(
+    create_production_table_with_policy(
         &catalog_store,
+        "primary",
+        "tenants/tenant-a/tables/orders",
         QueryPolicy {
             max_output_rows: Some(1),
             ..QueryPolicy::default()
@@ -1055,9 +1157,26 @@ async fn create_production_table(
     store_id: &str,
     object_key_prefix: &str,
 ) {
+    create_production_table_with_policy(
+        catalog_store,
+        store_id,
+        object_key_prefix,
+        QueryPolicy::default(),
+    )
+    .await;
+}
+
+async fn create_production_table_with_policy(
+    catalog_store: &Arc<dyn ObjectStore>,
+    store_id: &str,
+    object_key_prefix: &str,
+    policy: QueryPolicy,
+) {
     create_orders_relation_catalog(catalog_store).await;
+    create_standard_policy(catalog_store, policy).await;
     PersistedTableStore::new(Arc::clone(catalog_store))
         .create_production(
+            Arc::clone(catalog_store),
             Arc::clone(catalog_store),
             production_request(store_id, object_key_prefix),
         )
@@ -1211,9 +1330,44 @@ async fn write_table_catalog_object(
 
 async fn create_standard_policy(store: &Arc<dyn ObjectStore>, policy: QueryPolicy) {
     QueryPolicyCatalogStore::new(Arc::clone(store))
-        .create("tenant-a", "standard", policy)
+        .create_for_production_table_scan("tenant-a", "standard", production_policy_with(policy))
         .await
         .unwrap();
+}
+
+async fn overwrite_standard_policy(store: &Arc<dyn ObjectStore>, policy: QueryPolicy) {
+    let record = QueryPolicyCatalogRecord {
+        schema_version: QUERY_POLICY_CATALOG_SCHEMA_VERSION,
+        tenant_id: "tenant-a".to_string(),
+        query_policy_id: "standard".to_string(),
+        policy,
+    };
+    let key = ObjectKey::query_policy("tenant-a", "standard").unwrap();
+    store
+        .put(
+            &Path::from(key.as_str()),
+            Bytes::from(serde_json::to_vec(&record).unwrap()).into(),
+        )
+        .await
+        .unwrap();
+}
+
+fn production_policy_with(policy: QueryPolicy) -> QueryPolicy {
+    QueryPolicy {
+        max_sql_bytes: policy.max_sql_bytes.or(Some(16 * 1024)),
+        planning_timeout_ms: policy.planning_timeout_ms.or(Some(1_000)),
+        execution_timeout_ms: policy.execution_timeout_ms.or(Some(10_000)),
+        max_output_rows: policy.max_output_rows.or(Some(1_000)),
+        max_output_bytes: policy.max_output_bytes.or(Some(1_000_000)),
+        max_scan_files: policy.max_scan_files.or(Some(100)),
+        max_scan_bytes: policy.max_scan_bytes.or(Some(128 * 1024 * 1024)),
+        max_object_requests: policy.max_object_requests.or(Some(1_000)),
+        max_concurrent_queries: policy.max_concurrent_queries,
+        memory_limit_bytes: policy.memory_limit_bytes.or(Some(512 * 1024 * 1024)),
+        spill_limit_bytes: policy.spill_limit_bytes.or(Some(1024 * 1024 * 1024)),
+        batch_size: policy.batch_size,
+        target_partitions: policy.target_partitions,
+    }
 }
 
 fn parquet_input_batch(keys: &[&str], values: &[&str], weights: &[i64]) -> RecordBatch {

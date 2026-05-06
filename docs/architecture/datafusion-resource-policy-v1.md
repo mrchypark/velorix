@@ -20,13 +20,20 @@ Production query admission requires:
 - scan byte limit.
 - object request limit.
 - file and partition limits.
-- concurrent query limit.
+- tenant/global concurrent query limit at the shared production runtime boundary.
 - optional join and cross-join policy.
 
 Policy is an execution admission contract, not just metadata stored with a
 query spec. Runtime query paths build `SessionContext` instances through the
 Velorix DataFusion session factory so `batch_size`, `target_partitions`,
 `memory_limit_bytes`, and `spill_limit_bytes` have one mapping point.
+Generic query policy catalog `create`/`get` remains bootstrap-compatible and
+admits `QueryExecutionPolicyV1::default()`. Production table-scan admission uses
+the explicit catalog production methods, which fail closed unless
+`QueryExecutionPolicyV1::validate_production_table_scan` sees all required
+single-query production boundary fields. Tenant/global concurrency admission
+remains a shared-runtime responsibility because setting `max_concurrent_queries`
+without a shared limiter intentionally fails query execution.
 
 Current DataFusion 53 wiring:
 

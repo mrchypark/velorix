@@ -85,14 +85,13 @@ async fn s3_compatible_production_table_query_scans_parquet_through_registry() -
 
     let validation = async {
         create_orders_relation_catalog(&authority_store).await?;
+        create_production_query_policy(&authority_store).await?;
         PersistedTableStore::new(Arc::clone(&authority_store))
             .create_production(
                 Arc::clone(&authority_store),
+                Arc::clone(&authority_store),
                 production_request("primary", &object_key_prefix),
             )
-            .await?;
-        QueryPolicyCatalogStore::new(Arc::clone(&authority_store))
-            .create("tenant-a", "standard", QueryPolicy::default())
             .await?;
 
         let mut registry = StorageRegistry::new();
@@ -264,6 +263,15 @@ async fn create_orders_relation_catalog(
     Ok(())
 }
 
+async fn create_production_query_policy(
+    store: &Arc<dyn AuthorityObjectStore>,
+) -> Result<(), TestError> {
+    QueryPolicyCatalogStore::new(Arc::clone(store))
+        .create_for_production_table_scan("tenant-a", "standard", production_query_policy())
+        .await?;
+    Ok(())
+}
+
 async fn create_recovery_relation_catalog(
     store: &Arc<dyn AuthorityObjectStore>,
 ) -> Result<(), TestError> {
@@ -292,6 +300,22 @@ fn production_request(
             .as_str()
             .to_string(),
         query_policy_id: "standard".to_string(),
+    }
+}
+
+fn production_query_policy() -> QueryPolicy {
+    QueryPolicy {
+        max_sql_bytes: Some(16 * 1024),
+        planning_timeout_ms: Some(1_000),
+        execution_timeout_ms: Some(10_000),
+        max_output_rows: Some(1_000),
+        max_output_bytes: Some(1_000_000),
+        max_scan_files: Some(100),
+        max_scan_bytes: Some(128 * 1024 * 1024),
+        max_object_requests: Some(1_000),
+        memory_limit_bytes: Some(512 * 1024 * 1024),
+        spill_limit_bytes: Some(1024 * 1024 * 1024),
+        ..QueryPolicy::default()
     }
 }
 

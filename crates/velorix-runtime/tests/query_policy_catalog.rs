@@ -215,6 +215,79 @@ async fn query_policy_catalog_rejects_invalid_zero_policy_on_create_and_get() {
 }
 
 #[tokio::test]
+async fn query_policy_catalog_generic_create_and_get_allow_default_policy() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = QueryPolicyCatalogStore::new(Arc::clone(&store));
+
+    catalog
+        .create("tenant-a", "bootstrap", QueryExecutionPolicyV1::default())
+        .await
+        .unwrap();
+
+    let read = catalog.get("tenant-a", "bootstrap").await.unwrap();
+
+    assert_eq!(read.policy, QueryExecutionPolicyV1::default());
+}
+
+#[tokio::test]
+async fn query_policy_catalog_production_create_and_get_reject_default_policy() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = QueryPolicyCatalogStore::new(Arc::clone(&store));
+
+    let create_error = catalog
+        .create_for_production_table_scan(
+            "tenant-a",
+            "production",
+            QueryExecutionPolicyV1::default(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        create_error,
+        QueryPolicyCatalogError::Policy(QueryPolicyError::MissingProductionTableScanLimit {
+            field: "max_sql_bytes"
+        })
+    ));
+
+    catalog
+        .create("tenant-a", "bootstrap", QueryExecutionPolicyV1::default())
+        .await
+        .unwrap();
+
+    let get_error = catalog
+        .get_for_production_table_scan("tenant-a", "bootstrap")
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        get_error,
+        QueryPolicyCatalogError::Policy(QueryPolicyError::MissingProductionTableScanLimit {
+            field: "max_sql_bytes"
+        })
+    ));
+}
+
+#[tokio::test]
+async fn query_policy_catalog_production_create_and_get_accept_fully_bounded_policy() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = QueryPolicyCatalogStore::new(Arc::clone(&store));
+    let policy = fully_bounded_production_policy();
+
+    let created = catalog
+        .create_for_production_table_scan("tenant-a", "production", policy)
+        .await
+        .unwrap();
+    let read = catalog
+        .get_for_production_table_scan("tenant-a", "production")
+        .await
+        .unwrap();
+
+    assert_eq!(created, read);
+    assert_eq!(read.policy, policy);
+}
+
+#[tokio::test]
 async fn query_policy_catalog_rejects_unsafe_path_segments_without_writing() {
     let (_temp_dir, store) = temp_store();
     let catalog = QueryPolicyCatalogStore::new(Arc::clone(&store));
@@ -242,6 +315,23 @@ async fn query_policy_catalog_rejects_unsafe_path_segments_without_writing() {
                 .is_err(),
             "accepted invalid policy identity: {tenant_id}/{query_policy_id}"
         );
+    }
+}
+
+fn fully_bounded_production_policy() -> QueryExecutionPolicyV1 {
+    QueryExecutionPolicyV1 {
+        max_sql_bytes: Some(16 * 1024),
+        planning_timeout_ms: Some(1_000),
+        execution_timeout_ms: Some(10_000),
+        max_output_rows: Some(1_000),
+        max_output_bytes: Some(1_000_000),
+        max_scan_files: Some(100),
+        max_scan_bytes: Some(128 * 1024 * 1024),
+        max_object_requests: Some(1_000),
+        max_concurrent_queries: Some(4),
+        memory_limit_bytes: Some(512 * 1024 * 1024),
+        spill_limit_bytes: Some(1024 * 1024 * 1024),
+        ..QueryExecutionPolicyV1::default()
     }
 }
 

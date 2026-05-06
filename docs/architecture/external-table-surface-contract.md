@@ -29,6 +29,11 @@ authority. Prefixes must pass tenant namespace policy.
 
 Output row caps are not scan cost controls. Production scans require limits for
 scan bytes, object requests, file count, row groups, timeout, memory, and spill.
+Production table-scan policy admission is explicit: bootstrap catalog
+`create`/`get` can still read default policies, but production catalog methods
+reject policies missing required SQL-size, timeout, output, scan, object
+request, memory, or spill bounds. Tenant/global concurrency remains a separate
+shared-runtime boundary.
 DataFusion must register object stores through the shared registry only.
 Production Parquet scans register the table using the relation catalog
 DataFusion registration name and catalog-derived Arrow schema. The bootstrap
@@ -40,5 +45,7 @@ DataFusion registration name and catalog-derived Arrow schema. The bootstrap
 - Unregistered store id and cross-tenant prefixes are rejected.
 - Production SQL sees the relation catalog table name and not the bootstrap
   `input` alias.
+- Default/bootstrap query policies are rejected by production table-scan
+  catalog admission.
 - Large scans are stopped by scan-byte limits before output collection.
 - Many-small-file scans are stopped by file or object request limits.

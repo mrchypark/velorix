@@ -188,6 +188,7 @@ impl PersistedTableStore {
     pub async fn create_production(
         &self,
         relation_catalog_store: Arc<dyn ObjectStore>,
+        query_policy_catalog_store: Arc<dyn ObjectStore>,
         request: CreateProductionPersistedTableSpecRequest,
     ) -> Result<ProductionPersistedTableSpec, PersistedTableError> {
         let spec = ProductionPersistedTableSpec {
@@ -213,6 +214,9 @@ impl PersistedTableStore {
         )
         .await?;
         require_table_relation_registration(&relation_catalog)?;
+        QueryPolicyCatalogStore::new(query_policy_catalog_store)
+            .get_for_production_table_scan(&spec.tenant_id, &spec.query_policy_id)
+            .await?;
 
         let bytes = serde_json::to_vec(&spec)?;
         self.store
@@ -301,7 +305,7 @@ pub async fn query_production_persisted_object_backed_input(
     )
     .await?;
     let policy = QueryPolicyCatalogStore::new(policy_catalog_store)
-        .get(&spec.tenant_id, &spec.query_policy_id)
+        .get_for_production_table_scan(&spec.tenant_id, &spec.query_policy_id)
         .await?
         .policy;
 

@@ -72,6 +72,17 @@ impl QueryPolicyCatalogStore {
         Ok(record)
     }
 
+    pub async fn create_for_production_table_scan(
+        &self,
+        tenant_id: &str,
+        query_policy_id: &str,
+        policy: QueryExecutionPolicyV1,
+    ) -> Result<QueryPolicyCatalogRecord, QueryPolicyCatalogError> {
+        policy.validate_production_table_scan()?;
+
+        self.create(tenant_id, query_policy_id, policy).await
+    }
+
     pub async fn get(
         &self,
         tenant_id: &str,
@@ -104,6 +115,17 @@ impl QueryPolicyCatalogStore {
             });
         }
         record.policy.validate()?;
+
+        Ok(record)
+    }
+
+    pub async fn get_for_production_table_scan(
+        &self,
+        tenant_id: &str,
+        query_policy_id: &str,
+    ) -> Result<QueryPolicyCatalogRecord, QueryPolicyCatalogError> {
+        let record = self.get(tenant_id, query_policy_id).await?;
+        record.policy.validate_production_table_scan()?;
 
         Ok(record)
     }
