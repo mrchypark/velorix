@@ -75,10 +75,15 @@ jobs:
           tool: cargo-deny
 
       - name: Check dependencies
-        run: cargo deny check -W unmaintained
+        run: |
+          mkdir -p target/dependency-governance
+          cargo deny -f json check -W unmaintained 2> target/dependency-governance/cargo-deny.jsonl
 
       - name: Validate dependency governance manifest
-        run: cargo run -p velorix-cli -- dependency-governance-validate --manifest dependency-governance.json
+        run: |
+          cargo run -p velorix-cli -- dependency-governance-validate \
+            --manifest dependency-governance.json \
+            --cargo-deny-json target/dependency-governance/cargo-deny.jsonl
 
   benchmark-smoke:
     name: benchmark PR smoke gate

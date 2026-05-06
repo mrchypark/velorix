@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
+    collections::BTreeSet,
     fs,
     path::Path,
     path::PathBuf,
@@ -97,6 +98,8 @@ enum Command {
     DependencyGovernanceValidate {
         #[arg(long)]
         manifest: PathBuf,
+        #[arg(long = "cargo-deny-json")]
+        cargo_deny_json: Option<PathBuf>,
     },
 }
 
@@ -207,8 +210,11 @@ async fn main() -> anyhow::Result<()> {
                 print!("{}", format_readiness_report(&report));
             }
         }
-        Some(Command::DependencyGovernanceValidate { manifest }) => {
-            validate_dependency_governance_file(&manifest)?;
+        Some(Command::DependencyGovernanceValidate {
+            manifest,
+            cargo_deny_json,
+        }) => {
+            validate_dependency_governance_file(&manifest, cargo_deny_json.as_deref())?;
             println!("dependency governance manifest valid");
         }
         None => {
@@ -242,21 +248,79 @@ fn format_readiness_report(report: &ProductionReadinessReportV1) -> String {
     output
 }
 
-fn validate_dependency_governance_file(path: &Path) -> anyhow::Result<()> {
+fn validate_dependency_governance_file(
+    path: &Path,
+    deny_diagnostics: Option<&Path>,
+) -> anyhow::Result<()> {
     let contents = fs::read_to_string(path).with_context(|| {
         format!(
             "failed to read dependency governance manifest from {}",
             path.display()
         )
     })?;
-    validate_dependency_governance_manifest_text(&contents, &today_utc_string()?)
-        .with_context(|| format!("invalid dependency governance manifest {}", path.display()))
+    let today = today_utc_string()?;
+    validate_dependency_governance_manifest_text(&contents, &today)
+        .with_context(|| format!("invalid dependency governance manifest {}", path.display()))?;
+
+    if let Some(deny_diagnostics) = deny_diagnostics {
+        let diagnostics = fs::read_to_string(deny_diagnostics).with_context(|| {
+            format!(
+                "failed to read cargo-deny diagnostics from {}",
+                deny_diagnostics.display()
+            )
+        })?;
+        validate_dependency_governance_with_diagnostics_text(&contents, &diagnostics, &today)
+            .with_context(|| {
+                format!(
+                    "dependency governance manifest {} does not match cargo-deny diagnostics {}",
+                    path.display(),
+                    deny_diagnostics.display()
+                )
+            })?;
+    }
+
+    Ok(())
 }
 
 fn validate_dependency_governance_manifest_text(contents: &str, today: &str) -> anyhow::Result<()> {
     let manifest: DependencyGovernanceManifestV1 =
         serde_json::from_str(contents).context("failed to parse dependency governance JSON")?;
     manifest.validate(today)
+}
+
+fn validate_dependency_governance_with_diagnostics_text(
+    manifest_contents: &str,
+    diagnostics_contents: &str,
+    today: &str,
+) -> anyhow::Result<()> {
+    let manifest: DependencyGovernanceManifestV1 = serde_json::from_str(manifest_contents)
+        .context("failed to parse dependency governance JSON")?;
+    manifest.validate(today)?;
+
+    let expected = manifest.warning_exceptions();
+    let actual = parse_cargo_deny_warning_diagnostics(diagnostics_contents)?;
+    let mut errors = Vec::new();
+
+    for warning in actual.difference(&expected) {
+        errors.push(format!(
+            "uncovered {} warning for {}",
+            warning.kind.as_str(),
+            warning.crate_name
+        ));
+    }
+    for warning in expected.difference(&actual) {
+        errors.push(format!(
+            "stale {} exception for {}",
+            warning.kind.as_str(),
+            warning.crate_name
+        ));
+    }
+
+    if !errors.is_empty() {
+        bail!("{}", errors.join("; "));
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -293,6 +357,18 @@ enum DependencyGovernanceExceptionKind {
     Advisory,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+struct DependencyGovernanceWarning {
+    kind: CargoDenyWarningKind,
+    crate_name: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+enum CargoDenyWarningKind {
+    Duplicate,
+    Unmaintained,
+}
+
 impl DependencyGovernanceManifestV1 {
     fn validate(&self, today: &str) -> anyhow::Result<()> {
         if self.schema_version != 1 {
@@ -310,6 +386,131 @@ impl DependencyGovernanceManifestV1 {
 
         Ok(())
     }
+
+    fn warning_exceptions(&self) -> BTreeSet<DependencyGovernanceWarning> {
+        self.exceptions
+            .iter()
+            .filter_map(|exception| {
+                let kind = CargoDenyWarningKind::from_exception_kind(&exception.kind)?;
+                Some(DependencyGovernanceWarning {
+                    kind,
+                    crate_name: exception.crate_name.clone(),
+                })
+            })
+            .collect()
+    }
+}
+
+impl CargoDenyWarningKind {
+    fn from_exception_kind(kind: &DependencyGovernanceExceptionKind) -> Option<Self> {
+        match kind {
+            DependencyGovernanceExceptionKind::Duplicate => Some(Self::Duplicate),
+            DependencyGovernanceExceptionKind::Unmaintained => Some(Self::Unmaintained),
+            DependencyGovernanceExceptionKind::Advisory => None,
+        }
+    }
+
+    fn from_diagnostic_code(code: &str) -> Option<Self> {
+        match code {
+            "duplicate" => Some(Self::Duplicate),
+            "unmaintained" => Some(Self::Unmaintained),
+            _ => None,
+        }
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Duplicate => "duplicate",
+            Self::Unmaintained => "unmaintained",
+        }
+    }
+}
+
+fn parse_cargo_deny_warning_diagnostics(
+    contents: &str,
+) -> anyhow::Result<BTreeSet<DependencyGovernanceWarning>> {
+    let mut warnings = BTreeSet::new();
+
+    for (index, line) in contents.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let value: serde_json::Value = serde_json::from_str(line)
+            .with_context(|| format!("invalid cargo-deny JSONL on line {}", index + 1))?;
+        if value["type"] != "diagnostic" || value["fields"]["severity"] != "warning" {
+            continue;
+        }
+
+        let Some(code) = cargo_deny_diagnostic_code(&value) else {
+            continue;
+        };
+        let Some(kind) = CargoDenyWarningKind::from_diagnostic_code(code) else {
+            continue;
+        };
+
+        match kind {
+            CargoDenyWarningKind::Duplicate => {
+                let crate_names = duplicate_diagnostic_crate_names(&value);
+                if crate_names.is_empty() {
+                    bail!(
+                        "cargo-deny duplicate warning on line {} did not include crate names",
+                        index + 1
+                    );
+                }
+                for crate_name in crate_names {
+                    warnings.insert(DependencyGovernanceWarning {
+                        kind: CargoDenyWarningKind::Duplicate,
+                        crate_name,
+                    });
+                }
+            }
+            CargoDenyWarningKind::Unmaintained => {
+                let Some(crate_name) = unmaintained_diagnostic_crate_name(&value) else {
+                    bail!(
+                        "cargo-deny unmaintained warning on line {} did not include a crate name",
+                        index + 1
+                    );
+                };
+                warnings.insert(DependencyGovernanceWarning { kind, crate_name });
+            }
+        }
+    }
+
+    Ok(warnings)
+}
+
+fn cargo_deny_diagnostic_code(value: &serde_json::Value) -> Option<&str> {
+    value["fields"]["code"]
+        .as_str()
+        .or_else(|| value["fields"]["code"]["code"].as_str())
+}
+
+fn duplicate_diagnostic_crate_names(value: &serde_json::Value) -> BTreeSet<String> {
+    value["fields"]["graphs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|graph| graph["Krate"]["name"].as_str())
+        .map(str::to_string)
+        .collect()
+}
+
+fn unmaintained_diagnostic_crate_name(value: &serde_json::Value) -> Option<String> {
+    value["fields"]["labels"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|label| label["span"].as_str())
+        .filter_map(|span| span.split_whitespace().next())
+        .next()
+        .or_else(|| {
+            value["fields"]["message"]
+                .as_str()
+                .and_then(|message| message.split_once(" - ").map(|(crate_name, _)| crate_name))
+        })
+        .map(str::to_string)
 }
 
 impl DependencyGovernanceMsrvV1 {
@@ -864,6 +1065,65 @@ mod tests {
     }
 
     #[test]
+    fn dependency_governance_validator_accepts_matching_cargo_deny_warnings() {
+        validate_dependency_governance_with_diagnostics_text(
+            &valid_dependency_governance_json(),
+            cargo_deny_warning_diagnostics_jsonl(),
+            "2026-05-06",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn dependency_governance_validator_rejects_uncovered_cargo_deny_warning() {
+        let manifest = dependency_governance_json_with_exceptions([("duplicate", "hashbrown")]);
+
+        let error = validate_dependency_governance_with_diagnostics_text(
+            &manifest,
+            cargo_deny_warning_diagnostics_jsonl(),
+            "2026-05-06",
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("uncovered unmaintained warning for paste"));
+    }
+
+    #[test]
+    fn dependency_governance_validator_rejects_stale_warning_exception() {
+        let diagnostics = r#"{"type":"diagnostic","fields":{"code":"duplicate","severity":"warning","message":"found duplicate entries for crate 'hashbrown'","graphs":[{"Krate":{"name":"hashbrown","version":"0.15.5"}},{"Krate":{"name":"hashbrown","version":"0.16.0"}}]}}"#;
+
+        let error = validate_dependency_governance_with_diagnostics_text(
+            &valid_dependency_governance_json(),
+            diagnostics,
+            "2026-05-06",
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("stale unmaintained exception for paste"));
+    }
+
+    #[test]
+    fn dependency_governance_validator_rejects_known_warning_without_crate_name() {
+        let duplicate_without_graphs = r#"{"type":"diagnostic","fields":{"code":"duplicate","severity":"warning","message":"found duplicate entries"}}"#;
+        let error = validate_dependency_governance_with_diagnostics_text(
+            &valid_dependency_governance_json(),
+            duplicate_without_graphs,
+            "2026-05-06",
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("did not include crate names"));
+
+        let unmaintained_without_name = r#"{"type":"diagnostic","fields":{"code":"unmaintained","severity":"warning","message":"no delimiter here","labels":[]}}"#;
+        let error = validate_dependency_governance_with_diagnostics_text(
+            &valid_dependency_governance_json(),
+            unmaintained_without_name,
+            "2026-05-06",
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("did not include a crate name"));
+    }
+
+    #[test]
     fn dependency_governance_validator_rejects_missing_owner() {
         let manifest = serde_json::json!({
             "schema_version": 1,
@@ -1263,6 +1523,43 @@ mod tests {
             ]
         })
         .to_string()
+    }
+
+    fn dependency_governance_json_with_exceptions<const N: usize>(
+        exceptions: [(&str, &str); N],
+    ) -> String {
+        let exceptions = exceptions
+            .into_iter()
+            .map(|(kind, crate_name)| {
+                serde_json::json!({
+                    "kind": kind,
+                    "crate": crate_name,
+                    "owner": "runtime",
+                    "expires_on": "2026-06-30",
+                    "reason": "Temporary warning exception."
+                })
+            })
+            .collect::<Vec<_>>();
+
+        serde_json::json!({
+            "schema_version": 1,
+            "msrv": {
+                "minimum_rust_version": "1.85.0",
+                "policy": "CI and package updates keep the workspace buildable on the declared MSRV."
+            },
+            "exceptions": exceptions
+        })
+        .to_string()
+    }
+
+    fn cargo_deny_warning_diagnostics_jsonl() -> &'static str {
+        concat!(
+            r#"{"type":"diagnostic","fields":{"code":"duplicate","severity":"warning","message":"found duplicate entries for crate 'hashbrown'","graphs":[{"Krate":{"name":"hashbrown","version":"0.15.5"}},{"Krate":{"name":"hashbrown","version":"0.16.0"}}]}}"#,
+            "\n",
+            r#"{"type":"diagnostic","fields":{"code":"unmaintained","severity":"warning","message":"paste - no longer maintained","labels":[{"span":"paste 1.0.15 registry+https://github.com/rust-lang/crates.io-index"}]}}"#,
+            "\n",
+            r#"{"type":"summary","fields":{"bans":{"warnings":1},"advisories":{"warnings":1}}}"#,
+        )
     }
 
     fn valid_result_json_compact() -> String {
