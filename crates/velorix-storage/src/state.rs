@@ -91,6 +91,8 @@ pub enum CheckpointPublishError {
     OutputObjectAlreadyExists(ObjectKey),
     #[error("checkpoint manifest `{0}` already exists")]
     ManifestAlreadyExists(ObjectKey),
+    #[error("garbage collection run evidence `{0}` already exists")]
+    GarbageCollectionRunAlreadyExists(ObjectKey),
     #[error("garbage collection must retain at least one manifest")]
     InvalidGarbageCollectionPolicy,
     #[error("garbage collection retained manifest {0} is missing")]
@@ -682,6 +684,18 @@ impl CheckpointPublisher {
         policy: GarbageCollectionPolicy,
         plan: &GarbageCollectionPlan,
     ) -> Result<GarbageCollectionRunV1, CheckpointPublishError> {
+        let object_key = ObjectKey::garbage_collection_run(run_id)?;
+        let object_path = Path::from(object_key.as_str());
+        match self.store.head(&object_path).await {
+            Ok(_) => {
+                return Err(CheckpointPublishError::GarbageCollectionRunAlreadyExists(
+                    object_key,
+                ));
+            }
+            Err(object_store::Error::NotFound { .. }) => {}
+            Err(err) => return Err(err.into()),
+        }
+
         let report = self.execute_garbage_collection_plan(plan).await?;
         let run = GarbageCollectionRunV1 {
             schema_version: GC_RUN_SCHEMA_VERSION,
@@ -690,11 +704,10 @@ impl CheckpointPublisher {
             plan: plan.clone(),
             report,
         };
-        let object_key = ObjectKey::garbage_collection_run(run_id)?;
         let bytes = serde_json::to_vec(&run)?;
         self.store
             .put_opts(
-                &Path::from(object_key.as_str()),
+                &object_path,
                 Bytes::from(bytes).into(),
                 PutMode::Create.into(),
             )

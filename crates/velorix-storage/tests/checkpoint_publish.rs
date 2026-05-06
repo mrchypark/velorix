@@ -726,6 +726,45 @@ async fn gc_execution_writes_stable_run_evidence() {
 }
 
 #[tokio::test]
+async fn gc_execution_rejects_duplicate_run_evidence_before_deleting_candidates() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let policy = GarbageCollectionPolicy {
+        retain_latest_manifests: 1,
+    };
+    let retained_state = state_write(0, "state-retained", b"retained-state");
+    let orphan_state = state_write(0, "state-orphan", b"orphan-state");
+
+    let retained_state_ref = publisher.write_state_object(&retained_state).await.unwrap();
+    publisher.write_state_object(&orphan_state).await.unwrap();
+    publisher
+        .publish_manifest(&manifest(0, retained_state_ref))
+        .await
+        .unwrap();
+
+    let evidence_key = ObjectKey::garbage_collection_run("run-0001").unwrap();
+    store
+        .put(
+            &Path::from(evidence_key.as_str()),
+            Bytes::from_static(b"existing-run-evidence").into(),
+        )
+        .await
+        .unwrap();
+
+    let plan = publisher.plan_garbage_collection(policy).await.unwrap();
+    let err = publisher
+        .execute_garbage_collection_plan_with_evidence("run-0001", policy, &plan)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        CheckpointPublishError::GarbageCollectionRunAlreadyExists(_)
+    ));
+    assert!(object_exists(store.as_ref(), orphan_state.object_key()).await);
+}
+
+#[tokio::test]
 async fn gc_ignores_publish_temp_attempt_objects() {
     let (_temp_dir, store) = temp_store();
     let publisher = CheckpointPublisher::new(Arc::clone(&store));
