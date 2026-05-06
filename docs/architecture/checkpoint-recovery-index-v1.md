@@ -52,7 +52,11 @@ records do not make a valid manifest invalid.
 `velorix-cli checkpoint-inspect-local --object-store-dir <path>` exposes the
 read-only admin inspection path for local object-store directories. It reports
 the latest valid checkpoint and each visible manifest with lifecycle/status
-diagnostics. It does not repair, rewrite, or recover from a checkpoint.
+diagnostics. When GC leaves an older parent manifest listed but deletes that
+parent's raw state/output payloads, inspection may still use the parent
+manifest body as structural lineage evidence for newer retained checkpoints;
+the older manifest itself is reported invalid if its own payloads are missing.
+It does not repair, rewrite, or recover from a checkpoint.
 
 ## Verification
 
@@ -61,6 +65,9 @@ diagnostics. It does not repair, rewrite, or recover from a checkpoint.
 - Strict mode fails on invalid lineage.
 - Admin inspect identifies last known good checkpoint when a future manifest is
   corrupt.
+- Admin inspect treats GC-retired parent payloads as invalid for that older
+  manifest without invalidating a newer retained child checkpoint whose own
+  payloads remain available.
 - Local CLI admin inspect prints deterministic read-only checkpoint diagnostics.
 - Published lifecycle records are readable and digest-bound to their manifest.
 - Large-manifest-count benchmark records lookup memory and latency.

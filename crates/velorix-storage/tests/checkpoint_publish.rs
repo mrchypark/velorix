@@ -1150,6 +1150,68 @@ async fn checkpoint_admin_inspect_reports_last_known_good_when_future_manifest_i
 }
 
 #[tokio::test]
+async fn checkpoint_admin_inspect_treats_gc_retired_parent_payload_as_parent_lineage() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let state_0 = state_write(0, "state-0001", b"state-0");
+    let state_1 = state_write(1, "state-0002", b"state-1");
+    let output_0 = output_write(0, 0, "out-0001", b"output-0");
+    let output_1 = output_write(0, 1, "out-0002", b"output-1");
+
+    let state_ref_0 = publisher.write_state_object(&state_0).await.unwrap();
+    let output_ref_0 = publisher.write_output_object(&output_0).await.unwrap();
+    let mut manifest_0 = manifest(0, state_ref_0);
+    manifest_0.output_objects = vec![output_ref_0];
+    publisher.publish_manifest(&manifest_0).await.unwrap();
+
+    let state_ref_1 = publisher.write_state_object(&state_1).await.unwrap();
+    let output_ref_1 = publisher.write_output_object(&output_1).await.unwrap();
+    let mut manifest_1 = manifest(1, state_ref_1);
+    manifest_1.output_objects = vec![output_ref_1];
+    publisher.publish_manifest(&manifest_1).await.unwrap();
+
+    let plan = publisher
+        .plan_garbage_collection(GarbageCollectionPolicy {
+            retain_latest_manifests: 1,
+        })
+        .await
+        .unwrap();
+    publisher
+        .execute_garbage_collection_plan(&plan)
+        .await
+        .unwrap();
+
+    assert!(!object_exists(store.as_ref(), state_0.object_key()).await);
+    assert!(!object_exists(store.as_ref(), output_0.object_key()).await);
+    assert!(object_exists(store.as_ref(), state_1.object_key()).await);
+    assert!(object_exists(store.as_ref(), output_1.object_key()).await);
+    assert_eq!(
+        publisher.latest_manifest().await.unwrap(),
+        Some(manifest_1.clone())
+    );
+
+    let report = publisher.inspect_checkpoints().await.unwrap();
+
+    assert_eq!(report.latest_valid_checkpoint, Some(1));
+    assert_eq!(report.manifests.len(), 2);
+    assert_eq!(report.manifests[0].checkpoint_version, 0);
+    assert!(matches!(
+        report.manifests[0].status,
+        CheckpointManifestInspectionStatus::Invalid { .. }
+    ));
+    assert!(report.manifests[0]
+        .status
+        .reason()
+        .unwrap()
+        .contains(state_0.object_key().as_str()));
+    assert_eq!(report.manifests[1].checkpoint_version, 1);
+    assert!(matches!(
+        report.manifests[1].status,
+        CheckpointManifestInspectionStatus::Valid
+    ));
+}
+
+#[tokio::test]
 async fn checkpoint_publish_latest_manifest_uses_valid_marker_without_full_listing() {
     let (_temp_dir, store) = temp_store();
     let publisher = CheckpointPublisher::new(Arc::clone(&store));

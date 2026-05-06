@@ -172,8 +172,12 @@ to a checkpoint inspection result.
 Admin inspection can list checkpoint manifests, validate each manifest body,
 key, lineage, referenced state, and referenced outputs, report invalid future
 manifests with reasons, and return the latest valid checkpoint for repair or
-read-only diagnosis. It does not yet implement lifecycle transitions beyond
-`published`, retention tombstones, compaction state, or recovery-mode writes.
+read-only diagnosis. For lineage diagnostics, a structurally valid parent
+manifest remains usable as parent evidence even when that older manifest's own
+raw state/output payloads have been GC-deleted; each manifest's own payload
+availability still determines whether that manifest is reported valid. It does
+not yet implement lifecycle transitions beyond `published`, retention
+tombstones, compaction state, or recovery-mode writes.
 
 State object references may carry an `owner_claim` with `owner_id` and
 `owner_epoch`. This is distinct from the existing state ref `owner`, which
@@ -319,8 +323,10 @@ Manifest objects outside the latest-N retention set can remain listed and
 readable after GC, but their Velorix-owned raw state and output payloads are not
 part of the retained recovery set. Operators and recovery code must treat those
 older manifests as historical metadata only unless their referenced payloads are
-still available for some other reason. Broad manifest lifecycle retirement and
-retention tombstoning remain future work.
+still available for some other reason. Admin inspection may still use those
+older manifest bodies as structural parent-lineage evidence for newer retained
+checkpoints. Broad manifest lifecycle retirement and retention tombstoning
+remain future work.
 
 This is not a broad production GC service. It does not collect staging
 `v1/tmp/...` objects, does not add object-store listing-consistency controls,

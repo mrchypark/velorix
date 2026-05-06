@@ -39,6 +39,12 @@ pub struct CheckpointPublisher {
     state_store: Arc<dyn StateObjectStore>,
 }
 
+struct InspectableCheckpointManifest {
+    manifest: CheckpointManifest,
+    lifecycle_status: Option<CheckpointLifecycleStatus>,
+    payload_status: Result<(), String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StateObjectWrite {
     owner: String,
@@ -542,7 +548,7 @@ impl CheckpointPublisher {
             .collect::<Result<Vec<_>, CheckpointPublishError>>()?;
         manifest_objects.sort_by_key(|(checkpoint_version, _, _)| *checkpoint_version);
 
-        let mut valid_manifests = HashMap::new();
+        let mut lineage_manifests = HashMap::new();
         let mut inspections = Vec::with_capacity(manifest_objects.len());
         let mut latest_valid_checkpoint = None;
 
@@ -552,18 +558,35 @@ impl CheckpointPublisher {
                     checkpoint_version,
                     manifest_key.clone(),
                     &location,
-                    &valid_manifests,
+                    &lineage_manifests,
                 )
                 .await
             {
-                Ok((manifest, lifecycle_status)) => {
-                    latest_valid_checkpoint = Some(manifest.checkpoint_version);
-                    valid_manifests.insert(manifest.checkpoint_version, manifest);
-                    CheckpointManifestInspection {
-                        checkpoint_version,
-                        manifest_key,
-                        lifecycle_status,
-                        status: CheckpointManifestInspectionStatus::Valid,
+                Ok(inspectable) => {
+                    let checkpoint_version = inspectable.manifest.checkpoint_version;
+                    let lifecycle_status = inspectable.lifecycle_status;
+                    let payload_status = inspectable.payload_status;
+                    lineage_manifests.insert(
+                        inspectable.manifest.checkpoint_version,
+                        inspectable.manifest,
+                    );
+
+                    match payload_status {
+                        Ok(()) => {
+                            latest_valid_checkpoint = Some(checkpoint_version);
+                            CheckpointManifestInspection {
+                                checkpoint_version,
+                                manifest_key,
+                                lifecycle_status,
+                                status: CheckpointManifestInspectionStatus::Valid,
+                            }
+                        }
+                        Err(reason) => CheckpointManifestInspection {
+                            checkpoint_version,
+                            manifest_key,
+                            lifecycle_status,
+                            status: CheckpointManifestInspectionStatus::Invalid { reason },
+                        },
                     }
                 }
                 Err(reason) => CheckpointManifestInspection {
@@ -896,8 +919,8 @@ impl CheckpointPublisher {
         checkpoint_version: u64,
         manifest_key: ObjectKey,
         location: &Path,
-        valid_manifests: &HashMap<u64, CheckpointManifest>,
-    ) -> Result<(CheckpointManifest, Option<CheckpointLifecycleStatus>), String> {
+        lineage_manifests: &HashMap<u64, CheckpointManifest>,
+    ) -> Result<InspectableCheckpointManifest, String> {
         let bytes = self
             .store
             .get(location)
@@ -925,7 +948,7 @@ impl CheckpointPublisher {
             ));
         }
         if let Some(parent_checkpoint) = manifest.parent_checkpoint {
-            let parent = valid_manifests.get(&parent_checkpoint).ok_or_else(|| {
+            let parent = lineage_manifests.get(&parent_checkpoint).ok_or_else(|| {
                 CheckpointPublishError::MissingParentManifest {
                     checkpoint_version: manifest.checkpoint_version,
                     parent_checkpoint,
@@ -935,12 +958,13 @@ impl CheckpointPublisher {
             Self::validate_child_input_progress(&manifest, parent)
                 .map_err(|err| err.to_string())?;
         }
-        self.validate_state_objects_exist(&manifest)
-            .await
-            .map_err(|err| err.to_string())?;
-        self.validate_output_objects_exist(&manifest)
-            .await
-            .map_err(|err| err.to_string())?;
+        let payload_status = match self.validate_state_objects_exist(&manifest).await {
+            Ok(()) => self
+                .validate_output_objects_exist(&manifest)
+                .await
+                .map_err(|err| err.to_string()),
+            Err(err) => Err(err.to_string()),
+        };
 
         let lifecycle_status = self
             .read_checkpoint_lifecycle_record(checkpoint_version)
@@ -950,7 +974,11 @@ impl CheckpointPublisher {
                 (record.manifest_digest == manifest_digest(&bytes)).then_some(record.status)
             });
 
-        Ok((manifest, lifecycle_status))
+        Ok(InspectableCheckpointManifest {
+            manifest,
+            lifecycle_status,
+            payload_status,
+        })
     }
 
     fn validate_lifecycle_record(
