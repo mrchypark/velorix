@@ -1817,6 +1817,11 @@ mod tests {
                 "evidence": "trusted artifact metadata",
                 "evidence_kind": ["feldera_artifact_registry", "feldera_artifact_hash_verified"]
             },
+            "dependency_governance_status": {
+                "status": "pass",
+                "evidence": "dependency governance validated",
+                "evidence_kind": ["dependency_governance_validated"]
+            },
             "benchmark_gate_status": {
                 "status": "pass",
                 "evidence": "S3-compatible benchmark gate",

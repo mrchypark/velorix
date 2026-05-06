@@ -120,6 +120,24 @@ fn readiness_report_blocks_when_s3_compatible_benchmark_gate_evidence_is_missing
 }
 
 #[test]
+fn readiness_report_blocks_when_dependency_governance_evidence_is_missing() {
+    let report = ProductionReadinessEvidenceV1::from_json_str(&readiness_json(
+        &["dependency_governance_validated"],
+        false,
+        &[],
+    ))
+    .unwrap()
+    .try_into_report()
+    .unwrap();
+
+    assert!(!report.production_ready);
+    assert_eq!(
+        report.blocking_reasons,
+        vec!["dependency_governance_status missing dependency_governance_validated evidence"]
+    );
+}
+
+#[test]
 fn readiness_report_blocks_bootstrap_raw_state_path() {
     let report = ProductionReadinessEvidenceV1::from_json_str(&readiness_json(&[], true, &[]))
         .unwrap()
@@ -148,6 +166,24 @@ fn readiness_report_blocks_failed_statuses() {
     assert_eq!(
         report.blocking_reasons,
         vec!["benchmark_gate_status failed: regression gate failed closed"]
+    );
+}
+
+#[test]
+fn readiness_report_blocks_failed_dependency_governance_status() {
+    let report = ProductionReadinessEvidenceV1::from_json_str(&readiness_json(
+        &[],
+        false,
+        &["dependency_governance_status"],
+    ))
+    .unwrap()
+    .try_into_report()
+    .unwrap();
+
+    assert!(!report.production_ready);
+    assert_eq!(
+        report.blocking_reasons,
+        vec!["dependency_governance_status failed: dependency governance failed closed"]
     );
 }
 
@@ -211,6 +247,7 @@ fn readiness_evidence_rejects_unknown_json_fields() {
             "query_policy_status": { "status": "pass", "evidence": "bounded DataFusion policy", "evidence_kind": ["query_policy_catalog"] },
             "table_catalog_status": { "status": "pass", "evidence": "registry-backed table catalog", "evidence_kind": ["registry_backed_table_catalog"] },
             "feldera_artifact_status": { "status": "pass", "evidence": "trusted artifact metadata", "evidence_kind": ["feldera_artifact_registry", "feldera_artifact_hash_verified"] },
+            "dependency_governance_status": { "status": "pass", "evidence": "dependency governance validated", "evidence_kind": ["dependency_governance_validated"] },
             "benchmark_gate_status": { "status": "pass", "evidence": "S3-compatible benchmark gate", "evidence_kind": ["s3_compatible_benchmark_gate"] },
             "kubernetes_status": { "status": "pass", "evidence": "Kubernetes Lease client", "evidence_kind": ["kubernetes_lease_client"] },
             "surprise": true
@@ -297,6 +334,12 @@ fn readiness_json(
     } else {
         ""
     };
+    let dependency_governance_kind =
+        if !missing_evidence.contains(&"dependency_governance_validated") {
+            r#", "evidence_kind": ["dependency_governance_validated"]"#
+        } else {
+            ""
+        };
 
     format!(
         r#"{{
@@ -310,9 +353,13 @@ fn readiness_json(
             "query_policy_status": {{ "status": "pass", "evidence": "bounded DataFusion policy"{query_policy_kind} }},
             "table_catalog_status": {{ "status": "pass", "evidence": "registry-backed table catalog"{table_catalog_kind} }},
             "feldera_artifact_status": {{ "status": "pass", "evidence": "trusted artifact metadata"{feldera_artifact_kind} }},
+            "dependency_governance_status": {{ "status": "{dependency_governance_status}", "evidence": "{dependency_governance_evidence}"{dependency_governance_kind} }},
             "benchmark_gate_status": {{ "status": "{benchmark_status}", "evidence": "{benchmark_evidence}"{benchmark_gate_kind} }},
             "kubernetes_status": {{ "status": "pass", "evidence": "Kubernetes Lease client"{kubernetes_kind} }}
         }}"#,
+        dependency_governance_status = status_for("dependency_governance_status", failed_fields),
+        dependency_governance_evidence =
+            evidence_for("dependency_governance_status", failed_fields),
         benchmark_status = status_for("benchmark_gate_status", failed_fields),
         benchmark_evidence = evidence_for("benchmark_gate_status", failed_fields),
     )
@@ -327,9 +374,11 @@ fn status_for(field: &str, failed_fields: &[&str]) -> &'static str {
 }
 
 fn evidence_for(field: &str, failed_fields: &[&str]) -> &'static str {
-    if failed_fields.contains(&field) {
-        "regression gate failed closed"
-    } else {
-        "S3-compatible benchmark gate"
+    match (field, failed_fields.contains(&field)) {
+        ("dependency_governance_status", true) => "dependency governance failed closed",
+        ("benchmark_gate_status", true) => "regression gate failed closed",
+        ("dependency_governance_status", false) => "dependency governance validated",
+        ("benchmark_gate_status", false) => "S3-compatible benchmark gate",
+        _ => "readiness evidence",
     }
 }

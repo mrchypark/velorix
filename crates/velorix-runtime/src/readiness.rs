@@ -18,6 +18,7 @@ pub struct ProductionReadinessEvidenceV1 {
     pub query_policy_status: ReadinessCheck,
     pub table_catalog_status: ReadinessCheck,
     pub feldera_artifact_status: ReadinessCheck,
+    pub dependency_governance_status: ReadinessCheck,
     pub benchmark_gate_status: ReadinessCheck,
     pub kubernetes_status: ReadinessCheck,
 }
@@ -51,6 +52,7 @@ pub enum ReadinessEvidenceKind {
     RegistryBackedTableCatalog,
     FelderaArtifactRegistry,
     FelderaArtifactHashVerified,
+    DependencyGovernanceValidated,
     S3CompatibleBenchmarkGate,
 }
 
@@ -80,6 +82,7 @@ pub struct ProductionReadinessReportV1 {
     pub query_policy_status: ReadinessCheck,
     pub table_catalog_status: ReadinessCheck,
     pub feldera_artifact_status: ReadinessCheck,
+    pub dependency_governance_status: ReadinessCheck,
     pub benchmark_gate_status: ReadinessCheck,
     pub kubernetes_status: ReadinessCheck,
     pub production_ready: bool,
@@ -129,6 +132,11 @@ impl ProductionReadinessEvidenceV1 {
             &mut blocking_reasons,
             "feldera_artifact_status",
             &self.feldera_artifact_status,
+        );
+        push_failed_check(
+            &mut blocking_reasons,
+            "dependency_governance_status",
+            &self.dependency_governance_status,
         );
         push_failed_check(
             &mut blocking_reasons,
@@ -224,6 +232,15 @@ impl ProductionReadinessEvidenceV1 {
                 "benchmark_gate_status missing s3_compatible_benchmark_gate evidence".to_string(),
             );
         }
+        if !self
+            .dependency_governance_status
+            .has_evidence(ReadinessEvidenceKind::DependencyGovernanceValidated)
+        {
+            blocking_reasons.push(
+                "dependency_governance_status missing dependency_governance_validated evidence"
+                    .to_string(),
+            );
+        }
 
         ProductionReadinessReportV1 {
             schema_version: self.schema_version,
@@ -236,6 +253,7 @@ impl ProductionReadinessEvidenceV1 {
             query_policy_status: self.query_policy_status,
             table_catalog_status: self.table_catalog_status,
             feldera_artifact_status: self.feldera_artifact_status,
+            dependency_governance_status: self.dependency_governance_status,
             benchmark_gate_status: self.benchmark_gate_status,
             kubernetes_status: self.kubernetes_status,
             production_ready: blocking_reasons.is_empty(),
