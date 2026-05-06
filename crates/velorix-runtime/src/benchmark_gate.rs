@@ -90,6 +90,16 @@ pub enum BenchmarkGateError {
     UnsupportedSchemaVersion { actual: u8 },
     #[error("benchmark result field {field} must be present")]
     MissingRequiredField { field: &'static str },
+    #[error(
+        "benchmark backend {backend:?} requires workload {expected_workload}, got {actual_workload}"
+    )]
+    BackendWorkloadMismatch {
+        backend: BenchmarkBackend,
+        expected_workload: &'static str,
+        actual_workload: String,
+    },
+    #[error("benchmark S3-compatible result commit must not be a placeholder, got {commit}")]
+    PlaceholderS3Commit { commit: String },
     #[error("benchmark metric {metric} must be finite and non-negative, got {value}")]
     InvalidMetric { metric: &'static str, value: f64 },
     #[error("benchmark workload_metrics must be non-empty")]
@@ -171,6 +181,14 @@ impl BenchmarkGateResultV1 {
         }
         if self.workload.trim().is_empty() {
             return Err(BenchmarkGateError::MissingRequiredField { field: "workload" });
+        }
+        let expected_workload = expected_workload_for_backend(self.backend);
+        if self.workload != expected_workload {
+            return Err(BenchmarkGateError::BackendWorkloadMismatch {
+                backend: self.backend,
+                expected_workload,
+                actual_workload: self.workload.clone(),
+            });
         }
         self.metrics.validate()?;
         validate_workload_metrics(&self.workload_metrics)
@@ -314,6 +332,17 @@ impl BenchmarkGateResultV1 {
                     name: (*name).to_string(),
                 });
             }
+        }
+
+        Ok(())
+    }
+
+    pub fn reject_placeholder_s3_commit(&self) -> Result<(), BenchmarkGateError> {
+        if self.backend == BenchmarkBackend::S3Compatible && self.commit.starts_with("placeholder-")
+        {
+            return Err(BenchmarkGateError::PlaceholderS3Commit {
+                commit: self.commit.clone(),
+            });
         }
 
         Ok(())
@@ -507,6 +536,13 @@ fn validate_workload_metrics(
     }
 
     Ok(())
+}
+
+fn expected_workload_for_backend(backend: BenchmarkBackend) -> &'static str {
+    match backend {
+        BenchmarkBackend::Local => "local_incremental",
+        BenchmarkBackend::S3Compatible => "s3_incremental",
+    }
 }
 
 fn is_object_backed_workload(name: &str) -> bool {

@@ -788,6 +788,14 @@ fn run_benchmark_gate(
                     result.display()
                 )
             })?;
+        current_result
+            .reject_placeholder_s3_commit()
+            .with_context(|| {
+                format!(
+                    "benchmark result {} must be real backend evidence",
+                    result.display()
+                )
+            })?;
     }
 
     let Some(baseline) = baseline else {
@@ -1317,7 +1325,35 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(format!("{error:#}").contains("requires a real S3-compatible baseline"));
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("requires a real S3-compatible baseline"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn benchmark_gate_comparison_rejects_placeholder_s3_current_result() {
+        let dir = tempdir().unwrap();
+        let baseline = dir.path().join("baseline.json");
+        let result = dir.path().join("result.json");
+        fs::write(&baseline, release_result_json()).unwrap();
+        fs::write(&result, placeholder_current_s3_result_json()).unwrap();
+
+        let error = run_benchmark_gate(
+            Some(&baseline),
+            &result,
+            Some(BenchmarkGateLevel::Release),
+            Some(BenchmarkBackend::S3Compatible),
+            Some(0.10),
+        )
+        .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("must be real backend evidence"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -1579,7 +1615,7 @@ mod tests {
             "abc123",
             "pr_smoke",
             "s3_compatible",
-            "local_incremental",
+            "s3_incremental",
             1000.0,
             workload_metrics(),
         ))
@@ -1656,6 +1692,18 @@ mod tests {
             },
             "workload_metrics": workload_metrics(),
         }))
+        .unwrap()
+    }
+
+    fn placeholder_current_s3_result_json() -> String {
+        serde_json::to_string_pretty(&normal_result(
+            "placeholder-s3-nightly-result",
+            "release",
+            "s3_compatible",
+            "s3_incremental",
+            1000.0,
+            workload_metrics(),
+        ))
         .unwrap()
     }
 

@@ -11,6 +11,39 @@ fn local_smoke_result_validates_when_required_metrics_are_present() {
 }
 
 #[test]
+fn benchmark_gate_validation_fails_when_s3_backend_uses_local_workload() {
+    let mut result = s3_nightly_result();
+    result.workload = "local_incremental".to_string();
+
+    let error = result.validate().unwrap_err();
+
+    assert!(matches!(
+        error,
+        BenchmarkGateError::BackendWorkloadMismatch { .. }
+    ));
+}
+
+#[test]
+fn benchmark_gate_rejects_placeholder_s3_current_result() {
+    let mut result = s3_nightly_result();
+    result.commit = "placeholder-s3-nightly".to_string();
+
+    let error = result.reject_placeholder_s3_commit().unwrap_err();
+
+    assert!(matches!(
+        error,
+        BenchmarkGateError::PlaceholderS3Commit { .. }
+    ));
+}
+
+#[test]
+fn benchmark_gate_accepts_s3_nightly_result_with_real_commit() {
+    let result = s3_nightly_result();
+
+    result.validate().unwrap();
+}
+
+#[test]
 fn local_smoke_result_validation_fails_when_object_request_metrics_are_missing() {
     let error = BenchmarkGateResultV1::from_json_str(
         r#"{
@@ -113,6 +146,7 @@ fn benchmark_comparison_rejects_local_smoke_against_s3_baseline() {
     let mut baseline = local_smoke_result();
     baseline.backend = BenchmarkBackend::S3Compatible;
     baseline.gate_level = BenchmarkGateLevel::NightlyIntegration;
+    baseline.workload = "s3_incremental".to_string();
 
     let error = current
         .compare_against(&baseline, BenchmarkBudgetV1::relative(0.10))
@@ -239,6 +273,15 @@ fn local_smoke_result() -> BenchmarkGateResultV1 {
         },
         workload_metrics: local_workload_metrics(),
     }
+}
+
+fn s3_nightly_result() -> BenchmarkGateResultV1 {
+    let mut result = local_smoke_result();
+    result.commit = "abc123def456".to_string();
+    result.gate_level = BenchmarkGateLevel::NightlyIntegration;
+    result.backend = BenchmarkBackend::S3Compatible;
+    result.workload = "s3_incremental".to_string();
+    result
 }
 
 fn local_workload_metrics() -> Vec<BenchmarkWorkloadMetricsV1> {
