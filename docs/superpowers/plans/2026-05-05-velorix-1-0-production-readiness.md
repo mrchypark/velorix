@@ -788,7 +788,7 @@ implementation.
 
 **Commands:**
 
-- `velorix-cli readiness --json`
+- `velorix-cli readiness-report --evidence <evidence-json> --json`
 - `velorix-cli checkpoint inspect --stream-id <id>`
 - `velorix-cli gc plan --stream-id <id> --retention-checkpoints <n>`
 - `velorix-cli table inspect --tenant-id <id> --table-id <id>`
@@ -858,7 +858,7 @@ implementation.
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cargo run -p velorix-cli -- readiness --json
+cargo run -p velorix-cli -- readiness-report --evidence <evidence-json> --json
 ```
 
 - [ ] Run S3-compatible gate with required env:

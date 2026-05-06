@@ -1514,9 +1514,21 @@ mod tests {
             "ownership_status": { "status": "pass", "evidence": "durable epoch record" },
             "checkpoint_status": { "status": "pass", "evidence": "published checkpoint lifecycle" },
             "state_status": { "status": "pass", "evidence": "SlateDB checkpoint ref" },
-            "query_policy_status": { "status": "pass", "evidence": "bounded DataFusion policy" },
-            "table_catalog_status": { "status": "pass", "evidence": "registry-backed table catalog" },
-            "feldera_artifact_status": { "status": "pass", "evidence": "trusted artifact metadata" },
+            "query_policy_status": {
+                "status": "pass",
+                "evidence": "bounded DataFusion policy",
+                "evidence_kind": ["query_policy_catalog"]
+            },
+            "table_catalog_status": {
+                "status": "pass",
+                "evidence": "registry-backed table catalog",
+                "evidence_kind": ["registry_backed_table_catalog"]
+            },
+            "feldera_artifact_status": {
+                "status": "pass",
+                "evidence": "trusted artifact metadata",
+                "evidence_kind": ["feldera_artifact_registry"]
+            },
             "benchmark_gate_status": { "status": "pass", "evidence": "S3-compatible benchmark gate" },
             "kubernetes_status": {
                 "status": "pass",

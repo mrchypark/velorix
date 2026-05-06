@@ -41,6 +41,9 @@ pub enum ReadinessEvidenceKind {
     S3Compatible,
     KubernetesLeaseClient,
     BootstrapRawStatePath,
+    QueryPolicyCatalog,
+    RegistryBackedTableCatalog,
+    FelderaArtifactRegistry,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,6 +138,29 @@ impl ProductionReadinessEvidenceV1 {
             .has_evidence(ReadinessEvidenceKind::BootstrapRawStatePath)
         {
             blocking_reasons.push("state_status uses bootstrap raw state path".to_string());
+        }
+        if !self
+            .query_policy_status
+            .has_evidence(ReadinessEvidenceKind::QueryPolicyCatalog)
+        {
+            blocking_reasons
+                .push("query_policy_status missing query_policy_catalog evidence".to_string());
+        }
+        if !self
+            .table_catalog_status
+            .has_evidence(ReadinessEvidenceKind::RegistryBackedTableCatalog)
+        {
+            blocking_reasons.push(
+                "table_catalog_status missing registry_backed_table_catalog evidence".to_string(),
+            );
+        }
+        if !self
+            .feldera_artifact_status
+            .has_evidence(ReadinessEvidenceKind::FelderaArtifactRegistry)
+        {
+            blocking_reasons.push(
+                "feldera_artifact_status missing feldera_artifact_registry evidence".to_string(),
+            );
         }
 
         ProductionReadinessReportV1 {
