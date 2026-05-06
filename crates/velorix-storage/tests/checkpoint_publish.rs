@@ -34,17 +34,29 @@ use velorix_storage::{
 #[derive(Debug)]
 struct FullListingFailsStore {
     inner: Arc<dyn ObjectStore>,
+    failing_get_key: Option<&'static str>,
 }
 
 #[derive(Debug)]
 struct PrefixListingFailsStore {
     inner: Arc<dyn ObjectStore>,
     failing_prefix: &'static str,
+    fail_offset_listing: bool,
 }
 
 impl FullListingFailsStore {
     fn new(inner: Arc<dyn ObjectStore>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            failing_get_key: None,
+        }
+    }
+
+    fn new_with_read_failure(inner: Arc<dyn ObjectStore>, failing_get_key: &'static str) -> Self {
+        Self {
+            inner,
+            failing_get_key: Some(failing_get_key),
+        }
     }
 }
 
@@ -53,8 +65,38 @@ impl PrefixListingFailsStore {
         Self {
             inner,
             failing_prefix,
+            fail_offset_listing: false,
         }
     }
+
+    fn new_with_offset_failure(inner: Arc<dyn ObjectStore>, failing_prefix: &'static str) -> Self {
+        Self {
+            inner,
+            failing_prefix,
+            fail_offset_listing: true,
+        }
+    }
+}
+
+fn prefix_matches(prefix: Option<&Path>, expected: &str) -> bool {
+    prefix
+        .map(|prefix| prefix.as_ref() == expected)
+        .unwrap_or(false)
+}
+
+fn generic_store_error(store: &'static str, message: impl Into<String>) -> object_store::Error {
+    object_store::Error::Generic {
+        store,
+        source: Box::new(std::io::Error::other(message.into())),
+    }
+}
+
+fn failing_stream(
+    store: &'static str,
+    message: impl Into<String>,
+) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+    let message = message.into();
+    stream::once(async move { Err(generic_store_error(store, message)) }).boxed()
 }
 
 impl std::fmt::Display for FullListingFailsStore {
@@ -97,6 +139,16 @@ impl ObjectStore for FullListingFailsStore {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
+        if self
+            .failing_get_key
+            .is_some_and(|failing_key| location.as_ref() == failing_key)
+        {
+            return Err(generic_store_error(
+                "full-listing-fails",
+                format!("read failed for {location}"),
+            ));
+        }
+
         self.inner.get_opts(location, options).await
     }
 
@@ -108,15 +160,10 @@ impl ObjectStore for FullListingFailsStore {
         &self,
         _prefix: Option<&Path>,
     ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
-        stream::once(async {
-            Err(object_store::Error::Generic {
-                store: "full-listing-fails",
-                source: Box::new(std::io::Error::other(
-                    "latest_manifest should use the marker fast path",
-                )),
-            })
-        })
-        .boxed()
+        failing_stream(
+            "full-listing-fails",
+            "latest_manifest should use the marker fast path",
+        )
     }
 
     fn list_with_offset(
@@ -175,20 +222,12 @@ impl ObjectStore for PrefixListingFailsStore {
         &self,
         prefix: Option<&Path>,
     ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
-        if prefix
-            .map(|prefix| prefix.as_ref() == self.failing_prefix)
-            .unwrap_or(false)
-        {
+        if prefix_matches(prefix, self.failing_prefix) {
             let failing_prefix = self.failing_prefix;
-            return stream::once(async move {
-                Err(object_store::Error::Generic {
-                    store: "prefix-listing-fails",
-                    source: Box::new(std::io::Error::other(format!(
-                        "listing failed for {failing_prefix}/"
-                    ))),
-                })
-            })
-            .boxed();
+            return failing_stream(
+                "prefix-listing-fails",
+                format!("listing failed for {failing_prefix}/"),
+            );
         }
 
         self.inner.list(prefix)
@@ -199,6 +238,14 @@ impl ObjectStore for PrefixListingFailsStore {
         prefix: Option<&Path>,
         offset: &Path,
     ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+        if self.fail_offset_listing && prefix_matches(prefix, self.failing_prefix) {
+            let failing_prefix = self.failing_prefix;
+            return failing_stream(
+                "prefix-listing-fails",
+                format!("offset listing failed for {failing_prefix}/ after {offset}"),
+            );
+        }
+
         self.inner.list_with_offset(prefix, offset)
     }
 
@@ -1284,6 +1331,25 @@ async fn checkpoint_publish_latest_manifest_uses_valid_marker_without_full_listi
 }
 
 #[tokio::test]
+async fn checkpoint_publish_latest_manifest_fails_closed_when_marker_read_fails() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let state = state_write(0, "state-0001", b"state-0");
+    let manifest = manifest(0, publisher.write_state_object(&state).await.unwrap());
+
+    publisher.publish_manifest(&manifest).await.unwrap();
+
+    let marker_read_fails_store = Arc::new(FullListingFailsStore::new_with_read_failure(
+        store,
+        "v1/checkpoint-index/latest-candidate.json",
+    ));
+    let marker_reader = CheckpointPublisher::new(marker_read_fails_store);
+    let err = marker_reader.latest_manifest().await.unwrap_err();
+
+    assert!(err.to_string().contains("read failed"));
+}
+
+#[tokio::test]
 async fn checkpoint_publish_latest_manifest_falls_back_when_marker_is_corrupt() {
     let (_temp_dir, store) = temp_store();
     let publisher = CheckpointPublisher::new(Arc::clone(&store));
@@ -1300,6 +1366,25 @@ async fn checkpoint_publish_latest_manifest_falls_back_when_marker_is_corrupt() 
         .unwrap();
 
     assert_eq!(publisher.latest_manifest().await.unwrap(), Some(manifest));
+}
+
+#[tokio::test]
+async fn checkpoint_publish_latest_manifest_fails_closed_when_future_check_listing_fails() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let state = state_write(0, "state-0001", b"state-0");
+    let manifest = manifest(0, publisher.write_state_object(&state).await.unwrap());
+
+    publisher.publish_manifest(&manifest).await.unwrap();
+
+    let future_listing_fails_store = Arc::new(PrefixListingFailsStore::new_with_offset_failure(
+        store,
+        "v1/checkpoints",
+    ));
+    let marker_reader = CheckpointPublisher::new(future_listing_fails_store);
+    let err = marker_reader.latest_manifest().await.unwrap_err();
+
+    assert!(err.to_string().contains("offset listing failed"));
 }
 
 #[tokio::test]

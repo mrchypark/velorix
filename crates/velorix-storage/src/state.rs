@@ -1085,6 +1085,13 @@ impl CheckpointPublisher {
     ) -> Result<Option<CheckpointManifest>, CheckpointPublishError> {
         match self.try_latest_manifest_from_candidate_marker().await {
             Ok(manifest) => Ok(manifest),
+            Err(CheckpointPublishError::ObjectStore(err)) => Err(err.into()),
+            Err(CheckpointPublishError::MissingStateObject(err)) => {
+                Err(CheckpointPublishError::MissingStateObject(err))
+            }
+            Err(CheckpointPublishError::MissingOutputObject(err)) => {
+                Err(CheckpointPublishError::MissingOutputObject(err))
+            }
             Err(_) => Ok(None),
         }
     }
