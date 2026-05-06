@@ -1,24 +1,20 @@
 use std::sync::Arc;
 
-use arrow::{
-    array::{Array, Int64Array, StringArray, StringViewArray},
-    datatypes::DataType,
-};
 use object_store::{path::Path, ObjectStore};
-use serde_json::json;
 use thiserror::Error;
 use velorix_core::{
-    delta::{DeltaBatch, DeltaKey, DeltaRecord, DeltaValue},
+    delta::DeltaBatch,
     engine::{
         EngineCheckpoint, EngineCheckpointPayload, EngineError, IncrementalEngine, LogicalEpoch,
         PrototypeIncrementalEngine, ENGINE_CHECKPOINT_PAYLOAD_SCHEMA_VERSION,
     },
     relation::{
-        ArrowPhysicalTypeV1, DataFusionRegistrationModeV1, DataFusionRegistrationV1,
-        FelderaRelationBindingV1, IncrementalAdapterBindingV1, RelationColumnV1,
+        arrow_record_batches_to_orders_sum_count_delta_batch, ArrowPhysicalTypeV1,
+        DataFusionRegistrationModeV1, DataFusionRegistrationV1, FelderaRelationBindingV1,
+        IncrementalAdapterBindingV1, IncrementalInputAdapterError, RelationColumnV1,
         RelationOperationV1, RelationSchemaError, RelationSemanticRoleV1, SchemaFingerprintV1,
         VelorixLogicalTypeV1, VelorixRelationCatalogV1, VelorixRelationSchemaV1,
-        RELATION_SCHEMA_VERSION_V1,
+        ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID, RELATION_SCHEMA_VERSION_V1,
     },
 };
 use velorix_storage::{
@@ -32,7 +28,7 @@ use velorix_storage::{
 pub const ORDERS_SUM_COUNT_OWNER: &str = "orders_sum_count";
 pub const ORDERS_SUM_COUNT_RELATION_ID: &str = "orders";
 pub const ORDERS_SUM_COUNT_RELATION_VERSION: &str = "2026-05-05.v1";
-pub const ORDERS_SUM_COUNT_ADAPTER_ID: &str = "incremental-adapter-orders-sum-count-v1";
+pub const ORDERS_SUM_COUNT_ADAPTER_ID: &str = ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID;
 
 #[derive(Clone, Debug)]
 pub struct RecoveredRuntime {
@@ -345,226 +341,38 @@ fn prototype_delta_batch_from_arrow_envelope(
     envelope: &IngestEnvelope,
     catalog: &VelorixRelationCatalogV1,
 ) -> Result<DeltaBatch, RecoveryError> {
-    validate_envelope_relation(envelope, catalog)?;
-    if catalog.incremental_adapter.adapter_id != ORDERS_SUM_COUNT_ADAPTER_ID {
-        return Err(RecoveryError::UnsupportedIncrementalAdapter {
-            adapter_id: catalog.incremental_adapter.adapter_id.clone(),
-        });
-    }
-
-    let key_column = relation_column(
-        &catalog.relation_schema,
-        catalog.relation_schema.primary_key_column_ids[0].as_str(),
-    )?;
-    let value_column = single_value_column(&catalog.relation_schema)?;
-    let weight_column = relation_column(
-        &catalog.relation_schema,
-        catalog.relation_schema.weight_column_id.as_str(),
-    )?;
-    let mut records = Vec::new();
-
-    for batch in envelope.record_batches().map_err(IngestLogError::from)? {
-        validate_batch_schema_matches_relation(&batch, &catalog.relation_schema)?;
-        let key = string_column(&batch, key_column.name.as_str())?;
-        let value = int64_column(&batch, value_column.name.as_str())?;
-        let weight = int64_column(&batch, weight_column.name.as_str())?;
-
-        for row in 0..batch.num_rows() {
-            if key.is_null(row) || value.is_null(row) || weight.is_null(row) {
-                return Err(RecoveryError::MalformedPrototypeArrowIngest {
-                    reason: "prototype ingest columns must be non-null".to_string(),
-                });
-            }
-
-            records.push(DeltaRecord::new(
-                DeltaKey::from_json(json!(string_value(&key, row)?)),
-                DeltaValue::from_json(json!(value.value(row))),
-                weight.value(row),
-            ));
-        }
-    }
-
-    Ok(DeltaBatch::from_records(records))
-}
-
-fn validate_envelope_relation(
-    envelope: &IngestEnvelope,
-    catalog: &VelorixRelationCatalogV1,
-) -> Result<(), RecoveryError> {
     let header = envelope.header();
-    if header.relation_id != catalog.relation_schema.relation_id {
-        return Err(RecoveryError::IngestRelationMismatch {
-            field: "relation_id",
-            expected: catalog.relation_schema.relation_id.clone(),
-            actual: header.relation_id.clone(),
-        });
-    }
-    if header.relation_version != catalog.relation_schema.relation_version {
-        return Err(RecoveryError::IngestRelationMismatch {
-            field: "relation_version",
-            expected: catalog.relation_schema.relation_version.clone(),
-            actual: header.relation_version.clone(),
-        });
-    }
-    if header.schema_fingerprint != catalog.schema_fingerprint.as_str() {
-        return Err(RecoveryError::IngestRelationMismatch {
-            field: "schema_fingerprint",
-            expected: catalog.schema_fingerprint.to_string(),
-            actual: header.schema_fingerprint.clone(),
-        });
-    }
+    let batches = envelope.record_batches().map_err(IngestLogError::from)?;
 
-    Ok(())
+    arrow_record_batches_to_orders_sum_count_delta_batch(
+        catalog,
+        header.relation_id.as_str(),
+        header.relation_version.as_str(),
+        header.schema_fingerprint.as_str(),
+        &batches,
+    )
+    .map_err(recovery_error_from_incremental_input)
 }
 
-fn validate_batch_schema_matches_relation(
-    batch: &arrow::record_batch::RecordBatch,
-    relation_schema: &VelorixRelationSchemaV1,
-) -> Result<(), RecoveryError> {
-    if batch.num_columns() != relation_schema.columns.len() {
-        return Err(RecoveryError::MalformedPrototypeArrowIngest {
-            reason: format!(
-                "relation column count mismatch: expected={}, actual={}",
-                relation_schema.columns.len(),
-                batch.num_columns()
-            ),
-        });
-    }
-
-    let schema = batch.schema();
-    for column in &relation_schema.columns {
-        let field = schema.field(column.ordinal as usize);
-        if field.name() != &column.name {
-            return Err(RecoveryError::MalformedPrototypeArrowIngest {
-                reason: format!(
-                    "relation column `{}` must appear at ordinal {}",
-                    column.name, column.ordinal
-                ),
-            });
+fn recovery_error_from_incremental_input(error: IncrementalInputAdapterError) -> RecoveryError {
+    match error {
+        IncrementalInputAdapterError::RelationCatalog(error) => {
+            RecoveryError::RelationCatalog(error)
         }
-        if field.is_nullable() != column.nullable {
-            return Err(RecoveryError::MalformedPrototypeArrowIngest {
-                reason: format!("relation column `{}` nullability mismatch", column.name),
-            });
+        IncrementalInputAdapterError::IngestRelationMismatch {
+            field,
+            expected,
+            actual,
+        } => RecoveryError::IngestRelationMismatch {
+            field,
+            expected,
+            actual,
+        },
+        IncrementalInputAdapterError::UnsupportedIncrementalAdapter { adapter_id } => {
+            RecoveryError::UnsupportedIncrementalAdapter { adapter_id }
         }
-        if !physical_arrow_type_matches(&column.physical_arrow_type, field.data_type()) {
-            return Err(RecoveryError::MalformedPrototypeArrowIngest {
-                reason: format!(
-                    "relation column `{}` physical Arrow type mismatch",
-                    column.name
-                ),
-            });
+        IncrementalInputAdapterError::MalformedArrowInput { reason } => {
+            RecoveryError::MalformedPrototypeArrowIngest { reason }
         }
     }
-
-    Ok(())
-}
-
-fn physical_arrow_type_matches(expected: &ArrowPhysicalTypeV1, actual: &DataType) -> bool {
-    match expected {
-        ArrowPhysicalTypeV1::Boolean => actual == &DataType::Boolean,
-        ArrowPhysicalTypeV1::Int64 => actual == &DataType::Int64,
-        ArrowPhysicalTypeV1::Float64 => actual == &DataType::Float64,
-        ArrowPhysicalTypeV1::Utf8 | ArrowPhysicalTypeV1::JsonUtf8 => actual == &DataType::Utf8,
-        ArrowPhysicalTypeV1::Date32 => actual == &DataType::Date32,
-        ArrowPhysicalTypeV1::Decimal128 { precision, scale } => i8::try_from(*scale)
-            .is_ok_and(|scale| actual == &DataType::Decimal128(*precision, scale)),
-        ArrowPhysicalTypeV1::TimestampNanosecond { .. }
-        | ArrowPhysicalTypeV1::DictionaryUtf8 { .. } => false,
-    }
-}
-
-fn relation_column<'a>(
-    schema: &'a VelorixRelationSchemaV1,
-    column_id: &str,
-) -> Result<&'a RelationColumnV1, RecoveryError> {
-    schema
-        .columns
-        .iter()
-        .find(|column| column.column_id == column_id)
-        .ok_or_else(|| RecoveryError::MalformedPrototypeArrowIngest {
-            reason: format!("relation catalog is missing column `{column_id}`"),
-        })
-}
-
-fn single_value_column(
-    schema: &VelorixRelationSchemaV1,
-) -> Result<&RelationColumnV1, RecoveryError> {
-    let mut values = schema
-        .columns
-        .iter()
-        .filter(|column| column.semantic_role == RelationSemanticRoleV1::Value);
-    let Some(column) = values.next() else {
-        return Err(RecoveryError::MalformedPrototypeArrowIngest {
-            reason: "relation catalog must define one value column".to_string(),
-        });
-    };
-    if values.next().is_some() {
-        return Err(RecoveryError::MalformedPrototypeArrowIngest {
-            reason: "prototype adapter supports exactly one value column".to_string(),
-        });
-    }
-
-    Ok(column)
-}
-
-enum StringColumn<'a> {
-    Utf8(&'a StringArray),
-    Utf8View(&'a StringViewArray),
-}
-
-impl StringColumn<'_> {
-    fn is_null(&self, row: usize) -> bool {
-        match self {
-            Self::Utf8(array) => array.is_null(row),
-            Self::Utf8View(array) => array.is_null(row),
-        }
-    }
-}
-
-fn string_column<'a>(
-    batch: &'a arrow::record_batch::RecordBatch,
-    name: &str,
-) -> Result<StringColumn<'a>, RecoveryError> {
-    let column =
-        batch
-            .column_by_name(name)
-            .ok_or_else(|| RecoveryError::MalformedPrototypeArrowIngest {
-                reason: format!("missing `{name}` column"),
-            })?;
-
-    if let Some(array) = column.as_any().downcast_ref::<StringArray>() {
-        return Ok(StringColumn::Utf8(array));
-    }
-
-    if let Some(array) = column.as_any().downcast_ref::<StringViewArray>() {
-        return Ok(StringColumn::Utf8View(array));
-    }
-
-    Err(RecoveryError::MalformedPrototypeArrowIngest {
-        reason: format!("`{name}` column must be Utf8"),
-    })
-}
-
-fn string_value(column: &StringColumn<'_>, row: usize) -> Result<String, RecoveryError> {
-    Ok(match column {
-        StringColumn::Utf8(array) => array.value(row).to_string(),
-        StringColumn::Utf8View(array) => array.value(row).to_string(),
-    })
-}
-
-fn int64_column<'a>(
-    batch: &'a arrow::record_batch::RecordBatch,
-    name: &str,
-) -> Result<&'a Int64Array, RecoveryError> {
-    batch
-        .column_by_name(name)
-        .ok_or_else(|| RecoveryError::MalformedPrototypeArrowIngest {
-            reason: format!("missing `{name}` column"),
-        })?
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .ok_or_else(|| RecoveryError::MalformedPrototypeArrowIngest {
-            reason: format!("`{name}` column must be Int64"),
-        })
 }

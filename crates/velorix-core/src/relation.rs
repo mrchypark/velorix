@@ -2,20 +2,25 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::sync::Arc;
 
+use arrow::array::{Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
 use datafusion::error::DataFusionError;
 use datafusion::prelude::SessionContext;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+use crate::delta::{DeltaBatch, DeltaKey, DeltaRecord, DeltaValue};
 
 pub const RELATION_SCHEMA_VERSION_V1: u32 = 1;
 pub const SCHEMA_FINGERPRINT_V1_DOMAIN: &[u8] = b"velorix-relation-schema-v1\0";
 pub const DATAFUSION_RELATION_ID_METADATA_KEY: &str = "velorix.relation_id";
 pub const DATAFUSION_RELATION_VERSION_METADATA_KEY: &str = "velorix.relation_version";
 pub const DATAFUSION_SCHEMA_FINGERPRINT_METADATA_KEY: &str = "velorix.schema_fingerprint";
+pub const ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID: &str = "incremental-adapter-orders-sum-count-v1";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -356,6 +361,22 @@ pub enum RelationSchemaError {
     Serialization { reason: String },
 }
 
+#[derive(Debug, Error, Eq, PartialEq)]
+pub enum IncrementalInputAdapterError {
+    #[error(transparent)]
+    RelationCatalog(#[from] RelationSchemaError),
+    #[error("ingest relation mismatch for {field}: expected `{expected}`, actual `{actual}`")]
+    IngestRelationMismatch {
+        field: &'static str,
+        expected: String,
+        actual: String,
+    },
+    #[error("unsupported incremental adapter `{adapter_id}`")]
+    UnsupportedIncrementalAdapter { adapter_id: String },
+    #[error("malformed prototype Arrow ingest: {reason}")]
+    MalformedArrowInput { reason: String },
+}
+
 pub fn validate_schema_fingerprint(
     field: &'static str,
     fingerprint: &str,
@@ -449,6 +470,65 @@ pub fn validate_record_batch_matches_catalog(
     Ok(())
 }
 
+pub fn arrow_record_batches_to_orders_sum_count_delta_batch(
+    catalog: &VelorixRelationCatalogV1,
+    relation_id: &str,
+    relation_version: &str,
+    schema_fingerprint: &str,
+    batches: &[RecordBatch],
+) -> Result<DeltaBatch, IncrementalInputAdapterError> {
+    catalog.validate()?;
+    validate_incremental_input_identity(
+        catalog,
+        relation_id,
+        relation_version,
+        schema_fingerprint,
+    )?;
+    if catalog.incremental_adapter.adapter_id != ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID {
+        return Err(
+            IncrementalInputAdapterError::UnsupportedIncrementalAdapter {
+                adapter_id: catalog.incremental_adapter.adapter_id.clone(),
+            },
+        );
+    }
+    if batches.is_empty() {
+        return Err(IncrementalInputAdapterError::MalformedArrowInput {
+            reason: "at least one Arrow record batch is required".to_string(),
+        });
+    }
+
+    let key_column = single_primary_key_column(&catalog.relation_schema)?;
+    let value_column = single_value_column(&catalog.relation_schema)?;
+    let weight_column = relation_column(
+        &catalog.relation_schema,
+        catalog.relation_schema.weight_column_id.as_str(),
+    )?;
+    let mut records = Vec::new();
+
+    for batch in batches {
+        validate_record_batch_matches_catalog(catalog, batch)?;
+        let key = string_column(batch, key_column.name.as_str())?;
+        let value = int64_column(batch, value_column.name.as_str())?;
+        let weight = int64_column(batch, weight_column.name.as_str())?;
+
+        for row in 0..batch.num_rows() {
+            if key.is_null(row) || value.is_null(row) || weight.is_null(row) {
+                return Err(IncrementalInputAdapterError::MalformedArrowInput {
+                    reason: "prototype ingest columns must be non-null".to_string(),
+                });
+            }
+
+            records.push(DeltaRecord::new(
+                DeltaKey::from_json(json!(key.value(row))),
+                DeltaValue::from_json(json!(value.value(row))),
+                weight.value(row),
+            ));
+        }
+    }
+
+    Ok(DeltaBatch::from_records(records))
+}
+
 pub fn register_datafusion_catalog_batches(
     context: &SessionContext,
     catalog: &VelorixRelationCatalogV1,
@@ -501,6 +581,115 @@ fn data_type_for_arrow_physical_type(
             });
         }
     })
+}
+
+fn validate_incremental_input_identity(
+    catalog: &VelorixRelationCatalogV1,
+    relation_id: &str,
+    relation_version: &str,
+    schema_fingerprint: &str,
+) -> Result<(), IncrementalInputAdapterError> {
+    if relation_id != catalog.relation_schema.relation_id {
+        return Err(IncrementalInputAdapterError::IngestRelationMismatch {
+            field: "relation_id",
+            expected: catalog.relation_schema.relation_id.clone(),
+            actual: relation_id.to_string(),
+        });
+    }
+    if relation_version != catalog.relation_schema.relation_version {
+        return Err(IncrementalInputAdapterError::IngestRelationMismatch {
+            field: "relation_version",
+            expected: catalog.relation_schema.relation_version.clone(),
+            actual: relation_version.to_string(),
+        });
+    }
+    if schema_fingerprint != catalog.schema_fingerprint.as_str() {
+        return Err(IncrementalInputAdapterError::IngestRelationMismatch {
+            field: "schema_fingerprint",
+            expected: catalog.schema_fingerprint.to_string(),
+            actual: schema_fingerprint.to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn relation_column<'a>(
+    schema: &'a VelorixRelationSchemaV1,
+    column_id: &str,
+) -> Result<&'a RelationColumnV1, IncrementalInputAdapterError> {
+    schema
+        .columns
+        .iter()
+        .find(|column| column.column_id == column_id)
+        .ok_or_else(|| IncrementalInputAdapterError::MalformedArrowInput {
+            reason: format!("relation catalog is missing column `{column_id}`"),
+        })
+}
+
+fn single_primary_key_column(
+    schema: &VelorixRelationSchemaV1,
+) -> Result<&RelationColumnV1, IncrementalInputAdapterError> {
+    if schema.primary_key_column_ids.len() != 1 {
+        return Err(IncrementalInputAdapterError::MalformedArrowInput {
+            reason: "prototype adapter supports exactly one primary key column".to_string(),
+        });
+    }
+
+    relation_column(schema, schema.primary_key_column_ids[0].as_str())
+}
+
+fn single_value_column(
+    schema: &VelorixRelationSchemaV1,
+) -> Result<&RelationColumnV1, IncrementalInputAdapterError> {
+    let mut values = schema
+        .columns
+        .iter()
+        .filter(|column| column.semantic_role == RelationSemanticRoleV1::Value);
+    let Some(column) = values.next() else {
+        return Err(IncrementalInputAdapterError::MalformedArrowInput {
+            reason: "relation catalog must define one value column".to_string(),
+        });
+    };
+    if values.next().is_some() {
+        return Err(IncrementalInputAdapterError::MalformedArrowInput {
+            reason: "prototype adapter supports exactly one value column".to_string(),
+        });
+    }
+
+    Ok(column)
+}
+
+fn string_column<'a>(
+    batch: &'a RecordBatch,
+    name: &str,
+) -> Result<&'a StringArray, IncrementalInputAdapterError> {
+    batch
+        .column_by_name(name)
+        .ok_or_else(|| IncrementalInputAdapterError::MalformedArrowInput {
+            reason: format!("missing `{name}` column"),
+        })?
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| IncrementalInputAdapterError::MalformedArrowInput {
+            reason: format!("`{name}` column must be Utf8"),
+        })
+}
+
+fn int64_column<'a>(
+    batch: &'a RecordBatch,
+    name: &str,
+) -> Result<&'a Int64Array, IncrementalInputAdapterError> {
+    batch
+        .column_by_name(name)
+        .ok_or_else(|| IncrementalInputAdapterError::MalformedArrowInput {
+            reason: format!("missing `{name}` column"),
+        })?
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| IncrementalInputAdapterError::MalformedArrowInput {
+            reason: format!("`{name}` column must be Int64"),
+        })
 }
 
 fn relation_datafusion_error(error: RelationSchemaError) -> DataFusionError {

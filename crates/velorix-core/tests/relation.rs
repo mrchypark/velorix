@@ -6,13 +6,15 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use datafusion::prelude::SessionContext;
+use velorix_core::delta::{DeltaKey, DeltaRecord, DeltaValue};
 use velorix_core::relation::{
-    datafusion_schema_from_catalog, register_datafusion_catalog_batches,
-    validate_record_batch_matches_catalog, ArrowPhysicalTypeV1, DataFusionRegistrationModeV1,
-    DataFusionRegistrationV1, FelderaRelationBindingV1, IncrementalAdapterBindingV1,
+    arrow_record_batches_to_orders_sum_count_delta_batch, datafusion_schema_from_catalog,
+    register_datafusion_catalog_batches, validate_record_batch_matches_catalog,
+    ArrowPhysicalTypeV1, DataFusionRegistrationModeV1, DataFusionRegistrationV1,
+    FelderaRelationBindingV1, IncrementalAdapterBindingV1, IncrementalInputAdapterError,
     RelationColumnV1, RelationOperationV1, RelationSchemaError, RelationSemanticRoleV1,
     SchemaFingerprintV1, VelorixLogicalTypeV1, VelorixRelationCatalogV1, VelorixRelationSchemaV1,
-    RELATION_SCHEMA_VERSION_V1,
+    ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID, RELATION_SCHEMA_VERSION_V1,
 };
 
 const ORDERS_RELATION_SCHEMA_FINGERPRINT: &str =
@@ -312,6 +314,82 @@ fn relation_catalog_rejects_reserved_datafusion_registration_name() {
             "accepted invalid DataFusion registration name: {name}"
         );
     }
+}
+
+#[test]
+fn catalog_incremental_input_accepts_catalog_arrow_fixture() {
+    let mut catalog = orders_relation_catalog();
+    catalog.incremental_adapter.adapter_id = ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID.to_string();
+    let batch = orders_input_batch(&["order-a", "order-b"], &[42, 7], &[1, -1]);
+
+    let delta = arrow_record_batches_to_orders_sum_count_delta_batch(
+        &catalog,
+        catalog.relation_schema.relation_id.as_str(),
+        catalog.relation_schema.relation_version.as_str(),
+        catalog.schema_fingerprint.as_str(),
+        &[batch],
+    )
+    .unwrap();
+
+    assert_eq!(
+        delta.records(),
+        &[
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!("order-a")),
+                DeltaValue::from_json(serde_json::json!(42)),
+                1,
+            ),
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!("order-b")),
+                DeltaValue::from_json(serde_json::json!(7)),
+                -1,
+            ),
+        ]
+    );
+}
+
+#[test]
+fn catalog_incremental_input_rejects_unsupported_adapter() {
+    let catalog = orders_relation_catalog();
+    let batch = orders_input_batch(&["order-a"], &[42], &[1]);
+
+    let error = arrow_record_batches_to_orders_sum_count_delta_batch(
+        &catalog,
+        catalog.relation_schema.relation_id.as_str(),
+        catalog.relation_schema.relation_version.as_str(),
+        catalog.schema_fingerprint.as_str(),
+        &[batch],
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        IncrementalInputAdapterError::UnsupportedIncrementalAdapter { .. }
+    ));
+}
+
+#[test]
+fn catalog_incremental_input_rejects_catalog_identity_mismatch() {
+    let mut catalog = orders_relation_catalog();
+    catalog.incremental_adapter.adapter_id = ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID.to_string();
+    let batch = orders_input_batch(&["order-a"], &[42], &[1]);
+
+    let error = arrow_record_batches_to_orders_sum_count_delta_batch(
+        &catalog,
+        "customers",
+        catalog.relation_schema.relation_version.as_str(),
+        catalog.schema_fingerprint.as_str(),
+        &[batch],
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        IncrementalInputAdapterError::IngestRelationMismatch {
+            field: "relation_id",
+            ..
+        }
+    ));
 }
 
 fn orders_relation_catalog() -> VelorixRelationCatalogV1 {
