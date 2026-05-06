@@ -123,6 +123,40 @@ impl RecoveredRuntime {
         .await
     }
 
+    pub async fn recover_from_published_checkpoint_version(
+        store: Arc<dyn ObjectStore>,
+        checkpoint_version: u64,
+    ) -> Result<Self, RecoveryError> {
+        Self::recover_from_published_checkpoint_version_with_owner_and_relation_catalog(
+            store,
+            checkpoint_version,
+            ORDERS_SUM_COUNT_OWNER,
+            orders_sum_count_relation_catalog()?,
+        )
+        .await
+    }
+
+    pub async fn recover_from_published_checkpoint_version_with_owner_and_relation_catalog(
+        store: Arc<dyn ObjectStore>,
+        checkpoint_version: u64,
+        expected_owner: &str,
+        relation_catalog: VelorixRelationCatalogV1,
+    ) -> Result<Self, RecoveryError> {
+        let publisher = CheckpointPublisher::new(Arc::clone(&store));
+        let manifest = publisher
+            .read_published_checkpoint_manifest(checkpoint_version)
+            .await?;
+
+        Self::recover_with_selected_manifest_and_relation_catalog(
+            store,
+            publisher,
+            manifest,
+            expected_owner,
+            relation_catalog,
+        )
+        .await
+    }
+
     pub async fn recover_with_slatedb_state_store_and_relation_catalog(
         store: Arc<dyn ObjectStore>,
         db_path: impl Into<Path>,
@@ -149,9 +183,44 @@ impl RecoveredRuntime {
     ) -> Result<Self, RecoveryError> {
         relation_catalog.validate()?;
         let latest_manifest = publisher.latest_manifest().await?;
+        Self::recover_from_manifest_and_relation_catalog(
+            store,
+            publisher,
+            latest_manifest,
+            expected_owner,
+            relation_catalog,
+        )
+        .await
+    }
+
+    async fn recover_with_selected_manifest_and_relation_catalog(
+        store: Arc<dyn ObjectStore>,
+        publisher: CheckpointPublisher,
+        manifest: CheckpointManifest,
+        expected_owner: &str,
+        relation_catalog: VelorixRelationCatalogV1,
+    ) -> Result<Self, RecoveryError> {
+        relation_catalog.validate()?;
+        Self::recover_from_manifest_and_relation_catalog(
+            store,
+            publisher,
+            Some(manifest),
+            expected_owner,
+            relation_catalog,
+        )
+        .await
+    }
+
+    async fn recover_from_manifest_and_relation_catalog(
+        store: Arc<dyn ObjectStore>,
+        publisher: CheckpointPublisher,
+        manifest: Option<CheckpointManifest>,
+        expected_owner: &str,
+        relation_catalog: VelorixRelationCatalogV1,
+    ) -> Result<Self, RecoveryError> {
         let mut materialized = PrototypeIncrementalEngine::new();
 
-        if let Some(manifest) = latest_manifest.as_ref() {
+        if let Some(manifest) = manifest.as_ref() {
             let mut checkpointed_state = DeltaBatch::default();
             let mut checkpoint_logical_epoch = None;
             for state_ref in &manifest.state_objects {
@@ -191,7 +260,7 @@ impl RecoveredRuntime {
             ))?;
         }
 
-        let replay_checkpoints = replay_checkpoints(latest_manifest.as_ref());
+        let replay_checkpoints = replay_checkpoints(manifest.as_ref());
         let ingest_log = IngestLog::new(store);
         let replayed = ingest_log
             .replay_validated_envelopes_from(&replay_checkpoints)
@@ -213,7 +282,7 @@ impl RecoveredRuntime {
             materialized,
             replay_checkpoints,
             replayed_batch_count,
-            latest_checkpoint_version: latest_manifest.map(|manifest| manifest.checkpoint_version),
+            latest_checkpoint_version: manifest.map(|manifest| manifest.checkpoint_version),
         })
     }
 

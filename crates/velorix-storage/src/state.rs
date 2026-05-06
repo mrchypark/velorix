@@ -618,6 +618,59 @@ impl CheckpointPublisher {
         })
     }
 
+    pub async fn read_published_checkpoint_manifest(
+        &self,
+        checkpoint_version: u64,
+    ) -> Result<CheckpointManifest, CheckpointPublishError> {
+        let manifest_key = ObjectKey::checkpoint_manifest(checkpoint_version);
+        let manifest_path = Path::from(manifest_key.as_str());
+        let manifest_bytes = self.store.get(&manifest_path).await?.bytes().await?;
+        let manifest = serde_json::from_slice::<CheckpointManifest>(&manifest_bytes)?;
+        manifest.validate()?;
+
+        let body_key = manifest.object_key();
+        if manifest_key != body_key {
+            return Err(CheckpointPublishError::ManifestKeyMismatch {
+                object_key: manifest_key,
+                body_key,
+            });
+        }
+        if manifest.checkpoint_version != checkpoint_version {
+            return Err(CheckpointPublishError::ObjectKey(
+                ObjectKeyError::InvalidExternalKey(format!(
+                    "checkpoint manifest key version {checkpoint_version} does not match body version {}",
+                    manifest.checkpoint_version
+                )),
+            ));
+        }
+
+        self.validate_parent_manifest_visible(&manifest).await?;
+        self.validate_state_objects_exist(&manifest).await?;
+        self.validate_output_objects_exist(&manifest).await?;
+
+        let lifecycle = self
+            .read_checkpoint_lifecycle_record(checkpoint_version)
+            .await?;
+        let expected_digest = manifest_digest(&manifest_bytes);
+        if lifecycle.status != CheckpointLifecycleStatus::Published {
+            return Err(CheckpointPublishError::ObjectKey(
+                ObjectKeyError::InvalidExternalKey(format!(
+                    "checkpoint {checkpoint_version} is not published"
+                )),
+            ));
+        }
+        if lifecycle.manifest_digest != expected_digest {
+            return Err(CheckpointPublishError::ObjectKey(
+                ObjectKeyError::InvalidExternalKey(format!(
+                    "checkpoint lifecycle manifest digest mismatch for checkpoint {checkpoint_version}: expected {expected_digest}, actual {}",
+                    lifecycle.manifest_digest
+                )),
+            ));
+        }
+
+        Ok(manifest)
+    }
+
     pub async fn plan_garbage_collection(
         &self,
         policy: GarbageCollectionPolicy,

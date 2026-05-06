@@ -548,6 +548,108 @@ async fn local_recovery_uses_latest_manifest_when_multiple_are_published() {
 }
 
 #[tokio::test]
+async fn local_recovery_can_use_selected_checkpoint_when_future_manifest_is_corrupt() {
+    let (_temp_dir, store) = temp_store();
+    let ingest_log = IngestLog::new(Arc::clone(&store));
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+
+    let checkpointed = batch([input_delta("account-a", 10, 1)]);
+    let replayed_after_checkpoint = batch([input_delta("account-a", 5, 1)]);
+    let replayed_after_corrupt_manifest = batch([input_delta("account-b", 7, 1)]);
+
+    for (start, end, input) in [
+        (0, 1, &checkpointed),
+        (1, 2, &replayed_after_checkpoint),
+        (2, 3, &replayed_after_corrupt_manifest),
+    ] {
+        append_ingest_envelope(&ingest_log, "orders", 0, start, end, input).await;
+    }
+
+    let mut checkpointed_view = KeyedSumCountAggregate::new();
+    checkpointed_view.apply(&checkpointed).unwrap();
+    let state_ref = write_checkpoint_state(
+        &publisher,
+        0,
+        "state-last-known-good",
+        &checkpointed_view.state(),
+    )
+    .await;
+    publisher
+        .publish_manifest(&manifest_with_ranges(
+            0,
+            None,
+            vec![input_range("orders", 0, 0, 1)],
+            state_ref,
+        ))
+        .await
+        .unwrap();
+    store
+        .put(
+            &Path::from(ObjectKey::checkpoint_manifest(1).as_str()),
+            Bytes::from_static(b"{not valid json").into(),
+        )
+        .await
+        .unwrap();
+
+    assert!(RecoveredRuntime::recover(Arc::clone(&store)).await.is_err());
+
+    let recovered =
+        RecoveredRuntime::recover_from_published_checkpoint_version(Arc::clone(&store), 0)
+            .await
+            .unwrap();
+    let mut expected_view = KeyedSumCountAggregate::new();
+    for input in [
+        &checkpointed,
+        &replayed_after_checkpoint,
+        &replayed_after_corrupt_manifest,
+    ] {
+        expected_view.apply(input).unwrap();
+    }
+
+    assert_eq!(
+        recovered.materialized_state().net_rows().unwrap(),
+        expected_view.state().net_rows().unwrap()
+    );
+    assert_eq!(recovered.replayed_batch_count(), 2);
+    assert_eq!(recovered.latest_checkpoint_version(), Some(0));
+}
+
+#[tokio::test]
+async fn local_recovery_rejects_selected_checkpoint_when_payload_is_missing() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let checkpointed = batch([input_delta("account-a", 10, 1)]);
+    let state_ref = write_checkpoint_state(&publisher, 0, "missing-state", &checkpointed).await;
+
+    publisher
+        .publish_manifest(&manifest_with_ranges(
+            0,
+            None,
+            vec![input_range("orders", 0, 0, 1)],
+            state_ref,
+        ))
+        .await
+        .unwrap();
+    store
+        .delete(&Path::from(
+            ObjectKey::state_object(RECOVERY_OWNER, 0, 0, "missing-state")
+                .unwrap()
+                .as_str(),
+        ))
+        .await
+        .unwrap();
+
+    let error = RecoveredRuntime::recover_from_published_checkpoint_version(Arc::clone(&store), 0)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RecoveryError::Checkpoint(CheckpointPublishError::MissingStateObject(_))
+    ));
+}
+
+#[tokio::test]
 async fn local_recovery_preserves_signed_checkpoint_state_and_signed_replay() {
     let (_temp_dir, store) = temp_store();
     let ingest_log = IngestLog::new(Arc::clone(&store));

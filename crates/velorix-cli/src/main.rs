@@ -51,6 +51,8 @@ enum Command {
     RecoverLocal {
         #[arg(long)]
         object_store_dir: PathBuf,
+        #[arg(long)]
+        checkpoint_version: Option<u64>,
     },
     CheckpointInspectLocal {
         #[arg(long)]
@@ -121,10 +123,22 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Command::RecoverLocal { object_store_dir }) => {
-            let recovered = RecoveredRuntime::recover(local_object_store(&object_store_dir)?)
-                .await
-                .context("failed to recover local runtime")?;
+        Some(Command::RecoverLocal {
+            object_store_dir,
+            checkpoint_version,
+        }) => {
+            let store = local_object_store(&object_store_dir)?;
+            let recovered = match checkpoint_version {
+                Some(checkpoint_version) => {
+                    RecoveredRuntime::recover_from_published_checkpoint_version(
+                        store,
+                        checkpoint_version,
+                    )
+                    .await
+                }
+                None => RecoveredRuntime::recover(store).await,
+            }
+            .context("failed to recover local runtime")?;
             let materialized_records = recovered.materialized_state().records().len();
 
             println!(
@@ -1037,6 +1051,30 @@ mod tests {
 
         assert_eq!(gate_level, BenchmarkGateLevel::PrSmoke);
         assert_eq!(backend, BenchmarkBackend::Local);
+    }
+
+    #[test]
+    fn recover_local_cli_parses_selected_checkpoint_version() {
+        let cli = Cli::try_parse_from([
+            "velorix-cli",
+            "recover-local",
+            "--object-store-dir",
+            "/tmp/velorix",
+            "--checkpoint-version",
+            "7",
+        ])
+        .unwrap();
+
+        let Some(Command::RecoverLocal {
+            object_store_dir,
+            checkpoint_version,
+        }) = cli.command
+        else {
+            panic!("expected recover-local command");
+        };
+
+        assert_eq!(object_store_dir, PathBuf::from("/tmp/velorix"));
+        assert_eq!(checkpoint_version, Some(7));
     }
 
     #[test]
