@@ -239,6 +239,7 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 print!("{}", format_readiness_report(&report));
             }
+            ensure_readiness_report_passes(&report)?;
         }
         Some(Command::FelderaArtifactVerify {
             spec,
@@ -317,6 +318,17 @@ fn format_readiness_report(report: &ProductionReadinessReportV1) -> String {
         }
     }
     output
+}
+
+fn ensure_readiness_report_passes(report: &ProductionReadinessReportV1) -> anyhow::Result<()> {
+    if report.production_ready {
+        Ok(())
+    } else {
+        bail!(
+            "production readiness report is blocked: {}",
+            report.blocking_reasons.join("; ")
+        )
+    }
 }
 
 fn format_feldera_artifact_evidence_json(
@@ -1337,6 +1349,33 @@ mod tests {
 
         assert!(summary.starts_with("production_ready=true\n"));
         assert!(!summary.trim_start().starts_with('{'));
+    }
+
+    #[test]
+    fn readiness_report_gate_passes_when_production_ready() {
+        let report = ProductionReadinessEvidenceV1::from_json_str(&readiness_json())
+            .unwrap()
+            .try_into_report()
+            .unwrap();
+
+        ensure_readiness_report_passes(&report).unwrap();
+    }
+
+    #[test]
+    fn readiness_report_gate_fails_when_blocking_reasons_present() {
+        let report = ProductionReadinessEvidenceV1::from_json_str(&readiness_json().replace(
+            r#""evidence_kind":["dependency_governance_validated"]"#,
+            r#""evidence_kind":[]"#,
+        ))
+        .unwrap()
+        .try_into_report()
+        .unwrap();
+
+        let error = ensure_readiness_report_passes(&report).unwrap_err();
+
+        assert!(format!("{error:#}").contains(
+            "production readiness report is blocked: dependency_governance_status missing dependency_governance_validated evidence"
+        ));
     }
 
     #[test]
