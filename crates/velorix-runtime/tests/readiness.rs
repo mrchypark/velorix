@@ -1,4 +1,8 @@
-use velorix_runtime::readiness::ProductionReadinessEvidenceV1;
+use std::path::PathBuf;
+
+use velorix_runtime::readiness::{
+    verify_feldera_artifact_release_provenance_evidence, ProductionReadinessEvidenceV1,
+};
 
 #[test]
 fn readiness_report_is_production_ready_when_all_required_evidence_passes() {
@@ -234,6 +238,55 @@ fn readiness_report_blocks_when_feldera_artifact_hash_verified_evidence_is_missi
 }
 
 #[test]
+fn readiness_report_blocks_when_feldera_artifact_release_provenance_evidence_is_missing() {
+    let report = ProductionReadinessEvidenceV1::from_json_str(&readiness_json(
+        &["feldera_artifact_release_provenance"],
+        false,
+        &[],
+    ))
+    .unwrap()
+    .try_into_report()
+    .unwrap();
+
+    assert!(!report.production_ready);
+    assert_eq!(
+        report.blocking_reasons,
+        vec!["feldera_artifact_status missing feldera_artifact_release_provenance evidence"]
+    );
+}
+
+#[test]
+fn feldera_release_provenance_verifier_outputs_stable_readiness_evidence() {
+    let metadata_json = fixture_json("compile_artifact_valid");
+    let provenance_json = fixture_json("release_provenance_valid");
+
+    let evidence =
+        verify_feldera_artifact_release_provenance_evidence(&metadata_json, &provenance_json)
+            .unwrap();
+    let json = serde_json::to_value(evidence).unwrap();
+
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "schema_version": 1,
+            "status": "pass",
+            "evidence_kind": "feldera_artifact_release_provenance",
+            "release_id": "velorix-feldera-release-20260507",
+            "release_version": "1.0.0-rc.1",
+            "build_id": "feldera-build-20260507T000000Z",
+            "builder_id": "github-actions/feldera-artifacts",
+            "artifact_id": "feldera-artifact-orders-by-region-20260503",
+            "artifact_hash": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "spec_hash": "velorix-feldera-spec-sha256-v1:0e24cbe06543d735a6d62868f230c4610fb9139cb91e5e8f72042f17da0ecbea",
+            "generated_rust_abi_version": "feldera-generated-rust-abi-v1",
+            "generated_rust_crate_name": "orders_by_region_pipeline",
+            "source_repository": "https://github.com/mrchypark/velorix",
+            "source_revision": "0123456789abcdef0123456789abcdef01234567"
+        })
+    );
+}
+
+#[test]
 fn readiness_evidence_rejects_unknown_json_fields() {
     let error = ProductionReadinessEvidenceV1::from_json_str(
         r#"{
@@ -324,6 +377,9 @@ fn readiness_json(
     if !missing_evidence.contains(&"feldera_artifact_hash_verified") {
         feldera_artifact_evidence_kind.push("feldera_artifact_hash_verified");
     }
+    if !missing_evidence.contains(&"feldera_artifact_release_provenance") {
+        feldera_artifact_evidence_kind.push("feldera_artifact_release_provenance");
+    }
     let feldera_artifact_kind = if feldera_artifact_evidence_kind.is_empty() {
         String::new()
     } else {
@@ -363,6 +419,19 @@ fn readiness_json(
         benchmark_status = status_for("benchmark_gate_status", failed_fields),
         benchmark_evidence = evidence_for("benchmark_gate_status", failed_fields),
     )
+}
+
+fn fixture_json(name: &str) -> String {
+    std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("velorix-core")
+            .join("tests")
+            .join("fixtures")
+            .join("feldera")
+            .join(format!("{name}.json")),
+    )
+    .unwrap()
 }
 
 fn status_for(field: &str, failed_fields: &[&str]) -> &'static str {

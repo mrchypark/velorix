@@ -9,7 +9,7 @@ generated Rust at runtime.
 
 ## Contract Shape
 
-`velorix-core::feldera_artifact` defines two serde-backed documents:
+`velorix-core::feldera_artifact` defines three serde-backed documents:
 
 - `StandingViewSpec`: the Velorix view contract, including `view_id`, SQL text,
   Feldera SQL dialect/source kind, typed input relation schemas, typed output
@@ -18,6 +18,10 @@ generated Rust at runtime.
   metadata version, `view_id`, spec hash, artifact id/hash, Feldera compiler
   identity, generated Rust ABI identity, input/output schemas, state codec,
   state schema version, and epoch policy.
+- `FelderaReleaseArtifactProvenanceV1`: the release/build provenance identity,
+  including release id/version, build id/builder id, artifact id/hash, spec
+  hash, generated Rust ABI/crate identity, source repository/revision, and
+  compiler name/version.
 
 The v1 `spec_hash` format is
 `velorix-feldera-spec-sha256-v1:<hex>`. The digest is SHA-256 over the
@@ -61,6 +65,17 @@ against `FelderaCompileArtifactMetadata.artifact_hash`; they do not invoke
 Feldera, DBSP, Java/Maven, dynamic loading, or generated Rust execution. This is
 byte-integrity evidence, not proof that a trusted release pipeline produced the
 artifact.
+
+Release provenance is a separate fail-closed readiness slice. The provenance
+document uses serde `deny_unknown_fields`, requires every release/build/source
+identity string, and must match `FelderaCompileArtifactMetadata` for
+`artifact_id`, `artifact_hash`, `spec_hash`,
+`generated_rust.abi_version`, and `generated_rust.crate_name`.
+`velorix-cli feldera-artifact-provenance-verify --metadata <metadata-json>
+--provenance <provenance-json> --json` emits stable
+`feldera_artifact_release_provenance` readiness evidence after those checks
+pass. It only validates JSON identity; it does not load, compile, or execute a
+Feldera/DBSP artifact and it does not create a global artifact-id index.
 
 Object storage manifests remain durable data and progress authority. They may
 reference a validated artifact id/hash, but they cannot make code executable by

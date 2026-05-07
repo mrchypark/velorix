@@ -17,7 +17,8 @@ use velorix_runtime::benchmark_gate::{
     BenchmarkBackend, BenchmarkBudgetV1, BenchmarkGateLevel, BenchmarkGateResultV1,
 };
 use velorix_runtime::readiness::{
-    verify_feldera_artifact_hash_evidence, FelderaArtifactHashVerifiedEvidenceV1,
+    verify_feldera_artifact_hash_evidence, verify_feldera_artifact_release_provenance_evidence,
+    FelderaArtifactHashVerifiedEvidenceV1, FelderaArtifactReleaseProvenanceEvidenceV1,
     ProductionReadinessEvidenceV1, ProductionReadinessReportV1,
 };
 
@@ -134,6 +135,14 @@ enum Command {
         metadata: PathBuf,
         #[arg(long = "artifact-package")]
         artifact_package: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    FelderaArtifactProvenanceVerify {
+        #[arg(long)]
+        metadata: PathBuf,
+        #[arg(long)]
+        provenance: PathBuf,
         #[arg(long)]
         json: bool,
     },
@@ -279,6 +288,25 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
         }
+        Some(Command::FelderaArtifactProvenanceVerify {
+            metadata,
+            provenance,
+            json,
+        }) => {
+            let evidence =
+                read_feldera_artifact_release_provenance_evidence(&metadata, &provenance)?;
+            if json {
+                println!(
+                    "{}",
+                    format_feldera_artifact_release_provenance_evidence_json(&evidence)?
+                );
+            } else {
+                println!(
+                    "feldera_artifact_release_provenance release_id={} artifact_id={}",
+                    evidence.release_id, evidence.artifact_id
+                );
+            }
+        }
         Some(Command::DependencyGovernanceValidate {
             manifest,
             cargo_deny_json,
@@ -391,6 +419,27 @@ fn read_feldera_artifact_hash_verified_evidence(
         .map_err(anyhow::Error::msg)
 }
 
+fn read_feldera_artifact_release_provenance_evidence(
+    metadata: &Path,
+    provenance: &Path,
+) -> anyhow::Result<FelderaArtifactReleaseProvenanceEvidenceV1> {
+    let metadata_json = fs::read_to_string(metadata).with_context(|| {
+        format!(
+            "failed to read Feldera artifact metadata from {}",
+            metadata.display()
+        )
+    })?;
+    let provenance_json = fs::read_to_string(provenance).with_context(|| {
+        format!(
+            "failed to read Feldera release artifact provenance from {}",
+            provenance.display()
+        )
+    })?;
+
+    verify_feldera_artifact_release_provenance_evidence(&metadata_json, &provenance_json)
+        .map_err(anyhow::Error::msg)
+}
+
 fn format_readiness_report(report: &ProductionReadinessReportV1) -> String {
     let mut output = format!(
         "production_ready={}\ndeployment_id={}\nauthority_store_id={}\n",
@@ -422,6 +471,14 @@ fn format_feldera_artifact_evidence_json(
     evidence
         .to_json_pretty()
         .context("failed to serialize Feldera artifact evidence")
+}
+
+fn format_feldera_artifact_release_provenance_evidence_json(
+    evidence: &FelderaArtifactReleaseProvenanceEvidenceV1,
+) -> anyhow::Result<String> {
+    evidence
+        .to_json_pretty()
+        .context("failed to serialize Feldera release provenance evidence")
 }
 
 fn validate_dependency_governance_file(
@@ -1466,6 +1523,33 @@ mod tests {
     }
 
     #[test]
+    fn feldera_artifact_provenance_verify_cli_parses_json_command() {
+        let cli = Cli::try_parse_from([
+            "velorix-cli",
+            "feldera-artifact-provenance-verify",
+            "--metadata",
+            "metadata.json",
+            "--provenance",
+            "provenance.json",
+            "--json",
+        ])
+        .unwrap();
+
+        let Some(Command::FelderaArtifactProvenanceVerify {
+            metadata,
+            provenance,
+            json,
+        }) = cli.command
+        else {
+            panic!("expected feldera-artifact-provenance-verify command");
+        };
+
+        assert_eq!(metadata, PathBuf::from("metadata.json"));
+        assert_eq!(provenance, PathBuf::from("provenance.json"));
+        assert!(json);
+    }
+
+    #[test]
     fn feldera_artifact_verify_outputs_stable_json_evidence() {
         let dir = tempdir().unwrap();
         let spec = dir.path().join("spec.json");
@@ -1493,6 +1577,42 @@ mod tests {
                 "artifact_hash": "sha256:9063ca4eca6bd69190c68b01a00def0a5b86470abbc2312e94491c59a1c7f537",
                 "spec_hash": "velorix-feldera-spec-sha256-v1:0e24cbe06543d735a6d62868f230c4610fb9139cb91e5e8f72042f17da0ecbea",
                 "generated_rust_abi_version": "feldera-generated-rust-abi-v1"
+            })
+        );
+    }
+
+    #[test]
+    fn feldera_artifact_provenance_verify_outputs_stable_json_evidence() {
+        let dir = tempdir().unwrap();
+        let metadata = dir.path().join("metadata.json");
+        let provenance = dir.path().join("provenance.json");
+        fs::write(&metadata, feldera_metadata_json()).unwrap();
+        fs::write(&provenance, feldera_release_provenance_json()).unwrap();
+
+        let evidence =
+            read_feldera_artifact_release_provenance_evidence(&metadata, &provenance).unwrap();
+        let json: serde_json::Value = serde_json::from_str(
+            &format_feldera_artifact_release_provenance_evidence_json(&evidence).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "schema_version": 1,
+                "status": "pass",
+                "evidence_kind": "feldera_artifact_release_provenance",
+                "release_id": "velorix-feldera-release-20260507",
+                "release_version": "1.0.0-rc.1",
+                "build_id": "feldera-build-20260507T000000Z",
+                "builder_id": "github-actions/feldera-artifacts",
+                "artifact_id": "feldera-artifact-orders-by-region-20260503",
+                "artifact_hash": "sha256:9063ca4eca6bd69190c68b01a00def0a5b86470abbc2312e94491c59a1c7f537",
+                "spec_hash": "velorix-feldera-spec-sha256-v1:0e24cbe06543d735a6d62868f230c4610fb9139cb91e5e8f72042f17da0ecbea",
+                "generated_rust_abi_version": "feldera-generated-rust-abi-v1",
+                "generated_rust_crate_name": "orders_by_region_pipeline",
+                "source_repository": "https://github.com/mrchypark/velorix",
+                "source_revision": "0123456789abcdef0123456789abcdef01234567"
             })
         );
     }
@@ -2270,7 +2390,11 @@ mod tests {
             "feldera_artifact_status": {
                 "status": "pass",
                 "evidence": "trusted artifact metadata",
-                "evidence_kind": ["feldera_artifact_registry", "feldera_artifact_hash_verified"]
+                "evidence_kind": [
+                    "feldera_artifact_registry",
+                    "feldera_artifact_hash_verified",
+                    "feldera_artifact_release_provenance"
+                ]
             },
             "dependency_governance_status": {
                 "status": "pass",
@@ -2322,6 +2446,26 @@ mod tests {
             "sha256:9063ca4eca6bd69190c68b01a00def0a5b86470abbc2312e94491c59a1c7f537"
         );
         metadata.to_string()
+    }
+
+    fn feldera_release_provenance_json() -> String {
+        let mut provenance: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("..")
+                    .join("velorix-core")
+                    .join("tests")
+                    .join("fixtures")
+                    .join("feldera")
+                    .join("release_provenance_valid.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        provenance["build"]["artifact_hash"] = serde_json::json!(
+            "sha256:9063ca4eca6bd69190c68b01a00def0a5b86470abbc2312e94491c59a1c7f537"
+        );
+        provenance.to_string()
     }
 
     fn valid_dependency_governance_json() -> String {

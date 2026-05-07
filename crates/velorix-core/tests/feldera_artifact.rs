@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use velorix_core::feldera_artifact::{
     catalog_input_relation_schema, feldera_artifact_bytes_hash, feldera_spec_hash,
     validate_feldera_compile_artifact, validate_feldera_compile_artifact_for_catalog,
-    validate_feldera_compile_artifact_hash, FelderaArtifactError, FelderaCompileArtifactMetadata,
+    validate_feldera_compile_artifact_hash, validate_feldera_release_artifact_provenance,
+    FelderaArtifactError, FelderaCompileArtifactMetadata, FelderaReleaseArtifactProvenanceV1,
     StandingViewSpec,
 };
 use velorix_core::relation::{
@@ -23,6 +24,10 @@ fn load_artifact(name: &str) -> FelderaCompileArtifactMetadata {
 
 fn parse_artifact(name: &str) -> Result<FelderaCompileArtifactMetadata, serde_json::Error> {
     serde_json::from_str(&std::fs::read_to_string(fixture_path(name)).unwrap())
+}
+
+fn load_provenance(name: &str) -> FelderaReleaseArtifactProvenanceV1 {
+    serde_json::from_str(&std::fs::read_to_string(fixture_path(name)).unwrap()).unwrap()
 }
 
 fn fixture_path(name: &str) -> PathBuf {
@@ -427,6 +432,105 @@ fn feldera_artifact_rejects_input_schema_fingerprint_mismatch() {
 #[test]
 fn feldera_artifact_rejects_unknown_wire_fields() {
     let error = parse_artifact("compile_artifact_unknown_field").unwrap_err();
+
+    assert!(error.to_string().contains("unknown field"));
+}
+
+#[test]
+fn feldera_release_provenance_accepts_matching_compile_metadata() {
+    let artifact = load_artifact("compile_artifact_valid");
+    let provenance = load_provenance("release_provenance_valid");
+
+    validate_feldera_release_artifact_provenance(&artifact, &provenance).unwrap();
+}
+
+#[test]
+fn feldera_release_provenance_rejects_artifact_identity_mismatch() {
+    let artifact = load_artifact("compile_artifact_valid");
+    let mut provenance = load_provenance("release_provenance_valid");
+    provenance.build.artifact_hash = format!("sha256:{}", "9".repeat(64));
+
+    let error = validate_feldera_release_artifact_provenance(&artifact, &provenance).unwrap_err();
+
+    assert!(matches!(
+        error,
+        FelderaArtifactError::MismatchedReleaseProvenanceField {
+            field: "build.artifact_hash"
+        }
+    ));
+}
+
+#[test]
+fn feldera_release_provenance_rejects_unsupported_metadata_version() {
+    let mut artifact = load_artifact("compile_artifact_valid");
+    let provenance = load_provenance("release_provenance_valid");
+    artifact.metadata_version = 999;
+
+    let error = validate_feldera_release_artifact_provenance(&artifact, &provenance).unwrap_err();
+
+    assert!(matches!(
+        error,
+        FelderaArtifactError::UnsupportedMetadataVersion { version: 999 }
+    ));
+}
+
+#[test]
+fn feldera_release_provenance_rejects_generated_rust_identity_mismatch() {
+    let artifact = load_artifact("compile_artifact_valid");
+    let mut provenance = load_provenance("release_provenance_valid");
+    provenance.build.generated_rust.crate_name = "different_pipeline".to_string();
+
+    let error = validate_feldera_release_artifact_provenance(&artifact, &provenance).unwrap_err();
+
+    assert!(matches!(
+        error,
+        FelderaArtifactError::MismatchedReleaseProvenanceField {
+            field: "build.generated_rust.crate_name"
+        }
+    ));
+}
+
+#[test]
+fn feldera_release_provenance_rejects_compiler_identity_mismatch() {
+    let mut artifact = load_artifact("compile_artifact_valid");
+    let provenance = load_provenance("release_provenance_valid");
+    artifact.compiler.name = "different-compiler".to_string();
+
+    let error = validate_feldera_release_artifact_provenance(&artifact, &provenance).unwrap_err();
+
+    assert!(matches!(
+        error,
+        FelderaArtifactError::MismatchedReleaseProvenanceField {
+            field: "provenance.compiler_name"
+        }
+    ));
+}
+
+#[test]
+fn feldera_release_provenance_rejects_missing_release_identity() {
+    let artifact = load_artifact("compile_artifact_valid");
+    let mut provenance = load_provenance("release_provenance_valid");
+    provenance.release.release_id.clear();
+
+    let error = validate_feldera_release_artifact_provenance(&artifact, &provenance).unwrap_err();
+
+    assert!(matches!(
+        error,
+        FelderaArtifactError::MissingReleaseProvenanceField {
+            field: "release.release_id"
+        }
+    ));
+}
+
+#[test]
+fn feldera_release_provenance_rejects_unknown_wire_fields() {
+    let mut provenance: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(fixture_path("release_provenance_valid")).unwrap(),
+    )
+    .unwrap();
+    provenance["surprise"] = serde_json::json!(true);
+    let error: serde_json::Error =
+        serde_json::from_value::<FelderaReleaseArtifactProvenanceV1>(provenance).unwrap_err();
 
     assert!(error.to_string().contains("unknown field"));
 }

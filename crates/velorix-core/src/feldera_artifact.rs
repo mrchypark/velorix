@@ -9,6 +9,7 @@ use crate::relation::{
 };
 
 pub const FELDERA_ARTIFACT_METADATA_VERSION: u32 = 1;
+pub const FELDERA_RELEASE_ARTIFACT_PROVENANCE_VERSION: u16 = 1;
 pub const FELDERA_SPEC_HASH_PREFIX: &str = "velorix-feldera-spec-sha256-v1";
 pub const SUPPORTED_STATE_CODEC: &str = "feldera-dbsp-state-v1";
 pub const SUPPORTED_EPOCH_POLICY: &str = "monotonic-logical-epoch-v1";
@@ -113,12 +114,54 @@ pub struct GeneratedRustIdentity {
     pub crate_name: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FelderaReleaseArtifactProvenanceV1 {
+    pub schema_version: u16,
+    pub release: FelderaReleaseIdentityV1,
+    pub build: FelderaReleaseBuildIdentityV1,
+    pub provenance: FelderaReleaseProvenanceIdentityV1,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FelderaReleaseIdentityV1 {
+    pub release_id: String,
+    pub release_version: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FelderaReleaseBuildIdentityV1 {
+    pub build_id: String,
+    pub builder_id: String,
+    pub artifact_id: String,
+    pub artifact_hash: String,
+    pub spec_hash: String,
+    pub generated_rust: GeneratedRustIdentity,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FelderaReleaseProvenanceIdentityV1 {
+    pub source_repository: String,
+    pub source_revision: String,
+    pub compiler_name: String,
+    pub compiler_version: String,
+}
+
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum FelderaArtifactError {
     #[error("unsupported Feldera artifact metadata version: {version}")]
     UnsupportedMetadataVersion { version: u32 },
+    #[error("unsupported Feldera release artifact provenance version: {version}")]
+    UnsupportedReleaseProvenanceVersion { version: u16 },
     #[error("missing Feldera artifact identity field: {field}")]
     MissingIdentityField { field: &'static str },
+    #[error("missing Feldera release artifact provenance field: {field}")]
+    MissingReleaseProvenanceField { field: &'static str },
+    #[error("Feldera release artifact provenance mismatch: {field}")]
+    MismatchedReleaseProvenanceField { field: &'static str },
     #[error("missing Feldera artifact schema field: {field}")]
     MissingSchema { field: &'static str },
     #[error("unsupported Feldera artifact state codec: {codec}")]
@@ -355,6 +398,114 @@ pub fn validate_feldera_compile_artifact_hash_for_catalog(
     validate_artifact_bytes_hash(artifact, artifact_bytes)
 }
 
+pub fn validate_feldera_release_artifact_provenance(
+    artifact: &FelderaCompileArtifactMetadata,
+    provenance: &FelderaReleaseArtifactProvenanceV1,
+) -> Result<(), FelderaArtifactError> {
+    if artifact.metadata_version != FELDERA_ARTIFACT_METADATA_VERSION {
+        return Err(FelderaArtifactError::UnsupportedMetadataVersion {
+            version: artifact.metadata_version,
+        });
+    }
+    if provenance.schema_version != FELDERA_RELEASE_ARTIFACT_PROVENANCE_VERSION {
+        return Err(FelderaArtifactError::UnsupportedReleaseProvenanceVersion {
+            version: provenance.schema_version,
+        });
+    }
+
+    require_non_empty("artifact_id", &artifact.artifact_id)?;
+    require_non_empty("artifact_hash", &artifact.artifact_hash)?;
+    validate_artifact_hash("artifact_hash", &artifact.artifact_hash)?;
+    require_non_empty("spec_hash", &artifact.spec_hash)?;
+    require_non_empty(
+        "generated_rust.abi_version",
+        &artifact.generated_rust.abi_version,
+    )?;
+    require_non_empty(
+        "generated_rust.crate_name",
+        &artifact.generated_rust.crate_name,
+    )?;
+    if artifact.generated_rust.abi_version != SUPPORTED_GENERATED_RUST_ABI_VERSION {
+        return Err(FelderaArtifactError::UnsupportedGeneratedRustAbi {
+            abi_version: artifact.generated_rust.abi_version.clone(),
+        });
+    }
+
+    require_release_field("release.release_id", &provenance.release.release_id)?;
+    require_release_field(
+        "release.release_version",
+        &provenance.release.release_version,
+    )?;
+    require_release_field("build.build_id", &provenance.build.build_id)?;
+    require_release_field("build.builder_id", &provenance.build.builder_id)?;
+    require_release_field("build.artifact_id", &provenance.build.artifact_id)?;
+    require_release_field("build.artifact_hash", &provenance.build.artifact_hash)?;
+    validate_artifact_hash("build.artifact_hash", &provenance.build.artifact_hash)?;
+    require_release_field("build.spec_hash", &provenance.build.spec_hash)?;
+    require_release_field(
+        "build.generated_rust.abi_version",
+        &provenance.build.generated_rust.abi_version,
+    )?;
+    require_release_field(
+        "build.generated_rust.crate_name",
+        &provenance.build.generated_rust.crate_name,
+    )?;
+    require_release_field(
+        "provenance.source_repository",
+        &provenance.provenance.source_repository,
+    )?;
+    require_release_field(
+        "provenance.source_revision",
+        &provenance.provenance.source_revision,
+    )?;
+    require_release_field(
+        "provenance.compiler_name",
+        &provenance.provenance.compiler_name,
+    )?;
+    require_release_field(
+        "provenance.compiler_version",
+        &provenance.provenance.compiler_version,
+    )?;
+
+    require_release_match(
+        "build.artifact_id",
+        &artifact.artifact_id,
+        &provenance.build.artifact_id,
+    )?;
+    require_release_match(
+        "build.artifact_hash",
+        &artifact.artifact_hash,
+        &provenance.build.artifact_hash,
+    )?;
+    require_release_match(
+        "build.spec_hash",
+        &artifact.spec_hash,
+        &provenance.build.spec_hash,
+    )?;
+    require_release_match(
+        "build.generated_rust.abi_version",
+        &artifact.generated_rust.abi_version,
+        &provenance.build.generated_rust.abi_version,
+    )?;
+    require_release_match(
+        "build.generated_rust.crate_name",
+        &artifact.generated_rust.crate_name,
+        &provenance.build.generated_rust.crate_name,
+    )?;
+    require_release_match(
+        "provenance.compiler_name",
+        &artifact.compiler.name,
+        &provenance.provenance.compiler_name,
+    )?;
+    require_release_match(
+        "provenance.compiler_version",
+        &artifact.compiler.version,
+        &provenance.provenance.compiler_version,
+    )?;
+
+    Ok(())
+}
+
 /// Hashes the v1 standing-view spec contract as SHA-256 over the compact
 /// `serde_json::to_vec` serialization of `StandingViewSpec`.
 pub fn feldera_spec_hash(spec: &StandingViewSpec) -> Result<String, FelderaArtifactError> {
@@ -447,6 +598,26 @@ fn require_non_empty(field: &'static str, value: &str) -> Result<(), FelderaArti
     }
 
     Ok(())
+}
+
+fn require_release_field(field: &'static str, value: &str) -> Result<(), FelderaArtifactError> {
+    if value.trim().is_empty() {
+        return Err(FelderaArtifactError::MissingReleaseProvenanceField { field });
+    }
+
+    Ok(())
+}
+
+fn require_release_match(
+    field: &'static str,
+    expected: &str,
+    actual: &str,
+) -> Result<(), FelderaArtifactError> {
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(FelderaArtifactError::MismatchedReleaseProvenanceField { field })
+    }
 }
 
 fn validate_relation_schemas(schemas: &[RelationSchema]) -> Result<(), FelderaArtifactError> {
