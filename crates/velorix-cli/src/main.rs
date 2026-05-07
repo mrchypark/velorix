@@ -503,6 +503,7 @@ fn validate_dependency_governance_with_diagnostics_text(
 struct DependencyGovernanceManifestV1 {
     schema_version: u16,
     msrv: DependencyGovernanceMsrvV1,
+    package_reviews: Vec<DependencyGovernancePackageReviewV1>,
     exceptions: Vec<DependencyGovernanceExceptionV1>,
 }
 
@@ -515,6 +516,17 @@ struct DependencyGovernanceMsrvV1 {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct DependencyGovernancePackageReviewV1 {
+    subject: String,
+    owner: Option<String>,
+    reviewed_on: Option<String>,
+    audit_status: Option<String>,
+    feature_policy: Option<String>,
+    replacement_plan: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DependencyGovernanceExceptionV1 {
     kind: DependencyGovernanceExceptionKind,
     #[serde(rename = "crate")]
@@ -522,6 +534,8 @@ struct DependencyGovernanceExceptionV1 {
     owner: Option<String>,
     expires_on: Option<String>,
     reason: Option<String>,
+    replacement_plan: Option<String>,
+    promotion_rule: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -538,6 +552,16 @@ struct DependencyGovernanceWarning {
     crate_name: String,
 }
 
+const REQUIRED_PACKAGE_REVIEW_SUBJECTS: &[&str] = &[
+    "datafusion",
+    "object_store",
+    "kube",
+    "k8s-openapi",
+    "slatedb",
+    "foyer",
+    "feldera_artifacts",
+];
+
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
 enum CargoDenyWarningKind {
     Duplicate,
@@ -553,6 +577,7 @@ impl DependencyGovernanceManifestV1 {
             );
         }
         self.msrv.validate()?;
+        validate_package_reviews(&self.package_reviews)?;
         validate_date(today).context("validator today must use YYYY-MM-DD")?;
 
         for exception in &self.exceptions {
@@ -703,6 +728,52 @@ impl DependencyGovernanceMsrvV1 {
     }
 }
 
+fn validate_package_reviews(reviews: &[DependencyGovernancePackageReviewV1]) -> anyhow::Result<()> {
+    let mut seen = BTreeSet::new();
+    for review in reviews {
+        review.validate()?;
+        if !seen.insert(review.subject.clone()) {
+            bail!("duplicate package review subject {}", review.subject);
+        }
+    }
+
+    for subject in REQUIRED_PACKAGE_REVIEW_SUBJECTS {
+        if !seen.contains(*subject) {
+            bail!("missing required package review for {subject}");
+        }
+    }
+
+    Ok(())
+}
+
+impl DependencyGovernancePackageReviewV1 {
+    fn validate(&self) -> anyhow::Result<()> {
+        require_non_empty_text(Some(&self.subject), "subject", "package review")?;
+        require_non_empty_text(self.owner.as_deref(), "owner", &self.subject)?;
+        let reviewed_on =
+            require_non_empty_text(self.reviewed_on.as_deref(), "reviewed_on", &self.subject)?;
+        validate_date(reviewed_on).with_context(|| {
+            format!(
+                "package review for {} has invalid reviewed_on",
+                self.subject
+            )
+        })?;
+        require_non_empty_text(self.audit_status.as_deref(), "audit_status", &self.subject)?;
+        require_non_empty_text(
+            self.feature_policy.as_deref(),
+            "feature_policy",
+            &self.subject,
+        )?;
+        require_non_empty_text(
+            self.replacement_plan.as_deref(),
+            "replacement_plan",
+            &self.subject,
+        )?;
+
+        Ok(())
+    }
+}
+
 impl DependencyGovernanceExceptionV1 {
     fn validate(&self, today: &str) -> anyhow::Result<()> {
         if self.crate_name.trim().is_empty() {
@@ -736,6 +807,18 @@ impl DependencyGovernanceExceptionV1 {
                 expires_on
             );
         }
+        require_non_empty(
+            self.replacement_plan.as_deref(),
+            "replacement_plan",
+            &self.crate_name,
+            &self.kind,
+        )?;
+        require_non_empty(
+            self.promotion_rule.as_deref(),
+            "promotion_rule",
+            &self.crate_name,
+            &self.kind,
+        )?;
 
         Ok(())
     }
@@ -750,6 +833,17 @@ fn require_non_empty<'a>(
     match value.map(str::trim) {
         Some(value) if !value.is_empty() => Ok(value),
         _ => bail!("{kind:?} exception for {crate_name} is missing {field}"),
+    }
+}
+
+fn require_non_empty_text<'a>(
+    value: Option<&'a str>,
+    field: &str,
+    subject: &str,
+) -> anyhow::Result<&'a str> {
+    match value.map(str::trim) {
+        Some(value) if !value.is_empty() => Ok(value),
+        _ => bail!("{subject} is missing {field}"),
     }
 }
 
@@ -1558,12 +1652,15 @@ mod tests {
                 "minimum_rust_version": "1.85.0",
                 "policy": "CI and package updates keep the workspace buildable on the declared MSRV."
             },
+            "package_reviews": valid_package_reviews_json(),
             "exceptions": [
                 {
                     "kind": "duplicate",
                     "crate": "hashbrown",
                     "expires_on": "2026-06-30",
-                    "reason": "Await upstream convergence."
+                    "reason": "Await upstream convergence.",
+                    "replacement_plan": "Upgrade when upstream dependency ranges converge.",
+                    "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
                 }
             ]
         })
@@ -1583,13 +1680,16 @@ mod tests {
                 "minimum_rust_version": "1.85.0",
                 "policy": "CI and package updates keep the workspace buildable on the declared MSRV."
             },
+            "package_reviews": valid_package_reviews_json(),
             "exceptions": [
                 {
                     "kind": "unmaintained",
                     "crate": "paste",
                     "owner": "runtime",
                     "expires_on": "2026-05-05",
-                    "reason": "Temporary allowance while replacing the transitive dependency."
+                    "reason": "Temporary allowance while replacing the transitive dependency.",
+                    "replacement_plan": "Replace or remove the transitive dependency.",
+                    "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
                 }
             ]
         })
@@ -1609,13 +1709,16 @@ mod tests {
                 "minimum_rust_version": "1.85.0",
                 "policy": "CI and package updates keep the workspace buildable on the declared MSRV."
             },
+            "package_reviews": valid_package_reviews_json(),
             "exceptions": [
                 {
                     "kind": "advisory",
                     "crate": "example",
                     "owner": "security",
                     "expires_on": "2026-02-30",
-                    "reason": "Temporary advisory exception."
+                    "reason": "Temporary advisory exception.",
+                    "replacement_plan": "Patch or replace before promotion.",
+                    "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
                 }
             ]
         })
@@ -1635,6 +1738,7 @@ mod tests {
                 "minimum_rust_version": "1.85.0",
                 "policy": "CI and package updates keep the workspace buildable on the declared MSRV."
             },
+            "package_reviews": valid_package_reviews_json(),
             "exception": []
         })
         .to_string();
@@ -1653,19 +1757,107 @@ mod tests {
                 "minimum_rust_version": "1.85.0",
                 "policy": "CI and package updates keep the workspace buildable on the declared MSRV."
             },
+            "package_reviews": valid_package_reviews_json(),
             "exceptions": [
                 {
                     "kind": "advisory",
                     "crate": "example",
                     "owner": "security",
                     "expires_on": "2028-02-29",
-                    "reason": "Temporary advisory exception."
+                    "reason": "Temporary advisory exception.",
+                    "replacement_plan": "Patch or replace before promotion.",
+                    "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
                 }
             ]
         })
         .to_string();
 
         validate_dependency_governance_manifest_text(&manifest, "2028-02-01").unwrap();
+    }
+
+    #[test]
+    fn dependency_governance_validator_rejects_missing_required_package_review() {
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(&valid_dependency_governance_json()).unwrap();
+        manifest["package_reviews"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|review| review["subject"] != "datafusion");
+
+        let error = validate_dependency_governance_manifest_text(
+            &serde_json::to_string(&manifest).unwrap(),
+            "2026-05-06",
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("missing required package review for datafusion"));
+    }
+
+    #[test]
+    fn dependency_governance_validator_rejects_duplicate_package_review_subject() {
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(&valid_dependency_governance_json()).unwrap();
+        let reviews = manifest["package_reviews"].as_array_mut().unwrap();
+        reviews.push(reviews[0].clone());
+
+        let error = validate_dependency_governance_manifest_text(
+            &serde_json::to_string(&manifest).unwrap(),
+            "2026-05-06",
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("duplicate package review subject datafusion"));
+    }
+
+    #[test]
+    fn dependency_governance_validator_rejects_missing_exception_replacement_plan() {
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(&valid_dependency_governance_json()).unwrap();
+        manifest["exceptions"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("replacement_plan");
+
+        let error = validate_dependency_governance_manifest_text(
+            &serde_json::to_string(&manifest).unwrap(),
+            "2026-05-06",
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("missing replacement_plan"));
+    }
+
+    #[test]
+    fn dependency_governance_validator_rejects_missing_exception_promotion_rule() {
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(&valid_dependency_governance_json()).unwrap();
+        manifest["exceptions"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("promotion_rule");
+
+        let error = validate_dependency_governance_manifest_text(
+            &serde_json::to_string(&manifest).unwrap(),
+            "2026-05-06",
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("missing promotion_rule"));
+    }
+
+    #[test]
+    fn dependency_governance_validator_rejects_invalid_package_review_date() {
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(&valid_dependency_governance_json()).unwrap();
+        manifest["package_reviews"][0]["reviewed_on"] = serde_json::json!("2026-02-30");
+
+        let error = validate_dependency_governance_manifest_text(
+            &serde_json::to_string(&manifest).unwrap(),
+            "2026-05-06",
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("invalid reviewed_on"));
     }
 
     #[test]
@@ -2096,31 +2288,61 @@ mod tests {
                 "minimum_rust_version": "1.85.0",
                 "policy": "CI and package updates keep the workspace buildable on the declared MSRV."
             },
+            "package_reviews": valid_package_reviews_json(),
             "exceptions": [
                 {
                     "kind": "duplicate",
                     "crate": "hashbrown",
                     "owner": "runtime",
                     "expires_on": "2026-06-30",
-                    "reason": "Await upstream convergence in the DataFusion dependency graph."
+                    "reason": "Await upstream convergence in the DataFusion dependency graph.",
+                    "replacement_plan": "Upgrade when upstream dependency ranges converge.",
+                    "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
                 },
                 {
                     "kind": "unmaintained",
                     "crate": "paste",
                     "owner": "runtime",
                     "expires_on": "2026-06-30",
-                    "reason": "Temporary allowance while replacing the transitive dependency."
+                    "reason": "Temporary allowance while replacing the transitive dependency.",
+                    "replacement_plan": "Replace or remove the transitive dependency.",
+                    "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
                 },
                 {
                     "kind": "advisory",
                     "crate": "example",
                     "owner": "security",
                     "expires_on": "2026-06-30",
-                    "reason": "Advisory does not affect the enabled feature set."
+                    "reason": "Advisory does not affect the enabled feature set.",
+                    "replacement_plan": "Patch or replace before promotion.",
+                    "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
                 }
             ]
         })
         .to_string()
+    }
+
+    fn valid_package_reviews_json() -> serde_json::Value {
+        serde_json::json!([
+            package_review_json("datafusion", "SQL and Parquet query engine; keep features narrow and upgrade with DataFusion releases."),
+            package_review_json("object_store", "Authority-path object store client; keep create/read/list semantics explicit."),
+            package_review_json("kube", "Kubernetes API client for coordination only; object storage remains authoritative."),
+            package_review_json("k8s-openapi", "Kubernetes wire types generated for supported cluster APIs."),
+            package_review_json("slatedb", "State substrate; do not duplicate internal LSM or retention semantics."),
+            package_review_json("foyer", "Non-authoritative cache only; never part of durable database authority."),
+            package_review_json("feldera_artifacts", "Feldera artifacts are trusted only after release provenance is available.")
+        ])
+    }
+
+    fn package_review_json(subject: &str, replacement_plan: &str) -> serde_json::Value {
+        serde_json::json!({
+            "subject": subject,
+            "owner": "runtime",
+            "reviewed_on": "2026-05-07",
+            "audit_status": "local_reviewed_until_external_audit",
+            "feature_policy": "Use only the features documented in package reviews and CI-checked manifests.",
+            "replacement_plan": replacement_plan
+        })
     }
 
     fn dependency_governance_json_with_exceptions<const N: usize>(
@@ -2134,7 +2356,9 @@ mod tests {
                     "crate": crate_name,
                     "owner": "runtime",
                     "expires_on": "2026-06-30",
-                    "reason": "Temporary warning exception."
+                    "reason": "Temporary warning exception.",
+                    "replacement_plan": "Upgrade, replace, or remove the dependency before expiry.",
+                    "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
                 })
             })
             .collect::<Vec<_>>();
@@ -2145,6 +2369,7 @@ mod tests {
                 "minimum_rust_version": "1.85.0",
                 "policy": "CI and package updates keep the workspace buildable on the declared MSRV."
             },
+            "package_reviews": valid_package_reviews_json(),
             "exceptions": exceptions
         })
         .to_string()

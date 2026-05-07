@@ -4,97 +4,181 @@
     "minimum_rust_version": "1.88.0",
     "policy": "CI and package updates keep the workspace buildable on the declared MSRV; the current floor follows DataFusion 53.1.0 and kube 3.1.0."
   },
+  "package_reviews": [
+    {
+      "subject": "datafusion",
+      "owner": "runtime",
+      "reviewed_on": "2026-05-07",
+      "audit_status": "local_reviewed_until_external_audit",
+      "feature_policy": "Use DataFusion for ad hoc SQL and Parquet scans through Velorix query policy gates; do not make it durable authority.",
+      "replacement_plan": "Upgrade through the DataFusion release train and keep DataFusion-version-specific policy evidence explicit."
+    },
+    {
+      "subject": "object_store",
+      "owner": "storage",
+      "reviewed_on": "2026-05-07",
+      "audit_status": "local_reviewed_until_external_audit",
+      "feature_policy": "Use object_store for authoritative create/read/list/range behavior through Velorix capability probes; keep authority and DataFusion scan client boundaries explicit.",
+      "replacement_plan": "Unify duplicate object_store versions when DataFusion and authority-path dependencies converge without weakening create-only semantics."
+    },
+    {
+      "subject": "kube",
+      "owner": "control-plane",
+      "reviewed_on": "2026-05-07",
+      "audit_status": "local_reviewed_until_external_audit",
+      "feature_policy": "Use kube for Kubernetes coordination, CRDs, watch, and Lease APIs only; object storage remains database authority.",
+      "replacement_plan": "Upgrade with the kube release train and keep generated CRD/Lease evidence current."
+    },
+    {
+      "subject": "k8s-openapi",
+      "owner": "control-plane",
+      "reviewed_on": "2026-05-07",
+      "audit_status": "local_reviewed_until_external_audit",
+      "feature_policy": "Use the Kubernetes API version set selected by kube and CI; avoid hand-written Kubernetes wire types.",
+      "replacement_plan": "Advance with kube compatibility requirements and regenerate CRD evidence when supported cluster APIs change."
+    },
+    {
+      "subject": "slatedb",
+      "owner": "state",
+      "reviewed_on": "2026-05-07",
+      "audit_status": "local_reviewed_until_external_audit",
+      "feature_policy": "Use SlateDB as the state substrate; do not duplicate its LSM, SST, compaction, cache, or retention internals.",
+      "replacement_plan": "Upgrade through SlateDB releases and keep Velorix state refs/retention APIs at the SlateDB boundary."
+    },
+    {
+      "subject": "foyer",
+      "owner": "runtime",
+      "reviewed_on": "2026-05-07",
+      "audit_status": "local_reviewed_until_external_audit",
+      "feature_policy": "Use Foyer only as a non-authoritative cache; never use it as durable database state.",
+      "replacement_plan": "Replace or disable Foyer if cache behavior conflicts with authority-path object storage or SlateDB ownership."
+    },
+    {
+      "subject": "feldera_artifacts",
+      "owner": "standing-views",
+      "reviewed_on": "2026-05-07",
+      "audit_status": "local_reviewed_until_external_audit",
+      "feature_policy": "Treat Feldera/DBSP output as trusted only through Velorix artifact metadata, relation fingerprints, and release provenance gates.",
+      "replacement_plan": "Keep direct execution disabled until artifact, state, resource, and recovery contracts are proven."
+    }
+  ],
   "exceptions": [
     {
       "kind": "duplicate",
       "crate": "cpufeatures",
       "owner": "runtime",
       "expires_on": "2026-08-31",
-      "reason": "Duplicate versions are introduced by sha2 and DataFusion/object_store transitive dependencies while upstream graphs converge."
+      "reason": "Duplicate versions are introduced by sha2 and DataFusion/object_store transitive dependencies while upstream graphs converge.",
+      "replacement_plan": "Upgrade sha2/DataFusion/object_store dependency ranges when upstream graphs converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
       "kind": "duplicate",
       "crate": "foldhash",
       "owner": "runtime",
       "expires_on": "2026-08-31",
-      "reason": "Duplicate versions are introduced by hashbrown and DataFusion transitive dependencies while upstream graphs converge."
+      "reason": "Duplicate versions are introduced by hashbrown and DataFusion transitive dependencies while upstream graphs converge.",
+      "replacement_plan": "Upgrade hashbrown/DataFusion dependency ranges when upstream graphs converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
       "kind": "duplicate",
       "crate": "getrandom",
       "owner": "runtime",
       "expires_on": "2026-08-31",
-      "reason": "Duplicate versions are introduced by current random/crypto dependency families while upstream graphs converge."
+      "reason": "Duplicate versions are introduced by current random/crypto dependency families while upstream graphs converge.",
+      "replacement_plan": "Upgrade random/crypto dependency families when upstream ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
       "kind": "duplicate",
       "crate": "hashbrown",
       "owner": "runtime",
       "expires_on": "2026-08-31",
-      "reason": "Duplicate versions are introduced by DataFusion, kube-runtime, and related transitive dependency families while upstream graphs converge."
+      "reason": "Duplicate versions are introduced by DataFusion, kube-runtime, and related transitive dependency families while upstream graphs converge.",
+      "replacement_plan": "Upgrade DataFusion, kube-runtime, and related dependency families when their ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
       "kind": "duplicate",
       "crate": "heck",
       "owner": "runtime",
       "expires_on": "2026-08-31",
-      "reason": "Duplicate versions are introduced by code-generation transitive dependencies while upstream graphs converge."
+      "reason": "Duplicate versions are introduced by code-generation transitive dependencies while upstream graphs converge.",
+      "replacement_plan": "Upgrade code-generation dependencies when upstream ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
       "kind": "duplicate",
       "crate": "object_store",
       "owner": "runtime",
       "expires_on": "2026-08-31",
-      "reason": "Velorix intentionally carries object_store 0.12 for authority paths and DataFusion's object_store 0.13 for scan paths until the version boundary can be unified."
+      "reason": "Velorix intentionally carries object_store 0.12 for authority paths and DataFusion's object_store 0.13 for scan paths until the version boundary can be unified.",
+      "replacement_plan": "Unify authority and scan object_store clients when DataFusion and Velorix authority paths can share one compatible version.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
       "kind": "duplicate",
       "crate": "quick-xml",
       "owner": "runtime",
       "expires_on": "2026-08-31",
-      "reason": "Duplicate versions are introduced by Kubernetes/DataFusion transitive dependencies while upstream graphs converge."
+      "reason": "Duplicate versions are introduced by Kubernetes/DataFusion transitive dependencies while upstream graphs converge.",
+      "replacement_plan": "Upgrade Kubernetes/DataFusion transitive dependency families when upstream ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
       "kind": "duplicate",
       "crate": "rand",
       "owner": "runtime",
       "expires_on": "2026-08-31",
-      "reason": "Duplicate versions are introduced by current random/crypto dependency families while upstream graphs converge."
+      "reason": "Duplicate versions are introduced by current random/crypto dependency families while upstream graphs converge.",
+      "replacement_plan": "Upgrade random/crypto dependency families when upstream ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
       "kind": "duplicate",
       "crate": "rand_core",
       "owner": "runtime",
       "expires_on": "2026-08-31",
-      "reason": "Duplicate versions are introduced by current random/crypto dependency families while upstream graphs converge."
+      "reason": "Duplicate versions are introduced by current random/crypto dependency families while upstream graphs converge.",
+      "replacement_plan": "Upgrade random/crypto dependency families when upstream ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
       "kind": "duplicate",
       "crate": "thiserror",
       "owner": "runtime",
       "expires_on": "2026-08-31",
-      "reason": "Duplicate versions are introduced by mixed upstream crates while their dependency ranges converge."
+      "reason": "Duplicate versions are introduced by mixed upstream crates while their dependency ranges converge.",
+      "replacement_plan": "Upgrade mixed upstream crates when their dependency ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
       "kind": "duplicate",
       "crate": "thiserror-impl",
       "owner": "runtime",
       "expires_on": "2026-08-31",
-      "reason": "Duplicate versions follow the thiserror duplicate and will converge with upstream dependency ranges."
+      "reason": "Duplicate versions follow the thiserror duplicate and will converge with upstream dependency ranges.",
+      "replacement_plan": "Upgrade alongside thiserror when upstream dependency ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
       "kind": "duplicate",
       "crate": "winnow",
       "owner": "runtime",
       "expires_on": "2026-08-31",
-      "reason": "Duplicate versions are introduced by SlateDB/figment/toml transitive dependencies while upstream graphs converge."
+      "reason": "Duplicate versions are introduced by SlateDB/figment/toml transitive dependencies while upstream graphs converge.",
+      "replacement_plan": "Upgrade SlateDB/figment/toml dependency ranges when upstream graphs converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
       "kind": "unmaintained",
       "crate": "paste",
       "owner": "runtime",
       "expires_on": "2026-08-31",
-      "reason": "Temporary allowance for a transitive unmaintained advisory while upstream replacement options are tracked."
+      "reason": "Temporary allowance for a transitive unmaintained advisory while upstream replacement options are tracked.",
+      "replacement_plan": "Remove the transitive paste dependency through upstream package upgrades or replace the dependent package before expiry.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     }
   ]
 }
