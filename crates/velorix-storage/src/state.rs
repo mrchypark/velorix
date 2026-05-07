@@ -99,6 +99,11 @@ pub enum CheckpointPublishError {
     ManifestAlreadyExists(ObjectKey),
     #[error("garbage collection run evidence `{0}` already exists")]
     GarbageCollectionRunAlreadyExists(ObjectKey),
+    #[error("invalid garbage collection run evidence `{object_key}`: {reason}")]
+    InvalidGarbageCollectionRunEvidence {
+        object_key: ObjectKey,
+        reason: String,
+    },
     #[error("garbage collection must retain at least one manifest")]
     InvalidGarbageCollectionPolicy,
     #[error("garbage collection retained manifest {0} is missing")]
@@ -802,7 +807,66 @@ impl CheckpointPublisher {
             )
             .await?;
 
+        let restored = self.read_garbage_collection_run_evidence(run_id).await?;
+        if restored != run {
+            return Err(
+                CheckpointPublishError::InvalidGarbageCollectionRunEvidence {
+                    object_key,
+                    reason: "persisted body does not match executed run".to_string(),
+                },
+            );
+        }
+
+        Ok(restored)
+    }
+
+    pub async fn read_garbage_collection_run_evidence(
+        &self,
+        run_id: &str,
+    ) -> Result<GarbageCollectionRunV1, CheckpointPublishError> {
+        let object_key = ObjectKey::garbage_collection_run(run_id)?;
+        let bytes = self
+            .store
+            .get(&Path::from(object_key.as_str()))
+            .await?
+            .bytes()
+            .await?;
+        let run: GarbageCollectionRunV1 = serde_json::from_slice(&bytes)?;
+
+        Self::validate_garbage_collection_run_evidence(&object_key, run_id, &run)?;
+
         Ok(run)
+    }
+
+    fn validate_garbage_collection_run_evidence(
+        object_key: &ObjectKey,
+        expected_run_id: &str,
+        run: &GarbageCollectionRunV1,
+    ) -> Result<(), CheckpointPublishError> {
+        if run.schema_version != GC_RUN_SCHEMA_VERSION {
+            return Err(
+                CheckpointPublishError::InvalidGarbageCollectionRunEvidence {
+                    object_key: object_key.clone(),
+                    reason: format!(
+                        "unsupported schema_version {}, expected {}",
+                        run.schema_version, GC_RUN_SCHEMA_VERSION
+                    ),
+                },
+            );
+        }
+        if run.run_id != expected_run_id {
+            return Err(
+                CheckpointPublishError::InvalidGarbageCollectionRunEvidence {
+                    object_key: object_key.clone(),
+                    reason: format!(
+                        "run_id {} does not match requested run_id {}",
+                        run.run_id, expected_run_id
+                    ),
+                },
+            );
+        }
+
+        Ok(())
     }
 
     async fn referenced_garbage_collection_candidates_for_plan(

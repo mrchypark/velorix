@@ -16,7 +16,7 @@ use velorix_storage::{
     },
     gc::{
         GarbageCollectionCandidate, GarbageCollectionCandidateKind, GarbageCollectionPlan,
-        GarbageCollectionPolicy, GarbageCollectionRunV1,
+        GarbageCollectionPolicy, GarbageCollectionReport, GarbageCollectionRunV1,
     },
     manifest::{
         CheckpointManifest, InputRange, ManifestError, OutputObjectRef, PartitionOwnerClaim,
@@ -42,6 +42,12 @@ struct PrefixListingFailsStore {
     inner: Arc<dyn ObjectStore>,
     failing_prefix: &'static str,
     fail_offset_listing: bool,
+}
+
+#[derive(Debug)]
+struct ReadFailsStore {
+    inner: Arc<dyn ObjectStore>,
+    failing_key: &'static str,
 }
 
 impl FullListingFailsStore {
@@ -75,6 +81,12 @@ impl PrefixListingFailsStore {
             failing_prefix,
             fail_offset_listing: true,
         }
+    }
+}
+
+impl ReadFailsStore {
+    fn new(inner: Arc<dyn ObjectStore>, failing_key: &'static str) -> Self {
+        Self { inner, failing_key }
     }
 }
 
@@ -112,6 +124,12 @@ impl std::fmt::Display for PrefixListingFailsStore {
             "prefix-listing-fails({}, {})",
             self.failing_prefix, self.inner
         )
+    }
+}
+
+impl std::fmt::Display for ReadFailsStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "read-fails({}, {})", self.failing_key, self.inner)
     }
 }
 
@@ -262,6 +280,72 @@ impl ObjectStore for PrefixListingFailsStore {
     }
 }
 
+#[async_trait::async_trait]
+impl ObjectStore for ReadFailsStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        if location.as_ref() == self.failing_key {
+            return Err(generic_store_error(
+                "read-fails",
+                format!("read failed for {location}"),
+            ));
+        }
+
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn delete(&self, location: &Path) -> object_store::Result<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
 fn temp_store() -> (TempDir, Arc<dyn ObjectStore>) {
     let temp_dir = tempfile::tempdir().unwrap();
     let store = LocalFileSystem::new_with_prefix(temp_dir.path()).unwrap();
@@ -271,6 +355,24 @@ fn temp_store() -> (TempDir, Arc<dyn ObjectStore>) {
 
 async fn object_exists(store: &dyn ObjectStore, object_key: &ObjectKey) -> bool {
     store.head(&Path::from(object_key.as_str())).await.is_ok()
+}
+
+fn garbage_collection_run(run_id: &str, schema_version: u16) -> GarbageCollectionRunV1 {
+    GarbageCollectionRunV1 {
+        schema_version,
+        run_id: run_id.to_string(),
+        policy: GarbageCollectionPolicy {
+            retain_latest_manifests: 1,
+        },
+        plan: GarbageCollectionPlan {
+            retained_manifest_versions: vec![0],
+            candidates: Vec::new(),
+        },
+        report: GarbageCollectionReport {
+            deleted: Vec::new(),
+            skipped: Vec::new(),
+        },
+    }
 }
 
 fn input_range() -> InputRange {
@@ -770,6 +872,12 @@ async fn gc_execution_writes_stable_run_evidence() {
         .unwrap();
     let restored: GarbageCollectionRunV1 = serde_json::from_slice(&evidence_bytes).unwrap();
     assert_eq!(restored, run);
+
+    let read_back = publisher
+        .read_garbage_collection_run_evidence("run-0001")
+        .await
+        .unwrap();
+    assert_eq!(read_back, run);
 }
 
 #[tokio::test]
@@ -809,6 +917,94 @@ async fn gc_execution_rejects_duplicate_run_evidence_before_deleting_candidates(
         CheckpointPublishError::GarbageCollectionRunAlreadyExists(_)
     ));
     assert!(object_exists(store.as_ref(), orphan_state.object_key()).await);
+}
+
+#[tokio::test]
+async fn gc_execution_requires_readable_run_evidence_after_write() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::new(ReadFailsStore::new(
+        Arc::clone(&store),
+        "v1/gc-runs/run-0001.run.json",
+    )));
+    let policy = GarbageCollectionPolicy {
+        retain_latest_manifests: 1,
+    };
+    let retained_state = state_write(0, "state-retained", b"retained-state");
+    let orphan_state = state_write(0, "state-orphan", b"orphan-state");
+
+    let retained_state_ref = publisher.write_state_object(&retained_state).await.unwrap();
+    publisher.write_state_object(&orphan_state).await.unwrap();
+    publisher
+        .publish_manifest(&manifest(0, retained_state_ref))
+        .await
+        .unwrap();
+
+    let plan = publisher.plan_garbage_collection(policy).await.unwrap();
+    let err = publisher
+        .execute_garbage_collection_plan_with_evidence("run-0001", policy, &plan)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(&err, CheckpointPublishError::ObjectStore(_)));
+    assert!(err
+        .to_string()
+        .contains("read failed for v1/gc-runs/run-0001.run.json"));
+}
+
+#[tokio::test]
+async fn gc_read_run_evidence_rejects_mismatched_run_id() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let evidence_key = ObjectKey::garbage_collection_run("run-0001").unwrap();
+    let run = garbage_collection_run("other-run", 1);
+    store
+        .put(
+            &Path::from(evidence_key.as_str()),
+            Bytes::from(serde_json::to_vec(&run).unwrap()).into(),
+        )
+        .await
+        .unwrap();
+
+    let err = publisher
+        .read_garbage_collection_run_evidence("run-0001")
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        CheckpointPublishError::InvalidGarbageCollectionRunEvidence {
+            object_key,
+            reason,
+        } if object_key == evidence_key && reason.contains("run_id other-run")
+    ));
+}
+
+#[tokio::test]
+async fn gc_read_run_evidence_rejects_unsupported_schema_version() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let evidence_key = ObjectKey::garbage_collection_run("run-0001").unwrap();
+    let run = garbage_collection_run("run-0001", 2);
+    store
+        .put(
+            &Path::from(evidence_key.as_str()),
+            Bytes::from(serde_json::to_vec(&run).unwrap()).into(),
+        )
+        .await
+        .unwrap();
+
+    let err = publisher
+        .read_garbage_collection_run_evidence("run-0001")
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        CheckpointPublishError::InvalidGarbageCollectionRunEvidence {
+            object_key,
+            reason,
+        } if object_key == evidence_key && reason.contains("unsupported schema_version 2")
+    ));
 }
 
 #[tokio::test]

@@ -317,7 +317,9 @@ output objects under `v1/outputs/...`. The plan retains objects referenced by
 the latest N published manifests, where N must be at least one, and classifies
 only unreferenced raw state/output objects as candidates. Executed runs can
 write a stable `GcRunV1` evidence object under `v1/gc-runs/...` with the policy,
-plan, deleted candidates, and skipped candidates.
+plan, deleted candidates, and skipped candidates. The execute path reports
+success only after reading the persisted run evidence back and validating its
+schema version and `run_id`.
 
 Manifest objects outside the latest-N retention set can remain listed and
 readable after GC, but their Velorix-owned raw state and output payloads are not
