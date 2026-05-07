@@ -5,7 +5,8 @@ use tempfile::TempDir;
 use velorix_core::{
     feldera_artifact::{
         feldera_artifact_bytes_hash, feldera_spec_hash, FelderaArtifactError,
-        FelderaCompileArtifactMetadata, RelationSchema, StandingViewSpec,
+        FelderaCompileArtifactMetadata, FelderaReleaseArtifactProvenanceV1, RelationSchema,
+        StandingViewSpec,
     },
     relation::{
         ArrowPhysicalTypeV1, DataFusionRegistrationModeV1, DataFusionRegistrationV1,
@@ -44,6 +45,10 @@ fn load_spec(name: &str) -> StandingViewSpec {
 }
 
 fn load_artifact(name: &str) -> FelderaCompileArtifactMetadata {
+    serde_json::from_str(&std::fs::read_to_string(fixture_path(name)).unwrap()).unwrap()
+}
+
+fn load_provenance(name: &str) -> FelderaReleaseArtifactProvenanceV1 {
     serde_json::from_str(&std::fs::read_to_string(fixture_path(name)).unwrap()).unwrap()
 }
 
@@ -141,6 +146,20 @@ fn catalog_valid_fixture_parts() -> (
     (catalog, spec, artifact)
 }
 
+fn release_provenance_for_artifact(
+    artifact: &FelderaCompileArtifactMetadata,
+) -> FelderaReleaseArtifactProvenanceV1 {
+    let mut provenance = load_provenance("release_provenance_valid");
+    provenance.build.artifact_id = artifact.artifact_id.clone();
+    provenance.build.artifact_hash = artifact.artifact_hash.clone();
+    provenance.build.spec_hash = artifact.spec_hash.clone();
+    provenance.build.generated_rust = artifact.generated_rust.clone();
+    provenance.provenance.compiler_name = artifact.compiler.name.clone();
+    provenance.provenance.compiler_version = artifact.compiler.version.clone();
+
+    provenance
+}
+
 #[tokio::test]
 async fn feldera_runtime_registry_selects_valid_registered_artifact_for_catalog() {
     let (_temp_dir, store) = temp_store();
@@ -170,6 +189,159 @@ async fn feldera_runtime_registry_selects_valid_registered_artifact_for_catalog(
         selected.status,
         RuntimeFelderaArtifactSelectionStatus::DirectExecutionDisabled
     );
+}
+
+#[tokio::test]
+async fn feldera_runtime_registry_release_provenance_verified_path_keeps_execution_disabled() {
+    let (_temp_dir, store) = temp_store();
+    let registry = RuntimeFelderaArtifactRegistry::new(store);
+    let (catalog, spec, mut artifact) = catalog_valid_fixture_parts();
+    let artifact_bytes = b"compiled release artifact bytes";
+    artifact.artifact_hash = feldera_artifact_bytes_hash(artifact_bytes);
+    let provenance = release_provenance_for_artifact(&artifact);
+
+    let registered = registry
+        .register_release_provenance_verified_artifact(
+            &catalog,
+            &spec,
+            &artifact,
+            artifact_bytes,
+            &provenance,
+        )
+        .await
+        .unwrap();
+    let selected = registry
+        .select_release_provenance_verified_artifact(
+            &catalog,
+            &spec,
+            &artifact.artifact_id,
+            &artifact.artifact_hash,
+            &provenance,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        registered.register_outcome,
+        RegisterFelderaArtifactOutcome::Created
+    );
+    assert_eq!(selected.metadata, artifact);
+    assert_eq!(
+        registered.status,
+        RuntimeFelderaArtifactSelectionStatus::DirectExecutionDisabled
+    );
+    assert_eq!(
+        selected.status,
+        RuntimeFelderaArtifactSelectionStatus::DirectExecutionDisabled
+    );
+}
+
+#[tokio::test]
+async fn feldera_runtime_registry_release_provenance_mismatch_does_not_persist() {
+    let (_temp_dir, store) = temp_store();
+    let registry = RuntimeFelderaArtifactRegistry::new(store);
+    let (catalog, spec, mut artifact) = catalog_valid_fixture_parts();
+    let artifact_bytes = b"compiled release artifact bytes";
+    artifact.artifact_hash = feldera_artifact_bytes_hash(artifact_bytes);
+    let mut provenance = release_provenance_for_artifact(&artifact);
+    provenance.build.artifact_hash = format!("sha256:{}", "9".repeat(64));
+
+    let error = registry
+        .register_release_provenance_verified_artifact(
+            &catalog,
+            &spec,
+            &artifact,
+            artifact_bytes,
+            &provenance,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RuntimeFelderaArtifactError::Validation(
+            FelderaArtifactError::MismatchedReleaseProvenanceField {
+                field: "build.artifact_hash"
+            }
+        )
+    ));
+    let error = registry
+        .select_trusted_artifact(
+            &catalog,
+            &spec,
+            &artifact.artifact_id,
+            &artifact.artifact_hash,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        RuntimeFelderaArtifactError::Storage(FelderaArtifactRegistryError::ObjectStore(
+            object_store::Error::NotFound { .. }
+        ))
+    ));
+}
+
+#[tokio::test]
+async fn feldera_runtime_registry_release_provenance_selection_revalidates_stored_identity() {
+    let (_temp_dir, store) = temp_store();
+    let registry = RuntimeFelderaArtifactRegistry::new(store);
+    let (catalog, spec, mut artifact) = catalog_valid_fixture_parts();
+    let artifact_bytes = b"compiled release artifact bytes";
+    artifact.artifact_hash = feldera_artifact_bytes_hash(artifact_bytes);
+    let provenance = release_provenance_for_artifact(&artifact);
+
+    registry
+        .register_hash_verified_artifact(&catalog, &spec, &artifact, artifact_bytes)
+        .await
+        .unwrap();
+
+    let mut mismatched_provenance = provenance.clone();
+    mismatched_provenance.build.artifact_id = "different-artifact".to_string();
+    let error = registry
+        .select_release_provenance_verified_artifact(
+            &catalog,
+            &spec,
+            &artifact.artifact_id,
+            &artifact.artifact_hash,
+            &mismatched_provenance,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RuntimeFelderaArtifactError::Validation(
+            FelderaArtifactError::MismatchedReleaseProvenanceField {
+                field: "build.artifact_id"
+            }
+        )
+    ));
+
+    let mut changed_catalog = catalog;
+    changed_catalog.relation_schema.relation_version = "2026-05-05.v2".to_string();
+    changed_catalog.schema_fingerprint =
+        SchemaFingerprintV1::for_relation_schema(&changed_catalog.relation_schema).unwrap();
+    changed_catalog.feldera_relation.schema_fingerprint =
+        changed_catalog.schema_fingerprint.clone();
+    let mut changed_spec = spec;
+    changed_spec.input_relations = vec![catalog_input_schema(&changed_catalog)];
+
+    let error = registry
+        .select_release_provenance_verified_artifact(
+            &changed_catalog,
+            &changed_spec,
+            &artifact.artifact_id,
+            &artifact.artifact_hash,
+            &provenance,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RuntimeFelderaArtifactError::Validation(FelderaArtifactError::MismatchedSpecHash { .. })
+    ));
 }
 
 #[tokio::test]

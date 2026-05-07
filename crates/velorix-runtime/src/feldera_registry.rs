@@ -5,8 +5,9 @@ use thiserror::Error;
 use velorix_core::{
     feldera_artifact::{
         validate_feldera_compile_artifact_for_catalog,
-        validate_feldera_compile_artifact_hash_for_catalog, FelderaArtifactError,
-        FelderaCompileArtifactMetadata, StandingViewSpec,
+        validate_feldera_compile_artifact_hash_for_catalog,
+        validate_feldera_release_artifact_provenance, FelderaArtifactError,
+        FelderaCompileArtifactMetadata, FelderaReleaseArtifactProvenanceV1, StandingViewSpec,
     },
     relation::VelorixRelationCatalogV1,
 };
@@ -106,6 +107,31 @@ impl RuntimeFelderaArtifactRegistry {
         })
     }
 
+    pub async fn register_release_provenance_verified_artifact(
+        &self,
+        catalog: &VelorixRelationCatalogV1,
+        spec: &StandingViewSpec,
+        artifact: &FelderaCompileArtifactMetadata,
+        artifact_bytes: &[u8],
+        provenance: &FelderaReleaseArtifactProvenanceV1,
+    ) -> Result<RegisteredRuntimeFelderaArtifact, RuntimeFelderaArtifactError> {
+        validate_feldera_compile_artifact_hash_for_catalog(
+            catalog,
+            spec,
+            artifact,
+            artifact_bytes,
+        )?;
+        validate_feldera_release_artifact_provenance(artifact, provenance)?;
+
+        let register_outcome = self.storage.register(spec, artifact).await?;
+
+        Ok(RegisteredRuntimeFelderaArtifact {
+            metadata: artifact.clone(),
+            status: RuntimeFelderaArtifactSelectionStatus::DirectExecutionDisabled,
+            register_outcome,
+        })
+    }
+
     pub async fn select_trusted_artifact(
         &self,
         catalog: &VelorixRelationCatalogV1,
@@ -115,6 +141,24 @@ impl RuntimeFelderaArtifactRegistry {
     ) -> Result<RuntimeFelderaArtifactSelection, RuntimeFelderaArtifactError> {
         let metadata = self.storage.read(artifact_id, artifact_hash).await?;
         validate_feldera_compile_artifact_for_catalog(catalog, spec, &metadata)?;
+
+        Ok(RuntimeFelderaArtifactSelection {
+            metadata,
+            status: RuntimeFelderaArtifactSelectionStatus::DirectExecutionDisabled,
+        })
+    }
+
+    pub async fn select_release_provenance_verified_artifact(
+        &self,
+        catalog: &VelorixRelationCatalogV1,
+        spec: &StandingViewSpec,
+        artifact_id: &str,
+        artifact_hash: &str,
+        provenance: &FelderaReleaseArtifactProvenanceV1,
+    ) -> Result<RuntimeFelderaArtifactSelection, RuntimeFelderaArtifactError> {
+        let metadata = self.storage.read(artifact_id, artifact_hash).await?;
+        validate_feldera_compile_artifact_for_catalog(catalog, spec, &metadata)?;
+        validate_feldera_release_artifact_provenance(&metadata, provenance)?;
 
         Ok(RuntimeFelderaArtifactSelection {
             metadata,
