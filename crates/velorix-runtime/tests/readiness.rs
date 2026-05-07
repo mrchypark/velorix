@@ -142,6 +142,27 @@ fn readiness_report_blocks_when_dependency_governance_evidence_is_missing() {
 }
 
 #[test]
+fn readiness_report_blocks_when_gc_evidence_is_missing() {
+    let report = ProductionReadinessEvidenceV1::from_json_str(&readiness_json(
+        &["gc_run_evidence", "checkpoint_retention_record"],
+        false,
+        &[],
+    ))
+    .unwrap()
+    .try_into_report()
+    .unwrap();
+
+    assert!(!report.production_ready);
+    assert_eq!(
+        report.blocking_reasons,
+        vec![
+            "gc_status missing gc_run_evidence evidence",
+            "gc_status missing checkpoint_retention_record evidence",
+        ]
+    );
+}
+
+#[test]
 fn readiness_report_blocks_bootstrap_raw_state_path() {
     let report = ProductionReadinessEvidenceV1::from_json_str(&readiness_json(&[], true, &[]))
         .unwrap()
@@ -302,6 +323,7 @@ fn readiness_evidence_rejects_unknown_json_fields() {
             "feldera_artifact_status": { "status": "pass", "evidence": "trusted artifact metadata", "evidence_kind": ["feldera_artifact_registry", "feldera_artifact_hash_verified"] },
             "dependency_governance_status": { "status": "pass", "evidence": "dependency governance validated", "evidence_kind": ["dependency_governance_validated"] },
             "benchmark_gate_status": { "status": "pass", "evidence": "S3-compatible benchmark gate", "evidence_kind": ["s3_compatible_benchmark_gate"] },
+            "gc_status": { "status": "pass", "evidence": "GC run and retention evidence", "evidence_kind": ["gc_run_evidence", "checkpoint_retention_record"] },
             "kubernetes_status": { "status": "pass", "evidence": "Kubernetes Lease client", "evidence_kind": ["kubernetes_lease_client"] },
             "surprise": true
         }"#,
@@ -396,6 +418,18 @@ fn readiness_json(
         } else {
             ""
         };
+    let mut gc_evidence_kind = Vec::new();
+    if !missing_evidence.contains(&"gc_run_evidence") {
+        gc_evidence_kind.push("gc_run_evidence");
+    }
+    if !missing_evidence.contains(&"checkpoint_retention_record") {
+        gc_evidence_kind.push("checkpoint_retention_record");
+    }
+    let gc_kind = if gc_evidence_kind.is_empty() {
+        String::new()
+    } else {
+        format!(r#", "evidence_kind": {:?}"#, gc_evidence_kind)
+    };
 
     format!(
         r#"{{
@@ -411,6 +445,7 @@ fn readiness_json(
             "feldera_artifact_status": {{ "status": "pass", "evidence": "trusted artifact metadata"{feldera_artifact_kind} }},
             "dependency_governance_status": {{ "status": "{dependency_governance_status}", "evidence": "{dependency_governance_evidence}"{dependency_governance_kind} }},
             "benchmark_gate_status": {{ "status": "{benchmark_status}", "evidence": "{benchmark_evidence}"{benchmark_gate_kind} }},
+            "gc_status": {{ "status": "{gc_status}", "evidence": "{gc_evidence}"{gc_kind} }},
             "kubernetes_status": {{ "status": "pass", "evidence": "Kubernetes Lease client"{kubernetes_kind} }}
         }}"#,
         dependency_governance_status = status_for("dependency_governance_status", failed_fields),
@@ -418,6 +453,8 @@ fn readiness_json(
             evidence_for("dependency_governance_status", failed_fields),
         benchmark_status = status_for("benchmark_gate_status", failed_fields),
         benchmark_evidence = evidence_for("benchmark_gate_status", failed_fields),
+        gc_status = status_for("gc_status", failed_fields),
+        gc_evidence = evidence_for("gc_status", failed_fields),
     )
 }
 
@@ -446,8 +483,10 @@ fn evidence_for(field: &str, failed_fields: &[&str]) -> &'static str {
     match (field, failed_fields.contains(&field)) {
         ("dependency_governance_status", true) => "dependency governance failed closed",
         ("benchmark_gate_status", true) => "regression gate failed closed",
+        ("gc_status", true) => "GC evidence failed closed",
         ("dependency_governance_status", false) => "dependency governance validated",
         ("benchmark_gate_status", false) => "S3-compatible benchmark gate",
+        ("gc_status", false) => "GC run and retention evidence",
         _ => "readiness evidence",
     }
 }

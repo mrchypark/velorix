@@ -21,6 +21,7 @@ pub struct ProductionReadinessEvidenceV1 {
     pub feldera_artifact_status: ReadinessCheck,
     pub dependency_governance_status: ReadinessCheck,
     pub benchmark_gate_status: ReadinessCheck,
+    pub gc_status: ReadinessCheck,
     pub kubernetes_status: ReadinessCheck,
 }
 
@@ -56,6 +57,8 @@ pub enum ReadinessEvidenceKind {
     FelderaArtifactReleaseProvenance,
     DependencyGovernanceValidated,
     S3CompatibleBenchmarkGate,
+    GcRunEvidence,
+    CheckpointRetentionRecord,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,6 +108,7 @@ pub struct ProductionReadinessReportV1 {
     pub feldera_artifact_status: ReadinessCheck,
     pub dependency_governance_status: ReadinessCheck,
     pub benchmark_gate_status: ReadinessCheck,
+    pub gc_status: ReadinessCheck,
     pub kubernetes_status: ReadinessCheck,
     pub production_ready: bool,
     pub blocking_reasons: Vec<String>,
@@ -164,6 +168,7 @@ impl ProductionReadinessEvidenceV1 {
             "benchmark_gate_status",
             &self.benchmark_gate_status,
         );
+        push_failed_check(&mut blocking_reasons, "gc_status", &self.gc_status);
         push_failed_check(
             &mut blocking_reasons,
             "kubernetes_status",
@@ -263,6 +268,19 @@ impl ProductionReadinessEvidenceV1 {
             );
         }
         if !self
+            .gc_status
+            .has_evidence(ReadinessEvidenceKind::GcRunEvidence)
+        {
+            blocking_reasons.push("gc_status missing gc_run_evidence evidence".to_string());
+        }
+        if !self
+            .gc_status
+            .has_evidence(ReadinessEvidenceKind::CheckpointRetentionRecord)
+        {
+            blocking_reasons
+                .push("gc_status missing checkpoint_retention_record evidence".to_string());
+        }
+        if !self
             .dependency_governance_status
             .has_evidence(ReadinessEvidenceKind::DependencyGovernanceValidated)
         {
@@ -285,6 +303,7 @@ impl ProductionReadinessEvidenceV1 {
             feldera_artifact_status: self.feldera_artifact_status,
             dependency_governance_status: self.dependency_governance_status,
             benchmark_gate_status: self.benchmark_gate_status,
+            gc_status: self.gc_status,
             kubernetes_status: self.kubernetes_status,
             production_ready: blocking_reasons.is_empty(),
             blocking_reasons,

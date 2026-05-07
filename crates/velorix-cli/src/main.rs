@@ -2406,6 +2406,11 @@ mod tests {
                 "evidence": "S3-compatible benchmark gate",
                 "evidence_kind": ["s3_compatible_benchmark_gate"]
             },
+            "gc_status": {
+                "status": "pass",
+                "evidence": "GC run and retention evidence",
+                "evidence_kind": ["gc_run_evidence", "checkpoint_retention_record"]
+            },
             "kubernetes_status": {
                 "status": "pass",
                 "evidence": "Kubernetes Lease client",
