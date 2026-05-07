@@ -38,15 +38,19 @@ permanently hide the last known good checkpoint.
 - `last_known_good_read_only`: allow read-only recovery from an admin-selected
   valid checkpoint.
 
-`velorix-cli recover-local --object-store-dir <path> --relation-id <id> --relation-version <version> --checkpoint-version <n>`
-starts recovery from an admin-selected published checkpoint after reading the
-persisted relation catalog record and validating the manifest body/key/version,
-parent lineage, referenced payloads, and the digest-bound `published` lifecycle
-record. Recovery then replays durable ingest after that checkpoint boundary.
+`velorix-cli recover-local --object-store-dir <path> --relation-id <id> --relation-version <version> --slatedb-state-path <object-store-db-path> --checkpoint-version <n>`
+starts SlateDB-backed recovery from an admin-selected published checkpoint after
+reading the persisted relation catalog record and validating the manifest
+body/key/version, parent lineage, referenced payloads, and the digest-bound
+`published` lifecycle record. Recovery then replays durable ingest after that
+checkpoint boundary.
 SlateDB-backed checkpoint state is explicit: `--slatedb-state-path
 <object-store-db-path>` opens the SlateDB state substrate for
 selected-checkpoint or latest-checkpoint recovery; the path is the object-store
 database path stored in the checkpoint ref, not another local object-store root.
+If `--slatedb-state-path` is omitted, `recover-local` treats the operation as
+legacy raw-object bootstrap/migration recovery and requires
+`--allow-bootstrap-raw-state` before it will open that path.
 
 ## Lifecycle Status
 
@@ -100,4 +104,6 @@ delete, or recover from a checkpoint.
 - SlateDB selected-checkpoint local recovery opens state through
   `--slatedb-state-path` and rejects raw state paths on the SlateDB recovery
   path.
+- Local raw-object recovery requires the explicit
+  `--allow-bootstrap-raw-state` bootstrap/migration flag.
 - Large-manifest-count benchmark records lookup memory and latency.

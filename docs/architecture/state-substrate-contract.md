@@ -80,6 +80,8 @@ guard, not a retention handle.
   SlateDB store, keeps retained SlateDB refs readable, and records digest-bound
   retention evidence for the released state key.
 - Production publication rejects raw state refs without a bootstrap flag.
+- Local admin recovery rejects raw state refs unless `recover-local` is invoked
+  with the explicit `--allow-bootstrap-raw-state` bootstrap/migration flag.
 - `ref_type` is required outside migration mode.
 
 ## Remaining Gaps

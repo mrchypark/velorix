@@ -81,6 +81,11 @@ enum Command {
         slatedb_state_path: Option<String>,
         #[arg(
             long,
+            help = "Permit bootstrap/migration recovery from legacy raw object state refs"
+        )]
+        allow_bootstrap_raw_state: bool,
+        #[arg(
+            long,
             help = "Start recovery from this published checkpoint, then replay later ingest"
         )]
         checkpoint_version: Option<u64>,
@@ -171,6 +176,7 @@ async fn main() -> anyhow::Result<()> {
             relation_id,
             relation_version,
             slatedb_state_path,
+            allow_bootstrap_raw_state,
             checkpoint_version,
         }) => {
             let store = local_object_store(&object_store_dir)?;
@@ -180,6 +186,7 @@ async fn main() -> anyhow::Result<()> {
                 relation_version,
                 slatedb_state_path,
                 checkpoint_version,
+                allow_bootstrap_raw_state,
             )
             .await
             .context("failed to recover local runtime")?;
@@ -1030,53 +1037,63 @@ async fn recover_local_runtime(
     relation_version: String,
     slatedb_state_path: Option<String>,
     checkpoint_version: Option<u64>,
-) -> Result<RecoveredRuntime, velorix_runtime::recovery::RecoveryError> {
+    allow_bootstrap_raw_state: bool,
+) -> anyhow::Result<RecoveredRuntime> {
+    if slatedb_state_path.is_none() && !allow_bootstrap_raw_state {
+        bail!(
+            "recover-local raw object state recovery requires --allow-bootstrap-raw-state when \
+             --slatedb-state-path is omitted"
+        );
+    }
+
     match (slatedb_state_path, checkpoint_version) {
-        (None, None) => {
+        (None, None) => Ok(
             RecoveredRuntime::recover_with_owner_and_relation_catalog_record(
                 store,
                 ORDERS_SUM_COUNT_OWNER,
                 &relation_id,
                 &relation_version,
             )
-            .await
-        }
+            .await?,
+        ),
         (Some(db_path), Some(checkpoint_version)) => {
             let relation_catalog = RelationCatalogRegistry::new(Arc::clone(&store))
                 .read(&relation_id, &relation_version)
                 .await?;
-            RecoveredRuntime::recover_from_published_checkpoint_version_with_slatedb_state_store_and_relation_catalog(
+            Ok(RecoveredRuntime::recover_from_published_checkpoint_version_with_slatedb_state_store_and_relation_catalog(
                 store,
                 db_path,
                 checkpoint_version,
                 ORDERS_SUM_COUNT_OWNER,
                 relation_catalog,
             )
-            .await
+            .await?)
         }
         (Some(db_path), None) => {
             let relation_catalog = RelationCatalogRegistry::new(Arc::clone(&store))
                 .read(&relation_id, &relation_version)
                 .await?;
-            RecoveredRuntime::recover_with_slatedb_state_store_and_relation_catalog(
-                store,
-                db_path,
-                ORDERS_SUM_COUNT_OWNER,
-                relation_catalog,
+            Ok(
+                RecoveredRuntime::recover_with_slatedb_state_store_and_relation_catalog(
+                    store,
+                    db_path,
+                    ORDERS_SUM_COUNT_OWNER,
+                    relation_catalog,
+                )
+                .await?,
             )
-            .await
         }
         (None, Some(checkpoint_version)) => {
             let relation_catalog = RelationCatalogRegistry::new(Arc::clone(&store))
                 .read(&relation_id, &relation_version)
                 .await?;
-            RecoveredRuntime::recover_from_published_checkpoint_version_with_owner_and_relation_catalog(
+            Ok(RecoveredRuntime::recover_from_published_checkpoint_version_with_owner_and_relation_catalog(
                 store,
                 checkpoint_version,
                 ORDERS_SUM_COUNT_OWNER,
                 relation_catalog,
             )
-            .await
+            .await?)
         }
     }
 }
@@ -1431,6 +1448,7 @@ mod tests {
             relation_id,
             relation_version,
             slatedb_state_path,
+            allow_bootstrap_raw_state,
             checkpoint_version,
         }) = cli.command
         else {
@@ -1441,6 +1459,7 @@ mod tests {
         assert_eq!(relation_id, "orders");
         assert_eq!(relation_version, "2026-05-05.v1");
         assert_eq!(slatedb_state_path, None);
+        assert!(!allow_bootstrap_raw_state);
         assert_eq!(checkpoint_version, Some(7));
     }
 
@@ -1467,6 +1486,7 @@ mod tests {
             relation_id,
             relation_version,
             slatedb_state_path,
+            allow_bootstrap_raw_state,
             checkpoint_version,
         }) = cli.command
         else {
@@ -1477,7 +1497,34 @@ mod tests {
         assert_eq!(relation_id, "orders");
         assert_eq!(relation_version, "2026-05-05.v1");
         assert_eq!(slatedb_state_path, Some("v1/slatedb/state".to_string()));
+        assert!(!allow_bootstrap_raw_state);
         assert_eq!(checkpoint_version, Some(7));
+    }
+
+    #[test]
+    fn recover_local_cli_parses_bootstrap_raw_state_flag() {
+        let cli = Cli::try_parse_from([
+            "velorix-cli",
+            "recover-local",
+            "--object-store-dir",
+            "/tmp/velorix",
+            "--relation-id",
+            "orders",
+            "--relation-version",
+            "2026-05-05.v1",
+            "--allow-bootstrap-raw-state",
+        ])
+        .unwrap();
+
+        let Some(Command::RecoverLocal {
+            allow_bootstrap_raw_state,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected recover-local command");
+        };
+
+        assert!(allow_bootstrap_raw_state);
     }
 
     #[test]
@@ -1496,7 +1543,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_local_runtime_requires_persisted_relation_catalog_record() {
+    async fn recover_local_runtime_rejects_raw_state_without_bootstrap_flag() {
         let dir = tempdir().unwrap();
         let store = local_object_store(dir.path()).unwrap();
 
@@ -1506,12 +1553,33 @@ mod tests {
             "2026-05-05.v1".to_string(),
             None,
             None,
+            false,
         )
         .await
         .unwrap_err();
 
+        assert!(error.to_string().contains("--allow-bootstrap-raw-state"));
+    }
+
+    #[tokio::test]
+    async fn recover_local_runtime_allows_raw_state_with_bootstrap_flag() {
+        let dir = tempdir().unwrap();
+        let store = local_object_store(dir.path()).unwrap();
+
+        let error = recover_local_runtime(
+            store,
+            "orders".to_string(),
+            "2026-05-05.v1".to_string(),
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap_err();
+
+        let recovery_error = error.downcast_ref::<RecoveryError>().unwrap();
         assert!(matches!(
-            error,
+            recovery_error,
             RecoveryError::RelationCatalogRegistry(RelationCatalogRegistryError::ObjectStore(
                 object_store::Error::NotFound { .. }
             ))
@@ -1567,6 +1635,7 @@ mod tests {
             relation_version,
             Some("v1/slatedb/state".to_string()),
             Some(0),
+            false,
         )
         .await
         .unwrap();
