@@ -33,6 +33,11 @@ jobs:
       - name: Cache cargo build artifacts
         uses: Swatinem/rust-cache@v2
 
+      - name: Validate production readiness status matrix
+        run: |
+          cargo run -p velorix-cli -- release-status-validate \
+            --status-matrix docs/architecture/production-readiness-status.md
+
       - name: Run release benchmark gate
         run: |
           test -f "$S3_BENCHMARK_RESULT_PATH"
