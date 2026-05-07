@@ -175,9 +175,21 @@ manifests with reasons, and return the latest valid checkpoint for repair or
 read-only diagnosis. For lineage diagnostics, a structurally valid parent
 manifest remains usable as parent evidence even when that older manifest's own
 raw state/output payloads have been GC-deleted; each manifest's own payload
-availability still determines whether that manifest is reported valid. It does
-not yet implement lifecycle transitions beyond `published`, retention
-tombstones, compaction state, or recovery-mode writes.
+availability still determines whether that manifest is reported valid. After a
+GC run evidence object is written and read back successfully, GC also writes
+append-only retention evidence for non-retained checkpoints whose raw
+state/output payloads were deleted:
+
+```text
+v1/checkpoint-retention/{checkpoint_version:020}.retention.json
+```
+
+The retention record includes schema version, checkpoint version, manifest key,
+manifest digest, GC run id, policy, retained manifest versions, deleted
+candidate keys, and timestamp. Admin inspection attaches retention evidence
+only when the record validates and its manifest digest matches the inspected
+manifest. It does not yet implement lifecycle transitions beyond `published`,
+manifest deletion, compaction state, repair, or recovery-mode writes.
 
 State object references may carry an `owner_claim` with `owner_id` and
 `owner_epoch`. This is distinct from the existing state ref `owner`, which
@@ -330,8 +342,9 @@ part of the retained recovery set. Operators and recovery code must treat those
 older manifests as historical metadata only unless their referenced payloads are
 still available for some other reason. Admin inspection may still use those
 older manifest bodies as structural parent-lineage evidence for newer retained
-checkpoints. Broad manifest lifecycle retirement and retention tombstoning
-remain future work.
+checkpoints. Retention evidence records the GC run that removed payloads for
+non-retained checkpoints; broad manifest lifecycle retirement, manifest
+deletion, and compaction remain future work.
 
 This is not a broad production GC service. It does not collect staging
 `v1/tmp/...` objects, does not add object-store listing-consistency controls,

@@ -128,6 +128,12 @@ impl ObjectKey {
         ))
     }
 
+    pub fn checkpoint_retention_record(checkpoint_version: u64) -> Self {
+        Self(format!(
+            "v1/checkpoint-retention/{checkpoint_version:0CHECKPOINT_WIDTH$}.retention.json"
+        ))
+    }
+
     pub fn garbage_collection_run(run_id: &str) -> Result<Self, ObjectKeyError> {
         validate_segment("run_id", run_id)?;
 
@@ -291,6 +297,12 @@ fn validate_known_layout(value: &str) -> Result<(), ObjectKeyError> {
         ["v1", "checkpoint-lifecycle", status_file] => {
             let checkpoint = status_file
                 .strip_suffix(".status.json")
+                .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+            parse_fixed_u64("checkpoint_version", checkpoint, CHECKPOINT_WIDTH)?;
+        }
+        ["v1", "checkpoint-retention", retention_file] => {
+            let checkpoint = retention_file
+                .strip_suffix(".retention.json")
                 .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
             parse_fixed_u64("checkpoint_version", checkpoint, CHECKPOINT_WIDTH)?;
         }
@@ -668,6 +680,19 @@ mod tests {
         let restarted = ObjectKey::checkpoint_latest_candidate_marker();
 
         assert_eq!(key.as_str(), "v1/checkpoint-index/latest-candidate.json");
+        assert_eq!(key, restarted);
+        assert_eq!(ObjectKey::parse(key.as_str()).unwrap(), key);
+    }
+
+    #[test]
+    fn checkpoint_retention_record_key_is_deterministic_and_parseable() {
+        let key = ObjectKey::checkpoint_retention_record(9);
+        let restarted = ObjectKey::checkpoint_retention_record(9);
+
+        assert_eq!(
+            key.as_str(),
+            "v1/checkpoint-retention/00000000000000000009.retention.json"
+        );
         assert_eq!(key, restarted);
         assert_eq!(ObjectKey::parse(key.as_str()).unwrap(), key);
     }

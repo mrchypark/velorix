@@ -69,7 +69,16 @@ diagnostics. When GC leaves an older parent manifest listed but deletes that
 parent's raw state/output payloads, inspection may still use the parent
 manifest body as structural lineage evidence for newer retained checkpoints;
 the older manifest itself is reported invalid if its own payloads are missing.
-Inspection does not repair, rewrite, or recover from a checkpoint.
+When a GC run has successfully persisted and read back its `GcRunV1` evidence,
+inspection also reports digest-matched retention evidence from:
+
+```text
+v1/checkpoint-retention/{checkpoint_version:020}.retention.json
+```
+
+Retention evidence is an admin surface only. It records which GC run and policy
+removed payloads for a non-retained checkpoint; it does not repair, rewrite,
+delete, or recover from a checkpoint.
 
 ## Verification
 
@@ -84,6 +93,8 @@ Inspection does not repair, rewrite, or recover from a checkpoint.
   payloads remain available.
 - Local CLI admin inspect prints deterministic read-only checkpoint diagnostics.
 - Published lifecycle records are readable and digest-bound to their manifest.
+- Retention evidence is readable after successful GC evidence read-back and is
+  attached only when digest-bound to the inspected manifest.
 - Selected-checkpoint recovery requires a matching published lifecycle digest
   record and validates referenced state/output payload visibility.
 - SlateDB selected-checkpoint local recovery opens state through

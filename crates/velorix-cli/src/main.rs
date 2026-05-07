@@ -51,6 +51,7 @@ use velorix_runtime::recovery::{
 use velorix_storage::{
     checkpoint_index::{
         CheckpointAdminInspection, CheckpointLifecycleStatus, CheckpointManifestInspectionStatus,
+        CheckpointRetentionRecordV1,
     },
     gc::{GarbageCollectionPlan, GarbageCollectionPolicy, GarbageCollectionRunV1},
     state::CheckpointPublisher,
@@ -977,10 +978,11 @@ fn format_checkpoint_inspection(inspection: &CheckpointAdminInspection) -> Strin
 
     for manifest in &inspection.manifests {
         output.push_str(&format!(
-            "checkpoint={} key={} lifecycle={} status={}\n",
+            "checkpoint={} key={} lifecycle={} retention={} status={}\n",
             manifest.checkpoint_version,
             manifest.manifest_key,
             format_lifecycle_status(manifest.lifecycle_status),
+            format_retention_status(manifest.retention_record.as_ref()),
             format_manifest_status(&manifest.status),
         ));
     }
@@ -1053,6 +1055,19 @@ fn format_lifecycle_status(status: Option<CheckpointLifecycleStatus>) -> &'stati
         Some(CheckpointLifecycleStatus::Published) => "published",
         None => "none",
     }
+}
+
+fn format_retention_status(record: Option<&CheckpointRetentionRecordV1>) -> String {
+    record.map_or_else(
+        || "none".to_string(),
+        |record| {
+            format!(
+                "gc_run={} deleted={}",
+                record.gc_run_id,
+                record.deleted_candidate_keys.len()
+            )
+        },
+    )
 }
 
 fn format_manifest_status(status: &CheckpointManifestInspectionStatus) -> String {
@@ -2073,8 +2088,8 @@ mod tests {
             concat!(
                 "latest_valid_checkpoint=7\n",
                 "manifests:\n",
-                "checkpoint=3 key=v1/checkpoints/00000000000000000003.manifest lifecycle=published status=valid\n",
-                "checkpoint=8 key=v1/checkpoints/00000000000000000008.manifest lifecycle=none status=invalid reason=missing visible parent checkpoint 7\n",
+                "checkpoint=3 key=v1/checkpoints/00000000000000000003.manifest lifecycle=published retention=gc_run=run-0001 deleted=1 status=valid\n",
+                "checkpoint=8 key=v1/checkpoints/00000000000000000008.manifest lifecycle=none retention=none status=invalid reason=missing visible parent checkpoint 7\n",
             )
         );
     }
@@ -2087,6 +2102,10 @@ mod tests {
         assert_eq!(value["schema_version"], 1);
         assert_eq!(value["latest_valid_checkpoint"], 7);
         assert_eq!(value["manifests"][0]["status"], "valid");
+        assert_eq!(
+            value["manifests"][0]["retention_record"]["gc_run_id"],
+            "run-0001"
+        );
         assert_eq!(
             value["manifests"][1]["status"]["invalid"]["reason"],
             "missing visible parent checkpoint\n7"
@@ -2175,17 +2194,41 @@ mod tests {
                     checkpoint_version: 3,
                     manifest_key: ObjectKey::checkpoint_manifest(3),
                     lifecycle_status: Some(CheckpointLifecycleStatus::Published),
+                    retention_record: Some(checkpoint_retention_record(3)),
                     status: CheckpointManifestInspectionStatus::Valid,
                 },
                 CheckpointManifestInspection {
                     checkpoint_version: 8,
                     manifest_key: ObjectKey::checkpoint_manifest(8),
                     lifecycle_status: None,
+                    retention_record: None,
                     status: CheckpointManifestInspectionStatus::Invalid {
                         reason: "missing visible parent checkpoint\n7".to_string(),
                     },
                 },
             ],
+        }
+    }
+
+    fn checkpoint_retention_record(checkpoint_version: u64) -> CheckpointRetentionRecordV1 {
+        CheckpointRetentionRecordV1 {
+            schema_version: 1,
+            checkpoint_version,
+            manifest_key: ObjectKey::checkpoint_manifest(checkpoint_version),
+            manifest_digest: "sha256:retained".to_string(),
+            gc_run_id: "run-0001".to_string(),
+            policy: GarbageCollectionPolicy {
+                retain_latest_manifests: 1,
+            },
+            retained_manifest_versions: vec![7],
+            deleted_candidate_keys: vec![ObjectKey::state_object(
+                "balances_by_account",
+                0,
+                checkpoint_version,
+                "state-0001",
+            )
+            .unwrap()],
+            retained_at: "unix:0.000000001".to_string(),
         }
     }
 

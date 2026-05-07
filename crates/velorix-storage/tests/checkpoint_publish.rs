@@ -12,7 +12,7 @@ use tokio::sync::Barrier;
 use velorix_storage::{
     checkpoint_index::{
         CheckpointLifecycleRecord, CheckpointLifecycleStatus, CheckpointManifestInspectionStatus,
-        LatestCandidateMarker,
+        CheckpointRetentionRecordV1, LatestCandidateMarker,
     },
     gc::{
         GarbageCollectionCandidate, GarbageCollectionCandidateKind, GarbageCollectionPlan,
@@ -373,6 +373,27 @@ fn garbage_collection_run(run_id: &str, schema_version: u16) -> GarbageCollectio
             skipped: Vec::new(),
         },
     }
+}
+
+fn retention_record_for_test(
+    manifest: &CheckpointManifest,
+    deleted_candidate_keys: Vec<ObjectKey>,
+) -> CheckpointRetentionRecordV1 {
+    CheckpointRetentionRecordV1::for_manifest(
+        manifest,
+        &serde_json::to_vec(manifest).unwrap(),
+        "run-0001".to_string(),
+        GarbageCollectionPolicy {
+            retain_latest_manifests: 1,
+        },
+        vec![manifest.checkpoint_version + 1],
+        deleted_candidate_keys,
+        "unix:0.000000001".to_string(),
+    )
+}
+
+fn manifest_digest_for_test(manifest: &CheckpointManifest) -> String {
+    retention_record_for_test(manifest, Vec::new()).manifest_digest
 }
 
 fn input_range() -> InputRange {
@@ -878,6 +899,304 @@ async fn gc_execution_writes_stable_run_evidence() {
         .await
         .unwrap();
     assert_eq!(read_back, run);
+}
+
+#[tokio::test]
+async fn gc_execution_writes_retention_evidence_after_run_evidence_readback() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let policy = GarbageCollectionPolicy {
+        retain_latest_manifests: 1,
+    };
+    let state_0 = state_write(0, "state-0001", b"state-0");
+    let state_1 = state_write(1, "state-0002", b"state-1");
+
+    let state_ref_0 = publisher.write_state_object(&state_0).await.unwrap();
+    let manifest_0 = manifest(0, state_ref_0);
+    publisher.publish_manifest(&manifest_0).await.unwrap();
+    let state_ref_1 = publisher.write_state_object(&state_1).await.unwrap();
+    let manifest_1 = manifest(1, state_ref_1);
+    publisher.publish_manifest(&manifest_1).await.unwrap();
+
+    let plan = publisher.plan_garbage_collection(policy).await.unwrap();
+    let run = publisher
+        .execute_garbage_collection_plan_with_evidence("run-0001", policy, &plan)
+        .await
+        .unwrap();
+
+    let record = publisher.read_checkpoint_retention_record(0).await.unwrap();
+    assert_eq!(record.schema_version, 1);
+    assert_eq!(record.checkpoint_version, 0);
+    assert_eq!(record.manifest_key, manifest_0.object_key());
+    assert_eq!(record.gc_run_id, "run-0001");
+    assert_eq!(record.policy, policy);
+    assert_eq!(record.retained_manifest_versions, vec![1]);
+    assert_eq!(
+        record.deleted_candidate_keys,
+        vec![state_0.object_key().clone()]
+    );
+    assert_eq!(
+        record.manifest_digest,
+        manifest_digest_for_test(&manifest_0)
+    );
+    assert_eq!(
+        run.report.deleted[0].object_key,
+        state_0.object_key().clone()
+    );
+    assert!(matches!(
+        publisher.read_checkpoint_retention_record(1).await,
+        Err(CheckpointPublishError::ObjectStore(
+            object_store::Error::NotFound { .. }
+        ))
+    ));
+}
+
+#[tokio::test]
+async fn gc_execution_does_not_write_retention_evidence_when_run_evidence_fails() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::new(ReadFailsStore::new(
+        Arc::clone(&store),
+        "v1/gc-runs/run-0001.run.json",
+    )));
+    let policy = GarbageCollectionPolicy {
+        retain_latest_manifests: 1,
+    };
+    let state_0 = state_write(0, "state-0001", b"state-0");
+    let state_1 = state_write(1, "state-0002", b"state-1");
+
+    let state_ref_0 = publisher.write_state_object(&state_0).await.unwrap();
+    publisher
+        .publish_manifest(&manifest(0, state_ref_0))
+        .await
+        .unwrap();
+    let state_ref_1 = publisher.write_state_object(&state_1).await.unwrap();
+    publisher
+        .publish_manifest(&manifest(1, state_ref_1))
+        .await
+        .unwrap();
+
+    let plan = publisher.plan_garbage_collection(policy).await.unwrap();
+    publisher
+        .execute_garbage_collection_plan_with_evidence("run-0001", policy, &plan)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        store
+            .head(&Path::from(
+                ObjectKey::checkpoint_retention_record(0).as_str()
+            ))
+            .await,
+        Err(object_store::Error::NotFound { .. })
+    ));
+}
+
+#[tokio::test]
+async fn gc_execution_rejects_conflicting_retention_evidence_before_deleting_candidates() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let policy = GarbageCollectionPolicy {
+        retain_latest_manifests: 1,
+    };
+    let state_0 = state_write(0, "state-0001", b"state-0");
+    let state_1 = state_write(1, "state-0002", b"state-1");
+
+    let state_ref_0 = publisher.write_state_object(&state_0).await.unwrap();
+    let manifest_0 = manifest(0, state_ref_0);
+    publisher.publish_manifest(&manifest_0).await.unwrap();
+    let state_ref_1 = publisher.write_state_object(&state_1).await.unwrap();
+    publisher
+        .publish_manifest(&manifest(1, state_ref_1))
+        .await
+        .unwrap();
+    let mut conflicting =
+        retention_record_for_test(&manifest_0, vec![state_0.object_key().clone()]);
+    conflicting.gc_run_id = "other-run".to_string();
+    store
+        .put(
+            &Path::from(ObjectKey::checkpoint_retention_record(0).as_str()),
+            Bytes::from(serde_json::to_vec(&conflicting).unwrap()).into(),
+        )
+        .await
+        .unwrap();
+
+    let plan = publisher.plan_garbage_collection(policy).await.unwrap();
+    let err = publisher
+        .execute_garbage_collection_plan_with_evidence("run-0001", policy, &plan)
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("different causal fields"));
+    assert!(object_exists(store.as_ref(), state_0.object_key()).await);
+    assert!(matches!(
+        store
+            .head(&Path::from(
+                ObjectKey::garbage_collection_run("run-0001")
+                    .unwrap()
+                    .as_str()
+            ))
+            .await,
+        Err(object_store::Error::NotFound { .. })
+    ));
+}
+
+#[tokio::test]
+async fn checkpoint_admin_inspect_reports_retention_evidence_for_gc_retired_manifest() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let policy = GarbageCollectionPolicy {
+        retain_latest_manifests: 1,
+    };
+    let state_0 = state_write(0, "state-0001", b"state-0");
+    let state_1 = state_write(1, "state-0002", b"state-1");
+
+    let state_ref_0 = publisher.write_state_object(&state_0).await.unwrap();
+    publisher
+        .publish_manifest(&manifest(0, state_ref_0))
+        .await
+        .unwrap();
+    let state_ref_1 = publisher.write_state_object(&state_1).await.unwrap();
+    publisher
+        .publish_manifest(&manifest(1, state_ref_1))
+        .await
+        .unwrap();
+
+    let plan = publisher.plan_garbage_collection(policy).await.unwrap();
+    publisher
+        .execute_garbage_collection_plan_with_evidence("run-0001", policy, &plan)
+        .await
+        .unwrap();
+
+    let report = publisher.inspect_checkpoints().await.unwrap();
+    let retired = &report.manifests[0];
+    assert_eq!(retired.checkpoint_version, 0);
+    assert_eq!(
+        retired.retention_record.as_ref().unwrap().gc_run_id,
+        "run-0001"
+    );
+    assert!(matches!(
+        retired.status,
+        CheckpointManifestInspectionStatus::Invalid { .. }
+    ));
+    assert!(report.manifests[1].retention_record.is_none());
+    assert!(matches!(
+        report.manifests[1].status,
+        CheckpointManifestInspectionStatus::Valid
+    ));
+}
+
+#[tokio::test]
+async fn checkpoint_admin_inspect_ignores_retention_record_without_gc_run_evidence() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let state = state_write(0, "state-0001", b"state-0");
+    let manifest = manifest(0, publisher.write_state_object(&state).await.unwrap());
+    publisher.publish_manifest(&manifest).await.unwrap();
+    let record = retention_record_for_test(&manifest, vec![state.object_key().clone()]);
+    store
+        .put(
+            &Path::from(ObjectKey::checkpoint_retention_record(0).as_str()),
+            Bytes::from(serde_json::to_vec(&record).unwrap()).into(),
+        )
+        .await
+        .unwrap();
+
+    let report = publisher.inspect_checkpoints().await.unwrap();
+
+    assert!(report.manifests[0].retention_record.is_none());
+}
+
+#[tokio::test]
+async fn checkpoint_admin_inspect_ignores_retention_record_with_incomplete_deleted_keys() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let policy = GarbageCollectionPolicy {
+        retain_latest_manifests: 1,
+    };
+    let state_0 = state_write(0, "state-0001", b"state-0");
+    let state_1 = state_write(1, "state-0002", b"state-1");
+
+    let state_ref_0 = publisher.write_state_object(&state_0).await.unwrap();
+    let manifest_0 = manifest(0, state_ref_0);
+    publisher.publish_manifest(&manifest_0).await.unwrap();
+    let state_ref_1 = publisher.write_state_object(&state_1).await.unwrap();
+    publisher
+        .publish_manifest(&manifest(1, state_ref_1))
+        .await
+        .unwrap();
+
+    let plan = publisher.plan_garbage_collection(policy).await.unwrap();
+    publisher
+        .execute_garbage_collection_plan_with_evidence("run-0001", policy, &plan)
+        .await
+        .unwrap();
+    let truncated_record = CheckpointRetentionRecordV1::for_manifest(
+        &manifest_0,
+        &serde_json::to_vec(&manifest_0).unwrap(),
+        "run-0001".to_string(),
+        policy,
+        vec![1],
+        Vec::new(),
+        "unix:0.000000001".to_string(),
+    );
+    store
+        .put(
+            &Path::from(ObjectKey::checkpoint_retention_record(0).as_str()),
+            Bytes::from(serde_json::to_vec(&truncated_record).unwrap()).into(),
+        )
+        .await
+        .unwrap();
+
+    let report = publisher.inspect_checkpoints().await.unwrap();
+
+    assert!(report.manifests[0].retention_record.is_none());
+}
+
+#[tokio::test]
+async fn checkpoint_admin_inspect_ignores_retention_record_with_manifest_digest_mismatch() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let state = state_write(0, "state-0001", b"state-0");
+    let manifest = manifest(0, publisher.write_state_object(&state).await.unwrap());
+    publisher.publish_manifest(&manifest).await.unwrap();
+    let mut record = retention_record_for_test(&manifest, vec![state.object_key().clone()]);
+    record.manifest_digest = "sha256:mismatched".to_string();
+    store
+        .put(
+            &Path::from(ObjectKey::checkpoint_retention_record(0).as_str()),
+            Bytes::from(serde_json::to_vec(&record).unwrap()).into(),
+        )
+        .await
+        .unwrap();
+
+    let report = publisher.inspect_checkpoints().await.unwrap();
+
+    assert!(report.manifests[0].retention_record.is_none());
+}
+
+#[tokio::test]
+async fn checkpoint_retention_record_key_and_body_must_match() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let state = state_write(0, "state-0001", b"state-0");
+    let manifest = manifest(0, publisher.write_state_object(&state).await.unwrap());
+    publisher.publish_manifest(&manifest).await.unwrap();
+    let mut record = retention_record_for_test(&manifest, vec![state.object_key().clone()]);
+    record.checkpoint_version = 1;
+    store
+        .put(
+            &Path::from(ObjectKey::checkpoint_retention_record(0).as_str()),
+            Bytes::from(serde_json::to_vec(&record).unwrap()).into(),
+        )
+        .await
+        .unwrap();
+
+    let err = publisher
+        .read_checkpoint_retention_record(0)
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("does not match body checkpoint 1"));
 }
 
 #[tokio::test]

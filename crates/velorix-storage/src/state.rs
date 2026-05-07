@@ -13,7 +13,7 @@ use crate::{
     checkpoint_index::{
         manifest_digest, marker_updated_at_now, CheckpointAdminInspection,
         CheckpointLifecycleRecord, CheckpointLifecycleStatus, CheckpointManifestInspection,
-        CheckpointManifestInspectionStatus, LatestCandidateMarker,
+        CheckpointManifestInspectionStatus, CheckpointRetentionRecordV1, LatestCandidateMarker,
     },
     gc::{
         GarbageCollectionCandidate, GarbageCollectionCandidateKind, GarbageCollectionPlan,
@@ -42,6 +42,7 @@ pub struct CheckpointPublisher {
 struct InspectableCheckpointManifest {
     manifest: CheckpointManifest,
     lifecycle_status: Option<CheckpointLifecycleStatus>,
+    retention_record: Option<CheckpointRetentionRecordV1>,
     payload_status: Result<(), String>,
 }
 
@@ -557,6 +558,23 @@ impl CheckpointPublisher {
         Ok(record)
     }
 
+    pub async fn read_checkpoint_retention_record(
+        &self,
+        checkpoint_version: u64,
+    ) -> Result<CheckpointRetentionRecordV1, CheckpointPublishError> {
+        let object_key = ObjectKey::checkpoint_retention_record(checkpoint_version);
+        let bytes = self
+            .store
+            .get(&Path::from(object_key.as_str()))
+            .await?
+            .bytes()
+            .await?;
+        let record = serde_json::from_slice::<CheckpointRetentionRecordV1>(&bytes)?;
+        self.validate_retention_record(&object_key, &record)?;
+
+        Ok(record)
+    }
+
     pub async fn inspect_checkpoints(
         &self,
     ) -> Result<CheckpointAdminInspection, CheckpointPublishError> {
@@ -593,6 +611,7 @@ impl CheckpointPublisher {
                 Ok(inspectable) => {
                     let checkpoint_version = inspectable.manifest.checkpoint_version;
                     let lifecycle_status = inspectable.lifecycle_status;
+                    let retention_record = inspectable.retention_record;
                     let payload_status = inspectable.payload_status;
                     lineage_manifests.insert(
                         inspectable.manifest.checkpoint_version,
@@ -606,6 +625,7 @@ impl CheckpointPublisher {
                                 checkpoint_version,
                                 manifest_key,
                                 lifecycle_status,
+                                retention_record,
                                 status: CheckpointManifestInspectionStatus::Valid,
                             }
                         }
@@ -613,6 +633,7 @@ impl CheckpointPublisher {
                             checkpoint_version,
                             manifest_key,
                             lifecycle_status,
+                            retention_record,
                             status: CheckpointManifestInspectionStatus::Invalid { reason },
                         },
                     }
@@ -621,6 +642,7 @@ impl CheckpointPublisher {
                     checkpoint_version,
                     manifest_key,
                     lifecycle_status: None,
+                    retention_record: None,
                     status: CheckpointManifestInspectionStatus::Invalid { reason },
                 },
             };
@@ -814,6 +836,8 @@ impl CheckpointPublisher {
                 },
             );
         }
+        self.validate_no_conflicting_retention_records(run_id, policy, plan)
+            .await?;
 
         let report = self.execute_garbage_collection_plan(plan).await?;
         let run = GarbageCollectionRunV1 {
@@ -841,6 +865,7 @@ impl CheckpointPublisher {
                 },
             );
         }
+        self.publish_retention_records_for_run(&restored).await?;
 
         Ok(restored)
     }
@@ -892,6 +917,161 @@ impl CheckpointPublisher {
         }
 
         Ok(())
+    }
+
+    async fn publish_retention_records_for_run(
+        &self,
+        run: &GarbageCollectionRunV1,
+    ) -> Result<(), CheckpointPublishError> {
+        let deleted = run
+            .report
+            .deleted
+            .iter()
+            .map(|candidate| candidate.object_key.clone())
+            .collect::<HashSet<_>>();
+        for record in self
+            .retention_records_for_deleted_keys(
+                &run.run_id,
+                run.policy,
+                &run.plan.retained_manifest_versions,
+                &deleted,
+            )
+            .await?
+        {
+            self.write_checkpoint_retention_record(record).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn validate_no_conflicting_retention_records(
+        &self,
+        run_id: &str,
+        policy: GarbageCollectionPolicy,
+        plan: &GarbageCollectionPlan,
+    ) -> Result<(), CheckpointPublishError> {
+        let candidate_keys = plan
+            .candidates
+            .iter()
+            .map(|candidate| candidate.object_key.clone())
+            .collect::<HashSet<_>>();
+        for expected in self
+            .retention_records_for_deleted_keys(
+                run_id,
+                policy,
+                &plan.retained_manifest_versions,
+                &candidate_keys,
+            )
+            .await?
+        {
+            let existing = match self
+                .read_checkpoint_retention_record(expected.checkpoint_version)
+                .await
+            {
+                Ok(existing) => existing,
+                Err(CheckpointPublishError::ObjectStore(object_store::Error::NotFound {
+                    ..
+                })) => continue,
+                Err(err) => return Err(err),
+            };
+            if !same_retention_causal_fields(&existing, &expected) {
+                return Err(retention_conflict_error(expected.checkpoint_version));
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn retention_records_for_deleted_keys(
+        &self,
+        run_id: &str,
+        policy: GarbageCollectionPolicy,
+        retained_manifest_versions: &[u64],
+        deleted_keys: &HashSet<ObjectKey>,
+    ) -> Result<Vec<CheckpointRetentionRecordV1>, CheckpointPublishError> {
+        let retained = retained_manifest_versions
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        if deleted_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut records = Vec::new();
+        for manifest in self.list_published_manifests().await? {
+            if retained.contains(&manifest.checkpoint_version) {
+                continue;
+            }
+            let manifest_deleted_keys = manifest
+                .state_objects
+                .iter()
+                .map(|state_ref| &state_ref.object_key)
+                .chain(
+                    manifest
+                        .output_objects
+                        .iter()
+                        .map(|output_ref| &output_ref.object_key),
+                )
+                .filter(|object_key| deleted_keys.contains(*object_key))
+                .cloned()
+                .collect::<Vec<_>>();
+            if manifest_deleted_keys.is_empty() {
+                continue;
+            }
+
+            let manifest_key = manifest.object_key();
+            let manifest_bytes = self
+                .store
+                .get(&Path::from(manifest_key.as_str()))
+                .await?
+                .bytes()
+                .await?;
+            let record = CheckpointRetentionRecordV1::for_manifest(
+                &manifest,
+                &manifest_bytes,
+                run_id.to_string(),
+                policy,
+                retained_manifest_versions.to_vec(),
+                manifest_deleted_keys,
+                marker_updated_at_now(),
+            );
+            records.push(record);
+        }
+
+        Ok(records)
+    }
+
+    async fn write_checkpoint_retention_record(
+        &self,
+        record: CheckpointRetentionRecordV1,
+    ) -> Result<(), CheckpointPublishError> {
+        let object_key = ObjectKey::checkpoint_retention_record(record.checkpoint_version);
+        self.validate_retention_record(&object_key, &record)?;
+        let bytes = serde_json::to_vec(&record)?;
+        let path = Path::from(object_key.as_str());
+
+        match self
+            .store
+            .put_opts(
+                &path,
+                Bytes::from(bytes.clone()).into(),
+                PutMode::Create.into(),
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                let existing = self
+                    .read_checkpoint_retention_record(record.checkpoint_version)
+                    .await?;
+                if same_retention_causal_fields(&existing, &record) {
+                    Ok(())
+                } else {
+                    Err(retention_conflict_error(record.checkpoint_version))
+                }
+            }
+            Err(err) => Err(err.into()),
+        }
     }
 
     async fn referenced_garbage_collection_candidates_for_plan(
@@ -1128,10 +1308,20 @@ impl CheckpointPublisher {
             .and_then(|record| {
                 (record.manifest_digest == manifest_digest(&bytes)).then_some(record.status)
             });
+        let retention_record = self
+            .read_checkpoint_retention_record(checkpoint_version)
+            .await
+            .ok()
+            .filter(|record| record.manifest_digest == manifest_digest(&bytes));
+        let retention_record = match retention_record {
+            Some(record) if self.retention_record_matches_gc_run(&record).await => Some(record),
+            _ => None,
+        };
 
         Ok(InspectableCheckpointManifest {
             manifest,
             lifecycle_status,
+            retention_record,
             payload_status,
         })
     }
@@ -1165,6 +1355,72 @@ impl CheckpointPublisher {
                 )),
             ));
         }
+
+        Ok(())
+    }
+
+    async fn retention_record_matches_gc_run(&self, record: &CheckpointRetentionRecordV1) -> bool {
+        let Ok(run) = self
+            .read_garbage_collection_run_evidence(&record.gc_run_id)
+            .await
+        else {
+            return false;
+        };
+        let deleted_keys = run
+            .report
+            .deleted
+            .iter()
+            .map(|candidate| candidate.object_key.clone())
+            .collect::<HashSet<_>>();
+
+        let Ok(expected_records) = self
+            .retention_records_for_deleted_keys(
+                &run.run_id,
+                run.policy,
+                &run.plan.retained_manifest_versions,
+                &deleted_keys,
+            )
+            .await
+        else {
+            return false;
+        };
+
+        expected_records
+            .iter()
+            .find(|expected| expected.checkpoint_version == record.checkpoint_version)
+            .is_some_and(|expected| same_retention_causal_fields(expected, record))
+    }
+
+    fn validate_retention_record(
+        &self,
+        object_key: &ObjectKey,
+        record: &CheckpointRetentionRecordV1,
+    ) -> Result<(), CheckpointPublishError> {
+        if !record.validate_schema() {
+            return Err(CheckpointPublishError::ObjectKey(
+                ObjectKeyError::InvalidExternalKey(format!(
+                    "unsupported checkpoint retention schema version {}",
+                    record.schema_version
+                )),
+            ));
+        }
+        if *object_key != ObjectKey::checkpoint_retention_record(record.checkpoint_version) {
+            return Err(CheckpointPublishError::ObjectKey(
+                ObjectKeyError::InvalidExternalKey(format!(
+                    "checkpoint retention key `{object_key}` does not match body checkpoint {}",
+                    record.checkpoint_version
+                )),
+            ));
+        }
+        if record.manifest_key != ObjectKey::checkpoint_manifest(record.checkpoint_version) {
+            return Err(CheckpointPublishError::ObjectKey(
+                ObjectKeyError::InvalidExternalKey(format!(
+                    "checkpoint retention manifest key `{}` does not match checkpoint {}",
+                    record.manifest_key, record.checkpoint_version
+                )),
+            ));
+        }
+        ObjectKey::garbage_collection_run(&record.gc_run_id)?;
 
         Ok(())
     }
@@ -1645,6 +1901,26 @@ fn garbage_collection_candidate_keys(plan: &GarbageCollectionPlan) -> Vec<Object
         .iter()
         .map(|candidate| candidate.object_key.clone())
         .collect()
+}
+
+fn same_retention_causal_fields(
+    left: &CheckpointRetentionRecordV1,
+    right: &CheckpointRetentionRecordV1,
+) -> bool {
+    left.schema_version == right.schema_version
+        && left.checkpoint_version == right.checkpoint_version
+        && left.manifest_key == right.manifest_key
+        && left.manifest_digest == right.manifest_digest
+        && left.gc_run_id == right.gc_run_id
+        && left.policy == right.policy
+        && left.retained_manifest_versions == right.retained_manifest_versions
+        && left.deleted_candidate_keys == right.deleted_candidate_keys
+}
+
+fn retention_conflict_error(checkpoint_version: u64) -> CheckpointPublishError {
+    CheckpointPublishError::ObjectKey(ObjectKeyError::InvalidExternalKey(format!(
+        "checkpoint retention record already exists with different causal fields for checkpoint {checkpoint_version}"
+    )))
 }
 
 fn checkpoint_version_from_manifest_key(object_key: &ObjectKey) -> Result<u64, ObjectKeyError> {

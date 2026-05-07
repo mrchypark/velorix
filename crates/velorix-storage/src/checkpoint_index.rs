@@ -3,10 +3,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{manifest::CheckpointManifest, object_key::ObjectKey};
+use crate::{gc::GarbageCollectionPolicy, manifest::CheckpointManifest, object_key::ObjectKey};
 
 pub const LATEST_CANDIDATE_SCHEMA_VERSION: u16 = 1;
 pub const CHECKPOINT_LIFECYCLE_SCHEMA_VERSION: u16 = 1;
+pub const CHECKPOINT_RETENTION_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -30,6 +31,20 @@ pub struct CheckpointLifecycleRecord {
     pub status_updated_at: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointRetentionRecordV1 {
+    pub schema_version: u16,
+    pub checkpoint_version: u64,
+    pub manifest_key: ObjectKey,
+    pub manifest_digest: String,
+    pub gc_run_id: String,
+    pub policy: GarbageCollectionPolicy,
+    pub retained_manifest_versions: Vec<u64>,
+    pub deleted_candidate_keys: Vec<ObjectKey>,
+    pub retained_at: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckpointLifecycleStatus {
@@ -49,6 +64,7 @@ pub struct CheckpointManifestInspection {
     pub checkpoint_version: u64,
     pub manifest_key: ObjectKey,
     pub lifecycle_status: Option<CheckpointLifecycleStatus>,
+    pub retention_record: Option<CheckpointRetentionRecordV1>,
     pub status: CheckpointManifestInspectionStatus,
 }
 
@@ -98,6 +114,34 @@ impl CheckpointLifecycleRecord {
 
     pub fn validate_schema(&self) -> bool {
         self.schema_version == CHECKPOINT_LIFECYCLE_SCHEMA_VERSION
+    }
+}
+
+impl CheckpointRetentionRecordV1 {
+    pub fn for_manifest(
+        manifest: &CheckpointManifest,
+        manifest_bytes: &[u8],
+        gc_run_id: String,
+        policy: GarbageCollectionPolicy,
+        retained_manifest_versions: Vec<u64>,
+        deleted_candidate_keys: Vec<ObjectKey>,
+        retained_at: String,
+    ) -> Self {
+        Self {
+            schema_version: CHECKPOINT_RETENTION_SCHEMA_VERSION,
+            checkpoint_version: manifest.checkpoint_version,
+            manifest_key: manifest.object_key(),
+            manifest_digest: manifest_digest(manifest_bytes),
+            gc_run_id,
+            policy,
+            retained_manifest_versions,
+            deleted_candidate_keys,
+            retained_at,
+        }
+    }
+
+    pub fn validate_schema(&self) -> bool {
+        self.schema_version == CHECKPOINT_RETENTION_SCHEMA_VERSION
     }
 }
 
