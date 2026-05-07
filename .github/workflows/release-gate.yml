@@ -33,6 +33,19 @@ jobs:
       - name: Cache cargo build artifacts
         uses: Swatinem/rust-cache@v2
 
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: Check dependency governance
+        run: |
+          mkdir -p target/dependency-governance
+          cargo deny -f json check -W unmaintained 2> target/dependency-governance/cargo-deny.jsonl
+          cargo run -p velorix-cli -- dependency-governance-validate \
+            --manifest dependency-governance.json \
+            --cargo-deny-json target/dependency-governance/cargo-deny.jsonl
+
       - name: Validate production readiness status matrix
         run: |
           cargo run -p velorix-cli -- release-status-validate \
