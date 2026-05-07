@@ -99,6 +99,16 @@ pub enum CheckpointPublishError {
     ManifestAlreadyExists(ObjectKey),
     #[error("garbage collection run evidence `{0}` already exists")]
     GarbageCollectionRunAlreadyExists(ObjectKey),
+    #[error(
+        "garbage collection plan does not match policy retain_latest_manifests={retain_latest_manifests}: expected retained manifests {expected_retained_manifest_versions:?} and candidates {expected_candidate_keys:?}, actual retained manifests {actual_retained_manifest_versions:?} and candidates {actual_candidate_keys:?}"
+    )]
+    GarbageCollectionPlanPolicyMismatch {
+        retain_latest_manifests: usize,
+        expected_retained_manifest_versions: Vec<u64>,
+        actual_retained_manifest_versions: Vec<u64>,
+        expected_candidate_keys: Vec<ObjectKey>,
+        actual_candidate_keys: Vec<ObjectKey>,
+    },
     #[error("invalid garbage collection run evidence `{object_key}`: {reason}")]
     InvalidGarbageCollectionRunEvidence {
         object_key: ObjectKey,
@@ -788,6 +798,21 @@ impl CheckpointPublisher {
             }
             Err(object_store::Error::NotFound { .. }) => {}
             Err(err) => return Err(err.into()),
+        }
+
+        let expected_plan = self.plan_garbage_collection(policy).await?;
+        if expected_plan != *plan {
+            return Err(
+                CheckpointPublishError::GarbageCollectionPlanPolicyMismatch {
+                    retain_latest_manifests: policy.retain_latest_manifests,
+                    expected_retained_manifest_versions: expected_plan
+                        .retained_manifest_versions
+                        .clone(),
+                    actual_retained_manifest_versions: plan.retained_manifest_versions.clone(),
+                    expected_candidate_keys: garbage_collection_candidate_keys(&expected_plan),
+                    actual_candidate_keys: garbage_collection_candidate_keys(plan),
+                },
+            );
         }
 
         let report = self.execute_garbage_collection_plan(plan).await?;
@@ -1613,6 +1638,13 @@ impl CheckpointPublisher {
             || (current.owner_epoch == attempted.owner_epoch
                 && current.owner_id != attempted.owner_id)
     }
+}
+
+fn garbage_collection_candidate_keys(plan: &GarbageCollectionPlan) -> Vec<ObjectKey> {
+    plan.candidates
+        .iter()
+        .map(|candidate| candidate.object_key.clone())
+        .collect()
 }
 
 fn checkpoint_version_from_manifest_key(object_key: &ObjectKey) -> Result<u64, ObjectKeyError> {

@@ -920,6 +920,56 @@ async fn gc_execution_rejects_duplicate_run_evidence_before_deleting_candidates(
 }
 
 #[tokio::test]
+async fn gc_execution_rejects_policy_mismatched_plan_before_deleting_candidates() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let stale_policy = GarbageCollectionPolicy {
+        retain_latest_manifests: 1,
+    };
+    let requested_policy = GarbageCollectionPolicy {
+        retain_latest_manifests: 2,
+    };
+    let state_0 = state_write(0, "state-0001", b"state-0");
+    let state_1 = state_write(1, "state-0002", b"state-1");
+
+    let state_ref_0 = publisher.write_state_object(&state_0).await.unwrap();
+    publisher
+        .publish_manifest(&manifest(0, state_ref_0))
+        .await
+        .unwrap();
+    let state_ref_1 = publisher.write_state_object(&state_1).await.unwrap();
+    publisher
+        .publish_manifest(&manifest(1, state_ref_1))
+        .await
+        .unwrap();
+
+    let stale_plan = publisher
+        .plan_garbage_collection(stale_policy)
+        .await
+        .unwrap();
+    let err = publisher
+        .execute_garbage_collection_plan_with_evidence("run-0001", requested_policy, &stale_plan)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        CheckpointPublishError::GarbageCollectionPlanPolicyMismatch {
+            retain_latest_manifests: 2,
+            ..
+        }
+    ));
+    assert!(object_exists(store.as_ref(), state_0.object_key()).await);
+    assert!(object_exists(store.as_ref(), state_1.object_key()).await);
+
+    let evidence_key = ObjectKey::garbage_collection_run("run-0001").unwrap();
+    assert!(matches!(
+        store.head(&Path::from(evidence_key.as_str())).await,
+        Err(object_store::Error::NotFound { .. })
+    ));
+}
+
+#[tokio::test]
 async fn gc_execution_requires_readable_run_evidence_after_write() {
     let (_temp_dir, store) = temp_store();
     let publisher = CheckpointPublisher::new(Arc::new(ReadFailsStore::new(
