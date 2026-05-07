@@ -113,13 +113,14 @@ pub async fn query_object_backed_input_with_policy(
     query_object_backed_input_with_policy_and_limiter(store, table_url, sql, policy, None).await
 }
 
-pub(crate) async fn query_object_backed_relation_with_policy(
+pub(crate) async fn query_object_backed_relation_with_policy_and_limiter(
     store: Arc<dyn DataFusionObjectStore>,
     table_url: &str,
     table_name: &str,
     table_schema: Arc<Schema>,
     sql: &str,
     policy: QueryPolicy,
+    limiter: Option<QueryExecutionLimiter>,
 ) -> Result<Vec<RecordBatch>, RuntimeQueryError> {
     query_object_backed_table_with_policy_and_limiter_and_meter(
         store,
@@ -130,7 +131,7 @@ pub(crate) async fn query_object_backed_relation_with_policy(
         },
         sql,
         policy,
-        None,
+        limiter,
         None,
     )
     .await
@@ -282,6 +283,15 @@ fn acquire_query_permit(
             max_concurrent_queries,
         }
         .into()),
+        (Some(required_max_concurrent_queries), Some(limiter))
+            if limiter.max_concurrent_queries() != required_max_concurrent_queries =>
+        {
+            Err(QueryPolicyError::ConcurrencyLimiterPolicyMismatch {
+                required_max_concurrent_queries,
+                actual_max_concurrent_queries: limiter.max_concurrent_queries(),
+            }
+            .into())
+        }
         (_, Some(limiter)) => limiter.try_acquire().map(Some).map_err(QueryError::from),
         (None, None) => Ok(None),
     }

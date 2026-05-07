@@ -20,8 +20,8 @@ use velorix_storage::{
 };
 
 use crate::query::{
-    query_object_backed_input_with_policy, query_object_backed_relation_with_policy,
-    RuntimeQueryError,
+    query_object_backed_input_with_policy, query_object_backed_relation_with_policy_and_limiter,
+    QueryExecutionLimiter, RuntimeQueryError,
 };
 use crate::query_policy_catalog::{QueryPolicyCatalogError, QueryPolicyCatalogStore};
 use crate::storage_registry::{validate_tenant_prefix, StorageRegistry, StorageRegistryError};
@@ -76,6 +76,15 @@ pub struct CreateProductionPersistedTableSpecRequest {
     pub relation_version: String,
     pub schema_fingerprint: String,
     pub query_policy_id: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProductionPersistedTableQueryRequest<'a> {
+    pub registry: &'a StorageRegistry,
+    pub tenant_id: &'a str,
+    pub table_id: &'a str,
+    pub sql: &'a str,
+    pub limiter: Option<QueryExecutionLimiter>,
 }
 
 #[derive(Debug, Error)]
@@ -294,9 +303,30 @@ pub async fn query_production_persisted_object_backed_input(
     table_id: &str,
     sql: &str,
 ) -> Result<Vec<RecordBatch>, PersistedTableError> {
+    query_production_persisted_object_backed_input_with_limiter(
+        catalog_store,
+        relation_catalog_store,
+        policy_catalog_store,
+        ProductionPersistedTableQueryRequest {
+            registry,
+            tenant_id,
+            table_id,
+            sql,
+            limiter: None,
+        },
+    )
+    .await
+}
+
+pub async fn query_production_persisted_object_backed_input_with_limiter(
+    catalog_store: Arc<dyn ObjectStore>,
+    relation_catalog_store: Arc<dyn ObjectStore>,
+    policy_catalog_store: Arc<dyn ObjectStore>,
+    request: ProductionPersistedTableQueryRequest<'_>,
+) -> Result<Vec<RecordBatch>, PersistedTableError> {
     let catalog = PersistedTableStore::new(catalog_store);
-    let spec = catalog.get_production(table_id).await?;
-    reject_cross_tenant_production_query(tenant_id, &spec)?;
+    let spec = catalog.get_production(request.table_id).await?;
+    reject_cross_tenant_production_query(request.tenant_id, &spec)?;
     let relation_catalog = read_matching_relation_catalog(
         relation_catalog_store,
         &spec.relation_id,
@@ -309,8 +339,16 @@ pub async fn query_production_persisted_object_backed_input(
         .await?
         .policy;
 
-    query_production_spec_with_policy(registry, tenant_id, spec, relation_catalog, sql, policy)
-        .await
+    query_production_spec_with_policy(
+        request.registry,
+        request.tenant_id,
+        spec,
+        relation_catalog,
+        request.sql,
+        policy,
+        request.limiter,
+    )
+    .await
 }
 
 async fn query_production_spec_with_policy(
@@ -320,6 +358,7 @@ async fn query_production_spec_with_policy(
     relation_catalog: VelorixRelationCatalogV1,
     sql: &str,
     policy: QueryPolicy,
+    limiter: Option<QueryExecutionLimiter>,
 ) -> Result<Vec<RecordBatch>, PersistedTableError> {
     reject_cross_tenant_production_query(tenant_id, &spec)?;
 
@@ -338,6 +377,7 @@ async fn query_production_spec_with_policy(
                 &relation_catalog,
                 sql,
                 policy,
+                limiter,
             )
             .await
         }
@@ -350,16 +390,18 @@ async fn query_relation_backed_parquet_with_policy(
     relation_catalog: &VelorixRelationCatalogV1,
     sql: &str,
     policy: QueryPolicy,
+    limiter: Option<QueryExecutionLimiter>,
 ) -> Result<Vec<RecordBatch>, PersistedTableError> {
     require_table_relation_registration(relation_catalog)?;
     let catalog_schema = datafusion_schema_from_catalog(relation_catalog)?;
-    Ok(query_object_backed_relation_with_policy(
+    Ok(query_object_backed_relation_with_policy_and_limiter(
         store,
         table_url,
         relation_catalog.datafusion_registration.name.as_str(),
         catalog_schema,
         sql,
         policy,
+        limiter,
     )
     .await?)
 }

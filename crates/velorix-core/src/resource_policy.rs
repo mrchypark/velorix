@@ -106,6 +106,13 @@ pub enum QueryPolicyError {
         "query policy requires a shared concurrency limiter for {max_concurrent_queries} concurrent queries"
     )]
     ConcurrencyLimiterRequired { max_concurrent_queries: usize },
+    #[error(
+        "query policy requires a shared concurrency limiter for {required_max_concurrent_queries} concurrent queries, got limiter for {actual_max_concurrent_queries}"
+    )]
+    ConcurrencyLimiterPolicyMismatch {
+        required_max_concurrent_queries: usize,
+        actual_max_concurrent_queries: usize,
+    },
     #[error("query policy field {field} must be greater than zero when set")]
     InvalidZeroTimeout { field: &'static str },
     #[error("query policy field {field} must be greater than zero when set")]

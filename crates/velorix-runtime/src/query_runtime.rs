@@ -121,6 +121,10 @@ impl QueryExecutionLimiter {
             })
     }
 
+    pub fn max_concurrent_queries(&self) -> usize {
+        self.max_concurrent_queries
+    }
+
     pub(crate) fn try_acquire(&self) -> Result<OwnedSemaphorePermit, QueryPolicyError> {
         self.permits.clone().try_acquire_owned().map_err(|_| {
             QueryPolicyError::ConcurrencyLimitExceeded {
