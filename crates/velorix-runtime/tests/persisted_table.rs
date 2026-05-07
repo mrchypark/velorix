@@ -1160,6 +1160,56 @@ async fn production_object_backed_table_query_rejects_scan_above_file_count_limi
 }
 
 #[tokio::test]
+async fn production_object_backed_table_query_rejects_scan_above_byte_limit() {
+    let (_temp_dir, catalog_store) = temp_store();
+    let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
+    put_parquet_input(
+        &scan_store,
+        "tenants/tenant-a/tables/orders/snapshots/0001/part-000.parquet",
+        &parquet_orders_batch(&["account-a"], &[10], &[1]),
+    )
+    .await;
+    let mut registry = StorageRegistry::new();
+    register_production_scan_store(
+        &mut registry,
+        Arc::clone(&scan_store),
+        Arc::clone(&catalog_store),
+    )
+    .await;
+
+    create_production_table_with_policy(
+        &catalog_store,
+        "primary",
+        "tenants/tenant-a/tables/orders",
+        QueryPolicy {
+            max_scan_bytes: Some(1),
+            ..QueryPolicy::default()
+        },
+    )
+    .await;
+
+    let error = query_production_table(
+        &catalog_store,
+        &registry,
+        "tenant-a",
+        "orders-current",
+        "select account_id, value, weight from orders",
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        PersistedTableError::RuntimeQuery(RuntimeQueryError::Query(QueryError::Policy(
+            QueryPolicyError::ScanBytesExceeded {
+                observed_bytes,
+                max_bytes: 1,
+            }
+        ))) if observed_bytes > 1
+    ));
+}
+
+#[tokio::test]
 async fn production_object_backed_table_query_rejects_object_requests_above_limit() {
     let (_temp_dir, catalog_store) = temp_store();
     let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());

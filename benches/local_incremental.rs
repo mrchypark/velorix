@@ -155,7 +155,13 @@ async fn run() -> BenchResult<()> {
 
     let recovery_requests_before = metered_store.snapshot();
     let recovery_started = Instant::now();
-    let recovered = RecoveredRuntime::recover(Arc::clone(&store)).await?;
+    let recovered = RecoveredRuntime::recover_with_owner_and_relation_catalog_record(
+        Arc::clone(&store),
+        ORDERS_SUM_COUNT_OWNER,
+        ORDERS_SUM_COUNT_RELATION_ID,
+        ORDERS_SUM_COUNT_RELATION_VERSION,
+    )
+    .await?;
     let recovery_elapsed = recovery_started.elapsed();
     let recovery_requests = request_delta(&metered_store.snapshot(), &recovery_requests_before);
     let recovered_rows = recovered.materialized_state().net_rows()?;

@@ -98,7 +98,7 @@ fn ingest_envelope_bytes_with_batches(
 }
 
 #[tokio::test]
-async fn catalog_backed_recovery_reads_catalog_record_and_replays_ingest() {
+async fn catalog_backed_recovery_reads_catalog_record_and_replays_catalog_aware_ingest() {
     let (_temp_dir, store) = temp_store();
     let catalog = orders_sum_count_relation_catalog().unwrap();
     RelationCatalogRegistry::new(Arc::clone(&store))
@@ -107,7 +107,7 @@ async fn catalog_backed_recovery_reads_catalog_record_and_replays_ingest() {
         .unwrap();
     let input = input_batch([input_delta("account-a", 4, 1)]);
     IngestLog::new(Arc::clone(&store))
-        .append_validated_envelope(ingest_envelope_bytes(
+        .append_catalog_validated_envelope(ingest_envelope_bytes(
             ORDERS_SUM_COUNT_RELATION_VERSION,
             catalog.schema_fingerprint.as_str(),
             &input,
