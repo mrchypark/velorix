@@ -604,6 +604,16 @@ enum DependencyGovernanceExceptionKind {
     Advisory,
 }
 
+impl DependencyGovernanceExceptionKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Duplicate => "duplicate",
+            Self::Unmaintained => "unmaintained",
+            Self::Advisory => "advisory",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
 struct DependencyGovernanceWarning {
     kind: CargoDenyWarningKind,
@@ -638,8 +648,17 @@ impl DependencyGovernanceManifestV1 {
         validate_package_reviews(&self.package_reviews)?;
         validate_date(today).context("validator today must use YYYY-MM-DD")?;
 
+        let mut seen_exceptions = BTreeSet::new();
         for exception in &self.exceptions {
             exception.validate(today)?;
+            let key = (exception.kind.as_str(), exception.crate_name.as_str());
+            if !seen_exceptions.insert(key) {
+                bail!(
+                    "duplicate dependency governance exception for {} {}",
+                    exception.kind.as_str(),
+                    exception.crate_name
+                );
+            }
         }
 
         Ok(())
@@ -1834,6 +1853,45 @@ mod tests {
             validate_dependency_governance_manifest_text(&manifest, "2026-05-06").unwrap_err();
 
         assert!(format!("{error:#}").contains("expired"));
+    }
+
+    #[test]
+    fn dependency_governance_validator_rejects_duplicate_exception() {
+        let manifest = serde_json::json!({
+            "schema_version": 1,
+            "msrv": {
+                "minimum_rust_version": "1.85.0",
+                "policy": "CI and package updates keep the workspace buildable on the declared MSRV."
+            },
+            "package_reviews": valid_package_reviews_json(),
+            "exceptions": [
+                {
+                    "kind": "duplicate",
+                    "crate": "hashbrown",
+                    "owner": "runtime",
+                    "expires_on": "2026-06-30",
+                    "reason": "Await upstream convergence.",
+                    "replacement_plan": "Upgrade when upstream dependency ranges converge.",
+                    "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+                },
+                {
+                    "kind": "duplicate",
+                    "crate": "hashbrown",
+                    "owner": "security",
+                    "expires_on": "2026-07-31",
+                    "reason": "Second owner should not hide the first exception.",
+                    "replacement_plan": "Different duplicate plan.",
+                    "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+                }
+            ]
+        })
+        .to_string();
+
+        let error =
+            validate_dependency_governance_manifest_text(&manifest, "2026-05-06").unwrap_err();
+
+        assert!(format!("{error:#}")
+            .contains("duplicate dependency governance exception for duplicate hashbrown"));
     }
 
     #[test]
