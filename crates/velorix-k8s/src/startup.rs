@@ -39,8 +39,12 @@ impl ValidatedOperatorAuthority {
 
     pub(crate) fn into_parts(
         self,
-    ) -> (ObjectStoreAuthorityRef, Arc<dyn object_store::ObjectStore>) {
-        (self.authority, self.store)
+    ) -> (
+        ObjectStoreAuthorityRef,
+        Arc<dyn object_store::ObjectStore>,
+        AuthoritativeObjectStoreCapabilitiesV1,
+    ) {
+        (self.authority, self.store, self.capabilities)
     }
 }
 

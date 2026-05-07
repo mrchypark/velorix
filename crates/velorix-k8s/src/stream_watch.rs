@@ -8,6 +8,10 @@ use kube::{
 use std::sync::Arc;
 use thiserror::Error;
 use velorix_storage::{
+    capability::{
+        AuthoritativeNamespace, AuthoritativeObjectStoreCapabilitiesV1,
+        ObjectStoreCapabilityProfile,
+    },
     checkpoint_index::manifest_body_digest,
     relation_catalog_registry::{RelationCatalogRegistry, RelationCatalogRegistryError},
     state::{CheckpointPublishError, CheckpointPublisher},
@@ -38,19 +42,21 @@ pub trait AuthoritySnapshotProvider: Clone + Send + Sync + 'static {
 pub struct RelationCatalogSnapshotProvider {
     authority: ObjectStoreAuthorityRef,
     store: Arc<dyn object_store::ObjectStore>,
+    capabilities: AuthoritativeObjectStoreCapabilitiesV1,
 }
 
 impl RelationCatalogSnapshotProvider {
-    pub fn new(
-        authority: ObjectStoreAuthorityRef,
-        store: Arc<dyn object_store::ObjectStore>,
-    ) -> Self {
-        Self { authority, store }
+    pub fn for_production(validated_authority: ValidatedOperatorAuthority) -> Self {
+        let (authority, store, capabilities) = validated_authority.into_parts();
+        Self {
+            authority,
+            store,
+            capabilities,
+        }
     }
 
-    pub fn for_production(validated_authority: ValidatedOperatorAuthority) -> Self {
-        let (authority, store) = validated_authority.into_parts();
-        Self { authority, store }
+    pub fn capabilities(&self) -> &AuthoritativeObjectStoreCapabilitiesV1 {
+        &self.capabilities
     }
 }
 
@@ -65,7 +71,8 @@ impl AuthoritySnapshotProvider for RelationCatalogSnapshotProvider {
         }
 
         let mut snapshot = AuthoritySnapshot::default().with_authority(self.authority.clone());
-        match RelationCatalogRegistry::new(Arc::clone(&self.store))
+        match self
+            .relation_catalog_registry()?
             .read(
                 &stream.spec.relation.relation_id,
                 &stream.spec.relation.relation_version.to_string(),
@@ -99,11 +106,38 @@ impl AuthoritySnapshotProvider for RelationCatalogSnapshotProvider {
 }
 
 impl RelationCatalogSnapshotProvider {
+    fn relation_catalog_registry(&self) -> Result<RelationCatalogRegistry, StreamWatchError> {
+        RelationCatalogRegistry::new_checked(
+            Arc::clone(&self.store),
+            self.profile_for(AuthoritativeNamespace::RelationCatalog)?,
+        )
+        .map_err(|error| StreamWatchError::snapshot(error.to_string()))
+    }
+
+    fn checkpoint_publisher(&self) -> Result<CheckpointPublisher, StreamWatchError> {
+        CheckpointPublisher::new_checked(
+            Arc::clone(&self.store),
+            self.profile_for(AuthoritativeNamespace::Checkpoint)?,
+        )
+        .map_err(|error| StreamWatchError::snapshot(error.to_string()))
+    }
+
+    fn profile_for(
+        &self,
+        namespace: AuthoritativeNamespace,
+    ) -> Result<&ObjectStoreCapabilityProfile, StreamWatchError> {
+        self.capabilities.profiles.get(&namespace).ok_or_else(|| {
+            StreamWatchError::snapshot(format!(
+                "validated authority missing `{namespace}` capability evidence"
+            ))
+        })
+    }
+
     async fn latest_checkpoint_for_stream(
         &self,
         stream: &VelorixStream,
     ) -> Result<Option<CheckpointRef>, StreamWatchError> {
-        let publisher = CheckpointPublisher::new(Arc::clone(&self.store));
+        let publisher = self.checkpoint_publisher()?;
         let selected_manifest = publisher
             .list_published_manifests()
             .await

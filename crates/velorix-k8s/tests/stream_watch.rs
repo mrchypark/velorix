@@ -9,6 +9,7 @@ use velorix_k8s::{
         CheckpointRef, ConditionState, ObjectStoreAuthorityRef, RelationVersionRef, StreamStatus,
         VelorixCondition, VelorixStream, VelorixStreamSpec,
     },
+    startup::validate_operator_authority,
     status::{KubernetesStatusError, StreamStatusApi, StreamStatusWriter},
     stream_watch::{
         handle_stream_event, AuthoritySnapshotProvider, RelationCatalogSnapshotProvider,
@@ -16,6 +17,7 @@ use velorix_k8s::{
     },
 };
 use velorix_storage::{
+    capability::AuthoritativeNamespace,
     checkpoint_index::CheckpointLifecycleRecord,
     manifest::{CheckpointManifest, InputRange, StateObjectRef},
     object_key::ObjectKey,
@@ -117,7 +119,7 @@ async fn relation_catalog_snapshot_provider_reports_ready_when_catalog_exists() 
     create_relation_catalog(&store).await;
     let api = FakeStatusApi::default();
     let writer = StreamStatusWriter::new(api.clone());
-    let provider = RelationCatalogSnapshotProvider::new(authority(), store);
+    let provider = production_provider(store).await;
 
     handle_stream_event(StreamWatchEvent::Applied(stream()), &provider, &writer)
         .await
@@ -147,7 +149,7 @@ async fn relation_catalog_snapshot_provider_reports_latest_stream_checkpoint_fro
     let manifest_digest = publish_checkpoint(&store, 0, "deposits").await;
     let api = FakeStatusApi::default();
     let writer = StreamStatusWriter::new(api.clone());
-    let provider = RelationCatalogSnapshotProvider::new(authority(), store);
+    let provider = production_provider(store).await;
 
     handle_stream_event(StreamWatchEvent::Applied(stream()), &provider, &writer)
         .await
@@ -174,13 +176,68 @@ async fn relation_catalog_snapshot_provider_reports_latest_stream_checkpoint_fro
 }
 
 #[tokio::test]
+async fn production_relation_catalog_snapshot_provider_retains_validated_capability_evidence() {
+    let store = memory_store();
+    let validated = validate_operator_authority(
+        authority(),
+        Arc::clone(&store),
+        "memory-k8s-authority",
+        "v1/stream-watch-probes",
+    )
+    .await
+    .unwrap();
+    let expected_capabilities = validated.capabilities().clone();
+
+    let provider = RelationCatalogSnapshotProvider::for_production(validated);
+
+    assert_eq!(provider.capabilities(), &expected_capabilities);
+    assert_eq!(
+        provider.capabilities().profiles[&AuthoritativeNamespace::RelationCatalog].backend_name,
+        "memory-k8s-authority"
+    );
+    assert_eq!(
+        provider.capabilities().profiles[&AuthoritativeNamespace::Checkpoint].backend_name,
+        "memory-k8s-authority"
+    );
+}
+
+#[tokio::test]
+async fn production_relation_catalog_snapshot_provider_reads_checkpoint_from_validated_store_only()
+{
+    let validated_store = memory_store();
+    let other_store = memory_store();
+    create_relation_catalog(&validated_store).await;
+    let other_manifest_digest = publish_checkpoint(&other_store, 0, "deposits").await;
+    let provider = production_provider(validated_store).await;
+    let api = FakeStatusApi::default();
+    let writer = StreamStatusWriter::new(api.clone());
+
+    handle_stream_event(StreamWatchEvent::Applied(stream()), &provider, &writer)
+        .await
+        .unwrap();
+
+    assert_ne!(
+        api.writes()[0].patch["status"]["latest_published_checkpoint"],
+        json!(CheckpointRef {
+            checkpoint_version: 0,
+            manifest_digest: other_manifest_digest,
+        }),
+        "production provider must not read checkpoint evidence from an unvalidated store"
+    );
+    assert_eq!(
+        api.writes()[0].patch["status"]["latest_published_checkpoint"],
+        Value::Null
+    );
+}
+
+#[tokio::test]
 async fn relation_catalog_snapshot_provider_does_not_report_another_stream_checkpoint() {
     let store = memory_store();
     create_relation_catalog(&store).await;
     publish_checkpoint(&store, 0, "other-stream").await;
     let api = FakeStatusApi::default();
     let writer = StreamStatusWriter::new(api.clone());
-    let provider = RelationCatalogSnapshotProvider::new(authority(), store);
+    let provider = production_provider(store).await;
 
     handle_stream_event(StreamWatchEvent::Applied(stream()), &provider, &writer)
         .await
@@ -205,7 +262,7 @@ async fn relation_catalog_snapshot_provider_does_not_report_checkpoint_without_l
         .unwrap();
     let api = FakeStatusApi::default();
     let writer = StreamStatusWriter::new(api.clone());
-    let provider = RelationCatalogSnapshotProvider::new(authority(), store);
+    let provider = production_provider(store).await;
 
     handle_stream_event(StreamWatchEvent::Applied(stream()), &provider, &writer)
         .await
@@ -226,7 +283,7 @@ async fn relation_catalog_snapshot_provider_does_not_report_checkpoint_with_stal
     overwrite_lifecycle_digest(&store, 0, "sha256:bad").await;
     let api = FakeStatusApi::default();
     let writer = StreamStatusWriter::new(api.clone());
-    let provider = RelationCatalogSnapshotProvider::new(authority(), store);
+    let provider = production_provider(store).await;
 
     handle_stream_event(StreamWatchEvent::Applied(stream()), &provider, &writer)
         .await
@@ -243,7 +300,7 @@ async fn relation_catalog_snapshot_provider_reports_missing_relation_without_cat
     let store = memory_store();
     let api = FakeStatusApi::default();
     let writer = StreamStatusWriter::new(api.clone());
-    let provider = RelationCatalogSnapshotProvider::new(authority(), store);
+    let provider = production_provider(store).await;
 
     handle_stream_event(StreamWatchEvent::Applied(stream()), &provider, &writer)
         .await
@@ -277,13 +334,14 @@ async fn relation_catalog_snapshot_provider_ignores_unconfigured_authority() {
     create_relation_catalog(&store).await;
     let api = FakeStatusApi::default();
     let writer = StreamStatusWriter::new(api.clone());
-    let provider = RelationCatalogSnapshotProvider::new(
+    let provider = production_provider_for(
+        store,
         ObjectStoreAuthorityRef {
             store_id: "secondary".to_string(),
             namespace: "analytics".to_string(),
         },
-        store,
-    );
+    )
+    .await;
 
     handle_stream_event(StreamWatchEvent::Applied(stream()), &provider, &writer)
         .await
@@ -413,6 +471,26 @@ fn ready_condition() -> VelorixCondition {
 
 fn memory_store() -> Arc<dyn ObjectStore> {
     Arc::new(InMemory::new())
+}
+
+async fn production_provider(store: Arc<dyn ObjectStore>) -> RelationCatalogSnapshotProvider {
+    production_provider_for(store, authority()).await
+}
+
+async fn production_provider_for(
+    store: Arc<dyn ObjectStore>,
+    authority: ObjectStoreAuthorityRef,
+) -> RelationCatalogSnapshotProvider {
+    let validated = validate_operator_authority(
+        authority,
+        store,
+        "memory-k8s-authority",
+        "v1/stream-watch-probes",
+    )
+    .await
+    .unwrap();
+
+    RelationCatalogSnapshotProvider::for_production(validated)
 }
 
 async fn create_relation_catalog(store: &Arc<dyn ObjectStore>) {
