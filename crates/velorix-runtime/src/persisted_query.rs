@@ -5,7 +5,15 @@ use bytes::Bytes;
 use object_store::{path::Path, ObjectStore, PutMode};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use velorix_core::query::{validate_input_query_with_policy, QueryError, QueryPolicy};
+use velorix_core::{
+    query::{
+        validate_input_query_with_policy, validate_table_query_with_policy, QueryError, QueryPolicy,
+    },
+    relation::{
+        datafusion_schema_from_catalog, DataFusionRegistrationModeV1, RelationSchemaError,
+        VelorixRelationCatalogV1,
+    },
+};
 use velorix_storage::object_key::{ObjectKey, ObjectKeyError};
 
 use crate::query::{query_recovered_materialized_view_with_policy, RuntimeQueryError};
@@ -33,6 +41,8 @@ pub enum PersistedQueryError {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     RuntimeQuery(#[from] RuntimeQueryError),
+    #[error(transparent)]
+    RelationSchema(#[from] RelationSchemaError),
     #[error("unsupported persisted query schema version {schema_version}")]
     UnsupportedSchemaVersion { schema_version: u32 },
     #[error("persisted query id mismatch: expected {expected}, got {actual}")]
@@ -55,9 +65,28 @@ impl PersistedQueryStore {
         sql: &str,
         policy: QueryPolicy,
     ) -> Result<PersistedQuerySpec, PersistedQueryError> {
-        let object_key = ObjectKey::persisted_query(query_id)?;
         validate_input_query_with_policy(sql, policy).await?;
+        self.write_create(query_id, sql, policy).await
+    }
 
+    pub async fn create_for_production_relation(
+        &self,
+        query_id: &str,
+        sql: &str,
+        policy: QueryPolicy,
+        relation_catalog: &VelorixRelationCatalogV1,
+    ) -> Result<PersistedQuerySpec, PersistedQueryError> {
+        validate_production_relation_query(sql, policy, relation_catalog).await?;
+        self.write_create(query_id, sql, policy).await
+    }
+
+    async fn write_create(
+        &self,
+        query_id: &str,
+        sql: &str,
+        policy: QueryPolicy,
+    ) -> Result<PersistedQuerySpec, PersistedQueryError> {
+        let object_key = ObjectKey::persisted_query(query_id)?;
         let spec = PersistedQuerySpec {
             schema_version: PERSISTED_QUERY_SCHEMA_VERSION,
             query_id: query_id.to_string(),
@@ -100,6 +129,53 @@ impl PersistedQueryStore {
 
         Ok(spec)
     }
+
+    pub async fn get_for_production_relation(
+        &self,
+        query_id: &str,
+        relation_catalog: &VelorixRelationCatalogV1,
+    ) -> Result<PersistedQuerySpec, PersistedQueryError> {
+        let spec = self.get(query_id).await?;
+        validate_production_relation_query(&spec.sql, spec.policy, relation_catalog).await?;
+
+        Ok(spec)
+    }
+
+    pub async fn get_for_production_relation_with_policy(
+        &self,
+        query_id: &str,
+        relation_catalog: &VelorixRelationCatalogV1,
+        production_policy: QueryPolicy,
+    ) -> Result<PersistedQuerySpec, PersistedQueryError> {
+        let spec = self.get(query_id).await?;
+        validate_production_relation_query(&spec.sql, production_policy, relation_catalog).await?;
+
+        Ok(spec)
+    }
+}
+
+async fn validate_production_relation_query(
+    sql: &str,
+    policy: QueryPolicy,
+    relation_catalog: &VelorixRelationCatalogV1,
+) -> Result<(), PersistedQueryError> {
+    if relation_catalog.datafusion_registration.mode != DataFusionRegistrationModeV1::Table {
+        return Err(RelationSchemaError::InvalidRelationSchema {
+            field: "datafusion_registration.mode",
+        }
+        .into());
+    }
+
+    let table_schema = datafusion_schema_from_catalog(relation_catalog)?;
+    validate_table_query_with_policy(
+        sql,
+        relation_catalog.datafusion_registration.name.as_str(),
+        table_schema,
+        policy,
+    )
+    .await?;
+
+    Ok(())
 }
 
 pub async fn query_persisted_recovered_materialized_view(

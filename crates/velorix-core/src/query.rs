@@ -101,11 +101,20 @@ pub async fn validate_input_query_with_policy(
     sql: &str,
     policy: QueryPolicy,
 ) -> Result<(), QueryError> {
+    validate_table_query_with_policy(sql, INPUT_TABLE_NAME, input_schema(), policy).await
+}
+
+pub async fn validate_table_query_with_policy(
+    sql: &str,
+    table_name: &str,
+    table_schema: Arc<Schema>,
+    policy: QueryPolicy,
+) -> Result<(), QueryError> {
     policy.validate()?;
     validate_sql_text_policy(sql, policy)?;
 
-    let input = RecordBatch::new_empty(input_schema());
-    let context = input_context(vec![input], policy)?;
+    let input = RecordBatch::new_empty(table_schema.clone());
+    let context = table_context(table_name, table_schema, vec![input], policy)?;
 
     run_planning_with_policy(policy, async {
         let dataframe = context.sql(sql).await?;
@@ -154,7 +163,16 @@ fn input_context(
     input_batches: Vec<RecordBatch>,
     policy: QueryPolicy,
 ) -> Result<SessionContext, QueryError> {
-    let table = MemTable::try_new(input_schema(), vec![input_batches])?;
+    table_context(INPUT_TABLE_NAME, input_schema(), input_batches, policy)
+}
+
+fn table_context(
+    table_name: &str,
+    table_schema: Arc<Schema>,
+    table_batches: Vec<RecordBatch>,
+    policy: QueryPolicy,
+) -> Result<SessionContext, QueryError> {
+    let table = MemTable::try_new(table_schema, vec![table_batches])?;
     let mut config = SessionConfig::new();
     if let Some(batch_size) = policy.batch_size {
         config = config.with_batch_size(batch_size.get());
@@ -164,7 +182,7 @@ fn input_context(
     }
     let context = SessionContext::new_with_config(config);
 
-    context.register_table(INPUT_TABLE_NAME, Arc::new(table))?;
+    context.register_table(table_name, Arc::new(table))?;
 
     Ok(context)
 }

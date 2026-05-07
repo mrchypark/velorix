@@ -359,6 +359,137 @@ async fn production_persisted_object_backed_view_accepts_matching_shared_limiter
 }
 
 #[tokio::test]
+async fn production_persisted_object_backed_view_rejects_bootstrap_input_query_record() {
+    let (_temp_dir, catalog_store) = temp_store();
+    let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
+    let mut registry = StorageRegistry::new();
+    register_production_scan_store(
+        &mut registry,
+        Arc::clone(&scan_store),
+        Arc::clone(&catalog_store),
+    )
+    .await;
+    create_production_table_with_policy(
+        &catalog_store,
+        production_policy_with(QueryPolicy::default()),
+    )
+    .await;
+    PersistedQueryStore::new(Arc::clone(&catalog_store))
+        .create(
+            "bootstrap-input-query",
+            "select key_json from input",
+            QueryPolicy::default(),
+        )
+        .await
+        .unwrap();
+
+    let error = query_production_persisted_object_backed_view(
+        Arc::clone(&catalog_store),
+        Arc::clone(&catalog_store),
+        Arc::clone(&catalog_store),
+        &registry,
+        "tenant-a",
+        "orders-current",
+        "bootstrap-input-query",
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        PersistedViewError::QueryCatalog(PersistedQueryError::Query(_))
+    ));
+}
+
+#[tokio::test]
+async fn production_persisted_object_backed_view_validates_sql_with_table_policy_before_execution()
+{
+    let (_temp_dir, catalog_store) = temp_store();
+    let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
+    let mut registry = StorageRegistry::new();
+    register_production_scan_store(
+        &mut registry,
+        Arc::clone(&scan_store),
+        Arc::clone(&catalog_store),
+    )
+    .await;
+    create_production_table_with_policy(
+        &catalog_store,
+        production_policy_with(QueryPolicy {
+            max_sql_bytes: Some(40),
+            ..QueryPolicy::default()
+        }),
+    )
+    .await;
+    create_persisted_query(&catalog_store).await;
+
+    let error = query_production_persisted_object_backed_view(
+        Arc::clone(&catalog_store),
+        Arc::clone(&catalog_store),
+        Arc::clone(&catalog_store),
+        &registry,
+        "tenant-a",
+        "orders-current",
+        "orders-view",
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        PersistedViewError::QueryCatalog(PersistedQueryError::Query(QueryError::Policy(
+            QueryPolicyError::SqlTextTooLarge {
+                actual_bytes: _,
+                max_bytes: 40,
+            }
+        )))
+    ));
+}
+
+#[tokio::test]
+async fn production_persisted_object_backed_view_accepts_production_relation_query_record() {
+    let (_temp_dir, catalog_store) = temp_store();
+    let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
+    put_parquet_input(
+        &scan_store,
+        "tenants/tenant-a/tables/orders/snapshots/0001/part-000.parquet",
+        &parquet_orders_batch(&["account-a"], &[10], &[1]),
+    )
+    .await;
+    let mut registry = StorageRegistry::new();
+    register_production_scan_store(
+        &mut registry,
+        Arc::clone(&scan_store),
+        Arc::clone(&catalog_store),
+    )
+    .await;
+    create_production_table_with_policy(
+        &catalog_store,
+        production_policy_with(QueryPolicy::default()),
+    )
+    .await;
+    create_production_persisted_query(&catalog_store).await;
+
+    let output = query_production_persisted_object_backed_view(
+        Arc::clone(&catalog_store),
+        Arc::clone(&catalog_store),
+        Arc::clone(&catalog_store),
+        &registry,
+        "tenant-a",
+        "orders-current",
+        "orders-view",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].num_rows(), 1);
+    assert_eq!(string_value(&output[0], 0, 0), "account-a");
+    assert_eq!(int64_value(&output[0], 1, 0), 10);
+    assert_eq!(int64_value(&output[0], 2, 0), 1);
+}
+
+#[tokio::test]
 async fn production_persisted_object_backed_view_rejects_mismatched_shared_limiter() {
     let (_temp_dir, catalog_store) = temp_store();
     let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
@@ -456,6 +587,18 @@ async fn create_persisted_query(catalog_store: &Arc<dyn ObjectStore>) {
             &Path::from(key.as_str()),
             Bytes::from(serde_json::to_vec(&spec).unwrap()).into(),
             PutMode::Create.into(),
+        )
+        .await
+        .unwrap();
+}
+
+async fn create_production_persisted_query(catalog_store: &Arc<dyn ObjectStore>) {
+    PersistedQueryStore::new(Arc::clone(catalog_store))
+        .create_for_production_relation(
+            "orders-view",
+            "select account_id, value, weight from orders order by account_id",
+            QueryPolicy::default(),
+            &orders_relation_catalog(),
         )
         .await
         .unwrap();
