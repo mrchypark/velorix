@@ -104,6 +104,23 @@ fn benchmark_result_validation_fails_when_workload_p95_is_below_p50() {
 }
 
 #[test]
+fn benchmark_result_validation_fails_when_checkpoint_p95_is_below_p50() {
+    let mut result = local_smoke_result();
+    result.metrics.checkpoint_p50_ms = 5.0;
+    result.metrics.checkpoint_p95_ms = 4.0;
+
+    let error = result.validate().unwrap_err();
+
+    assert!(matches!(
+        error,
+        BenchmarkGateError::InvalidCheckpointLatencyOrder {
+            p50_ms: 5.0,
+            p95_ms: 4.0
+        }
+    ));
+}
+
+#[test]
 fn benchmark_result_validation_fails_when_object_backed_workload_has_no_requests() {
     let mut result = local_smoke_result();
     result.workload_metrics[0].object_requests = None;

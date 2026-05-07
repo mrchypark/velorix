@@ -114,6 +114,10 @@ pub enum BenchmarkGateError {
         p50_ms: f64,
         p95_ms: f64,
     },
+    #[error(
+        "benchmark checkpoint latency has invalid order: checkpoint_p95_ms {p95_ms} is below checkpoint_p50_ms {p50_ms}"
+    )]
+    InvalidCheckpointLatencyOrder { p50_ms: f64, p95_ms: f64 },
     #[error("benchmark workload metric {name} requires object_requests")]
     MissingWorkloadObjectRequests { name: String },
     #[error("benchmark result is missing required workload metric {name}")]
@@ -356,6 +360,12 @@ impl BenchmarkMetricsV1 {
         validate_finite_non_negative("put_per_gib", self.put_per_gib)?;
         validate_finite_non_negative("checkpoint_p50_ms", self.checkpoint_p50_ms)?;
         validate_finite_non_negative("checkpoint_p95_ms", self.checkpoint_p95_ms)?;
+        if self.checkpoint_p95_ms < self.checkpoint_p50_ms {
+            return Err(BenchmarkGateError::InvalidCheckpointLatencyOrder {
+                p50_ms: self.checkpoint_p50_ms,
+                p95_ms: self.checkpoint_p95_ms,
+            });
+        }
         validate_finite_non_negative("recovery_p95_ms", self.recovery_p95_ms)?;
         Ok(())
     }
