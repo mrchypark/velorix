@@ -60,8 +60,10 @@ successful `get_opts` ranges and `get_ranges` results without wrapping response
 streams; exact consumed-byte metering remains future work if DataFusion needs
 that distinction.
 
-Version-specific memory/spill failure tests, tenant/global shared runtime
-semantics, and Velorix-owned typed memory/spill errors remain future work.
+DataFusion 53 memory exhaustion now has version-specific runtime evidence for
+a grouped aggregate over the public object-backed Parquet query path.
+Version-specific spill failure tests, tenant/global shared runtime semantics,
+and Velorix-owned typed memory/spill errors remain future work.
 
 ## Typed Errors
 
@@ -76,6 +78,8 @@ error shape is DataFusion-version-dependent.
 - Large joins, sorts, high-cardinality aggregations, many-file scans, and large
   Parquet scans are bounded by policy where the current DataFusion version
   honors the configured memory and spill limits.
+- DataFusion 53 returns `ResourcesExhausted` for an object-backed grouped
+  aggregate that exceeds `memory_limit_bytes`.
 - `LIMIT 1` does not bypass scan byte or object request limits.
 - Concurrent queries cannot exceed concurrency pools; shared memory semantics
   require a future shared runtime boundary.

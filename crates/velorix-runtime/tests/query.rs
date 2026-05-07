@@ -1,12 +1,15 @@
-use std::{num::NonZeroUsize, sync::Arc};
+use std::{error::Error, num::NonZeroUsize, sync::Arc};
 
 use arrow::array::{ArrayRef, Int64Array, StringArray, StringViewArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
-use datafusion::object_store::{
-    memory::InMemory as DataFusionInMemory, path::Path as DataFusionPath,
-    ObjectStore as DataFusionObjectStore, ObjectStoreExt as DataFusionObjectStoreExt,
+use datafusion::{
+    error::DataFusionError,
+    object_store::{
+        memory::InMemory as DataFusionInMemory, path::Path as DataFusionPath,
+        ObjectStore as DataFusionObjectStore, ObjectStoreExt as DataFusionObjectStoreExt,
+    },
 };
 use object_store::{local::LocalFileSystem, ObjectStore};
 use parquet::arrow::ArrowWriter;
@@ -680,6 +683,42 @@ async fn query_object_backed_input_with_memory_and_spill_policy_still_runs() {
 }
 
 #[tokio::test]
+async fn query_object_backed_input_returns_datafusion_memory_exhausted_when_grouped_aggregate_exceeds_memory_policy(
+) {
+    let store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
+    put_parquet_input(
+        &store,
+        "input/part-000.parquet",
+        &parquet_input_batch(&["\"account-a\"", "\"account-b\""], &["10", "7"], &[1, 1]),
+    )
+    .await;
+
+    let error = query_object_backed_input_with_policy(
+        Arc::clone(&store),
+        "memory://velorix/input/",
+        "select key_json, sum(cast(value_json as int)) as total_value \
+         from input group by key_json",
+        QueryPolicy {
+            memory_limit_bytes: Some(1),
+            batch_size: Some(NonZeroUsize::new(2).unwrap()),
+            target_partitions: Some(NonZeroUsize::new(1).unwrap()),
+            ..QueryPolicy::default()
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(
+            error,
+            RuntimeQueryError::Query(QueryError::DataFusion(ref error))
+                if datafusion_error_has_resources_exhausted_root(error)
+        ),
+        "expected DataFusion ResourcesExhausted, got {error:?}"
+    );
+}
+
+#[tokio::test]
 async fn query_object_backed_input_rejects_scan_above_byte_limit() {
     let store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
     put_parquet_input(
@@ -833,6 +872,22 @@ async fn query_object_backed_input_propagates_datafusion_scan_errors() {
         error,
         RuntimeQueryError::Query(QueryError::DataFusion(_))
     ));
+}
+
+fn datafusion_error_has_resources_exhausted_root(error: &DataFusionError) -> bool {
+    if matches!(error, DataFusionError::ResourcesExhausted(_)) {
+        return true;
+    }
+
+    let mut source = error.source();
+    while let Some(error) = source {
+        if let Some(error) = error.downcast_ref::<DataFusionError>() {
+            return datafusion_error_has_resources_exhausted_root(error);
+        }
+        source = error.source();
+    }
+
+    false
 }
 
 fn string_value(batch: &arrow::record_batch::RecordBatch, column: usize, row: usize) -> String {
