@@ -178,7 +178,8 @@ raw state/output payloads have been GC-deleted; each manifest's own payload
 availability still determines whether that manifest is reported valid. After a
 GC run evidence object is written and read back successfully, GC also writes
 append-only retention evidence for non-retained checkpoints whose raw
-state/output payloads were deleted:
+state/output payloads were deleted or whose SlateDB logical state refs were
+released:
 
 ```text
 v1/checkpoint-retention/{checkpoint_version:020}.retention.json
@@ -324,10 +325,15 @@ operators until direct integration gates are satisfied.
 ## Garbage Collection
 
 The current implementation can build a deterministic manifest-aware GC plan and
-execute that plan for Velorix-owned raw state objects under `v1/state/...` and
-output objects under `v1/outputs/...`. The plan retains objects referenced by
-the latest N published manifests, where N must be at least one, and classifies
-only unreferenced raw state/output objects as candidates. Executed runs can
+execute that plan for Velorix-owned raw state objects under `v1/state/...`,
+output objects under `v1/outputs/...`, and manifest-retired
+`SlateDbCheckpointRefV1` state refs. Raw state/output candidates are deleted
+through the object-store API. SlateDB candidates release only the logical state
+key and Velorix marker key through the SlateDB state store; GC still does not
+walk or delete SlateDB internal object-store prefixes. The plan retains objects
+referenced by the latest N published manifests, where N must be at least one,
+and classifies only unreferenced raw state/output objects and retired SlateDB
+state refs as candidates. Executed runs can
 write a stable `GcRunV1` evidence object under `v1/gc-runs/...` with the policy,
 plan, deleted candidates, and skipped candidates. The execute path reports
 success only after reading the persisted run evidence back and validating its
@@ -348,6 +354,5 @@ deletion, and compaction remain future work.
 
 This is not a broad production GC service. It does not collect staging
 `v1/tmp/...` objects, does not add object-store listing-consistency controls,
-and does not delete SlateDB internal objects by prefix walking. SlateDB
-retention and release remain future integration through SlateDB-owned APIs or
-handles.
+and does not delete SlateDB internal objects by prefix walking. Broader SlateDB
+retention handles, manifest deletion, and compaction policy remain future work.

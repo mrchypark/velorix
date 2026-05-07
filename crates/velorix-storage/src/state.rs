@@ -721,6 +721,7 @@ impl CheckpointPublisher {
             .len()
             .saturating_sub(policy.retain_latest_manifests);
         let retained_manifests = &manifests[retained_from..];
+        let retired_manifests = &manifests[..retained_from];
 
         let mut referenced = HashSet::new();
         let mut retained_manifest_versions = Vec::with_capacity(retained_manifests.len());
@@ -740,14 +741,18 @@ impl CheckpointPublisher {
             );
         }
 
+        let mut raw_state_referenced = referenced.clone();
+        raw_state_referenced.extend(Self::slatedb_state_keys(&manifests));
+
         let mut candidates = Vec::new();
         self.add_unreferenced_candidates(
             STATE_PREFIX,
             GarbageCollectionCandidateKind::RawStateObject,
-            &referenced,
+            &raw_state_referenced,
             &mut candidates,
         )
         .await?;
+        Self::add_retired_slatedb_state_candidates(retired_manifests, &referenced, &mut candidates);
         self.add_unreferenced_candidates(
             OUTPUT_PREFIX,
             GarbageCollectionCandidateKind::OutputObject,
@@ -784,12 +789,27 @@ impl CheckpointPublisher {
             }
         }
 
+        let slatedb_state_refs = self.slatedb_state_refs_for_plan(plan).await?;
         let mut deleted = Vec::new();
         let mut skipped = Vec::new();
 
         for candidate in &plan.candidates {
             if !candidate.kind.matches_key(&candidate.object_key) {
                 skipped.push(candidate.clone());
+                continue;
+            }
+
+            if candidate.kind == GarbageCollectionCandidateKind::SlateDbStateRef {
+                let Some(state_ref) = slatedb_state_refs.get(&candidate.object_key) else {
+                    skipped.push(candidate.clone());
+                    continue;
+                };
+
+                if self.state_store.release_state_object(state_ref).await? {
+                    deleted.push(candidate.clone());
+                } else {
+                    skipped.push(candidate.clone());
+                }
                 continue;
             }
 
@@ -1104,6 +1124,43 @@ impl CheckpointPublisher {
         Ok(referenced)
     }
 
+    async fn slatedb_state_refs_for_plan(
+        &self,
+        plan: &GarbageCollectionPlan,
+    ) -> Result<HashMap<ObjectKey, StateObjectRef>, CheckpointPublishError> {
+        let slate_candidates = plan
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.kind == GarbageCollectionCandidateKind::SlateDbStateRef)
+            .map(|candidate| candidate.object_key.clone())
+            .collect::<HashSet<_>>();
+        if slate_candidates.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let retained = plan
+            .retained_manifest_versions
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let mut refs = HashMap::new();
+        for manifest in self.list_published_manifests().await? {
+            if retained.contains(&manifest.checkpoint_version) {
+                continue;
+            }
+            for state_ref in manifest.state_objects {
+                if state_ref.ref_type == StateRefType::SlateDbCheckpoint
+                    && slate_candidates.contains(&state_ref.object_key)
+                {
+                    refs.entry(state_ref.object_key.clone())
+                        .or_insert(state_ref);
+                }
+            }
+        }
+
+        Ok(refs)
+    }
+
     fn add_manifest_referenced_gc_keys(
         manifest: &CheckpointManifest,
         referenced: &mut HashMap<ObjectKey, u64>,
@@ -1120,6 +1177,36 @@ impl CheckpointPublisher {
                 .iter()
                 .map(|output_ref| (output_ref.object_key.clone(), manifest.checkpoint_version)),
         );
+    }
+
+    fn slatedb_state_keys(manifests: &[CheckpointManifest]) -> HashSet<ObjectKey> {
+        manifests
+            .iter()
+            .flat_map(|manifest| &manifest.state_objects)
+            .filter(|state_ref| state_ref.ref_type == StateRefType::SlateDbCheckpoint)
+            .map(|state_ref| state_ref.object_key.clone())
+            .collect()
+    }
+
+    fn add_retired_slatedb_state_candidates(
+        manifests: &[CheckpointManifest],
+        referenced: &HashSet<ObjectKey>,
+        candidates: &mut Vec<GarbageCollectionCandidate>,
+    ) {
+        let mut seen = HashSet::new();
+        for manifest in manifests {
+            for state_ref in &manifest.state_objects {
+                if state_ref.ref_type == StateRefType::SlateDbCheckpoint
+                    && !referenced.contains(&state_ref.object_key)
+                    && seen.insert(state_ref.object_key.clone())
+                {
+                    candidates.push(GarbageCollectionCandidate {
+                        object_key: state_ref.object_key.clone(),
+                        kind: GarbageCollectionCandidateKind::SlateDbStateRef,
+                    });
+                }
+            }
+        }
     }
 
     pub async fn latest_manifest(

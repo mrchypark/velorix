@@ -101,6 +101,67 @@ async fn slatedb_state_store_recovers_written_state_after_reopen() {
 }
 
 #[tokio::test]
+async fn slatedb_state_store_release_makes_checkpoint_ref_unreadable() {
+    let (_temp_dir, store) = temp_store();
+    let state_store = SlateDbStateStore::open("v1/slatedb/state", Arc::clone(&store))
+        .await
+        .unwrap();
+    let state = state_write(12, "state-0012", b"released-state");
+    let written_ref = state_store.write_state_object(&state).await.unwrap();
+
+    state_store
+        .release_state_object(&written_ref)
+        .await
+        .unwrap();
+
+    assert!(!state_store.state_object_exists(&written_ref).await.unwrap());
+    let err = state_store
+        .read_state_object(&written_ref)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        CheckpointPublishError::MissingStateObject(object_key)
+            if object_key == *state.object_key()
+    ));
+}
+
+#[tokio::test]
+async fn slatedb_state_store_release_fails_closed_when_payload_is_missing() {
+    let (_temp_dir, store) = temp_store();
+    let state = state_write(13, "state-0013", b"missing-payload");
+    let written_ref = {
+        let state_store = SlateDbStateStore::open("v1/slatedb/state", Arc::clone(&store))
+            .await
+            .unwrap();
+        let written_ref = state_store.write_state_object(&state).await.unwrap();
+        state_store.close().await.unwrap();
+        written_ref
+    };
+    let db = slatedb::Db::open("v1/slatedb/state", Arc::clone(&store))
+        .await
+        .unwrap();
+    db.delete(written_ref.object_key.as_str().as_bytes())
+        .await
+        .unwrap();
+    db.close().await.unwrap();
+
+    let reopened = SlateDbStateStore::open("v1/slatedb/state", Arc::clone(&store))
+        .await
+        .unwrap();
+    let err = reopened
+        .release_state_object(&written_ref)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        CheckpointPublishError::MissingStateObject(object_key)
+            if object_key == *state.object_key()
+    ));
+}
+
+#[tokio::test]
 async fn slatedb_state_store_fails_closed_for_raw_state_refs() {
     let (_temp_dir, store) = temp_store();
     let state_store = SlateDbStateStore::open("v1/slatedb/state", Arc::clone(&store))

@@ -952,6 +952,102 @@ async fn gc_execution_writes_retention_evidence_after_run_evidence_readback() {
 }
 
 #[tokio::test]
+async fn gc_execution_releases_manifest_retired_slatedb_state_refs() {
+    let (_temp_dir, store) = temp_store();
+    let publisher =
+        CheckpointPublisher::with_slatedb_state_store(Arc::clone(&store), "v1/slatedb/state")
+            .await
+            .unwrap();
+    let policy = GarbageCollectionPolicy {
+        retain_latest_manifests: 1,
+    };
+    let state_0 = state_write(0, "state-0001", b"state-0");
+    let state_1 = state_write(1, "state-0002", b"state-1");
+
+    let state_ref_0 = publisher.write_state_object(&state_0).await.unwrap();
+    publisher
+        .publish_manifest(&manifest(0, state_ref_0.clone()))
+        .await
+        .unwrap();
+    let state_ref_1 = publisher.write_state_object(&state_1).await.unwrap();
+    publisher
+        .publish_manifest(&manifest(1, state_ref_1.clone()))
+        .await
+        .unwrap();
+    store
+        .put(
+            &Path::from(state_0.object_key().as_str()),
+            Bytes::from_static(b"raw-shadow-with-same-key").into(),
+        )
+        .await
+        .unwrap();
+
+    let plan = publisher.plan_garbage_collection(policy).await.unwrap();
+    assert_eq!(
+        plan.candidates,
+        vec![GarbageCollectionCandidate {
+            object_key: state_0.object_key().clone(),
+            kind: GarbageCollectionCandidateKind::SlateDbStateRef,
+        }]
+    );
+
+    let run = publisher
+        .execute_garbage_collection_plan_with_evidence("run-0001", policy, &plan)
+        .await
+        .unwrap();
+
+    assert_eq!(run.report.deleted, plan.candidates);
+    assert!(matches!(
+        publisher.read_state_object(&state_ref_0).await,
+        Err(CheckpointPublishError::MissingStateObject(object_key))
+            if object_key == *state_0.object_key()
+    ));
+    assert_eq!(
+        publisher.read_state_object(&state_ref_1).await.unwrap(),
+        Bytes::from_static(b"state-1")
+    );
+
+    let record = publisher.read_checkpoint_retention_record(0).await.unwrap();
+    assert_eq!(
+        record.deleted_candidate_keys,
+        vec![state_0.object_key().clone()]
+    );
+    assert_eq!(
+        record.manifest_digest,
+        manifest_digest_for_test(&manifest(0, state_ref_0))
+    );
+}
+
+#[tokio::test]
+async fn gc_plan_keeps_slatedb_state_ref_referenced_by_retained_manifest() {
+    let (_temp_dir, store) = temp_store();
+    let publisher =
+        CheckpointPublisher::with_slatedb_state_store(Arc::clone(&store), "v1/slatedb/state")
+            .await
+            .unwrap();
+    let state = state_write(0, "state-0001", b"state");
+    let state_ref = publisher.write_state_object(&state).await.unwrap();
+    publisher
+        .publish_manifest(&manifest(0, state_ref.clone()))
+        .await
+        .unwrap();
+
+    let plan = publisher
+        .plan_garbage_collection(GarbageCollectionPolicy {
+            retain_latest_manifests: 1,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(plan.retained_manifest_versions, vec![0]);
+    assert!(plan.candidates.is_empty());
+    assert_eq!(
+        publisher.read_state_object(&state_ref).await.unwrap(),
+        Bytes::from_static(b"state")
+    );
+}
+
+#[tokio::test]
 async fn gc_execution_does_not_write_retention_evidence_when_run_evidence_fails() {
     let (_temp_dir, store) = temp_store();
     let publisher = CheckpointPublisher::new(Arc::new(ReadFailsStore::new(

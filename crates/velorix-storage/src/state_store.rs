@@ -32,6 +32,11 @@ pub trait StateObjectStore: fmt::Debug + Send + Sync {
         &self,
         state_ref: &StateObjectRef,
     ) -> Result<bool, CheckpointPublishError>;
+
+    async fn release_state_object(
+        &self,
+        state_ref: &StateObjectRef,
+    ) -> Result<bool, CheckpointPublishError>;
 }
 
 #[derive(Clone, Debug)]
@@ -136,6 +141,25 @@ impl StateObjectStore for RawObjectStateStore {
             Err(err) => Err(err.into()),
         }
     }
+
+    async fn release_state_object(
+        &self,
+        state_ref: &StateObjectRef,
+    ) -> Result<bool, CheckpointPublishError> {
+        if state_ref.ref_type == StateRefType::SlateDbCheckpoint {
+            return Ok(false);
+        }
+
+        match self
+            .store
+            .delete(&Path::from(state_ref.object_key.as_str()))
+            .await
+        {
+            Ok(()) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(err) => Err(err.into()),
+        }
+    }
 }
 
 #[async_trait]
@@ -234,6 +258,49 @@ impl StateObjectStore for SlateDbStateStore {
         }
 
         Ok(self.db.get(metadata.state_key.as_bytes()).await?.is_some())
+    }
+
+    async fn release_state_object(
+        &self,
+        state_ref: &StateObjectRef,
+    ) -> Result<bool, CheckpointPublishError> {
+        let metadata = self.validate_state_ref_metadata(state_ref)?;
+        let marker_key = state_marker_key(&metadata.state_key);
+        let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
+
+        let Some(marker_bytes) = txn.get(marker_key.as_bytes()).await? else {
+            return Ok(false);
+        };
+        let marker: SlateDbStateMarkerV1 = serde_json::from_slice(&marker_bytes)?;
+        if marker != SlateDbStateMarkerV1::from(metadata.clone()) {
+            return Err(CheckpointPublishError::InvalidSlateDbStateRef {
+                object_key: state_ref.object_key.clone(),
+                reason: "SlateDB state marker does not match state ref",
+            });
+        }
+
+        let Some(bytes) = txn.get(metadata.state_key.as_bytes()).await? else {
+            return Err(CheckpointPublishError::MissingStateObject(
+                state_ref.object_key.clone(),
+            ));
+        };
+        let actual_bytes = bytes.len() as u64;
+        let actual_digest = state_digest(&bytes);
+        if actual_bytes != metadata.state_bytes || actual_digest != metadata.state_digest {
+            return Err(CheckpointPublishError::SlateDbStatePayloadMismatch {
+                object_key: state_ref.object_key.clone(),
+                expected_digest: metadata.state_digest.clone(),
+                actual_digest,
+                expected_bytes: metadata.state_bytes,
+                actual_bytes,
+            });
+        }
+
+        txn.delete(metadata.state_key.as_bytes())?;
+        txn.delete(marker_key.as_bytes())?;
+        txn.commit().await?;
+
+        Ok(true)
     }
 }
 

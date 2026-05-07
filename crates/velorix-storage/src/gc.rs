@@ -44,6 +44,7 @@ pub struct GarbageCollectionCandidate {
 #[serde(rename_all = "snake_case")]
 pub enum GarbageCollectionCandidateKind {
     RawStateObject,
+    SlateDbStateRef,
     OutputObject,
 }
 
@@ -51,6 +52,7 @@ impl GarbageCollectionCandidateKind {
     pub(crate) fn matches_key(self, object_key: &ObjectKey) -> bool {
         match self {
             Self::RawStateObject => object_key.as_str().starts_with("v1/state/"),
+            Self::SlateDbStateRef => object_key.as_str().starts_with("v1/state/"),
             Self::OutputObject => object_key.as_str().starts_with("v1/outputs/"),
         }
     }
