@@ -127,6 +127,13 @@ impl ProductionReadinessEvidenceV1 {
     pub fn into_report(self) -> ProductionReadinessReportV1 {
         let mut blocking_reasons = Vec::new();
 
+        if self.deployment_id.trim().is_empty() {
+            blocking_reasons.push("deployment_id is empty".to_string());
+        }
+        if self.authority_store_id.trim().is_empty() {
+            blocking_reasons.push("authority_store_id is empty".to_string());
+        }
+
         push_check_blockers(
             &mut blocking_reasons,
             "capability_status",
@@ -394,12 +401,23 @@ pub fn verify_feldera_artifact_release_provenance_evidence(
 
 fn push_check_blockers(blocking_reasons: &mut Vec<String>, field: &str, check: &ReadinessCheck) {
     push_failed_check(blocking_reasons, field, check);
+    push_blank_evidence_check(blocking_reasons, field, check);
     push_placeholder_evidence_check(blocking_reasons, field, check);
 }
 
 fn push_failed_check(blocking_reasons: &mut Vec<String>, field: &str, check: &ReadinessCheck) {
     if check.status == ReadinessStatus::Fail {
         blocking_reasons.push(format!("{field} failed: {}", check.evidence));
+    }
+}
+
+fn push_blank_evidence_check(
+    blocking_reasons: &mut Vec<String>,
+    field: &str,
+    check: &ReadinessCheck,
+) {
+    if check.status == ReadinessStatus::Pass && check.evidence.trim().is_empty() {
+        blocking_reasons.push(format!("{field} missing evidence text"));
     }
 }
 

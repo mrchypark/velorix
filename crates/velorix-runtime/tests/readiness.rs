@@ -16,6 +16,28 @@ fn readiness_report_is_production_ready_when_all_required_evidence_passes() {
 }
 
 #[test]
+fn readiness_report_blocks_empty_top_level_identity() {
+    let report = report_with_identity("", " \t\n");
+
+    assert!(!report.production_ready);
+    assert_eq!(
+        report.blocking_reasons,
+        vec!["deployment_id is empty", "authority_store_id is empty"]
+    );
+}
+
+#[test]
+fn readiness_report_blocks_pass_check_with_blank_evidence() {
+    let report = report_with_evidence("capability_status", " \t\n");
+
+    assert!(!report.production_ready);
+    assert_eq!(
+        report.blocking_reasons,
+        vec!["capability_status missing evidence text"]
+    );
+}
+
+#[test]
 fn readiness_report_blocks_when_s3_compatible_evidence_is_missing() {
     let report = ProductionReadinessEvidenceV1::from_json_str(&readiness_json(
         &["s3_compatible"],
@@ -498,6 +520,20 @@ fn report_with_evidence(
         .unwrap()
         .try_into_report()
         .unwrap()
+}
+
+fn report_with_identity(
+    deployment_id: &str,
+    authority_store_id: &str,
+) -> velorix_runtime::readiness::ProductionReadinessReportV1 {
+    let mut value: serde_json::Value =
+        serde_json::from_str(&readiness_json(&[], false, &[])).unwrap();
+    value["deployment_id"] = serde_json::Value::String(deployment_id.to_string());
+    value["authority_store_id"] = serde_json::Value::String(authority_store_id.to_string());
+
+    ProductionReadinessEvidenceV1::from_json_str(&value.to_string())
+        .unwrap()
+        .into_report()
 }
 
 fn fixture_json(name: &str) -> String {
