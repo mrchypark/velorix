@@ -552,10 +552,14 @@ async fn create_production_table_with_policy(
         .create_for_production_table_scan("tenant-a", "standard", production_policy_with(policy))
         .await
         .unwrap();
+    let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
+    let mut registry = StorageRegistry::new();
+    register_production_scan_store(&mut registry, scan_store, Arc::clone(catalog_store)).await;
     PersistedTableStore::new(Arc::clone(catalog_store))
         .create_production(
             Arc::clone(catalog_store),
             Arc::clone(catalog_store),
+            &registry,
             CreateProductionPersistedTableSpecRequest {
                 table_id: "orders-current".to_string(),
                 tenant_id: "tenant-a".to_string(),

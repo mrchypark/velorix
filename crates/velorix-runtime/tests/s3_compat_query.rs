@@ -86,14 +86,6 @@ async fn s3_compatible_production_table_query_scans_parquet_through_registry() -
     let validation = async {
         create_orders_relation_catalog(&authority_store).await?;
         create_production_query_policy(&authority_store).await?;
-        PersistedTableStore::new(Arc::clone(&authority_store))
-            .create_production(
-                Arc::clone(&authority_store),
-                Arc::clone(&authority_store),
-                production_request("primary", &object_key_prefix),
-            )
-            .await?;
-
         let mut registry = StorageRegistry::new();
         registry
             .register_production_with_probe(
@@ -103,6 +95,14 @@ async fn s3_compatible_production_table_query_scans_parquet_through_registry() -
                 Arc::clone(&authority_store),
                 "s3-compatible",
                 format!("{}/capability-probes", config.run_prefix),
+            )
+            .await?;
+        PersistedTableStore::new(Arc::clone(&authority_store))
+            .create_production(
+                Arc::clone(&authority_store),
+                Arc::clone(&authority_store),
+                &registry,
+                production_request("primary", &object_key_prefix),
             )
             .await?;
 
