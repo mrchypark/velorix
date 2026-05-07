@@ -46,15 +46,14 @@ const REQUIRED_RELEASE_CONTRACTS: &[&str] = &[
     "GC",
     "dependency governance",
 ];
-use velorix_runtime::recovery::{
-    orders_sum_count_relation_catalog, RecoveredRuntime, ORDERS_SUM_COUNT_OWNER,
-};
+use velorix_runtime::recovery::{RecoveredRuntime, ORDERS_SUM_COUNT_OWNER};
 use velorix_storage::{
     checkpoint_index::{
         CheckpointAdminInspection, CheckpointLifecycleStatus, CheckpointManifestInspectionStatus,
         CheckpointRetentionRecordV1,
     },
     gc::{GarbageCollectionPlan, GarbageCollectionPolicy, GarbageCollectionRunV1},
+    relation_catalog_registry::RelationCatalogRegistry,
     state::CheckpointPublisher,
 };
 
@@ -71,6 +70,10 @@ enum Command {
     RecoverLocal {
         #[arg(long)]
         object_store_dir: PathBuf,
+        #[arg(long)]
+        relation_id: String,
+        #[arg(long)]
+        relation_version: String,
         #[arg(
             long,
             help = "Open checkpoint state through this SlateDB database path"
@@ -165,13 +168,21 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Some(Command::RecoverLocal {
             object_store_dir,
+            relation_id,
+            relation_version,
             slatedb_state_path,
             checkpoint_version,
         }) => {
             let store = local_object_store(&object_store_dir)?;
-            let recovered = recover_local_runtime(store, slatedb_state_path, checkpoint_version)
-                .await
-                .context("failed to recover local runtime")?;
+            let recovered = recover_local_runtime(
+                store,
+                relation_id,
+                relation_version,
+                slatedb_state_path,
+                checkpoint_version,
+            )
+            .await
+            .context("failed to recover local runtime")?;
             let materialized_records = recovered.materialized_state().records().len();
 
             println!(
@@ -1015,34 +1026,58 @@ fn local_object_store(object_store_dir: &Path) -> anyhow::Result<Arc<dyn ObjectS
 
 async fn recover_local_runtime(
     store: Arc<dyn ObjectStore>,
+    relation_id: String,
+    relation_version: String,
     slatedb_state_path: Option<String>,
     checkpoint_version: Option<u64>,
 ) -> Result<RecoveredRuntime, velorix_runtime::recovery::RecoveryError> {
     match (slatedb_state_path, checkpoint_version) {
+        (None, None) => {
+            RecoveredRuntime::recover_with_owner_and_relation_catalog_record(
+                store,
+                ORDERS_SUM_COUNT_OWNER,
+                &relation_id,
+                &relation_version,
+            )
+            .await
+        }
         (Some(db_path), Some(checkpoint_version)) => {
+            let relation_catalog = RelationCatalogRegistry::new(Arc::clone(&store))
+                .read(&relation_id, &relation_version)
+                .await?;
             RecoveredRuntime::recover_from_published_checkpoint_version_with_slatedb_state_store_and_relation_catalog(
                 store,
                 db_path,
                 checkpoint_version,
                 ORDERS_SUM_COUNT_OWNER,
-                orders_sum_count_relation_catalog()?,
+                relation_catalog,
             )
             .await
         }
         (Some(db_path), None) => {
+            let relation_catalog = RelationCatalogRegistry::new(Arc::clone(&store))
+                .read(&relation_id, &relation_version)
+                .await?;
             RecoveredRuntime::recover_with_slatedb_state_store_and_relation_catalog(
                 store,
                 db_path,
                 ORDERS_SUM_COUNT_OWNER,
-                orders_sum_count_relation_catalog()?,
+                relation_catalog,
             )
             .await
         }
         (None, Some(checkpoint_version)) => {
-            RecoveredRuntime::recover_from_published_checkpoint_version(store, checkpoint_version)
-                .await
+            let relation_catalog = RelationCatalogRegistry::new(Arc::clone(&store))
+                .read(&relation_id, &relation_version)
+                .await?;
+            RecoveredRuntime::recover_from_published_checkpoint_version_with_owner_and_relation_catalog(
+                store,
+                checkpoint_version,
+                ORDERS_SUM_COUNT_OWNER,
+                relation_catalog,
+            )
+            .await
         }
-        (None, None) => RecoveredRuntime::recover(store).await,
     }
 }
 
@@ -1285,6 +1320,7 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use tempfile::tempdir;
+    use velorix_runtime::recovery::{orders_sum_count_relation_catalog, RecoveryError};
     use velorix_storage::{
         checkpoint_index::{
             CheckpointAdminInspection, CheckpointLifecycleStatus, CheckpointManifestInspection,
@@ -1293,6 +1329,7 @@ mod tests {
         gc::{GarbageCollectionCandidate, GarbageCollectionCandidateKind, GarbageCollectionReport},
         manifest::{CheckpointManifest, InputRange},
         object_key::ObjectKey,
+        relation_catalog_registry::RelationCatalogRegistryError,
         state::{CheckpointPublisher, StateObjectWrite},
     };
 
@@ -1380,6 +1417,10 @@ mod tests {
             "recover-local",
             "--object-store-dir",
             "/tmp/velorix",
+            "--relation-id",
+            "orders",
+            "--relation-version",
+            "2026-05-05.v1",
             "--checkpoint-version",
             "7",
         ])
@@ -1387,6 +1428,8 @@ mod tests {
 
         let Some(Command::RecoverLocal {
             object_store_dir,
+            relation_id,
+            relation_version,
             slatedb_state_path,
             checkpoint_version,
         }) = cli.command
@@ -1395,6 +1438,8 @@ mod tests {
         };
 
         assert_eq!(object_store_dir, PathBuf::from("/tmp/velorix"));
+        assert_eq!(relation_id, "orders");
+        assert_eq!(relation_version, "2026-05-05.v1");
         assert_eq!(slatedb_state_path, None);
         assert_eq!(checkpoint_version, Some(7));
     }
@@ -1406,6 +1451,10 @@ mod tests {
             "recover-local",
             "--object-store-dir",
             "/tmp/velorix",
+            "--relation-id",
+            "orders",
+            "--relation-version",
+            "2026-05-05.v1",
             "--slatedb-state-path",
             "v1/slatedb/state",
             "--checkpoint-version",
@@ -1415,6 +1464,8 @@ mod tests {
 
         let Some(Command::RecoverLocal {
             object_store_dir,
+            relation_id,
+            relation_version,
             slatedb_state_path,
             checkpoint_version,
         }) = cli.command
@@ -1423,14 +1474,61 @@ mod tests {
         };
 
         assert_eq!(object_store_dir, PathBuf::from("/tmp/velorix"));
+        assert_eq!(relation_id, "orders");
+        assert_eq!(relation_version, "2026-05-05.v1");
         assert_eq!(slatedb_state_path, Some("v1/slatedb/state".to_string()));
         assert_eq!(checkpoint_version, Some(7));
+    }
+
+    #[test]
+    fn recover_local_cli_requires_relation_catalog_identity() {
+        let error = Cli::try_parse_from([
+            "velorix-cli",
+            "recover-local",
+            "--object-store-dir",
+            "/tmp/velorix",
+        ])
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("--relation-id"));
+        assert!(message.contains("--relation-version"));
+    }
+
+    #[tokio::test]
+    async fn recover_local_runtime_requires_persisted_relation_catalog_record() {
+        let dir = tempdir().unwrap();
+        let store = local_object_store(dir.path()).unwrap();
+
+        let error = recover_local_runtime(
+            store,
+            "orders".to_string(),
+            "2026-05-05.v1".to_string(),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RecoveryError::RelationCatalogRegistry(RelationCatalogRegistryError::ObjectStore(
+                object_store::Error::NotFound { .. }
+            ))
+        ));
     }
 
     #[tokio::test]
     async fn recover_local_runtime_uses_slatedb_state_store_for_selected_checkpoint() {
         let dir = tempdir().unwrap();
         let store = local_object_store(dir.path()).unwrap();
+        let catalog = orders_sum_count_relation_catalog().unwrap();
+        let relation_id = catalog.relation_schema.relation_id.clone();
+        let relation_version = catalog.relation_schema.relation_version.clone();
+        RelationCatalogRegistry::new(Arc::clone(&store))
+            .create(&catalog)
+            .await
+            .unwrap();
         let publisher =
             CheckpointPublisher::with_slatedb_state_store(Arc::clone(&store), "v1/slatedb/state")
                 .await
@@ -1463,9 +1561,15 @@ mod tests {
             .unwrap();
         drop(publisher);
 
-        let recovered = recover_local_runtime(store, Some("v1/slatedb/state".to_string()), Some(0))
-            .await
-            .unwrap();
+        let recovered = recover_local_runtime(
+            store,
+            relation_id,
+            relation_version,
+            Some("v1/slatedb/state".to_string()),
+            Some(0),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(recovered.latest_checkpoint_version(), Some(0));
         assert_eq!(recovered.replayed_batch_count(), 0);

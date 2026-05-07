@@ -38,15 +38,15 @@ permanently hide the last known good checkpoint.
 - `last_known_good_read_only`: allow read-only recovery from an admin-selected
   valid checkpoint.
 
-`velorix-cli recover-local --object-store-dir <path> --checkpoint-version <n>`
-starts recovery from an admin-selected published checkpoint after validating
-the manifest body/key/version, parent lineage, referenced payloads, and the
-digest-bound `published` lifecycle record. Recovery then replays durable ingest
-after that checkpoint boundary. SlateDB-backed checkpoint state is explicit:
-`--slatedb-state-path <object-store-db-path>` opens the SlateDB state substrate
-for selected-checkpoint or latest-checkpoint recovery; the path is the
-object-store database path stored in the checkpoint ref, not another local
-object-store root.
+`velorix-cli recover-local --object-store-dir <path> --relation-id <id> --relation-version <version> --checkpoint-version <n>`
+starts recovery from an admin-selected published checkpoint after reading the
+persisted relation catalog record and validating the manifest body/key/version,
+parent lineage, referenced payloads, and the digest-bound `published` lifecycle
+record. Recovery then replays durable ingest after that checkpoint boundary.
+SlateDB-backed checkpoint state is explicit: `--slatedb-state-path
+<object-store-db-path>` opens the SlateDB state substrate for
+selected-checkpoint or latest-checkpoint recovery; the path is the object-store
+database path stored in the checkpoint ref, not another local object-store root.
 
 ## Lifecycle Status
 
