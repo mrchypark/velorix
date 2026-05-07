@@ -38,14 +38,7 @@ use velorix_runtime::{
     query_policy_catalog::QueryPolicyCatalogStore,
     storage_registry::StorageRegistry,
 };
-use velorix_storage::{
-    capability::{
-        AuthoritativeNamespace, AuthoritativeObjectStoreCapabilitiesV1,
-        ObjectStoreCapabilityProfile,
-    },
-    object_key::ObjectKey,
-    relation_catalog_registry::RelationCatalogRegistry,
-};
+use velorix_storage::{object_key::ObjectKey, relation_catalog_registry::RelationCatalogRegistry};
 
 fn temp_store() -> (TempDir, Arc<dyn ObjectStore>) {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -54,26 +47,21 @@ fn temp_store() -> (TempDir, Arc<dyn ObjectStore>) {
     (temp_dir, Arc::new(store))
 }
 
-fn production_capabilities() -> AuthoritativeObjectStoreCapabilitiesV1 {
-    let profiles = AuthoritativeNamespace::all()
-        .into_iter()
-        .map(|namespace| (namespace, ObjectStoreCapabilityProfile::local_development()))
-        .collect();
-
-    AuthoritativeObjectStoreCapabilitiesV1::new(profiles)
-}
-
-fn register_production_scan_store(
+async fn register_production_scan_store(
     registry: &mut StorageRegistry,
     scan_store: Arc<dyn DataFusionObjectStore>,
+    authority_store: Arc<dyn ObjectStore>,
 ) {
     registry
-        .register_production(
+        .register_production_with_probe(
             "primary",
             "memory://velorix/",
             scan_store,
-            production_capabilities(),
+            authority_store,
+            "local-test",
+            "v1/probes",
         )
+        .await
         .unwrap();
 }
 
@@ -286,7 +274,12 @@ async fn production_persisted_object_backed_view_rejects_concurrency_policy_with
     let (_temp_dir, catalog_store) = temp_store();
     let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
     let mut registry = StorageRegistry::new();
-    register_production_scan_store(&mut registry, Arc::clone(&scan_store));
+    register_production_scan_store(
+        &mut registry,
+        Arc::clone(&scan_store),
+        Arc::clone(&catalog_store),
+    )
+    .await;
     create_production_table_with_policy(
         &catalog_store,
         QueryPolicy {
@@ -330,7 +323,12 @@ async fn production_persisted_object_backed_view_accepts_matching_shared_limiter
     )
     .await;
     let mut registry = StorageRegistry::new();
-    register_production_scan_store(&mut registry, Arc::clone(&scan_store));
+    register_production_scan_store(
+        &mut registry,
+        Arc::clone(&scan_store),
+        Arc::clone(&catalog_store),
+    )
+    .await;
     let policy = production_policy_with(QueryPolicy {
         max_concurrent_queries: Some(1),
         ..QueryPolicy::default()
@@ -365,7 +363,12 @@ async fn production_persisted_object_backed_view_rejects_mismatched_shared_limit
     let (_temp_dir, catalog_store) = temp_store();
     let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
     let mut registry = StorageRegistry::new();
-    register_production_scan_store(&mut registry, Arc::clone(&scan_store));
+    register_production_scan_store(
+        &mut registry,
+        Arc::clone(&scan_store),
+        Arc::clone(&catalog_store),
+    )
+    .await;
     create_production_table_with_policy(
         &catalog_store,
         production_policy_with(QueryPolicy {

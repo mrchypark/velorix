@@ -13,6 +13,28 @@ use velorix_storage::capability::{
     AuthoritativeObjectStoreCapabilityError, AuthoritativeObjectStoreCapabilityProbeError,
 };
 
+/// Production registration is intentionally probe-backed only.
+///
+/// ```compile_fail
+/// use std::sync::Arc;
+///
+/// use datafusion::object_store::{
+///     memory::InMemory,
+///     ObjectStore as DataFusionObjectStore,
+/// };
+/// use velorix_runtime::storage_registry::StorageRegistry;
+///
+/// let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(InMemory::new());
+/// let mut registry = StorageRegistry::new();
+/// registry
+///     .register_production(
+///         "primary",
+///         "memory://velorix/",
+///         scan_store,
+///         todo!(),
+///     )
+///     .unwrap();
+/// ```
 #[derive(Clone, Debug, Default)]
 pub struct StorageRegistry {
     entries: BTreeMap<String, RegisteredObjectStore>,
@@ -80,29 +102,6 @@ impl StorageRegistry {
                 store,
                 base_url,
                 production_capabilities: None,
-            },
-        );
-
-        Ok(())
-    }
-
-    pub fn register_production(
-        &mut self,
-        store_id: impl Into<String>,
-        base_url: &str,
-        store: Arc<dyn DataFusionObjectStore>,
-        production_capabilities: AuthoritativeObjectStoreCapabilitiesV1,
-    ) -> Result<(), StorageRegistryError> {
-        production_capabilities.validate_for_startup()?;
-        let store_id = validate_store_id(store_id.into())?;
-        let base_url = parse_base_url(base_url)?;
-
-        self.entries.insert(
-            store_id,
-            RegisteredObjectStore {
-                store,
-                base_url,
-                production_capabilities: Some(production_capabilities),
             },
         );
 
