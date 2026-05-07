@@ -33,6 +33,7 @@ use velorix_storage::{
     log::IngestLog,
     manifest::{CheckpointManifest, InputRange, StateObjectRef},
     object_key::ObjectKey,
+    relation_catalog_registry::RelationCatalogRegistry,
     state::{CheckpointPublisher, StateObjectWrite},
 };
 
@@ -306,8 +307,26 @@ async fn persisted_recovered_query_execution_uses_stored_sql_and_policy() {
         input_delta("account-b", 7, 1),
     ]);
 
-    append_ingest_envelope(&ingest_log, "orders", 0, 0, 2, &checkpoint_input).await;
-    append_ingest_envelope(&ingest_log, "orders", 0, 2, 4, &replay_input).await;
+    append_ingest_envelope(
+        Arc::clone(&store),
+        &ingest_log,
+        "orders",
+        0,
+        0,
+        2,
+        &checkpoint_input,
+    )
+    .await;
+    append_ingest_envelope(
+        Arc::clone(&store),
+        &ingest_log,
+        "orders",
+        0,
+        2,
+        4,
+        &replay_input,
+    )
+    .await;
 
     let mut checkpointed_view = KeyedSumCountAggregate::new();
     checkpointed_view.apply(&checkpoint_input).unwrap();
@@ -356,8 +375,26 @@ async fn persisted_recovered_query_execution_applies_stored_policy() {
     let checkpoint_input = batch([input_delta("account-a", 10, 1)]);
     let replay_input = batch([input_delta("account-b", 7, 1)]);
 
-    append_ingest_envelope(&ingest_log, "orders", 0, 0, 1, &checkpoint_input).await;
-    append_ingest_envelope(&ingest_log, "orders", 0, 1, 2, &replay_input).await;
+    append_ingest_envelope(
+        Arc::clone(&store),
+        &ingest_log,
+        "orders",
+        0,
+        0,
+        1,
+        &checkpoint_input,
+    )
+    .await;
+    append_ingest_envelope(
+        Arc::clone(&store),
+        &ingest_log,
+        "orders",
+        0,
+        1,
+        2,
+        &replay_input,
+    )
+    .await;
 
     let mut checkpointed_view = KeyedSumCountAggregate::new();
     checkpointed_view.apply(&checkpoint_input).unwrap();
@@ -445,6 +482,7 @@ fn ingest_record_batch(input: &DeltaBatch) -> RecordBatch {
 }
 
 async fn append_ingest_envelope(
+    store: Arc<dyn ObjectStore>,
     ingest_log: &IngestLog,
     stream_id: &str,
     partition_id: u32,
@@ -452,7 +490,18 @@ async fn append_ingest_envelope(
     end_offset_exclusive: u64,
     input: &DeltaBatch,
 ) {
-    let catalog = orders_sum_count_relation_catalog().unwrap();
+    let registry = RelationCatalogRegistry::new(store);
+    registry
+        .create(&orders_sum_count_relation_catalog().unwrap())
+        .await
+        .unwrap();
+    let catalog = registry
+        .read(
+            ORDERS_SUM_COUNT_RELATION_ID,
+            ORDERS_SUM_COUNT_RELATION_VERSION,
+        )
+        .await
+        .unwrap();
     let bytes = IngestEnvelope::encode_batches(
         IngestEnvelopeEncodeRequest {
             relation_id: ORDERS_SUM_COUNT_RELATION_ID.to_string(),
@@ -467,7 +516,10 @@ async fn append_ingest_envelope(
     )
     .unwrap();
 
-    ingest_log.append_validated_envelope(bytes).await.unwrap();
+    ingest_log
+        .append_catalog_validated_envelope(bytes)
+        .await
+        .unwrap();
 }
 
 async fn write_catalog_object(

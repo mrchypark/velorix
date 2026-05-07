@@ -167,6 +167,7 @@ async fn catalog_backed_recovery_rejects_replayed_ingest_relation_drift() {
         .unwrap();
     let input = input_batch([input_delta("account-a", 4, 1)]);
     IngestLog::new(Arc::clone(&store))
+        // Intentional bootstrap append: this fixture needs durable relation drift.
         .append_validated_envelope(ingest_envelope_bytes(
             "2026-05-06.v1",
             catalog.schema_fingerprint.as_str(),
@@ -215,6 +216,8 @@ async fn catalog_backed_recovery_reports_malformed_ingest_when_batch_schema_diff
     )
     .unwrap();
     IngestLog::new(Arc::clone(&store))
+        // Intentional bootstrap append: this fixture needs a malformed batch
+        // schema that catalog-aware append would reject before commit.
         .append_validated_envelope(ingest_envelope_bytes_with_batches(
             IngestEnvelopeEncodeRequest {
                 relation_id: ORDERS_SUM_COUNT_RELATION_ID.to_string(),

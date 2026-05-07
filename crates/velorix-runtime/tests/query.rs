@@ -41,6 +41,7 @@ use velorix_storage::{
     ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
     log::{IngestBatch, IngestLog, IngestLogError},
     manifest::{CheckpointManifest, InputRange, StateObjectRef},
+    relation_catalog_registry::{RelationCatalogRegistry, RelationCatalogRegistryError},
     state::{CheckpointPublisher, StateObjectWrite},
 };
 
@@ -131,6 +132,7 @@ fn ingest_envelope_bytes_with_relation(
 }
 
 async fn append_ingest_envelope(
+    store: Arc<dyn ObjectStore>,
     ingest_log: &IngestLog,
     stream_id: &str,
     partition_id: u32,
@@ -138,16 +140,53 @@ async fn append_ingest_envelope(
     end_offset_exclusive: u64,
     input: &DeltaBatch,
 ) {
+    let registry = RelationCatalogRegistry::new(store);
+    registry
+        .create(&orders_sum_count_relation_catalog().unwrap())
+        .await
+        .unwrap();
+    let catalog = registry
+        .read(
+            ORDERS_SUM_COUNT_RELATION_ID,
+            ORDERS_SUM_COUNT_RELATION_VERSION,
+        )
+        .await
+        .unwrap();
+
     ingest_log
-        .append_validated_envelope(ingest_envelope_bytes(
-            stream_id,
-            partition_id,
-            start_offset_inclusive,
-            end_offset_exclusive,
+        .append_catalog_validated_envelope(ingest_envelope_bytes_with_relation(
+            IngestEnvelopeEncodeRequest {
+                relation_id: ORDERS_SUM_COUNT_RELATION_ID.to_string(),
+                relation_version: ORDERS_SUM_COUNT_RELATION_VERSION.to_string(),
+                schema_fingerprint: catalog.schema_fingerprint.as_str().to_string(),
+                stream_id: stream_id.to_string(),
+                partition_id,
+                start_offset_inclusive,
+                end_offset_exclusive,
+            },
             input,
         ))
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn catalog_validated_ingest_append_fails_closed_when_relation_catalog_is_missing() {
+    let (_temp_dir, store) = temp_store();
+    let ingest_log = IngestLog::new(Arc::clone(&store));
+    let input = batch([input_delta("account-a", 4, 1)]);
+
+    let error = ingest_log
+        .append_catalog_validated_envelope(ingest_envelope_bytes("orders", 0, 0, 1, &input))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        IngestLogError::RelationCatalogRegistry(RelationCatalogRegistryError::ObjectStore(
+            object_store::Error::NotFound { .. }
+        ))
+    ));
 }
 
 fn parquet_input_batch(keys: &[&str], values: &[&str], weights: &[i64]) -> RecordBatch {
@@ -242,8 +281,26 @@ async fn query_recovered_materialized_view_reads_checkpointed_state_and_replayed
         input_delta("account-b", 7, 1),
     ]);
 
-    append_ingest_envelope(&ingest_log, "orders", 0, 0, 2, &checkpoint_input).await;
-    append_ingest_envelope(&ingest_log, "orders", 0, 2, 4, &replay_input).await;
+    append_ingest_envelope(
+        Arc::clone(&store),
+        &ingest_log,
+        "orders",
+        0,
+        0,
+        2,
+        &checkpoint_input,
+    )
+    .await;
+    append_ingest_envelope(
+        Arc::clone(&store),
+        &ingest_log,
+        "orders",
+        0,
+        2,
+        4,
+        &replay_input,
+    )
+    .await;
 
     let mut checkpointed_view = KeyedSumCountAggregate::new();
     checkpointed_view.apply(&checkpoint_input).unwrap();
@@ -283,8 +340,26 @@ async fn query_recovered_materialized_view_with_policy_applies_row_limit_to_reco
     ]);
     let replay_input = batch([input_delta("account-b", 7, 1)]);
 
-    append_ingest_envelope(&ingest_log, "orders", 0, 0, 2, &checkpoint_input).await;
-    append_ingest_envelope(&ingest_log, "orders", 0, 2, 3, &replay_input).await;
+    append_ingest_envelope(
+        Arc::clone(&store),
+        &ingest_log,
+        "orders",
+        0,
+        0,
+        2,
+        &checkpoint_input,
+    )
+    .await;
+    append_ingest_envelope(
+        Arc::clone(&store),
+        &ingest_log,
+        "orders",
+        0,
+        2,
+        3,
+        &replay_input,
+    )
+    .await;
 
     let mut checkpointed_view = KeyedSumCountAggregate::new();
     checkpointed_view.apply(&checkpoint_input).unwrap();
@@ -328,7 +403,16 @@ async fn query_recovered_materialized_view_with_policy_applies_byte_limit_under_
 
     let checkpoint_input = batch([input_delta("account-with-wide-output", 10, 1)]);
 
-    append_ingest_envelope(&ingest_log, "orders", 0, 0, 1, &checkpoint_input).await;
+    append_ingest_envelope(
+        Arc::clone(&store),
+        &ingest_log,
+        "orders",
+        0,
+        0,
+        1,
+        &checkpoint_input,
+    )
+    .await;
 
     let mut checkpointed_view = KeyedSumCountAggregate::new();
     checkpointed_view.apply(&checkpoint_input).unwrap();
@@ -405,6 +489,7 @@ async fn recovery_rejects_ingest_envelope_with_wrong_relation_version() {
         &input,
     );
 
+    // Intentional bootstrap append: this fixture needs durable relation drift.
     ingest_log.append_validated_envelope(bytes).await.unwrap();
 
     let error = RecoveredRuntime::recover(Arc::clone(&store))
@@ -440,6 +525,7 @@ async fn recovery_rejects_ingest_envelope_with_wrong_schema_fingerprint() {
         &input,
     );
 
+    // Intentional bootstrap append: this fixture needs durable schema drift.
     ingest_log.append_validated_envelope(bytes).await.unwrap();
 
     let error = RecoveredRuntime::recover(Arc::clone(&store))
@@ -464,7 +550,14 @@ async fn arrow_ingest_datafusion_and_feldera_use_the_same_catalog_identity() {
     let bytes = ingest_envelope_bytes("orders", 0, 0, 1, &input);
     let envelope = IngestEnvelope::decode(bytes.clone()).unwrap();
 
-    ingest_log.append_validated_envelope(bytes).await.unwrap();
+    RelationCatalogRegistry::new(Arc::clone(&store))
+        .create(&catalog)
+        .await
+        .unwrap();
+    ingest_log
+        .append_catalog_validated_envelope(bytes)
+        .await
+        .unwrap();
     let recovered = RecoveredRuntime::recover(Arc::clone(&store)).await.unwrap();
     let datafusion_schema = datafusion_schema_from_catalog(&catalog).unwrap();
     let feldera_schema = catalog_input_relation_schema(&catalog).unwrap();
@@ -514,7 +607,7 @@ async fn query_recovered_materialized_view_propagates_datafusion_errors() {
     let ingest_log = IngestLog::new(Arc::clone(&store));
     let input = batch([input_delta("account-a", 4, 1)]);
 
-    append_ingest_envelope(&ingest_log, "orders", 0, 0, 1, &input).await;
+    append_ingest_envelope(Arc::clone(&store), &ingest_log, "orders", 0, 0, 1, &input).await;
 
     let error =
         query_recovered_materialized_view(Arc::clone(&store), "select missing_column from input")

@@ -23,6 +23,7 @@ use velorix_storage::{
     log::{IngestBatch, IngestLog},
     manifest::{CheckpointManifest, InputRange, OutputObjectRef, StateObjectRef, StateRefType},
     object_key::ObjectKey,
+    relation_catalog_registry::RelationCatalogRegistry,
     state::{CheckpointPublishError, CheckpointPublisher, StateObjectWrite},
 };
 
@@ -84,6 +85,7 @@ fn ingest_record_batch(input: &DeltaBatch) -> RecordBatch {
 }
 
 async fn append_ingest_envelope(
+    store: Arc<dyn ObjectStore>,
     ingest_log: &IngestLog,
     stream_id: &str,
     partition_id: u32,
@@ -91,7 +93,18 @@ async fn append_ingest_envelope(
     end_offset_exclusive: u64,
     input: &DeltaBatch,
 ) {
-    let catalog = orders_sum_count_relation_catalog().unwrap();
+    let registry = RelationCatalogRegistry::new(store);
+    registry
+        .create(&orders_sum_count_relation_catalog().unwrap())
+        .await
+        .unwrap();
+    let catalog = registry
+        .read(
+            ORDERS_SUM_COUNT_RELATION_ID,
+            ORDERS_SUM_COUNT_RELATION_VERSION,
+        )
+        .await
+        .unwrap();
     let bytes = IngestEnvelope::encode_batches(
         IngestEnvelopeEncodeRequest {
             relation_id: ORDERS_SUM_COUNT_RELATION_ID.to_string(),
@@ -106,7 +119,10 @@ async fn append_ingest_envelope(
     )
     .unwrap();
 
-    ingest_log.append_validated_envelope(bytes).await.unwrap();
+    ingest_log
+        .append_catalog_validated_envelope(bytes)
+        .await
+        .unwrap();
 }
 
 fn checkpoint_bytes(checkpoint: &EngineCheckpoint) -> Bytes {
@@ -245,8 +261,26 @@ async fn local_recovery_recovers_checkpointed_view_and_replays_only_later_ingest
         input_delta("account-c", 11, 1),
     ]);
 
-    append_ingest_envelope(&ingest_log, "orders", 0, 0, 3, &first_input).await;
-    append_ingest_envelope(&ingest_log, "orders", 0, 3, 6, &second_input).await;
+    append_ingest_envelope(
+        Arc::clone(&store),
+        &ingest_log,
+        "orders",
+        0,
+        0,
+        3,
+        &first_input,
+    )
+    .await;
+    append_ingest_envelope(
+        Arc::clone(&store),
+        &ingest_log,
+        "orders",
+        0,
+        3,
+        6,
+        &second_input,
+    )
+    .await;
 
     let mut checkpointed_view = KeyedSumCountAggregate::new();
     checkpointed_view.apply(&first_input).unwrap();
@@ -304,8 +338,26 @@ async fn slatedb_local_recovery_recovers_reopened_checkpoint_state_and_replays_o
         input_delta("account-c", 8, 1),
     ]);
 
-    append_ingest_envelope(&ingest_log, "orders", 0, 0, 2, &checkpointed_input).await;
-    append_ingest_envelope(&ingest_log, "orders", 0, 2, 4, &replayed_input).await;
+    append_ingest_envelope(
+        Arc::clone(&store),
+        &ingest_log,
+        "orders",
+        0,
+        0,
+        2,
+        &checkpointed_input,
+    )
+    .await;
+    append_ingest_envelope(
+        Arc::clone(&store),
+        &ingest_log,
+        "orders",
+        0,
+        2,
+        4,
+        &replayed_input,
+    )
+    .await;
 
     let mut checkpointed_view = KeyedSumCountAggregate::new();
     checkpointed_view.apply(&checkpointed_input).unwrap();
@@ -365,8 +417,26 @@ async fn slatedb_local_recovery_can_use_selected_published_checkpoint() {
     let checkpointed_input = batch([input_delta("account-a", 10, 1)]);
     let replayed_input = batch([input_delta("account-a", 4, 1)]);
 
-    append_ingest_envelope(&ingest_log, "orders", 0, 0, 1, &checkpointed_input).await;
-    append_ingest_envelope(&ingest_log, "orders", 0, 1, 2, &replayed_input).await;
+    append_ingest_envelope(
+        Arc::clone(&store),
+        &ingest_log,
+        "orders",
+        0,
+        0,
+        1,
+        &checkpointed_input,
+    )
+    .await;
+    append_ingest_envelope(
+        Arc::clone(&store),
+        &ingest_log,
+        "orders",
+        0,
+        1,
+        2,
+        &replayed_input,
+    )
+    .await;
 
     let mut checkpointed_view = KeyedSumCountAggregate::new();
     checkpointed_view.apply(&checkpointed_input).unwrap();
@@ -462,7 +532,7 @@ async fn local_recovery_without_manifest_starts_empty_and_replays_from_zero() {
     let ingest_log = IngestLog::new(Arc::clone(&store));
     let input = batch([input_delta("account-a", 4, 1)]);
 
-    append_ingest_envelope(&ingest_log, "orders", 0, 0, 1, &input).await;
+    append_ingest_envelope(Arc::clone(&store), &ingest_log, "orders", 0, 0, 1, &input).await;
 
     let recovered = RecoveredRuntime::recover(Arc::clone(&store)).await.unwrap();
     let mut expected_view = KeyedSumCountAggregate::new();
@@ -513,7 +583,16 @@ async fn local_recovery_uses_manifest_boundaries_per_stream_partition_range() {
         ("payments", 0, 0, 1, &covered_payments),
         ("payments", 0, 1, 2, &later_payments),
     ] {
-        append_ingest_envelope(&ingest_log, stream, partition, start, end, input).await;
+        append_ingest_envelope(
+            Arc::clone(&store),
+            &ingest_log,
+            stream,
+            partition,
+            start,
+            end,
+            input,
+        )
+        .await;
     }
 
     let mut checkpointed_view = KeyedSumCountAggregate::new();
@@ -572,7 +651,16 @@ async fn local_recovery_uses_latest_manifest_when_multiple_are_published() {
     let third = batch([input_delta("account-a", 3, 1)]);
 
     for (start, end, input) in [(0, 1, &first), (1, 2, &second), (2, 3, &third)] {
-        append_ingest_envelope(&ingest_log, "orders", 0, start, end, input).await;
+        append_ingest_envelope(
+            Arc::clone(&store),
+            &ingest_log,
+            "orders",
+            0,
+            start,
+            end,
+            input,
+        )
+        .await;
     }
 
     let mut older_view = KeyedSumCountAggregate::new();
@@ -631,7 +719,16 @@ async fn local_recovery_can_use_selected_checkpoint_when_future_manifest_is_corr
         (1, 2, &replayed_after_checkpoint),
         (2, 3, &replayed_after_corrupt_manifest),
     ] {
-        append_ingest_envelope(&ingest_log, "orders", 0, start, end, input).await;
+        append_ingest_envelope(
+            Arc::clone(&store),
+            &ingest_log,
+            "orders",
+            0,
+            start,
+            end,
+            input,
+        )
+        .await;
     }
 
     let mut checkpointed_view = KeyedSumCountAggregate::new();
@@ -734,8 +831,26 @@ async fn local_recovery_preserves_signed_checkpoint_state_and_signed_replay() {
         input_delta("account-b", 3, -1),
     ]);
 
-    append_ingest_envelope(&ingest_log, "orders", 0, 0, 3, &checkpoint_input).await;
-    append_ingest_envelope(&ingest_log, "orders", 0, 3, 5, &replay_input).await;
+    append_ingest_envelope(
+        Arc::clone(&store),
+        &ingest_log,
+        "orders",
+        0,
+        0,
+        3,
+        &checkpoint_input,
+    )
+    .await;
+    append_ingest_envelope(
+        Arc::clone(&store),
+        &ingest_log,
+        "orders",
+        0,
+        3,
+        5,
+        &replay_input,
+    )
+    .await;
 
     let mut checkpointed_view = KeyedSumCountAggregate::new();
     checkpointed_view.apply(&checkpoint_input).unwrap();
@@ -775,8 +890,26 @@ async fn local_recovery_resumes_from_checkpointed_engine_logical_epoch_not_manif
     let first_input = batch([input_delta("account-a", 10, 1)]);
     let second_input = batch([input_delta("account-a", 5, 1)]);
 
-    append_ingest_envelope(&ingest_log, "orders", 0, 0, 1, &first_input).await;
-    append_ingest_envelope(&ingest_log, "orders", 0, 1, 2, &second_input).await;
+    append_ingest_envelope(
+        Arc::clone(&store),
+        &ingest_log,
+        "orders",
+        0,
+        0,
+        1,
+        &first_input,
+    )
+    .await;
+    append_ingest_envelope(
+        Arc::clone(&store),
+        &ingest_log,
+        "orders",
+        0,
+        1,
+        2,
+        &second_input,
+    )
+    .await;
 
     let mut checkpointed_view = KeyedSumCountAggregate::new();
     checkpointed_view.apply(&first_input).unwrap();
