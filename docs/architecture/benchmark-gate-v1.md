@@ -26,8 +26,11 @@ and object request metrics for object-backed workloads.
 
 Initial gates should use regression budgets rather than absolute targets. Local
 filesystem and S3-compatible baselines are separate and not interchangeable.
-The initial committed baselines are conservative placeholders for wiring the
-gate; they are not production performance claims.
+The committed local PR-smoke baseline is a non-placeholder, conservative
+threshold derived from a measured local run. It checks schema, required workload
+coverage, non-placeholder commit provenance, and gate wiring, not stable local
+machine performance. S3-compatible nightly and release baselines require live
+measured S3-compatible evidence and must not use placeholders.
 
 `local_incremental` is a bootstrap harness, not production readiness evidence.
 It currently emits real local workload details for catalog-aware ingest envelope

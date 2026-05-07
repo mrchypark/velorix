@@ -1162,14 +1162,13 @@ fn run_benchmark_gate(
                     result.display()
                 )
             })?;
-        current_result
-            .reject_placeholder_s3_commit()
-            .with_context(|| {
-                format!(
-                    "benchmark result {} must be real backend evidence",
-                    result.display()
-                )
-            })?;
+        if has_placeholder_commit(&current_result) {
+            bail!(
+                "benchmark result {} must be real backend evidence, got placeholder commit {}",
+                result.display(),
+                current_result.commit
+            );
+        }
     }
 
     let Some(baseline) = baseline else {
@@ -1199,9 +1198,10 @@ fn run_benchmark_gate(
                     baseline.display()
                 )
             })?;
-        if backend == BenchmarkBackend::S3Compatible && is_placeholder_baseline(&baseline_result) {
+        if has_placeholder_commit(&baseline_result) {
             bail!(
-                "S3-compatible benchmark gate requires a real baseline, got placeholder {}",
+                "benchmark gate requires a real baseline, got placeholder commit {} in {}",
+                baseline_result.commit,
                 baseline.display()
             );
         }
@@ -1217,7 +1217,7 @@ fn run_benchmark_gate(
         .context("benchmark result exceeds gate")
 }
 
-fn is_placeholder_baseline(result: &BenchmarkGateResultV1) -> bool {
+fn has_placeholder_commit(result: &BenchmarkGateResultV1) -> bool {
     result.commit.starts_with("placeholder-")
 }
 
@@ -2180,6 +2180,51 @@ mod tests {
     }
 
     #[test]
+    fn benchmark_gate_comparison_rejects_placeholder_local_current_result() {
+        let dir = tempdir().unwrap();
+        let baseline = dir.path().join("baseline.json");
+        let result = dir.path().join("result.json");
+        fs::write(&baseline, valid_result_json()).unwrap();
+        fs::write(&result, placeholder_current_local_result_json()).unwrap();
+
+        let error = run_benchmark_gate(
+            Some(&baseline),
+            &result,
+            Some(BenchmarkGateLevel::PrSmoke),
+            Some(BenchmarkBackend::Local),
+            Some(0.10),
+        )
+        .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("must be real backend evidence"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn benchmark_gate_comparison_rejects_placeholder_local_baseline() {
+        let dir = tempdir().unwrap();
+        let baseline = dir.path().join("baseline.json");
+        let result = dir.path().join("result.json");
+        fs::write(&baseline, placeholder_local_baseline_json()).unwrap();
+        fs::write(&result, valid_result_json()).unwrap();
+
+        let error = run_benchmark_gate(
+            Some(&baseline),
+            &result,
+            Some(BenchmarkGateLevel::PrSmoke),
+            Some(BenchmarkBackend::Local),
+            Some(0.10),
+        )
+        .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("requires a real baseline"), "{message}");
+    }
+
+    #[test]
     fn benchmark_gate_comparison_rejects_missing_required_workload_metric() {
         let dir = tempdir().unwrap();
         let baseline = dir.path().join("baseline.json");
@@ -2704,6 +2749,30 @@ mod tests {
             "release",
             "s3_compatible",
             "s3_incremental",
+            1000.0,
+            workload_metrics(),
+        ))
+        .unwrap()
+    }
+
+    fn placeholder_current_local_result_json() -> String {
+        serde_json::to_string_pretty(&normal_result(
+            "placeholder-local-pr-smoke-result",
+            "pr_smoke",
+            "local",
+            "local_incremental",
+            1000.0,
+            workload_metrics(),
+        ))
+        .unwrap()
+    }
+
+    fn placeholder_local_baseline_json() -> String {
+        serde_json::to_string_pretty(&normal_result(
+            "placeholder-local-pr-smoke-baseline",
+            "pr_smoke",
+            "local",
+            "local_incremental",
             1000.0,
             workload_metrics(),
         ))
