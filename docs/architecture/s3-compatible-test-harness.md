@@ -69,10 +69,11 @@ the runtime boundary:
 
 The test writes Parquet under the configured S3-compatible prefix, registers a
 production table through the storage registry's authority-store probe path,
-stores the relation catalog and query policy in object storage, and verifies a
-DataFusion aggregate query over the registered table. This proves the current
-two-version object-store boundary without adding an adapter or changing
-SlateDB/DataFusion dependency versions.
+stores the relation catalog and query policy in object storage, writes
+catalog-aware ingest envelopes for recovery coverage, and verifies a DataFusion
+aggregate query over the registered table. This proves the current two-version
+object-store boundary without adding an adapter or changing SlateDB/DataFusion
+dependency versions.
 
 ## Skip Behavior
 

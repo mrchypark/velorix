@@ -30,14 +30,15 @@ The initial committed baselines are conservative placeholders for wiring the
 gate; they are not production performance claims.
 
 `local_incremental` is a bootstrap harness, not production readiness evidence.
-It currently emits real local workload details for ingest envelope validation,
-checkpoint publication, checkpoint recovery, and a bounded DataFusion Parquet
-table scan. The DataFusion workload is instrumentation evidence that the local
-query path lists and reads Parquet objects under policy; it is not production
-scan latency evidence. The SlateDB workload writes a small checkpoint state
-payload through `SlateDbStateStore`, closes and drops the store, reopens the
-same object-store path, reads the state back, and records elapsed latency plus
-the local metered object-store requests visible through the harness wrapper.
+It currently emits real local workload details for catalog-aware ingest envelope
+admission, checkpoint publication, checkpoint recovery, and a bounded DataFusion
+Parquet table scan. The DataFusion workload is instrumentation evidence that the
+local query path lists and reads Parquet objects under policy; it is not
+production scan latency evidence. The SlateDB workload writes a small checkpoint
+state payload through `SlateDbStateStore`, closes and drops the store, reopens
+the same object-store path, reads the state back, and records elapsed latency
+plus the local metered object-store requests visible through the harness
+wrapper.
 This does not expose SlateDB internals or make object-request metering part of
 the state-store API. The GC dry-run workload prepares a small retained/orphan
 state-output set, calls `CheckpointPublisher::plan_garbage_collection`, asserts

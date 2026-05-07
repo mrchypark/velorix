@@ -486,7 +486,7 @@ async fn append_ingest_envelope(
         },
         &[ingest_record_batch(input)],
     )?;
-    ingest_log.append_validated_envelope(bytes).await?;
+    ingest_log.append_catalog_validated_envelope(bytes).await?;
     Ok(())
 }
 

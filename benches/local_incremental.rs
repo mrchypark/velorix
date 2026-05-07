@@ -46,6 +46,7 @@ use velorix_storage::{
     ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
     log::IngestLog,
     manifest::{CheckpointManifest, InputRange},
+    relation_catalog_registry::RelationCatalogRegistry,
     state::{CheckpointPublisher, OutputObjectWrite, StateObjectWrite},
     state_store::{SlateDbStateStore, StateObjectStore},
 };
@@ -73,6 +74,10 @@ async fn run() -> BenchResult<()> {
     let ingest_log = IngestLog::new(Arc::clone(&store));
     let publisher = CheckpointPublisher::new(Arc::clone(&store));
     let mut engine = PrototypeIncrementalEngine::new();
+
+    RelationCatalogRegistry::new(Arc::clone(&store))
+        .create(&orders_sum_count_relation_catalog()?)
+        .await?;
 
     let mut total_records = 0;
     let mut ingest_samples = Vec::new();
@@ -531,7 +536,7 @@ async fn append_ingest_envelope(
         &[batch],
     )?;
 
-    ingest_log.append_validated_envelope(bytes).await?;
+    ingest_log.append_catalog_validated_envelope(bytes).await?;
     Ok(())
 }
 

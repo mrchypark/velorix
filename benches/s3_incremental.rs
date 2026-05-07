@@ -622,7 +622,7 @@ mod live_s3 {
             &[batch],
         )?;
 
-        ingest_log.append_validated_envelope(bytes).await?;
+        ingest_log.append_catalog_validated_envelope(bytes).await?;
         Ok(())
     }
 
