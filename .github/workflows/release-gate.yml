@@ -7,10 +7,15 @@ on:
         description: Path to the S3-compatible release benchmark JSON result.
         required: false
         default: ""
+      readiness-evidence-path:
+        description: Path to the production readiness evidence JSON.
+        required: false
+        default: ""
 
 env:
   CARGO_TERM_COLOR: always
   S3_BENCHMARK_RESULT_PATH: ${{ inputs.s3-result-path }}
+  READINESS_EVIDENCE_PATH: ${{ inputs.readiness-evidence-path }}
 
 jobs:
   s3-release:
@@ -21,6 +26,10 @@ jobs:
         run: |
           if [ -z "$S3_BENCHMARK_RESULT_PATH" ]; then
             echo "release gate requires inputs.s3-result-path"
+            exit 1
+          fi
+          if [ -z "$READINESS_EVIDENCE_PATH" ]; then
+            echo "release gate requires inputs.readiness-evidence-path"
             exit 1
           fi
 
@@ -59,6 +68,13 @@ jobs:
             --backend s3-compatible \
             --baseline baselines/benchmark/s3/release.json \
             --result "$S3_BENCHMARK_RESULT_PATH"
+
+      - name: Validate production readiness report
+        run: |
+          test -f "$READINESS_EVIDENCE_PATH"
+          cargo run -p velorix-cli -- readiness-report \
+            --evidence "$READINESS_EVIDENCE_PATH" \
+            --json
 
       - name: Upload release benchmark result
         uses: actions/upload-artifact@v4
