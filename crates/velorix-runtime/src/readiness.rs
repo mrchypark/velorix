@@ -127,49 +127,49 @@ impl ProductionReadinessEvidenceV1 {
     pub fn into_report(self) -> ProductionReadinessReportV1 {
         let mut blocking_reasons = Vec::new();
 
-        push_failed_check(
+        push_check_blockers(
             &mut blocking_reasons,
             "capability_status",
             &self.capability_status,
         );
-        push_failed_check(
+        push_check_blockers(
             &mut blocking_reasons,
             "ownership_status",
             &self.ownership_status,
         );
-        push_failed_check(
+        push_check_blockers(
             &mut blocking_reasons,
             "checkpoint_status",
             &self.checkpoint_status,
         );
-        push_failed_check(&mut blocking_reasons, "state_status", &self.state_status);
-        push_failed_check(
+        push_check_blockers(&mut blocking_reasons, "state_status", &self.state_status);
+        push_check_blockers(
             &mut blocking_reasons,
             "query_policy_status",
             &self.query_policy_status,
         );
-        push_failed_check(
+        push_check_blockers(
             &mut blocking_reasons,
             "table_catalog_status",
             &self.table_catalog_status,
         );
-        push_failed_check(
+        push_check_blockers(
             &mut blocking_reasons,
             "feldera_artifact_status",
             &self.feldera_artifact_status,
         );
-        push_failed_check(
+        push_check_blockers(
             &mut blocking_reasons,
             "dependency_governance_status",
             &self.dependency_governance_status,
         );
-        push_failed_check(
+        push_check_blockers(
             &mut blocking_reasons,
             "benchmark_gate_status",
             &self.benchmark_gate_status,
         );
-        push_failed_check(&mut blocking_reasons, "gc_status", &self.gc_status);
-        push_failed_check(
+        push_check_blockers(&mut blocking_reasons, "gc_status", &self.gc_status);
+        push_check_blockers(
             &mut blocking_reasons,
             "kubernetes_status",
             &self.kubernetes_status,
@@ -392,9 +392,38 @@ pub fn verify_feldera_artifact_release_provenance_evidence(
     })
 }
 
+fn push_check_blockers(blocking_reasons: &mut Vec<String>, field: &str, check: &ReadinessCheck) {
+    push_failed_check(blocking_reasons, field, check);
+    push_placeholder_evidence_check(blocking_reasons, field, check);
+}
+
 fn push_failed_check(blocking_reasons: &mut Vec<String>, field: &str, check: &ReadinessCheck) {
     if check.status == ReadinessStatus::Fail {
         blocking_reasons.push(format!("{field} failed: {}", check.evidence));
+    }
+}
+
+fn push_placeholder_evidence_check(
+    blocking_reasons: &mut Vec<String>,
+    field: &str,
+    check: &ReadinessCheck,
+) {
+    if check.status != ReadinessStatus::Pass {
+        return;
+    }
+
+    let evidence = check.evidence.to_lowercase();
+    for (marker, reason) in [
+        ("placeholder", "placeholder"),
+        ("bootstrap", "bootstrap"),
+        ("local-only", "local-only"),
+        ("local only", "local-only"),
+        ("local filesystem", "local filesystem"),
+    ] {
+        if evidence.contains(marker) {
+            blocking_reasons.push(format!("{field} uses {reason} evidence"));
+            return;
+        }
     }
 }
 

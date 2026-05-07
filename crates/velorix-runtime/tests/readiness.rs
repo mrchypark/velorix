@@ -213,6 +213,34 @@ fn readiness_report_blocks_failed_dependency_governance_status() {
 }
 
 #[test]
+fn readiness_report_blocks_pass_check_with_placeholder_evidence_text() {
+    let report = report_with_evidence(
+        "benchmark_gate_status",
+        "placeholder benchmark gate evidence until S3 gate is wired",
+    );
+
+    assert!(!report.production_ready);
+    assert_eq!(
+        report.blocking_reasons,
+        vec!["benchmark_gate_status uses placeholder evidence"]
+    );
+}
+
+#[test]
+fn readiness_report_blocks_pass_check_with_local_only_evidence_text() {
+    let report = report_with_evidence(
+        "capability_status",
+        "S3-compatible capability probe passed against local-only storage",
+    );
+
+    assert!(!report.production_ready);
+    assert_eq!(
+        report.blocking_reasons,
+        vec!["capability_status uses local-only evidence"]
+    );
+}
+
+#[test]
 fn readiness_report_blocks_when_catalog_evidence_is_missing() {
     let report = ProductionReadinessEvidenceV1::from_json_str(&readiness_json(
         &[
@@ -456,6 +484,20 @@ fn readiness_json(
         gc_status = status_for("gc_status", failed_fields),
         gc_evidence = evidence_for("gc_status", failed_fields),
     )
+}
+
+fn report_with_evidence(
+    field: &str,
+    evidence: &str,
+) -> velorix_runtime::readiness::ProductionReadinessReportV1 {
+    let mut value: serde_json::Value =
+        serde_json::from_str(&readiness_json(&[], false, &[])).unwrap();
+    value[field]["evidence"] = serde_json::Value::String(evidence.to_string());
+
+    ProductionReadinessEvidenceV1::from_json_str(&value.to_string())
+        .unwrap()
+        .try_into_report()
+        .unwrap()
 }
 
 fn fixture_json(name: &str) -> String {
