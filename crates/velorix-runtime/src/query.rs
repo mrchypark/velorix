@@ -14,6 +14,7 @@ use datafusion::{
     prelude::{ParquetReadOptions, SessionContext},
 };
 use futures::TryStreamExt;
+use object_store::path::Path;
 use object_store::ObjectStore;
 use parquet::arrow::{
     arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions},
@@ -28,7 +29,8 @@ use crate::benchmark_gate::ObjectRequestMetricsV1;
 use crate::object_meter::{object_request_policy_error, MeteredObjectStore, ObjectStoreMeter};
 pub use crate::query_runtime::QueryExecutionLimiter;
 use crate::query_runtime::{DataFusionSessionFactory, QueryRuntimeLimits};
-use crate::recovery::{RecoveredRuntime, RecoveryError};
+use crate::recovery::{RecoveredRuntime, RecoveryError, ORDERS_SUM_COUNT_OWNER};
+use velorix_storage::relation_catalog_registry::RelationCatalogRegistry;
 
 #[derive(Debug, Error)]
 pub enum RuntimeQueryError {
@@ -64,8 +66,48 @@ pub async fn query_recovered_materialized_view_with_policy_and_limiter(
 
     let _permit = acquire_query_permit(policy, limiter.as_ref())?;
     let recovered = RecoveredRuntime::recover(store).await?;
-    let materialized = recovered.materialized_state();
 
+    collect_recovered_materialized_view(recovered, sql, policy)
+        .await
+        .map_err(Into::into)
+}
+
+pub async fn query_production_recovered_materialized_view_with_policy_and_limiter(
+    store: Arc<dyn ObjectStore>,
+    slatedb_state_path: impl Into<Path>,
+    relation_id: &str,
+    relation_version: &str,
+    sql: &str,
+    policy: QueryPolicy,
+    limiter: Option<QueryExecutionLimiter>,
+) -> Result<Vec<RecordBatch>, RuntimeQueryError> {
+    policy.validate().map_err(QueryError::from)?;
+    validate_sql_text_policy(sql, policy).map_err(QueryError::from)?;
+
+    let _permit = acquire_query_permit(policy, limiter.as_ref())?;
+    let relation_catalog = RelationCatalogRegistry::new(Arc::clone(&store))
+        .read(relation_id, relation_version)
+        .await
+        .map_err(RecoveryError::from)?;
+    let recovered = RecoveredRuntime::recover_with_slatedb_state_store_and_relation_catalog(
+        store,
+        slatedb_state_path,
+        ORDERS_SUM_COUNT_OWNER,
+        relation_catalog,
+    )
+    .await?;
+
+    collect_recovered_materialized_view(recovered, sql, policy)
+        .await
+        .map_err(Into::into)
+}
+
+async fn collect_recovered_materialized_view(
+    recovered: RecoveredRuntime,
+    sql: &str,
+    policy: QueryPolicy,
+) -> Result<Vec<RecordBatch>, QueryError> {
+    let materialized = recovered.materialized_state();
     let input = RecordBatch::try_new(
         input_schema(),
         vec![
