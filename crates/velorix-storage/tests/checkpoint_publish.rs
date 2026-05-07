@@ -1473,6 +1473,68 @@ async fn gc_read_run_evidence_rejects_unsupported_schema_version() {
 }
 
 #[tokio::test]
+async fn gc_read_run_evidence_rejects_zero_retention_policy() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let evidence_key = ObjectKey::garbage_collection_run("run-0001").unwrap();
+    let mut run = garbage_collection_run("run-0001", 1);
+    run.policy.retain_latest_manifests = 0;
+    store
+        .put(
+            &Path::from(evidence_key.as_str()),
+            Bytes::from(serde_json::to_vec(&run).unwrap()).into(),
+        )
+        .await
+        .unwrap();
+
+    let err = publisher
+        .read_garbage_collection_run_evidence("run-0001")
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        CheckpointPublishError::InvalidGarbageCollectionRunEvidence {
+            object_key,
+            reason,
+        } if object_key == evidence_key && reason.contains("retain_latest_manifests")
+    ));
+}
+
+#[tokio::test]
+async fn gc_read_run_evidence_rejects_report_entries_not_in_plan() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let evidence_key = ObjectKey::garbage_collection_run("run-0001").unwrap();
+    let mut run = garbage_collection_run("run-0001", 1);
+    let candidate = GarbageCollectionCandidate {
+        object_key: ObjectKey::state_object("orders", 0, 7, "unplanned").unwrap(),
+        kind: GarbageCollectionCandidateKind::RawStateObject,
+    };
+    run.report.deleted.push(candidate);
+    store
+        .put(
+            &Path::from(evidence_key.as_str()),
+            Bytes::from(serde_json::to_vec(&run).unwrap()).into(),
+        )
+        .await
+        .unwrap();
+
+    let err = publisher
+        .read_garbage_collection_run_evidence("run-0001")
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        CheckpointPublishError::InvalidGarbageCollectionRunEvidence {
+            object_key,
+            reason,
+        } if object_key == evidence_key && reason.contains("not in the recorded plan")
+    ));
+}
+
+#[tokio::test]
 async fn gc_ignores_publish_temp_attempt_objects() {
     let (_temp_dir, store) = temp_store();
     let publisher = CheckpointPublisher::new(Arc::clone(&store));

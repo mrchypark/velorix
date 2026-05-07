@@ -935,6 +935,27 @@ impl CheckpointPublisher {
                 },
             );
         }
+        if run.policy.retain_latest_manifests == 0 {
+            return Err(
+                CheckpointPublishError::InvalidGarbageCollectionRunEvidence {
+                    object_key: object_key.clone(),
+                    reason: "retain_latest_manifests must be greater than zero".to_string(),
+                },
+            );
+        }
+        for candidate in run.report.deleted.iter().chain(&run.report.skipped) {
+            if !run.plan.candidates.contains(candidate) {
+                return Err(
+                    CheckpointPublishError::InvalidGarbageCollectionRunEvidence {
+                        object_key: object_key.clone(),
+                        reason: format!(
+                            "report candidate `{}` is not in the recorded plan",
+                            candidate.object_key
+                        ),
+                    },
+                );
+            }
+        }
 
         Ok(())
     }
