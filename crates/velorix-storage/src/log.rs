@@ -4,11 +4,13 @@ use bytes::Bytes;
 use futures::TryStreamExt;
 use object_store::{path::Path, ObjectStore, PutMode};
 use thiserror::Error;
+use velorix_core::relation::{validate_record_batch_matches_catalog, RelationSchemaError};
 
 use crate::{
     capability::{ObjectStoreCapabilityError, ObjectStoreCapabilityProfile},
     ingest_envelope::{IngestEnvelope, IngestEnvelopeError},
     object_key::{ObjectKey, ObjectKeyError},
+    relation_catalog_registry::{RelationCatalogRegistry, RelationCatalogRegistryError},
 };
 
 const INGEST_PREFIX: &str = "v1/ingest";
@@ -85,6 +87,18 @@ pub enum IngestLogError {
         partition_id: u32,
     },
     #[error(transparent)]
+    RelationCatalogRegistry(#[from] RelationCatalogRegistryError),
+    #[error(transparent)]
+    RelationSchema(#[from] RelationSchemaError),
+    #[error(
+        "ingest envelope relation catalog mismatch for {field}: expected {expected}, found {actual}"
+    )]
+    RelationCatalogMismatch {
+        field: &'static str,
+        expected: String,
+        actual: String,
+    },
+    #[error(transparent)]
     IngestEnvelope(#[from] IngestEnvelopeError),
     #[error(transparent)]
     ObjectStore(#[from] object_store::Error),
@@ -125,8 +139,12 @@ impl IngestLog {
     }
 
     /// Validates an Arrow IPC ingest envelope and appends it as a create-only
-    /// durable ingest object. Production ingest callers should use this path
-    /// instead of constructing unchecked [`IngestBatch`] values directly.
+    /// durable ingest object without consulting the relation catalog.
+    ///
+    /// This remains for bootstrap/dev compatibility. Production ingest callers
+    /// should use [`Self::append_catalog_validated_envelope`] so relation
+    /// identity, schema fingerprint, and Arrow batch schema are checked before
+    /// durable append.
     pub async fn append_validated_envelope(
         &self,
         payload: Bytes,
@@ -135,15 +153,71 @@ impl IngestLog {
         self.append_validated_batch(batch).await
     }
 
-    /// Validates and appends an Arrow IPC ingest envelope in single-writer
-    /// admission mode. This rejects overlaps visible in already committed
-    /// ranges before writing, but it is not a distributed multi-writer range
-    /// admission guarantee.
+    /// Validates and appends an Arrow IPC ingest envelope in envelope-only
+    /// single-writer admission mode.
+    ///
+    /// This rejects overlaps visible in already committed ranges before
+    /// writing, but it does not consult the relation catalog and is not a
+    /// distributed multi-writer range admission guarantee. Production
+    /// single-writer callers should use
+    /// [`Self::append_catalog_validated_envelope_single_writer`].
     pub async fn append_validated_envelope_single_writer(
         &self,
         payload: Bytes,
     ) -> Result<AppendValidatedEnvelopeOutcome, IngestLogError> {
         let batch = IngestBatch::from_validated_envelope(payload)?;
+        self.append_validated_batch_single_writer(batch).await
+    }
+
+    /// Validates an Arrow IPC ingest envelope against the persisted relation
+    /// catalog before durable append. Production ingest callers should prefer
+    /// this entrypoint so relation identity, schema fingerprint, and Arrow
+    /// batch schema are checked before `v1/ingest` is mutated.
+    pub async fn append_catalog_validated_envelope(
+        &self,
+        payload: Bytes,
+    ) -> Result<AppendValidatedEnvelopeOutcome, IngestLogError> {
+        let batch = self.catalog_validated_batch(payload).await?;
+        self.append_validated_batch(batch).await
+    }
+
+    /// Catalog-aware single-writer admission. This keeps the same single-writer
+    /// overlap limits as [`Self::append_validated_envelope_single_writer`] and
+    /// adds relation catalog validation before writing.
+    pub async fn append_catalog_validated_envelope_single_writer(
+        &self,
+        payload: Bytes,
+    ) -> Result<AppendValidatedEnvelopeOutcome, IngestLogError> {
+        let batch = self.catalog_validated_batch(payload).await?;
+        self.append_validated_batch_single_writer(batch).await
+    }
+
+    async fn catalog_validated_batch(&self, payload: Bytes) -> Result<IngestBatch, IngestLogError> {
+        let envelope = IngestEnvelope::decode(payload.clone())?;
+        let header = envelope.header();
+        let catalog = RelationCatalogRegistry::new(Arc::clone(&self.store))
+            .read(&header.relation_id, &header.relation_version)
+            .await?;
+
+        if header.schema_fingerprint != catalog.schema_fingerprint.as_str() {
+            return Err(IngestLogError::RelationCatalogMismatch {
+                field: "schema_fingerprint",
+                expected: catalog.schema_fingerprint.as_str().to_string(),
+                actual: header.schema_fingerprint.clone(),
+            });
+        }
+
+        for batch in envelope.record_batches()? {
+            validate_record_batch_matches_catalog(&catalog, &batch)?;
+        }
+
+        IngestBatch::from_validated_envelope(payload)
+    }
+
+    async fn append_validated_batch_single_writer(
+        &self,
+        batch: IngestBatch,
+    ) -> Result<AppendValidatedEnvelopeOutcome, IngestLogError> {
         let descriptor = batch.descriptor();
         if let Some(committed) = self
             .list_committed()

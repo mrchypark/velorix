@@ -18,6 +18,15 @@ single-writer admission path for validated Arrow envelopes: adjacent ranges are
 allowed, same-key retries remain idempotent, and visible committed range
 overlaps return `range_overlap_committed`.
 
+Production callers should use the catalog-aware variants:
+`IngestLog::append_catalog_validated_envelope` and
+`IngestLog::append_catalog_validated_envelope_single_writer`. These read the
+persisted relation catalog before the create-only ingest write, require the
+envelope relation id/version and schema fingerprint to match the catalog, and
+validate Arrow batch schemas against the catalog. The older
+`append_validated_envelope` variants remain bootstrap/dev compatibility
+surfaces and do not prove relation-catalog admission.
+
 `Coordinated` mode uses a durable admission index or write coordinator. This is
 required before Velorix advertises production multi-writer range-overlap
 rejection.

@@ -11,6 +11,12 @@ use object_store::{local::LocalFileSystem, path::Path, ObjectStore};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
+use velorix_core::relation::{
+    ArrowPhysicalTypeV1, DataFusionRegistrationModeV1, DataFusionRegistrationV1,
+    FelderaRelationBindingV1, IncrementalAdapterBindingV1, RelationColumnV1, RelationOperationV1,
+    RelationSchemaError, RelationSemanticRoleV1, SchemaFingerprintV1, VelorixLogicalTypeV1,
+    VelorixRelationCatalogV1, VelorixRelationSchemaV1, RELATION_SCHEMA_VERSION_V1,
+};
 use velorix_storage::{
     ingest_envelope::{
         IngestEnvelope, IngestEnvelopeEncodeRequest, IngestEnvelopeError, INGEST_ENVELOPE_MAGIC,
@@ -20,6 +26,7 @@ use velorix_storage::{
         IngestLogError,
     },
     object_key::ObjectKey,
+    relation_catalog_registry::{RelationCatalogRegistry, RelationCatalogRegistryError},
 };
 
 fn temp_store() -> (TempDir, Arc<dyn ObjectStore>) {
@@ -68,6 +75,24 @@ fn valid_batch() -> RecordBatch {
     .unwrap()
 }
 
+fn batch_with_wrong_value_column() -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("account_id", DataType::Utf8, false),
+        Field::new("total", DataType::Int64, false),
+        Field::new("weight", DataType::Int64, false),
+    ]));
+
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["acct-1"])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![10])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+        ],
+    )
+    .unwrap()
+}
+
 fn batch_without_weight() -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![Field::new(
         "account_id",
@@ -98,6 +123,68 @@ fn batch_with_unsigned_weight() -> RecordBatch {
 
 fn envelope_bytes() -> Bytes {
     envelope_bytes_for("orders", 7, 10, 12)
+}
+
+fn catalog_envelope_bytes(catalog: &VelorixRelationCatalogV1) -> Bytes {
+    catalog_envelope_bytes_with_batches(catalog, &[valid_batch()])
+}
+
+fn catalog_envelope_bytes_with_batches(
+    catalog: &VelorixRelationCatalogV1,
+    batches: &[RecordBatch],
+) -> Bytes {
+    IngestEnvelope::encode_batches(
+        IngestEnvelopeEncodeRequest {
+            relation_id: catalog.relation_schema.relation_id.clone(),
+            relation_version: catalog.relation_schema.relation_version.clone(),
+            schema_fingerprint: catalog.schema_fingerprint.as_str().to_string(),
+            stream_id: "orders".to_string(),
+            partition_id: 7,
+            start_offset_inclusive: 10,
+            end_offset_exclusive: 12,
+        },
+        batches,
+    )
+    .unwrap()
+}
+
+fn catalog_envelope_bytes_for(
+    catalog: &VelorixRelationCatalogV1,
+    start_offset_inclusive: u64,
+    end_offset_exclusive: u64,
+) -> Bytes {
+    IngestEnvelope::encode_batches(
+        IngestEnvelopeEncodeRequest {
+            relation_id: catalog.relation_schema.relation_id.clone(),
+            relation_version: catalog.relation_schema.relation_version.clone(),
+            schema_fingerprint: catalog.schema_fingerprint.as_str().to_string(),
+            stream_id: "orders".to_string(),
+            partition_id: 7,
+            start_offset_inclusive,
+            end_offset_exclusive,
+        },
+        &[valid_batch()],
+    )
+    .unwrap()
+}
+
+fn catalog_envelope_bytes_with_fingerprint(
+    catalog: &VelorixRelationCatalogV1,
+    schema_fingerprint: &str,
+) -> Bytes {
+    IngestEnvelope::encode_batches(
+        IngestEnvelopeEncodeRequest {
+            relation_id: catalog.relation_schema.relation_id.clone(),
+            relation_version: catalog.relation_schema.relation_version.clone(),
+            schema_fingerprint: schema_fingerprint.to_string(),
+            stream_id: "orders".to_string(),
+            partition_id: 7,
+            start_offset_inclusive: 10,
+            end_offset_exclusive: 12,
+        },
+        &[valid_batch()],
+    )
+    .unwrap()
 }
 
 fn envelope_bytes_for(
@@ -237,6 +324,75 @@ fn mutate_header(bytes: &Bytes, mutate: impl FnOnce(&mut serde_json::Map<String,
     mutated.extend_from_slice(&new_header);
     mutated.extend_from_slice(&bytes[header_end..]);
     Bytes::from(mutated)
+}
+
+fn orders_relation_catalog() -> VelorixRelationCatalogV1 {
+    let relation_schema = VelorixRelationSchemaV1 {
+        relation_id: "orders_relation".to_string(),
+        relation_name: "orders".to_string(),
+        relation_version: "2026-05-05".to_string(),
+        columns: vec![
+            RelationColumnV1 {
+                column_id: "account_id".to_string(),
+                name: "account_id".to_string(),
+                logical_type: VelorixLogicalTypeV1::Utf8,
+                physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+                nullable: false,
+                ordinal: 0,
+                semantic_role: RelationSemanticRoleV1::PrimaryKey,
+            },
+            RelationColumnV1 {
+                column_id: "amount".to_string(),
+                name: "amount".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 1,
+                semantic_role: RelationSemanticRoleV1::Value,
+            },
+            RelationColumnV1 {
+                column_id: "weight".to_string(),
+                name: "weight".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 2,
+                semantic_role: RelationSemanticRoleV1::Weight,
+            },
+        ],
+        primary_key_column_ids: vec!["account_id".to_string()],
+        weight_column_id: "weight".to_string(),
+        allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+        event_time_column_id: None,
+    };
+    let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
+
+    VelorixRelationCatalogV1 {
+        schema_version: RELATION_SCHEMA_VERSION_V1,
+        relation_schema,
+        schema_fingerprint: schema_fingerprint.clone(),
+        datafusion_registration: DataFusionRegistrationV1 {
+            name: "orders".to_string(),
+            mode: DataFusionRegistrationModeV1::Table,
+        },
+        feldera_relation: FelderaRelationBindingV1 {
+            relation_id: "orders_relation".to_string(),
+            schema_fingerprint,
+        },
+        incremental_adapter: IncrementalAdapterBindingV1 {
+            adapter_id: "incremental-adapter-orders-sum-count-v1".to_string(),
+        },
+    }
+}
+
+async fn create_orders_relation_catalog(store: &Arc<dyn ObjectStore>) -> VelorixRelationCatalogV1 {
+    let catalog = orders_relation_catalog();
+    RelationCatalogRegistry::new(Arc::clone(store))
+        .create(&catalog)
+        .await
+        .unwrap();
+
+    catalog
 }
 
 #[test]
@@ -571,6 +727,148 @@ async fn append_validated_envelope_writes_batch_and_admits_same_digest_retry() {
     assert_eq!(
         outcome,
         AppendValidatedEnvelopeOutcome::Duplicate { descriptor }
+    );
+}
+
+#[tokio::test]
+async fn append_catalog_validated_envelope_writes_batch_after_catalog_match() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = create_orders_relation_catalog(&store).await;
+    let log = IngestLog::new(Arc::clone(&store));
+    let bytes = catalog_envelope_bytes(&catalog);
+
+    let outcome = log
+        .append_catalog_validated_envelope(bytes.clone())
+        .await
+        .unwrap();
+
+    let AppendValidatedEnvelopeOutcome::Appended { descriptor } = outcome else {
+        panic!("expected appended outcome, got {outcome:?}");
+    };
+    assert_eq!(descriptor, ingest_descriptor("orders", 7, 10, 12));
+
+    let replayed = log.replay_validated_envelopes_from(&[]).await.unwrap();
+    assert_eq!(replayed.len(), 1);
+    assert_eq!(replayed[0].payload(), &bytes);
+}
+
+#[tokio::test]
+async fn append_catalog_validated_envelope_admits_same_digest_retry_after_catalog_match() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = create_orders_relation_catalog(&store).await;
+    let log = IngestLog::new(Arc::clone(&store));
+    let bytes = catalog_envelope_bytes(&catalog);
+
+    let outcome = log
+        .append_catalog_validated_envelope(bytes.clone())
+        .await
+        .unwrap();
+    let AppendValidatedEnvelopeOutcome::Appended { descriptor } = outcome else {
+        panic!("expected appended outcome, got {outcome:?}");
+    };
+
+    let outcome = log.append_catalog_validated_envelope(bytes).await.unwrap();
+
+    assert_eq!(
+        outcome,
+        AppendValidatedEnvelopeOutcome::Duplicate { descriptor }
+    );
+}
+
+#[tokio::test]
+async fn append_catalog_validated_envelope_rejects_missing_relation_catalog_before_commit() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = orders_relation_catalog();
+    let log = IngestLog::new(Arc::clone(&store));
+
+    let error = log
+        .append_catalog_validated_envelope(catalog_envelope_bytes(&catalog))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        IngestLogError::RelationCatalogRegistry(RelationCatalogRegistryError::ObjectStore(
+            object_store::Error::NotFound { .. }
+        ))
+    ));
+    assert!(log.list_committed().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn append_catalog_validated_envelope_rejects_schema_fingerprint_mismatch_before_commit() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = create_orders_relation_catalog(&store).await;
+    let log = IngestLog::new(Arc::clone(&store));
+    let bytes = catalog_envelope_bytes_with_fingerprint(
+        &catalog,
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    );
+
+    let error = log
+        .append_catalog_validated_envelope(bytes)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        IngestLogError::RelationCatalogMismatch {
+            field: "schema_fingerprint",
+            expected,
+            actual,
+        } if expected == catalog.schema_fingerprint.as_str()
+            && actual == "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    ));
+    assert!(log.list_committed().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn append_catalog_validated_envelope_rejects_batch_schema_mismatch_before_commit() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = create_orders_relation_catalog(&store).await;
+    let log = IngestLog::new(Arc::clone(&store));
+    let bytes = catalog_envelope_bytes_with_batches(&catalog, &[batch_with_wrong_value_column()]);
+
+    let error = log
+        .append_catalog_validated_envelope(bytes)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        IngestLogError::RelationSchema(RelationSchemaError::InvalidRelationSchema {
+            field: "batch_schema"
+        })
+    ));
+    assert!(log.list_committed().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn append_catalog_validated_envelope_single_writer_rejects_committed_overlap_after_catalog_match(
+) {
+    let (_temp_dir, store) = temp_store();
+    let catalog = create_orders_relation_catalog(&store).await;
+    let log = IngestLog::new(Arc::clone(&store));
+
+    log.append_catalog_validated_envelope_single_writer(catalog_envelope_bytes_for(
+        &catalog, 10, 20,
+    ))
+    .await
+    .unwrap();
+    let outcome = log
+        .append_catalog_validated_envelope_single_writer(catalog_envelope_bytes_for(
+            &catalog, 15, 25,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        AppendValidatedEnvelopeOutcome::Conflict {
+            descriptor: ingest_descriptor("orders", 7, 15, 25),
+            object_key: ObjectKey::ingest_batch("orders", 7, 10, 20).unwrap(),
+            reason: "range_overlap_committed",
+        }
     );
 }
 
