@@ -5,9 +5,13 @@ use kube::{
     api::{Api, DeleteParams, PostParams},
     Client,
 };
-use velorix_k8s::crd::{
-    ObjectStoreAuthorityRef, RelationVersionRef, VelorixDatabase, VelorixDatabaseSpec,
-    VelorixStream, VelorixStreamSpec, VelorixWorkerShard, VelorixWorkerShardSpec,
+use velorix_k8s::{
+    crd::{
+        CheckpointRef, ConditionState, ObjectStoreAuthorityRef, RelationVersionRef, StreamStatus,
+        VelorixCondition, VelorixDatabase, VelorixDatabaseSpec, VelorixStream, VelorixStreamSpec,
+        VelorixWorkerShard, VelorixWorkerShardSpec,
+    },
+    status::{KubeStreamStatusApi, StreamStatusWriter},
 };
 
 #[tokio::test]
@@ -25,7 +29,7 @@ async fn live_velorix_crds_create_read_and_delete_when_enabled() -> Result<(), B
 
     let database_api: Api<VelorixDatabase> = Api::namespaced(client.clone(), &namespace);
     let stream_api: Api<VelorixStream> = Api::namespaced(client.clone(), &namespace);
-    let shard_api: Api<VelorixWorkerShard> = Api::namespaced(client, &namespace);
+    let shard_api: Api<VelorixWorkerShard> = Api::namespaced(client.clone(), &namespace);
 
     let database_name = format!("db-{suffix}");
     let stream_name = format!("stream-{suffix}");
@@ -48,7 +52,7 @@ async fn live_velorix_crds_create_read_and_delete_when_enabled() -> Result<(), B
             authority: authority.clone(),
         },
     );
-    let stream = VelorixStream::new(
+    let mut stream = VelorixStream::new(
         &stream_name,
         VelorixStreamSpec {
             stream_id: format!("orders-{suffix}"),
@@ -57,6 +61,7 @@ async fn live_velorix_crds_create_read_and_delete_when_enabled() -> Result<(), B
             authority: authority.clone(),
         },
     );
+    stream.metadata.namespace = Some(namespace.clone());
     let shard = VelorixWorkerShard::new(
         &shard_name,
         VelorixWorkerShardSpec {
@@ -75,6 +80,11 @@ async fn live_velorix_crds_create_read_and_delete_when_enabled() -> Result<(), B
     stream_api.create(&PostParams::default(), &stream).await?;
     shard_api.create(&PostParams::default(), &shard).await?;
 
+    let status = ready_status();
+    StreamStatusWriter::new(KubeStreamStatusApi::new(client))
+        .write_stream_status(&stream, status.clone())
+        .await?;
+
     assert_eq!(
         database_api.get(&database_name).await?.spec.database_id,
         format!("database-{suffix}")
@@ -83,6 +93,7 @@ async fn live_velorix_crds_create_read_and_delete_when_enabled() -> Result<(), B
         stream_api.get(&stream_name).await?.spec.stream_id,
         format!("orders-{suffix}")
     );
+    assert_eq!(stream_api.get(&stream_name).await?.status, Some(status));
     assert_eq!(
         shard_api.get(&shard_name).await?.spec.desired_owner_id,
         "worker-a"
@@ -127,4 +138,21 @@ where
 fn unique_suffix() -> Result<String, Box<dyn Error>> {
     let elapsed = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?;
     Ok(format!("{}-{}", std::process::id(), elapsed.as_millis()))
+}
+
+fn ready_status() -> StreamStatus {
+    StreamStatus {
+        observed_generation: Some(1),
+        last_accepted_relation_schema_fingerprint: Some(format!("sha256:{}", "a".repeat(64))),
+        latest_published_checkpoint: Some(CheckpointRef {
+            checkpoint_version: 7,
+            manifest_digest: format!("sha256:{}", "7".repeat(64)),
+        }),
+        readiness: Some(VelorixCondition {
+            type_: "Ready".to_string(),
+            status: ConditionState::True,
+            reason: "AuthorityValidated".to_string(),
+            message: "object-store authority and relation catalog records validated".to_string(),
+        }),
+    }
 }
