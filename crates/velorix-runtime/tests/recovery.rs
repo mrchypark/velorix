@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use arrow::{
     array::{ArrayRef, Int64Array, StringArray},
@@ -15,6 +15,10 @@ use velorix_runtime::recovery::{
     ORDERS_SUM_COUNT_RELATION_ID, ORDERS_SUM_COUNT_RELATION_VERSION,
 };
 use velorix_storage::{
+    capability::{
+        AuthoritativeNamespace, AuthoritativeObjectStoreCapabilitiesV1,
+        AuthoritativeObjectStoreCapabilityError, ObjectStoreCapabilityProfile,
+    },
     ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
     log::IngestLog,
     relation_catalog_registry::{RelationCatalogRegistry, RelationCatalogRegistryError},
@@ -25,6 +29,28 @@ fn temp_store() -> (TempDir, Arc<dyn ObjectStore>) {
     let store = LocalFileSystem::new_with_prefix(temp_dir.path()).unwrap();
 
     (temp_dir, Arc::new(store))
+}
+
+fn local_capabilities() -> AuthoritativeObjectStoreCapabilitiesV1 {
+    let profile = ObjectStoreCapabilityProfile::local_development();
+    AuthoritativeObjectStoreCapabilitiesV1::new(
+        AuthoritativeNamespace::all()
+            .into_iter()
+            .map(|namespace| (namespace, profile.clone()))
+            .collect::<BTreeMap<_, _>>(),
+    )
+}
+
+fn capabilities_missing(
+    namespace: AuthoritativeNamespace,
+) -> AuthoritativeObjectStoreCapabilitiesV1 {
+    let profile = ObjectStoreCapabilityProfile::local_development();
+    let mut profiles = AuthoritativeNamespace::all()
+        .into_iter()
+        .map(|namespace| (namespace, profile.clone()))
+        .collect::<BTreeMap<_, _>>();
+    profiles.remove(&namespace);
+    AuthoritativeObjectStoreCapabilitiesV1::new(profiles)
 }
 
 fn input_delta(account: &str, amount: i64, weight: i64) -> DeltaRecord {
@@ -134,6 +160,63 @@ async fn catalog_backed_recovery_reads_catalog_record_and_replays_catalog_aware_
             1,
         )]
     );
+}
+
+#[tokio::test]
+async fn checked_catalog_backed_recovery_requires_complete_authoritative_capabilities() {
+    let (_temp_dir, store) = temp_store();
+    let capabilities = capabilities_missing(AuthoritativeNamespace::Ingest);
+
+    let error = RecoveredRuntime::recover_with_owner_and_relation_catalog_record_checked(
+        Arc::clone(&store),
+        ORDERS_SUM_COUNT_OWNER,
+        ORDERS_SUM_COUNT_RELATION_ID,
+        ORDERS_SUM_COUNT_RELATION_VERSION,
+        &capabilities,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RecoveryError::AuthoritativeObjectStoreCapabilities(
+            AuthoritativeObjectStoreCapabilityError::MissingNamespace {
+                namespace: AuthoritativeNamespace::Ingest
+            }
+        )
+    ));
+}
+
+#[tokio::test]
+async fn checked_catalog_backed_recovery_reads_catalog_with_valid_capabilities() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = orders_sum_count_relation_catalog().unwrap();
+    RelationCatalogRegistry::new(Arc::clone(&store))
+        .create(&catalog)
+        .await
+        .unwrap();
+    let input = input_batch([input_delta("account-a", 4, 1)]);
+    IngestLog::new(Arc::clone(&store))
+        .append_catalog_validated_envelope(ingest_envelope_bytes(
+            ORDERS_SUM_COUNT_RELATION_VERSION,
+            catalog.schema_fingerprint.as_str(),
+            &input,
+        ))
+        .await
+        .unwrap();
+
+    let recovered = RecoveredRuntime::recover_with_owner_and_relation_catalog_record_checked(
+        Arc::clone(&store),
+        ORDERS_SUM_COUNT_OWNER,
+        ORDERS_SUM_COUNT_RELATION_ID,
+        ORDERS_SUM_COUNT_RELATION_VERSION,
+        &local_capabilities(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(recovered.replayed_batch_count(), 1);
+    assert_eq!(recovered.logical_epoch(), 1);
 }
 
 #[tokio::test]

@@ -1,6 +1,4 @@
-use std::fmt;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{collections::BTreeMap, fmt, sync::Arc, time::Duration};
 
 use arrow::{
     array::{ArrayRef, Int64Array, StringArray},
@@ -27,6 +25,19 @@ use velorix_runtime::{
     },
     recovery::{ORDERS_SUM_COUNT_RELATION_ID, ORDERS_SUM_COUNT_RELATION_VERSION},
 };
+use velorix_storage::capability::{
+    AuthoritativeNamespace, AuthoritativeObjectStoreCapabilitiesV1, ObjectStoreCapabilityProfile,
+};
+
+fn local_capabilities() -> AuthoritativeObjectStoreCapabilitiesV1 {
+    let profile = ObjectStoreCapabilityProfile::local_development();
+    AuthoritativeObjectStoreCapabilitiesV1::new(
+        AuthoritativeNamespace::all()
+            .into_iter()
+            .map(|namespace| (namespace, profile.clone()))
+            .collect::<BTreeMap<_, _>>(),
+    )
+}
 
 #[tokio::test]
 async fn query_recovered_materialized_view_requires_shared_limiter_when_concurrency_limit_is_set() {
@@ -62,6 +73,7 @@ async fn production_recovered_query_requires_shared_limiter_when_concurrency_lim
         "v1/slatedb/state",
         ORDERS_SUM_COUNT_RELATION_ID,
         ORDERS_SUM_COUNT_RELATION_VERSION,
+        &local_capabilities(),
         "select key_json, value_json, weight from input",
         QueryPolicy {
             max_concurrent_queries: Some(1),
@@ -96,6 +108,7 @@ async fn production_recovered_query_rejects_limiter_that_does_not_match_policy()
         "v1/slatedb/state",
         ORDERS_SUM_COUNT_RELATION_ID,
         ORDERS_SUM_COUNT_RELATION_VERSION,
+        &local_capabilities(),
         "select key_json, value_json, weight from input",
         QueryPolicy {
             max_concurrent_queries: Some(1),

@@ -18,6 +18,11 @@ use velorix_core::{
     },
 };
 use velorix_storage::{
+    capability::{
+        AuthoritativeNamespace, AuthoritativeObjectStoreCapabilitiesV1,
+        AuthoritativeObjectStoreCapabilityError, ObjectStoreCapabilityError,
+        ObjectStoreCapabilityProfile,
+    },
     ingest_envelope::IngestEnvelope,
     log::{IngestLog, IngestLogError, ReplayCheckpoint},
     manifest::CheckpointManifest,
@@ -65,6 +70,10 @@ pub enum RecoveryError {
     RelationCatalog(#[from] RelationSchemaError),
     #[error(transparent)]
     RelationCatalogRegistry(#[from] RelationCatalogRegistryError),
+    #[error(transparent)]
+    AuthoritativeObjectStoreCapabilities(#[from] AuthoritativeObjectStoreCapabilityError),
+    #[error(transparent)]
+    ObjectStoreCapability(#[from] ObjectStoreCapabilityError),
     #[error("ingest relation mismatch for {field}: expected `{expected}`, actual `{actual}`")]
     IngestRelationMismatch {
         field: &'static str,
@@ -75,6 +84,27 @@ pub enum RecoveryError {
     UnsupportedIncrementalAdapter { adapter_id: String },
     #[error("malformed prototype Arrow ingest envelope: {reason}")]
     MalformedPrototypeArrowIngest { reason: String },
+}
+
+struct ProductionRecoveryAuthority<'a> {
+    capabilities: &'a AuthoritativeObjectStoreCapabilitiesV1,
+}
+
+impl<'a> ProductionRecoveryAuthority<'a> {
+    fn new(
+        capabilities: &'a AuthoritativeObjectStoreCapabilitiesV1,
+    ) -> Result<Self, RecoveryError> {
+        capabilities.validate_for_startup()?;
+
+        Ok(Self { capabilities })
+    }
+
+    fn profile(&self, namespace: AuthoritativeNamespace) -> &ObjectStoreCapabilityProfile {
+        self.capabilities
+            .profiles
+            .get(&namespace)
+            .expect("startup capability validation guarantees every authoritative namespace")
+    }
 }
 
 impl RecoveredRuntime {
@@ -107,6 +137,30 @@ impl RecoveredRuntime {
         Self::recover_with_owner_and_relation_catalog(store, expected_owner, relation_catalog).await
     }
 
+    pub async fn recover_with_owner_and_relation_catalog_record_checked(
+        store: Arc<dyn ObjectStore>,
+        expected_owner: &str,
+        relation_id: &str,
+        relation_version: &str,
+        capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
+    ) -> Result<Self, RecoveryError> {
+        let authority = ProductionRecoveryAuthority::new(capabilities)?;
+        let relation_catalog = RelationCatalogRegistry::new_checked(
+            Arc::clone(&store),
+            authority.profile(AuthoritativeNamespace::RelationCatalog),
+        )?
+        .read(relation_id, relation_version)
+        .await?;
+
+        Self::recover_with_owner_and_relation_catalog_checked(
+            store,
+            expected_owner,
+            relation_catalog,
+            capabilities,
+        )
+        .await
+    }
+
     pub async fn recover_with_owner_and_relation_catalog(
         store: Arc<dyn ObjectStore>,
         expected_owner: &str,
@@ -117,6 +171,31 @@ impl RecoveredRuntime {
         Self::recover_with_publisher_and_relation_catalog(
             store,
             publisher,
+            expected_owner,
+            relation_catalog,
+        )
+        .await
+    }
+
+    pub async fn recover_with_owner_and_relation_catalog_checked(
+        store: Arc<dyn ObjectStore>,
+        expected_owner: &str,
+        relation_catalog: VelorixRelationCatalogV1,
+        capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
+    ) -> Result<Self, RecoveryError> {
+        let authority = ProductionRecoveryAuthority::new(capabilities)?;
+        let publisher = CheckpointPublisher::new_checked(
+            Arc::clone(&store),
+            authority.profile(AuthoritativeNamespace::Checkpoint),
+        )?;
+        let ingest_log = IngestLog::new_checked(
+            Arc::clone(&store),
+            authority.profile(AuthoritativeNamespace::Ingest),
+        )?;
+
+        Self::recover_with_publisher_log_and_relation_catalog(
+            publisher,
+            ingest_log,
             expected_owner,
             relation_catalog,
         )
@@ -198,17 +277,87 @@ impl RecoveredRuntime {
         .await
     }
 
+    pub async fn recover_with_slatedb_state_store_and_relation_catalog_checked(
+        store: Arc<dyn ObjectStore>,
+        db_path: impl Into<Path>,
+        expected_owner: &str,
+        relation_catalog: VelorixRelationCatalogV1,
+        capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
+    ) -> Result<Self, RecoveryError> {
+        let authority = ProductionRecoveryAuthority::new(capabilities)?;
+        let publisher = CheckpointPublisher::with_slatedb_state_store_checked(
+            Arc::clone(&store),
+            db_path,
+            authority.profile(AuthoritativeNamespace::Checkpoint),
+        )
+        .await?;
+        let ingest_log = IngestLog::new_checked(
+            Arc::clone(&store),
+            authority.profile(AuthoritativeNamespace::Ingest),
+        )?;
+
+        Self::recover_with_publisher_log_and_relation_catalog(
+            publisher,
+            ingest_log,
+            expected_owner,
+            relation_catalog,
+        )
+        .await
+    }
+
+    pub async fn recover_with_slatedb_state_store_and_catalog_record_checked(
+        store: Arc<dyn ObjectStore>,
+        db_path: impl Into<Path>,
+        expected_owner: &str,
+        relation_id: &str,
+        relation_version: &str,
+        capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
+    ) -> Result<Self, RecoveryError> {
+        let authority = ProductionRecoveryAuthority::new(capabilities)?;
+        let relation_catalog = RelationCatalogRegistry::new_checked(
+            Arc::clone(&store),
+            authority.profile(AuthoritativeNamespace::RelationCatalog),
+        )?
+        .read(relation_id, relation_version)
+        .await?;
+
+        Self::recover_with_slatedb_state_store_and_relation_catalog_checked(
+            store,
+            db_path,
+            expected_owner,
+            relation_catalog,
+            capabilities,
+        )
+        .await
+    }
+
     async fn recover_with_publisher_and_relation_catalog(
         store: Arc<dyn ObjectStore>,
         publisher: CheckpointPublisher,
         expected_owner: &str,
         relation_catalog: VelorixRelationCatalogV1,
     ) -> Result<Self, RecoveryError> {
+        let ingest_log = IngestLog::new(store);
+        Self::recover_with_publisher_log_and_relation_catalog(
+            publisher,
+            ingest_log,
+            expected_owner,
+            relation_catalog,
+        )
+        .await
+    }
+
+    async fn recover_with_publisher_log_and_relation_catalog(
+        publisher: CheckpointPublisher,
+        ingest_log: IngestLog,
+        expected_owner: &str,
+        relation_catalog: VelorixRelationCatalogV1,
+    ) -> Result<Self, RecoveryError> {
         relation_catalog.validate()?;
         let latest_manifest = publisher.latest_manifest().await?;
         Self::recover_from_manifest_and_relation_catalog(
-            store,
             publisher,
+            ingest_log,
             latest_manifest,
             expected_owner,
             relation_catalog,
@@ -224,9 +373,10 @@ impl RecoveredRuntime {
         relation_catalog: VelorixRelationCatalogV1,
     ) -> Result<Self, RecoveryError> {
         relation_catalog.validate()?;
+        let ingest_log = IngestLog::new(Arc::clone(&store));
         Self::recover_from_manifest_and_relation_catalog(
-            store,
             publisher,
+            ingest_log,
             Some(manifest),
             expected_owner,
             relation_catalog,
@@ -235,8 +385,8 @@ impl RecoveredRuntime {
     }
 
     async fn recover_from_manifest_and_relation_catalog(
-        store: Arc<dyn ObjectStore>,
         publisher: CheckpointPublisher,
+        ingest_log: IngestLog,
         manifest: Option<CheckpointManifest>,
         expected_owner: &str,
         relation_catalog: VelorixRelationCatalogV1,
@@ -284,7 +434,6 @@ impl RecoveredRuntime {
         }
 
         let replay_checkpoints = replay_checkpoints(manifest.as_ref());
-        let ingest_log = IngestLog::new(store);
         let replayed = ingest_log
             .replay_validated_envelopes_from(&replay_checkpoints)
             .await?;

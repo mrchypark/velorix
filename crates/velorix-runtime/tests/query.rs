@@ -1,4 +1,4 @@
-use std::{error::Error, num::NonZeroUsize, sync::Arc};
+use std::{collections::BTreeMap, error::Error, num::NonZeroUsize, sync::Arc};
 
 use arrow::array::{ArrayRef, Int64Array, StringArray, StringViewArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -39,6 +39,10 @@ use velorix_runtime::{
     },
 };
 use velorix_storage::{
+    capability::{
+        AuthoritativeNamespace, AuthoritativeObjectStoreCapabilitiesV1,
+        AuthoritativeObjectStoreCapabilityError, ObjectStoreCapabilityProfile,
+    },
     ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
     log::{IngestBatch, IngestLog, IngestLogError},
     manifest::{CheckpointManifest, InputRange, StateObjectRef},
@@ -53,6 +57,28 @@ fn temp_store() -> (TempDir, Arc<dyn ObjectStore>) {
     let store = LocalFileSystem::new_with_prefix(temp_dir.path()).unwrap();
 
     (temp_dir, Arc::new(store))
+}
+
+fn local_capabilities() -> AuthoritativeObjectStoreCapabilitiesV1 {
+    let profile = ObjectStoreCapabilityProfile::local_development();
+    AuthoritativeObjectStoreCapabilitiesV1::new(
+        AuthoritativeNamespace::all()
+            .into_iter()
+            .map(|namespace| (namespace, profile.clone()))
+            .collect::<BTreeMap<_, _>>(),
+    )
+}
+
+fn capabilities_missing(
+    namespace: AuthoritativeNamespace,
+) -> AuthoritativeObjectStoreCapabilitiesV1 {
+    let profile = ObjectStoreCapabilityProfile::local_development();
+    let mut profiles = AuthoritativeNamespace::all()
+        .into_iter()
+        .map(|namespace| (namespace, profile.clone()))
+        .collect::<BTreeMap<_, _>>();
+    profiles.remove(&namespace);
+    AuthoritativeObjectStoreCapabilitiesV1::new(profiles)
 }
 
 fn input_delta(account: &str, amount: i64, weight: i64) -> DeltaRecord {
@@ -503,6 +529,7 @@ async fn query_production_recovered_materialized_view_reads_slatedb_checkpoint_w
         "v1/slatedb/state",
         ORDERS_SUM_COUNT_RELATION_ID,
         ORDERS_SUM_COUNT_RELATION_VERSION,
+        &local_capabilities(),
         "select key_json, value_json, weight from input order by key_json",
         QueryPolicy::default(),
         None,
@@ -528,6 +555,7 @@ async fn query_production_recovered_materialized_view_fails_closed_when_relation
         "v1/slatedb/state",
         ORDERS_SUM_COUNT_RELATION_ID,
         ORDERS_SUM_COUNT_RELATION_VERSION,
+        &local_capabilities(),
         "select key_json, value_json, weight from input",
         QueryPolicy::default(),
         None,
@@ -539,6 +567,35 @@ async fn query_production_recovered_materialized_view_fails_closed_when_relation
         error,
         RuntimeQueryError::Recovery(RecoveryError::RelationCatalogRegistry(
             RelationCatalogRegistryError::ObjectStore(object_store::Error::NotFound { .. })
+        ))
+    ));
+}
+
+#[tokio::test]
+async fn query_production_recovered_materialized_view_fails_closed_when_capability_profile_is_missing(
+) {
+    let (_temp_dir, store) = temp_store();
+    let capabilities = capabilities_missing(AuthoritativeNamespace::Ingest);
+
+    let error = query_production_recovered_materialized_view_with_policy_and_limiter(
+        Arc::clone(&store),
+        "v1/slatedb/state",
+        ORDERS_SUM_COUNT_RELATION_ID,
+        ORDERS_SUM_COUNT_RELATION_VERSION,
+        &capabilities,
+        "select key_json, value_json, weight from input",
+        QueryPolicy::default(),
+        None,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RuntimeQueryError::Recovery(RecoveryError::AuthoritativeObjectStoreCapabilities(
+            AuthoritativeObjectStoreCapabilityError::MissingNamespace {
+                namespace: AuthoritativeNamespace::Ingest
+            }
         ))
     ));
 }
@@ -571,6 +628,7 @@ async fn query_production_recovered_materialized_view_fails_closed_for_raw_state
         "v1/slatedb/state",
         ORDERS_SUM_COUNT_RELATION_ID,
         ORDERS_SUM_COUNT_RELATION_VERSION,
+        &local_capabilities(),
         "select key_json, value_json, weight from input",
         QueryPolicy::default(),
         None,

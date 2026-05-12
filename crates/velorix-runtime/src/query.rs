@@ -30,7 +30,7 @@ use crate::object_meter::{object_request_policy_error, MeteredObjectStore, Objec
 pub use crate::query_runtime::QueryExecutionLimiter;
 use crate::query_runtime::{DataFusionSessionFactory, QueryRuntimeLimits};
 use crate::recovery::{RecoveredRuntime, RecoveryError, ORDERS_SUM_COUNT_OWNER};
-use velorix_storage::relation_catalog_registry::RelationCatalogRegistry;
+use velorix_storage::capability::AuthoritativeObjectStoreCapabilitiesV1;
 
 #[derive(Debug, Error)]
 pub enum RuntimeQueryError {
@@ -77,6 +77,7 @@ pub async fn query_production_recovered_materialized_view_with_policy_and_limite
     slatedb_state_path: impl Into<Path>,
     relation_id: &str,
     relation_version: &str,
+    capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
     sql: &str,
     policy: QueryPolicy,
     limiter: Option<QueryExecutionLimiter>,
@@ -85,15 +86,13 @@ pub async fn query_production_recovered_materialized_view_with_policy_and_limite
     validate_sql_text_policy(sql, policy).map_err(QueryError::from)?;
 
     let _permit = acquire_query_permit(policy, limiter.as_ref())?;
-    let relation_catalog = RelationCatalogRegistry::new(Arc::clone(&store))
-        .read(relation_id, relation_version)
-        .await
-        .map_err(RecoveryError::from)?;
-    let recovered = RecoveredRuntime::recover_with_slatedb_state_store_and_relation_catalog(
+    let recovered = RecoveredRuntime::recover_with_slatedb_state_store_and_catalog_record_checked(
         store,
         slatedb_state_path,
         ORDERS_SUM_COUNT_OWNER,
-        relation_catalog,
+        relation_id,
+        relation_version,
+        capabilities,
     )
     .await?;
 
