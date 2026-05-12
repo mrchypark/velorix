@@ -19,8 +19,9 @@ use velorix_runtime::recovery::{
 };
 use velorix_storage::{
     capability::{
-        AuthoritativeNamespace, AuthoritativeObjectStoreCapabilitiesV1,
-        AuthoritativeObjectStoreCapabilityError, ObjectStoreCapabilityProfile,
+        probe_authoritative_object_store_capabilities, AuthoritativeNamespace,
+        AuthoritativeObjectStoreCapabilitiesV1, AuthoritativeObjectStoreCapabilityError,
+        ObjectStoreCapabilityProfile,
     },
     ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
     log::IngestLog,
@@ -36,16 +37,6 @@ fn temp_store() -> (TempDir, Arc<dyn ObjectStore>) {
     (temp_dir, Arc::new(store))
 }
 
-fn local_capabilities() -> AuthoritativeObjectStoreCapabilitiesV1 {
-    let profile = ObjectStoreCapabilityProfile::local_development();
-    AuthoritativeObjectStoreCapabilitiesV1::new(
-        AuthoritativeNamespace::all()
-            .into_iter()
-            .map(|namespace| (namespace, profile.clone()))
-            .collect::<BTreeMap<_, _>>(),
-    )
-}
-
 fn capabilities_missing(
     namespace: AuthoritativeNamespace,
 ) -> AuthoritativeObjectStoreCapabilitiesV1 {
@@ -56,6 +47,12 @@ fn capabilities_missing(
         .collect::<BTreeMap<_, _>>();
     profiles.remove(&namespace);
     AuthoritativeObjectStoreCapabilitiesV1::new(profiles)
+}
+
+async fn probed_capabilities(store: &dyn ObjectStore) -> AuthoritativeObjectStoreCapabilitiesV1 {
+    probe_authoritative_object_store_capabilities(store, "local-recovery-test", "v1/probes")
+        .await
+        .unwrap()
 }
 
 fn input_delta(account: &str, amount: i64, weight: i64) -> DeltaRecord {
@@ -247,6 +244,7 @@ async fn checked_catalog_backed_recovery_requires_complete_authoritative_capabil
 #[tokio::test]
 async fn checked_catalog_backed_recovery_reads_catalog_with_valid_capabilities() {
     let (_temp_dir, store) = temp_store();
+    let capabilities = probed_capabilities(store.as_ref()).await;
     let catalog = orders_sum_count_relation_catalog().unwrap();
     RelationCatalogRegistry::new(Arc::clone(&store))
         .create(&catalog)
@@ -267,7 +265,7 @@ async fn checked_catalog_backed_recovery_reads_catalog_with_valid_capabilities()
         ORDERS_SUM_COUNT_OWNER,
         ORDERS_SUM_COUNT_RELATION_ID,
         ORDERS_SUM_COUNT_RELATION_VERSION,
-        &local_capabilities(),
+        &capabilities,
     )
     .await
     .unwrap();
@@ -332,6 +330,7 @@ async fn checked_selected_checkpoint_recovery_requires_ingest_capability() {
 #[tokio::test]
 async fn checked_selected_checkpoint_recovery_replays_catalog_aware_ingest() {
     let (_temp_dir, store) = temp_store();
+    let capabilities = probed_capabilities(store.as_ref()).await;
     let catalog = orders_sum_count_relation_catalog().unwrap();
     RelationCatalogRegistry::new(Arc::clone(&store))
         .create(&catalog)
@@ -373,7 +372,7 @@ async fn checked_selected_checkpoint_recovery_replays_catalog_aware_ingest() {
     let recovered = RecoveredRuntime::recover_from_published_checkpoint_version_checked(
         Arc::clone(&store),
         checkpoint_version,
-        &local_capabilities(),
+        &capabilities,
     )
     .await
     .unwrap();
