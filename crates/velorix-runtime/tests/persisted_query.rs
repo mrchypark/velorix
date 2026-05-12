@@ -805,6 +805,7 @@ async fn production_persisted_recovered_query_accepts_matching_shared_limiter_wh
         )
         .await
         .unwrap();
+    let capabilities = probed_persisted_query_capabilities(store.as_ref()).await;
 
     let output = query_production_persisted_recovered_materialized_view_with_limiter(
         Arc::clone(&store),
@@ -812,7 +813,7 @@ async fn production_persisted_recovered_query_accepts_matching_shared_limiter_wh
         "v1/slatedb/state",
         ORDERS_SUM_COUNT_RELATION_ID,
         ORDERS_SUM_COUNT_RELATION_VERSION,
-        &local_capabilities(),
+        &capabilities,
         QueryExecutionLimiter::from_policy(policy),
     )
     .await
