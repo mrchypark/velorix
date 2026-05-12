@@ -51,6 +51,12 @@ pub enum WorkerShardCommand {
     StartWorker { owner_id: String, owner_epoch: u64 },
 }
 
+#[derive(Clone, Debug)]
+pub enum WorkerShardEvent {
+    Applied(VelorixWorkerShard),
+    Deleted(VelorixWorkerShard),
+}
+
 #[derive(Debug, Error)]
 pub enum WorkerShardError {
     #[error("missing kubernetes worker shard object field `{field}`")]
@@ -171,6 +177,26 @@ where
     .await?;
 
     Ok(output)
+}
+
+pub async fn handle_worker_shard_event<L, E>(
+    event: WorkerShardEvent,
+    lease_client: &L,
+    epoch_store: &E,
+    input: WorkerShardReconcileInput,
+) -> Result<Option<WorkerShardReconcileOutput>, WorkerShardError>
+where
+    L: PartitionLeaseClient,
+    E: WorkerShardEpochStore,
+{
+    match event {
+        WorkerShardEvent::Applied(shard) => {
+            reconcile_worker_shard(&shard, lease_client, epoch_store, input)
+                .await
+                .map(Some)
+        }
+        WorkerShardEvent::Deleted(_) => Ok(None),
+    }
 }
 
 pub fn partition_lease_key_from_worker_shard(

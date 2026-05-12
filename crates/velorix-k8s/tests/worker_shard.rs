@@ -17,8 +17,9 @@ use velorix_k8s::{
         WorkerShardStatus,
     },
     worker_shard::{
-        reconcile_worker_shard, WorkerShardCommand, WorkerShardEpochStore,
-        WorkerShardReconcileConfig, WorkerShardReconcileInput, WorkerShardReconcileOutput,
+        handle_worker_shard_event, reconcile_worker_shard, WorkerShardCommand,
+        WorkerShardEpochStore, WorkerShardEvent, WorkerShardReconcileConfig,
+        WorkerShardReconcileInput, WorkerShardReconcileOutput,
     },
 };
 use velorix_storage::ownership::OwnershipEpochRecord;
@@ -101,6 +102,65 @@ async fn worker_shard_missing_lease_acquires_persists_epoch_record_and_emits_sta
         epoch_store.read("orders", 0, 1).await.unwrap(),
         Some(epoch_record("worker-a", 1))
     );
+}
+
+#[tokio::test]
+async fn applied_worker_shard_event_reconciles_through_lease_and_epoch_authority() {
+    let lease = FakeLeaseClient::default()
+        .with_current(None)
+        .with_acquired(grant("worker-a", 1));
+    let epoch_store = FakeEpochStore::default();
+
+    let output = handle_worker_shard_event(
+        WorkerShardEvent::Applied(shard()),
+        &lease,
+        &epoch_store,
+        input(None),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(
+        output.commands,
+        vec![
+            WorkerShardCommand::AcquireLease {
+                owner_id: "worker-a".to_string()
+            },
+            WorkerShardCommand::PersistEpochRecord {
+                owner_id: "worker-a".to_string(),
+                owner_epoch: 1,
+            },
+            WorkerShardCommand::StartWorker {
+                owner_id: "worker-a".to_string(),
+                owner_epoch: 1,
+            },
+        ]
+    );
+    assert_eq!(
+        epoch_store.read("orders", 0, 1).await.unwrap(),
+        Some(epoch_record("worker-a", 1))
+    );
+}
+
+#[tokio::test]
+async fn deleted_worker_shard_event_does_not_start_or_stop_workers() {
+    let lease = FakeLeaseClient::default().with_current(Some(grant("worker-a", 1)));
+    let epoch_store = FakeEpochStore::default().with_record(epoch_record("worker-a", 1));
+
+    let output = handle_worker_shard_event(
+        WorkerShardEvent::Deleted(shard()),
+        &lease,
+        &epoch_store,
+        input(Some(WorkerFact {
+            owner_id: "worker-a".to_string(),
+            owner_epoch: 1,
+        })),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(output, None);
 }
 
 #[tokio::test]
