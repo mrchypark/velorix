@@ -40,8 +40,9 @@ use velorix_runtime::{
 };
 use velorix_storage::{
     capability::{
-        AuthoritativeNamespace, AuthoritativeObjectStoreCapabilitiesV1,
-        AuthoritativeObjectStoreCapabilityError, ObjectStoreCapabilityProfile,
+        probe_authoritative_object_store_capabilities, AuthoritativeNamespace,
+        AuthoritativeObjectStoreCapabilitiesV1, AuthoritativeObjectStoreCapabilityError,
+        ObjectStoreCapabilityProfile,
     },
     ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
     log::{IngestBatch, IngestLog, IngestLogError},
@@ -79,6 +80,18 @@ fn capabilities_missing(
         .collect::<BTreeMap<_, _>>();
     profiles.remove(&namespace);
     AuthoritativeObjectStoreCapabilitiesV1::new(profiles)
+}
+
+async fn probed_query_capabilities(
+    store: &dyn ObjectStore,
+) -> AuthoritativeObjectStoreCapabilitiesV1 {
+    probe_authoritative_object_store_capabilities(
+        store,
+        "local-query-test",
+        "v1/query-capability-probes",
+    )
+    .await
+    .unwrap()
 }
 
 fn input_delta(account: &str, amount: i64, weight: i64) -> DeltaRecord {
@@ -480,6 +493,7 @@ async fn query_recovered_materialized_view_with_policy_applies_byte_limit_under_
 async fn query_production_recovered_materialized_view_reads_slatedb_checkpoint_with_catalog_record()
 {
     let (_temp_dir, store) = temp_store();
+    let capabilities = probed_query_capabilities(store.as_ref()).await;
     let ingest_log = IngestLog::new(Arc::clone(&store));
     let publisher =
         CheckpointPublisher::with_slatedb_state_store(Arc::clone(&store), "v1/slatedb/state")
@@ -529,7 +543,7 @@ async fn query_production_recovered_materialized_view_reads_slatedb_checkpoint_w
         "v1/slatedb/state",
         ORDERS_SUM_COUNT_RELATION_ID,
         ORDERS_SUM_COUNT_RELATION_VERSION,
-        &local_capabilities(),
+        &capabilities,
         "select key_json, value_json, weight from input order by key_json",
         QueryPolicy::default(),
         None,
