@@ -495,7 +495,7 @@ pub enum AuthoritativeNamespace {
 - Preserve the rule that Kubernetes lease alone is not enough; durable epoch record is still required before production publication.
 
 - [x] Unit tests use a fake Kubernetes client or serialized Lease objects and persist lease-derived epoch records through storage create-only semantics.
-- [ ] Integration tests run only when `VELORIX_K8S_INTEGRATION=1`.
+- [x] Integration tests run only when `VELORIX_K8S_INTEGRATION=1`.
 - [x] Commit: `feat: add kubernetes lease client`.
 
 ### Task 4.2a: Add Kube-Free Control-Plane Contract Skeleton
@@ -868,10 +868,10 @@ VELORIX_S3_COMPAT=1 cargo test --workspace s3_compat
 VELORIX_S3_COMPAT=1 cargo bench -p velorix-runtime --bench s3_incremental
 ```
 
-- [ ] Run Kubernetes gate with required env:
+- [x] Run Kubernetes gate with required env:
 
 ```bash
-VELORIX_K8S_INTEGRATION=1 cargo test -p velorix-control --test kubernetes_lease
+VELORIX_K8S_INTEGRATION=1 VELORIX_K8S_NAMESPACE=velorix-live cargo test -p velorix-k8s --test live_lease -- --nocapture --test-threads=1
 cargo test -p velorix-k8s
 ```
 
