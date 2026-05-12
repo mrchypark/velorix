@@ -142,6 +142,31 @@ async fn query_delta_batch_with_policy_rejects_results_above_row_limit() {
     ));
 }
 
+#[tokio::test]
+async fn query_delta_batch_with_policy_rejects_results_above_byte_limit() {
+    let input = DeltaBatch::from_records([record("acct:1", json!({ "amount": 10 }), 1)]);
+    let policy = QueryPolicy {
+        max_output_bytes: Some(1),
+        ..QueryPolicy::default()
+    };
+
+    let error = query_delta_batch_with_policy(
+        &input,
+        "select key_json, value_json, weight from input",
+        policy,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        QueryError::Policy(QueryPolicyError::OutputBytesExceeded {
+            observed_bytes,
+            max_bytes: 1,
+        }) if observed_bytes > 1
+    ));
+}
+
 #[test]
 fn query_policy_scan_file_limit_has_typed_error() {
     let error = QueryPolicyError::ScanFilesExceeded {

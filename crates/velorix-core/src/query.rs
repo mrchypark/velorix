@@ -75,26 +75,8 @@ pub async fn query_delta_batch_with_policy(
     )?;
     let context = input_context(vec![input], policy)?;
 
-    let dataframe = context.sql(sql).await?;
-    if let Some(max_rows) = policy.max_output_rows {
-        let fetch = max_rows.checked_add(1);
-        let output = match fetch {
-            Some(fetch) => dataframe.limit(0, Some(fetch))?.collect().await?,
-            None => dataframe.collect().await?,
-        };
-        let observed_rows = output.iter().map(RecordBatch::num_rows).sum();
-        if observed_rows > max_rows {
-            return Err(QueryPolicyError::OutputRowsExceeded {
-                observed_rows,
-                max_rows,
-            }
-            .into());
-        }
-
-        return Ok(output);
-    }
-
-    Ok(dataframe.collect().await?)
+    let dataframe = run_planning_with_policy(policy, async { Ok(context.sql(sql).await?) }).await?;
+    run_execution_with_policy(policy, collect_record_batches(dataframe, policy)).await
 }
 
 pub async fn validate_input_query_with_policy(
@@ -132,9 +114,87 @@ where
         return operation.await;
     };
 
+    run_with_timeout(
+        timeout_ms,
+        |timeout_ms| QueryPolicyError::PlanningTimeout { timeout_ms },
+        operation,
+    )
+    .await
+}
+
+async fn run_execution_with_policy<T, F>(policy: QueryPolicy, operation: F) -> Result<T, QueryError>
+where
+    F: Future<Output = Result<T, QueryError>>,
+{
+    let Some(timeout_ms) = policy.execution_timeout_ms else {
+        return operation.await;
+    };
+
+    run_with_timeout(
+        timeout_ms,
+        |timeout_ms| QueryPolicyError::ExecutionTimeout { timeout_ms },
+        operation,
+    )
+    .await
+}
+
+async fn run_with_timeout<T, F>(
+    timeout_ms: u64,
+    timeout_error: fn(u64) -> QueryPolicyError,
+    operation: F,
+) -> Result<T, QueryError>
+where
+    F: Future<Output = Result<T, QueryError>>,
+{
     tokio::time::timeout(Duration::from_millis(timeout_ms), operation)
         .await
-        .map_err(|_| QueryError::from(QueryPolicyError::PlanningTimeout { timeout_ms }))?
+        .map_err(|_| QueryError::from(timeout_error(timeout_ms)))?
+}
+
+async fn collect_record_batches(
+    dataframe: datafusion::dataframe::DataFrame,
+    policy: QueryPolicy,
+) -> Result<Vec<RecordBatch>, QueryError> {
+    let dataframe = match policy
+        .max_output_rows
+        .and_then(|max_rows| max_rows.checked_add(1))
+    {
+        Some(fetch) => dataframe.limit(0, Some(fetch))?,
+        None => dataframe,
+    };
+    let output = dataframe.collect().await?;
+
+    let observed_rows = output
+        .iter()
+        .fold(0usize, |rows, batch| rows.saturating_add(batch.num_rows()));
+    if let Some(max_rows) = policy.max_output_rows {
+        if observed_rows > max_rows {
+            return Err(QueryPolicyError::OutputRowsExceeded {
+                observed_rows,
+                max_rows,
+            }
+            .into());
+        }
+    }
+
+    let observed_bytes = output.iter().fold(0u64, |bytes, batch| {
+        bytes.saturating_add(record_batch_memory_size(batch))
+    });
+    if let Some(max_bytes) = policy.max_output_bytes {
+        if observed_bytes > max_bytes {
+            return Err(QueryPolicyError::OutputBytesExceeded {
+                observed_bytes,
+                max_bytes,
+            }
+            .into());
+        }
+    }
+
+    Ok(output)
+}
+
+fn record_batch_memory_size(batch: &RecordBatch) -> u64 {
+    u64::try_from(batch.get_array_memory_size()).unwrap_or(u64::MAX)
 }
 
 fn validate_sql_text_policy(sql: &str, policy: QueryPolicy) -> Result<(), QueryPolicyError> {
