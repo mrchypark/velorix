@@ -43,6 +43,13 @@ VELORIX_K8S_INTEGRATION=1 VELORIX_K8S_NAMESPACE=velorix-live \
   cargo test -p velorix-k8s --test live_lease -- --nocapture --test-threads=1
 ```
 
+Run the env-gated live CRD round-trip check against the active vind context:
+
+```bash
+VELORIX_K8S_INTEGRATION=1 VELORIX_K8S_NAMESPACE=velorix-live \
+  cargo test -p velorix-k8s --test live_crd_round_trip -- --nocapture --test-threads=1
+```
+
 Clean up the cluster when done:
 
 ```bash
