@@ -35,8 +35,8 @@ use velorix_runtime::recovery::{
 };
 use velorix_storage::{
     capability::{
-        AuthoritativeNamespace, AuthoritativeObjectStoreCapabilitiesV1,
-        ObjectStoreCapabilityProfile,
+        probe_authoritative_object_store_capabilities, AuthoritativeNamespace,
+        AuthoritativeObjectStoreCapabilitiesV1, ObjectStoreCapabilityProfile,
     },
     ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
     log::IngestLog,
@@ -607,6 +607,7 @@ async fn production_persisted_recovered_query_reads_slatedb_checkpoint_with_rela
         )
         .await
         .unwrap();
+    let capabilities = probed_persisted_query_capabilities(store.as_ref()).await;
 
     let output = query_production_persisted_recovered_materialized_view_with_limiter(
         Arc::clone(&store),
@@ -614,7 +615,7 @@ async fn production_persisted_recovered_query_reads_slatedb_checkpoint_with_rela
         "v1/slatedb/state",
         ORDERS_SUM_COUNT_RELATION_ID,
         ORDERS_SUM_COUNT_RELATION_VERSION,
-        &local_capabilities(),
+        &capabilities,
         None,
     )
     .await
@@ -831,6 +832,18 @@ fn local_capabilities() -> AuthoritativeObjectStoreCapabilitiesV1 {
             .map(|namespace| (namespace, profile.clone()))
             .collect::<BTreeMap<_, _>>(),
     )
+}
+
+async fn probed_persisted_query_capabilities(
+    store: &dyn ObjectStore,
+) -> AuthoritativeObjectStoreCapabilitiesV1 {
+    probe_authoritative_object_store_capabilities(
+        store,
+        "local-persisted-query-test",
+        "v1/persisted-query-capability-probes",
+    )
+    .await
+    .unwrap()
 }
 
 fn input_delta(account: &str, amount: i64, weight: i64) -> DeltaRecord {
