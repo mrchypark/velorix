@@ -123,7 +123,8 @@ jobs:
             --gate-level release \
             --backend s3-compatible \
             --baseline baselines/benchmark/s3/release.json \
-            --result "$S3_BENCHMARK_RESULT_PATH"
+            --result "$S3_BENCHMARK_RESULT_PATH" \
+            --json > target/release-evidence/s3-release-benchmark-gate.json
 
       - name: Validate production readiness report
         run: |
@@ -137,7 +138,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: s3-release-benchmark
-          path: ${{ env.S3_BENCHMARK_RESULT_PATH }}
+          path: |
+            ${{ env.S3_BENCHMARK_RESULT_PATH }}
+            target/release-evidence/s3-release-benchmark-gate.json
 
       - name: Upload dependency governance evidence
         uses: actions/upload-artifact@v4

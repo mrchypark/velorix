@@ -135,10 +135,11 @@ jobs:
             --gate-level pr-smoke \
             --backend local \
             --baseline baselines/benchmark/local/pr-smoke.json \
-            --result target/velorix-bench/local-pr-smoke.json
+            --result target/velorix-bench/local-pr-smoke.json \
+            --json > target/velorix-bench/local-pr-smoke-gate.json
 
       - name: Upload benchmark result
         uses: actions/upload-artifact@v4
         with:
           name: local-pr-smoke-benchmark
-          path: target/velorix-bench/local-pr-smoke.json
+          path: target/velorix-bench/*.json

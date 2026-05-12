@@ -121,16 +121,20 @@ jobs:
         if: steps.config.outputs.benchmark_configured == 'true' || steps.config.outputs.live_s3_configured == 'true'
         run: |
           test -f "${{ steps.config.outputs.benchmark_result_path }}"
+          mkdir -p target/velorix-bench
           cargo run -p velorix-cli -- benchmark-gate \
             --gate-level nightly-integration \
             --backend s3-compatible \
             --baseline baselines/benchmark/s3/nightly.json \
-            --result "${{ steps.config.outputs.benchmark_result_path }}"
+            --result "${{ steps.config.outputs.benchmark_result_path }}" \
+            --json > target/velorix-bench/s3-nightly-gate.json
 
       - name: Upload nightly benchmark result
         if: always() && (steps.config.outputs.benchmark_configured == 'true' || steps.config.outputs.live_s3_configured == 'true')
         uses: actions/upload-artifact@v4
         with:
           name: s3-nightly-benchmark
-          path: ${{ steps.config.outputs.benchmark_result_path }}
+          path: |
+            ${{ steps.config.outputs.benchmark_result_path }}
+            target/velorix-bench/s3-nightly-gate.json
           if-no-files-found: warn

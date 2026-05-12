@@ -138,6 +138,8 @@ enum Command {
         result: PathBuf,
         #[arg(long, default_value_t = 0.10)]
         max_regression_fraction: f64,
+        #[arg(long)]
+        json: bool,
     },
     ReadinessReport {
         #[arg(long)]
@@ -281,15 +283,20 @@ async fn main() -> anyhow::Result<()> {
             baseline,
             result,
             max_regression_fraction,
+            json,
         }) => {
-            run_benchmark_gate(
+            let evidence = run_benchmark_gate(
                 Some(&baseline),
                 &result,
                 Some(gate_level),
                 Some(backend),
                 Some(max_regression_fraction),
             )?;
-            println!("benchmark gate passed");
+            if json {
+                println!("{}", serde_json::to_string_pretty(&evidence)?);
+            } else {
+                println!("benchmark gate passed");
+            }
         }
         Some(Command::ReadinessReport { evidence, json }) => {
             let report = read_readiness_report(&evidence)?;
@@ -1367,7 +1374,7 @@ fn run_benchmark_gate(
     gate_level: Option<BenchmarkGateLevel>,
     backend: Option<BenchmarkBackend>,
     max_regression_fraction: Option<f64>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<BenchmarkGateEvidenceV1> {
     let current_result = read_benchmark_result(result)
         .with_context(|| format!("failed to validate benchmark result {}", result.display()))?;
     if let (Some(gate_level), Some(backend)) = (gate_level, backend) {
@@ -1397,7 +1404,10 @@ fn run_benchmark_gate(
     }
 
     let Some(baseline) = baseline else {
-        return Ok(());
+        return Ok(BenchmarkGateEvidenceV1::validate_only(
+            result,
+            &current_result,
+        ));
     };
 
     let baseline_result = read_benchmark_result(baseline).with_context(|| {
@@ -1439,7 +1449,88 @@ fn run_benchmark_gate(
             &baseline_result,
             BenchmarkBudgetV1::relative(max_regression_fraction),
         )
-        .context("benchmark result exceeds gate")
+        .context("benchmark result exceeds gate")?;
+
+    Ok(BenchmarkGateEvidenceV1::passed(
+        baseline,
+        result,
+        &baseline_result,
+        &current_result,
+        max_regression_fraction,
+    ))
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+struct BenchmarkGateEvidenceV1 {
+    schema_version: u16,
+    status: &'static str,
+    evidence_kind: &'static str,
+    gate_level: BenchmarkGateLevel,
+    backend: BenchmarkBackend,
+    workload: String,
+    baseline_path: Option<String>,
+    result_path: String,
+    baseline_commit: Option<String>,
+    result_commit: String,
+    max_regression_fraction: Option<f64>,
+    workload_metrics: Vec<String>,
+}
+
+impl BenchmarkGateEvidenceV1 {
+    fn validate_only(result_path: &Path, result: &BenchmarkGateResultV1) -> Self {
+        Self {
+            schema_version: 1,
+            status: "pass",
+            evidence_kind: benchmark_gate_evidence_kind(result.backend),
+            gate_level: result.gate_level,
+            backend: result.backend,
+            workload: result.workload.clone(),
+            baseline_path: None,
+            result_path: stable_path(result_path),
+            baseline_commit: None,
+            result_commit: result.commit.clone(),
+            max_regression_fraction: None,
+            workload_metrics: workload_metric_names(result),
+        }
+    }
+
+    fn passed(
+        baseline_path: &Path,
+        result_path: &Path,
+        baseline: &BenchmarkGateResultV1,
+        result: &BenchmarkGateResultV1,
+        max_regression_fraction: f64,
+    ) -> Self {
+        Self {
+            schema_version: 1,
+            status: "pass",
+            evidence_kind: benchmark_gate_evidence_kind(result.backend),
+            gate_level: result.gate_level,
+            backend: result.backend,
+            workload: result.workload.clone(),
+            baseline_path: Some(stable_path(baseline_path)),
+            result_path: stable_path(result_path),
+            baseline_commit: Some(baseline.commit.clone()),
+            result_commit: result.commit.clone(),
+            max_regression_fraction: Some(max_regression_fraction),
+            workload_metrics: workload_metric_names(result),
+        }
+    }
+}
+
+fn benchmark_gate_evidence_kind(backend: BenchmarkBackend) -> &'static str {
+    match backend {
+        BenchmarkBackend::Local => "local_benchmark_gate",
+        BenchmarkBackend::S3Compatible => "s3_compatible_benchmark_gate",
+    }
+}
+
+fn workload_metric_names(result: &BenchmarkGateResultV1) -> Vec<String> {
+    result
+        .workload_metrics
+        .iter()
+        .map(|metrics| metrics.name.clone())
+        .collect()
 }
 
 fn benchmark_gate_workloads_for_backend(backend: BenchmarkBackend) -> &'static [&'static str] {
@@ -1606,12 +1697,14 @@ mod tests {
             "baseline.json",
             "--result",
             "result.json",
+            "--json",
         ])
         .unwrap();
 
         let Some(Command::BenchmarkGate {
             gate_level,
             backend,
+            json,
             ..
         }) = cli.command
         else {
@@ -1620,6 +1713,52 @@ mod tests {
 
         assert_eq!(gate_level, BenchmarkGateLevel::PrSmoke);
         assert_eq!(backend, BenchmarkBackend::Local);
+        assert!(json);
+    }
+
+    #[test]
+    fn benchmark_gate_outputs_stable_gate_evidence() {
+        let dir = tempdir().unwrap();
+        let baseline = dir.path().join("baseline.json");
+        let result = dir.path().join("result.json");
+        fs::write(&baseline, valid_result_json()).unwrap();
+        fs::write(&result, valid_result_json()).unwrap();
+
+        let evidence = run_benchmark_gate(
+            Some(&baseline),
+            &result,
+            Some(BenchmarkGateLevel::PrSmoke),
+            Some(BenchmarkBackend::Local),
+            Some(0.10),
+        )
+        .unwrap();
+
+        assert_eq!(evidence.schema_version, 1);
+        assert_eq!(evidence.status, "pass");
+        assert_eq!(evidence.evidence_kind, "local_benchmark_gate");
+        assert_eq!(evidence.gate_level, BenchmarkGateLevel::PrSmoke);
+        assert_eq!(evidence.backend, BenchmarkBackend::Local);
+        assert_eq!(evidence.workload, "local_incremental");
+        assert_eq!(
+            evidence.baseline_path.as_deref(),
+            Some(baseline.to_str().unwrap())
+        );
+        assert_eq!(evidence.result_path, result.to_str().unwrap());
+        assert_eq!(evidence.baseline_commit.as_deref(), Some("abc123"));
+        assert_eq!(evidence.result_commit, "abc123");
+        assert_eq!(evidence.max_regression_fraction, Some(0.10));
+        assert_eq!(
+            evidence.workload_metrics,
+            vec![
+                "ingest_envelope_validation",
+                "checkpoint_publish",
+                "checkpoint_recovery",
+                "datafusion_table_scan",
+                "slatedb_state_reopen",
+                "gc_dry_run_planning",
+                "gc_execution_evidence"
+            ]
+        );
     }
 
     #[test]
