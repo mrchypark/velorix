@@ -46,3 +46,9 @@ jobs:
         env:
           VELORIX_VIND_CLEANUP: ${{ inputs.cleanup && '1' || '0' }}
         run: scripts/run-vind-k8s-gate.sh
+
+      - name: Upload vind Kubernetes evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: kubernetes-vind-evidence
+          path: target/velorix-k8s/*.json

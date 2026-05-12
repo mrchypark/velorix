@@ -63,8 +63,13 @@ Run the full local vind gate:
 scripts/run-vind-k8s-gate.sh
 ```
 
+On success, the gate writes `target/velorix-k8s/vind-k8s-gate-evidence.json`
+with the cluster context, namespace, applied CRDs, tool versions, and live k8s
+test set.
+
 Run the same gate in GitHub Actions with the `Kubernetes vind Gate` manual
-workflow.
+workflow. The workflow uploads `target/velorix-k8s/*.json` as the
+`kubernetes-vind-evidence` artifact.
 
 Clean up the cluster when done:
 

@@ -16,6 +16,7 @@ require() {
 require cargo
 require docker
 require kubectl
+require python3
 require vcluster
 
 cd "$repo_root"
@@ -43,6 +44,42 @@ cargo test -p velorix-k8s --test live_worker_shard -- --nocapture --test-threads
 kubectl get crd | grep velorix
 kubectl get leases -n "$namespace"
 kubectl get velorixdatabases,velorixstreams,velorixworkershards -n "$namespace"
+
+evidence_path="target/velorix-k8s/vind-k8s-gate-evidence.json"
+python3 - "$evidence_path" "$cluster" "$context" "$namespace" <<'PY'
+import json
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+
+def run(command):
+    return subprocess.check_output(command, text=True).strip().splitlines()
+
+
+path, cluster, context, namespace = sys.argv[1:]
+evidence = {
+    "schema_version": 1,
+    "evidence_kind": "kubernetes_vind_gate",
+    "readiness_evidence_kind": ["kubernetes_lease_client"],
+    "cluster": cluster,
+    "context": context,
+    "namespace": namespace,
+    "generated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+    "vcluster_version": run(["vcluster", "--version"])[0],
+    "kubectl_client_version": run(["kubectl", "version", "--client=true", "--output=yaml"]),
+    "applied_crds": run(["kubectl", "get", "crd", "-o", "name"]),
+    "live_tests": [
+        "cargo test -p velorix-k8s --test live_crd_round_trip",
+        "cargo test -p velorix-k8s --test live_lease",
+        "cargo test -p velorix-k8s --test live_worker_shard",
+    ],
+}
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(evidence, f, indent=2, sort_keys=True)
+    f.write("\n")
+PY
+echo "wrote vind Kubernetes gate evidence to ${evidence_path}"
 
 if [ "${VELORIX_VIND_CLEANUP:-0}" = "1" ]; then
   vcluster delete "$cluster" --driver docker
