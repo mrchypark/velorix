@@ -1,17 +1,22 @@
 use std::{env, error::Error, fmt::Debug, time::SystemTime};
 
+use async_trait::async_trait;
 use k8s_openapi::{api::core::v1::Namespace, apimachinery::pkg::apis::meta::v1::ObjectMeta};
 use kube::{
     api::{Api, DeleteParams, PostParams},
     Client,
 };
 use velorix_k8s::{
+    controller::AuthoritySnapshot,
     crd::{
-        CheckpointRef, ConditionState, ObjectStoreAuthorityRef, RelationVersionRef, StreamStatus,
+        ConditionState, ObjectStoreAuthorityRef, RelationVersionRef, StreamStatus,
         VelorixCondition, VelorixDatabase, VelorixDatabaseSpec, VelorixStream, VelorixStreamSpec,
         VelorixWorkerShard, VelorixWorkerShardSpec,
     },
     status::{KubeStreamStatusApi, StreamStatusWriter},
+    stream_watch::{
+        handle_stream_event, AuthoritySnapshotProvider, StreamWatchError, StreamWatchEvent,
+    },
 };
 
 #[tokio::test]
@@ -70,7 +75,7 @@ async fn live_velorix_crds_create_read_and_delete_when_enabled() -> Result<(), B
             stream_id: format!("orders-{suffix}"),
             partition_id: 0,
             desired_owner_id: "worker-a".to_string(),
-            authority,
+            authority: authority.clone(),
         },
     );
 
@@ -80,10 +85,18 @@ async fn live_velorix_crds_create_read_and_delete_when_enabled() -> Result<(), B
     stream_api.create(&PostParams::default(), &stream).await?;
     shard_api.create(&PostParams::default(), &shard).await?;
 
-    let status = ready_status();
-    StreamStatusWriter::new(KubeStreamStatusApi::new(client))
-        .write_stream_status(&stream, status.clone())
-        .await?;
+    let created_stream = stream_api.get(&stream_name).await?;
+    let snapshot = StaticSnapshotProvider(
+        AuthoritySnapshot::default()
+            .with_authority(authority.clone())
+            .with_relation_for_authority(&authority, &created_stream.spec.relation),
+    );
+    handle_stream_event(
+        StreamWatchEvent::Applied(created_stream.clone()),
+        &snapshot,
+        &StreamStatusWriter::new(KubeStreamStatusApi::new(client)),
+    )
+    .await?;
 
     assert_eq!(
         database_api.get(&database_name).await?.spec.database_id,
@@ -93,7 +106,10 @@ async fn live_velorix_crds_create_read_and_delete_when_enabled() -> Result<(), B
         stream_api.get(&stream_name).await?.spec.stream_id,
         format!("orders-{suffix}")
     );
-    assert_eq!(stream_api.get(&stream_name).await?.status, Some(status));
+    assert_eq!(
+        stream_api.get(&stream_name).await?.status,
+        Some(ready_status(created_stream.metadata.generation))
+    );
     assert_eq!(
         shard_api.get(&shard_name).await?.spec.desired_owner_id,
         "worker-a"
@@ -140,14 +156,24 @@ fn unique_suffix() -> Result<String, Box<dyn Error>> {
     Ok(format!("{}-{}", std::process::id(), elapsed.as_millis()))
 }
 
-fn ready_status() -> StreamStatus {
+#[derive(Clone)]
+struct StaticSnapshotProvider(AuthoritySnapshot);
+
+#[async_trait]
+impl AuthoritySnapshotProvider for StaticSnapshotProvider {
+    async fn snapshot_for_stream(
+        &self,
+        _stream: &VelorixStream,
+    ) -> Result<AuthoritySnapshot, StreamWatchError> {
+        Ok(self.0.clone())
+    }
+}
+
+fn ready_status(observed_generation: Option<i64>) -> StreamStatus {
     StreamStatus {
-        observed_generation: Some(1),
+        observed_generation,
         last_accepted_relation_schema_fingerprint: Some(format!("sha256:{}", "a".repeat(64))),
-        latest_published_checkpoint: Some(CheckpointRef {
-            checkpoint_version: 7,
-            manifest_digest: format!("sha256:{}", "7".repeat(64)),
-        }),
+        latest_published_checkpoint: None,
         readiness: Some(VelorixCondition {
             type_: "Ready".to_string(),
             status: ConditionState::True,

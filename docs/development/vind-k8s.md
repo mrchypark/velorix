@@ -43,7 +43,7 @@ VELORIX_K8S_INTEGRATION=1 VELORIX_K8S_NAMESPACE=velorix-live \
   cargo test -p velorix-k8s --test live_lease -- --nocapture --test-threads=1
 ```
 
-Run the env-gated live CRD and status round-trip check against the active vind context:
+Run the env-gated live CRD and reconciled-status round-trip check against the active vind context:
 
 ```bash
 VELORIX_K8S_INTEGRATION=1 VELORIX_K8S_NAMESPACE=velorix-live \
