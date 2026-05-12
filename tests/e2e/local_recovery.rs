@@ -36,6 +36,18 @@ fn temp_store() -> (TempDir, Arc<dyn ObjectStore>) {
     (temp_dir, Arc::new(store))
 }
 
+async fn recover_with_catalog_record(
+    store: Arc<dyn ObjectStore>,
+) -> Result<RecoveredRuntime, RecoveryError> {
+    RecoveredRuntime::recover_with_owner_and_relation_catalog_record(
+        store,
+        RECOVERY_OWNER,
+        ORDERS_SUM_COUNT_RELATION_ID,
+        ORDERS_SUM_COUNT_RELATION_VERSION,
+    )
+    .await
+}
+
 fn input_delta(account: &str, amount: i64, weight: i64) -> DeltaRecord {
     DeltaRecord::new(
         DeltaKey::from_json(json!(account)),
@@ -305,7 +317,9 @@ async fn local_recovery_recovers_checkpointed_view_and_replays_only_later_ingest
     drop(ingest_log);
     drop(publisher);
 
-    let recovered = RecoveredRuntime::recover(Arc::clone(&store)).await.unwrap();
+    let recovered = recover_with_catalog_record(Arc::clone(&store))
+        .await
+        .unwrap();
 
     let mut expected_view = KeyedSumCountAggregate::new();
     expected_view.apply(&first_input).unwrap();
@@ -534,7 +548,9 @@ async fn local_recovery_without_manifest_starts_empty_and_replays_from_zero() {
 
     append_ingest_envelope(Arc::clone(&store), &ingest_log, "orders", 0, 0, 1, &input).await;
 
-    let recovered = RecoveredRuntime::recover(Arc::clone(&store)).await.unwrap();
+    let recovered = recover_with_catalog_record(Arc::clone(&store))
+        .await
+        .unwrap();
     let mut expected_view = KeyedSumCountAggregate::new();
     expected_view.apply(&input).unwrap();
 
@@ -620,7 +636,9 @@ async fn local_recovery_uses_manifest_boundaries_per_stream_partition_range() {
         .await
         .unwrap();
 
-    let recovered = RecoveredRuntime::recover(Arc::clone(&store)).await.unwrap();
+    let recovered = recover_with_catalog_record(Arc::clone(&store))
+        .await
+        .unwrap();
     let mut expected_view = KeyedSumCountAggregate::new();
     for input in [
         &covered_orders_p0,
@@ -690,7 +708,9 @@ async fn local_recovery_uses_latest_manifest_when_multiple_are_published() {
         .await
         .unwrap();
 
-    let recovered = RecoveredRuntime::recover(Arc::clone(&store)).await.unwrap();
+    let recovered = recover_with_catalog_record(Arc::clone(&store))
+        .await
+        .unwrap();
     let mut expected_view = KeyedSumCountAggregate::new();
     expected_view.apply(&first).unwrap();
     expected_view.apply(&second).unwrap();
@@ -757,12 +777,19 @@ async fn local_recovery_can_use_selected_checkpoint_when_future_manifest_is_corr
         .await
         .unwrap();
 
-    assert!(RecoveredRuntime::recover(Arc::clone(&store)).await.is_err());
+    assert!(recover_with_catalog_record(Arc::clone(&store))
+        .await
+        .is_err());
 
     let recovered =
-        RecoveredRuntime::recover_from_published_checkpoint_version(Arc::clone(&store), 0)
-            .await
-            .unwrap();
+        RecoveredRuntime::recover_from_published_checkpoint_version_with_owner_and_relation_catalog(
+            Arc::clone(&store),
+            0,
+            RECOVERY_OWNER,
+            orders_sum_count_relation_catalog().unwrap(),
+        )
+        .await
+        .unwrap();
     let mut expected_view = KeyedSumCountAggregate::new();
     for input in [
         &checkpointed,
@@ -861,7 +888,9 @@ async fn local_recovery_preserves_signed_checkpoint_state_and_signed_replay() {
         .await
         .unwrap();
 
-    let recovered = RecoveredRuntime::recover(Arc::clone(&store)).await.unwrap();
+    let recovered = recover_with_catalog_record(Arc::clone(&store))
+        .await
+        .unwrap();
     let mut expected_view = KeyedSumCountAggregate::new();
     expected_view.apply(&checkpoint_input).unwrap();
     expected_view.apply(&replay_input).unwrap();
@@ -926,7 +955,9 @@ async fn local_recovery_resumes_from_checkpointed_engine_logical_epoch_not_manif
         .await
         .unwrap();
 
-    let recovered = RecoveredRuntime::recover(Arc::clone(&store)).await.unwrap();
+    let recovered = recover_with_catalog_record(Arc::clone(&store))
+        .await
+        .unwrap();
 
     assert_eq!(recovered.logical_epoch(), 4);
 }
