@@ -5,10 +5,7 @@ use std::{
 
 #[test]
 fn production_sources_do_not_call_bootstrap_ingest_apis() {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("storage crate lives under crates/velorix-storage");
+    let workspace = workspace_root();
     let forbidden = [
         "IngestLog::append(",
         ".append_validated_envelope(",
@@ -19,7 +16,7 @@ fn production_sources_do_not_call_bootstrap_ingest_apis() {
     ];
 
     let mut violations = Vec::new();
-    for source in rust_sources_under(&workspace.join("crates")) {
+    for source in production_source_scan_sources(&workspace) {
         let contents = fs::read_to_string(&source).expect("read Rust source");
         let lines = contents.lines().collect::<Vec<_>>();
         for (line_number, line) in lines.iter().enumerate() {
@@ -35,7 +32,7 @@ fn production_sources_do_not_call_bootstrap_ingest_apis() {
                 {
                     violations.push(format!(
                         "{}:{} uses bootstrap ingest API pattern `{pattern}`",
-                        source.strip_prefix(workspace).unwrap_or(&source).display(),
+                        source.strip_prefix(&workspace).unwrap_or(&source).display(),
                         line_number + 1
                     ));
                 }
@@ -48,6 +45,38 @@ fn production_sources_do_not_call_bootstrap_ingest_apis() {
         "production source must use catalog-aware ingest/recovery APIs:\n{}",
         violations.join("\n")
     );
+}
+
+#[test]
+fn production_source_scan_includes_top_level_benchmarks() {
+    let workspace = workspace_root();
+    let sources = production_source_scan_sources(&workspace);
+
+    for benchmark in top_level_rust_files(&workspace.join("benches")) {
+        assert!(
+            sources.iter().any(|source| source == &benchmark),
+            "production ingest source contract should scan {}",
+            benchmark
+                .strip_prefix(&workspace)
+                .unwrap_or(&benchmark)
+                .display()
+        );
+    }
+}
+
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("storage crate lives under crates/velorix-storage")
+        .to_path_buf()
+}
+
+fn production_source_scan_sources(workspace: &Path) -> Vec<PathBuf> {
+    let mut sources = rust_sources_under(&workspace.join("crates"));
+    sources.extend(top_level_rust_files(&workspace.join("benches")));
+    sources.sort();
+    sources
 }
 
 fn allowed_bootstrap_ingest_use(
@@ -85,6 +114,19 @@ fn allowed_bootstrap_ingest_use(
 fn rust_sources_under(root: &Path) -> Vec<PathBuf> {
     let mut sources = Vec::new();
     collect_rust_sources(root, &mut sources);
+    sources
+}
+
+fn top_level_rust_files(root: &Path) -> Vec<PathBuf> {
+    let mut sources = Vec::new();
+    let entries = fs::read_dir(root).expect("read benchmark directory");
+    for entry in entries {
+        let path = entry.expect("read benchmark directory entry").path();
+        if path.is_file() && path.extension().is_some_and(|extension| extension == "rs") {
+            sources.push(path);
+        }
+    }
+    sources.sort();
     sources
 }
 
