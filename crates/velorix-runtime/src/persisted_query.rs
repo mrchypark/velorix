@@ -17,9 +17,11 @@ use velorix_core::{
 use velorix_storage::object_key::{ObjectKey, ObjectKeyError};
 
 use crate::query::{
+    query_production_recovered_materialized_view_with_policy_and_limiter,
     query_recovered_materialized_view_with_policy_and_limiter, QueryExecutionLimiter,
     RuntimeQueryError,
 };
+use velorix_storage::capability::AuthoritativeObjectStoreCapabilitiesV1;
 
 pub const PERSISTED_QUERY_SCHEMA_VERSION: u32 = 1;
 
@@ -203,4 +205,51 @@ pub async fn query_persisted_recovered_materialized_view_with_limiter(
         limiter,
     )
     .await?)
+}
+
+pub async fn query_production_persisted_recovered_materialized_view(
+    store: Arc<dyn ObjectStore>,
+    query_id: &str,
+    slatedb_state_path: impl Into<Path>,
+    relation_id: &str,
+    relation_version: &str,
+    capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
+) -> Result<Vec<RecordBatch>, PersistedQueryError> {
+    query_production_persisted_recovered_materialized_view_with_limiter(
+        store,
+        query_id,
+        slatedb_state_path,
+        relation_id,
+        relation_version,
+        capabilities,
+        None,
+    )
+    .await
+}
+
+pub async fn query_production_persisted_recovered_materialized_view_with_limiter(
+    store: Arc<dyn ObjectStore>,
+    query_id: &str,
+    slatedb_state_path: impl Into<Path>,
+    relation_id: &str,
+    relation_version: &str,
+    capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
+    limiter: Option<QueryExecutionLimiter>,
+) -> Result<Vec<RecordBatch>, PersistedQueryError> {
+    let catalog = PersistedQueryStore::new(Arc::clone(&store));
+    let spec = catalog.get(query_id).await?;
+
+    Ok(
+        query_production_recovered_materialized_view_with_policy_and_limiter(
+            store,
+            slatedb_state_path,
+            relation_id,
+            relation_version,
+            capabilities,
+            &spec.sql,
+            spec.policy,
+            limiter,
+        )
+        .await?,
+    )
 }

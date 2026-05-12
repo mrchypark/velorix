@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use arrow::{
     array::{ArrayRef, Int64Array, StringArray},
@@ -23,21 +23,27 @@ use velorix_core::{
 };
 use velorix_runtime::persisted_query::{
     query_persisted_recovered_materialized_view,
-    query_persisted_recovered_materialized_view_with_limiter, PersistedQueryError,
+    query_persisted_recovered_materialized_view_with_limiter,
+    query_production_persisted_recovered_materialized_view,
+    query_production_persisted_recovered_materialized_view_with_limiter, PersistedQueryError,
     PersistedQueryStore,
 };
 use velorix_runtime::query::{QueryExecutionLimiter, RuntimeQueryError};
 use velorix_runtime::recovery::{
-    orders_sum_count_relation_catalog, ORDERS_SUM_COUNT_RELATION_ID,
+    orders_sum_count_relation_catalog, RecoveryError, ORDERS_SUM_COUNT_RELATION_ID,
     ORDERS_SUM_COUNT_RELATION_VERSION,
 };
 use velorix_storage::{
+    capability::{
+        AuthoritativeNamespace, AuthoritativeObjectStoreCapabilitiesV1,
+        ObjectStoreCapabilityProfile,
+    },
     ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
     log::IngestLog,
     manifest::{CheckpointManifest, InputRange, StateObjectRef},
     object_key::ObjectKey,
-    relation_catalog_registry::RelationCatalogRegistry,
-    state::{CheckpointPublisher, StateObjectWrite},
+    relation_catalog_registry::{RelationCatalogRegistry, RelationCatalogRegistryError},
+    state::{CheckpointPublishError, CheckpointPublisher, StateObjectWrite},
 };
 
 const RECOVERY_OWNER: &str = "orders_sum_count";
@@ -543,6 +549,288 @@ async fn persisted_recovered_query_accepts_matching_shared_limiter_when_policy_s
     assert_eq!(string_value(&output[0], 0, 0), "\"account-a\"");
     assert_eq!(string_value(&output[0], 1, 0), "{\"count\":2,\"sum\":13}");
     assert_eq!(int64_value(&output[0], 2, 0), 1);
+}
+
+#[tokio::test]
+async fn production_persisted_recovered_query_reads_slatedb_checkpoint_with_relation_catalog() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = PersistedQueryStore::new(Arc::clone(&store));
+    let ingest_log = IngestLog::new(Arc::clone(&store));
+    let publisher =
+        CheckpointPublisher::with_slatedb_state_store(Arc::clone(&store), "v1/slatedb/state")
+            .await
+            .unwrap();
+
+    let checkpoint_input = batch([input_delta("account-a", 10, 1)]);
+    let replay_input = batch([input_delta("account-b", 7, 1)]);
+
+    append_ingest_envelope(
+        Arc::clone(&store),
+        &ingest_log,
+        "orders",
+        0,
+        0,
+        1,
+        &checkpoint_input,
+    )
+    .await;
+    append_ingest_envelope(
+        Arc::clone(&store),
+        &ingest_log,
+        "orders",
+        0,
+        1,
+        2,
+        &replay_input,
+    )
+    .await;
+
+    let mut checkpointed_view = KeyedSumCountAggregate::new();
+    checkpointed_view.apply(&checkpoint_input).unwrap();
+    let state_ref = write_checkpoint_state(
+        &publisher,
+        "state-production-persisted-query",
+        1,
+        &checkpointed_view.state(),
+    )
+    .await;
+    publisher
+        .publish_manifest(&manifest(1, state_ref))
+        .await
+        .unwrap();
+
+    catalog
+        .create(
+            "production-persisted-recovered",
+            "select key_json, value_json, weight from input order by key_json",
+            QueryPolicy::default(),
+        )
+        .await
+        .unwrap();
+
+    let output = query_production_persisted_recovered_materialized_view_with_limiter(
+        Arc::clone(&store),
+        "production-persisted-recovered",
+        "v1/slatedb/state",
+        ORDERS_SUM_COUNT_RELATION_ID,
+        ORDERS_SUM_COUNT_RELATION_VERSION,
+        &local_capabilities(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].num_rows(), 2);
+    assert_eq!(string_value(&output[0], 0, 0), "\"account-a\"");
+    assert_eq!(string_value(&output[0], 1, 0), "{\"count\":1,\"sum\":10}");
+    assert_eq!(string_value(&output[0], 0, 1), "\"account-b\"");
+    assert_eq!(string_value(&output[0], 1, 1), "{\"count\":1,\"sum\":7}");
+}
+
+#[tokio::test]
+async fn production_persisted_recovered_query_fails_closed_when_relation_catalog_is_missing() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = PersistedQueryStore::new(Arc::clone(&store));
+
+    catalog
+        .create(
+            "production-missing-catalog",
+            "select key_json, value_json, weight from input",
+            QueryPolicy::default(),
+        )
+        .await
+        .unwrap();
+
+    let error = query_production_persisted_recovered_materialized_view_with_limiter(
+        Arc::clone(&store),
+        "production-missing-catalog",
+        "v1/slatedb/state",
+        ORDERS_SUM_COUNT_RELATION_ID,
+        ORDERS_SUM_COUNT_RELATION_VERSION,
+        &local_capabilities(),
+        None,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        PersistedQueryError::RuntimeQuery(RuntimeQueryError::Recovery(
+            RecoveryError::RelationCatalogRegistry(RelationCatalogRegistryError::ObjectStore(
+                object_store::Error::NotFound { .. }
+            ))
+        ))
+    ));
+}
+
+#[tokio::test]
+async fn production_persisted_recovered_query_fails_closed_for_raw_state_checkpoint() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = PersistedQueryStore::new(Arc::clone(&store));
+    RelationCatalogRegistry::new(Arc::clone(&store))
+        .create(&orders_sum_count_relation_catalog().unwrap())
+        .await
+        .unwrap();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let checkpoint_input = batch([input_delta("account-a", 10, 1)]);
+    let mut checkpointed_view = KeyedSumCountAggregate::new();
+    checkpointed_view.apply(&checkpoint_input).unwrap();
+    let state_ref = write_checkpoint_state(
+        &publisher,
+        "state-raw-production-persisted-query",
+        1,
+        &checkpointed_view.state(),
+    )
+    .await;
+    publisher
+        .publish_manifest(&manifest(1, state_ref))
+        .await
+        .unwrap();
+    catalog
+        .create(
+            "production-raw-state",
+            "select key_json, value_json, weight from input",
+            QueryPolicy::default(),
+        )
+        .await
+        .unwrap();
+
+    let error = query_production_persisted_recovered_materialized_view_with_limiter(
+        Arc::clone(&store),
+        "production-raw-state",
+        "v1/slatedb/state",
+        ORDERS_SUM_COUNT_RELATION_ID,
+        ORDERS_SUM_COUNT_RELATION_VERSION,
+        &local_capabilities(),
+        None,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        PersistedQueryError::RuntimeQuery(RuntimeQueryError::Recovery(RecoveryError::Checkpoint(
+            CheckpointPublishError::MissingStateObject(_)
+        )))
+    ));
+}
+
+#[tokio::test]
+async fn production_persisted_recovered_query_requires_shared_limiter_when_policy_sets_concurrency()
+{
+    let (_temp_dir, store) = temp_store();
+    let catalog = PersistedQueryStore::new(Arc::clone(&store));
+
+    catalog
+        .create(
+            "production-limited-recovered-query",
+            "select key_json, value_json, weight from input",
+            QueryPolicy {
+                max_concurrent_queries: Some(1),
+                ..QueryPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let error = query_production_persisted_recovered_materialized_view(
+        Arc::clone(&store),
+        "production-limited-recovered-query",
+        "v1/slatedb/state",
+        ORDERS_SUM_COUNT_RELATION_ID,
+        ORDERS_SUM_COUNT_RELATION_VERSION,
+        &local_capabilities(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        PersistedQueryError::RuntimeQuery(RuntimeQueryError::Query(QueryError::Policy(
+            QueryPolicyError::ConcurrencyLimiterRequired {
+                max_concurrent_queries: 1
+            }
+        )))
+    ));
+}
+
+#[tokio::test]
+async fn production_persisted_recovered_query_accepts_matching_shared_limiter_when_policy_sets_concurrency(
+) {
+    let (_temp_dir, store) = temp_store();
+    let catalog = PersistedQueryStore::new(Arc::clone(&store));
+    let ingest_log = IngestLog::new(Arc::clone(&store));
+    let publisher =
+        CheckpointPublisher::with_slatedb_state_store(Arc::clone(&store), "v1/slatedb/state")
+            .await
+            .unwrap();
+
+    let checkpoint_input = batch([input_delta("account-a", 10, 1)]);
+    append_ingest_envelope(
+        Arc::clone(&store),
+        &ingest_log,
+        "orders",
+        0,
+        0,
+        1,
+        &checkpoint_input,
+    )
+    .await;
+
+    let mut checkpointed_view = KeyedSumCountAggregate::new();
+    checkpointed_view.apply(&checkpoint_input).unwrap();
+    let state_ref = write_checkpoint_state(
+        &publisher,
+        "state-production-persisted-query-concurrency",
+        1,
+        &checkpointed_view.state(),
+    )
+    .await;
+    publisher
+        .publish_manifest(&manifest(1, state_ref))
+        .await
+        .unwrap();
+
+    let policy = QueryPolicy {
+        max_concurrent_queries: Some(1),
+        ..QueryPolicy::default()
+    };
+    catalog
+        .create(
+            "production-limited-recovered-query",
+            "select key_json, value_json, weight from input",
+            policy,
+        )
+        .await
+        .unwrap();
+
+    let output = query_production_persisted_recovered_materialized_view_with_limiter(
+        Arc::clone(&store),
+        "production-limited-recovered-query",
+        "v1/slatedb/state",
+        ORDERS_SUM_COUNT_RELATION_ID,
+        ORDERS_SUM_COUNT_RELATION_VERSION,
+        &local_capabilities(),
+        QueryExecutionLimiter::from_policy(policy),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].num_rows(), 1);
+    assert_eq!(string_value(&output[0], 0, 0), "\"account-a\"");
+    assert_eq!(string_value(&output[0], 1, 0), "{\"count\":1,\"sum\":10}");
+}
+
+fn local_capabilities() -> AuthoritativeObjectStoreCapabilitiesV1 {
+    let profile = ObjectStoreCapabilityProfile::local_development();
+    AuthoritativeObjectStoreCapabilitiesV1::new(
+        AuthoritativeNamespace::all()
+            .into_iter()
+            .map(|namespace| (namespace, profile.clone()))
+            .collect::<BTreeMap<_, _>>(),
+    )
 }
 
 fn input_delta(account: &str, amount: i64, weight: i64) -> DeltaRecord {
