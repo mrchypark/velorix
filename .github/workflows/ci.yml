@@ -99,7 +99,14 @@ jobs:
         run: |
           cargo run -p velorix-cli -- dependency-governance-validate \
             --manifest dependency-governance.json \
-            --cargo-deny-json target/dependency-governance/cargo-deny.jsonl
+            --cargo-deny-json target/dependency-governance/cargo-deny.jsonl \
+            --json > target/dependency-governance/dependency-governance-evidence.json
+
+      - name: Upload dependency governance evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-governance-evidence
+          path: target/dependency-governance/*
 
   benchmark-smoke:
     name: benchmark PR smoke gate

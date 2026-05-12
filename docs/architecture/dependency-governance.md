@@ -12,6 +12,22 @@ with:
 cargo run -p velorix-cli -- dependency-governance-validate --manifest dependency-governance.json
 ```
 
+Use `--json` to emit stable release evidence:
+
+```bash
+cargo run -p velorix-cli -- dependency-governance-validate \
+  --manifest dependency-governance.json \
+  --cargo-deny-json target/dependency-governance/cargo-deny.jsonl \
+  --json > target/dependency-governance/dependency-governance-evidence.json
+```
+
+The evidence has `schema_version=1`,
+`evidence_kind=dependency_governance_validated`, the manifest path/name, checked
+cargo-deny diagnostics path, required and reviewed package subjects, exception
+counts, and warning counts. `--json` requires `--cargo-deny-json` so release
+evidence cannot claim a dependency-governance pass from manifest-only
+validation. It is local governance evidence, not an external audit attestation.
+
 The manifest records the declared MSRV policy and requires package review
 records for the high-risk production dependency subjects that shape Velorix's
 database boundary: DataFusion, object storage, Kubernetes, SlateDB, Foyer, and

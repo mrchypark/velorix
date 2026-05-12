@@ -168,6 +168,8 @@ enum Command {
         manifest: PathBuf,
         #[arg(long = "cargo-deny-json")]
         cargo_deny_json: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
     },
     ReleaseStatusValidate {
         #[arg(long = "status-matrix")]
@@ -337,9 +339,18 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::DependencyGovernanceValidate {
             manifest,
             cargo_deny_json,
+            json,
         }) => {
-            validate_dependency_governance_file(&manifest, cargo_deny_json.as_deref())?;
-            println!("dependency governance manifest valid");
+            if json && cargo_deny_json.is_none() {
+                bail!("dependency-governance-validate --json requires --cargo-deny-json");
+            }
+            let evidence =
+                validate_dependency_governance_file(&manifest, cargo_deny_json.as_deref())?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&evidence)?);
+            } else {
+                println!("dependency governance manifest valid");
+            }
         }
         Some(Command::ReleaseStatusValidate { status_matrix }) => {
             validate_release_status_file(&status_matrix)?;
@@ -511,7 +522,7 @@ fn format_feldera_artifact_release_provenance_evidence_json(
 fn validate_dependency_governance_file(
     path: &Path,
     deny_diagnostics: Option<&Path>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<DependencyGovernanceEvidenceV1> {
     let contents = fs::read_to_string(path).with_context(|| {
         format!(
             "failed to read dependency governance manifest from {}",
@@ -519,35 +530,107 @@ fn validate_dependency_governance_file(
         )
     })?;
     let today = today_utc_string()?;
-    validate_dependency_governance_manifest_text(&contents, &today)
-        .with_context(|| format!("invalid dependency governance manifest {}", path.display()))?;
-
-    if let Some(deny_diagnostics) = deny_diagnostics {
-        let diagnostics = fs::read_to_string(deny_diagnostics).with_context(|| {
-            format!(
-                "failed to read cargo-deny diagnostics from {}",
-                deny_diagnostics.display()
-            )
-        })?;
-        validate_dependency_governance_with_diagnostics_text(&contents, &diagnostics, &today)
-            .with_context(|| {
+    let diagnostics = if let Some(deny_diagnostics) = deny_diagnostics {
+        Some((
+            deny_diagnostics,
+            fs::read_to_string(deny_diagnostics).with_context(|| {
                 format!(
-                    "dependency governance manifest {} does not match cargo-deny diagnostics {}",
-                    path.display(),
+                    "failed to read cargo-deny diagnostics from {}",
                     deny_diagnostics.display()
                 )
-            })?;
-    }
+            })?,
+        ))
+    } else {
+        None
+    };
 
-    Ok(())
+    build_dependency_governance_evidence(path, &contents, diagnostics, &today)
+        .with_context(|| format!("invalid dependency governance manifest {}", path.display()))
 }
 
+fn build_dependency_governance_evidence(
+    manifest_path: &Path,
+    manifest_contents: &str,
+    diagnostics: Option<(&Path, String)>,
+    today: &str,
+) -> anyhow::Result<DependencyGovernanceEvidenceV1> {
+    let manifest: DependencyGovernanceManifestV1 = serde_json::from_str(manifest_contents)
+        .context("failed to parse dependency governance JSON")?;
+    manifest.validate(today)?;
+
+    let (cargo_deny, warning_counts) = if let Some((diagnostics_path, diagnostics_contents)) =
+        diagnostics
+    {
+        (
+            CargoDenyGovernanceEvidenceV1 {
+                diagnostics_checked: true,
+                diagnostics_path: Some(stable_path(diagnostics_path)),
+            },
+            compare_dependency_governance_diagnostics(&manifest, &diagnostics_contents)
+                .with_context(|| {
+                    format!(
+                        "dependency governance manifest {} does not match cargo-deny diagnostics {}",
+                        manifest_path.display(),
+                        diagnostics_path.display()
+                    )
+                })?,
+        )
+    } else {
+        (
+            CargoDenyGovernanceEvidenceV1 {
+                diagnostics_checked: false,
+                diagnostics_path: None,
+            },
+            BTreeMap::new(),
+        )
+    };
+
+    Ok(DependencyGovernanceEvidenceV1 {
+        schema_version: 1,
+        status: "pass",
+        evidence_kind: "dependency_governance_validated",
+        manifest: ManifestGovernanceEvidenceV1 {
+            path: stable_path(manifest_path),
+            name: manifest_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("")
+                .to_string(),
+        },
+        cargo_deny,
+        required_package_review_subjects: REQUIRED_PACKAGE_REVIEW_SUBJECTS
+            .iter()
+            .map(|subject| (*subject).to_string())
+            .collect(),
+        reviewed_package_subjects: manifest.package_review_subjects(),
+        missing_required_package_review_subjects: Vec::new(),
+        exception_counts_by_kind: manifest.exception_counts(),
+        warning_counts_by_kind: warning_counts,
+        external_audit_attestation: false,
+    })
+}
+
+fn stable_path(path: &Path) -> String {
+    let stable = if path.is_absolute() {
+        std::env::current_dir()
+            .ok()
+            .and_then(|cwd| path.strip_prefix(cwd).ok().map(Path::to_path_buf))
+            .unwrap_or_else(|| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    };
+    let value = stable.display().to_string();
+    value.strip_prefix("./").unwrap_or(&value).to_string()
+}
+
+#[cfg(test)]
 fn validate_dependency_governance_manifest_text(contents: &str, today: &str) -> anyhow::Result<()> {
     let manifest: DependencyGovernanceManifestV1 =
         serde_json::from_str(contents).context("failed to parse dependency governance JSON")?;
     manifest.validate(today)
 }
 
+#[cfg(test)]
 fn validate_dependency_governance_with_diagnostics_text(
     manifest_contents: &str,
     diagnostics_contents: &str,
@@ -557,6 +640,15 @@ fn validate_dependency_governance_with_diagnostics_text(
         .context("failed to parse dependency governance JSON")?;
     manifest.validate(today)?;
 
+    compare_dependency_governance_diagnostics(&manifest, diagnostics_contents)?;
+
+    Ok(())
+}
+
+fn compare_dependency_governance_diagnostics(
+    manifest: &DependencyGovernanceManifestV1,
+    diagnostics_contents: &str,
+) -> anyhow::Result<BTreeMap<String, usize>> {
     let expected = manifest.warning_exceptions();
     let actual = parse_cargo_deny_warning_diagnostics(diagnostics_contents)?;
     let mut errors = Vec::new();
@@ -580,7 +672,35 @@ fn validate_dependency_governance_with_diagnostics_text(
         bail!("{}", errors.join("; "));
     }
 
-    Ok(())
+    Ok(warning_counts(&actual))
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+struct DependencyGovernanceEvidenceV1 {
+    schema_version: u16,
+    status: &'static str,
+    evidence_kind: &'static str,
+    manifest: ManifestGovernanceEvidenceV1,
+    cargo_deny: CargoDenyGovernanceEvidenceV1,
+    required_package_review_subjects: Vec<String>,
+    reviewed_package_subjects: Vec<String>,
+    missing_required_package_review_subjects: Vec<String>,
+    exception_counts_by_kind: BTreeMap<String, usize>,
+    warning_counts_by_kind: BTreeMap<String, usize>,
+    external_audit_attestation: bool,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+struct ManifestGovernanceEvidenceV1 {
+    path: String,
+    name: String,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+struct CargoDenyGovernanceEvidenceV1 {
+    diagnostics_checked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostics_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -703,6 +823,23 @@ impl DependencyGovernanceManifestV1 {
             })
             .collect()
     }
+
+    fn package_review_subjects(&self) -> Vec<String> {
+        self.package_reviews
+            .iter()
+            .map(|review| review.subject.clone())
+            .collect()
+    }
+
+    fn exception_counts(&self) -> BTreeMap<String, usize> {
+        let mut counts = BTreeMap::new();
+        for exception in &self.exceptions {
+            *counts
+                .entry(exception.kind.as_str().to_string())
+                .or_insert(0) += 1;
+        }
+        counts
+    }
 }
 
 impl CargoDenyWarningKind {
@@ -783,6 +920,14 @@ fn parse_cargo_deny_warning_diagnostics(
     }
 
     Ok(warnings)
+}
+
+fn warning_counts(warnings: &BTreeSet<DependencyGovernanceWarning>) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for warning in warnings {
+        *counts.entry(warning.kind.as_str().to_string()).or_insert(0) += 1;
+    }
+    counts
 }
 
 fn cargo_deny_diagnostic_code(value: &serde_json::Value) -> Option<&str> {
@@ -1734,6 +1879,38 @@ mod tests {
     }
 
     #[test]
+    fn dependency_governance_validate_cli_parses_json_command() {
+        let cli = Cli::try_parse_from([
+            "velorix-cli",
+            "dependency-governance-validate",
+            "--manifest",
+            "dependency-governance.json",
+            "--cargo-deny-json",
+            "target/dependency-governance/cargo-deny.jsonl",
+            "--json",
+        ])
+        .unwrap();
+
+        let Some(Command::DependencyGovernanceValidate {
+            manifest,
+            cargo_deny_json,
+            json,
+        }) = cli.command
+        else {
+            panic!("expected dependency-governance-validate command");
+        };
+
+        assert_eq!(manifest, PathBuf::from("dependency-governance.json"));
+        assert_eq!(
+            cargo_deny_json,
+            Some(PathBuf::from(
+                "target/dependency-governance/cargo-deny.jsonl"
+            ))
+        );
+        assert!(json);
+    }
+
+    #[test]
     fn feldera_artifact_verify_cli_parses_json_command() {
         let cli = Cli::try_parse_from([
             "velorix-cli",
@@ -1970,6 +2147,61 @@ mod tests {
             "2026-05-06",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn dependency_governance_validator_emits_stable_readiness_evidence() {
+        let evidence = build_dependency_governance_evidence(
+            Path::new("dependency-governance.json"),
+            &valid_dependency_governance_json(),
+            Some((
+                Path::new("target/dependency-governance/cargo-deny.jsonl"),
+                cargo_deny_warning_diagnostics_jsonl().to_string(),
+            )),
+            "2026-05-06",
+        )
+        .unwrap();
+
+        assert_eq!(evidence.schema_version, 1);
+        assert_eq!(evidence.status, "pass");
+        assert_eq!(evidence.evidence_kind, "dependency_governance_validated");
+        assert_eq!(evidence.manifest.path, "dependency-governance.json");
+        assert_eq!(evidence.manifest.name, "dependency-governance.json");
+        assert!(evidence.cargo_deny.diagnostics_checked);
+        assert_eq!(
+            evidence.cargo_deny.diagnostics_path.as_deref(),
+            Some("target/dependency-governance/cargo-deny.jsonl")
+        );
+        assert_eq!(
+            evidence.required_package_review_subjects,
+            vec![
+                "datafusion",
+                "object_store",
+                "kube",
+                "k8s-openapi",
+                "slatedb",
+                "foyer",
+                "feldera_artifacts"
+            ]
+        );
+        assert_eq!(
+            evidence.reviewed_package_subjects,
+            vec![
+                "datafusion",
+                "object_store",
+                "kube",
+                "k8s-openapi",
+                "slatedb",
+                "foyer",
+                "feldera_artifacts"
+            ]
+        );
+        assert!(evidence.missing_required_package_review_subjects.is_empty());
+        assert_eq!(evidence.exception_counts_by_kind["duplicate"], 1);
+        assert_eq!(evidence.exception_counts_by_kind["unmaintained"], 1);
+        assert_eq!(evidence.warning_counts_by_kind["duplicate"], 1);
+        assert_eq!(evidence.warning_counts_by_kind["unmaintained"], 1);
+        assert!(!evidence.external_audit_attestation);
     }
 
     #[test]
