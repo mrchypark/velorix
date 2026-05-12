@@ -26,6 +26,7 @@ use velorix_runtime::{
         query_persisted_object_backed_input_with_policy,
         query_production_persisted_object_backed_input,
         query_production_persisted_object_backed_input_with_limiter,
+        query_production_persisted_object_backed_input_with_metrics,
         CreateProductionPersistedTableSpecRequest, PersistedTableError, PersistedTableFormat,
         PersistedTableStore, ProductionPersistedTableFormat, ProductionPersistedTableQueryRequest,
     },
@@ -1095,6 +1096,47 @@ async fn production_object_backed_table_query_accepts_shared_limiter_when_catalo
 
     assert_eq!(output.len(), 1);
     assert_eq!(output[0].num_rows(), 1);
+}
+
+#[tokio::test]
+async fn production_object_backed_table_query_with_metrics_uses_registry_and_relation_table() {
+    let (_temp_dir, catalog_store) = temp_store();
+    let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
+    put_parquet_input(
+        &scan_store,
+        "tenants/tenant-a/tables/orders/snapshots/0001/part-000.parquet",
+        &parquet_orders_batch(&["account-a", "account-b"], &[10, 7], &[1, 1]),
+    )
+    .await;
+    let mut registry = StorageRegistry::new();
+    register_production_scan_store(
+        &mut registry,
+        Arc::clone(&scan_store),
+        Arc::clone(&catalog_store),
+    )
+    .await;
+    create_production_table(&catalog_store, "primary", "tenants/tenant-a/tables/orders").await;
+
+    let output = query_production_persisted_object_backed_input_with_metrics(
+        Arc::clone(&catalog_store),
+        Arc::clone(&catalog_store),
+        Arc::clone(&catalog_store),
+        &registry,
+        "tenant-a",
+        "orders-current",
+        "select account_id, value, weight from orders order by account_id",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(output.batches.len(), 1);
+    assert_eq!(output.batches[0].num_rows(), 2);
+    assert_eq!(string_value(&output.batches[0], 0, 0), "account-a");
+    assert!(output.object_requests.list_count >= 1);
+    assert!(
+        output.object_requests.get_count + output.object_requests.range_read_count >= 1,
+        "expected production table scan metrics to include a parquet read"
+    );
 }
 
 #[tokio::test]

@@ -179,6 +179,36 @@ pub(crate) async fn query_object_backed_relation_with_policy_and_limiter(
     .await
 }
 
+pub(crate) async fn query_object_backed_relation_with_policy_and_limiter_and_metrics(
+    store: Arc<dyn DataFusionObjectStore>,
+    table_url: &str,
+    table_name: &str,
+    table_schema: Arc<Schema>,
+    sql: &str,
+    policy: QueryPolicy,
+    limiter: Option<QueryExecutionLimiter>,
+) -> Result<ObjectBackedQueryResult, RuntimeQueryError> {
+    let meter = ObjectStoreMeter::default();
+    let batches = query_object_backed_table_with_policy_and_limiter_and_meter(
+        store,
+        table_url,
+        ObjectBackedTableRegistration {
+            table_name,
+            table_schema: Some(table_schema),
+        },
+        sql,
+        policy,
+        limiter,
+        Some(meter.clone()),
+    )
+    .await?;
+
+    Ok(ObjectBackedQueryResult {
+        batches,
+        object_requests: meter.snapshot(),
+    })
+}
+
 #[derive(Debug)]
 pub struct ObjectBackedQueryResult {
     pub batches: Vec<RecordBatch>,

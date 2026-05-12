@@ -95,11 +95,17 @@ mod live_s3 {
         BenchmarkBackend, BenchmarkGateLevel, BenchmarkGateResultV1, BenchmarkMetricsV1,
         BenchmarkWorkloadMetricsV1, ObjectRequestMetricsV1,
     };
-    use velorix_runtime::query::query_object_backed_input_with_policy_and_metrics;
+    use velorix_runtime::persisted_table::{
+        query_production_persisted_object_backed_input_with_metrics,
+        CreateProductionPersistedTableSpecRequest, PersistedTableStore,
+        ProductionPersistedTableFormat,
+    };
+    use velorix_runtime::query_policy_catalog::QueryPolicyCatalogStore;
     use velorix_runtime::recovery::{
         orders_sum_count_relation_catalog, RecoveredRuntime, ORDERS_SUM_COUNT_OWNER,
         ORDERS_SUM_COUNT_RELATION_ID, ORDERS_SUM_COUNT_RELATION_VERSION,
     };
+    use velorix_runtime::storage_registry::StorageRegistry;
     use velorix_storage::{
         gc::GarbageCollectionPolicy,
         ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
@@ -271,7 +277,8 @@ mod live_s3 {
         .await?;
         let slatedb_state_reopen =
             slatedb_state_reopen(Arc::clone(&store), Arc::clone(&metered_store)).await?;
-        let datafusion_scan = datafusion_table_scan(config, scan_store(config)?).await?;
+        let datafusion_scan =
+            datafusion_table_scan(config, Arc::clone(&store), scan_store(config)?).await?;
 
         let records_per_second = total_records as f64 / ingest_elapsed.as_secs_f64();
         let mut object_requests = metered_store.snapshot();
@@ -432,12 +439,31 @@ mod live_s3 {
 
     async fn datafusion_table_scan(
         config: &LiveConfig,
+        authority_store: Arc<dyn ObjectStore>,
         store: Arc<dyn DataFusionObjectStore>,
     ) -> BenchResult<MeasuredWorkload> {
-        let input = parquet_input_batch()?;
+        let input = ingest_record_batch(&DeltaBatch::from_records([
+            DeltaRecord::new(
+                DeltaKey::from_json(json!("account-a")),
+                DeltaValue::from_json(json!(10)),
+                1,
+            ),
+            DeltaRecord::new(
+                DeltaKey::from_json(json!("account-a")),
+                DeltaValue::from_json(json!(5)),
+                1,
+            ),
+            DeltaRecord::new(
+                DeltaKey::from_json(json!("account-b")),
+                DeltaValue::from_json(json!(7)),
+                -1,
+            ),
+        ]))?;
         let input_bytes = parquet_bytes(&input)?;
         let scan_bytes = input_bytes.len() as u64;
-        let input_prefix = format!("{}/datafusion-input", config.run_prefix);
+        let object_key_prefix = "tenants/tenant-a/tables/orders";
+        let snapshot_ref = "snapshots/s3-benchmark";
+        let input_prefix = format!("{}/{object_key_prefix}/{snapshot_ref}", config.run_prefix);
         let parquet_path = format!("{input_prefix}/part-000.parquet");
 
         store
@@ -447,26 +473,43 @@ mod live_s3 {
             )
             .await?;
 
+        create_production_query_policy(&authority_store).await?;
+        let mut registry = StorageRegistry::new();
+        registry
+            .register_production_with_probe(
+                "primary",
+                &format!("s3://{}/{}/", config.bucket, config.run_prefix),
+                Arc::clone(&store),
+                Arc::clone(&authority_store),
+                "s3-compatible",
+                format!("{}/datafusion-capability-probes", config.run_prefix),
+            )
+            .await?;
+        PersistedTableStore::new(Arc::clone(&authority_store))
+            .create_production(
+                Arc::clone(&authority_store),
+                Arc::clone(&authority_store),
+                &registry,
+                production_request("primary", object_key_prefix, snapshot_ref)?,
+            )
+            .await?;
+
         let started = Instant::now();
-        let output = query_object_backed_input_with_policy_and_metrics(
-            store,
-            &format!("s3://{}/{input_prefix}/", config.bucket),
-            "select key_json, sum(cast(value_json as int)) as total_value, sum(weight) as total_weight \
-             from input where weight > 0 group by key_json order by key_json",
-            QueryPolicy {
-                max_scan_files: Some(1),
-                max_scan_bytes: Some(scan_bytes),
-                max_object_requests: Some(100),
-                max_output_rows: Some(8),
-                max_output_bytes: Some(64 * 1024),
-                ..QueryPolicy::default()
-            },
+        let output = query_production_persisted_object_backed_input_with_metrics(
+            Arc::clone(&authority_store),
+            Arc::clone(&authority_store),
+            Arc::clone(&authority_store),
+            &registry,
+            "tenant-a",
+            "orders-current",
+            "select account_id, sum(amount) as total_value, sum(weight) as total_weight \
+             from orders where weight > 0 group by account_id order by account_id",
         )
         .await?;
         let elapsed = started.elapsed();
 
         assert_eq!(output.batches.len(), 1);
-        assert_eq!(output.batches[0].num_rows(), 2);
+        assert_eq!(output.batches[0].num_rows(), 1);
 
         Ok(MeasuredWorkload {
             samples: vec![elapsed],
@@ -526,25 +569,6 @@ mod live_s3 {
                 1,
             )
         }))
-    }
-
-    fn parquet_input_batch() -> BenchResult<RecordBatch> {
-        Ok(RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("key_json", DataType::Utf8, false),
-                Field::new("value_json", DataType::Utf8, false),
-                Field::new("weight", DataType::Int64, false),
-            ])),
-            vec![
-                Arc::new(StringArray::from(vec![
-                    "\"account-a\"",
-                    "\"account-a\"",
-                    "\"account-b\"",
-                ])) as ArrayRef,
-                Arc::new(StringArray::from(vec!["10", "5", "7"])) as ArrayRef,
-                Arc::new(Int64Array::from(vec![1, 1, 1])) as ArrayRef,
-            ],
-        )?)
     }
 
     fn parquet_bytes(batch: &RecordBatch) -> BenchResult<Bytes> {
@@ -624,6 +648,49 @@ mod live_s3 {
 
         ingest_log.append_catalog_validated_envelope(bytes).await?;
         Ok(())
+    }
+
+    async fn create_production_query_policy(store: &Arc<dyn ObjectStore>) -> BenchResult<()> {
+        QueryPolicyCatalogStore::new(Arc::clone(store))
+            .create_for_production_table_scan("tenant-a", "standard", production_query_policy())
+            .await?;
+        Ok(())
+    }
+
+    fn production_request(
+        store_id: &str,
+        object_key_prefix: &str,
+        snapshot_ref: &str,
+    ) -> BenchResult<CreateProductionPersistedTableSpecRequest> {
+        let catalog = orders_sum_count_relation_catalog()?;
+        Ok(CreateProductionPersistedTableSpecRequest {
+            table_id: "orders-current".to_string(),
+            tenant_id: "tenant-a".to_string(),
+            store_id: store_id.to_string(),
+            object_key_prefix: object_key_prefix.to_string(),
+            snapshot_ref: snapshot_ref.to_string(),
+            format: ProductionPersistedTableFormat::Parquet,
+            relation_id: ORDERS_SUM_COUNT_RELATION_ID.to_string(),
+            relation_version: ORDERS_SUM_COUNT_RELATION_VERSION.to_string(),
+            schema_fingerprint: catalog.schema_fingerprint.as_str().to_string(),
+            query_policy_id: "standard".to_string(),
+        })
+    }
+
+    fn production_query_policy() -> QueryPolicy {
+        QueryPolicy {
+            max_sql_bytes: Some(16 * 1024),
+            planning_timeout_ms: Some(1_000),
+            execution_timeout_ms: Some(10_000),
+            max_output_rows: Some(1_000),
+            max_output_bytes: Some(1_000_000),
+            max_scan_files: Some(100),
+            max_scan_bytes: Some(128 * 1024 * 1024),
+            max_object_requests: Some(1_000),
+            memory_limit_bytes: Some(512 * 1024 * 1024),
+            spill_limit_bytes: Some(1024 * 1024 * 1024),
+            ..QueryPolicy::default()
+        }
     }
 
     fn authority_s3(config: &LiveConfig) -> BenchResult<AmazonS3> {

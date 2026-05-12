@@ -21,6 +21,7 @@ use velorix_storage::{
 
 use crate::query::{
     query_object_backed_input_with_policy, query_object_backed_relation_with_policy_and_limiter,
+    query_object_backed_relation_with_policy_and_limiter_and_metrics, ObjectBackedQueryResult,
     QueryExecutionLimiter, RuntimeQueryError,
 };
 use crate::query_policy_catalog::{QueryPolicyCatalogError, QueryPolicyCatalogStore};
@@ -325,6 +326,41 @@ pub async fn query_production_persisted_object_backed_input(
     .await
 }
 
+pub async fn query_production_persisted_object_backed_input_with_metrics(
+    catalog_store: Arc<dyn ObjectStore>,
+    relation_catalog_store: Arc<dyn ObjectStore>,
+    policy_catalog_store: Arc<dyn ObjectStore>,
+    registry: &StorageRegistry,
+    tenant_id: &str,
+    table_id: &str,
+    sql: &str,
+) -> Result<ObjectBackedQueryResult, PersistedTableError> {
+    let catalog = PersistedTableStore::new(catalog_store);
+    let spec = catalog.get_production(table_id).await?;
+    reject_cross_tenant_production_query(tenant_id, &spec)?;
+    let relation_catalog = read_matching_relation_catalog(
+        relation_catalog_store,
+        &spec.relation_id,
+        &spec.relation_version,
+        &spec.schema_fingerprint,
+    )
+    .await?;
+    let policy = QueryPolicyCatalogStore::new(policy_catalog_store)
+        .get_for_production_table_scan(&spec.tenant_id, &spec.query_policy_id)
+        .await?
+        .policy;
+
+    query_production_spec_with_policy_and_metrics(
+        registry,
+        tenant_id,
+        spec,
+        relation_catalog,
+        sql,
+        policy,
+    )
+    .await
+}
+
 pub async fn query_production_persisted_object_backed_input_with_limiter(
     catalog_store: Arc<dyn ObjectStore>,
     relation_catalog_store: Arc<dyn ObjectStore>,
@@ -391,6 +427,37 @@ async fn query_production_spec_with_policy(
     }
 }
 
+async fn query_production_spec_with_policy_and_metrics(
+    registry: &StorageRegistry,
+    tenant_id: &str,
+    spec: ProductionPersistedTableSpec,
+    relation_catalog: VelorixRelationCatalogV1,
+    sql: &str,
+    policy: QueryPolicy,
+) -> Result<ObjectBackedQueryResult, PersistedTableError> {
+    reject_cross_tenant_production_query(tenant_id, &spec)?;
+
+    let location = registry.resolve_production_table_location(
+        &spec.store_id,
+        &spec.tenant_id,
+        &spec.object_key_prefix,
+        &spec.snapshot_ref,
+    )?;
+
+    match spec.format {
+        ProductionPersistedTableFormat::Parquet => {
+            query_relation_backed_parquet_with_policy_and_metrics(
+                location.store,
+                &location.table_url,
+                &relation_catalog,
+                sql,
+                policy,
+            )
+            .await
+        }
+    }
+}
+
 async fn query_relation_backed_parquet_with_policy(
     store: Arc<dyn DataFusionObjectStore>,
     table_url: &str,
@@ -411,6 +478,29 @@ async fn query_relation_backed_parquet_with_policy(
         limiter,
     )
     .await?)
+}
+
+async fn query_relation_backed_parquet_with_policy_and_metrics(
+    store: Arc<dyn DataFusionObjectStore>,
+    table_url: &str,
+    relation_catalog: &VelorixRelationCatalogV1,
+    sql: &str,
+    policy: QueryPolicy,
+) -> Result<ObjectBackedQueryResult, PersistedTableError> {
+    require_table_relation_registration(relation_catalog)?;
+    let catalog_schema = datafusion_schema_from_catalog(relation_catalog)?;
+    Ok(
+        query_object_backed_relation_with_policy_and_limiter_and_metrics(
+            store,
+            table_url,
+            relation_catalog.datafusion_registration.name.as_str(),
+            catalog_schema,
+            sql,
+            policy,
+            None,
+        )
+        .await?,
+    )
 }
 
 fn reject_cross_tenant_production_query(
