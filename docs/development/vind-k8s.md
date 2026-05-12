@@ -63,6 +63,9 @@ Run the full local vind gate:
 scripts/run-vind-k8s-gate.sh
 ```
 
+Run the same gate in GitHub Actions with the `Kubernetes vind Gate` manual
+workflow.
+
 Clean up the cluster when done:
 
 ```bash

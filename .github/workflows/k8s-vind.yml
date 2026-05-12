@@ -1,0 +1,48 @@
+name: Kubernetes vind Gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      cleanup:
+        description: Delete the local vCluster after the gate finishes.
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  VCLUSTER_VERSION: v0.34.0
+  VELORIX_VIND_CLUSTER: velorix-vind
+  VELORIX_K8S_NAMESPACE: velorix-live
+
+jobs:
+  vind-k8s:
+    name: Local vind Kubernetes gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Install vCluster
+        run: |
+          curl -L -o vcluster "https://github.com/loft-sh/vcluster/releases/download/${VCLUSTER_VERSION}/vcluster-linux-amd64"
+          sudo install -c -m 0755 vcluster /usr/local/bin/vcluster
+          rm -f vcluster
+          vcluster --version
+
+      - name: Run vind Kubernetes gate
+        env:
+          VELORIX_VIND_CLEANUP: ${{ inputs.cleanup && '1' || '0' }}
+        run: scripts/run-vind-k8s-gate.sh
