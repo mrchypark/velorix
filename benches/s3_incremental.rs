@@ -83,7 +83,10 @@ mod live_s3 {
         GetOptions, GetRange, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
         PutMultipartOptions, PutOptions, PutPayload, PutResult,
     };
-    use object_store_13::{aws::AmazonS3Builder as DataFusionS3Builder, ObjectStoreExt};
+    use object_store_13::{
+        aws::AmazonS3Builder as DataFusionS3Builder, prefix::PrefixStore as DataFusionPrefixStore,
+        ObjectStoreExt,
+    };
     use parquet::arrow::ArrowWriter;
     use serde_json::json;
     use velorix_core::{
@@ -298,7 +301,7 @@ mod live_s3 {
         let slatedb_state_reopen =
             slatedb_state_reopen(Arc::clone(&store), Arc::clone(&metered_store)).await?;
         let datafusion_scan =
-            datafusion_table_scan(config, Arc::clone(&store), scan_store(config)?).await?;
+            datafusion_table_scan(config, Arc::clone(&store), prefixed_scan_store(config)?).await?;
 
         let records_per_second = total_records as f64 / ingest_elapsed.as_secs_f64();
         let mut object_requests = metered_store.snapshot();
@@ -483,7 +486,7 @@ mod live_s3 {
         let scan_bytes = input_bytes.len() as u64;
         let object_key_prefix = "tenants/tenant-a/tables/orders";
         let snapshot_ref = "snapshots/s3-benchmark";
-        let input_prefix = format!("{}/{object_key_prefix}/{snapshot_ref}", config.run_prefix);
+        let input_prefix = format!("{object_key_prefix}/{snapshot_ref}");
         let parquet_path = format!("{input_prefix}/part-000.parquet");
 
         store
@@ -498,7 +501,7 @@ mod live_s3 {
         registry
             .register_production_with_probe(
                 "primary",
-                &format!("s3://{}/{}/", config.bucket, config.run_prefix),
+                &format!("s3://{}/", config.bucket),
                 Arc::clone(&store),
                 Arc::clone(&authority_store),
                 "s3-compatible",
@@ -746,6 +749,20 @@ mod live_s3 {
                 .with_allow_http(config.allow_http)
                 .build()?,
         ))
+    }
+
+    fn prefixed_scan_store(config: &LiveConfig) -> BenchResult<Arc<dyn DataFusionObjectStore>> {
+        Ok(Arc::new(DataFusionPrefixStore::new(
+            DataFusionS3Builder::new()
+                .with_endpoint(config.endpoint.clone())
+                .with_access_key_id(config.access_key_id.clone())
+                .with_secret_access_key(config.secret_access_key.clone())
+                .with_region(config.region.clone())
+                .with_bucket_name(config.bucket.clone())
+                .with_allow_http(config.allow_http)
+                .build()?,
+            config.run_prefix.as_str(),
+        )))
     }
 
     async fn cleanup_prefix(store: &dyn DataFusionObjectStore, prefix: &str) -> BenchResult<()> {

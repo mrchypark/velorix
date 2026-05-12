@@ -107,6 +107,55 @@ evidence independent:
 - If neither benchmark JSON nor live S3-compatible tests are configured, the
   nightly gate fails closed instead of passing without S3 evidence.
 
+## Local Floci S3 Emulator Gate
+
+For local S3 API compatibility checks, `scripts/run-floci-s3-gate.sh` starts a
+Floci container, creates a test bucket through the AWS S3 API, and runs the same
+env-gated storage/runtime harnesses against `http://127.0.0.1:4566`.
+
+```bash
+scripts/run-floci-s3-gate.sh
+```
+
+The script sets the normal live harness environment:
+
+```text
+VELORIX_S3_COMPAT=1
+AWS_ENDPOINT_URL=http://127.0.0.1:4566
+AWS_ACCESS_KEY_ID=test
+AWS_SECRET_ACCESS_KEY=test
+AWS_REGION=us-east-1
+VELORIX_S3_BUCKET=velorix-floci
+VELORIX_S3_PREFIX=floci-s3-gate/<timestamp>
+```
+
+It runs:
+
+```bash
+cargo test -p velorix-storage --test s3_compat --features s3-compat-tests
+cargo test -p velorix-runtime --test s3_compat_query --features s3-compat-tests
+cargo bench -p velorix-runtime --bench s3_incremental --features s3-compat-tests
+cargo run -p velorix-cli -- benchmark-validate --result target/velorix-bench/floci-s3-nightly.json
+```
+
+The benchmark step can be skipped with `VELORIX_FLOCI_RUN_BENCHMARK=0`. The
+script writes `target/velorix-s3/floci-s3-gate-evidence.json` and deletes the
+Floci container/network by default. Set `VELORIX_FLOCI_CLEANUP=0` to keep the
+container for debugging.
+
+Floci is useful fast local S3-compatible evidence because it speaks the AWS
+wire protocol and exercises the same `object_store` clients as the nightly
+harness. It is still emulator evidence, not a replacement for measured
+release-quality S3-compatible backend baselines.
+
+## GCS Emulator Boundary
+
+`fsouza/fake-gcs-server` is a Google Cloud Storage API emulator, not an S3 REST
+XML endpoint. Do not wire it into `VELORIX_S3_COMPAT` or count it as
+S3-compatible release evidence. If Velorix adds a first-class GCS backend later,
+it should get a separate GCS-specific harness and evidence kind instead of
+sharing the S3-compatible gate.
+
 ## Out Of Scope
 
 The current slice intentionally does not validate Foyer, Kubernetes

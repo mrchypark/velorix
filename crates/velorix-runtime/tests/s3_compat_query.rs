@@ -17,7 +17,10 @@ use object_store::{
     prefix::PrefixStore,
     ObjectStore as AuthorityObjectStore,
 };
-use object_store_13::{aws::AmazonS3Builder as DataFusionS3Builder, ObjectStoreExt};
+use object_store_13::{
+    aws::AmazonS3Builder as DataFusionS3Builder, prefix::PrefixStore as DataFusionPrefixStore,
+    ObjectStoreExt,
+};
 use parquet::arrow::ArrowWriter;
 use serde_json::json;
 use velorix_core::{
@@ -67,13 +70,11 @@ async fn s3_compatible_production_table_query_scans_parquet_through_registry() -
     };
 
     let authority_store = prefixed_authority_store(&config)?;
-    let scan_store = scan_store(&config)?;
+    let raw_scan_store = scan_store(&config)?;
+    let scan_store = prefixed_scan_store(&config)?;
     let object_key_prefix = "tenants/tenant-a/tables/orders".to_string();
     let snapshot_ref = "snapshots/0001";
-    let parquet_path = format!(
-        "{}/{object_key_prefix}/{snapshot_ref}/part-000.parquet",
-        config.run_prefix
-    );
+    let parquet_path = format!("{object_key_prefix}/{snapshot_ref}/part-000.parquet");
 
     scan_store
         .put(
@@ -94,7 +95,7 @@ async fn s3_compatible_production_table_query_scans_parquet_through_registry() -
         registry
             .register_production_with_probe(
                 "primary",
-                &format!("s3://{}/{}/", config.bucket, config.run_prefix),
+                &format!("s3://{}/", config.bucket),
                 Arc::clone(&scan_store),
                 Arc::clone(&authority_store),
                 "s3-compatible",
@@ -138,7 +139,7 @@ async fn s3_compatible_production_table_query_scans_parquet_through_registry() -
     }
     .await;
 
-    let _ = cleanup_prefix(scan_store.as_ref(), &config.run_prefix).await;
+    let _ = cleanup_prefix(raw_scan_store.as_ref(), &config.run_prefix).await;
     validation
 }
 
@@ -255,6 +256,20 @@ fn scan_store(config: &LiveConfig) -> Result<Arc<dyn DataFusionObjectStore>, Tes
             .with_allow_http(config.allow_http)
             .build()?,
     ))
+}
+
+fn prefixed_scan_store(config: &LiveConfig) -> Result<Arc<dyn DataFusionObjectStore>, TestError> {
+    Ok(Arc::new(DataFusionPrefixStore::new(
+        DataFusionS3Builder::new()
+            .with_endpoint(config.endpoint.clone())
+            .with_access_key_id(config.access_key_id.clone())
+            .with_secret_access_key(config.secret_access_key.clone())
+            .with_region(config.region.clone())
+            .with_bucket_name(config.bucket.clone())
+            .with_allow_http(config.allow_http)
+            .build()?,
+        config.run_prefix.as_str(),
+    )))
 }
 
 async fn cleanup_prefix(store: &dyn DataFusionObjectStore, prefix: &str) -> TestResult {
