@@ -138,6 +138,12 @@ jobs:
           name: s3-release-benchmark
           path: ${{ env.S3_BENCHMARK_RESULT_PATH }}
 
+      - name: Upload dependency governance evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-governance-evidence
+          path: target/dependency-governance/cargo-deny.jsonl
+
       - name: Upload Feldera release evidence
         uses: actions/upload-artifact@v4
         with:
