@@ -26,6 +26,7 @@ use velorix_runtime::{
         query_persisted_object_backed_input_with_policy,
         query_production_persisted_object_backed_input,
         query_production_persisted_object_backed_input_with_limiter,
+        query_production_persisted_object_backed_input_with_limiter_and_metrics,
         query_production_persisted_object_backed_input_with_metrics,
         CreateProductionPersistedTableSpecRequest, PersistedTableError, PersistedTableFormat,
         PersistedTableStore, ProductionPersistedTableFormat, ProductionPersistedTableQueryRequest,
@@ -1137,6 +1138,102 @@ async fn production_object_backed_table_query_with_metrics_uses_registry_and_rel
         output.object_requests.get_count + output.object_requests.range_read_count >= 1,
         "expected production table scan metrics to include a parquet read"
     );
+}
+
+#[tokio::test]
+async fn production_object_backed_table_query_with_metrics_requires_shared_limiter_when_catalog_concurrency_limit_is_set(
+) {
+    let (_temp_dir, catalog_store) = temp_store();
+    let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
+    let mut registry = StorageRegistry::new();
+    register_production_scan_store(
+        &mut registry,
+        Arc::clone(&scan_store),
+        Arc::clone(&catalog_store),
+    )
+    .await;
+
+    create_production_table_with_policy(
+        &catalog_store,
+        "primary",
+        "tenants/tenant-a/tables/orders",
+        QueryPolicy {
+            max_concurrent_queries: Some(1),
+            ..QueryPolicy::default()
+        },
+    )
+    .await;
+
+    let error = query_production_persisted_object_backed_input_with_metrics(
+        Arc::clone(&catalog_store),
+        Arc::clone(&catalog_store),
+        Arc::clone(&catalog_store),
+        &registry,
+        "tenant-a",
+        "orders-current",
+        "select account_id, value, weight from orders",
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        PersistedTableError::RuntimeQuery(RuntimeQueryError::Query(QueryError::Policy(
+            QueryPolicyError::ConcurrencyLimiterRequired {
+                max_concurrent_queries: 1,
+            }
+        )))
+    ));
+}
+
+#[tokio::test]
+async fn production_object_backed_table_query_with_metrics_accepts_shared_limiter_when_catalog_concurrency_limit_is_set(
+) {
+    let (_temp_dir, catalog_store) = temp_store();
+    let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
+    put_parquet_input(
+        &scan_store,
+        "tenants/tenant-a/tables/orders/snapshots/0001/part-000.parquet",
+        &parquet_orders_batch(&["account-a"], &[10], &[1]),
+    )
+    .await;
+    let mut registry = StorageRegistry::new();
+    register_production_scan_store(
+        &mut registry,
+        Arc::clone(&scan_store),
+        Arc::clone(&catalog_store),
+    )
+    .await;
+    let policy = production_policy_with(QueryPolicy {
+        max_concurrent_queries: Some(1),
+        ..QueryPolicy::default()
+    });
+    create_production_table_with_policy(
+        &catalog_store,
+        "primary",
+        "tenants/tenant-a/tables/orders",
+        policy,
+    )
+    .await;
+
+    let output = query_production_persisted_object_backed_input_with_limiter_and_metrics(
+        Arc::clone(&catalog_store),
+        Arc::clone(&catalog_store),
+        Arc::clone(&catalog_store),
+        ProductionPersistedTableQueryRequest {
+            registry: &registry,
+            tenant_id: "tenant-a",
+            table_id: "orders-current",
+            sql: "select account_id, value, weight from orders",
+            limiter: QueryExecutionLimiter::from_policy(policy),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(output.batches.len(), 1);
+    assert_eq!(output.batches[0].num_rows(), 1);
+    assert!(output.object_requests.list_count >= 1);
 }
 
 #[tokio::test]
