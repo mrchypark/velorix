@@ -215,6 +215,48 @@ impl RecoveredRuntime {
         .await
     }
 
+    pub async fn recover_from_published_checkpoint_version_checked(
+        store: Arc<dyn ObjectStore>,
+        checkpoint_version: u64,
+        capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
+    ) -> Result<Self, RecoveryError> {
+        Self::recover_from_published_checkpoint_version_with_owner_and_relation_catalog_record_checked(
+            store,
+            checkpoint_version,
+            ORDERS_SUM_COUNT_OWNER,
+            ORDERS_SUM_COUNT_RELATION_ID,
+            ORDERS_SUM_COUNT_RELATION_VERSION,
+            capabilities,
+        )
+        .await
+    }
+
+    pub async fn recover_from_published_checkpoint_version_with_owner_and_relation_catalog_record_checked(
+        store: Arc<dyn ObjectStore>,
+        checkpoint_version: u64,
+        expected_owner: &str,
+        relation_id: &str,
+        relation_version: &str,
+        capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
+    ) -> Result<Self, RecoveryError> {
+        let authority = ProductionRecoveryAuthority::new(capabilities)?;
+        let relation_catalog = RelationCatalogRegistry::new_checked(
+            Arc::clone(&store),
+            authority.profile(AuthoritativeNamespace::RelationCatalog),
+        )?
+        .read(relation_id, relation_version)
+        .await?;
+
+        Self::recover_from_published_checkpoint_version_with_owner_and_relation_catalog_checked(
+            store,
+            checkpoint_version,
+            expected_owner,
+            relation_catalog,
+            capabilities,
+        )
+        .await
+    }
+
     pub async fn recover_from_published_checkpoint_version_with_owner_and_relation_catalog(
         store: Arc<dyn ObjectStore>,
         checkpoint_version: u64,
@@ -229,6 +271,36 @@ impl RecoveredRuntime {
         Self::recover_with_selected_manifest_and_relation_catalog(
             store,
             publisher,
+            manifest,
+            expected_owner,
+            relation_catalog,
+        )
+        .await
+    }
+
+    pub async fn recover_from_published_checkpoint_version_with_owner_and_relation_catalog_checked(
+        store: Arc<dyn ObjectStore>,
+        checkpoint_version: u64,
+        expected_owner: &str,
+        relation_catalog: VelorixRelationCatalogV1,
+        capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
+    ) -> Result<Self, RecoveryError> {
+        let authority = ProductionRecoveryAuthority::new(capabilities)?;
+        let publisher = CheckpointPublisher::new_checked(
+            Arc::clone(&store),
+            authority.profile(AuthoritativeNamespace::Checkpoint),
+        )?;
+        let manifest = publisher
+            .read_published_checkpoint_manifest(checkpoint_version)
+            .await?;
+        let ingest_log = IngestLog::new_checked(
+            Arc::clone(&store),
+            authority.profile(AuthoritativeNamespace::Ingest),
+        )?;
+
+        Self::recover_with_selected_manifest_log_and_relation_catalog(
+            publisher,
+            ingest_log,
             manifest,
             expected_owner,
             relation_catalog,
@@ -372,8 +444,25 @@ impl RecoveredRuntime {
         expected_owner: &str,
         relation_catalog: VelorixRelationCatalogV1,
     ) -> Result<Self, RecoveryError> {
+        let ingest_log = IngestLog::new(store);
+        Self::recover_with_selected_manifest_log_and_relation_catalog(
+            publisher,
+            ingest_log,
+            manifest,
+            expected_owner,
+            relation_catalog,
+        )
+        .await
+    }
+
+    async fn recover_with_selected_manifest_log_and_relation_catalog(
+        publisher: CheckpointPublisher,
+        ingest_log: IngestLog,
+        manifest: CheckpointManifest,
+        expected_owner: &str,
+        relation_catalog: VelorixRelationCatalogV1,
+    ) -> Result<Self, RecoveryError> {
         relation_catalog.validate()?;
-        let ingest_log = IngestLog::new(Arc::clone(&store));
         Self::recover_from_manifest_and_relation_catalog(
             publisher,
             ingest_log,
