@@ -11,18 +11,38 @@ on:
         description: Path to the production readiness evidence JSON.
         required: false
         default: ""
+      feldera-spec-path:
+        description: Path to the Feldera standing-view spec JSON.
+        required: false
+        default: ""
+      feldera-metadata-path:
+        description: Path to the Feldera compile artifact metadata JSON.
+        required: false
+        default: ""
+      feldera-artifact-package-path:
+        description: Path to the compiled Feldera artifact package.
+        required: false
+        default: ""
+      feldera-provenance-path:
+        description: Path to the Feldera release provenance JSON.
+        required: false
+        default: ""
 
 env:
   CARGO_TERM_COLOR: always
   S3_BENCHMARK_RESULT_PATH: ${{ inputs.s3-result-path }}
   READINESS_EVIDENCE_PATH: ${{ inputs.readiness-evidence-path }}
+  FELDERA_SPEC_PATH: ${{ inputs.feldera-spec-path }}
+  FELDERA_METADATA_PATH: ${{ inputs.feldera-metadata-path }}
+  FELDERA_ARTIFACT_PACKAGE_PATH: ${{ inputs.feldera-artifact-package-path }}
+  FELDERA_PROVENANCE_PATH: ${{ inputs.feldera-provenance-path }}
 
 jobs:
   s3-release:
     name: S3-compatible release gate
     runs-on: ubuntu-latest
     steps:
-      - name: Require S3 benchmark result
+      - name: Require release inputs
         run: |
           if [ -z "$S3_BENCHMARK_RESULT_PATH" ]; then
             echo "release gate requires inputs.s3-result-path"
@@ -30,6 +50,22 @@ jobs:
           fi
           if [ -z "$READINESS_EVIDENCE_PATH" ]; then
             echo "release gate requires inputs.readiness-evidence-path"
+            exit 1
+          fi
+          if [ -z "$FELDERA_SPEC_PATH" ]; then
+            echo "release gate requires inputs.feldera-spec-path"
+            exit 1
+          fi
+          if [ -z "$FELDERA_METADATA_PATH" ]; then
+            echo "release gate requires inputs.feldera-metadata-path"
+            exit 1
+          fi
+          if [ -z "$FELDERA_ARTIFACT_PACKAGE_PATH" ]; then
+            echo "release gate requires inputs.feldera-artifact-package-path"
+            exit 1
+          fi
+          if [ -z "$FELDERA_PROVENANCE_PATH" ]; then
+            echo "release gate requires inputs.feldera-provenance-path"
             exit 1
           fi
 
@@ -60,6 +96,25 @@ jobs:
           cargo run -p velorix-cli -- release-status-validate \
             --status-matrix docs/architecture/production-readiness-status.md
 
+      - name: Validate Feldera release artifact evidence
+        run: |
+          test -f "$FELDERA_SPEC_PATH"
+          test -f "$FELDERA_METADATA_PATH"
+          test -f "$FELDERA_ARTIFACT_PACKAGE_PATH"
+          test -f "$FELDERA_PROVENANCE_PATH"
+          mkdir -p target/release-evidence
+          cargo run -p velorix-cli -- feldera-artifact-verify \
+            --spec "$FELDERA_SPEC_PATH" \
+            --metadata "$FELDERA_METADATA_PATH" \
+            --artifact-package "$FELDERA_ARTIFACT_PACKAGE_PATH" \
+            --json \
+            > target/release-evidence/feldera-artifact-hash.json
+          cargo run -p velorix-cli -- feldera-artifact-provenance-verify \
+            --metadata "$FELDERA_METADATA_PATH" \
+            --provenance "$FELDERA_PROVENANCE_PATH" \
+            --json \
+            > target/release-evidence/feldera-release-provenance.json
+
       - name: Run release benchmark gate
         run: |
           test -f "$S3_BENCHMARK_RESULT_PATH"
@@ -81,3 +136,9 @@ jobs:
         with:
           name: s3-release-benchmark
           path: ${{ env.S3_BENCHMARK_RESULT_PATH }}
+
+      - name: Upload Feldera release evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: feldera-release-evidence
+          path: target/release-evidence/*.json
