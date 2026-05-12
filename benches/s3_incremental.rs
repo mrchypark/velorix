@@ -107,6 +107,10 @@ mod live_s3 {
     };
     use velorix_runtime::storage_registry::StorageRegistry;
     use velorix_storage::{
+        capability::{
+            probe_authoritative_object_store_capabilities, AuthoritativeNamespace,
+            AuthoritativeObjectStoreCapabilitiesV1, ObjectStoreCapabilityProfile,
+        },
         gc::GarbageCollectionPolicy,
         ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
         log::IngestLog,
@@ -165,13 +169,28 @@ mod live_s3 {
         metered_store: Arc<MeteredObjectStore>,
         store: Arc<dyn ObjectStore>,
     ) -> BenchResult<BenchmarkGateResultV1> {
-        let ingest_log = IngestLog::new(Arc::clone(&store));
-        let publisher = CheckpointPublisher::new(Arc::clone(&store));
+        let capabilities = probe_authoritative_object_store_capabilities(
+            store.as_ref(),
+            "s3-compatible",
+            format!("{}/runtime-recovery-capability-probes", config.run_prefix),
+        )
+        .await?;
+        let ingest_log = IngestLog::new_checked(
+            Arc::clone(&store),
+            capability_profile(&capabilities, AuthoritativeNamespace::Ingest)?,
+        )?;
+        let publisher = CheckpointPublisher::new_checked(
+            Arc::clone(&store),
+            capability_profile(&capabilities, AuthoritativeNamespace::Checkpoint)?,
+        )?;
         let mut engine = PrototypeIncrementalEngine::new();
 
-        RelationCatalogRegistry::new(Arc::clone(&store))
-            .create(&orders_sum_count_relation_catalog()?)
-            .await?;
+        RelationCatalogRegistry::new_checked(
+            Arc::clone(&store),
+            capability_profile(&capabilities, AuthoritativeNamespace::RelationCatalog)?,
+        )?
+        .create(&orders_sum_count_relation_catalog()?)
+        .await?;
 
         let mut total_records = 0;
         let mut ingest_samples = Vec::new();
@@ -250,11 +269,12 @@ mod live_s3 {
 
         let recovery_requests_before = metered_store.snapshot();
         let recovery_started = Instant::now();
-        let recovered = RecoveredRuntime::recover_with_owner_and_relation_catalog_record(
+        let recovered = RecoveredRuntime::recover_with_owner_and_relation_catalog_record_checked(
             Arc::clone(&store),
             ORDERS_SUM_COUNT_OWNER,
             ORDERS_SUM_COUNT_RELATION_ID,
             ORDERS_SUM_COUNT_RELATION_VERSION,
+            &capabilities,
         )
         .await?;
         let recovery_elapsed = recovery_started.elapsed();
@@ -655,6 +675,17 @@ mod live_s3 {
             .create_for_production_table_scan("tenant-a", "standard", production_query_policy())
             .await?;
         Ok(())
+    }
+
+    fn capability_profile(
+        capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
+        namespace: AuthoritativeNamespace,
+    ) -> BenchResult<&ObjectStoreCapabilityProfile> {
+        capabilities.profiles.get(&namespace).ok_or_else(|| {
+            bench_error(format!(
+                "missing capability profile for authoritative namespace `{namespace}`"
+            ))
+        })
     }
 
     fn production_request(

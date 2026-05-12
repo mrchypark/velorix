@@ -45,6 +45,10 @@ use velorix_runtime::{
     storage_registry::StorageRegistry,
 };
 use velorix_storage::{
+    capability::{
+        probe_authoritative_object_store_capabilities, AuthoritativeNamespace,
+        AuthoritativeObjectStoreCapabilitiesV1, ObjectStoreCapabilityProfile,
+    },
     ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
     log::{IngestLog, ReplayCheckpoint},
     manifest::{CheckpointManifest, InputRange, StateObjectRef},
@@ -148,8 +152,20 @@ async fn s3_compatible_runtime_recovery_reads_checkpoint_and_replays_validated_i
 
     let raw_store = scan_store(&config)?;
     let store = prefixed_authority_store(&config)?;
-    let ingest_log = IngestLog::new(Arc::clone(&store));
-    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let capabilities = probe_authoritative_object_store_capabilities(
+        store.as_ref(),
+        "s3-compatible",
+        format!("{}/runtime-recovery-capability-probes", config.run_prefix),
+    )
+    .await?;
+    let ingest_log = IngestLog::new_checked(
+        Arc::clone(&store),
+        capability_profile(&capabilities, AuthoritativeNamespace::Ingest)?,
+    )?;
+    let publisher = CheckpointPublisher::new_checked(
+        Arc::clone(&store),
+        capability_profile(&capabilities, AuthoritativeNamespace::Checkpoint)?,
+    )?;
 
     let checkpoint_input = delta_batch([
         input_delta("account-a", 10, 1),
@@ -161,7 +177,7 @@ async fn s3_compatible_runtime_recovery_reads_checkpoint_and_replays_validated_i
     ]);
 
     let validation = async {
-        create_recovery_relation_catalog(&store).await?;
+        create_recovery_relation_catalog(&store, &capabilities).await?;
         append_ingest_envelope(&ingest_log, 0, 2, &checkpoint_input).await?;
         append_ingest_envelope(&ingest_log, 2, 4, &replay_input).await?;
 
@@ -172,11 +188,12 @@ async fn s3_compatible_runtime_recovery_reads_checkpoint_and_replays_validated_i
             .publish_manifest(&recovery_manifest(2, state_ref))
             .await?;
 
-        let recovered = RecoveredRuntime::recover_with_owner_and_relation_catalog_record(
+        let recovered = RecoveredRuntime::recover_with_owner_and_relation_catalog_record_checked(
             Arc::clone(&store),
             ORDERS_SUM_COUNT_OWNER,
             ORDERS_SUM_COUNT_RELATION_ID,
             ORDERS_SUM_COUNT_RELATION_VERSION,
+            &capabilities,
         )
         .await?;
 
@@ -274,12 +291,27 @@ async fn create_production_query_policy(
 
 async fn create_recovery_relation_catalog(
     store: &Arc<dyn AuthorityObjectStore>,
+    capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
 ) -> Result<(), TestError> {
     let catalog = velorix_runtime::recovery::orders_sum_count_relation_catalog()?;
-    RelationCatalogRegistry::new(Arc::clone(store))
-        .create(&catalog)
-        .await?;
+    RelationCatalogRegistry::new_checked(
+        Arc::clone(store),
+        capability_profile(capabilities, AuthoritativeNamespace::RelationCatalog)?,
+    )?
+    .create(&catalog)
+    .await?;
     Ok(())
+}
+
+fn capability_profile(
+    capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
+    namespace: AuthoritativeNamespace,
+) -> Result<&ObjectStoreCapabilityProfile, TestError> {
+    capabilities.profiles.get(&namespace).ok_or_else(|| {
+        test_error(format!(
+            "missing capability profile for authoritative namespace `{namespace}`"
+        ))
+    })
 }
 
 fn production_request(
