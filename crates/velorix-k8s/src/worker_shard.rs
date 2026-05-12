@@ -1,5 +1,10 @@
 use async_trait::async_trait;
-use kube::ResourceExt;
+use futures::StreamExt;
+use kube::{
+    api::Api,
+    runtime::watcher::{self, Event},
+    Client, ResourceExt,
+};
 use thiserror::Error;
 use velorix_control::{
     control_plane_contract::{
@@ -65,6 +70,8 @@ pub enum WorkerShardError {
     Lease(Box<LeaseError>),
     #[error("ownership epoch record store failed: {0}")]
     EpochStore(String),
+    #[error("kubernetes worker shard watcher failed: {message}")]
+    Watcher { message: String },
 }
 
 impl From<LeaseError> for WorkerShardError {
@@ -196,6 +203,42 @@ where
                 .map(Some)
         }
         WorkerShardEvent::Deleted(_) => Ok(None),
+    }
+}
+
+pub async fn watch_worker_shards<L, E>(
+    client: Client,
+    namespace: &str,
+    lease_client: L,
+    epoch_store: E,
+    mut input_for_shard: impl FnMut(&VelorixWorkerShard) -> WorkerShardReconcileInput + Send,
+) -> Result<(), WorkerShardError>
+where
+    L: PartitionLeaseClient,
+    E: WorkerShardEpochStore,
+{
+    let api: Api<VelorixWorkerShard> = Api::namespaced(client, namespace);
+    let mut events = Box::pin(watcher::watcher(api, watcher::Config::default()));
+
+    while let Some(event) = events.next().await {
+        let event = event.map_err(WorkerShardError::watcher)?;
+        if let Some(event) = worker_shard_watch_event(event) {
+            let input = match &event {
+                WorkerShardEvent::Applied(shard) | WorkerShardEvent::Deleted(shard) => {
+                    input_for_shard(shard)
+                }
+            };
+            handle_worker_shard_event(event, &lease_client, &epoch_store, input).await?;
+        }
+    }
+    Ok(())
+}
+
+pub fn worker_shard_watch_event(event: Event<VelorixWorkerShard>) -> Option<WorkerShardEvent> {
+    match event {
+        Event::Apply(shard) | Event::InitApply(shard) => Some(WorkerShardEvent::Applied(shard)),
+        Event::Delete(shard) => Some(WorkerShardEvent::Deleted(shard)),
+        Event::Init | Event::InitDone => None,
     }
 }
 
@@ -433,5 +476,13 @@ fn view_status_from_worker_status(status: Option<&WorkerShardStatus>) -> Velorix
             .as_ref()
             .map(|owner| owner.owner_epoch),
         conditions: Vec::new(),
+    }
+}
+
+impl WorkerShardError {
+    fn watcher(error: watcher::Error) -> Self {
+        Self::Watcher {
+            message: error.to_string(),
+        }
     }
 }

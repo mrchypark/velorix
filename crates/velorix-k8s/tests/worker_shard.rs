@@ -4,6 +4,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use kube::runtime::watcher::Event;
 use velorix_control::{
     lease::{
         LeaseAcquireRequest, LeaseError, PartitionLeaseClient, PartitionLeaseGrant,
@@ -17,8 +18,8 @@ use velorix_k8s::{
         WorkerShardStatus,
     },
     worker_shard::{
-        handle_worker_shard_event, reconcile_worker_shard, WorkerShardCommand,
-        WorkerShardEpochStore, WorkerShardEvent, WorkerShardReconcileConfig,
+        handle_worker_shard_event, reconcile_worker_shard, worker_shard_watch_event,
+        WorkerShardCommand, WorkerShardEpochStore, WorkerShardEvent, WorkerShardReconcileConfig,
         WorkerShardReconcileInput, WorkerShardReconcileOutput,
     },
 };
@@ -161,6 +162,33 @@ async fn deleted_worker_shard_event_does_not_start_or_stop_workers() {
     .unwrap();
 
     assert_eq!(output, None);
+}
+
+#[test]
+fn worker_shard_watch_event_maps_kubernetes_events_to_reconcile_events() {
+    assert!(worker_shard_watch_event(Event::Init).is_none());
+    assert!(worker_shard_watch_event(Event::InitDone).is_none());
+
+    match worker_shard_watch_event(Event::Apply(shard())) {
+        Some(WorkerShardEvent::Applied(shard)) => {
+            assert_eq!(shard.metadata.name.as_deref(), Some("orders-p0"));
+        }
+        other => panic!("expected applied worker shard event, got {other:?}"),
+    }
+
+    match worker_shard_watch_event(Event::InitApply(shard())) {
+        Some(WorkerShardEvent::Applied(shard)) => {
+            assert_eq!(shard.metadata.name.as_deref(), Some("orders-p0"));
+        }
+        other => panic!("expected init-applied worker shard event, got {other:?}"),
+    }
+
+    match worker_shard_watch_event(Event::Delete(shard())) {
+        Some(WorkerShardEvent::Deleted(shard)) => {
+            assert_eq!(shard.metadata.name.as_deref(), Some("orders-p0"));
+        }
+        other => panic!("expected deleted worker shard event, got {other:?}"),
+    }
 }
 
 #[tokio::test]
