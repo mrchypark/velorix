@@ -19,9 +19,13 @@ use futures::{stream, stream::BoxStream, StreamExt};
 use parquet::arrow::ArrowWriter;
 use tokio::sync::Barrier;
 use velorix_core::query::{QueryError, QueryPolicy, QueryPolicyError};
-use velorix_runtime::query::{
-    query_object_backed_input_with_policy, query_object_backed_input_with_policy_and_limiter,
-    query_recovered_materialized_view_with_policy, QueryExecutionLimiter, RuntimeQueryError,
+use velorix_runtime::{
+    query::{
+        query_object_backed_input_with_policy, query_object_backed_input_with_policy_and_limiter,
+        query_production_recovered_materialized_view_with_policy_and_limiter,
+        query_recovered_materialized_view_with_policy, QueryExecutionLimiter, RuntimeQueryError,
+    },
+    recovery::{ORDERS_SUM_COUNT_RELATION_ID, ORDERS_SUM_COUNT_RELATION_VERSION},
 };
 
 #[tokio::test]
@@ -44,6 +48,70 @@ async fn query_recovered_materialized_view_requires_shared_limiter_when_concurre
         RuntimeQueryError::Query(QueryError::Policy(
             QueryPolicyError::ConcurrencyLimiterRequired {
                 max_concurrent_queries: 1
+            }
+        ))
+    ));
+}
+
+#[tokio::test]
+async fn production_recovered_query_requires_shared_limiter_when_concurrency_limit_is_set() {
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+
+    let error = query_production_recovered_materialized_view_with_policy_and_limiter(
+        Arc::clone(&store),
+        "v1/slatedb/state",
+        ORDERS_SUM_COUNT_RELATION_ID,
+        ORDERS_SUM_COUNT_RELATION_VERSION,
+        "select key_json, value_json, weight from input",
+        QueryPolicy {
+            max_concurrent_queries: Some(1),
+            ..QueryPolicy::default()
+        },
+        None,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RuntimeQueryError::Query(QueryError::Policy(
+            QueryPolicyError::ConcurrencyLimiterRequired {
+                max_concurrent_queries: 1
+            }
+        ))
+    ));
+}
+
+#[tokio::test]
+async fn production_recovered_query_rejects_limiter_that_does_not_match_policy() {
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let limiter = QueryExecutionLimiter::from_policy(QueryPolicy {
+        max_concurrent_queries: Some(2),
+        ..QueryPolicy::default()
+    })
+    .unwrap();
+
+    let error = query_production_recovered_materialized_view_with_policy_and_limiter(
+        Arc::clone(&store),
+        "v1/slatedb/state",
+        ORDERS_SUM_COUNT_RELATION_ID,
+        ORDERS_SUM_COUNT_RELATION_VERSION,
+        "select key_json, value_json, weight from input",
+        QueryPolicy {
+            max_concurrent_queries: Some(1),
+            ..QueryPolicy::default()
+        },
+        Some(limiter),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RuntimeQueryError::Query(QueryError::Policy(
+            QueryPolicyError::ConcurrencyLimiterPolicyMismatch {
+                required_max_concurrent_queries: 1,
+                actual_max_concurrent_queries: 2
             }
         ))
     ));
