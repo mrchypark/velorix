@@ -57,6 +57,12 @@ VELORIX_K8S_INTEGRATION=1 VELORIX_K8S_NAMESPACE=velorix-live \
   cargo test -p velorix-k8s --test live_worker_shard -- --nocapture --test-threads=1
 ```
 
+Run the full local vind gate:
+
+```bash
+scripts/run-vind-k8s-gate.sh
+```
+
 Clean up the cluster when done:
 
 ```bash
