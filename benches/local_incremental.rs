@@ -42,7 +42,7 @@ use velorix_runtime::recovery::{
     ORDERS_SUM_COUNT_RELATION_ID, ORDERS_SUM_COUNT_RELATION_VERSION,
 };
 use velorix_storage::{
-    gc::GarbageCollectionPolicy,
+    gc::{GarbageCollectionPlan, GarbageCollectionPolicy},
     ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
     log::IngestLog,
     manifest::{CheckpointManifest, InputRange},
@@ -56,6 +56,7 @@ const PARTITION_ID: u32 = 0;
 const BATCH_COUNT: u64 = 64;
 const RECORDS_PER_BATCH: u64 = 16;
 const CHECKPOINT_VERSION: u64 = 0;
+const GC_EXECUTION_RUN_ID: &str = "local-incremental-gc-execution";
 
 type BenchResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -63,6 +64,14 @@ struct MeasuredWorkload {
     samples: Vec<Duration>,
     object_requests: ObjectRequestMetricsV1,
     scan_bytes: u64,
+}
+
+struct GcDryRunPlanningWorkload {
+    measurement: MeasuredWorkload,
+    policy: GarbageCollectionPolicy,
+    plan: GarbageCollectionPlan,
+    released_checkpoint_version: u64,
+    released_object_key: String,
 }
 
 fn main() -> BenchResult<()> {
@@ -180,6 +189,8 @@ async fn run() -> BenchResult<()> {
         total_records,
     )
     .await?;
+    let gc_execution_evidence =
+        gc_execution_evidence(&publisher, &metered_store, &gc_dry_run_planning).await?;
     let slatedb_state_reopen =
         slatedb_state_reopen(Arc::clone(&store), Arc::clone(&metered_store)).await?;
     let datafusion_scan = datafusion_table_scan().await?;
@@ -242,9 +253,15 @@ async fn run() -> BenchResult<()> {
             ),
             workload_metric(
                 "gc_dry_run_planning",
-                &gc_dry_run_planning.samples,
-                gc_dry_run_planning.object_requests,
-                gc_dry_run_planning.scan_bytes,
+                &gc_dry_run_planning.measurement.samples,
+                gc_dry_run_planning.measurement.object_requests,
+                gc_dry_run_planning.measurement.scan_bytes,
+            ),
+            workload_metric(
+                "gc_execution_evidence",
+                &gc_execution_evidence.samples,
+                gc_execution_evidence.object_requests,
+                gc_execution_evidence.scan_bytes,
             ),
         ],
     };
@@ -260,7 +277,7 @@ async fn gc_dry_run_planning(
     metered_store: &MeteredObjectStore,
     previous_state_key: &str,
     parent_end_offset_exclusive: u64,
-) -> BenchResult<MeasuredWorkload> {
+) -> BenchResult<GcDryRunPlanningWorkload> {
     let retained_state = StateObjectWrite::new(
         ORDERS_SUM_COUNT_OWNER,
         PARTITION_ID,
@@ -315,13 +332,12 @@ async fn gc_dry_run_planning(
         })
         .await?;
 
+    let policy = GarbageCollectionPolicy {
+        retain_latest_manifests: 1,
+    };
     let requests_before = metered_store.snapshot();
     let started = Instant::now();
-    let plan = publisher
-        .plan_garbage_collection(GarbageCollectionPolicy {
-            retain_latest_manifests: 1,
-        })
-        .await?;
+    let plan = publisher.plan_garbage_collection(policy).await?;
     let elapsed = started.elapsed();
 
     assert_eq!(
@@ -337,6 +353,57 @@ async fn gc_dry_run_planning(
     assert!(candidate_keys.contains(&previous_state_key));
     assert!(candidate_keys.contains(&orphan_state.object_key().as_str()));
     assert!(candidate_keys.contains(&orphan_output.object_key().as_str()));
+
+    Ok(GcDryRunPlanningWorkload {
+        measurement: MeasuredWorkload {
+            samples: vec![elapsed],
+            object_requests: request_delta(&metered_store.snapshot(), &requests_before),
+            scan_bytes: 0,
+        },
+        policy,
+        plan,
+        released_checkpoint_version: CHECKPOINT_VERSION,
+        released_object_key: previous_state_key.to_string(),
+    })
+}
+
+async fn gc_execution_evidence(
+    publisher: &CheckpointPublisher,
+    metered_store: &MeteredObjectStore,
+    planning: &GcDryRunPlanningWorkload,
+) -> BenchResult<MeasuredWorkload> {
+    let requests_before = metered_store.snapshot();
+    let started = Instant::now();
+    let run = publisher
+        .execute_garbage_collection_plan_with_evidence(
+            GC_EXECUTION_RUN_ID,
+            planning.policy,
+            &planning.plan,
+        )
+        .await?;
+    let read_back = publisher
+        .read_garbage_collection_run_evidence(GC_EXECUTION_RUN_ID)
+        .await?;
+    let retention_record = publisher
+        .read_checkpoint_retention_record(planning.released_checkpoint_version)
+        .await?;
+    let elapsed = started.elapsed();
+
+    assert_eq!(read_back, run);
+    assert_eq!(retention_record.gc_run_id, GC_EXECUTION_RUN_ID);
+    assert_eq!(
+        retention_record.retained_manifest_versions,
+        run.plan.retained_manifest_versions
+    );
+    assert!(run
+        .report
+        .deleted
+        .iter()
+        .any(|candidate| candidate.object_key.as_str() == planning.released_object_key));
+    assert!(retention_record
+        .deleted_candidate_keys
+        .iter()
+        .any(|object_key| object_key.as_str() == planning.released_object_key));
 
     Ok(MeasuredWorkload {
         samples: vec![elapsed],

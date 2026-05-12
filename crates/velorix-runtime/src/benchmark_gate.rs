@@ -564,6 +564,7 @@ fn is_object_backed_workload(name: &str) -> bool {
             | "datafusion_table_scan"
             | "slatedb_state_reopen"
             | "gc_dry_run_planning"
+            | "gc_execution_evidence"
     )
 }
 

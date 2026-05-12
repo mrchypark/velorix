@@ -142,6 +142,7 @@ fn benchmark_gate_can_require_specific_workload_names() {
             "datafusion_table_scan",
             "slatedb_state_reopen",
             "gc_dry_run_planning",
+            "gc_execution_evidence",
         ])
         .unwrap();
 }
@@ -231,7 +232,7 @@ fn benchmark_comparison_fails_when_baseline_lacks_workload_metric() {
 
     assert!(matches!(
         error,
-        BenchmarkGateError::MissingBaselineWorkload { name } if name == "gc_dry_run_planning"
+        BenchmarkGateError::MissingBaselineWorkload { name } if name == "gc_execution_evidence"
     ));
 }
 
@@ -247,7 +248,7 @@ fn benchmark_comparison_fails_when_current_lacks_baseline_workload_metric() {
 
     assert!(matches!(
         error,
-        BenchmarkGateError::MissingCurrentWorkload { name } if name == "gc_dry_run_planning"
+        BenchmarkGateError::MissingCurrentWorkload { name } if name == "gc_execution_evidence"
     ));
 }
 
@@ -387,6 +388,20 @@ fn local_workload_metrics() -> Vec<BenchmarkWorkloadMetricsV1> {
             }),
             scan_bytes: 0,
         },
+        BenchmarkWorkloadMetricsV1 {
+            name: "gc_execution_evidence".to_string(),
+            p50_ms: 4.0,
+            p95_ms: 5.0,
+            object_requests: Some(ObjectRequestMetricsV1 {
+                put_count: 1,
+                get_count: 4,
+                list_count: 4,
+                range_read_count: 0,
+                bytes_written: 1024,
+                bytes_read: 2048,
+            }),
+            scan_bytes: 0,
+        },
     ]
 }
 
@@ -497,6 +512,20 @@ const VALID_LOCAL_SMOKE_JSON: &str = r#"{
                 "range_read_count": 0,
                 "bytes_written": 0,
                 "bytes_read": 1024
+            },
+            "scan_bytes": 0
+        },
+        {
+            "name": "gc_execution_evidence",
+            "p50_ms": 4.0,
+            "p95_ms": 5.0,
+            "object_requests": {
+                "put_count": 1,
+                "get_count": 4,
+                "list_count": 4,
+                "range_read_count": 0,
+                "bytes_written": 1024,
+                "bytes_read": 2048
             },
             "scan_bytes": 0
         }

@@ -22,7 +22,16 @@ use velorix_runtime::readiness::{
     ProductionReadinessEvidenceV1, ProductionReadinessReportV1,
 };
 
-const BENCHMARK_GATE_WORKLOADS: &[&str] = &[
+const LOCAL_BENCHMARK_GATE_WORKLOADS: &[&str] = &[
+    "ingest_envelope_validation",
+    "checkpoint_publish",
+    "checkpoint_recovery",
+    "datafusion_table_scan",
+    "slatedb_state_reopen",
+    "gc_dry_run_planning",
+    "gc_execution_evidence",
+];
+const S3_COMPATIBLE_BENCHMARK_GATE_WORKLOADS: &[&str] = &[
     "ingest_envelope_validation",
     "checkpoint_publish",
     "checkpoint_recovery",
@@ -1226,7 +1235,7 @@ fn run_benchmark_gate(
                 )
             })?;
         current_result
-            .require_workloads(BENCHMARK_GATE_WORKLOADS)
+            .require_workloads(benchmark_gate_workloads_for_backend(backend))
             .with_context(|| {
                 format!(
                     "benchmark result {} is missing required workload metrics",
@@ -1262,7 +1271,7 @@ fn run_benchmark_gate(
                 )
             })?;
         baseline_result
-            .require_workloads(BENCHMARK_GATE_WORKLOADS)
+            .require_workloads(benchmark_gate_workloads_for_backend(backend))
             .with_context(|| {
                 format!(
                     "benchmark baseline {} is missing required workload metrics",
@@ -1286,6 +1295,13 @@ fn run_benchmark_gate(
             BenchmarkBudgetV1::relative(max_regression_fraction),
         )
         .context("benchmark result exceeds gate")
+}
+
+fn benchmark_gate_workloads_for_backend(backend: BenchmarkBackend) -> &'static [&'static str] {
+    match backend {
+        BenchmarkBackend::Local => LOCAL_BENCHMARK_GATE_WORKLOADS,
+        BenchmarkBackend::S3Compatible => S3_COMPATIBLE_BENCHMARK_GATE_WORKLOADS,
+    }
 }
 
 fn has_placeholder_commit(result: &BenchmarkGateResultV1) -> bool {
@@ -1380,6 +1396,40 @@ mod tests {
         fs::write(&result, valid_result_json()).unwrap();
 
         run_benchmark_gate(None, &result, None, None, None).unwrap();
+    }
+
+    #[test]
+    fn benchmark_gate_validate_only_requires_local_gc_execution_evidence() {
+        let dir = tempdir().unwrap();
+        let result = dir.path().join("result.json");
+        fs::write(&result, missing_gc_execution_workload_json()).unwrap();
+
+        let error = run_benchmark_gate(
+            None,
+            &result,
+            Some(BenchmarkGateLevel::PrSmoke),
+            Some(BenchmarkBackend::Local),
+            None,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("gc_execution_evidence"));
+    }
+
+    #[test]
+    fn benchmark_gate_validate_only_accepts_s3_without_local_gc_execution_evidence() {
+        let dir = tempdir().unwrap();
+        let result = dir.path().join("result.json");
+        fs::write(&result, s3_result_json()).unwrap();
+
+        run_benchmark_gate(
+            None,
+            &result,
+            Some(BenchmarkGateLevel::PrSmoke),
+            Some(BenchmarkBackend::S3Compatible),
+            None,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -2872,7 +2922,7 @@ mod tests {
             "s3_compatible",
             "s3_incremental",
             1000.0,
-            workload_metrics(),
+            s3_workload_metrics(),
         ))
         .unwrap()
     }
@@ -2884,7 +2934,7 @@ mod tests {
             "s3_compatible",
             "s3_incremental",
             1000.0,
-            workload_metrics(),
+            s3_workload_metrics(),
         ))
         .unwrap()
     }
@@ -2896,7 +2946,7 @@ mod tests {
             "s3_compatible",
             "s3_incremental",
             1000.0,
-            workload_metrics(),
+            s3_workload_metrics(),
         ))
         .unwrap()
     }
@@ -2927,6 +2977,18 @@ mod tests {
                 workload_metrics()[3],
                 workload_metrics()[4]
             ]),
+        ))
+        .unwrap()
+    }
+
+    fn missing_gc_execution_workload_json() -> String {
+        serde_json::to_string_pretty(&normal_result(
+            "abc123",
+            "pr_smoke",
+            "local",
+            "local_incremental",
+            1000.0,
+            s3_workload_metrics(),
         ))
         .unwrap()
     }
@@ -3159,6 +3221,26 @@ mod tests {
                 },
                 "scan_bytes": 0,
             },
+            {
+                "name": "gc_execution_evidence",
+                "p50_ms": 4.0,
+                "p95_ms": 5.0,
+                "object_requests": {
+                    "put_count": 1,
+                    "get_count": 4,
+                    "list_count": 4,
+                    "range_read_count": 0,
+                    "bytes_written": 1024,
+                    "bytes_read": 2048,
+                },
+                "scan_bytes": 0,
+            },
         ])
+    }
+
+    fn s3_workload_metrics() -> serde_json::Value {
+        let mut workloads = workload_metrics().as_array().unwrap().clone();
+        workloads.retain(|workload| workload["name"] != "gc_execution_evidence");
+        serde_json::Value::Array(workloads)
     }
 }

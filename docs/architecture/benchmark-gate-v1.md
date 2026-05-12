@@ -46,8 +46,11 @@ This does not expose SlateDB internals or make object-request metering part of
 the state-store API. The GC dry-run workload prepares a small retained/orphan
 state-output set, calls `CheckpointPublisher::plan_garbage_collection`, asserts
 the retained checkpoint and candidates, and records local metered object-store
-requests. It does not execute deletion, test listing-consistency failure modes,
-or provide S3-compatible evidence.
+requests. The local GC execution workload reuses that fixture, calls
+`execute_garbage_collection_plan_with_evidence`, reads back the persisted
+`GcRunV1`, verifies checkpoint-retention evidence for the released checkpoint
+object, and records local object-store requests. It does not test
+listing-consistency failure modes or provide S3-compatible evidence.
 
 ## Required Workloads
 
@@ -60,6 +63,7 @@ or provide S3-compatible evidence.
 - DataFusion bounded Parquet scan.
 - SlateDB state write/read/reopen latency.
 - GC dry-run planning latency.
+- Local-only GC execution evidence latency.
 - Many-small-file scan.
 - Duplicate retry latency.
 - Corrupt payload detection.
