@@ -19,7 +19,8 @@ use velorix_runtime::benchmark_gate::{
 use velorix_runtime::readiness::{
     verify_feldera_artifact_hash_evidence, verify_feldera_artifact_release_provenance_evidence,
     FelderaArtifactHashVerifiedEvidenceV1, FelderaArtifactReleaseProvenanceEvidenceV1,
-    ProductionReadinessEvidenceV1, ProductionReadinessReportV1,
+    ProductionReadinessEvidenceV1, ProductionReadinessReportV1, ReadinessEvidenceKind,
+    ReadinessStatus,
 };
 
 const LOCAL_BENCHMARK_GATE_WORKLOADS: &[&str] = &[
@@ -424,12 +425,11 @@ fn read_readiness_report(
     let evidence = ProductionReadinessEvidenceV1::from_json_str(&contents)
         .with_context(|| format!("failed to parse readiness evidence {}", path.display()))?;
     let report = evidence.try_into_report().map_err(anyhow::Error::msg)?;
-    validate_readiness_release_artifacts(&report, artifacts)?;
+    validate_readiness_release_artifacts(artifacts)?;
     Ok(report)
 }
 
 fn validate_readiness_release_artifacts(
-    _report: &ProductionReadinessReportV1,
     artifacts: &ReadinessReleaseArtifactPaths,
 ) -> anyhow::Result<()> {
     if artifacts.require_release_artifacts {
@@ -529,13 +529,41 @@ fn validate_feldera_release_evidence_artifacts(
     let provenance: FelderaArtifactReleaseProvenanceEvidenceV1 =
         read_json_artifact(provenance_path)?;
 
-    if hash.status != velorix_runtime::readiness::ReadinessStatus::Pass {
+    if hash.schema_version != 1 {
+        bail!(
+            "{} has unsupported schema_version {}, expected 1",
+            hash_path.display(),
+            hash.schema_version
+        );
+    }
+    if provenance.schema_version != 1 {
+        bail!(
+            "{} has unsupported schema_version {}, expected 1",
+            provenance_path.display(),
+            provenance.schema_version
+        );
+    }
+    if hash.evidence_kind != ReadinessEvidenceKind::FelderaArtifactHashVerified {
+        bail!(
+            "{} has evidence_kind {:?}, expected feldera_artifact_hash_verified",
+            hash_path.display(),
+            hash.evidence_kind
+        );
+    }
+    if provenance.evidence_kind != ReadinessEvidenceKind::FelderaArtifactReleaseProvenance {
+        bail!(
+            "{} has evidence_kind {:?}, expected feldera_artifact_release_provenance",
+            provenance_path.display(),
+            provenance.evidence_kind
+        );
+    }
+    if hash.status != ReadinessStatus::Pass {
         bail!(
             "{} Feldera artifact hash evidence is not pass",
             hash_path.display()
         );
     }
-    if provenance.status != velorix_runtime::readiness::ReadinessStatus::Pass {
+    if provenance.status != ReadinessStatus::Pass {
         bail!(
             "{} Feldera release provenance evidence is not pass",
             provenance_path.display()
@@ -2785,6 +2813,36 @@ mod tests {
         .unwrap_err();
 
         assert!(format!("{error:#}").contains("do not describe the same artifact"));
+    }
+
+    #[test]
+    fn readiness_report_rejects_wrong_feldera_hash_evidence_kind() {
+        let dir = tempdir().unwrap();
+        let readiness = dir.path().join("readiness.json");
+        let feldera_hash = dir.path().join("feldera-hash.json");
+        let feldera_provenance = dir.path().join("feldera-provenance.json");
+        fs::write(&readiness, readiness_json()).unwrap();
+        fs::write(
+            &feldera_hash,
+            feldera_hash_evidence_json().replace(
+                "feldera_artifact_hash_verified",
+                "feldera_artifact_release_provenance",
+            ),
+        )
+        .unwrap();
+        fs::write(&feldera_provenance, feldera_provenance_evidence_json()).unwrap();
+
+        let error = read_readiness_report(
+            &readiness,
+            &ReadinessReleaseArtifactPaths {
+                feldera_artifact_hash_evidence: Some(feldera_hash),
+                feldera_release_provenance_evidence: Some(feldera_provenance),
+                ..ReadinessReleaseArtifactPaths::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("expected feldera_artifact_hash_verified"));
     }
 
     #[test]
