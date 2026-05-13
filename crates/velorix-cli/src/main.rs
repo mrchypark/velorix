@@ -3791,13 +3791,18 @@ mod tests {
 
     fn readiness_json() -> String {
         serde_json::json!({
-            "schema_version": 2,
+            "schema_version": 3,
             "deployment_id": "prod-a",
             "authority_store_id": "s3://velorix-prod",
             "capability_status": {
                 "status": "pass",
                 "evidence": "s3-compatible capability probe",
                 "evidence_kind": ["s3_compatible"]
+            },
+            "s3_compatible_test_status": {
+                "status": "pass",
+                "evidence": "S3-compatible integration harness",
+                "evidence_kind": ["s3_compatible_integration_harness"]
             },
             "ownership_status": {
                 "status": "pass",

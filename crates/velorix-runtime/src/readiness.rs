@@ -4,7 +4,7 @@ use velorix_core::feldera_artifact::{
     FelderaCompileArtifactMetadata, FelderaReleaseArtifactProvenanceV1, StandingViewSpec,
 };
 
-const PRODUCTION_READINESS_SCHEMA_VERSION: u16 = 2;
+const PRODUCTION_READINESS_SCHEMA_VERSION: u16 = 3;
 const FELDERA_ARTIFACT_EVIDENCE_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -14,6 +14,7 @@ pub struct ProductionReadinessEvidenceV1 {
     pub deployment_id: String,
     pub authority_store_id: String,
     pub capability_status: ReadinessCheck,
+    pub s3_compatible_test_status: ReadinessCheck,
     pub ownership_status: ReadinessCheck,
     pub checkpoint_status: ReadinessCheck,
     pub ingest_status: ReadinessCheck,
@@ -48,6 +49,7 @@ pub enum ReadinessStatus {
 #[serde(rename_all = "snake_case")]
 pub enum ReadinessEvidenceKind {
     S3Compatible,
+    S3CompatibleIntegrationHarness,
     KubernetesLeaseClient,
     BootstrapRawStatePath,
     DurableOwnershipEpochRecord,
@@ -106,6 +108,7 @@ pub struct ProductionReadinessReportV1 {
     pub deployment_id: String,
     pub authority_store_id: String,
     pub capability_status: ReadinessCheck,
+    pub s3_compatible_test_status: ReadinessCheck,
     pub ownership_status: ReadinessCheck,
     pub checkpoint_status: ReadinessCheck,
     pub ingest_status: ReadinessCheck,
@@ -148,6 +151,11 @@ impl ProductionReadinessEvidenceV1 {
             &mut blocking_reasons,
             "capability_status",
             &self.capability_status,
+        );
+        push_check_blockers(
+            &mut blocking_reasons,
+            "s3_compatible_test_status",
+            &self.s3_compatible_test_status,
         );
         push_check_blockers(
             &mut blocking_reasons,
@@ -203,6 +211,15 @@ impl ProductionReadinessEvidenceV1 {
             .has_evidence(ReadinessEvidenceKind::S3Compatible)
         {
             blocking_reasons.push("capability_status missing s3_compatible evidence".to_string());
+        }
+        if !self
+            .s3_compatible_test_status
+            .has_evidence(ReadinessEvidenceKind::S3CompatibleIntegrationHarness)
+        {
+            blocking_reasons.push(
+                "s3_compatible_test_status missing s3_compatible_integration_harness evidence"
+                    .to_string(),
+            );
         }
         if !self
             .kubernetes_status
@@ -341,6 +358,7 @@ impl ProductionReadinessEvidenceV1 {
             deployment_id: self.deployment_id,
             authority_store_id: self.authority_store_id,
             capability_status: self.capability_status,
+            s3_compatible_test_status: self.s3_compatible_test_status,
             ownership_status: self.ownership_status,
             checkpoint_status: self.checkpoint_status,
             ingest_status: self.ingest_status,

@@ -77,6 +77,24 @@ fn readiness_report_blocks_when_s3_compatible_evidence_is_missing() {
 }
 
 #[test]
+fn readiness_report_blocks_when_s3_compatible_integration_harness_evidence_is_missing() {
+    let report = ProductionReadinessEvidenceV1::from_json_str(&readiness_json(
+        &["s3_compatible_integration_harness"],
+        false,
+        &[],
+    ))
+    .unwrap()
+    .try_into_report()
+    .unwrap();
+
+    assert!(!report.production_ready);
+    assert_eq!(
+        report.blocking_reasons,
+        vec!["s3_compatible_test_status missing s3_compatible_integration_harness evidence"]
+    );
+}
+
+#[test]
 fn readiness_report_blocks_when_kubernetes_lease_client_evidence_is_missing() {
     let report = ProductionReadinessEvidenceV1::from_json_str(&readiness_json(
         &["kubernetes_lease_client"],
@@ -477,10 +495,11 @@ fn feldera_release_provenance_verifier_outputs_stable_readiness_evidence() {
 fn readiness_evidence_rejects_unknown_json_fields() {
     let error = ProductionReadinessEvidenceV1::from_json_str(
         r#"{
-            "schema_version": 2,
+            "schema_version": 3,
             "deployment_id": "prod-a",
             "authority_store_id": "s3://velorix-prod",
             "capability_status": { "status": "pass", "evidence": "s3-compatible capability probe", "evidence_kind": ["s3_compatible"] },
+            "s3_compatible_test_status": { "status": "pass", "evidence": "S3-compatible integration harness", "evidence_kind": ["s3_compatible_integration_harness"] },
             "ownership_status": { "status": "pass", "evidence": "durable epoch record", "evidence_kind": ["durable_ownership_epoch_record"] },
             "checkpoint_status": { "status": "pass", "evidence": "published checkpoint lifecycle", "evidence_kind": ["published_checkpoint_lifecycle_record"] },
             "ingest_status": { "status": "pass", "evidence": "catalog-backed ingest admission", "evidence_kind": ["catalog_backed_ingest_admission"] },
@@ -504,13 +523,13 @@ fn readiness_evidence_rejects_unknown_json_fields() {
 #[test]
 fn readiness_report_rejects_unsupported_schema_version() {
     let error = ProductionReadinessEvidenceV1::from_json_str(
-        &readiness_json(&[], false, &[]).replace("\"schema_version\": 2", "\"schema_version\": 1"),
+        &readiness_json(&[], false, &[]).replace("\"schema_version\": 3", "\"schema_version\": 2"),
     )
     .unwrap()
     .try_into_report()
     .unwrap_err();
 
-    assert!(error.contains("unsupported readiness schema_version 1"));
+    assert!(error.contains("unsupported readiness schema_version 2"));
 }
 
 fn readiness_json(
@@ -523,6 +542,12 @@ fn readiness_json(
     } else {
         ""
     };
+    let s3_compatible_test_kind =
+        if !missing_evidence.contains(&"s3_compatible_integration_harness") {
+            r#", "evidence_kind": ["s3_compatible_integration_harness"]"#
+        } else {
+            ""
+        };
     let ownership_kind = if !missing_evidence.contains(&"durable_ownership_epoch_record") {
         r#", "evidence_kind": ["durable_ownership_epoch_record"]"#
     } else {
@@ -618,10 +643,11 @@ fn readiness_json(
 
     format!(
         r#"{{
-            "schema_version": 2,
+            "schema_version": 3,
             "deployment_id": "prod-a",
             "authority_store_id": "s3://velorix-prod",
             "capability_status": {{ "status": "pass", "evidence": "s3-compatible capability probe"{capability_kind} }},
+            "s3_compatible_test_status": {{ "status": "pass", "evidence": "S3-compatible integration harness"{s3_compatible_test_kind} }},
             "ownership_status": {{ "status": "pass", "evidence": "durable epoch record"{ownership_kind} }},
             "checkpoint_status": {{ "status": "pass", "evidence": "published checkpoint lifecycle"{checkpoint_kind} }},
             "ingest_status": {{ "status": "{ingest_status}", "evidence": "{ingest_evidence}"{ingest_kind} }},
