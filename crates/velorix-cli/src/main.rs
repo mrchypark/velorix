@@ -60,6 +60,7 @@ const REQUIRED_RELEASE_CONTRACTS: &[&str] = &[
 ];
 use velorix_runtime::recovery::{RecoveredRuntime, ORDERS_SUM_COUNT_OWNER};
 use velorix_storage::{
+    capability::probe_authoritative_object_store_capabilities,
     checkpoint_index::{
         CheckpointAdminInspection, CheckpointLifecycleStatus, CheckpointManifestInspectionStatus,
         CheckpointRetentionRecordV1,
@@ -1871,28 +1872,28 @@ async fn recover_local_runtime(
             .await?,
         ),
         (Some(db_path), Some(checkpoint_version)) => {
-            let relation_catalog = RelationCatalogRegistry::new(Arc::clone(&store))
-                .read(&relation_id, &relation_version)
-                .await?;
-            Ok(RecoveredRuntime::recover_from_published_checkpoint_version_with_slatedb_state_store_and_relation_catalog(
+            let capabilities = recover_local_capabilities(store.as_ref()).await?;
+            Ok(RecoveredRuntime::recover_from_published_checkpoint_version_with_slatedb_state_store_and_relation_catalog_record_checked(
                 store,
                 db_path,
                 checkpoint_version,
                 ORDERS_SUM_COUNT_OWNER,
-                relation_catalog,
+                &relation_id,
+                &relation_version,
+                &capabilities,
             )
             .await?)
         }
         (Some(db_path), None) => {
-            let relation_catalog = RelationCatalogRegistry::new(Arc::clone(&store))
-                .read(&relation_id, &relation_version)
-                .await?;
+            let capabilities = recover_local_capabilities(store.as_ref()).await?;
             Ok(
-                RecoveredRuntime::recover_with_slatedb_state_store_and_relation_catalog(
+                RecoveredRuntime::recover_with_slatedb_state_store_and_catalog_record_checked(
                     store,
                     db_path,
                     ORDERS_SUM_COUNT_OWNER,
-                    relation_catalog,
+                    &relation_id,
+                    &relation_version,
+                    &capabilities,
                 )
                 .await?,
             )
@@ -1910,6 +1911,17 @@ async fn recover_local_runtime(
             .await?)
         }
     }
+}
+
+async fn recover_local_capabilities(
+    store: &dyn ObjectStore,
+) -> anyhow::Result<velorix_storage::capability::AuthoritativeObjectStoreCapabilitiesV1> {
+    Ok(probe_authoritative_object_store_capabilities(
+        store,
+        "recover-local",
+        "recover-local-capability-probes",
+    )
+    .await?)
 }
 
 fn format_checkpoint_inspection(inspection: &CheckpointAdminInspection) -> String {
@@ -2241,12 +2253,14 @@ mod tests {
 
     use super::*;
     use bytes::Bytes;
+    use object_store::path::Path as ObjectStorePath;
     use tempfile::tempdir;
     use velorix_runtime::recovery::{orders_sum_count_relation_catalog, RecoveryError};
     use velorix_storage::{
         checkpoint_index::{
             CheckpointAdminInspection, CheckpointLifecycleStatus, CheckpointManifestInspection,
-            CheckpointManifestInspectionStatus,
+            CheckpointManifestInspectionStatus, CheckpointRecoveryMode,
+            CheckpointRecoveryTransitionRecordV1,
         },
         gc::{GarbageCollectionCandidate, GarbageCollectionCandidateKind, GarbageCollectionReport},
         manifest::{CheckpointManifest, InputRange},
@@ -2597,6 +2611,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recover_local_runtime_slatedb_latest_checks_capabilities_before_catalog_recovery() {
+        let dir = tempdir().unwrap();
+        let prefix_file = dir.path().join("not-a-directory");
+        fs::write(&prefix_file, b"not a directory").unwrap();
+        let store = local_object_store(&prefix_file).unwrap();
+
+        let error = recover_local_runtime(
+            store,
+            "orders".to_string(),
+            "2026-05-05.v1".to_string(),
+            Some("v1/slatedb/state".to_string()),
+            None,
+            false,
+        )
+        .await
+        .unwrap_err();
+
+        assert_recover_local_capability_probe_failed_before_recovery(error);
+    }
+
+    #[tokio::test]
+    async fn recover_local_runtime_slatedb_selected_checkpoint_checks_capabilities_before_recovery()
+    {
+        let dir = tempdir().unwrap();
+        let prefix_file = dir.path().join("not-a-directory");
+        fs::write(&prefix_file, b"not a directory").unwrap();
+        let store = local_object_store(&prefix_file).unwrap();
+
+        let error = recover_local_runtime(
+            store,
+            "orders".to_string(),
+            "2026-05-05.v1".to_string(),
+            Some("v1/slatedb/state".to_string()),
+            Some(7),
+            false,
+        )
+        .await
+        .unwrap_err();
+
+        assert_recover_local_capability_probe_failed_before_recovery(error);
+    }
+
+    #[tokio::test]
     async fn recover_local_runtime_allows_raw_state_with_bootstrap_flag() {
         let dir = tempdir().unwrap();
         let store = local_object_store(dir.path()).unwrap();
@@ -2665,7 +2722,7 @@ mod tests {
         drop(publisher);
 
         let recovered = recover_local_runtime(
-            store,
+            Arc::clone(&store),
             relation_id,
             relation_version,
             Some("v1/slatedb/state".to_string()),
@@ -2677,6 +2734,114 @@ mod tests {
 
         assert_eq!(recovered.latest_checkpoint_version(), Some(0));
         assert_eq!(recovered.replayed_batch_count(), 0);
+        assert_eq!(
+            single_recovery_transition_record(store.as_ref(), 0)
+                .await
+                .recovery_mode,
+            CheckpointRecoveryMode::SelectedCheckpoint
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_local_runtime_uses_slatedb_state_store_for_latest_checkpoint() {
+        let dir = tempdir().unwrap();
+        let store = local_object_store(dir.path()).unwrap();
+        let catalog = orders_sum_count_relation_catalog().unwrap();
+        let relation_id = catalog.relation_schema.relation_id.clone();
+        let relation_version = catalog.relation_schema.relation_version.clone();
+        RelationCatalogRegistry::new(Arc::clone(&store))
+            .create(&catalog)
+            .await
+            .unwrap();
+        let publisher =
+            CheckpointPublisher::with_slatedb_state_store(Arc::clone(&store), "v1/slatedb/state")
+                .await
+                .unwrap();
+        let state = StateObjectWrite::new(
+            ORDERS_SUM_COUNT_OWNER,
+            0,
+            0,
+            "state-0000",
+            Bytes::from_static(br#"{"records":[]}"#),
+        )
+        .unwrap();
+        let state_ref = publisher.write_state_object(&state).await.unwrap();
+        publisher
+            .publish_manifest(&CheckpointManifest {
+                schema_version: 1,
+                checkpoint_version: 0,
+                input_ranges: vec![InputRange {
+                    stream_id: "orders".to_string(),
+                    partition_id: 0,
+                    start_offset_inclusive: 0,
+                    end_offset_exclusive: 1,
+                }],
+                state_objects: vec![state_ref],
+                output_objects: vec![],
+                parent_checkpoint: None,
+                created_at: "2026-05-06T00:00:00Z".to_string(),
+            })
+            .await
+            .unwrap();
+        drop(publisher);
+
+        let recovered = recover_local_runtime(
+            Arc::clone(&store),
+            relation_id,
+            relation_version,
+            Some("v1/slatedb/state".to_string()),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(recovered.latest_checkpoint_version(), Some(0));
+        assert_eq!(recovered.replayed_batch_count(), 0);
+        assert_eq!(
+            single_recovery_transition_record(store.as_ref(), 0)
+                .await
+                .recovery_mode,
+            CheckpointRecoveryMode::SlateDbLatest
+        );
+    }
+
+    async fn single_recovery_transition_record(
+        store: &dyn ObjectStore,
+        checkpoint_version: u64,
+    ) -> CheckpointRecoveryTransitionRecordV1 {
+        let prefix = format!("v1/checkpoint-recovery/{checkpoint_version:020}/transitions");
+        let listing = store
+            .list_with_delimiter(Some(&ObjectStorePath::from(prefix)))
+            .await
+            .unwrap();
+        let objects = listing.objects;
+        assert_eq!(objects.len(), 1);
+
+        let bytes = store
+            .get(&objects[0].location)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn assert_recover_local_capability_probe_failed_before_recovery(error: anyhow::Error) {
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("capability probe write failed"),
+            "expected recover-local SlateDB path to fail in capability probe, got: {message}"
+        );
+        assert!(
+            !message.contains("relation catalog"),
+            "capability gate should run before relation-catalog recovery, got: {message}"
+        );
+        assert!(
+            !message.contains("published checkpoint"),
+            "capability gate should run before checkpoint recovery, got: {message}"
+        );
     }
 
     #[test]

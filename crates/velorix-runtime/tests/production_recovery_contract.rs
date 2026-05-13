@@ -52,6 +52,18 @@ fn production_recovery_contract_forbids_direct_bootstrap_recovery_callers() {
             "    RecoveredRuntime::recover_with_owner_and_relation_catalog_record(store, owner, relation_id, relation_version).await?;",
             "RecoveredRuntime::recover_with_owner_and_relation_catalog_record(",
         ),
+        (
+            "    RecoveredRuntime::recover_with_slatedb_state_store_and_relation_catalog(store, db_path, owner, catalog).await?;",
+            "RecoveredRuntime::recover_with_slatedb_state_store_and_relation_catalog(",
+        ),
+        (
+            "    RecoveredRuntime::recover_from_published_checkpoint_version_with_slatedb_state_store_and_relation_catalog(store, db_path, 7, owner, catalog).await?;",
+            "RecoveredRuntime::recover_from_published_checkpoint_version_with_slatedb_state_store_and_relation_catalog(",
+        ),
+        (
+            "    RecoveredRuntime::recover_from_published_checkpoint_version_with_owner_and_relation_catalog(store, 7, owner, catalog).await?;",
+            "RecoveredRuntime::recover_from_published_checkpoint_version_with_owner_and_relation_catalog(",
+        ),
     ] {
         assert_eq!(
             forbidden_bootstrap_recovery_use(workspace, &source, &[line], 0),
@@ -114,6 +126,9 @@ fn forbidden_bootstrap_recovery_patterns() -> &'static [&'static str] {
         "RecoveredRuntime::recover_with_owner(",
         "RecoveredRuntime::recover_from_published_checkpoint_version(",
         "RecoveredRuntime::recover_with_owner_and_relation_catalog_record(",
+        "RecoveredRuntime::recover_with_slatedb_state_store_and_relation_catalog(",
+        "RecoveredRuntime::recover_from_published_checkpoint_version_with_slatedb_state_store_and_relation_catalog(",
+        "RecoveredRuntime::recover_from_published_checkpoint_version_with_owner_and_relation_catalog(",
     ]
 }
 
@@ -140,7 +155,11 @@ fn allowed_bootstrap_recovery_use(
     }
 
     source == workspace.join("crates/velorix-cli/src/main.rs")
-        && pattern == "RecoveredRuntime::recover_with_owner_and_relation_catalog_record("
+        && [
+            "RecoveredRuntime::recover_with_owner_and_relation_catalog_record(",
+            "RecoveredRuntime::recover_from_published_checkpoint_version_with_owner_and_relation_catalog(",
+        ]
+        .contains(&pattern)
         && line_is_inside_function(lines, line_number, "async fn recover_local_runtime(")
 }
 
