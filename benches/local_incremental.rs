@@ -47,7 +47,10 @@ use velorix_runtime::recovery::{
 };
 use velorix_runtime::storage_registry::StorageRegistry;
 use velorix_storage::{
-    capability::probe_authoritative_object_store_capabilities,
+    capability::{
+        probe_authoritative_object_store_capabilities, AuthoritativeNamespace,
+        AuthoritativeObjectStoreCapabilitiesV1, ObjectStoreCapabilityProfile,
+    },
     gc::{GarbageCollectionPlan, GarbageCollectionPolicy},
     ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
     log::{IngestAdmissionCoordinator, IngestLog},
@@ -86,14 +89,29 @@ fn main() -> BenchResult<()> {
 
 async fn run() -> BenchResult<()> {
     let (_temp_dir, metered_store, store) = temp_store()?;
-    let ingest_log = IngestLog::new(Arc::clone(&store));
+    let capabilities = probe_authoritative_object_store_capabilities(
+        store.as_ref(),
+        "local-benchmark",
+        "local-incremental-startup-capability-probes",
+    )
+    .await?;
+    let ingest_log = IngestLog::new_checked(
+        Arc::clone(&store),
+        capability_profile(&capabilities, AuthoritativeNamespace::Ingest)?,
+    )?;
     let ingest_coordinator = IngestAdmissionCoordinator::new(ingest_log);
-    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let publisher = CheckpointPublisher::new_checked(
+        Arc::clone(&store),
+        capability_profile(&capabilities, AuthoritativeNamespace::Checkpoint)?,
+    )?;
     let mut engine = PrototypeIncrementalEngine::new();
 
-    RelationCatalogRegistry::new(Arc::clone(&store))
-        .create(&orders_sum_count_relation_catalog()?)
-        .await?;
+    RelationCatalogRegistry::new_checked(
+        Arc::clone(&store),
+        capability_profile(&capabilities, AuthoritativeNamespace::RelationCatalog)?,
+    )?
+    .create(&orders_sum_count_relation_catalog()?)
+    .await?;
 
     let mut total_records = 0;
     let mut ingest_samples = Vec::new();
@@ -169,13 +187,6 @@ async fn run() -> BenchResult<()> {
         &requests_before,
     );
 
-    let recovery_capabilities = probe_authoritative_object_store_capabilities(
-        store.as_ref(),
-        "local-benchmark",
-        "local-incremental-recovery-capability-probes",
-    )
-    .await?;
-
     let recovery_requests_before = metered_store.snapshot();
     let recovery_started = Instant::now();
     let recovered = RecoveredRuntime::recover_with_owner_and_relation_catalog_record_checked(
@@ -183,7 +194,7 @@ async fn run() -> BenchResult<()> {
         ORDERS_SUM_COUNT_OWNER,
         ORDERS_SUM_COUNT_RELATION_ID,
         ORDERS_SUM_COUNT_RELATION_VERSION,
-        &recovery_capabilities,
+        &capabilities,
     )
     .await?;
     let recovery_elapsed = recovery_started.elapsed();
@@ -667,6 +678,17 @@ async fn create_production_query_policy(store: &Arc<dyn ObjectStore>) -> BenchRe
         .create_for_production_table_scan("tenant-a", "standard", production_query_policy())
         .await?;
     Ok(())
+}
+
+fn capability_profile(
+    capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
+    namespace: AuthoritativeNamespace,
+) -> BenchResult<&ObjectStoreCapabilityProfile> {
+    capabilities.profiles.get(&namespace).ok_or_else(|| {
+        Box::new(std::io::Error::other(format!(
+            "missing capability profile for authoritative namespace `{namespace}`"
+        ))) as Box<dyn Error + Send + Sync>
+    })
 }
 
 fn production_request(

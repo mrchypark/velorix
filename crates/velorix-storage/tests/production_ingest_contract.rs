@@ -102,6 +102,30 @@ fn production_like_ingest_harnesses_use_process_local_coordinator() {
     }
 }
 
+#[test]
+fn production_like_authority_harnesses_use_checked_object_store_constructors() {
+    let workspace = workspace_root();
+    for source in [
+        workspace.join("benches/local_incremental.rs"),
+        workspace.join("benches/s3_incremental.rs"),
+        workspace.join("crates/velorix-runtime/tests/s3_compat_query.rs"),
+    ] {
+        let contents = fs::read_to_string(&source).expect("read production-like authority harness");
+        for required in [
+            "probe_authoritative_object_store_capabilities(",
+            "IngestLog::new_checked(",
+            "CheckpointPublisher::new_checked(",
+            "RelationCatalogRegistry::new_checked(",
+        ] {
+            assert!(
+                contents.contains(required),
+                "{} should use startup capability evidence before `{required}` authority setup",
+                source.strip_prefix(&workspace).unwrap_or(&source).display()
+            );
+        }
+    }
+}
+
 fn append_ingest_call_violations(contents: &str) -> Vec<String> {
     let lines = contents.lines().collect::<Vec<_>>();
     lines
