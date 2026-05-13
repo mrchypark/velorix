@@ -10,7 +10,7 @@ use velorix_control::{
         LeaseAcquireRequest, LeaseError, PartitionLeaseClient, PartitionLeaseGrant,
         PartitionLeaseKey,
     },
-    reconcile_plan::{ReconcileBlockReason, WorkerFact},
+    reconcile_plan::{ObservedControlPlaneFacts, ReconcileBlockReason, ReconcilePlan, WorkerFact},
 };
 use velorix_k8s::{
     crd::{
@@ -18,10 +18,11 @@ use velorix_k8s::{
         WorkerShardStatus,
     },
     worker_shard::{
-        handle_worker_shard_event, handle_worker_shard_event_with_output_sink,
-        reconcile_worker_shard, worker_shard_watch_event, WorkerShardCommand,
-        WorkerShardEpochStore, WorkerShardError, WorkerShardEvent, WorkerShardReconcileConfig,
-        WorkerShardReconcileInput, WorkerShardReconcileOutput,
+        execute_worker_shard_commands, handle_worker_shard_event,
+        handle_worker_shard_event_with_output_sink, reconcile_worker_shard,
+        worker_shard_watch_event, WorkerShardCommand, WorkerShardCommandExecutor,
+        WorkerShardCommandExecutorError, WorkerShardEpochStore, WorkerShardError, WorkerShardEvent,
+        WorkerShardReconcileConfig, WorkerShardReconcileInput, WorkerShardReconcileOutput,
     },
 };
 use velorix_storage::ownership::OwnershipEpochRecord;
@@ -396,11 +397,147 @@ async fn worker_shard_lease_epoch_regression_blocks_when_newer_durable_epoch_exi
     );
 }
 
+#[tokio::test]
+async fn worker_shard_command_executor_stops_stale_worker_before_starting_replacement() {
+    let executor = FakeCommandExecutor::default();
+
+    execute_worker_shard_commands(
+        &output_with_commands(vec![
+            WorkerShardCommand::StopWorker {
+                owner_id: "worker-a".to_string(),
+                owner_epoch: 5,
+            },
+            WorkerShardCommand::StartWorker {
+                owner_id: "worker-a".to_string(),
+                owner_epoch: 6,
+            },
+        ]),
+        &executor,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        executor.actions(),
+        vec![
+            ExecutedWorkerCommand::Stop {
+                owner_id: "worker-a".to_string(),
+                owner_epoch: 5,
+            },
+            ExecutedWorkerCommand::Start {
+                owner_id: "worker-a".to_string(),
+                owner_epoch: 6,
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn worker_shard_command_executor_ignores_acquire_and_persist_only_output() {
+    let executor = FakeCommandExecutor::default();
+
+    execute_worker_shard_commands(
+        &output_with_commands(vec![
+            WorkerShardCommand::AcquireLease {
+                owner_id: "worker-a".to_string(),
+            },
+            WorkerShardCommand::PersistEpochRecord {
+                owner_id: "worker-a".to_string(),
+                owner_epoch: 7,
+            },
+        ]),
+        &executor,
+    )
+    .await
+    .unwrap();
+
+    assert!(executor.actions().is_empty());
+}
+
+#[tokio::test]
+async fn worker_shard_command_executor_returns_typed_failure_without_later_execution() {
+    let executor = FakeCommandExecutor::default().fail_start("start failed");
+
+    let err = execute_worker_shard_commands(
+        &output_with_commands(vec![
+            WorkerShardCommand::StartWorker {
+                owner_id: "worker-a".to_string(),
+                owner_epoch: 6,
+            },
+            WorkerShardCommand::StopWorker {
+                owner_id: "worker-b".to_string(),
+                owner_epoch: 4,
+            },
+        ]),
+        &executor,
+    )
+    .await
+    .unwrap_err();
+
+    match err {
+        WorkerShardError::CommandExecutor { message } => {
+            assert_eq!(message, "start failed");
+        }
+        other => panic!("expected command executor error, got {other:?}"),
+    }
+    assert_eq!(
+        executor.actions(),
+        vec![ExecutedWorkerCommand::Start {
+            owner_id: "worker-a".to_string(),
+            owner_epoch: 6,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn worker_shard_command_executor_stop_failure_prevents_replacement_start() {
+    let executor = FakeCommandExecutor::default().fail_stop("stop failed");
+
+    let err = execute_worker_shard_commands(
+        &output_with_commands(vec![
+            WorkerShardCommand::StopWorker {
+                owner_id: "worker-a".to_string(),
+                owner_epoch: 5,
+            },
+            WorkerShardCommand::StartWorker {
+                owner_id: "worker-a".to_string(),
+                owner_epoch: 6,
+            },
+        ]),
+        &executor,
+    )
+    .await
+    .unwrap_err();
+
+    match err {
+        WorkerShardError::CommandExecutor { message } => {
+            assert_eq!(message, "stop failed");
+        }
+        other => panic!("expected command executor error, got {other:?}"),
+    }
+    assert_eq!(
+        executor.actions(),
+        vec![ExecutedWorkerCommand::Stop {
+            owner_id: "worker-a".to_string(),
+            owner_epoch: 5,
+        }]
+    );
+}
+
 fn has_start(output: &WorkerShardReconcileOutput) -> bool {
     output
         .commands
         .iter()
         .any(|command| matches!(command, WorkerShardCommand::StartWorker { .. }))
+}
+
+fn output_with_commands(commands: Vec<WorkerShardCommand>) -> WorkerShardReconcileOutput {
+    WorkerShardReconcileOutput {
+        plan: ReconcilePlan::default(),
+        facts: ObservedControlPlaneFacts::default(),
+        commands,
+        command_error: None,
+    }
 }
 
 fn input(worker: Option<WorkerFact>) -> WorkerShardReconcileInput {
@@ -412,6 +549,74 @@ fn input(worker: Option<WorkerFact>) -> WorkerShardReconcileInput {
             created_at: "2026-05-06T00:00:00Z".to_string(),
             previous_checkpoint_version: Some(8),
         },
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ExecutedWorkerCommand {
+    Stop { owner_id: String, owner_epoch: u64 },
+    Start { owner_id: String, owner_epoch: u64 },
+}
+
+#[derive(Clone, Default)]
+struct FakeCommandExecutor {
+    actions: Arc<Mutex<Vec<ExecutedWorkerCommand>>>,
+    fail_start: Arc<Mutex<Option<String>>>,
+    fail_stop: Arc<Mutex<Option<String>>>,
+}
+
+impl FakeCommandExecutor {
+    fn fail_start(self, message: &str) -> Self {
+        *self.fail_start.lock().unwrap() = Some(message.to_string());
+        self
+    }
+
+    fn fail_stop(self, message: &str) -> Self {
+        *self.fail_stop.lock().unwrap() = Some(message.to_string());
+        self
+    }
+
+    fn actions(&self) -> Vec<ExecutedWorkerCommand> {
+        self.actions.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl WorkerShardCommandExecutor for FakeCommandExecutor {
+    async fn stop_worker(
+        &self,
+        owner_id: &str,
+        owner_epoch: u64,
+    ) -> Result<(), WorkerShardCommandExecutorError> {
+        self.actions
+            .lock()
+            .unwrap()
+            .push(ExecutedWorkerCommand::Stop {
+                owner_id: owner_id.to_string(),
+                owner_epoch,
+            });
+        if let Some(message) = self.fail_stop.lock().unwrap().clone() {
+            return Err(WorkerShardCommandExecutorError::new(message));
+        }
+        Ok(())
+    }
+
+    async fn start_worker(
+        &self,
+        owner_id: &str,
+        owner_epoch: u64,
+    ) -> Result<(), WorkerShardCommandExecutorError> {
+        self.actions
+            .lock()
+            .unwrap()
+            .push(ExecutedWorkerCommand::Start {
+                owner_id: owner_id.to_string(),
+                owner_epoch,
+            });
+        if let Some(message) = self.fail_start.lock().unwrap().clone() {
+            return Err(WorkerShardCommandExecutorError::new(message));
+        }
+        Ok(())
     }
 }
 

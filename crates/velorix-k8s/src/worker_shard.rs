@@ -56,6 +56,46 @@ pub enum WorkerShardCommand {
     StartWorker { owner_id: String, owner_epoch: u64 },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkerShardCommandExecutorError {
+    message: String,
+}
+
+impl WorkerShardCommandExecutorError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for WorkerShardCommandExecutorError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for WorkerShardCommandExecutorError {}
+
+#[async_trait]
+pub trait WorkerShardCommandExecutor: Send + Sync {
+    async fn stop_worker(
+        &self,
+        owner_id: &str,
+        owner_epoch: u64,
+    ) -> Result<(), WorkerShardCommandExecutorError>;
+
+    async fn start_worker(
+        &self,
+        owner_id: &str,
+        owner_epoch: u64,
+    ) -> Result<(), WorkerShardCommandExecutorError>;
+}
+
 #[derive(Clone, Debug)]
 pub enum WorkerShardEvent {
     Applied(VelorixWorkerShard),
@@ -74,6 +114,8 @@ pub enum WorkerShardError {
     Watcher { message: String },
     #[error("worker shard command sink failed: {message}")]
     CommandSink { message: String },
+    #[error("worker shard command executor failed: {message}")]
+    CommandExecutor { message: String },
 }
 
 impl From<LeaseError> for WorkerShardError {
@@ -206,6 +248,36 @@ where
         }
         WorkerShardEvent::Deleted(_) => Ok(None),
     }
+}
+
+pub async fn execute_worker_shard_commands<X>(
+    output: &WorkerShardReconcileOutput,
+    executor: &X,
+) -> Result<(), WorkerShardError>
+where
+    X: WorkerShardCommandExecutor + ?Sized,
+{
+    for command in &output.commands {
+        match command {
+            WorkerShardCommand::AcquireLease { .. }
+            | WorkerShardCommand::PersistEpochRecord { .. } => {}
+            WorkerShardCommand::StopWorker {
+                owner_id,
+                owner_epoch,
+            } => executor
+                .stop_worker(owner_id, *owner_epoch)
+                .await
+                .map_err(WorkerShardError::command_executor)?,
+            WorkerShardCommand::StartWorker {
+                owner_id,
+                owner_epoch,
+            } => executor
+                .start_worker(owner_id, *owner_epoch)
+                .await
+                .map_err(WorkerShardError::command_executor)?,
+        }
+    }
+    Ok(())
 }
 
 pub async fn handle_worker_shard_event_with_output_sink<L, E, SinkError>(
@@ -518,6 +590,12 @@ impl WorkerShardError {
 
     fn command_sink(error: impl std::fmt::Display) -> Self {
         Self::CommandSink {
+            message: error.to_string(),
+        }
+    }
+
+    pub fn command_executor(error: impl std::fmt::Display) -> Self {
+        Self::CommandExecutor {
             message: error.to_string(),
         }
     }
