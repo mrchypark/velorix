@@ -1,7 +1,10 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use bytes::Bytes;
-use futures::TryStreamExt;
+use futures::{lock::Mutex as AsyncMutex, TryStreamExt};
 use object_store::{path::Path, ObjectStore, PutMode};
 use thiserror::Error;
 use velorix_core::relation::{validate_record_batch_matches_catalog, RelationSchemaError};
@@ -18,6 +21,12 @@ const INGEST_PREFIX: &str = "v1/ingest";
 #[derive(Clone, Debug)]
 pub struct IngestLog {
     store: Arc<dyn ObjectStore>,
+}
+
+#[derive(Clone)]
+pub struct IngestAdmissionCoordinator {
+    log: IngestLog,
+    admission_locks: Arc<Mutex<HashMap<(String, u32), Arc<AsyncMutex<()>>>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -102,6 +111,64 @@ pub enum IngestLogError {
     IngestEnvelope(#[from] IngestEnvelopeError),
     #[error(transparent)]
     ObjectStore(#[from] object_store::Error),
+}
+
+impl IngestAdmissionCoordinator {
+    pub fn new(log: IngestLog) -> Self {
+        Self {
+            log,
+            admission_locks: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Catalog-aware process-local coordinated admission.
+    ///
+    /// This serializes range checks for each stream/partition inside this
+    /// coordinator instance. It is useful for local/runtime write-coordinator
+    /// evidence, but it is not a distributed admission index across processes
+    /// or pods.
+    pub async fn append_catalog_validated_envelope(
+        &self,
+        payload: Bytes,
+    ) -> Result<AppendValidatedEnvelopeOutcome, IngestLogError> {
+        let batch = self.log.catalog_validated_batch(payload).await?;
+        let descriptor = batch.descriptor();
+        let admission_lock = self.admission_lock(&descriptor);
+        let _guard = admission_lock.lock().await;
+
+        if let Some(committed) = self
+            .log
+            .list_committed()
+            .await?
+            .into_iter()
+            .find(|committed| ranges_overlap(committed, &descriptor))
+        {
+            return Ok(AppendValidatedEnvelopeOutcome::Conflict {
+                descriptor,
+                object_key: committed.object_key,
+                reason: "range_overlap_committed",
+            });
+        }
+
+        self.log.append_validated_batch(batch).await
+    }
+
+    pub async fn list_committed(&self) -> Result<Vec<IngestBatchDescriptor>, IngestLogError> {
+        self.log.list_committed().await
+    }
+
+    fn admission_lock(&self, descriptor: &IngestBatchDescriptor) -> Arc<AsyncMutex<()>> {
+        let key = (descriptor.stream_id.clone(), descriptor.partition_id);
+        let mut locks = self
+            .admission_locks
+            .lock()
+            .expect("ingest admission lock map poisoned");
+        Arc::clone(
+            locks
+                .entry(key)
+                .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
+        )
+    }
 }
 
 impl IngestLog {

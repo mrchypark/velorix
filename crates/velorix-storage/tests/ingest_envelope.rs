@@ -11,6 +11,7 @@ use object_store::{local::LocalFileSystem, path::Path, ObjectStore};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
+use tokio::sync::Barrier;
 use velorix_core::relation::{
     ArrowPhysicalTypeV1, DataFusionRegistrationModeV1, DataFusionRegistrationV1,
     FelderaRelationBindingV1, IncrementalAdapterBindingV1, RelationColumnV1, RelationOperationV1,
@@ -22,8 +23,8 @@ use velorix_storage::{
         IngestEnvelope, IngestEnvelopeEncodeRequest, IngestEnvelopeError, INGEST_ENVELOPE_MAGIC,
     },
     log::{
-        AppendValidatedEnvelopeOutcome, IngestBatch, IngestBatchDescriptor, IngestLog,
-        IngestLogError,
+        AppendValidatedEnvelopeOutcome, IngestAdmissionCoordinator, IngestBatch,
+        IngestBatchDescriptor, IngestLog, IngestLogError,
     },
     object_key::ObjectKey,
     relation_catalog_registry::{RelationCatalogRegistry, RelationCatalogRegistryError},
@@ -55,6 +56,13 @@ fn ingest_descriptor(
         )
         .unwrap(),
     }
+}
+
+fn ranges_overlap_for_test(left: &IngestBatchDescriptor, right: &IngestBatchDescriptor) -> bool {
+    left.stream_id == right.stream_id
+        && left.partition_id == right.partition_id
+        && left.start_offset_inclusive < right.end_offset_exclusive
+        && right.start_offset_inclusive < left.end_offset_exclusive
 }
 
 fn valid_batch() -> RecordBatch {
@@ -869,6 +877,122 @@ async fn append_catalog_validated_envelope_single_writer_rejects_committed_overl
             object_key: ObjectKey::ingest_batch("orders", 7, 10, 20).unwrap(),
             reason: "range_overlap_committed",
         }
+    );
+}
+
+#[tokio::test]
+async fn process_local_coordinated_catalog_admission_rejects_one_concurrent_overlap() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = create_orders_relation_catalog(&store).await;
+    let coordinator = Arc::new(IngestAdmissionCoordinator::new(IngestLog::new(Arc::clone(
+        &store,
+    ))));
+    let first = catalog_envelope_bytes_for(&catalog, 0, 100);
+    let overlapping = catalog_envelope_bytes_for(&catalog, 50, 150);
+    let start = Arc::new(Barrier::new(3));
+
+    let first_task = tokio::spawn({
+        let coordinator = Arc::clone(&coordinator);
+        let start = Arc::clone(&start);
+        async move {
+            start.wait().await;
+            coordinator.append_catalog_validated_envelope(first).await
+        }
+    });
+    let overlapping_task = tokio::spawn({
+        let coordinator = Arc::clone(&coordinator);
+        let start = Arc::clone(&start);
+        async move {
+            start.wait().await;
+            coordinator
+                .append_catalog_validated_envelope(overlapping)
+                .await
+        }
+    });
+
+    start.wait().await;
+    let outcomes = vec![
+        first_task.await.unwrap().unwrap(),
+        overlapping_task.await.unwrap().unwrap(),
+    ];
+
+    let appended = outcomes
+        .iter()
+        .find_map(|outcome| match outcome {
+            AppendValidatedEnvelopeOutcome::Appended { descriptor } => Some(descriptor),
+            _ => None,
+        })
+        .expect("one overlapping concurrent admission should append");
+    let conflict = outcomes
+        .iter()
+        .find_map(|outcome| match outcome {
+            AppendValidatedEnvelopeOutcome::Conflict {
+                descriptor,
+                object_key,
+                reason,
+            } => Some((descriptor, object_key, reason)),
+            _ => None,
+        })
+        .expect("one overlapping concurrent admission should conflict");
+
+    assert_eq!(conflict.1, &appended.object_key);
+    assert_eq!(*conflict.2, "range_overlap_committed");
+    assert!(ranges_overlap_for_test(appended, conflict.0));
+    assert_eq!(coordinator.list_committed().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn process_local_coordinated_catalog_admission_allows_adjacent_ranges() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = create_orders_relation_catalog(&store).await;
+    let coordinator = IngestAdmissionCoordinator::new(IngestLog::new(Arc::clone(&store)));
+
+    let first = coordinator
+        .append_catalog_validated_envelope(catalog_envelope_bytes_for(&catalog, 0, 100))
+        .await
+        .unwrap();
+    let adjacent = coordinator
+        .append_catalog_validated_envelope(catalog_envelope_bytes_for(&catalog, 100, 150))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        first,
+        AppendValidatedEnvelopeOutcome::Appended {
+            descriptor
+        } if descriptor == ingest_descriptor("orders", 7, 0, 100)
+    ));
+    assert!(matches!(
+        adjacent,
+        AppendValidatedEnvelopeOutcome::Appended {
+            descriptor
+        } if descriptor == ingest_descriptor("orders", 7, 100, 150)
+    ));
+    assert_eq!(coordinator.list_committed().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn process_local_coordinated_catalog_admission_keeps_same_digest_retry_idempotent() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = create_orders_relation_catalog(&store).await;
+    let coordinator = IngestAdmissionCoordinator::new(IngestLog::new(Arc::clone(&store)));
+    let bytes = catalog_envelope_bytes_for(&catalog, 0, 100);
+
+    let first = coordinator
+        .append_catalog_validated_envelope(bytes.clone())
+        .await
+        .unwrap();
+    let AppendValidatedEnvelopeOutcome::Appended { descriptor } = first else {
+        panic!("expected appended outcome, got {first:?}");
+    };
+    let retry = coordinator
+        .append_catalog_validated_envelope(bytes)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        retry,
+        AppendValidatedEnvelopeOutcome::Duplicate { descriptor }
     );
 }
 
