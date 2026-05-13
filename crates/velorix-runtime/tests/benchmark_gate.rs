@@ -1,6 +1,7 @@
 use velorix_runtime::benchmark_gate::{
-    BenchmarkBackend, BenchmarkBudgetV1, BenchmarkGateError, BenchmarkGateLevel,
-    BenchmarkGateResultV1, BenchmarkMetricsV1, BenchmarkWorkloadMetricsV1, ObjectRequestMetricsV1,
+    BenchmarkBackend, BenchmarkBudgetV1, BenchmarkEvidenceScope, BenchmarkGateError,
+    BenchmarkGateLevel, BenchmarkGateResultV1, BenchmarkMetricsV1, BenchmarkWorkloadMetricsV1,
+    ObjectRequestMetricsV1,
 };
 
 #[test]
@@ -75,6 +76,39 @@ fn benchmark_gate_accepts_s3_nightly_result_with_real_commit() {
     let result = s3_nightly_result();
 
     result.validate().unwrap();
+}
+
+#[test]
+fn benchmark_gate_defaults_missing_evidence_scope_to_live_or_native() {
+    let result: BenchmarkGateResultV1 = serde_json::from_str(VALID_LOCAL_SMOKE_JSON).unwrap();
+
+    assert_eq!(
+        result.backend_evidence_scope,
+        BenchmarkEvidenceScope::LiveOrNative
+    );
+}
+
+#[test]
+fn benchmark_gate_rejects_local_emulator_s3_evidence() {
+    let mut result = s3_nightly_result();
+    result.backend_evidence_scope = BenchmarkEvidenceScope::LocalEmulator;
+
+    let error = result.reject_local_emulator_s3_evidence().unwrap_err();
+
+    assert!(matches!(error, BenchmarkGateError::LocalEmulatorS3Evidence));
+}
+
+#[test]
+fn benchmark_comparison_rejects_local_emulator_s3_current_result() {
+    let mut current = s3_nightly_result();
+    current.backend_evidence_scope = BenchmarkEvidenceScope::LocalEmulator;
+    let baseline = s3_nightly_result();
+
+    let error = current
+        .compare_against(&baseline, BenchmarkBudgetV1::relative(0.10))
+        .unwrap_err();
+
+    assert!(matches!(error, BenchmarkGateError::LocalEmulatorS3Evidence));
 }
 
 #[test]
@@ -303,6 +337,7 @@ fn local_smoke_result() -> BenchmarkGateResultV1 {
         commit: "abc123".to_string(),
         gate_level: BenchmarkGateLevel::PrSmoke,
         backend: BenchmarkBackend::Local,
+        backend_evidence_scope: BenchmarkEvidenceScope::LiveOrNative,
         workload: "local_incremental".to_string(),
         metrics: BenchmarkMetricsV1 {
             rows_per_second: 1000.0,

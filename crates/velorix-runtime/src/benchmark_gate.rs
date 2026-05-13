@@ -21,6 +21,13 @@ pub enum BenchmarkBackend {
     S3Compatible,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchmarkEvidenceScope {
+    LiveOrNative,
+    LocalEmulator,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BenchmarkGateResultV1 {
@@ -28,6 +35,8 @@ pub struct BenchmarkGateResultV1 {
     pub commit: String,
     pub gate_level: BenchmarkGateLevel,
     pub backend: BenchmarkBackend,
+    #[serde(default = "default_benchmark_evidence_scope")]
+    pub backend_evidence_scope: BenchmarkEvidenceScope,
     pub workload: String,
     pub metrics: BenchmarkMetricsV1,
     pub workload_metrics: Vec<BenchmarkWorkloadMetricsV1>,
@@ -100,6 +109,8 @@ pub enum BenchmarkGateError {
     },
     #[error("benchmark S3-compatible result commit must not be a placeholder, got {commit}")]
     PlaceholderS3Commit { commit: String },
+    #[error("benchmark S3-compatible result uses local emulator evidence")]
+    LocalEmulatorS3Evidence,
     #[error("benchmark metric {metric} must be finite and non-negative, got {value}")]
     InvalidMetric { metric: &'static str, value: f64 },
     #[error("benchmark workload_metrics must be non-empty")]
@@ -223,6 +234,8 @@ impl BenchmarkGateResultV1 {
         self.validate()?;
         baseline.validate()?;
         budget.validate()?;
+        self.reject_local_emulator_s3_evidence()?;
+        baseline.reject_local_emulator_s3_evidence()?;
 
         if self.gate_level != baseline.gate_level
             || self.backend != baseline.backend
@@ -352,6 +365,16 @@ impl BenchmarkGateResultV1 {
             return Err(BenchmarkGateError::PlaceholderS3Commit {
                 commit: self.commit.clone(),
             });
+        }
+
+        Ok(())
+    }
+
+    pub fn reject_local_emulator_s3_evidence(&self) -> Result<(), BenchmarkGateError> {
+        if self.backend == BenchmarkBackend::S3Compatible
+            && self.backend_evidence_scope == BenchmarkEvidenceScope::LocalEmulator
+        {
+            return Err(BenchmarkGateError::LocalEmulatorS3Evidence);
         }
 
         Ok(())
@@ -558,6 +581,10 @@ fn expected_workload_for_backend(backend: BenchmarkBackend) -> &'static str {
         BenchmarkBackend::Local => "local_incremental",
         BenchmarkBackend::S3Compatible => "s3_incremental",
     }
+}
+
+fn default_benchmark_evidence_scope() -> BenchmarkEvidenceScope {
+    BenchmarkEvidenceScope::LiveOrNative
 }
 
 fn is_object_backed_workload(name: &str) -> bool {

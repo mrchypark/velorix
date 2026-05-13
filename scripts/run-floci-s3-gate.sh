@@ -172,6 +172,7 @@ export AWS_SECRET_ACCESS_KEY=test
 export AWS_REGION="$region"
 export VELORIX_S3_BUCKET="$bucket"
 export VELORIX_S3_PREFIX="$prefix"
+export VELORIX_BENCHMARK_EVIDENCE_SCOPE=local_emulator
 
 cargo test -p velorix-storage --test s3_compat --features s3-compat-tests -- --nocapture --test-threads=1
 cargo test -p velorix-runtime --test s3_compat_query --features s3-compat-tests -- --nocapture --test-threads=1

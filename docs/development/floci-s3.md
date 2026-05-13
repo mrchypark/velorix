@@ -55,6 +55,13 @@ needed:
 VELORIX_FLOCI_RUN_BENCHMARK=0 scripts/run-floci-s3-gate.sh
 ```
 
+When the benchmark step is enabled, the script sets
+`VELORIX_BENCHMARK_EVIDENCE_SCOPE=local_emulator`. The resulting benchmark JSON
+can be validated for local review, but `velorix-cli benchmark-gate` rejects it
+as S3-compatible nightly or release comparison evidence. S3-compatible gate
+results must carry an explicit `backend_evidence_scope` field so missing scope
+metadata cannot default into release-quality evidence.
+
 ## GitHub Actions
 
 The manual `Floci S3 Emulator Gate` workflow runs the same script on an

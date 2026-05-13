@@ -16,7 +16,8 @@ use object_store::{local::LocalFileSystem, ObjectStore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use velorix_runtime::benchmark_gate::{
-    BenchmarkBackend, BenchmarkBudgetV1, BenchmarkGateLevel, BenchmarkGateResultV1,
+    BenchmarkBackend, BenchmarkBudgetV1, BenchmarkEvidenceScope, BenchmarkGateLevel,
+    BenchmarkGateResultV1,
 };
 use velorix_runtime::readiness::{
     verify_feldera_artifact_hash_evidence, verify_feldera_artifact_release_provenance_evidence,
@@ -698,7 +699,7 @@ fn validate_feldera_release_evidence_artifacts(
 
 fn validate_s3_release_benchmark_gate_evidence_artifact(path: &Path) -> anyhow::Result<()> {
     reject_local_readiness_artifact(&read_artifact_evidence_kind(path)?, path)?;
-    let artifact: BenchmarkGateEvidenceArtifactV1 = read_json_artifact(path)?;
+    let artifact = read_s3_benchmark_gate_evidence_artifact(path)?;
 
     if artifact.schema_version != 1 {
         bail!(
@@ -726,6 +727,12 @@ fn validate_s3_release_benchmark_gate_evidence_artifact(path: &Path) -> anyhow::
     if artifact.backend != BenchmarkBackend::S3Compatible {
         bail!(
             "{} benchmark gate evidence is not s3-compatible",
+            path.display()
+        );
+    }
+    if artifact.backend_evidence_scope == BenchmarkEvidenceScope::LocalEmulator {
+        bail!(
+            "{} benchmark gate evidence uses local emulator scope",
             path.display()
         );
     }
@@ -782,6 +789,21 @@ fn validate_s3_release_benchmark_gate_evidence_artifact(path: &Path) -> anyhow::
     }
 
     Ok(())
+}
+
+fn read_s3_benchmark_gate_evidence_artifact(
+    path: &Path,
+) -> anyhow::Result<BenchmarkGateEvidenceArtifactV1> {
+    let value: serde_json::Value = read_json_artifact(path)?;
+    if value.get("backend_evidence_scope").is_none() {
+        bail!(
+            "{} benchmark gate evidence is missing backend_evidence_scope",
+            path.display()
+        );
+    }
+
+    serde_json::from_value(value)
+        .with_context(|| format!("failed to parse benchmark gate evidence {}", path.display()))
 }
 
 fn validate_production_gc_run_evidence_artifact(
@@ -1334,6 +1356,7 @@ struct BenchmarkGateEvidenceArtifactV1 {
     evidence_kind: String,
     gate_level: BenchmarkGateLevel,
     backend: BenchmarkBackend,
+    backend_evidence_scope: BenchmarkEvidenceScope,
     workload: String,
     workload_metrics: Vec<String>,
     baseline_path: Option<String>,
@@ -2066,6 +2089,8 @@ fn run_benchmark_gate(
                 current_result.commit
             );
         }
+        require_explicit_s3_benchmark_evidence_scope(backend, result)?;
+        reject_local_emulator_s3_benchmark(&current_result, result)?;
     }
 
     let Some(baseline) = baseline else {
@@ -2105,6 +2130,7 @@ fn run_benchmark_gate(
                 baseline.display()
             );
         }
+        reject_local_emulator_s3_benchmark(&baseline_result, baseline)?;
     }
     let max_regression_fraction =
         max_regression_fraction.context("benchmark gate requires --max-regression-fraction")?;
@@ -2132,6 +2158,7 @@ struct BenchmarkGateEvidenceV1 {
     evidence_kind: &'static str,
     gate_level: BenchmarkGateLevel,
     backend: BenchmarkBackend,
+    backend_evidence_scope: BenchmarkEvidenceScope,
     workload: String,
     baseline_path: Option<String>,
     result_path: String,
@@ -2149,6 +2176,7 @@ impl BenchmarkGateEvidenceV1 {
             evidence_kind: benchmark_gate_evidence_kind(result.backend),
             gate_level: result.gate_level,
             backend: result.backend,
+            backend_evidence_scope: result.backend_evidence_scope,
             workload: result.workload.clone(),
             baseline_path: None,
             result_path: stable_path(result_path),
@@ -2172,6 +2200,7 @@ impl BenchmarkGateEvidenceV1 {
             evidence_kind: benchmark_gate_evidence_kind(result.backend),
             gate_level: result.gate_level,
             backend: result.backend,
+            backend_evidence_scope: result.backend_evidence_scope,
             workload: result.workload.clone(),
             baseline_path: Some(stable_path(baseline_path)),
             result_path: stable_path(result_path),
@@ -2202,6 +2231,54 @@ fn benchmark_gate_workloads_for_backend(backend: BenchmarkBackend) -> &'static [
     match backend {
         BenchmarkBackend::Local => LOCAL_BENCHMARK_GATE_WORKLOADS,
         BenchmarkBackend::S3Compatible => S3_COMPATIBLE_BENCHMARK_GATE_WORKLOADS,
+    }
+}
+
+fn reject_local_emulator_s3_benchmark(
+    result: &BenchmarkGateResultV1,
+    path: &Path,
+) -> anyhow::Result<()> {
+    result.reject_local_emulator_s3_evidence().with_context(|| {
+        format!(
+            "benchmark result {} is local emulator evidence and cannot satisfy S3-compatible benchmark gates",
+            path.display()
+        )
+    })
+}
+
+fn require_explicit_s3_benchmark_evidence_scope(
+    backend: BenchmarkBackend,
+    path: &Path,
+) -> anyhow::Result<()> {
+    if backend != BenchmarkBackend::S3Compatible {
+        return Ok(());
+    }
+
+    let value = read_benchmark_result_json_value(path)?;
+    if value.get("backend_evidence_scope").is_none() {
+        bail!(
+            "benchmark result {} is missing backend_evidence_scope for S3-compatible gate evidence",
+            path.display()
+        );
+    }
+
+    Ok(())
+}
+
+fn read_benchmark_result_json_value(path: &Path) -> anyhow::Result<serde_json::Value> {
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("failed to read benchmark JSON from {}", path.display()))?;
+    match serde_json::from_str(&contents) {
+        Ok(value) => Ok(value),
+        Err(full_error) => {
+            let last_json_line = contents
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .context("benchmark output is empty")?;
+            serde_json::from_str(last_json_line)
+                .with_context(|| format!("benchmark output is not valid JSON: {full_error}"))
+        }
     }
 }
 
@@ -3542,6 +3619,37 @@ mod tests {
     }
 
     #[test]
+    fn readiness_report_rejects_local_emulator_s3_release_evidence() {
+        let dir = tempdir().unwrap();
+        let s3_gate = dir.path().join("s3-release-local-emulator.json");
+        let mut artifact: serde_json::Value =
+            serde_json::from_str(&s3_release_benchmark_gate_json()).unwrap();
+        artifact["backend_evidence_scope"] = serde_json::json!("local_emulator");
+        fs::write(&s3_gate, artifact.to_string()).unwrap();
+
+        let error = validate_s3_release_benchmark_gate_evidence_artifact(&s3_gate).unwrap_err();
+
+        assert!(format!("{error:#}").contains("local emulator scope"));
+    }
+
+    #[test]
+    fn readiness_report_rejects_s3_release_evidence_missing_evidence_scope() {
+        let dir = tempdir().unwrap();
+        let s3_gate = dir.path().join("s3-release-missing-scope.json");
+        let mut artifact: serde_json::Value =
+            serde_json::from_str(&s3_release_benchmark_gate_json()).unwrap();
+        artifact
+            .as_object_mut()
+            .unwrap()
+            .remove("backend_evidence_scope");
+        fs::write(&s3_gate, artifact.to_string()).unwrap();
+
+        let error = validate_s3_release_benchmark_gate_evidence_artifact(&s3_gate).unwrap_err();
+
+        assert!(format!("{error:#}").contains("missing backend_evidence_scope"));
+    }
+
+    #[test]
     fn readiness_report_rejects_s3_release_evidence_missing_required_workload_metric() {
         let dir = tempdir().unwrap();
         let readiness = dir.path().join("readiness.json");
@@ -4241,6 +4349,63 @@ mod tests {
     }
 
     #[test]
+    fn benchmark_gate_comparison_rejects_local_emulator_s3_current_result() {
+        let dir = tempdir().unwrap();
+        let baseline = dir.path().join("baseline.json");
+        let result = dir.path().join("result.json");
+        fs::write(&baseline, release_result_json()).unwrap();
+        fs::write(&result, local_emulator_s3_result_json()).unwrap();
+
+        let error = run_benchmark_gate(
+            Some(&baseline),
+            &result,
+            Some(BenchmarkGateLevel::Release),
+            Some(BenchmarkBackend::S3Compatible),
+            Some(0.10),
+        )
+        .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("local emulator evidence"), "{message}");
+    }
+
+    #[test]
+    fn benchmark_gate_comparison_rejects_missing_s3_current_evidence_scope() {
+        let dir = tempdir().unwrap();
+        let baseline = dir.path().join("baseline.json");
+        let result = dir.path().join("result.json");
+        let mut current = normal_result(
+            "abc123",
+            "release",
+            "s3_compatible",
+            "s3_incremental",
+            1000.0,
+            s3_workload_metrics(),
+        );
+        current
+            .as_object_mut()
+            .unwrap()
+            .remove("backend_evidence_scope");
+        fs::write(&baseline, release_result_json()).unwrap();
+        fs::write(&result, serde_json::to_string_pretty(&current).unwrap()).unwrap();
+
+        let error = run_benchmark_gate(
+            Some(&baseline),
+            &result,
+            Some(BenchmarkGateLevel::Release),
+            Some(BenchmarkBackend::S3Compatible),
+            Some(0.10),
+        )
+        .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("missing backend_evidence_scope"),
+            "{message}"
+        );
+    }
+
+    #[test]
     fn benchmark_gate_comparison_rejects_all_zero_s3_baseline() {
         let dir = tempdir().unwrap();
         let baseline = dir.path().join("baseline.json");
@@ -4655,6 +4820,7 @@ mod tests {
             "evidence_kind": "s3_compatible_benchmark_gate",
             "gate_level": "release",
             "backend": "s3_compatible",
+            "backend_evidence_scope": "live_or_native",
             "workload": "s3_incremental",
             "baseline_path": "baselines/benchmark/s3/release.json",
             "result_path": "target/velorix-bench/s3-release.json",
@@ -4885,6 +5051,19 @@ mod tests {
         .unwrap()
     }
 
+    fn local_emulator_s3_result_json() -> String {
+        let mut result = normal_result(
+            "abc123",
+            "release",
+            "s3_compatible",
+            "s3_incremental",
+            1000.0,
+            s3_workload_metrics(),
+        );
+        result["backend_evidence_scope"] = serde_json::json!("local_emulator");
+        serde_json::to_string_pretty(&result).unwrap()
+    }
+
     fn regressed_result_json() -> String {
         serde_json::to_string_pretty(&normal_result(
             "def456",
@@ -5053,7 +5232,7 @@ mod tests {
         rows_per_second: f64,
         workload_metrics: serde_json::Value,
     ) -> serde_json::Value {
-        serde_json::json!({
+        let mut result = serde_json::json!({
             "schema_version": 1,
             "commit": commit,
             "gate_level": gate_level,
@@ -5079,7 +5258,11 @@ mod tests {
                 "scan_bytes": 0,
             },
             "workload_metrics": workload_metrics,
-        })
+        });
+        if backend == "s3_compatible" {
+            result["backend_evidence_scope"] = serde_json::json!("live_or_native");
+        }
+        result
     }
 
     fn workload_metrics() -> serde_json::Value {

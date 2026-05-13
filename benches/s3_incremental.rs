@@ -95,8 +95,8 @@ mod live_s3 {
         query::QueryPolicy,
     };
     use velorix_runtime::benchmark_gate::{
-        BenchmarkBackend, BenchmarkGateLevel, BenchmarkGateResultV1, BenchmarkMetricsV1,
-        BenchmarkWorkloadMetricsV1, ObjectRequestMetricsV1,
+        BenchmarkBackend, BenchmarkEvidenceScope, BenchmarkGateLevel, BenchmarkGateResultV1,
+        BenchmarkMetricsV1, BenchmarkWorkloadMetricsV1, ObjectRequestMetricsV1,
     };
     use velorix_runtime::persisted_table::{
         query_production_persisted_object_backed_input_with_metrics,
@@ -317,6 +317,7 @@ mod live_s3 {
             commit: git_commit()?,
             gate_level: BenchmarkGateLevel::NightlyIntegration,
             backend: BenchmarkBackend::S3Compatible,
+            backend_evidence_scope: benchmark_evidence_scope_from_env()?,
             workload: "s3_incremental".to_string(),
             metrics: BenchmarkMetricsV1 {
                 rows_per_second: records_per_second,
@@ -369,6 +370,35 @@ mod live_s3 {
                 ),
             ],
         })
+    }
+
+    fn benchmark_evidence_scope_from_env() -> BenchResult<BenchmarkEvidenceScope> {
+        match std::env::var("VELORIX_BENCHMARK_EVIDENCE_SCOPE") {
+            Ok(value) if value == "local_emulator" => Ok(BenchmarkEvidenceScope::LocalEmulator),
+            Ok(value) if value == "live_or_native" || value.trim().is_empty() => {
+                Ok(BenchmarkEvidenceScope::LiveOrNative)
+            }
+            Ok(value) => Err(bench_error(format!(
+                "unsupported VELORIX_BENCHMARK_EVIDENCE_SCOPE={value}; expected live_or_native or local_emulator"
+            ))),
+            Err(std::env::VarError::NotPresent) if endpoint_is_local_emulator() => {
+                Ok(BenchmarkEvidenceScope::LocalEmulator)
+            }
+            Err(std::env::VarError::NotPresent) => Ok(BenchmarkEvidenceScope::LiveOrNative),
+            Err(error) => Err(bench_error(format!(
+                "failed to read VELORIX_BENCHMARK_EVIDENCE_SCOPE: {error}"
+            ))),
+        }
+    }
+
+    fn endpoint_is_local_emulator() -> bool {
+        let Ok(endpoint) = std::env::var("AWS_ENDPOINT_URL") else {
+            return false;
+        };
+        let endpoint = endpoint.to_ascii_lowercase();
+        ["localhost", "127.0.0.1", "[::1]", "://::1"]
+            .iter()
+            .any(|marker| endpoint.contains(marker))
     }
 
     async fn gc_dry_run_planning(

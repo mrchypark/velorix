@@ -145,6 +145,12 @@ The benchmark step can be skipped with `VELORIX_FLOCI_RUN_BENCHMARK=0`. The
 script writes `target/velorix-s3/floci-s3-gate-evidence.json` and deletes the
 Floci container/network by default. Set `VELORIX_FLOCI_CLEANUP=0` to keep the
 container for debugging.
+When the benchmark step runs, it marks the benchmark JSON with
+`backend_evidence_scope=local_emulator`; validation can still check the file
+shape, but S3-compatible nightly/release benchmark gates reject that local
+emulator scope. S3-compatible benchmark gate results must include an explicit
+`backend_evidence_scope`; omitted scope remains backward-compatible for old
+baselines but is rejected for current S3-compatible gate evidence.
 
 The manual `Floci S3 Emulator Gate` workflow runs this same local emulator gate
 on a GitHub-hosted runner and uploads the JSON as `floci-s3-emulator-evidence`.

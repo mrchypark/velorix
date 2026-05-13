@@ -33,8 +33,8 @@ use velorix_core::{
     query::QueryPolicy,
 };
 use velorix_runtime::benchmark_gate::{
-    BenchmarkBackend, BenchmarkGateLevel, BenchmarkGateResultV1, BenchmarkMetricsV1,
-    BenchmarkWorkloadMetricsV1, ObjectRequestMetricsV1,
+    BenchmarkBackend, BenchmarkEvidenceScope, BenchmarkGateLevel, BenchmarkGateResultV1,
+    BenchmarkMetricsV1, BenchmarkWorkloadMetricsV1, ObjectRequestMetricsV1,
 };
 use velorix_runtime::persisted_table::{
     query_production_persisted_object_backed_input_with_metrics,
@@ -223,6 +223,7 @@ async fn run() -> BenchResult<()> {
         commit: git_commit(),
         gate_level: BenchmarkGateLevel::PrSmoke,
         backend: BenchmarkBackend::Local,
+        backend_evidence_scope: BenchmarkEvidenceScope::LiveOrNative,
         workload: "local_incremental".to_string(),
         metrics: BenchmarkMetricsV1 {
             rows_per_second: records_per_second,
