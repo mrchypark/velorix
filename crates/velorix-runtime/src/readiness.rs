@@ -4,7 +4,8 @@ use velorix_core::feldera_artifact::{
     FelderaCompileArtifactMetadata, FelderaReleaseArtifactProvenanceV1, StandingViewSpec,
 };
 
-const SCHEMA_VERSION: u16 = 1;
+const PRODUCTION_READINESS_SCHEMA_VERSION: u16 = 2;
+const FELDERA_ARTIFACT_EVIDENCE_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -15,6 +16,8 @@ pub struct ProductionReadinessEvidenceV1 {
     pub capability_status: ReadinessCheck,
     pub ownership_status: ReadinessCheck,
     pub checkpoint_status: ReadinessCheck,
+    pub ingest_status: ReadinessCheck,
+    pub relation_catalog_status: ReadinessCheck,
     pub state_status: ReadinessCheck,
     pub query_policy_status: ReadinessCheck,
     pub table_catalog_status: ReadinessCheck,
@@ -49,6 +52,9 @@ pub enum ReadinessEvidenceKind {
     BootstrapRawStatePath,
     DurableOwnershipEpochRecord,
     PublishedCheckpointLifecycleRecord,
+    CatalogBackedIngestAdmission,
+    RelationCatalogRecord,
+    RelationCatalogRegistry,
     SlateDbCheckpointRef,
     QueryPolicyCatalog,
     RegistryBackedTableCatalog,
@@ -102,6 +108,8 @@ pub struct ProductionReadinessReportV1 {
     pub capability_status: ReadinessCheck,
     pub ownership_status: ReadinessCheck,
     pub checkpoint_status: ReadinessCheck,
+    pub ingest_status: ReadinessCheck,
+    pub relation_catalog_status: ReadinessCheck,
     pub state_status: ReadinessCheck,
     pub query_policy_status: ReadinessCheck,
     pub table_catalog_status: ReadinessCheck,
@@ -150,6 +158,12 @@ impl ProductionReadinessEvidenceV1 {
             &mut blocking_reasons,
             "checkpoint_status",
             &self.checkpoint_status,
+        );
+        push_check_blockers(&mut blocking_reasons, "ingest_status", &self.ingest_status);
+        push_check_blockers(
+            &mut blocking_reasons,
+            "relation_catalog_status",
+            &self.relation_catalog_status,
         );
         push_check_blockers(&mut blocking_reasons, "state_status", &self.state_status);
         push_check_blockers(
@@ -212,6 +226,29 @@ impl ProductionReadinessEvidenceV1 {
             blocking_reasons.push(
                 "checkpoint_status missing published_checkpoint_lifecycle_record evidence"
                     .to_string(),
+            );
+        }
+        if !self
+            .ingest_status
+            .has_evidence(ReadinessEvidenceKind::CatalogBackedIngestAdmission)
+        {
+            blocking_reasons
+                .push("ingest_status missing catalog_backed_ingest_admission evidence".to_string());
+        }
+        if !self
+            .relation_catalog_status
+            .has_evidence(ReadinessEvidenceKind::RelationCatalogRecord)
+        {
+            blocking_reasons.push(
+                "relation_catalog_status missing relation_catalog_record evidence".to_string(),
+            );
+        }
+        if !self
+            .relation_catalog_status
+            .has_evidence(ReadinessEvidenceKind::RelationCatalogRegistry)
+        {
+            blocking_reasons.push(
+                "relation_catalog_status missing relation_catalog_registry evidence".to_string(),
             );
         }
         if self
@@ -306,6 +343,8 @@ impl ProductionReadinessEvidenceV1 {
             capability_status: self.capability_status,
             ownership_status: self.ownership_status,
             checkpoint_status: self.checkpoint_status,
+            ingest_status: self.ingest_status,
+            relation_catalog_status: self.relation_catalog_status,
             state_status: self.state_status,
             query_policy_status: self.query_policy_status,
             table_catalog_status: self.table_catalog_status,
@@ -358,7 +397,7 @@ pub fn verify_feldera_artifact_hash_evidence(
         .map_err(|error| error.to_string())?;
 
     Ok(FelderaArtifactHashVerifiedEvidenceV1 {
-        schema_version: SCHEMA_VERSION,
+        schema_version: FELDERA_ARTIFACT_EVIDENCE_SCHEMA_VERSION,
         status: ReadinessStatus::Pass,
         evidence_kind: ReadinessEvidenceKind::FelderaArtifactHashVerified,
         view_id: artifact.view_id,
@@ -384,7 +423,7 @@ pub fn verify_feldera_artifact_release_provenance_evidence(
         .map_err(|error| error.to_string())?;
 
     Ok(FelderaArtifactReleaseProvenanceEvidenceV1 {
-        schema_version: SCHEMA_VERSION,
+        schema_version: FELDERA_ARTIFACT_EVIDENCE_SCHEMA_VERSION,
         status: ReadinessStatus::Pass,
         evidence_kind: ReadinessEvidenceKind::FelderaArtifactReleaseProvenance,
         release_id: provenance.release.release_id,
@@ -473,11 +512,11 @@ fn is_local_dev_authority_store(authority_store_id: &str) -> bool {
 pub fn validate_readiness_schema_version(
     evidence: &ProductionReadinessEvidenceV1,
 ) -> Result<(), String> {
-    if evidence.schema_version == SCHEMA_VERSION {
+    if evidence.schema_version == PRODUCTION_READINESS_SCHEMA_VERSION {
         Ok(())
     } else {
         Err(format!(
-            "unsupported readiness schema_version {}, expected {SCHEMA_VERSION}",
+            "unsupported readiness schema_version {}, expected {PRODUCTION_READINESS_SCHEMA_VERSION}",
             evidence.schema_version
         ))
     }

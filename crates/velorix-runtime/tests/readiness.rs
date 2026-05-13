@@ -206,6 +206,73 @@ fn readiness_report_blocks_when_gc_evidence_is_missing() {
 }
 
 #[test]
+fn readiness_report_blocks_when_ingest_and_relation_catalog_evidence_is_missing() {
+    let report = ProductionReadinessEvidenceV1::from_json_str(&readiness_json(
+        &[
+            "catalog_backed_ingest_admission",
+            "relation_catalog_record",
+            "relation_catalog_registry",
+        ],
+        false,
+        &[],
+    ))
+    .unwrap()
+    .try_into_report()
+    .unwrap();
+
+    assert!(!report.production_ready);
+    assert_eq!(
+        report.blocking_reasons,
+        vec![
+            "ingest_status missing catalog_backed_ingest_admission evidence",
+            "relation_catalog_status missing relation_catalog_record evidence",
+            "relation_catalog_status missing relation_catalog_registry evidence",
+        ]
+    );
+}
+
+#[test]
+fn readiness_report_blocks_failed_ingest_and_relation_catalog_statuses() {
+    let report = ProductionReadinessEvidenceV1::from_json_str(&readiness_json(
+        &[],
+        false,
+        &["ingest_status", "relation_catalog_status"],
+    ))
+    .unwrap()
+    .try_into_report()
+    .unwrap();
+
+    assert!(!report.production_ready);
+    assert_eq!(
+        report.blocking_reasons,
+        vec![
+            "ingest_status failed: catalog-backed ingest admission failed closed",
+            "relation_catalog_status failed: relation catalog registry failed closed",
+        ]
+    );
+}
+
+#[test]
+fn readiness_report_blocks_ingest_and_relation_catalog_with_bad_evidence_text() {
+    let ingest_report = report_with_evidence("ingest_status", " \t\n");
+    assert!(!ingest_report.production_ready);
+    assert_eq!(
+        ingest_report.blocking_reasons,
+        vec!["ingest_status missing evidence text"]
+    );
+
+    let catalog_report = report_with_evidence(
+        "relation_catalog_status",
+        "relation catalog registry evidence from local-only fixture",
+    );
+    assert!(!catalog_report.production_ready);
+    assert_eq!(
+        catalog_report.blocking_reasons,
+        vec!["relation_catalog_status uses local-only evidence"]
+    );
+}
+
+#[test]
 fn readiness_report_blocks_bootstrap_raw_state_path() {
     let report = ProductionReadinessEvidenceV1::from_json_str(&readiness_json(&[], true, &[]))
         .unwrap()
@@ -410,12 +477,14 @@ fn feldera_release_provenance_verifier_outputs_stable_readiness_evidence() {
 fn readiness_evidence_rejects_unknown_json_fields() {
     let error = ProductionReadinessEvidenceV1::from_json_str(
         r#"{
-            "schema_version": 1,
+            "schema_version": 2,
             "deployment_id": "prod-a",
             "authority_store_id": "s3://velorix-prod",
             "capability_status": { "status": "pass", "evidence": "s3-compatible capability probe", "evidence_kind": ["s3_compatible"] },
             "ownership_status": { "status": "pass", "evidence": "durable epoch record", "evidence_kind": ["durable_ownership_epoch_record"] },
             "checkpoint_status": { "status": "pass", "evidence": "published checkpoint lifecycle", "evidence_kind": ["published_checkpoint_lifecycle_record"] },
+            "ingest_status": { "status": "pass", "evidence": "catalog-backed ingest admission", "evidence_kind": ["catalog_backed_ingest_admission"] },
+            "relation_catalog_status": { "status": "pass", "evidence": "durable relation catalog record and registry", "evidence_kind": ["relation_catalog_record", "relation_catalog_registry"] },
             "state_status": { "status": "pass", "evidence": "SlateDB checkpoint ref", "evidence_kind": ["slate_db_checkpoint_ref"] },
             "query_policy_status": { "status": "pass", "evidence": "bounded DataFusion policy", "evidence_kind": ["query_policy_catalog"] },
             "table_catalog_status": { "status": "pass", "evidence": "registry-backed table catalog", "evidence_kind": ["registry_backed_table_catalog"] },
@@ -435,13 +504,13 @@ fn readiness_evidence_rejects_unknown_json_fields() {
 #[test]
 fn readiness_report_rejects_unsupported_schema_version() {
     let error = ProductionReadinessEvidenceV1::from_json_str(
-        &readiness_json(&[], false, &[]).replace("\"schema_version\": 1", "\"schema_version\": 2"),
+        &readiness_json(&[], false, &[]).replace("\"schema_version\": 2", "\"schema_version\": 1"),
     )
     .unwrap()
     .try_into_report()
     .unwrap_err();
 
-    assert!(error.contains("unsupported readiness schema_version 2"));
+    assert!(error.contains("unsupported readiness schema_version 1"));
 }
 
 fn readiness_json(
@@ -468,6 +537,23 @@ fn readiness_json(
         r#", "evidence_kind": ["kubernetes_lease_client"]"#
     } else {
         ""
+    };
+    let ingest_kind = if !missing_evidence.contains(&"catalog_backed_ingest_admission") {
+        r#", "evidence_kind": ["catalog_backed_ingest_admission"]"#
+    } else {
+        ""
+    };
+    let mut relation_catalog_evidence_kind = Vec::new();
+    if !missing_evidence.contains(&"relation_catalog_record") {
+        relation_catalog_evidence_kind.push("relation_catalog_record");
+    }
+    if !missing_evidence.contains(&"relation_catalog_registry") {
+        relation_catalog_evidence_kind.push("relation_catalog_registry");
+    }
+    let relation_catalog_kind = if relation_catalog_evidence_kind.is_empty() {
+        String::new()
+    } else {
+        format!(r#", "evidence_kind": {:?}"#, relation_catalog_evidence_kind)
     };
     let mut state_evidence_kind = Vec::new();
     if include_bootstrap_raw_state_path {
@@ -532,12 +618,14 @@ fn readiness_json(
 
     format!(
         r#"{{
-            "schema_version": 1,
+            "schema_version": 2,
             "deployment_id": "prod-a",
             "authority_store_id": "s3://velorix-prod",
             "capability_status": {{ "status": "pass", "evidence": "s3-compatible capability probe"{capability_kind} }},
             "ownership_status": {{ "status": "pass", "evidence": "durable epoch record"{ownership_kind} }},
             "checkpoint_status": {{ "status": "pass", "evidence": "published checkpoint lifecycle"{checkpoint_kind} }},
+            "ingest_status": {{ "status": "{ingest_status}", "evidence": "{ingest_evidence}"{ingest_kind} }},
+            "relation_catalog_status": {{ "status": "{relation_catalog_status}", "evidence": "{relation_catalog_evidence}"{relation_catalog_kind} }},
             "state_status": {{ "status": "pass", "evidence": "SlateDB checkpoint ref"{state_kind} }},
             "query_policy_status": {{ "status": "pass", "evidence": "bounded DataFusion policy"{query_policy_kind} }},
             "table_catalog_status": {{ "status": "pass", "evidence": "registry-backed table catalog"{table_catalog_kind} }},
@@ -550,6 +638,10 @@ fn readiness_json(
         dependency_governance_status = status_for("dependency_governance_status", failed_fields),
         dependency_governance_evidence =
             evidence_for("dependency_governance_status", failed_fields),
+        ingest_status = status_for("ingest_status", failed_fields),
+        ingest_evidence = evidence_for("ingest_status", failed_fields),
+        relation_catalog_status = status_for("relation_catalog_status", failed_fields),
+        relation_catalog_evidence = evidence_for("relation_catalog_status", failed_fields),
         benchmark_status = status_for("benchmark_gate_status", failed_fields),
         benchmark_evidence = evidence_for("benchmark_gate_status", failed_fields),
         gc_status = status_for("gc_status", failed_fields),
@@ -609,9 +701,13 @@ fn status_for(field: &str, failed_fields: &[&str]) -> &'static str {
 fn evidence_for(field: &str, failed_fields: &[&str]) -> &'static str {
     match (field, failed_fields.contains(&field)) {
         ("dependency_governance_status", true) => "dependency governance failed closed",
+        ("ingest_status", true) => "catalog-backed ingest admission failed closed",
+        ("relation_catalog_status", true) => "relation catalog registry failed closed",
         ("benchmark_gate_status", true) => "regression gate failed closed",
         ("gc_status", true) => "GC evidence failed closed",
         ("dependency_governance_status", false) => "dependency governance validated",
+        ("ingest_status", false) => "catalog-backed ingest admission",
+        ("relation_catalog_status", false) => "durable relation catalog record and registry",
         ("benchmark_gate_status", false) => "S3-compatible benchmark gate",
         ("gc_status", false) => "GC run and retention evidence",
         _ => "readiness evidence",
