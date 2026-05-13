@@ -91,6 +91,7 @@ enum Command {
         slatedb_state_path: Option<String>,
         #[arg(
             long,
+            conflicts_with = "slatedb_state_path",
             help = "Permit bootstrap/migration recovery from legacy raw object state refs"
         )]
         allow_bootstrap_raw_state: bool,
@@ -1566,6 +1567,12 @@ async fn recover_local_runtime(
     checkpoint_version: Option<u64>,
     allow_bootstrap_raw_state: bool,
 ) -> anyhow::Result<RecoveredRuntime> {
+    if slatedb_state_path.is_some() && allow_bootstrap_raw_state {
+        bail!(
+            "recover-local --allow-bootstrap-raw-state cannot be combined with \
+             --slatedb-state-path"
+        );
+    }
     if slatedb_state_path.is_none() && !allow_bootstrap_raw_state {
         bail!(
             "recover-local raw object state recovery requires --allow-bootstrap-raw-state when \
@@ -2228,6 +2235,28 @@ mod tests {
     }
 
     #[test]
+    fn recover_local_cli_rejects_bootstrap_raw_state_with_slatedb_state_path() {
+        let error = Cli::try_parse_from([
+            "velorix-cli",
+            "recover-local",
+            "--object-store-dir",
+            "/tmp/velorix",
+            "--relation-id",
+            "orders",
+            "--relation-version",
+            "2026-05-05.v1",
+            "--slatedb-state-path",
+            "v1/slatedb/state",
+            "--allow-bootstrap-raw-state",
+        ])
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("--allow-bootstrap-raw-state"));
+        assert!(message.contains("--slatedb-state-path"));
+    }
+
+    #[test]
     fn recover_local_cli_requires_relation_catalog_identity() {
         let error = Cli::try_parse_from([
             "velorix-cli",
@@ -2259,6 +2288,27 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("--allow-bootstrap-raw-state"));
+    }
+
+    #[tokio::test]
+    async fn recover_local_runtime_rejects_bootstrap_raw_state_with_slatedb_state_path() {
+        let dir = tempdir().unwrap();
+        let store = local_object_store(dir.path()).unwrap();
+
+        let error = recover_local_runtime(
+            store,
+            "orders".to_string(),
+            "2026-05-05.v1".to_string(),
+            Some("v1/slatedb/state".to_string()),
+            None,
+            true,
+        )
+        .await
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("--allow-bootstrap-raw-state"));
+        assert!(message.contains("--slatedb-state-path"));
     }
 
     #[tokio::test]
