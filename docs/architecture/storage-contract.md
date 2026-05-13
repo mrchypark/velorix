@@ -189,8 +189,13 @@ The retention record includes schema version, checkpoint version, manifest key,
 manifest digest, GC run id, policy, retained manifest versions, deleted
 candidate keys, and timestamp. Admin inspection attaches retention evidence
 only when the record validates and its manifest digest matches the inspected
-manifest. It does not yet implement lifecycle transitions beyond `published`,
-manifest deletion, compaction state, repair, or recovery-mode writes.
+manifest. Successful checked recovery can also write append-only transition
+evidence under
+`v1/checkpoint-recovery/{checkpoint_version:020}/transitions/{transition_id}.transition.json`;
+that record is digest-bound to the recovered manifest and records the recovery
+mode and replay counts. It does not yet implement lifecycle transitions beyond
+`published`, manifest deletion, compaction state, repair, or authoritative
+recovery-mode state changes.
 
 State object references may carry an `owner_claim` with `owner_id` and
 `owner_epoch`. This is distinct from the existing state ref `owner`, which

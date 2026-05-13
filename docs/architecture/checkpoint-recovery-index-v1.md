@@ -84,6 +84,20 @@ Retention evidence is an admin surface only. It records which GC run and policy
 removed payloads for a non-retained checkpoint; it does not repair, rewrite,
 delete, or recover from a checkpoint.
 
+Successful checked recovery from a published checkpoint writes append-only
+recovery transition evidence:
+
+```text
+v1/checkpoint-recovery/{checkpoint_version:020}/transitions/{transition_id}.transition.json
+```
+
+The transition record is digest-bound to the recovered checkpoint manifest and
+records the recovery mode, replay checkpoint count, replayed batch count, and
+timestamp. It is readiness/admin evidence that recovery crossed a validated
+checkpoint boundary; it is not checkpoint authority, does not mutate lifecycle
+status, and does not claim broader compaction, repair, or manifest deletion
+policy.
+
 ## Verification
 
 - Valid marker fast path avoids full listing after manifest validation.
@@ -101,6 +115,8 @@ delete, or recover from a checkpoint.
   attached only when digest-bound to the inspected manifest.
 - Selected-checkpoint recovery requires a matching published lifecycle digest
   record and validates referenced state/output payload visibility.
+- Checked recovery writes digest-bound append-only recovery transition evidence
+  after successful recovery from a published checkpoint.
 - SlateDB selected-checkpoint local recovery opens state through
   `--slatedb-state-path` and rejects raw state paths on the SlateDB recovery
   path.

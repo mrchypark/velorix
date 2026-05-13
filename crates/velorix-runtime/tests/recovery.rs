@@ -6,7 +6,8 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use bytes::Bytes;
-use object_store::{local::LocalFileSystem, ObjectStore};
+use futures::TryStreamExt;
+use object_store::{local::LocalFileSystem, path::Path, ObjectStore};
 use serde_json::json;
 use tempfile::TempDir;
 use velorix_core::{
@@ -24,9 +25,11 @@ use velorix_storage::{
         AuthoritativeObjectStoreCapabilitiesV1, AuthoritativeObjectStoreCapabilityError,
         ObjectStoreCapabilityProfile,
     },
+    checkpoint_index::{CheckpointRecoveryMode, CheckpointRecoveryTransitionRecordV1},
     ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
     log::IngestLog,
     manifest::{CheckpointManifest, InputRange, StateObjectRef},
+    object_key::ObjectKey,
     relation_catalog_registry::{RelationCatalogRegistry, RelationCatalogRegistryError},
     state::{CheckpointPublisher, StateObjectWrite},
 };
@@ -347,6 +350,33 @@ async fn checked_selected_checkpoint_recovery_requires_ingest_capability() {
 }
 
 #[tokio::test]
+async fn checked_selected_checkpoint_recovery_requires_checkpoint_recovery_capability() {
+    let (_temp_dir, store) = temp_store();
+    let capabilities = capabilities_missing(AuthoritativeNamespace::CheckpointRecovery);
+
+    let error =
+        RecoveredRuntime::recover_from_published_checkpoint_version_with_owner_and_relation_catalog_record_checked(
+            Arc::clone(&store),
+            0,
+            ORDERS_SUM_COUNT_OWNER,
+            ORDERS_SUM_COUNT_RELATION_ID,
+            ORDERS_SUM_COUNT_RELATION_VERSION,
+            &capabilities,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RecoveryError::AuthoritativeObjectStoreCapabilities(
+            AuthoritativeObjectStoreCapabilityError::MissingNamespace {
+                namespace: AuthoritativeNamespace::CheckpointRecovery
+            }
+        )
+    ));
+}
+
+#[tokio::test]
 async fn checked_selected_checkpoint_recovery_replays_catalog_aware_ingest() {
     let (_temp_dir, store) = temp_store();
     let capabilities = probed_capabilities(store.as_ref()).await;
@@ -409,6 +439,29 @@ async fn checked_selected_checkpoint_recovery_replays_catalog_aware_ingest() {
             DeltaValue::from_json(json!({"count": 2, "sum": 7})),
             1,
         )]
+    );
+
+    let transition = single_recovery_transition_record(store.as_ref(), checkpoint_version).await;
+    assert_eq!(transition.checkpoint_version, checkpoint_version);
+    assert_eq!(
+        transition.manifest_key,
+        ObjectKey::checkpoint_manifest(checkpoint_version)
+    );
+    assert_eq!(
+        transition.recovery_mode,
+        CheckpointRecoveryMode::SelectedCheckpoint
+    );
+    assert_eq!(transition.replay_checkpoint_count, 1);
+    assert_eq!(transition.replayed_batch_count, 1);
+    assert_eq!(
+        publisher
+            .read_checkpoint_recovery_transition_record(
+                checkpoint_version,
+                transition.transition_id.as_str()
+            )
+            .await
+            .unwrap(),
+        transition
     );
 }
 
@@ -523,4 +576,26 @@ async fn catalog_backed_recovery_reports_malformed_ingest_when_batch_schema_diff
         RecoveryError::MalformedPrototypeArrowIngest { reason }
             if reason.contains("schema")
     ));
+}
+
+async fn single_recovery_transition_record(
+    store: &dyn ObjectStore,
+    checkpoint_version: u64,
+) -> CheckpointRecoveryTransitionRecordV1 {
+    let prefix = format!("v1/checkpoint-recovery/{checkpoint_version:020}/transitions");
+    let objects = store
+        .list(Some(&Path::from(prefix)))
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(objects.len(), 1);
+
+    let bytes = store
+        .get(&objects[0].location)
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
 }

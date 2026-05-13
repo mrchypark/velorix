@@ -12,7 +12,8 @@ use tokio::sync::Barrier;
 use velorix_storage::{
     checkpoint_index::{
         CheckpointLifecycleRecord, CheckpointLifecycleStatus, CheckpointManifestInspectionStatus,
-        CheckpointRetentionRecordV1, LatestCandidateMarker,
+        CheckpointRecoveryMode, CheckpointRecoveryTransitionRecordV1, CheckpointRetentionRecordV1,
+        LatestCandidateMarker,
     },
     gc::{
         GarbageCollectionCandidate, GarbageCollectionCandidateKind, GarbageCollectionPlan,
@@ -1930,6 +1931,132 @@ async fn checkpoint_read_published_manifest_rejects_lifecycle_digest_mismatch() 
 
     let err = publisher
         .read_published_checkpoint_manifest(0)
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("manifest digest"));
+}
+
+#[tokio::test]
+async fn checkpoint_recovery_transition_record_is_digest_bound_and_create_only() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(store);
+    let state = state_write(0, "state-0001", b"state-0");
+    let manifest = manifest(0, publisher.write_state_object(&state).await.unwrap());
+    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+
+    publisher.publish_manifest(&manifest).await.unwrap();
+
+    let record = publisher
+        .write_checkpoint_recovery_transition_record_with_id(
+            0,
+            "recovery-test-0001".to_string(),
+            CheckpointRecoveryMode::SelectedCheckpoint,
+            1,
+            2,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        record,
+        CheckpointRecoveryTransitionRecordV1::for_manifest(
+            &manifest,
+            &manifest_bytes,
+            "recovery-test-0001".to_string(),
+            CheckpointRecoveryMode::SelectedCheckpoint,
+            1,
+            2,
+            record.recovered_at.clone(),
+        )
+    );
+    assert_eq!(
+        publisher
+            .read_checkpoint_recovery_transition_record(0, "recovery-test-0001")
+            .await
+            .unwrap(),
+        record
+    );
+
+    let duplicate = publisher
+        .write_checkpoint_recovery_transition_record_with_id(
+            0,
+            "recovery-test-0001".to_string(),
+            CheckpointRecoveryMode::SelectedCheckpoint,
+            1,
+            2,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        duplicate,
+        CheckpointPublishError::CheckpointRecoveryTransitionAlreadyExists(_)
+    ));
+}
+
+#[tokio::test]
+async fn checkpoint_recovery_transition_record_requires_published_lifecycle() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let state = state_write(0, "state-0001", b"state-0");
+    let manifest = manifest(0, publisher.write_state_object(&state).await.unwrap());
+
+    publisher.publish_manifest(&manifest).await.unwrap();
+    store
+        .delete(&Path::from(
+            ObjectKey::checkpoint_lifecycle_record(0).as_str(),
+        ))
+        .await
+        .unwrap();
+
+    let err = publisher
+        .write_checkpoint_recovery_transition_record_with_id(
+            0,
+            "recovery-test-0001".to_string(),
+            CheckpointRecoveryMode::SelectedCheckpoint,
+            1,
+            2,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("not found"));
+}
+
+#[tokio::test]
+async fn checkpoint_recovery_transition_record_rejects_manifest_digest_mismatch() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let state = state_write(0, "state-0001", b"state-0");
+    let manifest = manifest(0, publisher.write_state_object(&state).await.unwrap());
+
+    publisher.publish_manifest(&manifest).await.unwrap();
+    let mut record = publisher
+        .write_checkpoint_recovery_transition_record_with_id(
+            0,
+            "recovery-test-0001".to_string(),
+            CheckpointRecoveryMode::SelectedCheckpoint,
+            1,
+            2,
+        )
+        .await
+        .unwrap();
+    record.manifest_digest = "sha256:mismatched".to_string();
+    store
+        .put(
+            &Path::from(
+                ObjectKey::checkpoint_recovery_transition_record(0, "recovery-test-0001")
+                    .unwrap()
+                    .as_str(),
+            ),
+            Bytes::from(serde_json::to_vec(&record).unwrap()).into(),
+        )
+        .await
+        .unwrap();
+
+    let err = publisher
+        .read_checkpoint_recovery_transition_record(0, "recovery-test-0001")
         .await
         .unwrap_err();
 

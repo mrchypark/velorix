@@ -23,6 +23,7 @@ use velorix_storage::{
         AuthoritativeObjectStoreCapabilityError, ObjectStoreCapabilityError,
         ObjectStoreCapabilityProfile,
     },
+    checkpoint_index::CheckpointRecoveryMode,
     ingest_envelope::IngestEnvelope,
     log::{IngestLog, IngestLogError, ReplayCheckpoint},
     manifest::CheckpointManifest,
@@ -193,13 +194,21 @@ impl RecoveredRuntime {
             authority.profile(AuthoritativeNamespace::Ingest),
         )?;
 
-        Self::recover_with_publisher_log_and_relation_catalog(
-            publisher,
+        let recovered = Self::recover_with_publisher_log_and_relation_catalog(
+            publisher.clone(),
             ingest_log,
             expected_owner,
             relation_catalog,
         )
-        .await
+        .await?;
+        Self::write_checked_recovery_transition(
+            &publisher,
+            &recovered,
+            CheckpointRecoveryMode::LatestCandidate,
+        )
+        .await?;
+
+        Ok(recovered)
     }
 
     pub async fn recover_from_published_checkpoint_version(
@@ -298,14 +307,22 @@ impl RecoveredRuntime {
             authority.profile(AuthoritativeNamespace::Ingest),
         )?;
 
-        Self::recover_with_selected_manifest_log_and_relation_catalog(
-            publisher,
+        let recovered = Self::recover_with_selected_manifest_log_and_relation_catalog(
+            publisher.clone(),
             ingest_log,
             manifest,
             expected_owner,
             relation_catalog,
         )
-        .await
+        .await?;
+        Self::write_checked_recovery_transition(
+            &publisher,
+            &recovered,
+            CheckpointRecoveryMode::SelectedCheckpoint,
+        )
+        .await?;
+
+        Ok(recovered)
     }
 
     pub async fn recover_from_published_checkpoint_version_with_slatedb_state_store_and_relation_catalog(
@@ -368,13 +385,21 @@ impl RecoveredRuntime {
             authority.profile(AuthoritativeNamespace::Ingest),
         )?;
 
-        Self::recover_with_publisher_log_and_relation_catalog(
-            publisher,
+        let recovered = Self::recover_with_publisher_log_and_relation_catalog(
+            publisher.clone(),
             ingest_log,
             expected_owner,
             relation_catalog,
         )
-        .await
+        .await?;
+        Self::write_checked_recovery_transition(
+            &publisher,
+            &recovered,
+            CheckpointRecoveryMode::SlateDbLatest,
+        )
+        .await?;
+
+        Ok(recovered)
     }
 
     pub async fn recover_with_slatedb_state_store_and_catalog_record_checked(
@@ -401,6 +426,25 @@ impl RecoveredRuntime {
             capabilities,
         )
         .await
+    }
+
+    async fn write_checked_recovery_transition(
+        publisher: &CheckpointPublisher,
+        recovered: &Self,
+        recovery_mode: CheckpointRecoveryMode,
+    ) -> Result<(), RecoveryError> {
+        if let Some(checkpoint_version) = recovered.latest_checkpoint_version {
+            publisher
+                .write_checkpoint_recovery_transition_record(
+                    checkpoint_version,
+                    recovery_mode,
+                    recovered.replay_checkpoints.len(),
+                    recovered.replayed_batch_count,
+                )
+                .await?;
+        }
+
+        Ok(())
     }
 
     async fn recover_with_publisher_and_relation_catalog(

@@ -27,6 +27,7 @@ pub enum AuthoritativeNamespace {
     CheckpointIndex,
     CheckpointLifecycle,
     CheckpointRetention,
+    CheckpointRecovery,
     Ownership,
     TableCatalog,
     RelationCatalog,
@@ -374,7 +375,7 @@ fn unique_probe_key(prefix: &str) -> String {
 }
 
 impl AuthoritativeNamespace {
-    pub fn all() -> [Self; 15] {
+    pub fn all() -> [Self; 16] {
         [
             Self::Ingest,
             Self::State,
@@ -383,6 +384,7 @@ impl AuthoritativeNamespace {
             Self::CheckpointIndex,
             Self::CheckpointLifecycle,
             Self::CheckpointRetention,
+            Self::CheckpointRecovery,
             Self::Ownership,
             Self::TableCatalog,
             Self::RelationCatalog,
@@ -416,6 +418,7 @@ impl fmt::Display for AuthoritativeNamespace {
             Self::CheckpointIndex => write!(f, "checkpoint-index"),
             Self::CheckpointLifecycle => write!(f, "checkpoint-lifecycle"),
             Self::CheckpointRetention => write!(f, "checkpoint-retention"),
+            Self::CheckpointRecovery => write!(f, "checkpoint-recovery"),
             Self::Ownership => write!(f, "ownership"),
             Self::TableCatalog => write!(f, "table_catalog"),
             Self::RelationCatalog => write!(f, "relation_catalog"),

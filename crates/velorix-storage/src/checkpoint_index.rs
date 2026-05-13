@@ -1,4 +1,7 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -8,6 +11,9 @@ use crate::{gc::GarbageCollectionPolicy, manifest::CheckpointManifest, object_ke
 pub const LATEST_CANDIDATE_SCHEMA_VERSION: u16 = 1;
 pub const CHECKPOINT_LIFECYCLE_SCHEMA_VERSION: u16 = 1;
 pub const CHECKPOINT_RETENTION_SCHEMA_VERSION: u16 = 1;
+pub const CHECKPOINT_RECOVERY_TRANSITION_SCHEMA_VERSION: u16 = 1;
+
+static RECOVERY_TRANSITION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -45,10 +51,32 @@ pub struct CheckpointRetentionRecordV1 {
     pub retained_at: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointRecoveryTransitionRecordV1 {
+    pub schema_version: u16,
+    pub checkpoint_version: u64,
+    pub transition_id: String,
+    pub manifest_key: ObjectKey,
+    pub manifest_digest: String,
+    pub recovery_mode: CheckpointRecoveryMode,
+    pub replay_checkpoint_count: usize,
+    pub replayed_batch_count: usize,
+    pub recovered_at: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckpointLifecycleStatus {
     Published,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointRecoveryMode {
+    LatestCandidate,
+    SelectedCheckpoint,
+    SlateDbLatest,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,6 +173,34 @@ impl CheckpointRetentionRecordV1 {
     }
 }
 
+impl CheckpointRecoveryTransitionRecordV1 {
+    pub fn for_manifest(
+        manifest: &CheckpointManifest,
+        manifest_bytes: &[u8],
+        transition_id: String,
+        recovery_mode: CheckpointRecoveryMode,
+        replay_checkpoint_count: usize,
+        replayed_batch_count: usize,
+        recovered_at: String,
+    ) -> Self {
+        Self {
+            schema_version: CHECKPOINT_RECOVERY_TRANSITION_SCHEMA_VERSION,
+            checkpoint_version: manifest.checkpoint_version,
+            transition_id,
+            manifest_key: manifest.object_key(),
+            manifest_digest: manifest_digest(manifest_bytes),
+            recovery_mode,
+            replay_checkpoint_count,
+            replayed_batch_count,
+            recovered_at,
+        }
+    }
+
+    pub fn validate_schema(&self) -> bool {
+        self.schema_version == CHECKPOINT_RECOVERY_TRANSITION_SCHEMA_VERSION
+    }
+}
+
 impl CheckpointManifestInspectionStatus {
     pub fn reason(&self) -> Option<&str> {
         match self {
@@ -172,4 +228,17 @@ pub(crate) fn marker_updated_at_now() -> String {
         .unwrap_or_default();
 
     format!("unix:{}.{:09}", duration.as_secs(), duration.subsec_nanos())
+}
+
+pub fn recovery_transition_id_now() -> String {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let sequence = RECOVERY_TRANSITION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+
+    format!(
+        "recovery-{}-{:09}-{sequence:016}",
+        duration.as_secs(),
+        duration.subsec_nanos()
+    )
 }

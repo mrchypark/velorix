@@ -78,7 +78,7 @@ fn assert_capability_error(
     assert_eq!(err.required_capability(), expected);
 }
 
-fn expected_authoritative_namespaces() -> [AuthoritativeNamespace; 15] {
+fn expected_authoritative_namespaces() -> [AuthoritativeNamespace; 16] {
     [
         AuthoritativeNamespace::Ingest,
         AuthoritativeNamespace::State,
@@ -87,6 +87,7 @@ fn expected_authoritative_namespaces() -> [AuthoritativeNamespace; 15] {
         AuthoritativeNamespace::CheckpointIndex,
         AuthoritativeNamespace::CheckpointLifecycle,
         AuthoritativeNamespace::CheckpointRetention,
+        AuthoritativeNamespace::CheckpointRecovery,
         AuthoritativeNamespace::Ownership,
         AuthoritativeNamespace::TableCatalog,
         AuthoritativeNamespace::RelationCatalog,

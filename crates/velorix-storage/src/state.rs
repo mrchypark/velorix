@@ -11,9 +11,10 @@ use thiserror::Error;
 use crate::{
     capability::{ObjectStoreCapabilityError, ObjectStoreCapabilityProfile},
     checkpoint_index::{
-        manifest_digest, marker_updated_at_now, CheckpointAdminInspection,
-        CheckpointLifecycleRecord, CheckpointLifecycleStatus, CheckpointManifestInspection,
-        CheckpointManifestInspectionStatus, CheckpointRetentionRecordV1, LatestCandidateMarker,
+        manifest_digest, marker_updated_at_now, recovery_transition_id_now,
+        CheckpointAdminInspection, CheckpointLifecycleRecord, CheckpointLifecycleStatus,
+        CheckpointManifestInspection, CheckpointManifestInspectionStatus, CheckpointRecoveryMode,
+        CheckpointRecoveryTransitionRecordV1, CheckpointRetentionRecordV1, LatestCandidateMarker,
     },
     gc::{
         GarbageCollectionCandidate, GarbageCollectionCandidateKind, GarbageCollectionPlan,
@@ -98,6 +99,8 @@ pub enum CheckpointPublishError {
     OutputObjectAlreadyExists(ObjectKey),
     #[error("checkpoint manifest `{0}` already exists")]
     ManifestAlreadyExists(ObjectKey),
+    #[error("checkpoint recovery transition record `{0}` already exists")]
+    CheckpointRecoveryTransitionAlreadyExists(ObjectKey),
     #[error("garbage collection run evidence `{0}` already exists")]
     GarbageCollectionRunAlreadyExists(ObjectKey),
     #[error(
@@ -571,6 +574,105 @@ impl CheckpointPublisher {
             .await?;
         let record = serde_json::from_slice::<CheckpointRetentionRecordV1>(&bytes)?;
         self.validate_retention_record(&object_key, &record)?;
+
+        Ok(record)
+    }
+
+    pub async fn write_checkpoint_recovery_transition_record(
+        &self,
+        checkpoint_version: u64,
+        recovery_mode: CheckpointRecoveryMode,
+        replay_checkpoint_count: usize,
+        replayed_batch_count: usize,
+    ) -> Result<CheckpointRecoveryTransitionRecordV1, CheckpointPublishError> {
+        self.write_checkpoint_recovery_transition_record_with_id(
+            checkpoint_version,
+            recovery_transition_id_now(),
+            recovery_mode,
+            replay_checkpoint_count,
+            replayed_batch_count,
+        )
+        .await
+    }
+
+    pub async fn write_checkpoint_recovery_transition_record_with_id(
+        &self,
+        checkpoint_version: u64,
+        transition_id: String,
+        recovery_mode: CheckpointRecoveryMode,
+        replay_checkpoint_count: usize,
+        replayed_batch_count: usize,
+    ) -> Result<CheckpointRecoveryTransitionRecordV1, CheckpointPublishError> {
+        let manifest_key = ObjectKey::checkpoint_manifest(checkpoint_version);
+        let manifest_path = Path::from(manifest_key.as_str());
+        let manifest_bytes = self.store.get(&manifest_path).await?.bytes().await?;
+        let manifest = self
+            .read_published_checkpoint_manifest(checkpoint_version)
+            .await?;
+        let record = CheckpointRecoveryTransitionRecordV1::for_manifest(
+            &manifest,
+            &manifest_bytes,
+            transition_id,
+            recovery_mode,
+            replay_checkpoint_count,
+            replayed_batch_count,
+            marker_updated_at_now(),
+        );
+        let object_key = ObjectKey::checkpoint_recovery_transition_record(
+            checkpoint_version,
+            &record.transition_id,
+        )?;
+        let bytes = serde_json::to_vec(&record)?;
+        let result = self
+            .store
+            .put_opts(
+                &Path::from(object_key.as_str()),
+                Bytes::from(bytes).into(),
+                PutMode::Create.into(),
+            )
+            .await;
+
+        match result {
+            Ok(_) => Ok(record),
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                Err(CheckpointPublishError::CheckpointRecoveryTransitionAlreadyExists(object_key))
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    pub async fn read_checkpoint_recovery_transition_record(
+        &self,
+        checkpoint_version: u64,
+        transition_id: &str,
+    ) -> Result<CheckpointRecoveryTransitionRecordV1, CheckpointPublishError> {
+        let object_key =
+            ObjectKey::checkpoint_recovery_transition_record(checkpoint_version, transition_id)?;
+        let bytes = self
+            .store
+            .get(&Path::from(object_key.as_str()))
+            .await?
+            .bytes()
+            .await?;
+        let record = serde_json::from_slice::<CheckpointRecoveryTransitionRecordV1>(&bytes)?;
+        self.validate_recovery_transition_record(&object_key, &record)?;
+        let manifest_bytes = self
+            .store
+            .get(&Path::from(record.manifest_key.as_str()))
+            .await?
+            .bytes()
+            .await?;
+        if record.manifest_digest != manifest_digest(&manifest_bytes) {
+            return Err(CheckpointPublishError::ObjectKey(
+                ObjectKeyError::InvalidExternalKey(format!(
+                    "checkpoint recovery transition manifest digest mismatch for checkpoint {} transition {}: expected {}, actual {}",
+                    record.checkpoint_version,
+                    record.transition_id,
+                    manifest_digest(&manifest_bytes),
+                    record.manifest_digest
+                )),
+            ));
+        }
 
         Ok(record)
     }
@@ -1459,6 +1561,44 @@ impl CheckpointPublisher {
             return Err(CheckpointPublishError::ObjectKey(
                 ObjectKeyError::InvalidExternalKey(format!(
                     "checkpoint lifecycle manifest key `{}` does not match checkpoint {}",
+                    record.manifest_key, record.checkpoint_version
+                )),
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn validate_recovery_transition_record(
+        &self,
+        object_key: &ObjectKey,
+        record: &CheckpointRecoveryTransitionRecordV1,
+    ) -> Result<(), CheckpointPublishError> {
+        if !record.validate_schema() {
+            return Err(CheckpointPublishError::ObjectKey(
+                ObjectKeyError::InvalidExternalKey(format!(
+                    "unsupported checkpoint recovery transition schema version {}",
+                    record.schema_version
+                )),
+            ));
+        }
+        if *object_key
+            != ObjectKey::checkpoint_recovery_transition_record(
+                record.checkpoint_version,
+                &record.transition_id,
+            )?
+        {
+            return Err(CheckpointPublishError::ObjectKey(
+                ObjectKeyError::InvalidExternalKey(format!(
+                    "checkpoint recovery transition key `{object_key}` does not match body checkpoint {} transition {}",
+                    record.checkpoint_version, record.transition_id
+                )),
+            ));
+        }
+        if record.manifest_key != ObjectKey::checkpoint_manifest(record.checkpoint_version) {
+            return Err(CheckpointPublishError::ObjectKey(
+                ObjectKeyError::InvalidExternalKey(format!(
+                    "checkpoint recovery transition manifest key `{}` does not match checkpoint {}",
                     record.manifest_key, record.checkpoint_version
                 )),
             ));
