@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use arrow::{
-    array::{ArrayRef, Int64Array, StringArray},
+    array::{ArrayRef, BooleanArray, Int64Array, StringArray},
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
@@ -382,6 +382,75 @@ fn generic_catalog_incremental_input_uses_catalog_roles_for_non_orders_columns()
 }
 
 #[test]
+fn generic_catalog_incremental_input_accepts_int64_primary_key() {
+    let catalog = account_balance_relation_catalog();
+    let batch = account_balance_input_batch(&[1001, 1002], &[500, 125], &[1, -1]);
+
+    let delta = arrow_record_batches_to_single_key_sum_count_delta_batch(
+        &catalog,
+        catalog.relation_schema.relation_id.as_str(),
+        catalog.relation_schema.relation_version.as_str(),
+        catalog.schema_fingerprint.as_str(),
+        &[batch],
+    )
+    .unwrap();
+
+    assert_eq!(
+        delta.records(),
+        &[
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!(1001)),
+                DeltaValue::from_json(serde_json::json!(500)),
+                1,
+            ),
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!(1002)),
+                DeltaValue::from_json(serde_json::json!(125)),
+                -1,
+            ),
+        ]
+    );
+}
+
+#[test]
+fn generic_catalog_incremental_input_rejects_unsupported_primary_key_type() {
+    let mut catalog = account_balance_relation_catalog();
+    catalog.relation_schema.columns[0].logical_type = VelorixLogicalTypeV1::Bool;
+    catalog.relation_schema.columns[0].physical_arrow_type = ArrowPhysicalTypeV1::Boolean;
+    catalog.schema_fingerprint =
+        SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema).unwrap();
+    catalog.feldera_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("account_id", DataType::Boolean, false),
+            Field::new("balance_cents", DataType::Int64, false),
+            Field::new("row_delta", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(BooleanArray::from(vec![true])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![500])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+
+    let error = arrow_record_batches_to_single_key_sum_count_delta_batch(
+        &catalog,
+        catalog.relation_schema.relation_id.as_str(),
+        catalog.relation_schema.relation_version.as_str(),
+        catalog.schema_fingerprint.as_str(),
+        &[batch],
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        IncrementalInputAdapterError::MalformedArrowInput { reason }
+            if reason == "prototype adapter key column `account_id` must be Utf8 or Int64"
+    ));
+}
+
+#[test]
 fn catalog_incremental_input_rejects_unsupported_adapter() {
     let catalog = orders_relation_catalog();
     let batch = orders_input_batch(&["order-a"], &[42], &[1]);
@@ -531,6 +600,65 @@ fn orders_relation_catalog() -> VelorixRelationCatalogV1 {
     }
 }
 
+fn account_balance_relation_catalog() -> VelorixRelationCatalogV1 {
+    let relation_schema = VelorixRelationSchemaV1 {
+        relation_id: "account_balances".to_string(),
+        relation_name: "account_balances".to_string(),
+        relation_version: "2026-05-13.v1".to_string(),
+        columns: vec![
+            RelationColumnV1 {
+                column_id: "account_id".to_string(),
+                name: "account_id".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 0,
+                semantic_role: RelationSemanticRoleV1::PrimaryKey,
+            },
+            RelationColumnV1 {
+                column_id: "balance_cents".to_string(),
+                name: "balance_cents".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 1,
+                semantic_role: RelationSemanticRoleV1::Value,
+            },
+            RelationColumnV1 {
+                column_id: "row_delta".to_string(),
+                name: "row_delta".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 2,
+                semantic_role: RelationSemanticRoleV1::Weight,
+            },
+        ],
+        primary_key_column_ids: vec!["account_id".to_string()],
+        weight_column_id: "row_delta".to_string(),
+        allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+        event_time_column_id: None,
+    };
+    let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
+
+    VelorixRelationCatalogV1 {
+        schema_version: RELATION_SCHEMA_VERSION_V1,
+        relation_schema,
+        schema_fingerprint: schema_fingerprint.clone(),
+        datafusion_registration: DataFusionRegistrationV1 {
+            name: "account_balances".to_string(),
+            mode: DataFusionRegistrationModeV1::Table,
+        },
+        feldera_relation: FelderaRelationBindingV1 {
+            relation_id: "account_balances".to_string(),
+            schema_fingerprint,
+        },
+        incremental_adapter: IncrementalAdapterBindingV1 {
+            adapter_id: CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID.to_string(),
+        },
+    }
+}
+
 fn customer_balance_relation_catalog() -> VelorixRelationCatalogV1 {
     let relation_schema = VelorixRelationSchemaV1 {
         relation_id: "customer_balances".to_string(),
@@ -601,6 +729,26 @@ fn orders_input_batch(order_ids: &[&str], amounts: &[i64], weights: &[i64]) -> R
             Arc::new(StringArray::from(order_ids.to_vec())) as ArrayRef,
             Arc::new(Int64Array::from(amounts.to_vec())) as ArrayRef,
             Arc::new(Int64Array::from(weights.to_vec())) as ArrayRef,
+        ],
+    )
+    .unwrap()
+}
+
+fn account_balance_input_batch(
+    account_ids: &[i64],
+    balance_cents: &[i64],
+    row_deltas: &[i64],
+) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("account_id", DataType::Int64, false),
+            Field::new("balance_cents", DataType::Int64, false),
+            Field::new("row_delta", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(account_ids.to_vec())) as ArrayRef,
+            Arc::new(Int64Array::from(balance_cents.to_vec())) as ArrayRef,
+            Arc::new(Int64Array::from(row_deltas.to_vec())) as ArrayRef,
         ],
     )
     .unwrap()

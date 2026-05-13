@@ -512,7 +512,7 @@ pub fn arrow_record_batches_to_single_key_sum_count_delta_batch(
     for batch in batches {
         validate_record_batch_matches_catalog(catalog, batch)
             .map_err(incremental_input_batch_schema_error)?;
-        let key = string_column(batch, key_column.name.as_str())?;
+        let key = incremental_key_column(batch, key_column)?;
         let value = int64_column(batch, value_column.name.as_str())?;
         let weight = int64_column(batch, weight_column.name.as_str())?;
 
@@ -524,7 +524,7 @@ pub fn arrow_record_batches_to_single_key_sum_count_delta_batch(
             }
 
             records.push(DeltaRecord::new(
-                DeltaKey::from_json(json!(key.value(row))),
+                key.delta_key(row),
                 DeltaValue::from_json(json!(value.value(row))),
                 weight.value(row),
             ));
@@ -716,6 +716,47 @@ fn string_column<'a>(
         .ok_or_else(|| IncrementalInputAdapterError::MalformedArrowInput {
             reason: format!("`{name}` column must be Utf8"),
         })
+}
+
+enum IncrementalKeyColumn<'a> {
+    Utf8(&'a StringArray),
+    Int64(&'a Int64Array),
+}
+
+impl IncrementalKeyColumn<'_> {
+    fn is_null(&self, row: usize) -> bool {
+        match self {
+            Self::Utf8(column) => column.is_null(row),
+            Self::Int64(column) => column.is_null(row),
+        }
+    }
+
+    fn delta_key(&self, row: usize) -> DeltaKey {
+        match self {
+            Self::Utf8(column) => DeltaKey::from_json(json!(column.value(row))),
+            Self::Int64(column) => DeltaKey::from_json(json!(column.value(row))),
+        }
+    }
+}
+
+fn incremental_key_column<'a>(
+    batch: &'a RecordBatch,
+    column: &RelationColumnV1,
+) -> Result<IncrementalKeyColumn<'a>, IncrementalInputAdapterError> {
+    match &column.physical_arrow_type {
+        ArrowPhysicalTypeV1::Utf8 => {
+            string_column(batch, column.name.as_str()).map(IncrementalKeyColumn::Utf8)
+        }
+        ArrowPhysicalTypeV1::Int64 => {
+            int64_column(batch, column.name.as_str()).map(IncrementalKeyColumn::Int64)
+        }
+        _ => Err(IncrementalInputAdapterError::MalformedArrowInput {
+            reason: format!(
+                "prototype adapter key column `{}` must be Utf8 or Int64",
+                column.name
+            ),
+        }),
+    }
 }
 
 fn int64_column<'a>(
