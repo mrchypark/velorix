@@ -2,8 +2,12 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::sync::Arc;
 
-use arrow::array::{Array, Date32Array, Int64Array, StringArray, TimestampNanosecondArray};
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::array::{
+    Array, Date32Array, DictionaryArray, Int64Array, StringArray, TimestampNanosecondArray,
+};
+use arrow::datatypes::{
+    DataType, Field, Int16Type, Int32Type, Int64Type, Int8Type, Schema, TimeUnit,
+};
 use arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
 use datafusion::error::DataFusionError;
@@ -617,12 +621,20 @@ fn data_type_for_arrow_physical_type(
         ArrowPhysicalTypeV1::TimestampNanosecond { timezone } => {
             DataType::Timestamp(TimeUnit::Nanosecond, timezone.clone().map(Into::into))
         }
-        ArrowPhysicalTypeV1::DictionaryUtf8 { .. } => {
-            return Err(RelationSchemaError::InvalidRelationSchema {
-                field: "unsupported_arrow_physical_type",
-            });
-        }
+        ArrowPhysicalTypeV1::DictionaryUtf8 { key_type, .. } => DataType::Dictionary(
+            Box::new(dictionary_key_data_type(key_type)),
+            Box::new(DataType::Utf8),
+        ),
     })
+}
+
+fn dictionary_key_data_type(key_type: &DictionaryKeyTypeV1) -> DataType {
+    match key_type {
+        DictionaryKeyTypeV1::Int8 => DataType::Int8,
+        DictionaryKeyTypeV1::Int16 => DataType::Int16,
+        DictionaryKeyTypeV1::Int32 => DataType::Int32,
+        DictionaryKeyTypeV1::Int64 => DataType::Int64,
+    }
 }
 
 fn validate_incremental_input_identity(
@@ -723,6 +735,10 @@ enum IncrementalKeyColumn<'a> {
     Int64(&'a Int64Array),
     Date32(&'a Date32Array),
     TimestampNanosecond(&'a TimestampNanosecondArray),
+    DictionaryUtf8Int8(&'a DictionaryArray<Int8Type>, &'a StringArray),
+    DictionaryUtf8Int16(&'a DictionaryArray<Int16Type>, &'a StringArray),
+    DictionaryUtf8Int32(&'a DictionaryArray<Int32Type>, &'a StringArray),
+    DictionaryUtf8Int64(&'a DictionaryArray<Int64Type>, &'a StringArray),
 }
 
 impl IncrementalKeyColumn<'_> {
@@ -732,6 +748,18 @@ impl IncrementalKeyColumn<'_> {
             Self::Int64(column) => column.is_null(row),
             Self::Date32(column) => column.is_null(row),
             Self::TimestampNanosecond(column) => column.is_null(row),
+            Self::DictionaryUtf8Int8(column, values) => {
+                dictionary_utf8_is_null(column, values, row)
+            }
+            Self::DictionaryUtf8Int16(column, values) => {
+                dictionary_utf8_is_null(column, values, row)
+            }
+            Self::DictionaryUtf8Int32(column, values) => {
+                dictionary_utf8_is_null(column, values, row)
+            }
+            Self::DictionaryUtf8Int64(column, values) => {
+                dictionary_utf8_is_null(column, values, row)
+            }
         }
     }
 
@@ -741,6 +769,18 @@ impl IncrementalKeyColumn<'_> {
             Self::Int64(column) => DeltaKey::from_json(json!(column.value(row))),
             Self::Date32(column) => DeltaKey::from_json(json!(column.value(row))),
             Self::TimestampNanosecond(column) => DeltaKey::from_json(json!(column.value(row))),
+            Self::DictionaryUtf8Int8(column, values) => {
+                DeltaKey::from_json(json!(dictionary_utf8_value(column, values, row)))
+            }
+            Self::DictionaryUtf8Int16(column, values) => {
+                DeltaKey::from_json(json!(dictionary_utf8_value(column, values, row)))
+            }
+            Self::DictionaryUtf8Int32(column, values) => {
+                DeltaKey::from_json(json!(dictionary_utf8_value(column, values, row)))
+            }
+            Self::DictionaryUtf8Int64(column, values) => {
+                DeltaKey::from_json(json!(dictionary_utf8_value(column, values, row)))
+            }
         }
     }
 }
@@ -763,12 +803,76 @@ fn incremental_key_column<'a>(
             timestamp_nanosecond_column(batch, column.name.as_str())
                 .map(IncrementalKeyColumn::TimestampNanosecond)
         }
+        ArrowPhysicalTypeV1::DictionaryUtf8 { key_type, .. } => {
+            dictionary_utf8_column(batch, column.name.as_str(), key_type)
+        }
         _ => Err(IncrementalInputAdapterError::MalformedArrowInput {
             reason: format!(
-                "prototype adapter key column `{}` must be Utf8, Int64, Date32, or TimestampNanosecond",
+                "prototype adapter key column `{}` must be Utf8, Int64, Date32, TimestampNanosecond, or DictionaryUtf8",
                 column.name
             ),
         }),
+    }
+}
+
+fn dictionary_utf8_column<'a>(
+    batch: &'a RecordBatch,
+    name: &str,
+    key_type: &DictionaryKeyTypeV1,
+) -> Result<IncrementalKeyColumn<'a>, IncrementalInputAdapterError> {
+    macro_rules! downcast_dictionary {
+        ($arrow_key_type:ty, $variant:ident) => {{
+            let column = batch
+                .column_by_name(name)
+                .ok_or_else(|| IncrementalInputAdapterError::MalformedArrowInput {
+                    reason: format!("missing `{name}` column"),
+                })?
+                .as_any()
+                .downcast_ref::<DictionaryArray<$arrow_key_type>>()
+                .ok_or_else(|| IncrementalInputAdapterError::MalformedArrowInput {
+                    reason: format!("`{name}` column must be DictionaryUtf8"),
+                })?;
+            let values = column
+                .values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| IncrementalInputAdapterError::MalformedArrowInput {
+                    reason: format!("`{name}` dictionary values must be DictionaryUtf8"),
+                })?;
+            Ok(IncrementalKeyColumn::$variant(column, values))
+        }};
+    }
+
+    match key_type {
+        DictionaryKeyTypeV1::Int8 => downcast_dictionary!(Int8Type, DictionaryUtf8Int8),
+        DictionaryKeyTypeV1::Int16 => downcast_dictionary!(Int16Type, DictionaryUtf8Int16),
+        DictionaryKeyTypeV1::Int32 => downcast_dictionary!(Int32Type, DictionaryUtf8Int32),
+        DictionaryKeyTypeV1::Int64 => downcast_dictionary!(Int64Type, DictionaryUtf8Int64),
+    }
+}
+
+fn dictionary_utf8_value<'a, K>(
+    column: &'a DictionaryArray<K>,
+    values: &'a StringArray,
+    row: usize,
+) -> &'a str
+where
+    K: arrow::array::types::ArrowDictionaryKeyType,
+{
+    values.value(
+        column
+            .key(row)
+            .expect("caller checked dictionary key is non-null"),
+    )
+}
+
+fn dictionary_utf8_is_null<K>(column: &DictionaryArray<K>, values: &StringArray, row: usize) -> bool
+where
+    K: arrow::array::types::ArrowDictionaryKeyType,
+{
+    match column.key(row) {
+        Some(key) => values.is_null(key),
+        None => true,
     }
 }
 

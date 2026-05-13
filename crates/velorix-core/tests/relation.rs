@@ -2,9 +2,10 @@ use std::sync::Arc;
 
 use arrow::{
     array::{
-        ArrayRef, BooleanArray, Date32Array, Int64Array, StringArray, TimestampNanosecondArray,
+        ArrayRef, BooleanArray, Date32Array, DictionaryArray, Int64Array, Int8Array, StringArray,
+        StringDictionaryBuilder, TimestampNanosecondArray,
     },
-    datatypes::{DataType, Field, Schema, TimeUnit},
+    datatypes::{DataType, Field, Int16Type, Int32Type, Int64Type, Int8Type, Schema, TimeUnit},
     record_batch::RecordBatch,
 };
 use datafusion::prelude::SessionContext;
@@ -14,11 +15,11 @@ use velorix_core::relation::{
     arrow_record_batches_to_single_key_sum_count_delta_batch, datafusion_schema_from_catalog,
     register_datafusion_catalog_batches, validate_record_batch_matches_catalog,
     ArrowPhysicalTypeV1, DataFusionRegistrationModeV1, DataFusionRegistrationV1,
-    FelderaRelationBindingV1, IncrementalAdapterBindingV1, IncrementalInputAdapterError,
-    RelationColumnV1, RelationOperationV1, RelationSchemaError, RelationSemanticRoleV1,
-    SchemaFingerprintV1, VelorixLogicalTypeV1, VelorixRelationCatalogV1, VelorixRelationSchemaV1,
-    CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID, ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID,
-    RELATION_SCHEMA_VERSION_V1,
+    DictionaryKeyTypeV1, FelderaRelationBindingV1, IncrementalAdapterBindingV1,
+    IncrementalInputAdapterError, RelationColumnV1, RelationOperationV1, RelationSchemaError,
+    RelationSemanticRoleV1, SchemaFingerprintV1, VelorixLogicalTypeV1, VelorixRelationCatalogV1,
+    VelorixRelationSchemaV1, CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID,
+    ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID, RELATION_SCHEMA_VERSION_V1,
 };
 
 const ORDERS_RELATION_SCHEMA_FINGERPRINT: &str =
@@ -236,6 +237,25 @@ async fn datafusion_registration_from_catalog_exposes_typed_columns() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("key_json"));
+}
+
+#[test]
+fn datafusion_schema_from_catalog_accepts_dictionary_utf8_primary_key_types() {
+    for (key_type, expected_key_data_type) in [
+        (DictionaryKeyTypeV1::Int8, DataType::Int8),
+        (DictionaryKeyTypeV1::Int16, DataType::Int16),
+        (DictionaryKeyTypeV1::Int32, DataType::Int32),
+        (DictionaryKeyTypeV1::Int64, DataType::Int64),
+    ] {
+        let catalog = dictionary_customer_balance_relation_catalog(key_type);
+
+        let schema = datafusion_schema_from_catalog(&catalog).unwrap();
+
+        assert_eq!(
+            schema.field(2).data_type(),
+            &DataType::Dictionary(Box::new(expected_key_data_type), Box::new(DataType::Utf8))
+        );
+    }
 }
 
 #[test]
@@ -481,6 +501,136 @@ fn generic_catalog_incremental_input_accepts_timestamp_nanosecond_primary_key() 
 }
 
 #[test]
+fn generic_catalog_incremental_input_accepts_dictionary_utf8_primary_key() {
+    for key_type in [
+        DictionaryKeyTypeV1::Int8,
+        DictionaryKeyTypeV1::Int16,
+        DictionaryKeyTypeV1::Int32,
+        DictionaryKeyTypeV1::Int64,
+    ] {
+        let catalog = dictionary_customer_balance_relation_catalog(key_type.clone());
+        let batch = dictionary_customer_balance_input_batch(
+            &key_type,
+            &["customer-a", "customer-b"],
+            &[500, 125],
+            &[1, -1],
+        );
+
+        let delta = arrow_record_batches_to_single_key_sum_count_delta_batch(
+            &catalog,
+            catalog.relation_schema.relation_id.as_str(),
+            catalog.relation_schema.relation_version.as_str(),
+            catalog.schema_fingerprint.as_str(),
+            &[batch],
+        )
+        .unwrap();
+
+        assert_eq!(
+            delta.records(),
+            &[
+                DeltaRecord::new(
+                    DeltaKey::from_json(serde_json::json!("customer-a")),
+                    DeltaValue::from_json(serde_json::json!(500)),
+                    1,
+                ),
+                DeltaRecord::new(
+                    DeltaKey::from_json(serde_json::json!("customer-b")),
+                    DeltaValue::from_json(serde_json::json!(125)),
+                    -1,
+                ),
+            ]
+        );
+    }
+}
+
+#[test]
+fn generic_catalog_incremental_input_rejects_dictionary_utf8_null_value() {
+    let catalog = dictionary_customer_balance_relation_catalog(DictionaryKeyTypeV1::Int8);
+    let key_values = StringArray::from(vec![Some("customer-a"), None]);
+    let customer_key_array = DictionaryArray::<Int8Type>::try_new(
+        Int8Array::from(vec![0_i8, 1_i8]),
+        Arc::new(key_values),
+    )
+    .unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("balance_cents", DataType::Int64, false),
+            Field::new("row_delta", DataType::Int64, false),
+            Field::new(
+                "customer_key",
+                DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+                false,
+            ),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![500, 125])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![1, -1])) as ArrayRef,
+            Arc::new(customer_key_array) as ArrayRef,
+        ],
+    )
+    .unwrap();
+
+    let error = arrow_record_batches_to_single_key_sum_count_delta_batch(
+        &catalog,
+        catalog.relation_schema.relation_id.as_str(),
+        catalog.relation_schema.relation_version.as_str(),
+        catalog.schema_fingerprint.as_str(),
+        &[batch],
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        IncrementalInputAdapterError::MalformedArrowInput { reason }
+            if reason == "prototype ingest columns must be non-null"
+    ));
+}
+
+#[test]
+fn generic_catalog_incremental_input_rejects_dictionary_utf8_null_key() {
+    let mut catalog = dictionary_customer_balance_relation_catalog(DictionaryKeyTypeV1::Int8);
+    catalog.relation_schema.columns[2].nullable = true;
+    catalog.schema_fingerprint =
+        SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema).unwrap();
+    catalog.feldera_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
+    let mut key_builder = StringDictionaryBuilder::<Int8Type>::new();
+    key_builder.append("customer-a").unwrap();
+    key_builder.append_null();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("balance_cents", DataType::Int64, false),
+            Field::new("row_delta", DataType::Int64, false),
+            Field::new(
+                "customer_key",
+                DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+                true,
+            ),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![500, 125])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![1, -1])) as ArrayRef,
+            Arc::new(key_builder.finish()) as ArrayRef,
+        ],
+    )
+    .unwrap();
+
+    let error = arrow_record_batches_to_single_key_sum_count_delta_batch(
+        &catalog,
+        catalog.relation_schema.relation_id.as_str(),
+        catalog.relation_schema.relation_version.as_str(),
+        catalog.schema_fingerprint.as_str(),
+        &[batch],
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        IncrementalInputAdapterError::MalformedArrowInput { reason }
+            if reason == "prototype ingest columns must be non-null"
+    ));
+}
+
+#[test]
 fn generic_catalog_incremental_input_rejects_unsupported_primary_key_type() {
     let mut catalog = account_balance_relation_catalog();
     catalog.relation_schema.columns[0].logical_type = VelorixLogicalTypeV1::Bool;
@@ -514,7 +664,7 @@ fn generic_catalog_incremental_input_rejects_unsupported_primary_key_type() {
     assert!(matches!(
         error,
         IncrementalInputAdapterError::MalformedArrowInput { reason }
-            if reason == "prototype adapter key column `account_id` must be Utf8, Int64, Date32, or TimestampNanosecond"
+            if reason == "prototype adapter key column `account_id` must be Utf8, Int64, Date32, TimestampNanosecond, or DictionaryUtf8"
     ));
 }
 
@@ -904,6 +1054,20 @@ fn customer_balance_relation_catalog() -> VelorixRelationCatalogV1 {
     }
 }
 
+fn dictionary_customer_balance_relation_catalog(
+    key_type: DictionaryKeyTypeV1,
+) -> VelorixRelationCatalogV1 {
+    let mut catalog = customer_balance_relation_catalog();
+    catalog.relation_schema.columns[2].physical_arrow_type = ArrowPhysicalTypeV1::DictionaryUtf8 {
+        key_type,
+        ordered: false,
+    };
+    catalog.schema_fingerprint =
+        SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema).unwrap();
+    catalog.feldera_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
+    catalog
+}
+
 fn orders_input_batch(order_ids: &[&str], amounts: &[i64], weights: &[i64]) -> RecordBatch {
     RecordBatch::try_new(
         Arc::new(Schema::new(vec![
@@ -999,6 +1163,48 @@ fn customer_balance_input_batch(
             Arc::new(Int64Array::from(balance_cents.to_vec())) as ArrayRef,
             Arc::new(Int64Array::from(row_deltas.to_vec())) as ArrayRef,
             Arc::new(StringArray::from(customer_keys.to_vec())) as ArrayRef,
+        ],
+    )
+    .unwrap()
+}
+
+fn dictionary_customer_balance_input_batch(
+    key_type: &DictionaryKeyTypeV1,
+    customer_keys: &[&str],
+    balance_cents: &[i64],
+    row_deltas: &[i64],
+) -> RecordBatch {
+    macro_rules! dictionary_array {
+        ($arrow_key_type:ty) => {{
+            let mut builder = StringDictionaryBuilder::<$arrow_key_type>::new();
+            for key in customer_keys {
+                builder.append(key).unwrap();
+            }
+            Arc::new(builder.finish()) as ArrayRef
+        }};
+    }
+
+    let (key_data_type, customer_key_array) = match key_type {
+        DictionaryKeyTypeV1::Int8 => (DataType::Int8, dictionary_array!(Int8Type)),
+        DictionaryKeyTypeV1::Int16 => (DataType::Int16, dictionary_array!(Int16Type)),
+        DictionaryKeyTypeV1::Int32 => (DataType::Int32, dictionary_array!(Int32Type)),
+        DictionaryKeyTypeV1::Int64 => (DataType::Int64, dictionary_array!(Int64Type)),
+    };
+
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("balance_cents", DataType::Int64, false),
+            Field::new("row_delta", DataType::Int64, false),
+            Field::new(
+                "customer_key",
+                DataType::Dictionary(Box::new(key_data_type), Box::new(DataType::Utf8)),
+                false,
+            ),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(balance_cents.to_vec())) as ArrayRef,
+            Arc::new(Int64Array::from(row_deltas.to_vec())) as ArrayRef,
+            customer_key_array,
         ],
     )
     .unwrap()
