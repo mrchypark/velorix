@@ -27,6 +27,27 @@ fn readiness_report_blocks_empty_top_level_identity() {
 }
 
 #[test]
+fn readiness_report_blocks_local_dev_authority_store_id() {
+    for authority_store_id in [
+        "memory://velorix",
+        "file:///tmp/velorix",
+        "http://localhost:9000/velorix",
+        "http://127.0.0.1:9000/velorix",
+        "floci://velorix",
+        "local filesystem authority",
+    ] {
+        let report = report_with_identity("prod-a", authority_store_id);
+
+        assert!(!report.production_ready, "{authority_store_id}");
+        assert_eq!(
+            report.blocking_reasons,
+            vec!["authority_store_id uses local/dev authority"],
+            "{authority_store_id}"
+        );
+    }
+}
+
+#[test]
 fn readiness_report_blocks_pass_check_with_blank_evidence() {
     let report = report_with_evidence("capability_status", " \t\n");
 

@@ -132,6 +132,8 @@ impl ProductionReadinessEvidenceV1 {
         }
         if self.authority_store_id.trim().is_empty() {
             blocking_reasons.push("authority_store_id is empty".to_string());
+        } else if is_local_dev_authority_store(&self.authority_store_id) {
+            blocking_reasons.push("authority_store_id uses local/dev authority".to_string());
         }
 
         push_check_blockers(
@@ -447,6 +449,25 @@ fn push_placeholder_evidence_check(
             return;
         }
     }
+}
+
+fn is_local_dev_authority_store(authority_store_id: &str) -> bool {
+    let authority_store_id = authority_store_id.to_lowercase();
+    [
+        "memory://",
+        "file://",
+        "localhost",
+        "127.0.0.1",
+        "floci",
+        "vind",
+        "vcluster",
+        "emulator",
+        "local-only",
+        "local only",
+        "local filesystem",
+    ]
+    .iter()
+    .any(|marker| authority_store_id.contains(marker))
 }
 
 pub fn validate_readiness_schema_version(
