@@ -955,9 +955,19 @@ fn validate_release_status_text(contents: &str) -> anyhow::Result<()> {
 
     for required in REQUIRED_RELEASE_CONTRACTS {
         match rows.get(*required) {
-            Some(status) if status == "complete" => {}
-            Some(status) => {
-                errors.push(format!("{required} status is {status}, expected complete"))
+            Some(row) => {
+                if row.status != "complete" {
+                    errors.push(format!(
+                        "{required} status is {}, expected complete",
+                        row.status
+                    ));
+                }
+                if !is_no_blocking_tasks(&row.blocking_tasks) {
+                    errors.push(format!(
+                        "{required} blocking tasks are {}, expected none",
+                        row.blocking_tasks
+                    ));
+                }
             }
             None => errors.push(format!("missing required release status row: {required}")),
         }
@@ -976,7 +986,13 @@ fn validate_release_status_text(contents: &str) -> anyhow::Result<()> {
     }
 }
 
-fn parse_release_status_rows(contents: &str) -> anyhow::Result<BTreeMap<String, String>> {
+#[derive(Debug, PartialEq, Eq)]
+struct ReleaseStatusRow {
+    status: String,
+    blocking_tasks: String,
+}
+
+fn parse_release_status_rows(contents: &str) -> anyhow::Result<BTreeMap<String, ReleaseStatusRow>> {
     let mut rows = BTreeMap::new();
 
     for line in contents.lines().filter(|line| line.starts_with('|')) {
@@ -990,13 +1006,20 @@ fn parse_release_status_rows(contents: &str) -> anyhow::Result<BTreeMap<String, 
         }
 
         let contract = cells[0].to_string();
-        let status = cells[3].to_string();
-        if rows.insert(contract.clone(), status).is_some() {
+        let row = ReleaseStatusRow {
+            status: cells[3].to_string(),
+            blocking_tasks: cells[4].to_string(),
+        };
+        if rows.insert(contract.clone(), row).is_some() {
             bail!("duplicate release status row: {contract}");
         }
     }
 
     Ok(rows)
+}
+
+fn is_no_blocking_tasks(value: &str) -> bool {
+    value.trim().eq_ignore_ascii_case("none")
 }
 
 fn read_feldera_artifact_hash_verified_evidence(
@@ -3836,6 +3859,20 @@ mod tests {
     }
 
     #[test]
+    fn release_status_validator_rejects_complete_status_with_blocking_tasks() {
+        let error = validate_release_status_text(&release_status_matrix_with_blocking_tasks(
+            "complete",
+            &[],
+            &[],
+            &[("ingest", "add live production evidence")],
+        ))
+        .unwrap_err();
+
+        assert!(format!("{error:#}")
+            .contains("ingest blocking tasks are add live production evidence, expected none"));
+    }
+
+    #[test]
     fn release_status_validator_rejects_missing_required_row() {
         let error = validate_release_status_text(&release_status_matrix("complete", &["GC"], &[]))
             .unwrap_err();
@@ -4809,6 +4846,15 @@ mod tests {
         omitted_contracts: &[&str],
         overrides: &[(&str, &str)],
     ) -> String {
+        release_status_matrix_with_blocking_tasks(default_status, omitted_contracts, overrides, &[])
+    }
+
+    fn release_status_matrix_with_blocking_tasks(
+        default_status: &str,
+        omitted_contracts: &[&str],
+        overrides: &[(&str, &str)],
+        blocking_overrides: &[(&str, &str)],
+    ) -> String {
         let mut matrix = String::from(
             "| Contract | Current Evidence | 1.0 Required Evidence | Status | Blocking Tasks |\n\
              | --- | --- | --- | --- | --- |\n",
@@ -4822,8 +4868,12 @@ mod tests {
                 .iter()
                 .find_map(|(name, status)| (*name == *contract).then_some(*status))
                 .unwrap_or(default_status);
+            let blocking_tasks = blocking_overrides
+                .iter()
+                .find_map(|(name, tasks)| (*name == *contract).then_some(*tasks))
+                .unwrap_or("none");
             matrix.push_str(&format!(
-                "| {contract} | evidence | required evidence | {status} | none |\n"
+                "| {contract} | evidence | required evidence | {status} | {blocking_tasks} |\n"
             ));
         }
 
