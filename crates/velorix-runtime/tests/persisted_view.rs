@@ -313,6 +313,44 @@ async fn production_persisted_object_backed_view_rejects_concurrency_policy_with
 }
 
 #[tokio::test]
+async fn production_persisted_object_backed_view_rejects_missing_capabilities_before_malformed_relation_catalog(
+) {
+    let (_temp_dir, catalog_store) = temp_store();
+    create_production_table_with_policy(
+        &catalog_store,
+        production_policy_with(QueryPolicy::default()),
+    )
+    .await;
+    overwrite_orders_relation_catalog_with_malformed_json(&catalog_store).await;
+    let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
+    let mut registry = StorageRegistry::new();
+    registry
+        .register("primary", "memory://velorix/", scan_store)
+        .unwrap();
+
+    let error = query_production_persisted_object_backed_view(
+        Arc::clone(&catalog_store),
+        Arc::clone(&catalog_store),
+        Arc::clone(&catalog_store),
+        &registry,
+        "tenant-a",
+        "orders-current",
+        "orders-view",
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        PersistedViewError::TableCatalog(PersistedTableError::StorageRegistry(
+            velorix_runtime::storage_registry::StorageRegistryError::MissingProductionCapabilities {
+                store_id,
+            }
+        )) if store_id == "primary"
+    ));
+}
+
+#[tokio::test]
 async fn production_persisted_object_backed_view_accepts_matching_shared_limiter() {
     let (_temp_dir, catalog_store) = temp_store();
     let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
@@ -603,6 +641,23 @@ async fn create_production_persisted_query(catalog_store: &Arc<dyn ObjectStore>)
             "select account_id, value, weight from orders order by account_id",
             QueryPolicy::default(),
             &orders_relation_catalog(),
+        )
+        .await
+        .unwrap();
+}
+
+async fn overwrite_orders_relation_catalog_with_malformed_json(store: &Arc<dyn ObjectStore>) {
+    let catalog = orders_relation_catalog();
+    let key = RelationCatalogRegistry::new(Arc::clone(store))
+        .object_key(
+            &catalog.relation_schema.relation_id,
+            &catalog.relation_schema.relation_version,
+        )
+        .unwrap();
+    store
+        .put(
+            &Path::from(key.as_str()),
+            Bytes::from_static(br#"{"schema_version":"#).into(),
         )
         .await
         .unwrap();

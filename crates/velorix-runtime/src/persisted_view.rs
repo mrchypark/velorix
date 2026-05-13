@@ -5,11 +5,11 @@ use datafusion::object_store::ObjectStore as DataFusionObjectStore;
 use object_store::ObjectStore;
 use thiserror::Error;
 use velorix_core::relation::VelorixRelationCatalogV1;
-use velorix_storage::relation_catalog_registry::RelationCatalogRegistry;
 
 use crate::{
     persisted_query::{PersistedQueryError, PersistedQueryStore},
     persisted_table::{
+        production_relation_catalog_registry,
         query_production_persisted_object_backed_input_with_limiter, PersistedTableError,
         PersistedTableFormat, PersistedTableStore, ProductionPersistedTableQueryRequest,
         ProductionPersistedTableSpec,
@@ -105,8 +105,13 @@ pub async fn query_production_persisted_object_backed_view_with_limiter(
         .map_err(PersistedViewError::TableCatalog)?;
     reject_cross_tenant_production_view(request.tenant_id, &table)
         .map_err(PersistedViewError::TableCatalog)?;
+    let capabilities = request
+        .registry
+        .production_capabilities(&table.store_id)
+        .map_err(PersistedTableError::from)
+        .map_err(PersistedViewError::TableCatalog)?;
     let relation_catalog =
-        read_pinned_relation_catalog(Arc::clone(&relation_catalog_store), &table)
+        read_pinned_relation_catalog(Arc::clone(&relation_catalog_store), capabilities, &table)
             .await
             .map_err(PersistedViewError::TableCatalog)?;
     let production_policy = QueryPolicyCatalogStore::new(Arc::clone(&policy_catalog_store))
@@ -145,11 +150,13 @@ pub async fn query_production_persisted_object_backed_view_with_limiter(
 
 async fn read_pinned_relation_catalog(
     relation_catalog_store: Arc<dyn ObjectStore>,
+    capabilities: &velorix_storage::capability::AuthoritativeObjectStoreCapabilitiesV1,
     table: &ProductionPersistedTableSpec,
 ) -> Result<VelorixRelationCatalogV1, PersistedTableError> {
-    let relation_catalog = RelationCatalogRegistry::new(relation_catalog_store)
-        .read(&table.relation_id, &table.relation_version)
-        .await?;
+    let relation_catalog =
+        production_relation_catalog_registry(relation_catalog_store, capabilities)?
+            .read(&table.relation_id, &table.relation_version)
+            .await?;
     let catalog_fingerprint = relation_catalog.schema_fingerprint.as_str();
     if catalog_fingerprint != table.schema_fingerprint {
         return Err(PersistedTableError::RelationCatalogFingerprintMismatch {

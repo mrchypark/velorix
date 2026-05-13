@@ -178,6 +178,23 @@ impl StorageRegistry {
         Ok(())
     }
 
+    pub fn production_capabilities(
+        &self,
+        store_id: &str,
+    ) -> Result<&AuthoritativeObjectStoreCapabilitiesV1, StorageRegistryError> {
+        let entry = self.entries.get(store_id).ok_or_else(|| {
+            StorageRegistryError::UnregisteredStoreId {
+                store_id: store_id.to_string(),
+            }
+        })?;
+
+        entry.production_capabilities.as_ref().ok_or_else(|| {
+            StorageRegistryError::MissingProductionCapabilities {
+                store_id: store_id.to_string(),
+            }
+        })
+    }
+
     fn resolve_unchecked_table_location(
         &self,
         store_id: &str,
@@ -211,16 +228,7 @@ impl StorageRegistry {
         object_key_prefix: &str,
         snapshot_ref: &str,
     ) -> Result<RegisteredTableLocation, StorageRegistryError> {
-        let entry = self.entries.get(store_id).ok_or_else(|| {
-            StorageRegistryError::UnregisteredStoreId {
-                store_id: store_id.to_string(),
-            }
-        })?;
-        if entry.production_capabilities.is_none() {
-            return Err(StorageRegistryError::MissingProductionCapabilities {
-                store_id: store_id.to_string(),
-            });
-        }
+        self.production_capabilities(store_id)?;
 
         self.resolve_unchecked_table_location(store_id, tenant_id, object_key_prefix, snapshot_ref)
     }

@@ -15,6 +15,10 @@ use velorix_core::{
     },
 };
 use velorix_storage::{
+    capability::{
+        AuthoritativeNamespace, AuthoritativeObjectStoreCapabilitiesV1,
+        AuthoritativeObjectStoreCapabilityError,
+    },
     object_key::{ObjectKey, ObjectKeyError},
     relation_catalog_registry::{RelationCatalogRegistry, RelationCatalogRegistryError},
 };
@@ -217,8 +221,10 @@ impl PersistedTableStore {
         };
         let object_key = ObjectKey::query_table(&spec.table_id)?;
         validate_production_table_fields(&spec)?;
+        let capabilities = registry.production_capabilities(&spec.store_id)?;
         let relation_catalog = read_matching_relation_catalog(
             relation_catalog_store,
+            capabilities,
             &spec.relation_id,
             &spec.relation_version,
             &spec.schema_fingerprint,
@@ -359,8 +365,10 @@ pub async fn query_production_persisted_object_backed_input_with_limiter_and_met
     let catalog = PersistedTableStore::new(catalog_store);
     let spec = catalog.get_production(request.table_id).await?;
     reject_cross_tenant_production_query(request.tenant_id, &spec)?;
+    let capabilities = request.registry.production_capabilities(&spec.store_id)?;
     let relation_catalog = read_matching_relation_catalog(
         relation_catalog_store,
+        capabilities,
         &spec.relation_id,
         &spec.relation_version,
         &spec.schema_fingerprint,
@@ -392,8 +400,10 @@ pub async fn query_production_persisted_object_backed_input_with_limiter(
     let catalog = PersistedTableStore::new(catalog_store);
     let spec = catalog.get_production(request.table_id).await?;
     reject_cross_tenant_production_query(request.tenant_id, &spec)?;
+    let capabilities = request.registry.production_capabilities(&spec.store_id)?;
     let relation_catalog = read_matching_relation_catalog(
         relation_catalog_store,
+        capabilities,
         &spec.relation_id,
         &spec.relation_version,
         &spec.schema_fingerprint,
@@ -589,13 +599,13 @@ fn validate_production_table_fields(
 
 async fn read_matching_relation_catalog(
     relation_catalog_store: Arc<dyn ObjectStore>,
+    capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
     relation_id: &str,
     relation_version: &str,
     schema_fingerprint: &str,
 ) -> Result<VelorixRelationCatalogV1, PersistedTableError> {
-    let relation_catalog = RelationCatalogRegistry::new(relation_catalog_store)
-        .read(relation_id, relation_version)
-        .await?;
+    let registry = production_relation_catalog_registry(relation_catalog_store, capabilities)?;
+    let relation_catalog = registry.read(relation_id, relation_version).await?;
     let catalog_fingerprint = relation_catalog.schema_fingerprint.as_str();
     if catalog_fingerprint != schema_fingerprint {
         return Err(PersistedTableError::RelationCatalogFingerprintMismatch {
@@ -607,6 +617,32 @@ async fn read_matching_relation_catalog(
     }
 
     Ok(relation_catalog)
+}
+
+pub(crate) fn production_relation_catalog_registry(
+    relation_catalog_store: Arc<dyn ObjectStore>,
+    capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
+) -> Result<RelationCatalogRegistry, PersistedTableError> {
+    let profile = capabilities
+        .profiles
+        .get(&AuthoritativeNamespace::RelationCatalog)
+        .ok_or_else(|| {
+            StorageRegistryError::ObjectStoreCapabilities(
+                AuthoritativeObjectStoreCapabilityError::MissingNamespace {
+                    namespace: AuthoritativeNamespace::RelationCatalog,
+                },
+            )
+        })?;
+
+    RelationCatalogRegistry::new_checked(relation_catalog_store, profile).map_err(|source| {
+        StorageRegistryError::ObjectStoreCapabilities(
+            AuthoritativeObjectStoreCapabilityError::NamespaceProfile {
+                namespace: AuthoritativeNamespace::RelationCatalog,
+                source,
+            },
+        )
+        .into()
+    })
 }
 
 fn require_table_relation_registration(

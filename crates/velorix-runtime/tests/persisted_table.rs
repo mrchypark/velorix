@@ -526,7 +526,9 @@ async fn production_persisted_table_store_rejects_missing_policy_before_writing(
     let (_temp_dir, store) = temp_store();
     let catalog = PersistedTableStore::new(Arc::clone(&store));
     create_orders_relation_catalog(&store).await;
-    let registry = StorageRegistry::new();
+    let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
+    let mut registry = StorageRegistry::new();
+    register_production_scan_store(&mut registry, scan_store, Arc::clone(&store)).await;
 
     let error = catalog
         .create_production(
@@ -560,7 +562,9 @@ async fn production_persisted_table_store_rejects_unbounded_policy_before_writin
         .create("tenant-a", "standard", QueryPolicy::default())
         .await
         .unwrap();
-    let registry = StorageRegistry::new();
+    let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
+    let mut registry = StorageRegistry::new();
+    register_production_scan_store(&mut registry, scan_store, Arc::clone(&store)).await;
 
     let error = catalog
         .create_production(
@@ -593,7 +597,9 @@ async fn production_persisted_table_store_rejects_relation_catalog_fingerprint_m
     let (_temp_dir, store) = temp_store();
     let catalog = PersistedTableStore::new(Arc::clone(&store));
     create_orders_relation_catalog(&store).await;
-    let registry = StorageRegistry::new();
+    let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
+    let mut registry = StorageRegistry::new();
+    register_production_scan_store(&mut registry, scan_store, Arc::clone(&store)).await;
     let mut request = production_request("primary", "tenants/tenant-a/tables/orders");
     request.schema_fingerprint = format!("sha256:{}", "1".repeat(64));
 
@@ -622,7 +628,9 @@ async fn production_persisted_table_store_rejects_non_table_relation_registratio
         .create(&catalog)
         .await
         .unwrap();
-    let registry = StorageRegistry::new();
+    let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
+    let mut registry = StorageRegistry::new();
+    register_production_scan_store(&mut registry, scan_store, Arc::clone(&store)).await;
 
     let error = PersistedTableStore::new(Arc::clone(&store))
         .create_production(
@@ -690,6 +698,45 @@ async fn production_object_backed_table_query_rejects_store_registered_without_c
         "tenant-a",
         "orders-current",
         "select key_json, value_json, weight from input",
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        PersistedTableError::StorageRegistry(
+            velorix_runtime::storage_registry::StorageRegistryError::MissingProductionCapabilities {
+                store_id,
+            }
+        ) if store_id == "primary"
+    ));
+}
+
+#[tokio::test]
+async fn production_object_backed_table_query_rejects_missing_capabilities_before_malformed_relation_catalog(
+) {
+    let (_temp_dir, catalog_store) = temp_store();
+    let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
+    let mut registry = StorageRegistry::new();
+    registry
+        .register("primary", "memory://velorix/", Arc::clone(&scan_store))
+        .unwrap();
+
+    create_orders_relation_catalog(&catalog_store).await;
+    create_standard_policy(&catalog_store, QueryPolicy::default()).await;
+    write_production_table_catalog_object(
+        &catalog_store,
+        production_request("primary", "tenants/tenant-a/tables/orders"),
+    )
+    .await;
+    overwrite_orders_relation_catalog_with_malformed_json(&catalog_store).await;
+
+    let error = query_production_table(
+        &catalog_store,
+        &registry,
+        "tenant-a",
+        "orders-current",
+        "select account_id, value, weight from orders",
     )
     .await
     .unwrap_err();
@@ -1715,6 +1762,23 @@ async fn overwrite_orders_relation_catalog(
         .put(
             &Path::from(key.as_str()),
             Bytes::from(serde_json::to_vec(&catalog).unwrap()).into(),
+        )
+        .await
+        .unwrap();
+}
+
+async fn overwrite_orders_relation_catalog_with_malformed_json(store: &Arc<dyn ObjectStore>) {
+    let catalog = orders_relation_catalog();
+    let key = RelationCatalogRegistry::new(Arc::clone(store))
+        .object_key(
+            &catalog.relation_schema.relation_id,
+            &catalog.relation_schema.relation_version,
+        )
+        .unwrap();
+    store
+        .put(
+            &Path::from(key.as_str()),
+            Bytes::from_static(br#"{"schema_version":"#).into(),
         )
         .await
         .unwrap();
