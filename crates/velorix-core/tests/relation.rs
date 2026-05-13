@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
 use arrow::{
-    array::{ArrayRef, BooleanArray, Date32Array, Int64Array, StringArray},
-    datatypes::{DataType, Field, Schema},
+    array::{
+        ArrayRef, BooleanArray, Date32Array, Int64Array, StringArray, TimestampNanosecondArray,
+    },
+    datatypes::{DataType, Field, Schema, TimeUnit},
     record_batch::RecordBatch,
 };
 use datafusion::prelude::SessionContext;
@@ -444,6 +446,41 @@ fn generic_catalog_incremental_input_accepts_date32_primary_key() {
 }
 
 #[test]
+fn generic_catalog_incremental_input_accepts_timestamp_nanosecond_primary_key() {
+    let catalog = timestamped_balance_relation_catalog();
+    let batch = timestamped_balance_input_batch(
+        &[1_769_289_600_000_000_000, 1_769_293_200_000_000_000],
+        &[500, 125],
+        &[1, -1],
+    );
+
+    let delta = arrow_record_batches_to_single_key_sum_count_delta_batch(
+        &catalog,
+        catalog.relation_schema.relation_id.as_str(),
+        catalog.relation_schema.relation_version.as_str(),
+        catalog.schema_fingerprint.as_str(),
+        &[batch],
+    )
+    .unwrap();
+
+    assert_eq!(
+        delta.records(),
+        &[
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!(1_769_289_600_000_000_000_i64)),
+                DeltaValue::from_json(serde_json::json!(500)),
+                1,
+            ),
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!(1_769_293_200_000_000_000_i64)),
+                DeltaValue::from_json(serde_json::json!(125)),
+                -1,
+            ),
+        ]
+    );
+}
+
+#[test]
 fn generic_catalog_incremental_input_rejects_unsupported_primary_key_type() {
     let mut catalog = account_balance_relation_catalog();
     catalog.relation_schema.columns[0].logical_type = VelorixLogicalTypeV1::Bool;
@@ -477,7 +514,7 @@ fn generic_catalog_incremental_input_rejects_unsupported_primary_key_type() {
     assert!(matches!(
         error,
         IncrementalInputAdapterError::MalformedArrowInput { reason }
-            if reason == "prototype adapter key column `account_id` must be Utf8, Int64, or Date32"
+            if reason == "prototype adapter key column `account_id` must be Utf8, Int64, Date32, or TimestampNanosecond"
     ));
 }
 
@@ -749,6 +786,65 @@ fn daily_balance_relation_catalog() -> VelorixRelationCatalogV1 {
     }
 }
 
+fn timestamped_balance_relation_catalog() -> VelorixRelationCatalogV1 {
+    let relation_schema = VelorixRelationSchemaV1 {
+        relation_id: "timestamped_balances".to_string(),
+        relation_name: "timestamped_balances".to_string(),
+        relation_version: "2026-05-13.v1".to_string(),
+        columns: vec![
+            RelationColumnV1 {
+                column_id: "observed_at".to_string(),
+                name: "observed_at".to_string(),
+                logical_type: VelorixLogicalTypeV1::Timestamp { timezone: None },
+                physical_arrow_type: ArrowPhysicalTypeV1::TimestampNanosecond { timezone: None },
+                nullable: false,
+                ordinal: 0,
+                semantic_role: RelationSemanticRoleV1::PrimaryKey,
+            },
+            RelationColumnV1 {
+                column_id: "balance_cents".to_string(),
+                name: "balance_cents".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 1,
+                semantic_role: RelationSemanticRoleV1::Value,
+            },
+            RelationColumnV1 {
+                column_id: "row_delta".to_string(),
+                name: "row_delta".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 2,
+                semantic_role: RelationSemanticRoleV1::Weight,
+            },
+        ],
+        primary_key_column_ids: vec!["observed_at".to_string()],
+        weight_column_id: "row_delta".to_string(),
+        allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+        event_time_column_id: None,
+    };
+    let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
+
+    VelorixRelationCatalogV1 {
+        schema_version: RELATION_SCHEMA_VERSION_V1,
+        relation_schema,
+        schema_fingerprint: schema_fingerprint.clone(),
+        datafusion_registration: DataFusionRegistrationV1 {
+            name: "timestamped_balances".to_string(),
+            mode: DataFusionRegistrationModeV1::Table,
+        },
+        feldera_relation: FelderaRelationBindingV1 {
+            relation_id: "timestamped_balances".to_string(),
+            schema_fingerprint,
+        },
+        incremental_adapter: IncrementalAdapterBindingV1 {
+            adapter_id: CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID.to_string(),
+        },
+    }
+}
+
 fn customer_balance_relation_catalog() -> VelorixRelationCatalogV1 {
     let relation_schema = VelorixRelationSchemaV1 {
         relation_id: "customer_balances".to_string(),
@@ -857,6 +953,30 @@ fn daily_balance_input_batch(
         ])),
         vec![
             Arc::new(Date32Array::from(business_dates.to_vec())) as ArrayRef,
+            Arc::new(Int64Array::from(balance_cents.to_vec())) as ArrayRef,
+            Arc::new(Int64Array::from(row_deltas.to_vec())) as ArrayRef,
+        ],
+    )
+    .unwrap()
+}
+
+fn timestamped_balance_input_batch(
+    observed_at: &[i64],
+    balance_cents: &[i64],
+    row_deltas: &[i64],
+) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new(
+                "observed_at",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("balance_cents", DataType::Int64, false),
+            Field::new("row_delta", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(TimestampNanosecondArray::from(observed_at.to_vec())) as ArrayRef,
             Arc::new(Int64Array::from(balance_cents.to_vec())) as ArrayRef,
             Arc::new(Int64Array::from(row_deltas.to_vec())) as ArrayRef,
         ],

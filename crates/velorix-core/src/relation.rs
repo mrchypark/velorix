@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::sync::Arc;
 
-use arrow::array::{Array, Date32Array, Int64Array, StringArray};
+use arrow::array::{Array, Date32Array, Int64Array, StringArray, TimestampNanosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
@@ -722,6 +722,7 @@ enum IncrementalKeyColumn<'a> {
     Utf8(&'a StringArray),
     Int64(&'a Int64Array),
     Date32(&'a Date32Array),
+    TimestampNanosecond(&'a TimestampNanosecondArray),
 }
 
 impl IncrementalKeyColumn<'_> {
@@ -730,6 +731,7 @@ impl IncrementalKeyColumn<'_> {
             Self::Utf8(column) => column.is_null(row),
             Self::Int64(column) => column.is_null(row),
             Self::Date32(column) => column.is_null(row),
+            Self::TimestampNanosecond(column) => column.is_null(row),
         }
     }
 
@@ -738,6 +740,7 @@ impl IncrementalKeyColumn<'_> {
             Self::Utf8(column) => DeltaKey::from_json(json!(column.value(row))),
             Self::Int64(column) => DeltaKey::from_json(json!(column.value(row))),
             Self::Date32(column) => DeltaKey::from_json(json!(column.value(row))),
+            Self::TimestampNanosecond(column) => DeltaKey::from_json(json!(column.value(row))),
         }
     }
 }
@@ -756,9 +759,13 @@ fn incremental_key_column<'a>(
         ArrowPhysicalTypeV1::Date32 => {
             date32_column(batch, column.name.as_str()).map(IncrementalKeyColumn::Date32)
         }
+        ArrowPhysicalTypeV1::TimestampNanosecond { .. } => {
+            timestamp_nanosecond_column(batch, column.name.as_str())
+                .map(IncrementalKeyColumn::TimestampNanosecond)
+        }
         _ => Err(IncrementalInputAdapterError::MalformedArrowInput {
             reason: format!(
-                "prototype adapter key column `{}` must be Utf8, Int64, or Date32",
+                "prototype adapter key column `{}` must be Utf8, Int64, Date32, or TimestampNanosecond",
                 column.name
             ),
         }),
@@ -794,6 +801,22 @@ fn date32_column<'a>(
         .downcast_ref::<Date32Array>()
         .ok_or_else(|| IncrementalInputAdapterError::MalformedArrowInput {
             reason: format!("`{name}` column must be Date32"),
+        })
+}
+
+fn timestamp_nanosecond_column<'a>(
+    batch: &'a RecordBatch,
+    name: &str,
+) -> Result<&'a TimestampNanosecondArray, IncrementalInputAdapterError> {
+    batch
+        .column_by_name(name)
+        .ok_or_else(|| IncrementalInputAdapterError::MalformedArrowInput {
+            reason: format!("missing `{name}` column"),
+        })?
+        .as_any()
+        .downcast_ref::<TimestampNanosecondArray>()
+        .ok_or_else(|| IncrementalInputAdapterError::MalformedArrowInput {
+            reason: format!("`{name}` column must be TimestampNanosecond"),
         })
 }
 
