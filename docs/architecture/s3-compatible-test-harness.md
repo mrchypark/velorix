@@ -112,6 +112,9 @@ evidence independent:
 For local S3 API compatibility checks, `scripts/run-floci-s3-gate.sh` starts a
 Floci container, creates a test bucket through the AWS S3 API, and runs the same
 env-gated storage/runtime harnesses against `http://127.0.0.1:4566`.
+Before setup, it creates a disposable Docker bridge network and runs a
+short-lived AWS CLI container on that network so Docker network-store or
+container-attach failures fail before evidence artifacts are written.
 
 ```bash
 scripts/run-floci-s3-gate.sh

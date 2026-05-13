@@ -37,6 +37,10 @@ AWS_REGION=us-east-1
 VELORIX_S3_BUCKET=velorix-floci
 ```
 
+Before creating the Floci container, the script creates a disposable Docker
+network and runs a short-lived AWS CLI container on it. This catches broken
+Docker bridge-network state before the gate writes evidence artifacts.
+
 On success, the gate writes:
 
 ```text

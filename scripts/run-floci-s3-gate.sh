@@ -25,6 +25,52 @@ require() {
   fi
 }
 
+preflight_docker_networks() {
+  local probe_network="${network}-preflight"
+  local probe_container="${probe_network}-container"
+  local output
+
+  if docker network inspect "$probe_network" >/dev/null 2>&1; then
+    echo "docker preflight network already exists: ${probe_network}" >&2
+    echo "remove it or set VELORIX_FLOCI_NETWORK to a fresh name" >&2
+    exit 1
+  fi
+  if docker container inspect "$probe_container" >/dev/null 2>&1; then
+    echo "docker preflight container already exists: ${probe_container}" >&2
+    echo "remove it or set VELORIX_FLOCI_NETWORK to a fresh name" >&2
+    exit 1
+  fi
+
+  if ! output="$(docker network create "$probe_network" 2>&1)"; then
+    echo "docker cannot create bridge networks required by the Floci S3 gate" >&2
+    echo "$output" >&2
+    echo "repair or restart Docker, then rerun scripts/run-floci-s3-gate.sh" >&2
+    exit 1
+  fi
+
+  if ! output="$(
+    docker run --rm \
+      --name "$probe_container" \
+      --network "$probe_network" \
+      "$aws_cli_image" \
+      --version 2>&1
+  )"; then
+    docker rm -f "$probe_container" >/dev/null 2>&1 || true
+    docker network rm "$probe_network" >/dev/null 2>&1 || true
+    echo "docker cannot run containers on bridge networks required by the Floci S3 gate" >&2
+    echo "$output" >&2
+    echo "repair or restart Docker, then rerun scripts/run-floci-s3-gate.sh" >&2
+    exit 1
+  fi
+
+  if ! output="$(docker network rm "$probe_network" 2>&1)"; then
+    echo "docker created the preflight network but could not remove it: ${probe_network}" >&2
+    echo "$output" >&2
+    echo "remove the probe network manually before rerunning the Floci S3 gate" >&2
+    exit 1
+  fi
+}
+
 cleanup_floci() {
   if [ "$cleanup" = "1" ]; then
     if [ "$created_container" = "1" ]; then
@@ -88,6 +134,7 @@ require cargo
 require curl
 require docker
 require python3
+preflight_docker_networks
 
 cd "$repo_root"
 trap cleanup_floci EXIT
