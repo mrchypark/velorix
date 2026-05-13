@@ -224,6 +224,70 @@ async fn query_object_backed_input_fails_immediately_when_shared_limiter_is_alre
 }
 
 #[tokio::test]
+async fn query_execution_limiter_gates_object_backed_and_production_recovered_query_surfaces() {
+    let inner_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
+    put_parquet_input(
+        &inner_store,
+        "input/part-000.parquet",
+        &parquet_input_batch(&["\"account-a\""], &["10"], &[1]),
+    )
+    .await;
+
+    let first_query_reached_list = Arc::new(Barrier::new(2));
+    let blocking_store: Arc<dyn DataFusionObjectStore> = Arc::new(BlockingListStore {
+        inner: Arc::clone(&inner_store),
+        first_query_reached_list: Arc::clone(&first_query_reached_list),
+        list_cancellation: None,
+    });
+    let policy = QueryPolicy {
+        max_concurrent_queries: Some(1),
+        ..QueryPolicy::default()
+    };
+    let limiter = QueryExecutionLimiter::from_policy(policy).unwrap();
+
+    let first_query = tokio::spawn(query_object_backed_input_with_policy_and_limiter(
+        Arc::clone(&blocking_store),
+        "memory://velorix/input/",
+        "select key_json, value_json, weight from input",
+        policy,
+        Some(limiter.clone()),
+    ));
+    tokio::time::timeout(Duration::from_secs(1), first_query_reached_list.wait())
+        .await
+        .expect("first query should acquire the limiter and reach object listing");
+
+    let recovery_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let error = tokio::time::timeout(
+        Duration::from_millis(50),
+        query_production_recovered_materialized_view_with_policy_and_limiter(
+            Arc::clone(&recovery_store),
+            "v1/slatedb/state",
+            ORDERS_SUM_COUNT_RELATION_ID,
+            ORDERS_SUM_COUNT_RELATION_VERSION,
+            &local_capabilities(),
+            "select key_json, value_json, weight from input",
+            policy,
+            Some(limiter),
+        ),
+    )
+    .await
+    .expect("production recovered query should fail without waiting for recovery")
+    .unwrap_err();
+
+    first_query.abort();
+
+    assert!(matches!(
+        error,
+        RuntimeQueryError::Query(QueryError::Policy(
+            QueryPolicyError::ConcurrencyLimitExceeded {
+                max_concurrent_queries: 1
+            }
+        ))
+    ));
+}
+
+#[tokio::test]
 async fn query_object_backed_input_runs_without_limiter_when_concurrency_limit_is_unset() {
     let store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
     put_parquet_input(
