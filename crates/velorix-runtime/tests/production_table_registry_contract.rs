@@ -6,28 +6,20 @@ use std::{
 #[test]
 fn production_sources_do_not_call_bootstrap_table_scan_apis() {
     let workspace = workspace_root();
-    let forbidden = [
-        "query_persisted_object_backed_input_with_policy(",
-        "query_object_backed_input_with_policy(",
-        "query_object_backed_input_with_policy_and_limiter(",
-        "query_object_backed_input_with_policy_and_metrics(",
-    ];
 
     let mut violations = Vec::new();
     for source in production_source_scan_sources(&workspace) {
         let contents = fs::read_to_string(&source).expect("read Rust source");
         let lines = contents.lines().collect::<Vec<_>>();
-        for (line_number, line) in lines.iter().enumerate() {
-            for pattern in forbidden {
-                if line.contains(pattern)
-                    && !allowed_bootstrap_table_scan_use(&workspace, &source, &lines, line_number)
-                {
-                    violations.push(format!(
-                        "{}:{} uses bootstrap table scan API pattern `{pattern}`",
-                        source.strip_prefix(&workspace).unwrap_or(&source).display(),
-                        line_number + 1
-                    ));
-                }
+        for line_number in 0..lines.len() {
+            if let Some(pattern) =
+                forbidden_bootstrap_table_scan_use(&workspace, &source, &lines, line_number)
+            {
+                violations.push(format!(
+                    "{}:{} uses bootstrap table scan API pattern `{pattern}`",
+                    source.strip_prefix(&workspace).unwrap_or(&source).display(),
+                    line_number + 1
+                ));
             }
         }
     }
@@ -36,6 +28,18 @@ fn production_sources_do_not_call_bootstrap_table_scan_apis() {
         violations.is_empty(),
         "production source must use registry-backed production table helpers:\n{}",
         violations.join("\n")
+    );
+}
+
+#[test]
+fn production_source_contract_forbids_direct_persisted_view_bootstrap_helper_callers() {
+    let workspace = Path::new("/workspace");
+    let source = workspace.join("crates/velorix-runtime/src/production_surface.rs");
+    let lines = ["    query_persisted_object_backed_view("];
+
+    assert_eq!(
+        forbidden_bootstrap_table_scan_use(workspace, &source, &lines, 0),
+        Some("query_persisted_object_backed_view(")
     );
 }
 
@@ -96,6 +100,32 @@ fn production_source_scan_sources(workspace: &Path) -> Vec<PathBuf> {
     sources.extend(top_level_rust_files(&workspace.join("benches")));
     sources.sort();
     sources
+}
+
+fn forbidden_bootstrap_table_scan_use(
+    workspace: &Path,
+    source: &Path,
+    lines: &[&str],
+    line_number: usize,
+) -> Option<&'static str> {
+    let line = lines[line_number];
+    forbidden_bootstrap_table_scan_patterns()
+        .iter()
+        .copied()
+        .find(|pattern| {
+            line.contains(pattern)
+                && !allowed_bootstrap_table_scan_use(workspace, source, lines, line_number)
+        })
+}
+
+fn forbidden_bootstrap_table_scan_patterns() -> &'static [&'static str] {
+    &[
+        "query_persisted_object_backed_input_with_policy(",
+        "query_persisted_object_backed_view(",
+        "query_object_backed_input_with_policy(",
+        "query_object_backed_input_with_policy_and_limiter(",
+        "query_object_backed_input_with_policy_and_metrics(",
+    ]
 }
 
 fn allowed_bootstrap_table_scan_use(
