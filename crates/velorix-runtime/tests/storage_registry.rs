@@ -1,4 +1,4 @@
-use std::{fmt, sync::Arc};
+use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use async_trait::async_trait;
 use datafusion::object_store::{
@@ -12,8 +12,9 @@ use object_store::{
 };
 use velorix_runtime::storage_registry::{StorageRegistry, StorageRegistryError};
 use velorix_storage::capability::{
-    AuthoritativeNamespace, AuthoritativeObjectStoreCapabilityProbeError,
-    ObjectStoreCapabilityProbeError, RequiredObjectStoreCapability,
+    AuthoritativeNamespace, AuthoritativeObjectStoreCapabilitiesV1,
+    AuthoritativeObjectStoreCapabilityError, AuthoritativeObjectStoreCapabilityProbeError,
+    ObjectStoreCapabilityProbeError, ObjectStoreCapabilityProfile, RequiredObjectStoreCapability,
 };
 
 #[test]
@@ -109,6 +110,95 @@ async fn storage_registry_registers_production_store_from_runtime_probe() {
 }
 
 #[test]
+fn storage_registry_registers_production_store_from_validated_capabilities() {
+    let mut registry = StorageRegistry::new();
+
+    registry
+        .register_production_with_capabilities(
+            "primary",
+            "memory://velorix/",
+            scan_store(),
+            all_namespace_capabilities(),
+        )
+        .unwrap();
+
+    let location = registry
+        .resolve_production_table_location(
+            "primary",
+            "tenant-a",
+            "tenants/tenant-a/tables/orders",
+            "snapshots/0001",
+        )
+        .unwrap();
+
+    assert_eq!(
+        location.table_url,
+        "memory://velorix/tenants/tenant-a/tables/orders/snapshots/0001/"
+    );
+}
+
+#[test]
+fn storage_registry_rejects_prevalidated_capabilities_missing_namespace() {
+    let mut registry = StorageRegistry::new();
+    let mut capabilities = all_namespace_capabilities();
+    capabilities
+        .profiles
+        .remove(&AuthoritativeNamespace::RelationCatalog);
+
+    let err = registry
+        .register_production_with_capabilities(
+            "primary",
+            "memory://velorix/",
+            scan_store(),
+            capabilities,
+        )
+        .unwrap_err();
+
+    assert_missing_namespace(err, AuthoritativeNamespace::RelationCatalog);
+    assert_unregistered_store_id(&registry, "primary");
+}
+
+#[test]
+fn storage_registry_rejects_prevalidated_capabilities_with_weak_profile() {
+    let mut registry = StorageRegistry::new();
+    let mut capabilities = all_namespace_capabilities();
+    capabilities.profiles.insert(
+        AuthoritativeNamespace::Output,
+        ObjectStoreCapabilityProfile {
+            backend_name: "weak-profile".to_string(),
+            conditional_create: false,
+            atomic_visibility: true,
+            list_after_write: true,
+            read_after_write: true,
+        },
+    );
+
+    let err = registry
+        .register_production_with_capabilities(
+            "primary",
+            "memory://velorix/",
+            scan_store(),
+            capabilities,
+        )
+        .unwrap_err();
+
+    match err {
+        StorageRegistryError::ObjectStoreCapabilities(
+            AuthoritativeObjectStoreCapabilityError::NamespaceProfile { namespace, source },
+        ) => {
+            assert_eq!(namespace, AuthoritativeNamespace::Output);
+            assert_eq!(source.backend_name(), "weak-profile");
+            assert_eq!(
+                source.required_capability(),
+                RequiredObjectStoreCapability::ConditionalCreate
+            );
+        }
+        other => panic!("expected namespace profile error, got {other:?}"),
+    }
+    assert_unregistered_store_id(&registry, "primary");
+}
+
+#[test]
 fn storage_registry_rejects_duplicate_unchecked_store_id() {
     let mut registry = StorageRegistry::new();
 
@@ -120,6 +210,39 @@ fn storage_registry_rejects_duplicate_unchecked_store_id() {
         .unwrap_err();
 
     assert_duplicate_store_id(err, "primary");
+}
+
+#[test]
+fn storage_registry_rejects_capability_backed_reregistration_of_existing_store_id() {
+    let mut registry = StorageRegistry::new();
+
+    registry
+        .register("primary", "memory://velorix/", scan_store())
+        .unwrap();
+    let err = registry
+        .register_production_with_capabilities(
+            "primary",
+            "memory://velorix-shadow/",
+            scan_store(),
+            all_namespace_capabilities(),
+        )
+        .unwrap_err();
+
+    assert_duplicate_store_id(err, "primary");
+    let err = registry
+        .resolve_production_table_location(
+            "primary",
+            "tenant-a",
+            "tenants/tenant-a/tables/orders",
+            "snapshots/0001",
+        )
+        .unwrap_err();
+    match err {
+        StorageRegistryError::MissingProductionCapabilities { store_id } => {
+            assert_eq!(store_id, "primary");
+        }
+        other => panic!("expected missing production capabilities, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -236,6 +359,16 @@ fn authority_store() -> Arc<dyn AuthorityObjectStore> {
     Arc::new(AuthorityInMemory::new())
 }
 
+fn all_namespace_capabilities() -> AuthoritativeObjectStoreCapabilitiesV1 {
+    let profile = ObjectStoreCapabilityProfile::local_development();
+    AuthoritativeObjectStoreCapabilitiesV1::new(
+        AuthoritativeNamespace::all()
+            .into_iter()
+            .map(|namespace| (namespace, profile.clone()))
+            .collect::<BTreeMap<_, _>>(),
+    )
+}
+
 fn assert_duplicate_store_id(err: StorageRegistryError, expected_store_id: &str) {
     match err {
         StorageRegistryError::DuplicateStoreId { store_id } => {
@@ -245,10 +378,39 @@ fn assert_duplicate_store_id(err: StorageRegistryError, expected_store_id: &str)
     }
 }
 
+fn assert_missing_namespace(err: StorageRegistryError, expected_namespace: AuthoritativeNamespace) {
+    match err {
+        StorageRegistryError::ObjectStoreCapabilities(
+            AuthoritativeObjectStoreCapabilityError::MissingNamespace { namespace },
+        ) => {
+            assert_eq!(namespace, expected_namespace);
+        }
+        other => panic!("expected missing namespace error, got {other:?}"),
+    }
+}
+
 fn assert_invalid_store_id(err: StorageRegistryError) {
     match err {
         StorageRegistryError::InvalidStoreId => {}
         other => panic!("expected invalid store id error, got {other:?}"),
+    }
+}
+
+fn assert_unregistered_store_id(registry: &StorageRegistry, store_id: &str) {
+    let err = registry
+        .resolve_production_table_location(
+            store_id,
+            "tenant-a",
+            "tenants/tenant-a/tables/orders",
+            "snapshots/0001",
+        )
+        .unwrap_err();
+
+    match err {
+        StorageRegistryError::UnregisteredStoreId { store_id: actual } => {
+            assert_eq!(actual, store_id);
+        }
+        other => panic!("expected unregistered store id, got {other:?}"),
     }
 }
 

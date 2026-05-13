@@ -13,7 +13,8 @@ use velorix_storage::capability::{
     AuthoritativeObjectStoreCapabilityError, AuthoritativeObjectStoreCapabilityProbeError,
 };
 
-/// Production registration is intentionally probe-backed only.
+/// Production registration requires either a runtime probe or prevalidated
+/// startup capabilities. Unchecked registration remains bootstrap/dev only.
 ///
 /// ```compile_fail
 /// use std::sync::Arc;
@@ -130,16 +131,41 @@ impl StorageRegistry {
         )
         .await?;
 
+        self.insert_production_store(store_id, base_url, scan_store, production_capabilities);
+        Ok(())
+    }
+
+    pub fn register_production_with_capabilities(
+        &mut self,
+        store_id: impl Into<String>,
+        base_url: &str,
+        scan_store: Arc<dyn DataFusionObjectStore>,
+        capabilities: AuthoritativeObjectStoreCapabilitiesV1,
+    ) -> Result<(), StorageRegistryError> {
+        let store_id = validate_store_id(store_id.into())?;
+        let base_url = parse_base_url(base_url)?;
+        self.ensure_store_id_available(&store_id)?;
+        capabilities.validate_for_startup()?;
+
+        self.insert_production_store(store_id, base_url, scan_store, capabilities);
+        Ok(())
+    }
+
+    fn insert_production_store(
+        &mut self,
+        store_id: String,
+        base_url: ObjectStoreUrl,
+        scan_store: Arc<dyn DataFusionObjectStore>,
+        capabilities: AuthoritativeObjectStoreCapabilitiesV1,
+    ) {
         self.entries.insert(
             store_id,
             RegisteredObjectStore {
                 store: scan_store,
                 base_url,
-                production_capabilities: Some(production_capabilities),
+                production_capabilities: Some(capabilities),
             },
         );
-
-        Ok(())
     }
 
     fn ensure_store_id_available(&self, store_id: &str) -> Result<(), StorageRegistryError> {
