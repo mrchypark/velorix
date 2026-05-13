@@ -68,6 +68,8 @@ pub enum StorageRegistryError {
     },
     #[error("unregistered object store id {store_id}")]
     UnregisteredStoreId { store_id: String },
+    #[error("duplicate object store id {store_id}")]
+    DuplicateStoreId { store_id: String },
     #[error("object store id {store_id} is not registered with production capabilities")]
     MissingProductionCapabilities { store_id: String },
     #[error(transparent)]
@@ -95,6 +97,7 @@ impl StorageRegistry {
     ) -> Result<(), StorageRegistryError> {
         let store_id = validate_store_id(store_id.into())?;
         let base_url = parse_base_url(base_url)?;
+        self.ensure_store_id_available(&store_id)?;
 
         self.entries.insert(
             store_id,
@@ -119,6 +122,7 @@ impl StorageRegistry {
     ) -> Result<(), StorageRegistryError> {
         let store_id = validate_store_id(store_id.into())?;
         let base_url = parse_base_url(base_url)?;
+        self.ensure_store_id_available(&store_id)?;
         let production_capabilities = probe_authoritative_object_store_capabilities(
             authority_store.as_ref(),
             backend_name.as_ref(),
@@ -134,6 +138,16 @@ impl StorageRegistry {
                 production_capabilities: Some(production_capabilities),
             },
         );
+
+        Ok(())
+    }
+
+    fn ensure_store_id_available(&self, store_id: &str) -> Result<(), StorageRegistryError> {
+        if self.entries.contains_key(store_id) {
+            return Err(StorageRegistryError::DuplicateStoreId {
+                store_id: store_id.to_string(),
+            });
+        }
 
         Ok(())
     }

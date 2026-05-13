@@ -49,6 +49,86 @@ async fn storage_registry_registers_production_store_from_runtime_probe() {
     );
 }
 
+#[test]
+fn storage_registry_rejects_duplicate_unchecked_store_id() {
+    let mut registry = StorageRegistry::new();
+
+    registry
+        .register("primary", "memory://velorix/", scan_store())
+        .unwrap();
+    let err = registry
+        .register("primary", "memory://velorix-shadow/", scan_store())
+        .unwrap_err();
+
+    assert_duplicate_store_id(err, "primary");
+}
+
+#[tokio::test]
+async fn storage_registry_rejects_unchecked_reregistration_of_probe_backed_store() {
+    let mut registry = StorageRegistry::new();
+
+    registry
+        .register_production_with_probe(
+            "primary",
+            "memory://velorix/",
+            scan_store(),
+            authority_store(),
+            "memory-test",
+            "v1/probes",
+        )
+        .await
+        .unwrap();
+    let err = registry
+        .register("primary", "memory://velorix-shadow/", scan_store())
+        .unwrap_err();
+
+    assert_duplicate_store_id(err, "primary");
+    registry
+        .resolve_production_table_location(
+            "primary",
+            "tenant-a",
+            "tenants/tenant-a/tables/orders",
+            "snapshots/0001",
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn storage_registry_rejects_probe_backed_reregistration_of_existing_store_id() {
+    let mut registry = StorageRegistry::new();
+
+    registry
+        .register("primary", "memory://velorix/", scan_store())
+        .unwrap();
+    let err = registry
+        .register_production_with_probe(
+            "primary",
+            "memory://velorix-shadow/",
+            scan_store(),
+            authority_store(),
+            "memory-test",
+            "v1/probes",
+        )
+        .await
+        .unwrap_err();
+
+    assert_duplicate_store_id(err, "primary");
+    let err = registry
+        .resolve_production_table_location(
+            "primary",
+            "tenant-a",
+            "tenants/tenant-a/tables/orders",
+            "snapshots/0001",
+        )
+        .unwrap_err();
+    match err {
+        StorageRegistryError::MissingProductionCapabilities { store_id } => {
+            assert_eq!(store_id, "primary");
+        }
+        other => panic!("expected missing production capabilities, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn storage_registry_probe_rejects_store_without_create_only_behavior() {
     let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
@@ -86,6 +166,23 @@ async fn storage_registry_probe_rejects_store_without_create_only_behavior() {
             }
         }
         other => panic!("expected object-store capability probe error, got {other:?}"),
+    }
+}
+
+fn scan_store() -> Arc<dyn DataFusionObjectStore> {
+    Arc::new(DataFusionInMemory::new())
+}
+
+fn authority_store() -> Arc<dyn AuthorityObjectStore> {
+    Arc::new(AuthorityInMemory::new())
+}
+
+fn assert_duplicate_store_id(err: StorageRegistryError, expected_store_id: &str) {
+    match err {
+        StorageRegistryError::DuplicateStoreId { store_id } => {
+            assert_eq!(store_id, expected_store_id);
+        }
+        other => panic!("expected duplicate store id error, got {other:?}"),
     }
 }
 
