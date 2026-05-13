@@ -116,7 +116,7 @@ mod live_s3 {
         },
         gc::GarbageCollectionPolicy,
         ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
-        log::IngestLog,
+        log::{IngestAdmissionCoordinator, IngestLog},
         manifest::{CheckpointManifest, InputRange},
         relation_catalog_registry::RelationCatalogRegistry,
         state::{CheckpointPublisher, OutputObjectWrite, StateObjectWrite},
@@ -182,6 +182,7 @@ mod live_s3 {
             Arc::clone(&store),
             capability_profile(&capabilities, AuthoritativeNamespace::Ingest)?,
         )?;
+        let ingest_coordinator = IngestAdmissionCoordinator::new(ingest_log);
         let publisher = CheckpointPublisher::new_checked(
             Arc::clone(&store),
             capability_profile(&capabilities, AuthoritativeNamespace::Checkpoint)?,
@@ -207,7 +208,7 @@ mod live_s3 {
 
             let requests_before = metered_store.snapshot();
             let validation_started = Instant::now();
-            append_ingest_envelope(&ingest_log, start_offset, end_offset, &input).await?;
+            append_ingest_envelope(&ingest_coordinator, start_offset, end_offset, &input).await?;
             ingest_samples.push(validation_started.elapsed());
             add_request_delta(
                 &mut ingest_requests,
@@ -257,7 +258,7 @@ mod live_s3 {
         let requests_before = metered_store.snapshot();
         let validation_started = Instant::now();
         append_ingest_envelope(
-            &ingest_log,
+            &ingest_coordinator,
             total_records,
             total_records + RECORDS_PER_BATCH,
             &tail_input,
@@ -649,7 +650,7 @@ mod live_s3 {
     }
 
     async fn append_ingest_envelope(
-        ingest_log: &IngestLog,
+        ingest_coordinator: &IngestAdmissionCoordinator,
         start_offset_inclusive: u64,
         end_offset_exclusive: u64,
         input: &DeltaBatch,
@@ -669,7 +670,9 @@ mod live_s3 {
             &[batch],
         )?;
 
-        ingest_log.append_catalog_validated_envelope(bytes).await?;
+        ingest_coordinator
+            .append_catalog_validated_envelope(bytes)
+            .await?;
         Ok(())
     }
 

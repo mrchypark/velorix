@@ -49,7 +49,7 @@ use velorix_runtime::storage_registry::StorageRegistry;
 use velorix_storage::{
     gc::{GarbageCollectionPlan, GarbageCollectionPolicy},
     ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
-    log::IngestLog,
+    log::{IngestAdmissionCoordinator, IngestLog},
     manifest::{CheckpointManifest, InputRange},
     relation_catalog_registry::RelationCatalogRegistry,
     state::{CheckpointPublisher, OutputObjectWrite, StateObjectWrite},
@@ -86,6 +86,7 @@ fn main() -> BenchResult<()> {
 async fn run() -> BenchResult<()> {
     let (_temp_dir, metered_store, store) = temp_store()?;
     let ingest_log = IngestLog::new(Arc::clone(&store));
+    let ingest_coordinator = IngestAdmissionCoordinator::new(ingest_log);
     let publisher = CheckpointPublisher::new(Arc::clone(&store));
     let mut engine = PrototypeIncrementalEngine::new();
 
@@ -105,7 +106,7 @@ async fn run() -> BenchResult<()> {
 
         let requests_before = metered_store.snapshot();
         let validation_started = Instant::now();
-        append_ingest_envelope(&ingest_log, start_offset, end_offset, &input).await?;
+        append_ingest_envelope(&ingest_coordinator, start_offset, end_offset, &input).await?;
         ingest_samples.push(validation_started.elapsed());
         add_request_delta(
             &mut ingest_requests,
@@ -154,7 +155,7 @@ async fn run() -> BenchResult<()> {
     let requests_before = metered_store.snapshot();
     let validation_started = Instant::now();
     append_ingest_envelope(
-        &ingest_log,
+        &ingest_coordinator,
         total_records,
         total_records + RECORDS_PER_BATCH,
         &tail_input,
@@ -625,7 +626,7 @@ fn ingest_record_batch(input: &DeltaBatch) -> BenchResult<RecordBatch> {
 }
 
 async fn append_ingest_envelope(
-    ingest_log: &IngestLog,
+    ingest_coordinator: &IngestAdmissionCoordinator,
     start_offset_inclusive: u64,
     end_offset_exclusive: u64,
     input: &DeltaBatch,
@@ -645,7 +646,9 @@ async fn append_ingest_envelope(
         &[batch],
     )?;
 
-    ingest_log.append_catalog_validated_envelope(bytes).await?;
+    ingest_coordinator
+        .append_catalog_validated_envelope(bytes)
+        .await?;
     Ok(())
 }
 

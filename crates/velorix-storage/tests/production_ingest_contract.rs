@@ -64,6 +64,80 @@ fn production_source_scan_includes_top_level_benchmarks() {
     }
 }
 
+#[test]
+fn production_like_ingest_harnesses_use_process_local_coordinator() {
+    let workspace = workspace_root();
+    for source in [
+        workspace.join("benches/local_incremental.rs"),
+        workspace.join("benches/s3_incremental.rs"),
+        workspace.join("crates/velorix-runtime/tests/s3_compat_query.rs"),
+    ] {
+        let contents = fs::read_to_string(&source).expect("read production-like ingest harness");
+        assert!(
+            contents.contains("IngestAdmissionCoordinator::new("),
+            "{} should construct the process-local ingest admission coordinator",
+            source.strip_prefix(&workspace).unwrap_or(&source).display()
+        );
+        let append_call_violations = append_ingest_call_violations(&contents);
+        assert!(
+            append_call_violations.is_empty(),
+            "{} should pass normal ingest appends through the process-local coordinator:\n{}",
+            source.strip_prefix(&workspace).unwrap_or(&source).display(),
+            append_call_violations.join("\n")
+        );
+
+        assert!(
+            helper_append_receiver_is_coordinator(&contents),
+            "{} should call append_catalog_validated_envelope on the coordinator helper receiver",
+            source.strip_prefix(&workspace).unwrap_or(&source).display()
+        );
+    }
+}
+
+fn append_ingest_call_violations(contents: &str) -> Vec<String> {
+    let lines = contents.lines().collect::<Vec<_>>();
+    lines
+        .iter()
+        .enumerate()
+        .filter_map(|(line_number, line)| {
+            if !line.contains("append_ingest_envelope(")
+                || line.contains("fn append_ingest_envelope(")
+            {
+                return None;
+            }
+
+            let uses_coordinator = lines
+                .iter()
+                .skip(line_number)
+                .take(4)
+                .any(|candidate| candidate.contains("&ingest_coordinator"));
+            (!uses_coordinator)
+                .then(|| format!("line {} starts `{}`", line_number + 1, line.trim()))
+        })
+        .collect()
+}
+
+fn helper_append_receiver_is_coordinator(contents: &str) -> bool {
+    let Some(helper_start) = contents.find("fn append_ingest_envelope(") else {
+        return false;
+    };
+    let helper = &contents[helper_start..];
+    if !helper.contains("ingest_coordinator: &IngestAdmissionCoordinator") {
+        return false;
+    }
+
+    let lines = helper.lines().collect::<Vec<_>>();
+    lines.iter().enumerate().any(|(line_number, line)| {
+        line.contains(".append_catalog_validated_envelope(")
+            && lines
+                .iter()
+                .take(line_number)
+                .rev()
+                .find(|candidate| !candidate.trim().is_empty())
+                .is_some_and(|receiver| receiver.trim() == "ingest_coordinator")
+    })
+}
+
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()

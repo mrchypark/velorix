@@ -53,7 +53,7 @@ use velorix_storage::{
         AuthoritativeObjectStoreCapabilitiesV1, ObjectStoreCapabilityProfile,
     },
     ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
-    log::{IngestLog, ReplayCheckpoint},
+    log::{IngestAdmissionCoordinator, IngestLog, ReplayCheckpoint},
     manifest::{CheckpointManifest, InputRange, StateObjectRef},
     relation_catalog_registry::RelationCatalogRegistry,
     state::{CheckpointPublisher, StateObjectWrite},
@@ -163,6 +163,7 @@ async fn s3_compatible_runtime_recovery_reads_checkpoint_and_replays_validated_i
         Arc::clone(&store),
         capability_profile(&capabilities, AuthoritativeNamespace::Ingest)?,
     )?;
+    let ingest_coordinator = IngestAdmissionCoordinator::new(ingest_log);
     let publisher = CheckpointPublisher::new_checked(
         Arc::clone(&store),
         capability_profile(&capabilities, AuthoritativeNamespace::Checkpoint)?,
@@ -179,8 +180,8 @@ async fn s3_compatible_runtime_recovery_reads_checkpoint_and_replays_validated_i
 
     let validation = async {
         create_recovery_relation_catalog(&store, &capabilities).await?;
-        append_ingest_envelope(&ingest_log, 0, 2, &checkpoint_input).await?;
-        append_ingest_envelope(&ingest_log, 2, 4, &replay_input).await?;
+        append_ingest_envelope(&ingest_coordinator, 0, 2, &checkpoint_input).await?;
+        append_ingest_envelope(&ingest_coordinator, 2, 4, &replay_input).await?;
 
         let mut checkpointed_view = KeyedSumCountAggregate::new();
         checkpointed_view.apply(&checkpoint_input)?;
@@ -515,7 +516,7 @@ fn int64_value(batch: &RecordBatch, column: usize, row: usize) -> i64 {
 }
 
 async fn append_ingest_envelope(
-    ingest_log: &IngestLog,
+    ingest_coordinator: &IngestAdmissionCoordinator,
     start_offset_inclusive: u64,
     end_offset_exclusive: u64,
     input: &DeltaBatch,
@@ -533,7 +534,9 @@ async fn append_ingest_envelope(
         },
         &[ingest_record_batch(input)],
     )?;
-    ingest_log.append_catalog_validated_envelope(bytes).await?;
+    ingest_coordinator
+        .append_catalog_validated_envelope(bytes)
+        .await?;
     Ok(())
 }
 
