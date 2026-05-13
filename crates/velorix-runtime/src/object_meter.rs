@@ -10,9 +10,9 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion::object_store::{
-    path::Path, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-    ObjectStore as DataFusionObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
-    RenameOptions, Result as ObjectStoreResult,
+    path::Path, CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload,
+    ObjectMeta, ObjectStore as DataFusionObjectStore, PutMultipartOptions, PutOptions, PutPayload,
+    PutResult, RenameOptions, Result as ObjectStoreResult,
 };
 use futures::{stream, StreamExt};
 use velorix_core::query::QueryPolicyError;
@@ -183,9 +183,7 @@ impl DataFusionObjectStore for MeteredObjectStore {
     async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
         self.observe(MeteredOperation::GetOpts)?;
         let result = self.inner.get_opts(location, options).await?;
-        self.meter
-            .add_bytes_returned(result.range.end.saturating_sub(result.range.start));
-        Ok(result)
+        Ok(meter_get_result(result, self.meter.clone()))
     }
 
     async fn get_ranges(
@@ -263,6 +261,30 @@ impl DataFusionObjectStore for MeteredObjectStore {
     }
 }
 
+fn meter_get_result(result: GetResult, meter: ObjectStoreMeter) -> GetResult {
+    let meta = result.meta.clone();
+    let range = result.range.clone();
+    let attributes = result.attributes.clone();
+    let payload = GetResultPayload::Stream(
+        result
+            .into_stream()
+            .map(move |result| {
+                if let Ok(bytes) = &result {
+                    meter.add_bytes_returned(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+                }
+                result
+            })
+            .boxed(),
+    );
+
+    GetResult {
+        payload,
+        meta,
+        range,
+        attributes,
+    }
+}
+
 fn object_request_error(
     observed_requests: usize,
     max_requests: usize,
@@ -299,7 +321,9 @@ pub(crate) fn object_request_policy_error(
 mod tests {
     use std::sync::atomic::Ordering;
 
-    use datafusion::object_store::{memory::InMemory, path::Path, GetOptions, ObjectStoreExt};
+    use datafusion::object_store::{
+        local::LocalFileSystem, memory::InMemory, path::Path, GetOptions, ObjectStoreExt,
+    };
     use futures::TryStreamExt;
 
     use super::*;
@@ -323,10 +347,11 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
-        store
+        let result = store
             .get_opts(&Path::from("input/part-000"), GetOptions::default())
             .await
             .unwrap();
+        result.bytes().await.unwrap();
         store
             .get_ranges(&Path::from("input/part-000"), &[0..2, 2..4])
             .await
@@ -337,6 +362,64 @@ mod tests {
         assert_eq!(meter.state.get_opts_requests.load(Ordering::SeqCst), 1);
         assert_eq!(meter.state.get_ranges_requests.load(Ordering::SeqCst), 1);
         assert_eq!(meter.state.bytes_returned.load(Ordering::SeqCst), 10);
+    }
+
+    #[tokio::test]
+    async fn get_opts_counts_stream_bytes_as_chunks_are_consumed() {
+        let inner = Arc::new(InMemory::new());
+        inner
+            .put(
+                &Path::from("input/part-000"),
+                Bytes::from_static(b"abcdef").into(),
+            )
+            .await
+            .unwrap();
+        let meter = ObjectStoreMeter::default();
+        let chunked_inner: Arc<dyn DataFusionObjectStore> = Arc::new(ChunkedGetStore {
+            inner,
+            chunks: vec![Bytes::from_static(b"abc"), Bytes::from_static(b"def")],
+        });
+        let store = MeteredObjectStore::with_meter(chunked_inner, meter.clone(), None);
+
+        let result = store
+            .get_opts(&Path::from("input/part-000"), GetOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(meter.state.get_opts_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(meter.state.bytes_returned.load(Ordering::SeqCst), 0);
+
+        let mut stream = result.into_stream();
+        assert_eq!(stream.try_next().await.unwrap().unwrap(), b"abc"[..]);
+        assert_eq!(meter.state.bytes_returned.load(Ordering::SeqCst), 3);
+
+        assert_eq!(stream.try_next().await.unwrap().unwrap(), b"def"[..]);
+        assert_eq!(meter.state.bytes_returned.load(Ordering::SeqCst), 6);
+        assert!(stream.try_next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn get_opts_counts_file_bytes_as_chunks_are_consumed() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp_dir.path().join("input")).unwrap();
+        std::fs::write(temp_dir.path().join("input/part-000"), b"abcdef").unwrap();
+        let file_store: Arc<dyn DataFusionObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(temp_dir.path()).unwrap());
+        let meter = ObjectStoreMeter::default();
+        let store = MeteredObjectStore::with_meter(file_store, meter.clone(), None);
+
+        let result = store
+            .get_opts(&Path::from("input/part-000"), GetOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(meter.state.get_opts_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(meter.state.bytes_returned.load(Ordering::SeqCst), 0);
+
+        let mut stream = result.into_stream();
+        let first_chunk = stream.try_next().await.unwrap().unwrap();
+        assert!(!first_chunk.is_empty());
+        assert!(meter.state.bytes_returned.load(Ordering::SeqCst) > 0);
+        while stream.try_next().await.unwrap().is_some() {}
+        assert_eq!(meter.state.bytes_returned.load(Ordering::SeqCst), 6);
     }
 
     #[tokio::test]
@@ -369,5 +452,105 @@ mod tests {
                 max_requests: 1,
             })
         );
+    }
+
+    #[derive(Debug)]
+    struct ChunkedGetStore {
+        inner: Arc<InMemory>,
+        chunks: Vec<Bytes>,
+    }
+
+    impl fmt::Display for ChunkedGetStore {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "ChunkedGetStore")
+        }
+    }
+
+    #[async_trait]
+    impl DataFusionObjectStore for ChunkedGetStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> ObjectStoreResult<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> ObjectStoreResult<GetResult> {
+            let result = self.inner.get_opts(location, options).await?;
+            let stream = stream::iter(self.chunks.clone().into_iter().map(Ok)).boxed();
+            Ok(GetResult {
+                payload: GetResultPayload::Stream(stream),
+                ..result
+            })
+        }
+
+        async fn get_ranges(
+            &self,
+            location: &Path,
+            ranges: &[Range<u64>],
+        ) -> ObjectStoreResult<Vec<Bytes>> {
+            self.inner.get_ranges(location, ranges).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, ObjectStoreResult<Path>>,
+        ) -> futures::stream::BoxStream<'static, ObjectStoreResult<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> futures::stream::BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> futures::stream::BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> ObjectStoreResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> ObjectStoreResult<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+
+        async fn rename_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: RenameOptions,
+        ) -> ObjectStoreResult<()> {
+            self.inner.rename_opts(from, to, options).await
+        }
     }
 }

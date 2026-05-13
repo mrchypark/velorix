@@ -55,17 +55,18 @@ wrapper for the whole query when `max_object_requests` is set. Scan preflight
 and DataFusion execution share that same meter, so preflight list operations
 debit the same request budget used by runtime file access. The wrapper counts
 trait-level object-store operations before delegation and rejects the next
-operation that would exceed the request budget. It also records bytes from
-successful `get_opts` ranges and `get_ranges` results without wrapping response
-streams; exact consumed-byte metering remains future work if DataFusion needs
-that distinction.
+operation that would exceed the request budget. It records bytes from
+successful `get_ranges` results and wraps `get_opts` response streams so
+`bytes_read` advances as DataFusion consumes chunks instead of when a stream is
+opened. Local filesystem payloads are converted through the same stream path
+before metering.
 
 DataFusion 53 memory exhaustion now has version-specific runtime evidence for
 a grouped aggregate over the public object-backed Parquet query path.
 Object-backed scan preflight timeout evidence also proves that cancellation
 drops the stalled list stream and releases the shared query limiter permit.
-Version-specific spill failure tests, tenant/global shared runtime semantics,
-and Velorix-owned typed memory/spill errors remain future work.
+Version-specific spill failure tests, broader tenant/global shared runtime
+semantics, and Velorix-owned typed memory/spill errors remain future work.
 
 ## Typed Errors
 
