@@ -44,6 +44,72 @@ fn production_source_contract_forbids_direct_persisted_view_bootstrap_helper_cal
 }
 
 #[test]
+fn production_source_contract_forbids_unchecked_storage_registry_registration() {
+    let workspace = Path::new("/workspace");
+    let source = workspace.join("benches/local_incremental.rs");
+    let lines = [
+        "    let mut registry = StorageRegistry::new();",
+        "    registry.register(\"primary\", \"memory://velorix/\", scan_store)?;",
+    ];
+
+    assert_eq!(
+        forbidden_bootstrap_table_scan_use(workspace, &source, &lines, 1),
+        Some("StorageRegistry::register(")
+    );
+}
+
+#[test]
+fn production_source_contract_forbids_multiline_unchecked_storage_registry_registration() {
+    let workspace = Path::new("/workspace");
+    let source = workspace.join("benches/local_incremental.rs");
+    let lines = [
+        "    let mut registry: StorageRegistry = StorageRegistry::new();",
+        "    registry",
+        "        .register(\"primary\", \"memory://velorix/\", scan_store)?;",
+    ];
+
+    assert_eq!(
+        forbidden_bootstrap_table_scan_use(workspace, &source, &lines, 2),
+        Some("StorageRegistry::register(")
+    );
+}
+
+#[test]
+fn production_source_contract_forbids_default_unchecked_storage_registry_registration() {
+    let workspace = Path::new("/workspace");
+    let source = workspace.join("benches/local_incremental.rs");
+    let lines = [
+        "    let mut registry: StorageRegistry = Default::default();",
+        "    registry.register(\"primary\", \"memory://velorix/\", scan_store)?;",
+    ];
+
+    assert_eq!(
+        forbidden_bootstrap_table_scan_use(workspace, &source, &lines, 1),
+        Some("StorageRegistry::register(")
+    );
+}
+
+#[test]
+fn production_source_contract_does_not_link_register_receivers_across_functions() {
+    let workspace = Path::new("/workspace");
+    let source = workspace.join("benches/local_incremental.rs");
+    let lines = [
+        "fn bootstrap_fixture() {",
+        "    let mut registry = StorageRegistry::new();",
+        "}",
+        "fn production_path(other: &mut ExternalRegistry) {",
+        "    let registry = other;",
+        "    registry.register(\"primary\")?;",
+        "}",
+    ];
+
+    assert_eq!(
+        forbidden_bootstrap_table_scan_use(workspace, &source, &lines, 5),
+        None
+    );
+}
+
+#[test]
 fn production_source_scan_includes_top_level_benchmarks() {
     let workspace = workspace_root();
     let sources = production_source_scan_sources(&workspace);
@@ -113,7 +179,9 @@ fn forbidden_bootstrap_table_scan_use(
         .iter()
         .copied()
         .find(|pattern| {
-            line.contains(pattern)
+            (line.contains(pattern)
+                || (pattern == &"StorageRegistry::register("
+                    && line_calls_unchecked_storage_registry_register(lines, line_number)))
                 && !allowed_bootstrap_table_scan_use(workspace, source, lines, line_number)
         })
 }
@@ -125,6 +193,7 @@ fn forbidden_bootstrap_table_scan_patterns() -> &'static [&'static str] {
         "query_object_backed_input_with_policy(",
         "query_object_backed_input_with_policy_and_limiter(",
         "query_object_backed_input_with_policy_and_metrics(",
+        "StorageRegistry::register(",
     ]
 }
 
@@ -161,7 +230,83 @@ fn allowed_bootstrap_table_scan_use(
         );
     }
 
+    if source == workspace.join("crates/velorix-runtime/src/storage_registry.rs") {
+        return true;
+    }
+
     false
+}
+
+fn line_calls_unchecked_storage_registry_register(lines: &[&str], line_number: usize) -> bool {
+    let line = lines[line_number];
+    if line.contains("StorageRegistry::new().register(")
+        || line.contains("StorageRegistry::default().register(")
+    {
+        return true;
+    }
+
+    let Some((receiver, _)) = line.split_once(".register(") else {
+        return false;
+    };
+    let registry_name = receiver
+        .split_whitespace()
+        .last()
+        .or_else(|| previous_non_empty_line(lines, line_number));
+    let Some(registry_name) = registry_name else {
+        return false;
+    };
+    if storage_registry_initializer(registry_name) {
+        return true;
+    }
+
+    current_function_previous_lines(lines, line_number).any(|previous| {
+        binding_name(previous) == Some(registry_name) && storage_registry_initializer(previous)
+    })
+}
+
+fn previous_non_empty_line<'a>(lines: &'a [&str], line_number: usize) -> Option<&'a str> {
+    lines[..line_number]
+        .iter()
+        .rev()
+        .map(|line| line.trim())
+        .find(|line| !line.is_empty())
+}
+
+fn current_function_previous_lines<'a>(
+    lines: &'a [&str],
+    line_number: usize,
+) -> impl Iterator<Item = &'a str> {
+    lines[..line_number]
+        .iter()
+        .rev()
+        .map(|line| *line)
+        .take_while(|line| !is_function_signature(line))
+}
+
+fn is_function_signature(line: &str) -> bool {
+    let line = line.trim_start();
+    line.starts_with("fn ")
+        || line.starts_with("async fn ")
+        || line.starts_with("pub fn ")
+        || line.starts_with("pub async fn ")
+}
+
+fn binding_name(line: &str) -> Option<&str> {
+    let (binding, _) = line.split_once('=')?;
+    binding
+        .trim()
+        .split(':')
+        .next()
+        .and_then(|binding| binding.split_whitespace().last())
+}
+
+fn storage_registry_initializer(line: &str) -> bool {
+    line.contains("StorageRegistry::new()")
+        || line.contains("StorageRegistry::default()")
+        || (line.contains("Default::default()")
+            && line
+                .split_once('=')
+                .is_some_and(|(binding, _)| binding.contains("StorageRegistry")))
 }
 
 fn line_is_inside_function(lines: &[&str], line_number: usize, signature: &str) -> bool {
