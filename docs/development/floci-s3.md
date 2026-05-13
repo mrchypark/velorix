@@ -8,6 +8,8 @@ This is local emulator evidence only. It exercises Velorix's S3-compatible
 client wiring, capability probes, catalog/query/table paths, and benchmark JSON
 generation, but it does not replace measured release-quality S3-compatible
 backend evidence.
+The generated evidence records both local readiness evidence kinds it exercises:
+`s3_compatible` and `s3_compatible_integration_harness`.
 
 Prerequisites:
 
@@ -48,6 +50,13 @@ needed:
 ```bash
 VELORIX_FLOCI_RUN_BENCHMARK=0 scripts/run-floci-s3-gate.sh
 ```
+
+## GitHub Actions
+
+The manual `Floci S3 Emulator Gate` workflow runs the same script on an
+Ubuntu runner and uploads `floci-s3-emulator-evidence` with the local emulator
+evidence JSON. Its `run-benchmark` input defaults to `false`; enable it only
+when the slower local benchmark JSON is useful for review.
 
 Keep the Floci container for debugging. The script uses run-scoped container and
 network names by default, so set explicit names when you want to inspect them:

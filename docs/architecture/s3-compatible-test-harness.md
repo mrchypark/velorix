@@ -143,6 +143,13 @@ script writes `target/velorix-s3/floci-s3-gate-evidence.json` and deletes the
 Floci container/network by default. Set `VELORIX_FLOCI_CLEANUP=0` to keep the
 container for debugging.
 
+The manual `Floci S3 Emulator Gate` workflow runs this same local emulator gate
+on a GitHub-hosted runner and uploads the JSON as `floci-s3-emulator-evidence`.
+Its benchmark input defaults off so the fast storage/runtime API behavior gate
+can be reviewed separately from slower local benchmark output. The generated
+artifact records the local `s3_compatible` and
+`s3_compatible_integration_harness` readiness evidence kinds.
+
 Floci is useful fast local S3-compatible evidence because it speaks the AWS
 wire protocol and exercises the same `object_store` clients as the nightly
 harness. It is still emulator evidence, not a replacement for measured

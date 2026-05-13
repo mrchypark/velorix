@@ -91,6 +91,8 @@ require python3
 
 cd "$repo_root"
 trap cleanup_floci EXIT
+mkdir -p "$(dirname "$evidence_path")" "$(dirname "$benchmark_path")"
+rm -f "$evidence_path" "$benchmark_path"
 
 if docker container inspect "$container" >/dev/null 2>&1; then
   echo "docker container already exists: ${container}" >&2
@@ -129,13 +131,11 @@ cargo test -p velorix-runtime --test s3_compat_query --features s3-compat-tests 
 
 benchmark_ran=false
 if [ "$run_benchmark" = "1" ]; then
-  mkdir -p "$(dirname "$benchmark_path")"
   cargo bench -p velorix-runtime --bench s3_incremental --features s3-compat-tests > "$benchmark_path"
   cargo run -p velorix-cli -- benchmark-validate --result "$benchmark_path"
   benchmark_ran=true
 fi
 
-mkdir -p "$(dirname "$evidence_path")"
 python3 - "$evidence_path" "$benchmark_path" "$benchmark_ran" "$container" "$image" "$port" "$bucket" "$prefix" "$region" <<'PY'
 import json
 import subprocess
@@ -162,7 +162,10 @@ def run(command):
 evidence = {
     "schema_version": 1,
     "evidence_kind": "floci_s3_compatible_gate",
-    "readiness_evidence_kind": ["s3_compatible"],
+    "readiness_evidence_kind": [
+        "s3_compatible",
+        "s3_compatible_integration_harness",
+    ],
     "endpoint": f"http://127.0.0.1:{port}",
     "bucket": bucket,
     "prefix": prefix,

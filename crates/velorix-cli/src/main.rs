@@ -2810,7 +2810,10 @@ mod tests {
             serde_json::json!({
                 "schema_version": 1,
                 "evidence_kind": "floci_s3_compatible_gate",
-                "readiness_evidence_kind": ["s3_compatible"],
+                "readiness_evidence_kind": [
+                    "s3_compatible",
+                    "s3_compatible_integration_harness"
+                ],
                 "scope": "local floci S3-compatible emulator evidence"
             })
             .to_string(),
