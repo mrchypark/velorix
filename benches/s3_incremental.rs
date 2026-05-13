@@ -172,12 +172,17 @@ mod live_s3 {
         metered_store: Arc<MeteredObjectStore>,
         store: Arc<dyn ObjectStore>,
     ) -> BenchResult<BenchmarkGateResultV1> {
+        let capability_probe_requests_before = metered_store.snapshot();
+        let capability_probe_started = Instant::now();
         let capabilities = probe_authoritative_object_store_capabilities(
             store.as_ref(),
             "s3-compatible",
             format!("{}/runtime-recovery-capability-probes", config.run_prefix),
         )
         .await?;
+        let capability_probe_elapsed = capability_probe_started.elapsed();
+        let capability_probe_requests =
+            request_delta(&metered_store.snapshot(), &capability_probe_requests_before);
         let ingest_log = IngestLog::new_checked(
             Arc::clone(&store),
             capability_profile(&capabilities, AuthoritativeNamespace::Ingest)?,
@@ -332,6 +337,12 @@ mod live_s3 {
                 scan_bytes: datafusion_scan.scan_bytes,
             },
             workload_metrics: vec![
+                workload_metric(
+                    "object_store_capability_probe",
+                    &[capability_probe_elapsed],
+                    capability_probe_requests,
+                    0,
+                ),
                 workload_metric(
                     "ingest_envelope_validation",
                     &ingest_samples,

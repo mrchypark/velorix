@@ -33,15 +33,15 @@ machine performance. S3-compatible nightly and release baselines require live
 measured S3-compatible evidence and must not use placeholders.
 
 `local_incremental` is a bootstrap harness, not production readiness evidence.
-It currently emits real local workload details for catalog-aware ingest envelope
-admission, checkpoint publication, checkpoint recovery, and a bounded DataFusion
-Parquet table scan. The DataFusion workload is instrumentation evidence that the
-local query path lists and reads Parquet objects under policy; it is not
-production scan latency evidence. The SlateDB workload writes a small checkpoint
-state payload through `SlateDbStateStore`, closes and drops the store, reopens
-the same object-store path, reads the state back, and records elapsed latency
-plus the local metered object-store requests visible through the harness
-wrapper.
+It currently emits real local workload details for the authoritative
+object-store capability probe, catalog-aware ingest envelope admission,
+checkpoint publication, checkpoint recovery, and a bounded DataFusion Parquet
+table scan. The DataFusion workload is instrumentation evidence that the local
+query path lists and reads Parquet objects under policy; it is not production
+scan latency evidence. The SlateDB workload writes a small checkpoint state
+payload through `SlateDbStateStore`, closes and drops the store, reopens the
+same object-store path, reads the state back, and records elapsed latency plus
+the local metered object-store requests visible through the harness wrapper.
 This does not expose SlateDB internals or make object-request metering part of
 the state-store API. The GC dry-run workload prepares a small retained/orphan
 state-output set, calls `CheckpointPublisher::plan_garbage_collection`, asserts
@@ -57,6 +57,7 @@ listing-consistency failure modes or provide S3-compatible evidence.
 The V1 CLI gate requires these `workload_metrics.name` values for local
 benchmark results:
 
+- `object_store_capability_probe`
 - `ingest_envelope_validation`
 - `checkpoint_publish`
 - `checkpoint_recovery`
@@ -72,6 +73,7 @@ implemented.
 ## Broader Benchmark Coverage
 
 - Small batch high-QPS ingest.
+- Object-store capability probe latency and request counts.
 - Large batch throughput ingest.
 - Many-partition replay.
 - High-cardinality aggregate.
@@ -104,6 +106,7 @@ implemented.
   when the S3-compatible baseline is still a placeholder.
 - `s3_incremental` fails closed unless `VELORIX_S3_COMPAT=1` is set. With the
   flag set, it still requires real S3-compatible object-store configuration.
-  When explicitly enabled, it emits S3-compatible benchmark JSON for ingest
-  envelope validation, checkpoint publication, checkpoint recovery, bounded
-  DataFusion Parquet scan, SlateDB state reopen, and GC dry-run planning.
+  When explicitly enabled, it emits S3-compatible benchmark JSON for the
+  authoritative object-store capability probe, ingest envelope validation,
+  checkpoint publication, checkpoint recovery, bounded DataFusion Parquet scan,
+  SlateDB state reopen, and GC dry-run planning.

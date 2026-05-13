@@ -590,7 +590,8 @@ fn default_benchmark_evidence_scope() -> BenchmarkEvidenceScope {
 fn is_object_backed_workload(name: &str) -> bool {
     matches!(
         name,
-        "ingest_envelope_validation"
+        "object_store_capability_probe"
+            | "ingest_envelope_validation"
             | "checkpoint_publish"
             | "checkpoint_recovery"
             | "datafusion_table_scan"

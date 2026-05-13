@@ -89,12 +89,17 @@ fn main() -> BenchResult<()> {
 
 async fn run() -> BenchResult<()> {
     let (_temp_dir, metered_store, store) = temp_store()?;
+    let capability_probe_requests_before = metered_store.snapshot();
+    let capability_probe_started = Instant::now();
     let capabilities = probe_authoritative_object_store_capabilities(
         store.as_ref(),
         "local-benchmark",
         "local-incremental-startup-capability-probes",
     )
     .await?;
+    let capability_probe_elapsed = capability_probe_started.elapsed();
+    let capability_probe_requests =
+        request_delta(&metered_store.snapshot(), &capability_probe_requests_before);
     let ingest_log = IngestLog::new_checked(
         Arc::clone(&store),
         capability_profile(&capabilities, AuthoritativeNamespace::Ingest)?,
@@ -249,6 +254,12 @@ async fn run() -> BenchResult<()> {
             scan_bytes: datafusion_scan.scan_bytes,
         },
         workload_metrics: vec![
+            workload_metric(
+                "object_store_capability_probe",
+                &[capability_probe_elapsed],
+                capability_probe_requests,
+                0,
+            ),
             workload_metric(
                 "ingest_envelope_validation",
                 &ingest_samples,

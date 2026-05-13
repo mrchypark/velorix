@@ -204,6 +204,7 @@ fn benchmark_gate_can_require_specific_workload_names() {
 
     result
         .require_workloads(&[
+            "object_store_capability_probe",
             "ingest_envelope_validation",
             "checkpoint_publish",
             "checkpoint_recovery",
@@ -284,7 +285,7 @@ fn benchmark_comparison_fails_when_workload_latency_regresses_over_budget() {
             workload,
             metric: "p95_ms",
             ..
-        } if workload == "ingest_envelope_validation"
+        } if workload == "object_store_capability_probe"
     ));
 }
 
@@ -373,6 +374,20 @@ fn s3_nightly_result() -> BenchmarkGateResultV1 {
 
 fn local_workload_metrics() -> Vec<BenchmarkWorkloadMetricsV1> {
     vec![
+        BenchmarkWorkloadMetricsV1 {
+            name: "object_store_capability_probe".to_string(),
+            p50_ms: 1.0,
+            p95_ms: 1.0,
+            object_requests: Some(ObjectRequestMetricsV1 {
+                put_count: 4,
+                get_count: 4,
+                list_count: 4,
+                range_read_count: 0,
+                bytes_written: 1024,
+                bytes_read: 1024,
+            }),
+            scan_bytes: 0,
+        },
         BenchmarkWorkloadMetricsV1 {
             name: "ingest_envelope_validation".to_string(),
             p50_ms: 2.0,
@@ -500,6 +515,20 @@ const VALID_LOCAL_SMOKE_JSON: &str = r#"{
         "scan_bytes": 0
     },
     "workload_metrics": [
+        {
+            "name": "object_store_capability_probe",
+            "p50_ms": 1.0,
+            "p95_ms": 1.0,
+            "object_requests": {
+                "put_count": 4,
+                "get_count": 4,
+                "list_count": 4,
+                "range_read_count": 0,
+                "bytes_written": 1024,
+                "bytes_read": 1024
+            },
+            "scan_bytes": 0
+        },
         {
             "name": "ingest_envelope_validation",
             "p50_ms": 2.0,

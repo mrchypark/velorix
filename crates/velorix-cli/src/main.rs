@@ -27,6 +27,7 @@ use velorix_runtime::readiness::{
 };
 
 const LOCAL_BENCHMARK_GATE_WORKLOADS: &[&str] = &[
+    "object_store_capability_probe",
     "ingest_envelope_validation",
     "checkpoint_publish",
     "checkpoint_recovery",
@@ -36,6 +37,7 @@ const LOCAL_BENCHMARK_GATE_WORKLOADS: &[&str] = &[
     "gc_execution_evidence",
 ];
 const S3_COMPATIBLE_BENCHMARK_GATE_WORKLOADS: &[&str] = &[
+    "object_store_capability_probe",
     "ingest_envelope_validation",
     "checkpoint_publish",
     "checkpoint_recovery",
@@ -2499,6 +2501,7 @@ mod tests {
         assert_eq!(
             evidence.workload_metrics,
             vec![
+                "object_store_capability_probe",
                 "ingest_envelope_validation",
                 "checkpoint_publish",
                 "checkpoint_recovery",
@@ -4500,7 +4503,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(format!("{error:#}").contains("gc_dry_run_planning"));
+        assert!(format!("{error:#}").contains("slatedb_state_reopen"));
     }
 
     #[test]
@@ -5267,6 +5270,20 @@ mod tests {
 
     fn workload_metrics() -> serde_json::Value {
         serde_json::json!([
+            {
+                "name": "object_store_capability_probe",
+                "p50_ms": 1.0,
+                "p95_ms": 1.0,
+                "object_requests": {
+                    "put_count": 4,
+                    "get_count": 4,
+                    "list_count": 4,
+                    "range_read_count": 0,
+                    "bytes_written": 1024,
+                    "bytes_read": 1024,
+                },
+                "scan_bytes": 0,
+            },
             {
                 "name": "ingest_envelope_validation",
                 "p50_ms": 2.0,
