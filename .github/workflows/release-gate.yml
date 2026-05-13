@@ -129,6 +129,7 @@ jobs:
       - name: Validate production readiness report
         run: |
           test -f "$READINESS_EVIDENCE_PATH"
+          cp "$READINESS_EVIDENCE_PATH" target/release-evidence/production-readiness-evidence.json
           cargo run -p velorix-cli -- readiness-report \
             --evidence "$READINESS_EVIDENCE_PATH" \
             --require-release-artifacts \
