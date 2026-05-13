@@ -3,7 +3,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, Date32Array, DictionaryArray, Int64Array, StringArray, TimestampNanosecondArray,
+    Array, BooleanArray, Date32Array, DictionaryArray, Int64Array, StringArray,
+    TimestampNanosecondArray,
 };
 use arrow::datatypes::{
     DataType, Field, Int16Type, Int32Type, Int64Type, Int8Type, Schema, TimeUnit,
@@ -731,6 +732,7 @@ fn string_column<'a>(
 }
 
 enum IncrementalKeyColumn<'a> {
+    Boolean(&'a BooleanArray),
     Utf8(&'a StringArray),
     Int64(&'a Int64Array),
     Date32(&'a Date32Array),
@@ -744,6 +746,7 @@ enum IncrementalKeyColumn<'a> {
 impl IncrementalKeyColumn<'_> {
     fn is_null(&self, row: usize) -> bool {
         match self {
+            Self::Boolean(column) => column.is_null(row),
             Self::Utf8(column) => column.is_null(row),
             Self::Int64(column) => column.is_null(row),
             Self::Date32(column) => column.is_null(row),
@@ -765,6 +768,7 @@ impl IncrementalKeyColumn<'_> {
 
     fn delta_key(&self, row: usize) -> DeltaKey {
         match self {
+            Self::Boolean(column) => DeltaKey::from_json(json!(column.value(row))),
             Self::Utf8(column) => DeltaKey::from_json(json!(column.value(row))),
             Self::Int64(column) => DeltaKey::from_json(json!(column.value(row))),
             Self::Date32(column) => DeltaKey::from_json(json!(column.value(row))),
@@ -790,6 +794,9 @@ fn incremental_key_column<'a>(
     column: &RelationColumnV1,
 ) -> Result<IncrementalKeyColumn<'a>, IncrementalInputAdapterError> {
     match &column.physical_arrow_type {
+        ArrowPhysicalTypeV1::Boolean => {
+            boolean_column(batch, column.name.as_str()).map(IncrementalKeyColumn::Boolean)
+        }
         ArrowPhysicalTypeV1::Utf8 => {
             string_column(batch, column.name.as_str()).map(IncrementalKeyColumn::Utf8)
         }
@@ -808,11 +815,27 @@ fn incremental_key_column<'a>(
         }
         _ => Err(IncrementalInputAdapterError::MalformedArrowInput {
             reason: format!(
-                "prototype adapter key column `{}` must be Utf8, Int64, Date32, TimestampNanosecond, or DictionaryUtf8",
+                "prototype adapter key column `{}` must be Boolean, Utf8, Int64, Date32, TimestampNanosecond, or DictionaryUtf8",
                 column.name
             ),
         }),
     }
+}
+
+fn boolean_column<'a>(
+    batch: &'a RecordBatch,
+    name: &str,
+) -> Result<&'a BooleanArray, IncrementalInputAdapterError> {
+    batch
+        .column_by_name(name)
+        .ok_or_else(|| IncrementalInputAdapterError::MalformedArrowInput {
+            reason: format!("missing `{name}` column"),
+        })?
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .ok_or_else(|| IncrementalInputAdapterError::MalformedArrowInput {
+            reason: format!("`{name}` column must be Boolean"),
+        })
 }
 
 fn dictionary_utf8_column<'a>(
