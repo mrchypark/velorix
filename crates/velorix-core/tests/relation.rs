@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use arrow::{
-    array::{ArrayRef, BooleanArray, Int64Array, StringArray},
+    array::{ArrayRef, BooleanArray, Date32Array, Int64Array, StringArray},
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
@@ -413,6 +413,37 @@ fn generic_catalog_incremental_input_accepts_int64_primary_key() {
 }
 
 #[test]
+fn generic_catalog_incremental_input_accepts_date32_primary_key() {
+    let catalog = daily_balance_relation_catalog();
+    let batch = daily_balance_input_batch(&[20_586, 20_587], &[500, 125], &[1, -1]);
+
+    let delta = arrow_record_batches_to_single_key_sum_count_delta_batch(
+        &catalog,
+        catalog.relation_schema.relation_id.as_str(),
+        catalog.relation_schema.relation_version.as_str(),
+        catalog.schema_fingerprint.as_str(),
+        &[batch],
+    )
+    .unwrap();
+
+    assert_eq!(
+        delta.records(),
+        &[
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!(20_586)),
+                DeltaValue::from_json(serde_json::json!(500)),
+                1,
+            ),
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!(20_587)),
+                DeltaValue::from_json(serde_json::json!(125)),
+                -1,
+            ),
+        ]
+    );
+}
+
+#[test]
 fn generic_catalog_incremental_input_rejects_unsupported_primary_key_type() {
     let mut catalog = account_balance_relation_catalog();
     catalog.relation_schema.columns[0].logical_type = VelorixLogicalTypeV1::Bool;
@@ -446,7 +477,7 @@ fn generic_catalog_incremental_input_rejects_unsupported_primary_key_type() {
     assert!(matches!(
         error,
         IncrementalInputAdapterError::MalformedArrowInput { reason }
-            if reason == "prototype adapter key column `account_id` must be Utf8 or Int64"
+            if reason == "prototype adapter key column `account_id` must be Utf8, Int64, or Date32"
     ));
 }
 
@@ -659,6 +690,65 @@ fn account_balance_relation_catalog() -> VelorixRelationCatalogV1 {
     }
 }
 
+fn daily_balance_relation_catalog() -> VelorixRelationCatalogV1 {
+    let relation_schema = VelorixRelationSchemaV1 {
+        relation_id: "daily_balances".to_string(),
+        relation_name: "daily_balances".to_string(),
+        relation_version: "2026-05-13.v1".to_string(),
+        columns: vec![
+            RelationColumnV1 {
+                column_id: "business_date".to_string(),
+                name: "business_date".to_string(),
+                logical_type: VelorixLogicalTypeV1::Date,
+                physical_arrow_type: ArrowPhysicalTypeV1::Date32,
+                nullable: false,
+                ordinal: 0,
+                semantic_role: RelationSemanticRoleV1::PrimaryKey,
+            },
+            RelationColumnV1 {
+                column_id: "balance_cents".to_string(),
+                name: "balance_cents".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 1,
+                semantic_role: RelationSemanticRoleV1::Value,
+            },
+            RelationColumnV1 {
+                column_id: "row_delta".to_string(),
+                name: "row_delta".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 2,
+                semantic_role: RelationSemanticRoleV1::Weight,
+            },
+        ],
+        primary_key_column_ids: vec!["business_date".to_string()],
+        weight_column_id: "row_delta".to_string(),
+        allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+        event_time_column_id: None,
+    };
+    let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
+
+    VelorixRelationCatalogV1 {
+        schema_version: RELATION_SCHEMA_VERSION_V1,
+        relation_schema,
+        schema_fingerprint: schema_fingerprint.clone(),
+        datafusion_registration: DataFusionRegistrationV1 {
+            name: "daily_balances".to_string(),
+            mode: DataFusionRegistrationModeV1::Table,
+        },
+        feldera_relation: FelderaRelationBindingV1 {
+            relation_id: "daily_balances".to_string(),
+            schema_fingerprint,
+        },
+        incremental_adapter: IncrementalAdapterBindingV1 {
+            adapter_id: CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID.to_string(),
+        },
+    }
+}
+
 fn customer_balance_relation_catalog() -> VelorixRelationCatalogV1 {
     let relation_schema = VelorixRelationSchemaV1 {
         relation_id: "customer_balances".to_string(),
@@ -747,6 +837,26 @@ fn account_balance_input_batch(
         ])),
         vec![
             Arc::new(Int64Array::from(account_ids.to_vec())) as ArrayRef,
+            Arc::new(Int64Array::from(balance_cents.to_vec())) as ArrayRef,
+            Arc::new(Int64Array::from(row_deltas.to_vec())) as ArrayRef,
+        ],
+    )
+    .unwrap()
+}
+
+fn daily_balance_input_batch(
+    business_dates: &[i32],
+    balance_cents: &[i64],
+    row_deltas: &[i64],
+) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("business_date", DataType::Date32, false),
+            Field::new("balance_cents", DataType::Int64, false),
+            Field::new("row_delta", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(Date32Array::from(business_dates.to_vec())) as ArrayRef,
             Arc::new(Int64Array::from(balance_cents.to_vec())) as ArrayRef,
             Arc::new(Int64Array::from(row_deltas.to_vec())) as ArrayRef,
         ],

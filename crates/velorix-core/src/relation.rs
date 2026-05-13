@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::sync::Arc;
 
-use arrow::array::{Array, Int64Array, StringArray};
+use arrow::array::{Array, Date32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
@@ -721,6 +721,7 @@ fn string_column<'a>(
 enum IncrementalKeyColumn<'a> {
     Utf8(&'a StringArray),
     Int64(&'a Int64Array),
+    Date32(&'a Date32Array),
 }
 
 impl IncrementalKeyColumn<'_> {
@@ -728,6 +729,7 @@ impl IncrementalKeyColumn<'_> {
         match self {
             Self::Utf8(column) => column.is_null(row),
             Self::Int64(column) => column.is_null(row),
+            Self::Date32(column) => column.is_null(row),
         }
     }
 
@@ -735,6 +737,7 @@ impl IncrementalKeyColumn<'_> {
         match self {
             Self::Utf8(column) => DeltaKey::from_json(json!(column.value(row))),
             Self::Int64(column) => DeltaKey::from_json(json!(column.value(row))),
+            Self::Date32(column) => DeltaKey::from_json(json!(column.value(row))),
         }
     }
 }
@@ -750,9 +753,12 @@ fn incremental_key_column<'a>(
         ArrowPhysicalTypeV1::Int64 => {
             int64_column(batch, column.name.as_str()).map(IncrementalKeyColumn::Int64)
         }
+        ArrowPhysicalTypeV1::Date32 => {
+            date32_column(batch, column.name.as_str()).map(IncrementalKeyColumn::Date32)
+        }
         _ => Err(IncrementalInputAdapterError::MalformedArrowInput {
             reason: format!(
-                "prototype adapter key column `{}` must be Utf8 or Int64",
+                "prototype adapter key column `{}` must be Utf8, Int64, or Date32",
                 column.name
             ),
         }),
@@ -772,6 +778,22 @@ fn int64_column<'a>(
         .downcast_ref::<Int64Array>()
         .ok_or_else(|| IncrementalInputAdapterError::MalformedArrowInput {
             reason: format!("`{name}` column must be Int64"),
+        })
+}
+
+fn date32_column<'a>(
+    batch: &'a RecordBatch,
+    name: &str,
+) -> Result<&'a Date32Array, IncrementalInputAdapterError> {
+    batch
+        .column_by_name(name)
+        .ok_or_else(|| IncrementalInputAdapterError::MalformedArrowInput {
+            reason: format!("missing `{name}` column"),
+        })?
+        .as_any()
+        .downcast_ref::<Date32Array>()
+        .ok_or_else(|| IncrementalInputAdapterError::MalformedArrowInput {
+            reason: format!("`{name}` column must be Date32"),
         })
 }
 
