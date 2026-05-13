@@ -20,11 +20,11 @@ use velorix_k8s::{
     },
     worker_shard::{
         execute_worker_shard_commands, handle_worker_shard_event,
-        handle_worker_shard_event_with_output_sink, reconcile_worker_shard,
+        handle_worker_shard_event_with_output_sink, reconcile_worker_shard, worker_shard_pod_name,
         worker_shard_watch_event, ProcessWorkerShardCommandExecutor, WorkerShardCommand,
         WorkerShardCommandExecutor, WorkerShardCommandExecutorError, WorkerShardEpochStore,
-        WorkerShardError, WorkerShardEvent, WorkerShardProcessCommand, WorkerShardReconcileConfig,
-        WorkerShardReconcileInput, WorkerShardReconcileOutput,
+        WorkerShardError, WorkerShardEvent, WorkerShardPodTemplate, WorkerShardProcessCommand,
+        WorkerShardReconcileConfig, WorkerShardReconcileInput, WorkerShardReconcileOutput,
     },
 };
 use velorix_storage::ownership::OwnershipEpochRecord;
@@ -594,6 +594,79 @@ async fn process_worker_shard_command_executor_returns_typed_error_on_nonzero_ex
     }
 }
 
+#[test]
+fn worker_shard_pod_name_is_stable_dns_label_for_unsafe_owner_id() {
+    let name = worker_shard_pod_name("Worker_A/West.Zone@VeryLongNameWithUnsafeCharacters", 42);
+
+    assert_eq!(
+        name,
+        worker_shard_pod_name("Worker_A/West.Zone@VeryLongNameWithUnsafeCharacters", 42)
+    );
+    assert!(name.len() <= 63);
+    assert!(name.starts_with("velorix-worker-worker-a-west"));
+    assert!(name.ends_with("-42"));
+    assert!(name
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'));
+    assert!(!name.ends_with('-'));
+}
+
+#[test]
+fn worker_shard_pod_template_builds_start_pod_with_owner_context() {
+    let template = WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0")
+        .unwrap()
+        .with_command(["velorix-worker"])
+        .with_args(["serve"])
+        .with_label("control.velorix.io/view-id", "balances-by-account")
+        .with_service_account_name("velorix-worker");
+
+    let pod = template.pod_for_owner("Worker_A/West", 42);
+    let labels = pod.metadata.labels.unwrap();
+    let spec = pod.spec.unwrap();
+    let container = spec.containers.into_iter().next().unwrap();
+
+    assert_eq!(
+        pod.metadata.name.as_deref(),
+        Some(worker_shard_pod_name("Worker_A/West", 42).as_str())
+    );
+    assert_eq!(labels["app.kubernetes.io/name"], "velorix-worker");
+    assert_eq!(labels["app.kubernetes.io/component"], "worker-shard");
+    assert_eq!(labels["control.velorix.io/owner-id"], "worker-a-west");
+    assert_eq!(labels["control.velorix.io/owner-epoch"], "42");
+    assert_eq!(labels["control.velorix.io/view-id"], "balances-by-account");
+    assert_eq!(spec.restart_policy.as_deref(), Some("Never"));
+    assert_eq!(spec.service_account_name.as_deref(), Some("velorix-worker"));
+    assert_eq!(container.name, "velorix-worker");
+    assert_eq!(
+        container.image.as_deref(),
+        Some("ghcr.io/floci-io/velorix-worker:1.0.0")
+    );
+    assert_eq!(
+        container.command.as_deref(),
+        Some(["velorix-worker".to_string()].as_slice())
+    );
+    assert_eq!(
+        container.args.as_deref(),
+        Some(["serve".to_string()].as_slice())
+    );
+    assert_eq!(
+        container.env.unwrap(),
+        vec![
+            env_var("VELORIX_WORKER_OWNER_ID", "Worker_A/West"),
+            env_var("VELORIX_WORKER_OWNER_EPOCH", "42"),
+        ]
+    );
+}
+
+#[test]
+fn worker_shard_pod_template_rejects_empty_image() {
+    let error = WorkerShardPodTemplate::new(" ").unwrap_err();
+
+    assert!(error
+        .message()
+        .contains("worker pod image must not be empty"));
+}
+
 fn has_start(output: &WorkerShardReconcileOutput) -> bool {
     output
         .commands
@@ -621,6 +694,14 @@ fn shell_log_command(log_path: &std::path::Path) -> WorkerShardProcessCommand {
         ],
     )
     .unwrap()
+}
+
+fn env_var(name: &str, value: &str) -> k8s_openapi::api::core::v1::EnvVar {
+    k8s_openapi::api::core::v1::EnvVar {
+        name: name.to_string(),
+        value: Some(value.to_string()),
+        value_from: None,
+    }
 }
 
 fn input(worker: Option<WorkerFact>) -> WorkerShardReconcileInput {

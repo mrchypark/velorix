@@ -1,7 +1,13 @@
+use std::collections::BTreeMap;
+
 use async_trait::async_trait;
 use futures::StreamExt;
+use k8s_openapi::{
+    api::core::v1::{Container, EnvVar, Pod, PodSpec},
+    apimachinery::pkg::apis::meta::v1::ObjectMeta,
+};
 use kube::{
-    api::Api,
+    api::{Api, DeleteParams, PostParams},
     runtime::watcher::{self, Event},
     Client, ResourceExt,
 };
@@ -200,6 +206,224 @@ impl WorkerShardCommandExecutor for ProcessWorkerShardCommandExecutor {
     ) -> Result<(), WorkerShardCommandExecutorError> {
         Self::run(&self.start_command, "start", owner_id, owner_epoch).await
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkerShardPodTemplate {
+    image: String,
+    command: Option<Vec<String>>,
+    args: Option<Vec<String>>,
+    labels: BTreeMap<String, String>,
+    service_account_name: Option<String>,
+}
+
+impl WorkerShardPodTemplate {
+    pub fn new(image: impl Into<String>) -> Result<Self, WorkerShardCommandExecutorError> {
+        let image = image.into();
+        if image.trim().is_empty() {
+            return Err(WorkerShardCommandExecutorError::new(
+                "worker pod image must not be empty",
+            ));
+        }
+
+        Ok(Self {
+            image,
+            command: None,
+            args: None,
+            labels: BTreeMap::new(),
+            service_account_name: None,
+        })
+    }
+
+    pub fn with_command(mut self, command: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.command = Some(command.into_iter().map(Into::into).collect());
+        self
+    }
+
+    pub fn with_args(mut self, args: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.args = Some(args.into_iter().map(Into::into).collect());
+        self
+    }
+
+    pub fn with_label(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.labels.insert(key.into(), value.into());
+        self
+    }
+
+    pub fn with_service_account_name(mut self, service_account_name: impl Into<String>) -> Self {
+        self.service_account_name = Some(service_account_name.into());
+        self
+    }
+
+    pub fn pod_for_owner(&self, owner_id: &str, owner_epoch: u64) -> Pod {
+        let pod_name = worker_shard_pod_name(owner_id, owner_epoch);
+        let mut labels = self.labels.clone();
+        labels.insert(
+            "app.kubernetes.io/name".to_string(),
+            "velorix-worker".to_string(),
+        );
+        labels.insert(
+            "app.kubernetes.io/component".to_string(),
+            "worker-shard".to_string(),
+        );
+        labels.insert(
+            "control.velorix.io/owner-id".to_string(),
+            dns_label_fragment(owner_id, 63),
+        );
+        labels.insert(
+            "control.velorix.io/owner-epoch".to_string(),
+            owner_epoch.to_string(),
+        );
+
+        Pod {
+            metadata: ObjectMeta {
+                name: Some(pod_name),
+                labels: Some(labels),
+                ..ObjectMeta::default()
+            },
+            spec: Some(PodSpec {
+                containers: vec![Container {
+                    name: "velorix-worker".to_string(),
+                    image: Some(self.image.clone()),
+                    command: self.command.clone(),
+                    args: self.args.clone(),
+                    env: Some(vec![
+                        env_var("VELORIX_WORKER_OWNER_ID", owner_id),
+                        env_var("VELORIX_WORKER_OWNER_EPOCH", &owner_epoch.to_string()),
+                    ]),
+                    ..Container::default()
+                }],
+                restart_policy: Some("Never".to_string()),
+                service_account_name: self.service_account_name.clone(),
+                ..PodSpec::default()
+            }),
+            status: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct KubernetesPodWorkerShardCommandExecutor {
+    pods: Api<Pod>,
+    template: WorkerShardPodTemplate,
+}
+
+impl KubernetesPodWorkerShardCommandExecutor {
+    pub fn new(client: Client, namespace: &str, template: WorkerShardPodTemplate) -> Self {
+        Self {
+            pods: Api::namespaced(client, namespace),
+            template,
+        }
+    }
+
+    pub fn from_api(pods: Api<Pod>, template: WorkerShardPodTemplate) -> Self {
+        Self { pods, template }
+    }
+
+    fn api_error(
+        action: &str,
+        owner_id: &str,
+        owner_epoch: u64,
+        error: kube::Error,
+    ) -> WorkerShardCommandExecutorError {
+        WorkerShardCommandExecutorError::new(format!(
+            "kubernetes pod worker {action} failed for owner `{owner_id}` epoch {owner_epoch}: {error}"
+        ))
+    }
+}
+
+#[async_trait]
+impl WorkerShardCommandExecutor for KubernetesPodWorkerShardCommandExecutor {
+    async fn stop_worker(
+        &self,
+        owner_id: &str,
+        owner_epoch: u64,
+    ) -> Result<(), WorkerShardCommandExecutorError> {
+        let pod_name = worker_shard_pod_name(owner_id, owner_epoch);
+        match self.pods.delete(&pod_name, &DeleteParams::default()).await {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(response)) if response.code == 404 => Ok(()),
+            Err(error) => Err(Self::api_error("stop", owner_id, owner_epoch, error)),
+        }
+    }
+
+    async fn start_worker(
+        &self,
+        owner_id: &str,
+        owner_epoch: u64,
+    ) -> Result<(), WorkerShardCommandExecutorError> {
+        let pod = self.template.pod_for_owner(owner_id, owner_epoch);
+        match self.pods.create(&PostParams::default(), &pod).await {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(response)) if response.code == 409 => Ok(()),
+            Err(error) => Err(Self::api_error("start", owner_id, owner_epoch, error)),
+        }
+    }
+}
+
+pub fn worker_shard_pod_name(owner_id: &str, owner_epoch: u64) -> String {
+    let prefix = "velorix-worker";
+    let epoch = owner_epoch.to_string();
+    let hash = stable_hash8(owner_id);
+    let max_fragment_len = 63usize
+        .saturating_sub(prefix.len())
+        .saturating_sub(epoch.len())
+        .saturating_sub(hash.len())
+        .saturating_sub(3);
+    let owner = dns_label_fragment(owner_id, max_fragment_len.max(1));
+    format!("{prefix}-{owner}-{hash}-{epoch}")
+}
+
+fn env_var(name: &str, value: &str) -> EnvVar {
+    EnvVar {
+        name: name.to_string(),
+        value: Some(value.to_string()),
+        value_from: None,
+    }
+}
+
+fn dns_label_fragment(value: &str, max_len: usize) -> String {
+    let mut fragment = String::new();
+    let mut last_was_dash = false;
+    for byte in value.bytes() {
+        let next = match byte {
+            b'a'..=b'z' | b'0'..=b'9' => byte as char,
+            b'A'..=b'Z' => (byte as char).to_ascii_lowercase(),
+            _ => '-',
+        };
+
+        if next == '-' {
+            if fragment.is_empty() || last_was_dash {
+                continue;
+            }
+            last_was_dash = true;
+        } else {
+            last_was_dash = false;
+        }
+        fragment.push(next);
+        if fragment.len() == max_len {
+            break;
+        }
+    }
+
+    while fragment.ends_with('-') {
+        fragment.pop();
+    }
+
+    if fragment.is_empty() {
+        "unknown".to_string()
+    } else {
+        fragment
+    }
+}
+
+fn stable_hash8(value: &str) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in value.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{:08x}", hash as u32)
 }
 
 #[derive(Clone, Debug)]
