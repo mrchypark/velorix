@@ -50,7 +50,7 @@ VELORIX_K8S_INTEGRATION=1 VELORIX_K8S_NAMESPACE=velorix-live \
   cargo test -p velorix-k8s --test live_crd_round_trip -- --nocapture --test-threads=1
 ```
 
-Run the env-gated live worker-shard ownership bridge check against the active vind context:
+Run the env-gated live worker-shard ownership and Pod executor bridge checks against the active vind context. The Pod check creates, reads, and deletes a worker Pod through the Pod-backed executor; it uses `registry.k8s.io/pause:3.10` by default and can be overridden with `VELORIX_K8S_WORKER_IMAGE`.
 
 ```bash
 VELORIX_K8S_INTEGRATION=1 VELORIX_K8S_NAMESPACE=velorix-live \

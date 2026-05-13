@@ -5,7 +5,10 @@ use std::{
 };
 
 use k8s_openapi::{
-    api::{coordination::v1::Lease, core::v1::Namespace},
+    api::{
+        coordination::v1::Lease,
+        core::v1::{Namespace, Pod},
+    },
     apimachinery::pkg::apis::meta::v1::ObjectMeta,
 };
 use kube::{
@@ -18,8 +21,10 @@ use velorix_k8s::{
     crd::{ObjectStoreAuthorityRef, VelorixWorkerShard, VelorixWorkerShardSpec},
     lease::{partition_lease_identity, KubeLeaseApi, KubernetesPartitionLeaseClient},
     worker_shard::{
-        handle_worker_shard_event, partition_lease_key_from_worker_shard,
-        CheckpointPublisherEpochStore, WorkerShardCommand, WorkerShardEvent,
+        handle_worker_shard_event, handle_worker_shard_event_with_command_executor,
+        partition_lease_key_from_worker_shard, worker_shard_pod_name,
+        CheckpointPublisherEpochStore, KubernetesPodWorkerShardCommandExecutor, WorkerShardCommand,
+        WorkerShardCommandExecutor, WorkerShardEvent, WorkerShardPodTemplate,
         WorkerShardReconcileConfig, WorkerShardReconcileInput,
     },
 };
@@ -93,7 +98,117 @@ async fn live_worker_shard_reconciles_lease_and_epoch_record_when_enabled(
     Ok(())
 }
 
+#[tokio::test]
+async fn live_worker_shard_reconciles_and_creates_worker_pod_when_enabled(
+) -> Result<(), Box<dyn Error>> {
+    if env::var("VELORIX_K8S_INTEGRATION").as_deref() != Ok("1") {
+        eprintln!("skipping live Kubernetes worker pod test; set VELORIX_K8S_INTEGRATION=1");
+        return Ok(());
+    }
+
+    let namespace =
+        env::var("VELORIX_K8S_NAMESPACE").unwrap_or_else(|_| "velorix-live".to_string());
+    let worker_image = env::var("VELORIX_K8S_WORKER_IMAGE")
+        .unwrap_or_else(|_| "registry.k8s.io/pause:3.10".to_string());
+    let suffix = unique_suffix()?;
+    let owner_id = format!("worker-{suffix}");
+    let client = Client::try_default().await?;
+    ensure_namespace(client.clone(), &namespace).await?;
+
+    let shard = worker_shard_with_owner(&namespace, &suffix, &owner_id);
+    let key = partition_lease_key_from_worker_shard(&shard)?;
+    let lease_client = KubernetesPartitionLeaseClient::new(KubeLeaseApi::new(client.clone()));
+    let publisher = CheckpointPublisher::new(std::sync::Arc::new(InMemory::new()));
+    let epoch_store = CheckpointPublisherEpochStore::new(publisher.clone());
+    let executor = KubernetesPodWorkerShardCommandExecutor::new(
+        client.clone(),
+        &namespace,
+        WorkerShardPodTemplate::new(worker_image.clone())?,
+    );
+
+    let output = handle_worker_shard_event_with_command_executor(
+        WorkerShardEvent::Applied(shard),
+        &lease_client,
+        &epoch_store,
+        WorkerShardReconcileInput {
+            now_unix_ms: unix_ms()?,
+            ttl_ms: 60_000,
+            running_worker: None,
+            config: WorkerShardReconcileConfig {
+                created_at: "2026-05-12T17:33:23Z".to_string(),
+                previous_checkpoint_version: None,
+            },
+        },
+        &executor,
+    )
+    .await?
+    .expect("applied worker shard should reconcile");
+
+    assert_eq!(
+        output.commands,
+        vec![
+            WorkerShardCommand::AcquireLease {
+                owner_id: owner_id.clone(),
+            },
+            WorkerShardCommand::PersistEpochRecord {
+                owner_id: owner_id.clone(),
+                owner_epoch: 1,
+            },
+            WorkerShardCommand::StartWorker {
+                owner_id: owner_id.clone(),
+                owner_epoch: 1,
+            },
+        ]
+    );
+
+    let record = publisher
+        .read_ownership_epoch_record(&key.stream_id, key.partition_id, 1)
+        .await?;
+    assert_eq!(record.owner_id, owner_id);
+    assert_eq!(record.lease_identity, partition_lease_identity(&key));
+
+    let pod_name = worker_shard_pod_name(&record.owner_id, 1);
+    let pod_api: Api<Pod> = Api::namespaced(client.clone(), &namespace);
+    let pod = pod_api.get(&pod_name).await?;
+    assert_eq!(pod.metadata.name.as_deref(), Some(pod_name.as_str()));
+    assert_eq!(
+        pod.metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get("control.velorix.io/owner-epoch"))
+            .map(String::as_str),
+        Some("1")
+    );
+    let container = pod
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.containers.first())
+        .ok_or("worker Pod is missing its first container")?;
+    assert_eq!(container.image.as_deref(), Some(worker_image.as_str()));
+    assert_eq!(
+        container_env_value(container, "VELORIX_WORKER_OWNER_ID"),
+        Some(record.owner_id.as_str())
+    );
+    assert_eq!(
+        container_env_value(container, "VELORIX_WORKER_OWNER_EPOCH"),
+        Some("1")
+    );
+
+    executor.stop_worker(&record.owner_id, 1).await?;
+    assert!(pod_api.get_opt(&pod_name).await?.is_none());
+    lease_client
+        .release(&key, &record.owner_id, 1, unix_ms()?)
+        .await?;
+    delete_lease(client, &key).await?;
+
+    Ok(())
+}
+
 fn worker_shard(namespace: &str, suffix: &str) -> VelorixWorkerShard {
+    worker_shard_with_owner(namespace, suffix, "worker-a")
+}
+
+fn worker_shard_with_owner(namespace: &str, suffix: &str, owner_id: &str) -> VelorixWorkerShard {
     let mut shard = VelorixWorkerShard::new(
         &format!("orders-p0-{suffix}"),
         VelorixWorkerShardSpec {
@@ -101,7 +216,7 @@ fn worker_shard(namespace: &str, suffix: &str) -> VelorixWorkerShard {
             view_id: "live-worker-view".to_string(),
             stream_id: format!("orders-{suffix}"),
             partition_id: 0,
-            desired_owner_id: "worker-a".to_string(),
+            desired_owner_id: owner_id.to_string(),
             authority: ObjectStoreAuthorityRef {
                 store_id: "primary".to_string(),
                 namespace: "analytics".to_string(),
@@ -111,6 +226,19 @@ fn worker_shard(namespace: &str, suffix: &str) -> VelorixWorkerShard {
     shard.metadata.namespace = Some(namespace.to_string());
     shard.metadata.generation = Some(1);
     shard
+}
+
+fn container_env_value<'a>(
+    container: &'a k8s_openapi::api::core::v1::Container,
+    name: &str,
+) -> Option<&'a str> {
+    container.env.as_ref()?.iter().find_map(|env| {
+        if env.name == name {
+            env.value.as_deref()
+        } else {
+            None
+        }
+    })
 }
 
 async fn ensure_namespace(client: Client, namespace: &str) -> Result<(), Box<dyn Error>> {

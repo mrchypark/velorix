@@ -212,7 +212,7 @@ def run(command):
 evidence = {
     "schema_version": 1,
     "evidence_kind": "kubernetes_vind_gate",
-    "readiness_evidence_kind": ["kubernetes_lease_client"],
+    "readiness_evidence_kind": ["kubernetes_lease_client", "kubernetes_worker_shard_live_pod_executor"],
     "cluster": cluster,
     "context": context,
     "namespace": namespace,
