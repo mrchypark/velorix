@@ -11,6 +11,10 @@ on:
         description: Path to the production readiness evidence JSON.
         required: false
         default: ""
+      dependency-governance-evidence-path:
+        description: Path to externally attested dependency governance evidence JSON.
+        required: false
+        default: ""
       feldera-spec-path:
         description: Path to the Feldera standing-view spec JSON.
         required: false
@@ -34,8 +38,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RELEASE_COMMIT: ${{ github.sha }}
   S3_BENCHMARK_RESULT_PATH: ${{ inputs.s3-result-path }}
   READINESS_EVIDENCE_PATH: ${{ inputs.readiness-evidence-path }}
+  DEPENDENCY_GOVERNANCE_EVIDENCE_PATH: ${{ inputs.dependency-governance-evidence-path }}
   FELDERA_SPEC_PATH: ${{ inputs.feldera-spec-path }}
   FELDERA_METADATA_PATH: ${{ inputs.feldera-metadata-path }}
   FELDERA_ARTIFACT_PACKAGE_PATH: ${{ inputs.feldera-artifact-package-path }}
@@ -55,6 +61,10 @@ jobs:
           fi
           if [ -z "$READINESS_EVIDENCE_PATH" ]; then
             echo "release gate requires inputs.readiness-evidence-path"
+            exit 1
+          fi
+          if [ -z "$DEPENDENCY_GOVERNANCE_EVIDENCE_PATH" ]; then
+            echo "release gate requires inputs.dependency-governance-evidence-path"
             exit 1
           fi
           if [ -z "$FELDERA_SPEC_PATH" ]; then
@@ -99,7 +109,7 @@ jobs:
           cargo run -p velorix-cli -- dependency-governance-validate \
             --manifest dependency-governance.json \
             --cargo-deny-json target/dependency-governance/cargo-deny.jsonl \
-            --json > target/dependency-governance/dependency-governance-evidence.json
+            --json > target/dependency-governance/local-dependency-governance-evidence.json
 
       - name: Validate production readiness status matrix
         run: |
@@ -138,13 +148,17 @@ jobs:
       - name: Validate production readiness report
         run: |
           test -f "$READINESS_EVIDENCE_PATH"
+          test -f "$DEPENDENCY_GOVERNANCE_EVIDENCE_PATH"
           test -f "$PRODUCTION_GC_EVIDENCE_PATH"
           cp "$READINESS_EVIDENCE_PATH" target/release-evidence/production-readiness-evidence.json
+          cp "$DEPENDENCY_GOVERNANCE_EVIDENCE_PATH" target/release-evidence/dependency-governance-release-evidence.json
           cp "$PRODUCTION_GC_EVIDENCE_PATH" target/release-evidence/production-gc-run-evidence.json
           cargo run -p velorix-cli -- readiness-report \
             --evidence "$READINESS_EVIDENCE_PATH" \
             --require-release-artifacts \
-            --dependency-governance-evidence target/dependency-governance/dependency-governance-evidence.json \
+            --dependency-governance-evidence "$DEPENDENCY_GOVERNANCE_EVIDENCE_PATH" \
+            --dependency-governance-manifest dependency-governance.json \
+            --release-commit "$RELEASE_COMMIT" \
             --feldera-artifact-hash-evidence target/release-evidence/feldera-artifact-hash.json \
             --feldera-release-provenance-evidence target/release-evidence/feldera-release-provenance.json \
             --s3-release-benchmark-gate-evidence target/release-evidence/s3-release-benchmark-gate.json \

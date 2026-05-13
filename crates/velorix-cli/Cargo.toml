@@ -10,6 +10,7 @@ clap = { workspace = true }
 object_store = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true }
 velorix-runtime = { path = "../velorix-runtime" }
 velorix-storage = { path = "../velorix-storage" }

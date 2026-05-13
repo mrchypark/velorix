@@ -12,21 +12,28 @@ with:
 cargo run -p velorix-cli -- dependency-governance-validate --manifest dependency-governance.json
 ```
 
-Use `--json` to emit stable release evidence:
+Use `--json` to emit stable local governance evidence:
 
 ```bash
 cargo run -p velorix-cli -- dependency-governance-validate \
   --manifest dependency-governance.json \
   --cargo-deny-json target/dependency-governance/cargo-deny.jsonl \
-  --json > target/dependency-governance/dependency-governance-evidence.json
+  --json > target/dependency-governance/local-dependency-governance-evidence.json
 ```
 
-The evidence has `schema_version=1`,
+The local evidence has `schema_version=1`,
 `evidence_kind=dependency_governance_validated`, the manifest path/name, checked
 cargo-deny diagnostics path, required and reviewed package subjects, exception
 counts, and warning counts. `--json` requires `--cargo-deny-json` so release
 evidence cannot claim a dependency-governance pass from manifest-only
-validation. It is local governance evidence, not an external audit attestation.
+validation. It sets `external_audit_attestation=false`, so it is local
+governance evidence, not release-satisfying external audit evidence. Release
+readiness requires a separate dependency-governance artifact with
+`external_audit_attestation=true` and an `external_audit` object naming the
+provider, tool, pass result, subject commit, `sha256:` manifest digest,
+completion time, and reviewable attestation URI. The artifact-gated
+`readiness-report` compares that subject commit with `--release-commit` and
+that digest with `--dependency-governance-manifest`.
 
 The manifest records the declared MSRV policy and requires package review
 records for the high-risk production dependency subjects that shape Velorix's

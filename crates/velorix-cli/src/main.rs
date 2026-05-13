@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fmt::Write as _,
     fs,
     path::Path,
     path::PathBuf,
@@ -13,6 +14,7 @@ use anyhow::{bail, Context};
 use clap::{CommandFactory, Parser, Subcommand};
 use object_store::{local::LocalFileSystem, ObjectStore};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use velorix_runtime::benchmark_gate::{
     BenchmarkBackend, BenchmarkBudgetV1, BenchmarkGateLevel, BenchmarkGateResultV1,
 };
@@ -150,6 +152,10 @@ enum Command {
         require_release_artifacts: bool,
         #[arg(long)]
         dependency_governance_evidence: Option<PathBuf>,
+        #[arg(long)]
+        dependency_governance_manifest: Option<PathBuf>,
+        #[arg(long)]
+        release_commit: Option<String>,
         #[arg(long)]
         feldera_artifact_hash_evidence: Option<PathBuf>,
         #[arg(long)]
@@ -316,6 +322,8 @@ async fn main() -> anyhow::Result<()> {
             evidence,
             require_release_artifacts,
             dependency_governance_evidence,
+            dependency_governance_manifest,
+            release_commit,
             feldera_artifact_hash_evidence,
             feldera_release_provenance_evidence,
             s3_release_benchmark_gate_evidence,
@@ -325,6 +333,8 @@ async fn main() -> anyhow::Result<()> {
             let artifacts = ReadinessReleaseArtifactPaths {
                 require_release_artifacts,
                 dependency_governance_evidence,
+                dependency_governance_manifest,
+                release_commit,
                 feldera_artifact_hash_evidence,
                 feldera_release_provenance_evidence,
                 s3_release_benchmark_gate_evidence,
@@ -407,6 +417,8 @@ async fn main() -> anyhow::Result<()> {
 struct ReadinessReleaseArtifactPaths {
     require_release_artifacts: bool,
     dependency_governance_evidence: Option<PathBuf>,
+    dependency_governance_manifest: Option<PathBuf>,
+    release_commit: Option<String>,
     feldera_artifact_hash_evidence: Option<PathBuf>,
     feldera_release_provenance_evidence: Option<PathBuf>,
     s3_release_benchmark_gate_evidence: Option<PathBuf>,
@@ -416,6 +428,8 @@ struct ReadinessReleaseArtifactPaths {
 impl ReadinessReleaseArtifactPaths {
     fn any_path_supplied(&self) -> bool {
         self.dependency_governance_evidence.is_some()
+            || self.dependency_governance_manifest.is_some()
+            || self.release_commit.is_some()
             || self.feldera_artifact_hash_evidence.is_some()
             || self.feldera_release_provenance_evidence.is_some()
             || self.s3_release_benchmark_gate_evidence.is_some()
@@ -451,6 +465,11 @@ fn validate_readiness_release_artifacts(
             &artifacts.dependency_governance_evidence,
         )?;
         require_artifact_path(
+            "dependency-governance-manifest",
+            &artifacts.dependency_governance_manifest,
+        )?;
+        require_release_commit(&artifacts.release_commit)?;
+        require_artifact_path(
             "feldera-artifact-hash-evidence",
             &artifacts.feldera_artifact_hash_evidence,
         )?;
@@ -471,7 +490,11 @@ fn validate_readiness_release_artifacts(
     }
 
     if let Some(path) = &artifacts.dependency_governance_evidence {
-        validate_dependency_governance_evidence_artifact(path)?;
+        validate_dependency_governance_evidence_artifact(
+            path,
+            artifacts.release_commit.as_deref(),
+            artifacts.dependency_governance_manifest.as_deref(),
+        )?;
     }
     if let (Some(hash_path), Some(provenance_path)) = (
         &artifacts.feldera_artifact_hash_evidence,
@@ -501,7 +524,18 @@ fn require_artifact_path(name: &str, path: &Option<PathBuf>) -> anyhow::Result<(
     }
 }
 
-fn validate_dependency_governance_evidence_artifact(path: &Path) -> anyhow::Result<()> {
+fn require_release_commit(release_commit: &Option<String>) -> anyhow::Result<()> {
+    match release_commit.as_deref().map(str::trim) {
+        Some(value) if !value.is_empty() => Ok(()),
+        _ => bail!("readiness-report --require-release-artifacts requires --release-commit"),
+    }
+}
+
+fn validate_dependency_governance_evidence_artifact(
+    path: &Path,
+    release_commit: Option<&str>,
+    manifest_path: Option<&Path>,
+) -> anyhow::Result<()> {
     reject_local_readiness_artifact(&read_artifact_evidence_kind(path)?, path)?;
     let artifact: DependencyGovernanceEvidenceArtifactV1 = read_json_artifact(path)?;
 
@@ -529,6 +563,67 @@ fn validate_dependency_governance_evidence_artifact(path: &Path) -> anyhow::Resu
         bail!(
             "{} dependency governance evidence did not check cargo-deny diagnostics",
             path.display()
+        );
+    }
+    if !artifact.external_audit_attestation {
+        bail!(
+            "{} dependency governance evidence is local-only and missing external audit attestation",
+            path.display()
+        );
+    }
+    let Some(external_audit) = artifact.external_audit.as_ref() else {
+        bail!(
+            "{} dependency governance evidence is missing external audit details",
+            path.display()
+        );
+    };
+    require_external_audit_field(path, &external_audit.provider, "provider")?;
+    require_external_audit_field(path, &external_audit.tool, "tool")?;
+    require_external_audit_field(path, &external_audit.subject_commit, "subject_commit")?;
+    require_external_audit_field(path, &external_audit.manifest_digest, "manifest_digest")?;
+    require_external_audit_field(path, &external_audit.completed_at, "completed_at")?;
+    require_external_audit_field(path, &external_audit.attestation_uri, "attestation_uri")?;
+    if external_audit.result != "pass" {
+        bail!(
+            "{} dependency governance external audit result is not pass",
+            path.display()
+        );
+    }
+    if is_placeholder_commit(&external_audit.subject_commit) {
+        bail!(
+            "{} dependency governance external audit uses placeholder subject_commit",
+            path.display()
+        );
+    }
+    if !external_audit.manifest_digest.starts_with("sha256:") {
+        bail!(
+            "{} dependency governance external audit manifest_digest must start with sha256:",
+            path.display()
+        );
+    }
+    let Some(release_commit) = release_commit
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        bail!("readiness-report with --dependency-governance-evidence requires --release-commit");
+    };
+    if external_audit.subject_commit != release_commit {
+        bail!(
+            "{} dependency governance external audit subject_commit does not match release commit",
+            path.display()
+        );
+    }
+    let Some(manifest_path) = manifest_path else {
+        bail!(
+            "readiness-report with --dependency-governance-evidence requires --dependency-governance-manifest"
+        );
+    };
+    let manifest_digest = sha256_digest_path(manifest_path)?;
+    if external_audit.manifest_digest != manifest_digest {
+        bail!(
+            "{} dependency governance external audit manifest_digest does not match {}",
+            path.display(),
+            manifest_path.display()
         );
     }
     if !artifact.missing_required_package_review_subjects.is_empty() {
@@ -772,6 +867,27 @@ fn reject_local_readiness_artifact(evidence_kind: &str, path: &Path) -> anyhow::
         );
     }
     Ok(())
+}
+
+fn require_external_audit_field(path: &Path, value: &str, field: &str) -> anyhow::Result<()> {
+    if value.trim().is_empty() {
+        bail!(
+            "{} dependency governance external audit is missing {field}",
+            path.display()
+        );
+    }
+
+    Ok(())
+}
+
+fn sha256_digest_path(path: &Path) -> anyhow::Result<String> {
+    let contents = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let digest = Sha256::digest(contents);
+    let mut value = String::from("sha256:");
+    for byte in digest {
+        write!(&mut value, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    Ok(value)
 }
 
 fn read_json_artifact<T: for<'de> Deserialize<'de>>(path: &Path) -> anyhow::Result<T> {
@@ -1159,7 +1275,23 @@ struct DependencyGovernanceEvidenceArtifactV1 {
     status: String,
     evidence_kind: String,
     cargo_deny: CargoDenyGovernanceEvidenceArtifactV1,
+    #[serde(default)]
+    external_audit_attestation: bool,
+    external_audit: Option<ExternalAuditAttestationArtifactV1>,
     missing_required_package_review_subjects: Vec<String>,
+    #[serde(flatten)]
+    _extra: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExternalAuditAttestationArtifactV1 {
+    provider: String,
+    tool: String,
+    result: String,
+    subject_commit: String,
+    manifest_digest: String,
+    completed_at: String,
+    attestation_uri: String,
     #[serde(flatten)]
     _extra: BTreeMap<String, serde_json::Value>,
 }
@@ -2100,6 +2232,11 @@ mod tests {
         state::{CheckpointPublisher, StateObjectWrite},
     };
 
+    const TEST_RELEASE_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+    const TEST_DEPENDENCY_MANIFEST_CONTENTS: &str = "dependency governance test manifest\n";
+    const TEST_DEPENDENCY_MANIFEST_DIGEST: &str =
+        "sha256:a40627c73380c28e7fff1a5dac4a874fb85ce79366d67a51570904715934ea88";
+
     #[test]
     fn benchmark_result_parser_accepts_pretty_json() {
         parse_benchmark_result_text(&valid_result_json()).unwrap();
@@ -2534,6 +2671,8 @@ mod tests {
             evidence,
             require_release_artifacts,
             dependency_governance_evidence,
+            dependency_governance_manifest,
+            release_commit,
             feldera_artifact_hash_evidence,
             feldera_release_provenance_evidence,
             s3_release_benchmark_gate_evidence,
@@ -2547,6 +2686,8 @@ mod tests {
         assert_eq!(evidence, PathBuf::from("readiness.json"));
         assert!(!require_release_artifacts);
         assert!(dependency_governance_evidence.is_none());
+        assert!(dependency_governance_manifest.is_none());
+        assert!(release_commit.is_none());
         assert!(feldera_artifact_hash_evidence.is_none());
         assert!(feldera_release_provenance_evidence.is_none());
         assert!(s3_release_benchmark_gate_evidence.is_none());
@@ -2564,6 +2705,10 @@ mod tests {
             "--require-release-artifacts",
             "--dependency-governance-evidence",
             "dependency.json",
+            "--dependency-governance-manifest",
+            "dependency-governance.json",
+            "--release-commit",
+            "0123456789abcdef0123456789abcdef01234567",
             "--feldera-artifact-hash-evidence",
             "feldera-hash.json",
             "--feldera-release-provenance-evidence",
@@ -2578,6 +2723,8 @@ mod tests {
         let Some(Command::ReadinessReport {
             require_release_artifacts,
             dependency_governance_evidence,
+            dependency_governance_manifest,
+            release_commit,
             feldera_artifact_hash_evidence,
             feldera_release_provenance_evidence,
             s3_release_benchmark_gate_evidence,
@@ -2592,6 +2739,14 @@ mod tests {
         assert_eq!(
             dependency_governance_evidence,
             Some(PathBuf::from("dependency.json"))
+        );
+        assert_eq!(
+            dependency_governance_manifest,
+            Some(PathBuf::from("dependency-governance.json"))
+        );
+        assert_eq!(
+            release_commit.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
         );
         assert_eq!(
             feldera_artifact_hash_evidence,
@@ -2909,12 +3064,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let readiness = dir.path().join("readiness.json");
         let dependency = dir.path().join("dependency.json");
+        let dependency_manifest = write_dependency_governance_manifest(dir.path());
         let feldera_hash = dir.path().join("feldera-hash.json");
         let feldera_provenance = dir.path().join("feldera-provenance.json");
         let s3_gate = dir.path().join("s3-gate.json");
         let production_gc = dir.path().join("production-gc.json");
         fs::write(&readiness, readiness_json()).unwrap();
-        fs::write(&dependency, dependency_governance_evidence_json()).unwrap();
+        fs::write(&dependency, dependency_governance_evidence_json(true)).unwrap();
         fs::write(&feldera_hash, feldera_hash_evidence_json()).unwrap();
         fs::write(&feldera_provenance, feldera_provenance_evidence_json()).unwrap();
         fs::write(&s3_gate, s3_release_benchmark_gate_json()).unwrap();
@@ -2925,6 +3081,8 @@ mod tests {
             &ReadinessReleaseArtifactPaths {
                 require_release_artifacts: true,
                 dependency_governance_evidence: Some(dependency),
+                dependency_governance_manifest: Some(dependency_manifest),
+                release_commit: Some(TEST_RELEASE_COMMIT.to_string()),
                 feldera_artifact_hash_evidence: Some(feldera_hash),
                 feldera_release_provenance_evidence: Some(feldera_provenance),
                 s3_release_benchmark_gate_evidence: Some(s3_gate),
@@ -2937,15 +3095,135 @@ mod tests {
     }
 
     #[test]
+    fn readiness_report_rejects_local_dependency_governance_release_evidence() {
+        let dir = tempdir().unwrap();
+        let readiness = dir.path().join("readiness.json");
+        let dependency = dir.path().join("dependency.json");
+        fs::write(&readiness, readiness_json()).unwrap();
+        fs::write(&dependency, dependency_governance_evidence_json(false)).unwrap();
+
+        let error = read_readiness_report(
+            &readiness,
+            &ReadinessReleaseArtifactPaths {
+                dependency_governance_evidence: Some(dependency),
+                ..ReadinessReleaseArtifactPaths::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("missing external audit attestation"));
+    }
+
+    #[test]
+    fn readiness_report_rejects_dependency_governance_evidence_without_attestation_field() {
+        let dir = tempdir().unwrap();
+        let readiness = dir.path().join("readiness.json");
+        let dependency = dir.path().join("dependency.json");
+        let mut dependency_json: serde_json::Value =
+            serde_json::from_str(&dependency_governance_evidence_json(true)).unwrap();
+        dependency_json
+            .as_object_mut()
+            .unwrap()
+            .remove("external_audit_attestation");
+        fs::write(&readiness, readiness_json()).unwrap();
+        fs::write(&dependency, dependency_json.to_string()).unwrap();
+
+        let error = read_readiness_report(
+            &readiness,
+            &ReadinessReleaseArtifactPaths {
+                dependency_governance_evidence: Some(dependency),
+                ..ReadinessReleaseArtifactPaths::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("missing external audit attestation"));
+    }
+
+    #[test]
+    fn readiness_report_rejects_dependency_governance_evidence_without_external_audit_details() {
+        let dir = tempdir().unwrap();
+        let readiness = dir.path().join("readiness.json");
+        let dependency = dir.path().join("dependency.json");
+        let mut dependency_json: serde_json::Value =
+            serde_json::from_str(&dependency_governance_evidence_json(true)).unwrap();
+        dependency_json
+            .as_object_mut()
+            .unwrap()
+            .remove("external_audit");
+        fs::write(&readiness, readiness_json()).unwrap();
+        fs::write(&dependency, dependency_json.to_string()).unwrap();
+
+        let error = read_readiness_report(
+            &readiness,
+            &ReadinessReleaseArtifactPaths {
+                dependency_governance_evidence: Some(dependency),
+                ..ReadinessReleaseArtifactPaths::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("missing external audit details"));
+    }
+
+    #[test]
+    fn readiness_report_rejects_dependency_governance_evidence_for_different_commit() {
+        let dir = tempdir().unwrap();
+        let readiness = dir.path().join("readiness.json");
+        let dependency = dir.path().join("dependency.json");
+        let dependency_manifest = write_dependency_governance_manifest(dir.path());
+        fs::write(&readiness, readiness_json()).unwrap();
+        fs::write(&dependency, dependency_governance_evidence_json(true)).unwrap();
+
+        let error = read_readiness_report(
+            &readiness,
+            &ReadinessReleaseArtifactPaths {
+                dependency_governance_evidence: Some(dependency),
+                dependency_governance_manifest: Some(dependency_manifest),
+                release_commit: Some("abcdefabcdefabcdefabcdefabcdefabcdefabcd".to_string()),
+                ..ReadinessReleaseArtifactPaths::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("subject_commit does not match release commit"));
+    }
+
+    #[test]
+    fn readiness_report_rejects_dependency_governance_evidence_for_different_manifest() {
+        let dir = tempdir().unwrap();
+        let readiness = dir.path().join("readiness.json");
+        let dependency = dir.path().join("dependency.json");
+        let dependency_manifest = dir.path().join("dependency-governance.json");
+        fs::write(&readiness, readiness_json()).unwrap();
+        fs::write(&dependency, dependency_governance_evidence_json(true)).unwrap();
+        fs::write(&dependency_manifest, "different manifest\n").unwrap();
+
+        let error = read_readiness_report(
+            &readiness,
+            &ReadinessReleaseArtifactPaths {
+                dependency_governance_evidence: Some(dependency),
+                dependency_governance_manifest: Some(dependency_manifest),
+                release_commit: Some(TEST_RELEASE_COMMIT.to_string()),
+                ..ReadinessReleaseArtifactPaths::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("manifest_digest does not match"));
+    }
+
+    #[test]
     fn readiness_report_requires_production_gc_artifact_when_release_artifacts_required() {
         let dir = tempdir().unwrap();
         let readiness = dir.path().join("readiness.json");
         let dependency = dir.path().join("dependency.json");
+        let dependency_manifest = write_dependency_governance_manifest(dir.path());
         let feldera_hash = dir.path().join("feldera-hash.json");
         let feldera_provenance = dir.path().join("feldera-provenance.json");
         let s3_gate = dir.path().join("s3-gate.json");
         fs::write(&readiness, readiness_json()).unwrap();
-        fs::write(&dependency, dependency_governance_evidence_json()).unwrap();
+        fs::write(&dependency, dependency_governance_evidence_json(true)).unwrap();
         fs::write(&feldera_hash, feldera_hash_evidence_json()).unwrap();
         fs::write(&feldera_provenance, feldera_provenance_evidence_json()).unwrap();
         fs::write(&s3_gate, s3_release_benchmark_gate_json()).unwrap();
@@ -2955,6 +3233,8 @@ mod tests {
             &ReadinessReleaseArtifactPaths {
                 require_release_artifacts: true,
                 dependency_governance_evidence: Some(dependency),
+                dependency_governance_manifest: Some(dependency_manifest),
+                release_commit: Some(TEST_RELEASE_COMMIT.to_string()),
                 feldera_artifact_hash_evidence: Some(feldera_hash),
                 feldera_release_provenance_evidence: Some(feldera_provenance),
                 s3_release_benchmark_gate_evidence: Some(s3_gate),
@@ -4099,8 +4379,8 @@ mod tests {
         .to_string()
     }
 
-    fn dependency_governance_evidence_json() -> String {
-        serde_json::json!({
+    fn dependency_governance_evidence_json(external_audit_attestation: bool) -> String {
+        let mut evidence = serde_json::json!({
             "schema_version": 1,
             "status": "pass",
             "evidence_kind": "dependency_governance_validated",
@@ -4108,9 +4388,28 @@ mod tests {
                 "diagnostics_checked": true,
                 "diagnostics_path": "target/dependency-governance/cargo-deny.jsonl"
             },
+            "external_audit_attestation": external_audit_attestation,
             "missing_required_package_review_subjects": []
-        })
-        .to_string()
+        });
+        if external_audit_attestation {
+            evidence["external_audit"] = serde_json::json!({
+                "provider": "cargo-vet-review-board",
+                "tool": "cargo-vet",
+                "result": "pass",
+                "subject_commit": TEST_RELEASE_COMMIT,
+                "manifest_digest": TEST_DEPENDENCY_MANIFEST_DIGEST,
+                "completed_at": "2026-05-13T00:00:00Z",
+                "attestation_uri": "https://example.invalid/velorix/dependency-governance/attestation.json"
+            });
+        }
+
+        evidence.to_string()
+    }
+
+    fn write_dependency_governance_manifest(parent: &Path) -> PathBuf {
+        let path = parent.join("dependency-governance.json");
+        fs::write(&path, TEST_DEPENDENCY_MANIFEST_CONTENTS).unwrap();
+        path
     }
 
     fn feldera_hash_evidence_json() -> String {

@@ -4658,6 +4658,7 @@ dependencies = [
  "object_store 0.12.5",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "velorix-runtime",
