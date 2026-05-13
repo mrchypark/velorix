@@ -8,13 +8,15 @@ use arrow::{
 use datafusion::prelude::SessionContext;
 use velorix_core::delta::{DeltaKey, DeltaRecord, DeltaValue};
 use velorix_core::relation::{
-    arrow_record_batches_to_orders_sum_count_delta_batch, datafusion_schema_from_catalog,
+    arrow_record_batches_to_orders_sum_count_delta_batch,
+    arrow_record_batches_to_single_key_sum_count_delta_batch, datafusion_schema_from_catalog,
     register_datafusion_catalog_batches, validate_record_batch_matches_catalog,
     ArrowPhysicalTypeV1, DataFusionRegistrationModeV1, DataFusionRegistrationV1,
     FelderaRelationBindingV1, IncrementalAdapterBindingV1, IncrementalInputAdapterError,
     RelationColumnV1, RelationOperationV1, RelationSchemaError, RelationSemanticRoleV1,
     SchemaFingerprintV1, VelorixLogicalTypeV1, VelorixRelationCatalogV1, VelorixRelationSchemaV1,
-    ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID, RELATION_SCHEMA_VERSION_V1,
+    CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID, ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID,
+    RELATION_SCHEMA_VERSION_V1,
 };
 
 const ORDERS_RELATION_SCHEMA_FINGERPRINT: &str =
@@ -349,11 +351,11 @@ fn catalog_incremental_input_accepts_catalog_arrow_fixture() {
 }
 
 #[test]
-fn catalog_incremental_input_uses_catalog_roles_for_non_orders_columns() {
+fn generic_catalog_incremental_input_uses_catalog_roles_for_non_orders_columns() {
     let catalog = customer_balance_relation_catalog();
     let batch = customer_balance_input_batch(&["customer-a", "customer-b"], &[500, 125], &[1, -1]);
 
-    let delta = arrow_record_batches_to_orders_sum_count_delta_batch(
+    let delta = arrow_record_batches_to_single_key_sum_count_delta_batch(
         &catalog,
         catalog.relation_schema.relation_id.as_str(),
         catalog.relation_schema.relation_version.as_str(),
@@ -583,7 +585,7 @@ fn customer_balance_relation_catalog() -> VelorixRelationCatalogV1 {
             schema_fingerprint,
         },
         incremental_adapter: IncrementalAdapterBindingV1 {
-            adapter_id: ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID.to_string(),
+            adapter_id: CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID.to_string(),
         },
     }
 }

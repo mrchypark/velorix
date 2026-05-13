@@ -9,7 +9,7 @@ use velorix_core::{
         PrototypeIncrementalEngine, ENGINE_CHECKPOINT_PAYLOAD_SCHEMA_VERSION,
     },
     relation::{
-        arrow_record_batches_to_orders_sum_count_delta_batch, ArrowPhysicalTypeV1,
+        arrow_record_batches_to_single_key_sum_count_delta_batch, ArrowPhysicalTypeV1,
         DataFusionRegistrationModeV1, DataFusionRegistrationV1, FelderaRelationBindingV1,
         IncrementalAdapterBindingV1, IncrementalInputAdapterError, RelationColumnV1,
         RelationOperationV1, RelationSchemaError, RelationSemanticRoleV1, SchemaFingerprintV1,
@@ -674,7 +674,7 @@ fn prototype_delta_batch_from_arrow_envelope(
     let header = envelope.header();
     let batches = envelope.record_batches().map_err(IngestLogError::from)?;
 
-    arrow_record_batches_to_orders_sum_count_delta_batch(
+    arrow_record_batches_to_single_key_sum_count_delta_batch(
         catalog,
         header.relation_id.as_str(),
         header.relation_version.as_str(),

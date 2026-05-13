@@ -14,8 +14,9 @@ use velorix_core::{
     engine::EngineCheckpoint,
 };
 use velorix_runtime::recovery::{
-    orders_sum_count_relation_catalog, RecoveredRuntime, RecoveryError, ORDERS_SUM_COUNT_OWNER,
-    ORDERS_SUM_COUNT_RELATION_ID, ORDERS_SUM_COUNT_RELATION_VERSION,
+    orders_sum_count_relation_catalog, RecoveredRuntime, RecoveryError,
+    ORDERS_SUM_COUNT_ADAPTER_ID, ORDERS_SUM_COUNT_OWNER, ORDERS_SUM_COUNT_RELATION_ID,
+    ORDERS_SUM_COUNT_RELATION_VERSION,
 };
 use velorix_storage::{
     capability::{
@@ -47,6 +48,24 @@ fn capabilities_missing(
         .collect::<BTreeMap<_, _>>();
     profiles.remove(&namespace);
     AuthoritativeObjectStoreCapabilitiesV1::new(profiles)
+}
+
+#[test]
+fn default_orders_relation_catalog_keeps_legacy_adapter_id_for_durable_key_compatibility() {
+    let catalog = orders_sum_count_relation_catalog().unwrap();
+
+    assert_eq!(
+        catalog.relation_schema.relation_id,
+        ORDERS_SUM_COUNT_RELATION_ID
+    );
+    assert_eq!(
+        catalog.relation_schema.relation_version,
+        ORDERS_SUM_COUNT_RELATION_VERSION
+    );
+    assert_eq!(
+        catalog.incremental_adapter.adapter_id,
+        ORDERS_SUM_COUNT_ADAPTER_ID
+    );
 }
 
 async fn probed_capabilities(store: &dyn ObjectStore) -> AuthoritativeObjectStoreCapabilitiesV1 {

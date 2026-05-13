@@ -20,6 +20,8 @@ pub const SCHEMA_FINGERPRINT_V1_DOMAIN: &[u8] = b"velorix-relation-schema-v1\0";
 pub const DATAFUSION_RELATION_ID_METADATA_KEY: &str = "velorix.relation_id";
 pub const DATAFUSION_RELATION_VERSION_METADATA_KEY: &str = "velorix.relation_version";
 pub const DATAFUSION_SCHEMA_FINGERPRINT_METADATA_KEY: &str = "velorix.schema_fingerprint";
+pub const CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID: &str =
+    "incremental-adapter-single-key-sum-count-v1";
 pub const ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID: &str = "incremental-adapter-orders-sum-count-v1";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -470,7 +472,7 @@ pub fn validate_record_batch_matches_catalog(
     Ok(())
 }
 
-pub fn arrow_record_batches_to_orders_sum_count_delta_batch(
+pub fn arrow_record_batches_to_single_key_sum_count_delta_batch(
     catalog: &VelorixRelationCatalogV1,
     relation_id: &str,
     relation_version: &str,
@@ -484,7 +486,9 @@ pub fn arrow_record_batches_to_orders_sum_count_delta_batch(
         relation_version,
         schema_fingerprint,
     )?;
-    if catalog.incremental_adapter.adapter_id != ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID {
+    if !is_single_key_sum_count_incremental_adapter_id(
+        catalog.incremental_adapter.adapter_id.as_str(),
+    ) {
         return Err(
             IncrementalInputAdapterError::UnsupportedIncrementalAdapter {
                 adapter_id: catalog.incremental_adapter.adapter_id.clone(),
@@ -528,6 +532,30 @@ pub fn arrow_record_batches_to_orders_sum_count_delta_batch(
     }
 
     Ok(DeltaBatch::from_records(records))
+}
+
+pub fn arrow_record_batches_to_orders_sum_count_delta_batch(
+    catalog: &VelorixRelationCatalogV1,
+    relation_id: &str,
+    relation_version: &str,
+    schema_fingerprint: &str,
+    batches: &[RecordBatch],
+) -> Result<DeltaBatch, IncrementalInputAdapterError> {
+    arrow_record_batches_to_single_key_sum_count_delta_batch(
+        catalog,
+        relation_id,
+        relation_version,
+        schema_fingerprint,
+        batches,
+    )
+}
+
+fn is_single_key_sum_count_incremental_adapter_id(adapter_id: &str) -> bool {
+    matches!(
+        adapter_id,
+        CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID
+            | ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID
+    )
 }
 
 fn incremental_input_batch_schema_error(
