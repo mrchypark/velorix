@@ -62,6 +62,8 @@ that distinction.
 
 DataFusion 53 memory exhaustion now has version-specific runtime evidence for
 a grouped aggregate over the public object-backed Parquet query path.
+Object-backed scan preflight timeout evidence also proves that cancellation
+drops the stalled list stream and releases the shared query limiter permit.
 Version-specific spill failure tests, tenant/global shared runtime semantics,
 and Velorix-owned typed memory/spill errors remain future work.
 
