@@ -437,6 +437,10 @@ fn push_placeholder_evidence_check(
         ("local-only", "local-only"),
         ("local only", "local-only"),
         ("local filesystem", "local filesystem"),
+        ("floci", "local Floci emulator"),
+        ("vind", "local vind Kubernetes"),
+        ("vcluster", "local Kubernetes vCluster"),
+        ("emulator", "emulator"),
     ] {
         if evidence.contains(marker) {
             blocking_reasons.push(format!("{field} uses {reason} evidence"));

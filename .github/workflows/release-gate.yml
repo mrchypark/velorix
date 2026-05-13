@@ -131,6 +131,11 @@ jobs:
           test -f "$READINESS_EVIDENCE_PATH"
           cargo run -p velorix-cli -- readiness-report \
             --evidence "$READINESS_EVIDENCE_PATH" \
+            --require-release-artifacts \
+            --dependency-governance-evidence target/dependency-governance/dependency-governance-evidence.json \
+            --feldera-artifact-hash-evidence target/release-evidence/feldera-artifact-hash.json \
+            --feldera-release-provenance-evidence target/release-evidence/feldera-release-provenance.json \
+            --s3-release-benchmark-gate-evidence target/release-evidence/s3-release-benchmark-gate.json \
             --json \
             > target/release-evidence/production-readiness-report.json
 

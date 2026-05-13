@@ -263,6 +263,34 @@ fn readiness_report_blocks_pass_check_with_local_only_evidence_text() {
 }
 
 #[test]
+fn readiness_report_blocks_pass_check_with_floci_evidence_text() {
+    let report = report_with_evidence(
+        "capability_status",
+        "Floci S3-compatible emulator gate passed",
+    );
+
+    assert!(!report.production_ready);
+    assert_eq!(
+        report.blocking_reasons,
+        vec!["capability_status uses local Floci emulator evidence"]
+    );
+}
+
+#[test]
+fn readiness_report_blocks_pass_check_with_vind_evidence_text() {
+    let report = report_with_evidence(
+        "kubernetes_status",
+        "local vind/vCluster Kubernetes gate passed",
+    );
+
+    assert!(!report.production_ready);
+    assert_eq!(
+        report.blocking_reasons,
+        vec!["kubernetes_status uses local vind Kubernetes evidence"]
+    );
+}
+
+#[test]
 fn readiness_report_blocks_when_catalog_evidence_is_missing() {
     let report = ProductionReadinessEvidenceV1::from_json_str(&readiness_json(
         &[

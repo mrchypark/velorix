@@ -145,6 +145,16 @@ enum Command {
         #[arg(long)]
         evidence: PathBuf,
         #[arg(long)]
+        require_release_artifacts: bool,
+        #[arg(long)]
+        dependency_governance_evidence: Option<PathBuf>,
+        #[arg(long)]
+        feldera_artifact_hash_evidence: Option<PathBuf>,
+        #[arg(long)]
+        feldera_release_provenance_evidence: Option<PathBuf>,
+        #[arg(long)]
+        s3_release_benchmark_gate_evidence: Option<PathBuf>,
+        #[arg(long)]
         json: bool,
     },
     FelderaArtifactVerify {
@@ -298,8 +308,23 @@ async fn main() -> anyhow::Result<()> {
                 println!("benchmark gate passed");
             }
         }
-        Some(Command::ReadinessReport { evidence, json }) => {
-            let report = read_readiness_report(&evidence)?;
+        Some(Command::ReadinessReport {
+            evidence,
+            require_release_artifacts,
+            dependency_governance_evidence,
+            feldera_artifact_hash_evidence,
+            feldera_release_provenance_evidence,
+            s3_release_benchmark_gate_evidence,
+            json,
+        }) => {
+            let artifacts = ReadinessReleaseArtifactPaths {
+                require_release_artifacts,
+                dependency_governance_evidence,
+                feldera_artifact_hash_evidence,
+                feldera_release_provenance_evidence,
+                s3_release_benchmark_gate_evidence,
+            };
+            let report = read_readiness_report(&evidence, &artifacts)?;
             if json {
                 println!("{}", report.to_json_pretty()?);
             } else {
@@ -372,12 +397,273 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn read_readiness_report(path: &Path) -> anyhow::Result<ProductionReadinessReportV1> {
+#[derive(Debug, Default)]
+struct ReadinessReleaseArtifactPaths {
+    require_release_artifacts: bool,
+    dependency_governance_evidence: Option<PathBuf>,
+    feldera_artifact_hash_evidence: Option<PathBuf>,
+    feldera_release_provenance_evidence: Option<PathBuf>,
+    s3_release_benchmark_gate_evidence: Option<PathBuf>,
+}
+
+impl ReadinessReleaseArtifactPaths {
+    fn any_path_supplied(&self) -> bool {
+        self.dependency_governance_evidence.is_some()
+            || self.feldera_artifact_hash_evidence.is_some()
+            || self.feldera_release_provenance_evidence.is_some()
+            || self.s3_release_benchmark_gate_evidence.is_some()
+    }
+}
+
+fn read_readiness_report(
+    path: &Path,
+    artifacts: &ReadinessReleaseArtifactPaths,
+) -> anyhow::Result<ProductionReadinessReportV1> {
     let contents = fs::read_to_string(path)
         .with_context(|| format!("failed to read readiness evidence from {}", path.display()))?;
     let evidence = ProductionReadinessEvidenceV1::from_json_str(&contents)
         .with_context(|| format!("failed to parse readiness evidence {}", path.display()))?;
-    evidence.try_into_report().map_err(anyhow::Error::msg)
+    let report = evidence.try_into_report().map_err(anyhow::Error::msg)?;
+    validate_readiness_release_artifacts(&report, artifacts)?;
+    Ok(report)
+}
+
+fn validate_readiness_release_artifacts(
+    _report: &ProductionReadinessReportV1,
+    artifacts: &ReadinessReleaseArtifactPaths,
+) -> anyhow::Result<()> {
+    if artifacts.require_release_artifacts {
+        require_artifact_path(
+            "dependency-governance-evidence",
+            &artifacts.dependency_governance_evidence,
+        )?;
+        require_artifact_path(
+            "feldera-artifact-hash-evidence",
+            &artifacts.feldera_artifact_hash_evidence,
+        )?;
+        require_artifact_path(
+            "feldera-release-provenance-evidence",
+            &artifacts.feldera_release_provenance_evidence,
+        )?;
+        require_artifact_path(
+            "s3-release-benchmark-gate-evidence",
+            &artifacts.s3_release_benchmark_gate_evidence,
+        )?;
+    } else if !artifacts.any_path_supplied() {
+        return Ok(());
+    }
+
+    if let Some(path) = &artifacts.dependency_governance_evidence {
+        validate_dependency_governance_evidence_artifact(path)?;
+    }
+    if let (Some(hash_path), Some(provenance_path)) = (
+        &artifacts.feldera_artifact_hash_evidence,
+        &artifacts.feldera_release_provenance_evidence,
+    ) {
+        validate_feldera_release_evidence_artifacts(hash_path, provenance_path)?;
+    } else if artifacts.feldera_artifact_hash_evidence.is_some()
+        || artifacts.feldera_release_provenance_evidence.is_some()
+    {
+        bail!("Feldera release evidence requires both hash and provenance artifacts");
+    }
+    if let Some(path) = &artifacts.s3_release_benchmark_gate_evidence {
+        validate_s3_release_benchmark_gate_evidence_artifact(path)?;
+    }
+
+    Ok(())
+}
+
+fn require_artifact_path(name: &str, path: &Option<PathBuf>) -> anyhow::Result<()> {
+    if path.is_some() {
+        Ok(())
+    } else {
+        bail!("readiness-report --require-release-artifacts requires --{name}")
+    }
+}
+
+fn validate_dependency_governance_evidence_artifact(path: &Path) -> anyhow::Result<()> {
+    reject_local_readiness_artifact(&read_artifact_evidence_kind(path)?, path)?;
+    let artifact: DependencyGovernanceEvidenceArtifactV1 = read_json_artifact(path)?;
+
+    if artifact.schema_version != 1 {
+        bail!(
+            "{} has unsupported schema_version {}, expected 1",
+            path.display(),
+            artifact.schema_version
+        );
+    }
+    if artifact.status != "pass" {
+        bail!(
+            "{} dependency governance evidence is not pass",
+            path.display()
+        );
+    }
+    if artifact.evidence_kind != "dependency_governance_validated" {
+        bail!(
+            "{} has evidence_kind {}, expected dependency_governance_validated",
+            path.display(),
+            artifact.evidence_kind
+        );
+    }
+    if !artifact.cargo_deny.diagnostics_checked {
+        bail!(
+            "{} dependency governance evidence did not check cargo-deny diagnostics",
+            path.display()
+        );
+    }
+    if !artifact.missing_required_package_review_subjects.is_empty() {
+        bail!(
+            "{} dependency governance evidence has missing package review subjects",
+            path.display()
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_feldera_release_evidence_artifacts(
+    hash_path: &Path,
+    provenance_path: &Path,
+) -> anyhow::Result<()> {
+    let hash: FelderaArtifactHashVerifiedEvidenceV1 = read_json_artifact(hash_path)?;
+    let provenance: FelderaArtifactReleaseProvenanceEvidenceV1 =
+        read_json_artifact(provenance_path)?;
+
+    if hash.status != velorix_runtime::readiness::ReadinessStatus::Pass {
+        bail!(
+            "{} Feldera artifact hash evidence is not pass",
+            hash_path.display()
+        );
+    }
+    if provenance.status != velorix_runtime::readiness::ReadinessStatus::Pass {
+        bail!(
+            "{} Feldera release provenance evidence is not pass",
+            provenance_path.display()
+        );
+    }
+    if hash.artifact_id != provenance.artifact_id
+        || hash.artifact_hash != provenance.artifact_hash
+        || hash.spec_hash != provenance.spec_hash
+        || hash.generated_rust_abi_version != provenance.generated_rust_abi_version
+    {
+        bail!("Feldera hash and release provenance evidence do not describe the same artifact");
+    }
+
+    Ok(())
+}
+
+fn validate_s3_release_benchmark_gate_evidence_artifact(path: &Path) -> anyhow::Result<()> {
+    reject_local_readiness_artifact(&read_artifact_evidence_kind(path)?, path)?;
+    let artifact: BenchmarkGateEvidenceArtifactV1 = read_json_artifact(path)?;
+
+    if artifact.schema_version != 1 {
+        bail!(
+            "{} has unsupported schema_version {}, expected 1",
+            path.display(),
+            artifact.schema_version
+        );
+    }
+    if artifact.status != "pass" {
+        bail!("{} benchmark gate evidence is not pass", path.display());
+    }
+    if artifact.evidence_kind != "s3_compatible_benchmark_gate" {
+        bail!(
+            "{} has evidence_kind {}, expected s3_compatible_benchmark_gate",
+            path.display(),
+            artifact.evidence_kind
+        );
+    }
+    if artifact.gate_level != BenchmarkGateLevel::Release {
+        bail!(
+            "{} benchmark gate evidence is not release level",
+            path.display()
+        );
+    }
+    if artifact.backend != BenchmarkBackend::S3Compatible {
+        bail!(
+            "{} benchmark gate evidence is not s3-compatible",
+            path.display()
+        );
+    }
+    if artifact.workload != "s3_incremental" {
+        bail!(
+            "{} benchmark gate workload is {}, expected s3_incremental",
+            path.display(),
+            artifact.workload
+        );
+    }
+    if artifact
+        .baseline_path
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .is_empty()
+        || artifact
+            .baseline_commit
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+        || artifact.max_regression_fraction.is_none()
+    {
+        bail!(
+            "{} benchmark gate evidence is missing release baseline comparison fields",
+            path.display()
+        );
+    }
+    if is_placeholder_commit(&artifact.baseline_commit.unwrap_or_default())
+        || is_placeholder_commit(&artifact.result_commit)
+    {
+        bail!(
+            "{} benchmark gate evidence uses placeholder commits",
+            path.display()
+        );
+    }
+
+    Ok(())
+}
+
+fn reject_local_readiness_artifact(evidence_kind: &str, path: &Path) -> anyhow::Result<()> {
+    if matches!(
+        evidence_kind,
+        "floci_s3_compatible_gate" | "kubernetes_vind_gate" | "local_benchmark_gate"
+    ) {
+        bail!(
+            "{} is local-scoped evidence ({evidence_kind}) and cannot satisfy release readiness",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn read_json_artifact<T: for<'de> Deserialize<'de>>(path: &Path) -> anyhow::Result<T> {
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("failed to read evidence artifact from {}", path.display()))?;
+    serde_json::from_str(&contents)
+        .with_context(|| format!("failed to parse evidence artifact {}", path.display()))
+}
+
+fn read_artifact_evidence_kind(path: &Path) -> anyhow::Result<String> {
+    let value: serde_json::Value = read_json_artifact(path)?;
+    value
+        .get("evidence_kind")
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string)
+        .with_context(|| {
+            format!(
+                "evidence artifact {} is missing evidence_kind",
+                path.display()
+            )
+        })
+}
+
+fn is_placeholder_commit(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    value.is_empty()
+        || value.contains("placeholder")
+        || value == "unknown"
+        || value == "local"
+        || value.chars().all(|c| c == '0')
 }
 
 fn validate_release_status_file(path: &Path) -> anyhow::Result<()> {
@@ -708,6 +994,40 @@ struct CargoDenyGovernanceEvidenceV1 {
     diagnostics_checked: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     diagnostics_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DependencyGovernanceEvidenceArtifactV1 {
+    schema_version: u16,
+    status: String,
+    evidence_kind: String,
+    cargo_deny: CargoDenyGovernanceEvidenceArtifactV1,
+    missing_required_package_review_subjects: Vec<String>,
+    #[serde(flatten)]
+    _extra: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoDenyGovernanceEvidenceArtifactV1 {
+    diagnostics_checked: bool,
+    #[serde(flatten)]
+    _extra: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BenchmarkGateEvidenceArtifactV1 {
+    schema_version: u16,
+    status: String,
+    evidence_kind: String,
+    gate_level: BenchmarkGateLevel,
+    backend: BenchmarkBackend,
+    workload: String,
+    baseline_path: Option<String>,
+    baseline_commit: Option<String>,
+    result_commit: String,
+    max_regression_fraction: Option<f64>,
+    #[serde(flatten)]
+    _extra: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1989,12 +2309,76 @@ mod tests {
         ])
         .unwrap();
 
-        let Some(Command::ReadinessReport { evidence, json }) = cli.command else {
+        let Some(Command::ReadinessReport {
+            evidence,
+            require_release_artifacts,
+            dependency_governance_evidence,
+            feldera_artifact_hash_evidence,
+            feldera_release_provenance_evidence,
+            s3_release_benchmark_gate_evidence,
+            json,
+        }) = cli.command
+        else {
             panic!("expected readiness-report command");
         };
 
         assert_eq!(evidence, PathBuf::from("readiness.json"));
+        assert!(!require_release_artifacts);
+        assert!(dependency_governance_evidence.is_none());
+        assert!(feldera_artifact_hash_evidence.is_none());
+        assert!(feldera_release_provenance_evidence.is_none());
+        assert!(s3_release_benchmark_gate_evidence.is_none());
         assert!(json);
+    }
+
+    #[test]
+    fn readiness_report_cli_parses_release_artifact_flags() {
+        let cli = Cli::try_parse_from([
+            "velorix-cli",
+            "readiness-report",
+            "--evidence",
+            "readiness.json",
+            "--require-release-artifacts",
+            "--dependency-governance-evidence",
+            "dependency.json",
+            "--feldera-artifact-hash-evidence",
+            "feldera-hash.json",
+            "--feldera-release-provenance-evidence",
+            "feldera-provenance.json",
+            "--s3-release-benchmark-gate-evidence",
+            "s3-gate.json",
+        ])
+        .unwrap();
+
+        let Some(Command::ReadinessReport {
+            require_release_artifacts,
+            dependency_governance_evidence,
+            feldera_artifact_hash_evidence,
+            feldera_release_provenance_evidence,
+            s3_release_benchmark_gate_evidence,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected readiness-report command");
+        };
+
+        assert!(require_release_artifacts);
+        assert_eq!(
+            dependency_governance_evidence,
+            Some(PathBuf::from("dependency.json"))
+        );
+        assert_eq!(
+            feldera_artifact_hash_evidence,
+            Some(PathBuf::from("feldera-hash.json"))
+        );
+        assert_eq!(
+            feldera_release_provenance_evidence,
+            Some(PathBuf::from("feldera-provenance.json"))
+        );
+        assert_eq!(
+            s3_release_benchmark_gate_evidence,
+            Some(PathBuf::from("s3-gate.json"))
+        );
     }
 
     #[test]
@@ -2267,6 +2651,140 @@ mod tests {
         assert!(format!("{error:#}").contains(
             "production readiness report is blocked: dependency_governance_status missing dependency_governance_validated evidence"
         ));
+    }
+
+    #[test]
+    fn readiness_report_requires_all_release_artifact_paths_when_required() {
+        let dir = tempdir().unwrap();
+        let readiness = dir.path().join("readiness.json");
+        fs::write(&readiness, readiness_json()).unwrap();
+
+        let error = read_readiness_report(
+            &readiness,
+            &ReadinessReleaseArtifactPaths {
+                require_release_artifacts: true,
+                ..ReadinessReleaseArtifactPaths::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}")
+                .contains("readiness-report --require-release-artifacts requires --dependency-governance-evidence")
+        );
+    }
+
+    #[test]
+    fn readiness_report_validates_release_evidence_artifacts_when_required() {
+        let dir = tempdir().unwrap();
+        let readiness = dir.path().join("readiness.json");
+        let dependency = dir.path().join("dependency.json");
+        let feldera_hash = dir.path().join("feldera-hash.json");
+        let feldera_provenance = dir.path().join("feldera-provenance.json");
+        let s3_gate = dir.path().join("s3-gate.json");
+        fs::write(&readiness, readiness_json()).unwrap();
+        fs::write(&dependency, dependency_governance_evidence_json()).unwrap();
+        fs::write(&feldera_hash, feldera_hash_evidence_json()).unwrap();
+        fs::write(&feldera_provenance, feldera_provenance_evidence_json()).unwrap();
+        fs::write(&s3_gate, s3_release_benchmark_gate_json()).unwrap();
+
+        let report = read_readiness_report(
+            &readiness,
+            &ReadinessReleaseArtifactPaths {
+                require_release_artifacts: true,
+                dependency_governance_evidence: Some(dependency),
+                feldera_artifact_hash_evidence: Some(feldera_hash),
+                feldera_release_provenance_evidence: Some(feldera_provenance),
+                s3_release_benchmark_gate_evidence: Some(s3_gate),
+            },
+        )
+        .unwrap();
+
+        assert!(report.production_ready);
+    }
+
+    #[test]
+    fn readiness_report_rejects_floci_artifact_as_s3_release_benchmark_evidence() {
+        let dir = tempdir().unwrap();
+        let readiness = dir.path().join("readiness.json");
+        let s3_gate = dir.path().join("floci.json");
+        fs::write(&readiness, readiness_json()).unwrap();
+        fs::write(
+            &s3_gate,
+            serde_json::json!({
+                "schema_version": 1,
+                "evidence_kind": "floci_s3_compatible_gate",
+                "readiness_evidence_kind": ["s3_compatible"],
+                "scope": "local floci S3-compatible emulator evidence"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let error = read_readiness_report(
+            &readiness,
+            &ReadinessReleaseArtifactPaths {
+                s3_release_benchmark_gate_evidence: Some(s3_gate),
+                ..ReadinessReleaseArtifactPaths::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("local-scoped evidence"));
+    }
+
+    #[test]
+    fn readiness_report_rejects_nightly_s3_artifact_as_release_evidence() {
+        let dir = tempdir().unwrap();
+        let readiness = dir.path().join("readiness.json");
+        let s3_gate = dir.path().join("s3-nightly.json");
+        fs::write(&readiness, readiness_json()).unwrap();
+        fs::write(
+            &s3_gate,
+            s3_release_benchmark_gate_json().replace("\"release\"", "\"nightly_integration\""),
+        )
+        .unwrap();
+
+        let error = read_readiness_report(
+            &readiness,
+            &ReadinessReleaseArtifactPaths {
+                s3_release_benchmark_gate_evidence: Some(s3_gate),
+                ..ReadinessReleaseArtifactPaths::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("not release level"));
+    }
+
+    #[test]
+    fn readiness_report_rejects_mismatched_feldera_release_provenance() {
+        let dir = tempdir().unwrap();
+        let readiness = dir.path().join("readiness.json");
+        let feldera_hash = dir.path().join("feldera-hash.json");
+        let feldera_provenance = dir.path().join("feldera-provenance.json");
+        fs::write(&readiness, readiness_json()).unwrap();
+        fs::write(&feldera_hash, feldera_hash_evidence_json()).unwrap();
+        fs::write(
+            &feldera_provenance,
+            feldera_provenance_evidence_json().replace(
+                "feldera-artifact-orders-by-region-20260503",
+                "different-artifact",
+            ),
+        )
+        .unwrap();
+
+        let error = read_readiness_report(
+            &readiness,
+            &ReadinessReleaseArtifactPaths {
+                feldera_artifact_hash_evidence: Some(feldera_hash),
+                feldera_release_provenance_evidence: Some(feldera_provenance),
+                ..ReadinessReleaseArtifactPaths::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("do not describe the same artifact"));
     }
 
     #[test]
@@ -3113,6 +3631,72 @@ mod tests {
                 "evidence": "Kubernetes Lease client",
                 "evidence_kind": ["kubernetes_lease_client"]
             }
+        })
+        .to_string()
+    }
+
+    fn dependency_governance_evidence_json() -> String {
+        serde_json::json!({
+            "schema_version": 1,
+            "status": "pass",
+            "evidence_kind": "dependency_governance_validated",
+            "cargo_deny": {
+                "diagnostics_checked": true,
+                "diagnostics_path": "target/dependency-governance/cargo-deny.jsonl"
+            },
+            "missing_required_package_review_subjects": []
+        })
+        .to_string()
+    }
+
+    fn feldera_hash_evidence_json() -> String {
+        serde_json::json!({
+            "schema_version": 1,
+            "status": "pass",
+            "evidence_kind": "feldera_artifact_hash_verified",
+            "view_id": "standing_view_orders_by_region",
+            "artifact_id": "feldera-artifact-orders-by-region-20260503",
+            "artifact_hash": "sha256:9063ca4eca6bd69190c68b01a00def0a5b86470abbc2312e94491c59a1c7f537",
+            "spec_hash": "velorix-feldera-spec-sha256-v1:0e24cbe06543d735a6d62868f230c4610fb9139cb91e5e8f72042f17da0ecbea",
+            "generated_rust_abi_version": "feldera-generated-rust-abi-v1"
+        })
+        .to_string()
+    }
+
+    fn feldera_provenance_evidence_json() -> String {
+        serde_json::json!({
+            "schema_version": 1,
+            "status": "pass",
+            "evidence_kind": "feldera_artifact_release_provenance",
+            "release_id": "velorix-feldera-release-20260507",
+            "release_version": "1.0.0-rc.1",
+            "build_id": "feldera-build-20260507T000000Z",
+            "builder_id": "github-actions/feldera-artifacts",
+            "artifact_id": "feldera-artifact-orders-by-region-20260503",
+            "artifact_hash": "sha256:9063ca4eca6bd69190c68b01a00def0a5b86470abbc2312e94491c59a1c7f537",
+            "spec_hash": "velorix-feldera-spec-sha256-v1:0e24cbe06543d735a6d62868f230c4610fb9139cb91e5e8f72042f17da0ecbea",
+            "generated_rust_abi_version": "feldera-generated-rust-abi-v1",
+            "generated_rust_crate_name": "orders_by_region_pipeline",
+            "source_repository": "https://github.com/mrchypark/velorix",
+            "source_revision": "0123456789abcdef0123456789abcdef01234567"
+        })
+        .to_string()
+    }
+
+    fn s3_release_benchmark_gate_json() -> String {
+        serde_json::json!({
+            "schema_version": 1,
+            "status": "pass",
+            "evidence_kind": "s3_compatible_benchmark_gate",
+            "gate_level": "release",
+            "backend": "s3_compatible",
+            "workload": "s3_incremental",
+            "baseline_path": "baselines/benchmark/s3/release.json",
+            "result_path": "target/velorix-bench/s3-release.json",
+            "baseline_commit": "1111111111111111111111111111111111111111",
+            "result_commit": "2222222222222222222222222222222222222222",
+            "max_regression_fraction": 0.10,
+            "workload_metrics": ["ingest_envelope_validation"]
         })
         .to_string()
     }
