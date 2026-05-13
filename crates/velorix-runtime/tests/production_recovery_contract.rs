@@ -48,6 +48,10 @@ fn production_recovery_contract_forbids_direct_bootstrap_recovery_callers() {
             "    RecoveredRuntime::recover_from_published_checkpoint_version(store, publisher, 7).await?;",
             "RecoveredRuntime::recover_from_published_checkpoint_version(",
         ),
+        (
+            "    RecoveredRuntime::recover_with_owner_and_relation_catalog_record(store, owner, relation_id, relation_version).await?;",
+            "RecoveredRuntime::recover_with_owner_and_relation_catalog_record(",
+        ),
     ] {
         assert_eq!(
             forbidden_bootstrap_recovery_use(workspace, &source, &[line], 0),
@@ -109,6 +113,7 @@ fn forbidden_bootstrap_recovery_patterns() -> &'static [&'static str] {
         "RecoveredRuntime::recover(",
         "RecoveredRuntime::recover_with_owner(",
         "RecoveredRuntime::recover_from_published_checkpoint_version(",
+        "RecoveredRuntime::recover_with_owner_and_relation_catalog_record(",
     ]
 }
 
@@ -123,13 +128,20 @@ fn allowed_bootstrap_recovery_use(
         return true;
     }
 
-    source == workspace.join("crates/velorix-runtime/src/query.rs")
+    if source == workspace.join("crates/velorix-runtime/src/query.rs")
         && pattern == "RecoveredRuntime::recover("
         && line_is_inside_function(
             lines,
             line_number,
             "pub async fn query_recovered_materialized_view_with_policy_and_limiter(",
         )
+    {
+        return true;
+    }
+
+    source == workspace.join("crates/velorix-cli/src/main.rs")
+        && pattern == "RecoveredRuntime::recover_with_owner_and_relation_catalog_record("
+        && line_is_inside_function(lines, line_number, "async fn recover_local_runtime(")
 }
 
 fn line_is_inside_function(lines: &[&str], line_number: usize, signature: &str) -> bool {

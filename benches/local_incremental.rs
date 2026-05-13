@@ -47,6 +47,7 @@ use velorix_runtime::recovery::{
 };
 use velorix_runtime::storage_registry::StorageRegistry;
 use velorix_storage::{
+    capability::probe_authoritative_object_store_capabilities,
     gc::{GarbageCollectionPlan, GarbageCollectionPolicy},
     ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
     log::{IngestAdmissionCoordinator, IngestLog},
@@ -168,13 +169,21 @@ async fn run() -> BenchResult<()> {
         &requests_before,
     );
 
+    let recovery_capabilities = probe_authoritative_object_store_capabilities(
+        store.as_ref(),
+        "local-benchmark",
+        "local-incremental-recovery-capability-probes",
+    )
+    .await?;
+
     let recovery_requests_before = metered_store.snapshot();
     let recovery_started = Instant::now();
-    let recovered = RecoveredRuntime::recover_with_owner_and_relation_catalog_record(
+    let recovered = RecoveredRuntime::recover_with_owner_and_relation_catalog_record_checked(
         Arc::clone(&store),
         ORDERS_SUM_COUNT_OWNER,
         ORDERS_SUM_COUNT_RELATION_ID,
         ORDERS_SUM_COUNT_RELATION_VERSION,
+        &recovery_capabilities,
     )
     .await?;
     let recovery_elapsed = recovery_started.elapsed();
