@@ -63,16 +63,38 @@ Run the full local vind gate:
 scripts/run-vind-k8s-gate.sh
 ```
 
-On success, the gate writes `target/velorix-k8s/vind-k8s-gate-evidence.json`
-with the cluster context, namespace, applied CRDs, tool versions, and live k8s
-test set.
+By default, the gate creates a run-owned `velorix-vind-*` vCluster, deletes
+that cluster on exit, and writes
+`target/velorix-k8s/vind-k8s-gate-evidence.json` with the cluster context,
+namespace, applied CRDs, tool versions, and live k8s test set. The artifact is
+local Kubernetes evidence only; it is not 1.0 completion evidence. On failure,
+the gate writes `target/velorix-k8s/vind-k8s-gate-diagnostics.txt` before
+cleaning up owned resources.
 
-Run the same gate in GitHub Actions with the `Kubernetes vind Gate` manual
-workflow. The workflow uploads `target/velorix-k8s/*.json` as the
-`kubernetes-vind-evidence` artifact.
-
-Clean up the cluster when done:
+Useful overrides:
 
 ```bash
-vcluster delete velorix-vind
+VELORIX_VIND_CLUSTER=velorix-vind \
+VELORIX_VIND_REUSE_EXISTING=1 \
+VELORIX_VIND_CLEANUP=0 \
+VELORIX_VIND_EVIDENCE_PATH=target/velorix-k8s/local-evidence.json \
+VELORIX_VIND_DIAGNOSTICS_PATH=target/velorix-k8s/local-diagnostics.txt \
+  scripts/run-vind-k8s-gate.sh
+```
+
+If the requested vCluster name or generated kube context already exists, the
+gate fails before applying CRDs or running tests unless
+`VELORIX_VIND_REUSE_EXISTING=1` is set. Reused clusters are never deleted by the
+gate.
+
+Run the same gate in GitHub Actions with the `Kubernetes vind Gate` manual
+workflow. The workflow always attempts to upload JSON evidence and TXT
+diagnostics from `target/velorix-k8s` as the `kubernetes-vind-evidence` artifact
+so successful evidence or failure context is preserved even when later cleanup
+fails.
+
+If you set `VELORIX_VIND_CLEANUP=0`, clean up the cluster when done:
+
+```bash
+vcluster delete velorix-vind --driver docker
 ```
