@@ -86,6 +86,14 @@ fn production_like_ingest_harnesses_use_process_local_coordinator() {
             append_call_violations.join("\n")
         );
 
+        let catalog_append_violations = catalog_append_call_violations(&contents);
+        assert!(
+            catalog_append_violations.is_empty(),
+            "{} should not bypass the process-local coordinator for catalog-aware appends:\n{}",
+            source.strip_prefix(&workspace).unwrap_or(&source).display(),
+            catalog_append_violations.join("\n")
+        );
+
         assert!(
             helper_append_receiver_is_coordinator(&contents),
             "{} should call append_catalog_validated_envelope on the coordinator helper receiver",
@@ -117,6 +125,136 @@ fn append_ingest_call_violations(contents: &str) -> Vec<String> {
         .collect()
 }
 
+#[test]
+fn ingest_harness_contract_forbids_direct_catalog_aware_append_receiver() {
+    let contents = r#"
+async fn append_ingest_envelope(
+    ingest_coordinator: &IngestAdmissionCoordinator,
+    ingest_log: &IngestLog,
+    bytes: Bytes,
+) {
+    IngestLog::append_catalog_validated_envelope_single_writer(ingest_log, bytes).await?;
+}
+"#;
+
+    let violations = catalog_append_call_violations(contents);
+    assert_eq!(violations.len(), 1);
+    assert!(violations[0].contains("append_catalog_validated_envelope_single_writer"));
+    assert!(violations[0].contains("receiver `IngestLog`"));
+}
+
+#[test]
+fn ingest_harness_contract_allows_multiline_coordinator_catalog_append() {
+    let contents = r#"
+async fn append_ingest_envelope(
+    ingest_coordinator: &IngestAdmissionCoordinator,
+    bytes: Bytes,
+) {
+    ingest_coordinator
+        .append_catalog_validated_envelope(bytes)
+        .await?;
+}
+"#;
+
+    assert!(catalog_append_call_violations(contents).is_empty());
+}
+
+#[test]
+fn ingest_harness_contract_allows_inline_coordinator_catalog_append() {
+    let contents = r#"
+async fn append_ingest_envelope(ingest_coordinator: &IngestAdmissionCoordinator, bytes: Bytes) {
+    ingest_coordinator.append_catalog_validated_envelope(bytes).await?;
+}
+"#;
+
+    assert!(catalog_append_call_violations(contents).is_empty());
+}
+
+#[test]
+fn ingest_harness_contract_allows_ufcs_coordinator_catalog_append() {
+    let contents = r#"
+async fn append_ingest_envelope(ingest_coordinator: &IngestAdmissionCoordinator, bytes: Bytes) {
+    IngestAdmissionCoordinator::append_catalog_validated_envelope(ingest_coordinator, bytes)
+        .await?;
+}
+"#;
+
+    assert!(catalog_append_call_violations(contents).is_empty());
+}
+
+fn catalog_append_call_violations(contents: &str) -> Vec<String> {
+    let lines = contents.lines().collect::<Vec<_>>();
+    lines
+        .iter()
+        .enumerate()
+        .filter_map(|(line_number, line)| {
+            if !line_calls_catalog_append(line) {
+                return None;
+            }
+
+            let receiver = catalog_append_receiver(&lines, line_number);
+            (receiver.as_deref() != Some("ingest_coordinator")).then(|| {
+                format!(
+                    "line {} starts `{}` with receiver `{}`",
+                    line_number + 1,
+                    line.trim(),
+                    receiver.as_deref().unwrap_or("<unknown>")
+                )
+            })
+        })
+        .collect()
+}
+
+fn line_calls_catalog_append(line: &str) -> bool {
+    catalog_append_dot_pattern(line).is_some()
+        || [
+            "IngestLog::append_catalog_validated_envelope(",
+            "IngestLog::append_catalog_validated_envelope_single_writer(",
+            "IngestAdmissionCoordinator::append_catalog_validated_envelope(",
+        ]
+        .into_iter()
+        .any(|pattern| line.contains(pattern))
+}
+
+fn catalog_append_dot_pattern(line: &str) -> Option<&'static str> {
+    [
+        ".append_catalog_validated_envelope(",
+        ".append_catalog_validated_envelope_single_writer(",
+    ]
+    .into_iter()
+    .find(|pattern| line.contains(pattern))
+}
+
+fn catalog_append_receiver(lines: &[&str], line_number: usize) -> Option<String> {
+    let line = lines[line_number].trim();
+    if line.contains("IngestLog::append_catalog_validated_envelope(")
+        || line.contains("IngestLog::append_catalog_validated_envelope_single_writer(")
+    {
+        return Some("IngestLog".to_string());
+    }
+    if line_uses_coordinator_ufcs_receiver(line) {
+        return Some("ingest_coordinator".to_string());
+    }
+
+    let pattern = catalog_append_dot_pattern(line)?;
+    line.split_once(pattern)
+        .and_then(|(receiver, _)| receiver.split_whitespace().last())
+        .filter(|receiver| !receiver.is_empty())
+        .or_else(|| previous_non_empty_line(lines, line_number))
+        .map(str::to_string)
+}
+
+fn line_uses_coordinator_ufcs_receiver(line: &str) -> bool {
+    line.split_once("IngestAdmissionCoordinator::append_catalog_validated_envelope(")
+        .and_then(|(_, arguments)| arguments.split(',').next())
+        .is_some_and(|receiver| {
+            matches!(
+                receiver.trim(),
+                "ingest_coordinator" | "&ingest_coordinator"
+            )
+        })
+}
+
 fn helper_append_receiver_is_coordinator(contents: &str) -> bool {
     let Some(helper_start) = contents.find("fn append_ingest_envelope(") else {
         return false;
@@ -136,6 +274,14 @@ fn helper_append_receiver_is_coordinator(contents: &str) -> bool {
                 .find(|candidate| !candidate.trim().is_empty())
                 .is_some_and(|receiver| receiver.trim() == "ingest_coordinator")
     })
+}
+
+fn previous_non_empty_line<'a>(lines: &'a [&str], line_number: usize) -> Option<&'a str> {
+    lines[..line_number]
+        .iter()
+        .rev()
+        .map(|line| line.trim())
+        .find(|line| !line.is_empty())
 }
 
 fn workspace_root() -> PathBuf {

@@ -66,3 +66,5 @@ Conflict reasons must be explicit:
 - Adjacent ranges are allowed.
 - Crash-after-create-before-response retry returns `200 OK` for same digest.
 - Same key with different digest returns `409 Conflict`.
+- Production-like harness source contracts reject catalog-aware append receivers
+  other than `IngestAdmissionCoordinator`.
