@@ -325,6 +325,93 @@ impl RecoveredRuntime {
         Ok(recovered)
     }
 
+    pub async fn recover_from_published_checkpoint_version_with_slatedb_state_store_checked(
+        store: Arc<dyn ObjectStore>,
+        db_path: impl Into<Path>,
+        checkpoint_version: u64,
+        capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
+    ) -> Result<Self, RecoveryError> {
+        Self::recover_from_published_checkpoint_version_with_slatedb_state_store_and_relation_catalog_record_checked(
+            store,
+            db_path,
+            checkpoint_version,
+            ORDERS_SUM_COUNT_OWNER,
+            ORDERS_SUM_COUNT_RELATION_ID,
+            ORDERS_SUM_COUNT_RELATION_VERSION,
+            capabilities,
+        )
+        .await
+    }
+
+    pub async fn recover_from_published_checkpoint_version_with_slatedb_state_store_and_relation_catalog_record_checked(
+        store: Arc<dyn ObjectStore>,
+        db_path: impl Into<Path>,
+        checkpoint_version: u64,
+        expected_owner: &str,
+        relation_id: &str,
+        relation_version: &str,
+        capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
+    ) -> Result<Self, RecoveryError> {
+        let authority = ProductionRecoveryAuthority::new(capabilities)?;
+        let relation_catalog = RelationCatalogRegistry::new_checked(
+            Arc::clone(&store),
+            authority.profile(AuthoritativeNamespace::RelationCatalog),
+        )?
+        .read(relation_id, relation_version)
+        .await?;
+
+        Self::recover_from_published_checkpoint_version_with_slatedb_state_store_and_relation_catalog_checked(
+            store,
+            db_path,
+            checkpoint_version,
+            expected_owner,
+            relation_catalog,
+            capabilities,
+        )
+        .await
+    }
+
+    pub async fn recover_from_published_checkpoint_version_with_slatedb_state_store_and_relation_catalog_checked(
+        store: Arc<dyn ObjectStore>,
+        db_path: impl Into<Path>,
+        checkpoint_version: u64,
+        expected_owner: &str,
+        relation_catalog: VelorixRelationCatalogV1,
+        capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
+    ) -> Result<Self, RecoveryError> {
+        let authority = ProductionRecoveryAuthority::new(capabilities)?;
+        let publisher = CheckpointPublisher::with_slatedb_state_store_checked(
+            Arc::clone(&store),
+            db_path,
+            authority.profile(AuthoritativeNamespace::Checkpoint),
+        )
+        .await?;
+        let manifest = publisher
+            .read_published_checkpoint_manifest(checkpoint_version)
+            .await?;
+        let ingest_log = IngestLog::new_checked(
+            Arc::clone(&store),
+            authority.profile(AuthoritativeNamespace::Ingest),
+        )?;
+
+        let recovered = Self::recover_with_selected_manifest_log_and_relation_catalog(
+            publisher.clone(),
+            ingest_log,
+            manifest,
+            expected_owner,
+            relation_catalog,
+        )
+        .await?;
+        Self::write_checked_recovery_transition(
+            &publisher,
+            &recovered,
+            CheckpointRecoveryMode::SelectedCheckpoint,
+        )
+        .await?;
+
+        Ok(recovered)
+    }
+
     pub async fn recover_from_published_checkpoint_version_with_slatedb_state_store_and_relation_catalog(
         store: Arc<dyn ObjectStore>,
         db_path: impl Into<Path>,

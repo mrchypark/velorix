@@ -466,6 +466,110 @@ async fn checked_selected_checkpoint_recovery_replays_catalog_aware_ingest() {
 }
 
 #[tokio::test]
+async fn checked_selected_checkpoint_recovery_with_slatedb_state_replays_catalog_aware_ingest() {
+    let (_temp_dir, store) = temp_store();
+    let capabilities = probed_capabilities(store.as_ref()).await;
+    let catalog = orders_sum_count_relation_catalog().unwrap();
+    RelationCatalogRegistry::new(Arc::clone(&store))
+        .create(&catalog)
+        .await
+        .unwrap();
+
+    let ingest_log = IngestLog::new(Arc::clone(&store));
+    let publisher =
+        CheckpointPublisher::with_slatedb_state_store(Arc::clone(&store), "v1/slatedb/state")
+            .await
+            .unwrap();
+    let checkpoint_version = 0;
+    let checkpoint_state = aggregate_state("account-a", 4, 1);
+    let replay_input = input_batch([input_delta("account-a", 3, 1)]);
+
+    ingest_log
+        .append_catalog_validated_envelope(ingest_envelope_bytes_with_batches(
+            IngestEnvelopeEncodeRequest {
+                relation_id: ORDERS_SUM_COUNT_RELATION_ID.to_string(),
+                relation_version: ORDERS_SUM_COUNT_RELATION_VERSION.to_string(),
+                schema_fingerprint: catalog.schema_fingerprint.as_str().to_string(),
+                stream_id: "orders".to_string(),
+                partition_id: 0,
+                start_offset_inclusive: 1,
+                end_offset_exclusive: 2,
+            },
+            &[ingest_record_batch(&replay_input)],
+        ))
+        .await
+        .unwrap();
+    let state_ref =
+        write_checkpoint_state(&publisher, checkpoint_version, 1, &checkpoint_state).await;
+    publisher
+        .publish_manifest(&selected_checkpoint_manifest(
+            checkpoint_version,
+            1,
+            state_ref,
+        ))
+        .await
+        .unwrap();
+
+    let recovered =
+        RecoveredRuntime::recover_from_published_checkpoint_version_with_slatedb_state_store_checked(
+            Arc::clone(&store),
+            "v1/slatedb/state",
+            checkpoint_version,
+            &capabilities,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        recovered.latest_checkpoint_version(),
+        Some(checkpoint_version)
+    );
+    assert_eq!(recovered.replayed_batch_count(), 1);
+    assert_eq!(recovered.logical_epoch(), 2);
+    assert_eq!(
+        recovered.materialized_state().net_rows().unwrap(),
+        vec![DeltaRecord::new(
+            DeltaKey::from_json(json!("account-a")),
+            DeltaValue::from_json(json!({"count": 2, "sum": 7})),
+            1,
+        )]
+    );
+
+    let transition = single_recovery_transition_record(store.as_ref(), checkpoint_version).await;
+    assert_eq!(
+        transition.recovery_mode,
+        CheckpointRecoveryMode::SelectedCheckpoint
+    );
+    assert_eq!(transition.replay_checkpoint_count, 1);
+    assert_eq!(transition.replayed_batch_count, 1);
+}
+
+#[tokio::test]
+async fn checked_selected_checkpoint_recovery_with_slatedb_state_requires_checkpoint_capability() {
+    let (_temp_dir, store) = temp_store();
+    let capabilities = capabilities_missing(AuthoritativeNamespace::Checkpoint);
+
+    let error =
+        RecoveredRuntime::recover_from_published_checkpoint_version_with_slatedb_state_store_checked(
+            Arc::clone(&store),
+            "v1/slatedb/state",
+            0,
+            &capabilities,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RecoveryError::AuthoritativeObjectStoreCapabilities(
+            AuthoritativeObjectStoreCapabilityError::MissingNamespace {
+                namespace: AuthoritativeNamespace::Checkpoint
+            }
+        )
+    ));
+}
+
+#[tokio::test]
 async fn catalog_backed_recovery_fails_closed_when_catalog_record_is_missing() {
     let (_temp_dir, store) = temp_store();
 
