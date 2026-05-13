@@ -12,7 +12,11 @@ use velorix_core::{
     relation::VelorixRelationCatalogV1,
 };
 use velorix_storage::{
-    capability::{ObjectStoreCapabilityError, ObjectStoreCapabilityProfile},
+    capability::{
+        AuthoritativeNamespace, AuthoritativeObjectStoreCapabilitiesV1,
+        AuthoritativeObjectStoreCapabilityError, ObjectStoreCapabilityError,
+        ObjectStoreCapabilityProfile,
+    },
     feldera_artifact_registry::{
         FelderaArtifactRegistry, FelderaArtifactRegistryError, RegisterFelderaArtifactOutcome,
     },
@@ -60,6 +64,26 @@ impl RuntimeFelderaArtifactRegistry {
     ) -> Result<Self, ObjectStoreCapabilityError> {
         Ok(Self::from_storage_registry(
             FelderaArtifactRegistry::new_checked(store, profile)?,
+        ))
+    }
+
+    pub fn new_with_startup_capabilities(
+        store: Arc<dyn ObjectStore>,
+        capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
+    ) -> Result<Self, AuthoritativeObjectStoreCapabilityError> {
+        capabilities.validate_for_startup()?;
+        let profile = capabilities
+            .profiles
+            .get(&AuthoritativeNamespace::ArtifactCatalog)
+            .expect("startup capability validation guarantees artifact catalog evidence");
+
+        Ok(Self::from_storage_registry(
+            FelderaArtifactRegistry::new_checked(store, profile).map_err(|source| {
+                AuthoritativeObjectStoreCapabilityError::NamespaceProfile {
+                    namespace: AuthoritativeNamespace::ArtifactCatalog,
+                    source,
+                }
+            })?,
         ))
     }
 

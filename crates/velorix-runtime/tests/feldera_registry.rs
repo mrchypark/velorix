@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
 use object_store::{local::LocalFileSystem, ObjectStore};
 use tempfile::TempDir;
@@ -19,6 +19,11 @@ use velorix_runtime::feldera_registry::{
     RuntimeFelderaArtifactError, RuntimeFelderaArtifactRegistry,
     RuntimeFelderaArtifactSelectionStatus,
 };
+use velorix_storage::capability::{
+    AuthoritativeNamespace, AuthoritativeObjectStoreCapabilitiesV1,
+    AuthoritativeObjectStoreCapabilityError, ObjectStoreCapabilityProfile,
+    RequiredObjectStoreCapability,
+};
 use velorix_storage::feldera_artifact_registry::{
     FelderaArtifactRegistryError, RegisterFelderaArtifactOutcome,
 };
@@ -28,6 +33,40 @@ fn temp_store() -> (TempDir, Arc<dyn ObjectStore>) {
     let store = LocalFileSystem::new_with_prefix(temp_dir.path()).unwrap();
 
     (temp_dir, Arc::new(store))
+}
+
+fn all_namespace_capabilities() -> AuthoritativeObjectStoreCapabilitiesV1 {
+    AuthoritativeObjectStoreCapabilitiesV1::new(
+        AuthoritativeNamespace::all()
+            .into_iter()
+            .map(|namespace| (namespace, ObjectStoreCapabilityProfile::local_development()))
+            .collect::<BTreeMap<_, _>>(),
+    )
+}
+
+fn capabilities_missing(
+    namespace: AuthoritativeNamespace,
+) -> AuthoritativeObjectStoreCapabilitiesV1 {
+    let mut profiles = all_namespace_capabilities().profiles;
+    profiles.remove(&namespace);
+    AuthoritativeObjectStoreCapabilitiesV1::new(profiles)
+}
+
+fn capabilities_with_weak_namespace(
+    namespace: AuthoritativeNamespace,
+) -> AuthoritativeObjectStoreCapabilitiesV1 {
+    let mut profiles = all_namespace_capabilities().profiles;
+    profiles.insert(
+        namespace,
+        ObjectStoreCapabilityProfile {
+            backend_name: "weak-artifact-catalog".to_string(),
+            conditional_create: false,
+            atomic_visibility: true,
+            list_after_write: true,
+            read_after_write: true,
+        },
+    );
+    AuthoritativeObjectStoreCapabilitiesV1::new(profiles)
 }
 
 fn fixture_path(name: &str) -> PathBuf {
@@ -189,6 +228,64 @@ async fn feldera_runtime_registry_selects_valid_registered_artifact_for_catalog(
         selected.status,
         RuntimeFelderaArtifactSelectionStatus::DirectExecutionDisabled
     );
+}
+
+#[tokio::test]
+async fn feldera_runtime_registry_accepts_startup_capabilities_for_artifact_catalog() {
+    let (_temp_dir, store) = temp_store();
+    let registry = RuntimeFelderaArtifactRegistry::new_with_startup_capabilities(
+        store,
+        &all_namespace_capabilities(),
+    )
+    .unwrap();
+    let (catalog, spec, artifact) = catalog_valid_fixture_parts();
+
+    let registered = registry
+        .register_trusted_artifact(&catalog, &spec, &artifact)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        registered.register_outcome,
+        RegisterFelderaArtifactOutcome::Created
+    );
+    assert_eq!(
+        registered.status,
+        RuntimeFelderaArtifactSelectionStatus::DirectExecutionDisabled
+    );
+}
+
+#[test]
+fn feldera_runtime_registry_rejects_missing_artifact_catalog_startup_capability() {
+    let (_temp_dir, store) = temp_store();
+    let capabilities = capabilities_missing(AuthoritativeNamespace::ArtifactCatalog);
+
+    let error = RuntimeFelderaArtifactRegistry::new_with_startup_capabilities(store, &capabilities)
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        AuthoritativeObjectStoreCapabilityError::MissingNamespace {
+            namespace: AuthoritativeNamespace::ArtifactCatalog
+        }
+    ));
+}
+
+#[test]
+fn feldera_runtime_registry_rejects_weak_artifact_catalog_startup_capability() {
+    let (_temp_dir, store) = temp_store();
+    let capabilities = capabilities_with_weak_namespace(AuthoritativeNamespace::ArtifactCatalog);
+
+    let error = RuntimeFelderaArtifactRegistry::new_with_startup_capabilities(store, &capabilities)
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        AuthoritativeObjectStoreCapabilityError::NamespaceProfile {
+            namespace: AuthoritativeNamespace::ArtifactCatalog,
+            source
+        } if source.required_capability() == RequiredObjectStoreCapability::ConditionalCreate
+    ));
 }
 
 #[tokio::test]
