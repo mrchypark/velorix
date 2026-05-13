@@ -667,6 +667,37 @@ async fn production_persisted_recovered_query_fails_closed_when_relation_catalog
 }
 
 #[tokio::test]
+async fn production_persisted_recovered_query_validates_stored_sql_before_recovery() {
+    let (_temp_dir, store) = temp_store();
+
+    write_catalog_object(
+        Arc::clone(&store),
+        "production-invalid-recovered-query",
+        json!({
+            "schema_version": 1,
+            "query_id": "production-invalid-recovered-query",
+            "sql": "select missing_column from input",
+            "policy": QueryPolicy::default(),
+        }),
+    )
+    .await;
+
+    let error = query_production_persisted_recovered_materialized_view_with_limiter(
+        Arc::clone(&store),
+        "production-invalid-recovered-query",
+        "v1/slatedb/state",
+        ORDERS_SUM_COUNT_RELATION_ID,
+        ORDERS_SUM_COUNT_RELATION_VERSION,
+        &local_capabilities(),
+        None,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(error, PersistedQueryError::Query(_)));
+}
+
+#[tokio::test]
 async fn production_persisted_recovered_query_validates_capabilities_before_catalog_read() {
     let (_temp_dir, store) = temp_store();
     let key = ObjectKey::persisted_query("malformed-production-query").unwrap();

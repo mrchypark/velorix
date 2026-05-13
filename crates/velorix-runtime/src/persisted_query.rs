@@ -158,6 +158,16 @@ impl PersistedQueryStore {
 
         Ok(spec)
     }
+
+    pub async fn get_for_production_recovered_materialized_view(
+        &self,
+        query_id: &str,
+    ) -> Result<PersistedQuerySpec, PersistedQueryError> {
+        let spec = self.get(query_id).await?;
+        validate_input_query_with_policy(&spec.sql, spec.policy).await?;
+
+        Ok(spec)
+    }
 }
 
 async fn validate_production_relation_query(
@@ -242,7 +252,9 @@ pub async fn query_production_persisted_recovered_materialized_view_with_limiter
         .map_err(RecoveryError::from)
         .map_err(RuntimeQueryError::from)?;
     let catalog = PersistedQueryStore::new(Arc::clone(&store));
-    let spec = catalog.get(query_id).await?;
+    let spec = catalog
+        .get_for_production_recovered_materialized_view(query_id)
+        .await?;
 
     Ok(
         query_production_recovered_materialized_view_with_policy_and_limiter(
