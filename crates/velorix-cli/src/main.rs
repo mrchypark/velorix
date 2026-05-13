@@ -3811,8 +3811,11 @@ mod tests {
             },
             "checkpoint_status": {
                 "status": "pass",
-                "evidence": "published checkpoint lifecycle",
-                "evidence_kind": ["published_checkpoint_lifecycle_record"]
+                "evidence": "published checkpoint lifecycle and recovery transition",
+                "evidence_kind": [
+                    "published_checkpoint_lifecycle_record",
+                    "checkpoint_recovery_transition_record"
+                ]
             },
             "ingest_status": {
                 "status": "pass",

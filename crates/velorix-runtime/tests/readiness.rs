@@ -149,6 +149,24 @@ fn readiness_report_blocks_when_published_checkpoint_lifecycle_record_evidence_i
 }
 
 #[test]
+fn readiness_report_blocks_when_checkpoint_recovery_transition_record_evidence_is_missing() {
+    let report = ProductionReadinessEvidenceV1::from_json_str(&readiness_json(
+        &["checkpoint_recovery_transition_record"],
+        false,
+        &[],
+    ))
+    .unwrap()
+    .try_into_report()
+    .unwrap();
+
+    assert!(!report.production_ready);
+    assert_eq!(
+        report.blocking_reasons,
+        vec!["checkpoint_status missing checkpoint_recovery_transition_record evidence"]
+    );
+}
+
+#[test]
 fn readiness_report_blocks_when_slate_db_checkpoint_ref_evidence_is_missing() {
     let report = ProductionReadinessEvidenceV1::from_json_str(&readiness_json(
         &["slate_db_checkpoint_ref"],
@@ -501,7 +519,7 @@ fn readiness_evidence_rejects_unknown_json_fields() {
             "capability_status": { "status": "pass", "evidence": "s3-compatible capability probe", "evidence_kind": ["s3_compatible"] },
             "s3_compatible_test_status": { "status": "pass", "evidence": "S3-compatible integration harness", "evidence_kind": ["s3_compatible_integration_harness"] },
             "ownership_status": { "status": "pass", "evidence": "durable epoch record", "evidence_kind": ["durable_ownership_epoch_record"] },
-            "checkpoint_status": { "status": "pass", "evidence": "published checkpoint lifecycle", "evidence_kind": ["published_checkpoint_lifecycle_record"] },
+            "checkpoint_status": { "status": "pass", "evidence": "published checkpoint lifecycle and recovery transition", "evidence_kind": ["published_checkpoint_lifecycle_record", "checkpoint_recovery_transition_record"] },
             "ingest_status": { "status": "pass", "evidence": "catalog-backed ingest admission", "evidence_kind": ["catalog_backed_ingest_admission"] },
             "relation_catalog_status": { "status": "pass", "evidence": "durable relation catalog record and registry", "evidence_kind": ["relation_catalog_record", "relation_catalog_registry"] },
             "state_status": { "status": "pass", "evidence": "SlateDB checkpoint ref", "evidence_kind": ["slate_db_checkpoint_ref"] },
@@ -553,10 +571,17 @@ fn readiness_json(
     } else {
         ""
     };
-    let checkpoint_kind = if !missing_evidence.contains(&"published_checkpoint_lifecycle_record") {
-        r#", "evidence_kind": ["published_checkpoint_lifecycle_record"]"#
+    let mut checkpoint_evidence_kind = Vec::new();
+    if !missing_evidence.contains(&"published_checkpoint_lifecycle_record") {
+        checkpoint_evidence_kind.push("published_checkpoint_lifecycle_record");
+    }
+    if !missing_evidence.contains(&"checkpoint_recovery_transition_record") {
+        checkpoint_evidence_kind.push("checkpoint_recovery_transition_record");
+    }
+    let checkpoint_kind = if checkpoint_evidence_kind.is_empty() {
+        String::new()
     } else {
-        ""
+        format!(r#", "evidence_kind": {:?}"#, checkpoint_evidence_kind)
     };
     let kubernetes_kind = if !missing_evidence.contains(&"kubernetes_lease_client") {
         r#", "evidence_kind": ["kubernetes_lease_client"]"#
@@ -649,7 +674,7 @@ fn readiness_json(
             "capability_status": {{ "status": "pass", "evidence": "s3-compatible capability probe"{capability_kind} }},
             "s3_compatible_test_status": {{ "status": "pass", "evidence": "S3-compatible integration harness"{s3_compatible_test_kind} }},
             "ownership_status": {{ "status": "pass", "evidence": "durable epoch record"{ownership_kind} }},
-            "checkpoint_status": {{ "status": "pass", "evidence": "published checkpoint lifecycle"{checkpoint_kind} }},
+            "checkpoint_status": {{ "status": "pass", "evidence": "published checkpoint lifecycle and recovery transition"{checkpoint_kind} }},
             "ingest_status": {{ "status": "{ingest_status}", "evidence": "{ingest_evidence}"{ingest_kind} }},
             "relation_catalog_status": {{ "status": "{relation_catalog_status}", "evidence": "{relation_catalog_evidence}"{relation_catalog_kind} }},
             "state_status": {{ "status": "pass", "evidence": "SlateDB checkpoint ref"{state_kind} }},

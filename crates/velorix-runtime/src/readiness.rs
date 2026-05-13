@@ -54,6 +54,7 @@ pub enum ReadinessEvidenceKind {
     BootstrapRawStatePath,
     DurableOwnershipEpochRecord,
     PublishedCheckpointLifecycleRecord,
+    CheckpointRecoveryTransitionRecord,
     CatalogBackedIngestAdmission,
     RelationCatalogRecord,
     RelationCatalogRegistry,
@@ -242,6 +243,15 @@ impl ProductionReadinessEvidenceV1 {
         {
             blocking_reasons.push(
                 "checkpoint_status missing published_checkpoint_lifecycle_record evidence"
+                    .to_string(),
+            );
+        }
+        if !self
+            .checkpoint_status
+            .has_evidence(ReadinessEvidenceKind::CheckpointRecoveryTransitionRecord)
+        {
+            blocking_reasons.push(
+                "checkpoint_status missing checkpoint_recovery_transition_record evidence"
                     .to_string(),
             );
         }
