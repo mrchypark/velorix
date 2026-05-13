@@ -16,6 +16,65 @@ use velorix_storage::capability::{
     ObjectStoreCapabilityProbeError, RequiredObjectStoreCapability,
 };
 
+#[test]
+fn storage_registry_accepts_simple_store_id_characters() {
+    for store_id in ["primary", "primary-prod", "primary_prod", "primary.prod"] {
+        let mut registry = StorageRegistry::new();
+
+        registry
+            .register(store_id, "memory://velorix/", scan_store())
+            .unwrap();
+    }
+}
+
+#[test]
+fn storage_registry_rejects_invalid_unchecked_store_ids() {
+    for store_id in [
+        "",
+        " ",
+        "\t",
+        "\n",
+        " primary",
+        "primary ",
+        "primary\n",
+        "primary/store",
+        "primary\\store",
+        ".",
+        "..",
+        "s3://prod",
+        "file://tmp",
+    ] {
+        let mut registry = StorageRegistry::new();
+        let err = registry
+            .register(store_id, "memory://velorix/", scan_store())
+            .unwrap_err();
+
+        assert_invalid_store_id(err);
+    }
+}
+
+#[tokio::test]
+async fn storage_registry_rejects_invalid_probe_backed_store_ids_before_probe() {
+    let authority_store: Arc<dyn AuthorityObjectStore> = Arc::new(OverwriteCreateStore {
+        inner: Arc::new(AuthorityInMemory::new()),
+    });
+    let mut registry = StorageRegistry::new();
+
+    let err = registry
+        .register_production_with_probe(
+            "s3://prod",
+            "memory://velorix/",
+            scan_store(),
+            authority_store,
+            "memory-test",
+            "v1/probes",
+        )
+        .await
+        .unwrap_err();
+
+    assert_invalid_store_id(err);
+}
+
 #[tokio::test]
 async fn storage_registry_registers_production_store_from_runtime_probe() {
     let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
@@ -183,6 +242,13 @@ fn assert_duplicate_store_id(err: StorageRegistryError, expected_store_id: &str)
             assert_eq!(store_id, expected_store_id);
         }
         other => panic!("expected duplicate store id error, got {other:?}"),
+    }
+}
+
+fn assert_invalid_store_id(err: StorageRegistryError) {
+    match err {
+        StorageRegistryError::InvalidStoreId => {}
+        other => panic!("expected invalid store id error, got {other:?}"),
     }
 }
 

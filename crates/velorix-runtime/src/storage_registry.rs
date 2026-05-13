@@ -201,7 +201,14 @@ impl StorageRegistry {
 }
 
 fn validate_store_id(store_id: String) -> Result<String, StorageRegistryError> {
-    if store_id.is_empty() {
+    if store_id.is_empty()
+        || store_id.trim() != store_id
+        || store_id == "."
+        || store_id == ".."
+        || store_id.contains("://")
+        || store_id.contains('/')
+        || store_id.contains('\\')
+    {
         return Err(StorageRegistryError::InvalidStoreId);
     }
 
