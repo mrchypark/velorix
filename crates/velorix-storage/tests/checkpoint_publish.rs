@@ -3049,7 +3049,7 @@ async fn checkpoint_publish_production_state_write_rejects_lower_epoch_after_hig
 }
 
 #[tokio::test]
-async fn checkpoint_publish_production_fenced_publish_rejects_raw_state_ref_with_matching_ownership_records(
+async fn checkpoint_publish_production_fenced_state_write_rejects_raw_state_store_with_matching_ownership_record(
 ) {
     let (_temp_dir, store) = temp_store();
     let publisher = CheckpointPublisher::new(Arc::clone(&store));
@@ -3058,33 +3058,21 @@ async fn checkpoint_publish_production_fenced_publish_rejects_raw_state_ref_with
         .create_ownership_epoch_record(&ownership_record("orders", 0, "worker-a", 1))
         .await
         .unwrap();
-    publisher
-        .create_ownership_epoch_record(&ownership_record("settlements", 0, "worker-a", 1))
-        .await
-        .unwrap();
 
     let state = fenced_state_write(0, "state-0001", claim.clone(), b"state");
-    let output = fenced_output_write(0, 0, "out-0001", claim.clone(), b"output");
-    let state_ref = publisher
+    let err = publisher
         .write_state_object_fenced_production(&state, "orders", &claim)
-        .await
-        .unwrap();
-    let output_ref = publisher
-        .write_output_object_fenced_production(&output, &claim)
-        .await
-        .unwrap();
-    let mut manifest = manifest(0, state_ref);
-    manifest.output_objects = vec![output_ref];
-
-    publisher
-        .publish_manifest_fenced_production(&manifest, &claim)
         .await
         .unwrap_err();
 
-    assert!(store
-        .head(&Path::from(manifest.object_key().as_str()))
-        .await
-        .is_err());
+    assert!(matches!(
+        err,
+        CheckpointPublishError::ProductionStateRefNotSlateDbCheckpoint {
+            ref object_id,
+            ref_type: StateRefType::RawObject
+        } if object_id == "state-0001"
+    ));
+    assert!(!object_exists(store.as_ref(), state.object_key()).await);
 }
 
 #[tokio::test]

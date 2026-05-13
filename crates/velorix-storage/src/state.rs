@@ -328,6 +328,16 @@ impl CheckpointPublisher {
         self.validate_production_owner_claim_current(stream_id, state.partition_id(), owner_claim)
             .await?;
 
+        let ref_type = self.produced_state_ref_type();
+        if ref_type != StateRefType::SlateDbCheckpoint {
+            return Err(
+                CheckpointPublishError::ProductionStateRefNotSlateDbCheckpoint {
+                    object_id: state.object_id().to_string(),
+                    ref_type,
+                },
+            );
+        }
+
         self.write_state_object(state).await
     }
 
