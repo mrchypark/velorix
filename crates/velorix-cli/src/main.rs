@@ -1907,7 +1907,7 @@ fn benchmark_gate_workloads_for_backend(backend: BenchmarkBackend) -> &'static [
 }
 
 fn has_placeholder_commit(result: &BenchmarkGateResultV1) -> bool {
-    result.commit.starts_with("placeholder-")
+    is_placeholder_commit(&result.commit)
 }
 
 fn parse_benchmark_gate_level(value: &str) -> Result<BenchmarkGateLevel, String> {
@@ -3450,6 +3450,75 @@ mod tests {
             message.contains("must be real backend evidence"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn benchmark_gate_comparison_rejects_unknown_s3_current_result() {
+        let dir = tempdir().unwrap();
+        let baseline = dir.path().join("baseline.json");
+        let result = dir.path().join("result.json");
+        fs::write(&baseline, release_result_json()).unwrap();
+        fs::write(
+            &result,
+            serde_json::to_string_pretty(&normal_result(
+                "unknown",
+                "release",
+                "s3_compatible",
+                "s3_incremental",
+                1000.0,
+                s3_workload_metrics(),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let error = run_benchmark_gate(
+            Some(&baseline),
+            &result,
+            Some(BenchmarkGateLevel::Release),
+            Some(BenchmarkBackend::S3Compatible),
+            Some(0.10),
+        )
+        .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("must be real backend evidence"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn benchmark_gate_comparison_rejects_all_zero_s3_baseline() {
+        let dir = tempdir().unwrap();
+        let baseline = dir.path().join("baseline.json");
+        let result = dir.path().join("result.json");
+        fs::write(
+            &baseline,
+            serde_json::to_string_pretty(&normal_result(
+                "0000000000000000000000000000000000000000",
+                "release",
+                "s3_compatible",
+                "s3_incremental",
+                1000.0,
+                s3_workload_metrics(),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(&result, release_result_json()).unwrap();
+
+        let error = run_benchmark_gate(
+            Some(&baseline),
+            &result,
+            Some(BenchmarkGateLevel::Release),
+            Some(BenchmarkBackend::S3Compatible),
+            Some(0.10),
+        )
+        .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("requires a real baseline"), "{message}");
     }
 
     #[test]
