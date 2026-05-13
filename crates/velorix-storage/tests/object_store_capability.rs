@@ -78,6 +78,26 @@ fn assert_capability_error(
     assert_eq!(err.required_capability(), expected);
 }
 
+fn expected_authoritative_namespaces() -> [AuthoritativeNamespace; 15] {
+    [
+        AuthoritativeNamespace::Ingest,
+        AuthoritativeNamespace::State,
+        AuthoritativeNamespace::Output,
+        AuthoritativeNamespace::Checkpoint,
+        AuthoritativeNamespace::CheckpointIndex,
+        AuthoritativeNamespace::CheckpointLifecycle,
+        AuthoritativeNamespace::CheckpointRetention,
+        AuthoritativeNamespace::Ownership,
+        AuthoritativeNamespace::TableCatalog,
+        AuthoritativeNamespace::RelationCatalog,
+        AuthoritativeNamespace::ArtifactCatalog,
+        AuthoritativeNamespace::BenchmarkEvidence,
+        AuthoritativeNamespace::GcRuns,
+        AuthoritativeNamespace::Queries,
+        AuthoritativeNamespace::QueryPolicy,
+    ]
+}
+
 #[derive(Debug)]
 struct OverwriteCreateStore {
     inner: Arc<dyn ObjectStore>,
@@ -174,6 +194,14 @@ async fn object_store_capability_probe_observes_create_read_and_list_behavior() 
         .unwrap();
 }
 
+#[test]
+fn authoritative_namespaces_include_current_velorix_owned_durable_prefixes() {
+    assert_eq!(
+        AuthoritativeNamespace::all().as_slice(),
+        expected_authoritative_namespaces().as_slice()
+    );
+}
+
 #[tokio::test]
 async fn production_capability_probe_rejects_store_without_create_only_behavior() {
     let (_temp_dir, inner) = temp_store();
@@ -205,6 +233,11 @@ async fn authoritative_capability_probe_covers_every_namespace() {
             .unwrap();
 
     capabilities.validate_for_startup().unwrap();
+    let observed_namespaces = capabilities.profiles.keys().copied().collect::<Vec<_>>();
+    assert_eq!(
+        observed_namespaces.as_slice(),
+        expected_authoritative_namespaces().as_slice()
+    );
     for namespace in AuthoritativeNamespace::all() {
         let profile = capabilities.profiles.get(&namespace).unwrap();
         assert_eq!(profile.backend_name, "local-test");
@@ -240,7 +273,7 @@ async fn authoritative_capability_probe_reports_namespace_for_create_only_failur
 #[test]
 fn authoritative_capabilities_reject_missing_namespace() {
     let mut profiles = all_namespace_profiles();
-    profiles.remove(&AuthoritativeNamespace::RelationCatalog);
+    profiles.remove(&AuthoritativeNamespace::QueryPolicy);
     let capabilities = AuthoritativeObjectStoreCapabilitiesV1::new(profiles);
 
     let error = capabilities.validate_for_startup().unwrap_err();
@@ -248,7 +281,7 @@ fn authoritative_capabilities_reject_missing_namespace() {
     assert!(matches!(
         error,
         AuthoritativeObjectStoreCapabilityError::MissingNamespace {
-            namespace: AuthoritativeNamespace::RelationCatalog
+            namespace: AuthoritativeNamespace::QueryPolicy
         }
     ));
 }
@@ -310,10 +343,18 @@ fn authoritative_capabilities_diagnostics_report_backend_namespace_and_missing_c
     let mut profiles = all_namespace_profiles();
     let weak_profile = profile_missing(RequiredObjectStoreCapability::ConditionalCreate);
     profiles.insert(AuthoritativeNamespace::Output, weak_profile.clone());
-    profiles.remove(&AuthoritativeNamespace::BenchmarkEvidence);
+    profiles.remove(&AuthoritativeNamespace::GcRuns);
     let capabilities = AuthoritativeObjectStoreCapabilitiesV1::new(profiles);
 
     let diagnostics = capabilities.diagnostics();
+    let observed_namespaces = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.namespace)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        observed_namespaces.as_slice(),
+        expected_authoritative_namespaces().as_slice()
+    );
 
     let output = diagnostics
         .iter()
@@ -328,13 +369,13 @@ fn authoritative_capabilities_diagnostics_report_backend_namespace_and_missing_c
         vec![RequiredObjectStoreCapability::ConditionalCreate]
     );
 
-    let benchmark = diagnostics
+    let gc_runs = diagnostics
         .iter()
-        .find(|diagnostic| diagnostic.namespace == AuthoritativeNamespace::BenchmarkEvidence)
+        .find(|diagnostic| diagnostic.namespace == AuthoritativeNamespace::GcRuns)
         .unwrap();
-    assert_eq!(benchmark.backend_name, None);
+    assert_eq!(gc_runs.backend_name, None);
     assert_eq!(
-        benchmark.missing_capabilities,
+        gc_runs.missing_capabilities,
         vec![
             RequiredObjectStoreCapability::ConditionalCreate,
             RequiredObjectStoreCapability::AtomicVisibility,

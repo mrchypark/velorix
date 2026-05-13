@@ -24,11 +24,17 @@ pub enum AuthoritativeNamespace {
     State,
     Output,
     Checkpoint,
+    CheckpointIndex,
+    CheckpointLifecycle,
+    CheckpointRetention,
     Ownership,
     TableCatalog,
     RelationCatalog,
     ArtifactCatalog,
     BenchmarkEvidence,
+    GcRuns,
+    Queries,
+    QueryPolicy,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -368,17 +374,23 @@ fn unique_probe_key(prefix: &str) -> String {
 }
 
 impl AuthoritativeNamespace {
-    pub fn all() -> [Self; 9] {
+    pub fn all() -> [Self; 15] {
         [
             Self::Ingest,
             Self::State,
             Self::Output,
             Self::Checkpoint,
+            Self::CheckpointIndex,
+            Self::CheckpointLifecycle,
+            Self::CheckpointRetention,
             Self::Ownership,
             Self::TableCatalog,
             Self::RelationCatalog,
             Self::ArtifactCatalog,
             Self::BenchmarkEvidence,
+            Self::GcRuns,
+            Self::Queries,
+            Self::QueryPolicy,
         ]
     }
 }
@@ -401,11 +413,17 @@ impl fmt::Display for AuthoritativeNamespace {
             Self::State => write!(f, "state"),
             Self::Output => write!(f, "output"),
             Self::Checkpoint => write!(f, "checkpoint"),
+            Self::CheckpointIndex => write!(f, "checkpoint-index"),
+            Self::CheckpointLifecycle => write!(f, "checkpoint-lifecycle"),
+            Self::CheckpointRetention => write!(f, "checkpoint-retention"),
             Self::Ownership => write!(f, "ownership"),
             Self::TableCatalog => write!(f, "table_catalog"),
             Self::RelationCatalog => write!(f, "relation_catalog"),
             Self::ArtifactCatalog => write!(f, "artifact_catalog"),
             Self::BenchmarkEvidence => write!(f, "benchmark_evidence"),
+            Self::GcRuns => write!(f, "gc-runs"),
+            Self::Queries => write!(f, "queries"),
+            Self::QueryPolicy => write!(f, "query-policy"),
         }
     }
 }

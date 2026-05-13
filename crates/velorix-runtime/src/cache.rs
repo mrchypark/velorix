@@ -3,6 +3,9 @@ use std::{path::Path as FsPath, sync::Arc};
 use foyer::{BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder};
 use object_store::{path::Path, ObjectStore};
 use thiserror::Error;
+use velorix_storage::capability::{
+    AuthoritativeObjectStoreCapabilitiesV1, AuthoritativeObjectStoreCapabilityError,
+};
 use velorix_storage::object_key::ObjectKey;
 
 #[derive(Debug, Error)]
@@ -11,6 +14,8 @@ pub enum CacheError {
     ObjectStore(#[from] object_store::Error),
     #[error("foyer cache error: {0}")]
     Foyer(#[from] foyer::Error),
+    #[error(transparent)]
+    ObjectStoreCapabilities(#[from] AuthoritativeObjectStoreCapabilityError),
 }
 
 #[derive(Debug)]
@@ -39,6 +44,17 @@ impl HybridLocalCache {
             .await?;
 
         Ok(Self { store, cache })
+    }
+
+    pub async fn open_production(
+        store: Arc<dyn ObjectStore>,
+        cache_dir: impl AsRef<FsPath>,
+        memory_capacity_bytes: usize,
+        disk_capacity_bytes: usize,
+        capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
+    ) -> Result<Self, CacheError> {
+        capabilities.validate_for_startup()?;
+        Self::open(store, cache_dir, memory_capacity_bytes, disk_capacity_bytes).await
     }
 
     pub async fn fetch(&self, key: &ObjectKey) -> Result<Vec<u8>, CacheError> {

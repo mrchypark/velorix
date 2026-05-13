@@ -5,6 +5,11 @@ use bytes::Bytes;
 use object_store::{local::LocalFileSystem, path::Path, ObjectStore};
 use tempfile::TempDir;
 use velorix_runtime::cache::HybridLocalCache;
+use velorix_storage::capability::{
+    probe_authoritative_object_store_capabilities, AuthoritativeNamespace,
+    AuthoritativeObjectStoreCapabilitiesV1, ObjectStoreCapabilityProfile,
+    RequiredObjectStoreCapability,
+};
 use velorix_storage::object_key::ObjectKey;
 
 const MEMORY_CAPACITY_BYTES: usize = 64;
@@ -129,6 +134,109 @@ async fn put_object(store: &dyn ObjectStore, key: &ObjectKey, payload: &'static 
 
 fn ingest_key(start: u64, end: u64) -> ObjectKey {
     ObjectKey::ingest_batch("orders", 0, start, end).unwrap()
+}
+
+fn all_namespace_capabilities() -> AuthoritativeObjectStoreCapabilitiesV1 {
+    AuthoritativeObjectStoreCapabilitiesV1::new(
+        AuthoritativeNamespace::all()
+            .into_iter()
+            .map(|namespace| (namespace, ObjectStoreCapabilityProfile::local_development()))
+            .collect(),
+    )
+}
+
+fn capabilities_missing(
+    namespace: AuthoritativeNamespace,
+) -> AuthoritativeObjectStoreCapabilitiesV1 {
+    let mut profiles = all_namespace_capabilities().profiles;
+    profiles.remove(&namespace);
+
+    AuthoritativeObjectStoreCapabilitiesV1::new(profiles)
+}
+
+fn capabilities_missing_required(
+    namespace: AuthoritativeNamespace,
+    required_capability: RequiredObjectStoreCapability,
+) -> AuthoritativeObjectStoreCapabilitiesV1 {
+    let mut profiles = all_namespace_capabilities().profiles;
+    let mut profile = ObjectStoreCapabilityProfile::local_development();
+    match required_capability {
+        RequiredObjectStoreCapability::ConditionalCreate => profile.conditional_create = false,
+        RequiredObjectStoreCapability::AtomicVisibility => profile.atomic_visibility = false,
+        RequiredObjectStoreCapability::ListAfterWrite => profile.list_after_write = false,
+        RequiredObjectStoreCapability::ReadAfterWrite => profile.read_after_write = false,
+    }
+    profiles.insert(namespace, profile);
+
+    AuthoritativeObjectStoreCapabilitiesV1::new(profiles)
+}
+
+#[tokio::test]
+async fn production_cache_open_rejects_missing_namespace_capability_evidence() {
+    let (_store_dir, store) = temp_store();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let capabilities = capabilities_missing(AuthoritativeNamespace::Ingest);
+
+    let err = HybridLocalCache::open_production(
+        store,
+        cache_dir.path(),
+        MEMORY_CAPACITY_BYTES,
+        DISK_CAPACITY_BYTES,
+        &capabilities,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(err.to_string().contains("namespace `ingest` is missing"));
+}
+
+#[tokio::test]
+async fn production_cache_open_rejects_weak_namespace_capability_evidence() {
+    let (_store_dir, store) = temp_store();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let capabilities = capabilities_missing_required(
+        AuthoritativeNamespace::Output,
+        RequiredObjectStoreCapability::ConditionalCreate,
+    );
+
+    let err = HybridLocalCache::open_production(
+        store,
+        cache_dir.path(),
+        MEMORY_CAPACITY_BYTES,
+        DISK_CAPACITY_BYTES,
+        &capabilities,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(err.to_string().contains("namespace `output`"));
+    assert!(err.to_string().contains("conditional_create"));
+}
+
+#[tokio::test]
+async fn production_cache_fetches_after_startup_capabilities_are_validated() {
+    let (_store_dir, store) = temp_store();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let capabilities =
+        probe_authoritative_object_store_capabilities(store.as_ref(), "local-test", "v1/probes")
+            .await
+            .unwrap();
+    let cache = HybridLocalCache::open_production(
+        Arc::clone(&store),
+        cache_dir.path(),
+        MEMORY_CAPACITY_BYTES,
+        DISK_CAPACITY_BYTES,
+        &capabilities,
+    )
+    .await
+    .unwrap();
+    let key = ingest_key(70, 80);
+    put_object(store.as_ref(), &key, b"production-authoritative").await;
+
+    let fetched = cache.fetch(&key).await.unwrap();
+
+    assert_eq!(fetched, b"production-authoritative");
+    cache.close().await.unwrap();
 }
 
 #[tokio::test]
