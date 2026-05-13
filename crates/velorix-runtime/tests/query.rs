@@ -586,6 +586,33 @@ async fn query_production_recovered_materialized_view_fails_closed_when_relation
 }
 
 #[tokio::test]
+async fn query_production_recovered_materialized_view_validates_sql_before_recovery() {
+    let (_temp_dir, store) = temp_store();
+
+    let error = query_production_recovered_materialized_view_with_policy_and_limiter(
+        Arc::clone(&store),
+        "v1/slatedb/state",
+        ORDERS_SUM_COUNT_RELATION_ID,
+        ORDERS_SUM_COUNT_RELATION_VERSION,
+        &local_capabilities(),
+        "select missing_column from input",
+        QueryPolicy::default(),
+        None,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(
+            error,
+            RuntimeQueryError::Query(QueryError::DataFusion(ref datafusion_error))
+                if datafusion_error.to_string().contains("missing_column")
+        ),
+        "expected SQL planning to reject missing_column before recovery, got {error:?}"
+    );
+}
+
+#[tokio::test]
 async fn query_production_recovered_materialized_view_fails_closed_when_capability_profile_is_missing(
 ) {
     let (_temp_dir, store) = temp_store();

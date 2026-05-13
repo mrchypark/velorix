@@ -23,7 +23,9 @@ use parquet::arrow::{
 use parquet::errors::ParquetError;
 use thiserror::Error;
 use url::Url;
-use velorix_core::query::{QueryError, QueryPolicy, QueryPolicyError, INPUT_TABLE_NAME};
+use velorix_core::query::{
+    validate_input_query_with_policy, QueryError, QueryPolicy, QueryPolicyError, INPUT_TABLE_NAME,
+};
 
 use crate::benchmark_gate::ObjectRequestMetricsV1;
 use crate::object_meter::{object_request_policy_error, MeteredObjectStore, ObjectStoreMeter};
@@ -86,6 +88,7 @@ pub async fn query_production_recovered_materialized_view_with_policy_and_limite
     validate_sql_text_policy(sql, policy).map_err(QueryError::from)?;
 
     let _permit = acquire_query_permit(policy, limiter.as_ref())?;
+    validate_input_query_with_policy(sql, policy).await?;
     let recovered = RecoveredRuntime::recover_with_slatedb_state_store_and_catalog_record_checked(
         store,
         slatedb_state_path,
