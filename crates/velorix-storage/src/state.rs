@@ -31,6 +31,7 @@ use crate::{
 };
 
 const CHECKPOINT_PREFIX: &str = "v1/checkpoints";
+const GC_RUN_PREFIX: &str = "v1/gc-runs";
 const STATE_PREFIX: &str = "v1/state";
 const OUTPUT_PREFIX: &str = "v1/outputs";
 
@@ -1008,6 +1009,99 @@ impl CheckpointPublisher {
         Self::validate_garbage_collection_run_evidence(&object_key, run_id, &run)?;
 
         Ok(run)
+    }
+
+    pub async fn verify_garbage_collection_run_retention_evidence(
+        &self,
+        run_id: &str,
+    ) -> Result<GarbageCollectionRunV1, CheckpointPublishError> {
+        let object_key = ObjectKey::garbage_collection_run(run_id)?;
+        let run = self.read_garbage_collection_run_evidence(run_id).await?;
+        self.verify_garbage_collection_run_is_listed(&object_key)
+            .await?;
+        self.verify_retention_records_for_garbage_collection_run(&object_key, &run)
+            .await?;
+
+        Ok(run)
+    }
+
+    async fn verify_garbage_collection_run_is_listed(
+        &self,
+        object_key: &ObjectKey,
+    ) -> Result<(), CheckpointPublishError> {
+        let objects = self
+            .store
+            .list(Some(&Path::from(GC_RUN_PREFIX)))
+            .try_collect::<Vec<_>>()
+            .await?;
+        let expected = Path::from(object_key.as_str());
+        if objects.iter().any(|object| object.location == expected) {
+            return Ok(());
+        }
+
+        Err(
+            CheckpointPublishError::InvalidGarbageCollectionRunEvidence {
+                object_key: object_key.clone(),
+                reason: "run evidence is not visible in v1/gc-runs listing".to_string(),
+            },
+        )
+    }
+
+    async fn verify_retention_records_for_garbage_collection_run(
+        &self,
+        object_key: &ObjectKey,
+        run: &GarbageCollectionRunV1,
+    ) -> Result<(), CheckpointPublishError> {
+        let deleted_keys = run
+            .report
+            .deleted
+            .iter()
+            .map(|candidate| candidate.object_key.clone())
+            .collect::<HashSet<_>>();
+        for expected in self
+            .retention_records_for_deleted_keys(
+                &run.run_id,
+                run.policy,
+                &run.plan.retained_manifest_versions,
+                &deleted_keys,
+            )
+            .await?
+        {
+            let existing = match self
+                .read_checkpoint_retention_record(expected.checkpoint_version)
+                .await
+            {
+                Ok(existing) => existing,
+                Err(CheckpointPublishError::ObjectStore(object_store::Error::NotFound {
+                    ..
+                })) => {
+                    return Err(
+                        CheckpointPublishError::InvalidGarbageCollectionRunEvidence {
+                            object_key: object_key.clone(),
+                            reason: format!(
+                                "missing checkpoint retention record for checkpoint {}",
+                                expected.checkpoint_version
+                            ),
+                        },
+                    );
+                }
+                Err(err) => return Err(err),
+            };
+
+            if !same_retention_causal_fields(&existing, &expected) {
+                return Err(
+                    CheckpointPublishError::InvalidGarbageCollectionRunEvidence {
+                        object_key: object_key.clone(),
+                        reason: format!(
+                        "checkpoint retention record for checkpoint {} does not match run evidence",
+                        expected.checkpoint_version
+                    ),
+                    },
+                );
+            }
+        }
+
+        Ok(())
     }
 
     fn validate_garbage_collection_run_evidence(

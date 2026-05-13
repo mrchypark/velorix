@@ -346,6 +346,12 @@ schema version and `run_id`. Before deleting candidates for an evidenced run,
 the execute path recomputes the plan from the supplied policy and rejects
 mismatched or stale caller plans so the persisted policy and executed plan
 describe the same retention decision.
+Storage also exposes a release-evidence prerequisite verifier that re-reads a
+persisted `GcRunV1`, requires the run object to be visible in the `v1/gc-runs`
+listing, and checks that any expected checkpoint retention records still match
+the run's deleted checkpoint payloads. This verifier is a storage consistency
+boundary only; it is not a production GC command or live backend attestation by
+itself.
 
 Manifest objects outside the latest-N retention set can remain listed and
 readable after GC, but their Velorix-owned raw state and output payloads are not

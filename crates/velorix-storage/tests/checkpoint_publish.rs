@@ -1183,6 +1183,111 @@ async fn checkpoint_admin_inspect_reports_retention_evidence_for_gc_retired_mani
 }
 
 #[tokio::test]
+async fn gc_verify_run_retention_evidence_accepts_readable_listed_run_with_matching_retention() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let policy = GarbageCollectionPolicy {
+        retain_latest_manifests: 1,
+    };
+    let state_0 = state_write(0, "state-0001", b"state-0");
+    let state_1 = state_write(1, "state-0002", b"state-1");
+
+    let state_ref_0 = publisher.write_state_object(&state_0).await.unwrap();
+    publisher
+        .publish_manifest(&manifest(0, state_ref_0))
+        .await
+        .unwrap();
+    let state_ref_1 = publisher.write_state_object(&state_1).await.unwrap();
+    publisher
+        .publish_manifest(&manifest(1, state_ref_1))
+        .await
+        .unwrap();
+
+    let plan = publisher.plan_garbage_collection(policy).await.unwrap();
+    publisher
+        .execute_garbage_collection_plan_with_evidence("run-0001", policy, &plan)
+        .await
+        .unwrap();
+
+    let verified = publisher
+        .verify_garbage_collection_run_retention_evidence("run-0001")
+        .await
+        .unwrap();
+
+    assert_eq!(verified.run_id, "run-0001");
+}
+
+#[tokio::test]
+async fn gc_verify_run_retention_evidence_rejects_missing_retention_record() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let policy = GarbageCollectionPolicy {
+        retain_latest_manifests: 1,
+    };
+    let state_0 = state_write(0, "state-0001", b"state-0");
+    let state_1 = state_write(1, "state-0002", b"state-1");
+
+    let state_ref_0 = publisher.write_state_object(&state_0).await.unwrap();
+    publisher
+        .publish_manifest(&manifest(0, state_ref_0))
+        .await
+        .unwrap();
+    let state_ref_1 = publisher.write_state_object(&state_1).await.unwrap();
+    publisher
+        .publish_manifest(&manifest(1, state_ref_1))
+        .await
+        .unwrap();
+
+    let plan = publisher.plan_garbage_collection(policy).await.unwrap();
+    publisher
+        .execute_garbage_collection_plan_with_evidence("run-0001", policy, &plan)
+        .await
+        .unwrap();
+    store
+        .delete(&Path::from(
+            ObjectKey::checkpoint_retention_record(0).as_str(),
+        ))
+        .await
+        .unwrap();
+
+    let err = publisher
+        .verify_garbage_collection_run_retention_evidence("run-0001")
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        CheckpointPublishError::InvalidGarbageCollectionRunEvidence { reason, .. }
+            if reason.contains("missing checkpoint retention record")
+    ));
+}
+
+#[tokio::test]
+async fn gc_verify_run_retention_evidence_requires_listed_run_evidence() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::new(PrefixListingFailsStore::new(
+        Arc::clone(&store),
+        "v1/gc-runs",
+    )));
+    let evidence_key = ObjectKey::garbage_collection_run("run-0001").unwrap();
+    let run = garbage_collection_run("run-0001", 1);
+    store
+        .put(
+            &Path::from(evidence_key.as_str()),
+            Bytes::from(serde_json::to_vec(&run).unwrap()).into(),
+        )
+        .await
+        .unwrap();
+
+    let err = publisher
+        .verify_garbage_collection_run_retention_evidence("run-0001")
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, CheckpointPublishError::ObjectStore(_)));
+}
+
+#[tokio::test]
 async fn checkpoint_admin_inspect_ignores_retention_record_without_gc_run_evidence() {
     let (_temp_dir, store) = temp_store();
     let publisher = CheckpointPublisher::new(Arc::clone(&store));
