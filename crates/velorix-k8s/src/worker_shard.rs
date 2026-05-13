@@ -72,6 +72,8 @@ pub enum WorkerShardError {
     EpochStore(String),
     #[error("kubernetes worker shard watcher failed: {message}")]
     Watcher { message: String },
+    #[error("worker shard command sink failed: {message}")]
+    CommandSink { message: String },
 }
 
 impl From<LeaseError> for WorkerShardError {
@@ -206,16 +208,37 @@ where
     }
 }
 
-pub async fn watch_worker_shards<L, E>(
+pub async fn handle_worker_shard_event_with_output_sink<L, E, SinkError>(
+    event: WorkerShardEvent,
+    lease_client: &L,
+    epoch_store: &E,
+    input: WorkerShardReconcileInput,
+    mut output_sink: impl FnMut(&WorkerShardReconcileOutput) -> Result<(), SinkError> + Send,
+) -> Result<Option<WorkerShardReconcileOutput>, WorkerShardError>
+where
+    L: PartitionLeaseClient,
+    E: WorkerShardEpochStore,
+    SinkError: std::fmt::Display,
+{
+    let output = handle_worker_shard_event(event, lease_client, epoch_store, input).await?;
+    if let Some(output) = &output {
+        output_sink(output).map_err(WorkerShardError::command_sink)?;
+    }
+    Ok(output)
+}
+
+pub async fn watch_worker_shards<L, E, SinkError>(
     client: Client,
     namespace: &str,
     lease_client: L,
     epoch_store: E,
     mut input_for_shard: impl FnMut(&VelorixWorkerShard) -> WorkerShardReconcileInput + Send,
+    mut output_sink: impl FnMut(&WorkerShardReconcileOutput) -> Result<(), SinkError> + Send,
 ) -> Result<(), WorkerShardError>
 where
     L: PartitionLeaseClient,
     E: WorkerShardEpochStore,
+    SinkError: std::fmt::Display,
 {
     let api: Api<VelorixWorkerShard> = Api::namespaced(client, namespace);
     let mut events = Box::pin(watcher::watcher(api, watcher::Config::default()));
@@ -228,7 +251,14 @@ where
                     input_for_shard(shard)
                 }
             };
-            handle_worker_shard_event(event, &lease_client, &epoch_store, input).await?;
+            handle_worker_shard_event_with_output_sink(
+                event,
+                &lease_client,
+                &epoch_store,
+                input,
+                &mut output_sink,
+            )
+            .await?;
         }
     }
     Ok(())
@@ -482,6 +512,12 @@ fn view_status_from_worker_status(status: Option<&WorkerShardStatus>) -> Velorix
 impl WorkerShardError {
     fn watcher(error: watcher::Error) -> Self {
         Self::Watcher {
+            message: error.to_string(),
+        }
+    }
+
+    fn command_sink(error: impl std::fmt::Display) -> Self {
+        Self::CommandSink {
             message: error.to_string(),
         }
     }

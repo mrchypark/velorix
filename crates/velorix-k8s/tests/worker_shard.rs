@@ -18,8 +18,9 @@ use velorix_k8s::{
         WorkerShardStatus,
     },
     worker_shard::{
-        handle_worker_shard_event, reconcile_worker_shard, worker_shard_watch_event,
-        WorkerShardCommand, WorkerShardEpochStore, WorkerShardEvent, WorkerShardReconcileConfig,
+        handle_worker_shard_event, handle_worker_shard_event_with_output_sink,
+        reconcile_worker_shard, worker_shard_watch_event, WorkerShardCommand,
+        WorkerShardEpochStore, WorkerShardError, WorkerShardEvent, WorkerShardReconcileConfig,
         WorkerShardReconcileInput, WorkerShardReconcileOutput,
     },
 };
@@ -145,6 +146,113 @@ async fn applied_worker_shard_event_reconciles_through_lease_and_epoch_authority
 }
 
 #[tokio::test]
+async fn applied_worker_shard_event_sends_acquire_persist_and_start_output_to_sink() {
+    let lease = FakeLeaseClient::default()
+        .with_current(None)
+        .with_acquired(grant("worker-a", 1));
+    let epoch_store = FakeEpochStore::default();
+    let emitted = Arc::new(Mutex::new(Vec::new()));
+
+    let output = handle_worker_shard_event_with_output_sink(
+        WorkerShardEvent::Applied(shard()),
+        &lease,
+        &epoch_store,
+        input(None),
+        {
+            let emitted = Arc::clone(&emitted);
+            move |output| {
+                emitted.lock().unwrap().push(output.commands.clone());
+                Ok::<(), &'static str>(())
+            }
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let expected = vec![
+        WorkerShardCommand::AcquireLease {
+            owner_id: "worker-a".to_string(),
+        },
+        WorkerShardCommand::PersistEpochRecord {
+            owner_id: "worker-a".to_string(),
+            owner_epoch: 1,
+        },
+        WorkerShardCommand::StartWorker {
+            owner_id: "worker-a".to_string(),
+            owner_epoch: 1,
+        },
+    ];
+    assert_eq!(output.commands, expected);
+    assert_eq!(*emitted.lock().unwrap(), vec![expected]);
+}
+
+#[tokio::test]
+async fn applied_worker_shard_event_returns_sink_error() {
+    let lease = FakeLeaseClient::default()
+        .with_current(None)
+        .with_acquired(grant("worker-a", 1));
+    let epoch_store = FakeEpochStore::default();
+
+    let err = handle_worker_shard_event_with_output_sink(
+        WorkerShardEvent::Applied(shard()),
+        &lease,
+        &epoch_store,
+        input(None),
+        |_output| Err::<(), _>("enqueue failed"),
+    )
+    .await
+    .unwrap_err();
+
+    match err {
+        WorkerShardError::CommandSink { message } => {
+            assert_eq!(message, "enqueue failed");
+        }
+        other => panic!("expected command sink error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn applied_worker_shard_event_sends_stop_output_to_sink() {
+    let lease = FakeLeaseClient::default().with_current(Some(grant("worker-a", 6)));
+    let epoch_store = FakeEpochStore::default().with_record(epoch_record("worker-a", 6));
+    let emitted = Arc::new(Mutex::new(Vec::new()));
+
+    let output = handle_worker_shard_event_with_output_sink(
+        WorkerShardEvent::Applied(shard()),
+        &lease,
+        &epoch_store,
+        input(Some(WorkerFact {
+            owner_id: "worker-a".to_string(),
+            owner_epoch: 5,
+        })),
+        {
+            let emitted = Arc::clone(&emitted);
+            move |output| {
+                emitted.lock().unwrap().push(output.commands.clone());
+                Ok::<(), &'static str>(())
+            }
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let expected = vec![
+        WorkerShardCommand::StopWorker {
+            owner_id: "worker-a".to_string(),
+            owner_epoch: 5,
+        },
+        WorkerShardCommand::StartWorker {
+            owner_id: "worker-a".to_string(),
+            owner_epoch: 6,
+        },
+    ];
+    assert_eq!(output.commands, expected);
+    assert_eq!(*emitted.lock().unwrap(), vec![expected]);
+}
+
+#[tokio::test]
 async fn deleted_worker_shard_event_does_not_start_or_stop_workers() {
     let lease = FakeLeaseClient::default().with_current(Some(grant("worker-a", 1)));
     let epoch_store = FakeEpochStore::default().with_record(epoch_record("worker-a", 1));
@@ -162,6 +270,35 @@ async fn deleted_worker_shard_event_does_not_start_or_stop_workers() {
     .unwrap();
 
     assert_eq!(output, None);
+}
+
+#[tokio::test]
+async fn deleted_worker_shard_event_does_not_send_output_to_sink() {
+    let lease = FakeLeaseClient::default().with_current(Some(grant("worker-a", 1)));
+    let epoch_store = FakeEpochStore::default().with_record(epoch_record("worker-a", 1));
+    let emitted = Arc::new(Mutex::new(Vec::<Vec<WorkerShardCommand>>::new()));
+
+    let output = handle_worker_shard_event_with_output_sink(
+        WorkerShardEvent::Deleted(shard()),
+        &lease,
+        &epoch_store,
+        input(Some(WorkerFact {
+            owner_id: "worker-a".to_string(),
+            owner_epoch: 1,
+        })),
+        {
+            let emitted = Arc::clone(&emitted);
+            move |output| {
+                emitted.lock().unwrap().push(output.commands.clone());
+                Ok::<(), &'static str>(())
+            }
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(output, None);
+    assert!(emitted.lock().unwrap().is_empty());
 }
 
 #[test]
