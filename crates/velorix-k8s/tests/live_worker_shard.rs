@@ -1,7 +1,7 @@
 use std::{
     env,
     error::Error,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use k8s_openapi::{
@@ -195,7 +195,7 @@ async fn live_worker_shard_reconciles_and_creates_worker_pod_when_enabled(
     );
 
     executor.stop_worker(&record.owner_id, 1).await?;
-    assert!(pod_api.get_opt(&pod_name).await?.is_none());
+    wait_for_pod_deleted(&pod_api, &pod_name).await?;
     lease_client
         .release(&key, &record.owner_id, 1, unix_ms()?)
         .await?;
@@ -239,6 +239,17 @@ fn container_env_value<'a>(
             None
         }
     })
+}
+
+async fn wait_for_pod_deleted(pod_api: &Api<Pod>, pod_name: &str) -> Result<(), Box<dyn Error>> {
+    for _ in 0..50 {
+        if pod_api.get_opt(pod_name).await?.is_none() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    Err(format!("worker Pod {pod_name} was not deleted within 5s").into())
 }
 
 async fn ensure_namespace(client: Client, namespace: &str) -> Result<(), Box<dyn Error>> {
