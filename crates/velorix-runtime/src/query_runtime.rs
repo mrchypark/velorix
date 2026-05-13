@@ -151,7 +151,7 @@ where
 mod tests {
     use super::*;
     use datafusion::execution::memory_pool::MemoryLimit;
-    use std::num::NonZeroUsize;
+    use std::{io::Write, num::NonZeroUsize};
 
     #[tokio::test]
     async fn query_runtime_limits_returns_planning_timeout_when_planning_does_not_finish() {
@@ -212,6 +212,36 @@ mod tests {
         assert_eq!(
             runtime.disk_manager.max_temp_directory_size(),
             32 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn datafusion_session_factory_enforces_spill_quota_through_datafusion_disk_manager() {
+        let policy = QueryPolicy {
+            spill_limit_bytes: Some(8),
+            ..QueryPolicy::default()
+        };
+
+        let context = DataFusionSessionFactory::from_policy(policy)
+            .session_context()
+            .unwrap();
+        let disk_manager = &context.runtime_env().disk_manager;
+        let mut spill_file = disk_manager
+            .create_tmp_file("Velorix spill quota policy evidence")
+            .unwrap();
+
+        spill_file
+            .inner()
+            .as_file()
+            .write_all(b"spill-over")
+            .unwrap();
+        let error = spill_file.update_disk_usage().unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("used disk space during the spilling process has exceeded"),
+            "expected DataFusion disk-manager spill quota error, got {error:?}"
         );
     }
 }
