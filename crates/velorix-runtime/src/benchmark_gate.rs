@@ -342,8 +342,13 @@ impl BenchmarkGateResultV1 {
     }
 
     pub fn reject_placeholder_s3_commit(&self) -> Result<(), BenchmarkGateError> {
-        if self.backend == BenchmarkBackend::S3Compatible && self.commit.starts_with("placeholder-")
-        {
+        let commit = self.commit.trim().to_ascii_lowercase();
+        let is_placeholder = commit.contains("placeholder")
+            || commit == "unknown"
+            || commit == "local"
+            || (!commit.is_empty() && commit.chars().all(|c| c == '0'));
+
+        if self.backend == BenchmarkBackend::S3Compatible && is_placeholder {
             return Err(BenchmarkGateError::PlaceholderS3Commit {
                 commit: self.commit.clone(),
             });

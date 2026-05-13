@@ -37,6 +37,40 @@ fn benchmark_gate_rejects_placeholder_s3_current_result() {
 }
 
 #[test]
+fn benchmark_gate_rejects_unknown_s3_current_result() {
+    let mut result = s3_nightly_result();
+    result.commit = "unknown".to_string();
+
+    let error = result.reject_placeholder_s3_commit().unwrap_err();
+
+    assert!(matches!(
+        error,
+        BenchmarkGateError::PlaceholderS3Commit { .. }
+    ));
+}
+
+#[test]
+fn benchmark_gate_rejects_all_zero_s3_current_result() {
+    let mut result = s3_nightly_result();
+    result.commit = "0000000000000000000000000000000000000000".to_string();
+
+    let error = result.reject_placeholder_s3_commit().unwrap_err();
+
+    assert!(matches!(
+        error,
+        BenchmarkGateError::PlaceholderS3Commit { .. }
+    ));
+}
+
+#[test]
+fn benchmark_gate_allows_placeholder_local_current_result() {
+    let mut result = local_smoke_result();
+    result.commit = "placeholder-local-pr-smoke-result".to_string();
+
+    result.reject_placeholder_s3_commit().unwrap();
+}
+
+#[test]
 fn benchmark_gate_accepts_s3_nightly_result_with_real_commit() {
     let result = s3_nightly_result();
 
