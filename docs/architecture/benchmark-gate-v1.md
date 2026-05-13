@@ -52,7 +52,24 @@ requests. The local GC execution workload reuses that fixture, calls
 object, and records local object-store requests. It does not test
 listing-consistency failure modes or provide S3-compatible evidence.
 
-## Required Workloads
+## V1 Gate-Enforced Workload Metrics
+
+The V1 CLI gate requires these `workload_metrics.name` values for local
+benchmark results:
+
+- `ingest_envelope_validation`
+- `checkpoint_publish`
+- `checkpoint_recovery`
+- `datafusion_table_scan`
+- `slatedb_state_reopen`
+- `gc_dry_run_planning`
+- `gc_execution_evidence`
+
+S3-compatible benchmark gates do not currently require `gc_execution_evidence`,
+which remains local-only until S3-compatible GC execution evidence is
+implemented.
+
+## Broader Benchmark Coverage
 
 - Small batch high-QPS ingest.
 - Large batch throughput ingest.
