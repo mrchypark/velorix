@@ -6,6 +6,7 @@ use kube::{
     Client, ResourceExt,
 };
 use thiserror::Error;
+use tokio::process::Command;
 use velorix_control::{
     control_plane_contract::{
         ContractMetadata, VelorixView, VelorixViewSpec, VelorixViewStatus, WorkerIntent,
@@ -94,6 +95,111 @@ pub trait WorkerShardCommandExecutor: Send + Sync {
         owner_id: &str,
         owner_epoch: u64,
     ) -> Result<(), WorkerShardCommandExecutorError>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkerShardProcessCommand {
+    program: String,
+    args: Vec<String>,
+}
+
+impl WorkerShardProcessCommand {
+    pub fn new(
+        program: impl Into<String>,
+        args: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Result<Self, WorkerShardCommandExecutorError> {
+        let program = program.into();
+        if program.trim().is_empty() {
+            return Err(WorkerShardCommandExecutorError::new(
+                "worker process command program must not be empty",
+            ));
+        }
+
+        Ok(Self {
+            program,
+            args: args.into_iter().map(Into::into).collect(),
+        })
+    }
+
+    pub fn from_argv(
+        argv: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Result<Self, WorkerShardCommandExecutorError> {
+        let mut argv = argv.into_iter().map(Into::into);
+        let Some(program) = argv.next() else {
+            return Err(WorkerShardCommandExecutorError::new(
+                "worker process command argv must not be empty",
+            ));
+        };
+
+        Self::new(program, argv)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ProcessWorkerShardCommandExecutor {
+    start_command: WorkerShardProcessCommand,
+    stop_command: WorkerShardProcessCommand,
+}
+
+impl ProcessWorkerShardCommandExecutor {
+    pub fn new(
+        start_command: WorkerShardProcessCommand,
+        stop_command: WorkerShardProcessCommand,
+    ) -> Self {
+        Self {
+            start_command,
+            stop_command,
+        }
+    }
+
+    async fn run(
+        command: &WorkerShardProcessCommand,
+        action: &str,
+        owner_id: &str,
+        owner_epoch: u64,
+    ) -> Result<(), WorkerShardCommandExecutorError> {
+        let status = Command::new(&command.program)
+            .args(&command.args)
+            .env("VELORIX_WORKER_ACTION", action)
+            .env("VELORIX_WORKER_OWNER_ID", owner_id)
+            .env("VELORIX_WORKER_OWNER_EPOCH", owner_epoch.to_string())
+            .status()
+            .await
+            .map_err(|error| {
+                WorkerShardCommandExecutorError::new(format!(
+                    "failed to execute worker {action} command `{}`: {error}",
+                    command.program
+                ))
+            })?;
+
+        if status.success() {
+            Ok(())
+        } else {
+            Err(WorkerShardCommandExecutorError::new(format!(
+                "worker {action} command `{}` exited with {status}",
+                command.program
+            )))
+        }
+    }
+}
+
+#[async_trait]
+impl WorkerShardCommandExecutor for ProcessWorkerShardCommandExecutor {
+    async fn stop_worker(
+        &self,
+        owner_id: &str,
+        owner_epoch: u64,
+    ) -> Result<(), WorkerShardCommandExecutorError> {
+        Self::run(&self.stop_command, "stop", owner_id, owner_epoch).await
+    }
+
+    async fn start_worker(
+        &self,
+        owner_id: &str,
+        owner_epoch: u64,
+    ) -> Result<(), WorkerShardCommandExecutorError> {
+        Self::run(&self.start_command, "start", owner_id, owner_epoch).await
+    }
 }
 
 #[derive(Clone, Debug)]

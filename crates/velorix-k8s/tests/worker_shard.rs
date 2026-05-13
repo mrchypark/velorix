@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    fs,
     sync::{Arc, Mutex},
 };
 
@@ -20,9 +21,10 @@ use velorix_k8s::{
     worker_shard::{
         execute_worker_shard_commands, handle_worker_shard_event,
         handle_worker_shard_event_with_output_sink, reconcile_worker_shard,
-        worker_shard_watch_event, WorkerShardCommand, WorkerShardCommandExecutor,
-        WorkerShardCommandExecutorError, WorkerShardEpochStore, WorkerShardError, WorkerShardEvent,
-        WorkerShardReconcileConfig, WorkerShardReconcileInput, WorkerShardReconcileOutput,
+        worker_shard_watch_event, ProcessWorkerShardCommandExecutor, WorkerShardCommand,
+        WorkerShardCommandExecutor, WorkerShardCommandExecutorError, WorkerShardEpochStore,
+        WorkerShardError, WorkerShardEvent, WorkerShardProcessCommand, WorkerShardReconcileConfig,
+        WorkerShardReconcileInput, WorkerShardReconcileOutput,
     },
 };
 use velorix_storage::ownership::OwnershipEpochRecord;
@@ -524,6 +526,74 @@ async fn worker_shard_command_executor_stop_failure_prevents_replacement_start()
     );
 }
 
+#[tokio::test]
+async fn process_worker_shard_command_executor_runs_start_and_stop_with_owner_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("worker-actions.log");
+    let command = shell_log_command(&log_path);
+    let executor = ProcessWorkerShardCommandExecutor::new(command.clone(), command);
+
+    execute_worker_shard_commands(
+        &output_with_commands(vec![
+            WorkerShardCommand::StopWorker {
+                owner_id: "worker-a".to_string(),
+                owner_epoch: 5,
+            },
+            WorkerShardCommand::StartWorker {
+                owner_id: "worker-b".to_string(),
+                owner_epoch: 6,
+            },
+        ]),
+        &executor,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        fs::read_to_string(log_path).unwrap(),
+        "stop worker-a 5\nstart worker-b 6\n"
+    );
+}
+
+#[tokio::test]
+async fn process_worker_shard_command_executor_rejects_empty_program() {
+    let error = WorkerShardProcessCommand::new(" ", std::iter::empty::<String>()).unwrap_err();
+
+    assert!(error.message().contains("program must not be empty"));
+}
+
+#[tokio::test]
+async fn process_worker_shard_command_executor_rejects_empty_argv_config() {
+    let error = WorkerShardProcessCommand::from_argv(std::iter::empty::<String>()).unwrap_err();
+
+    assert!(error.message().contains("argv must not be empty"));
+}
+
+#[tokio::test]
+async fn process_worker_shard_command_executor_returns_typed_error_on_nonzero_exit() {
+    let start = WorkerShardProcessCommand::from_argv(["/bin/sh", "-c", "exit 7"]).unwrap();
+    let stop = shell_log_command(&tempfile::tempdir().unwrap().path().join("unused.log"));
+    let executor = ProcessWorkerShardCommandExecutor::new(start, stop);
+
+    let error = execute_worker_shard_commands(
+        &output_with_commands(vec![WorkerShardCommand::StartWorker {
+            owner_id: "worker-a".to_string(),
+            owner_epoch: 6,
+        }]),
+        &executor,
+    )
+    .await
+    .unwrap_err();
+
+    match error {
+        WorkerShardError::CommandExecutor { message } => {
+            assert!(message.contains("worker start command"));
+            assert!(message.contains("exited with"));
+        }
+        other => panic!("expected command executor error, got {other:?}"),
+    }
+}
+
 fn has_start(output: &WorkerShardReconcileOutput) -> bool {
     output
         .commands
@@ -538,6 +608,19 @@ fn output_with_commands(commands: Vec<WorkerShardCommand>) -> WorkerShardReconci
         commands,
         command_error: None,
     }
+}
+
+fn shell_log_command(log_path: &std::path::Path) -> WorkerShardProcessCommand {
+    WorkerShardProcessCommand::new(
+        "/bin/sh",
+        [
+            "-c",
+            "printf '%s %s %s\n' \"$VELORIX_WORKER_ACTION\" \"$VELORIX_WORKER_OWNER_ID\" \"$VELORIX_WORKER_OWNER_EPOCH\" >> \"$1\"",
+            "worker-shard-test",
+            log_path.to_str().unwrap(),
+        ],
+    )
+    .unwrap()
 }
 
 fn input(worker: Option<WorkerFact>) -> WorkerShardReconcileInput {

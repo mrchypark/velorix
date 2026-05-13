@@ -14,9 +14,9 @@ schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true, features = ["process"] }
 velorix-control = { path = "../velorix-control" }
 velorix-storage = { path = "../velorix-storage" }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-tokio = { workspace = true }
