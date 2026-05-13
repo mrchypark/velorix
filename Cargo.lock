@@ -4700,6 +4700,8 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures",
+ "http",
+ "http-body-util",
  "k8s-openapi",
  "kube",
  "object_store 0.12.5",
@@ -4709,6 +4711,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tower",
  "velorix-control",
  "velorix-storage",
 ]

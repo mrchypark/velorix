@@ -1,11 +1,17 @@
 use std::{
     collections::BTreeMap,
+    convert::Infallible,
     fs,
     sync::{Arc, Mutex},
 };
 
 use async_trait::async_trait;
-use kube::runtime::watcher::Event;
+use http::{Method, Request, Response, StatusCode};
+use kube::{
+    client::{Body, ClientBuilder},
+    runtime::watcher::Event,
+};
+use serde_json::{json, Value};
 use velorix_control::{
     lease::{
         LeaseAcquireRequest, LeaseError, PartitionLeaseClient, PartitionLeaseGrant,
@@ -20,11 +26,13 @@ use velorix_k8s::{
     },
     worker_shard::{
         execute_worker_shard_commands, handle_worker_shard_event,
+        handle_worker_shard_event_with_command_executor,
         handle_worker_shard_event_with_output_sink, reconcile_worker_shard, worker_shard_pod_name,
-        worker_shard_watch_event, ProcessWorkerShardCommandExecutor, WorkerShardCommand,
-        WorkerShardCommandExecutor, WorkerShardCommandExecutorError, WorkerShardEpochStore,
-        WorkerShardError, WorkerShardEvent, WorkerShardPodTemplate, WorkerShardProcessCommand,
-        WorkerShardReconcileConfig, WorkerShardReconcileInput, WorkerShardReconcileOutput,
+        worker_shard_watch_event, KubernetesPodWorkerShardCommandExecutor,
+        ProcessWorkerShardCommandExecutor, WorkerShardCommand, WorkerShardCommandExecutor,
+        WorkerShardCommandExecutorError, WorkerShardEpochStore, WorkerShardError, WorkerShardEvent,
+        WorkerShardPodTemplate, WorkerShardProcessCommand, WorkerShardReconcileConfig,
+        WorkerShardReconcileInput, WorkerShardReconcileOutput,
     },
 };
 use velorix_storage::ownership::OwnershipEpochRecord;
@@ -253,6 +261,214 @@ async fn applied_worker_shard_event_sends_stop_output_to_sink() {
     ];
     assert_eq!(output.commands, expected);
     assert_eq!(*emitted.lock().unwrap(), vec![expected]);
+}
+
+#[tokio::test]
+async fn applied_worker_shard_event_executes_reconciled_worker_commands() {
+    let lease = FakeLeaseClient::default()
+        .with_current(None)
+        .with_acquired(grant("worker-a", 1));
+    let epoch_store = FakeEpochStore::default();
+    let executor = FakeCommandExecutor::default();
+
+    let output = handle_worker_shard_event_with_command_executor(
+        WorkerShardEvent::Applied(shard()),
+        &lease,
+        &epoch_store,
+        input(None),
+        &executor,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(
+        output.commands,
+        vec![
+            WorkerShardCommand::AcquireLease {
+                owner_id: "worker-a".to_string(),
+            },
+            WorkerShardCommand::PersistEpochRecord {
+                owner_id: "worker-a".to_string(),
+                owner_epoch: 1,
+            },
+            WorkerShardCommand::StartWorker {
+                owner_id: "worker-a".to_string(),
+                owner_epoch: 1,
+            },
+        ]
+    );
+    assert_eq!(
+        executor.actions(),
+        vec![ExecutedWorkerCommand::Start {
+            owner_id: "worker-a".to_string(),
+            owner_epoch: 1,
+        }]
+    );
+    assert_eq!(
+        epoch_store.read("orders", 0, 1).await.unwrap(),
+        Some(epoch_record("worker-a", 1))
+    );
+}
+
+#[tokio::test]
+async fn applied_worker_shard_event_returns_executor_error_from_operator_wiring() {
+    let lease = FakeLeaseClient::default()
+        .with_current(None)
+        .with_acquired(grant("worker-a", 1));
+    let epoch_store = FakeEpochStore::default();
+    let executor = FakeCommandExecutor::default().fail_start("pod create failed");
+
+    let err = handle_worker_shard_event_with_command_executor(
+        WorkerShardEvent::Applied(shard()),
+        &lease,
+        &epoch_store,
+        input(None),
+        &executor,
+    )
+    .await
+    .unwrap_err();
+
+    match err {
+        WorkerShardError::CommandExecutor { message } => {
+            assert_eq!(message, "pod create failed");
+        }
+        other => panic!("expected command executor error, got {other:?}"),
+    }
+    assert_eq!(
+        executor.actions(),
+        vec![ExecutedWorkerCommand::Start {
+            owner_id: "worker-a".to_string(),
+            owner_epoch: 1,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn applied_worker_shard_event_wires_reconciled_start_to_kubernetes_pod_executor() {
+    let lease = FakeLeaseClient::default()
+        .with_current(None)
+        .with_acquired(grant("worker-a", 1));
+    let epoch_store = FakeEpochStore::default();
+    let (client, requests) = fake_pod_client(StatusCode::CREATED);
+    let executor = KubernetesPodWorkerShardCommandExecutor::new(
+        client,
+        "workers",
+        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+    );
+
+    let output = handle_worker_shard_event_with_command_executor(
+        WorkerShardEvent::Applied(shard()),
+        &lease,
+        &epoch_store,
+        input(None),
+        &executor,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(
+        output.commands,
+        vec![
+            WorkerShardCommand::AcquireLease {
+                owner_id: "worker-a".to_string(),
+            },
+            WorkerShardCommand::PersistEpochRecord {
+                owner_id: "worker-a".to_string(),
+                owner_epoch: 1,
+            },
+            WorkerShardCommand::StartWorker {
+                owner_id: "worker-a".to_string(),
+                owner_epoch: 1,
+            },
+        ]
+    );
+    assert_eq!(
+        epoch_store.read("orders", 0, 1).await.unwrap(),
+        Some(epoch_record("worker-a", 1))
+    );
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, Method::POST);
+    assert_eq!(requests[0].path, "/api/v1/namespaces/workers/pods");
+    assert_eq!(
+        requests[0].body["metadata"]["name"],
+        worker_shard_pod_name("worker-a", 1)
+    );
+    assert_eq!(
+        requests[0].body["spec"]["containers"][0]["env"],
+        json!([
+            {"name": "VELORIX_WORKER_OWNER_ID", "value": "worker-a"},
+            {"name": "VELORIX_WORKER_OWNER_EPOCH", "value": "1"}
+        ])
+    );
+}
+
+#[tokio::test]
+async fn kubernetes_pod_worker_shard_executor_deletes_stop_pod_by_owner_epoch_name() {
+    let (client, requests) = fake_pod_client(StatusCode::OK);
+    let executor = KubernetesPodWorkerShardCommandExecutor::new(
+        client,
+        "workers",
+        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+    );
+
+    executor.stop_worker("Worker_A/West", 42).await.unwrap();
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, Method::DELETE);
+    assert_eq!(
+        requests[0].path,
+        format!(
+            "/api/v1/namespaces/workers/pods/{}",
+            worker_shard_pod_name("Worker_A/West", 42)
+        )
+    );
+}
+
+#[tokio::test]
+async fn kubernetes_pod_worker_shard_executor_treats_duplicate_start_as_idempotent() {
+    let (client, _requests) = fake_pod_client(StatusCode::CONFLICT);
+    let executor = KubernetesPodWorkerShardCommandExecutor::new(
+        client,
+        "workers",
+        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+    );
+
+    executor.start_worker("worker-a", 1).await.unwrap();
+}
+
+#[tokio::test]
+async fn kubernetes_pod_worker_shard_executor_treats_missing_stop_as_idempotent() {
+    let (client, _requests) = fake_pod_client(StatusCode::NOT_FOUND);
+    let executor = KubernetesPodWorkerShardCommandExecutor::new(
+        client,
+        "workers",
+        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+    );
+
+    executor.stop_worker("worker-a", 1).await.unwrap();
+}
+
+#[tokio::test]
+async fn kubernetes_pod_worker_shard_executor_maps_api_failure_to_typed_error() {
+    let (client, _requests) = fake_pod_client(StatusCode::INTERNAL_SERVER_ERROR);
+    let executor = KubernetesPodWorkerShardCommandExecutor::new(
+        client,
+        "workers",
+        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+    );
+
+    let error = executor.start_worker("worker-a", 1).await.unwrap_err();
+
+    assert!(error
+        .message()
+        .contains("kubernetes pod worker start failed"));
+    assert!(error.message().contains("worker-a"));
+    assert!(error.message().contains("epoch 1"));
 }
 
 #[tokio::test]
@@ -702,6 +918,78 @@ fn env_var(name: &str, value: &str) -> k8s_openapi::api::core::v1::EnvVar {
         value: Some(value.to_string()),
         value_from: None,
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RecordedKubeRequest {
+    method: Method,
+    path: String,
+    body: Value,
+}
+
+fn fake_pod_client(
+    response_status: StatusCode,
+) -> (kube::Client, Arc<Mutex<Vec<RecordedKubeRequest>>>) {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let service = tower::service_fn({
+        let requests = Arc::clone(&requests);
+        move |request: Request<Body>| {
+            let requests = Arc::clone(&requests);
+            async move {
+                let method = request.method().clone();
+                let path = request.uri().path().to_string();
+                let body_bytes = request.into_body().collect_bytes().await.unwrap();
+                let body: Value = if body_bytes.is_empty() {
+                    Value::Null
+                } else {
+                    serde_json::from_slice(&body_bytes).unwrap()
+                };
+                requests.lock().unwrap().push(RecordedKubeRequest {
+                    method: method.clone(),
+                    path,
+                    body: body.clone(),
+                });
+
+                let response_body = if response_status.is_success() {
+                    if method == Method::DELETE {
+                        json!({
+                            "apiVersion": "v1",
+                            "kind": "Status",
+                            "metadata": {},
+                            "status": "Success",
+                            "code": response_status.as_u16()
+                        })
+                    } else {
+                        body
+                    }
+                } else {
+                    json!({
+                        "apiVersion": "v1",
+                        "kind": "Status",
+                        "metadata": {},
+                        "status": "Failure",
+                        "message": "fake kubernetes error",
+                        "reason": match response_status {
+                            StatusCode::NOT_FOUND => "NotFound",
+                            StatusCode::CONFLICT => "AlreadyExists",
+                            _ => "InternalError",
+                        },
+                        "code": response_status.as_u16()
+                    })
+                };
+
+                Ok::<_, Infallible>(
+                    Response::builder()
+                        .status(response_status)
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&response_body).unwrap()))
+                        .unwrap(),
+                )
+            }
+        }
+    });
+
+    (ClientBuilder::new(service, "default").build(), requests)
 }
 
 fn input(worker: Option<WorkerFact>) -> WorkerShardReconcileInput {

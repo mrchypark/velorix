@@ -19,4 +19,7 @@ velorix-control = { path = "../velorix-control" }
 velorix-storage = { path = "../velorix-storage" }
 
 [dev-dependencies]
+http = "1"
+http-body-util = "0.1"
 tempfile = { workspace = true }
+tower = { version = "0.5", features = ["util"] }

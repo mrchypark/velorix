@@ -610,6 +610,25 @@ where
     Ok(())
 }
 
+pub async fn handle_worker_shard_event_with_command_executor<L, E, X>(
+    event: WorkerShardEvent,
+    lease_client: &L,
+    epoch_store: &E,
+    input: WorkerShardReconcileInput,
+    executor: &X,
+) -> Result<Option<WorkerShardReconcileOutput>, WorkerShardError>
+where
+    L: PartitionLeaseClient,
+    E: WorkerShardEpochStore,
+    X: WorkerShardCommandExecutor + ?Sized,
+{
+    let output = handle_worker_shard_event(event, lease_client, epoch_store, input).await?;
+    if let Some(output) = &output {
+        execute_worker_shard_commands(output, executor).await?;
+    }
+    Ok(output)
+}
+
 pub async fn handle_worker_shard_event_with_output_sink<L, E, SinkError>(
     event: WorkerShardEvent,
     lease_client: &L,
@@ -627,6 +646,43 @@ where
         output_sink(output).map_err(WorkerShardError::command_sink)?;
     }
     Ok(output)
+}
+
+pub async fn watch_worker_shards_with_command_executor<L, E, X>(
+    client: Client,
+    namespace: &str,
+    lease_client: L,
+    epoch_store: E,
+    mut input_for_shard: impl FnMut(&VelorixWorkerShard) -> WorkerShardReconcileInput + Send,
+    executor: X,
+) -> Result<(), WorkerShardError>
+where
+    L: PartitionLeaseClient,
+    E: WorkerShardEpochStore,
+    X: WorkerShardCommandExecutor,
+{
+    let api: Api<VelorixWorkerShard> = Api::namespaced(client, namespace);
+    let mut events = Box::pin(watcher::watcher(api, watcher::Config::default()));
+
+    while let Some(event) = events.next().await {
+        let event = event.map_err(WorkerShardError::watcher)?;
+        if let Some(event) = worker_shard_watch_event(event) {
+            let input = match &event {
+                WorkerShardEvent::Applied(shard) | WorkerShardEvent::Deleted(shard) => {
+                    input_for_shard(shard)
+                }
+            };
+            handle_worker_shard_event_with_command_executor(
+                event,
+                &lease_client,
+                &epoch_store,
+                input,
+                &executor,
+            )
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 pub async fn watch_worker_shards<L, E, SinkError>(
