@@ -27,6 +27,10 @@ on:
         description: Path to the Feldera release provenance JSON.
         required: false
         default: ""
+      production-gc-evidence-path:
+        description: Path to production GC run evidence JSON.
+        required: false
+        default: ""
 
 env:
   CARGO_TERM_COLOR: always
@@ -36,6 +40,7 @@ env:
   FELDERA_METADATA_PATH: ${{ inputs.feldera-metadata-path }}
   FELDERA_ARTIFACT_PACKAGE_PATH: ${{ inputs.feldera-artifact-package-path }}
   FELDERA_PROVENANCE_PATH: ${{ inputs.feldera-provenance-path }}
+  PRODUCTION_GC_EVIDENCE_PATH: ${{ inputs.production-gc-evidence-path }}
 
 jobs:
   s3-release:
@@ -66,6 +71,10 @@ jobs:
           fi
           if [ -z "$FELDERA_PROVENANCE_PATH" ]; then
             echo "release gate requires inputs.feldera-provenance-path"
+            exit 1
+          fi
+          if [ -z "$PRODUCTION_GC_EVIDENCE_PATH" ]; then
+            echo "release gate requires inputs.production-gc-evidence-path"
             exit 1
           fi
 
@@ -129,7 +138,9 @@ jobs:
       - name: Validate production readiness report
         run: |
           test -f "$READINESS_EVIDENCE_PATH"
+          test -f "$PRODUCTION_GC_EVIDENCE_PATH"
           cp "$READINESS_EVIDENCE_PATH" target/release-evidence/production-readiness-evidence.json
+          cp "$PRODUCTION_GC_EVIDENCE_PATH" target/release-evidence/production-gc-run-evidence.json
           cargo run -p velorix-cli -- readiness-report \
             --evidence "$READINESS_EVIDENCE_PATH" \
             --require-release-artifacts \
@@ -137,6 +148,7 @@ jobs:
             --feldera-artifact-hash-evidence target/release-evidence/feldera-artifact-hash.json \
             --feldera-release-provenance-evidence target/release-evidence/feldera-release-provenance.json \
             --s3-release-benchmark-gate-evidence target/release-evidence/s3-release-benchmark-gate.json \
+            --production-gc-run-evidence "$PRODUCTION_GC_EVIDENCE_PATH" \
             --json \
             > target/release-evidence/production-readiness-report.json
 

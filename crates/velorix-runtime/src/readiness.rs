@@ -67,6 +67,7 @@ pub enum ReadinessEvidenceKind {
     DependencyGovernanceValidated,
     S3CompatibleBenchmarkGate,
     GcRunEvidence,
+    ProductionGcRunEvidence,
     CheckpointRetentionRecord,
 }
 
@@ -345,6 +346,13 @@ impl ProductionReadinessEvidenceV1 {
             .has_evidence(ReadinessEvidenceKind::GcRunEvidence)
         {
             blocking_reasons.push("gc_status missing gc_run_evidence evidence".to_string());
+        }
+        if !self
+            .gc_status
+            .has_evidence(ReadinessEvidenceKind::ProductionGcRunEvidence)
+        {
+            blocking_reasons
+                .push("gc_status missing production_gc_run_evidence evidence".to_string());
         }
         if !self
             .gc_status

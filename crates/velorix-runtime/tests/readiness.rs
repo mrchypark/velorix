@@ -223,7 +223,11 @@ fn readiness_report_blocks_when_dependency_governance_evidence_is_missing() {
 #[test]
 fn readiness_report_blocks_when_gc_evidence_is_missing() {
     let report = ProductionReadinessEvidenceV1::from_json_str(&readiness_json(
-        &["gc_run_evidence", "checkpoint_retention_record"],
+        &[
+            "gc_run_evidence",
+            "production_gc_run_evidence",
+            "checkpoint_retention_record",
+        ],
         false,
         &[],
     ))
@@ -236,8 +240,27 @@ fn readiness_report_blocks_when_gc_evidence_is_missing() {
         report.blocking_reasons,
         vec![
             "gc_status missing gc_run_evidence evidence",
+            "gc_status missing production_gc_run_evidence evidence",
             "gc_status missing checkpoint_retention_record evidence",
         ]
+    );
+}
+
+#[test]
+fn readiness_report_blocks_when_gc_has_only_local_admin_evidence() {
+    let report = ProductionReadinessEvidenceV1::from_json_str(&readiness_json(
+        &["production_gc_run_evidence"],
+        false,
+        &[],
+    ))
+    .unwrap()
+    .try_into_report()
+    .unwrap();
+
+    assert!(!report.production_ready);
+    assert_eq!(
+        report.blocking_reasons,
+        vec!["gc_status missing production_gc_run_evidence evidence"]
     );
 }
 
@@ -528,7 +551,7 @@ fn readiness_evidence_rejects_unknown_json_fields() {
             "feldera_artifact_status": { "status": "pass", "evidence": "trusted artifact metadata", "evidence_kind": ["feldera_artifact_registry", "feldera_artifact_hash_verified"] },
             "dependency_governance_status": { "status": "pass", "evidence": "dependency governance validated", "evidence_kind": ["dependency_governance_validated"] },
             "benchmark_gate_status": { "status": "pass", "evidence": "S3-compatible benchmark gate", "evidence_kind": ["s3_compatible_benchmark_gate"] },
-            "gc_status": { "status": "pass", "evidence": "GC run and retention evidence", "evidence_kind": ["gc_run_evidence", "checkpoint_retention_record"] },
+            "gc_status": { "status": "pass", "evidence": "production GC run and retention evidence", "evidence_kind": ["gc_run_evidence", "production_gc_run_evidence", "checkpoint_retention_record"] },
             "kubernetes_status": { "status": "pass", "evidence": "Kubernetes Lease client", "evidence_kind": ["kubernetes_lease_client"] },
             "surprise": true
         }"#,
@@ -656,6 +679,9 @@ fn readiness_json(
     let mut gc_evidence_kind = Vec::new();
     if !missing_evidence.contains(&"gc_run_evidence") {
         gc_evidence_kind.push("gc_run_evidence");
+    }
+    if !missing_evidence.contains(&"production_gc_run_evidence") {
+        gc_evidence_kind.push("production_gc_run_evidence");
     }
     if !missing_evidence.contains(&"checkpoint_retention_record") {
         gc_evidence_kind.push("checkpoint_retention_record");
