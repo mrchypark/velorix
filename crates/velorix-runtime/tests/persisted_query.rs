@@ -36,7 +36,8 @@ use velorix_runtime::recovery::{
 use velorix_storage::{
     capability::{
         probe_authoritative_object_store_capabilities, AuthoritativeNamespace,
-        AuthoritativeObjectStoreCapabilitiesV1, ObjectStoreCapabilityProfile,
+        AuthoritativeObjectStoreCapabilitiesV1, AuthoritativeObjectStoreCapabilityError,
+        ObjectStoreCapabilityProfile,
     },
     ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
     log::IngestLog,
@@ -666,6 +667,66 @@ async fn production_persisted_recovered_query_fails_closed_when_relation_catalog
 }
 
 #[tokio::test]
+async fn production_persisted_recovered_query_validates_capabilities_before_catalog_read() {
+    let (_temp_dir, store) = temp_store();
+    let key = ObjectKey::persisted_query("malformed-production-query").unwrap();
+    store
+        .put(
+            &Path::from(key.as_str()),
+            Bytes::from_static(br#"{"schema_version":"#).into(),
+        )
+        .await
+        .unwrap();
+
+    let missing_error = query_production_persisted_recovered_materialized_view_with_limiter(
+        Arc::clone(&store),
+        "malformed-production-query",
+        "v1/slatedb/state",
+        ORDERS_SUM_COUNT_RELATION_ID,
+        ORDERS_SUM_COUNT_RELATION_VERSION,
+        &capabilities_missing(AuthoritativeNamespace::Queries),
+        None,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        missing_error,
+        PersistedQueryError::RuntimeQuery(RuntimeQueryError::Recovery(
+            RecoveryError::AuthoritativeObjectStoreCapabilities(
+                AuthoritativeObjectStoreCapabilityError::MissingNamespace {
+                    namespace: AuthoritativeNamespace::Queries
+                }
+            )
+        ))
+    ));
+
+    let weak_error = query_production_persisted_recovered_materialized_view_with_limiter(
+        Arc::clone(&store),
+        "missing-production-query",
+        "v1/slatedb/state",
+        ORDERS_SUM_COUNT_RELATION_ID,
+        ORDERS_SUM_COUNT_RELATION_VERSION,
+        &capabilities_with_weak_namespace(AuthoritativeNamespace::Queries),
+        None,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        weak_error,
+        PersistedQueryError::RuntimeQuery(RuntimeQueryError::Recovery(
+            RecoveryError::AuthoritativeObjectStoreCapabilities(
+                AuthoritativeObjectStoreCapabilityError::NamespaceProfile {
+                    namespace: AuthoritativeNamespace::Queries,
+                    ..
+                }
+            )
+        ))
+    ));
+}
+
+#[tokio::test]
 async fn production_persisted_recovered_query_fails_closed_for_raw_state_checkpoint() {
     let (_temp_dir, store) = temp_store();
     let catalog = PersistedQueryStore::new(Arc::clone(&store));
@@ -833,6 +894,24 @@ fn local_capabilities() -> AuthoritativeObjectStoreCapabilitiesV1 {
             .map(|namespace| (namespace, profile.clone()))
             .collect::<BTreeMap<_, _>>(),
     )
+}
+
+fn capabilities_missing(
+    namespace: AuthoritativeNamespace,
+) -> AuthoritativeObjectStoreCapabilitiesV1 {
+    let mut profiles = local_capabilities().profiles;
+    profiles.remove(&namespace);
+    AuthoritativeObjectStoreCapabilitiesV1::new(profiles)
+}
+
+fn capabilities_with_weak_namespace(
+    namespace: AuthoritativeNamespace,
+) -> AuthoritativeObjectStoreCapabilitiesV1 {
+    let mut profile = ObjectStoreCapabilityProfile::local_development();
+    profile.conditional_create = false;
+    let mut profiles = local_capabilities().profiles;
+    profiles.insert(namespace, profile);
+    AuthoritativeObjectStoreCapabilitiesV1::new(profiles)
 }
 
 async fn probed_persisted_query_capabilities(

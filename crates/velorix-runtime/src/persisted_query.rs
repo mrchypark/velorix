@@ -21,6 +21,7 @@ use crate::query::{
     query_recovered_materialized_view_with_policy_and_limiter, QueryExecutionLimiter,
     RuntimeQueryError,
 };
+use crate::recovery::RecoveryError;
 use velorix_storage::capability::AuthoritativeObjectStoreCapabilitiesV1;
 
 pub const PERSISTED_QUERY_SCHEMA_VERSION: u32 = 1;
@@ -236,6 +237,10 @@ pub async fn query_production_persisted_recovered_materialized_view_with_limiter
     capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
     limiter: Option<QueryExecutionLimiter>,
 ) -> Result<Vec<RecordBatch>, PersistedQueryError> {
+    capabilities
+        .validate_for_startup()
+        .map_err(RecoveryError::from)
+        .map_err(RuntimeQueryError::from)?;
     let catalog = PersistedQueryStore::new(Arc::clone(&store));
     let spec = catalog.get(query_id).await?;
 
