@@ -584,6 +584,65 @@ fn generic_catalog_incremental_input_accepts_boolean_primary_key() {
 }
 
 #[test]
+fn generic_catalog_incremental_input_accepts_json_utf8_primary_key() {
+    let catalog = json_account_balance_relation_catalog();
+    let batch = json_account_balance_input_batch(
+        &[
+            r#"{"tenant":"a","account":1001}"#,
+            r#"{"tenant":"b","account":1002}"#,
+        ],
+        &[500, 125],
+        &[1, -1],
+    );
+
+    let delta = arrow_record_batches_to_single_key_sum_count_delta_batch(
+        &catalog,
+        catalog.relation_schema.relation_id.as_str(),
+        catalog.relation_schema.relation_version.as_str(),
+        catalog.schema_fingerprint.as_str(),
+        &[batch],
+    )
+    .unwrap();
+
+    assert_eq!(
+        delta.records(),
+        &[
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!({"tenant": "a", "account": 1001})),
+                DeltaValue::from_json(serde_json::json!(500)),
+                1,
+            ),
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!({"tenant": "b", "account": 1002})),
+                DeltaValue::from_json(serde_json::json!(125)),
+                -1,
+            ),
+        ]
+    );
+}
+
+#[test]
+fn generic_catalog_incremental_input_rejects_invalid_json_utf8_primary_key() {
+    let catalog = json_account_balance_relation_catalog();
+    let batch = json_account_balance_input_batch(&[r#"{"tenant":"a""#], &[500], &[1]);
+
+    let error = arrow_record_batches_to_single_key_sum_count_delta_batch(
+        &catalog,
+        catalog.relation_schema.relation_id.as_str(),
+        catalog.relation_schema.relation_version.as_str(),
+        catalog.schema_fingerprint.as_str(),
+        &[batch],
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        IncrementalInputAdapterError::MalformedArrowInput { reason }
+            if reason.starts_with("JsonUtf8 key column contains invalid JSON")
+    ));
+}
+
+#[test]
 fn generic_catalog_incremental_input_rejects_dictionary_utf8_null_value() {
     let catalog = dictionary_customer_balance_relation_catalog(DictionaryKeyTypeV1::Int8);
     let key_values = StringArray::from(vec![Some("customer-a"), None]);
@@ -704,7 +763,7 @@ fn generic_catalog_incremental_input_rejects_unsupported_primary_key_type() {
     assert!(matches!(
         error,
         IncrementalInputAdapterError::MalformedArrowInput { reason }
-            if reason == "prototype adapter key column `account_id` must be Boolean, Utf8, Int64, Date32, TimestampNanosecond, or DictionaryUtf8"
+            if reason == "prototype adapter key column `account_id` must be Boolean, Utf8, JsonUtf8, Int64, Date32, TimestampNanosecond, or DictionaryUtf8"
     ));
 }
 
@@ -921,6 +980,16 @@ fn boolean_account_balance_relation_catalog() -> VelorixRelationCatalogV1 {
     let mut catalog = account_balance_relation_catalog();
     catalog.relation_schema.columns[0].logical_type = VelorixLogicalTypeV1::Bool;
     catalog.relation_schema.columns[0].physical_arrow_type = ArrowPhysicalTypeV1::Boolean;
+    catalog.schema_fingerprint =
+        SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema).unwrap();
+    catalog.feldera_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
+    catalog
+}
+
+fn json_account_balance_relation_catalog() -> VelorixRelationCatalogV1 {
+    let mut catalog = account_balance_relation_catalog();
+    catalog.relation_schema.columns[0].logical_type = VelorixLogicalTypeV1::Json;
+    catalog.relation_schema.columns[0].physical_arrow_type = ArrowPhysicalTypeV1::JsonUtf8;
     catalog.schema_fingerprint =
         SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema).unwrap();
     catalog.feldera_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
@@ -1167,6 +1236,26 @@ fn boolean_account_balance_input_batch(
         ])),
         vec![
             Arc::new(BooleanArray::from(account_ids.to_vec())) as ArrayRef,
+            Arc::new(Int64Array::from(balance_cents.to_vec())) as ArrayRef,
+            Arc::new(Int64Array::from(row_deltas.to_vec())) as ArrayRef,
+        ],
+    )
+    .unwrap()
+}
+
+fn json_account_balance_input_batch(
+    account_ids: &[&str],
+    balance_cents: &[i64],
+    row_deltas: &[i64],
+) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("account_id", DataType::Utf8, false),
+            Field::new("balance_cents", DataType::Int64, false),
+            Field::new("row_delta", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(account_ids.to_vec())) as ArrayRef,
             Arc::new(Int64Array::from(balance_cents.to_vec())) as ArrayRef,
             Arc::new(Int64Array::from(row_deltas.to_vec())) as ArrayRef,
         ],

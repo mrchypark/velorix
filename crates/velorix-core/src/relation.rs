@@ -529,7 +529,7 @@ pub fn arrow_record_batches_to_single_key_sum_count_delta_batch(
             }
 
             records.push(DeltaRecord::new(
-                key.delta_key(row),
+                key.delta_key(row)?,
                 DeltaValue::from_json(json!(value.value(row))),
                 weight.value(row),
             ));
@@ -734,6 +734,7 @@ fn string_column<'a>(
 enum IncrementalKeyColumn<'a> {
     Boolean(&'a BooleanArray),
     Utf8(&'a StringArray),
+    JsonUtf8(&'a StringArray),
     Int64(&'a Int64Array),
     Date32(&'a Date32Array),
     TimestampNanosecond(&'a TimestampNanosecondArray),
@@ -748,6 +749,7 @@ impl IncrementalKeyColumn<'_> {
         match self {
             Self::Boolean(column) => column.is_null(row),
             Self::Utf8(column) => column.is_null(row),
+            Self::JsonUtf8(column) => column.is_null(row),
             Self::Int64(column) => column.is_null(row),
             Self::Date32(column) => column.is_null(row),
             Self::TimestampNanosecond(column) => column.is_null(row),
@@ -766,25 +768,30 @@ impl IncrementalKeyColumn<'_> {
         }
     }
 
-    fn delta_key(&self, row: usize) -> DeltaKey {
+    fn delta_key(&self, row: usize) -> Result<DeltaKey, IncrementalInputAdapterError> {
         match self {
-            Self::Boolean(column) => DeltaKey::from_json(json!(column.value(row))),
-            Self::Utf8(column) => DeltaKey::from_json(json!(column.value(row))),
-            Self::Int64(column) => DeltaKey::from_json(json!(column.value(row))),
-            Self::Date32(column) => DeltaKey::from_json(json!(column.value(row))),
-            Self::TimestampNanosecond(column) => DeltaKey::from_json(json!(column.value(row))),
-            Self::DictionaryUtf8Int8(column, values) => {
-                DeltaKey::from_json(json!(dictionary_utf8_value(column, values, row)))
-            }
-            Self::DictionaryUtf8Int16(column, values) => {
-                DeltaKey::from_json(json!(dictionary_utf8_value(column, values, row)))
-            }
-            Self::DictionaryUtf8Int32(column, values) => {
-                DeltaKey::from_json(json!(dictionary_utf8_value(column, values, row)))
-            }
-            Self::DictionaryUtf8Int64(column, values) => {
-                DeltaKey::from_json(json!(dictionary_utf8_value(column, values, row)))
-            }
+            Self::Boolean(column) => Ok(DeltaKey::from_json(json!(column.value(row)))),
+            Self::Utf8(column) => Ok(DeltaKey::from_json(json!(column.value(row)))),
+            Self::JsonUtf8(column) => serde_json::from_str(column.value(row))
+                .map(DeltaKey::from_json)
+                .map_err(|error| IncrementalInputAdapterError::MalformedArrowInput {
+                    reason: format!("JsonUtf8 key column contains invalid JSON: {error}"),
+                }),
+            Self::Int64(column) => Ok(DeltaKey::from_json(json!(column.value(row)))),
+            Self::Date32(column) => Ok(DeltaKey::from_json(json!(column.value(row)))),
+            Self::TimestampNanosecond(column) => Ok(DeltaKey::from_json(json!(column.value(row)))),
+            Self::DictionaryUtf8Int8(column, values) => Ok(DeltaKey::from_json(json!(
+                dictionary_utf8_value(column, values, row)
+            ))),
+            Self::DictionaryUtf8Int16(column, values) => Ok(DeltaKey::from_json(json!(
+                dictionary_utf8_value(column, values, row)
+            ))),
+            Self::DictionaryUtf8Int32(column, values) => Ok(DeltaKey::from_json(json!(
+                dictionary_utf8_value(column, values, row)
+            ))),
+            Self::DictionaryUtf8Int64(column, values) => Ok(DeltaKey::from_json(json!(
+                dictionary_utf8_value(column, values, row)
+            ))),
         }
     }
 }
@@ -799,6 +806,9 @@ fn incremental_key_column<'a>(
         }
         ArrowPhysicalTypeV1::Utf8 => {
             string_column(batch, column.name.as_str()).map(IncrementalKeyColumn::Utf8)
+        }
+        ArrowPhysicalTypeV1::JsonUtf8 => {
+            string_column(batch, column.name.as_str()).map(IncrementalKeyColumn::JsonUtf8)
         }
         ArrowPhysicalTypeV1::Int64 => {
             int64_column(batch, column.name.as_str()).map(IncrementalKeyColumn::Int64)
@@ -815,7 +825,7 @@ fn incremental_key_column<'a>(
         }
         _ => Err(IncrementalInputAdapterError::MalformedArrowInput {
             reason: format!(
-                "prototype adapter key column `{}` must be Boolean, Utf8, Int64, Date32, TimestampNanosecond, or DictionaryUtf8",
+                "prototype adapter key column `{}` must be Boolean, Utf8, JsonUtf8, Int64, Date32, TimestampNanosecond, or DictionaryUtf8",
                 column.name
             ),
         }),
