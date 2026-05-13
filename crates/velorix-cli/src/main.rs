@@ -620,6 +620,23 @@ fn validate_s3_release_benchmark_gate_evidence_artifact(path: &Path) -> anyhow::
             artifact.workload
         );
     }
+    let missing_workload_metrics: Vec<&str> = S3_COMPATIBLE_BENCHMARK_GATE_WORKLOADS
+        .iter()
+        .copied()
+        .filter(|required| {
+            !artifact
+                .workload_metrics
+                .iter()
+                .any(|actual| actual == required)
+        })
+        .collect();
+    if !missing_workload_metrics.is_empty() {
+        bail!(
+            "{} benchmark gate evidence is missing required S3 workload_metrics: {}",
+            path.display(),
+            missing_workload_metrics.join(", ")
+        );
+    }
     if artifact
         .baseline_path
         .as_deref()
@@ -1050,6 +1067,7 @@ struct BenchmarkGateEvidenceArtifactV1 {
     gate_level: BenchmarkGateLevel,
     backend: BenchmarkBackend,
     workload: String,
+    workload_metrics: Vec<String>,
     baseline_path: Option<String>,
     baseline_commit: Option<String>,
     result_commit: String,
@@ -2786,6 +2804,33 @@ mod tests {
     }
 
     #[test]
+    fn readiness_report_rejects_s3_release_evidence_missing_required_workload_metric() {
+        let dir = tempdir().unwrap();
+        let readiness = dir.path().join("readiness.json");
+        let s3_gate = dir.path().join("s3-gate.json");
+        let mut artifact: serde_json::Value =
+            serde_json::from_str(&s3_release_benchmark_gate_json()).unwrap();
+        artifact
+            .get_mut("workload_metrics")
+            .and_then(|metrics| metrics.as_array_mut())
+            .unwrap()
+            .retain(|metric| metric.as_str() != Some("checkpoint_recovery"));
+        fs::write(&readiness, readiness_json()).unwrap();
+        fs::write(&s3_gate, artifact.to_string()).unwrap();
+
+        let error = read_readiness_report(
+            &readiness,
+            &ReadinessReleaseArtifactPaths {
+                s3_release_benchmark_gate_evidence: Some(s3_gate),
+                ..ReadinessReleaseArtifactPaths::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("missing required S3 workload_metrics"));
+    }
+
+    #[test]
     fn readiness_report_rejects_mismatched_feldera_release_provenance() {
         let dir = tempdir().unwrap();
         let readiness = dir.path().join("readiness.json");
@@ -3754,7 +3799,7 @@ mod tests {
             "baseline_commit": "1111111111111111111111111111111111111111",
             "result_commit": "2222222222222222222222222222222222222222",
             "max_regression_fraction": 0.10,
-            "workload_metrics": ["ingest_envelope_validation"]
+            "workload_metrics": S3_COMPATIBLE_BENCHMARK_GATE_WORKLOADS
         })
         .to_string()
     }
