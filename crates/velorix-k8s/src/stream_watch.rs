@@ -13,7 +13,7 @@ use velorix_storage::{
         ObjectStoreCapabilityProfile,
     },
     checkpoint_index::manifest_body_digest,
-    log::IngestAdmissionCoordinator,
+    log::{IngestAdmissionCoordinator, IngestAdmissionReconstructionReport},
     relation_catalog_registry::{RelationCatalogRegistry, RelationCatalogRegistryError},
     state::{CheckpointPublishError, CheckpointPublisher},
 };
@@ -86,13 +86,37 @@ impl IngestAdmissionCoordinatorProvider {
         &self.capabilities
     }
 
-    pub fn coordinator(&self) -> Result<IngestAdmissionCoordinator, StreamWatchError> {
+    fn coordinator(&self) -> Result<IngestAdmissionCoordinator, StreamWatchError> {
         IngestAdmissionCoordinator::new_checked(
             Arc::clone(&self.store),
             self.profile_for(AuthoritativeNamespace::Ingest)?,
             self.profile_for(AuthoritativeNamespace::IngestAdmission)?,
         )
         .map_err(|error| StreamWatchError::snapshot(error.to_string()))
+    }
+
+    pub async fn coordinator_after_startup_reconstruction(
+        &self,
+    ) -> Result<
+        (
+            IngestAdmissionCoordinator,
+            IngestAdmissionReconstructionReport,
+        ),
+        StreamWatchError,
+    > {
+        let coordinator = self.coordinator()?;
+        let report = coordinator
+            .reconstruct_active_admissions()
+            .await
+            .map_err(|error| StreamWatchError::snapshot(error.to_string()))?;
+
+        Ok((coordinator, report))
+    }
+
+    pub async fn startup(&self) -> Result<IngestAdmissionReconstructionReport, StreamWatchError> {
+        self.coordinator_after_startup_reconstruction()
+            .await
+            .map(|(_, report)| report)
     }
 
     fn profile_for(

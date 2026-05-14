@@ -84,6 +84,22 @@ ordinary ingest retries and is not admission evidence for committed replay.
 Until an operator-authorized deployed expiry/repair path and live restart
 evidence exist, `orphan_reserved` remains a production cutover blocker.
 
+Current local implementation exposes the restart reconstruction as a checked
+startup preflight: `IngestAdmissionCoordinator::reconstruct_active_admissions`
+reports active reservations and digest-bound expired orphan decisions, validates
+visible committed batches against the admission record's digest and relation
+metadata, and `IngestAdmissionCoordinatorProvider::startup` runs that
+reconstruction before a Kubernetes operator path exposes a coordinator. The
+provider's raw coordinator constructor is not a public production API. This is
+local preflight wiring, not live cutover evidence. The remaining row-closing
+evidence requires a deployed writer/coordinator path that calls the preflight
+before serving writers, plus authority-store evidence for live
+operator-authorized repair/expiry restart, multi-process or multi-pod overlap
+races, adjacent range races, crash/retry windows, restart reconstruction, and
+leader handoff. The available broader gates are `scripts/run-floci-s3-gate.sh`
+and `scripts/run-vind-k8s-gate.sh`, but they must include the ingest-specific
+overlap/restart scenarios before they can close this contract.
+
 ## Conflict Semantics
 
 Create-only object writes only reject identical-key conflicts. They do not
@@ -95,6 +111,7 @@ exists.
 Conflict reasons must be explicit:
 
 - `same_key_different_digest`.
+- `same_range_different_digest_reserved`.
 - `idempotency_key_reused`.
 - `range_overlap_committed`.
 - `range_overlap_reserved`.

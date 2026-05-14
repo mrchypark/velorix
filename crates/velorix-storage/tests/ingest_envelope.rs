@@ -1411,6 +1411,131 @@ async fn durable_orphan_expiry_decision_digest_mismatch_keeps_reservation_active
 }
 
 #[tokio::test]
+async fn active_admission_reconstruction_exposes_committed_and_unexpired_records() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = create_orders_relation_catalog(&store).await;
+    let log = IngestLog::new(Arc::clone(&store));
+
+    let committed_payload = catalog_envelope_bytes_for(&catalog, 0, 100);
+    let committed_admission = durable_admission_record_for_payload(committed_payload.clone());
+    put_durable_admission_record(&store, &committed_admission).await;
+    log.append_validated_envelope(committed_payload)
+        .await
+        .unwrap();
+
+    let orphan_payload = catalog_envelope_bytes_for(&catalog, 100, 200);
+    let orphan_admission = durable_admission_record_for_payload(orphan_payload);
+    put_durable_admission_record(&store, &orphan_admission).await;
+
+    let expired_payload = catalog_envelope_bytes_for(&catalog, 200, 300);
+    let expired_admission = durable_admission_record_for_payload(expired_payload);
+    put_durable_admission_record(&store, &expired_admission).await;
+    IngestAdmissionCoordinator::new(IngestLog::new(Arc::clone(&store)))
+        .expire_orphan_admission(
+            "orders",
+            7,
+            200,
+            300,
+            "repair-0001",
+            "batch_append_failed_after_admission",
+            "operator-1",
+        )
+        .await
+        .unwrap();
+
+    let report = IngestAdmissionCoordinator::new(log.clone())
+        .reconstruct_active_admissions()
+        .await
+        .unwrap();
+    let mut active = log.reconstruct_active_admissions().await.unwrap();
+    active.sort_by_key(|record| record.start_offset_inclusive);
+
+    assert_eq!(report.active_admission_records, 2);
+    assert_eq!(report.expired_orphan_admission_records, 1);
+    assert_eq!(active, vec![committed_admission, orphan_admission]);
+}
+
+#[tokio::test]
+async fn active_admission_reconstruction_rejects_committed_batch_digest_mismatch() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = create_orders_relation_catalog(&store).await;
+    let log = IngestLog::new(Arc::clone(&store));
+
+    let admitted_payload = catalog_envelope_bytes_for(&catalog, 0, 100);
+    let admission = durable_admission_record_for_payload(admitted_payload);
+    put_durable_admission_record(&store, &admission).await;
+    let conflicting_payload = IngestEnvelope::encode_batches(
+        IngestEnvelopeEncodeRequest {
+            relation_id: catalog.relation_schema.relation_id.clone(),
+            relation_version: catalog.relation_schema.relation_version.clone(),
+            schema_fingerprint: catalog.schema_fingerprint.as_str().to_string(),
+            stream_id: "orders".to_string(),
+            partition_id: 7,
+            start_offset_inclusive: 0,
+            end_offset_exclusive: 100,
+        },
+        &[valid_batch_with_different_payload()],
+    )
+    .unwrap();
+    store
+        .put_opts(
+            &Path::from(admission.batch_key.as_str()),
+            conflicting_payload.into(),
+            PutMode::Create.into(),
+        )
+        .await
+        .unwrap();
+
+    let err = log.reconstruct_active_admissions().await.unwrap_err();
+
+    assert!(matches!(
+        err,
+        IngestLogError::IngestAdmissionMismatch {
+            field: "payload_digest",
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn active_admission_reconstruction_rejects_semantically_malformed_admission_record() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = create_orders_relation_catalog(&store).await;
+    let log = IngestLog::new(Arc::clone(&store));
+    let payload = catalog_envelope_bytes_for(&catalog, 0, 100);
+    let mut admission = durable_admission_record_for_payload(payload);
+    admission.schema_fingerprint = "not-a-digest".to_string();
+    put_durable_admission_record(&store, &admission).await;
+
+    let err = log.reconstruct_active_admissions().await.unwrap_err();
+
+    assert!(matches!(
+        err,
+        IngestLogError::MalformedIngestAdmissionRecord { reason, .. }
+            if reason == "schema_fingerprint must be sha256:<64 hex chars>"
+    ));
+}
+
+#[tokio::test]
+async fn active_admission_reconstruction_rejects_unknown_admission_mode() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = create_orders_relation_catalog(&store).await;
+    let log = IngestLog::new(Arc::clone(&store));
+    let payload = catalog_envelope_bytes_for(&catalog, 0, 100);
+    let mut admission = durable_admission_record_for_payload(payload);
+    admission.admission_mode = "uncoordinated".to_string();
+    put_durable_admission_record(&store, &admission).await;
+
+    let err = log.reconstruct_active_admissions().await.unwrap_err();
+
+    assert!(matches!(
+        err,
+        IngestLogError::MalformedIngestAdmissionRecord { reason, .. }
+            if reason == "unsupported admission_mode `uncoordinated`"
+    ));
+}
+
+#[tokio::test]
 async fn durable_admission_reconstruction_fails_closed_on_unknown_admission_namespace_object() {
     let (_temp_dir, store) = temp_store();
     let catalog = create_orders_relation_catalog(&store).await;

@@ -97,6 +97,18 @@ pub struct DurableIngestAdmissionExpiryDecisionRecordV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IngestAdmissionReconstructionReport {
+    pub active_admission_records: usize,
+    pub expired_orphan_admission_records: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IngestAdmissionReconstruction {
+    active_records: Vec<DurableIngestAdmissionRecordV1>,
+    expired_orphan_admission_records: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplayCheckpoint {
     pub stream_id: String,
     pub partition_id: u32,
@@ -496,6 +508,30 @@ impl DurableIngestAdmissionRecordV1 {
                 reason: "payload_digest must be sha256:<64 hex chars>".to_string(),
             });
         }
+        if self.relation_id.trim().is_empty() {
+            return Err(IngestLogError::MalformedIngestAdmissionRecord {
+                key: self.admission_record_key.to_string(),
+                reason: "relation_id must be nonempty".to_string(),
+            });
+        }
+        if self.relation_version.trim().is_empty() {
+            return Err(IngestLogError::MalformedIngestAdmissionRecord {
+                key: self.admission_record_key.to_string(),
+                reason: "relation_version must be nonempty".to_string(),
+            });
+        }
+        if !is_sha256_digest(&self.schema_fingerprint) {
+            return Err(IngestLogError::MalformedIngestAdmissionRecord {
+                key: self.admission_record_key.to_string(),
+                reason: "schema_fingerprint must be sha256:<64 hex chars>".to_string(),
+            });
+        }
+        if self.admission_mode != "process_local_serialized" {
+            return Err(IngestLogError::MalformedIngestAdmissionRecord {
+                key: self.admission_record_key.to_string(),
+                reason: format!("unsupported admission_mode `{}`", self.admission_mode),
+            });
+        }
 
         Ok(())
     }
@@ -670,6 +706,23 @@ impl IngestAdmissionCoordinator {
         self.log.list_committed().await
     }
 
+    /// Reconstructs the durable admission namespace before exposing the
+    /// coordinator to production writers.
+    ///
+    /// This uses the same active-admission view that rejects overlapping
+    /// writes, including digest-bound orphan expiry decisions, and fails closed
+    /// on malformed or unexpected objects under `v1/ingest-admission`.
+    pub async fn reconstruct_active_admissions(
+        &self,
+    ) -> Result<IngestAdmissionReconstructionReport, IngestLogError> {
+        let reconstruction = self.log.reconstruct_admission_namespace().await?;
+
+        Ok(IngestAdmissionReconstructionReport {
+            active_admission_records: reconstruction.active_records.len(),
+            expired_orphan_admission_records: reconstruction.expired_orphan_admission_records,
+        })
+    }
+
     pub async fn expire_orphan_admission(
         &self,
         stream_id: &str,
@@ -723,6 +776,21 @@ impl IngestLog {
         profile.validate_for_velorix_durability()?;
 
         Ok(Self::new(store))
+    }
+
+    /// Reconstructs the active durable admission records from Velorix-owned
+    /// admission and expiry records.
+    ///
+    /// The reconstruction includes committed records for replay provenance,
+    /// retains unexpired reservations, ignores only digest-bound expired
+    /// orphans, and fails closed on malformed or unexpected admission namespace
+    /// objects.
+    pub async fn reconstruct_active_admissions(
+        &self,
+    ) -> Result<Vec<DurableIngestAdmissionRecordV1>, IngestLogError> {
+        self.reconstruct_admission_namespace()
+            .await
+            .map(|reconstruction| reconstruction.active_records)
     }
 
     pub async fn append(&self, batch: &IngestBatch) -> Result<(), IngestLogError> {
@@ -1034,6 +1102,14 @@ impl IngestLog {
     async fn list_active_admission_records(
         &self,
     ) -> Result<Vec<DurableIngestAdmissionRecordV1>, IngestLogError> {
+        self.reconstruct_admission_namespace()
+            .await
+            .map(|reconstruction| reconstruction.active_records)
+    }
+
+    async fn reconstruct_admission_namespace(
+        &self,
+    ) -> Result<IngestAdmissionReconstruction, IngestLogError> {
         let committed_by_key = self
             .list_committed()
             .await?
@@ -1041,20 +1117,30 @@ impl IngestLog {
             .map(|descriptor| (descriptor.object_key.clone(), descriptor))
             .collect::<HashMap<_, _>>();
         let expiry_decisions = self.list_admission_expiry_decisions().await?;
-        let active = self
-            .list_admission_record_bodies()
-            .await?
-            .into_iter()
-            .filter(|(admission_bytes, admission)| {
-                committed_by_key.contains_key(&admission.batch_key)
-                    || !expiry_decisions
-                        .iter()
-                        .any(|decision| decision.expires_admission(admission_bytes, admission))
-            })
-            .map(|(_, admission)| admission)
-            .collect();
+        let mut active_records = Vec::new();
+        let mut expired_orphan_admission_records = 0;
 
-        Ok(active)
+        for (admission_bytes, admission) in self.list_admission_record_bodies().await? {
+            let committed = committed_by_key.get(&admission.batch_key);
+            let expired = expiry_decisions
+                .iter()
+                .any(|decision| decision.expires_admission(&admission_bytes, &admission));
+
+            if let Some(descriptor) = committed {
+                self.validate_committed_admission(&admission, descriptor)
+                    .await?;
+                active_records.push(admission);
+            } else if !expired {
+                active_records.push(admission);
+            } else {
+                expired_orphan_admission_records += 1;
+            }
+        }
+
+        Ok(IngestAdmissionReconstruction {
+            active_records,
+            expired_orphan_admission_records,
+        })
     }
 
     async fn admission_has_matching_expiry(
@@ -1067,6 +1153,22 @@ impl IngestLog {
             .await?
             .iter()
             .any(|decision| decision.expires_admission(admission_bytes, admission)))
+    }
+
+    async fn validate_committed_admission(
+        &self,
+        admission: &DurableIngestAdmissionRecordV1,
+        descriptor: &IngestBatchDescriptor,
+    ) -> Result<(), IngestLogError> {
+        let bytes = self
+            .store
+            .get(&Path::from(descriptor.object_key.as_str()))
+            .await?
+            .bytes()
+            .await?;
+        let envelope = IngestEnvelope::decode(bytes)?;
+        envelope.validate_descriptor(descriptor)?;
+        validate_admission_matches_replayed_batch(admission, descriptor, &envelope)
     }
 
     async fn object_exists(&self, object_key: &ObjectKey) -> Result<bool, IngestLogError> {

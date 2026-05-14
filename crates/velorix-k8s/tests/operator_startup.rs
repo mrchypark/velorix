@@ -147,7 +147,10 @@ async fn production_ingest_admission_provider_constructs_from_validated_authorit
     .unwrap();
     let provider = IngestAdmissionCoordinatorProvider::for_production(validated);
 
-    let coordinator = provider.coordinator().unwrap();
+    let (coordinator, report) = provider
+        .coordinator_after_startup_reconstruction()
+        .await
+        .unwrap();
 
     assert_eq!(
         provider.capabilities().profiles[&AuthoritativeNamespace::Ingest].backend_name,
@@ -157,7 +160,40 @@ async fn production_ingest_admission_provider_constructs_from_validated_authorit
         provider.capabilities().profiles[&AuthoritativeNamespace::IngestAdmission].backend_name,
         "local-k8s-authority"
     );
+    assert_eq!(report.active_admission_records, 0);
+    assert_eq!(report.expired_orphan_admission_records, 0);
     assert_eq!(coordinator.list_committed().await.unwrap(), Vec::new());
+}
+
+#[tokio::test]
+async fn production_ingest_admission_provider_startup_reconstructs_admissions_before_use() {
+    let (_temp_dir, store) = temp_store();
+    store
+        .put_opts(
+            &Path::from(
+                "v1/ingest-admission/deposits/p=0000000000/ranges/00000000000000000000-00000000000000000010/notes.txt",
+            ),
+            "unexpected admission namespace object".into(),
+            PutMode::Create.into(),
+        )
+        .await
+        .unwrap();
+    let validated = validate_operator_authority(
+        authority(),
+        Arc::clone(&store),
+        "local-k8s-authority",
+        "v1/operator-startup-probes",
+    )
+    .await
+    .unwrap();
+    let provider = IngestAdmissionCoordinatorProvider::for_production(validated);
+
+    let err = provider.startup().await.unwrap_err();
+
+    assert!(
+        matches!(err, velorix_k8s::stream_watch::StreamWatchError::Snapshot { message }
+        if message.contains("unexpected object under v1/ingest-admission"))
+    );
 }
 
 fn temp_store() -> (TempDir, Arc<dyn ObjectStore>) {
