@@ -4711,7 +4711,7 @@ mod tests {
 
     fn readiness_json() -> String {
         serde_json::json!({
-            "schema_version": 3,
+            "schema_version": 4,
             "deployment_id": "prod-a",
             "authority_store_id": "s3://velorix-prod",
             "capability_status": {
@@ -4739,8 +4739,8 @@ mod tests {
             },
             "ingest_status": {
                 "status": "pass",
-                "evidence": "catalog-backed ingest admission",
-                "evidence_kind": ["catalog_backed_ingest_admission"]
+                "evidence": "catalog-backed deployed ingest admission",
+                "evidence_kind": ["catalog_backed_ingest_admission", "deployed_ingest_admission"]
             },
             "relation_catalog_status": {
                 "status": "pass",

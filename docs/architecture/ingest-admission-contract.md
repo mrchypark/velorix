@@ -46,6 +46,40 @@ advertises production multi-writer range-overlap rejection.
 separate admission status lifecycle and must not claim persistent ingest before
 the canonical batch object is created.
 
+## Admission-Before-Batch Orphans
+
+An admission-before-batch orphan is a `v1/ingest-admission/...` record whose
+canonical `v1/ingest/...` batch object is not visible. Checked recovery must
+not replay that reservation as data. The deployed coordinator must treat the
+record as a reservation until an operator explicitly repairs or expires it.
+
+Before live writer cutover, operators must run an admission-repair inspection
+against the same authority store and namespace prefix used by the deployed
+coordinator:
+
+1. List `v1/ingest-admission/{stream_id}/p=.../ranges/...` and decode each
+   admission record.
+2. For each admission record, use the recorded batch key, or derive the
+   canonical ingest batch key from the recorded stream, partition, and range.
+3. If the batch exists and its digest matches the admission record, classify
+   the reservation as `committed`.
+4. If the batch is missing, classify it as `orphan_reserved` and keep rejecting
+   overlapping writes until an operator either replays the exact same payload
+   through the coordinator or writes a durable expiry/repair decision for that
+   reservation.
+5. If the batch exists, validate the digest, relation identity, and schema
+   fingerprint against the admission record. Any mismatch is
+   `corrupt_conflict`; do not repair automatically, and block writer cutover
+   until the operator resolves the authority-store conflict.
+
+Expiry is not a time-only delete. An expiry decision must be a durable
+Velorix-owned record bound to the admission record digest, reason, operator
+identity, and observed missing batch key. It must be read during deployed
+coordinator restart reconstruction before the coordinator can stop reserving
+the orphaned range. Until that expiry record type and deployed coordinator
+reconstruction path exist, `orphan_reserved` remains a production cutover
+blocker.
+
 ## Conflict Semantics
 
 Create-only object writes only reject identical-key conflicts. They do not
@@ -68,6 +102,9 @@ Conflict reasons must be explicit:
   process-local coordinator.
 - A separate coordinator rejects a range already reserved by durable serialized
   admission evidence before any batch object is committed.
+- Admission-before-batch orphans are inspectable, remain reserved by default,
+  and can be released only by a durable expiry/repair decision read during
+  deployed coordinator restart reconstruction.
 - The same race is not claimed safe in create-only-only mode.
 - Adjacent ranges are allowed.
 - Crash-after-create-before-response retry returns `200 OK` for same digest.

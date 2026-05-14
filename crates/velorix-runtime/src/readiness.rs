@@ -4,7 +4,7 @@ use velorix_core::feldera_artifact::{
     FelderaCompileArtifactMetadata, FelderaReleaseArtifactProvenanceV1, StandingViewSpec,
 };
 
-const PRODUCTION_READINESS_SCHEMA_VERSION: u16 = 3;
+const PRODUCTION_READINESS_SCHEMA_VERSION: u16 = 4;
 const FELDERA_ARTIFACT_EVIDENCE_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,6 +56,7 @@ pub enum ReadinessEvidenceKind {
     PublishedCheckpointLifecycleRecord,
     CheckpointRecoveryTransitionRecord,
     CatalogBackedIngestAdmission,
+    DeployedIngestAdmission,
     RelationCatalogRecord,
     RelationCatalogRegistry,
     SlateDbCheckpointRef,
@@ -262,6 +263,13 @@ impl ProductionReadinessEvidenceV1 {
         {
             blocking_reasons
                 .push("ingest_status missing catalog_backed_ingest_admission evidence".to_string());
+        }
+        if !self
+            .ingest_status
+            .has_evidence(ReadinessEvidenceKind::DeployedIngestAdmission)
+        {
+            blocking_reasons
+                .push("ingest_status missing deployed_ingest_admission evidence".to_string());
         }
         if !self
             .relation_catalog_status
