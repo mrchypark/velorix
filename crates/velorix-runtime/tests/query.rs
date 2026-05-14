@@ -369,6 +369,25 @@ async fn query_recovered_materialized_view_reads_checkpointed_state_and_replayed
 }
 
 #[tokio::test]
+async fn query_recovered_materialized_view_requires_relation_catalog_record() {
+    let (_temp_dir, store) = temp_store();
+
+    let error = query_recovered_materialized_view(
+        Arc::clone(&store),
+        "select key_json, value_json, weight from input",
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RuntimeQueryError::Recovery(RecoveryError::RelationCatalogRegistry(
+            RelationCatalogRegistryError::ObjectStore(object_store::Error::NotFound { .. })
+        ))
+    ));
+}
+
+#[tokio::test]
 async fn query_recovered_materialized_view_with_policy_applies_row_limit_to_recovered_state() {
     let (_temp_dir, store) = temp_store();
     let ingest_coordinator = IngestAdmissionCoordinator::new(IngestLog::new(Arc::clone(&store)));

@@ -161,7 +161,7 @@ fn allowed_bootstrap_recovery_use(
     }
 
     if source == workspace.join("crates/velorix-runtime/src/query.rs")
-        && pattern == "RecoveredRuntime::recover("
+        && pattern == "RecoveredRuntime::recover_with_owner_and_relation_catalog_record("
         && line_is_inside_function(
             lines,
             line_number,

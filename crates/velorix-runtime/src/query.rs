@@ -31,7 +31,10 @@ use crate::benchmark_gate::ObjectRequestMetricsV1;
 use crate::object_meter::{object_request_policy_error, MeteredObjectStore, ObjectStoreMeter};
 pub use crate::query_runtime::QueryExecutionLimiter;
 use crate::query_runtime::{DataFusionSessionFactory, QueryRuntimeLimits};
-use crate::recovery::{RecoveredRuntime, RecoveryError, ORDERS_SUM_COUNT_OWNER};
+use crate::recovery::{
+    RecoveredRuntime, RecoveryError, ORDERS_SUM_COUNT_OWNER, ORDERS_SUM_COUNT_RELATION_ID,
+    ORDERS_SUM_COUNT_RELATION_VERSION,
+};
 use velorix_storage::capability::AuthoritativeObjectStoreCapabilitiesV1;
 
 #[derive(Debug, Error)]
@@ -67,7 +70,13 @@ pub async fn query_recovered_materialized_view_with_policy_and_limiter(
     validate_sql_text_policy(sql, policy).map_err(QueryError::from)?;
 
     let _permit = acquire_query_permit(policy, limiter.as_ref())?;
-    let recovered = RecoveredRuntime::recover(store).await?;
+    let recovered = RecoveredRuntime::recover_with_owner_and_relation_catalog_record(
+        store,
+        ORDERS_SUM_COUNT_OWNER,
+        ORDERS_SUM_COUNT_RELATION_ID,
+        ORDERS_SUM_COUNT_RELATION_VERSION,
+    )
+    .await?;
 
     collect_recovered_materialized_view(recovered, sql, policy)
         .await
