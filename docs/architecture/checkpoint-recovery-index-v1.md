@@ -69,8 +69,9 @@ records do not make a valid manifest invalid.
 `velorix-cli checkpoint-inspect-local --object-store-dir <path>` exposes the
 read-only admin inspection path for local object-store directories. It reports
 the latest valid checkpoint and each visible manifest with lifecycle/status
-diagnostics. When GC leaves an older parent manifest listed but deletes that
-parent's raw state/output payloads, inspection may still use the parent
+diagnostics. JSON inspection output uses `schema_version=2` when reporting
+recovery transition records. When GC leaves an older parent manifest listed but
+deletes that parent's raw state/output payloads, inspection may still use the parent
 manifest body as structural lineage evidence for newer retained checkpoints;
 the older manifest itself is reported invalid if its own payloads are missing.
 When a GC run has successfully persisted and read back its `GcRunV1` evidence,

@@ -93,6 +93,7 @@ pub struct CheckpointManifestInspection {
     pub manifest_key: ObjectKey,
     pub lifecycle_status: Option<CheckpointLifecycleStatus>,
     pub retention_record: Option<CheckpointRetentionRecordV1>,
+    pub recovery_transition_records: Vec<CheckpointRecoveryTransitionRecordV1>,
     pub status: CheckpointManifestInspectionStatus,
 }
 

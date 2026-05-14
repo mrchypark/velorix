@@ -2169,6 +2169,100 @@ async fn checkpoint_recovery_transition_record_rejects_manifest_digest_mismatch(
 }
 
 #[tokio::test]
+async fn checkpoint_admin_inspect_reports_recovery_transition_records() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(store);
+    let state = state_write(0, "state-0001", b"state-0");
+    let manifest = manifest(0, publisher.write_state_object(&state).await.unwrap());
+
+    publisher.publish_manifest(&manifest).await.unwrap();
+    publisher
+        .write_checkpoint_recovery_transition_record_with_id(
+            0,
+            "recovery-test-0002".to_string(),
+            CheckpointRecoveryMode::LatestCandidate,
+            2,
+            3,
+        )
+        .await
+        .unwrap();
+    publisher
+        .write_checkpoint_recovery_transition_record_with_id(
+            0,
+            "recovery-test-0001".to_string(),
+            CheckpointRecoveryMode::SelectedCheckpoint,
+            1,
+            2,
+        )
+        .await
+        .unwrap();
+
+    let report = publisher.inspect_checkpoints().await.unwrap();
+    let transitions = &report.manifests[0].recovery_transition_records;
+
+    assert_eq!(
+        transitions
+            .iter()
+            .map(|record| record.transition_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["recovery-test-0001", "recovery-test-0002"]
+    );
+    assert_eq!(
+        transitions[0].recovery_mode,
+        CheckpointRecoveryMode::SelectedCheckpoint
+    );
+    assert_eq!(
+        transitions[1].recovery_mode,
+        CheckpointRecoveryMode::LatestCandidate
+    );
+}
+
+#[tokio::test]
+async fn checkpoint_admin_inspect_ignores_mismatched_and_adjacent_recovery_transition_records() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let state = state_write(0, "state-0001", b"state-0");
+    let manifest = manifest(0, publisher.write_state_object(&state).await.unwrap());
+
+    publisher.publish_manifest(&manifest).await.unwrap();
+    let mut mismatched = publisher
+        .write_checkpoint_recovery_transition_record_with_id(
+            0,
+            "recovery-test-0001".to_string(),
+            CheckpointRecoveryMode::SelectedCheckpoint,
+            1,
+            2,
+        )
+        .await
+        .unwrap();
+    mismatched.manifest_digest = "sha256:mismatched".to_string();
+    store
+        .put(
+            &Path::from(
+                ObjectKey::checkpoint_recovery_transition_record(0, "recovery-test-0001")
+                    .unwrap()
+                    .as_str(),
+            ),
+            Bytes::from(serde_json::to_vec(&mismatched).unwrap()).into(),
+        )
+        .await
+        .unwrap();
+    store
+        .put(
+            &Path::from(
+                "v1/checkpoint-recovery/00000000000000000000/transitions-extra/not-a-record.json",
+            ),
+            Bytes::from_static(b"{not valid json").into(),
+        )
+        .await
+        .unwrap();
+
+    let report = publisher.inspect_checkpoints().await.unwrap();
+
+    assert!(report.manifests[0].recovery_transition_records.is_empty());
+}
+
+#[tokio::test]
 async fn checkpoint_admin_inspect_reports_last_known_good_when_future_manifest_is_corrupt() {
     let (_temp_dir, store) = temp_store();
     let publisher = CheckpointPublisher::new(Arc::clone(&store));

@@ -3,7 +3,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, BooleanArray, Date32Array, DictionaryArray, Int64Array, StringArray,
+    Array, BooleanArray, Date32Array, DictionaryArray, Float64Array, Int64Array, StringArray,
     TimestampNanosecondArray,
 };
 use arrow::datatypes::{
@@ -518,7 +518,7 @@ pub fn arrow_record_batches_to_single_key_sum_count_delta_batch(
         validate_record_batch_matches_catalog(catalog, batch)
             .map_err(incremental_input_batch_schema_error)?;
         let key = incremental_key_column(batch, key_column)?;
-        let value = int64_column(batch, value_column.name.as_str())?;
+        let value = incremental_value_column(batch, value_column)?;
         let weight = int64_column(batch, weight_column.name.as_str())?;
 
         for row in 0..batch.num_rows() {
@@ -530,7 +530,7 @@ pub fn arrow_record_batches_to_single_key_sum_count_delta_batch(
 
             records.push(DeltaRecord::new(
                 key.delta_key(row)?,
-                DeltaValue::from_json(json!(value.value(row))),
+                value.delta_value(row)?,
                 weight.value(row),
             ));
         }
@@ -744,6 +744,11 @@ enum IncrementalKeyColumn<'a> {
     DictionaryUtf8Int64(&'a DictionaryArray<Int64Type>, &'a StringArray),
 }
 
+enum IncrementalValueColumn<'a> {
+    Int64(&'a Int64Array),
+    Float64(&'a Float64Array),
+}
+
 impl IncrementalKeyColumn<'_> {
     fn is_null(&self, row: usize) -> bool {
         match self {
@@ -796,6 +801,31 @@ impl IncrementalKeyColumn<'_> {
     }
 }
 
+impl IncrementalValueColumn<'_> {
+    fn is_null(&self, row: usize) -> bool {
+        match self {
+            Self::Int64(column) => column.is_null(row),
+            Self::Float64(column) => column.is_null(row),
+        }
+    }
+
+    fn delta_value(&self, row: usize) -> Result<DeltaValue, IncrementalInputAdapterError> {
+        match self {
+            Self::Int64(column) => Ok(DeltaValue::from_json(json!(column.value(row)))),
+            Self::Float64(column) => {
+                let value = column.value(row);
+                if !value.is_finite() {
+                    return Err(IncrementalInputAdapterError::MalformedArrowInput {
+                        reason: "Float64 value column must contain only finite values".to_string(),
+                    });
+                }
+
+                Ok(DeltaValue::from_json(json!(value)))
+            }
+        }
+    }
+}
+
 fn incremental_key_column<'a>(
     batch: &'a RecordBatch,
     column: &RelationColumnV1,
@@ -826,6 +856,26 @@ fn incremental_key_column<'a>(
         _ => Err(IncrementalInputAdapterError::MalformedArrowInput {
             reason: format!(
                 "prototype adapter key column `{}` must be Boolean, Utf8, JsonUtf8, Int64, Date32, TimestampNanosecond, or DictionaryUtf8",
+                column.name
+            ),
+        }),
+    }
+}
+
+fn incremental_value_column<'a>(
+    batch: &'a RecordBatch,
+    column: &RelationColumnV1,
+) -> Result<IncrementalValueColumn<'a>, IncrementalInputAdapterError> {
+    match &column.physical_arrow_type {
+        ArrowPhysicalTypeV1::Int64 => {
+            int64_column(batch, column.name.as_str()).map(IncrementalValueColumn::Int64)
+        }
+        ArrowPhysicalTypeV1::Float64 => {
+            float64_column(batch, column.name.as_str()).map(IncrementalValueColumn::Float64)
+        }
+        _ => Err(IncrementalInputAdapterError::MalformedArrowInput {
+            reason: format!(
+                "prototype adapter value column `{}` must be Int64 or Float64",
                 column.name
             ),
         }),
@@ -922,6 +972,22 @@ fn int64_column<'a>(
         .downcast_ref::<Int64Array>()
         .ok_or_else(|| IncrementalInputAdapterError::MalformedArrowInput {
             reason: format!("`{name}` column must be Int64"),
+        })
+}
+
+fn float64_column<'a>(
+    batch: &'a RecordBatch,
+    name: &str,
+) -> Result<&'a Float64Array, IncrementalInputAdapterError> {
+    batch
+        .column_by_name(name)
+        .ok_or_else(|| IncrementalInputAdapterError::MalformedArrowInput {
+            reason: format!("missing `{name}` column"),
+        })?
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .ok_or_else(|| IncrementalInputAdapterError::MalformedArrowInput {
+            reason: format!("`{name}` column must be Float64"),
         })
 }
 

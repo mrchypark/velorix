@@ -45,6 +45,7 @@ struct InspectableCheckpointManifest {
     manifest: CheckpointManifest,
     lifecycle_status: Option<CheckpointLifecycleStatus>,
     retention_record: Option<CheckpointRetentionRecordV1>,
+    recovery_transition_records: Vec<CheckpointRecoveryTransitionRecordV1>,
     payload_status: Result<(), String>,
 }
 
@@ -725,6 +726,7 @@ impl CheckpointPublisher {
                     let checkpoint_version = inspectable.manifest.checkpoint_version;
                     let lifecycle_status = inspectable.lifecycle_status;
                     let retention_record = inspectable.retention_record;
+                    let recovery_transition_records = inspectable.recovery_transition_records;
                     let payload_status = inspectable.payload_status;
                     lineage_manifests.insert(
                         inspectable.manifest.checkpoint_version,
@@ -739,6 +741,7 @@ impl CheckpointPublisher {
                                 manifest_key,
                                 lifecycle_status,
                                 retention_record,
+                                recovery_transition_records,
                                 status: CheckpointManifestInspectionStatus::Valid,
                             }
                         }
@@ -747,6 +750,7 @@ impl CheckpointPublisher {
                             manifest_key,
                             lifecycle_status,
                             retention_record,
+                            recovery_transition_records,
                             status: CheckpointManifestInspectionStatus::Invalid { reason },
                         },
                     }
@@ -756,6 +760,7 @@ impl CheckpointPublisher {
                     manifest_key,
                     lifecycle_status: None,
                     retention_record: None,
+                    recovery_transition_records: vec![],
                     status: CheckpointManifestInspectionStatus::Invalid { reason },
                 },
             };
@@ -1631,13 +1636,59 @@ impl CheckpointPublisher {
             Some(record) if self.retention_record_matches_gc_run(&record).await => Some(record),
             _ => None,
         };
+        let recovery_transition_records = self
+            .list_checkpoint_recovery_transition_records(&manifest, &bytes)
+            .await
+            .map_err(|err| err.to_string())?;
 
         Ok(InspectableCheckpointManifest {
             manifest,
             lifecycle_status,
             retention_record,
+            recovery_transition_records,
             payload_status,
         })
+    }
+
+    async fn list_checkpoint_recovery_transition_records(
+        &self,
+        manifest: &CheckpointManifest,
+        manifest_bytes: &[u8],
+    ) -> Result<Vec<CheckpointRecoveryTransitionRecordV1>, CheckpointPublishError> {
+        let prefix = checkpoint_recovery_transition_prefix(manifest.checkpoint_version)?;
+        let objects = self
+            .store
+            .list(Some(&Path::from(prefix.as_str())))
+            .try_collect::<Vec<_>>()
+            .await?;
+        let expected_digest = manifest_digest(manifest_bytes);
+        let expected_manifest_key = manifest.object_key();
+        let mut records = Vec::new();
+
+        for object in objects {
+            let Ok(object_key) = ObjectKey::parse(object.location.to_string()) else {
+                continue;
+            };
+            let bytes = self.store.get(&object.location).await?.bytes().await?;
+            let Ok(record) = serde_json::from_slice::<CheckpointRecoveryTransitionRecordV1>(&bytes)
+            else {
+                continue;
+            };
+            if self
+                .validate_recovery_transition_record(&object_key, &record)
+                .is_err()
+            {
+                continue;
+            }
+            if record.manifest_key == expected_manifest_key
+                && record.manifest_digest == expected_digest
+            {
+                records.push(record);
+            }
+        }
+
+        records.sort_by(|left, right| left.transition_id.cmp(&right.transition_id));
+        Ok(records)
     }
 
     fn validate_lifecycle_record(
@@ -2287,6 +2338,17 @@ fn checkpoint_version_from_manifest_key(object_key: &ObjectKey) -> Result<u64, O
     version
         .parse()
         .map_err(|_| ObjectKeyError::InvalidExternalKey(value.to_string()))
+}
+
+fn checkpoint_recovery_transition_prefix(
+    checkpoint_version: u64,
+) -> Result<String, ObjectKeyError> {
+    let probe = ObjectKey::checkpoint_recovery_transition_record(checkpoint_version, "probe")?;
+    let Some(prefix) = probe.as_str().strip_suffix("probe.transition.json") else {
+        return Err(ObjectKeyError::InvalidExternalKey(probe.to_string()));
+    };
+
+    Ok(prefix.to_string())
 }
 
 impl StateObjectWrite {

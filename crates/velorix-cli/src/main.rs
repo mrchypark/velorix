@@ -1957,11 +1957,12 @@ fn format_checkpoint_inspection(inspection: &CheckpointAdminInspection) -> Strin
 
     for manifest in &inspection.manifests {
         output.push_str(&format!(
-            "checkpoint={} key={} lifecycle={} retention={} status={}\n",
+            "checkpoint={} key={} lifecycle={} retention={} recovery_transitions={} status={}\n",
             manifest.checkpoint_version,
             manifest.manifest_key,
             format_lifecycle_status(manifest.lifecycle_status),
             format_retention_status(manifest.retention_record.as_ref()),
+            manifest.recovery_transition_records.len(),
             format_manifest_status(&manifest.status),
         ));
     }
@@ -1980,7 +1981,7 @@ fn format_checkpoint_inspection_json(
     }
 
     serde_json::to_string_pretty(&CheckpointInspectionReport {
-        schema_version: 1,
+        schema_version: 2,
         inspection,
     })
     .context("failed to serialize checkpoint inspection")
@@ -4509,16 +4510,14 @@ mod tests {
     #[test]
     fn checkpoint_inspection_formatter_prints_stable_operator_summary() {
         let summary = checkpoint_inspection_summary();
-
-        assert_eq!(
-            format_checkpoint_inspection(&summary),
-            concat!(
-                "latest_valid_checkpoint=7\n",
-                "manifests:\n",
-                "checkpoint=3 key=v1/checkpoints/00000000000000000003.manifest lifecycle=published retention=gc_run=run-0001 deleted=1 status=valid\n",
-                "checkpoint=8 key=v1/checkpoints/00000000000000000008.manifest lifecycle=none retention=none status=invalid reason=missing visible parent checkpoint 7\n",
-            )
+        let expected = concat!(
+            "latest_valid_checkpoint=7\n",
+            "manifests:\n",
+            "checkpoint=3 key=v1/checkpoints/00000000000000000003.manifest lifecycle=published retention=gc_run=run-0001 deleted=1 recovery_transitions=1 status=valid\n",
+            "checkpoint=8 key=v1/checkpoints/00000000000000000008.manifest lifecycle=none retention=none recovery_transitions=0 status=invalid reason=missing visible parent checkpoint 7\n",
         );
+
+        assert_eq!(format_checkpoint_inspection(&summary), expected);
     }
 
     #[test]
@@ -4526,12 +4525,16 @@ mod tests {
         let json = format_checkpoint_inspection_json(&checkpoint_inspection_summary()).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["schema_version"], 2);
         assert_eq!(value["latest_valid_checkpoint"], 7);
         assert_eq!(value["manifests"][0]["status"], "valid");
         assert_eq!(
             value["manifests"][0]["retention_record"]["gc_run_id"],
             "run-0001"
+        );
+        assert_eq!(
+            value["manifests"][0]["recovery_transition_records"][0]["transition_id"],
+            "recovery-test-0001"
         );
         assert_eq!(
             value["manifests"][1]["status"]["invalid"]["reason"],
@@ -4622,6 +4625,7 @@ mod tests {
                     manifest_key: ObjectKey::checkpoint_manifest(3),
                     lifecycle_status: Some(CheckpointLifecycleStatus::Published),
                     retention_record: Some(checkpoint_retention_record(3)),
+                    recovery_transition_records: vec![checkpoint_recovery_transition_record(3)],
                     status: CheckpointManifestInspectionStatus::Valid,
                 },
                 CheckpointManifestInspection {
@@ -4629,6 +4633,7 @@ mod tests {
                     manifest_key: ObjectKey::checkpoint_manifest(8),
                     lifecycle_status: None,
                     retention_record: None,
+                    recovery_transition_records: vec![],
                     status: CheckpointManifestInspectionStatus::Invalid {
                         reason: "missing visible parent checkpoint\n7".to_string(),
                     },
@@ -4656,6 +4661,22 @@ mod tests {
             )
             .unwrap()],
             retained_at: "unix:0.000000001".to_string(),
+        }
+    }
+
+    fn checkpoint_recovery_transition_record(
+        checkpoint_version: u64,
+    ) -> CheckpointRecoveryTransitionRecordV1 {
+        CheckpointRecoveryTransitionRecordV1 {
+            schema_version: 1,
+            checkpoint_version,
+            transition_id: "recovery-test-0001".to_string(),
+            manifest_key: ObjectKey::checkpoint_manifest(checkpoint_version),
+            manifest_digest: "sha256:recovered".to_string(),
+            recovery_mode: CheckpointRecoveryMode::SelectedCheckpoint,
+            replay_checkpoint_count: 1,
+            replayed_batch_count: 2,
+            recovered_at: "2026-05-13T00:00:00Z".to_string(),
         }
     }
 
