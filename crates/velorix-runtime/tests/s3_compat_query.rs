@@ -53,7 +53,7 @@ use velorix_storage::{
         AuthoritativeObjectStoreCapabilitiesV1, ObjectStoreCapabilityProfile,
     },
     ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
-    log::{IngestAdmissionCoordinator, IngestLog, ReplayCheckpoint},
+    log::{IngestAdmissionCoordinator, ReplayCheckpoint},
     manifest::{CheckpointManifest, InputRange, StateObjectRef},
     relation_catalog_registry::RelationCatalogRegistry,
     state::{CheckpointPublisher, StateObjectWrite},
@@ -162,11 +162,8 @@ async fn s3_compatible_runtime_recovery_reads_checkpoint_and_replays_validated_i
         format!("{}/runtime-recovery-capability-probes", config.run_prefix),
     )
     .await?;
-    let ingest_log = IngestLog::new_checked(
-        Arc::clone(&store),
-        capability_profile(&capabilities, AuthoritativeNamespace::Ingest)?,
-    )?;
-    let ingest_coordinator = IngestAdmissionCoordinator::new(ingest_log);
+    let ingest_coordinator =
+        IngestAdmissionCoordinator::new_checked(Arc::clone(&store), &capabilities)?;
     let publisher = CheckpointPublisher::new_checked(
         Arc::clone(&store),
         capability_profile(&capabilities, AuthoritativeNamespace::Checkpoint)?,

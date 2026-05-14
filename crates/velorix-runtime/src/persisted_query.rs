@@ -263,11 +263,11 @@ pub async fn query_production_persisted_recovered_materialized_view_with_limiter
     capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
     limiter: Option<QueryExecutionLimiter>,
 ) -> Result<Vec<RecordBatch>, PersistedQueryError> {
+    let catalog = PersistedQueryStore::new_checked(Arc::clone(&store), capabilities)?;
     capabilities
         .validate_for_startup()
         .map_err(RecoveryError::from)
         .map_err(RuntimeQueryError::from)?;
-    let catalog = PersistedQueryStore::new(Arc::clone(&store));
     let spec = catalog
         .get_for_production_recovered_materialized_view(query_id)
         .await?;

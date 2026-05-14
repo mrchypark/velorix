@@ -121,7 +121,8 @@ fn production_like_ingest_harnesses_use_process_local_coordinator() {
     ] {
         let contents = fs::read_to_string(&source).expect("read production-like ingest harness");
         assert!(
-            contents.contains("IngestAdmissionCoordinator::new("),
+            contents.contains("IngestAdmissionCoordinator::new(")
+                || contents.contains("IngestAdmissionCoordinator::new_checked("),
             "{} should construct the process-local ingest admission coordinator",
             source.strip_prefix(&workspace).unwrap_or(&source).display()
         );
@@ -160,7 +161,7 @@ fn production_like_authority_harnesses_use_checked_object_store_constructors() {
         let contents = fs::read_to_string(&source).expect("read production-like authority harness");
         for required in [
             "probe_authoritative_object_store_capabilities(",
-            "IngestLog::new_checked(",
+            "IngestAdmissionCoordinator::new_checked(",
             "CheckpointPublisher::new_checked(",
             "RelationCatalogRegistry::new_checked(",
         ] {

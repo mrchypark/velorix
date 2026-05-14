@@ -87,12 +87,8 @@ impl IngestAdmissionCoordinatorProvider {
     }
 
     fn coordinator(&self) -> Result<IngestAdmissionCoordinator, StreamWatchError> {
-        IngestAdmissionCoordinator::new_checked(
-            Arc::clone(&self.store),
-            self.profile_for(AuthoritativeNamespace::Ingest)?,
-            self.profile_for(AuthoritativeNamespace::IngestAdmission)?,
-        )
-        .map_err(|error| StreamWatchError::snapshot(error.to_string()))
+        IngestAdmissionCoordinator::new_checked(Arc::clone(&self.store), &self.capabilities)
+            .map_err(|error| StreamWatchError::snapshot(error.to_string()))
     }
 
     pub async fn coordinator_after_startup_reconstruction(
@@ -117,17 +113,6 @@ impl IngestAdmissionCoordinatorProvider {
         self.coordinator_after_startup_reconstruction()
             .await
             .map(|(_, report)| report)
-    }
-
-    fn profile_for(
-        &self,
-        namespace: AuthoritativeNamespace,
-    ) -> Result<&ObjectStoreCapabilityProfile, StreamWatchError> {
-        self.capabilities.profiles.get(&namespace).ok_or_else(|| {
-            StreamWatchError::snapshot(format!(
-                "validated authority missing `{namespace}` capability evidence"
-            ))
-        })
     }
 }
 

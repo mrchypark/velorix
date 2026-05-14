@@ -53,7 +53,7 @@ use velorix_storage::{
     },
     gc::{GarbageCollectionPlan, GarbageCollectionPolicy},
     ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
-    log::{IngestAdmissionCoordinator, IngestLog},
+    log::IngestAdmissionCoordinator,
     manifest::{CheckpointManifest, InputRange},
     relation_catalog_registry::RelationCatalogRegistry,
     state::{CheckpointPublisher, OutputObjectWrite, StateObjectWrite},
@@ -100,11 +100,8 @@ async fn run() -> BenchResult<()> {
     let capability_probe_elapsed = capability_probe_started.elapsed();
     let capability_probe_requests =
         request_delta(&metered_store.snapshot(), &capability_probe_requests_before);
-    let ingest_log = IngestLog::new_checked(
-        Arc::clone(&store),
-        capability_profile(&capabilities, AuthoritativeNamespace::Ingest)?,
-    )?;
-    let ingest_coordinator = IngestAdmissionCoordinator::new(ingest_log);
+    let ingest_coordinator =
+        IngestAdmissionCoordinator::new_checked(Arc::clone(&store), &capabilities)?;
     let publisher = CheckpointPublisher::new_checked(
         Arc::clone(&store),
         capability_profile(&capabilities, AuthoritativeNamespace::Checkpoint)?,

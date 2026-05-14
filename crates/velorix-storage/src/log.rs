@@ -12,7 +12,11 @@ use thiserror::Error;
 use velorix_core::relation::{validate_record_batch_matches_catalog, RelationSchemaError};
 
 use crate::{
-    capability::{ObjectStoreCapabilityError, ObjectStoreCapabilityProfile},
+    capability::{
+        AuthoritativeNamespace, AuthoritativeObjectStoreCapabilitiesV1,
+        AuthoritativeObjectStoreCapabilityError, ObjectStoreCapabilityError,
+        ObjectStoreCapabilityProfile,
+    },
     ingest_envelope::{IngestEnvelope, IngestEnvelopeError},
     object_key::{ObjectKey, ObjectKeyError},
     relation_catalog_registry::{RelationCatalogRegistry, RelationCatalogRegistryError},
@@ -26,6 +30,7 @@ const INGEST_ADMISSION_EXPIRY_DECISION_RECORD_KIND_V1: &str =
 #[derive(Clone, Debug)]
 pub struct IngestLog {
     store: Arc<dyn ObjectStore>,
+    relation_catalog: Option<RelationCatalogRegistry>,
 }
 
 #[derive(Clone, Debug)]
@@ -202,6 +207,10 @@ pub enum IngestLogError {
     },
     #[error(transparent)]
     RelationCatalogRegistry(#[from] RelationCatalogRegistryError),
+    #[error(transparent)]
+    ObjectStoreCapability(#[from] ObjectStoreCapabilityError),
+    #[error(transparent)]
+    AuthoritativeObjectStoreCapabilities(#[from] AuthoritativeObjectStoreCapabilityError),
     #[error(transparent)]
     RelationSchema(#[from] RelationSchemaError),
     #[error(
@@ -663,16 +672,15 @@ impl IngestAdmissionCoordinator {
         }
     }
 
-    /// Constructs an ingest admission coordinator after validating the object
-    /// store profiles required for both committed ingest objects and durable
-    /// admission records.
+    /// Constructs an ingest admission coordinator from the shared startup
+    /// capability evidence required for committed ingest objects, durable
+    /// admission records, and relation-catalog reads before catalog-aware appends.
     pub fn new_checked(
         store: Arc<dyn ObjectStore>,
-        ingest_profile: &ObjectStoreCapabilityProfile,
-        ingest_admission_profile: &ObjectStoreCapabilityProfile,
-    ) -> Result<Self, ObjectStoreCapabilityError> {
-        let log = IngestLog::new_checked(store, ingest_profile)?;
-        ingest_admission_profile.validate_for_velorix_durability()?;
+        capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
+    ) -> Result<Self, AuthoritativeObjectStoreCapabilityError> {
+        capabilities.validate_namespace(AuthoritativeNamespace::IngestAdmission)?;
+        let log = IngestLog::new_catalog_checked(store, capabilities)?;
 
         Ok(Self::new(log))
     }
@@ -764,7 +772,10 @@ impl IngestLog {
     /// Constructs an ingest log without object-store capability validation.
     /// Production/durable callers should use [`Self::new_checked`].
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            relation_catalog: None,
+        }
     }
 
     /// Constructs an ingest log after validating the supplied object-store
@@ -776,6 +787,30 @@ impl IngestLog {
         profile.validate_for_velorix_durability()?;
 
         Ok(Self::new(store))
+    }
+
+    /// Constructs an ingest log from shared startup capability evidence required
+    /// for committed ingest writes and catalog-aware relation-catalog reads.
+    pub fn new_catalog_checked(
+        store: Arc<dyn ObjectStore>,
+        capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
+    ) -> Result<Self, AuthoritativeObjectStoreCapabilityError> {
+        capabilities.validate_namespace(AuthoritativeNamespace::Ingest)?;
+        let relation_catalog = RelationCatalogRegistry::new_checked(
+            Arc::clone(&store),
+            capabilities.validate_namespace(AuthoritativeNamespace::RelationCatalog)?,
+        )
+        .map_err(
+            |source| AuthoritativeObjectStoreCapabilityError::NamespaceProfile {
+                namespace: AuthoritativeNamespace::RelationCatalog,
+                source,
+            },
+        )?;
+
+        Ok(Self {
+            store,
+            relation_catalog: Some(relation_catalog),
+        })
     }
 
     /// Reconstructs the active durable admission records from Velorix-owned
@@ -866,9 +901,18 @@ impl IngestLog {
     async fn catalog_validated_batch(&self, payload: Bytes) -> Result<IngestBatch, IngestLogError> {
         let envelope = IngestEnvelope::decode(payload.clone())?;
         let header = envelope.header();
-        let catalog = RelationCatalogRegistry::new(Arc::clone(&self.store))
-            .read(&header.relation_id, &header.relation_version)
-            .await?;
+        let catalog = match &self.relation_catalog {
+            Some(registry) => {
+                registry
+                    .read(&header.relation_id, &header.relation_version)
+                    .await?
+            }
+            None => {
+                RelationCatalogRegistry::new(Arc::clone(&self.store))
+                    .read(&header.relation_id, &header.relation_version)
+                    .await?
+            }
+        };
 
         if header.schema_fingerprint != catalog.schema_fingerprint.as_str() {
             return Err(IngestLogError::RelationCatalogMismatch {

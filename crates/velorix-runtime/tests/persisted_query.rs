@@ -698,7 +698,7 @@ async fn production_persisted_recovered_query_validates_stored_sql_before_recove
 }
 
 #[tokio::test]
-async fn production_persisted_recovered_query_validates_capabilities_before_catalog_read() {
+async fn production_persisted_recovered_query_uses_checked_catalog_before_catalog_read() {
     let (_temp_dir, store) = temp_store();
     let key = ObjectKey::persisted_query("malformed-production-query").unwrap();
     store
@@ -723,13 +723,11 @@ async fn production_persisted_recovered_query_validates_capabilities_before_cata
 
     assert!(matches!(
         missing_error,
-        PersistedQueryError::RuntimeQuery(RuntimeQueryError::Recovery(
-            RecoveryError::AuthoritativeObjectStoreCapabilities(
-                AuthoritativeObjectStoreCapabilityError::MissingNamespace {
-                    namespace: AuthoritativeNamespace::Queries
-                }
-            )
-        ))
+        PersistedQueryError::ObjectStoreCapabilities(
+            AuthoritativeObjectStoreCapabilityError::MissingNamespace {
+                namespace: AuthoritativeNamespace::Queries
+            }
+        )
     ));
 
     let weak_error = query_production_persisted_recovered_materialized_view_with_limiter(
@@ -746,14 +744,12 @@ async fn production_persisted_recovered_query_validates_capabilities_before_cata
 
     assert!(matches!(
         weak_error,
-        PersistedQueryError::RuntimeQuery(RuntimeQueryError::Recovery(
-            RecoveryError::AuthoritativeObjectStoreCapabilities(
-                AuthoritativeObjectStoreCapabilityError::NamespaceProfile {
-                    namespace: AuthoritativeNamespace::Queries,
-                    ..
-                }
-            )
-        ))
+        PersistedQueryError::ObjectStoreCapabilities(
+            AuthoritativeObjectStoreCapabilityError::NamespaceProfile {
+                namespace: AuthoritativeNamespace::Queries,
+                ..
+            }
+        )
     ));
 }
 

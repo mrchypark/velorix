@@ -440,42 +440,93 @@ fn capability_gate_rejects_each_missing_capability_for_ingest_log() {
 #[test]
 fn capability_gate_rejects_missing_ingest_capability_for_ingest_admission_coordinator() {
     let (_temp_dir, store) = temp_store();
-    let ingest_profile = profile_missing(RequiredObjectStoreCapability::ConditionalCreate);
-    let ingest_admission_profile = ObjectStoreCapabilityProfile::local_development();
+    let mut profiles = all_namespace_profiles();
+    profiles.remove(&AuthoritativeNamespace::Ingest);
+    let capabilities = AuthoritativeObjectStoreCapabilitiesV1::new(profiles);
 
-    let Err(err) =
-        IngestAdmissionCoordinator::new_checked(store, &ingest_profile, &ingest_admission_profile)
-    else {
+    let Err(err) = IngestAdmissionCoordinator::new_checked(store, &capabilities) else {
         panic!("expected ingest capability validation to reject coordinator construction");
     };
 
-    assert_capability_error(
+    assert!(matches!(
         err,
-        &ingest_profile,
-        RequiredObjectStoreCapability::ConditionalCreate,
-    );
+        AuthoritativeObjectStoreCapabilityError::MissingNamespace {
+            namespace: AuthoritativeNamespace::Ingest
+        }
+    ));
 }
 
 #[test]
 fn capability_gate_rejects_missing_ingest_admission_capability_for_ingest_admission_coordinator() {
     let (_temp_dir, store) = temp_store();
-    let ingest_profile = ObjectStoreCapabilityProfile::local_development();
-    let ingest_admission_profile =
-        profile_missing(RequiredObjectStoreCapability::ConditionalCreate);
+    let mut profiles = all_namespace_profiles();
+    profiles.remove(&AuthoritativeNamespace::IngestAdmission);
+    let capabilities = AuthoritativeObjectStoreCapabilitiesV1::new(profiles);
 
-    let Err(err) =
-        IngestAdmissionCoordinator::new_checked(store, &ingest_profile, &ingest_admission_profile)
-    else {
+    let Err(err) = IngestAdmissionCoordinator::new_checked(store, &capabilities) else {
         panic!(
             "expected ingest-admission capability validation to reject coordinator construction"
         );
     };
 
-    assert_capability_error(
+    assert!(matches!(
         err,
-        &ingest_admission_profile,
-        RequiredObjectStoreCapability::ConditionalCreate,
+        AuthoritativeObjectStoreCapabilityError::MissingNamespace {
+            namespace: AuthoritativeNamespace::IngestAdmission
+        }
+    ));
+}
+
+#[test]
+fn capability_gate_rejects_missing_relation_catalog_capability_for_ingest_admission_coordinator() {
+    let (_temp_dir, store) = temp_store();
+    let mut profiles = all_namespace_profiles();
+    profiles.remove(&AuthoritativeNamespace::RelationCatalog);
+    let capabilities = AuthoritativeObjectStoreCapabilitiesV1::new(profiles);
+
+    let Err(err) = IngestAdmissionCoordinator::new_checked(store, &capabilities) else {
+        panic!(
+            "expected relation-catalog capability validation to reject coordinator construction"
+        );
+    };
+
+    assert!(matches!(
+        err,
+        AuthoritativeObjectStoreCapabilityError::MissingNamespace {
+            namespace: AuthoritativeNamespace::RelationCatalog
+        }
+    ));
+}
+
+#[test]
+fn capability_gate_rejects_weak_relation_catalog_capability_for_ingest_admission_coordinator() {
+    let (_temp_dir, store) = temp_store();
+    let mut profiles = all_namespace_profiles();
+    let relation_catalog_profile =
+        profile_missing(RequiredObjectStoreCapability::ConditionalCreate);
+    profiles.insert(
+        AuthoritativeNamespace::RelationCatalog,
+        relation_catalog_profile.clone(),
     );
+    let capabilities = AuthoritativeObjectStoreCapabilitiesV1::new(profiles);
+
+    let Err(err) = IngestAdmissionCoordinator::new_checked(store, &capabilities) else {
+        panic!(
+            "expected weak relation-catalog capability validation to reject coordinator construction"
+        );
+    };
+
+    match err {
+        AuthoritativeObjectStoreCapabilityError::NamespaceProfile { namespace, source } => {
+            assert_eq!(namespace, AuthoritativeNamespace::RelationCatalog);
+            assert_capability_error(
+                source,
+                &relation_catalog_profile,
+                RequiredObjectStoreCapability::ConditionalCreate,
+            );
+        }
+        other => panic!("expected relation-catalog namespace profile error, got {other:?}"),
+    }
 }
 
 #[test]
