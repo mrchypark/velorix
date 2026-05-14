@@ -25,17 +25,16 @@ use velorix_k8s::{
         ObjectStoreAuthorityRef, OwnerEpochStatus, VelorixWorkerShard, VelorixWorkerShardSpec,
         WorkerShardStatus,
     },
-    startup::validate_operator_authority,
+    startup::{validate_operator_authority, OperatorAuthorityStartupComponents},
     worker_shard::{
         execute_worker_shard_commands, handle_worker_shard_event,
         handle_worker_shard_event_with_command_executor,
         handle_worker_shard_event_with_output_sink, reconcile_worker_shard, worker_shard_pod_name,
-        worker_shard_watch_event, CheckpointPublisherEpochStore,
-        KubernetesPodWorkerShardCommandExecutor, ProcessWorkerShardCommandExecutor,
-        WorkerShardCommand, WorkerShardCommandExecutor, WorkerShardCommandExecutorError,
-        WorkerShardEpochStore, WorkerShardError, WorkerShardEvent, WorkerShardPodTemplate,
-        WorkerShardProcessCommand, WorkerShardReconcileConfig, WorkerShardReconcileInput,
-        WorkerShardReconcileOutput,
+        worker_shard_watch_event, KubernetesPodWorkerShardCommandExecutor,
+        ProcessWorkerShardCommandExecutor, WorkerShardCommand, WorkerShardCommandExecutor,
+        WorkerShardCommandExecutorError, WorkerShardEpochStore, WorkerShardError, WorkerShardEvent,
+        WorkerShardPodTemplate, WorkerShardProcessCommand, WorkerShardReconcileConfig,
+        WorkerShardReconcileInput, WorkerShardReconcileOutput,
     },
 };
 use velorix_storage::ownership::OwnershipEpochRecord;
@@ -50,7 +49,10 @@ async fn checkpoint_publisher_epoch_store_for_production_uses_validated_authorit
     )
     .await
     .unwrap();
-    let epoch_store = CheckpointPublisherEpochStore::for_production(validated_authority).unwrap();
+    let epoch_store =
+        OperatorAuthorityStartupComponents::from_validated_authority(validated_authority)
+            .worker_shard_epoch_store()
+            .unwrap();
     let record = epoch_record("worker-a", 1);
 
     epoch_store.create(record.clone()).await.unwrap();

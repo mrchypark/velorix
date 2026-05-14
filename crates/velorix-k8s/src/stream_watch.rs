@@ -21,7 +21,6 @@ use velorix_storage::{
 use crate::{
     controller::{reconcile_stream, AuthoritySnapshot, ControllerAction},
     crd::{CheckpointRef, ObjectStoreAuthorityRef, RelationVersionRef, VelorixStream},
-    startup::ValidatedOperatorAuthority,
     status::{KubernetesStatusError, StreamStatusApi, StreamStatusWriter},
 };
 
@@ -54,11 +53,6 @@ pub struct IngestAdmissionCoordinatorProvider {
 }
 
 impl RelationCatalogSnapshotProvider {
-    pub fn for_production(validated_authority: ValidatedOperatorAuthority) -> Self {
-        let (authority, store, capabilities) = validated_authority.into_parts();
-        Self::from_authority_parts(authority, store, Arc::new(capabilities))
-    }
-
     pub(crate) fn from_authority_parts(
         authority: ObjectStoreAuthorityRef,
         store: Arc<dyn object_store::ObjectStore>,
@@ -77,11 +71,6 @@ impl RelationCatalogSnapshotProvider {
 }
 
 impl IngestAdmissionCoordinatorProvider {
-    pub fn for_production(validated_authority: ValidatedOperatorAuthority) -> Self {
-        let (authority, store, capabilities) = validated_authority.into_parts();
-        Self::from_authority_parts(authority, store, Arc::new(capabilities))
-    }
-
     pub(crate) fn from_authority_parts(
         authority: ObjectStoreAuthorityRef,
         store: Arc<dyn object_store::ObjectStore>,

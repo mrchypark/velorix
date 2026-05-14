@@ -14,7 +14,11 @@ route provider and epoch-store construction through
 `OperatorAuthorityStartupComponents`, the shared startup component object built
 from validated object-store authority evidence, rather than direct
 per-component production constructors. This narrows the local deployment/runtime
-construction gap without marking the row complete.
+construction gap without marking the row complete. The per-component Kubernetes
+`for_production` constructors have also been removed from the public assembly
+surface, so production-style tests and runtime assembly must construct
+relation-snapshot, ingest-admission, and worker-epoch-store components through
+the shared startup component object.
 
 Velorix 1.0 also includes the cross-cutting API serving scope in
 `api-serving-scope-v1.md`: governed endpoints, parameter validation,

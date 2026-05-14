@@ -1,4 +1,4 @@
-use std::{fmt, sync::Arc};
+use std::{fmt, fs, sync::Arc};
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -15,10 +15,7 @@ use velorix_k8s::{
     startup::{
         validate_operator_authority, OperatorAuthorityStartupComponents, OperatorStartupError,
     },
-    stream_watch::{
-        AuthoritySnapshotProvider, IngestAdmissionCoordinatorProvider,
-        RelationCatalogSnapshotProvider,
-    },
+    stream_watch::AuthoritySnapshotProvider,
     worker_shard::WorkerShardEpochStore,
 };
 use velorix_storage::{
@@ -98,7 +95,8 @@ async fn production_snapshot_provider_uses_validated_operator_authority() {
     )
     .await
     .unwrap();
-    let provider = RelationCatalogSnapshotProvider::for_production(validated);
+    let provider = OperatorAuthorityStartupComponents::from_validated_authority(validated)
+        .relation_snapshot_provider();
 
     let snapshot = provider.snapshot_for_stream(&stream()).await.unwrap();
     let ControllerAction::WriteStreamStatus(status) = reconcile_stream(&stream(), &snapshot).action;
@@ -123,7 +121,8 @@ async fn production_snapshot_provider_reads_from_validated_store_only() {
     )
     .await
     .unwrap();
-    let provider = RelationCatalogSnapshotProvider::for_production(validated);
+    let provider = OperatorAuthorityStartupComponents::from_validated_authority(validated)
+        .relation_snapshot_provider();
 
     let snapshot = provider.snapshot_for_stream(&stream()).await.unwrap();
     let ControllerAction::WriteStreamStatus(status) = reconcile_stream(&stream(), &snapshot).action;
@@ -149,7 +148,8 @@ async fn production_ingest_admission_provider_constructs_from_validated_authorit
     )
     .await
     .unwrap();
-    let provider = IngestAdmissionCoordinatorProvider::for_production(validated);
+    let provider = OperatorAuthorityStartupComponents::from_validated_authority(validated)
+        .ingest_admission_coordinator_provider();
 
     let (coordinator, report) = provider
         .coordinator_after_startup_reconstruction()
@@ -190,7 +190,8 @@ async fn production_ingest_admission_provider_startup_reconstructs_admissions_be
     )
     .await
     .unwrap();
-    let provider = IngestAdmissionCoordinatorProvider::for_production(validated);
+    let provider = OperatorAuthorityStartupComponents::from_validated_authority(validated)
+        .ingest_admission_coordinator_provider();
 
     let err = provider.startup().await.unwrap_err();
 
@@ -302,6 +303,11 @@ async fn operator_authority_startup_components_preflight_fails_before_component_
 fn live_gate_sources_construct_production_components_through_operator_startup_components() {
     for (path, source, forbidden) in [
         (
+            "stream_watch.rs",
+            include_str!("stream_watch.rs"),
+            "RelationCatalogSnapshotProvider::for_production",
+        ),
+        (
             "live_ingest_admission.rs",
             include_str!("live_ingest_admission.rs"),
             "IngestAdmissionCoordinatorProvider::for_production",
@@ -321,6 +327,32 @@ fn live_gate_sources_construct_production_components_through_operator_startup_co
             !source_code.contains(forbidden),
             "{path} must not directly call {forbidden}",
         );
+    }
+}
+
+#[test]
+fn k8s_src_runtime_assembly_does_not_call_direct_production_constructors() {
+    let forbidden = [
+        "RelationCatalogSnapshotProvider::for_production",
+        "IngestAdmissionCoordinatorProvider::for_production",
+        "CheckpointPublisherEpochStore::for_production",
+    ];
+    let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+
+    for entry in fs::read_dir(&src_dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
+            continue;
+        }
+
+        let source_code = strip_line_comments(&fs::read_to_string(&path).unwrap());
+        for forbidden_call in forbidden {
+            assert!(
+                !source_code.contains(forbidden_call),
+                "{} must route live gate construction through OperatorAuthorityStartupComponents, not {forbidden_call}",
+                path.display(),
+            );
+        }
     }
 }
 

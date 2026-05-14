@@ -9,7 +9,7 @@ use velorix_k8s::{
         CheckpointRef, ConditionState, ObjectStoreAuthorityRef, RelationVersionRef, StreamStatus,
         VelorixCondition, VelorixStream, VelorixStreamSpec,
     },
-    startup::validate_operator_authority,
+    startup::{validate_operator_authority, OperatorAuthorityStartupComponents},
     status::{KubernetesStatusError, StreamStatusApi, StreamStatusWriter},
     stream_watch::{
         handle_stream_event, AuthoritySnapshotProvider, RelationCatalogSnapshotProvider,
@@ -186,7 +186,8 @@ async fn production_relation_catalog_snapshot_provider_retains_validated_capabil
     .unwrap();
     let expected_capabilities = validated.capabilities().clone();
 
-    let provider = RelationCatalogSnapshotProvider::for_production(validated);
+    let provider = OperatorAuthorityStartupComponents::from_validated_authority(validated)
+        .relation_snapshot_provider();
 
     assert_eq!(provider.capabilities(), &expected_capabilities);
     assert_eq!(
@@ -488,7 +489,8 @@ async fn production_provider_for(
     .await
     .unwrap();
 
-    RelationCatalogSnapshotProvider::for_production(validated)
+    OperatorAuthorityStartupComponents::from_validated_authority(validated)
+        .relation_snapshot_provider()
 }
 
 async fn create_relation_catalog(store: &Arc<dyn ObjectStore>) {
