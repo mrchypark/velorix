@@ -112,15 +112,18 @@ pub async fn query_production_persisted_object_backed_view_with_limiter(
             .map_err(PersistedViewError::TableCatalog)?;
     reject_cross_tenant_production_view(request.tenant_id, &table)
         .map_err(PersistedViewError::TableCatalog)?;
-    let capabilities = request
+    request
         .registry
         .production_capabilities(&table.store_id)
         .map_err(PersistedTableError::from)
         .map_err(PersistedViewError::TableCatalog)?;
-    let relation_catalog =
-        read_pinned_relation_catalog(Arc::clone(&relation_catalog_store), capabilities, &table)
-            .await
-            .map_err(PersistedViewError::TableCatalog)?;
+    let relation_catalog = read_pinned_relation_catalog(
+        Arc::clone(&relation_catalog_store),
+        request.startup_capabilities,
+        &table,
+    )
+    .await
+    .map_err(PersistedViewError::TableCatalog)?;
     let production_policy = QueryPolicyCatalogStore::new_checked(
         Arc::clone(&policy_catalog_store),
         request.startup_capabilities,
@@ -159,11 +162,11 @@ pub async fn query_production_persisted_object_backed_view_with_limiter(
 
 async fn read_pinned_relation_catalog(
     relation_catalog_store: Arc<dyn ObjectStore>,
-    capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
+    startup_capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
     table: &ProductionPersistedTableSpec,
 ) -> Result<VelorixRelationCatalogV1, PersistedTableError> {
     let relation_catalog =
-        production_relation_catalog_registry(relation_catalog_store, capabilities)?
+        production_relation_catalog_registry(relation_catalog_store, startup_capabilities)?
             .read(&table.relation_id, &table.relation_version)
             .await?;
     let catalog_fingerprint = relation_catalog.schema_fingerprint.as_str();

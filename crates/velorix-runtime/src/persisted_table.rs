@@ -117,6 +117,10 @@ pub enum PersistedTableError {
     MalformedTableUrl(url::ParseError),
     #[error("raw URL table spec is not allowed for production table scans")]
     RawUrlProductionSpec,
+    #[error(
+        "production persisted table catalog requires shared startup object-store capability evidence"
+    )]
+    MissingProductionAuthorityEvidence,
     #[error("cross-tenant object key prefix for tenant {tenant_id}: {object_key_prefix}")]
     CrossTenantPrefix {
         tenant_id: String,
@@ -142,11 +146,15 @@ pub enum PersistedTableError {
 #[derive(Clone, Debug)]
 pub struct PersistedTableStore {
     store: Arc<dyn ObjectStore>,
+    production_authority_validated: bool,
 }
 
 impl PersistedTableStore {
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            production_authority_validated: false,
+        }
     }
 
     pub fn new_checked(
@@ -155,7 +163,10 @@ impl PersistedTableStore {
     ) -> Result<Self, PersistedTableError> {
         capabilities.validate_namespace(AuthoritativeNamespace::TableCatalog)?;
 
-        Ok(Self { store })
+        Ok(Self {
+            store,
+            production_authority_validated: true,
+        })
     }
 
     pub async fn create(
@@ -219,6 +230,7 @@ impl PersistedTableStore {
         startup_capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
         request: CreateProductionPersistedTableSpecRequest,
     ) -> Result<ProductionPersistedTableSpec, PersistedTableError> {
+        self.require_production_authority()?;
         startup_capabilities.validate_namespace(AuthoritativeNamespace::TableCatalog)?;
         let spec = ProductionPersistedTableSpec {
             schema_version: PERSISTED_TABLE_SCHEMA_VERSION,
@@ -271,6 +283,7 @@ impl PersistedTableStore {
         &self,
         table_id: &str,
     ) -> Result<ProductionPersistedTableSpec, PersistedTableError> {
+        self.require_production_authority()?;
         let object_key = ObjectKey::query_table(table_id)?;
         let bytes = self
             .store
@@ -299,6 +312,14 @@ impl PersistedTableStore {
         validate_production_table_fields(&spec)?;
 
         Ok(spec)
+    }
+
+    fn require_production_authority(&self) -> Result<(), PersistedTableError> {
+        if self.production_authority_validated {
+            Ok(())
+        } else {
+            Err(PersistedTableError::MissingProductionAuthorityEvidence)
+        }
     }
 }
 
@@ -383,10 +404,10 @@ pub async fn query_production_persisted_object_backed_input_with_limiter_and_met
     let catalog = PersistedTableStore::new_checked(catalog_store, request.startup_capabilities)?;
     let spec = catalog.get_production(request.table_id).await?;
     reject_cross_tenant_production_query(request.tenant_id, &spec)?;
-    let capabilities = request.registry.production_capabilities(&spec.store_id)?;
+    request.registry.production_capabilities(&spec.store_id)?;
     let relation_catalog = read_matching_relation_catalog(
         relation_catalog_store,
-        capabilities,
+        request.startup_capabilities,
         &spec.relation_id,
         &spec.relation_version,
         &spec.schema_fingerprint,
@@ -419,10 +440,10 @@ pub async fn query_production_persisted_object_backed_input_with_limiter(
     let catalog = PersistedTableStore::new_checked(catalog_store, request.startup_capabilities)?;
     let spec = catalog.get_production(request.table_id).await?;
     reject_cross_tenant_production_query(request.tenant_id, &spec)?;
-    let capabilities = request.registry.production_capabilities(&spec.store_id)?;
+    request.registry.production_capabilities(&spec.store_id)?;
     let relation_catalog = read_matching_relation_catalog(
         relation_catalog_store,
-        capabilities,
+        request.startup_capabilities,
         &spec.relation_id,
         &spec.relation_version,
         &spec.schema_fingerprint,
@@ -619,12 +640,13 @@ fn validate_production_table_fields(
 
 async fn read_matching_relation_catalog(
     relation_catalog_store: Arc<dyn ObjectStore>,
-    capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
+    startup_capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
     relation_id: &str,
     relation_version: &str,
     schema_fingerprint: &str,
 ) -> Result<VelorixRelationCatalogV1, PersistedTableError> {
-    let registry = production_relation_catalog_registry(relation_catalog_store, capabilities)?;
+    let registry =
+        production_relation_catalog_registry(relation_catalog_store, startup_capabilities)?;
     let relation_catalog = registry.read(relation_id, relation_version).await?;
     let catalog_fingerprint = relation_catalog.schema_fingerprint.as_str();
     if catalog_fingerprint != schema_fingerprint {
@@ -641,9 +663,9 @@ async fn read_matching_relation_catalog(
 
 pub(crate) fn production_relation_catalog_registry(
     relation_catalog_store: Arc<dyn ObjectStore>,
-    capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
+    startup_capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
 ) -> Result<RelationCatalogRegistry, PersistedTableError> {
-    let profile = capabilities
+    let profile = startup_capabilities
         .validate_namespace(AuthoritativeNamespace::RelationCatalog)
         .map_err(|source| StorageRegistryError::ObjectStoreCapabilities(source))?;
 

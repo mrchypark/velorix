@@ -450,6 +450,43 @@ async fn production_persisted_object_backed_view_rejects_missing_capabilities_be
 }
 
 #[tokio::test]
+async fn production_persisted_object_backed_view_uses_startup_capabilities_for_relation_catalog() {
+    let (_temp_dir, catalog_store) = temp_store();
+    create_production_table_with_policy(
+        &catalog_store,
+        production_policy_with(QueryPolicy::default()),
+    )
+    .await;
+    overwrite_orders_relation_catalog_with_malformed_json(&catalog_store).await;
+    let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
+    let mut registry = StorageRegistry::new();
+    register_production_scan_store(&mut registry, scan_store, Arc::clone(&catalog_store)).await;
+
+    let error = query_production_persisted_object_backed_view(
+        Arc::clone(&catalog_store),
+        Arc::clone(&catalog_store),
+        Arc::clone(&catalog_store),
+        &registry,
+        &capabilities_with_weak_namespace(AuthoritativeNamespace::RelationCatalog),
+        "tenant-a",
+        "orders-current",
+        "orders-view",
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        PersistedViewError::TableCatalog(PersistedTableError::StorageRegistry(
+            velorix_runtime::storage_registry::StorageRegistryError::ObjectStoreCapabilities(
+                AuthoritativeObjectStoreCapabilityError::NamespaceProfile { namespace, source }
+            )
+        )) if namespace == AuthoritativeNamespace::RelationCatalog
+            && source.required_capability() == RequiredObjectStoreCapability::ConditionalCreate
+    ));
+}
+
+#[tokio::test]
 async fn production_persisted_object_backed_view_rejects_missing_query_capabilities_before_malformed_query_json(
 ) {
     let (_temp_dir, catalog_store) = temp_store();
@@ -807,7 +844,8 @@ async fn write_malformed_persisted_query_json(
 }
 
 async fn create_production_persisted_query(catalog_store: &Arc<dyn ObjectStore>) {
-    PersistedQueryStore::new(Arc::clone(catalog_store))
+    PersistedQueryStore::new_checked(Arc::clone(catalog_store), &all_namespace_capabilities())
+        .unwrap()
         .create_for_production_relation(
             "orders-view",
             "select account_id, value, weight from orders order by account_id",

@@ -36,6 +36,10 @@ pub enum QueryPolicyCatalogError {
     ObjectKey(#[from] ObjectKeyError),
     #[error(transparent)]
     ObjectStoreCapabilities(#[from] AuthoritativeObjectStoreCapabilityError),
+    #[error(
+        "production query policy catalog requires shared startup object-store capability evidence"
+    )]
+    MissingProductionAuthorityEvidence,
     #[error("unsupported query policy catalog schema version {schema_version}")]
     UnsupportedSchemaVersion { schema_version: u32 },
     #[error("query policy tenant id mismatch: expected {expected}, got {actual}")]
@@ -47,11 +51,15 @@ pub enum QueryPolicyCatalogError {
 #[derive(Clone, Debug)]
 pub struct QueryPolicyCatalogStore {
     store: Arc<dyn ObjectStore>,
+    production_authority_validated: bool,
 }
 
 impl QueryPolicyCatalogStore {
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            production_authority_validated: false,
+        }
     }
 
     pub fn new_checked(
@@ -60,7 +68,10 @@ impl QueryPolicyCatalogStore {
     ) -> Result<Self, QueryPolicyCatalogError> {
         capabilities.validate_namespace(AuthoritativeNamespace::QueryPolicy)?;
 
-        Ok(Self { store })
+        Ok(Self {
+            store,
+            production_authority_validated: true,
+        })
     }
 
     pub async fn create(
@@ -95,6 +106,7 @@ impl QueryPolicyCatalogStore {
         query_policy_id: &str,
         policy: QueryExecutionPolicyV1,
     ) -> Result<QueryPolicyCatalogRecord, QueryPolicyCatalogError> {
+        self.require_production_authority()?;
         policy.validate_production_table_scan()?;
 
         self.create(tenant_id, query_policy_id, policy).await
@@ -141,10 +153,19 @@ impl QueryPolicyCatalogStore {
         tenant_id: &str,
         query_policy_id: &str,
     ) -> Result<QueryPolicyCatalogRecord, QueryPolicyCatalogError> {
+        self.require_production_authority()?;
         let record = self.get(tenant_id, query_policy_id).await?;
         record.policy.validate_production_table_scan()?;
 
         Ok(record)
+    }
+
+    fn require_production_authority(&self) -> Result<(), QueryPolicyCatalogError> {
+        if self.production_authority_validated {
+            Ok(())
+        } else {
+            Err(QueryPolicyCatalogError::MissingProductionAuthorityEvidence)
+        }
     }
 }
 

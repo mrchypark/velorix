@@ -56,6 +56,10 @@ pub enum PersistedQueryError {
     RelationSchema(#[from] RelationSchemaError),
     #[error(transparent)]
     ObjectStoreCapabilities(#[from] AuthoritativeObjectStoreCapabilityError),
+    #[error(
+        "production persisted query catalog requires shared startup object-store capability evidence"
+    )]
+    MissingProductionAuthorityEvidence,
     #[error("unsupported persisted query schema version {schema_version}")]
     UnsupportedSchemaVersion { schema_version: u32 },
     #[error("persisted query id mismatch: expected {expected}, got {actual}")]
@@ -65,11 +69,15 @@ pub enum PersistedQueryError {
 #[derive(Clone, Debug)]
 pub struct PersistedQueryStore {
     store: Arc<dyn ObjectStore>,
+    production_authority_validated: bool,
 }
 
 impl PersistedQueryStore {
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            production_authority_validated: false,
+        }
     }
 
     pub fn new_checked(
@@ -78,7 +86,10 @@ impl PersistedQueryStore {
     ) -> Result<Self, PersistedQueryError> {
         capabilities.validate_namespace(AuthoritativeNamespace::Queries)?;
 
-        Ok(Self { store })
+        Ok(Self {
+            store,
+            production_authority_validated: true,
+        })
     }
 
     pub async fn create(
@@ -98,6 +109,7 @@ impl PersistedQueryStore {
         policy: QueryPolicy,
         relation_catalog: &VelorixRelationCatalogV1,
     ) -> Result<PersistedQuerySpec, PersistedQueryError> {
+        self.require_production_authority()?;
         validate_production_relation_query(sql, policy, relation_catalog).await?;
         self.write_create(query_id, sql, policy).await
     }
@@ -157,6 +169,7 @@ impl PersistedQueryStore {
         query_id: &str,
         relation_catalog: &VelorixRelationCatalogV1,
     ) -> Result<PersistedQuerySpec, PersistedQueryError> {
+        self.require_production_authority()?;
         let spec = self.get(query_id).await?;
         validate_production_relation_query(&spec.sql, spec.policy, relation_catalog).await?;
 
@@ -169,6 +182,7 @@ impl PersistedQueryStore {
         relation_catalog: &VelorixRelationCatalogV1,
         production_policy: QueryPolicy,
     ) -> Result<PersistedQuerySpec, PersistedQueryError> {
+        self.require_production_authority()?;
         let spec = self.get(query_id).await?;
         validate_production_relation_query(&spec.sql, production_policy, relation_catalog).await?;
 
@@ -179,10 +193,19 @@ impl PersistedQueryStore {
         &self,
         query_id: &str,
     ) -> Result<PersistedQuerySpec, PersistedQueryError> {
+        self.require_production_authority()?;
         let spec = self.get(query_id).await?;
         validate_input_query_with_policy(&spec.sql, spec.policy).await?;
 
         Ok(spec)
+    }
+
+    fn require_production_authority(&self) -> Result<(), PersistedQueryError> {
+        if self.production_authority_validated {
+            Ok(())
+        } else {
+            Err(PersistedQueryError::MissingProductionAuthorityEvidence)
+        }
     }
 }
 

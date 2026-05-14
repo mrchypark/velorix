@@ -276,9 +276,31 @@ async fn query_policy_catalog_generic_create_and_get_allow_default_policy() {
 }
 
 #[tokio::test]
-async fn query_policy_catalog_production_create_and_get_reject_default_policy() {
+async fn unchecked_query_policy_catalog_rejects_production_create_before_policy_validation() {
     let (_temp_dir, store) = temp_store();
     let catalog = QueryPolicyCatalogStore::new(Arc::clone(&store));
+
+    let error = catalog
+        .create_for_production_table_scan(
+            "tenant-a",
+            "production",
+            fully_bounded_production_policy(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        QueryPolicyCatalogError::MissingProductionAuthorityEvidence
+    ));
+}
+
+#[tokio::test]
+async fn query_policy_catalog_production_create_and_get_reject_default_policy() {
+    let (_temp_dir, store) = temp_store();
+    let catalog =
+        QueryPolicyCatalogStore::new_checked(Arc::clone(&store), &all_namespace_capabilities())
+            .unwrap();
 
     let create_error = catalog
         .create_for_production_table_scan(
@@ -317,7 +339,9 @@ async fn query_policy_catalog_production_create_and_get_reject_default_policy() 
 #[tokio::test]
 async fn query_policy_catalog_production_create_and_get_accept_fully_bounded_policy() {
     let (_temp_dir, store) = temp_store();
-    let catalog = QueryPolicyCatalogStore::new(Arc::clone(&store));
+    let catalog =
+        QueryPolicyCatalogStore::new_checked(Arc::clone(&store), &all_namespace_capabilities())
+            .unwrap();
     let policy = fully_bounded_production_policy();
 
     let created = catalog

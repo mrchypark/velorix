@@ -132,9 +132,32 @@ async fn persisted_query_store_does_not_write_catalog_object_when_sql_is_invalid
 }
 
 #[tokio::test]
-async fn persisted_query_store_creates_production_relation_query_against_catalog_table() {
+async fn unchecked_persisted_query_store_rejects_production_relation_create_before_validation() {
     let (_temp_dir, store) = temp_store();
     let catalog = PersistedQueryStore::new(Arc::clone(&store));
+    let relation_catalog = orders_relation_catalog();
+
+    let error = catalog
+        .create_for_production_relation(
+            "orders-production",
+            "select account_id, value, weight from orders",
+            QueryPolicy::default(),
+            &relation_catalog,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        PersistedQueryError::MissingProductionAuthorityEvidence
+    ));
+}
+
+#[tokio::test]
+async fn persisted_query_store_creates_production_relation_query_against_catalog_table() {
+    let (_temp_dir, store) = temp_store();
+    let catalog =
+        PersistedQueryStore::new_checked(Arc::clone(&store), &local_capabilities()).unwrap();
     let relation_catalog = orders_relation_catalog();
 
     let created = catalog
@@ -157,7 +180,8 @@ async fn persisted_query_store_creates_production_relation_query_against_catalog
 #[tokio::test]
 async fn persisted_query_store_rejects_input_query_for_production_relation_before_writing() {
     let (_temp_dir, store) = temp_store();
-    let catalog = PersistedQueryStore::new(Arc::clone(&store));
+    let catalog =
+        PersistedQueryStore::new_checked(Arc::clone(&store), &local_capabilities()).unwrap();
     let relation_catalog = orders_relation_catalog();
 
     let error = catalog
