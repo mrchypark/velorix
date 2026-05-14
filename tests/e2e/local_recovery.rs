@@ -19,8 +19,9 @@ use velorix_runtime::recovery::{
     ORDERS_SUM_COUNT_RELATION_ID, ORDERS_SUM_COUNT_RELATION_VERSION,
 };
 use velorix_storage::{
+    capability::ObjectStoreCapabilityProfile,
     ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
-    log::{IngestBatch, IngestLog},
+    log::{IngestAdmissionCoordinator, IngestBatch, IngestLog},
     manifest::{CheckpointManifest, InputRange, OutputObjectRef, StateObjectRef, StateRefType},
     object_key::ObjectKey,
     relation_catalog_registry::RelationCatalogRegistry,
@@ -34,6 +35,16 @@ fn temp_store() -> (TempDir, Arc<dyn ObjectStore>) {
     let store = LocalFileSystem::new_with_prefix(temp_dir.path()).unwrap();
 
     (temp_dir, Arc::new(store))
+}
+
+fn local_object_store_profile() -> ObjectStoreCapabilityProfile {
+    ObjectStoreCapabilityProfile::local_development()
+}
+
+fn local_ingest_coordinator(store: Arc<dyn ObjectStore>) -> IngestAdmissionCoordinator {
+    IngestAdmissionCoordinator::new(
+        IngestLog::new_checked(store, &local_object_store_profile()).unwrap(),
+    )
 }
 
 async fn recover_with_catalog_record(
@@ -98,14 +109,15 @@ fn ingest_record_batch(input: &DeltaBatch) -> RecordBatch {
 
 async fn append_ingest_envelope(
     store: Arc<dyn ObjectStore>,
-    ingest_log: &IngestLog,
+    ingest_coordinator: &IngestAdmissionCoordinator,
     stream_id: &str,
     partition_id: u32,
     start_offset_inclusive: u64,
     end_offset_exclusive: u64,
     input: &DeltaBatch,
 ) {
-    let registry = RelationCatalogRegistry::new(store);
+    let registry =
+        RelationCatalogRegistry::new_checked(store, &local_object_store_profile()).unwrap();
     registry
         .create(&orders_sum_count_relation_catalog().unwrap())
         .await
@@ -131,7 +143,7 @@ async fn append_ingest_envelope(
     )
     .unwrap();
 
-    ingest_log
+    ingest_coordinator
         .append_catalog_validated_envelope(bytes)
         .await
         .unwrap();
@@ -259,7 +271,7 @@ async fn write_engine_checkpoint_state(
 #[tokio::test]
 async fn local_recovery_recovers_checkpointed_view_and_replays_only_later_ingest_batches() {
     let (_temp_dir, store) = temp_store();
-    let ingest_log = IngestLog::new(Arc::clone(&store));
+    let ingest_coordinator = local_ingest_coordinator(Arc::clone(&store));
     let publisher = CheckpointPublisher::new(Arc::clone(&store));
 
     let first_input = batch([
@@ -275,7 +287,7 @@ async fn local_recovery_recovers_checkpointed_view_and_replays_only_later_ingest
 
     append_ingest_envelope(
         Arc::clone(&store),
-        &ingest_log,
+        &ingest_coordinator,
         "orders",
         0,
         0,
@@ -285,7 +297,7 @@ async fn local_recovery_recovers_checkpointed_view_and_replays_only_later_ingest
     .await;
     append_ingest_envelope(
         Arc::clone(&store),
-        &ingest_log,
+        &ingest_coordinator,
         "orders",
         0,
         3,
@@ -314,7 +326,7 @@ async fn local_recovery_recovers_checkpointed_view_and_replays_only_later_ingest
         .unwrap();
 
     drop(checkpointed_view);
-    drop(ingest_log);
+    drop(ingest_coordinator);
     drop(publisher);
 
     let recovered = recover_with_catalog_record(Arc::clone(&store))
@@ -337,7 +349,7 @@ async fn local_recovery_recovers_checkpointed_view_and_replays_only_later_ingest
 async fn slatedb_local_recovery_recovers_reopened_checkpoint_state_and_replays_only_later_ingest_batches(
 ) {
     let (_temp_dir, store) = temp_store();
-    let ingest_log = IngestLog::new(Arc::clone(&store));
+    let ingest_coordinator = local_ingest_coordinator(Arc::clone(&store));
     let publisher =
         CheckpointPublisher::with_slatedb_state_store(Arc::clone(&store), "v1/slatedb/state")
             .await
@@ -354,7 +366,7 @@ async fn slatedb_local_recovery_recovers_reopened_checkpoint_state_and_replays_o
 
     append_ingest_envelope(
         Arc::clone(&store),
-        &ingest_log,
+        &ingest_coordinator,
         "orders",
         0,
         0,
@@ -364,7 +376,7 @@ async fn slatedb_local_recovery_recovers_reopened_checkpoint_state_and_replays_o
     .await;
     append_ingest_envelope(
         Arc::clone(&store),
-        &ingest_log,
+        &ingest_coordinator,
         "orders",
         0,
         2,
@@ -395,7 +407,7 @@ async fn slatedb_local_recovery_recovers_reopened_checkpoint_state_and_replays_o
         .unwrap();
 
     drop(checkpointed_view);
-    drop(ingest_log);
+    drop(ingest_coordinator);
     drop(publisher);
 
     let recovered = RecoveredRuntime::recover_with_slatedb_state_store_and_relation_catalog(
@@ -422,7 +434,7 @@ async fn slatedb_local_recovery_recovers_reopened_checkpoint_state_and_replays_o
 #[tokio::test]
 async fn slatedb_local_recovery_can_use_selected_published_checkpoint() {
     let (_temp_dir, store) = temp_store();
-    let ingest_log = IngestLog::new(Arc::clone(&store));
+    let ingest_coordinator = local_ingest_coordinator(Arc::clone(&store));
     let publisher =
         CheckpointPublisher::with_slatedb_state_store(Arc::clone(&store), "v1/slatedb/state")
             .await
@@ -433,7 +445,7 @@ async fn slatedb_local_recovery_can_use_selected_published_checkpoint() {
 
     append_ingest_envelope(
         Arc::clone(&store),
-        &ingest_log,
+        &ingest_coordinator,
         "orders",
         0,
         0,
@@ -443,7 +455,7 @@ async fn slatedb_local_recovery_can_use_selected_published_checkpoint() {
     .await;
     append_ingest_envelope(
         Arc::clone(&store),
-        &ingest_log,
+        &ingest_coordinator,
         "orders",
         0,
         1,
@@ -543,10 +555,19 @@ async fn slatedb_local_recovery_rejects_raw_state_manifest() {
 #[tokio::test]
 async fn local_recovery_without_manifest_starts_empty_and_replays_from_zero() {
     let (_temp_dir, store) = temp_store();
-    let ingest_log = IngestLog::new(Arc::clone(&store));
+    let ingest_coordinator = local_ingest_coordinator(Arc::clone(&store));
     let input = batch([input_delta("account-a", 4, 1)]);
 
-    append_ingest_envelope(Arc::clone(&store), &ingest_log, "orders", 0, 0, 1, &input).await;
+    append_ingest_envelope(
+        Arc::clone(&store),
+        &ingest_coordinator,
+        "orders",
+        0,
+        0,
+        1,
+        &input,
+    )
+    .await;
 
     let recovered = recover_with_catalog_record(Arc::clone(&store))
         .await
@@ -581,7 +602,7 @@ async fn local_recovery_rejects_json_deltabatch_ingest_object() {
 #[tokio::test]
 async fn local_recovery_uses_manifest_boundaries_per_stream_partition_range() {
     let (_temp_dir, store) = temp_store();
-    let ingest_log = IngestLog::new(Arc::clone(&store));
+    let ingest_coordinator = local_ingest_coordinator(Arc::clone(&store));
     let publisher = CheckpointPublisher::new(Arc::clone(&store));
 
     let covered_orders_p0 = batch([input_delta("account-a", 10, 1)]);
@@ -601,7 +622,7 @@ async fn local_recovery_uses_manifest_boundaries_per_stream_partition_range() {
     ] {
         append_ingest_envelope(
             Arc::clone(&store),
-            &ingest_log,
+            &ingest_coordinator,
             stream,
             partition,
             start,
@@ -661,7 +682,7 @@ async fn local_recovery_uses_manifest_boundaries_per_stream_partition_range() {
 #[tokio::test]
 async fn local_recovery_uses_latest_manifest_when_multiple_are_published() {
     let (_temp_dir, store) = temp_store();
-    let ingest_log = IngestLog::new(Arc::clone(&store));
+    let ingest_coordinator = local_ingest_coordinator(Arc::clone(&store));
     let publisher = CheckpointPublisher::new(Arc::clone(&store));
 
     let first = batch([input_delta("account-a", 10, 1)]);
@@ -671,7 +692,7 @@ async fn local_recovery_uses_latest_manifest_when_multiple_are_published() {
     for (start, end, input) in [(0, 1, &first), (1, 2, &second), (2, 3, &third)] {
         append_ingest_envelope(
             Arc::clone(&store),
-            &ingest_log,
+            &ingest_coordinator,
             "orders",
             0,
             start,
@@ -727,7 +748,7 @@ async fn local_recovery_uses_latest_manifest_when_multiple_are_published() {
 #[tokio::test]
 async fn local_recovery_can_use_selected_checkpoint_when_future_manifest_is_corrupt() {
     let (_temp_dir, store) = temp_store();
-    let ingest_log = IngestLog::new(Arc::clone(&store));
+    let ingest_coordinator = local_ingest_coordinator(Arc::clone(&store));
     let publisher = CheckpointPublisher::new(Arc::clone(&store));
 
     let checkpointed = batch([input_delta("account-a", 10, 1)]);
@@ -741,7 +762,7 @@ async fn local_recovery_can_use_selected_checkpoint_when_future_manifest_is_corr
     ] {
         append_ingest_envelope(
             Arc::clone(&store),
-            &ingest_log,
+            &ingest_coordinator,
             "orders",
             0,
             start,
@@ -845,7 +866,7 @@ async fn local_recovery_rejects_selected_checkpoint_when_payload_is_missing() {
 #[tokio::test]
 async fn local_recovery_preserves_signed_checkpoint_state_and_signed_replay() {
     let (_temp_dir, store) = temp_store();
-    let ingest_log = IngestLog::new(Arc::clone(&store));
+    let ingest_coordinator = local_ingest_coordinator(Arc::clone(&store));
     let publisher = CheckpointPublisher::new(Arc::clone(&store));
 
     let checkpoint_input = batch([
@@ -860,7 +881,7 @@ async fn local_recovery_preserves_signed_checkpoint_state_and_signed_replay() {
 
     append_ingest_envelope(
         Arc::clone(&store),
-        &ingest_log,
+        &ingest_coordinator,
         "orders",
         0,
         0,
@@ -870,7 +891,7 @@ async fn local_recovery_preserves_signed_checkpoint_state_and_signed_replay() {
     .await;
     append_ingest_envelope(
         Arc::clone(&store),
-        &ingest_log,
+        &ingest_coordinator,
         "orders",
         0,
         3,
@@ -913,7 +934,7 @@ async fn local_recovery_preserves_signed_checkpoint_state_and_signed_replay() {
 #[tokio::test]
 async fn local_recovery_resumes_from_checkpointed_engine_logical_epoch_not_manifest_version() {
     let (_temp_dir, store) = temp_store();
-    let ingest_log = IngestLog::new(Arc::clone(&store));
+    let ingest_coordinator = local_ingest_coordinator(Arc::clone(&store));
     let publisher = CheckpointPublisher::new(Arc::clone(&store));
 
     let first_input = batch([input_delta("account-a", 10, 1)]);
@@ -921,7 +942,7 @@ async fn local_recovery_resumes_from_checkpointed_engine_logical_epoch_not_manif
 
     append_ingest_envelope(
         Arc::clone(&store),
-        &ingest_log,
+        &ingest_coordinator,
         "orders",
         0,
         0,
@@ -931,7 +952,7 @@ async fn local_recovery_resumes_from_checkpointed_engine_logical_epoch_not_manif
     .await;
     append_ingest_envelope(
         Arc::clone(&store),
-        &ingest_log,
+        &ingest_coordinator,
         "orders",
         0,
         1,

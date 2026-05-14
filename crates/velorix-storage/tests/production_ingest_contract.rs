@@ -21,7 +21,9 @@ fn production_sources_do_not_call_bootstrap_ingest_apis() {
         let lines = contents.lines().collect::<Vec<_>>();
         for (line_number, line) in lines.iter().enumerate() {
             for pattern in forbidden {
-                if line.contains(pattern)
+                if (line.contains(pattern)
+                    || (pattern == "IngestLog::append("
+                        && line_calls_ingest_log_append(&lines, line_number)))
                     && !allowed_bootstrap_ingest_use(
                         &workspace,
                         &source,
@@ -65,12 +67,27 @@ fn production_source_scan_includes_top_level_benchmarks() {
 }
 
 #[test]
+fn production_source_scan_includes_top_level_e2e_tests() {
+    let workspace = workspace_root();
+    let sources = production_source_scan_sources(&workspace);
+
+    for test in rust_sources_under(&workspace.join("tests")) {
+        assert!(
+            sources.iter().any(|source| source == &test),
+            "production ingest source contract should scan {}",
+            test.strip_prefix(&workspace).unwrap_or(&test).display()
+        );
+    }
+}
+
+#[test]
 fn production_like_ingest_harnesses_use_process_local_coordinator() {
     let workspace = workspace_root();
     for source in [
         workspace.join("benches/local_incremental.rs"),
         workspace.join("benches/s3_incremental.rs"),
         workspace.join("crates/velorix-runtime/tests/s3_compat_query.rs"),
+        workspace.join("tests/e2e/local_recovery.rs"),
     ] {
         let contents = fs::read_to_string(&source).expect("read production-like ingest harness");
         assert!(
@@ -147,6 +164,56 @@ fn append_ingest_call_violations(contents: &str) -> Vec<String> {
                 .then(|| format!("line {} starts `{}`", line_number + 1, line.trim()))
         })
         .collect()
+}
+
+#[test]
+fn production_source_contract_forbids_direct_ingest_log_append_method_callers() {
+    let workspace = Path::new("/workspace");
+    let source = workspace.join("tests/e2e/production_like.rs");
+    let lines = [
+        "async fn production_path() {",
+        "    let ingest_log = IngestLog::new(store);",
+        "    ingest_log.append(&legacy_batch).await?;",
+        "}",
+    ];
+
+    assert!(!allowed_bootstrap_ingest_use(
+        workspace,
+        &source,
+        &lines,
+        2,
+        "IngestLog::append("
+    ));
+    assert!(line_calls_ingest_log_append(&lines, 2));
+}
+
+#[test]
+fn production_source_contract_allows_intentional_json_deltabatch_rejection_fixture() {
+    let workspace = Path::new("/workspace");
+    let source = workspace.join("tests/e2e/local_recovery.rs");
+    let lines = [
+        "#[tokio::test]",
+        "async fn local_recovery_rejects_json_deltabatch_ingest_object() {",
+        "    let ingest_log = IngestLog::new(store);",
+        "    let legacy_batch = IngestBatch::new(\"orders\", 0, 0, 1, bytes).unwrap();",
+        "    ingest_log.append(&legacy_batch).await.unwrap();",
+        "}",
+    ];
+
+    assert!(allowed_bootstrap_ingest_use(
+        workspace,
+        &source,
+        &lines,
+        3,
+        "IngestBatch::new("
+    ));
+    assert!(allowed_bootstrap_ingest_use(
+        workspace,
+        &source,
+        &lines,
+        4,
+        "IngestLog::append("
+    ));
 }
 
 #[test]
@@ -319,6 +386,7 @@ fn workspace_root() -> PathBuf {
 fn production_source_scan_sources(workspace: &Path) -> Vec<PathBuf> {
     let mut sources = rust_sources_under(&workspace.join("crates"));
     sources.extend(top_level_rust_files(&workspace.join("benches")));
+    sources.extend(rust_sources_under(&workspace.join("tests")));
     sources.sort();
     sources
 }
@@ -352,7 +420,109 @@ fn allowed_bootstrap_ingest_use(
             );
     }
 
+    let local_recovery_e2e = workspace.join("tests/e2e/local_recovery.rs");
+    if source == local_recovery_e2e && pattern == "IngestBatch::new(" {
+        return line_is_inside_function(
+            lines,
+            line_number,
+            "async fn local_recovery_rejects_json_deltabatch_ingest_object()",
+        );
+    }
+    if source == local_recovery_e2e && pattern == "IngestLog::append(" {
+        return line_is_inside_function(
+            lines,
+            line_number,
+            "async fn local_recovery_rejects_json_deltabatch_ingest_object()",
+        );
+    }
+
     false
+}
+
+fn line_calls_ingest_log_append(lines: &[&str], line_number: usize) -> bool {
+    let line = lines[line_number];
+    let Some((receiver, _)) = line.split_once(".append(") else {
+        return false;
+    };
+    let receiver = receiver
+        .split_whitespace()
+        .last()
+        .or_else(|| previous_non_empty_line(lines, line_number));
+    let Some(receiver) = receiver else {
+        return false;
+    };
+
+    if ingest_log_initializer(receiver) {
+        return true;
+    }
+
+    current_function_previous_lines(lines, line_number).any(|previous| {
+        binding_name(previous) == Some(receiver) && ingest_log_initializer(previous)
+    })
+}
+
+fn ingest_log_initializer(line: &str) -> bool {
+    line.contains("IngestLog::new(") || line.contains("IngestLog::new_checked(")
+}
+
+fn binding_name(line: &str) -> Option<&str> {
+    let (binding, _) = line.split_once('=')?;
+    binding
+        .trim()
+        .split(':')
+        .next()
+        .and_then(|binding| binding.split_whitespace().last())
+}
+
+fn current_function_previous_lines<'a>(
+    lines: &'a [&str],
+    line_number: usize,
+) -> impl Iterator<Item = &'a str> {
+    lines[..line_number]
+        .iter()
+        .rev()
+        .map(|line| *line)
+        .take_while(|line| !is_function_signature(line))
+}
+
+fn is_function_signature(line: &str) -> bool {
+    let line = line.trim_start();
+    line.starts_with("fn ")
+        || line.starts_with("async fn ")
+        || line.starts_with("pub fn ")
+        || line.starts_with("pub async fn ")
+}
+
+fn line_is_inside_function(lines: &[&str], line_number: usize, signature: &str) -> bool {
+    let Some(signature_line) = lines[..=line_number]
+        .iter()
+        .rposition(|line| line.contains(signature))
+    else {
+        return false;
+    };
+
+    if line_number == signature_line {
+        return true;
+    }
+
+    let mut brace_depth = 0usize;
+    let mut opened = false;
+    for line in &lines[signature_line..=line_number] {
+        for character in line.chars() {
+            match character {
+                '{' => {
+                    opened = true;
+                    brace_depth += 1;
+                }
+                '}' => {
+                    brace_depth = brace_depth.saturating_sub(1);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    opened && brace_depth > 0
 }
 
 fn rust_sources_under(root: &Path) -> Vec<PathBuf> {
