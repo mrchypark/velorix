@@ -10,7 +10,7 @@ use arrow::{
 };
 use bytes::Bytes;
 use futures::TryStreamExt;
-use object_store::{local::LocalFileSystem, path::Path, ObjectStore};
+use object_store::{local::LocalFileSystem, path::Path, ObjectStore, PutMode};
 use serde_json::json;
 use tempfile::TempDir;
 use velorix_core::{
@@ -37,7 +37,7 @@ use velorix_storage::{
     },
     checkpoint_index::{CheckpointRecoveryMode, CheckpointRecoveryTransitionRecordV1},
     ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
-    log::{IngestAdmissionCoordinator, IngestLog},
+    log::{IngestAdmissionCoordinator, IngestLog, IngestLogError},
     manifest::{CheckpointManifest, InputRange, StateObjectRef},
     object_key::ObjectKey,
     relation_catalog_registry::{RelationCatalogRegistry, RelationCatalogRegistryError},
@@ -369,6 +369,38 @@ async fn append_ingest_envelope(ingest_coordinator: &IngestAdmissionCoordinator,
         .append_catalog_validated_envelope(bytes)
         .await
         .unwrap();
+}
+
+async fn put_unadmitted_ingest_envelope(store: &Arc<dyn ObjectStore>, bytes: Bytes) -> ObjectKey {
+    let envelope = IngestEnvelope::decode(bytes.clone()).unwrap();
+    let header = envelope.header();
+    let object_key = ObjectKey::ingest_batch(
+        &header.stream_id,
+        header.partition_id,
+        header.start_offset_inclusive,
+        header.end_offset_exclusive,
+    )
+    .unwrap();
+    envelope
+        .validate_descriptor(&velorix_storage::log::IngestBatchDescriptor {
+            stream_id: header.stream_id.clone(),
+            partition_id: header.partition_id,
+            start_offset_inclusive: header.start_offset_inclusive,
+            end_offset_exclusive: header.end_offset_exclusive,
+            object_key: object_key.clone(),
+        })
+        .unwrap();
+
+    store
+        .put_opts(
+            &Path::from(object_key.as_str()),
+            bytes.into(),
+            PutMode::Create.into(),
+        )
+        .await
+        .unwrap();
+
+    object_key
 }
 
 fn int64_account_relation_catalog() -> VelorixRelationCatalogV1 {
@@ -1243,6 +1275,68 @@ async fn checked_catalog_backed_recovery_requires_complete_authoritative_capabil
 }
 
 #[tokio::test]
+async fn checked_catalog_backed_recovery_requires_ingest_admission_capability() {
+    let (_temp_dir, store) = temp_store();
+    let capabilities = capabilities_missing(AuthoritativeNamespace::IngestAdmission);
+
+    let error = RecoveredRuntime::recover_with_owner_and_relation_catalog_record_checked(
+        Arc::clone(&store),
+        ORDERS_SUM_COUNT_OWNER,
+        ORDERS_SUM_COUNT_RELATION_ID,
+        ORDERS_SUM_COUNT_RELATION_VERSION,
+        &capabilities,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RecoveryError::AuthoritativeObjectStoreCapabilities(
+            AuthoritativeObjectStoreCapabilityError::MissingNamespace {
+                namespace: AuthoritativeNamespace::IngestAdmission
+            }
+        )
+    ));
+}
+
+#[tokio::test]
+async fn checked_catalog_backed_recovery_rejects_replayed_ingest_without_admission_record() {
+    let (_temp_dir, store) = temp_store();
+    let capabilities = probed_capabilities(store.as_ref()).await;
+    let catalog = orders_sum_count_relation_catalog().unwrap();
+    RelationCatalogRegistry::new(Arc::clone(&store))
+        .create(&catalog)
+        .await
+        .unwrap();
+    let input = input_batch([input_delta("account-a", 4, 1)]);
+    let batch_key = put_unadmitted_ingest_envelope(
+        &store,
+        ingest_envelope_bytes(
+            ORDERS_SUM_COUNT_RELATION_VERSION,
+            catalog.schema_fingerprint.as_str(),
+            &input,
+        ),
+    )
+    .await;
+
+    let error = RecoveredRuntime::recover_with_owner_and_relation_catalog_record_checked(
+        Arc::clone(&store),
+        ORDERS_SUM_COUNT_OWNER,
+        ORDERS_SUM_COUNT_RELATION_ID,
+        ORDERS_SUM_COUNT_RELATION_VERSION,
+        &capabilities,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RecoveryError::Ingest(IngestLogError::MissingIngestAdmissionRecord { batch_key: actual })
+            if actual == batch_key
+    ));
+}
+
+#[tokio::test]
 async fn checked_catalog_backed_recovery_reads_catalog_with_valid_capabilities() {
     let (_temp_dir, store) = temp_store();
     let capabilities = probed_capabilities(store.as_ref()).await;
@@ -1275,6 +1369,158 @@ async fn checked_catalog_backed_recovery_reads_catalog_with_valid_capabilities()
 
     assert_eq!(recovered.replayed_batch_count(), 1);
     assert_eq!(recovered.logical_epoch(), 1);
+}
+
+#[tokio::test]
+async fn checked_catalog_backed_recovery_rejects_batch_without_admission() {
+    let (_temp_dir, store) = temp_store();
+    let capabilities = probed_capabilities(store.as_ref()).await;
+    let catalog = orders_sum_count_relation_catalog().unwrap();
+    RelationCatalogRegistry::new(Arc::clone(&store))
+        .create(&catalog)
+        .await
+        .unwrap();
+    let input = input_batch([input_delta("account-a", 4, 1)]);
+    IngestLog::new(Arc::clone(&store))
+        .append_validated_envelope(ingest_envelope_bytes(
+            ORDERS_SUM_COUNT_RELATION_VERSION,
+            catalog.schema_fingerprint.as_str(),
+            &input,
+        ))
+        .await
+        .unwrap();
+
+    let error = RecoveredRuntime::recover_with_owner_and_relation_catalog_record_checked(
+        Arc::clone(&store),
+        ORDERS_SUM_COUNT_OWNER,
+        ORDERS_SUM_COUNT_RELATION_ID,
+        ORDERS_SUM_COUNT_RELATION_VERSION,
+        &capabilities,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RecoveryError::Ingest(IngestLogError::MissingIngestAdmissionRecord { .. })
+    ));
+}
+
+#[tokio::test]
+async fn checked_selected_checkpoint_recovery_rejects_post_checkpoint_ingest_without_admission_record(
+) {
+    let (_temp_dir, store) = temp_store();
+    let capabilities = probed_capabilities(store.as_ref()).await;
+    let catalog = orders_sum_count_relation_catalog().unwrap();
+    RelationCatalogRegistry::new(Arc::clone(&store))
+        .create(&catalog)
+        .await
+        .unwrap();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let checkpoint_version = 0;
+    let checkpoint_state = aggregate_state("account-a", 4, 1);
+    let replay_input = input_batch([input_delta("account-a", 3, 1)]);
+    let batch_key = put_unadmitted_ingest_envelope(
+        &store,
+        ingest_envelope_bytes_with_batches(
+            IngestEnvelopeEncodeRequest {
+                relation_id: ORDERS_SUM_COUNT_RELATION_ID.to_string(),
+                relation_version: ORDERS_SUM_COUNT_RELATION_VERSION.to_string(),
+                schema_fingerprint: catalog.schema_fingerprint.as_str().to_string(),
+                stream_id: "orders".to_string(),
+                partition_id: 0,
+                start_offset_inclusive: 1,
+                end_offset_exclusive: 2,
+            },
+            &[ingest_record_batch(&replay_input)],
+        ),
+    )
+    .await;
+    let state_ref =
+        write_checkpoint_state(&publisher, checkpoint_version, 1, &checkpoint_state).await;
+    publisher
+        .publish_manifest(&selected_checkpoint_manifest(
+            checkpoint_version,
+            1,
+            state_ref,
+        ))
+        .await
+        .unwrap();
+
+    let error = RecoveredRuntime::recover_from_published_checkpoint_version_checked(
+        Arc::clone(&store),
+        checkpoint_version,
+        &capabilities,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RecoveryError::Ingest(IngestLogError::MissingIngestAdmissionRecord { batch_key: actual })
+            if actual == batch_key
+    ));
+}
+
+#[tokio::test]
+async fn checked_selected_checkpoint_recovery_allows_pre_admission_batch_when_checkpoint_covers_it()
+{
+    let (_temp_dir, store) = temp_store();
+    let capabilities = probed_capabilities(store.as_ref()).await;
+    let catalog = orders_sum_count_relation_catalog().unwrap();
+    RelationCatalogRegistry::new(Arc::clone(&store))
+        .create(&catalog)
+        .await
+        .unwrap();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let checkpoint_version = 0;
+    let checkpoint_state = aggregate_state("account-a", 4, 1);
+    let checkpointed_input = input_batch([input_delta("account-z", 99, 1)]);
+    put_unadmitted_ingest_envelope(
+        &store,
+        ingest_envelope_bytes_with_batches(
+            IngestEnvelopeEncodeRequest {
+                relation_id: ORDERS_SUM_COUNT_RELATION_ID.to_string(),
+                relation_version: ORDERS_SUM_COUNT_RELATION_VERSION.to_string(),
+                schema_fingerprint: catalog.schema_fingerprint.as_str().to_string(),
+                stream_id: "orders".to_string(),
+                partition_id: 0,
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 1,
+            },
+            &[ingest_record_batch(&checkpointed_input)],
+        ),
+    )
+    .await;
+    let state_ref =
+        write_checkpoint_state(&publisher, checkpoint_version, 1, &checkpoint_state).await;
+    publisher
+        .publish_manifest(&selected_checkpoint_manifest(
+            checkpoint_version,
+            1,
+            state_ref,
+        ))
+        .await
+        .unwrap();
+
+    let recovered = RecoveredRuntime::recover_from_published_checkpoint_version_checked(
+        Arc::clone(&store),
+        checkpoint_version,
+        &capabilities,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(recovered.replayed_batch_count(), 0);
+    assert_eq!(recovered.logical_epoch(), 1);
+    assert_eq!(
+        recovered.materialized_state().net_rows().unwrap(),
+        vec![DeltaRecord::new(
+            DeltaKey::from_json(json!("account-a")),
+            DeltaValue::from_json(json!({"count": 1, "sum": 4})),
+            1,
+        )]
+    );
 }
 
 #[tokio::test]

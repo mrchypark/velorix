@@ -24,7 +24,7 @@ use velorix_storage::{
     },
     log::{
         AppendValidatedEnvelopeOutcome, DurableIngestAdmissionRecordV1, IngestAdmissionCoordinator,
-        IngestBatch, IngestBatchDescriptor, IngestLog, IngestLogError,
+        IngestBatch, IngestBatchDescriptor, IngestLog, IngestLogError, ReplayCheckpoint,
     },
     object_key::ObjectKey,
     relation_catalog_registry::{RelationCatalogRegistry, RelationCatalogRegistryError},
@@ -192,6 +192,48 @@ fn catalog_envelope_bytes_for(
         &[valid_batch()],
     )
     .unwrap()
+}
+
+fn durable_admission_record_for_payload(payload: Bytes) -> DurableIngestAdmissionRecordV1 {
+    let batch = IngestBatch::from_validated_envelope(payload.clone()).unwrap();
+    let envelope = IngestEnvelope::decode(payload).unwrap();
+    let descriptor = batch.descriptor();
+
+    DurableIngestAdmissionRecordV1 {
+        schema_version: 1,
+        record_kind: "ingest_range_admission_v1".to_string(),
+        stream_id: descriptor.stream_id.clone(),
+        partition_id: descriptor.partition_id,
+        start_offset_inclusive: descriptor.start_offset_inclusive,
+        end_offset_exclusive: descriptor.end_offset_exclusive,
+        batch_key: descriptor.object_key.clone(),
+        admission_record_key: ObjectKey::ingest_admission_record(
+            &descriptor.stream_id,
+            descriptor.partition_id,
+            descriptor.start_offset_inclusive,
+            descriptor.end_offset_exclusive,
+        )
+        .unwrap(),
+        payload_digest: envelope.header().payload_digest.clone(),
+        relation_id: envelope.header().relation_id.clone(),
+        relation_version: envelope.header().relation_version.clone(),
+        schema_fingerprint: envelope.header().schema_fingerprint.clone(),
+        admission_mode: "process_local_serialized".to_string(),
+    }
+}
+
+async fn put_durable_admission_record(
+    store: &Arc<dyn ObjectStore>,
+    record: &DurableIngestAdmissionRecordV1,
+) {
+    store
+        .put_opts(
+            &Path::from(record.admission_record_key.as_str()),
+            Bytes::from(serde_json::to_vec(record).unwrap()).into(),
+            PutMode::Create.into(),
+        )
+        .await
+        .unwrap();
 }
 
 fn catalog_envelope_bytes_with_fingerprint(
@@ -1347,5 +1389,92 @@ async fn validated_replay_rejects_raw_non_envelope_bytes_under_valid_ingest_key(
     assert!(matches!(
         err,
         IngestLogError::IngestEnvelope(IngestEnvelopeError::MalformedEnvelope { .. })
+    ));
+}
+
+#[tokio::test]
+async fn admitted_replay_rejects_batch_without_admission_in_replay_window() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = create_orders_relation_catalog(&store).await;
+    let log = IngestLog::new(Arc::clone(&store));
+    let payload = catalog_envelope_bytes_for(&catalog, 10, 12);
+    log.append_validated_envelope(payload).await.unwrap();
+
+    let err = log
+        .replay_admitted_validated_envelopes_from(&[])
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        IngestLogError::MissingIngestAdmissionRecord { batch_key }
+            if batch_key == ObjectKey::ingest_batch("orders", 7, 10, 12).unwrap()
+    ));
+}
+
+#[tokio::test]
+async fn admitted_replay_ignores_orphan_admission_without_batch_in_replay_window() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = create_orders_relation_catalog(&store).await;
+    let log = IngestLog::new(Arc::clone(&store));
+    let payload = catalog_envelope_bytes_for(&catalog, 10, 12);
+    let admission = durable_admission_record_for_payload(payload);
+    put_durable_admission_record(&store, &admission).await;
+
+    let replayed = log
+        .replay_admitted_validated_envelopes_from(&[])
+        .await
+        .unwrap();
+
+    assert!(replayed.is_empty());
+}
+
+#[tokio::test]
+async fn admitted_replay_rejects_admission_digest_mismatch() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = create_orders_relation_catalog(&store).await;
+    let log = IngestLog::new(Arc::clone(&store));
+    let payload = catalog_envelope_bytes_for(&catalog, 10, 12);
+    let mut admission = durable_admission_record_for_payload(payload.clone());
+    admission.payload_digest =
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_string();
+    put_durable_admission_record(&store, &admission).await;
+    log.append_validated_envelope(payload).await.unwrap();
+
+    let err = log
+        .replay_admitted_validated_envelopes_from(&[])
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        IngestLogError::IngestAdmissionMismatch {
+            field: "payload_digest",
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn admitted_replay_rejects_checkpoint_inside_admitted_range() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = create_orders_relation_catalog(&store).await;
+    let log = IngestLog::new(Arc::clone(&store));
+    let payload = catalog_envelope_bytes_for(&catalog, 10, 20);
+    let admission = durable_admission_record_for_payload(payload.clone());
+    put_durable_admission_record(&store, &admission).await;
+    log.append_validated_envelope(payload).await.unwrap();
+
+    let err = log
+        .replay_admitted_validated_envelopes_from(&[ReplayCheckpoint::new("orders", 7, 15)])
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        IngestLogError::CheckpointInsideAdmittedRange {
+            checkpoint_end_offset_exclusive: 15,
+            admission_record_key,
+        } if admission_record_key == admission.admission_record_key
     ));
 }

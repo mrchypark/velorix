@@ -199,6 +199,7 @@ impl RecoveredRuntime {
             ingest_log,
             expected_owner,
             relation_catalog,
+            ReplayAdmissionEvidence::DurableAdmissionRequired,
         )
         .await?;
         Self::write_checked_recovery_transition(
@@ -313,6 +314,7 @@ impl RecoveredRuntime {
             manifest,
             expected_owner,
             relation_catalog,
+            ReplayAdmissionEvidence::DurableAdmissionRequired,
         )
         .await?;
         Self::write_checked_recovery_transition(
@@ -400,6 +402,7 @@ impl RecoveredRuntime {
             manifest,
             expected_owner,
             relation_catalog,
+            ReplayAdmissionEvidence::DurableAdmissionRequired,
         )
         .await?;
         Self::write_checked_recovery_transition(
@@ -477,6 +480,7 @@ impl RecoveredRuntime {
             ingest_log,
             expected_owner,
             relation_catalog,
+            ReplayAdmissionEvidence::DurableAdmissionRequired,
         )
         .await?;
         Self::write_checked_recovery_transition(
@@ -546,6 +550,7 @@ impl RecoveredRuntime {
             ingest_log,
             expected_owner,
             relation_catalog,
+            ReplayAdmissionEvidence::EnvelopeOnly,
         )
         .await
     }
@@ -555,6 +560,7 @@ impl RecoveredRuntime {
         ingest_log: IngestLog,
         expected_owner: &str,
         relation_catalog: VelorixRelationCatalogV1,
+        replay_admission_evidence: ReplayAdmissionEvidence,
     ) -> Result<Self, RecoveryError> {
         relation_catalog.validate()?;
         let latest_manifest = publisher.latest_manifest().await?;
@@ -564,6 +570,7 @@ impl RecoveredRuntime {
             latest_manifest,
             expected_owner,
             relation_catalog,
+            replay_admission_evidence,
         )
         .await
     }
@@ -582,6 +589,7 @@ impl RecoveredRuntime {
             manifest,
             expected_owner,
             relation_catalog,
+            ReplayAdmissionEvidence::EnvelopeOnly,
         )
         .await
     }
@@ -592,6 +600,7 @@ impl RecoveredRuntime {
         manifest: CheckpointManifest,
         expected_owner: &str,
         relation_catalog: VelorixRelationCatalogV1,
+        replay_admission_evidence: ReplayAdmissionEvidence,
     ) -> Result<Self, RecoveryError> {
         relation_catalog.validate()?;
         Self::recover_from_manifest_and_relation_catalog(
@@ -600,6 +609,7 @@ impl RecoveredRuntime {
             Some(manifest),
             expected_owner,
             relation_catalog,
+            replay_admission_evidence,
         )
         .await
     }
@@ -610,6 +620,7 @@ impl RecoveredRuntime {
         manifest: Option<CheckpointManifest>,
         expected_owner: &str,
         relation_catalog: VelorixRelationCatalogV1,
+        replay_admission_evidence: ReplayAdmissionEvidence,
     ) -> Result<Self, RecoveryError> {
         let mut materialized = PrototypeIncrementalEngine::new();
 
@@ -654,9 +665,18 @@ impl RecoveredRuntime {
         }
 
         let replay_checkpoints = replay_checkpoints(manifest.as_ref());
-        let replayed = ingest_log
-            .replay_validated_envelopes_from(&replay_checkpoints)
-            .await?;
+        let replayed = match replay_admission_evidence {
+            ReplayAdmissionEvidence::EnvelopeOnly => {
+                ingest_log
+                    .replay_validated_envelopes_from(&replay_checkpoints)
+                    .await?
+            }
+            ReplayAdmissionEvidence::DurableAdmissionRequired => {
+                ingest_log
+                    .replay_admitted_validated_envelopes_from(&replay_checkpoints)
+                    .await?
+            }
+        };
         let replayed_batch_count = replayed.len();
         let mut logical_epoch = materialized.logical_epoch();
 
@@ -762,6 +782,12 @@ pub fn orders_sum_count_relation_catalog() -> Result<VelorixRelationCatalogV1, R
 enum DecodedCheckpointState {
     Versioned(EngineCheckpoint),
     Legacy(DeltaBatch),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplayAdmissionEvidence {
+    EnvelopeOnly,
+    DurableAdmissionRequired,
 }
 
 fn decode_checkpoint_state(bytes: &[u8]) -> Result<DecodedCheckpointState, RecoveryError> {

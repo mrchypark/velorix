@@ -48,6 +48,25 @@ fn production_sources_do_not_call_bootstrap_ingest_apis() {
         "production source must use catalog-aware ingest/recovery APIs:\n{}",
         violations.join("\n")
     );
+
+    let runtime_recovery =
+        fs::read_to_string(workspace.join("crates/velorix-runtime/src/recovery.rs"))
+            .expect("read runtime recovery source");
+    assert!(
+        runtime_recovery.contains(".replay_admitted_validated_envelopes_from(&replay_checkpoints)"),
+        "checked runtime recovery must have a durable-admission replay branch"
+    );
+    assert!(
+        runtime_recovery.contains("ReplayAdmissionEvidence::DurableAdmissionRequired"),
+        "checked runtime recovery must select durable admission evidence explicitly"
+    );
+    let checked_recovery_violations =
+        checked_recovery_admission_selection_violations(&runtime_recovery);
+    assert!(
+        checked_recovery_violations.is_empty(),
+        "checked runtime recovery entrypoints must require durable admission evidence:\n{}",
+        checked_recovery_violations.join("\n")
+    );
 }
 
 #[test]
@@ -168,6 +187,27 @@ fn append_ingest_call_violations(contents: &str) -> Vec<String> {
                 .then(|| format!("line {} starts `{}`", line_number + 1, line.trim()))
         })
         .collect()
+}
+
+fn checked_recovery_admission_selection_violations(contents: &str) -> Vec<String> {
+    [
+        "pub async fn recover_with_owner_and_relation_catalog_checked(",
+        "pub async fn recover_from_published_checkpoint_version_with_owner_and_relation_catalog_checked(",
+        "pub async fn recover_from_published_checkpoint_version_with_slatedb_state_store_and_relation_catalog_checked(",
+        "pub async fn recover_with_slatedb_state_store_and_relation_catalog_checked(",
+    ]
+    .into_iter()
+    .filter_map(|signature| {
+        let body = function_body(contents, signature)?;
+        let selects_durable = body.contains("ReplayAdmissionEvidence::DurableAdmissionRequired");
+        let selects_envelope_only = body.contains("ReplayAdmissionEvidence::EnvelopeOnly");
+        (!selects_durable || selects_envelope_only).then(|| {
+            format!(
+                "{signature} must pass ReplayAdmissionEvidence::DurableAdmissionRequired and must not pass EnvelopeOnly"
+            )
+        })
+    })
+    .collect()
 }
 
 #[test]
@@ -450,17 +490,16 @@ fn allowed_bootstrap_ingest_use(
     if source == runtime_recovery && pattern == ".replay_validated_envelopes_from(" {
         let has_expected_call =
             lines[line_number].contains(".replay_validated_envelopes_from(&replay_checkpoints)");
-        let following_context = lines
+        let preceding_context = lines
             .iter()
-            .skip(line_number)
-            .take(16)
+            .take(line_number)
+            .rev()
+            .take(8)
             .copied()
             .collect::<Vec<_>>()
             .join("\n");
         return has_expected_call
-            && following_context.contains(
-                "prototype_delta_batch_from_arrow_envelope(&envelope, &relation_catalog)",
-            );
+            && preceding_context.contains("ReplayAdmissionEvidence::EnvelopeOnly");
     }
 
     let local_recovery_e2e = workspace.join("tests/e2e/local_recovery.rs");
@@ -566,6 +605,26 @@ fn line_is_inside_function(lines: &[&str], line_number: usize, signature: &str) 
     }
 
     opened && brace_depth > 0
+}
+
+fn function_body<'a>(contents: &'a str, signature: &str) -> Option<&'a str> {
+    let signature_start = contents.find(signature)?;
+    let body_start = contents[signature_start..].find('{')? + signature_start;
+    let mut brace_depth = 0usize;
+    for (offset, character) in contents[body_start..].char_indices() {
+        match character {
+            '{' => brace_depth += 1,
+            '}' => {
+                brace_depth = brace_depth.saturating_sub(1);
+                if brace_depth == 0 {
+                    return Some(&contents[body_start..=body_start + offset]);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
 }
 
 fn rust_sources_under(root: &Path) -> Vec<PathBuf> {

@@ -133,6 +133,25 @@ pub enum IngestLogError {
         checkpoint_end_offset_exclusive: u64,
         object_key: ObjectKey,
     },
+    #[error(
+        "checkpoint boundary {checkpoint_end_offset_exclusive} falls inside admitted range `{admission_record_key}`"
+    )]
+    CheckpointInsideAdmittedRange {
+        checkpoint_end_offset_exclusive: u64,
+        admission_record_key: ObjectKey,
+    },
+    #[error("committed ingest batch `{batch_key}` has no matching admission record")]
+    MissingIngestAdmissionRecord { batch_key: ObjectKey },
+    #[error(
+        "admission record `{admission_record_key}` does not match ingest batch `{batch_key}` for {field}: expected {expected}, found {actual}"
+    )]
+    IngestAdmissionMismatch {
+        admission_record_key: ObjectKey,
+        batch_key: ObjectKey,
+        field: &'static str,
+        expected: String,
+        actual: String,
+    },
     #[error("duplicate replay checkpoint for {stream_id}/p={partition_id}")]
     DuplicateReplayCheckpoint {
         stream_id: String,
@@ -677,6 +696,37 @@ impl IngestLog {
         Ok(descriptors)
     }
 
+    async fn list_admission_records(
+        &self,
+    ) -> Result<Vec<DurableIngestAdmissionRecordV1>, IngestLogError> {
+        let mut objects = self
+            .store
+            .list(Some(&Path::from("v1/ingest-admission")))
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        objects.sort_by(|left, right| left.location.cmp(&right.location));
+
+        let mut records = Vec::with_capacity(objects.len());
+        for object in objects {
+            let bytes = self.store.get(&object.location).await?.bytes().await?;
+            let record: DurableIngestAdmissionRecordV1 = serde_json::from_slice(&bytes)?;
+            record.validate_key()?;
+            if object.location != Path::from(record.admission_record_key.as_str()) {
+                return Err(IngestLogError::MalformedIngestAdmissionRecord {
+                    key: object.location.to_string(),
+                    reason: format!(
+                        "stored path does not match body admission_record_key `{}`",
+                        record.admission_record_key
+                    ),
+                });
+            }
+            records.push(record);
+        }
+
+        Ok(records)
+    }
+
     /// Replays committed batches without validating payload bytes.
     ///
     /// This remains for bootstrap/local compatibility while runtime replay is
@@ -763,6 +813,65 @@ impl IngestLog {
 
         Ok(batches)
     }
+
+    /// Replays committed V1 Arrow IPC ingest envelopes only when each replayed
+    /// batch is backed by matching durable admission evidence. This is the
+    /// checked production recovery path; bootstrap/local recovery remains on
+    /// the non-admitted replay APIs above while old data is migrated.
+    pub async fn replay_admitted_validated_envelopes_from(
+        &self,
+        checkpoints: &[ReplayCheckpoint],
+    ) -> Result<Vec<IngestBatch>, IngestLogError> {
+        let checkpoint_offsets = validate_checkpoints(checkpoints)?;
+        let committed = self.list_committed().await?;
+        let committed_by_key = committed
+            .iter()
+            .map(|descriptor| (descriptor.object_key.clone(), descriptor.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut replay_admissions = HashMap::new();
+
+        for admission in self.list_admission_records().await? {
+            let admission_descriptor = admission.descriptor()?;
+            if !committed_by_key.contains_key(&admission.batch_key) {
+                continue;
+            }
+
+            if !admission_in_replay_window(
+                &admission_descriptor,
+                &admission.admission_record_key,
+                &checkpoint_offsets,
+            )? {
+                continue;
+            }
+
+            replay_admissions.insert(admission.batch_key.clone(), admission);
+        }
+
+        let mut batches = Vec::new();
+        for descriptor in committed {
+            if !batch_in_replay_window(&descriptor, &checkpoint_offsets)? {
+                continue;
+            }
+
+            let bytes = self
+                .store
+                .get(&Path::from(descriptor.object_key.as_str()))
+                .await?
+                .bytes()
+                .await?;
+            let envelope = IngestEnvelope::decode(bytes.clone())?;
+            envelope.validate_descriptor(&descriptor)?;
+            let Some(admission) = replay_admissions.remove(&descriptor.object_key) else {
+                return Err(IngestLogError::MissingIngestAdmissionRecord {
+                    batch_key: descriptor.object_key,
+                });
+            };
+            validate_admission_matches_replayed_batch(&admission, &descriptor, &envelope)?;
+            batches.push(IngestBatch::from_descriptor(descriptor, bytes));
+        }
+
+        Ok(batches)
+    }
 }
 
 fn ranges_overlap(previous: &IngestBatchDescriptor, current: &IngestBatchDescriptor) -> bool {
@@ -804,6 +913,157 @@ fn admission_record_for_batch(
     record.validate_key()?;
 
     Ok(record)
+}
+
+fn batch_in_replay_window(
+    descriptor: &IngestBatchDescriptor,
+    checkpoint_offsets: &HashMap<(String, u32), u64>,
+) -> Result<bool, IngestLogError> {
+    let checkpoint_end = checkpoint_offsets
+        .get(&(descriptor.stream_id.clone(), descriptor.partition_id))
+        .copied()
+        .unwrap_or(0);
+
+    if descriptor.end_offset_exclusive <= checkpoint_end {
+        return Ok(false);
+    }
+
+    if descriptor.start_offset_inclusive < checkpoint_end
+        && checkpoint_end < descriptor.end_offset_exclusive
+    {
+        return Err(IngestLogError::CheckpointInsideBatch {
+            checkpoint_end_offset_exclusive: checkpoint_end,
+            object_key: descriptor.object_key.clone(),
+        });
+    }
+
+    Ok(true)
+}
+
+fn admission_in_replay_window(
+    descriptor: &IngestBatchDescriptor,
+    admission_record_key: &ObjectKey,
+    checkpoint_offsets: &HashMap<(String, u32), u64>,
+) -> Result<bool, IngestLogError> {
+    let checkpoint_end = checkpoint_offsets
+        .get(&(descriptor.stream_id.clone(), descriptor.partition_id))
+        .copied()
+        .unwrap_or(0);
+
+    if descriptor.end_offset_exclusive <= checkpoint_end {
+        return Ok(false);
+    }
+
+    if descriptor.start_offset_inclusive < checkpoint_end
+        && checkpoint_end < descriptor.end_offset_exclusive
+    {
+        return Err(IngestLogError::CheckpointInsideAdmittedRange {
+            checkpoint_end_offset_exclusive: checkpoint_end,
+            admission_record_key: admission_record_key.clone(),
+        });
+    }
+
+    Ok(true)
+}
+
+fn validate_admission_matches_replayed_batch(
+    admission: &DurableIngestAdmissionRecordV1,
+    descriptor: &IngestBatchDescriptor,
+    envelope: &IngestEnvelope,
+) -> Result<(), IngestLogError> {
+    let header = envelope.header();
+    validate_admission_field(
+        admission,
+        descriptor,
+        "batch_key",
+        descriptor.object_key.as_str(),
+        admission.batch_key.as_str(),
+    )?;
+    validate_admission_field(
+        admission,
+        descriptor,
+        "stream_id",
+        &descriptor.stream_id,
+        &admission.stream_id,
+    )?;
+    validate_admission_field(
+        admission,
+        descriptor,
+        "partition_id",
+        &descriptor.partition_id.to_string(),
+        &admission.partition_id.to_string(),
+    )?;
+    validate_admission_field(
+        admission,
+        descriptor,
+        "start_offset_inclusive",
+        &descriptor.start_offset_inclusive.to_string(),
+        &admission.start_offset_inclusive.to_string(),
+    )?;
+    validate_admission_field(
+        admission,
+        descriptor,
+        "end_offset_exclusive",
+        &descriptor.end_offset_exclusive.to_string(),
+        &admission.end_offset_exclusive.to_string(),
+    )?;
+    validate_admission_field(
+        admission,
+        descriptor,
+        "payload_digest",
+        &header.payload_digest,
+        &admission.payload_digest,
+    )?;
+    validate_admission_field(
+        admission,
+        descriptor,
+        "relation_id",
+        &header.relation_id,
+        &admission.relation_id,
+    )?;
+    validate_admission_field(
+        admission,
+        descriptor,
+        "relation_version",
+        &header.relation_version,
+        &admission.relation_version,
+    )?;
+    validate_admission_field(
+        admission,
+        descriptor,
+        "schema_fingerprint",
+        &header.schema_fingerprint,
+        &admission.schema_fingerprint,
+    )?;
+    validate_admission_field(
+        admission,
+        descriptor,
+        "admission_mode",
+        "process_local_serialized",
+        &admission.admission_mode,
+    )?;
+
+    Ok(())
+}
+
+fn validate_admission_field(
+    admission: &DurableIngestAdmissionRecordV1,
+    descriptor: &IngestBatchDescriptor,
+    field: &'static str,
+    expected: &str,
+    actual: &str,
+) -> Result<(), IngestLogError> {
+    if expected == actual {
+        return Ok(());
+    }
+
+    Err(IngestLogError::IngestAdmissionMismatch {
+        admission_record_key: admission.admission_record_key.clone(),
+        batch_key: descriptor.object_key.clone(),
+        field,
+        expected: expected.to_string(),
+        actual: actual.to_string(),
+    })
 }
 
 fn is_sha256_digest(value: &str) -> bool {
