@@ -7,6 +7,7 @@ use bytes::Bytes;
 use futures::{lock::Mutex as AsyncMutex, TryStreamExt};
 use object_store::{path::Path, ObjectStore, PutMode};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use velorix_core::relation::{validate_record_batch_matches_catalog, RelationSchemaError};
 
@@ -19,6 +20,8 @@ use crate::{
 
 const INGEST_PREFIX: &str = "v1/ingest";
 const INGEST_ADMISSION_RECORD_KIND_V1: &str = "ingest_range_admission_v1";
+const INGEST_ADMISSION_EXPIRY_DECISION_RECORD_KIND_V1: &str =
+    "ingest_admission_orphan_expiry_decision_v1";
 
 #[derive(Clone, Debug)]
 pub struct IngestLog {
@@ -76,6 +79,23 @@ pub struct DurableIngestAdmissionRecordV1 {
     pub admission_mode: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DurableIngestAdmissionExpiryDecisionRecordV1 {
+    pub schema_version: u16,
+    pub record_kind: String,
+    pub stream_id: String,
+    pub partition_id: u32,
+    pub start_offset_inclusive: u64,
+    pub end_offset_exclusive: u64,
+    pub batch_key: ObjectKey,
+    pub admission_record_key: ObjectKey,
+    pub observed_missing_batch_key: ObjectKey,
+    pub expiry_decision_key: ObjectKey,
+    pub admission_record_digest: String,
+    pub expired_reason: String,
+    pub operator_id: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplayCheckpoint {
     pub stream_id: String,
@@ -108,6 +128,17 @@ pub enum IngestLogError {
     MalformedIngestKey { key: String, source: ObjectKeyError },
     #[error("malformed durable ingest admission record `{key}`: {reason}")]
     MalformedIngestAdmissionRecord { key: String, reason: String },
+    #[error("malformed durable ingest admission expiry decision `{key}`: {reason}")]
+    MalformedIngestAdmissionExpiryDecision { key: String, reason: String },
+    #[error("ingest admission expiry decision `{expiry_decision_key}` already exists with a different body")]
+    IngestAdmissionExpiryDecisionConflict { expiry_decision_key: ObjectKey },
+    #[error(
+        "cannot expire committed ingest admission `{admission_record_key}` for batch `{batch_key}`"
+    )]
+    CannotExpireCommittedIngestAdmission {
+        admission_record_key: ObjectKey,
+        batch_key: ObjectKey,
+    },
     #[error(
         "admission serialization guard is for {guard_stream_id}/p={guard_partition_id}, not {stream_id}/p={partition_id}"
     )]
@@ -254,7 +285,7 @@ impl DurableIngestAdmission {
         record: &DurableIngestAdmissionRecordV1,
     ) -> Result<AdmissionReservationOutcome, IngestLogError> {
         let descriptor = record.descriptor()?;
-        let existing = self.list_admission_records().await?;
+        let existing = self.log.list_active_admission_records().await?;
 
         for candidate in &existing {
             let candidate_descriptor = candidate.descriptor()?;
@@ -290,15 +321,27 @@ impl DurableIngestAdmission {
         {
             Ok(_) => Ok(AdmissionReservationOutcome::Admitted),
             Err(object_store::Error::AlreadyExists { .. }) => {
-                let existing = self
+                let existing_bytes = self
                     .log
                     .store
                     .get(&Path::from(record.admission_record_key.as_str()))
                     .await?
                     .bytes()
                     .await?;
-                let existing: DurableIngestAdmissionRecordV1 = serde_json::from_slice(&existing)?;
+                let existing: DurableIngestAdmissionRecordV1 =
+                    serde_json::from_slice(&existing_bytes)?;
                 existing.validate_key()?;
+                if self
+                    .log
+                    .admission_has_matching_expiry(&existing_bytes, &existing)
+                    .await?
+                    && !self.log.object_exists(&existing.batch_key).await?
+                {
+                    return Ok(AdmissionReservationOutcome::Conflict {
+                        object_key: existing.batch_key,
+                        reason: "admission_expired",
+                    });
+                }
                 if &existing == record {
                     Ok(AdmissionReservationOutcome::Duplicate)
                 } else {
@@ -312,36 +355,85 @@ impl DurableIngestAdmission {
         }
     }
 
-    async fn list_admission_records(
+    async fn expire_orphan_admission(
         &self,
-    ) -> Result<Vec<DurableIngestAdmissionRecordV1>, IngestLogError> {
-        let mut objects = self
+        stream_id: &str,
+        partition_id: u32,
+        start_offset_inclusive: u64,
+        end_offset_exclusive: u64,
+        decision_id: &str,
+        expired_reason: &str,
+        operator_id: &str,
+    ) -> Result<DurableIngestAdmissionExpiryDecisionRecordV1, IngestLogError> {
+        let admission_record_key = ObjectKey::ingest_admission_record(
+            stream_id,
+            partition_id,
+            start_offset_inclusive,
+            end_offset_exclusive,
+        )?;
+        let batch_key = ObjectKey::ingest_batch(
+            stream_id,
+            partition_id,
+            start_offset_inclusive,
+            end_offset_exclusive,
+        )?;
+        let Some((admission_bytes, admission)) = self
             .log
-            .store
-            .list(Some(&Path::from("v1/ingest-admission")))
-            .try_collect::<Vec<_>>()
-            .await?;
+            .list_admission_record_bodies()
+            .await?
+            .into_iter()
+            .find(|(_, record)| record.admission_record_key == admission_record_key)
+        else {
+            return Err(IngestLogError::MissingIngestAdmissionRecord { batch_key });
+        };
 
-        objects.sort_by(|left, right| left.location.cmp(&right.location));
-
-        let mut records = Vec::with_capacity(objects.len());
-        for object in objects {
-            let bytes = self.log.store.get(&object.location).await?.bytes().await?;
-            let record: DurableIngestAdmissionRecordV1 = serde_json::from_slice(&bytes)?;
-            record.validate_key()?;
-            if object.location != Path::from(record.admission_record_key.as_str()) {
-                return Err(IngestLogError::MalformedIngestAdmissionRecord {
-                    key: object.location.to_string(),
-                    reason: format!(
-                        "stored path does not match body admission_record_key `{}`",
-                        record.admission_record_key
-                    ),
-                });
-            }
-            records.push(record);
+        if self.log.object_exists(&admission.batch_key).await? {
+            return Err(IngestLogError::CannotExpireCommittedIngestAdmission {
+                admission_record_key: admission.admission_record_key,
+                batch_key: admission.batch_key,
+            });
         }
 
-        Ok(records)
+        let decision = expiry_decision_record_for_admission(
+            &admission_bytes,
+            &admission,
+            decision_id,
+            expired_reason,
+            operator_id,
+        )?;
+        let bytes = Bytes::from(serde_json::to_vec(&decision)?);
+        match self
+            .log
+            .store
+            .put_opts(
+                &Path::from(decision.expiry_decision_key.as_str()),
+                bytes.into(),
+                PutMode::Create.into(),
+            )
+            .await
+        {
+            Ok(_) => Ok(decision),
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                let existing = self
+                    .log
+                    .store
+                    .get(&Path::from(decision.expiry_decision_key.as_str()))
+                    .await?
+                    .bytes()
+                    .await?;
+                let existing: DurableIngestAdmissionExpiryDecisionRecordV1 =
+                    serde_json::from_slice(&existing)?;
+                existing.validate_key()?;
+                if existing == decision {
+                    Ok(existing)
+                } else {
+                    Err(IngestLogError::IngestAdmissionExpiryDecisionConflict {
+                        expiry_decision_key: decision.expiry_decision_key,
+                    })
+                }
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 }
 
@@ -409,6 +501,113 @@ impl DurableIngestAdmissionRecordV1 {
     }
 }
 
+impl DurableIngestAdmissionExpiryDecisionRecordV1 {
+    fn validate_key(&self) -> Result<(), IngestLogError> {
+        let expected_batch_key = ObjectKey::ingest_batch(
+            &self.stream_id,
+            self.partition_id,
+            self.start_offset_inclusive,
+            self.end_offset_exclusive,
+        )?;
+        let expected_admission_record_key = ObjectKey::ingest_admission_record(
+            &self.stream_id,
+            self.partition_id,
+            self.start_offset_inclusive,
+            self.end_offset_exclusive,
+        )?;
+        let expected_expiry_prefix = format!(
+            "v1/ingest-admission/{}/p={:010}/ranges/{:020}-{:020}/expiry-decisions/",
+            self.stream_id,
+            self.partition_id,
+            self.start_offset_inclusive,
+            self.end_offset_exclusive
+        );
+
+        if self.schema_version != 1 {
+            return Err(IngestLogError::MalformedIngestAdmissionExpiryDecision {
+                key: self.expiry_decision_key.to_string(),
+                reason: format!("unsupported schema_version {}", self.schema_version),
+            });
+        }
+        if self.record_kind != INGEST_ADMISSION_EXPIRY_DECISION_RECORD_KIND_V1 {
+            return Err(IngestLogError::MalformedIngestAdmissionExpiryDecision {
+                key: self.expiry_decision_key.to_string(),
+                reason: format!("unsupported record_kind `{}`", self.record_kind),
+            });
+        }
+        if self.batch_key != expected_batch_key {
+            return Err(IngestLogError::MalformedIngestAdmissionExpiryDecision {
+                key: self.expiry_decision_key.to_string(),
+                reason: format!(
+                    "batch_key `{}` does not match decision range",
+                    self.batch_key
+                ),
+            });
+        }
+        if self.admission_record_key != expected_admission_record_key {
+            return Err(IngestLogError::MalformedIngestAdmissionExpiryDecision {
+                key: self.expiry_decision_key.to_string(),
+                reason: format!(
+                    "admission_record_key does not match expected `{expected_admission_record_key}`"
+                ),
+            });
+        }
+        if self.observed_missing_batch_key != expected_batch_key {
+            return Err(IngestLogError::MalformedIngestAdmissionExpiryDecision {
+                key: self.expiry_decision_key.to_string(),
+                reason: format!(
+                    "observed_missing_batch_key does not match expected `{expected_batch_key}`"
+                ),
+            });
+        }
+        if !self
+            .expiry_decision_key
+            .as_str()
+            .starts_with(&expected_expiry_prefix)
+        {
+            return Err(IngestLogError::MalformedIngestAdmissionExpiryDecision {
+                key: self.expiry_decision_key.to_string(),
+                reason: "expiry_decision_key does not match decision range".to_string(),
+            });
+        }
+        if !is_sha256_digest(&self.admission_record_digest) {
+            return Err(IngestLogError::MalformedIngestAdmissionExpiryDecision {
+                key: self.expiry_decision_key.to_string(),
+                reason: "admission_record_digest must be sha256:<64 hex chars>".to_string(),
+            });
+        }
+        if self.expired_reason.trim().is_empty() {
+            return Err(IngestLogError::MalformedIngestAdmissionExpiryDecision {
+                key: self.expiry_decision_key.to_string(),
+                reason: "expired_reason must be nonempty".to_string(),
+            });
+        }
+        if self.operator_id.trim().is_empty() {
+            return Err(IngestLogError::MalformedIngestAdmissionExpiryDecision {
+                key: self.expiry_decision_key.to_string(),
+                reason: "operator_id must be nonempty".to_string(),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn expires_admission(
+        &self,
+        admission_bytes: &Bytes,
+        admission: &DurableIngestAdmissionRecordV1,
+    ) -> bool {
+        self.stream_id == admission.stream_id
+            && self.partition_id == admission.partition_id
+            && self.start_offset_inclusive == admission.start_offset_inclusive
+            && self.end_offset_exclusive == admission.end_offset_exclusive
+            && self.batch_key == admission.batch_key
+            && self.observed_missing_batch_key == admission.batch_key
+            && self.admission_record_key == admission.admission_record_key
+            && self.admission_record_digest == digest_bytes(admission_bytes)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum AdmissionReservationOutcome {
     Admitted,
@@ -469,6 +668,29 @@ impl IngestAdmissionCoordinator {
 
     pub async fn list_committed(&self) -> Result<Vec<IngestBatchDescriptor>, IngestLogError> {
         self.log.list_committed().await
+    }
+
+    pub async fn expire_orphan_admission(
+        &self,
+        stream_id: &str,
+        partition_id: u32,
+        start_offset_inclusive: u64,
+        end_offset_exclusive: u64,
+        decision_id: &str,
+        expired_reason: &str,
+        operator_id: &str,
+    ) -> Result<DurableIngestAdmissionExpiryDecisionRecordV1, IngestLogError> {
+        self.durable_admission
+            .expire_orphan_admission(
+                stream_id,
+                partition_id,
+                start_offset_inclusive,
+                end_offset_exclusive,
+                decision_id,
+                expired_reason,
+                operator_id,
+            )
+            .await
     }
 
     fn admission_lock(&self, descriptor: &IngestBatchDescriptor) -> Arc<AsyncMutex<()>> {
@@ -699,6 +921,14 @@ impl IngestLog {
     async fn list_admission_records(
         &self,
     ) -> Result<Vec<DurableIngestAdmissionRecordV1>, IngestLogError> {
+        self.list_admission_record_bodies()
+            .await
+            .map(|records| records.into_iter().map(|(_, record)| record).collect())
+    }
+
+    async fn list_admission_record_bodies(
+        &self,
+    ) -> Result<Vec<(Bytes, DurableIngestAdmissionRecordV1)>, IngestLogError> {
         let mut objects = self
             .store
             .list(Some(&Path::from("v1/ingest-admission")))
@@ -709,6 +939,27 @@ impl IngestLog {
 
         let mut records = Vec::with_capacity(objects.len());
         for object in objects {
+            if object.location.as_ref().ends_with(".expiry.json") {
+                ObjectKey::parse(object.location.to_string()).map_err(|error| {
+                    IngestLogError::MalformedIngestAdmissionExpiryDecision {
+                        key: object.location.to_string(),
+                        reason: error.to_string(),
+                    }
+                })?;
+                continue;
+            }
+            if !object.location.as_ref().ends_with(".admission.json") {
+                return Err(IngestLogError::MalformedIngestAdmissionRecord {
+                    key: object.location.to_string(),
+                    reason: "unexpected object under v1/ingest-admission".to_string(),
+                });
+            }
+            ObjectKey::parse(object.location.to_string()).map_err(|error| {
+                IngestLogError::MalformedIngestAdmissionRecord {
+                    key: object.location.to_string(),
+                    reason: error.to_string(),
+                }
+            })?;
             let bytes = self.store.get(&object.location).await?.bytes().await?;
             let record: DurableIngestAdmissionRecordV1 = serde_json::from_slice(&bytes)?;
             record.validate_key()?;
@@ -721,10 +972,109 @@ impl IngestLog {
                     ),
                 });
             }
+            records.push((bytes, record));
+        }
+
+        Ok(records)
+    }
+
+    async fn list_admission_expiry_decisions(
+        &self,
+    ) -> Result<Vec<DurableIngestAdmissionExpiryDecisionRecordV1>, IngestLogError> {
+        let mut objects = self
+            .store
+            .list(Some(&Path::from("v1/ingest-admission")))
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        objects.sort_by(|left, right| left.location.cmp(&right.location));
+
+        let mut records = Vec::with_capacity(objects.len());
+        for object in objects {
+            if object.location.as_ref().ends_with(".admission.json") {
+                ObjectKey::parse(object.location.to_string()).map_err(|error| {
+                    IngestLogError::MalformedIngestAdmissionRecord {
+                        key: object.location.to_string(),
+                        reason: error.to_string(),
+                    }
+                })?;
+                continue;
+            }
+            if !object.location.as_ref().ends_with(".expiry.json") {
+                return Err(IngestLogError::MalformedIngestAdmissionExpiryDecision {
+                    key: object.location.to_string(),
+                    reason: "unexpected object under v1/ingest-admission".to_string(),
+                });
+            }
+            ObjectKey::parse(object.location.to_string()).map_err(|error| {
+                IngestLogError::MalformedIngestAdmissionExpiryDecision {
+                    key: object.location.to_string(),
+                    reason: error.to_string(),
+                }
+            })?;
+            let bytes = self.store.get(&object.location).await?.bytes().await?;
+            let record: DurableIngestAdmissionExpiryDecisionRecordV1 =
+                serde_json::from_slice(&bytes)?;
+            record.validate_key()?;
+            if object.location != Path::from(record.expiry_decision_key.as_str()) {
+                return Err(IngestLogError::MalformedIngestAdmissionExpiryDecision {
+                    key: object.location.to_string(),
+                    reason: format!(
+                        "stored path does not match body expiry_decision_key `{}`",
+                        record.expiry_decision_key
+                    ),
+                });
+            }
             records.push(record);
         }
 
         Ok(records)
+    }
+
+    async fn list_active_admission_records(
+        &self,
+    ) -> Result<Vec<DurableIngestAdmissionRecordV1>, IngestLogError> {
+        let committed_by_key = self
+            .list_committed()
+            .await?
+            .into_iter()
+            .map(|descriptor| (descriptor.object_key.clone(), descriptor))
+            .collect::<HashMap<_, _>>();
+        let expiry_decisions = self.list_admission_expiry_decisions().await?;
+        let active = self
+            .list_admission_record_bodies()
+            .await?
+            .into_iter()
+            .filter(|(admission_bytes, admission)| {
+                committed_by_key.contains_key(&admission.batch_key)
+                    || !expiry_decisions
+                        .iter()
+                        .any(|decision| decision.expires_admission(admission_bytes, admission))
+            })
+            .map(|(_, admission)| admission)
+            .collect();
+
+        Ok(active)
+    }
+
+    async fn admission_has_matching_expiry(
+        &self,
+        admission_bytes: &Bytes,
+        admission: &DurableIngestAdmissionRecordV1,
+    ) -> Result<bool, IngestLogError> {
+        Ok(self
+            .list_admission_expiry_decisions()
+            .await?
+            .iter()
+            .any(|decision| decision.expires_admission(admission_bytes, admission)))
+    }
+
+    async fn object_exists(&self, object_key: &ObjectKey) -> Result<bool, IngestLogError> {
+        match self.store.get(&Path::from(object_key.as_str())).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Replays committed batches without validating payload bytes.
@@ -915,6 +1265,40 @@ fn admission_record_for_batch(
     Ok(record)
 }
 
+fn expiry_decision_record_for_admission(
+    admission_record_bytes: &Bytes,
+    admission: &DurableIngestAdmissionRecordV1,
+    decision_id: &str,
+    expired_reason: &str,
+    operator_id: &str,
+) -> Result<DurableIngestAdmissionExpiryDecisionRecordV1, IngestLogError> {
+    let expiry_decision_key = ObjectKey::ingest_admission_orphan_expiry_decision(
+        &admission.stream_id,
+        admission.partition_id,
+        admission.start_offset_inclusive,
+        admission.end_offset_exclusive,
+        decision_id,
+    )?;
+    let record = DurableIngestAdmissionExpiryDecisionRecordV1 {
+        schema_version: 1,
+        record_kind: INGEST_ADMISSION_EXPIRY_DECISION_RECORD_KIND_V1.to_string(),
+        stream_id: admission.stream_id.clone(),
+        partition_id: admission.partition_id,
+        start_offset_inclusive: admission.start_offset_inclusive,
+        end_offset_exclusive: admission.end_offset_exclusive,
+        batch_key: admission.batch_key.clone(),
+        admission_record_key: admission.admission_record_key.clone(),
+        observed_missing_batch_key: admission.batch_key.clone(),
+        expiry_decision_key,
+        admission_record_digest: digest_bytes(admission_record_bytes),
+        expired_reason: expired_reason.to_string(),
+        operator_id: operator_id.to_string(),
+    };
+    record.validate_key()?;
+
+    Ok(record)
+}
+
 fn batch_in_replay_window(
     descriptor: &IngestBatchDescriptor,
     checkpoint_offsets: &HashMap<(String, u32), u64>,
@@ -1072,6 +1456,10 @@ fn is_sha256_digest(value: &str) -> bool {
     };
 
     hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn digest_bytes(bytes: &Bytes) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
 impl IngestBatch {

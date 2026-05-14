@@ -64,21 +64,25 @@ coordinator:
 3. If the batch exists and its digest matches the admission record, classify
    the reservation as `committed`.
 4. If the batch is missing, classify it as `orphan_reserved` and keep rejecting
-   overlapping writes until an operator either replays the exact same payload
-   through the coordinator or writes a durable expiry/repair decision for that
-   reservation.
+   overlapping writes until an operator writes a durable expiry/repair decision
+   for that reservation. A stale retry of the original payload through normal
+   ingest after expiry must be rejected as `admission_expired`; only an explicit
+   operator repair path may restore the original batch.
 5. If the batch exists, validate the digest, relation identity, and schema
    fingerprint against the admission record. Any mismatch is
    `corrupt_conflict`; do not repair automatically, and block writer cutover
    until the operator resolves the authority-store conflict.
 
-Expiry is not a time-only delete. An expiry decision must be a durable
-Velorix-owned record bound to the admission record digest, reason, operator
-identity, and observed missing batch key. It must be read during deployed
-coordinator restart reconstruction before the coordinator can stop reserving
-the orphaned range. Until that expiry record type and deployed coordinator
-reconstruction path exist, `orphan_reserved` remains a production cutover
-blocker.
+Expiry is not a time-only delete. An expiry decision is a durable Velorix-owned
+record under
+`v1/ingest-admission/{stream_id}/p=.../ranges/{start-end}/expiry-decisions/{decision_id}.expiry.json`
+bound to the full admission record digest, reason, operator identity, and
+observed missing batch key. Coordinator restart reconstruction may omit the
+orphan reservation only when the expiry decision matches the exact admission
+record digest and the canonical batch is still missing. Expiry is terminal for
+ordinary ingest retries and is not admission evidence for committed replay.
+Until an operator-authorized deployed expiry/repair path and live restart
+evidence exist, `orphan_reserved` remains a production cutover blocker.
 
 ## Conflict Semantics
 
@@ -94,6 +98,7 @@ Conflict reasons must be explicit:
 - `idempotency_key_reused`.
 - `range_overlap_committed`.
 - `range_overlap_reserved`.
+- `admission_expired`.
 - `unsupported_overlap_guarantee`.
 
 ## Verification
@@ -103,8 +108,10 @@ Conflict reasons must be explicit:
 - A separate coordinator rejects a range already reserved by durable serialized
   admission evidence before any batch object is committed.
 - Admission-before-batch orphans are inspectable, remain reserved by default,
-  and can be released only by a durable expiry/repair decision read during
-  deployed coordinator restart reconstruction.
+  and can be released only by a digest-bound durable expiry/repair decision read
+  during coordinator restart reconstruction.
+- A stale ordinary ingest retry of an expired orphan returns `admission_expired`
+  and does not write the canonical batch.
 - The same race is not claimed safe in create-only-only mode.
 - Adjacent ranges are allowed.
 - Crash-after-create-before-response retry returns `200 OK` for same digest.

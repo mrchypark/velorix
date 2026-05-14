@@ -23,8 +23,9 @@ use velorix_storage::{
         IngestEnvelope, IngestEnvelopeEncodeRequest, IngestEnvelopeError, INGEST_ENVELOPE_MAGIC,
     },
     log::{
-        AppendValidatedEnvelopeOutcome, DurableIngestAdmissionRecordV1, IngestAdmissionCoordinator,
-        IngestBatch, IngestBatchDescriptor, IngestLog, IngestLogError, ReplayCheckpoint,
+        AppendValidatedEnvelopeOutcome, DurableIngestAdmissionExpiryDecisionRecordV1,
+        DurableIngestAdmissionRecordV1, IngestAdmissionCoordinator, IngestBatch,
+        IngestBatchDescriptor, IngestLog, IngestLogError, ReplayCheckpoint,
     },
     object_key::ObjectKey,
     relation_catalog_registry::{RelationCatalogRegistry, RelationCatalogRegistryError},
@@ -1227,6 +1228,216 @@ async fn durable_serialized_catalog_admission_does_not_reserve_same_key_differen
         reservation.schema_fingerprint,
         catalog.schema_fingerprint.as_str()
     );
+}
+
+#[tokio::test]
+async fn durable_orphan_expiry_decision_allows_restarted_coordinator_to_admit_range() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = create_orders_relation_catalog(&store).await;
+    let orphan_payload = catalog_envelope_bytes_for(&catalog, 0, 100);
+    let orphan_admission = durable_admission_record_for_payload(orphan_payload);
+    put_durable_admission_record(&store, &orphan_admission).await;
+
+    let coordinator = IngestAdmissionCoordinator::new(IngestLog::new(Arc::clone(&store)));
+    let decision = coordinator
+        .expire_orphan_admission(
+            "orders",
+            7,
+            0,
+            100,
+            "repair-0001",
+            "batch_append_failed_after_admission",
+            "operator-1",
+        )
+        .await
+        .unwrap();
+    store
+        .get(&Path::from(decision.expiry_decision_key.as_str()))
+        .await
+        .unwrap();
+
+    let restarted = IngestAdmissionCoordinator::new(IngestLog::new(Arc::clone(&store)));
+    let outcome = restarted
+        .append_catalog_validated_envelope(catalog_envelope_bytes_for(&catalog, 50, 150))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        AppendValidatedEnvelopeOutcome::Appended {
+            descriptor: ingest_descriptor("orders", 7, 50, 150),
+        }
+    );
+    assert_eq!(restarted.list_committed().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn durable_orphan_expiry_decision_rejects_stale_original_retry() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = create_orders_relation_catalog(&store).await;
+    let orphan_payload = catalog_envelope_bytes_for(&catalog, 0, 100);
+    let orphan_admission = durable_admission_record_for_payload(orphan_payload.clone());
+    put_durable_admission_record(&store, &orphan_admission).await;
+
+    let coordinator = IngestAdmissionCoordinator::new(IngestLog::new(Arc::clone(&store)));
+    coordinator
+        .expire_orphan_admission(
+            "orders",
+            7,
+            0,
+            100,
+            "repair-0001",
+            "batch_append_failed_after_admission",
+            "operator-1",
+        )
+        .await
+        .unwrap();
+
+    let outcome = coordinator
+        .append_catalog_validated_envelope(orphan_payload)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        AppendValidatedEnvelopeOutcome::Conflict {
+            descriptor: ingest_descriptor("orders", 7, 0, 100),
+            object_key: ObjectKey::ingest_batch("orders", 7, 0, 100).unwrap(),
+            reason: "admission_expired",
+        }
+    );
+    assert!(coordinator.list_committed().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn durable_orphan_expiry_decision_uses_stored_admission_bytes_for_retry_rejection() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = create_orders_relation_catalog(&store).await;
+    let orphan_payload = catalog_envelope_bytes_for(&catalog, 0, 100);
+    let orphan_admission = durable_admission_record_for_payload(orphan_payload.clone());
+    store
+        .put_opts(
+            &Path::from(orphan_admission.admission_record_key.as_str()),
+            Bytes::from(serde_json::to_vec_pretty(&orphan_admission).unwrap()).into(),
+            PutMode::Create.into(),
+        )
+        .await
+        .unwrap();
+
+    let coordinator = IngestAdmissionCoordinator::new(IngestLog::new(Arc::clone(&store)));
+    coordinator
+        .expire_orphan_admission(
+            "orders",
+            7,
+            0,
+            100,
+            "repair-0001",
+            "batch_append_failed_after_admission",
+            "operator-1",
+        )
+        .await
+        .unwrap();
+
+    let outcome = coordinator
+        .append_catalog_validated_envelope(orphan_payload)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        AppendValidatedEnvelopeOutcome::Conflict {
+            descriptor: ingest_descriptor("orders", 7, 0, 100),
+            object_key: ObjectKey::ingest_batch("orders", 7, 0, 100).unwrap(),
+            reason: "admission_expired",
+        }
+    );
+    assert!(coordinator.list_committed().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn durable_orphan_expiry_decision_digest_mismatch_keeps_reservation_active() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = create_orders_relation_catalog(&store).await;
+    let orphan_payload = catalog_envelope_bytes_for(&catalog, 0, 100);
+    let orphan_admission = durable_admission_record_for_payload(orphan_payload);
+    put_durable_admission_record(&store, &orphan_admission).await;
+    let decision = DurableIngestAdmissionExpiryDecisionRecordV1 {
+        schema_version: 1,
+        record_kind: "ingest_admission_orphan_expiry_decision_v1".to_string(),
+        stream_id: "orders".to_string(),
+        partition_id: 7,
+        start_offset_inclusive: 0,
+        end_offset_exclusive: 100,
+        batch_key: ObjectKey::ingest_batch("orders", 7, 0, 100).unwrap(),
+        admission_record_key: ObjectKey::ingest_admission_record("orders", 7, 0, 100).unwrap(),
+        observed_missing_batch_key: ObjectKey::ingest_batch("orders", 7, 0, 100).unwrap(),
+        expiry_decision_key: ObjectKey::ingest_admission_orphan_expiry_decision(
+            "orders",
+            7,
+            0,
+            100,
+            "repair-0001",
+        )
+        .unwrap(),
+        admission_record_digest:
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+        expired_reason: "batch_append_failed_after_admission".to_string(),
+        operator_id: "operator-1".to_string(),
+    };
+    store
+        .put_opts(
+            &Path::from(decision.expiry_decision_key.as_str()),
+            Bytes::from(serde_json::to_vec(&decision).unwrap()).into(),
+            PutMode::Create.into(),
+        )
+        .await
+        .unwrap();
+
+    let restarted = IngestAdmissionCoordinator::new(IngestLog::new(Arc::clone(&store)));
+    let outcome = restarted
+        .append_catalog_validated_envelope(catalog_envelope_bytes_for(&catalog, 50, 150))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        AppendValidatedEnvelopeOutcome::Conflict {
+            descriptor: ingest_descriptor("orders", 7, 50, 150),
+            object_key: ObjectKey::ingest_batch("orders", 7, 0, 100).unwrap(),
+            reason: "range_overlap_reserved",
+        }
+    );
+    assert!(restarted.list_committed().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn durable_admission_reconstruction_fails_closed_on_unknown_admission_namespace_object() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = create_orders_relation_catalog(&store).await;
+    let unknown = Path::from(
+        "v1/ingest-admission/orders/p=0000000007/ranges/00000000000000000000-00000000000000000100/notes.txt",
+    );
+    store
+        .put_opts(
+            &unknown,
+            Bytes::from_static(b"unknown admission namespace object").into(),
+            PutMode::Create.into(),
+        )
+        .await
+        .unwrap();
+
+    let coordinator = IngestAdmissionCoordinator::new(IngestLog::new(Arc::clone(&store)));
+    let err = coordinator
+        .append_catalog_validated_envelope(catalog_envelope_bytes_for(&catalog, 50, 150))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        IngestLogError::MalformedIngestAdmissionExpiryDecision { key, reason }
+            if key == unknown.as_ref()
+                && reason == "unexpected object under v1/ingest-admission"
+    ));
 }
 
 #[tokio::test]

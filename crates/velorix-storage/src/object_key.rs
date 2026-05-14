@@ -82,6 +82,22 @@ impl ObjectKey {
         )))
     }
 
+    pub fn ingest_admission_orphan_expiry_decision(
+        stream_id: &str,
+        partition_id: u32,
+        start_offset_inclusive: u64,
+        end_offset_exclusive: u64,
+        decision_id: &str,
+    ) -> Result<Self, ObjectKeyError> {
+        validate_segment("stream_id", stream_id)?;
+        validate_segment("decision_id", decision_id)?;
+        validate_offset_range(start_offset_inclusive, end_offset_exclusive)?;
+
+        Ok(Self(format!(
+            "v1/ingest-admission/{stream_id}/p={partition_id:0PARTITION_WIDTH$}/ranges/{start_offset_inclusive:0OFFSET_WIDTH$}-{end_offset_exclusive:0OFFSET_WIDTH$}/expiry-decisions/{decision_id}.expiry.json"
+        )))
+    }
+
     pub fn state_object(
         owner: &str,
         partition_id: u32,
@@ -301,6 +317,16 @@ fn validate_known_layout(value: &str) -> Result<(), ObjectKeyError> {
                 .strip_suffix(".admission.json")
                 .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
             parse_offset_range(value, range)?;
+        }
+        ["v1", "ingest-admission", stream_id, partition, "ranges", range, "expiry-decisions", decision_file] =>
+        {
+            validate_segment("stream_id", stream_id)?;
+            parse_prefixed_u32("partition_id", partition, "p=", PARTITION_WIDTH)?;
+            parse_offset_range(value, range)?;
+            let decision_id = decision_file
+                .strip_suffix(".expiry.json")
+                .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+            validate_segment("decision_id", decision_id)?;
         }
         ["v1", "state", owner, partition, checkpoint, object_file] => {
             validate_segment("owner", owner)?;
@@ -645,6 +671,19 @@ mod tests {
         assert_eq!(
             key.as_str(),
             "v1/ingest-admission/orders/p=0000000007/ranges/00000000000000000042-00000000000000000100.admission.json"
+        );
+        assert_eq!(ObjectKey::parse(key.as_str()).unwrap(), key);
+    }
+
+    #[test]
+    fn ingest_admission_orphan_expiry_decision_key_is_range_scoped_and_parseable() {
+        let key =
+            ObjectKey::ingest_admission_orphan_expiry_decision("orders", 7, 42, 100, "repair-1")
+                .unwrap();
+
+        assert_eq!(
+            key.as_str(),
+            "v1/ingest-admission/orders/p=0000000007/ranges/00000000000000000042-00000000000000000100/expiry-decisions/repair-1.expiry.json"
         );
         assert_eq!(ObjectKey::parse(key.as_str()).unwrap(), key);
     }
