@@ -29,11 +29,12 @@ evidence cannot claim a dependency-governance pass from manifest-only
 validation. It sets `external_audit_attestation=false`, so it is local
 governance evidence, not release-satisfying external audit evidence. Release
 readiness requires a separate dependency-governance artifact with
-`external_audit_attestation=true` and an `external_audit` object naming the
-provider, tool, pass result, subject commit, `sha256:` manifest digest,
-completion time, and reviewable attestation URI. The artifact-gated
-`readiness-report` compares that subject commit with `--release-commit` and
-that digest with `--dependency-governance-manifest`.
+`external_audit_attestation=true` and an `external_audit` object naming a
+`cargo-vet` audit, provider, pass result, subject commit, `sha256:` manifest
+digest, completion time, and reviewable attestation URI. The artifact-gated
+`readiness-report` requires `external_audit.tool="cargo-vet"`, compares that
+subject commit with `--release-commit`, and compares that digest with
+`--dependency-governance-manifest`.
 
 The manifest records the declared MSRV policy and requires package review
 records for the high-risk production dependency subjects that shape Velorix's
@@ -62,6 +63,8 @@ Unmaintained advisories are also warnings today. Each allowed exception is
 tracked in the governance manifest with an owner, expiry, reason, replacement
 plan, and promotion rule.
 
-Remaining gaps for 1.0 are external audit attestations such as `cargo-vet` and
-decisions about which warning classes graduate from local-review exception
-governance into hard `deny.toml` gates.
+The remaining 1.0 dependency-governance blocker is the `cargo-vet` release
+attestation. Decisions about whether duplicate-version, unmaintained, or
+advisory warnings later graduate from local-review exception governance into
+hard `deny.toml` gates are ongoing maintenance policy, not a 1.0 release
+blocker.

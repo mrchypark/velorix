@@ -587,6 +587,12 @@ fn validate_dependency_governance_evidence_artifact(
     require_external_audit_field(path, &external_audit.manifest_digest, "manifest_digest")?;
     require_external_audit_field(path, &external_audit.completed_at, "completed_at")?;
     require_external_audit_field(path, &external_audit.attestation_uri, "attestation_uri")?;
+    if external_audit.tool != "cargo-vet" {
+        bail!(
+            "{} dependency governance external audit tool must be cargo-vet",
+            path.display()
+        );
+    }
     if external_audit.result != "pass" {
         bail!(
             "{} dependency governance external audit result is not pass",
@@ -3433,6 +3439,29 @@ mod tests {
         .unwrap_err();
 
         assert!(format!("{error:#}").contains("missing external audit details"));
+    }
+
+    #[test]
+    fn readiness_report_rejects_dependency_governance_evidence_without_cargo_vet_attestation() {
+        let dir = tempdir().unwrap();
+        let readiness = dir.path().join("readiness.json");
+        let dependency = dir.path().join("dependency.json");
+        let mut dependency_json: serde_json::Value =
+            serde_json::from_str(&dependency_governance_evidence_json(true)).unwrap();
+        dependency_json["external_audit"]["tool"] = serde_json::json!("manual-review");
+        fs::write(&readiness, readiness_json()).unwrap();
+        fs::write(&dependency, dependency_json.to_string()).unwrap();
+
+        let error = read_readiness_report(
+            &readiness,
+            &ReadinessReleaseArtifactPaths {
+                dependency_governance_evidence: Some(dependency),
+                ..ReadinessReleaseArtifactPaths::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("tool must be cargo-vet"));
     }
 
     #[test]

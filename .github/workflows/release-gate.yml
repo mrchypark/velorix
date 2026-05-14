@@ -12,7 +12,7 @@ on:
         required: false
         default: ""
       dependency-governance-evidence-path:
-        description: Path to externally attested dependency governance evidence JSON.
+        description: Path to cargo-vet attested dependency governance evidence JSON.
         required: false
         default: ""
       feldera-spec-path:
