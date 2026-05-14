@@ -8,6 +8,14 @@ or a claim that Velorix is production-ready today.
 
 Status values are limited to `complete`, `partial`, and `missing`.
 
+Object-store capability evidence note, 2026-05-15: the live
+vind-gated Kubernetes ingest-admission and worker-shard test entrypoints now
+route provider and epoch-store construction through
+`OperatorAuthorityStartupComponents`, the shared startup component object built
+from validated object-store authority evidence, rather than direct
+per-component production constructors. This narrows the local deployment/runtime
+construction gap without marking the row complete.
+
 Velorix 1.0 also includes the cross-cutting API serving scope in
 `api-serving-scope-v1.md`: governed endpoints, parameter validation,
 response-shape contracts, OpenAPI-compatible catalog metadata, query/cost

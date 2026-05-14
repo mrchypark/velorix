@@ -298,6 +298,40 @@ async fn operator_authority_startup_components_preflight_fails_before_component_
     );
 }
 
+#[test]
+fn live_gate_sources_construct_production_components_through_operator_startup_components() {
+    for (path, source, forbidden) in [
+        (
+            "live_ingest_admission.rs",
+            include_str!("live_ingest_admission.rs"),
+            "IngestAdmissionCoordinatorProvider::for_production",
+        ),
+        (
+            "live_worker_shard.rs",
+            include_str!("live_worker_shard.rs"),
+            "CheckpointPublisherEpochStore::for_production",
+        ),
+    ] {
+        let source_code = strip_line_comments(source);
+        assert!(
+            source_code.contains("OperatorAuthorityStartupComponents::from_validated_authority"),
+            "{path} must route live gate construction through OperatorAuthorityStartupComponents",
+        );
+        assert!(
+            !source_code.contains(forbidden),
+            "{path} must not directly call {forbidden}",
+        );
+    }
+}
+
+fn strip_line_comments(source: &str) -> String {
+    source
+        .lines()
+        .map(|line| line.split_once("//").map_or(line, |(code, _comment)| code))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn temp_store() -> (TempDir, Arc<dyn ObjectStore>) {
     let temp_dir = tempfile::tempdir().unwrap();
     let store = LocalFileSystem::new_with_prefix(temp_dir.path()).unwrap();

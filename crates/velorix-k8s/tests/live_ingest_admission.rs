@@ -9,8 +9,8 @@ use object_store::{local::LocalFileSystem, path::Path, ObjectStore, PutMode};
 use tempfile::TempDir;
 use velorix_k8s::{
     crd::ObjectStoreAuthorityRef,
-    startup::validate_operator_authority,
-    stream_watch::{IngestAdmissionCoordinatorProvider, StreamWatchError},
+    startup::{validate_operator_authority, OperatorAuthorityStartupComponents},
+    stream_watch::StreamWatchError,
 };
 use velorix_storage::{log::DurableIngestAdmissionRecordV1, object_key::ObjectKey};
 
@@ -38,8 +38,11 @@ async fn live_vind_gated_ingest_admission_startup_preflight_runs_when_enabled(
         &format!("v1/vind-ingest-startup-probes/{suffix}/clean"),
     )
     .await?;
-    let provider = IngestAdmissionCoordinatorProvider::for_production(validated);
-    let report = provider.startup().await?;
+    let components = OperatorAuthorityStartupComponents::from_validated_authority(validated);
+    let report = components
+        .ingest_admission_startup_preflight()
+        .await?
+        .ingest_admission;
 
     assert_eq!(report.active_admission_records, 0);
     assert_eq!(report.expired_orphan_admission_records, 0);
@@ -53,7 +56,8 @@ async fn live_vind_gated_ingest_admission_startup_preflight_runs_when_enabled(
         &format!("v1/vind-ingest-startup-probes/{suffix}/orphan-active"),
     )
     .await?;
-    let provider = IngestAdmissionCoordinatorProvider::for_production(validated);
+    let components = OperatorAuthorityStartupComponents::from_validated_authority(validated);
+    let provider = components.ingest_admission_coordinator_provider();
     let (coordinator, report) = provider.coordinator_after_startup_reconstruction().await?;
 
     assert_eq!(report.active_admission_records, 1);
@@ -103,7 +107,8 @@ async fn live_vind_gated_ingest_admission_startup_preflight_runs_when_enabled(
         &format!("v1/vind-ingest-startup-probes/{suffix}/orphan-expired-restart"),
     )
     .await?;
-    let provider = IngestAdmissionCoordinatorProvider::for_production(validated);
+    let components = OperatorAuthorityStartupComponents::from_validated_authority(validated);
+    let provider = components.ingest_admission_coordinator_provider();
     let (restarted, report) = provider.coordinator_after_startup_reconstruction().await?;
 
     assert_eq!(report.active_admission_records, 0);
@@ -126,8 +131,11 @@ async fn live_vind_gated_ingest_admission_startup_preflight_runs_when_enabled(
         &format!("v1/vind-ingest-startup-probes/{suffix}/corrupt"),
     )
     .await?;
-    let provider = IngestAdmissionCoordinatorProvider::for_production(validated);
-    let err = provider.startup().await.unwrap_err();
+    let components = OperatorAuthorityStartupComponents::from_validated_authority(validated);
+    let err = components
+        .ingest_admission_startup_preflight()
+        .await
+        .unwrap_err();
 
     assert!(matches!(err, StreamWatchError::Snapshot { message }
         if message.contains("unexpected object under v1/ingest-admission")));

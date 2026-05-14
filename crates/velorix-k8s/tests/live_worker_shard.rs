@@ -20,7 +20,7 @@ use velorix_control::lease::PartitionLeaseClient;
 use velorix_k8s::{
     crd::{ObjectStoreAuthorityRef, VelorixWorkerShard, VelorixWorkerShardSpec},
     lease::{partition_lease_identity, KubeLeaseApi, KubernetesPartitionLeaseClient},
-    startup::validate_operator_authority,
+    startup::{validate_operator_authority, OperatorAuthorityStartupComponents},
     worker_shard::{
         handle_worker_shard_event, handle_worker_shard_event_with_command_executor,
         partition_lease_key_from_worker_shard, watch_worker_shards_with_command_executor,
@@ -312,9 +312,10 @@ async fn production_epoch_store(
     )
     .await?;
 
-    Ok(CheckpointPublisherEpochStore::for_production(
-        validated_authority,
-    )?)
+    let components =
+        OperatorAuthorityStartupComponents::from_validated_authority(validated_authority);
+
+    Ok(components.worker_shard_epoch_store()?)
 }
 
 fn worker_shard(namespace: &str, suffix: &str) -> VelorixWorkerShard {
