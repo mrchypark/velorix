@@ -45,6 +45,10 @@ Required fields:
 - Feldera artifacts validate against relation catalog identity.
 - Incremental execution consumes typed relation batches, not durable JSON
   `DeltaKey`/`DeltaValue` payloads.
+- Catalog-backed sum/count adapters must declare whether they use legacy scalar
+  single-key encoding or row-key encoding. Row-key encoding keeps a single value
+  column and encodes multi-column primary keys as deterministic JSON objects
+  keyed by stable catalog column id.
 - Relation mismatch fails closed before view activation, query execution, or
   checkpoint publication.
 
@@ -55,5 +59,7 @@ Required fields:
 - Feldera artifact schema fingerprint mismatch fails activation.
 - DataFusion production input registration exposes typed columns, not
   `key_json`/`value_json`.
+- The row-key sum/count adapter preserves existing scalar single-key output and
+  proves multi-column primary-key replay through the relation catalog.
 - Relation version pinning rejects payloads written for a different relation
   version.

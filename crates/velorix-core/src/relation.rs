@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::sync::Arc;
 
@@ -14,7 +14,7 @@ use datafusion::datasource::MemTable;
 use datafusion::error::DataFusionError;
 use datafusion::prelude::SessionContext;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -27,6 +27,8 @@ pub const DATAFUSION_RELATION_VERSION_METADATA_KEY: &str = "velorix.relation_ver
 pub const DATAFUSION_SCHEMA_FINGERPRINT_METADATA_KEY: &str = "velorix.schema_fingerprint";
 pub const CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID: &str =
     "incremental-adapter-single-key-sum-count-v1";
+pub const CATALOG_ROW_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID: &str =
+    "incremental-adapter-row-key-sum-count-v1";
 pub const ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID: &str = "incremental-adapter-orders-sum-count-v1";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -491,22 +493,25 @@ pub fn arrow_record_batches_to_single_key_sum_count_delta_batch(
         relation_version,
         schema_fingerprint,
     )?;
-    if !is_single_key_sum_count_incremental_adapter_id(
-        catalog.incremental_adapter.adapter_id.as_str(),
-    ) {
-        return Err(
-            IncrementalInputAdapterError::UnsupportedIncrementalAdapter {
-                adapter_id: catalog.incremental_adapter.adapter_id.clone(),
-            },
-        );
-    }
+    let adapter_shape =
+        sum_count_incremental_adapter_shape(catalog.incremental_adapter.adapter_id.as_str())
+            .ok_or_else(
+                || IncrementalInputAdapterError::UnsupportedIncrementalAdapter {
+                    adapter_id: catalog.incremental_adapter.adapter_id.clone(),
+                },
+            )?;
     if batches.is_empty() {
         return Err(IncrementalInputAdapterError::MalformedArrowInput {
             reason: "at least one Arrow record batch is required".to_string(),
         });
     }
 
-    let key_column = single_primary_key_column(&catalog.relation_schema)?;
+    let key_columns = match adapter_shape {
+        SumCountIncrementalAdapterShape::SingleKey => {
+            vec![single_primary_key_column(&catalog.relation_schema)?]
+        }
+        SumCountIncrementalAdapterShape::RowKey => primary_key_columns(&catalog.relation_schema)?,
+    };
     let value_column = single_value_column(&catalog.relation_schema)?;
     let weight_column = relation_column(
         &catalog.relation_schema,
@@ -517,19 +522,25 @@ pub fn arrow_record_batches_to_single_key_sum_count_delta_batch(
     for batch in batches {
         validate_record_batch_matches_catalog(catalog, batch)
             .map_err(incremental_input_batch_schema_error)?;
-        let key = incremental_key_column(batch, key_column)?;
+        let keys = key_columns
+            .iter()
+            .map(|column| incremental_key_column(batch, column).map(|key| (*column, key)))
+            .collect::<Result<Vec<_>, _>>()?;
         let value = incremental_value_column(batch, value_column)?;
         let weight = int64_column(batch, weight_column.name.as_str())?;
 
         for row in 0..batch.num_rows() {
-            if key.is_null(row) || value.is_null(row) || weight.is_null(row) {
+            if keys.iter().any(|(_, key)| key.is_null(row))
+                || value.is_null(row)
+                || weight.is_null(row)
+            {
                 return Err(IncrementalInputAdapterError::MalformedArrowInput {
                     reason: "prototype ingest columns must be non-null".to_string(),
                 });
             }
 
             records.push(DeltaRecord::new(
-                key.delta_key(row)?,
+                delta_key_from_columns(&keys, row)?,
                 value.delta_value(row)?,
                 weight.value(row),
             ));
@@ -555,12 +566,25 @@ pub fn arrow_record_batches_to_orders_sum_count_delta_batch(
     )
 }
 
-fn is_single_key_sum_count_incremental_adapter_id(adapter_id: &str) -> bool {
-    matches!(
-        adapter_id,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SumCountIncrementalAdapterShape {
+    SingleKey,
+    RowKey,
+}
+
+fn sum_count_incremental_adapter_shape(
+    adapter_id: &str,
+) -> Option<SumCountIncrementalAdapterShape> {
+    match adapter_id {
         CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID
-            | ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID
-    )
+        | ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID => {
+            Some(SumCountIncrementalAdapterShape::SingleKey)
+        }
+        CATALOG_ROW_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID => {
+            Some(SumCountIncrementalAdapterShape::RowKey)
+        }
+        _ => None,
+    }
 }
 
 fn incremental_input_batch_schema_error(
@@ -682,6 +706,16 @@ fn relation_column<'a>(
         })
 }
 
+fn primary_key_columns(
+    schema: &VelorixRelationSchemaV1,
+) -> Result<Vec<&RelationColumnV1>, IncrementalInputAdapterError> {
+    schema
+        .primary_key_column_ids
+        .iter()
+        .map(|column_id| relation_column(schema, column_id.as_str()))
+        .collect()
+}
+
 fn single_primary_key_column(
     schema: &VelorixRelationSchemaV1,
 ) -> Result<&RelationColumnV1, IncrementalInputAdapterError> {
@@ -713,6 +747,24 @@ fn single_value_column(
     }
 
     Ok(column)
+}
+
+fn delta_key_from_columns(
+    columns: &[(&RelationColumnV1, IncrementalKeyColumn<'_>)],
+    row: usize,
+) -> Result<DeltaKey, IncrementalInputAdapterError> {
+    if let [(_, column)] = columns {
+        return column.delta_key(row);
+    }
+
+    let mut object = BTreeMap::new();
+    for (catalog_column, column) in columns {
+        object.insert(catalog_column.column_id.clone(), column.json_value(row)?);
+    }
+
+    Ok(DeltaKey::from_json(Value::Object(
+        object.into_iter().collect(),
+    )))
 }
 
 fn string_column<'a>(
@@ -779,15 +831,19 @@ impl IncrementalKeyColumn<'_> {
     }
 
     fn delta_key(&self, row: usize) -> Result<DeltaKey, IncrementalInputAdapterError> {
+        self.json_value(row).map(DeltaKey::from_json)
+    }
+
+    fn json_value(&self, row: usize) -> Result<Value, IncrementalInputAdapterError> {
         match self {
-            Self::Boolean(column) => Ok(DeltaKey::from_json(json!(column.value(row)))),
-            Self::Utf8(column) => Ok(DeltaKey::from_json(json!(column.value(row)))),
-            Self::JsonUtf8(column) => serde_json::from_str(column.value(row))
-                .map(DeltaKey::from_json)
-                .map_err(|error| IncrementalInputAdapterError::MalformedArrowInput {
+            Self::Boolean(column) => Ok(json!(column.value(row))),
+            Self::Utf8(column) => Ok(json!(column.value(row))),
+            Self::JsonUtf8(column) => serde_json::from_str(column.value(row)).map_err(|error| {
+                IncrementalInputAdapterError::MalformedArrowInput {
                     reason: format!("JsonUtf8 key column contains invalid JSON: {error}"),
-                }),
-            Self::Int64(column) => Ok(DeltaKey::from_json(json!(column.value(row)))),
+                }
+            }),
+            Self::Int64(column) => Ok(json!(column.value(row))),
             Self::Float64(column) => {
                 let value = column.value(row);
                 if !value.is_finite() {
@@ -796,25 +852,27 @@ impl IncrementalKeyColumn<'_> {
                     });
                 }
 
-                Ok(DeltaKey::from_json(json!(value)))
+                Ok(json!(value))
             }
-            Self::Decimal128(column, precision, scale) => Ok(DeltaKey::from_json(json!(
-                decimal128_string(column.value(row), *precision, *scale)?
-            ))),
-            Self::Date32(column) => Ok(DeltaKey::from_json(json!(column.value(row)))),
-            Self::TimestampNanosecond(column) => Ok(DeltaKey::from_json(json!(column.value(row)))),
-            Self::DictionaryUtf8Int8(column, values) => Ok(DeltaKey::from_json(json!(
-                dictionary_utf8_value(column, values, row)
-            ))),
-            Self::DictionaryUtf8Int16(column, values) => Ok(DeltaKey::from_json(json!(
-                dictionary_utf8_value(column, values, row)
-            ))),
-            Self::DictionaryUtf8Int32(column, values) => Ok(DeltaKey::from_json(json!(
-                dictionary_utf8_value(column, values, row)
-            ))),
-            Self::DictionaryUtf8Int64(column, values) => Ok(DeltaKey::from_json(json!(
-                dictionary_utf8_value(column, values, row)
-            ))),
+            Self::Decimal128(column, precision, scale) => Ok(json!(decimal128_string(
+                column.value(row),
+                *precision,
+                *scale
+            )?)),
+            Self::Date32(column) => Ok(json!(column.value(row))),
+            Self::TimestampNanosecond(column) => Ok(json!(column.value(row))),
+            Self::DictionaryUtf8Int8(column, values) => {
+                Ok(json!(dictionary_utf8_value(column, values, row)))
+            }
+            Self::DictionaryUtf8Int16(column, values) => {
+                Ok(json!(dictionary_utf8_value(column, values, row)))
+            }
+            Self::DictionaryUtf8Int32(column, values) => {
+                Ok(json!(dictionary_utf8_value(column, values, row)))
+            }
+            Self::DictionaryUtf8Int64(column, values) => {
+                Ok(json!(dictionary_utf8_value(column, values, row)))
+            }
         }
     }
 }
@@ -829,8 +887,12 @@ impl IncrementalValueColumn<'_> {
     }
 
     fn delta_value(&self, row: usize) -> Result<DeltaValue, IncrementalInputAdapterError> {
+        self.json_value(row).map(DeltaValue::from_json)
+    }
+
+    fn json_value(&self, row: usize) -> Result<Value, IncrementalInputAdapterError> {
         match self {
-            Self::Int64(column) => Ok(DeltaValue::from_json(json!(column.value(row)))),
+            Self::Int64(column) => Ok(json!(column.value(row))),
             Self::Float64(column) => {
                 let value = column.value(row);
                 if !value.is_finite() {
@@ -839,11 +901,13 @@ impl IncrementalValueColumn<'_> {
                     });
                 }
 
-                Ok(DeltaValue::from_json(json!(value)))
+                Ok(json!(value))
             }
-            Self::Decimal128(column, precision, scale) => Ok(DeltaValue::from_json(json!(
-                decimal128_string(column.value(row), *precision, *scale)?
-            ))),
+            Self::Decimal128(column, precision, scale) => Ok(json!(decimal128_string(
+                column.value(row),
+                *precision,
+                *scale
+            )?)),
         }
     }
 }

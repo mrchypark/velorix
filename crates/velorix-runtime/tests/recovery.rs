@@ -21,6 +21,7 @@ use velorix_core::{
         DictionaryKeyTypeV1, FelderaRelationBindingV1, IncrementalAdapterBindingV1,
         RelationColumnV1, RelationOperationV1, RelationSemanticRoleV1, SchemaFingerprintV1,
         VelorixLogicalTypeV1, VelorixRelationCatalogV1, VelorixRelationSchemaV1,
+        CATALOG_ROW_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID,
         CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID, RELATION_SCHEMA_VERSION_V1,
     },
 };
@@ -158,6 +159,29 @@ fn ingest_int64_key_record_batch(input: &DeltaBatch) -> RecordBatch {
             Arc::new(Int64Array::from(keys)) as ArrayRef,
             Arc::new(Int64Array::from(values)) as ArrayRef,
             Arc::new(Int64Array::from(weights)) as ArrayRef,
+        ],
+    )
+    .unwrap()
+}
+
+fn ingest_row_key_record_batch(
+    account_ids: &[i64],
+    currencies: &[&str],
+    amounts: &[i64],
+    weights: &[i64],
+) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("account_id", DataType::Int64, false),
+            Field::new("currency_code", DataType::Utf8, false),
+            Field::new("amount", DataType::Int64, false),
+            Field::new("weight", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(account_ids.to_vec())) as ArrayRef,
+            Arc::new(StringArray::from(currencies.to_vec())) as ArrayRef,
+            Arc::new(Int64Array::from(amounts.to_vec())) as ArrayRef,
+            Arc::new(Int64Array::from(weights.to_vec())) as ArrayRef,
         ],
     )
     .unwrap()
@@ -482,6 +506,74 @@ fn int64_account_relation_catalog() -> VelorixRelationCatalogV1 {
         },
         incremental_adapter: IncrementalAdapterBindingV1 {
             adapter_id: CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID.to_string(),
+        },
+    }
+}
+
+fn account_currency_relation_catalog() -> VelorixRelationCatalogV1 {
+    let relation_schema = VelorixRelationSchemaV1 {
+        relation_id: "account_currencies".to_string(),
+        relation_name: "account_currencies".to_string(),
+        relation_version: "2026-05-14.v1".to_string(),
+        columns: vec![
+            RelationColumnV1 {
+                column_id: "account_id".to_string(),
+                name: "account_id".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 0,
+                semantic_role: RelationSemanticRoleV1::PrimaryKey,
+            },
+            RelationColumnV1 {
+                column_id: "currency".to_string(),
+                name: "currency_code".to_string(),
+                logical_type: VelorixLogicalTypeV1::Utf8,
+                physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+                nullable: false,
+                ordinal: 1,
+                semantic_role: RelationSemanticRoleV1::PrimaryKey,
+            },
+            RelationColumnV1 {
+                column_id: "amount".to_string(),
+                name: "amount".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 2,
+                semantic_role: RelationSemanticRoleV1::Value,
+            },
+            RelationColumnV1 {
+                column_id: "weight".to_string(),
+                name: "weight".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 3,
+                semantic_role: RelationSemanticRoleV1::Weight,
+            },
+        ],
+        primary_key_column_ids: vec!["account_id".to_string(), "currency".to_string()],
+        weight_column_id: "weight".to_string(),
+        allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+        event_time_column_id: None,
+    };
+    let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
+
+    VelorixRelationCatalogV1 {
+        schema_version: RELATION_SCHEMA_VERSION_V1,
+        relation_schema,
+        schema_fingerprint: schema_fingerprint.clone(),
+        datafusion_registration: DataFusionRegistrationV1 {
+            name: "account_currencies".to_string(),
+            mode: DataFusionRegistrationModeV1::Table,
+        },
+        feldera_relation: FelderaRelationBindingV1 {
+            relation_id: "account_currencies".to_string(),
+            schema_fingerprint,
+        },
+        incremental_adapter: IncrementalAdapterBindingV1 {
+            adapter_id: CATALOG_ROW_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID.to_string(),
         },
     }
 }
@@ -1002,6 +1094,71 @@ async fn catalog_backed_recovery_replays_int64_primary_key_relation() {
             DeltaRecord::new(
                 DeltaKey::from_json(json!(1002)),
                 DeltaValue::from_json(json!({"count": 1, "sum": 7})),
+                1,
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn catalog_backed_recovery_replays_row_key_relation() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = account_currency_relation_catalog();
+    RelationCatalogRegistry::new(Arc::clone(&store))
+        .create(&catalog)
+        .await
+        .unwrap();
+    let ingest_coordinator = local_ingest_coordinator(Arc::clone(&store));
+    append_ingest_envelope(
+        &ingest_coordinator,
+        ingest_envelope_bytes_with_batches(
+            IngestEnvelopeEncodeRequest {
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                schema_fingerprint: catalog.schema_fingerprint.as_str().to_string(),
+                stream_id: "account-currencies".to_string(),
+                partition_id: 0,
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 2,
+            },
+            &[ingest_row_key_record_batch(
+                &[1001, 1001],
+                &["USD", "EUR"],
+                &[4, 7],
+                &[1, 1],
+            )],
+        ),
+    )
+    .await;
+
+    let recovered = RecoveredRuntime::recover_with_owner_and_relation_catalog_record(
+        Arc::clone(&store),
+        ORDERS_SUM_COUNT_OWNER,
+        catalog.relation_schema.relation_id.as_str(),
+        catalog.relation_schema.relation_version.as_str(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(recovered.replayed_batch_count(), 1);
+    assert_eq!(recovered.logical_epoch(), 1);
+    assert_eq!(
+        recovered.materialized_state().net_rows().unwrap(),
+        vec![
+            DeltaRecord::new(
+                DeltaKey::from_json(json!({
+                    "account_id": 1001,
+                    "currency": "EUR"
+                })),
+                DeltaValue::from_json(json!({"count": 1, "sum": 7})),
+                1,
+            ),
+            DeltaRecord::new(
+                DeltaKey::from_json(json!({
+                    "account_id": 1001,
+                    "currency": "USD"
+                })),
+                DeltaValue::from_json(json!({"count": 1, "sum": 4})),
                 1,
             ),
         ]

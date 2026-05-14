@@ -18,8 +18,9 @@ use velorix_core::relation::{
     DictionaryKeyTypeV1, FelderaRelationBindingV1, IncrementalAdapterBindingV1,
     IncrementalInputAdapterError, RelationColumnV1, RelationOperationV1, RelationSchemaError,
     RelationSemanticRoleV1, SchemaFingerprintV1, VelorixLogicalTypeV1, VelorixRelationCatalogV1,
-    VelorixRelationSchemaV1, CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID,
-    ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID, RELATION_SCHEMA_VERSION_V1,
+    VelorixRelationSchemaV1, CATALOG_ROW_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID,
+    CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID, ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID,
+    RELATION_SCHEMA_VERSION_V1,
 };
 
 const ORDERS_RELATION_SCHEMA_FINGERPRINT: &str =
@@ -1010,6 +1011,71 @@ fn generic_catalog_incremental_input_accepts_decimal128_value_column_as_canonica
 }
 
 #[test]
+fn row_key_catalog_incremental_input_accepts_multi_column_key_as_column_id_object() {
+    let catalog = account_balance_by_currency_relation_catalog();
+    let batch = account_balance_by_currency_input_batch(
+        &[1001, 1001],
+        &["USD", "EUR"],
+        &[500, 125],
+        &[1, -1],
+    );
+
+    let delta = arrow_record_batches_to_single_key_sum_count_delta_batch(
+        &catalog,
+        catalog.relation_schema.relation_id.as_str(),
+        catalog.relation_schema.relation_version.as_str(),
+        catalog.schema_fingerprint.as_str(),
+        &[batch],
+    )
+    .unwrap();
+
+    assert_eq!(
+        delta.records(),
+        &[
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!({
+                    "account_id": 1001,
+                    "currency": "USD"
+                })),
+                DeltaValue::from_json(serde_json::json!(500)),
+                1,
+            ),
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!({
+                    "account_id": 1001,
+                    "currency": "EUR"
+                })),
+                DeltaValue::from_json(serde_json::json!(125)),
+                -1,
+            ),
+        ]
+    );
+}
+
+#[test]
+fn single_key_catalog_incremental_input_still_rejects_multi_column_key() {
+    let mut catalog = account_balance_by_currency_relation_catalog();
+    catalog.incremental_adapter.adapter_id =
+        CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID.to_string();
+    let batch = account_balance_by_currency_input_batch(&[1001], &["USD"], &[500], &[1]);
+
+    let error = arrow_record_batches_to_single_key_sum_count_delta_batch(
+        &catalog,
+        catalog.relation_schema.relation_id.as_str(),
+        catalog.relation_schema.relation_version.as_str(),
+        catalog.schema_fingerprint.as_str(),
+        &[batch],
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        IncrementalInputAdapterError::MalformedArrowInput { reason }
+            if reason == "prototype adapter supports exactly one primary key column"
+    ));
+}
+
+#[test]
 fn generic_catalog_incremental_input_rejects_decimal128_precision_scale_mismatch() {
     let catalog = decimal_key_account_balance_relation_catalog();
     let batch = RecordBatch::try_new(
@@ -1251,6 +1317,74 @@ fn account_balance_relation_catalog() -> VelorixRelationCatalogV1 {
         },
         incremental_adapter: IncrementalAdapterBindingV1 {
             adapter_id: CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID.to_string(),
+        },
+    }
+}
+
+fn account_balance_by_currency_relation_catalog() -> VelorixRelationCatalogV1 {
+    let relation_schema = VelorixRelationSchemaV1 {
+        relation_id: "account_balances_by_currency".to_string(),
+        relation_name: "account_balances_by_currency".to_string(),
+        relation_version: "2026-05-13.v1".to_string(),
+        columns: vec![
+            RelationColumnV1 {
+                column_id: "account_id".to_string(),
+                name: "account_id".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 0,
+                semantic_role: RelationSemanticRoleV1::PrimaryKey,
+            },
+            RelationColumnV1 {
+                column_id: "currency".to_string(),
+                name: "currency_code".to_string(),
+                logical_type: VelorixLogicalTypeV1::Utf8,
+                physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+                nullable: false,
+                ordinal: 1,
+                semantic_role: RelationSemanticRoleV1::PrimaryKey,
+            },
+            RelationColumnV1 {
+                column_id: "balance_cents".to_string(),
+                name: "balance_cents".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 2,
+                semantic_role: RelationSemanticRoleV1::Value,
+            },
+            RelationColumnV1 {
+                column_id: "row_delta".to_string(),
+                name: "row_delta".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 3,
+                semantic_role: RelationSemanticRoleV1::Weight,
+            },
+        ],
+        primary_key_column_ids: vec!["account_id".to_string(), "currency".to_string()],
+        weight_column_id: "row_delta".to_string(),
+        allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+        event_time_column_id: None,
+    };
+    let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
+
+    VelorixRelationCatalogV1 {
+        schema_version: RELATION_SCHEMA_VERSION_V1,
+        relation_schema,
+        schema_fingerprint: schema_fingerprint.clone(),
+        datafusion_registration: DataFusionRegistrationV1 {
+            name: "account_balances_by_currency".to_string(),
+            mode: DataFusionRegistrationModeV1::Table,
+        },
+        feldera_relation: FelderaRelationBindingV1 {
+            relation_id: "account_balances_by_currency".to_string(),
+            schema_fingerprint,
+        },
+        incremental_adapter: IncrementalAdapterBindingV1 {
+            adapter_id: CATALOG_ROW_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID.to_string(),
         },
     }
 }
@@ -1547,6 +1681,29 @@ fn account_balance_input_batch(
         ])),
         vec![
             Arc::new(Int64Array::from(account_ids.to_vec())) as ArrayRef,
+            Arc::new(Int64Array::from(balance_cents.to_vec())) as ArrayRef,
+            Arc::new(Int64Array::from(row_deltas.to_vec())) as ArrayRef,
+        ],
+    )
+    .unwrap()
+}
+
+fn account_balance_by_currency_input_batch(
+    account_ids: &[i64],
+    currencies: &[&str],
+    balance_cents: &[i64],
+    row_deltas: &[i64],
+) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("account_id", DataType::Int64, false),
+            Field::new("currency_code", DataType::Utf8, false),
+            Field::new("balance_cents", DataType::Int64, false),
+            Field::new("row_delta", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(account_ids.to_vec())) as ArrayRef,
+            Arc::new(StringArray::from(currencies.to_vec())) as ArrayRef,
             Arc::new(Int64Array::from(balance_cents.to_vec())) as ArrayRef,
             Arc::new(Int64Array::from(row_deltas.to_vec())) as ArrayRef,
         ],
