@@ -143,10 +143,11 @@ async fn relation_catalog_snapshot_provider_reports_ready_when_catalog_exists() 
 }
 
 #[tokio::test]
-async fn relation_catalog_snapshot_provider_reports_latest_stream_checkpoint_from_object_store() {
+async fn relation_catalog_snapshot_provider_does_not_report_stream_only_checkpoint_without_manifest_relation_identity(
+) {
     let store = memory_store();
     create_relation_catalog(&store).await;
-    let manifest_digest = publish_checkpoint(&store, 0, "deposits").await;
+    publish_checkpoint(&store, 0, "deposits").await;
     let api = FakeStatusApi::default();
     let writer = StreamStatusWriter::new(api.clone());
     let provider = production_provider(store).await;
@@ -164,10 +165,7 @@ async fn relation_catalog_snapshot_provider_reports_latest_stream_checkpoint_fro
                 "status": StreamStatus {
                     observed_generation: Some(1),
                     last_accepted_relation_schema_fingerprint: Some(relation().schema_fingerprint),
-                    latest_published_checkpoint: Some(CheckpointRef {
-                        checkpoint_version: 0,
-                        manifest_digest,
-                    }),
+                    latest_published_checkpoint: None,
                     readiness: Some(ready_condition()),
                 }
             }),

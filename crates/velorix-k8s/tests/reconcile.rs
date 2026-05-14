@@ -65,6 +65,72 @@ fn reconcile_stream_reports_relation_fingerprint_mismatch_from_authority_snapsho
 }
 
 #[test]
+fn reconcile_stream_hides_checkpoint_until_relation_catalog_is_visible() {
+    let stream = stream();
+    let snapshot = AuthoritySnapshot::default()
+        .with_authority(authority())
+        .with_latest_stream_checkpoint_for_authority(
+            &authority(),
+            "deposits",
+            &relation(),
+            checkpoint(7),
+        );
+
+    let outcome = reconcile_stream(&stream, &snapshot);
+
+    assert_eq!(
+        outcome.action,
+        ControllerAction::WriteStreamStatus(StreamStatus {
+            observed_generation: Some(1),
+            last_accepted_relation_schema_fingerprint: None,
+            latest_published_checkpoint: None,
+            readiness: Some(VelorixCondition {
+                type_: "Ready".to_string(),
+                status: ConditionState::False,
+                reason: "MissingRelationCatalogRecord".to_string(),
+                message: "relation catalog record is not visible".to_string(),
+            }),
+        })
+    );
+}
+
+#[test]
+fn reconcile_stream_hides_checkpoint_when_relation_fingerprint_mismatches() {
+    let stream = stream();
+    let stale_relation = RelationVersionRef {
+        schema_fingerprint: format!("sha256:{}", "0".repeat(64)),
+        ..relation()
+    };
+    let snapshot = AuthoritySnapshot::default()
+        .with_authority(authority())
+        .with_relation_for_authority(&authority(), &stale_relation)
+        .with_latest_stream_checkpoint_for_authority(
+            &authority(),
+            "deposits",
+            &relation(),
+            checkpoint(7),
+        );
+
+    let outcome = reconcile_stream(&stream, &snapshot);
+
+    assert_eq!(
+        outcome.action,
+        ControllerAction::WriteStreamStatus(StreamStatus {
+            observed_generation: Some(1),
+            last_accepted_relation_schema_fingerprint: Some(stale_relation.schema_fingerprint),
+            latest_published_checkpoint: None,
+            readiness: Some(VelorixCondition {
+                type_: "Ready".to_string(),
+                status: ConditionState::False,
+                reason: "RelationFingerprintMismatch".to_string(),
+                message: "stream spec relation fingerprint does not match object-store catalog"
+                    .to_string(),
+            }),
+        })
+    );
+}
+
+#[test]
 fn reconcile_stream_replaces_stale_checkpoint_status_with_authoritative_checkpoint() {
     let mut stream = stream();
     stream.status = Some(StreamStatus {
@@ -76,7 +142,12 @@ fn reconcile_stream_replaces_stale_checkpoint_status_with_authoritative_checkpoi
     let snapshot = AuthoritySnapshot::default()
         .with_authority(authority())
         .with_relation_for_authority(&authority(), &relation())
-        .with_latest_stream_checkpoint_for_authority(&authority(), "deposits", checkpoint(7));
+        .with_latest_stream_checkpoint_for_authority(
+            &authority(),
+            "deposits",
+            &relation(),
+            checkpoint(7),
+        );
 
     let outcome = reconcile_stream(&stream, &snapshot);
 
@@ -142,7 +213,12 @@ fn reconcile_stream_ignores_checkpoint_evidence_from_other_authority() {
     let snapshot = AuthoritySnapshot::default()
         .with_authority(authority())
         .with_relation_for_authority(&authority(), &relation())
-        .with_latest_stream_checkpoint_for_authority(&other_authority(), "deposits", checkpoint(7));
+        .with_latest_stream_checkpoint_for_authority(
+            &other_authority(),
+            "deposits",
+            &relation(),
+            checkpoint(7),
+        );
 
     let outcome = reconcile_stream(&stream, &snapshot);
 
@@ -152,6 +228,56 @@ fn reconcile_stream_ignores_checkpoint_evidence_from_other_authority() {
             observed_generation: Some(1),
             last_accepted_relation_schema_fingerprint: Some(relation().schema_fingerprint),
             latest_published_checkpoint: None,
+            readiness: Some(ready_condition()),
+        })
+    );
+}
+
+#[test]
+fn reconcile_stream_ignores_checkpoint_evidence_for_same_stream_with_different_relation() {
+    let stream = stream();
+    let other_relation = RelationVersionRef {
+        relation_id: "withdrawals".to_string(),
+        ..relation()
+    };
+    let snapshot = AuthoritySnapshot::default()
+        .with_authority(authority())
+        .with_relation_for_authority(&authority(), &relation())
+        .with_latest_stream_checkpoint_for_authority(
+            &authority(),
+            "deposits",
+            &other_relation,
+            checkpoint(7),
+        );
+
+    let outcome = reconcile_stream(&stream, &snapshot);
+
+    assert_eq!(
+        outcome.action,
+        ControllerAction::WriteStreamStatus(StreamStatus {
+            observed_generation: Some(1),
+            last_accepted_relation_schema_fingerprint: Some(relation().schema_fingerprint),
+            latest_published_checkpoint: None,
+            readiness: Some(ready_condition()),
+        })
+    );
+
+    let bound_snapshot = AuthoritySnapshot::default()
+        .with_authority(authority())
+        .with_relation_for_authority(&authority(), &relation())
+        .with_latest_stream_checkpoint_for_authority(
+            &authority(),
+            "deposits",
+            &relation(),
+            checkpoint(7),
+        );
+    assert_ne!(other_relation.relation_id, stream.spec.relation.relation_id);
+    assert_eq!(
+        reconcile_stream(&stream, &bound_snapshot).action,
+        ControllerAction::WriteStreamStatus(StreamStatus {
+            observed_generation: Some(1),
+            last_accepted_relation_schema_fingerprint: Some(relation().schema_fingerprint),
+            latest_published_checkpoint: Some(checkpoint(7)),
             readiness: Some(ready_condition()),
         })
     );

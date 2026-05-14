@@ -169,6 +169,7 @@ impl AuthoritySnapshotProvider for RelationCatalogSnapshotProvider {
             snapshot = snapshot.with_latest_stream_checkpoint_for_authority(
                 &self.authority,
                 &stream.spec.stream_id,
+                &stream.spec.relation,
                 checkpoint,
             );
         }
@@ -220,6 +221,7 @@ impl RelationCatalogSnapshotProvider {
                     .input_ranges
                     .iter()
                     .any(|range| range.stream_id == stream.spec.stream_id)
+                    && checkpoint_manifest_proves_relation_identity(manifest, &stream.spec.relation)
             })
             .max_by_key(|manifest| manifest.checkpoint_version);
 
@@ -242,6 +244,15 @@ impl RelationCatalogSnapshotProvider {
             Err(error) => Err(snapshot_error(error)),
         }
     }
+}
+
+fn checkpoint_manifest_proves_relation_identity(
+    _manifest: &velorix_storage::manifest::CheckpointManifest,
+    _relation: &RelationVersionRef,
+) -> bool {
+    // CheckpointManifest v1 has no relation id/version/fingerprint fields. A matching
+    // input stream alone is not enough evidence for Kubernetes relation-scoped status.
+    false
 }
 
 fn snapshot_error(error: CheckpointPublishError) -> StreamWatchError {

@@ -9,7 +9,7 @@ use crate::crd::{
 pub struct AuthoritySnapshot {
     authorities: BTreeSet<ObjectStoreAuthorityRef>,
     relation_fingerprints: BTreeMap<RelationEvidenceKey, String>,
-    latest_stream_checkpoints: BTreeMap<StreamEvidenceKey, CheckpointRef>,
+    latest_stream_checkpoints: BTreeMap<StreamRelationEvidenceKey, CheckpointRef>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,11 +51,13 @@ impl AuthoritySnapshot {
     pub fn with_latest_stream_checkpoint(
         self,
         stream_id: impl Into<String>,
+        relation: &RelationVersionRef,
         checkpoint: CheckpointRef,
     ) -> Self {
         self.with_latest_stream_checkpoint_for_authority(
             &ObjectStoreAuthorityRef::default(),
             stream_id,
+            relation,
             checkpoint,
         )
     }
@@ -64,12 +66,16 @@ impl AuthoritySnapshot {
         mut self,
         authority: &ObjectStoreAuthorityRef,
         stream_id: impl Into<String>,
+        relation: &RelationVersionRef,
         checkpoint: CheckpointRef,
     ) -> Self {
         self.latest_stream_checkpoints.insert(
-            StreamEvidenceKey {
+            StreamRelationEvidenceKey {
                 authority: authority.clone(),
                 stream_id: stream_id.into(),
+                relation_id: relation.relation_id.clone(),
+                relation_version: relation.relation_version,
+                schema_fingerprint: relation.schema_fingerprint.clone(),
             },
             checkpoint,
         );
@@ -98,11 +104,15 @@ impl AuthoritySnapshot {
         &self,
         authority: &ObjectStoreAuthorityRef,
         stream_id: &str,
+        relation: &RelationVersionRef,
     ) -> Option<CheckpointRef> {
         self.latest_stream_checkpoints
-            .get(&StreamEvidenceKey {
+            .get(&StreamRelationEvidenceKey {
                 authority: authority.clone(),
                 stream_id: stream_id.to_string(),
+                relation_id: relation.relation_id.clone(),
+                relation_version: relation.relation_version,
+                schema_fingerprint: relation.schema_fingerprint.clone(),
             })
             .cloned()
     }
@@ -121,14 +131,12 @@ fn stream_status_from_authority(
     snapshot: &AuthoritySnapshot,
 ) -> StreamStatus {
     let observed_generation = stream.metadata.generation;
-    let latest_published_checkpoint =
-        snapshot.latest_stream_checkpoint(&stream.spec.authority, &stream.spec.stream_id);
 
     if !snapshot.has_authority(&stream.spec.authority) {
         return StreamStatus {
             observed_generation,
             last_accepted_relation_schema_fingerprint: None,
-            latest_published_checkpoint,
+            latest_published_checkpoint: None,
             readiness: Some(condition(
                 ConditionState::False,
                 "MissingAuthorityRecord",
@@ -143,7 +151,7 @@ fn stream_status_from_authority(
         return StreamStatus {
             observed_generation,
             last_accepted_relation_schema_fingerprint: None,
-            latest_published_checkpoint,
+            latest_published_checkpoint: None,
             readiness: Some(condition(
                 ConditionState::False,
                 "MissingRelationCatalogRecord",
@@ -156,7 +164,7 @@ fn stream_status_from_authority(
         return StreamStatus {
             observed_generation,
             last_accepted_relation_schema_fingerprint: Some(catalog_fingerprint.to_string()),
-            latest_published_checkpoint,
+            latest_published_checkpoint: None,
             readiness: Some(condition(
                 ConditionState::False,
                 "RelationFingerprintMismatch",
@@ -164,6 +172,12 @@ fn stream_status_from_authority(
             )),
         };
     }
+
+    let latest_published_checkpoint = snapshot.latest_stream_checkpoint(
+        &stream.spec.authority,
+        &stream.spec.stream_id,
+        &stream.spec.relation,
+    );
 
     StreamStatus {
         observed_generation,
@@ -185,9 +199,12 @@ struct RelationEvidenceKey {
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct StreamEvidenceKey {
+struct StreamRelationEvidenceKey {
     authority: ObjectStoreAuthorityRef,
     stream_id: String,
+    relation_id: String,
+    relation_version: u64,
+    schema_fingerprint: String,
 }
 
 fn condition(status: ConditionState, reason: &str, message: &str) -> VelorixCondition {
