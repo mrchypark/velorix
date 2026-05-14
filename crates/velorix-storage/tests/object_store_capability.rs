@@ -518,6 +518,32 @@ async fn capability_gate_rejects_slatedb_checkpoint_publisher_before_opening_sta
 }
 
 #[tokio::test]
+async fn authoritative_capability_gate_rejects_slatedb_state_namespace_before_opening_state_store()
+{
+    let (_temp_dir, store) = temp_store();
+    let mut profiles = all_namespace_profiles();
+    profiles.remove(&AuthoritativeNamespace::State);
+    let capabilities = AuthoritativeObjectStoreCapabilitiesV1::new(profiles);
+
+    let err = CheckpointPublisher::with_slatedb_state_store_authoritative(
+        store,
+        Path::from("state-db"),
+        &capabilities,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        err,
+        CheckpointPublishError::AuthoritativeObjectStoreCapabilities(
+            AuthoritativeObjectStoreCapabilityError::MissingNamespace {
+                namespace: AuthoritativeNamespace::State
+            }
+        )
+    ));
+}
+
+#[tokio::test]
 async fn local_development_profile_allows_checkpoint_checked_construction_and_create_only_writes() {
     let (_temp_dir, store) = temp_store();
     let publisher =

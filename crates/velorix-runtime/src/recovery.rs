@@ -384,10 +384,10 @@ impl RecoveredRuntime {
         capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
     ) -> Result<Self, RecoveryError> {
         let authority = ProductionRecoveryAuthority::new(capabilities)?;
-        let publisher = CheckpointPublisher::with_slatedb_state_store_checked(
+        let publisher = CheckpointPublisher::with_slatedb_state_store_authoritative(
             Arc::clone(&store),
             db_path,
-            authority.profile(AuthoritativeNamespace::Checkpoint),
+            capabilities,
         )
         .await?;
         let manifest = publisher
@@ -466,10 +466,10 @@ impl RecoveredRuntime {
         capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
     ) -> Result<Self, RecoveryError> {
         let authority = ProductionRecoveryAuthority::new(capabilities)?;
-        let publisher = CheckpointPublisher::with_slatedb_state_store_checked(
+        let publisher = CheckpointPublisher::with_slatedb_state_store_authoritative(
             Arc::clone(&store),
             db_path,
-            authority.profile(AuthoritativeNamespace::Checkpoint),
+            capabilities,
         )
         .await?;
         let ingest_log = IngestLog::new_checked(

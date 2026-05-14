@@ -67,6 +67,13 @@ fn production_sources_do_not_call_bootstrap_ingest_apis() {
         "checked runtime recovery entrypoints must require durable admission evidence:\n{}",
         checked_recovery_violations.join("\n")
     );
+    let slatedb_authority_violations =
+        checked_slatedb_recovery_capability_violations(&runtime_recovery);
+    assert!(
+        slatedb_authority_violations.is_empty(),
+        "checked SlateDB recovery entrypoints must route through the authoritative SlateDB constructor:\n{}",
+        slatedb_authority_violations.join("\n")
+    );
 }
 
 #[test]
@@ -204,6 +211,23 @@ fn checked_recovery_admission_selection_violations(contents: &str) -> Vec<String
         (!selects_durable || selects_envelope_only).then(|| {
             format!(
                 "{signature} must pass ReplayAdmissionEvidence::DurableAdmissionRequired and must not pass EnvelopeOnly"
+            )
+        })
+        })
+    .collect()
+}
+
+fn checked_slatedb_recovery_capability_violations(contents: &str) -> Vec<String> {
+    [
+        "pub async fn recover_from_published_checkpoint_version_with_slatedb_state_store_and_relation_catalog_checked(",
+        "pub async fn recover_with_slatedb_state_store_and_relation_catalog_checked(",
+    ]
+    .into_iter()
+    .filter_map(|signature| {
+        let body = function_body(contents, signature)?;
+        (!body.contains("CheckpointPublisher::with_slatedb_state_store_authoritative(")).then(|| {
+            format!(
+                "{signature} must open SlateDB state through the startup-capability authoritative constructor"
             )
         })
     })

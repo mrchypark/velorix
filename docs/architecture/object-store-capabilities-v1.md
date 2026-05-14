@@ -68,6 +68,9 @@ durability capabilities for every authoritative namespace.
   capabilities.
 - Production persisted table scans accept stores registered with complete
   declared namespace capabilities.
+- Checked production SlateDB recovery opens the state store only through shared
+  startup `AuthoritativeObjectStoreCapabilitiesV1` evidence and requires both
+  checkpoint and state namespaces before opening SlateDB.
 - Env-gated S3-compatible storage evidence validates create-only conflict,
   read-after-write, list-after-write, and range-read behavior.
 - Env-gated S3-compatible capability evidence validates startup capabilities for

@@ -9,7 +9,11 @@ use object_store::{path::Path, ObjectStore, PutMode};
 use thiserror::Error;
 
 use crate::{
-    capability::{ObjectStoreCapabilityError, ObjectStoreCapabilityProfile},
+    capability::{
+        AuthoritativeNamespace, AuthoritativeObjectStoreCapabilitiesV1,
+        AuthoritativeObjectStoreCapabilityError, ObjectStoreCapabilityError,
+        ObjectStoreCapabilityProfile,
+    },
     checkpoint_index::{
         manifest_digest, marker_updated_at_now, recovery_transition_id_now,
         CheckpointAdminInspection, CheckpointLifecycleRecord, CheckpointLifecycleStatus,
@@ -95,6 +99,8 @@ pub enum CheckpointPublishError {
     OwnershipEpochRecord(#[from] OwnershipEpochRecordError),
     #[error(transparent)]
     ObjectStoreCapability(#[from] ObjectStoreCapabilityError),
+    #[error(transparent)]
+    AuthoritativeObjectStoreCapabilities(#[from] AuthoritativeObjectStoreCapabilityError),
     #[error("state object `{0}` already exists")]
     StateObjectAlreadyExists(ObjectKey),
     #[error("output object `{0}` already exists")]
@@ -272,8 +278,9 @@ impl CheckpointPublisher {
     }
 
     /// Constructs a checkpoint publisher with a SlateDB state store without
-    /// object-store capability validation. Production/durable callers should
-    /// use [`Self::with_slatedb_state_store_checked`].
+    /// object-store capability validation. Production callers should use
+    /// [`Self::with_slatedb_state_store_authoritative`] so both checkpoint and
+    /// state namespaces are validated from shared startup evidence.
     pub async fn with_slatedb_state_store(
         store: Arc<dyn ObjectStore>,
         db_path: impl Into<Path>,
@@ -284,14 +291,30 @@ impl CheckpointPublisher {
     }
 
     /// Constructs a checkpoint publisher with a SlateDB state store after
-    /// validating the supplied object-store profile has the capabilities
-    /// required by Velorix durability.
+    /// validating one supplied object-store profile. This remains useful for
+    /// bootstrap or compatibility callers that do not yet have namespace-scoped
+    /// startup evidence; production callers should use
+    /// [`Self::with_slatedb_state_store_authoritative`].
     pub async fn with_slatedb_state_store_checked(
         store: Arc<dyn ObjectStore>,
         db_path: impl Into<Path>,
         profile: &ObjectStoreCapabilityProfile,
     ) -> Result<Self, CheckpointPublishError> {
         profile.validate_for_velorix_durability()?;
+
+        Self::with_slatedb_state_store(store, db_path).await
+    }
+
+    /// Constructs a production checkpoint publisher with a SlateDB state store
+    /// after validating both checkpoint-manifest and state-substrate
+    /// authoritative namespaces from the shared startup capability evidence.
+    pub async fn with_slatedb_state_store_authoritative(
+        store: Arc<dyn ObjectStore>,
+        db_path: impl Into<Path>,
+        capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
+    ) -> Result<Self, CheckpointPublishError> {
+        capabilities.validate_namespace(AuthoritativeNamespace::Checkpoint)?;
+        capabilities.validate_namespace(AuthoritativeNamespace::State)?;
 
         Self::with_slatedb_state_store(store, db_path).await
     }

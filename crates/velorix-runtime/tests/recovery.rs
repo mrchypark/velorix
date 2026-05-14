@@ -2474,6 +2474,31 @@ async fn checked_selected_checkpoint_recovery_with_slatedb_state_requires_checkp
 }
 
 #[tokio::test]
+async fn checked_selected_checkpoint_recovery_with_slatedb_state_requires_state_capability() {
+    let (_temp_dir, store) = temp_store();
+    let capabilities = capabilities_missing(AuthoritativeNamespace::State);
+
+    let error =
+        RecoveredRuntime::recover_from_published_checkpoint_version_with_slatedb_state_store_checked(
+            Arc::clone(&store),
+            "v1/slatedb/state",
+            0,
+            &capabilities,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RecoveryError::AuthoritativeObjectStoreCapabilities(
+            AuthoritativeObjectStoreCapabilityError::MissingNamespace {
+                namespace: AuthoritativeNamespace::State
+            }
+        )
+    ));
+}
+
+#[tokio::test]
 async fn catalog_backed_recovery_fails_closed_when_catalog_record_is_missing() {
     let (_temp_dir, store) = temp_store();
 
