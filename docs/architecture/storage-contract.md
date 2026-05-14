@@ -19,6 +19,7 @@ segment.
 | Object | Key form | Authority |
 | --- | --- | --- |
 | Ingest batch | `v1/ingest/{stream_id}/p={partition_id:010}/{start:020}-{end:020}.batch` | Immutable input delta object; input-only namespace |
+| Ingest admission record | `v1/ingest-admission/{stream_id}/p={partition_id:010}/ranges/{start:020}-{end:020}.admission.json` | Velorix-owned serialized admission evidence; object storage is evidence authority, deployed coordinator is serialization authority |
 | State object | `v1/state/{owner}/p={partition_id:010}/chk={checkpoint_version:020}/{object_id}.state` | Checkpoint-referenced state payload |
 | Output object | `v1/outputs/{stream_id}/p={partition_id:010}/chk={checkpoint_version:020}/{start:020}-{end:020}/{object_id}.output` | Manifest-referenced internal materialized output |
 | Temporary publish object | `v1/tmp/{checkpoint_version:020}/{attempt_or_object_id}/{kind}` | Non-authoritative staging location |

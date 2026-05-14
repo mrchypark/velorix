@@ -78,9 +78,10 @@ fn assert_capability_error(
     assert_eq!(err.required_capability(), expected);
 }
 
-fn expected_authoritative_namespaces() -> [AuthoritativeNamespace; 16] {
+fn expected_authoritative_namespaces() -> [AuthoritativeNamespace; 17] {
     [
         AuthoritativeNamespace::Ingest,
+        AuthoritativeNamespace::IngestAdmission,
         AuthoritativeNamespace::State,
         AuthoritativeNamespace::Output,
         AuthoritativeNamespace::Checkpoint,
@@ -274,7 +275,7 @@ async fn authoritative_capability_probe_reports_namespace_for_create_only_failur
 #[test]
 fn authoritative_capabilities_reject_missing_namespace() {
     let mut profiles = all_namespace_profiles();
-    profiles.remove(&AuthoritativeNamespace::QueryPolicy);
+    profiles.remove(&AuthoritativeNamespace::IngestAdmission);
     let capabilities = AuthoritativeObjectStoreCapabilitiesV1::new(profiles);
 
     let error = capabilities.validate_for_startup().unwrap_err();
@@ -282,7 +283,7 @@ fn authoritative_capabilities_reject_missing_namespace() {
     assert!(matches!(
         error,
         AuthoritativeObjectStoreCapabilityError::MissingNamespace {
-            namespace: AuthoritativeNamespace::QueryPolicy
+            namespace: AuthoritativeNamespace::IngestAdmission
         }
     ));
 }
@@ -291,14 +292,14 @@ fn authoritative_capabilities_reject_missing_namespace() {
 fn authoritative_capabilities_report_weak_namespace_profile() {
     let mut profiles = all_namespace_profiles();
     let profile = profile_missing(RequiredObjectStoreCapability::ConditionalCreate);
-    profiles.insert(AuthoritativeNamespace::Output, profile.clone());
+    profiles.insert(AuthoritativeNamespace::IngestAdmission, profile.clone());
     let capabilities = AuthoritativeObjectStoreCapabilitiesV1::new(profiles);
 
     let error = capabilities.validate_for_startup().unwrap_err();
 
     match error {
         AuthoritativeObjectStoreCapabilityError::NamespaceProfile { namespace, source } => {
-            assert_eq!(namespace, AuthoritativeNamespace::Output);
+            assert_eq!(namespace, AuthoritativeNamespace::IngestAdmission);
             assert_capability_error(
                 source,
                 &profile,

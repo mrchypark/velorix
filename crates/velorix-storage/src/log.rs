@@ -6,6 +6,7 @@ use std::{
 use bytes::Bytes;
 use futures::{lock::Mutex as AsyncMutex, TryStreamExt};
 use object_store::{path::Path, ObjectStore, PutMode};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use velorix_core::relation::{validate_record_batch_matches_catalog, RelationSchemaError};
 
@@ -17,15 +18,29 @@ use crate::{
 };
 
 const INGEST_PREFIX: &str = "v1/ingest";
+const INGEST_ADMISSION_RECORD_KIND_V1: &str = "ingest_range_admission_v1";
 
 #[derive(Clone, Debug)]
 pub struct IngestLog {
     store: Arc<dyn ObjectStore>,
 }
 
+#[derive(Clone, Debug)]
+struct DurableIngestAdmission {
+    log: IngestLog,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AdmissionSerializationGuard {
+    stream_id: String,
+    partition_id: u32,
+    _private: (),
+}
+
 #[derive(Clone)]
 pub struct IngestAdmissionCoordinator {
     log: IngestLog,
+    durable_admission: DurableIngestAdmission,
     admission_locks: Arc<Mutex<HashMap<(String, u32), Arc<AsyncMutex<()>>>>>,
 }
 
@@ -42,6 +57,23 @@ pub struct IngestBatchDescriptor {
     pub start_offset_inclusive: u64,
     pub end_offset_exclusive: u64,
     pub object_key: ObjectKey,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DurableIngestAdmissionRecordV1 {
+    pub schema_version: u16,
+    pub record_kind: String,
+    pub stream_id: String,
+    pub partition_id: u32,
+    pub start_offset_inclusive: u64,
+    pub end_offset_exclusive: u64,
+    pub batch_key: ObjectKey,
+    pub admission_record_key: ObjectKey,
+    pub payload_digest: String,
+    pub relation_id: String,
+    pub relation_version: String,
+    pub schema_fingerprint: String,
+    pub admission_mode: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,6 +106,17 @@ pub enum IngestLogError {
     AlreadyExists(ObjectKey),
     #[error("malformed ingest batch key `{key}`: {source}")]
     MalformedIngestKey { key: String, source: ObjectKeyError },
+    #[error("malformed durable ingest admission record `{key}`: {reason}")]
+    MalformedIngestAdmissionRecord { key: String, reason: String },
+    #[error(
+        "admission serialization guard is for {guard_stream_id}/p={guard_partition_id}, not {stream_id}/p={partition_id}"
+    )]
+    AdmissionSerializationGuardMismatch {
+        guard_stream_id: String,
+        guard_partition_id: u32,
+        stream_id: String,
+        partition_id: u32,
+    },
     #[error(
         "overlapping committed ingest ranges for {stream_id}/p={partition_id}: `{previous}` overlaps `{current}`"
     )]
@@ -111,22 +154,268 @@ pub enum IngestLogError {
     IngestEnvelope(#[from] IngestEnvelopeError),
     #[error(transparent)]
     ObjectStore(#[from] object_store::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+}
+
+impl AdmissionSerializationGuard {
+    fn process_local(stream_id: String, partition_id: u32) -> Self {
+        Self {
+            stream_id,
+            partition_id,
+            _private: (),
+        }
+    }
+
+    fn validate(&self, descriptor: &IngestBatchDescriptor) -> Result<(), IngestLogError> {
+        if self.stream_id == descriptor.stream_id && self.partition_id == descriptor.partition_id {
+            return Ok(());
+        }
+
+        Err(IngestLogError::AdmissionSerializationGuardMismatch {
+            guard_stream_id: self.stream_id.clone(),
+            guard_partition_id: self.partition_id,
+            stream_id: descriptor.stream_id.clone(),
+            partition_id: descriptor.partition_id,
+        })
+    }
+}
+
+impl DurableIngestAdmission {
+    fn new(log: IngestLog) -> Self {
+        Self { log }
+    }
+
+    /// Records durable serialized admission evidence, then appends the
+    /// canonical ingest object. The supplied guard is the serialization
+    /// boundary; this facade deliberately does not claim that object-store range
+    /// records alone can reject arbitrary concurrent overlaps.
+    async fn admit_validated_batch(
+        &self,
+        batch: IngestBatch,
+        guard: &AdmissionSerializationGuard,
+    ) -> Result<AppendValidatedEnvelopeOutcome, IngestLogError> {
+        let descriptor = batch.descriptor();
+        guard.validate(&descriptor)?;
+
+        for committed in self.log.list_committed().await? {
+            if committed.object_key == descriptor.object_key {
+                continue;
+            }
+            if ranges_overlap(&committed, &descriptor) {
+                return Ok(AppendValidatedEnvelopeOutcome::Conflict {
+                    descriptor,
+                    object_key: committed.object_key,
+                    reason: "range_overlap_committed",
+                });
+            }
+        }
+
+        if let Some(existing) = self.log.existing_batch_conflict(&batch).await? {
+            return Ok(existing);
+        }
+
+        let record = admission_record_for_batch(&batch)?;
+        match self.reserve_admission_record(&record).await? {
+            AdmissionReservationOutcome::Admitted | AdmissionReservationOutcome::Duplicate => {}
+            AdmissionReservationOutcome::Conflict { object_key, reason } => {
+                return Ok(AppendValidatedEnvelopeOutcome::Conflict {
+                    descriptor,
+                    object_key,
+                    reason,
+                });
+            }
+        }
+
+        self.log.append_validated_batch(batch).await
+    }
+
+    async fn reserve_admission_record(
+        &self,
+        record: &DurableIngestAdmissionRecordV1,
+    ) -> Result<AdmissionReservationOutcome, IngestLogError> {
+        let descriptor = record.descriptor()?;
+        let existing = self.list_admission_records().await?;
+
+        for candidate in &existing {
+            let candidate_descriptor = candidate.descriptor()?;
+            if candidate.admission_record_key == record.admission_record_key {
+                if candidate == record {
+                    return Ok(AdmissionReservationOutcome::Duplicate);
+                }
+
+                return Ok(AdmissionReservationOutcome::Conflict {
+                    object_key: candidate.batch_key.clone(),
+                    reason: "same_range_different_digest_reserved",
+                });
+            }
+
+            if ranges_overlap(&candidate_descriptor, &descriptor) {
+                return Ok(AdmissionReservationOutcome::Conflict {
+                    object_key: candidate.batch_key.clone(),
+                    reason: "range_overlap_reserved",
+                });
+            }
+        }
+
+        let bytes = Bytes::from(serde_json::to_vec(record)?);
+        match self
+            .log
+            .store
+            .put_opts(
+                &Path::from(record.admission_record_key.as_str()),
+                bytes.clone().into(),
+                PutMode::Create.into(),
+            )
+            .await
+        {
+            Ok(_) => Ok(AdmissionReservationOutcome::Admitted),
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                let existing = self
+                    .log
+                    .store
+                    .get(&Path::from(record.admission_record_key.as_str()))
+                    .await?
+                    .bytes()
+                    .await?;
+                let existing: DurableIngestAdmissionRecordV1 = serde_json::from_slice(&existing)?;
+                existing.validate_key()?;
+                if &existing == record {
+                    Ok(AdmissionReservationOutcome::Duplicate)
+                } else {
+                    Ok(AdmissionReservationOutcome::Conflict {
+                        object_key: existing.batch_key,
+                        reason: "same_range_different_digest_reserved",
+                    })
+                }
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn list_admission_records(
+        &self,
+    ) -> Result<Vec<DurableIngestAdmissionRecordV1>, IngestLogError> {
+        let mut objects = self
+            .log
+            .store
+            .list(Some(&Path::from("v1/ingest-admission")))
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        objects.sort_by(|left, right| left.location.cmp(&right.location));
+
+        let mut records = Vec::with_capacity(objects.len());
+        for object in objects {
+            let bytes = self.log.store.get(&object.location).await?.bytes().await?;
+            let record: DurableIngestAdmissionRecordV1 = serde_json::from_slice(&bytes)?;
+            record.validate_key()?;
+            if object.location != Path::from(record.admission_record_key.as_str()) {
+                return Err(IngestLogError::MalformedIngestAdmissionRecord {
+                    key: object.location.to_string(),
+                    reason: format!(
+                        "stored path does not match body admission_record_key `{}`",
+                        record.admission_record_key
+                    ),
+                });
+            }
+            records.push(record);
+        }
+
+        Ok(records)
+    }
+}
+
+impl DurableIngestAdmissionRecordV1 {
+    fn descriptor(&self) -> Result<IngestBatchDescriptor, IngestLogError> {
+        self.validate_key()?;
+
+        Ok(IngestBatchDescriptor {
+            stream_id: self.stream_id.clone(),
+            partition_id: self.partition_id,
+            start_offset_inclusive: self.start_offset_inclusive,
+            end_offset_exclusive: self.end_offset_exclusive,
+            object_key: self.batch_key.clone(),
+        })
+    }
+
+    fn validate_key(&self) -> Result<(), IngestLogError> {
+        let expected_batch_key = ObjectKey::ingest_batch(
+            &self.stream_id,
+            self.partition_id,
+            self.start_offset_inclusive,
+            self.end_offset_exclusive,
+        )?;
+        let expected_admission_record_key = ObjectKey::ingest_admission_record(
+            &self.stream_id,
+            self.partition_id,
+            self.start_offset_inclusive,
+            self.end_offset_exclusive,
+        )?;
+
+        if self.schema_version != 1 {
+            return Err(IngestLogError::MalformedIngestAdmissionRecord {
+                key: self.admission_record_key.to_string(),
+                reason: format!("unsupported schema_version {}", self.schema_version),
+            });
+        }
+        if self.record_kind != INGEST_ADMISSION_RECORD_KIND_V1 {
+            return Err(IngestLogError::MalformedIngestAdmissionRecord {
+                key: self.admission_record_key.to_string(),
+                reason: format!("unsupported record_kind `{}`", self.record_kind),
+            });
+        }
+        if self.batch_key != expected_batch_key {
+            return Err(IngestLogError::MalformedIngestAdmissionRecord {
+                key: self.admission_record_key.to_string(),
+                reason: format!("batch_key `{}` does not match record range", self.batch_key),
+            });
+        }
+        if self.admission_record_key != expected_admission_record_key {
+            return Err(IngestLogError::MalformedIngestAdmissionRecord {
+                key: self.admission_record_key.to_string(),
+                reason: format!(
+                    "admission_record_key does not match expected `{expected_admission_record_key}`"
+                ),
+            });
+        }
+        if !is_sha256_digest(&self.payload_digest) {
+            return Err(IngestLogError::MalformedIngestAdmissionRecord {
+                key: self.admission_record_key.to_string(),
+                reason: "payload_digest must be sha256:<64 hex chars>".to_string(),
+            });
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AdmissionReservationOutcome {
+    Admitted,
+    Duplicate,
+    Conflict {
+        object_key: ObjectKey,
+        reason: &'static str,
+    },
 }
 
 impl IngestAdmissionCoordinator {
     pub fn new(log: IngestLog) -> Self {
         Self {
+            durable_admission: DurableIngestAdmission::new(log.clone()),
             log,
             admission_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// Catalog-aware process-local coordinated admission.
+    /// Catalog-aware process-local coordinated admission with durable
+    /// serialized admission evidence.
     ///
     /// This serializes range checks for each stream/partition inside this
-    /// coordinator instance. It is useful for local/runtime write-coordinator
-    /// evidence, but it is not a distributed admission index across processes
-    /// or pods.
+    /// coordinator instance and records a Velorix-owned admission record before
+    /// appending. It is useful storage plumbing for a deployed coordinator, but
+    /// it is not itself a distributed admission index across processes or pods.
     pub async fn append_catalog_validated_envelope(
         &self,
         payload: Bytes,
@@ -135,22 +424,14 @@ impl IngestAdmissionCoordinator {
         let descriptor = batch.descriptor();
         let admission_lock = self.admission_lock(&descriptor);
         let _guard = admission_lock.lock().await;
+        let serialization_guard = AdmissionSerializationGuard::process_local(
+            descriptor.stream_id.clone(),
+            descriptor.partition_id,
+        );
 
-        if let Some(committed) = self
-            .log
-            .list_committed()
-            .await?
-            .into_iter()
-            .find(|committed| ranges_overlap(committed, &descriptor))
-        {
-            return Ok(AppendValidatedEnvelopeOutcome::Conflict {
-                descriptor,
-                object_key: committed.object_key,
-                reason: "range_overlap_committed",
-            });
-        }
-
-        self.log.append_validated_batch(batch).await
+        self.durable_admission
+            .admit_validated_batch(batch, &serialization_guard)
+            .await
     }
 
     pub async fn list_committed(&self) -> Result<Vec<IngestBatchDescriptor>, IngestLogError> {
@@ -333,6 +614,36 @@ impl IngestLog {
         }
     }
 
+    async fn existing_batch_conflict(
+        &self,
+        batch: &IngestBatch,
+    ) -> Result<Option<AppendValidatedEnvelopeOutcome>, IngestLogError> {
+        match self
+            .store
+            .get(&Path::from(batch.object_key().as_str()))
+            .await
+        {
+            Ok(existing) => {
+                let existing = IngestEnvelope::decode(existing.bytes().await?)?;
+                let incoming = IngestEnvelope::decode(batch.payload.clone())?;
+                let descriptor = batch.descriptor();
+                if existing.header().payload_digest == incoming.header().payload_digest {
+                    Ok(Some(AppendValidatedEnvelopeOutcome::Duplicate {
+                        descriptor,
+                    }))
+                } else {
+                    Ok(Some(AppendValidatedEnvelopeOutcome::Conflict {
+                        descriptor,
+                        reason: "same_key_different_digest",
+                        object_key: batch.object_key().clone(),
+                    }))
+                }
+            }
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub async fn list_committed(&self) -> Result<Vec<IngestBatchDescriptor>, IngestLogError> {
         let mut objects = self
             .store
@@ -446,6 +757,47 @@ fn ranges_overlap(previous: &IngestBatchDescriptor, current: &IngestBatchDescrip
         && previous.start_offset_inclusive < current.end_offset_exclusive
         && current.start_offset_inclusive < previous.end_offset_exclusive
         && previous.object_key != current.object_key
+}
+
+fn admission_record_for_batch(
+    batch: &IngestBatch,
+) -> Result<DurableIngestAdmissionRecordV1, IngestLogError> {
+    let envelope = IngestEnvelope::decode(batch.payload.clone())?;
+    let header = envelope.header();
+    let descriptor = batch.descriptor();
+    let admission_record_key = ObjectKey::ingest_admission_record(
+        &descriptor.stream_id,
+        descriptor.partition_id,
+        descriptor.start_offset_inclusive,
+        descriptor.end_offset_exclusive,
+    )?;
+
+    let record = DurableIngestAdmissionRecordV1 {
+        schema_version: 1,
+        record_kind: INGEST_ADMISSION_RECORD_KIND_V1.to_string(),
+        stream_id: descriptor.stream_id,
+        partition_id: descriptor.partition_id,
+        start_offset_inclusive: descriptor.start_offset_inclusive,
+        end_offset_exclusive: descriptor.end_offset_exclusive,
+        batch_key: descriptor.object_key,
+        admission_record_key,
+        payload_digest: header.payload_digest.clone(),
+        relation_id: header.relation_id.clone(),
+        relation_version: header.relation_version.clone(),
+        schema_fingerprint: header.schema_fingerprint.clone(),
+        admission_mode: "process_local_serialized".to_string(),
+    };
+    record.validate_key()?;
+
+    Ok(record)
+}
+
+fn is_sha256_digest(value: &str) -> bool {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return false;
+    };
+
+    hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 impl IngestBatch {

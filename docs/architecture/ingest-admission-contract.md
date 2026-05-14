@@ -29,14 +29,18 @@ surfaces and do not prove relation-catalog admission.
 
 `IngestAdmissionCoordinator` is a process-local write coordinator for
 catalog-aware envelopes. It serializes admission per `(stream_id, partition_id)`
-inside one coordinator instance, rechecks committed ranges while guarded,
-rejects visible overlaps, permits adjacent ranges, and preserves same-digest
-retry idempotency. This is local/runtime coordinator evidence only; it does not
-provide a distributed admission index across processes or pods.
+inside one coordinator instance, records immutable Velorix-owned serialized
+admission evidence under `v1/ingest-admission/...`, rechecks committed and
+reserved ranges while guarded, rejects visible overlaps, permits adjacent
+ranges, and preserves same-digest retry idempotency. This is storage plumbing
+for deployed admission and local/runtime coordinator evidence only; object-store
+range records alone do not provide a distributed admission index across
+processes or pods.
 
-Production `Coordinated` mode uses a durable admission index or a deployed write
-coordinator with the same semantics. This is required before Velorix advertises
-production multi-writer range-overlap rejection.
+Production `Coordinated` mode uses a deployed write coordinator as the
+serialization authority and `v1/ingest-admission` records as durable database
+evidence and restart-reconstruction input. This is required before Velorix
+advertises production multi-writer range-overlap rejection.
 
 `AsyncBuffered` mode is future work. It may return `202 Accepted` only with a
 separate admission status lifecycle and must not claim persistent ingest before
@@ -62,6 +66,8 @@ Conflict reasons must be explicit:
 
 - Concurrent `[0,100)` and `[50,150)` admission rejects one request in the
   process-local coordinator.
+- A separate coordinator rejects a range already reserved by durable serialized
+  admission evidence before any batch object is committed.
 - The same race is not claimed safe in create-only-only mode.
 - Adjacent ranges are allowed.
 - Crash-after-create-before-response retry returns `200 OK` for same digest.

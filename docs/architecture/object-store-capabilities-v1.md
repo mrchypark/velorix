@@ -13,6 +13,7 @@ manifest publication.
 | Namespace | Write requirement | Read/list requirement |
 | --- | --- | --- |
 | `v1/ingest` | Create-only object writes; no overwrite fallback. | Read-after-create, partition/range listing, metadata or ETag. |
+| `v1/ingest-admission` | Create-only serialized admission evidence writes; no overwrite fallback. | Read-after-create and stream/partition/range listing. |
 | `v1/state/raw` | Create-only raw bootstrap state writes. | Read-after-create, metadata or ETag. |
 | SlateDB state | SlateDB-required object semantics. | Owned by the SlateDB adapter. |
 | `v1/outputs` | Create-only output writes. | Read-after-create, metadata or ETag. |
@@ -20,7 +21,7 @@ manifest publication.
 | `v1/queries` | Create-only catalog writes. | Read-after-create. |
 | `v1/tables` | Create-only catalog writes. | Read-after-create. |
 | `v1/relations` | Create-only relation catalog writes. | Read-after-create. |
-| `v1/ownership` | Create-only epoch and admission records, when enabled. | Read-after-create and documented listing semantics. |
+| `v1/ownership` | Create-only epoch records, when enabled. | Read-after-create and documented listing semantics. |
 
 Production startup must reject unsupported conditional create or CAS behavior.
 Overwrite-based emulation is forbidden in production. Local filesystem or fake
@@ -45,7 +46,7 @@ telemetry.
 Phase 2.3 records declared capability profiles as
 `AuthoritativeObjectStoreCapabilitiesV1`, keyed by these authoritative
 namespaces: ingest, state, output, checkpoint, ownership, table catalog,
-relation catalog, artifact catalog, and benchmark evidence.
+relation catalog, artifact catalog, ingest admission, and benchmark evidence.
 
 Startup validation rejects a missing namespace profile and rejects any namespace
 whose `ObjectStoreCapabilityProfile` is missing a required durability

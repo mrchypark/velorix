@@ -7,7 +7,7 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use bytes::Bytes;
-use object_store::{local::LocalFileSystem, path::Path, ObjectStore};
+use object_store::{local::LocalFileSystem, path::Path, ObjectStore, PutMode};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -23,8 +23,8 @@ use velorix_storage::{
         IngestEnvelope, IngestEnvelopeEncodeRequest, IngestEnvelopeError, INGEST_ENVELOPE_MAGIC,
     },
     log::{
-        AppendValidatedEnvelopeOutcome, IngestAdmissionCoordinator, IngestBatch,
-        IngestBatchDescriptor, IngestLog, IngestLogError,
+        AppendValidatedEnvelopeOutcome, DurableIngestAdmissionRecordV1, IngestAdmissionCoordinator,
+        IngestBatch, IngestBatchDescriptor, IngestLog, IngestLogError,
     },
     object_key::ObjectKey,
     relation_catalog_registry::{RelationCatalogRegistry, RelationCatalogRegistryError},
@@ -77,6 +77,24 @@ fn valid_batch() -> RecordBatch {
         vec![
             Arc::new(StringArray::from(vec!["acct-1", "acct-2"])) as ArrayRef,
             Arc::new(Int64Array::from(vec![10, 20])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![1, -1])) as ArrayRef,
+        ],
+    )
+    .unwrap()
+}
+
+fn valid_batch_with_different_payload() -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("account_id", DataType::Utf8, false),
+        Field::new("amount", DataType::Int64, false),
+        Field::new("weight", DataType::Int64, false),
+    ]));
+
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["acct-3", "acct-4"])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![30, 40])) as ArrayRef,
             Arc::new(Int64Array::from(vec![1, -1])) as ArrayRef,
         ],
     )
@@ -993,6 +1011,179 @@ async fn process_local_coordinated_catalog_admission_keeps_same_digest_retry_ide
     assert_eq!(
         retry,
         AppendValidatedEnvelopeOutcome::Duplicate { descriptor }
+    );
+}
+
+#[tokio::test]
+async fn durable_serialized_catalog_admission_rejects_overlap_reserved_by_separate_coordinator() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = create_orders_relation_catalog(&store).await;
+    let reserved_payload = catalog_envelope_bytes_for(&catalog, 0, 100);
+    let reserved_batch = IngestBatch::from_validated_envelope(reserved_payload.clone()).unwrap();
+    let reserved_envelope = IngestEnvelope::decode(reserved_payload).unwrap();
+    let reserved_descriptor = reserved_batch.descriptor();
+    let reservation = DurableIngestAdmissionRecordV1 {
+        schema_version: 1,
+        record_kind: "ingest_range_admission_v1".to_string(),
+        stream_id: reserved_descriptor.stream_id.clone(),
+        partition_id: reserved_descriptor.partition_id,
+        start_offset_inclusive: reserved_descriptor.start_offset_inclusive,
+        end_offset_exclusive: reserved_descriptor.end_offset_exclusive,
+        batch_key: reserved_descriptor.object_key.clone(),
+        admission_record_key: ObjectKey::ingest_admission_record(
+            &reserved_descriptor.stream_id,
+            reserved_descriptor.partition_id,
+            reserved_descriptor.start_offset_inclusive,
+            reserved_descriptor.end_offset_exclusive,
+        )
+        .unwrap(),
+        payload_digest: reserved_envelope.header().payload_digest.clone(),
+        relation_id: reserved_envelope.header().relation_id.clone(),
+        relation_version: reserved_envelope.header().relation_version.clone(),
+        schema_fingerprint: reserved_envelope.header().schema_fingerprint.clone(),
+        admission_mode: "process_local_serialized".to_string(),
+    };
+
+    store
+        .put_opts(
+            &Path::from(reservation.admission_record_key.as_str()),
+            Bytes::from(serde_json::to_vec(&reservation).unwrap()).into(),
+            PutMode::Create.into(),
+        )
+        .await
+        .unwrap();
+
+    let separate_coordinator = IngestAdmissionCoordinator::new(IngestLog::new(Arc::clone(&store)));
+    let outcome = separate_coordinator
+        .append_catalog_validated_envelope(catalog_envelope_bytes_for(&catalog, 50, 150))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        AppendValidatedEnvelopeOutcome::Conflict {
+            descriptor: ingest_descriptor("orders", 7, 50, 150),
+            object_key: reserved_descriptor.object_key,
+            reason: "range_overlap_reserved",
+        }
+    );
+    assert!(separate_coordinator
+        .list_committed()
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn durable_serialized_catalog_admission_fails_closed_on_record_body_key_mismatch() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = create_orders_relation_catalog(&store).await;
+    let reserved_payload = catalog_envelope_bytes_for(&catalog, 0, 100);
+    let reserved_batch = IngestBatch::from_validated_envelope(reserved_payload.clone()).unwrap();
+    let reserved_envelope = IngestEnvelope::decode(reserved_payload).unwrap();
+    let reserved_descriptor = reserved_batch.descriptor();
+    let reservation = DurableIngestAdmissionRecordV1 {
+        schema_version: 1,
+        record_kind: "ingest_range_admission_v1".to_string(),
+        stream_id: reserved_descriptor.stream_id.clone(),
+        partition_id: reserved_descriptor.partition_id,
+        start_offset_inclusive: reserved_descriptor.start_offset_inclusive,
+        end_offset_exclusive: reserved_descriptor.end_offset_exclusive,
+        batch_key: reserved_descriptor.object_key.clone(),
+        admission_record_key: ObjectKey::ingest_admission_record(
+            &reserved_descriptor.stream_id,
+            reserved_descriptor.partition_id,
+            reserved_descriptor.start_offset_inclusive,
+            reserved_descriptor.end_offset_exclusive,
+        )
+        .unwrap(),
+        payload_digest: reserved_envelope.header().payload_digest.clone(),
+        relation_id: reserved_envelope.header().relation_id.clone(),
+        relation_version: reserved_envelope.header().relation_version.clone(),
+        schema_fingerprint: reserved_envelope.header().schema_fingerprint.clone(),
+        admission_mode: "process_local_serialized".to_string(),
+    };
+    let wrong_path = ObjectKey::ingest_admission_record(
+        &reserved_descriptor.stream_id,
+        reserved_descriptor.partition_id,
+        0,
+        101,
+    )
+    .unwrap();
+
+    store
+        .put_opts(
+            &Path::from(wrong_path.as_str()),
+            Bytes::from(serde_json::to_vec(&reservation).unwrap()).into(),
+            PutMode::Create.into(),
+        )
+        .await
+        .unwrap();
+
+    let separate_coordinator = IngestAdmissionCoordinator::new(IngestLog::new(Arc::clone(&store)));
+    let error = separate_coordinator
+        .append_catalog_validated_envelope(catalog_envelope_bytes_for(&catalog, 100, 150))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        IngestLogError::MalformedIngestAdmissionRecord { key, reason }
+            if key == wrong_path.as_str()
+                && reason.contains("stored path does not match body admission_record_key")
+    ));
+}
+
+#[tokio::test]
+async fn durable_serialized_catalog_admission_does_not_reserve_same_key_different_digest() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = create_orders_relation_catalog(&store).await;
+    let coordinator = IngestAdmissionCoordinator::new(IngestLog::new(Arc::clone(&store)));
+    let first = catalog_envelope_bytes_for(&catalog, 0, 100);
+    let conflicting = IngestEnvelope::encode_batches(
+        IngestEnvelopeEncodeRequest {
+            relation_id: catalog.relation_schema.relation_id.clone(),
+            relation_version: catalog.relation_schema.relation_version.clone(),
+            schema_fingerprint: catalog.schema_fingerprint.as_str().to_string(),
+            stream_id: "orders".to_string(),
+            partition_id: 7,
+            start_offset_inclusive: 0,
+            end_offset_exclusive: 100,
+        },
+        &[valid_batch_with_different_payload()],
+    )
+    .unwrap();
+
+    coordinator
+        .append_catalog_validated_envelope(first)
+        .await
+        .unwrap();
+    let outcome = coordinator
+        .append_catalog_validated_envelope(conflicting)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        AppendValidatedEnvelopeOutcome::Conflict {
+            descriptor: ingest_descriptor("orders", 7, 0, 100),
+            object_key: ObjectKey::ingest_batch("orders", 7, 0, 100).unwrap(),
+            reason: "same_key_different_digest",
+        }
+    );
+
+    let reservation_key = ObjectKey::ingest_admission_record("orders", 7, 0, 100).unwrap();
+    let reservation = store
+        .get(&Path::from(reservation_key.as_str()))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let reservation: DurableIngestAdmissionRecordV1 = serde_json::from_slice(&reservation).unwrap();
+    assert_eq!(
+        reservation.schema_fingerprint,
+        catalog.schema_fingerprint.as_str()
     );
 }
 
