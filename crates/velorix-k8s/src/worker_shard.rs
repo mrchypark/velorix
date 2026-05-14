@@ -888,8 +888,46 @@ where
                 .await
                 .map(Some)
         }
-        WorkerShardEvent::Deleted(_) => Ok(None),
+        WorkerShardEvent::Deleted(shard) => Ok(deleted_worker_shard_output(&shard, &input)),
     }
+}
+
+fn deleted_worker_shard_output(
+    shard: &VelorixWorkerShard,
+    input: &WorkerShardReconcileInput,
+) -> Option<WorkerShardReconcileOutput> {
+    let worker = input.running_worker.as_ref()?;
+    let current_owner = shard
+        .status
+        .as_ref()
+        .and_then(|status| status.current_owner_epoch.as_ref())?;
+    if current_owner.stream_id != shard.spec.stream_id
+        || current_owner.partition_id != shard.spec.partition_id
+        || current_owner.owner_id != worker.owner_id
+        || current_owner.owner_epoch != worker.owner_epoch
+    {
+        return None;
+    }
+
+    Some(WorkerShardReconcileOutput {
+        plan: ReconcilePlan {
+            actions: vec![ReconcileAction::StopWorker {
+                owner_id: worker.owner_id.clone(),
+                owner_epoch: worker.owner_epoch,
+            }],
+            block_reason: None,
+        },
+        facts: ObservedControlPlaneFacts {
+            lease: None,
+            epoch_record: None,
+            worker: Some(worker.clone()),
+        },
+        commands: vec![WorkerShardCommand::StopWorker {
+            owner_id: worker.owner_id.clone(),
+            owner_epoch: worker.owner_epoch,
+        }],
+        command_error: None,
+    })
 }
 
 pub async fn execute_worker_shard_commands<X>(
@@ -1048,36 +1086,17 @@ where
         }
         WorkerShardEvent::Deleted(shard) => {
             validate_worker_shard_authority(&shard, expected_authority)?;
-            let Some(worker) = input.running_worker.as_ref() else {
-                return Ok(None);
-            };
-            let output = WorkerShardReconcileOutput {
-                plan: ReconcilePlan {
-                    actions: vec![ReconcileAction::StopWorker {
-                        owner_id: worker.owner_id.clone(),
-                        owner_epoch: worker.owner_epoch,
-                    }],
-                    block_reason: None,
-                },
-                facts: ObservedControlPlaneFacts {
-                    lease: None,
-                    epoch_record: None,
-                    worker: Some(worker.clone()),
-                },
-                commands: vec![WorkerShardCommand::StopWorker {
-                    owner_id: worker.owner_id.clone(),
-                    owner_epoch: worker.owner_epoch,
-                }],
-                command_error: None,
-            };
-            execute_scoped_worker_shard_commands_with_authority(
-                &shard,
-                &output,
-                executor,
-                expected_authority,
-            )
-            .await?;
-            Ok(Some(output))
+            let output = deleted_worker_shard_output(&shard, &input);
+            if let Some(output) = &output {
+                execute_scoped_worker_shard_commands_with_authority(
+                    &shard,
+                    output,
+                    executor,
+                    expected_authority,
+                )
+                .await?;
+            }
+            Ok(output)
         }
     }
 }
@@ -1094,9 +1113,13 @@ where
     E: WorkerShardEpochStore,
     X: WorkerShardCommandExecutor + ?Sized,
 {
+    // Delete stops need shard/authority identity; keep them on the scoped executor path.
+    let execute_commands = matches!(&event, WorkerShardEvent::Applied(_));
     let output = handle_worker_shard_event(event, lease_client, epoch_store, input).await?;
-    if let Some(output) = &output {
-        execute_worker_shard_commands(output, executor).await?;
+    if execute_commands {
+        if let Some(output) = &output {
+            execute_worker_shard_commands(output, executor).await?;
+        }
     }
     Ok(output)
 }

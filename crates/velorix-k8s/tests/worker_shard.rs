@@ -18,7 +18,9 @@ use velorix_control::{
         LeaseAcquireRequest, LeaseError, PartitionLeaseClient, PartitionLeaseGrant,
         PartitionLeaseKey,
     },
-    reconcile_plan::{ObservedControlPlaneFacts, ReconcileBlockReason, ReconcilePlan, WorkerFact},
+    reconcile_plan::{
+        ObservedControlPlaneFacts, ReconcileAction, ReconcileBlockReason, ReconcilePlan, WorkerFact,
+    },
 };
 use velorix_k8s::{
     crd::{
@@ -29,8 +31,9 @@ use velorix_k8s::{
     worker_shard::{
         build_kubernetes_worker_shard_operator_runtime, execute_worker_shard_commands,
         handle_worker_shard_event, handle_worker_shard_event_with_command_executor,
-        handle_worker_shard_event_with_output_sink, reconcile_worker_shard,
-        runtime_identity_from_worker_shard, worker_shard_pod_name,
+        handle_worker_shard_event_with_output_sink,
+        handle_worker_shard_event_with_scoped_command_executor_and_authority,
+        reconcile_worker_shard, runtime_identity_from_worker_shard, worker_shard_pod_name,
         worker_shard_pod_name_for_identity, worker_shard_watch_event,
         KubernetesPodWorkerShardCommandExecutor, KubernetesPodWorkerShardScopedCommandExecutor,
         ProcessWorkerShardCommandExecutor, WorkerShardCommand, WorkerShardCommandExecutor,
@@ -749,14 +752,56 @@ async fn kubernetes_pod_worker_shard_executor_maps_api_failure_to_typed_error() 
 }
 
 #[tokio::test]
-async fn deleted_worker_shard_event_does_not_start_or_stop_workers() {
-    let lease = FakeLeaseClient::default().with_current(Some(grant("worker-a", 1)));
-    let epoch_store = FakeEpochStore::default().with_record(epoch_record("worker-a", 1));
+async fn deleted_worker_shard_event_stops_running_worker() {
+    let output = handle_worker_shard_event(
+        WorkerShardEvent::Deleted(shard_with_owner_status("worker-a", 1)),
+        &PanicLeaseClient,
+        &PanicEpochStore,
+        input(Some(WorkerFact {
+            owner_id: "worker-a".to_string(),
+            owner_epoch: 1,
+        })),
+    )
+    .await
+    .unwrap()
+    .unwrap();
 
+    assert_eq!(
+        output.commands,
+        vec![WorkerShardCommand::StopWorker {
+            owner_id: "worker-a".to_string(),
+            owner_epoch: 1,
+        }]
+    );
+    assert_eq!(
+        output.plan.actions,
+        vec![ReconcileAction::StopWorker {
+            owner_id: "worker-a".to_string(),
+            owner_epoch: 1,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn deleted_worker_shard_event_without_running_worker_emits_no_output() {
     let output = handle_worker_shard_event(
         WorkerShardEvent::Deleted(shard()),
-        &lease,
-        &epoch_store,
+        &PanicLeaseClient,
+        &PanicEpochStore,
+        input(None),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(output, None);
+}
+
+#[tokio::test]
+async fn deleted_worker_shard_event_without_status_emits_no_output() {
+    let output = handle_worker_shard_event(
+        WorkerShardEvent::Deleted(shard()),
+        &PanicLeaseClient,
+        &PanicEpochStore,
         input(Some(WorkerFact {
             owner_id: "worker-a".to_string(),
             owner_epoch: 1,
@@ -769,13 +814,30 @@ async fn deleted_worker_shard_event_does_not_start_or_stop_workers() {
 }
 
 #[tokio::test]
-async fn deleted_worker_shard_event_does_not_send_output_to_sink() {
+async fn deleted_worker_shard_event_ignores_stale_status_for_newer_running_worker() {
+    let output = handle_worker_shard_event(
+        WorkerShardEvent::Deleted(shard_with_owner_status("worker-a", 1)),
+        &PanicLeaseClient,
+        &PanicEpochStore,
+        input(Some(WorkerFact {
+            owner_id: "worker-a".to_string(),
+            owner_epoch: 2,
+        })),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(output, None);
+}
+
+#[tokio::test]
+async fn deleted_worker_shard_event_sends_stop_output_to_sink() {
     let lease = FakeLeaseClient::default().with_current(Some(grant("worker-a", 1)));
     let epoch_store = FakeEpochStore::default().with_record(epoch_record("worker-a", 1));
     let emitted = Arc::new(Mutex::new(Vec::<Vec<WorkerShardCommand>>::new()));
 
     let output = handle_worker_shard_event_with_output_sink(
-        WorkerShardEvent::Deleted(shard()),
+        WorkerShardEvent::Deleted(shard_with_owner_status("worker-a", 1)),
         &lease,
         &epoch_store,
         input(Some(WorkerFact {
@@ -791,10 +853,133 @@ async fn deleted_worker_shard_event_does_not_send_output_to_sink() {
         },
     )
     .await
+    .unwrap()
     .unwrap();
 
-    assert_eq!(output, None);
-    assert!(emitted.lock().unwrap().is_empty());
+    let expected = vec![WorkerShardCommand::StopWorker {
+        owner_id: "worker-a".to_string(),
+        owner_epoch: 1,
+    }];
+    assert_eq!(output.commands, expected);
+    assert_eq!(*emitted.lock().unwrap(), vec![expected]);
+}
+
+#[tokio::test]
+async fn deleted_worker_shard_event_with_generic_executor_does_not_execute_unscoped_stop() {
+    let lease = FakeLeaseClient::default().with_current(Some(grant("worker-a", 1)));
+    let epoch_store = FakeEpochStore::default().with_record(epoch_record("worker-a", 1));
+    let executor = FakeCommandExecutor::default();
+
+    let output = handle_worker_shard_event_with_command_executor(
+        WorkerShardEvent::Deleted(shard_with_owner_status("worker-a", 1)),
+        &lease,
+        &epoch_store,
+        input(Some(WorkerFact {
+            owner_id: "worker-a".to_string(),
+            owner_epoch: 1,
+        })),
+        &executor,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(
+        output.commands,
+        vec![WorkerShardCommand::StopWorker {
+            owner_id: "worker-a".to_string(),
+            owner_epoch: 1,
+        }]
+    );
+    assert!(executor.actions().is_empty());
+}
+
+#[tokio::test]
+async fn scoped_deleted_worker_shard_event_executes_scoped_stop_when_status_matches() {
+    let executor = FakeCommandExecutor::default();
+
+    let output = handle_worker_shard_event_with_scoped_command_executor_and_authority(
+        WorkerShardEvent::Deleted(shard_with_owner_status("worker-a", 1)),
+        &PanicLeaseClient,
+        &PanicEpochStore,
+        input(Some(WorkerFact {
+            owner_id: "worker-a".to_string(),
+            owner_epoch: 1,
+        })),
+        &executor,
+        Some(&authority()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(
+        output.commands,
+        vec![WorkerShardCommand::StopWorker {
+            owner_id: "worker-a".to_string(),
+            owner_epoch: 1,
+        }]
+    );
+    assert_eq!(
+        executor.actions(),
+        vec![ExecutedWorkerCommand::Stop {
+            owner_id: "worker-a".to_string(),
+            owner_epoch: 1,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn scoped_deleted_worker_shard_event_validates_authority_before_stop_with_worker() {
+    let executor = FakeCommandExecutor::default();
+
+    let error = handle_worker_shard_event_with_scoped_command_executor_and_authority(
+        WorkerShardEvent::Deleted(shard()),
+        &PanicLeaseClient,
+        &PanicEpochStore,
+        input(Some(WorkerFact {
+            owner_id: "worker-a".to_string(),
+            owner_epoch: 1,
+        })),
+        &executor,
+        Some(&ObjectStoreAuthorityRef::default()),
+    )
+    .await
+    .unwrap_err();
+
+    match error {
+        WorkerShardError::AuthorityMismatch { actual, expected } => {
+            assert_eq!(actual, authority());
+            assert_eq!(expected, ObjectStoreAuthorityRef::default());
+        }
+        other => panic!("expected authority mismatch, got {other:?}"),
+    }
+    assert!(executor.actions().is_empty());
+}
+
+#[tokio::test]
+async fn scoped_deleted_worker_shard_event_validates_authority_without_worker() {
+    let executor = FakeCommandExecutor::default();
+
+    let error = handle_worker_shard_event_with_scoped_command_executor_and_authority(
+        WorkerShardEvent::Deleted(shard()),
+        &PanicLeaseClient,
+        &PanicEpochStore,
+        input(None),
+        &executor,
+        Some(&ObjectStoreAuthorityRef::default()),
+    )
+    .await
+    .unwrap_err();
+
+    match error {
+        WorkerShardError::AuthorityMismatch { actual, expected } => {
+            assert_eq!(actual, authority());
+            assert_eq!(expected, ObjectStoreAuthorityRef::default());
+        }
+        other => panic!("expected authority mismatch, got {other:?}"),
+    }
+    assert!(executor.actions().is_empty());
 }
 
 #[test]
@@ -1547,6 +1732,21 @@ fn shard_with_stream_partition(stream_id: &str, partition_id: u32) -> VelorixWor
     shard
 }
 
+fn shard_with_owner_status(owner_id: &str, owner_epoch: u64) -> VelorixWorkerShard {
+    let mut shard = shard();
+    shard.status = Some(WorkerShardStatus {
+        observed_generation: Some(2),
+        current_owner_epoch: Some(OwnerEpochStatus {
+            stream_id: shard.spec.stream_id.clone(),
+            partition_id: shard.spec.partition_id,
+            owner_id: owner_id.to_string(),
+            owner_epoch,
+        }),
+        readiness: None,
+    });
+    shard
+}
+
 fn authority() -> ObjectStoreAuthorityRef {
     ObjectStoreAuthorityRef {
         store_id: "primary".to_string(),
@@ -1582,6 +1782,66 @@ fn epoch_record(owner_id: &str, owner_epoch: u64) -> OwnershipEpochRecord {
         created_at: "2026-05-06T00:00:00Z".to_string(),
         previous_epoch: owner_epoch.checked_sub(1),
         previous_checkpoint_version: Some(8),
+    }
+}
+
+struct PanicLeaseClient;
+
+#[async_trait]
+impl PartitionLeaseClient for PanicLeaseClient {
+    async fn acquire_or_renew(
+        &self,
+        _request: LeaseAcquireRequest,
+    ) -> Result<PartitionLeaseGrant, LeaseError> {
+        panic!("delete handling must not acquire or renew leases")
+    }
+
+    async fn current(
+        &self,
+        _key: &PartitionLeaseKey,
+        _now_unix_ms: u64,
+    ) -> Result<Option<PartitionLeaseGrant>, LeaseError> {
+        panic!("delete handling must not read leases")
+    }
+
+    async fn release(
+        &self,
+        _key: &PartitionLeaseKey,
+        _owner_id: &str,
+        _owner_epoch: u64,
+        _now_unix_ms: u64,
+    ) -> Result<(), LeaseError> {
+        panic!("delete handling must not release leases")
+    }
+}
+
+struct PanicEpochStore;
+
+#[async_trait]
+impl WorkerShardEpochStore for PanicEpochStore {
+    async fn read(
+        &self,
+        _stream_id: &str,
+        _partition_id: u32,
+        _owner_epoch: u64,
+    ) -> Result<Option<OwnershipEpochRecord>, velorix_k8s::worker_shard::WorkerShardError> {
+        panic!("delete handling must not read epoch records")
+    }
+
+    async fn create(
+        &self,
+        _record: OwnershipEpochRecord,
+    ) -> Result<(), velorix_k8s::worker_shard::WorkerShardError> {
+        panic!("delete handling must not create epoch records")
+    }
+
+    async fn has_newer(
+        &self,
+        _stream_id: &str,
+        _partition_id: u32,
+        _owner_epoch: u64,
+    ) -> Result<bool, velorix_k8s::worker_shard::WorkerShardError> {
+        panic!("delete handling must not check newer epoch records")
     }
 }
 
