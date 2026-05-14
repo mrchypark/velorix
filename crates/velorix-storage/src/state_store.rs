@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use slatedb::{ErrorKind, IsolationLevel};
 
 use crate::{
+    capability::{AuthoritativeNamespace, AuthoritativeObjectStoreCapabilitiesV1},
     manifest::{SlateDbCheckpointRefV1, StateObjectRef, StateRefType},
     state::{CheckpointPublishError, StateObjectWrite},
 };
@@ -65,6 +66,18 @@ impl SlateDbStateStore {
         let db = slatedb::Db::open(db_path.clone(), object_store).await?;
 
         Ok(Self { db, db_path })
+    }
+
+    /// Opens a SlateDB state store after validating the authoritative state
+    /// namespace from shared startup capability evidence.
+    pub async fn open_authoritative(
+        db_path: impl Into<Path>,
+        object_store: Arc<dyn ObjectStore>,
+        capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
+    ) -> Result<Self, CheckpointPublishError> {
+        capabilities.validate_namespace(AuthoritativeNamespace::State)?;
+
+        Self::open(db_path, object_store).await
     }
 
     pub async fn close(&self) -> Result<(), CheckpointPublishError> {

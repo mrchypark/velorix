@@ -304,8 +304,12 @@ mod live_s3 {
             total_records,
         )
         .await?;
-        let slatedb_state_reopen =
-            slatedb_state_reopen(Arc::clone(&store), Arc::clone(&metered_store)).await?;
+        let slatedb_state_reopen = slatedb_state_reopen(
+            Arc::clone(&store),
+            Arc::clone(&metered_store),
+            &capabilities,
+        )
+        .await?;
         let datafusion_scan = datafusion_table_scan(
             config,
             Arc::clone(&store),
@@ -589,6 +593,7 @@ mod live_s3 {
     async fn slatedb_state_reopen(
         object_store: Arc<dyn ObjectStore>,
         metered_store: Arc<MeteredObjectStore>,
+        capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
     ) -> BenchResult<MeasuredWorkload> {
         let payload = Bytes::from_static(br#"{"state":"slatedb-reopen-smoke","version":1}"#);
         let state = StateObjectWrite::new(
@@ -602,17 +607,23 @@ mod live_s3 {
         let started = Instant::now();
 
         let state_ref = {
-            let state_store =
-                SlateDbStateStore::open("v1/slatedb/benchmark-state", Arc::clone(&object_store))
-                    .await?;
+            let state_store = SlateDbStateStore::open_authoritative(
+                "v1/slatedb/benchmark-state",
+                Arc::clone(&object_store),
+                capabilities,
+            )
+            .await?;
             let state_ref = state_store.write_state_object(&state).await?;
             state_store.close().await?;
             state_ref
         };
 
-        let reopened =
-            SlateDbStateStore::open("v1/slatedb/benchmark-state", Arc::clone(&object_store))
-                .await?;
+        let reopened = SlateDbStateStore::open_authoritative(
+            "v1/slatedb/benchmark-state",
+            Arc::clone(&object_store),
+            capabilities,
+        )
+        .await?;
         let recovered = reopened.read_state_object(&state_ref).await?;
         reopened.close().await?;
         let elapsed = started.elapsed();

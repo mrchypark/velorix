@@ -21,7 +21,7 @@ use velorix_storage::{
     log::{IngestAdmissionCoordinator, IngestBatch, IngestLog, IngestLogError},
     manifest::{CheckpointManifest, InputRange, StateObjectRef},
     state::{CheckpointPublishError, CheckpointPublisher, StateObjectWrite},
-    state_store::RawObjectStateStore,
+    state_store::{RawObjectStateStore, SlateDbStateStore},
 };
 
 fn temp_store() -> (TempDir, Arc<dyn ObjectStore>) {
@@ -541,6 +541,64 @@ async fn authoritative_capability_gate_rejects_slatedb_state_namespace_before_op
             }
         )
     ));
+}
+
+#[tokio::test]
+async fn authoritative_state_store_opener_rejects_missing_state_namespace_before_opening_state_store(
+) {
+    let (_temp_dir, store) = temp_store();
+    let mut profiles = all_namespace_profiles();
+    profiles.remove(&AuthoritativeNamespace::State);
+    let capabilities = AuthoritativeObjectStoreCapabilitiesV1::new(profiles);
+
+    let err = SlateDbStateStore::open_authoritative(
+        Path::from("state-db"),
+        Arc::clone(&store),
+        &capabilities,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        err,
+        CheckpointPublishError::AuthoritativeObjectStoreCapabilities(
+            AuthoritativeObjectStoreCapabilityError::MissingNamespace {
+                namespace: AuthoritativeNamespace::State
+            }
+        )
+    ));
+}
+
+#[tokio::test]
+async fn authoritative_state_store_opener_rejects_weak_state_namespace_before_opening_state_store()
+{
+    let (_temp_dir, store) = temp_store();
+    let mut profiles = all_namespace_profiles();
+    let profile = profile_missing(RequiredObjectStoreCapability::ConditionalCreate);
+    profiles.insert(AuthoritativeNamespace::State, profile.clone());
+    let capabilities = AuthoritativeObjectStoreCapabilitiesV1::new(profiles);
+
+    let err = SlateDbStateStore::open_authoritative(
+        Path::from("state-db"),
+        Arc::clone(&store),
+        &capabilities,
+    )
+    .await
+    .unwrap_err();
+
+    match err {
+        CheckpointPublishError::AuthoritativeObjectStoreCapabilities(
+            AuthoritativeObjectStoreCapabilityError::NamespaceProfile { namespace, source },
+        ) => {
+            assert_eq!(namespace, AuthoritativeNamespace::State);
+            assert_capability_error(
+                source,
+                &profile,
+                RequiredObjectStoreCapability::ConditionalCreate,
+            );
+        }
+        other => panic!("expected authoritative state namespace error, got {other:?}"),
+    }
 }
 
 #[tokio::test]

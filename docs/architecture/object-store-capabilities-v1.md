@@ -71,6 +71,9 @@ durability capabilities for every authoritative namespace.
 - Checked production SlateDB recovery opens the state store only through shared
   startup `AuthoritativeObjectStoreCapabilitiesV1` evidence and requires both
   checkpoint and state namespaces before opening SlateDB.
+- Env-gated S3-compatible `slatedb_state_reopen` benchmark evidence uses the
+  same already-probed startup capability object before the initial SlateDB open
+  and before reopening SlateDB.
 - Production leased checkpoint publishing requires the checked leased-publisher
   constructor, which reuses the checked SlateDB checkpoint publisher and
   additionally requires output and ownership namespace evidence before
