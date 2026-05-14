@@ -7,6 +7,7 @@ use std::{
 fn production_sources_do_not_call_bootstrap_ingest_apis() {
     let workspace = workspace_root();
     let forbidden = [
+        "IngestLog::new(",
         "IngestLog::append(",
         ".append_validated_envelope(",
         ".append_validated_envelope_single_writer(",
@@ -185,6 +186,25 @@ fn production_source_contract_forbids_direct_ingest_log_append_method_callers() 
         "IngestLog::append("
     ));
     assert!(line_calls_ingest_log_append(&lines, 2));
+}
+
+#[test]
+fn production_source_contract_forbids_unchecked_ingest_log_constructors() {
+    let workspace = Path::new("/workspace");
+    let source = workspace.join("crates/velorix-runtime/src/production_path.rs");
+    let lines = [
+        "async fn production_path() {",
+        "    let ingest_log = IngestLog::new(store);",
+        "}",
+    ];
+
+    assert!(!allowed_bootstrap_ingest_use(
+        workspace,
+        &source,
+        &lines,
+        1,
+        "IngestLog::new("
+    ));
 }
 
 #[test]
@@ -404,6 +424,17 @@ fn allowed_bootstrap_ingest_use(
     }
 
     let runtime_recovery = workspace.join("crates/velorix-runtime/src/recovery.rs");
+    if source == runtime_recovery && pattern == "IngestLog::new(" {
+        return line_is_inside_function(
+            lines,
+            line_number,
+            "async fn recover_with_publisher_and_relation_catalog(",
+        ) || line_is_inside_function(
+            lines,
+            line_number,
+            "async fn recover_with_selected_manifest_and_relation_catalog(",
+        );
+    }
     if source == runtime_recovery && pattern == ".replay_validated_envelopes_from(" {
         let has_expected_call =
             lines[line_number].contains(".replay_validated_envelopes_from(&replay_checkpoints)");
