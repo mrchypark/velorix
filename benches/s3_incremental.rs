@@ -544,7 +544,7 @@ mod live_s3 {
             )
             .await?;
 
-        create_production_query_policy(&authority_store).await?;
+        create_production_query_policy(&authority_store, capabilities).await?;
         let mut registry = StorageRegistry::new();
         registry.register_production_with_capabilities(
             "primary",
@@ -552,7 +552,7 @@ mod live_s3 {
             Arc::clone(&store),
             capabilities.clone(),
         )?;
-        PersistedTableStore::new(Arc::clone(&authority_store))
+        PersistedTableStore::new_checked(Arc::clone(&authority_store), capabilities)?
             .create_production(
                 Arc::clone(&authority_store),
                 Arc::clone(&authority_store),
@@ -567,6 +567,7 @@ mod live_s3 {
             Arc::clone(&authority_store),
             Arc::clone(&authority_store),
             &registry,
+            capabilities,
             "tenant-a",
             "orders-current",
             "select account_id, sum(amount) as total_value, sum(weight) as total_weight \
@@ -719,8 +720,11 @@ mod live_s3 {
         Ok(())
     }
 
-    async fn create_production_query_policy(store: &Arc<dyn ObjectStore>) -> BenchResult<()> {
-        QueryPolicyCatalogStore::new(Arc::clone(store))
+    async fn create_production_query_policy(
+        store: &Arc<dyn ObjectStore>,
+        capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
+    ) -> BenchResult<()> {
+        QueryPolicyCatalogStore::new_checked(Arc::clone(store), capabilities)?
             .create_for_production_table_scan("tenant-a", "standard", production_query_policy())
             .await?;
         Ok(())

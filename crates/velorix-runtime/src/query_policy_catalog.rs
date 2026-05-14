@@ -5,7 +5,13 @@ use object_store::{path::Path, ObjectStore, PutMode};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use velorix_core::query::{QueryExecutionPolicyV1, QueryPolicyError};
-use velorix_storage::object_key::{ObjectKey, ObjectKeyError};
+use velorix_storage::{
+    capability::{
+        AuthoritativeNamespace, AuthoritativeObjectStoreCapabilitiesV1,
+        AuthoritativeObjectStoreCapabilityError,
+    },
+    object_key::{ObjectKey, ObjectKeyError},
+};
 
 pub const QUERY_POLICY_CATALOG_SCHEMA_VERSION: u32 = 1;
 
@@ -28,6 +34,8 @@ pub enum QueryPolicyCatalogError {
     Policy(#[from] QueryPolicyError),
     #[error(transparent)]
     ObjectKey(#[from] ObjectKeyError),
+    #[error(transparent)]
+    ObjectStoreCapabilities(#[from] AuthoritativeObjectStoreCapabilityError),
     #[error("unsupported query policy catalog schema version {schema_version}")]
     UnsupportedSchemaVersion { schema_version: u32 },
     #[error("query policy tenant id mismatch: expected {expected}, got {actual}")]
@@ -44,6 +52,15 @@ pub struct QueryPolicyCatalogStore {
 impl QueryPolicyCatalogStore {
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
         Self { store }
+    }
+
+    pub fn new_checked(
+        store: Arc<dyn ObjectStore>,
+        capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
+    ) -> Result<Self, QueryPolicyCatalogError> {
+        capabilities.validate_namespace(AuthoritativeNamespace::QueryPolicy)?;
+
+        Ok(Self { store })
     }
 
     pub async fn create(

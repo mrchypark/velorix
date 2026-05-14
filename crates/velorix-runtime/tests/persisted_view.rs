@@ -1,4 +1,10 @@
-use std::sync::Arc;
+use std::{
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 
 use arrow::array::{ArrayRef, Int64Array, StringArray, StringViewArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -38,13 +44,103 @@ use velorix_runtime::{
     query_policy_catalog::QueryPolicyCatalogStore,
     storage_registry::StorageRegistry,
 };
-use velorix_storage::{object_key::ObjectKey, relation_catalog_registry::RelationCatalogRegistry};
+use velorix_storage::{
+    capability::{
+        AuthoritativeNamespace, AuthoritativeObjectStoreCapabilitiesV1,
+        AuthoritativeObjectStoreCapabilityError, ObjectStoreCapabilityProfile,
+        RequiredObjectStoreCapability,
+    },
+    object_key::ObjectKey,
+    relation_catalog_registry::RelationCatalogRegistry,
+};
 
 fn temp_store() -> (TempDir, Arc<dyn ObjectStore>) {
     let temp_dir = tempfile::tempdir().unwrap();
     let store = LocalFileSystem::new_with_prefix(temp_dir.path()).unwrap();
 
     (temp_dir, Arc::new(store))
+}
+
+#[derive(Debug)]
+struct CountingStore {
+    inner: Arc<dyn ObjectStore>,
+    get_count: AtomicUsize,
+}
+
+impl CountingStore {
+    fn new(inner: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            inner,
+            get_count: AtomicUsize::new(0),
+        }
+    }
+
+    fn get_count(&self) -> usize {
+        self.get_count.load(Ordering::SeqCst)
+    }
+}
+
+impl std::fmt::Display for CountingStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CountingStore")
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for CountingStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        if !options.head {
+            self.get_count.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn delete(&self, location: &Path) -> object_store::Result<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
 }
 
 async fn register_production_scan_store(
@@ -295,6 +391,7 @@ async fn production_persisted_object_backed_view_rejects_concurrency_policy_with
         Arc::clone(&catalog_store),
         Arc::clone(&catalog_store),
         &registry,
+        &all_namespace_capabilities(),
         "tenant-a",
         "orders-current",
         "orders-view",
@@ -333,6 +430,7 @@ async fn production_persisted_object_backed_view_rejects_missing_capabilities_be
         Arc::clone(&catalog_store),
         Arc::clone(&catalog_store),
         &registry,
+        &all_namespace_capabilities(),
         "tenant-a",
         "orders-current",
         "orders-view",
@@ -348,6 +446,56 @@ async fn production_persisted_object_backed_view_rejects_missing_capabilities_be
             }
         )) if store_id == "primary"
     ));
+}
+
+#[tokio::test]
+async fn production_persisted_object_backed_view_rejects_missing_query_capabilities_before_malformed_query_json(
+) {
+    let (_temp_dir, catalog_store) = temp_store();
+    let counting_catalog_store = Arc::new(CountingStore::new(Arc::clone(&catalog_store)));
+    let counted_catalog_store: Arc<dyn ObjectStore> = counting_catalog_store.clone();
+    write_malformed_persisted_query_json(&catalog_store, "orders-view").await;
+
+    let error = query_production_persisted_object_backed_view(
+        Arc::clone(&counted_catalog_store),
+        Arc::clone(&counted_catalog_store),
+        Arc::clone(&counted_catalog_store),
+        &StorageRegistry::new(),
+        &capabilities_missing(AuthoritativeNamespace::Queries),
+        "tenant-a",
+        "orders-current",
+        "orders-view",
+    )
+    .await
+    .unwrap_err();
+
+    assert_missing_query_capability(error, AuthoritativeNamespace::Queries);
+    assert_eq!(counting_catalog_store.get_count(), 0);
+}
+
+#[tokio::test]
+async fn production_persisted_object_backed_view_rejects_weak_query_capabilities_before_malformed_query_json(
+) {
+    let (_temp_dir, catalog_store) = temp_store();
+    let counting_catalog_store = Arc::new(CountingStore::new(Arc::clone(&catalog_store)));
+    let counted_catalog_store: Arc<dyn ObjectStore> = counting_catalog_store.clone();
+    write_malformed_persisted_query_json(&catalog_store, "orders-view").await;
+
+    let error = query_production_persisted_object_backed_view(
+        Arc::clone(&counted_catalog_store),
+        Arc::clone(&counted_catalog_store),
+        Arc::clone(&counted_catalog_store),
+        &StorageRegistry::new(),
+        &capabilities_with_weak_namespace(AuthoritativeNamespace::Queries),
+        "tenant-a",
+        "orders-current",
+        "orders-view",
+    )
+    .await
+    .unwrap_err();
+
+    assert_weak_query_capability(error, AuthoritativeNamespace::Queries);
+    assert_eq!(counting_catalog_store.get_count(), 0);
 }
 
 #[tokio::test]
@@ -380,6 +528,7 @@ async fn production_persisted_object_backed_view_accepts_matching_shared_limiter
         Arc::clone(&catalog_store),
         ProductionPersistedViewQueryRequest {
             registry: &registry,
+            startup_capabilities: &all_namespace_capabilities(),
             tenant_id: "tenant-a",
             table_id: "orders-current",
             query_id: "orders-view",
@@ -426,6 +575,7 @@ async fn production_persisted_object_backed_view_rejects_bootstrap_input_query_r
         Arc::clone(&catalog_store),
         Arc::clone(&catalog_store),
         &registry,
+        &all_namespace_capabilities(),
         "tenant-a",
         "orders-current",
         "bootstrap-input-query",
@@ -466,6 +616,7 @@ async fn production_persisted_object_backed_view_validates_sql_with_table_policy
         Arc::clone(&catalog_store),
         Arc::clone(&catalog_store),
         &registry,
+        &all_namespace_capabilities(),
         "tenant-a",
         "orders-current",
         "orders-view",
@@ -513,6 +664,7 @@ async fn production_persisted_object_backed_view_accepts_production_relation_que
         Arc::clone(&catalog_store),
         Arc::clone(&catalog_store),
         &registry,
+        &all_namespace_capabilities(),
         "tenant-a",
         "orders-current",
         "orders-view",
@@ -554,6 +706,7 @@ async fn production_persisted_object_backed_view_rejects_mismatched_shared_limit
         Arc::clone(&catalog_store),
         ProductionPersistedViewQueryRequest {
             registry: &registry,
+            startup_capabilities: &all_namespace_capabilities(),
             tenant_id: "tenant-a",
             table_id: "orders-current",
             query_id: "orders-view",
@@ -586,14 +739,16 @@ async fn create_production_table_with_policy(
         .create(&catalog)
         .await
         .unwrap();
-    QueryPolicyCatalogStore::new(Arc::clone(catalog_store))
+    QueryPolicyCatalogStore::new_checked(Arc::clone(catalog_store), &all_namespace_capabilities())
+        .unwrap()
         .create_for_production_table_scan("tenant-a", "standard", production_policy_with(policy))
         .await
         .unwrap();
     let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
     let mut registry = StorageRegistry::new();
     register_production_scan_store(&mut registry, scan_store, Arc::clone(catalog_store)).await;
-    PersistedTableStore::new(Arc::clone(catalog_store))
+    PersistedTableStore::new_checked(Arc::clone(catalog_store), &all_namespace_capabilities())
+        .unwrap()
         .create_production(
             Arc::clone(catalog_store),
             Arc::clone(catalog_store),
@@ -629,6 +784,21 @@ async fn create_persisted_query(catalog_store: &Arc<dyn ObjectStore>) {
             &Path::from(key.as_str()),
             Bytes::from(serde_json::to_vec(&spec).unwrap()).into(),
             PutMode::Create.into(),
+        )
+        .await
+        .unwrap();
+}
+
+async fn write_malformed_persisted_query_json(
+    catalog_store: &Arc<dyn ObjectStore>,
+    query_id: &str,
+) {
+    let key = ObjectKey::persisted_query(query_id).unwrap();
+
+    catalog_store
+        .put(
+            &Path::from(key.as_str()),
+            Bytes::from_static(br#"{"schema_version":"#).into(),
         )
         .await
         .unwrap();
@@ -679,6 +849,59 @@ fn production_policy_with(policy: QueryPolicy) -> QueryPolicy {
         batch_size: policy.batch_size,
         target_partitions: policy.target_partitions,
     }
+}
+
+fn all_namespace_capabilities() -> AuthoritativeObjectStoreCapabilitiesV1 {
+    let profile = ObjectStoreCapabilityProfile::local_development();
+    AuthoritativeObjectStoreCapabilitiesV1::new(
+        AuthoritativeNamespace::all()
+            .into_iter()
+            .map(|namespace| (namespace, profile.clone()))
+            .collect::<BTreeMap<_, _>>(),
+    )
+}
+
+fn capabilities_missing(
+    namespace: AuthoritativeNamespace,
+) -> AuthoritativeObjectStoreCapabilitiesV1 {
+    let mut profiles = all_namespace_capabilities().profiles;
+    profiles.remove(&namespace);
+    AuthoritativeObjectStoreCapabilitiesV1::new(profiles)
+}
+
+fn capabilities_with_weak_namespace(
+    namespace: AuthoritativeNamespace,
+) -> AuthoritativeObjectStoreCapabilitiesV1 {
+    let mut profile = ObjectStoreCapabilityProfile::local_development();
+    profile.conditional_create = false;
+    let mut profiles = all_namespace_capabilities().profiles;
+    profiles.insert(namespace, profile);
+    AuthoritativeObjectStoreCapabilitiesV1::new(profiles)
+}
+
+fn assert_missing_query_capability(
+    error: PersistedViewError,
+    expected_namespace: AuthoritativeNamespace,
+) {
+    assert!(matches!(
+        error,
+        PersistedViewError::QueryCatalog(PersistedQueryError::ObjectStoreCapabilities(
+            AuthoritativeObjectStoreCapabilityError::MissingNamespace { namespace }
+        )) if namespace == expected_namespace
+    ));
+}
+
+fn assert_weak_query_capability(
+    error: PersistedViewError,
+    expected_namespace: AuthoritativeNamespace,
+) {
+    assert!(matches!(
+        error,
+        PersistedViewError::QueryCatalog(PersistedQueryError::ObjectStoreCapabilities(
+            AuthoritativeObjectStoreCapabilityError::NamespaceProfile { namespace, source }
+        )) if namespace == expected_namespace
+            && source.required_capability() == RequiredObjectStoreCapability::ConditionalCreate
+    ));
 }
 
 fn orders_relation_catalog() -> VelorixRelationCatalogV1 {

@@ -195,21 +195,30 @@ impl AuthoritativeObjectStoreCapabilitiesV1 {
 
     pub fn validate_for_startup(&self) -> Result<(), AuthoritativeObjectStoreCapabilityError> {
         for namespace in AuthoritativeNamespace::all() {
-            let profile = self
-                .profiles
-                .get(&namespace)
-                .ok_or(AuthoritativeObjectStoreCapabilityError::MissingNamespace { namespace })?;
-            profile
-                .validate_for_velorix_durability()
-                .map_err(
-                    |source| AuthoritativeObjectStoreCapabilityError::NamespaceProfile {
-                        namespace,
-                        source,
-                    },
-                )?;
+            self.validate_namespace(namespace)?;
         }
 
         Ok(())
+    }
+
+    pub fn validate_namespace(
+        &self,
+        namespace: AuthoritativeNamespace,
+    ) -> Result<&ObjectStoreCapabilityProfile, AuthoritativeObjectStoreCapabilityError> {
+        let profile = self
+            .profiles
+            .get(&namespace)
+            .ok_or(AuthoritativeObjectStoreCapabilityError::MissingNamespace { namespace })?;
+        profile
+            .validate_for_velorix_durability()
+            .map_err(
+                |source| AuthoritativeObjectStoreCapabilityError::NamespaceProfile {
+                    namespace,
+                    source,
+                },
+            )?;
+
+        Ok(profile)
     }
 
     pub fn diagnostics(&self) -> Vec<ObjectStoreCapabilityDiagnostic> {

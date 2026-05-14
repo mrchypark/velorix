@@ -14,7 +14,13 @@ use velorix_core::{
         VelorixRelationCatalogV1,
     },
 };
-use velorix_storage::object_key::{ObjectKey, ObjectKeyError};
+use velorix_storage::{
+    capability::{
+        AuthoritativeNamespace, AuthoritativeObjectStoreCapabilitiesV1,
+        AuthoritativeObjectStoreCapabilityError,
+    },
+    object_key::{ObjectKey, ObjectKeyError},
+};
 
 use crate::query::{
     query_production_recovered_materialized_view_with_policy_and_limiter,
@@ -22,7 +28,6 @@ use crate::query::{
     RuntimeQueryError,
 };
 use crate::recovery::RecoveryError;
-use velorix_storage::capability::AuthoritativeObjectStoreCapabilitiesV1;
 
 pub const PERSISTED_QUERY_SCHEMA_VERSION: u32 = 1;
 
@@ -49,6 +54,8 @@ pub enum PersistedQueryError {
     RuntimeQuery(#[from] RuntimeQueryError),
     #[error(transparent)]
     RelationSchema(#[from] RelationSchemaError),
+    #[error(transparent)]
+    ObjectStoreCapabilities(#[from] AuthoritativeObjectStoreCapabilityError),
     #[error("unsupported persisted query schema version {schema_version}")]
     UnsupportedSchemaVersion { schema_version: u32 },
     #[error("persisted query id mismatch: expected {expected}, got {actual}")]
@@ -63,6 +70,15 @@ pub struct PersistedQueryStore {
 impl PersistedQueryStore {
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
         Self { store }
+    }
+
+    pub fn new_checked(
+        store: Arc<dyn ObjectStore>,
+        capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
+    ) -> Result<Self, PersistedQueryError> {
+        capabilities.validate_namespace(AuthoritativeNamespace::Queries)?;
+
+        Ok(Self { store })
     }
 
     pub async fn create(

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use bytes::Bytes;
 use object_store::{local::LocalFileSystem, path::Path, ObjectStore};
@@ -8,12 +8,58 @@ use velorix_core::query::{QueryExecutionPolicyV1, QueryPolicyError};
 use velorix_runtime::query_policy_catalog::{
     QueryPolicyCatalogError, QueryPolicyCatalogStore, QUERY_POLICY_CATALOG_SCHEMA_VERSION,
 };
+use velorix_storage::capability::{
+    AuthoritativeNamespace, AuthoritativeObjectStoreCapabilitiesV1,
+    AuthoritativeObjectStoreCapabilityError, ObjectStoreCapabilityProfile,
+    RequiredObjectStoreCapability,
+};
 
 fn temp_store() -> (TempDir, Arc<dyn ObjectStore>) {
     let temp_dir = tempfile::tempdir().unwrap();
     let store = LocalFileSystem::new_with_prefix(temp_dir.path()).unwrap();
 
     (temp_dir, Arc::new(store))
+}
+
+#[tokio::test]
+async fn query_policy_catalog_checked_constructor_rejects_missing_query_policy_namespace() {
+    let (_temp_dir, store) = temp_store();
+
+    let error = QueryPolicyCatalogStore::new_checked(
+        Arc::clone(&store),
+        &capabilities_missing(AuthoritativeNamespace::QueryPolicy),
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        QueryPolicyCatalogError::ObjectStoreCapabilities(
+            AuthoritativeObjectStoreCapabilityError::MissingNamespace {
+                namespace: AuthoritativeNamespace::QueryPolicy
+            }
+        )
+    ));
+}
+
+#[tokio::test]
+async fn query_policy_catalog_checked_constructor_rejects_weak_query_policy_namespace() {
+    let (_temp_dir, store) = temp_store();
+
+    let error = QueryPolicyCatalogStore::new_checked(
+        Arc::clone(&store),
+        &capabilities_with_weak_namespace(AuthoritativeNamespace::QueryPolicy),
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        QueryPolicyCatalogError::ObjectStoreCapabilities(
+            AuthoritativeObjectStoreCapabilityError::NamespaceProfile {
+                namespace: AuthoritativeNamespace::QueryPolicy,
+                source,
+            }
+        ) if source.required_capability() == RequiredObjectStoreCapability::ConditionalCreate
+    ));
 }
 
 #[tokio::test]
@@ -350,4 +396,32 @@ async fn write_policy_catalog_object(
         )
         .await
         .unwrap();
+}
+
+fn all_namespace_capabilities() -> AuthoritativeObjectStoreCapabilitiesV1 {
+    let profile = ObjectStoreCapabilityProfile::local_development();
+    AuthoritativeObjectStoreCapabilitiesV1::new(
+        AuthoritativeNamespace::all()
+            .into_iter()
+            .map(|namespace| (namespace, profile.clone()))
+            .collect::<BTreeMap<_, _>>(),
+    )
+}
+
+fn capabilities_missing(
+    namespace: AuthoritativeNamespace,
+) -> AuthoritativeObjectStoreCapabilitiesV1 {
+    let mut profiles = all_namespace_capabilities().profiles;
+    profiles.remove(&namespace);
+    AuthoritativeObjectStoreCapabilitiesV1::new(profiles)
+}
+
+fn capabilities_with_weak_namespace(
+    namespace: AuthoritativeNamespace,
+) -> AuthoritativeObjectStoreCapabilitiesV1 {
+    let mut profile = ObjectStoreCapabilityProfile::local_development();
+    profile.conditional_create = false;
+    let mut profiles = all_namespace_capabilities().profiles;
+    profiles.insert(namespace, profile);
+    AuthoritativeObjectStoreCapabilitiesV1::new(profiles)
 }

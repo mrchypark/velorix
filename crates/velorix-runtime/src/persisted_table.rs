@@ -86,6 +86,7 @@ pub struct CreateProductionPersistedTableSpecRequest {
 #[derive(Clone, Debug)]
 pub struct ProductionPersistedTableQueryRequest<'a> {
     pub registry: &'a StorageRegistry,
+    pub startup_capabilities: &'a AuthoritativeObjectStoreCapabilitiesV1,
     pub tenant_id: &'a str,
     pub table_id: &'a str,
     pub sql: &'a str,
@@ -110,6 +111,8 @@ pub enum PersistedTableError {
     RelationCatalogRegistry(#[from] RelationCatalogRegistryError),
     #[error(transparent)]
     StorageRegistry(#[from] StorageRegistryError),
+    #[error(transparent)]
+    ObjectStoreCapabilities(#[from] AuthoritativeObjectStoreCapabilityError),
     #[error("malformed table url: {0}")]
     MalformedTableUrl(url::ParseError),
     #[error("raw URL table spec is not allowed for production table scans")]
@@ -144,6 +147,15 @@ pub struct PersistedTableStore {
 impl PersistedTableStore {
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
         Self { store }
+    }
+
+    pub fn new_checked(
+        store: Arc<dyn ObjectStore>,
+        capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
+    ) -> Result<Self, PersistedTableError> {
+        capabilities.validate_namespace(AuthoritativeNamespace::TableCatalog)?;
+
+        Ok(Self { store })
     }
 
     pub async fn create(
@@ -222,6 +234,7 @@ impl PersistedTableStore {
         let object_key = ObjectKey::query_table(&spec.table_id)?;
         validate_production_table_fields(&spec)?;
         let capabilities = registry.production_capabilities(&spec.store_id)?;
+        capabilities.validate_namespace(AuthoritativeNamespace::TableCatalog)?;
         let relation_catalog = read_matching_relation_catalog(
             relation_catalog_store,
             capabilities,
@@ -231,7 +244,7 @@ impl PersistedTableStore {
         )
         .await?;
         require_table_relation_registration(&relation_catalog)?;
-        QueryPolicyCatalogStore::new(query_policy_catalog_store)
+        QueryPolicyCatalogStore::new_checked(query_policy_catalog_store, capabilities)?
             .get_for_production_table_scan(&spec.tenant_id, &spec.query_policy_id)
             .await?;
         registry.resolve_production_table_location(
@@ -313,6 +326,7 @@ pub async fn query_production_persisted_object_backed_input(
     relation_catalog_store: Arc<dyn ObjectStore>,
     policy_catalog_store: Arc<dyn ObjectStore>,
     registry: &StorageRegistry,
+    startup_capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
     tenant_id: &str,
     table_id: &str,
     sql: &str,
@@ -323,6 +337,7 @@ pub async fn query_production_persisted_object_backed_input(
         policy_catalog_store,
         ProductionPersistedTableQueryRequest {
             registry,
+            startup_capabilities,
             tenant_id,
             table_id,
             sql,
@@ -337,6 +352,7 @@ pub async fn query_production_persisted_object_backed_input_with_metrics(
     relation_catalog_store: Arc<dyn ObjectStore>,
     policy_catalog_store: Arc<dyn ObjectStore>,
     registry: &StorageRegistry,
+    startup_capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
     tenant_id: &str,
     table_id: &str,
     sql: &str,
@@ -347,6 +363,7 @@ pub async fn query_production_persisted_object_backed_input_with_metrics(
         policy_catalog_store,
         ProductionPersistedTableQueryRequest {
             registry,
+            startup_capabilities,
             tenant_id,
             table_id,
             sql,
@@ -362,7 +379,7 @@ pub async fn query_production_persisted_object_backed_input_with_limiter_and_met
     policy_catalog_store: Arc<dyn ObjectStore>,
     request: ProductionPersistedTableQueryRequest<'_>,
 ) -> Result<ObjectBackedQueryResult, PersistedTableError> {
-    let catalog = PersistedTableStore::new(catalog_store);
+    let catalog = PersistedTableStore::new_checked(catalog_store, request.startup_capabilities)?;
     let spec = catalog.get_production(request.table_id).await?;
     reject_cross_tenant_production_query(request.tenant_id, &spec)?;
     let capabilities = request.registry.production_capabilities(&spec.store_id)?;
@@ -374,10 +391,11 @@ pub async fn query_production_persisted_object_backed_input_with_limiter_and_met
         &spec.schema_fingerprint,
     )
     .await?;
-    let policy = QueryPolicyCatalogStore::new(policy_catalog_store)
-        .get_for_production_table_scan(&spec.tenant_id, &spec.query_policy_id)
-        .await?
-        .policy;
+    let policy =
+        QueryPolicyCatalogStore::new_checked(policy_catalog_store, request.startup_capabilities)?
+            .get_for_production_table_scan(&spec.tenant_id, &spec.query_policy_id)
+            .await?
+            .policy;
 
     query_production_spec_with_policy_and_metrics(
         request.registry,
@@ -397,7 +415,7 @@ pub async fn query_production_persisted_object_backed_input_with_limiter(
     policy_catalog_store: Arc<dyn ObjectStore>,
     request: ProductionPersistedTableQueryRequest<'_>,
 ) -> Result<Vec<RecordBatch>, PersistedTableError> {
-    let catalog = PersistedTableStore::new(catalog_store);
+    let catalog = PersistedTableStore::new_checked(catalog_store, request.startup_capabilities)?;
     let spec = catalog.get_production(request.table_id).await?;
     reject_cross_tenant_production_query(request.tenant_id, &spec)?;
     let capabilities = request.registry.production_capabilities(&spec.store_id)?;
@@ -409,10 +427,11 @@ pub async fn query_production_persisted_object_backed_input_with_limiter(
         &spec.schema_fingerprint,
     )
     .await?;
-    let policy = QueryPolicyCatalogStore::new(policy_catalog_store)
-        .get_for_production_table_scan(&spec.tenant_id, &spec.query_policy_id)
-        .await?
-        .policy;
+    let policy =
+        QueryPolicyCatalogStore::new_checked(policy_catalog_store, request.startup_capabilities)?
+            .get_for_production_table_scan(&spec.tenant_id, &spec.query_policy_id)
+            .await?
+            .policy;
 
     query_production_spec_with_policy(
         request.registry,
@@ -426,7 +445,7 @@ pub async fn query_production_persisted_object_backed_input_with_limiter(
     .await
 }
 
-async fn query_production_spec_with_policy(
+pub(crate) async fn query_production_spec_with_policy(
     registry: &StorageRegistry,
     tenant_id: &str,
     spec: ProductionPersistedTableSpec,
@@ -624,15 +643,8 @@ pub(crate) fn production_relation_catalog_registry(
     capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
 ) -> Result<RelationCatalogRegistry, PersistedTableError> {
     let profile = capabilities
-        .profiles
-        .get(&AuthoritativeNamespace::RelationCatalog)
-        .ok_or_else(|| {
-            StorageRegistryError::ObjectStoreCapabilities(
-                AuthoritativeObjectStoreCapabilityError::MissingNamespace {
-                    namespace: AuthoritativeNamespace::RelationCatalog,
-                },
-            )
-        })?;
+        .validate_namespace(AuthoritativeNamespace::RelationCatalog)
+        .map_err(|source| StorageRegistryError::ObjectStoreCapabilities(source))?;
 
     RelationCatalogRegistry::new_checked(relation_catalog_store, profile).map_err(|source| {
         StorageRegistryError::ObjectStoreCapabilities(

@@ -1,4 +1,10 @@
-use std::sync::Arc;
+use std::{
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 
 use arrow::array::{ArrayRef, Int64Array, StringArray, StringViewArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -38,13 +44,103 @@ use velorix_runtime::{
     },
     storage_registry::StorageRegistry,
 };
-use velorix_storage::{object_key::ObjectKey, relation_catalog_registry::RelationCatalogRegistry};
+use velorix_storage::{
+    capability::{
+        AuthoritativeNamespace, AuthoritativeObjectStoreCapabilitiesV1,
+        AuthoritativeObjectStoreCapabilityError, ObjectStoreCapabilityProfile,
+        RequiredObjectStoreCapability,
+    },
+    object_key::ObjectKey,
+    relation_catalog_registry::RelationCatalogRegistry,
+};
 
 fn temp_store() -> (TempDir, Arc<dyn ObjectStore>) {
     let temp_dir = tempfile::tempdir().unwrap();
     let store = LocalFileSystem::new_with_prefix(temp_dir.path()).unwrap();
 
     (temp_dir, Arc::new(store))
+}
+
+#[derive(Debug)]
+struct CountingStore {
+    inner: Arc<dyn ObjectStore>,
+    get_count: AtomicUsize,
+}
+
+impl CountingStore {
+    fn new(inner: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            inner,
+            get_count: AtomicUsize::new(0),
+        }
+    }
+
+    fn get_count(&self) -> usize {
+        self.get_count.load(Ordering::SeqCst)
+    }
+}
+
+impl std::fmt::Display for CountingStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CountingStore")
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for CountingStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        if !options.head {
+            self.get_count.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn delete(&self, location: &Path) -> object_store::Result<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
 }
 
 fn production_request(
@@ -664,6 +760,7 @@ async fn production_object_backed_table_query_rejects_unregistered_store_id() {
     let error = query_production_table(
         &catalog_store,
         &registry,
+        &all_namespace_capabilities(),
         "tenant-a",
         "orders-current",
         "select key_json, value_json, weight from input",
@@ -695,6 +792,7 @@ async fn production_object_backed_table_query_rejects_store_registered_without_c
     let error = query_production_table(
         &catalog_store,
         &registry,
+        &all_namespace_capabilities(),
         "tenant-a",
         "orders-current",
         "select key_json, value_json, weight from input",
@@ -734,6 +832,7 @@ async fn production_object_backed_table_query_rejects_missing_capabilities_befor
     let error = query_production_table(
         &catalog_store,
         &registry,
+        &all_namespace_capabilities(),
         "tenant-a",
         "orders-current",
         "select account_id, value, weight from orders",
@@ -749,6 +848,138 @@ async fn production_object_backed_table_query_rejects_missing_capabilities_befor
             }
         ) if store_id == "primary"
     ));
+}
+
+#[tokio::test]
+async fn production_object_backed_table_query_rejects_missing_table_catalog_capabilities_before_malformed_table_json(
+) {
+    let (_temp_dir, catalog_store) = temp_store();
+    let counting_catalog_store = Arc::new(CountingStore::new(Arc::clone(&catalog_store)));
+    let counted_catalog_store: Arc<dyn ObjectStore> = counting_catalog_store.clone();
+    let registry = StorageRegistry::new();
+    write_malformed_table_catalog_json(&catalog_store, "orders-current").await;
+
+    let error = query_production_persisted_object_backed_input(
+        Arc::clone(&counted_catalog_store),
+        Arc::clone(&counted_catalog_store),
+        Arc::clone(&counted_catalog_store),
+        &registry,
+        &capabilities_missing(AuthoritativeNamespace::TableCatalog),
+        "tenant-a",
+        "orders-current",
+        "select account_id, value, weight from orders",
+    )
+    .await
+    .unwrap_err();
+
+    assert_missing_persisted_table_capability(error, AuthoritativeNamespace::TableCatalog);
+    assert_eq!(counting_catalog_store.get_count(), 0);
+}
+
+#[tokio::test]
+async fn production_object_backed_table_query_rejects_weak_table_catalog_capabilities_before_malformed_table_json(
+) {
+    let (_temp_dir, catalog_store) = temp_store();
+    let counting_catalog_store = Arc::new(CountingStore::new(Arc::clone(&catalog_store)));
+    let counted_catalog_store: Arc<dyn ObjectStore> = counting_catalog_store.clone();
+    let registry = StorageRegistry::new();
+    write_malformed_table_catalog_json(&catalog_store, "orders-current").await;
+
+    let error = query_production_persisted_object_backed_input(
+        Arc::clone(&counted_catalog_store),
+        Arc::clone(&counted_catalog_store),
+        Arc::clone(&counted_catalog_store),
+        &registry,
+        &capabilities_with_weak_namespace(AuthoritativeNamespace::TableCatalog),
+        "tenant-a",
+        "orders-current",
+        "select account_id, value, weight from orders",
+    )
+    .await
+    .unwrap_err();
+
+    assert_weak_persisted_table_capability(error, AuthoritativeNamespace::TableCatalog);
+    assert_eq!(counting_catalog_store.get_count(), 0);
+}
+
+#[tokio::test]
+async fn production_object_backed_table_query_rejects_missing_query_policy_capabilities_before_malformed_policy_json(
+) {
+    let (_temp_dir, catalog_store) = temp_store();
+    let (_policy_temp_dir, policy_store) = temp_store();
+    let counting_policy_store = Arc::new(CountingStore::new(Arc::clone(&policy_store)));
+    let counted_policy_store: Arc<dyn ObjectStore> = counting_policy_store.clone();
+    create_orders_relation_catalog(&catalog_store).await;
+    write_production_table_catalog_object(
+        &catalog_store,
+        production_request("primary", "tenants/tenant-a/tables/orders"),
+    )
+    .await;
+    write_malformed_query_policy_json(&policy_store, "tenant-a", "standard").await;
+    let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
+    let mut registry = StorageRegistry::new();
+    register_production_scan_store(
+        &mut registry,
+        Arc::clone(&scan_store),
+        Arc::clone(&catalog_store),
+    )
+    .await;
+
+    let error = query_production_persisted_object_backed_input(
+        Arc::clone(&catalog_store),
+        Arc::clone(&catalog_store),
+        Arc::clone(&counted_policy_store),
+        &registry,
+        &capabilities_missing(AuthoritativeNamespace::QueryPolicy),
+        "tenant-a",
+        "orders-current",
+        "select account_id, value, weight from orders",
+    )
+    .await
+    .unwrap_err();
+
+    assert_missing_policy_catalog_capability(error, AuthoritativeNamespace::QueryPolicy);
+    assert_eq!(counting_policy_store.get_count(), 0);
+}
+
+#[tokio::test]
+async fn production_object_backed_table_query_rejects_weak_query_policy_capabilities_before_malformed_policy_json(
+) {
+    let (_temp_dir, catalog_store) = temp_store();
+    let (_policy_temp_dir, policy_store) = temp_store();
+    let counting_policy_store = Arc::new(CountingStore::new(Arc::clone(&policy_store)));
+    let counted_policy_store: Arc<dyn ObjectStore> = counting_policy_store.clone();
+    create_orders_relation_catalog(&catalog_store).await;
+    write_production_table_catalog_object(
+        &catalog_store,
+        production_request("primary", "tenants/tenant-a/tables/orders"),
+    )
+    .await;
+    write_malformed_query_policy_json(&policy_store, "tenant-a", "standard").await;
+    let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
+    let mut registry = StorageRegistry::new();
+    register_production_scan_store(
+        &mut registry,
+        Arc::clone(&scan_store),
+        Arc::clone(&catalog_store),
+    )
+    .await;
+
+    let error = query_production_persisted_object_backed_input(
+        Arc::clone(&catalog_store),
+        Arc::clone(&catalog_store),
+        Arc::clone(&counted_policy_store),
+        &registry,
+        &capabilities_with_weak_namespace(AuthoritativeNamespace::QueryPolicy),
+        "tenant-a",
+        "orders-current",
+        "select account_id, value, weight from orders",
+    )
+    .await
+    .unwrap_err();
+
+    assert_weak_policy_catalog_capability(error, AuthoritativeNamespace::QueryPolicy);
+    assert_eq!(counting_policy_store.get_count(), 0);
 }
 
 #[tokio::test]
@@ -779,6 +1010,7 @@ async fn production_object_backed_table_query_accepts_capability_registered_stor
     let output = query_production_table(
         &catalog_store,
         &registry,
+        &all_namespace_capabilities(),
         "tenant-a",
         "orders-current",
         "select account_id, sum(value) as total_value, sum(weight) as total_weight \
@@ -818,6 +1050,7 @@ async fn production_object_backed_table_query_rejects_parquet_schema_not_matchin
     let error = query_production_table(
         &catalog_store,
         &registry,
+        &all_namespace_capabilities(),
         "tenant-a",
         "orders-current",
         "select account_id, value, weight from orders",
@@ -854,6 +1087,7 @@ async fn production_object_backed_table_query_does_not_register_legacy_input_tab
     let error = query_production_table(
         &catalog_store,
         &registry,
+        &all_namespace_capabilities(),
         "tenant-a",
         "orders-current",
         "select key_json, value_json, weight from input",
@@ -885,6 +1119,7 @@ async fn production_object_backed_table_query_rejects_stale_relation_catalog_fin
     let error = query_production_table(
         &catalog_store,
         &registry,
+        &all_namespace_capabilities(),
         "tenant-a",
         "orders-current",
         "select account_id, value, weight from orders",
@@ -924,6 +1159,7 @@ async fn production_object_backed_table_query_rejects_non_table_relation_registr
     let error = query_production_table(
         &catalog_store,
         &registry,
+        &all_namespace_capabilities(),
         "tenant-a",
         "orders-current",
         "select account_id, value, weight from orders",
@@ -956,6 +1192,7 @@ async fn production_object_backed_table_query_rejects_missing_catalog_policy() {
     let error = query_production_table(
         &catalog_store,
         &registry,
+        &all_namespace_capabilities(),
         "tenant-a",
         "orders-current",
         "select account_id, value, weight from orders",
@@ -989,6 +1226,7 @@ async fn production_object_backed_table_query_rejects_unbounded_catalog_policy()
     let error = query_production_table(
         &catalog_store,
         &registry,
+        &all_namespace_capabilities(),
         "tenant-a",
         "orders-current",
         "select account_id, value, weight from orders",
@@ -1038,6 +1276,7 @@ async fn production_object_backed_table_query_applies_catalog_policy_id() {
     let error = query_production_table(
         &catalog_store,
         &registry,
+        &all_namespace_capabilities(),
         "tenant-a",
         "orders-current",
         "select account_id, value, weight from orders order by account_id",
@@ -1083,6 +1322,7 @@ async fn production_object_backed_table_query_requires_shared_limiter_when_catal
     let error = query_production_table(
         &catalog_store,
         &registry,
+        &all_namespace_capabilities(),
         "tenant-a",
         "orders-current",
         "select account_id, value, weight from orders",
@@ -1134,6 +1374,7 @@ async fn production_object_backed_table_query_accepts_shared_limiter_when_catalo
     let output = query_production_table_with_limiter(
         &catalog_store,
         &registry,
+        &all_namespace_capabilities(),
         "tenant-a",
         "orders-current",
         "select account_id, value, weight from orders",
@@ -1170,6 +1411,7 @@ async fn production_object_backed_table_query_with_metrics_uses_registry_and_rel
         Arc::clone(&catalog_store),
         Arc::clone(&catalog_store),
         &registry,
+        &all_namespace_capabilities(),
         "tenant-a",
         "orders-current",
         "select account_id, value, weight from orders order by account_id",
@@ -1216,6 +1458,7 @@ async fn production_object_backed_table_query_with_metrics_requires_shared_limit
         Arc::clone(&catalog_store),
         Arc::clone(&catalog_store),
         &registry,
+        &all_namespace_capabilities(),
         "tenant-a",
         "orders-current",
         "select account_id, value, weight from orders",
@@ -1269,6 +1512,7 @@ async fn production_object_backed_table_query_with_metrics_accepts_shared_limite
         Arc::clone(&catalog_store),
         ProductionPersistedTableQueryRequest {
             registry: &registry,
+            startup_capabilities: &all_namespace_capabilities(),
             tenant_id: "tenant-a",
             table_id: "orders-current",
             sql: "select account_id, value, weight from orders",
@@ -1312,6 +1556,7 @@ async fn production_object_backed_table_query_rejects_limiter_that_does_not_matc
     let error = query_production_table_with_limiter(
         &catalog_store,
         &registry,
+        &all_namespace_capabilities(),
         "tenant-a",
         "orders-current",
         "select account_id, value, weight from orders",
@@ -1357,6 +1602,7 @@ async fn production_object_backed_table_query_rejects_cross_tenant_catalog_polic
     let error = query_production_table(
         &catalog_store,
         &registry,
+        &all_namespace_capabilities(),
         "tenant-b",
         "orders-current",
         "select account_id, value, weight from orders",
@@ -1412,6 +1658,7 @@ async fn production_object_backed_table_query_rejects_scan_above_file_count_limi
     let error = query_production_table(
         &catalog_store,
         &registry,
+        &all_namespace_capabilities(),
         "tenant-a",
         "orders-current",
         "select account_id, value, weight from orders",
@@ -1462,6 +1709,7 @@ async fn production_object_backed_table_query_rejects_scan_above_byte_limit() {
     let error = query_production_table(
         &catalog_store,
         &registry,
+        &all_namespace_capabilities(),
         "tenant-a",
         "orders-current",
         "select account_id, value, weight from orders",
@@ -1518,6 +1766,7 @@ async fn production_object_backed_table_query_rejects_object_requests_above_limi
     let error = query_production_table(
         &catalog_store,
         &registry,
+        &all_namespace_capabilities(),
         "tenant-a",
         "orders-current",
         "select account_id, value, weight from orders limit 1",
@@ -1570,6 +1819,7 @@ async fn production_object_backed_table_query_still_applies_output_row_limit() {
     let error = query_production_table(
         &catalog_store,
         &registry,
+        &all_namespace_capabilities(),
         "tenant-a",
         "orders-current",
         "select account_id, value, weight from orders order by account_id",
@@ -1685,7 +1935,8 @@ async fn create_production_table_with_policy(
     let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
     let mut registry = StorageRegistry::new();
     register_production_scan_store(&mut registry, scan_store, Arc::clone(catalog_store)).await;
-    PersistedTableStore::new(Arc::clone(catalog_store))
+    PersistedTableStore::new_checked(Arc::clone(catalog_store), &all_namespace_capabilities())
+        .unwrap()
         .create_production(
             Arc::clone(catalog_store),
             Arc::clone(catalog_store),
@@ -1699,6 +1950,7 @@ async fn create_production_table_with_policy(
 async fn query_production_table(
     catalog_store: &Arc<dyn ObjectStore>,
     registry: &StorageRegistry,
+    startup_capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
     tenant_id: &str,
     table_id: &str,
     sql: &str,
@@ -1708,6 +1960,7 @@ async fn query_production_table(
         Arc::clone(catalog_store),
         Arc::clone(catalog_store),
         registry,
+        startup_capabilities,
         tenant_id,
         table_id,
         sql,
@@ -1718,6 +1971,7 @@ async fn query_production_table(
 async fn query_production_table_with_limiter(
     catalog_store: &Arc<dyn ObjectStore>,
     registry: &StorageRegistry,
+    startup_capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
     tenant_id: &str,
     table_id: &str,
     sql: &str,
@@ -1729,6 +1983,7 @@ async fn query_production_table_with_limiter(
         Arc::clone(catalog_store),
         ProductionPersistedTableQueryRequest {
             registry,
+            startup_capabilities,
             tenant_id,
             table_id,
             sql,
@@ -1736,6 +1991,110 @@ async fn query_production_table_with_limiter(
         },
     )
     .await
+}
+
+async fn write_malformed_table_catalog_json(store: &Arc<dyn ObjectStore>, table_id: &str) {
+    let key = ObjectKey::query_table(table_id).unwrap();
+    store
+        .put(
+            &Path::from(key.as_str()),
+            Bytes::from_static(br#"{"schema_version":"#).into(),
+        )
+        .await
+        .unwrap();
+}
+
+async fn write_malformed_query_policy_json(
+    store: &Arc<dyn ObjectStore>,
+    tenant_id: &str,
+    query_policy_id: &str,
+) {
+    let key = ObjectKey::query_policy(tenant_id, query_policy_id).unwrap();
+    store
+        .put(
+            &Path::from(key.as_str()),
+            Bytes::from_static(br#"{"schema_version":"#).into(),
+        )
+        .await
+        .unwrap();
+}
+
+fn all_namespace_capabilities() -> AuthoritativeObjectStoreCapabilitiesV1 {
+    let profile = ObjectStoreCapabilityProfile::local_development();
+    AuthoritativeObjectStoreCapabilitiesV1::new(
+        AuthoritativeNamespace::all()
+            .into_iter()
+            .map(|namespace| (namespace, profile.clone()))
+            .collect::<BTreeMap<_, _>>(),
+    )
+}
+
+fn capabilities_missing(
+    namespace: AuthoritativeNamespace,
+) -> AuthoritativeObjectStoreCapabilitiesV1 {
+    let mut profiles = all_namespace_capabilities().profiles;
+    profiles.remove(&namespace);
+    AuthoritativeObjectStoreCapabilitiesV1::new(profiles)
+}
+
+fn capabilities_with_weak_namespace(
+    namespace: AuthoritativeNamespace,
+) -> AuthoritativeObjectStoreCapabilitiesV1 {
+    let mut profile = ObjectStoreCapabilityProfile::local_development();
+    profile.conditional_create = false;
+    let mut profiles = all_namespace_capabilities().profiles;
+    profiles.insert(namespace, profile);
+    AuthoritativeObjectStoreCapabilitiesV1::new(profiles)
+}
+
+fn assert_missing_persisted_table_capability(
+    error: PersistedTableError,
+    expected_namespace: AuthoritativeNamespace,
+) {
+    assert!(matches!(
+        error,
+        PersistedTableError::ObjectStoreCapabilities(
+            AuthoritativeObjectStoreCapabilityError::MissingNamespace { namespace }
+        ) if namespace == expected_namespace
+    ));
+}
+
+fn assert_weak_persisted_table_capability(
+    error: PersistedTableError,
+    expected_namespace: AuthoritativeNamespace,
+) {
+    assert!(matches!(
+        error,
+        PersistedTableError::ObjectStoreCapabilities(
+            AuthoritativeObjectStoreCapabilityError::NamespaceProfile { namespace, source }
+        ) if namespace == expected_namespace
+            && source.required_capability() == RequiredObjectStoreCapability::ConditionalCreate
+    ));
+}
+
+fn assert_missing_policy_catalog_capability(
+    error: PersistedTableError,
+    expected_namespace: AuthoritativeNamespace,
+) {
+    assert!(matches!(
+        error,
+        PersistedTableError::QueryPolicyCatalog(QueryPolicyCatalogError::ObjectStoreCapabilities(
+            AuthoritativeObjectStoreCapabilityError::MissingNamespace { namespace }
+        )) if namespace == expected_namespace
+    ));
+}
+
+fn assert_weak_policy_catalog_capability(
+    error: PersistedTableError,
+    expected_namespace: AuthoritativeNamespace,
+) {
+    assert!(matches!(
+        error,
+        PersistedTableError::QueryPolicyCatalog(QueryPolicyCatalogError::ObjectStoreCapabilities(
+            AuthoritativeObjectStoreCapabilityError::NamespaceProfile { namespace, source }
+        )) if namespace == expected_namespace
+            && source.required_capability() == RequiredObjectStoreCapability::ConditionalCreate
+    ));
 }
 
 async fn create_orders_relation_catalog(store: &Arc<dyn ObjectStore>) -> VelorixRelationCatalogV1 {
@@ -1905,7 +2264,8 @@ async fn write_production_table_catalog_object(
 }
 
 async fn create_standard_policy(store: &Arc<dyn ObjectStore>, policy: QueryPolicy) {
-    QueryPolicyCatalogStore::new(Arc::clone(store))
+    QueryPolicyCatalogStore::new_checked(Arc::clone(store), &all_namespace_capabilities())
+        .unwrap()
         .create_for_production_table_scan("tenant-a", "standard", production_policy_with(policy))
         .await
         .unwrap();

@@ -5,13 +5,13 @@ use datafusion::object_store::ObjectStore as DataFusionObjectStore;
 use object_store::ObjectStore;
 use thiserror::Error;
 use velorix_core::relation::VelorixRelationCatalogV1;
+use velorix_storage::capability::AuthoritativeObjectStoreCapabilitiesV1;
 
 use crate::{
     persisted_query::{PersistedQueryError, PersistedQueryStore},
     persisted_table::{
-        production_relation_catalog_registry,
-        query_production_persisted_object_backed_input_with_limiter, PersistedTableError,
-        PersistedTableFormat, PersistedTableStore, ProductionPersistedTableQueryRequest,
+        production_relation_catalog_registry, query_production_spec_with_policy,
+        PersistedTableError, PersistedTableFormat, PersistedTableStore,
         ProductionPersistedTableSpec,
     },
     query::{query_object_backed_input_with_policy, QueryExecutionLimiter, RuntimeQueryError},
@@ -32,6 +32,7 @@ pub enum PersistedViewError {
 #[derive(Clone, Debug)]
 pub struct ProductionPersistedViewQueryRequest<'a> {
     pub registry: &'a StorageRegistry,
+    pub startup_capabilities: &'a AuthoritativeObjectStoreCapabilitiesV1,
     pub tenant_id: &'a str,
     pub table_id: &'a str,
     pub query_id: &'a str,
@@ -73,6 +74,7 @@ pub async fn query_production_persisted_object_backed_view(
     relation_catalog_store: Arc<dyn ObjectStore>,
     policy_catalog_store: Arc<dyn ObjectStore>,
     registry: &StorageRegistry,
+    startup_capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
     tenant_id: &str,
     table_id: &str,
     query_id: &str,
@@ -83,6 +85,7 @@ pub async fn query_production_persisted_object_backed_view(
         policy_catalog_store,
         ProductionPersistedViewQueryRequest {
             registry,
+            startup_capabilities,
             tenant_id,
             table_id,
             query_id,
@@ -98,11 +101,15 @@ pub async fn query_production_persisted_object_backed_view_with_limiter(
     policy_catalog_store: Arc<dyn ObjectStore>,
     request: ProductionPersistedViewQueryRequest<'_>,
 ) -> Result<Vec<RecordBatch>, PersistedViewError> {
-    let query_catalog = PersistedQueryStore::new(Arc::clone(&catalog_store));
-    let table = PersistedTableStore::new(Arc::clone(&catalog_store))
-        .get_production(request.table_id)
-        .await
-        .map_err(PersistedViewError::TableCatalog)?;
+    let query_catalog =
+        PersistedQueryStore::new_checked(Arc::clone(&catalog_store), request.startup_capabilities)
+            .map_err(PersistedViewError::QueryCatalog)?;
+    let table =
+        PersistedTableStore::new_checked(Arc::clone(&catalog_store), request.startup_capabilities)
+            .map_err(PersistedViewError::TableCatalog)?
+            .get_production(request.table_id)
+            .await
+            .map_err(PersistedViewError::TableCatalog)?;
     reject_cross_tenant_production_view(request.tenant_id, &table)
         .map_err(PersistedViewError::TableCatalog)?;
     let capabilities = request
@@ -114,12 +121,17 @@ pub async fn query_production_persisted_object_backed_view_with_limiter(
         read_pinned_relation_catalog(Arc::clone(&relation_catalog_store), capabilities, &table)
             .await
             .map_err(PersistedViewError::TableCatalog)?;
-    let production_policy = QueryPolicyCatalogStore::new(Arc::clone(&policy_catalog_store))
-        .get_for_production_table_scan(&table.tenant_id, &table.query_policy_id)
-        .await
-        .map_err(PersistedTableError::from)
-        .map_err(PersistedViewError::TableCatalog)?
-        .policy;
+    let production_policy = QueryPolicyCatalogStore::new_checked(
+        Arc::clone(&policy_catalog_store),
+        request.startup_capabilities,
+    )
+    .map_err(PersistedTableError::from)
+    .map_err(PersistedViewError::TableCatalog)?
+    .get_for_production_table_scan(&table.tenant_id, &table.query_policy_id)
+    .await
+    .map_err(PersistedTableError::from)
+    .map_err(PersistedViewError::TableCatalog)?
+    .policy;
     let query = query_catalog
         .get_for_production_relation_with_policy(
             request.query_id,
@@ -129,17 +141,14 @@ pub async fn query_production_persisted_object_backed_view_with_limiter(
         .await
         .map_err(PersistedViewError::QueryCatalog)?;
 
-    query_production_persisted_object_backed_input_with_limiter(
-        catalog_store,
-        relation_catalog_store,
-        policy_catalog_store,
-        ProductionPersistedTableQueryRequest {
-            registry: request.registry,
-            tenant_id: request.tenant_id,
-            table_id: request.table_id,
-            sql: &query.sql,
-            limiter: request.limiter,
-        },
+    query_production_spec_with_policy(
+        request.registry,
+        request.tenant_id,
+        table,
+        relation_catalog,
+        &query.sql,
+        production_policy,
+        request.limiter,
     )
     .await
     .map_err(|error| match error {
@@ -150,7 +159,7 @@ pub async fn query_production_persisted_object_backed_view_with_limiter(
 
 async fn read_pinned_relation_catalog(
     relation_catalog_store: Arc<dyn ObjectStore>,
-    capabilities: &velorix_storage::capability::AuthoritativeObjectStoreCapabilitiesV1,
+    capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
     table: &ProductionPersistedTableSpec,
 ) -> Result<VelorixRelationCatalogV1, PersistedTableError> {
     let relation_catalog =

@@ -476,7 +476,7 @@ async fn datafusion_table_scan(
         .await?;
 
     let requests_before = metered_store.snapshot();
-    create_production_query_policy(&authority_store).await?;
+    create_production_query_policy(&authority_store, capabilities).await?;
     let mut registry = StorageRegistry::new();
     registry.register_production_with_capabilities(
         "primary",
@@ -484,7 +484,7 @@ async fn datafusion_table_scan(
         Arc::clone(&inner),
         capabilities.clone(),
     )?;
-    PersistedTableStore::new(Arc::clone(&authority_store))
+    PersistedTableStore::new_checked(Arc::clone(&authority_store), capabilities)?
         .create_production(
             Arc::clone(&authority_store),
             Arc::clone(&authority_store),
@@ -499,6 +499,7 @@ async fn datafusion_table_scan(
         Arc::clone(&authority_store),
         Arc::clone(&authority_store),
         &registry,
+        capabilities,
         "tenant-a",
         "orders-current",
         "select account_id, sum(amount) as total_value, sum(weight) as total_weight \
@@ -685,8 +686,11 @@ async fn append_ingest_envelope(
     Ok(())
 }
 
-async fn create_production_query_policy(store: &Arc<dyn ObjectStore>) -> BenchResult<()> {
-    QueryPolicyCatalogStore::new(Arc::clone(store))
+async fn create_production_query_policy(
+    store: &Arc<dyn ObjectStore>,
+    capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
+) -> BenchResult<()> {
+    QueryPolicyCatalogStore::new_checked(Arc::clone(store), capabilities)?
         .create_for_production_table_scan("tenant-a", "standard", production_query_policy())
         .await?;
     Ok(())

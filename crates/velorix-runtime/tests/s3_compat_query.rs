@@ -90,19 +90,21 @@ async fn s3_compatible_production_table_query_scans_parquet_through_registry() -
 
     let validation = async {
         create_orders_relation_catalog(&authority_store).await?;
-        create_production_query_policy(&authority_store).await?;
+        let startup_capabilities = probe_authoritative_object_store_capabilities(
+            authority_store.as_ref(),
+            "s3-compatible",
+            format!("{}/table-query-capability-probes", config.run_prefix),
+        )
+        .await?;
+        create_production_query_policy(&authority_store, &startup_capabilities).await?;
         let mut registry = StorageRegistry::new();
-        registry
-            .register_production_with_probe(
-                "primary",
-                &format!("s3://{}/", config.bucket),
-                Arc::clone(&scan_store),
-                Arc::clone(&authority_store),
-                "s3-compatible",
-                format!("{}/capability-probes", config.run_prefix),
-            )
-            .await?;
-        PersistedTableStore::new(Arc::clone(&authority_store))
+        registry.register_production_with_capabilities(
+            "primary",
+            &format!("s3://{}/", config.bucket),
+            Arc::clone(&scan_store),
+            startup_capabilities.clone(),
+        )?;
+        PersistedTableStore::new_checked(Arc::clone(&authority_store), &startup_capabilities)?
             .create_production(
                 Arc::clone(&authority_store),
                 Arc::clone(&authority_store),
@@ -116,6 +118,7 @@ async fn s3_compatible_production_table_query_scans_parquet_through_registry() -
             Arc::clone(&authority_store),
             Arc::clone(&authority_store),
             &registry,
+            &startup_capabilities,
             "tenant-a",
             "orders-current",
             "select account_id, sum(value) as total_value, sum(weight) as total_weight \
@@ -298,8 +301,9 @@ async fn create_orders_relation_catalog(
 
 async fn create_production_query_policy(
     store: &Arc<dyn AuthorityObjectStore>,
+    capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
 ) -> Result<(), TestError> {
-    QueryPolicyCatalogStore::new(Arc::clone(store))
+    QueryPolicyCatalogStore::new_checked(Arc::clone(store), capabilities)?
         .create_for_production_table_scan("tenant-a", "standard", production_query_policy())
         .await?;
     Ok(())
