@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -27,7 +27,9 @@ use velorix_control::{
     },
 };
 use velorix_storage::{
-    capability::AuthoritativeNamespace, ownership::OwnershipEpochRecord, state::CheckpointPublisher,
+    capability::{AuthoritativeNamespace, AuthoritativeObjectStoreCapabilitiesV1},
+    ownership::OwnershipEpochRecord,
+    state::CheckpointPublisher,
 };
 
 use crate::{
@@ -486,7 +488,7 @@ pub struct CheckpointPublisherEpochStore {
 }
 
 impl CheckpointPublisherEpochStore {
-    pub fn new(publisher: CheckpointPublisher) -> Self {
+    pub(crate) fn new(publisher: CheckpointPublisher) -> Self {
         Self { publisher }
     }
 
@@ -494,6 +496,13 @@ impl CheckpointPublisherEpochStore {
         validated_authority: ValidatedOperatorAuthority,
     ) -> Result<Self, WorkerShardError> {
         let (_authority, store, capabilities) = validated_authority.into_parts();
+        Self::from_authority_parts(store, Arc::new(capabilities))
+    }
+
+    pub(crate) fn from_authority_parts(
+        store: Arc<dyn object_store::ObjectStore>,
+        capabilities: Arc<AuthoritativeObjectStoreCapabilitiesV1>,
+    ) -> Result<Self, WorkerShardError> {
         let profile = capabilities
             .validate_namespace(AuthoritativeNamespace::Ownership)
             .map_err(|error| WorkerShardError::EpochStore(error.to_string()))?;

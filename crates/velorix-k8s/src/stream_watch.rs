@@ -43,19 +43,27 @@ pub trait AuthoritySnapshotProvider: Clone + Send + Sync + 'static {
 pub struct RelationCatalogSnapshotProvider {
     authority: ObjectStoreAuthorityRef,
     store: Arc<dyn object_store::ObjectStore>,
-    capabilities: AuthoritativeObjectStoreCapabilitiesV1,
+    capabilities: Arc<AuthoritativeObjectStoreCapabilitiesV1>,
 }
 
 #[derive(Clone, Debug)]
 pub struct IngestAdmissionCoordinatorProvider {
     authority: ObjectStoreAuthorityRef,
     store: Arc<dyn object_store::ObjectStore>,
-    capabilities: AuthoritativeObjectStoreCapabilitiesV1,
+    capabilities: Arc<AuthoritativeObjectStoreCapabilitiesV1>,
 }
 
 impl RelationCatalogSnapshotProvider {
     pub fn for_production(validated_authority: ValidatedOperatorAuthority) -> Self {
         let (authority, store, capabilities) = validated_authority.into_parts();
+        Self::from_authority_parts(authority, store, Arc::new(capabilities))
+    }
+
+    pub(crate) fn from_authority_parts(
+        authority: ObjectStoreAuthorityRef,
+        store: Arc<dyn object_store::ObjectStore>,
+        capabilities: Arc<AuthoritativeObjectStoreCapabilitiesV1>,
+    ) -> Self {
         Self {
             authority,
             store,
@@ -71,6 +79,14 @@ impl RelationCatalogSnapshotProvider {
 impl IngestAdmissionCoordinatorProvider {
     pub fn for_production(validated_authority: ValidatedOperatorAuthority) -> Self {
         let (authority, store, capabilities) = validated_authority.into_parts();
+        Self::from_authority_parts(authority, store, Arc::new(capabilities))
+    }
+
+    pub(crate) fn from_authority_parts(
+        authority: ObjectStoreAuthorityRef,
+        store: Arc<dyn object_store::ObjectStore>,
+        capabilities: Arc<AuthoritativeObjectStoreCapabilitiesV1>,
+    ) -> Self {
         Self {
             authority,
             store,

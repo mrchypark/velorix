@@ -12,17 +12,21 @@ use tempfile::TempDir;
 use velorix_k8s::{
     controller::{reconcile_stream, ControllerAction},
     crd::{ObjectStoreAuthorityRef, RelationVersionRef, VelorixStream, VelorixStreamSpec},
-    startup::{validate_operator_authority, OperatorStartupError},
+    startup::{
+        validate_operator_authority, OperatorAuthorityStartupComponents, OperatorStartupError,
+    },
     stream_watch::{
         AuthoritySnapshotProvider, IngestAdmissionCoordinatorProvider,
         RelationCatalogSnapshotProvider,
     },
+    worker_shard::WorkerShardEpochStore,
 };
 use velorix_storage::{
     capability::{
         AuthoritativeNamespace, AuthoritativeObjectStoreCapabilityProbeError,
         ObjectStoreCapabilityProbeError, RequiredObjectStoreCapability,
     },
+    ownership::OwnershipEpochRecord,
     relation_catalog_registry::RelationCatalogRegistry,
 };
 
@@ -196,6 +200,104 @@ async fn production_ingest_admission_provider_startup_reconstructs_admissions_be
     );
 }
 
+#[tokio::test]
+async fn operator_authority_startup_components_reuse_validated_evidence_for_providers() {
+    let (_temp_dir, store) = temp_store();
+    create_relation_catalog(&store).await;
+    let validated = validate_operator_authority(
+        authority(),
+        Arc::clone(&store),
+        "local-k8s-authority",
+        "v1/operator-startup-probes",
+    )
+    .await
+    .unwrap();
+    let expected_capabilities = validated.capabilities().clone();
+    let components = OperatorAuthorityStartupComponents::from_validated_authority(validated);
+
+    let snapshot_provider = components.relation_snapshot_provider();
+    let admission_provider = components.ingest_admission_coordinator_provider();
+    let epoch_store = components.worker_shard_epoch_store().unwrap();
+
+    assert_eq!(components.authority(), &authority());
+    assert_eq!(components.capabilities(), &expected_capabilities);
+    assert_eq!(snapshot_provider.capabilities(), components.capabilities());
+    assert_eq!(admission_provider.authority(), components.authority());
+    assert_eq!(admission_provider.capabilities(), components.capabilities());
+    for namespace in [
+        AuthoritativeNamespace::RelationCatalog,
+        AuthoritativeNamespace::Checkpoint,
+        AuthoritativeNamespace::Ingest,
+        AuthoritativeNamespace::IngestAdmission,
+        AuthoritativeNamespace::Ownership,
+    ] {
+        assert_eq!(
+            components.capabilities().profiles[&namespace].backend_name,
+            "local-k8s-authority"
+        );
+    }
+
+    let snapshot = snapshot_provider
+        .snapshot_for_stream(&stream())
+        .await
+        .unwrap();
+    let ControllerAction::WriteStreamStatus(status) = reconcile_stream(&stream(), &snapshot).action;
+    assert_eq!(
+        status.last_accepted_relation_schema_fingerprint,
+        Some(relation().schema_fingerprint)
+    );
+
+    let report = components
+        .ingest_admission_startup_preflight()
+        .await
+        .unwrap();
+    assert_eq!(report.ingest_admission.active_admission_records, 0);
+
+    let record = ownership_epoch_record();
+    epoch_store.create(record.clone()).await.unwrap();
+    assert_eq!(
+        epoch_store
+            .read(&record.stream_id, record.partition_id, record.owner_epoch)
+            .await
+            .unwrap(),
+        Some(record)
+    );
+}
+
+#[tokio::test]
+async fn operator_authority_startup_components_preflight_fails_before_component_use() {
+    let (_temp_dir, store) = temp_store();
+    store
+        .put_opts(
+            &Path::from(
+                "v1/ingest-admission/deposits/p=0000000000/ranges/00000000000000000000-00000000000000000010/notes.txt",
+            ),
+            "unexpected admission namespace object".into(),
+            PutMode::Create.into(),
+        )
+        .await
+        .unwrap();
+    let validated = validate_operator_authority(
+        authority(),
+        Arc::clone(&store),
+        "local-k8s-authority",
+        "v1/operator-startup-probes",
+    )
+    .await
+    .unwrap();
+    let components = OperatorAuthorityStartupComponents::from_validated_authority(validated);
+
+    let err = components
+        .ingest_admission_startup_preflight()
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, velorix_k8s::stream_watch::StreamWatchError::Snapshot { message }
+        if message.contains("unexpected object under v1/ingest-admission"))
+    );
+}
+
 fn temp_store() -> (TempDir, Arc<dyn ObjectStore>) {
     let temp_dir = tempfile::tempdir().unwrap();
     let store = LocalFileSystem::new_with_prefix(temp_dir.path()).unwrap();
@@ -296,6 +398,19 @@ fn relation_catalog_json() -> Value {
             "adapter_id": "incremental-adapter-single-key-sum-count-v1",
         },
     })
+}
+
+fn ownership_epoch_record() -> OwnershipEpochRecord {
+    OwnershipEpochRecord {
+        stream_id: "deposits".to_string(),
+        partition_id: 0,
+        owner_id: "worker-a".to_string(),
+        owner_epoch: 1,
+        lease_identity: "analytics/deposits/0".to_string(),
+        created_at: "2026-05-14T00:00:00Z".to_string(),
+        previous_epoch: None,
+        previous_checkpoint_version: None,
+    }
 }
 
 #[derive(Debug)]
