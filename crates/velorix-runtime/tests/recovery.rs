@@ -37,7 +37,7 @@ use velorix_storage::{
     },
     checkpoint_index::{CheckpointRecoveryMode, CheckpointRecoveryTransitionRecordV1},
     ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
-    log::IngestLog,
+    log::{IngestAdmissionCoordinator, IngestLog},
     manifest::{CheckpointManifest, InputRange, StateObjectRef},
     object_key::ObjectKey,
     relation_catalog_registry::{RelationCatalogRegistry, RelationCatalogRegistryError},
@@ -358,6 +358,17 @@ fn ingest_envelope_bytes_with_batches(
     batches: &[RecordBatch],
 ) -> Bytes {
     IngestEnvelope::encode_batches(request, batches).unwrap()
+}
+
+fn local_ingest_coordinator(store: Arc<dyn ObjectStore>) -> IngestAdmissionCoordinator {
+    IngestAdmissionCoordinator::new(IngestLog::new(store))
+}
+
+async fn append_ingest_envelope(ingest_coordinator: &IngestAdmissionCoordinator, bytes: Bytes) {
+    ingest_coordinator
+        .append_catalog_validated_envelope(bytes)
+        .await
+        .unwrap();
 }
 
 fn int64_account_relation_catalog() -> VelorixRelationCatalogV1 {
@@ -778,14 +789,16 @@ async fn catalog_backed_recovery_reads_catalog_record_and_replays_catalog_aware_
         .await
         .unwrap();
     let input = input_batch([input_delta("account-a", 4, 1)]);
-    IngestLog::new(Arc::clone(&store))
-        .append_catalog_validated_envelope(ingest_envelope_bytes(
+    let ingest_coordinator = local_ingest_coordinator(Arc::clone(&store));
+    append_ingest_envelope(
+        &ingest_coordinator,
+        ingest_envelope_bytes(
             ORDERS_SUM_COUNT_RELATION_VERSION,
             catalog.schema_fingerprint.as_str(),
             &input,
-        ))
-        .await
-        .unwrap();
+        ),
+    )
+    .await;
 
     let recovered = RecoveredRuntime::recover_with_owner_and_relation_catalog_record(
         Arc::clone(&store),
@@ -828,8 +841,10 @@ async fn catalog_backed_recovery_replays_int64_primary_key_relation() {
             1,
         ),
     ]);
-    IngestLog::new(Arc::clone(&store))
-        .append_catalog_validated_envelope(ingest_envelope_bytes_with_batches(
+    let ingest_coordinator = local_ingest_coordinator(Arc::clone(&store));
+    append_ingest_envelope(
+        &ingest_coordinator,
+        ingest_envelope_bytes_with_batches(
             IngestEnvelopeEncodeRequest {
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
@@ -840,9 +855,9 @@ async fn catalog_backed_recovery_replays_int64_primary_key_relation() {
                 end_offset_exclusive: input.records().len() as u64,
             },
             &[ingest_int64_key_record_batch(&input)],
-        ))
-        .await
-        .unwrap();
+        ),
+    )
+    .await;
 
     let recovered = RecoveredRuntime::recover_with_owner_and_relation_catalog_record(
         Arc::clone(&store),
@@ -892,8 +907,10 @@ async fn catalog_backed_recovery_replays_boolean_primary_key_relation() {
             1,
         ),
     ]);
-    IngestLog::new(Arc::clone(&store))
-        .append_catalog_validated_envelope(ingest_envelope_bytes_with_batches(
+    let ingest_coordinator = local_ingest_coordinator(Arc::clone(&store));
+    append_ingest_envelope(
+        &ingest_coordinator,
+        ingest_envelope_bytes_with_batches(
             IngestEnvelopeEncodeRequest {
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
@@ -904,9 +921,9 @@ async fn catalog_backed_recovery_replays_boolean_primary_key_relation() {
                 end_offset_exclusive: input.records().len() as u64,
             },
             &[ingest_boolean_key_record_batch(&input)],
-        ))
-        .await
-        .unwrap();
+        ),
+    )
+    .await;
 
     let recovered = RecoveredRuntime::recover_with_owner_and_relation_catalog_record(
         Arc::clone(&store),
@@ -956,8 +973,10 @@ async fn catalog_backed_recovery_replays_date32_primary_key_relation() {
             1,
         ),
     ]);
-    IngestLog::new(Arc::clone(&store))
-        .append_catalog_validated_envelope(ingest_envelope_bytes_with_batches(
+    let ingest_coordinator = local_ingest_coordinator(Arc::clone(&store));
+    append_ingest_envelope(
+        &ingest_coordinator,
+        ingest_envelope_bytes_with_batches(
             IngestEnvelopeEncodeRequest {
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
@@ -968,9 +987,9 @@ async fn catalog_backed_recovery_replays_date32_primary_key_relation() {
                 end_offset_exclusive: input.records().len() as u64,
             },
             &[ingest_date32_key_record_batch(&input)],
-        ))
-        .await
-        .unwrap();
+        ),
+    )
+    .await;
 
     let recovered = RecoveredRuntime::recover_with_owner_and_relation_catalog_record(
         Arc::clone(&store),
@@ -1020,8 +1039,10 @@ async fn catalog_backed_recovery_replays_timestamp_nanosecond_primary_key_relati
             1,
         ),
     ]);
-    IngestLog::new(Arc::clone(&store))
-        .append_catalog_validated_envelope(ingest_envelope_bytes_with_batches(
+    let ingest_coordinator = local_ingest_coordinator(Arc::clone(&store));
+    append_ingest_envelope(
+        &ingest_coordinator,
+        ingest_envelope_bytes_with_batches(
             IngestEnvelopeEncodeRequest {
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
@@ -1032,9 +1053,9 @@ async fn catalog_backed_recovery_replays_timestamp_nanosecond_primary_key_relati
                 end_offset_exclusive: input.records().len() as u64,
             },
             &[ingest_timestamp_key_record_batch(&input)],
-        ))
-        .await
-        .unwrap();
+        ),
+    )
+    .await;
 
     let recovered = RecoveredRuntime::recover_with_owner_and_relation_catalog_record(
         Arc::clone(&store),
@@ -1084,8 +1105,10 @@ async fn catalog_backed_recovery_replays_dictionary_utf8_primary_key_relation() 
             1,
         ),
     ]);
-    IngestLog::new(Arc::clone(&store))
-        .append_catalog_validated_envelope(ingest_envelope_bytes_with_batches(
+    let ingest_coordinator = local_ingest_coordinator(Arc::clone(&store));
+    append_ingest_envelope(
+        &ingest_coordinator,
+        ingest_envelope_bytes_with_batches(
             IngestEnvelopeEncodeRequest {
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
@@ -1096,9 +1119,9 @@ async fn catalog_backed_recovery_replays_dictionary_utf8_primary_key_relation() 
                 end_offset_exclusive: input.records().len() as u64,
             },
             &[ingest_dictionary_utf8_key_record_batch(&input)],
-        ))
-        .await
-        .unwrap();
+        ),
+    )
+    .await;
 
     let recovered = RecoveredRuntime::recover_with_owner_and_relation_catalog_record(
         Arc::clone(&store),
@@ -1148,8 +1171,10 @@ async fn catalog_backed_recovery_replays_json_utf8_primary_key_relation() {
             1,
         ),
     ]);
-    IngestLog::new(Arc::clone(&store))
-        .append_catalog_validated_envelope(ingest_envelope_bytes_with_batches(
+    let ingest_coordinator = local_ingest_coordinator(Arc::clone(&store));
+    append_ingest_envelope(
+        &ingest_coordinator,
+        ingest_envelope_bytes_with_batches(
             IngestEnvelopeEncodeRequest {
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
@@ -1160,9 +1185,9 @@ async fn catalog_backed_recovery_replays_json_utf8_primary_key_relation() {
                 end_offset_exclusive: input.records().len() as u64,
             },
             &[ingest_json_utf8_key_record_batch(&input)],
-        ))
-        .await
-        .unwrap();
+        ),
+    )
+    .await;
 
     let recovered = RecoveredRuntime::recover_with_owner_and_relation_catalog_record(
         Arc::clone(&store),
@@ -1227,14 +1252,16 @@ async fn checked_catalog_backed_recovery_reads_catalog_with_valid_capabilities()
         .await
         .unwrap();
     let input = input_batch([input_delta("account-a", 4, 1)]);
-    IngestLog::new(Arc::clone(&store))
-        .append_catalog_validated_envelope(ingest_envelope_bytes(
+    let ingest_coordinator = local_ingest_coordinator(Arc::clone(&store));
+    append_ingest_envelope(
+        &ingest_coordinator,
+        ingest_envelope_bytes(
             ORDERS_SUM_COUNT_RELATION_VERSION,
             catalog.schema_fingerprint.as_str(),
             &input,
-        ))
-        .await
-        .unwrap();
+        ),
+    )
+    .await;
 
     let recovered = RecoveredRuntime::recover_with_owner_and_relation_catalog_record_checked(
         Arc::clone(&store),
@@ -1340,14 +1367,15 @@ async fn checked_selected_checkpoint_recovery_replays_catalog_aware_ingest() {
         .await
         .unwrap();
 
-    let ingest_log = IngestLog::new(Arc::clone(&store));
+    let ingest_coordinator = local_ingest_coordinator(Arc::clone(&store));
     let publisher = CheckpointPublisher::new(Arc::clone(&store));
     let checkpoint_version = 0;
     let checkpoint_state = aggregate_state("account-a", 4, 1);
     let replay_input = input_batch([input_delta("account-a", 3, 1)]);
 
-    ingest_log
-        .append_catalog_validated_envelope(ingest_envelope_bytes_with_batches(
+    append_ingest_envelope(
+        &ingest_coordinator,
+        ingest_envelope_bytes_with_batches(
             IngestEnvelopeEncodeRequest {
                 relation_id: ORDERS_SUM_COUNT_RELATION_ID.to_string(),
                 relation_version: ORDERS_SUM_COUNT_RELATION_VERSION.to_string(),
@@ -1358,9 +1386,9 @@ async fn checked_selected_checkpoint_recovery_replays_catalog_aware_ingest() {
                 end_offset_exclusive: 2,
             },
             &[ingest_record_batch(&replay_input)],
-        ))
-        .await
-        .unwrap();
+        ),
+    )
+    .await;
     let state_ref =
         write_checkpoint_state(&publisher, checkpoint_version, 1, &checkpoint_state).await;
     publisher
@@ -1429,7 +1457,7 @@ async fn checked_selected_checkpoint_recovery_with_slatedb_state_replays_catalog
         .await
         .unwrap();
 
-    let ingest_log = IngestLog::new(Arc::clone(&store));
+    let ingest_coordinator = local_ingest_coordinator(Arc::clone(&store));
     let publisher =
         CheckpointPublisher::with_slatedb_state_store(Arc::clone(&store), "v1/slatedb/state")
             .await
@@ -1438,8 +1466,9 @@ async fn checked_selected_checkpoint_recovery_with_slatedb_state_replays_catalog
     let checkpoint_state = aggregate_state("account-a", 4, 1);
     let replay_input = input_batch([input_delta("account-a", 3, 1)]);
 
-    ingest_log
-        .append_catalog_validated_envelope(ingest_envelope_bytes_with_batches(
+    append_ingest_envelope(
+        &ingest_coordinator,
+        ingest_envelope_bytes_with_batches(
             IngestEnvelopeEncodeRequest {
                 relation_id: ORDERS_SUM_COUNT_RELATION_ID.to_string(),
                 relation_version: ORDERS_SUM_COUNT_RELATION_VERSION.to_string(),
@@ -1450,9 +1479,9 @@ async fn checked_selected_checkpoint_recovery_with_slatedb_state_replays_catalog
                 end_offset_exclusive: 2,
             },
             &[ingest_record_batch(&replay_input)],
-        ))
-        .await
-        .unwrap();
+        ),
+    )
+    .await;
     let state_ref =
         write_checkpoint_state(&publisher, checkpoint_version, 1, &checkpoint_state).await;
     publisher

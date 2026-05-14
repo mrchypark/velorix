@@ -68,4 +68,5 @@ Conflict reasons must be explicit:
 - Same key with different digest returns `409 Conflict`.
 - Production-like harness source contracts reject catalog-aware append receivers
   other than `IngestAdmissionCoordinator`, including the runtime and
-  persisted-query recovered-runtime fixtures.
+  persisted-query recovered-runtime fixtures plus catalog-backed runtime
+  recovery fixtures.

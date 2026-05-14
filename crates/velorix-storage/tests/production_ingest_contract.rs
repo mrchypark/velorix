@@ -89,6 +89,7 @@ fn production_like_ingest_harnesses_use_process_local_coordinator() {
         workspace.join("benches/s3_incremental.rs"),
         workspace.join("crates/velorix-runtime/tests/persisted_query.rs"),
         workspace.join("crates/velorix-runtime/tests/query.rs"),
+        workspace.join("crates/velorix-runtime/tests/recovery.rs"),
         workspace.join("crates/velorix-runtime/tests/s3_compat_query.rs"),
         workspace.join("tests/e2e/local_recovery.rs"),
     ] {
