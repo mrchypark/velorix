@@ -7,7 +7,7 @@ use k8s_openapi::{
     apimachinery::pkg::apis::meta::v1::ObjectMeta,
 };
 use kube::{
-    api::{Api, DeleteParams, PostParams},
+    api::{Api, DeleteParams, ListParams, PostParams},
     runtime::watcher::{self, Event},
     Client, ResourceExt,
 };
@@ -741,6 +741,10 @@ pub enum WorkerShardError {
     },
     #[error("kubernetes worker shard watcher failed: {message}")]
     Watcher { message: String },
+    #[error("kubernetes worker shard API failed: {message}")]
+    KubernetesApi { message: String },
+    #[error("worker shard resync exceeded {bound} bound of {limit}")]
+    ResyncBoundExceeded { bound: &'static str, limit: usize },
     #[error("worker shard command sink failed: {message}")]
     CommandSink { message: String },
     #[error("worker shard command executor failed: {message}")]
@@ -1179,6 +1183,39 @@ impl<L, E, X> WorkerShardOperatorRuntime<L, E, X> {
             authority: Some(authority),
         }
     }
+
+    fn require_authority(&self) -> Result<(), WorkerShardError> {
+        if self.authority.is_some() {
+            Ok(())
+        } else {
+            Err(WorkerShardError::Authority {
+                message: "worker-shard resync requires validated operator authority".to_string(),
+            })
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkerShardResyncOptions {
+    pub page_size: u32,
+    pub max_pages: usize,
+    pub max_shards: usize,
+}
+
+impl Default for WorkerShardResyncOptions {
+    fn default() -> Self {
+        Self {
+            page_size: 128,
+            max_pages: 32,
+            max_shards: 1024,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkerShardResyncSummary {
+    pub listed: usize,
+    pub applied: usize,
 }
 
 impl<L, E, X> WorkerShardOperatorRuntime<L, E, X>
@@ -1249,6 +1286,93 @@ where
         }
     }
     Ok(())
+}
+
+pub async fn resync_worker_shards_once_with_operator_runtime<L, E, X>(
+    client: Client,
+    namespace: &str,
+    runtime: &WorkerShardOperatorRuntime<L, E, X>,
+    mut input_for_shard: impl FnMut(&VelorixWorkerShard) -> WorkerShardReconcileInput + Send,
+    options: WorkerShardResyncOptions,
+) -> Result<WorkerShardResyncSummary, WorkerShardError>
+where
+    L: PartitionLeaseClient,
+    E: WorkerShardEpochStore,
+    X: WorkerShardScopedCommandExecutor,
+{
+    runtime.require_authority()?;
+    if options.max_pages == 0 {
+        return Err(WorkerShardError::ResyncBoundExceeded {
+            bound: "worker shard list pages",
+            limit: options.max_pages,
+        });
+    }
+
+    let api: Api<VelorixWorkerShard> = Api::namespaced(client, namespace);
+    let mut shards = Vec::new();
+    let mut continue_token: Option<String> = None;
+    for _ in 0..options.max_pages {
+        let mut params = ListParams::default().limit(options.page_size.max(1));
+        if let Some(token) = continue_token.as_ref() {
+            params = params.continue_token(token);
+        }
+        let page = api
+            .list(&params)
+            .await
+            .map_err(WorkerShardError::kubernetes_api)?;
+        for shard in page.items {
+            if shards.len() >= options.max_shards {
+                return Err(WorkerShardError::ResyncBoundExceeded {
+                    bound: "worker shards",
+                    limit: options.max_shards,
+                });
+            }
+            shards.push(shard);
+        }
+        continue_token = page.metadata.continue_;
+        if continue_token.is_none() {
+            break;
+        }
+    }
+    if continue_token.is_some() {
+        return Err(WorkerShardError::ResyncBoundExceeded {
+            bound: "worker shard list pages",
+            limit: options.max_pages,
+        });
+    }
+
+    shards.sort_by(worker_shard_resync_order);
+    let listed = shards.len();
+    let mut applied = 0;
+    for shard in shards {
+        let input = input_for_shard(&shard);
+        runtime
+            .handle_event(WorkerShardEvent::Applied(shard), input)
+            .await?;
+        applied += 1;
+    }
+
+    Ok(WorkerShardResyncSummary { listed, applied })
+}
+
+fn worker_shard_resync_order(
+    left: &VelorixWorkerShard,
+    right: &VelorixWorkerShard,
+) -> std::cmp::Ordering {
+    (
+        left.namespace().unwrap_or_default(),
+        left.name_any(),
+        left.spec.view_id.as_str(),
+        left.spec.stream_id.as_str(),
+        left.spec.partition_id,
+    )
+        .cmp(&(
+            right.namespace().unwrap_or_default(),
+            right.name_any(),
+            right.spec.view_id.as_str(),
+            right.spec.stream_id.as_str(),
+            right.spec.partition_id,
+        ))
 }
 
 pub async fn watch_worker_shards_with_kubernetes_runtime(
@@ -1633,6 +1757,12 @@ fn view_status_from_worker_status(status: Option<&WorkerShardStatus>) -> Velorix
 impl WorkerShardError {
     fn watcher(error: watcher::Error) -> Self {
         Self::Watcher {
+            message: error.to_string(),
+        }
+    }
+
+    fn kubernetes_api(error: kube::Error) -> Self {
+        Self::KubernetesApi {
             message: error.to_string(),
         }
     }

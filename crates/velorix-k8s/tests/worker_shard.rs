@@ -10,6 +10,7 @@ use http::{Method, Request, Response, StatusCode};
 use kube::{
     client::{Body, ClientBuilder},
     runtime::watcher::Event,
+    ResourceExt,
 };
 use object_store::memory::InMemory;
 use serde_json::{json, Value};
@@ -33,14 +34,16 @@ use velorix_k8s::{
         handle_worker_shard_event, handle_worker_shard_event_with_command_executor,
         handle_worker_shard_event_with_output_sink,
         handle_worker_shard_event_with_scoped_command_executor_and_authority,
-        reconcile_worker_shard, runtime_identity_from_worker_shard, worker_shard_pod_name,
+        reconcile_worker_shard, resync_worker_shards_once_with_operator_runtime,
+        runtime_identity_from_worker_shard, worker_shard_pod_name,
         worker_shard_pod_name_for_identity, worker_shard_watch_event,
         KubernetesPodWorkerShardCommandExecutor, KubernetesPodWorkerShardScopedCommandExecutor,
         ProcessWorkerShardCommandExecutor, WorkerShardCommand, WorkerShardCommandExecutor,
         WorkerShardCommandExecutorError, WorkerShardEpochStore, WorkerShardError, WorkerShardEvent,
         WorkerShardOperatorRuntime, WorkerShardPodTemplate, WorkerShardProcessCommand,
         WorkerShardReconcileConfig, WorkerShardReconcileInput, WorkerShardReconcileOutput,
-        WorkerShardRuntimeIdentity, WorkerShardScopedCommandExecutor,
+        WorkerShardResyncOptions, WorkerShardResyncSummary, WorkerShardRuntimeIdentity,
+        WorkerShardScopedCommandExecutor,
     },
 };
 use velorix_storage::ownership::OwnershipEpochRecord;
@@ -649,6 +652,223 @@ async fn kubernetes_worker_shard_operator_runtime_rejects_shard_authority_mismat
     assert!(requests.lock().unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn worker_shard_resync_pass_reconciles_listed_shards_through_authority_bound_runtime() {
+    let (client, requests) = fake_worker_shard_list_client(vec![list_page(vec![shard()], None)]);
+    let runtime = WorkerShardOperatorRuntime::with_authority(
+        FakeLeaseClient::default()
+            .with_current(None)
+            .with_acquired(grant("worker-a", 1)),
+        FakeEpochStore::default(),
+        FakeCommandExecutor::default(),
+        authority(),
+    );
+
+    let summary = resync_worker_shards_once_with_operator_runtime(
+        client,
+        "default",
+        &runtime,
+        |_| input(None),
+        WorkerShardResyncOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        summary,
+        WorkerShardResyncSummary {
+            listed: 1,
+            applied: 1,
+        }
+    );
+    assert_eq!(requests.lock().unwrap()[0].method, Method::GET);
+    assert_eq!(
+        requests.lock().unwrap()[0].path,
+        "/apis/control.velorix.io/v1alpha1/namespaces/default/velorixworkershards"
+    );
+}
+
+#[tokio::test]
+async fn worker_shard_resync_pass_stops_stale_running_worker_without_watch_event() {
+    let (client, _requests) = fake_worker_shard_list_client(vec![list_page(vec![shard()], None)]);
+    let executor = FakeCommandExecutor::default();
+    let runtime = WorkerShardOperatorRuntime::with_authority(
+        FakeLeaseClient::default().with_current(Some(grant("worker-a", 6))),
+        FakeEpochStore::default().with_record(epoch_record("worker-a", 6)),
+        executor.clone(),
+        authority(),
+    );
+
+    let summary = resync_worker_shards_once_with_operator_runtime(
+        client,
+        "default",
+        &runtime,
+        |_| {
+            input(Some(WorkerFact {
+                owner_id: "worker-a".to_string(),
+                owner_epoch: 5,
+            }))
+        },
+        WorkerShardResyncOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        summary,
+        WorkerShardResyncSummary {
+            listed: 1,
+            applied: 1,
+        }
+    );
+    assert_eq!(
+        executor.actions(),
+        vec![
+            ExecutedWorkerCommand::Stop {
+                owner_id: "worker-a".to_string(),
+                owner_epoch: 5,
+            },
+            ExecutedWorkerCommand::Start {
+                owner_id: "worker-a".to_string(),
+                owner_epoch: 6,
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn worker_shard_resync_pass_sorts_listed_shards_before_reconcile() {
+    let west = shard_with_stream_partition("orders-west", 1);
+    let east = shard_with_stream_partition("orders-east", 0);
+    let (client, _requests) =
+        fake_worker_shard_list_client(vec![list_page(vec![west.clone(), east.clone()], None)]);
+    let runtime = WorkerShardOperatorRuntime::with_authority(
+        FakeLeaseClient::default(),
+        FakeEpochStore::default(),
+        FakeCommandExecutor::default(),
+        authority(),
+    );
+    let order = Arc::new(Mutex::new(Vec::new()));
+
+    resync_worker_shards_once_with_operator_runtime(
+        client,
+        "default",
+        &runtime,
+        {
+            let order = Arc::clone(&order);
+            move |shard| {
+                order.lock().unwrap().push(shard.name_any());
+                input(None)
+            }
+        },
+        WorkerShardResyncOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        *order.lock().unwrap(),
+        vec![east.name_any(), west.name_any()]
+    );
+}
+
+#[tokio::test]
+async fn worker_shard_resync_pass_rejects_unvalidated_runtime_before_listing() {
+    let (client, requests) = fake_worker_shard_list_client(vec![list_page(vec![shard()], None)]);
+    let runtime = WorkerShardOperatorRuntime::new(
+        FakeLeaseClient::default(),
+        FakeEpochStore::default(),
+        FakeCommandExecutor::default(),
+    );
+
+    let error = resync_worker_shards_once_with_operator_runtime(
+        client,
+        "default",
+        &runtime,
+        |_| input(None),
+        WorkerShardResyncOptions::default(),
+    )
+    .await
+    .unwrap_err();
+
+    match error {
+        WorkerShardError::Authority { message } => {
+            assert!(message.contains("validated operator authority"));
+        }
+        other => panic!("expected authority error, got {other:?}"),
+    }
+    assert!(requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn worker_shard_resync_pass_fails_closed_when_object_bound_is_exceeded() {
+    let (client, requests) = fake_worker_shard_list_client(vec![list_page(vec![shard()], None)]);
+    let runtime = WorkerShardOperatorRuntime::with_authority(
+        FakeLeaseClient::default()
+            .with_current(None)
+            .with_acquired(grant("worker-a", 1)),
+        FakeEpochStore::default(),
+        FakeCommandExecutor::default(),
+        authority(),
+    );
+
+    let error = resync_worker_shards_once_with_operator_runtime(
+        client,
+        "default",
+        &runtime,
+        |_| input(None),
+        WorkerShardResyncOptions {
+            max_shards: 0,
+            ..WorkerShardResyncOptions::default()
+        },
+    )
+    .await
+    .unwrap_err();
+
+    match error {
+        WorkerShardError::ResyncBoundExceeded { bound, limit } => {
+            assert_eq!(bound, "worker shards");
+            assert_eq!(limit, 0);
+        }
+        other => panic!("expected resync bound error, got {other:?}"),
+    }
+    assert_eq!(requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn worker_shard_resync_pass_fails_closed_when_page_bound_is_exceeded() {
+    let (client, requests) =
+        fake_worker_shard_list_client(vec![list_page(Vec::new(), Some("next-page"))]);
+    let runtime = WorkerShardOperatorRuntime::with_authority(
+        FakeLeaseClient::default(),
+        FakeEpochStore::default(),
+        FakeCommandExecutor::default(),
+        authority(),
+    );
+
+    let error = resync_worker_shards_once_with_operator_runtime(
+        client,
+        "default",
+        &runtime,
+        |_| input(None),
+        WorkerShardResyncOptions {
+            max_pages: 1,
+            ..WorkerShardResyncOptions::default()
+        },
+    )
+    .await
+    .unwrap_err();
+
+    match error {
+        WorkerShardError::ResyncBoundExceeded { bound, limit } => {
+            assert_eq!(bound, "worker shard list pages");
+            assert_eq!(limit, 1);
+        }
+        other => panic!("expected resync bound error, got {other:?}"),
+    }
+    assert_eq!(requests.lock().unwrap().len(), 1);
+}
+
 #[test]
 fn worker_shard_scoped_pod_name_separates_same_owner_epoch_across_shards() {
     let first = runtime_identity_from_worker_shard(&shard(), "worker-a", 1).unwrap();
@@ -749,6 +969,116 @@ async fn kubernetes_pod_worker_shard_executor_maps_api_failure_to_typed_error() 
         .contains("kubernetes pod worker start failed"));
     assert!(error.message().contains("worker-a"));
     assert!(error.message().contains("epoch 1"));
+}
+
+#[tokio::test]
+async fn scoped_kubernetes_pod_executor_stops_stale_pod_before_replacement_start() {
+    let lease = FakeLeaseClient::default().with_current(Some(grant("worker-a", 6)));
+    let epoch_store = FakeEpochStore::default().with_record(epoch_record("worker-a", 6));
+    let (client, requests) = fake_pod_client(StatusCode::CREATED);
+    let executor = KubernetesPodWorkerShardScopedCommandExecutor::new(
+        client,
+        "workers",
+        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+    );
+
+    let output = handle_worker_shard_event_with_scoped_command_executor_and_authority(
+        WorkerShardEvent::Applied(shard()),
+        &lease,
+        &epoch_store,
+        input(Some(WorkerFact {
+            owner_id: "worker-a".to_string(),
+            owner_epoch: 5,
+        })),
+        &executor,
+        Some(&authority()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(
+        output.commands,
+        vec![
+            WorkerShardCommand::StopWorker {
+                owner_id: "worker-a".to_string(),
+                owner_epoch: 5,
+            },
+            WorkerShardCommand::StartWorker {
+                owner_id: "worker-a".to_string(),
+                owner_epoch: 6,
+            },
+        ]
+    );
+    let old_identity = runtime_identity_from_worker_shard(&shard(), "worker-a", 5).unwrap();
+    let new_identity = runtime_identity_from_worker_shard(&shard(), "worker-a", 6).unwrap();
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].method, Method::DELETE);
+    assert_eq!(
+        requests[0].path,
+        format!(
+            "/api/v1/namespaces/workers/pods/{}",
+            worker_shard_pod_name_for_identity(&old_identity)
+        )
+    );
+    assert_eq!(
+        requests[0].body,
+        json!({
+            "gracePeriodSeconds": 0
+        })
+    );
+    assert_eq!(requests[1].method, Method::POST);
+    assert_eq!(requests[1].path, "/api/v1/namespaces/workers/pods");
+    assert_eq!(
+        requests[1].body["metadata"]["name"],
+        worker_shard_pod_name_for_identity(&new_identity)
+    );
+}
+
+#[tokio::test]
+async fn scoped_kubernetes_pod_executor_stops_running_pod_on_lease_loss_without_replacement_start()
+{
+    let lease = FakeLeaseClient::default().with_current(None);
+    lease.fail_acquire();
+    let (client, requests) = fake_pod_client(StatusCode::OK);
+    let executor = KubernetesPodWorkerShardScopedCommandExecutor::new(
+        client,
+        "workers",
+        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+    );
+
+    let error = handle_worker_shard_event_with_scoped_command_executor_and_authority(
+        WorkerShardEvent::Applied(shard()),
+        &lease,
+        &FakeEpochStore::default(),
+        input(Some(WorkerFact {
+            owner_id: "worker-a".to_string(),
+            owner_epoch: 9,
+        })),
+        &executor,
+        Some(&authority()),
+    )
+    .await
+    .unwrap_err();
+
+    match error {
+        WorkerShardError::Authority { message } => {
+            assert!(message.contains("held"));
+        }
+        other => panic!("expected runtime authority error, got {other:?}"),
+    }
+    let identity = runtime_identity_from_worker_shard(&shard(), "worker-a", 9).unwrap();
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, Method::DELETE);
+    assert_eq!(
+        requests[0].path,
+        format!(
+            "/api/v1/namespaces/workers/pods/{}",
+            worker_shard_pod_name_for_identity(&identity)
+        )
+    );
 }
 
 #[tokio::test]
@@ -1570,6 +1900,95 @@ fn fake_worker_shard_runtime_client() -> (kube::Client, Arc<Mutex<Vec<RecordedKu
                     }
                     (Method::POST, "/api/v1/namespaces/default/pods") => {
                         (StatusCode::CREATED, body)
+                    }
+                    _ => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        json!({
+                            "apiVersion": "v1",
+                            "kind": "Status",
+                            "metadata": {},
+                            "status": "Failure",
+                            "message": "unexpected fake kubernetes request",
+                            "reason": "InternalError",
+                            "code": 500
+                        }),
+                    ),
+                };
+
+                Ok::<_, Infallible>(
+                    Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&response_body).unwrap()))
+                        .unwrap(),
+                )
+            }
+        }
+    });
+
+    (ClientBuilder::new(service, "default").build(), requests)
+}
+
+#[derive(Clone)]
+struct WorkerShardListPage {
+    items: Vec<VelorixWorkerShard>,
+    continue_token: Option<String>,
+}
+
+fn list_page(items: Vec<VelorixWorkerShard>, continue_token: Option<&str>) -> WorkerShardListPage {
+    WorkerShardListPage {
+        items,
+        continue_token: continue_token.map(ToString::to_string),
+    }
+}
+
+fn fake_worker_shard_list_client(
+    pages: Vec<WorkerShardListPage>,
+) -> (kube::Client, Arc<Mutex<Vec<RecordedKubeRequest>>>) {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let pages = Arc::new(Mutex::new(pages.into_iter()));
+    let service = tower::service_fn({
+        let requests = Arc::clone(&requests);
+        let pages = Arc::clone(&pages);
+        move |request: Request<Body>| {
+            let requests = Arc::clone(&requests);
+            let pages = Arc::clone(&pages);
+            async move {
+                let method = request.method().clone();
+                let path = request.uri().path().to_string();
+                let body_bytes = request.into_body().collect_bytes().await.unwrap();
+                let body: Value = if body_bytes.is_empty() {
+                    Value::Null
+                } else {
+                    serde_json::from_slice(&body_bytes).unwrap()
+                };
+                requests.lock().unwrap().push(RecordedKubeRequest {
+                    method: method.clone(),
+                    path: path.clone(),
+                    body,
+                });
+
+                let (status, response_body) = match (method, path.as_str()) {
+                    (
+                        Method::GET,
+                        "/apis/control.velorix.io/v1alpha1/namespaces/default/velorixworkershards",
+                    ) => {
+                        let page = pages
+                            .lock()
+                            .unwrap()
+                            .next()
+                            .unwrap_or_else(|| list_page(Vec::new(), None));
+                        (
+                            StatusCode::OK,
+                            json!({
+                                "apiVersion": "control.velorix.io/v1alpha1",
+                                "kind": "VelorixWorkerShardList",
+                                "metadata": {
+                                    "continue": page.continue_token,
+                                },
+                                "items": page.items,
+                            }),
+                        )
                     }
                     _ => (
                         StatusCode::INTERNAL_SERVER_ERROR,
