@@ -63,7 +63,7 @@ const REQUIRED_RELEASE_CONTRACTS: &[&str] = &[
 ];
 use velorix_runtime::recovery::{RecoveredRuntime, ORDERS_SUM_COUNT_OWNER};
 use velorix_storage::{
-    capability::probe_authoritative_object_store_capabilities,
+    capability::{probe_authoritative_object_store_capabilities, AuthoritativeNamespace},
     checkpoint_index::{
         CheckpointAdminInspection, CheckpointLifecycleStatus, CheckpointManifestInspectionStatus,
         CheckpointRetentionRecordV1,
@@ -241,8 +241,7 @@ async fn main() -> anyhow::Result<()> {
             json,
         }) => {
             let store = local_object_store(&object_store_dir)?;
-            let inspection = CheckpointPublisher::new(store)
-                .inspect_checkpoints()
+            let inspection = inspect_local_checkpoints(store)
                 .await
                 .context("failed to inspect local checkpoints")?;
 
@@ -258,12 +257,14 @@ async fn main() -> anyhow::Result<()> {
             json,
         }) => {
             let store = local_object_store(&object_store_dir)?;
-            let plan = CheckpointPublisher::new(store)
-                .plan_garbage_collection(GarbageCollectionPolicy {
+            let plan = plan_local_garbage_collection(
+                store,
+                GarbageCollectionPolicy {
                     retain_latest_manifests,
-                })
-                .await
-                .context("failed to plan local garbage collection")?;
+                },
+            )
+            .await
+            .context("failed to plan local garbage collection")?;
 
             if json {
                 println!("{}", format_gc_plan_json(&plan)?);
@@ -278,16 +279,10 @@ async fn main() -> anyhow::Result<()> {
             json,
         }) => {
             let store = local_object_store(&object_store_dir)?;
-            let publisher = CheckpointPublisher::new(store);
             let policy = GarbageCollectionPolicy {
                 retain_latest_manifests,
             };
-            let plan = publisher
-                .plan_garbage_collection(policy)
-                .await
-                .context("failed to plan local garbage collection")?;
-            let run = publisher
-                .execute_garbage_collection_plan_with_evidence(&run_id, policy, &plan)
+            let run = execute_local_garbage_collection(store, &run_id, policy)
                 .await
                 .context("failed to execute local garbage collection")?;
 
@@ -1965,6 +1960,52 @@ async fn recover_local_capabilities(
     .await?)
 }
 
+async fn checked_local_admin_checkpoint_publisher(
+    store: Arc<dyn ObjectStore>,
+) -> anyhow::Result<CheckpointPublisher> {
+    let capabilities = recover_local_capabilities(store.as_ref()).await?;
+    capabilities
+        .validate_for_startup()
+        .map_err(anyhow::Error::from)?;
+    let checkpoint_profile = capabilities
+        .validate_namespace(AuthoritativeNamespace::Checkpoint)
+        .map_err(anyhow::Error::from)?;
+
+    CheckpointPublisher::new_checked(store, checkpoint_profile).map_err(anyhow::Error::from)
+}
+
+async fn inspect_local_checkpoints(
+    store: Arc<dyn ObjectStore>,
+) -> anyhow::Result<CheckpointAdminInspection> {
+    Ok(checked_local_admin_checkpoint_publisher(store)
+        .await?
+        .inspect_checkpoints()
+        .await?)
+}
+
+async fn plan_local_garbage_collection(
+    store: Arc<dyn ObjectStore>,
+    policy: GarbageCollectionPolicy,
+) -> anyhow::Result<GarbageCollectionPlan> {
+    Ok(checked_local_admin_checkpoint_publisher(store)
+        .await?
+        .plan_garbage_collection(policy)
+        .await?)
+}
+
+async fn execute_local_garbage_collection(
+    store: Arc<dyn ObjectStore>,
+    run_id: &str,
+    policy: GarbageCollectionPolicy,
+) -> anyhow::Result<GarbageCollectionRunV1> {
+    let publisher = checked_local_admin_checkpoint_publisher(store).await?;
+    let plan = publisher.plan_garbage_collection(policy).await?;
+
+    Ok(publisher
+        .execute_garbage_collection_plan_with_evidence(run_id, policy, &plan)
+        .await?)
+}
+
 fn format_checkpoint_inspection(inspection: &CheckpointAdminInspection) -> String {
     let latest = inspection
         .latest_valid_checkpoint
@@ -2772,6 +2813,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checkpoint_inspect_local_checks_capabilities_before_inspection() {
+        let dir = tempdir().unwrap();
+        let prefix_file = dir.path().join("not-a-directory");
+        fs::write(&prefix_file, b"not a directory").unwrap();
+        let store = local_object_store(&prefix_file).unwrap();
+
+        let error = inspect_local_checkpoints(store).await.unwrap_err();
+
+        assert_local_admin_capability_probe_failed(error);
+    }
+
+    #[tokio::test]
+    async fn gc_plan_local_checks_capabilities_before_planning() {
+        let dir = tempdir().unwrap();
+        let prefix_file = dir.path().join("not-a-directory");
+        fs::write(&prefix_file, b"not a directory").unwrap();
+        let store = local_object_store(&prefix_file).unwrap();
+
+        let error = plan_local_garbage_collection(
+            store,
+            GarbageCollectionPolicy {
+                retain_latest_manifests: 1,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_local_admin_capability_probe_failed(error);
+    }
+
+    #[tokio::test]
+    async fn gc_execute_local_checks_capabilities_before_execution() {
+        let dir = tempdir().unwrap();
+        let prefix_file = dir.path().join("not-a-directory");
+        fs::write(&prefix_file, b"not a directory").unwrap();
+        let store = local_object_store(&prefix_file).unwrap();
+
+        let error = execute_local_garbage_collection(
+            store,
+            "local-admin-capability-test",
+            GarbageCollectionPolicy {
+                retain_latest_manifests: 1,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_local_admin_capability_probe_failed(error);
+    }
+
+    #[tokio::test]
     async fn recover_local_runtime_allows_raw_state_with_bootstrap_flag() {
         let dir = tempdir().unwrap();
         let store = local_object_store(dir.path()).unwrap();
@@ -2959,6 +3051,18 @@ mod tests {
         assert!(
             !message.contains("published checkpoint"),
             "capability gate should run before checkpoint recovery, got: {message}"
+        );
+    }
+
+    fn assert_local_admin_capability_probe_failed(error: anyhow::Error) {
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("capability probe write failed"),
+            "expected local-admin checked path to fail in capability probe, got: {message}"
+        );
+        assert!(
+            !message.contains("garbage collection policy"),
+            "capability gate should run before GC policy/planning logic, got: {message}"
         );
     }
 
