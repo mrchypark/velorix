@@ -45,7 +45,7 @@ use velorix_storage::{
         ObjectStoreCapabilityProfile,
     },
     ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
-    log::{IngestBatch, IngestLog, IngestLogError},
+    log::{IngestAdmissionCoordinator, IngestBatch, IngestLog, IngestLogError},
     manifest::{CheckpointManifest, InputRange, StateObjectRef},
     relation_catalog_registry::{RelationCatalogRegistry, RelationCatalogRegistryError},
     state::{CheckpointPublishError, CheckpointPublisher, StateObjectWrite},
@@ -173,7 +173,7 @@ fn ingest_envelope_bytes_with_relation(
 
 async fn append_ingest_envelope(
     store: Arc<dyn ObjectStore>,
-    ingest_log: &IngestLog,
+    ingest_coordinator: &IngestAdmissionCoordinator,
     stream_id: &str,
     partition_id: u32,
     start_offset_inclusive: u64,
@@ -193,7 +193,7 @@ async fn append_ingest_envelope(
         .await
         .unwrap();
 
-    ingest_log
+    ingest_coordinator
         .append_catalog_validated_envelope(ingest_envelope_bytes_with_relation(
             IngestEnvelopeEncodeRequest {
                 relation_id: ORDERS_SUM_COUNT_RELATION_ID.to_string(),
@@ -213,10 +213,10 @@ async fn append_ingest_envelope(
 #[tokio::test]
 async fn catalog_validated_ingest_append_fails_closed_when_relation_catalog_is_missing() {
     let (_temp_dir, store) = temp_store();
-    let ingest_log = IngestLog::new(Arc::clone(&store));
+    let ingest_coordinator = IngestAdmissionCoordinator::new(IngestLog::new(Arc::clone(&store)));
     let input = batch([input_delta("account-a", 4, 1)]);
 
-    let error = ingest_log
+    let error = ingest_coordinator
         .append_catalog_validated_envelope(ingest_envelope_bytes("orders", 0, 0, 1, &input))
         .await
         .unwrap_err();
@@ -309,7 +309,7 @@ async fn write_checkpoint_state(
 #[tokio::test]
 async fn query_recovered_materialized_view_reads_checkpointed_state_and_replayed_ingest() {
     let (_temp_dir, store) = temp_store();
-    let ingest_log = IngestLog::new(Arc::clone(&store));
+    let ingest_coordinator = IngestAdmissionCoordinator::new(IngestLog::new(Arc::clone(&store)));
     let publisher = CheckpointPublisher::new(Arc::clone(&store));
 
     let checkpoint_input = batch([
@@ -323,7 +323,7 @@ async fn query_recovered_materialized_view_reads_checkpointed_state_and_replayed
 
     append_ingest_envelope(
         Arc::clone(&store),
-        &ingest_log,
+        &ingest_coordinator,
         "orders",
         0,
         0,
@@ -333,7 +333,7 @@ async fn query_recovered_materialized_view_reads_checkpointed_state_and_replayed
     .await;
     append_ingest_envelope(
         Arc::clone(&store),
-        &ingest_log,
+        &ingest_coordinator,
         "orders",
         0,
         2,
@@ -371,7 +371,7 @@ async fn query_recovered_materialized_view_reads_checkpointed_state_and_replayed
 #[tokio::test]
 async fn query_recovered_materialized_view_with_policy_applies_row_limit_to_recovered_state() {
     let (_temp_dir, store) = temp_store();
-    let ingest_log = IngestLog::new(Arc::clone(&store));
+    let ingest_coordinator = IngestAdmissionCoordinator::new(IngestLog::new(Arc::clone(&store)));
     let publisher = CheckpointPublisher::new(Arc::clone(&store));
 
     let checkpoint_input = batch([
@@ -382,7 +382,7 @@ async fn query_recovered_materialized_view_with_policy_applies_row_limit_to_reco
 
     append_ingest_envelope(
         Arc::clone(&store),
-        &ingest_log,
+        &ingest_coordinator,
         "orders",
         0,
         0,
@@ -392,7 +392,7 @@ async fn query_recovered_materialized_view_with_policy_applies_row_limit_to_reco
     .await;
     append_ingest_envelope(
         Arc::clone(&store),
-        &ingest_log,
+        &ingest_coordinator,
         "orders",
         0,
         2,
@@ -438,14 +438,14 @@ async fn query_recovered_materialized_view_with_policy_applies_row_limit_to_reco
 #[tokio::test]
 async fn query_recovered_materialized_view_with_policy_applies_byte_limit_under_row_limit() {
     let (_temp_dir, store) = temp_store();
-    let ingest_log = IngestLog::new(Arc::clone(&store));
+    let ingest_coordinator = IngestAdmissionCoordinator::new(IngestLog::new(Arc::clone(&store)));
     let publisher = CheckpointPublisher::new(Arc::clone(&store));
 
     let checkpoint_input = batch([input_delta("account-with-wide-output", 10, 1)]);
 
     append_ingest_envelope(
         Arc::clone(&store),
-        &ingest_log,
+        &ingest_coordinator,
         "orders",
         0,
         0,
@@ -494,7 +494,7 @@ async fn query_production_recovered_materialized_view_reads_slatedb_checkpoint_w
 {
     let (_temp_dir, store) = temp_store();
     let capabilities = probed_query_capabilities(store.as_ref()).await;
-    let ingest_log = IngestLog::new(Arc::clone(&store));
+    let ingest_coordinator = IngestAdmissionCoordinator::new(IngestLog::new(Arc::clone(&store)));
     let publisher =
         CheckpointPublisher::with_slatedb_state_store(Arc::clone(&store), "v1/slatedb/state")
             .await
@@ -505,7 +505,7 @@ async fn query_production_recovered_materialized_view_reads_slatedb_checkpoint_w
 
     append_ingest_envelope(
         Arc::clone(&store),
-        &ingest_log,
+        &ingest_coordinator,
         "orders",
         0,
         0,
@@ -515,7 +515,7 @@ async fn query_production_recovered_materialized_view_reads_slatedb_checkpoint_w
     .await;
     append_ingest_envelope(
         Arc::clone(&store),
-        &ingest_log,
+        &ingest_coordinator,
         "orders",
         0,
         1,
@@ -780,7 +780,7 @@ async fn recovery_rejects_ingest_envelope_with_wrong_schema_fingerprint() {
 #[tokio::test]
 async fn arrow_ingest_datafusion_and_feldera_use_the_same_catalog_identity() {
     let (_temp_dir, store) = temp_store();
-    let ingest_log = IngestLog::new(Arc::clone(&store));
+    let ingest_coordinator = IngestAdmissionCoordinator::new(IngestLog::new(Arc::clone(&store)));
     let input = batch([input_delta("account-a", 4, 1)]);
     let catalog = orders_sum_count_relation_catalog().unwrap();
     let bytes = ingest_envelope_bytes("orders", 0, 0, 1, &input);
@@ -790,7 +790,7 @@ async fn arrow_ingest_datafusion_and_feldera_use_the_same_catalog_identity() {
         .create(&catalog)
         .await
         .unwrap();
-    ingest_log
+    ingest_coordinator
         .append_catalog_validated_envelope(bytes)
         .await
         .unwrap();
@@ -840,10 +840,19 @@ async fn arrow_ingest_datafusion_and_feldera_use_the_same_catalog_identity() {
 #[tokio::test]
 async fn query_recovered_materialized_view_propagates_datafusion_errors() {
     let (_temp_dir, store) = temp_store();
-    let ingest_log = IngestLog::new(Arc::clone(&store));
+    let ingest_coordinator = IngestAdmissionCoordinator::new(IngestLog::new(Arc::clone(&store)));
     let input = batch([input_delta("account-a", 4, 1)]);
 
-    append_ingest_envelope(Arc::clone(&store), &ingest_log, "orders", 0, 0, 1, &input).await;
+    append_ingest_envelope(
+        Arc::clone(&store),
+        &ingest_coordinator,
+        "orders",
+        0,
+        0,
+        1,
+        &input,
+    )
+    .await;
 
     let error =
         query_recovered_materialized_view(Arc::clone(&store), "select missing_column from input")

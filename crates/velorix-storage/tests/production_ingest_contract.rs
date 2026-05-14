@@ -88,6 +88,7 @@ fn production_like_ingest_harnesses_use_process_local_coordinator() {
         workspace.join("benches/local_incremental.rs"),
         workspace.join("benches/s3_incremental.rs"),
         workspace.join("crates/velorix-runtime/tests/persisted_query.rs"),
+        workspace.join("crates/velorix-runtime/tests/query.rs"),
         workspace.join("crates/velorix-runtime/tests/s3_compat_query.rs"),
         workspace.join("tests/e2e/local_recovery.rs"),
     ] {
@@ -353,7 +354,16 @@ fn catalog_append_receiver(lines: &[&str], line_number: usize) -> Option<String>
         .and_then(|(receiver, _)| receiver.split_whitespace().last())
         .filter(|receiver| !receiver.is_empty())
         .or_else(|| previous_non_empty_line(lines, line_number))
+        .map(catalog_append_receiver_name)
         .map(str::to_string)
+}
+
+fn catalog_append_receiver_name(receiver_line: &str) -> &str {
+    receiver_line
+        .split_once('=')
+        .map_or(receiver_line, |(_, expression)| expression)
+        .trim()
+        .trim_end_matches(';')
 }
 
 fn line_uses_coordinator_ufcs_receiver(line: &str) -> bool {
