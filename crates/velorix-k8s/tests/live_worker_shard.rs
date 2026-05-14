@@ -20,16 +20,16 @@ use velorix_control::lease::PartitionLeaseClient;
 use velorix_k8s::{
     crd::{ObjectStoreAuthorityRef, VelorixWorkerShard, VelorixWorkerShardSpec},
     lease::{partition_lease_identity, KubeLeaseApi, KubernetesPartitionLeaseClient},
+    startup::validate_operator_authority,
     worker_shard::{
         handle_worker_shard_event, handle_worker_shard_event_with_command_executor,
         partition_lease_key_from_worker_shard, watch_worker_shards_with_command_executor,
         worker_shard_pod_name, CheckpointPublisherEpochStore,
         KubernetesPodWorkerShardCommandExecutor, WorkerShardCommand, WorkerShardCommandExecutor,
-        WorkerShardEvent, WorkerShardPodTemplate, WorkerShardReconcileConfig,
-        WorkerShardReconcileInput,
+        WorkerShardEpochStore, WorkerShardEvent, WorkerShardPodTemplate,
+        WorkerShardReconcileConfig, WorkerShardReconcileInput,
     },
 };
-use velorix_storage::state::CheckpointPublisher;
 
 #[tokio::test]
 async fn live_worker_shard_reconciles_lease_and_epoch_record_when_enabled(
@@ -48,8 +48,7 @@ async fn live_worker_shard_reconciles_lease_and_epoch_record_when_enabled(
     let shard = worker_shard(&namespace, &suffix);
     let key = partition_lease_key_from_worker_shard(&shard)?;
     let lease_client = KubernetesPartitionLeaseClient::new(KubeLeaseApi::new(client.clone()));
-    let publisher = CheckpointPublisher::new(std::sync::Arc::new(InMemory::new()));
-    let epoch_store = CheckpointPublisherEpochStore::new(publisher.clone());
+    let epoch_store = production_epoch_store(&suffix).await?;
 
     let output = handle_worker_shard_event(
         WorkerShardEvent::Applied(shard),
@@ -85,9 +84,10 @@ async fn live_worker_shard_reconciles_lease_and_epoch_record_when_enabled(
         ]
     );
 
-    let record = publisher
-        .read_ownership_epoch_record(&key.stream_id, key.partition_id, 1)
-        .await?;
+    let record = epoch_store
+        .read(&key.stream_id, key.partition_id, 1)
+        .await?
+        .expect("epoch record should be persisted");
     assert_eq!(record.owner_id, "worker-a");
     assert_eq!(record.lease_identity, partition_lease_identity(&key));
 
@@ -119,8 +119,7 @@ async fn live_worker_shard_reconciles_and_creates_worker_pod_when_enabled(
     let shard = worker_shard_with_owner(&namespace, &suffix, &owner_id);
     let key = partition_lease_key_from_worker_shard(&shard)?;
     let lease_client = KubernetesPartitionLeaseClient::new(KubeLeaseApi::new(client.clone()));
-    let publisher = CheckpointPublisher::new(std::sync::Arc::new(InMemory::new()));
-    let epoch_store = CheckpointPublisherEpochStore::new(publisher.clone());
+    let epoch_store = production_epoch_store(&suffix).await?;
     let executor = KubernetesPodWorkerShardCommandExecutor::new(
         client.clone(),
         &namespace,
@@ -162,9 +161,10 @@ async fn live_worker_shard_reconciles_and_creates_worker_pod_when_enabled(
         ]
     );
 
-    let record = publisher
-        .read_ownership_epoch_record(&key.stream_id, key.partition_id, 1)
-        .await?;
+    let record = epoch_store
+        .read(&key.stream_id, key.partition_id, 1)
+        .await?
+        .expect("epoch record should be persisted");
     assert_eq!(record.owner_id, owner_id);
     assert_eq!(record.lease_identity, partition_lease_identity(&key));
 
@@ -227,8 +227,8 @@ async fn live_worker_shard_watch_loop_creates_worker_pod_when_enabled() -> Resul
     let shard = worker_shard_with_owner(&namespace, &suffix, &owner_id);
     let key = partition_lease_key_from_worker_shard(&shard)?;
     let lease_client = KubernetesPartitionLeaseClient::new(KubeLeaseApi::new(client.clone()));
-    let publisher = CheckpointPublisher::new(std::sync::Arc::new(InMemory::new()));
-    let epoch_store = CheckpointPublisherEpochStore::new(publisher.clone());
+    let epoch_store = production_epoch_store(&suffix).await?;
+    let epoch_store_for_assert = epoch_store.clone();
     let executor = KubernetesPodWorkerShardCommandExecutor::new(
         client.clone(),
         &namespace,
@@ -279,9 +279,10 @@ async fn live_worker_shard_watch_loop_creates_worker_pod_when_enabled() -> Resul
         Some("1")
     );
 
-    let record = publisher
-        .read_ownership_epoch_record(&key.stream_id, key.partition_id, 1)
-        .await?;
+    let record = epoch_store_for_assert
+        .read(&key.stream_id, key.partition_id, 1)
+        .await?
+        .expect("epoch record should be persisted");
     assert_eq!(record.owner_id, owner_id);
     assert_eq!(record.lease_identity, partition_lease_identity(&key));
 
@@ -298,6 +299,22 @@ async fn live_worker_shard_watch_loop_creates_worker_pod_when_enabled() -> Resul
     delete_lease(client, &key).await?;
 
     Ok(())
+}
+
+async fn production_epoch_store(
+    suffix: &str,
+) -> Result<CheckpointPublisherEpochStore, Box<dyn Error>> {
+    let validated_authority = validate_operator_authority(
+        ObjectStoreAuthorityRef::default(),
+        std::sync::Arc::new(InMemory::new()),
+        "live-worker-shard-local-authority",
+        format!("v1/probes/worker-shard-{suffix}"),
+    )
+    .await?;
+
+    Ok(CheckpointPublisherEpochStore::for_production(
+        validated_authority,
+    )?)
 }
 
 fn worker_shard(namespace: &str, suffix: &str) -> VelorixWorkerShard {

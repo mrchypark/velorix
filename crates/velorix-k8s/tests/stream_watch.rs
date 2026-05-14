@@ -629,7 +629,7 @@ fn relation_catalog_json() -> Value {
             "schema_fingerprint": relation().schema_fingerprint,
         },
         "incremental_adapter": {
-            "adapter_id": "incremental-adapter-deposits-v1",
+            "adapter_id": "incremental-adapter-single-key-sum-count-v1",
         },
     })
 }

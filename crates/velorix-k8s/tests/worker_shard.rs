@@ -11,6 +11,7 @@ use kube::{
     client::{Body, ClientBuilder},
     runtime::watcher::Event,
 };
+use object_store::memory::InMemory;
 use serde_json::{json, Value};
 use velorix_control::{
     lease::{
@@ -24,18 +25,44 @@ use velorix_k8s::{
         ObjectStoreAuthorityRef, OwnerEpochStatus, VelorixWorkerShard, VelorixWorkerShardSpec,
         WorkerShardStatus,
     },
+    startup::validate_operator_authority,
     worker_shard::{
         execute_worker_shard_commands, handle_worker_shard_event,
         handle_worker_shard_event_with_command_executor,
         handle_worker_shard_event_with_output_sink, reconcile_worker_shard, worker_shard_pod_name,
-        worker_shard_watch_event, KubernetesPodWorkerShardCommandExecutor,
-        ProcessWorkerShardCommandExecutor, WorkerShardCommand, WorkerShardCommandExecutor,
-        WorkerShardCommandExecutorError, WorkerShardEpochStore, WorkerShardError, WorkerShardEvent,
-        WorkerShardPodTemplate, WorkerShardProcessCommand, WorkerShardReconcileConfig,
-        WorkerShardReconcileInput, WorkerShardReconcileOutput,
+        worker_shard_watch_event, CheckpointPublisherEpochStore,
+        KubernetesPodWorkerShardCommandExecutor, ProcessWorkerShardCommandExecutor,
+        WorkerShardCommand, WorkerShardCommandExecutor, WorkerShardCommandExecutorError,
+        WorkerShardEpochStore, WorkerShardError, WorkerShardEvent, WorkerShardPodTemplate,
+        WorkerShardProcessCommand, WorkerShardReconcileConfig, WorkerShardReconcileInput,
+        WorkerShardReconcileOutput,
     },
 };
 use velorix_storage::ownership::OwnershipEpochRecord;
+
+#[tokio::test]
+async fn checkpoint_publisher_epoch_store_for_production_uses_validated_authority() {
+    let validated_authority = validate_operator_authority(
+        ObjectStoreAuthorityRef::default(),
+        Arc::new(InMemory::new()),
+        "worker-shard-authority",
+        "v1/probes/worker-shard",
+    )
+    .await
+    .unwrap();
+    let epoch_store = CheckpointPublisherEpochStore::for_production(validated_authority).unwrap();
+    let record = epoch_record("worker-a", 1);
+
+    epoch_store.create(record.clone()).await.unwrap();
+
+    assert_eq!(
+        epoch_store
+            .read(&record.stream_id, record.partition_id, record.owner_epoch)
+            .await
+            .unwrap(),
+        Some(record)
+    );
+}
 
 #[tokio::test]
 async fn worker_shard_status_only_never_starts_worker() {

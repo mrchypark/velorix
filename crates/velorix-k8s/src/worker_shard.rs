@@ -26,11 +26,14 @@ use velorix_control::{
         ReconcilePlan, WorkerFact,
     },
 };
-use velorix_storage::{ownership::OwnershipEpochRecord, state::CheckpointPublisher};
+use velorix_storage::{
+    capability::AuthoritativeNamespace, ownership::OwnershipEpochRecord, state::CheckpointPublisher,
+};
 
 use crate::{
     crd::{VelorixWorkerShard, WorkerShardStatus},
     lease::{ownership_epoch_record_from_grant, partition_lease_identity},
+    startup::ValidatedOperatorAuthority,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -485,6 +488,19 @@ pub struct CheckpointPublisherEpochStore {
 impl CheckpointPublisherEpochStore {
     pub fn new(publisher: CheckpointPublisher) -> Self {
         Self { publisher }
+    }
+
+    pub fn for_production(
+        validated_authority: ValidatedOperatorAuthority,
+    ) -> Result<Self, WorkerShardError> {
+        let (_authority, store, capabilities) = validated_authority.into_parts();
+        let profile = capabilities
+            .validate_namespace(AuthoritativeNamespace::Ownership)
+            .map_err(|error| WorkerShardError::EpochStore(error.to_string()))?;
+        let publisher = CheckpointPublisher::new_checked(store, profile)
+            .map_err(|error| WorkerShardError::EpochStore(error.to_string()))?;
+
+        Ok(Self::new(publisher))
     }
 }
 

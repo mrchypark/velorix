@@ -71,6 +71,9 @@ durability capabilities for every authoritative namespace.
 - Checked production SlateDB recovery opens the state store only through shared
   startup `AuthoritativeObjectStoreCapabilitiesV1` evidence and requires both
   checkpoint and state namespaces before opening SlateDB.
+- Kubernetes worker-shard epoch-store construction can reuse validated operator
+  startup evidence and requires the ownership namespace before persisting
+  durable epoch records.
 - Env-gated S3-compatible storage evidence validates create-only conflict,
   read-after-write, list-after-write, and range-read behavior.
 - Env-gated S3-compatible capability evidence validates startup capabilities for
