@@ -71,6 +71,10 @@ durability capabilities for every authoritative namespace.
 - Checked production SlateDB recovery opens the state store only through shared
   startup `AuthoritativeObjectStoreCapabilitiesV1` evidence and requires both
   checkpoint and state namespaces before opening SlateDB.
+- Production leased checkpoint publishing requires the checked leased-publisher
+  constructor, which reuses the checked SlateDB checkpoint publisher and
+  additionally requires output and ownership namespace evidence before
+  production publication can proceed.
 - Kubernetes worker-shard epoch-store construction can reuse validated operator
   startup evidence and requires the ownership namespace before persisting
   durable epoch records.

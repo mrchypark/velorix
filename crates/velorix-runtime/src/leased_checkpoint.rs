@@ -1,6 +1,10 @@
+use std::sync::Arc;
+
+use object_store::ObjectStore;
 use thiserror::Error;
 use velorix_control::lease::PartitionLeaseGrant;
 use velorix_storage::{
+    capability::{AuthoritativeNamespace, AuthoritativeObjectStoreCapabilitiesV1},
     manifest::{
         CheckpointManifest, ManifestError, OutputObjectRef, PartitionOwnerClaim, StateObjectRef,
         StateRefType,
@@ -12,6 +16,7 @@ use velorix_storage::{
 #[derive(Clone, Debug)]
 pub struct LeasedCheckpointPublisher {
     publisher: CheckpointPublisher,
+    production_authority_validated: bool,
 }
 
 #[derive(Debug, Error)]
@@ -63,13 +68,47 @@ pub enum LeasedCheckpointError {
         expected: StateRefType,
         actual: StateRefType,
     },
+    #[error(
+        "production leased checkpoint publisher requires shared startup object-store capability evidence"
+    )]
+    MissingProductionAuthorityEvidence,
     #[error(transparent)]
     Publish(#[from] CheckpointPublishError),
 }
 
 impl LeasedCheckpointPublisher {
     pub fn new(publisher: CheckpointPublisher) -> Self {
-        Self { publisher }
+        Self {
+            publisher,
+            production_authority_validated: false,
+        }
+    }
+
+    /// Constructs the production leased checkpoint publisher from shared
+    /// startup capability evidence instead of accepting an unchecked
+    /// checkpoint publisher.
+    pub async fn with_slatedb_state_store_authoritative(
+        store: Arc<dyn ObjectStore>,
+        db_path: impl Into<object_store::path::Path>,
+        capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
+    ) -> Result<Self, LeasedCheckpointError> {
+        capabilities
+            .validate_namespace(AuthoritativeNamespace::Output)
+            .map_err(CheckpointPublishError::from)?;
+        capabilities
+            .validate_namespace(AuthoritativeNamespace::Ownership)
+            .map_err(CheckpointPublishError::from)?;
+        let publisher = CheckpointPublisher::with_slatedb_state_store_authoritative(
+            store,
+            db_path,
+            capabilities,
+        )
+        .await?;
+
+        Ok(Self {
+            publisher,
+            production_authority_validated: true,
+        })
     }
 
     pub async fn publish(
@@ -120,6 +159,10 @@ impl LeasedCheckpointPublisher {
         output_objects: Vec<OutputObjectWrite>,
         manifest: CheckpointManifest,
     ) -> Result<(), LeasedCheckpointError> {
+        if !self.production_authority_validated {
+            return Err(LeasedCheckpointError::MissingProductionAuthorityEvidence);
+        }
+
         validate_grant_unexpired(&grant, now_unix_ms)?;
         manifest.validate()?;
 
