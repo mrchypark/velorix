@@ -103,7 +103,7 @@ excludes the `payload_digest` field from its own digest input.
 
 This decision intentionally breaks current bootstrap assumptions:
 
-- `RecoveredRuntime::recover` can no longer call
+- `RecoveredRuntime::recover_bootstrap` can no longer call
   `serde_json::from_slice::<DeltaBatch>` on ingest payloads.
 - `IngestBatch` construction must move from arbitrary `Bytes` toward typed
   envelope creation or validation before append.

@@ -86,7 +86,7 @@ pub async fn query_bootstrap_recovered_materialized_view_with_policy_and_limiter
     validate_sql_text_policy(sql, policy).map_err(QueryError::from)?;
 
     let _permit = acquire_query_permit(policy, limiter.as_ref())?;
-    let recovered = RecoveredRuntime::recover_with_owner_and_relation_catalog_record(
+    let recovered = RecoveredRuntime::recover_bootstrap_with_owner_and_relation_catalog_record(
         store,
         ORDERS_SUM_COUNT_OWNER,
         ORDERS_SUM_COUNT_RELATION_ID,

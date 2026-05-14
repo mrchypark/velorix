@@ -1146,7 +1146,7 @@ async fn catalog_backed_recovery_reads_catalog_record_and_replays_catalog_aware_
     )
     .await;
 
-    let recovered = RecoveredRuntime::recover_with_owner_and_relation_catalog_record(
+    let recovered = RecoveredRuntime::recover_bootstrap_with_owner_and_relation_catalog_record(
         Arc::clone(&store),
         ORDERS_SUM_COUNT_OWNER,
         ORDERS_SUM_COUNT_RELATION_ID,
@@ -1205,7 +1205,7 @@ async fn catalog_backed_recovery_replays_int64_primary_key_relation() {
     )
     .await;
 
-    let recovered = RecoveredRuntime::recover_with_owner_and_relation_catalog_record(
+    let recovered = RecoveredRuntime::recover_bootstrap_with_owner_and_relation_catalog_record(
         Arc::clone(&store),
         ORDERS_SUM_COUNT_OWNER,
         catalog.relation_schema.relation_id.as_str(),
@@ -1264,7 +1264,7 @@ async fn catalog_backed_recovery_replays_row_key_relation() {
     )
     .await;
 
-    let recovered = RecoveredRuntime::recover_with_owner_and_relation_catalog_record(
+    let recovered = RecoveredRuntime::recover_bootstrap_with_owner_and_relation_catalog_record(
         Arc::clone(&store),
         ORDERS_SUM_COUNT_OWNER,
         catalog.relation_schema.relation_id.as_str(),
@@ -1336,7 +1336,7 @@ async fn catalog_backed_recovery_replays_boolean_primary_key_relation() {
     )
     .await;
 
-    let recovered = RecoveredRuntime::recover_with_owner_and_relation_catalog_record(
+    let recovered = RecoveredRuntime::recover_bootstrap_with_owner_and_relation_catalog_record(
         Arc::clone(&store),
         ORDERS_SUM_COUNT_OWNER,
         catalog.relation_schema.relation_id.as_str(),
@@ -1409,7 +1409,7 @@ async fn catalog_backed_recovery_replays_decimal128_primary_key_relation() {
     )
     .await;
 
-    let recovered = RecoveredRuntime::recover_with_owner_and_relation_catalog_record(
+    let recovered = RecoveredRuntime::recover_bootstrap_with_owner_and_relation_catalog_record(
         Arc::clone(&store),
         ORDERS_SUM_COUNT_OWNER,
         catalog.relation_schema.relation_id.as_str(),
@@ -1467,7 +1467,7 @@ async fn catalog_backed_recovery_replays_decimal128_value_relation_exactly() {
     )
     .await;
 
-    let recovered = RecoveredRuntime::recover_with_owner_and_relation_catalog_record(
+    let recovered = RecoveredRuntime::recover_bootstrap_with_owner_and_relation_catalog_record(
         Arc::clone(&store),
         ORDERS_SUM_COUNT_OWNER,
         catalog.relation_schema.relation_id.as_str(),
@@ -1526,7 +1526,7 @@ async fn catalog_backed_recovery_replays_date32_primary_key_relation() {
     )
     .await;
 
-    let recovered = RecoveredRuntime::recover_with_owner_and_relation_catalog_record(
+    let recovered = RecoveredRuntime::recover_bootstrap_with_owner_and_relation_catalog_record(
         Arc::clone(&store),
         ORDERS_SUM_COUNT_OWNER,
         catalog.relation_schema.relation_id.as_str(),
@@ -1592,7 +1592,7 @@ async fn catalog_backed_recovery_replays_timestamp_nanosecond_primary_key_relati
     )
     .await;
 
-    let recovered = RecoveredRuntime::recover_with_owner_and_relation_catalog_record(
+    let recovered = RecoveredRuntime::recover_bootstrap_with_owner_and_relation_catalog_record(
         Arc::clone(&store),
         ORDERS_SUM_COUNT_OWNER,
         catalog.relation_schema.relation_id.as_str(),
@@ -1658,7 +1658,7 @@ async fn catalog_backed_recovery_replays_dictionary_utf8_primary_key_relation() 
     )
     .await;
 
-    let recovered = RecoveredRuntime::recover_with_owner_and_relation_catalog_record(
+    let recovered = RecoveredRuntime::recover_bootstrap_with_owner_and_relation_catalog_record(
         Arc::clone(&store),
         ORDERS_SUM_COUNT_OWNER,
         catalog.relation_schema.relation_id.as_str(),
@@ -1724,7 +1724,7 @@ async fn catalog_backed_recovery_replays_json_utf8_primary_key_relation() {
     )
     .await;
 
-    let recovered = RecoveredRuntime::recover_with_owner_and_relation_catalog_record(
+    let recovered = RecoveredRuntime::recover_bootstrap_with_owner_and_relation_catalog_record(
         Arc::clone(&store),
         ORDERS_SUM_COUNT_OWNER,
         catalog.relation_schema.relation_id.as_str(),
@@ -2241,7 +2241,7 @@ async fn selected_checkpoint_recovery_hydrates_decimal128_value_state() {
         .unwrap();
 
     let recovered =
-        RecoveredRuntime::recover_from_published_checkpoint_version_with_owner_and_relation_catalog(
+        RecoveredRuntime::recover_bootstrap_from_published_checkpoint_version_with_owner_and_relation_catalog(
             Arc::clone(&store),
             checkpoint_version,
             ORDERS_SUM_COUNT_OWNER,
@@ -2281,7 +2281,7 @@ async fn selected_checkpoint_recovery_rejects_unsupported_adapter_before_checkpo
         .unwrap();
 
     let error =
-        RecoveredRuntime::recover_from_published_checkpoint_version_with_owner_and_relation_catalog(
+        RecoveredRuntime::recover_bootstrap_from_published_checkpoint_version_with_owner_and_relation_catalog(
             Arc::clone(&store),
             checkpoint_version,
             ORDERS_SUM_COUNT_OWNER,
@@ -2316,7 +2316,7 @@ async fn selected_checkpoint_recovery_rejects_multiple_value_columns_before_chec
         .unwrap();
 
     let error =
-        RecoveredRuntime::recover_from_published_checkpoint_version_with_owner_and_relation_catalog(
+        RecoveredRuntime::recover_bootstrap_from_published_checkpoint_version_with_owner_and_relation_catalog(
             Arc::clone(&store),
             checkpoint_version,
             ORDERS_SUM_COUNT_OWNER,
@@ -2352,7 +2352,7 @@ async fn selected_checkpoint_recovery_rejects_scalar_adapter_multi_key_before_ch
         .unwrap();
 
     let error =
-        RecoveredRuntime::recover_from_published_checkpoint_version_with_owner_and_relation_catalog(
+        RecoveredRuntime::recover_bootstrap_from_published_checkpoint_version_with_owner_and_relation_catalog(
             Arc::clone(&store),
             checkpoint_version,
             ORDERS_SUM_COUNT_OWNER,
@@ -2502,7 +2502,7 @@ async fn checked_selected_checkpoint_recovery_with_slatedb_state_requires_state_
 async fn catalog_backed_recovery_fails_closed_when_catalog_record_is_missing() {
     let (_temp_dir, store) = temp_store();
 
-    let error = RecoveredRuntime::recover_with_owner_and_relation_catalog_record(
+    let error = RecoveredRuntime::recover_bootstrap_with_owner_and_relation_catalog_record(
         Arc::clone(&store),
         ORDERS_SUM_COUNT_OWNER,
         ORDERS_SUM_COUNT_RELATION_ID,
@@ -2538,7 +2538,7 @@ async fn catalog_backed_recovery_rejects_replayed_ingest_relation_drift() {
         .await
         .unwrap();
 
-    let error = RecoveredRuntime::recover_with_owner_and_relation_catalog_record(
+    let error = RecoveredRuntime::recover_bootstrap_with_owner_and_relation_catalog_record(
         Arc::clone(&store),
         ORDERS_SUM_COUNT_OWNER,
         ORDERS_SUM_COUNT_RELATION_ID,
@@ -2595,7 +2595,7 @@ async fn catalog_backed_recovery_reports_malformed_ingest_when_batch_schema_diff
         .await
         .unwrap();
 
-    let error = RecoveredRuntime::recover_with_owner_and_relation_catalog_record(
+    let error = RecoveredRuntime::recover_bootstrap_with_owner_and_relation_catalog_record(
         Arc::clone(&store),
         ORDERS_SUM_COUNT_OWNER,
         ORDERS_SUM_COUNT_RELATION_ID,

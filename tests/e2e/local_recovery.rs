@@ -505,10 +505,12 @@ async fn slatedb_local_recovery_can_use_selected_published_checkpoint() {
 
     drop(publisher);
 
-    let raw_error =
-        RecoveredRuntime::recover_from_published_checkpoint_version(Arc::clone(&store), 0)
-            .await
-            .unwrap_err();
+    let raw_error = RecoveredRuntime::recover_bootstrap_from_published_checkpoint_version(
+        Arc::clone(&store),
+        0,
+    )
+    .await
+    .unwrap_err();
     assert!(matches!(
         raw_error,
         RecoveryError::Checkpoint(CheckpointPublishError::MissingStateObject(_))
@@ -556,7 +558,7 @@ async fn slatedb_local_recovery_rejects_raw_state_manifest() {
         .await
         .unwrap();
 
-    let error = RecoveredRuntime::recover_with_slatedb_state_store_and_relation_catalog(
+    let error = RecoveredRuntime::recover_bootstrap_with_slatedb_state_store_and_relation_catalog(
         Arc::clone(&store),
         "v1/slatedb/state",
         RECOVERY_OWNER,
@@ -612,7 +614,7 @@ async fn local_recovery_rejects_json_deltabatch_ingest_object() {
 
     ingest_log.append(&legacy_batch).await.unwrap();
 
-    let error = RecoveredRuntime::recover(Arc::clone(&store))
+    let error = RecoveredRuntime::recover_bootstrap(Arc::clone(&store))
         .await
         .unwrap_err();
 
@@ -875,9 +877,12 @@ async fn local_recovery_rejects_selected_checkpoint_when_payload_is_missing() {
         .await
         .unwrap();
 
-    let error = RecoveredRuntime::recover_from_published_checkpoint_version(Arc::clone(&store), 0)
-        .await
-        .unwrap_err();
+    let error = RecoveredRuntime::recover_bootstrap_from_published_checkpoint_version(
+        Arc::clone(&store),
+        0,
+    )
+    .await
+    .unwrap_err();
 
     assert!(matches!(
         error,
@@ -1022,7 +1027,7 @@ async fn local_recovery_rejects_manifest_state_with_unexpected_owner() {
         .await
         .unwrap();
 
-    let err = RecoveredRuntime::recover(Arc::clone(&store))
+    let err = RecoveredRuntime::recover_bootstrap(Arc::clone(&store))
         .await
         .unwrap_err();
 

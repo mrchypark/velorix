@@ -32,37 +32,185 @@ fn production_sources_do_not_call_bootstrap_recovery_apis() {
 }
 
 #[test]
+fn recovery_public_api_names_make_bootstrap_recovery_explicit() {
+    let workspace = workspace_root();
+    let source = workspace.join("crates/velorix-runtime/src/recovery.rs");
+    let contents = fs::read_to_string(&source).expect("read recovery source");
+
+    let ambiguous_public_recovery_apis = contents
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            ambiguous_public_recovery_api_name(line).map(|name| {
+                format!(
+                    "{}:{} exposes unchecked recovery as `{name}`",
+                    source.strip_prefix(&workspace).unwrap_or(&source).display(),
+                    index + 1
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        ambiguous_public_recovery_apis.is_empty(),
+        "unchecked public recovery APIs must use explicit bootstrap names; production recovery APIs must be checked:\n{}",
+        ambiguous_public_recovery_apis.join("\n")
+    );
+}
+
+#[test]
+fn production_recovery_public_apis_require_startup_capabilities_in_signature() {
+    let workspace = workspace_root();
+    let source = workspace.join("crates/velorix-runtime/src/recovery.rs");
+    let contents = fs::read_to_string(&source).expect("read recovery source");
+    let lines = contents.lines().collect::<Vec<_>>();
+
+    let violations = public_recovery_apis_without_required_capabilities(&lines)
+        .into_iter()
+        .map(|(line_number, name)| {
+            format!(
+                "{}:{} production recovery API `{name}` lacks `AuthoritativeObjectStoreCapabilitiesV1`",
+                source.strip_prefix(&workspace).unwrap_or(&source).display(),
+                line_number + 1
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        violations.is_empty(),
+        "production-looking public recovery APIs must require startup capabilities:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn production_recovery_contract_forbids_checked_names_without_capability_parameter() {
+    let lines = [
+        "    pub async fn recover_with_owner_and_relation_catalog_checked(",
+        "        store: Arc<dyn ObjectStore>,",
+        "    ) -> Result<Self, RecoveryError> {",
+        "        Ok(todo!())",
+        "    }",
+    ];
+
+    assert_eq!(
+        public_recovery_apis_without_required_capabilities(&lines),
+        vec![(0, "recover_with_owner_and_relation_catalog_checked")]
+    );
+}
+
+#[test]
+fn production_recovery_public_apis_do_not_call_unchecked_authority_constructors() {
+    let workspace = workspace_root();
+    let source = workspace.join("crates/velorix-runtime/src/recovery.rs");
+    let contents = fs::read_to_string(&source).expect("read recovery source");
+    let lines = contents.lines().collect::<Vec<_>>();
+
+    let mut violations = Vec::new();
+    for line_number in 0..lines.len() {
+        if let Some(pattern) = forbidden_unchecked_authority_constructor_use_in_public_recovery_api(
+            &lines,
+            line_number,
+        ) {
+            violations.push(format!(
+                "{}:{} public production recovery API uses unchecked authority constructor `{pattern}`",
+                source.strip_prefix(&workspace).unwrap_or(&source).display(),
+                line_number + 1
+            ));
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "non-bootstrap public recovery APIs must use startup-capability-backed constructors:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn production_recovery_contract_forbids_unchecked_authority_constructors_in_checked_public_apis() {
+    let lines = [
+        "    pub async fn recover_with_owner_and_relation_catalog_checked(",
+        "        store: Arc<dyn ObjectStore>,",
+        "        capabilities: &AuthoritativeObjectStoreCapabilitiesV1,",
+        "    ) -> Result<Self, RecoveryError> {",
+        "        let publisher = CheckpointPublisher::new(Arc::clone(&store));",
+        "        Ok(todo!())",
+        "    }",
+    ];
+
+    assert_eq!(
+        forbidden_unchecked_authority_constructor_use_in_public_recovery_api(&lines, 4),
+        Some("CheckpointPublisher::new(")
+    );
+}
+
+#[test]
+fn production_recovery_contract_forbids_bootstrap_delegation_in_checked_public_apis() {
+    let lines = [
+        "    pub async fn recover_with_owner_and_relation_catalog_checked(",
+        "        store: Arc<dyn ObjectStore>,",
+        "        capabilities: &AuthoritativeObjectStoreCapabilitiesV1,",
+        "    ) -> Result<Self, RecoveryError> {",
+        "        Self::recover_bootstrap_with_owner_and_relation_catalog(store, owner, catalog).await",
+        "    }",
+    ];
+
+    assert_eq!(
+        forbidden_unchecked_authority_constructor_use_in_public_recovery_api(&lines, 4),
+        Some("Self::recover_bootstrap")
+    );
+}
+
+#[test]
+fn production_recovery_contract_allows_unchecked_authority_constructors_in_bootstrap_public_apis() {
+    let lines = [
+        "    pub async fn recover_bootstrap_with_owner_and_relation_catalog(",
+        "        store: Arc<dyn ObjectStore>,",
+        "    ) -> Result<Self, RecoveryError> {",
+        "        let publisher = CheckpointPublisher::new(Arc::clone(&store));",
+        "        Ok(todo!())",
+        "    }",
+    ];
+
+    assert_eq!(
+        forbidden_unchecked_authority_constructor_use_in_public_recovery_api(&lines, 3),
+        None
+    );
+}
+
+#[test]
 fn production_recovery_contract_forbids_direct_bootstrap_recovery_callers() {
     let workspace = Path::new("/workspace");
     let source = workspace.join("crates/velorix-runtime/src/production_surface.rs");
     for (line, pattern) in [
         (
-            "    RecoveredRuntime::recover(store).await?;",
-            "RecoveredRuntime::recover(",
+            "    RecoveredRuntime::recover_bootstrap(store).await?;",
+            "RecoveredRuntime::recover_bootstrap(",
         ),
         (
-            "    RecoveredRuntime::recover_with_owner(store, owner).await?;",
-            "RecoveredRuntime::recover_with_owner(",
+            "    RecoveredRuntime::recover_bootstrap_with_owner(store, owner).await?;",
+            "RecoveredRuntime::recover_bootstrap_with_owner(",
         ),
         (
-            "    RecoveredRuntime::recover_from_published_checkpoint_version(store, publisher, 7).await?;",
-            "RecoveredRuntime::recover_from_published_checkpoint_version(",
+            "    RecoveredRuntime::recover_bootstrap_from_published_checkpoint_version(store, publisher, 7).await?;",
+            "RecoveredRuntime::recover_bootstrap_from_published_checkpoint_version(",
         ),
         (
-            "    RecoveredRuntime::recover_with_owner_and_relation_catalog_record(store, owner, relation_id, relation_version).await?;",
-            "RecoveredRuntime::recover_with_owner_and_relation_catalog_record(",
+            "    RecoveredRuntime::recover_bootstrap_with_owner_and_relation_catalog_record(store, owner, relation_id, relation_version).await?;",
+            "RecoveredRuntime::recover_bootstrap_with_owner_and_relation_catalog_record(",
         ),
         (
-            "    RecoveredRuntime::recover_with_slatedb_state_store_and_relation_catalog(store, db_path, owner, catalog).await?;",
-            "RecoveredRuntime::recover_with_slatedb_state_store_and_relation_catalog(",
+            "    RecoveredRuntime::recover_bootstrap_with_slatedb_state_store_and_relation_catalog(store, db_path, owner, catalog).await?;",
+            "RecoveredRuntime::recover_bootstrap_with_slatedb_state_store_and_relation_catalog(",
         ),
         (
-            "    RecoveredRuntime::recover_from_published_checkpoint_version_with_slatedb_state_store_and_relation_catalog(store, db_path, 7, owner, catalog).await?;",
-            "RecoveredRuntime::recover_from_published_checkpoint_version_with_slatedb_state_store_and_relation_catalog(",
+            "    RecoveredRuntime::recover_bootstrap_from_published_checkpoint_version_with_slatedb_state_store_and_relation_catalog(store, db_path, 7, owner, catalog).await?;",
+            "RecoveredRuntime::recover_bootstrap_from_published_checkpoint_version_with_slatedb_state_store_and_relation_catalog(",
         ),
         (
-            "    RecoveredRuntime::recover_from_published_checkpoint_version_with_owner_and_relation_catalog(store, 7, owner, catalog).await?;",
-            "RecoveredRuntime::recover_from_published_checkpoint_version_with_owner_and_relation_catalog(",
+            "    RecoveredRuntime::recover_bootstrap_from_published_checkpoint_version_with_owner_and_relation_catalog(store, 7, owner, catalog).await?;",
+            "RecoveredRuntime::recover_bootstrap_from_published_checkpoint_version_with_owner_and_relation_catalog(",
         ),
     ] {
         assert_eq!(
@@ -300,14 +448,129 @@ fn forbidden_bootstrap_recovery_use(
 
 fn forbidden_bootstrap_recovery_patterns() -> &'static [&'static str] {
     &[
-        "RecoveredRuntime::recover(",
-        "RecoveredRuntime::recover_with_owner(",
-        "RecoveredRuntime::recover_from_published_checkpoint_version(",
-        "RecoveredRuntime::recover_with_owner_and_relation_catalog_record(",
-        "RecoveredRuntime::recover_with_slatedb_state_store_and_relation_catalog(",
-        "RecoveredRuntime::recover_from_published_checkpoint_version_with_slatedb_state_store_and_relation_catalog(",
-        "RecoveredRuntime::recover_from_published_checkpoint_version_with_owner_and_relation_catalog(",
+        "RecoveredRuntime::recover_bootstrap(",
+        "RecoveredRuntime::recover_bootstrap_with_owner(",
+        "RecoveredRuntime::recover_bootstrap_from_published_checkpoint_version(",
+        "RecoveredRuntime::recover_bootstrap_with_owner_and_relation_catalog_record(",
+        "RecoveredRuntime::recover_bootstrap_with_slatedb_state_store_and_relation_catalog(",
+        "RecoveredRuntime::recover_bootstrap_from_published_checkpoint_version_with_slatedb_state_store_and_relation_catalog(",
+        "RecoveredRuntime::recover_bootstrap_from_published_checkpoint_version_with_owner_and_relation_catalog(",
     ]
+}
+
+fn ambiguous_public_recovery_api_name(line: &str) -> Option<&str> {
+    let full_name = public_recovery_api_name(line)?;
+
+    if full_name.starts_with("recover_bootstrap") || full_name.ends_with("_checked") {
+        None
+    } else {
+        Some(full_name)
+    }
+}
+
+fn public_recovery_apis_without_required_capabilities<'a>(
+    lines: &'a [&'a str],
+) -> Vec<(usize, &'a str)> {
+    lines
+        .iter()
+        .enumerate()
+        .filter_map(|(line_number, line)| {
+            let name = public_recovery_api_name(line)?;
+            if name.starts_with("recover_bootstrap") {
+                return None;
+            }
+            (!function_signature_has_startup_capabilities(lines, line_number))
+                .then_some((line_number, name))
+        })
+        .collect()
+}
+
+fn function_signature_has_startup_capabilities(lines: &[&str], signature_line: usize) -> bool {
+    lines[signature_line..]
+        .iter()
+        .take_while(|line| !line.contains('{'))
+        .chain(
+            lines[signature_line..]
+                .iter()
+                .find(|line| line.contains('{')),
+        )
+        .any(|line| line.contains("AuthoritativeObjectStoreCapabilitiesV1"))
+}
+
+fn forbidden_unchecked_authority_constructor_use_in_public_recovery_api(
+    lines: &[&str],
+    line_number: usize,
+) -> Option<&'static str> {
+    let line = lines[line_number].trim_start();
+    if line.starts_with("//") || line.starts_with("///") {
+        return None;
+    }
+
+    let pattern = unchecked_authority_constructor_patterns()
+        .iter()
+        .copied()
+        .find(|pattern| line.contains(pattern))?;
+    let signature_line = lines[..=line_number]
+        .iter()
+        .rposition(|line| public_recovery_api_name(line).is_some())?;
+    let api_name = public_recovery_api_name(lines[signature_line])?;
+
+    if api_name.starts_with("recover_bootstrap")
+        || !line_is_inside_function_starting_at(lines, signature_line, line_number)
+    {
+        return None;
+    }
+
+    Some(pattern)
+}
+
+fn public_recovery_api_name(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    let name = trimmed
+        .strip_prefix("pub async fn ")
+        .and_then(|rest| rest.split_once('('))
+        .map(|(name, _)| name)?;
+
+    (name == "recover" || name.starts_with("recover_")).then_some(name)
+}
+
+fn unchecked_authority_constructor_patterns() -> &'static [&'static str] {
+    &[
+        "CheckpointPublisher::new(",
+        "CheckpointPublisher::with_slatedb_state_store(",
+        "IngestLog::new(",
+        "RelationCatalogRegistry::new(",
+        "Self::recover_bootstrap",
+        "RecoveredRuntime::recover_bootstrap",
+    ]
+}
+
+fn line_is_inside_function_starting_at(
+    lines: &[&str],
+    signature_line: usize,
+    line_number: usize,
+) -> bool {
+    let mut brace_depth = 0usize;
+    let mut opened = false;
+    for (offset, line) in lines[signature_line..=line_number].iter().enumerate() {
+        for character in line.chars() {
+            match character {
+                '{' => {
+                    opened = true;
+                    brace_depth += 1;
+                }
+                '}' => {
+                    brace_depth = brace_depth.saturating_sub(1);
+                }
+                _ => {}
+            }
+        }
+        if opened && brace_depth == 0 && signature_line + offset < line_number {
+            return false;
+        }
+    }
+
+    opened && brace_depth > 0
 }
 
 fn allowed_bootstrap_recovery_use(
@@ -322,7 +585,7 @@ fn allowed_bootstrap_recovery_use(
     }
 
     if source == workspace.join("crates/velorix-runtime/src/query.rs")
-        && pattern == "RecoveredRuntime::recover_with_owner_and_relation_catalog_record("
+        && pattern == "RecoveredRuntime::recover_bootstrap_with_owner_and_relation_catalog_record("
         && line_is_inside_function(
             lines,
             line_number,
@@ -334,8 +597,8 @@ fn allowed_bootstrap_recovery_use(
 
     if source == workspace.join("crates/velorix-cli/src/main.rs")
         && [
-            "RecoveredRuntime::recover_with_owner_and_relation_catalog_record(",
-            "RecoveredRuntime::recover_from_published_checkpoint_version_with_owner_and_relation_catalog(",
+            "RecoveredRuntime::recover_bootstrap_with_owner_and_relation_catalog_record(",
+            "RecoveredRuntime::recover_bootstrap_from_published_checkpoint_version_with_owner_and_relation_catalog(",
         ]
         .contains(&pattern)
         && line_is_inside_function(lines, line_number, "async fn recover_local_runtime(")
@@ -356,23 +619,23 @@ fn allowed_local_recovery_bootstrap_fixture(
     pattern: &str,
 ) -> bool {
     match pattern {
-        "RecoveredRuntime::recover(" => [
+        "RecoveredRuntime::recover_bootstrap(" => [
             "async fn local_recovery_rejects_json_deltabatch_ingest_object()",
             "async fn local_recovery_rejects_manifest_state_with_unexpected_owner()",
         ]
         .iter()
         .any(|signature| line_is_inside_function(lines, line_number, signature)),
-        "RecoveredRuntime::recover_from_published_checkpoint_version(" => {
+        "RecoveredRuntime::recover_bootstrap_from_published_checkpoint_version(" => {
             ["async fn local_recovery_rejects_selected_checkpoint_when_payload_is_missing()"]
                 .iter()
                 .any(|signature| line_is_inside_function(lines, line_number, signature))
-                || (line_is_inside_function(
+                || line_is_inside_function(
                     lines,
                     line_number,
                     "async fn slatedb_local_recovery_can_use_selected_published_checkpoint()",
-                ) && previous_nonempty_line_contains(lines, line_number, "let raw_error ="))
+                )
         }
-        "RecoveredRuntime::recover_with_slatedb_state_store_and_relation_catalog(" => {
+        "RecoveredRuntime::recover_bootstrap_with_slatedb_state_store_and_relation_catalog(" => {
             line_is_inside_function(
                 lines,
                 line_number,
@@ -381,14 +644,6 @@ fn allowed_local_recovery_bootstrap_fixture(
         }
         _ => false,
     }
-}
-
-fn previous_nonempty_line_contains(lines: &[&str], line_number: usize, needle: &str) -> bool {
-    lines[..line_number]
-        .iter()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .is_some_and(|line| line.contains(needle))
 }
 
 fn line_is_inside_function(lines: &[&str], line_number: usize, signature: &str) -> bool {

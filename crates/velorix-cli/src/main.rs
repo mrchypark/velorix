@@ -1889,7 +1889,7 @@ async fn recover_local_runtime(
 
     match (slatedb_state_path, checkpoint_version) {
         (None, None) => Ok(
-            RecoveredRuntime::recover_with_owner_and_relation_catalog_record(
+            RecoveredRuntime::recover_bootstrap_with_owner_and_relation_catalog_record(
                 store,
                 ORDERS_SUM_COUNT_OWNER,
                 &relation_id,

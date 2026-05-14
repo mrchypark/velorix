@@ -111,15 +111,15 @@ impl<'a> ProductionRecoveryAuthority<'a> {
 }
 
 impl RecoveredRuntime {
-    pub async fn recover(store: Arc<dyn ObjectStore>) -> Result<Self, RecoveryError> {
-        Self::recover_with_owner(store, ORDERS_SUM_COUNT_OWNER).await
+    pub async fn recover_bootstrap(store: Arc<dyn ObjectStore>) -> Result<Self, RecoveryError> {
+        Self::recover_bootstrap_with_owner(store, ORDERS_SUM_COUNT_OWNER).await
     }
 
-    pub async fn recover_with_owner(
+    pub async fn recover_bootstrap_with_owner(
         store: Arc<dyn ObjectStore>,
         expected_owner: &str,
     ) -> Result<Self, RecoveryError> {
-        Self::recover_with_owner_and_relation_catalog(
+        Self::recover_bootstrap_with_owner_and_relation_catalog(
             store,
             expected_owner,
             orders_sum_count_relation_catalog()?,
@@ -127,7 +127,7 @@ impl RecoveredRuntime {
         .await
     }
 
-    pub async fn recover_with_owner_and_relation_catalog_record(
+    pub async fn recover_bootstrap_with_owner_and_relation_catalog_record(
         store: Arc<dyn ObjectStore>,
         expected_owner: &str,
         relation_id: &str,
@@ -137,7 +137,12 @@ impl RecoveredRuntime {
             .read(relation_id, relation_version)
             .await?;
 
-        Self::recover_with_owner_and_relation_catalog(store, expected_owner, relation_catalog).await
+        Self::recover_bootstrap_with_owner_and_relation_catalog(
+            store,
+            expected_owner,
+            relation_catalog,
+        )
+        .await
     }
 
     pub async fn recover_with_owner_and_relation_catalog_record_checked(
@@ -164,7 +169,7 @@ impl RecoveredRuntime {
         .await
     }
 
-    pub async fn recover_with_owner_and_relation_catalog(
+    pub async fn recover_bootstrap_with_owner_and_relation_catalog(
         store: Arc<dyn ObjectStore>,
         expected_owner: &str,
         relation_catalog: VelorixRelationCatalogV1,
@@ -214,11 +219,11 @@ impl RecoveredRuntime {
         Ok(recovered)
     }
 
-    pub async fn recover_from_published_checkpoint_version(
+    pub async fn recover_bootstrap_from_published_checkpoint_version(
         store: Arc<dyn ObjectStore>,
         checkpoint_version: u64,
     ) -> Result<Self, RecoveryError> {
-        Self::recover_from_published_checkpoint_version_with_owner_and_relation_catalog(
+        Self::recover_bootstrap_from_published_checkpoint_version_with_owner_and_relation_catalog(
             store,
             checkpoint_version,
             ORDERS_SUM_COUNT_OWNER,
@@ -269,7 +274,7 @@ impl RecoveredRuntime {
         .await
     }
 
-    pub async fn recover_from_published_checkpoint_version_with_owner_and_relation_catalog(
+    pub async fn recover_bootstrap_from_published_checkpoint_version_with_owner_and_relation_catalog(
         store: Arc<dyn ObjectStore>,
         checkpoint_version: u64,
         expected_owner: &str,
@@ -417,7 +422,7 @@ impl RecoveredRuntime {
         Ok(recovered)
     }
 
-    pub async fn recover_from_published_checkpoint_version_with_slatedb_state_store_and_relation_catalog(
+    pub async fn recover_bootstrap_from_published_checkpoint_version_with_slatedb_state_store_and_relation_catalog(
         store: Arc<dyn ObjectStore>,
         db_path: impl Into<Path>,
         checkpoint_version: u64,
@@ -440,7 +445,7 @@ impl RecoveredRuntime {
         .await
     }
 
-    pub async fn recover_with_slatedb_state_store_and_relation_catalog(
+    pub async fn recover_bootstrap_with_slatedb_state_store_and_relation_catalog(
         store: Arc<dyn ObjectStore>,
         db_path: impl Into<Path>,
         expected_owner: &str,

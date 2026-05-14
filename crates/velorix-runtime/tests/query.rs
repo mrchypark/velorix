@@ -718,7 +718,7 @@ async fn recovery_rejects_json_bytes_under_valid_v1_ingest_key() {
         .await
         .unwrap();
 
-    let error = RecoveredRuntime::recover(Arc::clone(&store))
+    let error = RecoveredRuntime::recover_bootstrap(Arc::clone(&store))
         .await
         .unwrap_err();
 
@@ -750,7 +750,7 @@ async fn recovery_rejects_ingest_envelope_with_wrong_relation_version() {
     // Intentional bootstrap append: this fixture needs durable relation drift.
     ingest_log.append_validated_envelope(bytes).await.unwrap();
 
-    let error = RecoveredRuntime::recover(Arc::clone(&store))
+    let error = RecoveredRuntime::recover_bootstrap(Arc::clone(&store))
         .await
         .unwrap_err();
 
@@ -786,7 +786,7 @@ async fn recovery_rejects_ingest_envelope_with_wrong_schema_fingerprint() {
     // Intentional bootstrap append: this fixture needs durable schema drift.
     ingest_log.append_validated_envelope(bytes).await.unwrap();
 
-    let error = RecoveredRuntime::recover(Arc::clone(&store))
+    let error = RecoveredRuntime::recover_bootstrap(Arc::clone(&store))
         .await
         .unwrap_err();
 
@@ -816,7 +816,9 @@ async fn arrow_ingest_datafusion_and_feldera_use_the_same_catalog_identity() {
         .append_catalog_validated_envelope(bytes)
         .await
         .unwrap();
-    let recovered = RecoveredRuntime::recover(Arc::clone(&store)).await.unwrap();
+    let recovered = RecoveredRuntime::recover_bootstrap(Arc::clone(&store))
+        .await
+        .unwrap();
     let datafusion_schema = datafusion_schema_from_catalog(&catalog).unwrap();
     let feldera_schema = catalog_input_relation_schema(&catalog).unwrap();
 
