@@ -36,6 +36,10 @@ disposable, scaling horizontally without state migration as the runtime matures.
 - Persisted table catalog v0 for deterministic object-backed Parquet scan URLs
 - Persisted view access v0 for executing stored query specs over stored
   object-backed Parquet table specs
+- 1.0 API serving scope for governed data endpoints, request parameter
+  validation, response-shape contracts, OpenAPI-compatible catalog metadata,
+  policy-bound cost controls, and immediate-response paths from materialized or
+  checkpoint-recovered state where available
 - Feldera SQL-to-DBSP standing-view compile artifact contract for validating
   externally compiled standing-view artifacts; direct runtime Feldera/dbsp
   integration remains gated
@@ -76,8 +80,12 @@ packages already fit the problem:
   and one stored object-backed Parquet table spec, then delegates SQL and
   Parquet execution to DataFusion. The boundary includes a minimal policy for
   SQL text size, output row caps, DataFusion batch size, and target partitions.
-  Broader table layout, scheduling/versioning, permissions, and broader
-  cost/resource policy remain future work.
+  Velorix 1.0 also includes the product-facing API serving contract described
+  in `docs/architecture/api-serving-scope-v1.md`: stable endpoint identities,
+  request parameter validation, response-shape metadata, OpenAPI-compatible
+  catalog output, and policy-bound cost controls over these query surfaces.
+  Broader no-code builders, dashboards, arbitrary middleware, and broader
+  application-framework features remain future work.
 - **Feldera SQL-to-DBSP** owns standing-view SQL compilation. Velorix now has a
   phase-0 compile artifact contract that validates Feldera standing-view specs
   and externally produced artifact metadata. Direct runtime Feldera/dbsp crate
@@ -185,8 +193,13 @@ SlateDB layout, compaction, and lifecycle work remain gated follow-on work.
     recovered-state boundary. Persisted table catalog v0 adds create/read JSON
     specs for Parquet scan URLs and composes them with the direct scan boundary.
     Persisted view access v0 composes stored query specs with stored
-    object-backed Parquet table specs. Future work is broader table layout,
-    scheduler/versioning, permissions, and broader resource policy.
+    object-backed Parquet table specs. The 1.0 product scope also includes a
+    governed API serving layer over these surfaces: endpoint definitions,
+    parameter validation, response-shape contracts, OpenAPI-compatible catalog
+    metadata, query/cost policy linkage, and immediate-response paths from
+    materialized or checkpoint-recovered state where available. Future work is
+    broader table layout, scheduler/versioning, permissions, no-code API
+    builders, dashboards, and broader resource policy.
 11. **Use Feldera for standing-view SQL compilation:** validate Feldera
     SQL-to-DBSP compile artifacts before any future `FelderaPipelineEngine`
     consumes release-built generated code. The v1 spec hash is

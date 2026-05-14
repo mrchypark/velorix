@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Finish Velorix 1.0 production readiness so docs, code, tests, CI-facing gates, and operational surfaces demonstrate an object-storage-authoritative, Kubernetes-native database runtime.
+**Goal:** Finish Velorix 1.0 production readiness so docs, code, tests, CI-facing gates, and operational surfaces demonstrate an object-storage-authoritative, Kubernetes-native database runtime with a minimal governed API serving surface for data apps, internal tools, and AI agents.
 
 **Architecture:** Keep object storage as the durable authority and keep compute stateless. Kubernetes coordinates ownership and lifecycle, but every authoritative input, state, output, checkpoint, ownership, catalog, table, artifact, and benchmark decision is backed by Velorix-owned object-store records. Production APIs fail closed when bootstrap-only raw JSON, raw object URLs, local-only stores, missing ownership epochs, missing capability profiles, or incomplete resource policies are used.
 
@@ -35,6 +35,7 @@ The remaining work is not cosmetic. It is the difference between "strong bootstr
 - Foyer is a non-authoritative cache only.
 - SlateDB owns durable state substrate internals; Velorix GC must never prefix-walk SlateDB internal objects.
 - DataFusion is the ad hoc SQL query engine and must run under an enforceable resource policy in production.
+- Velorix 1.0 includes governed API serving contracts: endpoint identities, request parameter validation, response-shape metadata, OpenAPI-compatible catalog output, policy-bound cost controls, and immediate-response paths from materialized or checkpoint-recovered state where available.
 - Feldera/DBSP is the standing-view semantic direction; direct runtime execution remains gated until artifact, state, resource, and recovery contracts are proven.
 - Bootstrap/dev paths may remain only behind explicit APIs and must not be callable from production paths.
 
@@ -91,6 +92,7 @@ The remaining work is not cosmetic. It is the difference between "strong bootstr
 - `crates/velorix-k8s/tests/reconcile.rs`: pure reconcile-core tests.
 - `crates/velorix-runtime/src/feldera_registry.rs`: persisted Feldera artifact registry.
 - `crates/velorix-runtime/tests/feldera_registry.rs`: artifact registry and fingerprint tests.
+- `docs/architecture/api-serving-scope-v1.md`: 1.0 API serving scope and cross-row contract mapping.
 - `baselines/benchmark/local/pr-smoke.json`: local PR-smoke baseline.
 - `baselines/benchmark/s3/nightly.json`: S3-compatible nightly baseline.
 - `baselines/benchmark/s3/release.json`: S3-compatible release baseline.
