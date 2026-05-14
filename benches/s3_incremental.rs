@@ -558,6 +558,7 @@ mod live_s3 {
                 Arc::clone(&authority_store),
                 Arc::clone(&authority_store),
                 &registry,
+                capabilities,
                 production_request("primary", object_key_prefix, snapshot_ref)?,
             )
             .await?;

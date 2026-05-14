@@ -754,6 +754,7 @@ async fn create_production_table_with_policy(
             Arc::clone(catalog_store),
             Arc::clone(catalog_store),
             &registry,
+            &all_namespace_capabilities(),
             CreateProductionPersistedTableSpecRequest {
                 table_id: "orders-current".to_string(),
                 tenant_id: "tenant-a".to_string(),

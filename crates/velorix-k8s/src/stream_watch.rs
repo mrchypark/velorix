@@ -21,7 +21,8 @@ use velorix_storage::{
 use crate::{
     controller::{reconcile_stream, AuthoritySnapshot, ControllerAction},
     crd::{CheckpointRef, ObjectStoreAuthorityRef, RelationVersionRef, VelorixStream},
-    status::{KubernetesStatusError, StreamStatusApi, StreamStatusWriter},
+    startup::OperatorAuthorityStartupComponents,
+    status::{KubeStreamStatusApi, KubernetesStatusError, StreamStatusApi, StreamStatusWriter},
 };
 
 #[derive(Clone, Debug)]
@@ -298,6 +299,17 @@ where
         }
     }
     Ok(())
+}
+
+pub async fn watch_streams_with_kubernetes_runtime(
+    client: Client,
+    namespace: &str,
+    startup_components: &OperatorAuthorityStartupComponents,
+) -> Result<(), StreamWatchError> {
+    let snapshot_provider = startup_components.relation_snapshot_provider();
+    let status_writer = StreamStatusWriter::new(KubeStreamStatusApi::new(client.clone()));
+
+    watch_streams(client, namespace, snapshot_provider, status_writer).await
 }
 
 fn stream_watch_event(event: Event<VelorixStream>) -> Option<StreamWatchEvent> {

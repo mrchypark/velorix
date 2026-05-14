@@ -215,6 +215,7 @@ evidence = {
     "evidence_kind": "kubernetes_vind_gate",
     "readiness_evidence_kind": [
         "kubernetes_lease_client",
+        "kubernetes_stream_watch_startup_components",
         "kubernetes_worker_shard_live_pod_executor",
         "kubernetes_worker_shard_local_filesystem_durable_epoch_restart_read_back",
         "kubernetes_ingest_admission_startup_preflight",
@@ -242,6 +243,7 @@ evidence = {
     "scope": "local vind Docker Kubernetes evidence with run-local filesystem object-store authority; not 1.0 completion evidence; not multi-pod production ingest-admission readiness",
     "limitations": [
         "ingest-admission startup preflight and run-local expiry/restart use a run-local object-store authority",
+        "stream watch uses run-local filesystem object-store authority through OperatorAuthorityStartupComponents before patching Kubernetes status",
         "worker-shard live Pod runtime uses a run-local filesystem-backed object-store authority for epoch records",
         "worker-shard restart read-back recreates checked startup components over the same local filesystem authority root",
         "does not exercise distributed or multi-pod admission races",

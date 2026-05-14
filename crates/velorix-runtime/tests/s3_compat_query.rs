@@ -110,6 +110,7 @@ async fn s3_compatible_production_table_query_scans_parquet_through_registry() -
                 Arc::clone(&authority_store),
                 Arc::clone(&authority_store),
                 &registry,
+                &startup_capabilities,
                 production_request("primary", &object_key_prefix),
             )
             .await?;

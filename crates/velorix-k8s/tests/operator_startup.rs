@@ -331,6 +331,24 @@ fn live_gate_sources_construct_production_components_through_operator_startup_co
 }
 
 #[test]
+fn stream_watch_exposes_startup_component_kubernetes_runtime() {
+    let source_code = include_str!("../src/stream_watch.rs");
+
+    assert!(
+        source_code.contains("pub async fn watch_streams_with_kubernetes_runtime("),
+        "stream watch should expose a Kubernetes runtime assembly helper that takes startup components"
+    );
+    assert!(
+        source_code.contains("startup_components.relation_snapshot_provider()"),
+        "stream-watch runtime assembly must build snapshots from OperatorAuthorityStartupComponents"
+    );
+    assert!(
+        source_code.contains("StreamStatusWriter::new(KubeStreamStatusApi::new(client.clone()))"),
+        "stream-watch runtime assembly must wire the Kubernetes status writer"
+    );
+}
+
+#[test]
 fn k8s_src_runtime_assembly_does_not_call_direct_production_constructors() {
     let forbidden = [
         "RelationCatalogSnapshotProvider::for_production",

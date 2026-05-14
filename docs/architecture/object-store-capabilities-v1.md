@@ -78,11 +78,16 @@ durability capabilities for every authoritative namespace.
   constructor, which reuses the checked SlateDB checkpoint publisher and
   additionally requires output and ownership namespace evidence before
   production publication can proceed.
-- Kubernetes worker-shard epoch-store construction can reuse validated operator
-  startup evidence and requires the ownership namespace before persisting
-  durable epoch records; env-gated local Kubernetes evidence reconstructs checked
-  startup components over a local-filesystem authority and reads those epoch
-  records back without falling through in-memory authority.
+- Kubernetes stream-watch runtime construction can reuse validated operator
+  startup evidence before patching status, and Kubernetes worker-shard
+  epoch-store construction can reuse validated operator startup evidence and
+  requires the ownership namespace before persisting durable epoch records;
+  env-gated local Kubernetes evidence reconstructs checked startup components
+  over a local-filesystem authority and reads those epoch records back without
+  falling through in-memory authority.
+- Production persisted table creation requires shared startup capabilities for
+  table-catalog, relation-catalog, and query-policy authority checks before
+  writing a production table spec.
 - Env-gated S3-compatible storage evidence validates create-only conflict,
   read-after-write, list-after-write, and range-read behavior.
 - Env-gated S3-compatible capability evidence validates startup capabilities for

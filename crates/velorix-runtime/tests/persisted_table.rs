@@ -481,7 +481,13 @@ async fn production_persisted_table_store_rejects_unsafe_query_policy_id() {
     request.query_policy_id = "standard/base".to_string();
 
     let error = catalog
-        .create_production(Arc::clone(&store), Arc::clone(&store), &registry, request)
+        .create_production(
+            Arc::clone(&store),
+            Arc::clone(&store),
+            &registry,
+            &all_namespace_capabilities(),
+            request,
+        )
         .await
         .unwrap_err();
 
@@ -505,6 +511,7 @@ async fn production_persisted_table_store_rejects_cross_tenant_prefix() {
             Arc::clone(&store),
             Arc::clone(&store),
             &registry,
+            &all_namespace_capabilities(),
             production_request("primary", "tenants/tenant-b/tables/orders"),
         )
         .await
@@ -535,6 +542,7 @@ async fn production_persisted_table_store_creates_spec_when_relation_catalog_fin
             Arc::clone(&store),
             Arc::clone(&store),
             &registry,
+            &all_namespace_capabilities(),
             production_request("primary", "tenants/tenant-a/tables/orders"),
         )
         .await
@@ -561,6 +569,7 @@ async fn production_persisted_table_store_rejects_unregistered_store_before_writ
             Arc::clone(&store),
             Arc::clone(&store),
             &registry,
+            &all_namespace_capabilities(),
             production_request("missing-store", "tenants/tenant-a/tables/orders"),
         )
         .await
@@ -598,6 +607,7 @@ async fn production_persisted_table_store_rejects_store_without_capabilities_bef
             Arc::clone(&store),
             Arc::clone(&store),
             &registry,
+            &all_namespace_capabilities(),
             production_request("primary", "tenants/tenant-a/tables/orders"),
         )
         .await
@@ -632,6 +642,7 @@ async fn production_persisted_table_store_rejects_missing_policy_before_writing(
             Arc::clone(&store),
             Arc::clone(&store),
             &registry,
+            &all_namespace_capabilities(),
             production_request("primary", "tenants/tenant-a/tables/orders"),
         )
         .await
@@ -668,6 +679,7 @@ async fn production_persisted_table_store_rejects_unbounded_policy_before_writin
             Arc::clone(&store),
             Arc::clone(&store),
             &registry,
+            &all_namespace_capabilities(),
             production_request("primary", "tenants/tenant-a/tables/orders"),
         )
         .await
@@ -701,7 +713,13 @@ async fn production_persisted_table_store_rejects_relation_catalog_fingerprint_m
     request.schema_fingerprint = format!("sha256:{}", "1".repeat(64));
 
     let error = catalog
-        .create_production(Arc::clone(&store), Arc::clone(&store), &registry, request)
+        .create_production(
+            Arc::clone(&store),
+            Arc::clone(&store),
+            &registry,
+            &all_namespace_capabilities(),
+            request,
+        )
         .await
         .unwrap_err();
 
@@ -734,6 +752,7 @@ async fn production_persisted_table_store_rejects_non_table_relation_registratio
             Arc::clone(&store),
             Arc::clone(&store),
             &registry,
+            &all_namespace_capabilities(),
             production_request("primary", "tenants/tenant-a/tables/orders"),
         )
         .await
@@ -1942,6 +1961,7 @@ async fn create_production_table_with_policy(
             Arc::clone(catalog_store),
             Arc::clone(catalog_store),
             &registry,
+            &all_namespace_capabilities(),
             production_request(store_id, object_key_prefix),
         )
         .await

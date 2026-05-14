@@ -216,8 +216,10 @@ impl PersistedTableStore {
         relation_catalog_store: Arc<dyn ObjectStore>,
         query_policy_catalog_store: Arc<dyn ObjectStore>,
         registry: &StorageRegistry,
+        startup_capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
         request: CreateProductionPersistedTableSpecRequest,
     ) -> Result<ProductionPersistedTableSpec, PersistedTableError> {
+        startup_capabilities.validate_namespace(AuthoritativeNamespace::TableCatalog)?;
         let spec = ProductionPersistedTableSpec {
             schema_version: PERSISTED_TABLE_SCHEMA_VERSION,
             table_id: request.table_id,
@@ -233,18 +235,17 @@ impl PersistedTableStore {
         };
         let object_key = ObjectKey::query_table(&spec.table_id)?;
         validate_production_table_fields(&spec)?;
-        let capabilities = registry.production_capabilities(&spec.store_id)?;
-        capabilities.validate_namespace(AuthoritativeNamespace::TableCatalog)?;
+        registry.production_capabilities(&spec.store_id)?;
         let relation_catalog = read_matching_relation_catalog(
             relation_catalog_store,
-            capabilities,
+            startup_capabilities,
             &spec.relation_id,
             &spec.relation_version,
             &spec.schema_fingerprint,
         )
         .await?;
         require_table_relation_registration(&relation_catalog)?;
-        QueryPolicyCatalogStore::new_checked(query_policy_catalog_store, capabilities)?
+        QueryPolicyCatalogStore::new_checked(query_policy_catalog_store, startup_capabilities)?
             .get_for_production_table_scan(&spec.tenant_id, &spec.query_policy_id)
             .await?;
         registry.resolve_production_table_location(
