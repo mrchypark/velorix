@@ -22,12 +22,11 @@ use velorix_k8s::{
     lease::{partition_lease_identity, KubeLeaseApi, KubernetesPartitionLeaseClient},
     startup::{validate_operator_authority, OperatorAuthorityStartupComponents},
     worker_shard::{
-        handle_worker_shard_event, handle_worker_shard_event_with_command_executor,
-        partition_lease_key_from_worker_shard, watch_worker_shards_with_command_executor,
-        worker_shard_pod_name, CheckpointPublisherEpochStore,
-        KubernetesPodWorkerShardCommandExecutor, WorkerShardCommand, WorkerShardCommandExecutor,
-        WorkerShardEpochStore, WorkerShardEvent, WorkerShardPodTemplate,
-        WorkerShardReconcileConfig, WorkerShardReconcileInput,
+        build_kubernetes_worker_shard_operator_runtime, handle_worker_shard_event,
+        partition_lease_key_from_worker_shard, runtime_identity_from_worker_shard,
+        watch_worker_shards_with_kubernetes_runtime, worker_shard_pod_name_for_identity,
+        CheckpointPublisherEpochStore, WorkerShardCommand, WorkerShardEpochStore, WorkerShardEvent,
+        WorkerShardPodTemplate, WorkerShardReconcileConfig, WorkerShardReconcileInput,
     },
 };
 
@@ -118,31 +117,30 @@ async fn live_worker_shard_reconciles_and_creates_worker_pod_when_enabled(
 
     let shard = worker_shard_with_owner(&namespace, &suffix, &owner_id);
     let key = partition_lease_key_from_worker_shard(&shard)?;
-    let lease_client = KubernetesPartitionLeaseClient::new(KubeLeaseApi::new(client.clone()));
-    let epoch_store = production_epoch_store(&suffix).await?;
-    let executor = KubernetesPodWorkerShardCommandExecutor::new(
+    let components = operator_startup_components(&suffix).await?;
+    let epoch_store = components.worker_shard_epoch_store()?;
+    let runtime = build_kubernetes_worker_shard_operator_runtime(
         client.clone(),
         &namespace,
+        &components,
         WorkerShardPodTemplate::new(worker_image.clone())?,
-    );
+    )?;
 
-    let output = handle_worker_shard_event_with_command_executor(
-        WorkerShardEvent::Applied(shard),
-        &lease_client,
-        &epoch_store,
-        WorkerShardReconcileInput {
-            now_unix_ms: unix_ms()?,
-            ttl_ms: 60_000,
-            running_worker: None,
-            config: WorkerShardReconcileConfig {
-                created_at: "2026-05-12T17:33:23Z".to_string(),
-                previous_checkpoint_version: None,
+    let output = runtime
+        .handle_event(
+            WorkerShardEvent::Applied(shard),
+            WorkerShardReconcileInput {
+                now_unix_ms: unix_ms()?,
+                ttl_ms: 60_000,
+                running_worker: None,
+                config: WorkerShardReconcileConfig {
+                    created_at: "2026-05-12T17:33:23Z".to_string(),
+                    previous_checkpoint_version: None,
+                },
             },
-        },
-        &executor,
-    )
-    .await?
-    .expect("applied worker shard should reconcile");
+        )
+        .await?
+        .expect("applied worker shard should reconcile");
 
     assert_eq!(
         output.commands,
@@ -168,7 +166,12 @@ async fn live_worker_shard_reconciles_and_creates_worker_pod_when_enabled(
     assert_eq!(record.owner_id, owner_id);
     assert_eq!(record.lease_identity, partition_lease_identity(&key));
 
-    let pod_name = worker_shard_pod_name(&record.owner_id, 1);
+    let identity = runtime_identity_from_worker_shard(
+        &worker_shard_with_owner(&namespace, &suffix, &record.owner_id),
+        &record.owner_id,
+        1,
+    )?;
+    let pod_name = worker_shard_pod_name_for_identity(&identity);
     let pod_api: Api<Pod> = Api::namespaced(client.clone(), &namespace);
     let pod = pod_api.get(&pod_name).await?;
     assert_eq!(pod.metadata.name.as_deref(), Some(pod_name.as_str()));
@@ -194,9 +197,14 @@ async fn live_worker_shard_reconciles_and_creates_worker_pod_when_enabled(
         container_env_value(container, "VELORIX_WORKER_OWNER_EPOCH"),
         Some("1")
     );
+    assert_eq!(
+        container_env_value(container, "VELORIX_WORKER_STREAM_ID"),
+        Some(key.stream_id.as_str())
+    );
 
-    executor.stop_worker(&record.owner_id, 1).await?;
+    delete_pod_if_present(&pod_api, &pod_name).await?;
     wait_for_pod_deleted(&pod_api, &pod_name).await?;
+    let lease_client = KubernetesPartitionLeaseClient::new(KubeLeaseApi::new(client.clone()));
     lease_client
         .release(&key, &record.owner_id, 1, unix_ms()?)
         .await?;
@@ -226,23 +234,20 @@ async fn live_worker_shard_watch_loop_creates_worker_pod_when_enabled() -> Resul
 
     let shard = worker_shard_with_owner(&namespace, &suffix, &owner_id);
     let key = partition_lease_key_from_worker_shard(&shard)?;
-    let lease_client = KubernetesPartitionLeaseClient::new(KubeLeaseApi::new(client.clone()));
-    let epoch_store = production_epoch_store(&suffix).await?;
-    let epoch_store_for_assert = epoch_store.clone();
-    let executor = KubernetesPodWorkerShardCommandExecutor::new(
-        client.clone(),
-        &namespace,
-        WorkerShardPodTemplate::new(worker_image.clone())?,
-    );
+    let components = operator_startup_components(&suffix).await?;
+    let epoch_store_for_assert = components.worker_shard_epoch_store()?;
 
     let watch_namespace = namespace.clone();
     let watch_client = client.clone();
+    let watch_components = components.clone();
+    let watch_worker_image = worker_image.clone();
     let watch_task = tokio::spawn(async move {
-        watch_worker_shards_with_command_executor(
+        watch_worker_shards_with_kubernetes_runtime(
             watch_client,
             &watch_namespace,
-            lease_client,
-            epoch_store,
+            &watch_components,
+            WorkerShardPodTemplate::new(watch_worker_image.clone())
+                .expect("worker image should be valid"),
             |_| WorkerShardReconcileInput {
                 now_unix_ms: unix_ms().expect("system clock should be after Unix epoch"),
                 ttl_ms: 60_000,
@@ -252,7 +257,6 @@ async fn live_worker_shard_watch_loop_creates_worker_pod_when_enabled() -> Resul
                     previous_checkpoint_version: None,
                 },
             },
-            executor,
         )
         .await
     });
@@ -260,7 +264,8 @@ async fn live_worker_shard_watch_loop_creates_worker_pod_when_enabled() -> Resul
     let shard_api: Api<VelorixWorkerShard> = Api::namespaced(client.clone(), &namespace);
     shard_api.create(&PostParams::default(), &shard).await?;
 
-    let pod_name = worker_shard_pod_name(&owner_id, 1);
+    let identity = runtime_identity_from_worker_shard(&shard, &owner_id, 1)?;
+    let pod_name = worker_shard_pod_name_for_identity(&identity);
     let pod_api: Api<Pod> = Api::namespaced(client.clone(), &namespace);
     let pod = wait_for_pod(&pod_api, &pod_name).await?;
     assert_eq!(pod.metadata.name.as_deref(), Some(pod_name.as_str()));
@@ -277,6 +282,10 @@ async fn live_worker_shard_watch_loop_creates_worker_pod_when_enabled() -> Resul
     assert_eq!(
         container_env_value(container, "VELORIX_WORKER_OWNER_EPOCH"),
         Some("1")
+    );
+    assert_eq!(
+        container_env_value(container, "VELORIX_WORKER_STREAM_ID"),
+        Some(key.stream_id.as_str())
     );
 
     let record = epoch_store_for_assert
@@ -304,18 +313,23 @@ async fn live_worker_shard_watch_loop_creates_worker_pod_when_enabled() -> Resul
 async fn production_epoch_store(
     suffix: &str,
 ) -> Result<CheckpointPublisherEpochStore, Box<dyn Error>> {
+    Ok(operator_startup_components(suffix)
+        .await?
+        .worker_shard_epoch_store()?)
+}
+
+async fn operator_startup_components(
+    suffix: &str,
+) -> Result<OperatorAuthorityStartupComponents, Box<dyn Error>> {
     let validated_authority = validate_operator_authority(
-        ObjectStoreAuthorityRef::default(),
+        authority(),
         std::sync::Arc::new(InMemory::new()),
         "live-worker-shard-local-authority",
         format!("v1/probes/worker-shard-{suffix}"),
     )
     .await?;
 
-    let components =
-        OperatorAuthorityStartupComponents::from_validated_authority(validated_authority);
-
-    Ok(components.worker_shard_epoch_store()?)
+    Ok(OperatorAuthorityStartupComponents::from_validated_authority(validated_authority))
 }
 
 fn worker_shard(namespace: &str, suffix: &str) -> VelorixWorkerShard {
@@ -331,15 +345,19 @@ fn worker_shard_with_owner(namespace: &str, suffix: &str, owner_id: &str) -> Vel
             stream_id: format!("orders-{suffix}"),
             partition_id: 0,
             desired_owner_id: owner_id.to_string(),
-            authority: ObjectStoreAuthorityRef {
-                store_id: "primary".to_string(),
-                namespace: "analytics".to_string(),
-            },
+            authority: authority(),
         },
     );
     shard.metadata.namespace = Some(namespace.to_string());
     shard.metadata.generation = Some(1);
     shard
+}
+
+fn authority() -> ObjectStoreAuthorityRef {
+    ObjectStoreAuthorityRef {
+        store_id: "primary".to_string(),
+        namespace: "analytics".to_string(),
+    }
 }
 
 fn container_env_value<'a>(

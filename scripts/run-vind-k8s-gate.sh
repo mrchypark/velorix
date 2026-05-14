@@ -241,7 +241,9 @@ evidence = {
     "scope": "local vind Docker Kubernetes evidence; not 1.0 completion evidence; not multi-pod production ingest-admission readiness",
     "limitations": [
         "ingest-admission startup preflight and run-local expiry/restart use a run-local object-store authority",
+        "worker-shard live Pod runtime uses run-local in-memory object-store authority for epoch records",
         "does not exercise distributed or multi-pod admission races",
+        "does not prove worker-shard restart epoch read-back across operator process restart or non-memory authority durability",
     ],
 }
 with open(path, "w", encoding="utf-8") as f:

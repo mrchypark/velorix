@@ -33,8 +33,12 @@ use velorix_storage::{
 };
 
 use crate::{
-    crd::{VelorixWorkerShard, WorkerShardStatus},
-    lease::{ownership_epoch_record_from_grant, partition_lease_identity},
+    crd::{ObjectStoreAuthorityRef, VelorixWorkerShard, WorkerShardStatus},
+    lease::{
+        ownership_epoch_record_from_grant, partition_lease_identity, KubeLeaseApi,
+        KubernetesPartitionLeaseClient,
+    },
+    startup::OperatorAuthorityStartupComponents,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -65,6 +69,18 @@ pub enum WorkerShardCommand {
     PersistEpochRecord { owner_id: String, owner_epoch: u64 },
     StopWorker { owner_id: String, owner_epoch: u64 },
     StartWorker { owner_id: String, owner_epoch: u64 },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkerShardRuntimeIdentity {
+    pub namespace: String,
+    pub view_id: String,
+    pub stream_id: String,
+    pub partition_id: u32,
+    pub authority: ObjectStoreAuthorityRef,
+    pub lease_identity: String,
+    pub owner_id: String,
+    pub owner_epoch: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -104,6 +120,19 @@ pub trait WorkerShardCommandExecutor: Send + Sync {
         &self,
         owner_id: &str,
         owner_epoch: u64,
+    ) -> Result<(), WorkerShardCommandExecutorError>;
+}
+
+#[async_trait]
+pub trait WorkerShardScopedCommandExecutor: Send + Sync {
+    async fn stop_worker(
+        &self,
+        identity: &WorkerShardRuntimeIdentity,
+    ) -> Result<(), WorkerShardCommandExecutorError>;
+
+    async fn start_worker(
+        &self,
+        identity: &WorkerShardRuntimeIdentity,
     ) -> Result<(), WorkerShardCommandExecutorError>;
 }
 
@@ -304,6 +333,73 @@ impl WorkerShardPodTemplate {
             status: None,
         }
     }
+
+    pub fn pod_for_identity(&self, identity: &WorkerShardRuntimeIdentity) -> Pod {
+        let pod_name = worker_shard_pod_name_for_identity(identity);
+        let labels = self.labels_for_identity(identity);
+
+        Pod {
+            metadata: ObjectMeta {
+                name: Some(pod_name),
+                labels: Some(labels),
+                ..ObjectMeta::default()
+            },
+            spec: Some(PodSpec {
+                containers: vec![Container {
+                    name: "velorix-worker".to_string(),
+                    image: Some(self.image.clone()),
+                    command: self.command.clone(),
+                    args: self.args.clone(),
+                    env: Some(env_for_identity(identity)),
+                    ..Container::default()
+                }],
+                restart_policy: Some("Never".to_string()),
+                service_account_name: self.service_account_name.clone(),
+                ..PodSpec::default()
+            }),
+            status: None,
+        }
+    }
+
+    fn labels_for_identity(
+        &self,
+        identity: &WorkerShardRuntimeIdentity,
+    ) -> BTreeMap<String, String> {
+        let mut labels = self.labels.clone();
+        labels.insert(
+            "app.kubernetes.io/name".to_string(),
+            "velorix-worker".to_string(),
+        );
+        labels.insert(
+            "app.kubernetes.io/component".to_string(),
+            "worker-shard".to_string(),
+        );
+        labels.insert(
+            "control.velorix.io/owner-id".to_string(),
+            dns_label_fragment(&identity.owner_id, 63),
+        );
+        labels.insert(
+            "control.velorix.io/owner-epoch".to_string(),
+            identity.owner_epoch.to_string(),
+        );
+        labels.insert(
+            "control.velorix.io/view-id".to_string(),
+            dns_label_fragment(&identity.view_id, 63),
+        );
+        labels.insert(
+            "control.velorix.io/stream-id".to_string(),
+            dns_label_fragment(&identity.stream_id, 63),
+        );
+        labels.insert(
+            "control.velorix.io/partition-id".to_string(),
+            identity.partition_id.to_string(),
+        );
+        labels.insert(
+            "control.velorix.io/identity-hash".to_string(),
+            worker_shard_identity_hash(identity),
+        );
+        labels
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -369,6 +465,89 @@ impl WorkerShardCommandExecutor for KubernetesPodWorkerShardCommandExecutor {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct KubernetesPodWorkerShardScopedCommandExecutor {
+    pods: Api<Pod>,
+    template: WorkerShardPodTemplate,
+}
+
+impl KubernetesPodWorkerShardScopedCommandExecutor {
+    pub fn new(client: Client, namespace: &str, template: WorkerShardPodTemplate) -> Self {
+        Self {
+            pods: Api::namespaced(client, namespace),
+            template,
+        }
+    }
+
+    pub fn from_api(pods: Api<Pod>, template: WorkerShardPodTemplate) -> Self {
+        Self { pods, template }
+    }
+
+    fn api_error(
+        action: &str,
+        identity: &WorkerShardRuntimeIdentity,
+        error: kube::Error,
+    ) -> WorkerShardCommandExecutorError {
+        WorkerShardCommandExecutorError::new(format!(
+            "kubernetes pod worker {action} failed for shard `{}`/{} owner `{}` epoch {}: {error}",
+            identity.stream_id, identity.partition_id, identity.owner_id, identity.owner_epoch
+        ))
+    }
+
+    fn identity_mismatch_error(
+        action: &str,
+        identity: &WorkerShardRuntimeIdentity,
+    ) -> WorkerShardCommandExecutorError {
+        WorkerShardCommandExecutorError::new(format!(
+            "kubernetes pod worker {action} identity mismatch for shard `{}`/{} owner `{}` epoch {}",
+            identity.stream_id, identity.partition_id, identity.owner_id, identity.owner_epoch
+        ))
+    }
+}
+
+#[async_trait]
+impl WorkerShardScopedCommandExecutor for KubernetesPodWorkerShardScopedCommandExecutor {
+    async fn stop_worker(
+        &self,
+        identity: &WorkerShardRuntimeIdentity,
+    ) -> Result<(), WorkerShardCommandExecutorError> {
+        let pod_name = worker_shard_pod_name_for_identity(identity);
+        match self
+            .pods
+            .delete(&pod_name, &DeleteParams::default().grace_period(0))
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(response)) if response.code == 404 => Ok(()),
+            Err(error) => Err(Self::api_error("stop", identity, error)),
+        }
+    }
+
+    async fn start_worker(
+        &self,
+        identity: &WorkerShardRuntimeIdentity,
+    ) -> Result<(), WorkerShardCommandExecutorError> {
+        let pod = self.template.pod_for_identity(identity);
+        match self.pods.create(&PostParams::default(), &pod).await {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(response)) if response.code == 409 => {
+                let pod_name = worker_shard_pod_name_for_identity(identity);
+                let existing = self
+                    .pods
+                    .get(&pod_name)
+                    .await
+                    .map_err(|error| Self::api_error("read-existing", identity, error))?;
+                if pod_matches_identity(&existing, &self.template, identity) {
+                    Ok(())
+                } else {
+                    Err(Self::identity_mismatch_error("start", identity))
+                }
+            }
+            Err(error) => Err(Self::api_error("start", identity, error)),
+        }
+    }
+}
+
 pub fn worker_shard_pod_name(owner_id: &str, owner_epoch: u64) -> String {
     let prefix = "velorix-worker";
     let epoch = owner_epoch.to_string();
@@ -382,12 +561,117 @@ pub fn worker_shard_pod_name(owner_id: &str, owner_epoch: u64) -> String {
     format!("{prefix}-{owner}-{hash}-{epoch}")
 }
 
+pub fn worker_shard_pod_name_for_identity(identity: &WorkerShardRuntimeIdentity) -> String {
+    let prefix = "velorix-worker";
+    let epoch = identity.owner_epoch.to_string();
+    let hash = worker_shard_identity_hash(identity);
+    let max_fragment_len = 63usize
+        .saturating_sub(prefix.len())
+        .saturating_sub(epoch.len())
+        .saturating_sub(hash.len())
+        .saturating_sub(3);
+    let fragment = dns_label_fragment(
+        &format!(
+            "{}-{}-{}",
+            identity.stream_id, identity.partition_id, identity.owner_id
+        ),
+        max_fragment_len.max(1),
+    );
+    format!("{prefix}-{fragment}-{hash}-{epoch}")
+}
+
+fn worker_shard_identity_hash(identity: &WorkerShardRuntimeIdentity) -> String {
+    stable_hash8(&format!(
+        "{}/{}/{}/{}/{}/{}/{}",
+        identity.namespace,
+        identity.view_id,
+        identity.stream_id,
+        identity.partition_id,
+        identity.authority.store_id,
+        identity.authority.namespace,
+        identity.owner_id,
+    ))
+}
+
 fn env_var(name: &str, value: &str) -> EnvVar {
     EnvVar {
         name: name.to_string(),
         value: Some(value.to_string()),
         value_from: None,
     }
+}
+
+fn env_for_identity(identity: &WorkerShardRuntimeIdentity) -> Vec<EnvVar> {
+    vec![
+        env_var("VELORIX_WORKER_NAMESPACE", &identity.namespace),
+        env_var("VELORIX_WORKER_VIEW_ID", &identity.view_id),
+        env_var("VELORIX_WORKER_STREAM_ID", &identity.stream_id),
+        env_var(
+            "VELORIX_WORKER_PARTITION_ID",
+            &identity.partition_id.to_string(),
+        ),
+        env_var(
+            "VELORIX_WORKER_AUTHORITY_STORE_ID",
+            &identity.authority.store_id,
+        ),
+        env_var(
+            "VELORIX_WORKER_AUTHORITY_NAMESPACE",
+            &identity.authority.namespace,
+        ),
+        env_var("VELORIX_WORKER_LEASE_IDENTITY", &identity.lease_identity),
+        env_var("VELORIX_WORKER_OWNER_ID", &identity.owner_id),
+        env_var(
+            "VELORIX_WORKER_OWNER_EPOCH",
+            &identity.owner_epoch.to_string(),
+        ),
+    ]
+}
+
+fn pod_matches_identity(
+    pod: &Pod,
+    template: &WorkerShardPodTemplate,
+    identity: &WorkerShardRuntimeIdentity,
+) -> bool {
+    let Some(metadata_name) = pod.metadata.name.as_deref() else {
+        return false;
+    };
+    if metadata_name != worker_shard_pod_name_for_identity(identity) {
+        return false;
+    }
+
+    let expected_labels = template.labels_for_identity(identity);
+    let Some(labels) = pod.metadata.labels.as_ref() else {
+        return false;
+    };
+    for (key, expected) in expected_labels {
+        if labels.get(&key) != Some(&expected) {
+            return false;
+        }
+    }
+
+    let Some(spec) = pod.spec.as_ref() else {
+        return false;
+    };
+    if spec.service_account_name != template.service_account_name {
+        return false;
+    }
+    let Some(container) = spec.containers.first() else {
+        return false;
+    };
+    if container.image != Some(template.image.clone())
+        || container.command != template.command
+        || container.args != template.args
+    {
+        return false;
+    }
+
+    let expected_env = env_for_identity(identity);
+    let Some(env) = container.env.as_ref() else {
+        return false;
+    };
+    expected_env
+        .iter()
+        .all(|expected| env.iter().any(|actual| actual == expected))
 }
 
 fn dns_label_fragment(value: &str, max_len: usize) -> String {
@@ -448,6 +732,13 @@ pub enum WorkerShardError {
     Lease(Box<LeaseError>),
     #[error("ownership epoch record store failed: {0}")]
     EpochStore(String),
+    #[error("worker shard authority failed: {message}")]
+    Authority { message: String },
+    #[error("worker shard authority mismatch: shard references {actual:?}, operator validated {expected:?}")]
+    AuthorityMismatch {
+        actual: ObjectStoreAuthorityRef,
+        expected: ObjectStoreAuthorityRef,
+    },
     #[error("kubernetes worker shard watcher failed: {message}")]
     Watcher { message: String },
     #[error("worker shard command sink failed: {message}")]
@@ -631,6 +922,166 @@ where
     Ok(())
 }
 
+pub async fn execute_scoped_worker_shard_commands<X>(
+    shard: &VelorixWorkerShard,
+    output: &WorkerShardReconcileOutput,
+    executor: &X,
+) -> Result<(), WorkerShardError>
+where
+    X: WorkerShardScopedCommandExecutor + ?Sized,
+{
+    execute_scoped_worker_shard_commands_with_authority(shard, output, executor, None).await
+}
+
+pub async fn execute_scoped_worker_shard_commands_with_authority<X>(
+    shard: &VelorixWorkerShard,
+    output: &WorkerShardReconcileOutput,
+    executor: &X,
+    expected_authority: Option<&ObjectStoreAuthorityRef>,
+) -> Result<(), WorkerShardError>
+where
+    X: WorkerShardScopedCommandExecutor + ?Sized,
+{
+    validate_worker_shard_authority(shard, expected_authority)?;
+    let mut deferred_stop_error = None;
+
+    for command in output.commands.iter().filter(|command| {
+        matches!(
+            command,
+            WorkerShardCommand::StopWorker {
+                owner_id: _,
+                owner_epoch: _
+            }
+        )
+    }) {
+        let WorkerShardCommand::StopWorker {
+            owner_id,
+            owner_epoch,
+        } = command
+        else {
+            unreachable!();
+        };
+        let identity = runtime_identity_from_worker_shard(shard, owner_id, *owner_epoch)?;
+        if let Err(error) = executor.stop_worker(&identity).await {
+            deferred_stop_error.get_or_insert(error);
+        }
+    }
+
+    if let Some(error) = &output.command_error {
+        return Err(WorkerShardError::Authority {
+            message: error.clone(),
+        });
+    }
+
+    if let Some(error) = deferred_stop_error {
+        return Err(WorkerShardError::command_executor(error));
+    }
+
+    for command in &output.commands {
+        match command {
+            WorkerShardCommand::AcquireLease { .. }
+            | WorkerShardCommand::PersistEpochRecord { .. }
+            | WorkerShardCommand::StopWorker { .. } => {}
+            WorkerShardCommand::StartWorker {
+                owner_id,
+                owner_epoch,
+            } => {
+                let identity = runtime_identity_from_worker_shard(shard, owner_id, *owner_epoch)?;
+                executor
+                    .start_worker(&identity)
+                    .await
+                    .map_err(WorkerShardError::command_executor)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub async fn handle_worker_shard_event_with_scoped_command_executor<L, E, X>(
+    event: WorkerShardEvent,
+    lease_client: &L,
+    epoch_store: &E,
+    input: WorkerShardReconcileInput,
+    executor: &X,
+) -> Result<Option<WorkerShardReconcileOutput>, WorkerShardError>
+where
+    L: PartitionLeaseClient,
+    E: WorkerShardEpochStore,
+    X: WorkerShardScopedCommandExecutor + ?Sized,
+{
+    handle_worker_shard_event_with_scoped_command_executor_and_authority(
+        event,
+        lease_client,
+        epoch_store,
+        input,
+        executor,
+        None,
+    )
+    .await
+}
+
+pub async fn handle_worker_shard_event_with_scoped_command_executor_and_authority<L, E, X>(
+    event: WorkerShardEvent,
+    lease_client: &L,
+    epoch_store: &E,
+    input: WorkerShardReconcileInput,
+    executor: &X,
+    expected_authority: Option<&ObjectStoreAuthorityRef>,
+) -> Result<Option<WorkerShardReconcileOutput>, WorkerShardError>
+where
+    L: PartitionLeaseClient,
+    E: WorkerShardEpochStore,
+    X: WorkerShardScopedCommandExecutor + ?Sized,
+{
+    match event {
+        WorkerShardEvent::Applied(shard) => {
+            validate_worker_shard_authority(&shard, expected_authority)?;
+            let output = reconcile_worker_shard(&shard, lease_client, epoch_store, input).await?;
+            execute_scoped_worker_shard_commands_with_authority(
+                &shard,
+                &output,
+                executor,
+                expected_authority,
+            )
+            .await?;
+            Ok(Some(output))
+        }
+        WorkerShardEvent::Deleted(shard) => {
+            validate_worker_shard_authority(&shard, expected_authority)?;
+            let Some(worker) = input.running_worker.as_ref() else {
+                return Ok(None);
+            };
+            let output = WorkerShardReconcileOutput {
+                plan: ReconcilePlan {
+                    actions: vec![ReconcileAction::StopWorker {
+                        owner_id: worker.owner_id.clone(),
+                        owner_epoch: worker.owner_epoch,
+                    }],
+                    block_reason: None,
+                },
+                facts: ObservedControlPlaneFacts {
+                    lease: None,
+                    epoch_record: None,
+                    worker: Some(worker.clone()),
+                },
+                commands: vec![WorkerShardCommand::StopWorker {
+                    owner_id: worker.owner_id.clone(),
+                    owner_epoch: worker.owner_epoch,
+                }],
+                command_error: None,
+            };
+            execute_scoped_worker_shard_commands_with_authority(
+                &shard,
+                &output,
+                executor,
+                expected_authority,
+            )
+            .await?;
+            Ok(Some(output))
+        }
+    }
+}
+
 pub async fn handle_worker_shard_event_with_command_executor<L, E, X>(
     event: WorkerShardEvent,
     lease_client: &L,
@@ -667,6 +1118,130 @@ where
         output_sink(output).map_err(WorkerShardError::command_sink)?;
     }
     Ok(output)
+}
+
+pub type KubernetesWorkerShardOperatorRuntime = WorkerShardOperatorRuntime<
+    KubernetesPartitionLeaseClient<KubeLeaseApi>,
+    CheckpointPublisherEpochStore,
+    KubernetesPodWorkerShardScopedCommandExecutor,
+>;
+
+pub struct WorkerShardOperatorRuntime<L, E, X> {
+    lease_client: L,
+    epoch_store: E,
+    executor: X,
+    authority: Option<ObjectStoreAuthorityRef>,
+}
+
+impl<L, E, X> WorkerShardOperatorRuntime<L, E, X> {
+    pub fn new(lease_client: L, epoch_store: E, executor: X) -> Self {
+        Self {
+            lease_client,
+            epoch_store,
+            executor,
+            authority: None,
+        }
+    }
+
+    pub fn with_authority(
+        lease_client: L,
+        epoch_store: E,
+        executor: X,
+        authority: ObjectStoreAuthorityRef,
+    ) -> Self {
+        Self {
+            lease_client,
+            epoch_store,
+            executor,
+            authority: Some(authority),
+        }
+    }
+}
+
+impl<L, E, X> WorkerShardOperatorRuntime<L, E, X>
+where
+    L: PartitionLeaseClient,
+    E: WorkerShardEpochStore,
+    X: WorkerShardScopedCommandExecutor,
+{
+    pub async fn handle_event(
+        &self,
+        event: WorkerShardEvent,
+        input: WorkerShardReconcileInput,
+    ) -> Result<Option<WorkerShardReconcileOutput>, WorkerShardError> {
+        handle_worker_shard_event_with_scoped_command_executor_and_authority(
+            event,
+            &self.lease_client,
+            &self.epoch_store,
+            input,
+            &self.executor,
+            self.authority.as_ref(),
+        )
+        .await
+    }
+}
+
+pub fn build_kubernetes_worker_shard_operator_runtime(
+    client: Client,
+    namespace: &str,
+    startup_components: &OperatorAuthorityStartupComponents,
+    pod_template: WorkerShardPodTemplate,
+) -> Result<KubernetesWorkerShardOperatorRuntime, WorkerShardError> {
+    let lease_client = KubernetesPartitionLeaseClient::new(KubeLeaseApi::new(client.clone()));
+    let epoch_store = startup_components.worker_shard_epoch_store()?;
+    let executor =
+        KubernetesPodWorkerShardScopedCommandExecutor::new(client, namespace, pod_template);
+
+    Ok(WorkerShardOperatorRuntime::with_authority(
+        lease_client,
+        epoch_store,
+        executor,
+        startup_components.authority().clone(),
+    ))
+}
+
+pub async fn watch_worker_shards_with_operator_runtime<L, E, X>(
+    client: Client,
+    namespace: &str,
+    runtime: WorkerShardOperatorRuntime<L, E, X>,
+    mut input_for_shard: impl FnMut(&VelorixWorkerShard) -> WorkerShardReconcileInput + Send,
+) -> Result<(), WorkerShardError>
+where
+    L: PartitionLeaseClient,
+    E: WorkerShardEpochStore,
+    X: WorkerShardScopedCommandExecutor,
+{
+    let api: Api<VelorixWorkerShard> = Api::namespaced(client, namespace);
+    let mut events = Box::pin(watcher::watcher(api, watcher::Config::default()));
+
+    while let Some(event) = events.next().await {
+        let event = event.map_err(WorkerShardError::watcher)?;
+        if let Some(event) = worker_shard_watch_event(event) {
+            let input = match &event {
+                WorkerShardEvent::Applied(shard) | WorkerShardEvent::Deleted(shard) => {
+                    input_for_shard(shard)
+                }
+            };
+            runtime.handle_event(event, input).await?;
+        }
+    }
+    Ok(())
+}
+
+pub async fn watch_worker_shards_with_kubernetes_runtime(
+    client: Client,
+    namespace: &str,
+    startup_components: &OperatorAuthorityStartupComponents,
+    pod_template: WorkerShardPodTemplate,
+    input_for_shard: impl FnMut(&VelorixWorkerShard) -> WorkerShardReconcileInput + Send,
+) -> Result<(), WorkerShardError> {
+    let runtime = build_kubernetes_worker_shard_operator_runtime(
+        client.clone(),
+        namespace,
+        startup_components,
+        pod_template,
+    )?;
+    watch_worker_shards_with_operator_runtime(client, namespace, runtime, input_for_shard).await
 }
 
 pub async fn watch_worker_shards_with_command_executor<L, E, X>(
@@ -766,6 +1341,50 @@ pub fn partition_lease_key_from_worker_shard(
         stream_id: shard.spec.stream_id.clone(),
         partition_id: shard.spec.partition_id,
     })
+}
+
+pub fn runtime_identity_from_worker_shard(
+    shard: &VelorixWorkerShard,
+    owner_id: &str,
+    owner_epoch: u64,
+) -> Result<WorkerShardRuntimeIdentity, WorkerShardError> {
+    let key = partition_lease_key_from_worker_shard(shard)?;
+    Ok(WorkerShardRuntimeIdentity {
+        namespace: key.namespace,
+        view_id: key.view_id,
+        stream_id: key.stream_id,
+        partition_id: key.partition_id,
+        authority: shard.spec.authority.clone(),
+        lease_identity: partition_lease_identity(&PartitionLeaseKey {
+            namespace: shard
+                .namespace()
+                .ok_or(WorkerShardError::MissingObjectField {
+                    field: "metadata.namespace",
+                })?,
+            view_id: shard.spec.view_id.clone(),
+            stream_id: shard.spec.stream_id.clone(),
+            partition_id: shard.spec.partition_id,
+        }),
+        owner_id: owner_id.to_string(),
+        owner_epoch,
+    })
+}
+
+fn validate_worker_shard_authority(
+    shard: &VelorixWorkerShard,
+    expected_authority: Option<&ObjectStoreAuthorityRef>,
+) -> Result<(), WorkerShardError> {
+    let Some(expected_authority) = expected_authority else {
+        return Ok(());
+    };
+    if &shard.spec.authority == expected_authority {
+        Ok(())
+    } else {
+        Err(WorkerShardError::AuthorityMismatch {
+            actual: shard.spec.authority.clone(),
+            expected: expected_authority.clone(),
+        })
+    }
 }
 
 pub fn velorix_view_from_worker_shard(

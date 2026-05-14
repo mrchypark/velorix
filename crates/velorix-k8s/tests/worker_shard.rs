@@ -27,14 +27,17 @@ use velorix_k8s::{
     },
     startup::{validate_operator_authority, OperatorAuthorityStartupComponents},
     worker_shard::{
-        execute_worker_shard_commands, handle_worker_shard_event,
-        handle_worker_shard_event_with_command_executor,
-        handle_worker_shard_event_with_output_sink, reconcile_worker_shard, worker_shard_pod_name,
-        worker_shard_watch_event, KubernetesPodWorkerShardCommandExecutor,
+        build_kubernetes_worker_shard_operator_runtime, execute_worker_shard_commands,
+        handle_worker_shard_event, handle_worker_shard_event_with_command_executor,
+        handle_worker_shard_event_with_output_sink, reconcile_worker_shard,
+        runtime_identity_from_worker_shard, worker_shard_pod_name,
+        worker_shard_pod_name_for_identity, worker_shard_watch_event,
+        KubernetesPodWorkerShardCommandExecutor, KubernetesPodWorkerShardScopedCommandExecutor,
         ProcessWorkerShardCommandExecutor, WorkerShardCommand, WorkerShardCommandExecutor,
         WorkerShardCommandExecutorError, WorkerShardEpochStore, WorkerShardError, WorkerShardEvent,
-        WorkerShardPodTemplate, WorkerShardProcessCommand, WorkerShardReconcileConfig,
-        WorkerShardReconcileInput, WorkerShardReconcileOutput,
+        WorkerShardOperatorRuntime, WorkerShardPodTemplate, WorkerShardProcessCommand,
+        WorkerShardReconcileConfig, WorkerShardReconcileInput, WorkerShardReconcileOutput,
+        WorkerShardRuntimeIdentity, WorkerShardScopedCommandExecutor,
     },
 };
 use velorix_storage::ownership::OwnershipEpochRecord;
@@ -433,6 +436,250 @@ async fn applied_worker_shard_event_wires_reconciled_start_to_kubernetes_pod_exe
             {"name": "VELORIX_WORKER_OWNER_EPOCH", "value": "1"}
         ])
     );
+}
+
+#[tokio::test]
+async fn worker_shard_operator_runtime_executes_only_after_durable_lease_epoch_authority() {
+    let lease = FakeLeaseClient::default()
+        .with_current(None)
+        .with_acquired(grant("worker-a", 1));
+    let epoch_store = FakeEpochStore::default();
+    let executor = FakeCommandExecutor::default();
+    let runtime = WorkerShardOperatorRuntime::new(lease, epoch_store.clone(), executor.clone());
+
+    let output = runtime
+        .handle_event(WorkerShardEvent::Applied(shard()), input(None))
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        output.commands,
+        vec![
+            WorkerShardCommand::AcquireLease {
+                owner_id: "worker-a".to_string(),
+            },
+            WorkerShardCommand::PersistEpochRecord {
+                owner_id: "worker-a".to_string(),
+                owner_epoch: 1,
+            },
+            WorkerShardCommand::StartWorker {
+                owner_id: "worker-a".to_string(),
+                owner_epoch: 1,
+            },
+        ]
+    );
+    assert_eq!(
+        epoch_store.read("orders", 0, 1).await.unwrap(),
+        Some(epoch_record("worker-a", 1))
+    );
+    assert_eq!(
+        executor.actions(),
+        vec![ExecutedWorkerCommand::Start {
+            owner_id: "worker-a".to_string(),
+            owner_epoch: 1,
+        }]
+    );
+
+    let blocked_runtime = WorkerShardOperatorRuntime::new(
+        FakeLeaseClient::default().with_current(Some(grant("worker-a", 5))),
+        FakeEpochStore::default(),
+        FakeCommandExecutor::default(),
+    );
+
+    let blocked = blocked_runtime
+        .handle_event(WorkerShardEvent::Applied(shard()), input(None))
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(blocked.commands.is_empty());
+    assert!(!has_start(&blocked));
+}
+
+#[tokio::test]
+async fn worker_shard_operator_runtime_surfaces_authority_failures_without_starting_worker() {
+    let lease = FakeLeaseClient::default().with_current(None);
+    lease.fail_acquire();
+    let executor = FakeCommandExecutor::default();
+    let runtime =
+        WorkerShardOperatorRuntime::new(lease, FakeEpochStore::default(), executor.clone());
+
+    let err = runtime
+        .handle_event(
+            WorkerShardEvent::Applied(shard()),
+            input(Some(WorkerFact {
+                owner_id: "worker-a".to_string(),
+                owner_epoch: 9,
+            })),
+        )
+        .await
+        .unwrap_err();
+
+    match err {
+        WorkerShardError::Authority { message } => {
+            assert!(message.contains("held"));
+        }
+        other => panic!("expected runtime authority error, got {other:?}"),
+    }
+    assert_eq!(
+        executor.actions(),
+        vec![ExecutedWorkerCommand::Stop {
+            owner_id: "worker-a".to_string(),
+            owner_epoch: 9,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn kubernetes_worker_shard_operator_runtime_uses_checked_epoch_store_from_startup_components()
+{
+    let validated_authority = validate_operator_authority(
+        authority(),
+        Arc::new(InMemory::new()),
+        "worker-shard-runtime-authority",
+        "v1/probes/worker-shard-runtime",
+    )
+    .await
+    .unwrap();
+    let components =
+        OperatorAuthorityStartupComponents::from_validated_authority(validated_authority);
+    let (client, requests) = fake_worker_shard_runtime_client();
+    let runtime = build_kubernetes_worker_shard_operator_runtime(
+        client,
+        "default",
+        &components,
+        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+    )
+    .unwrap();
+
+    let output = runtime
+        .handle_event(WorkerShardEvent::Applied(shard()), input(None))
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        output.commands,
+        vec![
+            WorkerShardCommand::AcquireLease {
+                owner_id: "worker-a".to_string(),
+            },
+            WorkerShardCommand::PersistEpochRecord {
+                owner_id: "worker-a".to_string(),
+                owner_epoch: 1,
+            },
+            WorkerShardCommand::StartWorker {
+                owner_id: "worker-a".to_string(),
+                owner_epoch: 1,
+            },
+        ]
+    );
+
+    let epoch_store = components.worker_shard_epoch_store().unwrap();
+    assert_eq!(
+        epoch_store.read("orders", 0, 1).await.unwrap(),
+        Some(epoch_record("worker-a", 1))
+    );
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 4);
+    assert_eq!(requests[0].method, Method::GET);
+    assert!(requests[0]
+        .path
+        .starts_with("/apis/coordination.k8s.io/v1/namespaces/default/leases/velorix-"));
+    assert_eq!(requests[1].method, Method::GET);
+    assert!(requests[1]
+        .path
+        .starts_with("/apis/coordination.k8s.io/v1/namespaces/default/leases/velorix-"));
+    assert_eq!(requests[2].method, Method::POST);
+    assert_eq!(
+        requests[2].path,
+        "/apis/coordination.k8s.io/v1/namespaces/default/leases"
+    );
+    assert_eq!(
+        requests[2].body["metadata"]["annotations"]["control.velorix.io/stream-id"],
+        "orders"
+    );
+    assert_eq!(requests[3].method, Method::POST);
+    assert_eq!(requests[3].path, "/api/v1/namespaces/default/pods");
+    let expected_identity = runtime_identity_from_worker_shard(&shard(), "worker-a", 1).unwrap();
+    assert_eq!(
+        requests[3].body["metadata"]["name"],
+        worker_shard_pod_name_for_identity(&expected_identity)
+    );
+}
+
+#[tokio::test]
+async fn kubernetes_worker_shard_operator_runtime_rejects_shard_authority_mismatch() {
+    let validated_authority = validate_operator_authority(
+        ObjectStoreAuthorityRef::default(),
+        Arc::new(InMemory::new()),
+        "worker-shard-runtime-authority",
+        "v1/probes/worker-shard-runtime-mismatch",
+    )
+    .await
+    .unwrap();
+    let components =
+        OperatorAuthorityStartupComponents::from_validated_authority(validated_authority);
+    let (client, requests) = fake_worker_shard_runtime_client();
+    let runtime = build_kubernetes_worker_shard_operator_runtime(
+        client,
+        "default",
+        &components,
+        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+    )
+    .unwrap();
+
+    let err = runtime
+        .handle_event(WorkerShardEvent::Applied(shard()), input(None))
+        .await
+        .unwrap_err();
+
+    match err {
+        WorkerShardError::AuthorityMismatch { actual, expected } => {
+            assert_eq!(actual, authority());
+            assert_eq!(expected, ObjectStoreAuthorityRef::default());
+        }
+        other => panic!("expected authority mismatch, got {other:?}"),
+    }
+    assert!(requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn worker_shard_scoped_pod_name_separates_same_owner_epoch_across_shards() {
+    let first = runtime_identity_from_worker_shard(&shard(), "worker-a", 1).unwrap();
+    let second = runtime_identity_from_worker_shard(
+        &shard_with_stream_partition("orders-west", 1),
+        "worker-a",
+        1,
+    )
+    .unwrap();
+
+    assert_ne!(
+        worker_shard_pod_name_for_identity(&first),
+        worker_shard_pod_name_for_identity(&second)
+    );
+}
+
+#[tokio::test]
+async fn scoped_kubernetes_pod_executor_rejects_conflicting_existing_pod_identity() {
+    let template = WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap();
+    let requested = runtime_identity_from_worker_shard(&shard(), "worker-a", 1).unwrap();
+    let conflicting = runtime_identity_from_worker_shard(
+        &shard_with_stream_partition("orders-west", 1),
+        "worker-a",
+        1,
+    )
+    .unwrap();
+    let mut existing_pod = template.pod_for_identity(&conflicting);
+    existing_pod.metadata.name = Some(worker_shard_pod_name_for_identity(&requested));
+    let (client, _requests) = fake_pod_create_conflict_then_get_client(existing_pod);
+    let executor = KubernetesPodWorkerShardScopedCommandExecutor::new(client, "default", template);
+
+    let error = executor.start_worker(&requested).await.unwrap_err();
+
+    assert!(error.message().contains("identity mismatch"));
 }
 
 #[tokio::test]
@@ -1022,6 +1269,151 @@ fn fake_pod_client(
     (ClientBuilder::new(service, "default").build(), requests)
 }
 
+fn fake_pod_create_conflict_then_get_client(
+    existing_pod: k8s_openapi::api::core::v1::Pod,
+) -> (kube::Client, Arc<Mutex<Vec<RecordedKubeRequest>>>) {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let existing_pod = Arc::new(existing_pod);
+    let service = tower::service_fn({
+        let requests = Arc::clone(&requests);
+        let existing_pod = Arc::clone(&existing_pod);
+        move |request: Request<Body>| {
+            let requests = Arc::clone(&requests);
+            let existing_pod = Arc::clone(&existing_pod);
+            async move {
+                let method = request.method().clone();
+                let path = request.uri().path().to_string();
+                let body_bytes = request.into_body().collect_bytes().await.unwrap();
+                let body: Value = if body_bytes.is_empty() {
+                    Value::Null
+                } else {
+                    serde_json::from_slice(&body_bytes).unwrap()
+                };
+                requests.lock().unwrap().push(RecordedKubeRequest {
+                    method: method.clone(),
+                    path: path.clone(),
+                    body,
+                });
+
+                let (status, response_body) = match method {
+                    Method::POST => (
+                        StatusCode::CONFLICT,
+                        json!({
+                            "apiVersion": "v1",
+                            "kind": "Status",
+                            "metadata": {},
+                            "status": "Failure",
+                            "message": "already exists",
+                            "reason": "AlreadyExists",
+                            "code": 409
+                        }),
+                    ),
+                    Method::GET => (
+                        StatusCode::OK,
+                        serde_json::to_value(&*existing_pod).unwrap(),
+                    ),
+                    _ => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        json!({
+                            "apiVersion": "v1",
+                            "kind": "Status",
+                            "metadata": {},
+                            "status": "Failure",
+                            "message": "unexpected fake kubernetes request",
+                            "reason": "InternalError",
+                            "code": 500
+                        }),
+                    ),
+                };
+
+                Ok::<_, Infallible>(
+                    Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&response_body).unwrap()))
+                        .unwrap(),
+                )
+            }
+        }
+    });
+
+    (ClientBuilder::new(service, "default").build(), requests)
+}
+
+fn fake_worker_shard_runtime_client() -> (kube::Client, Arc<Mutex<Vec<RecordedKubeRequest>>>) {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let service = tower::service_fn({
+        let requests = Arc::clone(&requests);
+        move |request: Request<Body>| {
+            let requests = Arc::clone(&requests);
+            async move {
+                let method = request.method().clone();
+                let path = request.uri().path().to_string();
+                let body_bytes = request.into_body().collect_bytes().await.unwrap();
+                let body: Value = if body_bytes.is_empty() {
+                    Value::Null
+                } else {
+                    serde_json::from_slice(&body_bytes).unwrap()
+                };
+                requests.lock().unwrap().push(RecordedKubeRequest {
+                    method: method.clone(),
+                    path: path.clone(),
+                    body: body.clone(),
+                });
+
+                let (status, response_body) = match (method, path.as_str()) {
+                    (Method::GET, path)
+                        if path.starts_with(
+                            "/apis/coordination.k8s.io/v1/namespaces/default/leases/",
+                        ) =>
+                    {
+                        (
+                            StatusCode::NOT_FOUND,
+                            json!({
+                                "apiVersion": "v1",
+                                "kind": "Status",
+                                "metadata": {},
+                                "status": "Failure",
+                                "message": "fake lease not found",
+                                "reason": "NotFound",
+                                "code": 404
+                            }),
+                        )
+                    }
+                    (Method::POST, "/apis/coordination.k8s.io/v1/namespaces/default/leases") => {
+                        (StatusCode::CREATED, body)
+                    }
+                    (Method::POST, "/api/v1/namespaces/default/pods") => {
+                        (StatusCode::CREATED, body)
+                    }
+                    _ => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        json!({
+                            "apiVersion": "v1",
+                            "kind": "Status",
+                            "metadata": {},
+                            "status": "Failure",
+                            "message": "unexpected fake kubernetes request",
+                            "reason": "InternalError",
+                            "code": 500
+                        }),
+                    ),
+                };
+
+                Ok::<_, Infallible>(
+                    Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&response_body).unwrap()))
+                        .unwrap(),
+                )
+            }
+        }
+    });
+
+    (ClientBuilder::new(service, "default").build(), requests)
+}
+
 fn input(worker: Option<WorkerFact>) -> WorkerShardReconcileInput {
     WorkerShardReconcileInput {
         now_unix_ms: 1_000,
@@ -1102,6 +1494,25 @@ impl WorkerShardCommandExecutor for FakeCommandExecutor {
     }
 }
 
+#[async_trait]
+impl WorkerShardScopedCommandExecutor for FakeCommandExecutor {
+    async fn stop_worker(
+        &self,
+        identity: &WorkerShardRuntimeIdentity,
+    ) -> Result<(), WorkerShardCommandExecutorError> {
+        WorkerShardCommandExecutor::stop_worker(self, &identity.owner_id, identity.owner_epoch)
+            .await
+    }
+
+    async fn start_worker(
+        &self,
+        identity: &WorkerShardRuntimeIdentity,
+    ) -> Result<(), WorkerShardCommandExecutorError> {
+        WorkerShardCommandExecutor::start_worker(self, &identity.owner_id, identity.owner_epoch)
+            .await
+    }
+}
+
 fn shard() -> VelorixWorkerShard {
     let mut shard = VelorixWorkerShard::new(
         "orders-p0",
@@ -1111,15 +1522,36 @@ fn shard() -> VelorixWorkerShard {
             stream_id: "orders".to_string(),
             partition_id: 0,
             desired_owner_id: "worker-a".to_string(),
-            authority: ObjectStoreAuthorityRef {
-                store_id: "primary".to_string(),
-                namespace: "analytics".to_string(),
-            },
+            authority: authority(),
         },
     );
     shard.metadata.namespace = Some("default".to_string());
     shard.metadata.generation = Some(2);
     shard
+}
+
+fn shard_with_stream_partition(stream_id: &str, partition_id: u32) -> VelorixWorkerShard {
+    let mut shard = VelorixWorkerShard::new(
+        &format!("{stream_id}-p{partition_id}"),
+        VelorixWorkerShardSpec {
+            worker_id: "worker-a".to_string(),
+            view_id: "balances_by_account".to_string(),
+            stream_id: stream_id.to_string(),
+            partition_id,
+            desired_owner_id: "worker-a".to_string(),
+            authority: authority(),
+        },
+    );
+    shard.metadata.namespace = Some("default".to_string());
+    shard.metadata.generation = Some(2);
+    shard
+}
+
+fn authority() -> ObjectStoreAuthorityRef {
+    ObjectStoreAuthorityRef {
+        store_id: "primary".to_string(),
+        namespace: "analytics".to_string(),
+    }
 }
 
 fn key() -> PartitionLeaseKey {
