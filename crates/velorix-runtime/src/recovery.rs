@@ -5,8 +5,9 @@ use thiserror::Error;
 use velorix_core::{
     delta::DeltaBatch,
     engine::{
-        EngineCheckpoint, EngineCheckpointPayload, EngineError, IncrementalEngine, LogicalEpoch,
-        PrototypeIncrementalEngine, ENGINE_CHECKPOINT_PAYLOAD_SCHEMA_VERSION,
+        AggregateValueMode, EngineCheckpoint, EngineCheckpointPayload, EngineError,
+        IncrementalEngine, LogicalEpoch, PrototypeIncrementalEngine,
+        ENGINE_CHECKPOINT_PAYLOAD_SCHEMA_VERSION,
     },
     relation::{
         arrow_record_batches_to_single_key_sum_count_delta_batch, ArrowPhysicalTypeV1,
@@ -14,6 +15,8 @@ use velorix_core::{
         IncrementalAdapterBindingV1, IncrementalInputAdapterError, RelationColumnV1,
         RelationOperationV1, RelationSchemaError, RelationSemanticRoleV1, SchemaFingerprintV1,
         VelorixLogicalTypeV1, VelorixRelationCatalogV1, VelorixRelationSchemaV1,
+        CATALOG_ROW_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID,
+        CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID,
         ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID, RELATION_SCHEMA_VERSION_V1,
     },
 };
@@ -622,7 +625,9 @@ impl RecoveredRuntime {
         relation_catalog: VelorixRelationCatalogV1,
         replay_admission_evidence: ReplayAdmissionEvidence,
     ) -> Result<Self, RecoveryError> {
-        let mut materialized = PrototypeIncrementalEngine::new();
+        let aggregate_value_mode = aggregate_value_mode_for_sum_count_catalog(&relation_catalog)?;
+        let mut materialized =
+            PrototypeIncrementalEngine::with_aggregate_value_mode(aggregate_value_mode);
 
         if let Some(manifest) = manifest.as_ref() {
             let mut checkpointed_state = DeltaBatch::default();
@@ -658,10 +663,10 @@ impl RecoveredRuntime {
                 }
             }
             let logical_epoch = checkpoint_logical_epoch.unwrap_or(manifest.checkpoint_version);
-            materialized = PrototypeIncrementalEngine::from_checkpoint(EngineCheckpoint::new(
-                logical_epoch,
-                checkpointed_state,
-            ))?;
+            materialized = PrototypeIncrementalEngine::from_checkpoint_with_aggregate_value_mode(
+                EngineCheckpoint::new(logical_epoch, checkpointed_state),
+                aggregate_value_mode,
+            )?;
         }
 
         let replay_checkpoints = replay_checkpoints(manifest.as_ref());
@@ -839,6 +844,53 @@ fn prototype_delta_batch_from_arrow_envelope(
         &batches,
     )
     .map_err(recovery_error_from_incremental_input)
+}
+
+fn aggregate_value_mode_for_sum_count_catalog(
+    catalog: &VelorixRelationCatalogV1,
+) -> Result<AggregateValueMode, RecoveryError> {
+    match catalog.incremental_adapter.adapter_id.as_str() {
+        CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID
+        | CATALOG_ROW_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID
+        | ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID => {}
+        _ => {
+            return Err(RecoveryError::UnsupportedIncrementalAdapter {
+                adapter_id: catalog.incremental_adapter.adapter_id.clone(),
+            });
+        }
+    }
+
+    let mut value_columns = catalog
+        .relation_schema
+        .columns
+        .iter()
+        .filter(|column| column.semantic_role == RelationSemanticRoleV1::Value);
+    let Some(column) = value_columns.next() else {
+        return Err(RecoveryError::MalformedPrototypeArrowIngest {
+            reason: "prototype adapter supports exactly one value column".to_string(),
+        });
+    };
+    if value_columns.next().is_some() {
+        return Err(RecoveryError::MalformedPrototypeArrowIngest {
+            reason: "prototype adapter supports exactly one value column".to_string(),
+        });
+    }
+
+    match &column.physical_arrow_type {
+        ArrowPhysicalTypeV1::Int64 => Ok(AggregateValueMode::Integer),
+        ArrowPhysicalTypeV1::Decimal128 { precision, scale } => {
+            Ok(AggregateValueMode::Decimal128 {
+                precision: *precision,
+                scale: *scale,
+            })
+        }
+        _ => Err(RecoveryError::MalformedPrototypeArrowIngest {
+            reason: format!(
+                "prototype sum/count runtime value column `{}` must be Int64 or Decimal128",
+                column.name
+            ),
+        }),
+    }
 }
 
 fn recovery_error_from_incremental_input(error: IncrementalInputAdapterError) -> RecoveryError {

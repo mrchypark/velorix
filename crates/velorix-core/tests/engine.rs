@@ -2,12 +2,20 @@ use serde_json::json;
 use velorix_core::{
     delta::{DeltaBatch, DeltaKey, DeltaRecord, DeltaValue},
     engine::{
-        EngineCheckpoint, EngineCheckpointPayload, IncrementalEngine, PrototypeIncrementalEngine,
-        ENGINE_CHECKPOINT_PAYLOAD_SCHEMA_VERSION,
+        AggregateValueMode, EngineCheckpoint, EngineCheckpointPayload, IncrementalEngine,
+        PrototypeIncrementalEngine, ENGINE_CHECKPOINT_PAYLOAD_SCHEMA_VERSION,
     },
 };
 
 fn input_delta(account: &str, amount: i64, weight: i64) -> DeltaRecord {
+    DeltaRecord::new(
+        DeltaKey::from_json(json!(account)),
+        DeltaValue::from_json(json!(amount)),
+        weight,
+    )
+}
+
+fn decimal_input_delta(account: &str, amount: &str, weight: i64) -> DeltaRecord {
     DeltaRecord::new(
         DeltaKey::from_json(json!(account)),
         DeltaValue::from_json(json!(amount)),
@@ -111,6 +119,31 @@ fn prototype_incremental_engine_checkpoint_plus_replay_matches_uninterrupted_run
     restored.push_changes(2, &replay_input).unwrap();
 
     assert_eq!(net_state(&restored), net_state(&uninterrupted));
+}
+
+#[test]
+fn prototype_incremental_engine_hydrates_decimal128_checkpoint_with_selected_mode() {
+    let checkpoint = EngineCheckpoint::new(
+        1,
+        batch([state_delta("account-a", json!("0.10"), json!(1))]),
+    );
+    let mut restored = PrototypeIncrementalEngine::from_checkpoint_with_aggregate_value_mode(
+        checkpoint,
+        AggregateValueMode::Decimal128 {
+            precision: 38,
+            scale: 2,
+        },
+    )
+    .unwrap();
+
+    restored
+        .push_changes(2, &batch([decimal_input_delta("account-a", "0.20", 1)]))
+        .unwrap();
+
+    assert_eq!(
+        net_state(&restored),
+        vec![state_delta("account-a", json!("0.30"), json!(2))]
+    );
 }
 
 #[test]

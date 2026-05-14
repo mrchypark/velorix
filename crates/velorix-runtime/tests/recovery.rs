@@ -243,6 +243,30 @@ fn ingest_decimal_key_record_batch(
     .unwrap()
 }
 
+fn ingest_decimal_value_record_batch(
+    account_ids: &[&str],
+    amounts: &[i128],
+    weights: &[i64],
+) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("account_id", DataType::Utf8, false),
+            Field::new("amount", DataType::Decimal128(38, 2), false),
+            Field::new("weight", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(account_ids.to_vec())) as ArrayRef,
+            Arc::new(
+                Decimal128Array::from(amounts.to_vec())
+                    .with_precision_and_scale(38, 2)
+                    .unwrap(),
+            ) as ArrayRef,
+            Arc::new(Int64Array::from(weights.to_vec())) as ArrayRef,
+        ],
+    )
+    .unwrap()
+}
+
 fn ingest_date32_key_record_batch(input: &DeltaBatch) -> RecordBatch {
     let keys = input
         .records()
@@ -702,6 +726,90 @@ fn decimal_account_relation_catalog() -> VelorixRelationCatalogV1 {
     }
 }
 
+fn decimal_value_relation_catalog() -> VelorixRelationCatalogV1 {
+    let relation_schema = VelorixRelationSchemaV1 {
+        relation_id: "decimal_value_accounts".to_string(),
+        relation_name: "decimal_value_accounts".to_string(),
+        relation_version: "2026-05-15.v1".to_string(),
+        columns: vec![
+            RelationColumnV1 {
+                column_id: "account_id".to_string(),
+                name: "account_id".to_string(),
+                logical_type: VelorixLogicalTypeV1::Utf8,
+                physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+                nullable: false,
+                ordinal: 0,
+                semantic_role: RelationSemanticRoleV1::PrimaryKey,
+            },
+            RelationColumnV1 {
+                column_id: "amount".to_string(),
+                name: "amount".to_string(),
+                logical_type: VelorixLogicalTypeV1::Decimal {
+                    precision: 38,
+                    scale: 2,
+                },
+                physical_arrow_type: ArrowPhysicalTypeV1::Decimal128 {
+                    precision: 38,
+                    scale: 2,
+                },
+                nullable: false,
+                ordinal: 1,
+                semantic_role: RelationSemanticRoleV1::Value,
+            },
+            RelationColumnV1 {
+                column_id: "weight".to_string(),
+                name: "weight".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 2,
+                semantic_role: RelationSemanticRoleV1::Weight,
+            },
+        ],
+        primary_key_column_ids: vec!["account_id".to_string()],
+        weight_column_id: "weight".to_string(),
+        allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+        event_time_column_id: None,
+    };
+    let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
+
+    VelorixRelationCatalogV1 {
+        schema_version: RELATION_SCHEMA_VERSION_V1,
+        relation_schema,
+        schema_fingerprint: schema_fingerprint.clone(),
+        datafusion_registration: DataFusionRegistrationV1 {
+            name: "decimal_value_accounts".to_string(),
+            mode: DataFusionRegistrationModeV1::Table,
+        },
+        feldera_relation: FelderaRelationBindingV1 {
+            relation_id: "decimal_value_accounts".to_string(),
+            schema_fingerprint,
+        },
+        incremental_adapter: IncrementalAdapterBindingV1 {
+            adapter_id: CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID.to_string(),
+        },
+    }
+}
+
+fn unsupported_adapter_relation_catalog() -> VelorixRelationCatalogV1 {
+    let mut catalog = orders_sum_count_relation_catalog().unwrap();
+    catalog.incremental_adapter.adapter_id = "incremental-adapter-future-row-shaped-v1".to_string();
+    catalog
+}
+
+fn multiple_value_relation_catalog() -> VelorixRelationCatalogV1 {
+    let mut catalog = orders_sum_count_relation_catalog().unwrap();
+    let mut extra_value = catalog.relation_schema.columns[1].clone();
+    extra_value.column_id = "fee".to_string();
+    extra_value.name = "fee".to_string();
+    extra_value.ordinal = 3;
+    catalog.relation_schema.columns.push(extra_value);
+    catalog.schema_fingerprint =
+        SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema).unwrap();
+    catalog.feldera_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
+    catalog
+}
+
 fn date32_daily_relation_catalog() -> VelorixRelationCatalogV1 {
     let relation_schema = VelorixRelationSchemaV1 {
         relation_id: "daily_balances".to_string(),
@@ -986,6 +1094,14 @@ async fn write_checkpoint_state(
 }
 
 fn aggregate_state(account: &str, sum: i64, count: i64) -> DeltaBatch {
+    input_batch([DeltaRecord::new(
+        DeltaKey::from_json(json!(account)),
+        DeltaValue::from_json(json!({ "count": count, "sum": sum })),
+        1,
+    )])
+}
+
+fn aggregate_decimal_state(account: &str, sum: &str, count: i64) -> DeltaBatch {
     input_batch([DeltaRecord::new(
         DeltaKey::from_json(json!(account)),
         DeltaValue::from_json(json!({ "count": count, "sum": sum })),
@@ -1301,6 +1417,57 @@ async fn catalog_backed_recovery_replays_decimal128_primary_key_relation() {
                 1,
             ),
         ]
+    );
+}
+
+#[tokio::test]
+async fn catalog_backed_recovery_replays_decimal128_value_relation_exactly() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = decimal_value_relation_catalog();
+    RelationCatalogRegistry::new(Arc::clone(&store))
+        .create(&catalog)
+        .await
+        .unwrap();
+    let ingest_coordinator = local_ingest_coordinator(Arc::clone(&store));
+    append_ingest_envelope(
+        &ingest_coordinator,
+        ingest_envelope_bytes_with_batches(
+            IngestEnvelopeEncodeRequest {
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                schema_fingerprint: catalog.schema_fingerprint.as_str().to_string(),
+                stream_id: "decimal-value-accounts".to_string(),
+                partition_id: 0,
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 3,
+            },
+            &[ingest_decimal_value_record_batch(
+                &["account-a", "account-a", "account-a"],
+                &[10, 20, 10],
+                &[1, 1, -1],
+            )],
+        ),
+    )
+    .await;
+
+    let recovered = RecoveredRuntime::recover_with_owner_and_relation_catalog_record(
+        Arc::clone(&store),
+        ORDERS_SUM_COUNT_OWNER,
+        catalog.relation_schema.relation_id.as_str(),
+        catalog.relation_schema.relation_version.as_str(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(recovered.replayed_batch_count(), 1);
+    assert_eq!(recovered.logical_epoch(), 1);
+    assert_eq!(
+        recovered.materialized_state().net_rows().unwrap(),
+        vec![DeltaRecord::new(
+            DeltaKey::from_json(json!("account-a")),
+            DeltaValue::from_json(json!({"count": 1, "sum": "0.20"})),
+            1,
+        )]
     );
 }
 
@@ -2010,6 +2177,142 @@ async fn checked_selected_checkpoint_recovery_replays_catalog_aware_ingest() {
             .unwrap(),
         transition
     );
+}
+
+#[tokio::test]
+async fn selected_checkpoint_recovery_hydrates_decimal128_value_state() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = decimal_value_relation_catalog();
+    RelationCatalogRegistry::new(Arc::clone(&store))
+        .create(&catalog)
+        .await
+        .unwrap();
+    let ingest_coordinator = local_ingest_coordinator(Arc::clone(&store));
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let checkpoint_version = 0;
+    let checkpoint_state = aggregate_decimal_state("account-a", "0.10", 1);
+
+    append_ingest_envelope(
+        &ingest_coordinator,
+        ingest_envelope_bytes_with_batches(
+            IngestEnvelopeEncodeRequest {
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                schema_fingerprint: catalog.schema_fingerprint.as_str().to_string(),
+                stream_id: "orders".to_string(),
+                partition_id: 0,
+                start_offset_inclusive: 1,
+                end_offset_exclusive: 2,
+            },
+            &[ingest_decimal_value_record_batch(
+                &["account-a"],
+                &[20],
+                &[1],
+            )],
+        ),
+    )
+    .await;
+    let state_ref =
+        write_checkpoint_state(&publisher, checkpoint_version, 1, &checkpoint_state).await;
+    publisher
+        .publish_manifest(&selected_checkpoint_manifest(
+            checkpoint_version,
+            1,
+            state_ref,
+        ))
+        .await
+        .unwrap();
+
+    let recovered =
+        RecoveredRuntime::recover_from_published_checkpoint_version_with_owner_and_relation_catalog(
+            Arc::clone(&store),
+            checkpoint_version,
+            ORDERS_SUM_COUNT_OWNER,
+            catalog,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(recovered.replayed_batch_count(), 1);
+    assert_eq!(recovered.logical_epoch(), 2);
+    assert_eq!(
+        recovered.materialized_state().net_rows().unwrap(),
+        vec![DeltaRecord::new(
+            DeltaKey::from_json(json!("account-a")),
+            DeltaValue::from_json(json!({"count": 2, "sum": "0.30"})),
+            1,
+        )]
+    );
+}
+
+#[tokio::test]
+async fn selected_checkpoint_recovery_rejects_unsupported_adapter_before_checkpoint_hydration() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = unsupported_adapter_relation_catalog();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let checkpoint_version = 0;
+    let checkpoint_state = aggregate_state("account-a", 4, 1);
+    let state_ref =
+        write_checkpoint_state(&publisher, checkpoint_version, 1, &checkpoint_state).await;
+    publisher
+        .publish_manifest(&selected_checkpoint_manifest(
+            checkpoint_version,
+            1,
+            state_ref,
+        ))
+        .await
+        .unwrap();
+
+    let error =
+        RecoveredRuntime::recover_from_published_checkpoint_version_with_owner_and_relation_catalog(
+            Arc::clone(&store),
+            checkpoint_version,
+            ORDERS_SUM_COUNT_OWNER,
+            catalog,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RecoveryError::UnsupportedIncrementalAdapter { adapter_id }
+            if adapter_id == "incremental-adapter-future-row-shaped-v1"
+    ));
+}
+
+#[tokio::test]
+async fn selected_checkpoint_recovery_rejects_multiple_value_columns_before_checkpoint_hydration() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = multiple_value_relation_catalog();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let checkpoint_version = 0;
+    let checkpoint_state = aggregate_state("account-a", 4, 1);
+    let state_ref =
+        write_checkpoint_state(&publisher, checkpoint_version, 1, &checkpoint_state).await;
+    publisher
+        .publish_manifest(&selected_checkpoint_manifest(
+            checkpoint_version,
+            1,
+            state_ref,
+        ))
+        .await
+        .unwrap();
+
+    let error =
+        RecoveredRuntime::recover_from_published_checkpoint_version_with_owner_and_relation_catalog(
+            Arc::clone(&store),
+            checkpoint_version,
+            ORDERS_SUM_COUNT_OWNER,
+            catalog,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RecoveryError::MalformedPrototypeArrowIngest { reason }
+            if reason == "prototype adapter supports exactly one value column"
+    ));
 }
 
 #[tokio::test]

@@ -49,6 +49,12 @@ Required fields:
   single-key encoding or row-key encoding. Row-key encoding keeps a single value
   column and encodes multi-column primary keys as deterministic JSON objects
   keyed by stable catalog column id.
+- Catalog-backed sum/count execution selects exact Decimal128 value aggregation
+  only when the relation catalog has exactly one Decimal128 value column for a
+  known sum/count adapter. It consumes the adapter's canonical fixed-scale
+  Decimal128 strings, aggregates scaled integers, and emits aggregate state with
+  a string `sum` and numeric `count`; integer value columns keep the legacy
+  numeric `sum` shape.
 - Relation mismatch fails closed before view activation, query execution, or
   checkpoint publication.
 
@@ -61,5 +67,7 @@ Required fields:
   `key_json`/`value_json`.
 - The row-key sum/count adapter preserves existing scalar single-key output and
   proves multi-column primary-key replay through the relation catalog.
+- Decimal128 value sum/count replay proves exact aggregation and checkpoint
+  hydration in the catalog-backed single-value sum/count path.
 - Relation version pinning rejects payloads written for a different relation
   version.

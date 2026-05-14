@@ -13,6 +13,10 @@ pub enum OperatorError {
     WeightOverflow,
     #[error("aggregate input value must be a signed integer")]
     NonIntegerAggregateValue,
+    #[error("aggregate input value must be a Decimal128 string")]
+    NonDecimalAggregateValue,
+    #[error("aggregate decimal value exceeds declared precision")]
+    DecimalPrecisionOverflow,
     #[error("aggregate state value must contain integer `sum` and `count` fields")]
     InvalidAggregateStateValue,
 }
@@ -104,9 +108,47 @@ where
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AggregateValueMode {
+    #[default]
+    Integer,
+    Decimal128 {
+        precision: u8,
+        scale: u8,
+    },
+}
+
+impl AggregateValueMode {
+    fn parse_input(self, value: &DeltaValue) -> Result<i128, OperatorError> {
+        match self {
+            Self::Integer => value
+                .as_json()
+                .as_i64()
+                .map(i128::from)
+                .ok_or(OperatorError::NonIntegerAggregateValue),
+            Self::Decimal128 { precision, scale } => {
+                parse_decimal128_value(value.as_json(), precision, scale)
+            }
+        }
+    }
+
+    fn parse_state_sum(self, value: &Value) -> Result<i128, OperatorError> {
+        match self {
+            Self::Integer => value
+                .as_i64()
+                .map(i128::from)
+                .ok_or(OperatorError::InvalidAggregateStateValue),
+            Self::Decimal128 { precision, scale } => {
+                parse_decimal128_value_for_state(value, precision, scale)
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct KeyedSumCountAggregate {
     state: BTreeMap<String, AggregateEntry>,
+    value_mode: AggregateValueMode,
 }
 
 impl KeyedSumCountAggregate {
@@ -114,11 +156,25 @@ impl KeyedSumCountAggregate {
         Self::default()
     }
 
+    pub fn with_value_mode(value_mode: AggregateValueMode) -> Self {
+        Self {
+            state: BTreeMap::new(),
+            value_mode,
+        }
+    }
+
     pub fn from_state(state: &DeltaBatch) -> Result<Self, OperatorError> {
-        let mut aggregate = Self::default();
+        Self::from_state_with_value_mode(state, AggregateValueMode::Integer)
+    }
+
+    pub fn from_state_with_value_mode(
+        state: &DeltaBatch,
+        value_mode: AggregateValueMode,
+    ) -> Result<Self, OperatorError> {
+        let mut aggregate = Self::with_value_mode(value_mode);
 
         for record in state.records() {
-            let (sum, count) = aggregate_state_sum_count(&record.value)?;
+            let (sum, count) = aggregate_state_sum_count(&record.value, value_mode)?;
             let key = canonical_json(record.key.as_json());
             let entry = aggregate
                 .state
@@ -134,6 +190,7 @@ impl KeyedSumCountAggregate {
                 aggregate.state.remove(&key);
             }
         }
+        validate_aggregate_entries(&aggregate.state, value_mode)?;
 
         Ok(aggregate)
     }
@@ -142,11 +199,7 @@ impl KeyedSumCountAggregate {
         let mut changes: BTreeMap<String, AggregateChange> = BTreeMap::new();
 
         for record in input.records() {
-            let amount = record
-                .value
-                .as_json()
-                .as_i64()
-                .ok_or(OperatorError::NonIntegerAggregateValue)?;
+            let amount = self.value_mode.parse_input(&record.value)?;
             let key = canonical_json(record.key.as_json());
             let change = changes
                 .entry(key)
@@ -155,6 +208,7 @@ impl KeyedSumCountAggregate {
         }
 
         let mut output = Vec::new();
+        let mut next_state = self.state.clone();
 
         for (key, change) in changes {
             let before = self.state.get(&key).cloned();
@@ -165,20 +219,21 @@ impl KeyedSumCountAggregate {
             }
 
             if let Some(before) = before {
-                output.push(before.to_record(-1)?);
+                output.push(before.to_record(-1, self.value_mode)?);
             }
 
             match after {
                 Some(after) => {
-                    output.push(after.to_record(1)?);
-                    self.state.insert(key, after);
+                    output.push(after.to_record(1, self.value_mode)?);
+                    next_state.insert(key, after);
                 }
                 None => {
-                    self.state.remove(&key);
+                    next_state.remove(&key);
                 }
             }
         }
 
+        self.state = next_state;
         Ok(DeltaBatch::from_records(output))
     }
 
@@ -186,7 +241,7 @@ impl KeyedSumCountAggregate {
         DeltaBatch::from_records(
             self.state
                 .values()
-                .map(|entry| entry.to_record(1))
+                .map(|entry| entry.to_record(1, self.value_mode))
                 .collect::<Result<Vec<_>, _>>()
                 .expect("stored aggregate state must fit delta records"),
         )
@@ -305,11 +360,11 @@ struct AggregateEntry {
 impl AggregateEntry {
     fn add_weighted(
         &mut self,
-        sum: i64,
+        sum: i128,
         count: i64,
         weight: DeltaWeight,
     ) -> Result<(), OperatorError> {
-        let sum_delta = i128::from(sum)
+        let sum_delta = sum
             .checked_mul(i128::from(weight))
             .ok_or(OperatorError::WeightOverflow)?;
         let count_delta = i128::from(count)
@@ -330,15 +385,16 @@ impl AggregateEntry {
         self.sum == 0 && self.count == 0
     }
 
-    fn to_record(&self, weight: DeltaWeight) -> Result<DeltaRecord, OperatorError> {
-        let sum: i64 = self
-            .sum
-            .try_into()
-            .map_err(|_| OperatorError::WeightOverflow)?;
+    fn to_record(
+        &self,
+        weight: DeltaWeight,
+        value_mode: AggregateValueMode,
+    ) -> Result<DeltaRecord, OperatorError> {
         let count: i64 = self
             .count
             .try_into()
             .map_err(|_| OperatorError::WeightOverflow)?;
+        let sum = aggregate_sum_json_value(self.sum, value_mode)?;
 
         Ok(DeltaRecord::new(
             self.key.clone(),
@@ -351,18 +407,48 @@ impl AggregateEntry {
     }
 }
 
-fn aggregate_state_sum_count(value: &DeltaValue) -> Result<(i64, i64), OperatorError> {
+fn aggregate_state_sum_count(
+    value: &DeltaValue,
+    value_mode: AggregateValueMode,
+) -> Result<(i128, i64), OperatorError> {
     let value = value.as_json();
     let sum = value
         .get("sum")
-        .and_then(Value::as_i64)
-        .ok_or(OperatorError::InvalidAggregateStateValue)?;
+        .ok_or(OperatorError::InvalidAggregateStateValue)
+        .and_then(|sum| value_mode.parse_state_sum(sum))?;
     let count = value
         .get("count")
         .and_then(Value::as_i64)
         .ok_or(OperatorError::InvalidAggregateStateValue)?;
 
     Ok((sum, count))
+}
+
+fn aggregate_sum_json_value(
+    sum: i128,
+    value_mode: AggregateValueMode,
+) -> Result<Value, OperatorError> {
+    match value_mode {
+        AggregateValueMode::Integer => {
+            let sum: i64 = sum.try_into().map_err(|_| OperatorError::WeightOverflow)?;
+            Ok(json!(sum))
+        }
+        AggregateValueMode::Decimal128 { precision, scale } => {
+            ensure_decimal128_precision(sum.unsigned_abs(), precision)?;
+            Ok(json!(format_decimal128_value(sum, scale)))
+        }
+    }
+}
+
+fn validate_aggregate_entries(
+    state: &BTreeMap<String, AggregateEntry>,
+    value_mode: AggregateValueMode,
+) -> Result<(), OperatorError> {
+    for entry in state.values() {
+        entry.to_record(1, value_mode)?;
+    }
+
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -381,8 +467,8 @@ impl AggregateChange {
         }
     }
 
-    fn add(&mut self, amount: i64, weight: DeltaWeight) -> Result<(), OperatorError> {
-        let weighted_amount = i128::from(amount)
+    fn add(&mut self, amount: i128, weight: DeltaWeight) -> Result<(), OperatorError> {
+        let weighted_amount = amount
             .checked_mul(i128::from(weight))
             .ok_or(OperatorError::WeightOverflow)?;
         self.sum_delta = self
@@ -418,6 +504,108 @@ impl AggregateChange {
                 count,
             }))
         }
+    }
+}
+
+fn parse_decimal128_value(value: &Value, precision: u8, scale: u8) -> Result<i128, OperatorError> {
+    let value = value
+        .as_str()
+        .ok_or(OperatorError::NonDecimalAggregateValue)?;
+    parse_decimal128_str(value, precision, scale).ok_or(OperatorError::NonDecimalAggregateValue)
+}
+
+fn parse_decimal128_value_for_state(
+    value: &Value,
+    precision: u8,
+    scale: u8,
+) -> Result<i128, OperatorError> {
+    let value = value
+        .as_str()
+        .ok_or(OperatorError::InvalidAggregateStateValue)?;
+    parse_decimal128_str(value, precision, scale).ok_or(OperatorError::InvalidAggregateStateValue)
+}
+
+fn parse_decimal128_str(value: &str, precision: u8, scale: u8) -> Option<i128> {
+    let (negative, digits) = match value.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, value),
+    };
+    if digits.is_empty() {
+        return None;
+    }
+
+    let scale = usize::from(scale);
+    let (whole, fractional) = match digits.split_once('.') {
+        Some((whole, fractional)) => (whole, fractional),
+        None if scale == 0 => (digits, ""),
+        None => return None,
+    };
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || fractional.len() != scale
+        || !fractional.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+
+    let mut magnitude = whole.parse::<i128>().ok()?;
+    let factor = decimal128_scale_factor(scale)?;
+    magnitude = magnitude.checked_mul(factor)?;
+    if scale > 0 {
+        magnitude = magnitude.checked_add(fractional.parse::<i128>().ok()?)?;
+    }
+    ensure_decimal128_precision(magnitude.unsigned_abs(), precision).ok()?;
+
+    let signed_magnitude = if negative {
+        magnitude.checked_neg()?
+    } else {
+        magnitude
+    };
+    if format_decimal128_value(signed_magnitude, scale as u8) != value {
+        return None;
+    }
+
+    Some(signed_magnitude)
+}
+
+fn format_decimal128_value(value: i128, scale: u8) -> String {
+    let mut digits = value.unsigned_abs().to_string();
+    let scale = usize::from(scale);
+    let mut decimal = if scale == 0 {
+        digits
+    } else if digits.len() <= scale {
+        let leading_zeroes = "0".repeat(scale - digits.len());
+        format!("0.{leading_zeroes}{digits}")
+    } else {
+        let fractional = digits.split_off(digits.len() - scale);
+        format!("{digits}.{fractional}")
+    };
+
+    if value.is_negative() {
+        decimal.insert(0, '-');
+    }
+
+    decimal
+}
+
+fn decimal128_scale_factor(scale: usize) -> Option<i128> {
+    let mut factor = 1_i128;
+    for _ in 0..scale {
+        factor = factor.checked_mul(10)?;
+    }
+    Some(factor)
+}
+
+fn ensure_decimal128_precision(value: u128, precision: u8) -> Result<(), OperatorError> {
+    let digits = if value == 0 {
+        1
+    } else {
+        value.ilog10() as u8 + 1
+    };
+    if digits > precision {
+        Err(OperatorError::DecimalPrecisionOverflow)
+    } else {
+        Ok(())
     }
 }
 

@@ -1,5 +1,6 @@
 use thiserror::Error;
 
+pub use crate::operator::AggregateValueMode;
 use crate::{
     delta::DeltaBatch,
     operator::{KeyedSumCountAggregate, OperatorError},
@@ -100,6 +101,26 @@ impl PrototypeIncrementalEngine {
     pub fn new() -> Self {
         Self::default()
     }
+
+    pub fn with_aggregate_value_mode(value_mode: AggregateValueMode) -> Self {
+        Self {
+            logical_epoch: 0,
+            aggregate: KeyedSumCountAggregate::with_value_mode(value_mode),
+        }
+    }
+
+    pub fn from_checkpoint_with_aggregate_value_mode(
+        checkpoint: EngineCheckpoint,
+        value_mode: AggregateValueMode,
+    ) -> Result<Self, EngineError> {
+        Ok(Self {
+            logical_epoch: checkpoint.logical_epoch,
+            aggregate: KeyedSumCountAggregate::from_state_with_value_mode(
+                &checkpoint.state,
+                value_mode,
+            )?,
+        })
+    }
 }
 
 impl IncrementalEngine for PrototypeIncrementalEngine {
@@ -133,9 +154,6 @@ impl IncrementalEngine for PrototypeIncrementalEngine {
     }
 
     fn from_checkpoint(checkpoint: EngineCheckpoint) -> Result<Self, EngineError> {
-        Ok(Self {
-            logical_epoch: checkpoint.logical_epoch,
-            aggregate: KeyedSumCountAggregate::from_state(&checkpoint.state)?,
-        })
+        Self::from_checkpoint_with_aggregate_value_mode(checkpoint, AggregateValueMode::Integer)
     }
 }

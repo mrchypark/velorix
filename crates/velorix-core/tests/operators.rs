@@ -1,7 +1,8 @@
 use serde_json::json;
 use velorix_core::delta::{DeltaBatch, DeltaKey, DeltaRecord, DeltaValue};
 use velorix_core::operator::{
-    filter_delta_batch, map_delta_batch, KeyedEquiJoin, KeyedSumCountAggregate, OperatorError,
+    filter_delta_batch, map_delta_batch, AggregateValueMode, KeyedEquiJoin, KeyedSumCountAggregate,
+    OperatorError,
 };
 
 #[test]
@@ -321,6 +322,213 @@ fn operators_keyed_sum_count_aggregate_rejects_malformed_materialized_state() {
     assert_eq!(
         KeyedSumCountAggregate::from_state(&malformed).unwrap_err(),
         OperatorError::InvalidAggregateStateValue
+    );
+}
+
+#[test]
+fn operators_keyed_sum_count_aggregate_sums_decimal128_string_values_exactly() {
+    let mut aggregate = KeyedSumCountAggregate::with_value_mode(AggregateValueMode::Decimal128 {
+        precision: 38,
+        scale: 2,
+    });
+
+    let first = DeltaBatch::from_records([
+        record("acct:1", json!("0.10"), 1),
+        record("acct:1", json!("0.20"), 1),
+    ]);
+    let first_output = aggregate.apply(&first).unwrap();
+
+    assert_eq!(
+        first_output.net_rows().unwrap(),
+        vec![DeltaRecord::new(
+            DeltaKey::from_json(json!("acct:1")),
+            DeltaValue::from_json(json!({ "sum": "0.30", "count": 2 })),
+            1,
+        )]
+    );
+
+    let retract = DeltaBatch::from_records([record("acct:1", json!("0.10"), -1)]);
+    let retract_output = aggregate.apply(&retract).unwrap();
+
+    assert_eq!(
+        retract_output.net_rows().unwrap(),
+        vec![
+            DeltaRecord::new(
+                DeltaKey::from_json(json!("acct:1")),
+                DeltaValue::from_json(json!({ "sum": "0.20", "count": 1 })),
+                1,
+            ),
+            DeltaRecord::new(
+                DeltaKey::from_json(json!("acct:1")),
+                DeltaValue::from_json(json!({ "sum": "0.30", "count": 2 })),
+                -1,
+            ),
+        ]
+    );
+}
+
+#[test]
+fn operators_keyed_sum_count_aggregate_hydrates_decimal128_state() {
+    let checkpointed_state = DeltaBatch::from_records([DeltaRecord::new(
+        DeltaKey::from_json(json!("acct:1")),
+        DeltaValue::from_json(json!({ "sum": "0.10", "count": 1 })),
+        1,
+    )]);
+
+    let mut aggregate = KeyedSumCountAggregate::from_state_with_value_mode(
+        &checkpointed_state,
+        AggregateValueMode::Decimal128 {
+            precision: 38,
+            scale: 2,
+        },
+    )
+    .unwrap();
+    aggregate
+        .apply(&DeltaBatch::from_records([record(
+            "acct:1",
+            json!("0.20"),
+            1,
+        )]))
+        .unwrap();
+
+    assert_eq!(
+        aggregate.state().net_rows().unwrap(),
+        vec![DeltaRecord::new(
+            DeltaKey::from_json(json!("acct:1")),
+            DeltaValue::from_json(json!({ "sum": "0.30", "count": 2 })),
+            1,
+        )]
+    );
+}
+
+#[test]
+fn operators_keyed_sum_count_aggregate_rejects_decimal128_checkpoint_overflow() {
+    let checkpointed_state = DeltaBatch::from_records([
+        DeltaRecord::new(
+            DeltaKey::from_json(json!("acct:1")),
+            DeltaValue::from_json(json!({ "sum": "9.99", "count": 1 })),
+            1,
+        ),
+        DeltaRecord::new(
+            DeltaKey::from_json(json!("acct:1")),
+            DeltaValue::from_json(json!({ "sum": "0.01", "count": 1 })),
+            1,
+        ),
+    ]);
+
+    let error = KeyedSumCountAggregate::from_state_with_value_mode(
+        &checkpointed_state,
+        AggregateValueMode::Decimal128 {
+            precision: 3,
+            scale: 2,
+        },
+    )
+    .unwrap_err();
+
+    assert_eq!(error, OperatorError::DecimalPrecisionOverflow);
+}
+
+#[test]
+fn operators_keyed_sum_count_aggregate_rejects_noncanonical_decimal128_without_mutation() {
+    let mut aggregate = KeyedSumCountAggregate::with_value_mode(AggregateValueMode::Decimal128 {
+        precision: 38,
+        scale: 2,
+    });
+    aggregate
+        .apply(&DeltaBatch::from_records([record(
+            "acct:1",
+            json!("0.10"),
+            1,
+        )]))
+        .unwrap();
+
+    let error = aggregate
+        .apply(&DeltaBatch::from_records([record(
+            "acct:1",
+            json!("00.20"),
+            1,
+        )]))
+        .unwrap_err();
+
+    assert_eq!(error, OperatorError::NonDecimalAggregateValue);
+    assert_eq!(
+        aggregate.state().net_rows().unwrap(),
+        vec![DeltaRecord::new(
+            DeltaKey::from_json(json!("acct:1")),
+            DeltaValue::from_json(json!({ "sum": "0.10", "count": 1 })),
+            1,
+        )]
+    );
+}
+
+#[test]
+fn operators_keyed_sum_count_aggregate_rejects_decimal128_precision_overflow_without_mutation() {
+    let mut aggregate = KeyedSumCountAggregate::with_value_mode(AggregateValueMode::Decimal128 {
+        precision: 3,
+        scale: 2,
+    });
+    aggregate
+        .apply(&DeltaBatch::from_records([record(
+            "acct:1",
+            json!("9.99"),
+            1,
+        )]))
+        .unwrap();
+
+    let error = aggregate
+        .apply(&DeltaBatch::from_records([record(
+            "acct:1",
+            json!("0.01"),
+            1,
+        )]))
+        .unwrap_err();
+
+    assert_eq!(error, OperatorError::DecimalPrecisionOverflow);
+    assert_eq!(
+        aggregate.state().net_rows().unwrap(),
+        vec![DeltaRecord::new(
+            DeltaKey::from_json(json!("acct:1")),
+            DeltaValue::from_json(json!({ "sum": "9.99", "count": 1 })),
+            1,
+        )]
+    );
+}
+
+#[test]
+fn operators_keyed_sum_count_aggregate_rejects_decimal128_precision_overflow_atomically() {
+    let mut aggregate = KeyedSumCountAggregate::with_value_mode(AggregateValueMode::Decimal128 {
+        precision: 3,
+        scale: 2,
+    });
+    aggregate
+        .apply(&DeltaBatch::from_records([
+            record("acct:1", json!("1.00"), 1),
+            record("acct:2", json!("9.99"), 1),
+        ]))
+        .unwrap();
+
+    let error = aggregate
+        .apply(&DeltaBatch::from_records([
+            record("acct:1", json!("1.00"), 1),
+            record("acct:2", json!("0.01"), 1),
+        ]))
+        .unwrap_err();
+
+    assert_eq!(error, OperatorError::DecimalPrecisionOverflow);
+    assert_eq!(
+        aggregate.state().net_rows().unwrap(),
+        vec![
+            DeltaRecord::new(
+                DeltaKey::from_json(json!("acct:1")),
+                DeltaValue::from_json(json!({ "sum": "1.00", "count": 1 })),
+                1,
+            ),
+            DeltaRecord::new(
+                DeltaKey::from_json(json!("acct:2")),
+                DeltaValue::from_json(json!({ "sum": "9.99", "count": 1 })),
+                1,
+            ),
+        ]
     );
 }
 
