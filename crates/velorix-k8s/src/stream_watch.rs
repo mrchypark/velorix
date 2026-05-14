@@ -13,6 +13,7 @@ use velorix_storage::{
         ObjectStoreCapabilityProfile,
     },
     checkpoint_index::manifest_body_digest,
+    log::IngestAdmissionCoordinator,
     relation_catalog_registry::{RelationCatalogRegistry, RelationCatalogRegistryError},
     state::{CheckpointPublishError, CheckpointPublisher},
 };
@@ -45,6 +46,13 @@ pub struct RelationCatalogSnapshotProvider {
     capabilities: AuthoritativeObjectStoreCapabilitiesV1,
 }
 
+#[derive(Clone, Debug)]
+pub struct IngestAdmissionCoordinatorProvider {
+    authority: ObjectStoreAuthorityRef,
+    store: Arc<dyn object_store::ObjectStore>,
+    capabilities: AuthoritativeObjectStoreCapabilitiesV1,
+}
+
 impl RelationCatalogSnapshotProvider {
     pub fn for_production(validated_authority: ValidatedOperatorAuthority) -> Self {
         let (authority, store, capabilities) = validated_authority.into_parts();
@@ -57,6 +65,45 @@ impl RelationCatalogSnapshotProvider {
 
     pub fn capabilities(&self) -> &AuthoritativeObjectStoreCapabilitiesV1 {
         &self.capabilities
+    }
+}
+
+impl IngestAdmissionCoordinatorProvider {
+    pub fn for_production(validated_authority: ValidatedOperatorAuthority) -> Self {
+        let (authority, store, capabilities) = validated_authority.into_parts();
+        Self {
+            authority,
+            store,
+            capabilities,
+        }
+    }
+
+    pub fn authority(&self) -> &ObjectStoreAuthorityRef {
+        &self.authority
+    }
+
+    pub fn capabilities(&self) -> &AuthoritativeObjectStoreCapabilitiesV1 {
+        &self.capabilities
+    }
+
+    pub fn coordinator(&self) -> Result<IngestAdmissionCoordinator, StreamWatchError> {
+        IngestAdmissionCoordinator::new_checked(
+            Arc::clone(&self.store),
+            self.profile_for(AuthoritativeNamespace::Ingest)?,
+            self.profile_for(AuthoritativeNamespace::IngestAdmission)?,
+        )
+        .map_err(|error| StreamWatchError::snapshot(error.to_string()))
+    }
+
+    fn profile_for(
+        &self,
+        namespace: AuthoritativeNamespace,
+    ) -> Result<&ObjectStoreCapabilityProfile, StreamWatchError> {
+        self.capabilities.profiles.get(&namespace).ok_or_else(|| {
+            StreamWatchError::snapshot(format!(
+                "validated authority missing `{namespace}` capability evidence"
+            ))
+        })
     }
 }
 

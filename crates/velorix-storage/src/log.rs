@@ -409,6 +409,20 @@ impl IngestAdmissionCoordinator {
         }
     }
 
+    /// Constructs an ingest admission coordinator after validating the object
+    /// store profiles required for both committed ingest objects and durable
+    /// admission records.
+    pub fn new_checked(
+        store: Arc<dyn ObjectStore>,
+        ingest_profile: &ObjectStoreCapabilityProfile,
+        ingest_admission_profile: &ObjectStoreCapabilityProfile,
+    ) -> Result<Self, ObjectStoreCapabilityError> {
+        let log = IngestLog::new_checked(store, ingest_profile)?;
+        ingest_admission_profile.validate_for_velorix_durability()?;
+
+        Ok(Self::new(log))
+    }
+
     /// Catalog-aware process-local coordinated admission with durable
     /// serialized admission evidence.
     ///

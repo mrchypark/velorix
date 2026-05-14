@@ -13,7 +13,10 @@ use velorix_k8s::{
     controller::{reconcile_stream, ControllerAction},
     crd::{ObjectStoreAuthorityRef, RelationVersionRef, VelorixStream, VelorixStreamSpec},
     startup::{validate_operator_authority, OperatorStartupError},
-    stream_watch::{AuthoritySnapshotProvider, RelationCatalogSnapshotProvider},
+    stream_watch::{
+        AuthoritySnapshotProvider, IngestAdmissionCoordinatorProvider,
+        RelationCatalogSnapshotProvider,
+    },
 };
 use velorix_storage::{
     capability::{
@@ -129,6 +132,32 @@ async fn production_snapshot_provider_reads_from_validated_store_only() {
         status.readiness.unwrap().reason,
         "MissingRelationCatalogRecord"
     );
+}
+
+#[tokio::test]
+async fn production_ingest_admission_provider_constructs_from_validated_authority() {
+    let (_temp_dir, store) = temp_store();
+    let validated = validate_operator_authority(
+        authority(),
+        Arc::clone(&store),
+        "local-k8s-authority",
+        "v1/operator-startup-probes",
+    )
+    .await
+    .unwrap();
+    let provider = IngestAdmissionCoordinatorProvider::for_production(validated);
+
+    let coordinator = provider.coordinator().unwrap();
+
+    assert_eq!(
+        provider.capabilities().profiles[&AuthoritativeNamespace::Ingest].backend_name,
+        "local-k8s-authority"
+    );
+    assert_eq!(
+        provider.capabilities().profiles[&AuthoritativeNamespace::IngestAdmission].backend_name,
+        "local-k8s-authority"
+    );
+    assert_eq!(coordinator.list_committed().await.unwrap(), Vec::new());
 }
 
 fn temp_store() -> (TempDir, Arc<dyn ObjectStore>) {

@@ -18,7 +18,7 @@ use velorix_storage::{
         ObjectStoreCapabilityProbeError, ObjectStoreCapabilityProfile,
         RequiredObjectStoreCapability,
     },
-    log::{IngestBatch, IngestLog, IngestLogError},
+    log::{IngestAdmissionCoordinator, IngestBatch, IngestLog, IngestLogError},
     manifest::{CheckpointManifest, InputRange, StateObjectRef},
     state::{CheckpointPublishError, CheckpointPublisher, StateObjectWrite},
     state_store::RawObjectStateStore,
@@ -435,6 +435,47 @@ fn capability_gate_rejects_each_missing_capability_for_ingest_log() {
 
         assert_capability_error(err, &profile, required_capability);
     }
+}
+
+#[test]
+fn capability_gate_rejects_missing_ingest_capability_for_ingest_admission_coordinator() {
+    let (_temp_dir, store) = temp_store();
+    let ingest_profile = profile_missing(RequiredObjectStoreCapability::ConditionalCreate);
+    let ingest_admission_profile = ObjectStoreCapabilityProfile::local_development();
+
+    let Err(err) =
+        IngestAdmissionCoordinator::new_checked(store, &ingest_profile, &ingest_admission_profile)
+    else {
+        panic!("expected ingest capability validation to reject coordinator construction");
+    };
+
+    assert_capability_error(
+        err,
+        &ingest_profile,
+        RequiredObjectStoreCapability::ConditionalCreate,
+    );
+}
+
+#[test]
+fn capability_gate_rejects_missing_ingest_admission_capability_for_ingest_admission_coordinator() {
+    let (_temp_dir, store) = temp_store();
+    let ingest_profile = ObjectStoreCapabilityProfile::local_development();
+    let ingest_admission_profile =
+        profile_missing(RequiredObjectStoreCapability::ConditionalCreate);
+
+    let Err(err) =
+        IngestAdmissionCoordinator::new_checked(store, &ingest_profile, &ingest_admission_profile)
+    else {
+        panic!(
+            "expected ingest-admission capability validation to reject coordinator construction"
+        );
+    };
+
+    assert_capability_error(
+        err,
+        &ingest_admission_profile,
+        RequiredObjectStoreCapability::ConditionalCreate,
+    );
 }
 
 #[test]
