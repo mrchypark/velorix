@@ -1930,14 +1930,24 @@ async fn recover_local_runtime(
             )
         }
         (None, Some(checkpoint_version)) => {
-            let relation_catalog = RelationCatalogRegistry::new(Arc::clone(&store))
-                .read(&relation_id, &relation_version)
-                .await?;
-            Ok(RecoveredRuntime::recover_from_published_checkpoint_version_with_owner_and_relation_catalog(
+            let capabilities = recover_local_capabilities(store.as_ref()).await?;
+            let relation_catalog = RelationCatalogRegistry::new_checked(
+                Arc::clone(&store),
+                capabilities
+                    .validate_namespace(
+                        velorix_storage::capability::AuthoritativeNamespace::RelationCatalog,
+                    )
+                    .map_err(anyhow::Error::from)?,
+            )
+            .map_err(anyhow::Error::from)?
+            .read(&relation_id, &relation_version)
+            .await?;
+            Ok(RecoveredRuntime::recover_from_published_checkpoint_version_with_owner_and_relation_catalog_checked(
                 store,
                 checkpoint_version,
                 ORDERS_SUM_COUNT_OWNER,
                 relation_catalog,
+                &capabilities,
             )
             .await?)
         }
@@ -2741,6 +2751,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recover_local_runtime_raw_selected_checkpoint_checks_capabilities_before_recovery() {
+        let dir = tempdir().unwrap();
+        let prefix_file = dir.path().join("not-a-directory");
+        fs::write(&prefix_file, b"not a directory").unwrap();
+        let store = local_object_store(&prefix_file).unwrap();
+
+        let error = recover_local_runtime(
+            store,
+            "orders".to_string(),
+            "2026-05-05.v1".to_string(),
+            None,
+            Some(7),
+            true,
+        )
+        .await
+        .unwrap_err();
+
+        assert_recover_local_capability_probe_failed_before_recovery(error);
+    }
+
+    #[tokio::test]
     async fn recover_local_runtime_allows_raw_state_with_bootstrap_flag() {
         let dir = tempdir().unwrap();
         let store = local_object_store(dir.path()).unwrap();
@@ -2919,7 +2950,7 @@ mod tests {
         let message = format!("{error:#}");
         assert!(
             message.contains("capability probe write failed"),
-            "expected recover-local SlateDB path to fail in capability probe, got: {message}"
+            "expected recover-local checked path to fail in capability probe, got: {message}"
         );
         assert!(
             !message.contains("relation catalog"),
