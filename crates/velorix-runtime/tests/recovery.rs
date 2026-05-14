@@ -2,8 +2,8 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use arrow::{
     array::{
-        ArrayRef, BooleanArray, Date32Array, Int64Array, StringArray, StringDictionaryBuilder,
-        TimestampNanosecondArray,
+        ArrayRef, BooleanArray, Date32Array, Decimal128Array, Int64Array, StringArray,
+        StringDictionaryBuilder, TimestampNanosecondArray,
     },
     datatypes::{DataType, Field, Int32Type, Schema, TimeUnit},
     record_batch::RecordBatch,
@@ -190,6 +190,30 @@ fn ingest_boolean_key_record_batch(input: &DeltaBatch) -> RecordBatch {
             Arc::new(BooleanArray::from(keys)) as ArrayRef,
             Arc::new(Int64Array::from(values)) as ArrayRef,
             Arc::new(Int64Array::from(weights)) as ArrayRef,
+        ],
+    )
+    .unwrap()
+}
+
+fn ingest_decimal_key_record_batch(
+    account_ids: &[i128],
+    amounts: &[i64],
+    weights: &[i64],
+) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("account_id", DataType::Decimal128(38, 2), false),
+            Field::new("amount", DataType::Int64, false),
+            Field::new("weight", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(
+                Decimal128Array::from(account_ids.to_vec())
+                    .with_precision_and_scale(38, 2)
+                    .unwrap(),
+            ) as ArrayRef,
+            Arc::new(Int64Array::from(amounts.to_vec())) as ArrayRef,
+            Arc::new(Int64Array::from(weights.to_vec())) as ArrayRef,
         ],
     )
     .unwrap()
@@ -513,6 +537,71 @@ fn boolean_account_relation_catalog() -> VelorixRelationCatalogV1 {
         },
         feldera_relation: FelderaRelationBindingV1 {
             relation_id: "boolean_accounts".to_string(),
+            schema_fingerprint,
+        },
+        incremental_adapter: IncrementalAdapterBindingV1 {
+            adapter_id: CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID.to_string(),
+        },
+    }
+}
+
+fn decimal_account_relation_catalog() -> VelorixRelationCatalogV1 {
+    let relation_schema = VelorixRelationSchemaV1 {
+        relation_id: "decimal_accounts".to_string(),
+        relation_name: "decimal_accounts".to_string(),
+        relation_version: "2026-05-14.v1".to_string(),
+        columns: vec![
+            RelationColumnV1 {
+                column_id: "account_id".to_string(),
+                name: "account_id".to_string(),
+                logical_type: VelorixLogicalTypeV1::Decimal {
+                    precision: 38,
+                    scale: 2,
+                },
+                physical_arrow_type: ArrowPhysicalTypeV1::Decimal128 {
+                    precision: 38,
+                    scale: 2,
+                },
+                nullable: false,
+                ordinal: 0,
+                semantic_role: RelationSemanticRoleV1::PrimaryKey,
+            },
+            RelationColumnV1 {
+                column_id: "amount".to_string(),
+                name: "amount".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 1,
+                semantic_role: RelationSemanticRoleV1::Value,
+            },
+            RelationColumnV1 {
+                column_id: "weight".to_string(),
+                name: "weight".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 2,
+                semantic_role: RelationSemanticRoleV1::Weight,
+            },
+        ],
+        primary_key_column_ids: vec!["account_id".to_string()],
+        weight_column_id: "weight".to_string(),
+        allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+        event_time_column_id: None,
+    };
+    let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
+
+    VelorixRelationCatalogV1 {
+        schema_version: RELATION_SCHEMA_VERSION_V1,
+        relation_schema,
+        schema_fingerprint: schema_fingerprint.clone(),
+        datafusion_registration: DataFusionRegistrationV1 {
+            name: "decimal_accounts".to_string(),
+            mode: DataFusionRegistrationModeV1::Table,
+        },
+        feldera_relation: FelderaRelationBindingV1 {
+            relation_id: "decimal_accounts".to_string(),
             schema_fingerprint,
         },
         incremental_adapter: IncrementalAdapterBindingV1 {
@@ -978,6 +1067,79 @@ async fn catalog_backed_recovery_replays_boolean_primary_key_relation() {
             ),
             DeltaRecord::new(
                 DeltaKey::from_json(json!(true)),
+                DeltaValue::from_json(json!({"count": 1, "sum": 4})),
+                1,
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn catalog_backed_recovery_replays_decimal128_primary_key_relation() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = decimal_account_relation_catalog();
+    RelationCatalogRegistry::new(Arc::clone(&store))
+        .create(&catalog)
+        .await
+        .unwrap();
+    let input = input_batch([
+        DeltaRecord::new(
+            DeltaKey::from_json(json!("1234567890123456789012345678901234.56")),
+            DeltaValue::from_json(json!(4)),
+            1,
+        ),
+        DeltaRecord::new(
+            DeltaKey::from_json(json!("-1.00")),
+            DeltaValue::from_json(json!(7)),
+            1,
+        ),
+    ]);
+    let ingest_coordinator = local_ingest_coordinator(Arc::clone(&store));
+    append_ingest_envelope(
+        &ingest_coordinator,
+        ingest_envelope_bytes_with_batches(
+            IngestEnvelopeEncodeRequest {
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                schema_fingerprint: catalog.schema_fingerprint.as_str().to_string(),
+                stream_id: "decimal-accounts".to_string(),
+                partition_id: 0,
+                start_offset_inclusive: 0,
+                end_offset_exclusive: input.records().len() as u64,
+            },
+            &[ingest_decimal_key_record_batch(
+                &[
+                    123_456_789_012_345_678_901_234_567_890_123_456_i128,
+                    -100_i128,
+                ],
+                &[4, 7],
+                &[1, 1],
+            )],
+        ),
+    )
+    .await;
+
+    let recovered = RecoveredRuntime::recover_with_owner_and_relation_catalog_record(
+        Arc::clone(&store),
+        ORDERS_SUM_COUNT_OWNER,
+        catalog.relation_schema.relation_id.as_str(),
+        catalog.relation_schema.relation_version.as_str(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(recovered.replayed_batch_count(), 1);
+    assert_eq!(recovered.logical_epoch(), 1);
+    assert_eq!(
+        recovered.materialized_state().net_rows().unwrap(),
+        vec![
+            DeltaRecord::new(
+                DeltaKey::from_json(json!("-1.00")),
+                DeltaValue::from_json(json!({"count": 1, "sum": 7})),
+                1,
+            ),
+            DeltaRecord::new(
+                DeltaKey::from_json(json!("1234567890123456789012345678901234.56")),
                 DeltaValue::from_json(json!({"count": 1, "sum": 4})),
                 1,
             ),

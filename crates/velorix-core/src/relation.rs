@@ -3,8 +3,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, BooleanArray, Date32Array, DictionaryArray, Float64Array, Int64Array, StringArray,
-    TimestampNanosecondArray,
+    Array, BooleanArray, Date32Array, Decimal128Array, DictionaryArray, Float64Array, Int64Array,
+    StringArray, TimestampNanosecondArray,
 };
 use arrow::datatypes::{
     DataType, Field, Int16Type, Int32Type, Int64Type, Int8Type, Schema, TimeUnit,
@@ -737,6 +737,7 @@ enum IncrementalKeyColumn<'a> {
     JsonUtf8(&'a StringArray),
     Int64(&'a Int64Array),
     Float64(&'a Float64Array),
+    Decimal128(&'a Decimal128Array, u8, u8),
     Date32(&'a Date32Array),
     TimestampNanosecond(&'a TimestampNanosecondArray),
     DictionaryUtf8Int8(&'a DictionaryArray<Int8Type>, &'a StringArray),
@@ -748,6 +749,7 @@ enum IncrementalKeyColumn<'a> {
 enum IncrementalValueColumn<'a> {
     Int64(&'a Int64Array),
     Float64(&'a Float64Array),
+    Decimal128(&'a Decimal128Array, u8, u8),
 }
 
 impl IncrementalKeyColumn<'_> {
@@ -758,6 +760,7 @@ impl IncrementalKeyColumn<'_> {
             Self::JsonUtf8(column) => column.is_null(row),
             Self::Int64(column) => column.is_null(row),
             Self::Float64(column) => column.is_null(row),
+            Self::Decimal128(column, _, _) => column.is_null(row),
             Self::Date32(column) => column.is_null(row),
             Self::TimestampNanosecond(column) => column.is_null(row),
             Self::DictionaryUtf8Int8(column, values) => {
@@ -795,6 +798,9 @@ impl IncrementalKeyColumn<'_> {
 
                 Ok(DeltaKey::from_json(json!(value)))
             }
+            Self::Decimal128(column, precision, scale) => Ok(DeltaKey::from_json(json!(
+                decimal128_string(column.value(row), *precision, *scale)?
+            ))),
             Self::Date32(column) => Ok(DeltaKey::from_json(json!(column.value(row)))),
             Self::TimestampNanosecond(column) => Ok(DeltaKey::from_json(json!(column.value(row)))),
             Self::DictionaryUtf8Int8(column, values) => Ok(DeltaKey::from_json(json!(
@@ -818,6 +824,7 @@ impl IncrementalValueColumn<'_> {
         match self {
             Self::Int64(column) => column.is_null(row),
             Self::Float64(column) => column.is_null(row),
+            Self::Decimal128(column, _, _) => column.is_null(row),
         }
     }
 
@@ -834,6 +841,9 @@ impl IncrementalValueColumn<'_> {
 
                 Ok(DeltaValue::from_json(json!(value)))
             }
+            Self::Decimal128(column, precision, scale) => Ok(DeltaValue::from_json(json!(
+                decimal128_string(column.value(row), *precision, *scale)?
+            ))),
         }
     }
 }
@@ -858,6 +868,10 @@ fn incremental_key_column<'a>(
         ArrowPhysicalTypeV1::Float64 => {
             float64_column(batch, column.name.as_str()).map(IncrementalKeyColumn::Float64)
         }
+        ArrowPhysicalTypeV1::Decimal128 { precision, scale } => {
+            decimal128_column(batch, column.name.as_str())
+                .map(|array| IncrementalKeyColumn::Decimal128(array, *precision, *scale))
+        }
         ArrowPhysicalTypeV1::Date32 => {
             date32_column(batch, column.name.as_str()).map(IncrementalKeyColumn::Date32)
         }
@@ -868,12 +882,6 @@ fn incremental_key_column<'a>(
         ArrowPhysicalTypeV1::DictionaryUtf8 { key_type, .. } => {
             dictionary_utf8_column(batch, column.name.as_str(), key_type)
         }
-        _ => Err(IncrementalInputAdapterError::MalformedArrowInput {
-            reason: format!(
-                "prototype adapter key column `{}` must be Boolean, Utf8, JsonUtf8, Int64, Float64, Date32, TimestampNanosecond, or DictionaryUtf8",
-                column.name
-            ),
-        }),
     }
 }
 
@@ -888,9 +896,13 @@ fn incremental_value_column<'a>(
         ArrowPhysicalTypeV1::Float64 => {
             float64_column(batch, column.name.as_str()).map(IncrementalValueColumn::Float64)
         }
+        ArrowPhysicalTypeV1::Decimal128 { precision, scale } => {
+            decimal128_column(batch, column.name.as_str())
+                .map(|array| IncrementalValueColumn::Decimal128(array, *precision, *scale))
+        }
         _ => Err(IncrementalInputAdapterError::MalformedArrowInput {
             reason: format!(
-                "prototype adapter value column `{}` must be Int64 or Float64",
+                "prototype adapter value column `{}` must be Int64, Float64, or Decimal128",
                 column.name
             ),
         }),
@@ -1006,6 +1018,61 @@ fn float64_column<'a>(
         })
 }
 
+fn decimal128_column<'a>(
+    batch: &'a RecordBatch,
+    name: &str,
+) -> Result<&'a Decimal128Array, IncrementalInputAdapterError> {
+    batch
+        .column_by_name(name)
+        .ok_or_else(|| IncrementalInputAdapterError::MalformedArrowInput {
+            reason: format!("missing `{name}` column"),
+        })?
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .ok_or_else(|| IncrementalInputAdapterError::MalformedArrowInput {
+            reason: format!("`{name}` column must be Decimal128"),
+        })
+}
+
+fn decimal128_string(
+    value: i128,
+    precision: u8,
+    scale: u8,
+) -> Result<String, IncrementalInputAdapterError> {
+    let magnitude = value.unsigned_abs();
+    if decimal128_digit_count(magnitude) > precision {
+        return Err(IncrementalInputAdapterError::MalformedArrowInput {
+            reason: "Decimal128 column value exceeds declared precision".to_string(),
+        });
+    }
+
+    let mut digits = magnitude.to_string();
+    let scale = usize::from(scale);
+    let mut decimal = if scale == 0 {
+        digits
+    } else if digits.len() <= scale {
+        let leading_zeroes = "0".repeat(scale - digits.len());
+        format!("0.{leading_zeroes}{digits}")
+    } else {
+        let fractional = digits.split_off(digits.len() - scale);
+        format!("{digits}.{fractional}")
+    };
+
+    if value.is_negative() {
+        decimal.insert(0, '-');
+    }
+
+    Ok(decimal)
+}
+
+fn decimal128_digit_count(value: u128) -> u8 {
+    if value == 0 {
+        1
+    } else {
+        value.ilog10() as u8 + 1
+    }
+}
+
 fn date32_column<'a>(
     batch: &'a RecordBatch,
     name: &str,
@@ -1093,7 +1160,7 @@ fn require_non_empty(field: &'static str, value: &str) -> Result<(), RelationSch
 }
 
 fn validate_decimal(precision: u8, scale: u8) -> Result<(), RelationSchemaError> {
-    if precision == 0 || scale > precision {
+    if precision == 0 || precision > 38 || scale > precision {
         return Err(RelationSchemaError::InvalidRelationSchema { field: "decimal" });
     }
 
