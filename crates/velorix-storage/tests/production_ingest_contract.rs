@@ -171,6 +171,18 @@ fn production_like_authority_harnesses_use_checked_object_store_constructors() {
                 source.strip_prefix(&workspace).unwrap_or(&source).display()
             );
         }
+        if source.ends_with("local_incremental.rs") || source.ends_with("s3_incremental.rs") {
+            assert!(
+                contents.contains("SlateDbStateStore::open_authoritative("),
+                "{} should use startup capability evidence before SlateDB benchmark state opens",
+                source.strip_prefix(&workspace).unwrap_or(&source).display()
+            );
+            assert!(
+                !contents.contains("SlateDbStateStore::open("),
+                "{} should not open SlateDB benchmark state without startup capability evidence",
+                source.strip_prefix(&workspace).unwrap_or(&source).display()
+            );
+        }
     }
 }
 

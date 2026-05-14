@@ -89,13 +89,13 @@ async fn s3_compatible_production_table_query_scans_parquet_through_registry() -
         .await?;
 
     let validation = async {
-        create_orders_relation_catalog(&authority_store).await?;
         let startup_capabilities = probe_authoritative_object_store_capabilities(
             authority_store.as_ref(),
             "s3-compatible",
             format!("{}/table-query-capability-probes", config.run_prefix),
         )
         .await?;
+        create_orders_relation_catalog(&authority_store, &startup_capabilities).await?;
         create_production_query_policy(&authority_store, &startup_capabilities).await?;
         let mut registry = StorageRegistry::new();
         registry.register_production_with_capabilities(
@@ -289,10 +289,14 @@ async fn cleanup_prefix(store: &dyn DataFusionObjectStore, prefix: &str) -> Test
 
 async fn create_orders_relation_catalog(
     store: &Arc<dyn AuthorityObjectStore>,
+    capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
 ) -> Result<(), TestError> {
-    RelationCatalogRegistry::new(Arc::clone(store))
-        .create(&orders_relation_catalog())
-        .await?;
+    RelationCatalogRegistry::new_checked(
+        Arc::clone(store),
+        capability_profile(capabilities, AuthoritativeNamespace::RelationCatalog)?,
+    )?
+    .create(&orders_relation_catalog())
+    .await?;
     Ok(())
 }
 
