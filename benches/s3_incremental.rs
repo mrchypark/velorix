@@ -306,8 +306,13 @@ mod live_s3 {
         .await?;
         let slatedb_state_reopen =
             slatedb_state_reopen(Arc::clone(&store), Arc::clone(&metered_store)).await?;
-        let datafusion_scan =
-            datafusion_table_scan(config, Arc::clone(&store), prefixed_scan_store(config)?).await?;
+        let datafusion_scan = datafusion_table_scan(
+            config,
+            Arc::clone(&store),
+            prefixed_scan_store(config)?,
+            &capabilities,
+        )
+        .await?;
 
         let records_per_second = total_records as f64 / ingest_elapsed.as_secs_f64();
         let mut object_requests = metered_store.snapshot();
@@ -506,6 +511,7 @@ mod live_s3 {
         config: &LiveConfig,
         authority_store: Arc<dyn ObjectStore>,
         store: Arc<dyn DataFusionObjectStore>,
+        capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
     ) -> BenchResult<MeasuredWorkload> {
         let input = ingest_record_batch(&DeltaBatch::from_records([
             DeltaRecord::new(
@@ -540,16 +546,12 @@ mod live_s3 {
 
         create_production_query_policy(&authority_store).await?;
         let mut registry = StorageRegistry::new();
-        registry
-            .register_production_with_probe(
-                "primary",
-                &format!("s3://{}/", config.bucket),
-                Arc::clone(&store),
-                Arc::clone(&authority_store),
-                "s3-compatible",
-                format!("{}/datafusion-capability-probes", config.run_prefix),
-            )
-            .await?;
+        registry.register_production_with_capabilities(
+            "primary",
+            &format!("s3://{}/", config.bucket),
+            Arc::clone(&store),
+            capabilities.clone(),
+        )?;
         PersistedTableStore::new(Arc::clone(&authority_store))
             .create_production(
                 Arc::clone(&authority_store),

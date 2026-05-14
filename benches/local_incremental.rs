@@ -224,8 +224,12 @@ async fn run() -> BenchResult<()> {
         gc_execution_evidence(&publisher, &metered_store, &gc_dry_run_planning).await?;
     let slatedb_state_reopen =
         slatedb_state_reopen(Arc::clone(&store), Arc::clone(&metered_store)).await?;
-    let datafusion_scan =
-        datafusion_table_scan(Arc::clone(&store), Arc::clone(&metered_store)).await?;
+    let datafusion_scan = datafusion_table_scan(
+        Arc::clone(&store),
+        Arc::clone(&metered_store),
+        &capabilities,
+    )
+    .await?;
 
     let records_per_second = total_records as f64 / ingest_elapsed.as_secs_f64();
     let mut object_requests = metered_store.snapshot();
@@ -454,6 +458,7 @@ async fn gc_execution_evidence(
 async fn datafusion_table_scan(
     authority_store: Arc<dyn ObjectStore>,
     metered_store: Arc<MeteredObjectStore>,
+    capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
 ) -> BenchResult<MeasuredWorkload> {
     let inner: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
     let input = parquet_input_batch()?;
@@ -473,16 +478,12 @@ async fn datafusion_table_scan(
     let requests_before = metered_store.snapshot();
     create_production_query_policy(&authority_store).await?;
     let mut registry = StorageRegistry::new();
-    registry
-        .register_production_with_probe(
-            "primary",
-            "memory://velorix/",
-            Arc::clone(&inner),
-            Arc::clone(&authority_store),
-            "local-benchmark",
-            "datafusion-capability-probes",
-        )
-        .await?;
+    registry.register_production_with_capabilities(
+        "primary",
+        "memory://velorix/",
+        Arc::clone(&inner),
+        capabilities.clone(),
+    )?;
     PersistedTableStore::new(Arc::clone(&authority_store))
         .create_production(
             Arc::clone(&authority_store),
