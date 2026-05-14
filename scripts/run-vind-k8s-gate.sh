@@ -216,7 +216,8 @@ evidence = {
     "readiness_evidence_kind": [
         "kubernetes_lease_client",
         "kubernetes_worker_shard_live_pod_executor",
-        "kubernetes_ingest_admission_startup_preflight"
+        "kubernetes_ingest_admission_startup_preflight",
+        "kubernetes_ingest_admission_run_local_expiry_restart"
     ],
     "cluster": cluster,
     "context": context,
@@ -239,7 +240,7 @@ evidence = {
     ],
     "scope": "local vind Docker Kubernetes evidence; not 1.0 completion evidence; not multi-pod production ingest-admission readiness",
     "limitations": [
-        "ingest-admission startup preflight uses a run-local object-store authority",
+        "ingest-admission startup preflight and run-local expiry/restart use a run-local object-store authority",
         "does not exercise distributed or multi-pod admission races",
     ],
 }
