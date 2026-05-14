@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use arrow::{
     array::{ArrayRef, Int64Array, StringArray},
@@ -19,7 +19,10 @@ use velorix_runtime::recovery::{
     ORDERS_SUM_COUNT_RELATION_ID, ORDERS_SUM_COUNT_RELATION_VERSION,
 };
 use velorix_storage::{
-    capability::ObjectStoreCapabilityProfile,
+    capability::{
+        AuthoritativeNamespace, AuthoritativeObjectStoreCapabilitiesV1,
+        ObjectStoreCapabilityProfile,
+    },
     ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
     log::{IngestAdmissionCoordinator, IngestBatch, IngestLog},
     manifest::{CheckpointManifest, InputRange, OutputObjectRef, StateObjectRef, StateRefType},
@@ -41,6 +44,16 @@ fn local_object_store_profile() -> ObjectStoreCapabilityProfile {
     ObjectStoreCapabilityProfile::local_development()
 }
 
+fn local_authoritative_capabilities() -> AuthoritativeObjectStoreCapabilitiesV1 {
+    let profile = local_object_store_profile();
+    AuthoritativeObjectStoreCapabilitiesV1::new(
+        AuthoritativeNamespace::all()
+            .into_iter()
+            .map(|namespace| (namespace, profile.clone()))
+            .collect::<BTreeMap<_, _>>(),
+    )
+}
+
 fn local_ingest_coordinator(store: Arc<dyn ObjectStore>) -> IngestAdmissionCoordinator {
     IngestAdmissionCoordinator::new(
         IngestLog::new_checked(store, &local_object_store_profile()).unwrap(),
@@ -50,11 +63,13 @@ fn local_ingest_coordinator(store: Arc<dyn ObjectStore>) -> IngestAdmissionCoord
 async fn recover_with_catalog_record(
     store: Arc<dyn ObjectStore>,
 ) -> Result<RecoveredRuntime, RecoveryError> {
-    RecoveredRuntime::recover_with_owner_and_relation_catalog_record(
+    let capabilities = local_authoritative_capabilities();
+    RecoveredRuntime::recover_with_owner_and_relation_catalog_record_checked(
         store,
         RECOVERY_OWNER,
         ORDERS_SUM_COUNT_RELATION_ID,
         ORDERS_SUM_COUNT_RELATION_VERSION,
+        &capabilities,
     )
     .await
 }
@@ -410,14 +425,17 @@ async fn slatedb_local_recovery_recovers_reopened_checkpoint_state_and_replays_o
     drop(ingest_coordinator);
     drop(publisher);
 
-    let recovered = RecoveredRuntime::recover_with_slatedb_state_store_and_relation_catalog(
-        Arc::clone(&store),
-        "v1/slatedb/state",
-        RECOVERY_OWNER,
-        orders_sum_count_relation_catalog().unwrap(),
-    )
-    .await
-    .unwrap();
+    let capabilities = local_authoritative_capabilities();
+    let recovered =
+        RecoveredRuntime::recover_with_slatedb_state_store_and_relation_catalog_checked(
+            Arc::clone(&store),
+            "v1/slatedb/state",
+            RECOVERY_OWNER,
+            orders_sum_count_relation_catalog().unwrap(),
+            &capabilities,
+        )
+        .await
+        .unwrap();
 
     let mut expected_view = KeyedSumCountAggregate::new();
     expected_view.apply(&checkpointed_input).unwrap();
@@ -496,13 +514,15 @@ async fn slatedb_local_recovery_can_use_selected_published_checkpoint() {
         RecoveryError::Checkpoint(CheckpointPublishError::MissingStateObject(_))
     ));
 
+    let capabilities = local_authoritative_capabilities();
     let recovered =
-        RecoveredRuntime::recover_from_published_checkpoint_version_with_slatedb_state_store_and_relation_catalog(
+        RecoveredRuntime::recover_from_published_checkpoint_version_with_slatedb_state_store_and_relation_catalog_checked(
             Arc::clone(&store),
             "v1/slatedb/state",
             0,
             RECOVERY_OWNER,
             orders_sum_count_relation_catalog().unwrap(),
+            &capabilities,
         )
         .await
         .unwrap();
@@ -802,12 +822,14 @@ async fn local_recovery_can_use_selected_checkpoint_when_future_manifest_is_corr
         .await
         .is_err());
 
+    let capabilities = local_authoritative_capabilities();
     let recovered =
-        RecoveredRuntime::recover_from_published_checkpoint_version_with_owner_and_relation_catalog(
+        RecoveredRuntime::recover_from_published_checkpoint_version_with_owner_and_relation_catalog_checked(
             Arc::clone(&store),
             0,
             RECOVERY_OWNER,
             orders_sum_count_relation_catalog().unwrap(),
+            &capabilities,
         )
         .await
         .unwrap();
