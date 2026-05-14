@@ -23,7 +23,8 @@ use velorix_core::{
         ArrowPhysicalTypeV1, DataFusionRegistrationModeV1, DataFusionRegistrationV1,
         FelderaRelationBindingV1, IncrementalAdapterBindingV1, RelationColumnV1,
         RelationOperationV1, RelationSemanticRoleV1, SchemaFingerprintV1, VelorixLogicalTypeV1,
-        VelorixRelationCatalogV1, VelorixRelationSchemaV1, RELATION_SCHEMA_VERSION_V1,
+        VelorixRelationCatalogV1, VelorixRelationSchemaV1, ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID,
+        RELATION_SCHEMA_VERSION_V1,
     },
 };
 use velorix_runtime::{
@@ -958,7 +959,7 @@ fn orders_relation_catalog() -> VelorixRelationCatalogV1 {
             schema_fingerprint,
         },
         incremental_adapter: IncrementalAdapterBindingV1 {
-            adapter_id: "incremental-adapter-orders-v1".to_string(),
+            adapter_id: ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID.to_string(),
         },
     }
 }

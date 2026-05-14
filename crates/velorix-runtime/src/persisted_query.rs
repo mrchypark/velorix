@@ -23,8 +23,8 @@ use velorix_storage::{
 };
 
 use crate::query::{
-    query_production_recovered_materialized_view_with_policy_and_limiter,
-    query_recovered_materialized_view_with_policy_and_limiter, QueryExecutionLimiter,
+    query_bootstrap_recovered_materialized_view_with_policy_and_limiter,
+    query_production_recovered_materialized_view_with_policy_and_limiter, QueryExecutionLimiter,
     RuntimeQueryError,
 };
 use crate::recovery::RecoveryError;
@@ -210,14 +210,24 @@ async fn validate_production_relation_query(
     Ok(())
 }
 
-pub async fn query_persisted_recovered_materialized_view(
+/// Bootstrap/dev persisted recovered-query helper backed by raw object-state
+/// recovery and unchecked persisted-query catalog reads.
+///
+/// Production callers must use
+/// [`query_production_persisted_recovered_materialized_view`].
+pub async fn query_bootstrap_persisted_recovered_materialized_view(
     store: Arc<dyn ObjectStore>,
     query_id: &str,
 ) -> Result<Vec<RecordBatch>, PersistedQueryError> {
-    query_persisted_recovered_materialized_view_with_limiter(store, query_id, None).await
+    query_bootstrap_persisted_recovered_materialized_view_with_limiter(store, query_id, None).await
 }
 
-pub async fn query_persisted_recovered_materialized_view_with_limiter(
+/// Bootstrap/dev persisted recovered-query helper backed by raw object-state
+/// recovery and unchecked persisted-query catalog reads.
+///
+/// Production callers must use
+/// [`query_production_persisted_recovered_materialized_view_with_limiter`].
+pub async fn query_bootstrap_persisted_recovered_materialized_view_with_limiter(
     store: Arc<dyn ObjectStore>,
     query_id: &str,
     limiter: Option<QueryExecutionLimiter>,
@@ -225,13 +235,15 @@ pub async fn query_persisted_recovered_materialized_view_with_limiter(
     let catalog = PersistedQueryStore::new(Arc::clone(&store));
     let spec = catalog.get(query_id).await?;
 
-    Ok(query_recovered_materialized_view_with_policy_and_limiter(
-        store,
-        &spec.sql,
-        spec.policy,
-        limiter,
+    Ok(
+        query_bootstrap_recovered_materialized_view_with_policy_and_limiter(
+            store,
+            &spec.sql,
+            spec.policy,
+            limiter,
+        )
+        .await?,
     )
-    .await?)
 }
 
 pub async fn query_production_persisted_recovered_materialized_view(

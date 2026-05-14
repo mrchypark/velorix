@@ -28,10 +28,10 @@ use velorix_core::{
 };
 use velorix_runtime::{
     query::{
+        query_bootstrap_recovered_materialized_view,
+        query_bootstrap_recovered_materialized_view_with_policy,
         query_object_backed_input_with_policy, query_object_backed_input_with_policy_and_metrics,
-        query_production_recovered_materialized_view_with_policy_and_limiter,
-        query_recovered_materialized_view, query_recovered_materialized_view_with_policy,
-        RuntimeQueryError,
+        query_production_recovered_materialized_view_with_policy_and_limiter, RuntimeQueryError,
     },
     recovery::{
         orders_sum_count_relation_catalog, RecoveredRuntime, RecoveryError,
@@ -307,7 +307,8 @@ async fn write_checkpoint_state(
 }
 
 #[tokio::test]
-async fn query_recovered_materialized_view_reads_checkpointed_state_and_replayed_ingest() {
+async fn query_bootstrap_recovered_materialized_view_reads_checkpointed_state_and_replayed_ingest()
+{
     let (_temp_dir, store) = temp_store();
     let ingest_coordinator = IngestAdmissionCoordinator::new(IngestLog::new(Arc::clone(&store)));
     let publisher = CheckpointPublisher::new(Arc::clone(&store));
@@ -351,7 +352,7 @@ async fn query_recovered_materialized_view_reads_checkpointed_state_and_replayed
         .await
         .unwrap();
 
-    let output = query_recovered_materialized_view(
+    let output = query_bootstrap_recovered_materialized_view(
         Arc::clone(&store),
         "select key_json, value_json, weight from input order by key_json",
     )
@@ -369,10 +370,10 @@ async fn query_recovered_materialized_view_reads_checkpointed_state_and_replayed
 }
 
 #[tokio::test]
-async fn query_recovered_materialized_view_requires_relation_catalog_record() {
+async fn query_bootstrap_recovered_materialized_view_requires_relation_catalog_record() {
     let (_temp_dir, store) = temp_store();
 
-    let error = query_recovered_materialized_view(
+    let error = query_bootstrap_recovered_materialized_view(
         Arc::clone(&store),
         "select key_json, value_json, weight from input",
     )
@@ -388,7 +389,8 @@ async fn query_recovered_materialized_view_requires_relation_catalog_record() {
 }
 
 #[tokio::test]
-async fn query_recovered_materialized_view_with_policy_applies_row_limit_to_recovered_state() {
+async fn query_bootstrap_recovered_materialized_view_with_policy_applies_row_limit_to_recovered_state(
+) {
     let (_temp_dir, store) = temp_store();
     let ingest_coordinator = IngestAdmissionCoordinator::new(IngestLog::new(Arc::clone(&store)));
     let publisher = CheckpointPublisher::new(Arc::clone(&store));
@@ -434,7 +436,7 @@ async fn query_recovered_materialized_view_with_policy_applies_row_limit_to_reco
         .await
         .unwrap();
 
-    let error = query_recovered_materialized_view_with_policy(
+    let error = query_bootstrap_recovered_materialized_view_with_policy(
         Arc::clone(&store),
         "select key_json, value_json, weight from input order by key_json",
         QueryPolicy {
@@ -455,7 +457,8 @@ async fn query_recovered_materialized_view_with_policy_applies_row_limit_to_reco
 }
 
 #[tokio::test]
-async fn query_recovered_materialized_view_with_policy_applies_byte_limit_under_row_limit() {
+async fn query_bootstrap_recovered_materialized_view_with_policy_applies_byte_limit_under_row_limit(
+) {
     let (_temp_dir, store) = temp_store();
     let ingest_coordinator = IngestAdmissionCoordinator::new(IngestLog::new(Arc::clone(&store)));
     let publisher = CheckpointPublisher::new(Arc::clone(&store));
@@ -487,7 +490,7 @@ async fn query_recovered_materialized_view_with_policy_applies_byte_limit_under_
         .await
         .unwrap();
 
-    let error = query_recovered_materialized_view_with_policy(
+    let error = query_bootstrap_recovered_materialized_view_with_policy(
         Arc::clone(&store),
         "select key_json, value_json, weight from input",
         QueryPolicy {
@@ -857,7 +860,7 @@ async fn arrow_ingest_datafusion_and_feldera_use_the_same_catalog_identity() {
 }
 
 #[tokio::test]
-async fn query_recovered_materialized_view_propagates_datafusion_errors() {
+async fn query_bootstrap_recovered_materialized_view_propagates_datafusion_errors() {
     let (_temp_dir, store) = temp_store();
     let ingest_coordinator = IngestAdmissionCoordinator::new(IngestLog::new(Arc::clone(&store)));
     let input = batch([input_delta("account-a", 4, 1)]);
@@ -873,10 +876,12 @@ async fn query_recovered_materialized_view_propagates_datafusion_errors() {
     )
     .await;
 
-    let error =
-        query_recovered_materialized_view(Arc::clone(&store), "select missing_column from input")
-            .await
-            .unwrap_err();
+    let error = query_bootstrap_recovered_materialized_view(
+        Arc::clone(&store),
+        "select missing_column from input",
+    )
+    .await
+    .unwrap_err();
 
     assert!(error.to_string().contains("missing_column"));
 }

@@ -27,9 +27,10 @@ use tokio::sync::{Barrier, Notify};
 use velorix_core::query::{QueryError, QueryPolicy, QueryPolicyError};
 use velorix_runtime::{
     query::{
+        query_bootstrap_recovered_materialized_view_with_policy,
         query_object_backed_input_with_policy, query_object_backed_input_with_policy_and_limiter,
         query_production_recovered_materialized_view_with_policy_and_limiter,
-        query_recovered_materialized_view_with_policy, QueryExecutionLimiter, RuntimeQueryError,
+        QueryExecutionLimiter, RuntimeQueryError,
     },
     recovery::{ORDERS_SUM_COUNT_RELATION_ID, ORDERS_SUM_COUNT_RELATION_VERSION},
 };
@@ -48,10 +49,11 @@ fn local_capabilities() -> AuthoritativeObjectStoreCapabilitiesV1 {
 }
 
 #[tokio::test]
-async fn query_recovered_materialized_view_requires_shared_limiter_when_concurrency_limit_is_set() {
+async fn query_bootstrap_recovered_materialized_view_requires_shared_limiter_when_concurrency_limit_is_set(
+) {
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
 
-    let error = query_recovered_materialized_view_with_policy(
+    let error = query_bootstrap_recovered_materialized_view_with_policy(
         Arc::clone(&store),
         "select key_json, value_json, weight from input",
         QueryPolicy {

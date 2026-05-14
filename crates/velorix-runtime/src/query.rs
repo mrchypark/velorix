@@ -45,22 +45,38 @@ pub enum RuntimeQueryError {
     Query(#[from] QueryError),
 }
 
-pub async fn query_recovered_materialized_view(
+/// Bootstrap/dev recovered-query helper backed by raw object-state recovery.
+///
+/// Production callers must use
+/// [`query_production_recovered_materialized_view_with_policy_and_limiter`],
+/// which requires shared startup object-store capability evidence and checked
+/// SlateDB/catalog recovery.
+pub async fn query_bootstrap_recovered_materialized_view(
     store: Arc<dyn ObjectStore>,
     sql: &str,
 ) -> Result<Vec<RecordBatch>, RuntimeQueryError> {
-    query_recovered_materialized_view_with_policy(store, sql, QueryPolicy::default()).await
+    query_bootstrap_recovered_materialized_view_with_policy(store, sql, QueryPolicy::default())
+        .await
 }
 
-pub async fn query_recovered_materialized_view_with_policy(
+/// Bootstrap/dev recovered-query helper backed by raw object-state recovery.
+///
+/// Production callers must use
+/// [`query_production_recovered_materialized_view_with_policy_and_limiter`].
+pub async fn query_bootstrap_recovered_materialized_view_with_policy(
     store: Arc<dyn ObjectStore>,
     sql: &str,
     policy: QueryPolicy,
 ) -> Result<Vec<RecordBatch>, RuntimeQueryError> {
-    query_recovered_materialized_view_with_policy_and_limiter(store, sql, policy, None).await
+    query_bootstrap_recovered_materialized_view_with_policy_and_limiter(store, sql, policy, None)
+        .await
 }
 
-pub async fn query_recovered_materialized_view_with_policy_and_limiter(
+/// Bootstrap/dev recovered-query helper backed by raw object-state recovery.
+///
+/// Production callers must use
+/// [`query_production_recovered_materialized_view_with_policy_and_limiter`].
+pub async fn query_bootstrap_recovered_materialized_view_with_policy_and_limiter(
     store: Arc<dyn ObjectStore>,
     sql: &str,
     policy: QueryPolicy,

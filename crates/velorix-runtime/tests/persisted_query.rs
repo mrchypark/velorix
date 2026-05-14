@@ -22,8 +22,8 @@ use velorix_core::{
     },
 };
 use velorix_runtime::persisted_query::{
-    query_persisted_recovered_materialized_view,
-    query_persisted_recovered_materialized_view_with_limiter,
+    query_bootstrap_persisted_recovered_materialized_view,
+    query_bootstrap_persisted_recovered_materialized_view_with_limiter,
     query_production_persisted_recovered_materialized_view,
     query_production_persisted_recovered_materialized_view_with_limiter, PersistedQueryError,
     PersistedQueryStore,
@@ -364,9 +364,10 @@ async fn persisted_recovered_query_execution_uses_stored_sql_and_policy() {
         .await
         .unwrap();
 
-    let output = query_persisted_recovered_materialized_view(Arc::clone(&store), "account-a-only")
-        .await
-        .unwrap();
+    let output =
+        query_bootstrap_persisted_recovered_materialized_view(Arc::clone(&store), "account-a-only")
+            .await
+            .unwrap();
 
     assert_eq!(output.len(), 1);
     assert_eq!(output[0].num_rows(), 1);
@@ -432,9 +433,10 @@ async fn persisted_recovered_query_execution_applies_stored_policy() {
         .await
         .unwrap();
 
-    let error = query_persisted_recovered_materialized_view(Arc::clone(&store), "too-many-rows")
-        .await
-        .unwrap_err();
+    let error =
+        query_bootstrap_persisted_recovered_materialized_view(Arc::clone(&store), "too-many-rows")
+            .await
+            .unwrap_err();
 
     assert!(matches!(
         error,
@@ -464,10 +466,12 @@ async fn persisted_recovered_query_requires_shared_limiter_when_stored_policy_se
         .await
         .unwrap();
 
-    let error =
-        query_persisted_recovered_materialized_view(Arc::clone(&store), "limited-recovered-query")
-            .await
-            .unwrap_err();
+    let error = query_bootstrap_persisted_recovered_materialized_view(
+        Arc::clone(&store),
+        "limited-recovered-query",
+    )
+    .await
+    .unwrap_err();
 
     assert!(matches!(
         error,
@@ -537,7 +541,7 @@ async fn persisted_recovered_query_accepts_matching_shared_limiter_when_policy_s
         .await
         .unwrap();
 
-    let output = query_persisted_recovered_materialized_view_with_limiter(
+    let output = query_bootstrap_persisted_recovered_materialized_view_with_limiter(
         Arc::clone(&store),
         "limited-recovered-query",
         QueryExecutionLimiter::from_policy(policy),
