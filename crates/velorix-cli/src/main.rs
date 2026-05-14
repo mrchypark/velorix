@@ -4744,8 +4744,8 @@ mod tests {
             },
             "relation_catalog_status": {
                 "status": "pass",
-                "evidence": "durable relation catalog record and registry",
-                "evidence_kind": ["relation_catalog_record", "relation_catalog_registry"]
+                "evidence": "durable relation catalog record, registry, closed adapter scope, and fail-closed unsupported adapters",
+                "evidence_kind": ["relation_catalog_record", "relation_catalog_registry", "relation_catalog_closed_adapter_scope", "relation_catalog_unsupported_adapter_fail_closed"]
             },
             "state_status": {
                 "status": "pass",

@@ -10,14 +10,13 @@ use velorix_core::{
         ENGINE_CHECKPOINT_PAYLOAD_SCHEMA_VERSION,
     },
     relation::{
-        arrow_record_batches_to_single_key_sum_count_delta_batch, ArrowPhysicalTypeV1,
-        DataFusionRegistrationModeV1, DataFusionRegistrationV1, FelderaRelationBindingV1,
-        IncrementalAdapterBindingV1, IncrementalInputAdapterError, RelationColumnV1,
-        RelationOperationV1, RelationSchemaError, RelationSemanticRoleV1, SchemaFingerprintV1,
-        VelorixLogicalTypeV1, VelorixRelationCatalogV1, VelorixRelationSchemaV1,
-        CATALOG_ROW_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID,
-        CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID,
-        ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID, RELATION_SCHEMA_VERSION_V1,
+        arrow_record_batches_to_single_key_sum_count_delta_batch,
+        supported_incremental_adapter_spec, ArrowPhysicalTypeV1, DataFusionRegistrationModeV1,
+        DataFusionRegistrationV1, FelderaRelationBindingV1, IncrementalAdapterBindingV1,
+        IncrementalInputAdapterError, RelationColumnV1, RelationOperationV1, RelationSchemaError,
+        RelationSemanticRoleV1, SchemaFingerprintV1, VelorixLogicalTypeV1,
+        VelorixRelationCatalogV1, VelorixRelationSchemaV1, ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID,
+        RELATION_SCHEMA_VERSION_V1,
     },
 };
 use velorix_storage::{
@@ -565,7 +564,7 @@ impl RecoveredRuntime {
         relation_catalog: VelorixRelationCatalogV1,
         replay_admission_evidence: ReplayAdmissionEvidence,
     ) -> Result<Self, RecoveryError> {
-        relation_catalog.validate()?;
+        validate_recovery_incremental_adapter_scope(&relation_catalog)?;
         let latest_manifest = publisher.latest_manifest().await?;
         Self::recover_from_manifest_and_relation_catalog(
             publisher,
@@ -625,6 +624,7 @@ impl RecoveredRuntime {
         relation_catalog: VelorixRelationCatalogV1,
         replay_admission_evidence: ReplayAdmissionEvidence,
     ) -> Result<Self, RecoveryError> {
+        validate_recovery_incremental_adapter_scope(&relation_catalog)?;
         let aggregate_value_mode = aggregate_value_mode_for_sum_count_catalog(&relation_catalog)?;
         let mut materialized =
             PrototypeIncrementalEngine::with_aggregate_value_mode(aggregate_value_mode);
@@ -849,15 +849,10 @@ fn prototype_delta_batch_from_arrow_envelope(
 fn aggregate_value_mode_for_sum_count_catalog(
     catalog: &VelorixRelationCatalogV1,
 ) -> Result<AggregateValueMode, RecoveryError> {
-    match catalog.incremental_adapter.adapter_id.as_str() {
-        CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID
-        | CATALOG_ROW_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID
-        | ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID => {}
-        _ => {
-            return Err(RecoveryError::UnsupportedIncrementalAdapter {
-                adapter_id: catalog.incremental_adapter.adapter_id.clone(),
-            });
-        }
+    if supported_incremental_adapter_spec(&catalog.incremental_adapter.adapter_id).is_none() {
+        return Err(RecoveryError::UnsupportedIncrementalAdapter {
+            adapter_id: catalog.incremental_adapter.adapter_id.clone(),
+        });
     }
 
     let mut value_columns = catalog
@@ -890,6 +885,44 @@ fn aggregate_value_mode_for_sum_count_catalog(
                 column.name
             ),
         }),
+    }
+}
+
+fn validate_recovery_incremental_adapter_scope(
+    catalog: &VelorixRelationCatalogV1,
+) -> Result<(), RecoveryError> {
+    catalog
+        .validate_supported_incremental_adapter_scope()
+        .map(|_| ())
+        .map_err(|error| recovery_error_from_adapter_scope(catalog, error))
+}
+
+fn recovery_error_from_adapter_scope(
+    catalog: &VelorixRelationCatalogV1,
+    error: RelationSchemaError,
+) -> RecoveryError {
+    match error {
+        RelationSchemaError::InvalidRelationSchema {
+            field: "incremental_adapter.adapter_id",
+        } => RecoveryError::UnsupportedIncrementalAdapter {
+            adapter_id: catalog.incremental_adapter.adapter_id.clone(),
+        },
+        RelationSchemaError::InvalidRelationSchema {
+            field: "incremental_adapter.value_column",
+        } => RecoveryError::MalformedPrototypeArrowIngest {
+            reason: "relation catalog must define one value column".to_string(),
+        },
+        RelationSchemaError::InvalidRelationSchema {
+            field: "incremental_adapter.value_columns",
+        } => RecoveryError::MalformedPrototypeArrowIngest {
+            reason: "prototype adapter supports exactly one value column".to_string(),
+        },
+        RelationSchemaError::InvalidRelationSchema {
+            field: "incremental_adapter.primary_key_column_ids",
+        } => RecoveryError::MalformedPrototypeArrowIngest {
+            reason: "prototype adapter supports exactly one primary key column".to_string(),
+        },
+        error => RecoveryError::RelationCatalog(error),
     }
 }
 

@@ -59,6 +59,8 @@ pub enum ReadinessEvidenceKind {
     DeployedIngestAdmission,
     RelationCatalogRecord,
     RelationCatalogRegistry,
+    RelationCatalogClosedAdapterScope,
+    RelationCatalogUnsupportedAdapterFailClosed,
     SlateDbCheckpointRef,
     QueryPolicyCatalog,
     RegistryBackedTableCatalog,
@@ -285,6 +287,24 @@ impl ProductionReadinessEvidenceV1 {
         {
             blocking_reasons.push(
                 "relation_catalog_status missing relation_catalog_registry evidence".to_string(),
+            );
+        }
+        if !self
+            .relation_catalog_status
+            .has_evidence(ReadinessEvidenceKind::RelationCatalogClosedAdapterScope)
+        {
+            blocking_reasons.push(
+                "relation_catalog_status missing relation_catalog_closed_adapter_scope evidence"
+                    .to_string(),
+            );
+        }
+        if !self
+            .relation_catalog_status
+            .has_evidence(ReadinessEvidenceKind::RelationCatalogUnsupportedAdapterFailClosed)
+        {
+            blocking_reasons.push(
+                "relation_catalog_status missing relation_catalog_unsupported_adapter_fail_closed evidence"
+                    .to_string(),
             );
         }
         if self

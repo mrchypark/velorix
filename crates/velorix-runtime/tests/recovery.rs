@@ -810,6 +810,23 @@ fn multiple_value_relation_catalog() -> VelorixRelationCatalogV1 {
     catalog
 }
 
+fn scalar_adapter_multi_key_relation_catalog() -> VelorixRelationCatalogV1 {
+    let mut catalog = orders_sum_count_relation_catalog().unwrap();
+    let mut extra_key = catalog.relation_schema.columns[0].clone();
+    extra_key.column_id = "store_id".to_string();
+    extra_key.name = "store_id".to_string();
+    extra_key.ordinal = 3;
+    catalog.relation_schema.columns.push(extra_key);
+    catalog
+        .relation_schema
+        .primary_key_column_ids
+        .push("store_id".to_string());
+    catalog.schema_fingerprint =
+        SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema).unwrap();
+    catalog.feldera_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
+    catalog
+}
+
 fn date32_daily_relation_catalog() -> VelorixRelationCatalogV1 {
     let relation_schema = VelorixRelationSchemaV1 {
         relation_id: "daily_balances".to_string(),
@@ -2312,6 +2329,42 @@ async fn selected_checkpoint_recovery_rejects_multiple_value_columns_before_chec
         error,
         RecoveryError::MalformedPrototypeArrowIngest { reason }
             if reason == "prototype adapter supports exactly one value column"
+    ));
+}
+
+#[tokio::test]
+async fn selected_checkpoint_recovery_rejects_scalar_adapter_multi_key_before_checkpoint_hydration()
+{
+    let (_temp_dir, store) = temp_store();
+    let catalog = scalar_adapter_multi_key_relation_catalog();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let checkpoint_version = 0;
+    let checkpoint_state = aggregate_state("account-a", 4, 1);
+    let state_ref =
+        write_checkpoint_state(&publisher, checkpoint_version, 1, &checkpoint_state).await;
+    publisher
+        .publish_manifest(&selected_checkpoint_manifest(
+            checkpoint_version,
+            1,
+            state_ref,
+        ))
+        .await
+        .unwrap();
+
+    let error =
+        RecoveredRuntime::recover_from_published_checkpoint_version_with_owner_and_relation_catalog(
+            Arc::clone(&store),
+            checkpoint_version,
+            ORDERS_SUM_COUNT_OWNER,
+            catalog,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RecoveryError::MalformedPrototypeArrowIngest { reason }
+            if reason == "prototype adapter supports exactly one primary key column"
     ));
 }
 

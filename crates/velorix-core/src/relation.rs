@@ -31,6 +31,27 @@ pub const CATALOG_ROW_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID: &str =
     "incremental-adapter-row-key-sum-count-v1";
 pub const ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID: &str = "incremental-adapter-orders-sum-count-v1";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SupportedIncrementalAdapterSpec {
+    ScalarSumCount,
+    RowKeySumCount,
+}
+
+pub fn supported_incremental_adapter_spec(
+    adapter_id: &str,
+) -> Option<SupportedIncrementalAdapterSpec> {
+    match adapter_id {
+        CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID
+        | ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID => {
+            Some(SupportedIncrementalAdapterSpec::ScalarSumCount)
+        }
+        CATALOG_ROW_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID => {
+            Some(SupportedIncrementalAdapterSpec::RowKeySumCount)
+        }
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct VelorixRelationCatalogV1 {
@@ -84,6 +105,29 @@ impl VelorixRelationCatalogV1 {
         )?;
 
         Ok(())
+    }
+
+    pub fn validate_supported_incremental_adapter_scope(
+        &self,
+    ) -> Result<SupportedIncrementalAdapterSpec, RelationSchemaError> {
+        self.validate()?;
+
+        let spec = supported_incremental_adapter_spec(&self.incremental_adapter.adapter_id).ok_or(
+            RelationSchemaError::InvalidRelationSchema {
+                field: "incremental_adapter.adapter_id",
+            },
+        )?;
+
+        match spec {
+            SupportedIncrementalAdapterSpec::ScalarSumCount
+                if self.relation_schema.primary_key_column_ids.len() != 1 =>
+            {
+                Err(RelationSchemaError::InvalidRelationSchema {
+                    field: "incremental_adapter.primary_key_column_ids",
+                })
+            }
+            _ => validate_single_value_column_for_adapter(&self.relation_schema).map(|()| spec),
+        }
     }
 }
 
@@ -493,13 +537,12 @@ pub fn arrow_record_batches_to_single_key_sum_count_delta_batch(
         relation_version,
         schema_fingerprint,
     )?;
-    let adapter_shape =
-        sum_count_incremental_adapter_shape(catalog.incremental_adapter.adapter_id.as_str())
-            .ok_or_else(
-                || IncrementalInputAdapterError::UnsupportedIncrementalAdapter {
-                    adapter_id: catalog.incremental_adapter.adapter_id.clone(),
-                },
-            )?;
+    let adapter_shape = supported_incremental_adapter_spec(&catalog.incremental_adapter.adapter_id)
+        .ok_or_else(
+            || IncrementalInputAdapterError::UnsupportedIncrementalAdapter {
+                adapter_id: catalog.incremental_adapter.adapter_id.clone(),
+            },
+        )?;
     if batches.is_empty() {
         return Err(IncrementalInputAdapterError::MalformedArrowInput {
             reason: "at least one Arrow record batch is required".to_string(),
@@ -507,10 +550,12 @@ pub fn arrow_record_batches_to_single_key_sum_count_delta_batch(
     }
 
     let key_columns = match adapter_shape {
-        SumCountIncrementalAdapterShape::SingleKey => {
+        SupportedIncrementalAdapterSpec::ScalarSumCount => {
             vec![single_primary_key_column(&catalog.relation_schema)?]
         }
-        SumCountIncrementalAdapterShape::RowKey => primary_key_columns(&catalog.relation_schema)?,
+        SupportedIncrementalAdapterSpec::RowKeySumCount => {
+            primary_key_columns(&catalog.relation_schema)?
+        }
     };
     let value_column = single_value_column(&catalog.relation_schema)?;
     let weight_column = relation_column(
@@ -564,27 +609,6 @@ pub fn arrow_record_batches_to_orders_sum_count_delta_batch(
         schema_fingerprint,
         batches,
     )
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SumCountIncrementalAdapterShape {
-    SingleKey,
-    RowKey,
-}
-
-fn sum_count_incremental_adapter_shape(
-    adapter_id: &str,
-) -> Option<SumCountIncrementalAdapterShape> {
-    match adapter_id {
-        CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID
-        | ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID => {
-            Some(SumCountIncrementalAdapterShape::SingleKey)
-        }
-        CATALOG_ROW_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID => {
-            Some(SumCountIncrementalAdapterShape::RowKey)
-        }
-        _ => None,
-    }
 }
 
 fn incremental_input_batch_schema_error(
@@ -731,22 +755,46 @@ fn single_primary_key_column(
 fn single_value_column(
     schema: &VelorixRelationSchemaV1,
 ) -> Result<&RelationColumnV1, IncrementalInputAdapterError> {
+    validate_single_value_column_for_adapter(schema).map_err(|error| {
+        IncrementalInputAdapterError::MalformedArrowInput {
+            reason: match error {
+                RelationSchemaError::InvalidRelationSchema {
+                    field: "incremental_adapter.value_column",
+                } => "relation catalog must define one value column".to_string(),
+                RelationSchemaError::InvalidRelationSchema {
+                    field: "incremental_adapter.value_columns",
+                } => "prototype adapter supports exactly one value column".to_string(),
+                _ => "prototype adapter supports exactly one value column".to_string(),
+            },
+        }
+    })?;
+
+    Ok(schema
+        .columns
+        .iter()
+        .find(|column| column.semantic_role == RelationSemanticRoleV1::Value)
+        .expect("validated single value column must exist"))
+}
+
+fn validate_single_value_column_for_adapter(
+    schema: &VelorixRelationSchemaV1,
+) -> Result<(), RelationSchemaError> {
     let mut values = schema
         .columns
         .iter()
         .filter(|column| column.semantic_role == RelationSemanticRoleV1::Value);
-    let Some(column) = values.next() else {
-        return Err(IncrementalInputAdapterError::MalformedArrowInput {
-            reason: "relation catalog must define one value column".to_string(),
+    if values.next().is_none() {
+        return Err(RelationSchemaError::InvalidRelationSchema {
+            field: "incremental_adapter.value_column",
         });
-    };
+    }
     if values.next().is_some() {
-        return Err(IncrementalInputAdapterError::MalformedArrowInput {
-            reason: "prototype adapter supports exactly one value column".to_string(),
+        return Err(RelationSchemaError::InvalidRelationSchema {
+            field: "incremental_adapter.value_columns",
         });
     }
 
-    Ok(column)
+    Ok(())
 }
 
 fn delta_key_from_columns(

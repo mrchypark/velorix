@@ -272,6 +272,8 @@ fn readiness_report_blocks_when_ingest_and_relation_catalog_evidence_is_missing(
             "deployed_ingest_admission",
             "relation_catalog_record",
             "relation_catalog_registry",
+            "relation_catalog_closed_adapter_scope",
+            "relation_catalog_unsupported_adapter_fail_closed",
         ],
         false,
         &[],
@@ -288,6 +290,8 @@ fn readiness_report_blocks_when_ingest_and_relation_catalog_evidence_is_missing(
             "ingest_status missing deployed_ingest_admission evidence",
             "relation_catalog_status missing relation_catalog_record evidence",
             "relation_catalog_status missing relation_catalog_registry evidence",
+            "relation_catalog_status missing relation_catalog_closed_adapter_scope evidence",
+            "relation_catalog_status missing relation_catalog_unsupported_adapter_fail_closed evidence",
         ]
     );
 }
@@ -564,7 +568,7 @@ fn readiness_evidence_rejects_unknown_json_fields() {
             "ownership_status": { "status": "pass", "evidence": "durable epoch record", "evidence_kind": ["durable_ownership_epoch_record"] },
             "checkpoint_status": { "status": "pass", "evidence": "published checkpoint lifecycle and recovery transition", "evidence_kind": ["published_checkpoint_lifecycle_record", "checkpoint_recovery_transition_record"] },
             "ingest_status": { "status": "pass", "evidence": "catalog-backed deployed ingest admission", "evidence_kind": ["catalog_backed_ingest_admission", "deployed_ingest_admission"] },
-            "relation_catalog_status": { "status": "pass", "evidence": "durable relation catalog record and registry", "evidence_kind": ["relation_catalog_record", "relation_catalog_registry"] },
+            "relation_catalog_status": { "status": "pass", "evidence": "durable relation catalog record, registry, closed adapter scope, and fail-closed unsupported adapters", "evidence_kind": ["relation_catalog_record", "relation_catalog_registry", "relation_catalog_closed_adapter_scope", "relation_catalog_unsupported_adapter_fail_closed"] },
             "state_status": { "status": "pass", "evidence": "SlateDB checkpoint ref", "evidence_kind": ["slate_db_checkpoint_ref"] },
             "query_policy_status": { "status": "pass", "evidence": "bounded DataFusion policy", "evidence_kind": ["query_policy_catalog"] },
             "table_catalog_status": { "status": "pass", "evidence": "registry-backed table catalog", "evidence_kind": ["registry_backed_table_catalog"] },
@@ -649,6 +653,12 @@ fn readiness_json(
     }
     if !missing_evidence.contains(&"relation_catalog_registry") {
         relation_catalog_evidence_kind.push("relation_catalog_registry");
+    }
+    if !missing_evidence.contains(&"relation_catalog_closed_adapter_scope") {
+        relation_catalog_evidence_kind.push("relation_catalog_closed_adapter_scope");
+    }
+    if !missing_evidence.contains(&"relation_catalog_unsupported_adapter_fail_closed") {
+        relation_catalog_evidence_kind.push("relation_catalog_unsupported_adapter_fail_closed");
     }
     let relation_catalog_kind = if relation_catalog_evidence_kind.is_empty() {
         String::new()
@@ -811,7 +821,9 @@ fn evidence_for(field: &str, failed_fields: &[&str]) -> &'static str {
         ("gc_status", true) => "GC evidence failed closed",
         ("dependency_governance_status", false) => "dependency governance validated",
         ("ingest_status", false) => "catalog-backed deployed ingest admission",
-        ("relation_catalog_status", false) => "durable relation catalog record and registry",
+        ("relation_catalog_status", false) => {
+            "durable relation catalog record, registry, closed adapter scope, and fail-closed unsupported adapters"
+        }
         ("benchmark_gate_status", false) => "S3-compatible benchmark gate",
         ("gc_status", false) => "GC run and retention evidence",
         _ => "readiness evidence",
