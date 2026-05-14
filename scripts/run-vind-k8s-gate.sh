@@ -182,6 +182,7 @@ export VELORIX_K8S_NAMESPACE="$namespace"
 
 cargo test -p velorix-k8s --test live_crd_round_trip -- --nocapture --test-threads=1
 cargo test -p velorix-k8s --test live_lease -- --nocapture --test-threads=1
+cargo test -p velorix-k8s --test live_ingest_admission -- --nocapture --test-threads=1
 cargo test -p velorix-k8s --test live_worker_shard -- --nocapture --test-threads=1
 
 kubectl --context "$context" get crd | grep velorix
@@ -212,7 +213,11 @@ def run(command):
 evidence = {
     "schema_version": 1,
     "evidence_kind": "kubernetes_vind_gate",
-    "readiness_evidence_kind": ["kubernetes_lease_client", "kubernetes_worker_shard_live_pod_executor"],
+    "readiness_evidence_kind": [
+        "kubernetes_lease_client",
+        "kubernetes_worker_shard_live_pod_executor",
+        "kubernetes_ingest_admission_startup_preflight"
+    ],
     "cluster": cluster,
     "context": context,
     "namespace": namespace,
@@ -229,9 +234,14 @@ evidence = {
     "live_tests": [
         "cargo test -p velorix-k8s --test live_crd_round_trip",
         "cargo test -p velorix-k8s --test live_lease",
+        "cargo test -p velorix-k8s --test live_ingest_admission",
         "cargo test -p velorix-k8s --test live_worker_shard",
     ],
-    "scope": "local vind Docker Kubernetes evidence; not 1.0 completion evidence",
+    "scope": "local vind Docker Kubernetes evidence; not 1.0 completion evidence; not multi-pod production ingest-admission readiness",
+    "limitations": [
+        "ingest-admission startup preflight uses a run-local object-store authority",
+        "does not exercise distributed or multi-pod admission races",
+    ],
 }
 with open(path, "w", encoding="utf-8") as f:
     json.dump(evidence, f, indent=2, sort_keys=True)

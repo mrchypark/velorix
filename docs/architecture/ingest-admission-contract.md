@@ -96,9 +96,10 @@ evidence requires a deployed writer/coordinator path that calls the preflight
 before serving writers, plus authority-store evidence for live
 operator-authorized repair/expiry restart, multi-process or multi-pod overlap
 races, adjacent range races, crash/retry windows, restart reconstruction, and
-leader handoff. The available broader gates are `scripts/run-floci-s3-gate.sh`
-and `scripts/run-vind-k8s-gate.sh`, but they must include the ingest-specific
-overlap/restart scenarios before they can close this contract.
+leader handoff. `scripts/run-vind-k8s-gate.sh` includes a live Kubernetes
+startup-preflight check for this provider, but the broader floci/vind gates must
+still include the ingest-specific overlap, restart, and handoff scenarios before
+they can close this contract.
 
 ## Conflict Semantics
 

@@ -57,6 +57,18 @@ VELORIX_K8S_INTEGRATION=1 VELORIX_K8S_NAMESPACE=velorix-live \
   cargo test -p velorix-k8s --test live_worker_shard -- --nocapture --test-threads=1
 ```
 
+Run the env-gated ingest-admission startup preflight against the active vind
+context:
+
+```bash
+VELORIX_K8S_INTEGRATION=1 VELORIX_K8S_NAMESPACE=velorix-live \
+  cargo test -p velorix-k8s --test live_ingest_admission -- --nocapture --test-threads=1
+```
+
+This checks Kubernetes API reachability and exercises
+`IngestAdmissionCoordinatorProvider::startup()` against a run-local object-store
+authority. It does not exercise distributed or multi-pod admission races.
+
 Run the full local vind gate:
 
 ```bash
@@ -67,9 +79,10 @@ By default, the gate creates a run-owned `velorix-vind-*` vCluster, deletes
 that cluster on exit, and writes
 `target/velorix-k8s/vind-k8s-gate-evidence.json` with the cluster context,
 namespace, applied CRDs, tool versions, and live k8s test set. The artifact is
-local Kubernetes evidence only; it is not 1.0 completion evidence. On failure,
-the gate writes `target/velorix-k8s/vind-k8s-gate-diagnostics.txt` before
-cleaning up owned resources.
+local Kubernetes evidence only; it is not 1.0 completion evidence and does not
+claim multi-pod production ingest-admission readiness. On failure, the gate
+writes `target/velorix-k8s/vind-k8s-gate-diagnostics.txt` before cleaning up
+owned resources.
 
 Useful overrides:
 
