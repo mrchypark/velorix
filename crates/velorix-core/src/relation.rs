@@ -736,6 +736,7 @@ enum IncrementalKeyColumn<'a> {
     Utf8(&'a StringArray),
     JsonUtf8(&'a StringArray),
     Int64(&'a Int64Array),
+    Float64(&'a Float64Array),
     Date32(&'a Date32Array),
     TimestampNanosecond(&'a TimestampNanosecondArray),
     DictionaryUtf8Int8(&'a DictionaryArray<Int8Type>, &'a StringArray),
@@ -756,6 +757,7 @@ impl IncrementalKeyColumn<'_> {
             Self::Utf8(column) => column.is_null(row),
             Self::JsonUtf8(column) => column.is_null(row),
             Self::Int64(column) => column.is_null(row),
+            Self::Float64(column) => column.is_null(row),
             Self::Date32(column) => column.is_null(row),
             Self::TimestampNanosecond(column) => column.is_null(row),
             Self::DictionaryUtf8Int8(column, values) => {
@@ -783,6 +785,16 @@ impl IncrementalKeyColumn<'_> {
                     reason: format!("JsonUtf8 key column contains invalid JSON: {error}"),
                 }),
             Self::Int64(column) => Ok(DeltaKey::from_json(json!(column.value(row)))),
+            Self::Float64(column) => {
+                let value = column.value(row);
+                if !value.is_finite() {
+                    return Err(IncrementalInputAdapterError::MalformedArrowInput {
+                        reason: "Float64 key column must contain only finite values".to_string(),
+                    });
+                }
+
+                Ok(DeltaKey::from_json(json!(value)))
+            }
             Self::Date32(column) => Ok(DeltaKey::from_json(json!(column.value(row)))),
             Self::TimestampNanosecond(column) => Ok(DeltaKey::from_json(json!(column.value(row)))),
             Self::DictionaryUtf8Int8(column, values) => Ok(DeltaKey::from_json(json!(
@@ -843,6 +855,9 @@ fn incremental_key_column<'a>(
         ArrowPhysicalTypeV1::Int64 => {
             int64_column(batch, column.name.as_str()).map(IncrementalKeyColumn::Int64)
         }
+        ArrowPhysicalTypeV1::Float64 => {
+            float64_column(batch, column.name.as_str()).map(IncrementalKeyColumn::Float64)
+        }
         ArrowPhysicalTypeV1::Date32 => {
             date32_column(batch, column.name.as_str()).map(IncrementalKeyColumn::Date32)
         }
@@ -855,7 +870,7 @@ fn incremental_key_column<'a>(
         }
         _ => Err(IncrementalInputAdapterError::MalformedArrowInput {
             reason: format!(
-                "prototype adapter key column `{}` must be Boolean, Utf8, JsonUtf8, Int64, Date32, TimestampNanosecond, or DictionaryUtf8",
+                "prototype adapter key column `{}` must be Boolean, Utf8, JsonUtf8, Int64, Float64, Date32, TimestampNanosecond, or DictionaryUtf8",
                 column.name
             ),
         }),

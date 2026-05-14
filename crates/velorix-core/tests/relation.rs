@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use arrow::{
     array::{
-        ArrayRef, BooleanArray, Date32Array, DictionaryArray, Float64Array, Int64Array, Int8Array,
-        StringArray, StringDictionaryBuilder, TimestampNanosecondArray,
+        ArrayRef, BooleanArray, Date32Array, Decimal128Array, DictionaryArray, Float64Array,
+        Int64Array, Int8Array, StringArray, StringDictionaryBuilder, TimestampNanosecondArray,
     },
     datatypes::{DataType, Field, Int16Type, Int32Type, Int64Type, Int8Type, Schema, TimeUnit},
     record_batch::RecordBatch,
@@ -444,6 +444,57 @@ fn generic_catalog_incremental_input_accepts_int64_primary_key() {
 }
 
 #[test]
+fn generic_catalog_incremental_input_accepts_float64_primary_key() {
+    let catalog = float_key_account_balance_relation_catalog();
+    let batch = float_key_account_balance_input_batch(&[1001.5, 1002.25], &[500, 125], &[1, -1]);
+
+    let delta = arrow_record_batches_to_single_key_sum_count_delta_batch(
+        &catalog,
+        "account_balances",
+        "2026-05-13.v1",
+        catalog.schema_fingerprint.as_str(),
+        &[batch],
+    )
+    .unwrap();
+
+    assert_eq!(
+        delta.records(),
+        &[
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!(1001.5)),
+                DeltaValue::from_json(serde_json::json!(500)),
+                1,
+            ),
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!(1002.25)),
+                DeltaValue::from_json(serde_json::json!(125)),
+                -1,
+            ),
+        ]
+    );
+}
+
+#[test]
+fn generic_catalog_incremental_input_rejects_non_finite_float64_primary_key() {
+    let catalog = float_key_account_balance_relation_catalog();
+    let batch = float_key_account_balance_input_batch(&[f64::INFINITY], &[500], &[1]);
+
+    let error = arrow_record_batches_to_single_key_sum_count_delta_batch(
+        &catalog,
+        "account_balances",
+        "2026-05-13.v1",
+        catalog.schema_fingerprint.as_str(),
+        &[batch],
+    )
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("finite"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
 fn generic_catalog_incremental_input_accepts_float64_value_column() {
     let catalog = float_account_balance_relation_catalog();
     let batch = float_account_balance_input_batch(&[1001, 1002], &[50.25, -12.5], &[1, -1]);
@@ -783,19 +834,29 @@ fn generic_catalog_incremental_input_rejects_dictionary_utf8_null_key() {
 #[test]
 fn generic_catalog_incremental_input_rejects_unsupported_primary_key_type() {
     let mut catalog = account_balance_relation_catalog();
-    catalog.relation_schema.columns[0].logical_type = VelorixLogicalTypeV1::Float64;
-    catalog.relation_schema.columns[0].physical_arrow_type = ArrowPhysicalTypeV1::Float64;
+    catalog.relation_schema.columns[0].logical_type = VelorixLogicalTypeV1::Decimal {
+        precision: 18,
+        scale: 2,
+    };
+    catalog.relation_schema.columns[0].physical_arrow_type = ArrowPhysicalTypeV1::Decimal128 {
+        precision: 18,
+        scale: 2,
+    };
     catalog.schema_fingerprint =
         SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema).unwrap();
     catalog.feldera_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
     let batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![
-            Field::new("account_id", DataType::Float64, false),
+            Field::new("account_id", DataType::Decimal128(18, 2), false),
             Field::new("balance_cents", DataType::Int64, false),
             Field::new("row_delta", DataType::Int64, false),
         ])),
         vec![
-            Arc::new(Float64Array::from(vec![1001.0])) as ArrayRef,
+            Arc::new(
+                Decimal128Array::from(vec![100100])
+                    .with_precision_and_scale(18, 2)
+                    .unwrap(),
+            ) as ArrayRef,
             Arc::new(Int64Array::from(vec![500])) as ArrayRef,
             Arc::new(Int64Array::from(vec![1])) as ArrayRef,
         ],
@@ -814,7 +875,7 @@ fn generic_catalog_incremental_input_rejects_unsupported_primary_key_type() {
     assert!(matches!(
         error,
         IncrementalInputAdapterError::MalformedArrowInput { reason }
-            if reason == "prototype adapter key column `account_id` must be Boolean, Utf8, JsonUtf8, Int64, Date32, TimestampNanosecond, or DictionaryUtf8"
+            if reason == "prototype adapter key column `account_id` must be Boolean, Utf8, JsonUtf8, Int64, Float64, Date32, TimestampNanosecond, or DictionaryUtf8"
     ));
 }
 
@@ -1041,6 +1102,16 @@ fn float_account_balance_relation_catalog() -> VelorixRelationCatalogV1 {
     let mut catalog = account_balance_relation_catalog();
     catalog.relation_schema.columns[1].logical_type = VelorixLogicalTypeV1::Float64;
     catalog.relation_schema.columns[1].physical_arrow_type = ArrowPhysicalTypeV1::Float64;
+    catalog.schema_fingerprint =
+        SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema).unwrap();
+    catalog.feldera_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
+    catalog
+}
+
+fn float_key_account_balance_relation_catalog() -> VelorixRelationCatalogV1 {
+    let mut catalog = account_balance_relation_catalog();
+    catalog.relation_schema.columns[0].logical_type = VelorixLogicalTypeV1::Float64;
+    catalog.relation_schema.columns[0].physical_arrow_type = ArrowPhysicalTypeV1::Float64;
     catalog.schema_fingerprint =
         SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema).unwrap();
     catalog.feldera_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
@@ -1298,6 +1369,26 @@ fn float_account_balance_input_batch(
         vec![
             Arc::new(Int64Array::from(account_ids.to_vec())) as ArrayRef,
             Arc::new(Float64Array::from(balances.to_vec())) as ArrayRef,
+            Arc::new(Int64Array::from(row_deltas.to_vec())) as ArrayRef,
+        ],
+    )
+    .unwrap()
+}
+
+fn float_key_account_balance_input_batch(
+    account_ids: &[f64],
+    balance_cents: &[i64],
+    row_deltas: &[i64],
+) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("account_id", DataType::Float64, false),
+            Field::new("balance_cents", DataType::Int64, false),
+            Field::new("row_delta", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(Float64Array::from(account_ids.to_vec())) as ArrayRef,
+            Arc::new(Int64Array::from(balance_cents.to_vec())) as ArrayRef,
             Arc::new(Int64Array::from(row_deltas.to_vec())) as ArrayRef,
         ],
     )
