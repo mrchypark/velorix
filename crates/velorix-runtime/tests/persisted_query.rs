@@ -40,7 +40,7 @@ use velorix_storage::{
         ObjectStoreCapabilityProfile,
     },
     ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
-    log::IngestLog,
+    log::{IngestAdmissionCoordinator, IngestLog},
     manifest::{CheckpointManifest, InputRange, StateObjectRef},
     object_key::ObjectKey,
     relation_catalog_registry::{RelationCatalogRegistry, RelationCatalogRegistryError},
@@ -305,7 +305,7 @@ async fn persisted_query_store_rejects_unknown_policy_field_from_object_storage(
 async fn persisted_recovered_query_execution_uses_stored_sql_and_policy() {
     let (_temp_dir, store) = temp_store();
     let catalog = PersistedQueryStore::new(Arc::clone(&store));
-    let ingest_log = IngestLog::new(Arc::clone(&store));
+    let ingest_coordinator = IngestAdmissionCoordinator::new(IngestLog::new(Arc::clone(&store)));
     let publisher = CheckpointPublisher::new(Arc::clone(&store));
 
     let checkpoint_input = batch([
@@ -319,7 +319,7 @@ async fn persisted_recovered_query_execution_uses_stored_sql_and_policy() {
 
     append_ingest_envelope(
         Arc::clone(&store),
-        &ingest_log,
+        &ingest_coordinator,
         "orders",
         0,
         0,
@@ -329,7 +329,7 @@ async fn persisted_recovered_query_execution_uses_stored_sql_and_policy() {
     .await;
     append_ingest_envelope(
         Arc::clone(&store),
-        &ingest_log,
+        &ingest_coordinator,
         "orders",
         0,
         2,
@@ -379,7 +379,7 @@ async fn persisted_recovered_query_execution_uses_stored_sql_and_policy() {
 async fn persisted_recovered_query_execution_applies_stored_policy() {
     let (_temp_dir, store) = temp_store();
     let catalog = PersistedQueryStore::new(Arc::clone(&store));
-    let ingest_log = IngestLog::new(Arc::clone(&store));
+    let ingest_coordinator = IngestAdmissionCoordinator::new(IngestLog::new(Arc::clone(&store)));
     let publisher = CheckpointPublisher::new(Arc::clone(&store));
 
     let checkpoint_input = batch([input_delta("account-a", 10, 1)]);
@@ -387,7 +387,7 @@ async fn persisted_recovered_query_execution_applies_stored_policy() {
 
     append_ingest_envelope(
         Arc::clone(&store),
-        &ingest_log,
+        &ingest_coordinator,
         "orders",
         0,
         0,
@@ -397,7 +397,7 @@ async fn persisted_recovered_query_execution_applies_stored_policy() {
     .await;
     append_ingest_envelope(
         Arc::clone(&store),
-        &ingest_log,
+        &ingest_coordinator,
         "orders",
         0,
         1,
@@ -483,7 +483,7 @@ async fn persisted_recovered_query_requires_shared_limiter_when_stored_policy_se
 async fn persisted_recovered_query_accepts_matching_shared_limiter_when_policy_sets_concurrency() {
     let (_temp_dir, store) = temp_store();
     let catalog = PersistedQueryStore::new(Arc::clone(&store));
-    let ingest_log = IngestLog::new(Arc::clone(&store));
+    let ingest_coordinator = IngestAdmissionCoordinator::new(IngestLog::new(Arc::clone(&store)));
     let publisher = CheckpointPublisher::new(Arc::clone(&store));
 
     let checkpoint_input = batch([input_delta("account-a", 10, 1)]);
@@ -491,7 +491,7 @@ async fn persisted_recovered_query_accepts_matching_shared_limiter_when_policy_s
 
     append_ingest_envelope(
         Arc::clone(&store),
-        &ingest_log,
+        &ingest_coordinator,
         "orders",
         0,
         0,
@@ -501,7 +501,7 @@ async fn persisted_recovered_query_accepts_matching_shared_limiter_when_policy_s
     .await;
     append_ingest_envelope(
         Arc::clone(&store),
-        &ingest_log,
+        &ingest_coordinator,
         "orders",
         0,
         1,
@@ -556,7 +556,7 @@ async fn persisted_recovered_query_accepts_matching_shared_limiter_when_policy_s
 async fn production_persisted_recovered_query_reads_slatedb_checkpoint_with_relation_catalog() {
     let (_temp_dir, store) = temp_store();
     let catalog = PersistedQueryStore::new(Arc::clone(&store));
-    let ingest_log = IngestLog::new(Arc::clone(&store));
+    let ingest_coordinator = IngestAdmissionCoordinator::new(IngestLog::new(Arc::clone(&store)));
     let publisher =
         CheckpointPublisher::with_slatedb_state_store(Arc::clone(&store), "v1/slatedb/state")
             .await
@@ -567,7 +567,7 @@ async fn production_persisted_recovered_query_reads_slatedb_checkpoint_with_rela
 
     append_ingest_envelope(
         Arc::clone(&store),
-        &ingest_log,
+        &ingest_coordinator,
         "orders",
         0,
         0,
@@ -577,7 +577,7 @@ async fn production_persisted_recovered_query_reads_slatedb_checkpoint_with_rela
     .await;
     append_ingest_envelope(
         Arc::clone(&store),
-        &ingest_log,
+        &ingest_coordinator,
         "orders",
         0,
         1,
@@ -853,7 +853,7 @@ async fn production_persisted_recovered_query_accepts_matching_shared_limiter_wh
 ) {
     let (_temp_dir, store) = temp_store();
     let catalog = PersistedQueryStore::new(Arc::clone(&store));
-    let ingest_log = IngestLog::new(Arc::clone(&store));
+    let ingest_coordinator = IngestAdmissionCoordinator::new(IngestLog::new(Arc::clone(&store)));
     let publisher =
         CheckpointPublisher::with_slatedb_state_store(Arc::clone(&store), "v1/slatedb/state")
             .await
@@ -862,7 +862,7 @@ async fn production_persisted_recovered_query_accepts_matching_shared_limiter_wh
     let checkpoint_input = batch([input_delta("account-a", 10, 1)]);
     append_ingest_envelope(
         Arc::clone(&store),
-        &ingest_log,
+        &ingest_coordinator,
         "orders",
         0,
         0,
@@ -1003,7 +1003,7 @@ fn ingest_record_batch(input: &DeltaBatch) -> RecordBatch {
 
 async fn append_ingest_envelope(
     store: Arc<dyn ObjectStore>,
-    ingest_log: &IngestLog,
+    ingest_coordinator: &IngestAdmissionCoordinator,
     stream_id: &str,
     partition_id: u32,
     start_offset_inclusive: u64,
@@ -1036,7 +1036,7 @@ async fn append_ingest_envelope(
     )
     .unwrap();
 
-    ingest_log
+    ingest_coordinator
         .append_catalog_validated_envelope(bytes)
         .await
         .unwrap();

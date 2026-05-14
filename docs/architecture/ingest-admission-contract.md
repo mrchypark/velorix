@@ -67,4 +67,5 @@ Conflict reasons must be explicit:
 - Crash-after-create-before-response retry returns `200 OK` for same digest.
 - Same key with different digest returns `409 Conflict`.
 - Production-like harness source contracts reject catalog-aware append receivers
-  other than `IngestAdmissionCoordinator`.
+  other than `IngestAdmissionCoordinator`, including the persisted-query
+  recovered-runtime fixture.
