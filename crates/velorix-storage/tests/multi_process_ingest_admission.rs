@@ -1,3 +1,5 @@
+#[cfg(feature = "s3-compat-tests")]
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
     collections::BTreeMap,
     env, fs,
@@ -14,7 +16,13 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use bytes::Bytes;
-use object_store::{local::LocalFileSystem, ObjectStore};
+use object_store::local::LocalFileSystem;
+#[cfg(not(feature = "s3-compat-tests"))]
+use object_store::ObjectStore;
+#[cfg(feature = "s3-compat-tests")]
+use object_store::{
+    aws::AmazonS3Builder, path::Path as ObjectStorePath, prefix::PrefixStore, ObjectStore,
+};
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 use velorix_core::relation::{
@@ -42,6 +50,9 @@ const OUTCOME_FILE_ENV: &str = "VELORIX_STORAGE_MULTI_PROCESS_OUTCOME_FILE";
 const START_OFFSET_ENV: &str = "VELORIX_STORAGE_MULTI_PROCESS_START_OFFSET";
 const END_OFFSET_ENV: &str = "VELORIX_STORAGE_MULTI_PROCESS_END_OFFSET";
 const POST_START_DELAY_MS_ENV: &str = "VELORIX_STORAGE_MULTI_PROCESS_POST_START_DELAY_MS";
+const STORE_BACKEND_ENV: &str = "VELORIX_STORAGE_MULTI_PROCESS_STORE_BACKEND";
+#[cfg(feature = "s3-compat-tests")]
+const S3_AUTHORITY_PREFIX_ENV: &str = "VELORIX_STORAGE_MULTI_PROCESS_S3_AUTHORITY_PREFIX";
 
 #[tokio::test]
 async fn local_filesystem_serialized_multi_process_admission_rejects_one_overlapping_range() {
@@ -193,6 +204,86 @@ async fn local_filesystem_multi_process_admission_allows_adjacent_ranges() {
     );
 }
 
+#[cfg(feature = "s3-compat-tests")]
+#[tokio::test]
+async fn s3_compatible_multi_process_admission_rejects_overlap_and_allows_adjacent_ranges() {
+    let Some(config) = live_config() else {
+        println!(
+            "skipping S3-compatible multi-process ingest admission harness; set VELORIX_S3_COMPAT=1 and configure AWS_ENDPOINT_URL, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, and VELORIX_S3_BUCKET to enable"
+        );
+        return;
+    };
+
+    let overlap_config = config.scenario("overlap");
+    let overlap_store = live_authority_store(&overlap_config).unwrap();
+    create_orders_relation_catalog(&overlap_store).await;
+    let overlap_outcomes = run_s3_children(
+        &overlap_config,
+        "s3-overlap",
+        &[(0, 100, 0, "first"), (50, 150, 250, "overlapping")],
+    );
+    assert_eq!(
+        overlap_outcomes
+            .iter()
+            .filter(|outcome| outcome.kind == "appended")
+            .count(),
+        1,
+        "{overlap_outcomes:?}"
+    );
+    assert_eq!(
+        overlap_outcomes
+            .iter()
+            .filter(|outcome| outcome.kind == "conflict")
+            .count(),
+        1,
+        "{overlap_outcomes:?}"
+    );
+    assert!(overlap_outcomes
+        .iter()
+        .all(|outcome| outcome.error.is_none()));
+
+    let appended = overlap_outcomes
+        .iter()
+        .find(|outcome| outcome.kind == "appended")
+        .unwrap();
+    let conflict = overlap_outcomes
+        .iter()
+        .find(|outcome| outcome.kind == "conflict")
+        .unwrap();
+    assert_eq!(conflict.conflict_object_key, appended.object_key);
+    assert!(matches!(
+        conflict.reason.as_deref(),
+        Some("range_overlap_reserved" | "range_overlap_committed")
+    ));
+
+    let capabilities = complete_capabilities();
+    let committed = IngestLog::new_catalog_checked(Arc::clone(&overlap_store), &capabilities)
+        .unwrap()
+        .list_committed()
+        .await
+        .unwrap();
+    assert_eq!(committed.len(), 1);
+
+    let adjacent_config = config.scenario("adjacent");
+    let adjacent_store = live_authority_store(&adjacent_config).unwrap();
+    create_orders_relation_catalog(&adjacent_store).await;
+    let adjacent_outcomes = run_s3_children(
+        &adjacent_config,
+        "s3-adjacent",
+        &[(0, 100, 0, "first"), (100, 150, 0, "adjacent")],
+    );
+    assert!(adjacent_outcomes
+        .iter()
+        .all(|outcome| outcome.kind == "appended" && outcome.error.is_none()),);
+
+    let committed = IngestLog::new_catalog_checked(adjacent_store, &capabilities)
+        .unwrap()
+        .list_committed()
+        .await
+        .unwrap();
+    assert_eq!(committed.len(), 2);
+}
+
 #[test]
 fn multi_process_ingest_admission_child() {
     if env::var_os(CHILD_MODE_ENV).is_none() {
@@ -205,7 +296,6 @@ fn multi_process_ingest_admission_child() {
 }
 
 async fn run_child() {
-    let authority_root = path_from_env(AUTHORITY_ROOT_ENV);
     let start_marker = path_from_env(START_MARKER_ENV);
     let ready_file = path_from_env(READY_FILE_ENV);
     let outcome_file = path_from_env(OUTCOME_FILE_ENV);
@@ -219,8 +309,7 @@ async fn run_child() {
         thread::sleep(Duration::from_millis(post_start_delay_ms));
     }
 
-    let store: Arc<dyn ObjectStore> =
-        Arc::new(LocalFileSystem::new_with_prefix(&authority_root).unwrap());
+    let store = child_authority_store();
     let capabilities = complete_capabilities();
     let coordinator = IngestAdmissionCoordinator::new_checked(store, &capabilities).unwrap();
     let payload = catalog_envelope_bytes_for(&orders_relation_catalog(), start_offset, end_offset);
@@ -289,6 +378,7 @@ fn spawn_child(
         .arg("multi_process_ingest_admission_child")
         .arg("--nocapture")
         .env(CHILD_MODE_ENV, "1")
+        .env(STORE_BACKEND_ENV, "local")
         .env(AUTHORITY_ROOT_ENV, authority_root)
         .env(START_MARKER_ENV, start_marker)
         .env(READY_FILE_ENV, ready_file)
@@ -298,6 +388,69 @@ fn spawn_child(
         .env(POST_START_DELAY_MS_ENV, post_start_delay_ms.to_string())
         .spawn()
         .unwrap()
+}
+
+#[cfg(feature = "s3-compat-tests")]
+fn spawn_s3_child(
+    config: &LiveConfig,
+    start_marker: &Path,
+    ready_file: &Path,
+    outcome_file: &Path,
+    start_offset: u64,
+    end_offset: u64,
+    post_start_delay_ms: u64,
+) -> Child {
+    Command::new(env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("multi_process_ingest_admission_child")
+        .arg("--nocapture")
+        .env(CHILD_MODE_ENV, "1")
+        .env(STORE_BACKEND_ENV, "s3")
+        .env(S3_AUTHORITY_PREFIX_ENV, &config.run_prefix)
+        .env(START_MARKER_ENV, start_marker)
+        .env(READY_FILE_ENV, ready_file)
+        .env(OUTCOME_FILE_ENV, outcome_file)
+        .env(START_OFFSET_ENV, start_offset.to_string())
+        .env(END_OFFSET_ENV, end_offset.to_string())
+        .env(POST_START_DELAY_MS_ENV, post_start_delay_ms.to_string())
+        .spawn()
+        .unwrap()
+}
+
+#[cfg(feature = "s3-compat-tests")]
+fn run_s3_children(
+    config: &LiveConfig,
+    marker_name: &str,
+    ranges: &[(u64, u64, u64, &str)],
+) -> Vec<ChildOutcome> {
+    let scratch = tempfile::tempdir().unwrap();
+    let start_marker = scratch.path().join(marker_name);
+    let mut children = Vec::new();
+    let mut ready_files = Vec::new();
+    let mut outcome_files = Vec::new();
+
+    for (start_offset, end_offset, post_start_delay_ms, name) in ranges {
+        let ready_file = scratch.path().join(format!("{name}.ready"));
+        let outcome_file = scratch.path().join(format!("{name}.json"));
+        children.push(spawn_s3_child(
+            config,
+            &start_marker,
+            &ready_file,
+            &outcome_file,
+            *start_offset,
+            *end_offset,
+            *post_start_delay_ms,
+        ));
+        ready_files.push(ready_file);
+        outcome_files.push(outcome_file);
+    }
+
+    release_children(&start_marker, &ready_files);
+    for child in &mut children {
+        assert_child_success(child);
+    }
+
+    read_outcomes(&outcome_files)
 }
 
 fn release_children(start_marker: &Path, ready_files: &[PathBuf]) {
@@ -344,12 +497,138 @@ fn integer_from_env(name: &str) -> u64 {
         .unwrap_or_else(|error| panic!("{name} must be an integer: {error}"))
 }
 
+fn child_authority_store() -> Arc<dyn ObjectStore> {
+    match env::var(STORE_BACKEND_ENV).as_deref() {
+        Ok("local") | Err(_) => {
+            let authority_root = path_from_env(AUTHORITY_ROOT_ENV);
+            Arc::new(LocalFileSystem::new_with_prefix(&authority_root).unwrap())
+        }
+        #[cfg(feature = "s3-compat-tests")]
+        Ok("s3") => {
+            let config = live_config_with_prefix(required_env(S3_AUTHORITY_PREFIX_ENV)).unwrap();
+            live_authority_store(&config).unwrap()
+        }
+        Ok(other) => panic!("unsupported {STORE_BACKEND_ENV}: {other}"),
+    }
+}
+
 fn temp_authority_store() -> (TempDir, PathBuf, Arc<dyn ObjectStore>) {
     let temp_dir = tempfile::tempdir().unwrap();
     let authority_root = temp_dir.path().to_path_buf();
     let store = LocalFileSystem::new_with_prefix(&authority_root).unwrap();
 
     (temp_dir, authority_root, Arc::new(store))
+}
+
+#[cfg(feature = "s3-compat-tests")]
+fn live_authority_store(config: &LiveConfig) -> object_store::Result<Arc<dyn ObjectStore>> {
+    let store = AmazonS3Builder::new()
+        .with_endpoint(config.endpoint.clone())
+        .with_access_key_id(config.access_key_id.clone())
+        .with_secret_access_key(config.secret_access_key.clone())
+        .with_region(config.region.clone())
+        .with_bucket_name(config.bucket.clone())
+        .with_allow_http(config.allow_http)
+        .build()?;
+
+    Ok(Arc::new(PrefixStore::new(
+        store,
+        ObjectStorePath::from(config.run_prefix.clone()),
+    )))
+}
+
+#[cfg(feature = "s3-compat-tests")]
+#[derive(Clone)]
+struct LiveConfig {
+    endpoint: String,
+    access_key_id: String,
+    secret_access_key: String,
+    region: String,
+    bucket: String,
+    allow_http: bool,
+    run_prefix: String,
+}
+
+#[cfg(feature = "s3-compat-tests")]
+impl LiveConfig {
+    fn scenario(&self, name: &str) -> Self {
+        let mut config = self.clone();
+        config.run_prefix = join_prefixes(&self.run_prefix, name);
+        config
+    }
+}
+
+#[cfg(feature = "s3-compat-tests")]
+fn live_config() -> Option<LiveConfig> {
+    if env::var("VELORIX_S3_COMPAT").ok().as_deref() != Some("1") {
+        return None;
+    }
+
+    let required = [
+        "AWS_ENDPOINT_URL",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_REGION",
+        "VELORIX_S3_BUCKET",
+    ];
+    let missing = required
+        .iter()
+        .copied()
+        .filter(|name| env::var(name).is_err())
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        println!(
+            "skipping S3-compatible multi-process ingest admission harness; missing {}",
+            missing.join(", ")
+        );
+        return None;
+    }
+
+    let prefix = env::var("VELORIX_S3_PREFIX").unwrap_or_default();
+    let run_prefix = join_prefixes(&prefix, &unique_run_prefix());
+    Some(live_config_with_prefix(run_prefix).unwrap())
+}
+
+#[cfg(feature = "s3-compat-tests")]
+fn live_config_with_prefix(run_prefix: String) -> Option<LiveConfig> {
+    let endpoint = required_env("AWS_ENDPOINT_URL");
+    let allow_http = endpoint.starts_with("http://");
+
+    Some(LiveConfig {
+        endpoint,
+        access_key_id: required_env("AWS_ACCESS_KEY_ID"),
+        secret_access_key: required_env("AWS_SECRET_ACCESS_KEY"),
+        region: required_env("AWS_REGION"),
+        bucket: required_env("VELORIX_S3_BUCKET"),
+        allow_http,
+        run_prefix,
+    })
+}
+
+#[cfg(feature = "s3-compat-tests")]
+fn required_env(name: &str) -> String {
+    env::var(name).unwrap_or_else(|_| panic!("{name} is required when VELORIX_S3_COMPAT=1"))
+}
+
+#[cfg(feature = "s3-compat-tests")]
+fn unique_run_prefix() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after Unix epoch")
+        .as_nanos();
+
+    format!(
+        "velorix-s3-compat-multi-process/{}-{nanos}",
+        std::process::id()
+    )
+}
+
+#[cfg(feature = "s3-compat-tests")]
+fn join_prefixes(base: &str, run: &str) -> String {
+    match base.trim_matches('/') {
+        "" => run.to_string(),
+        base => format!("{base}/{}", run.trim_matches('/')),
+    }
 }
 
 async fn create_orders_relation_catalog(store: &Arc<dyn ObjectStore>) {

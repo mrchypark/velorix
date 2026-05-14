@@ -175,6 +175,7 @@ export VELORIX_S3_PREFIX="$prefix"
 export VELORIX_BENCHMARK_EVIDENCE_SCOPE=local_emulator
 
 cargo test -p velorix-storage --test s3_compat --features s3-compat-tests -- --nocapture --test-threads=1
+cargo test -p velorix-storage --test multi_process_ingest_admission --features s3-compat-tests -- --nocapture --test-threads=1
 cargo test -p velorix-runtime --test s3_compat_query --features s3-compat-tests -- --nocapture --test-threads=1
 
 benchmark_ran=false
@@ -224,6 +225,7 @@ evidence = {
     "docker_version": run(["docker", "version", "--format", "{{.Server.Version}}"])[0],
     "live_tests": [
         "cargo test -p velorix-storage --test s3_compat --features s3-compat-tests",
+        "cargo test -p velorix-storage --test multi_process_ingest_admission --features s3-compat-tests",
         "cargo test -p velorix-runtime --test s3_compat_query --features s3-compat-tests",
     ],
     "benchmark": {
