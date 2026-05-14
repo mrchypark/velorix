@@ -340,7 +340,11 @@ impl WorkerShardCommandExecutor for KubernetesPodWorkerShardCommandExecutor {
         owner_epoch: u64,
     ) -> Result<(), WorkerShardCommandExecutorError> {
         let pod_name = worker_shard_pod_name(owner_id, owner_epoch);
-        match self.pods.delete(&pod_name, &DeleteParams::default()).await {
+        match self
+            .pods
+            .delete(&pod_name, &DeleteParams::default().grace_period(0))
+            .await
+        {
             Ok(_) => Ok(()),
             Err(kube::Error::Api(response)) if response.code == 404 => Ok(()),
             Err(error) => Err(Self::api_error("stop", owner_id, owner_epoch, error)),

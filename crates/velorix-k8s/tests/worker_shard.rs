@@ -427,6 +427,7 @@ async fn kubernetes_pod_worker_shard_executor_deletes_stop_pod_by_owner_epoch_na
             worker_shard_pod_name("Worker_A/West", 42)
         )
     );
+    assert_eq!(requests[0].body["gracePeriodSeconds"], 0);
 }
 
 #[tokio::test]
