@@ -80,7 +80,9 @@ durability capabilities for every authoritative namespace.
   production publication can proceed.
 - Kubernetes worker-shard epoch-store construction can reuse validated operator
   startup evidence and requires the ownership namespace before persisting
-  durable epoch records.
+  durable epoch records; env-gated local Kubernetes evidence reconstructs checked
+  startup components over a local-filesystem authority and reads those epoch
+  records back without falling through in-memory authority.
 - Env-gated S3-compatible storage evidence validates create-only conflict,
   read-after-write, list-after-write, and range-read behavior.
 - Env-gated S3-compatible capability evidence validates startup capabilities for

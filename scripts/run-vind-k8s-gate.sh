@@ -216,6 +216,7 @@ evidence = {
     "readiness_evidence_kind": [
         "kubernetes_lease_client",
         "kubernetes_worker_shard_live_pod_executor",
+        "kubernetes_worker_shard_local_filesystem_durable_epoch_restart_read_back",
         "kubernetes_ingest_admission_startup_preflight",
         "kubernetes_ingest_admission_run_local_expiry_restart"
     ],
@@ -238,12 +239,13 @@ evidence = {
         "cargo test -p velorix-k8s --test live_ingest_admission",
         "cargo test -p velorix-k8s --test live_worker_shard",
     ],
-    "scope": "local vind Docker Kubernetes evidence; not 1.0 completion evidence; not multi-pod production ingest-admission readiness",
+    "scope": "local vind Docker Kubernetes evidence with run-local filesystem object-store authority; not 1.0 completion evidence; not multi-pod production ingest-admission readiness",
     "limitations": [
         "ingest-admission startup preflight and run-local expiry/restart use a run-local object-store authority",
-        "worker-shard live Pod runtime uses run-local in-memory object-store authority for epoch records",
+        "worker-shard live Pod runtime uses a run-local filesystem-backed object-store authority for epoch records",
+        "worker-shard restart read-back recreates checked startup components over the same local filesystem authority root",
         "does not exercise distributed or multi-pod admission races",
-        "does not prove worker-shard restart epoch read-back across operator process restart or non-memory authority durability",
+        "does not prove worker-shard epoch durability on a production S3-compatible authority, multi-pod restart, or broader operator lifecycle management",
     ],
 }
 with open(path, "w", encoding="utf-8") as f:

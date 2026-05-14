@@ -1,6 +1,10 @@
 use std::{
     env,
     error::Error,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -15,7 +19,7 @@ use kube::{
     api::{Api, DeleteParams, PostParams},
     Client, ResourceExt,
 };
-use object_store::memory::InMemory;
+use object_store::local::LocalFileSystem;
 use velorix_control::lease::PartitionLeaseClient;
 use velorix_k8s::{
     crd::{ObjectStoreAuthorityRef, VelorixWorkerShard, VelorixWorkerShardSpec},
@@ -25,10 +29,46 @@ use velorix_k8s::{
         build_kubernetes_worker_shard_operator_runtime, handle_worker_shard_event,
         partition_lease_key_from_worker_shard, runtime_identity_from_worker_shard,
         watch_worker_shards_with_kubernetes_runtime, worker_shard_pod_name_for_identity,
-        CheckpointPublisherEpochStore, WorkerShardCommand, WorkerShardEpochStore, WorkerShardEvent,
-        WorkerShardPodTemplate, WorkerShardReconcileConfig, WorkerShardReconcileInput,
+        WorkerShardCommand, WorkerShardEpochStore, WorkerShardEvent, WorkerShardPodTemplate,
+        WorkerShardReconcileConfig, WorkerShardReconcileInput,
     },
 };
+use velorix_storage::ownership::OwnershipEpochRecord;
+
+#[tokio::test]
+async fn live_worker_shard_epoch_store_reads_record_after_checked_authority_reconstruction_on_local_filesystem(
+) -> Result<(), Box<dyn Error>> {
+    let suffix = unique_suffix()?;
+    let authority = LiveWorkerShardAuthority::new(&suffix)?;
+    let components = authority.startup_components().await?;
+    let epoch_store = components.worker_shard_epoch_store()?;
+    let record = OwnershipEpochRecord {
+        stream_id: format!("orders-{suffix}"),
+        partition_id: 0,
+        owner_id: "worker-a".to_string(),
+        owner_epoch: 1,
+        lease_identity: format!("default/live-worker-view/orders-{suffix}/0"),
+        created_at: "2026-05-12T17:33:23Z".to_string(),
+        previous_epoch: None,
+        previous_checkpoint_version: None,
+    };
+
+    epoch_store.create(record.clone()).await?;
+
+    drop(epoch_store);
+    drop(components);
+    let restarted_components = authority.startup_components().await?;
+    let restarted_epoch_store = restarted_components.worker_shard_epoch_store()?;
+
+    assert_eq!(
+        restarted_epoch_store
+            .read(&record.stream_id, record.partition_id, record.owner_epoch)
+            .await?,
+        Some(record)
+    );
+
+    Ok(())
+}
 
 #[tokio::test]
 async fn live_worker_shard_reconciles_lease_and_epoch_record_when_enabled(
@@ -47,7 +87,9 @@ async fn live_worker_shard_reconciles_lease_and_epoch_record_when_enabled(
     let shard = worker_shard(&namespace, &suffix);
     let key = partition_lease_key_from_worker_shard(&shard)?;
     let lease_client = KubernetesPartitionLeaseClient::new(KubeLeaseApi::new(client.clone()));
-    let epoch_store = production_epoch_store(&suffix).await?;
+    let authority = LiveWorkerShardAuthority::new(&suffix)?;
+    let components = authority.startup_components().await?;
+    let epoch_store = components.worker_shard_epoch_store()?;
 
     let output = handle_worker_shard_event(
         WorkerShardEvent::Applied(shard),
@@ -90,6 +132,16 @@ async fn live_worker_shard_reconciles_lease_and_epoch_record_when_enabled(
     assert_eq!(record.owner_id, "worker-a");
     assert_eq!(record.lease_identity, partition_lease_identity(&key));
 
+    drop(epoch_store);
+    drop(components);
+    let restarted_components = authority.startup_components().await?;
+    let restarted_epoch_store = restarted_components.worker_shard_epoch_store()?;
+    let restarted_record = restarted_epoch_store
+        .read(&key.stream_id, key.partition_id, 1)
+        .await?
+        .expect("epoch record should survive checked authority reconstruction");
+    assert_eq!(restarted_record, record);
+
     lease_client
         .release(&key, "worker-a", 1, unix_ms()?)
         .await?;
@@ -117,7 +169,8 @@ async fn live_worker_shard_reconciles_and_creates_worker_pod_when_enabled(
 
     let shard = worker_shard_with_owner(&namespace, &suffix, &owner_id);
     let key = partition_lease_key_from_worker_shard(&shard)?;
-    let components = operator_startup_components(&suffix).await?;
+    let authority = LiveWorkerShardAuthority::new(&suffix)?;
+    let components = authority.startup_components().await?;
     let epoch_store = components.worker_shard_epoch_store()?;
     let runtime = build_kubernetes_worker_shard_operator_runtime(
         client.clone(),
@@ -165,6 +218,15 @@ async fn live_worker_shard_reconciles_and_creates_worker_pod_when_enabled(
         .expect("epoch record should be persisted");
     assert_eq!(record.owner_id, owner_id);
     assert_eq!(record.lease_identity, partition_lease_identity(&key));
+
+    drop(epoch_store);
+    let restarted_components = authority.startup_components().await?;
+    let restarted_epoch_store = restarted_components.worker_shard_epoch_store()?;
+    let restarted_record = restarted_epoch_store
+        .read(&key.stream_id, key.partition_id, 1)
+        .await?
+        .expect("epoch record should survive checked authority reconstruction");
+    assert_eq!(restarted_record, record);
 
     let identity = runtime_identity_from_worker_shard(
         &worker_shard_with_owner(&namespace, &suffix, &record.owner_id),
@@ -234,7 +296,8 @@ async fn live_worker_shard_watch_loop_creates_worker_pod_when_enabled() -> Resul
 
     let shard = worker_shard_with_owner(&namespace, &suffix, &owner_id);
     let key = partition_lease_key_from_worker_shard(&shard)?;
-    let components = operator_startup_components(&suffix).await?;
+    let authority = LiveWorkerShardAuthority::new(&suffix)?;
+    let components = authority.startup_components().await?;
     let epoch_store_for_assert = components.worker_shard_epoch_store()?;
 
     let watch_namespace = namespace.clone();
@@ -295,6 +358,15 @@ async fn live_worker_shard_watch_loop_creates_worker_pod_when_enabled() -> Resul
     assert_eq!(record.owner_id, owner_id);
     assert_eq!(record.lease_identity, partition_lease_identity(&key));
 
+    drop(epoch_store_for_assert);
+    let restarted_components = authority.startup_components().await?;
+    let restarted_epoch_store = restarted_components.worker_shard_epoch_store()?;
+    let restarted_record = restarted_epoch_store
+        .read(&key.stream_id, key.partition_id, 1)
+        .await?
+        .expect("epoch record should survive checked authority reconstruction");
+    assert_eq!(restarted_record, record);
+
     watch_task.abort();
     shard_api
         .delete(shard.name_any().as_str(), &DeleteParams::default())
@@ -310,26 +382,36 @@ async fn live_worker_shard_watch_loop_creates_worker_pod_when_enabled() -> Resul
     Ok(())
 }
 
-async fn production_epoch_store(
-    suffix: &str,
-) -> Result<CheckpointPublisherEpochStore, Box<dyn Error>> {
-    Ok(operator_startup_components(suffix)
-        .await?
-        .worker_shard_epoch_store()?)
+struct LiveWorkerShardAuthority {
+    suffix: String,
+    temp_dir: tempfile::TempDir,
+    probe_sequence: AtomicU64,
 }
 
-async fn operator_startup_components(
-    suffix: &str,
-) -> Result<OperatorAuthorityStartupComponents, Box<dyn Error>> {
-    let validated_authority = validate_operator_authority(
-        authority(),
-        std::sync::Arc::new(InMemory::new()),
-        "live-worker-shard-local-authority",
-        format!("v1/probes/worker-shard-{suffix}"),
-    )
-    .await?;
+impl LiveWorkerShardAuthority {
+    fn new(suffix: &str) -> Result<Self, Box<dyn Error>> {
+        Ok(Self {
+            suffix: suffix.to_string(),
+            temp_dir: tempfile::tempdir()?,
+            probe_sequence: AtomicU64::new(0),
+        })
+    }
 
-    Ok(OperatorAuthorityStartupComponents::from_validated_authority(validated_authority))
+    async fn startup_components(
+        &self,
+    ) -> Result<OperatorAuthorityStartupComponents, Box<dyn Error>> {
+        let probe_sequence = self.probe_sequence.fetch_add(1, Ordering::Relaxed);
+        let store = LocalFileSystem::new_with_prefix(self.temp_dir.path())?;
+        let validated_authority = validate_operator_authority(
+            authority(),
+            Arc::new(store),
+            "live-worker-shard-local-filesystem-authority",
+            format!("v1/probes/worker-shard-{}-{probe_sequence}", self.suffix),
+        )
+        .await?;
+
+        Ok(OperatorAuthorityStartupComponents::from_validated_authority(validated_authority))
+    }
 }
 
 fn worker_shard(namespace: &str, suffix: &str) -> VelorixWorkerShard {
