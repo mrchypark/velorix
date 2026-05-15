@@ -218,6 +218,8 @@ evidence = {
         "kubernetes_stream_watch_startup_components",
         "kubernetes_worker_shard_live_pod_executor",
         "kubernetes_worker_shard_startup_resync_before_watch",
+        "kubernetes_worker_shard_live_stale_pod_replacement",
+        "kubernetes_worker_shard_live_lease_loss_stop_without_replacement",
         "kubernetes_worker_shard_local_filesystem_durable_epoch_restart_read_back",
         "kubernetes_ingest_admission_startup_preflight",
         "kubernetes_ingest_admission_run_local_expiry_restart"
@@ -247,6 +249,8 @@ evidence = {
         "stream watch uses run-local filesystem object-store authority through OperatorAuthorityStartupComponents before patching Kubernetes status",
         "worker-shard live Pod runtime uses a run-local filesystem-backed object-store authority for epoch records",
         "worker-shard startup resync runs before watch entry but remains a single startup pass, not periodic controller lifecycle evidence",
+        "worker-shard stale Pod replacement is exercised after release/reacquire against local vind Kubernetes but does not prove multi-pod leader-handoff or production S3-compatible authority behavior",
+        "worker-shard lease-loss cleanup is exercised after a conflicting owner acquires the Lease against local vind Kubernetes but does not prove multi-pod leader election or production S3-compatible authority behavior",
         "worker-shard restart read-back recreates checked startup components over the same local filesystem authority root",
         "does not exercise distributed or multi-pod admission races",
         "does not prove worker-shard epoch durability on a production S3-compatible authority, multi-pod restart, or broader operator lifecycle management",

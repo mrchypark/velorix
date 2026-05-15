@@ -20,7 +20,10 @@ use kube::{
     Client, ResourceExt,
 };
 use object_store::local::LocalFileSystem;
-use velorix_control::lease::PartitionLeaseClient;
+use velorix_control::{
+    lease::{LeaseAcquireRequest, PartitionLeaseClient},
+    reconcile_plan::{ReconcileBlockReason, WorkerFact},
+};
 use velorix_k8s::{
     crd::{ObjectStoreAuthorityRef, VelorixWorkerShard, VelorixWorkerShardSpec},
     lease::{partition_lease_identity, KubeLeaseApi, KubernetesPartitionLeaseClient},
@@ -271,6 +274,271 @@ async fn live_worker_shard_reconciles_and_creates_worker_pod_when_enabled(
     let lease_client = KubernetesPartitionLeaseClient::new(KubeLeaseApi::new(client.clone()));
     lease_client
         .release(&key, &record.owner_id, 1, unix_ms()?)
+        .await?;
+    delete_lease(client, &key).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn live_worker_shard_replaces_stale_worker_pod_after_lease_reacquire_when_enabled(
+) -> Result<(), Box<dyn Error>> {
+    if env::var("VELORIX_K8S_INTEGRATION").as_deref() != Ok("1") {
+        eprintln!(
+            "skipping live Kubernetes worker shard stale-pod replacement test; set VELORIX_K8S_INTEGRATION=1"
+        );
+        return Ok(());
+    }
+
+    let namespace =
+        env::var("VELORIX_K8S_NAMESPACE").unwrap_or_else(|_| "velorix-live".to_string());
+    let worker_image = env::var("VELORIX_K8S_WORKER_IMAGE")
+        .unwrap_or_else(|_| "registry.k8s.io/pause:3.10".to_string());
+    let suffix = unique_suffix()?;
+    let owner_id = format!("stale-worker-{suffix}");
+    let client = Client::try_default().await?;
+    ensure_namespace(client.clone(), &namespace).await?;
+
+    let shard = worker_shard_with_owner(&namespace, &suffix, &owner_id);
+    let key = partition_lease_key_from_worker_shard(&shard)?;
+    let authority = LiveWorkerShardAuthority::new(&suffix)?;
+    let components = authority.startup_components().await?;
+    let epoch_store = components.worker_shard_epoch_store()?;
+    let runtime = build_kubernetes_worker_shard_operator_runtime(
+        client.clone(),
+        &namespace,
+        &components,
+        WorkerShardPodTemplate::new(worker_image.clone())?,
+    )?;
+
+    let first_output = runtime
+        .handle_event(
+            WorkerShardEvent::Applied(shard.clone()),
+            WorkerShardReconcileInput {
+                now_unix_ms: unix_ms()?,
+                ttl_ms: 60_000,
+                running_worker: None,
+                config: WorkerShardReconcileConfig {
+                    created_at: "2026-05-12T17:33:23Z".to_string(),
+                    previous_checkpoint_version: None,
+                },
+            },
+        )
+        .await?
+        .expect("applied worker shard should reconcile first epoch");
+
+    assert_eq!(
+        first_output.commands,
+        vec![
+            WorkerShardCommand::AcquireLease {
+                owner_id: owner_id.clone(),
+            },
+            WorkerShardCommand::PersistEpochRecord {
+                owner_id: owner_id.clone(),
+                owner_epoch: 1,
+            },
+            WorkerShardCommand::StartWorker {
+                owner_id: owner_id.clone(),
+                owner_epoch: 1,
+            },
+        ]
+    );
+
+    let first_identity = runtime_identity_from_worker_shard(&shard, &owner_id, 1)?;
+    let first_pod_name = worker_shard_pod_name_for_identity(&first_identity);
+    let pod_api: Api<Pod> = Api::namespaced(client.clone(), &namespace);
+    wait_for_pod(&pod_api, &first_pod_name).await?;
+
+    let lease_client = KubernetesPartitionLeaseClient::new(KubeLeaseApi::new(client.clone()));
+    lease_client.release(&key, &owner_id, 1, unix_ms()?).await?;
+
+    let second_output = runtime
+        .handle_event(
+            WorkerShardEvent::Applied(shard.clone()),
+            WorkerShardReconcileInput {
+                now_unix_ms: unix_ms()?,
+                ttl_ms: 60_000,
+                running_worker: Some(WorkerFact {
+                    owner_id: owner_id.clone(),
+                    owner_epoch: 1,
+                }),
+                config: WorkerShardReconcileConfig {
+                    created_at: "2026-05-12T17:33:23Z".to_string(),
+                    previous_checkpoint_version: None,
+                },
+            },
+        )
+        .await?
+        .expect("applied worker shard should reconcile replacement epoch");
+
+    assert_eq!(
+        second_output.commands,
+        vec![
+            WorkerShardCommand::StopWorker {
+                owner_id: owner_id.clone(),
+                owner_epoch: 1,
+            },
+            WorkerShardCommand::AcquireLease {
+                owner_id: owner_id.clone(),
+            },
+            WorkerShardCommand::PersistEpochRecord {
+                owner_id: owner_id.clone(),
+                owner_epoch: 2,
+            },
+            WorkerShardCommand::StartWorker {
+                owner_id: owner_id.clone(),
+                owner_epoch: 2,
+            },
+        ]
+    );
+
+    wait_for_pod_deleted(&pod_api, &first_pod_name).await?;
+    let second_identity = runtime_identity_from_worker_shard(&shard, &owner_id, 2)?;
+    let second_pod_name = worker_shard_pod_name_for_identity(&second_identity);
+    let second_pod = wait_for_pod(&pod_api, &second_pod_name).await?;
+    assert_eq!(
+        second_pod.metadata.name.as_deref(),
+        Some(second_pod_name.as_str())
+    );
+    assert_eq!(
+        second_pod
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get("control.velorix.io/owner-epoch"))
+            .map(String::as_str),
+        Some("2")
+    );
+
+    let second_record = epoch_store
+        .read(&key.stream_id, key.partition_id, 2)
+        .await?
+        .expect("replacement epoch record should be persisted");
+    assert_eq!(second_record.owner_id, owner_id);
+    assert_eq!(second_record.lease_identity, partition_lease_identity(&key));
+
+    delete_pod_if_present(&pod_api, &second_pod_name).await?;
+    wait_for_pod_deleted(&pod_api, &second_pod_name).await?;
+    lease_client.release(&key, &owner_id, 2, unix_ms()?).await?;
+    delete_lease(client, &key).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn live_worker_shard_stops_pod_without_replacement_when_lease_moves_to_other_owner_when_enabled(
+) -> Result<(), Box<dyn Error>> {
+    if env::var("VELORIX_K8S_INTEGRATION").as_deref() != Ok("1") {
+        eprintln!(
+            "skipping live Kubernetes worker shard lease-loss cleanup test; set VELORIX_K8S_INTEGRATION=1"
+        );
+        return Ok(());
+    }
+
+    let namespace =
+        env::var("VELORIX_K8S_NAMESPACE").unwrap_or_else(|_| "velorix-live".to_string());
+    let worker_image = env::var("VELORIX_K8S_WORKER_IMAGE")
+        .unwrap_or_else(|_| "registry.k8s.io/pause:3.10".to_string());
+    let suffix = unique_suffix()?;
+    let owner_id = format!("lease-loss-worker-{suffix}");
+    let other_owner_id = format!("lease-loss-other-{suffix}");
+    let client = Client::try_default().await?;
+    ensure_namespace(client.clone(), &namespace).await?;
+
+    let shard = worker_shard_with_owner(&namespace, &suffix, &owner_id);
+    let key = partition_lease_key_from_worker_shard(&shard)?;
+    let authority = LiveWorkerShardAuthority::new(&suffix)?;
+    let components = authority.startup_components().await?;
+    let epoch_store = components.worker_shard_epoch_store()?;
+    let runtime = build_kubernetes_worker_shard_operator_runtime(
+        client.clone(),
+        &namespace,
+        &components,
+        WorkerShardPodTemplate::new(worker_image.clone())?,
+    )?;
+
+    runtime
+        .handle_event(
+            WorkerShardEvent::Applied(shard.clone()),
+            WorkerShardReconcileInput {
+                now_unix_ms: unix_ms()?,
+                ttl_ms: 60_000,
+                running_worker: None,
+                config: WorkerShardReconcileConfig {
+                    created_at: "2026-05-12T17:33:23Z".to_string(),
+                    previous_checkpoint_version: None,
+                },
+            },
+        )
+        .await?
+        .expect("applied worker shard should reconcile first epoch");
+
+    let first_identity = runtime_identity_from_worker_shard(&shard, &owner_id, 1)?;
+    let first_pod_name = worker_shard_pod_name_for_identity(&first_identity);
+    let pod_api: Api<Pod> = Api::namespaced(client.clone(), &namespace);
+    wait_for_pod(&pod_api, &first_pod_name).await?;
+
+    let lease_client = KubernetesPartitionLeaseClient::new(KubeLeaseApi::new(client.clone()));
+    lease_client.release(&key, &owner_id, 1, unix_ms()?).await?;
+    let other_grant = lease_client
+        .acquire_or_renew(LeaseAcquireRequest {
+            key: key.clone(),
+            owner_id: other_owner_id.clone(),
+            now_unix_ms: unix_ms()?,
+            ttl_ms: 60_000,
+        })
+        .await?;
+    assert_eq!(other_grant.owner_id, other_owner_id);
+    assert_eq!(other_grant.owner_epoch, 2);
+
+    let output = runtime
+        .handle_event(
+            WorkerShardEvent::Applied(shard.clone()),
+            WorkerShardReconcileInput {
+                now_unix_ms: unix_ms()?,
+                ttl_ms: 60_000,
+                running_worker: Some(WorkerFact {
+                    owner_id: owner_id.clone(),
+                    owner_epoch: 1,
+                }),
+                config: WorkerShardReconcileConfig {
+                    created_at: "2026-05-12T17:33:23Z".to_string(),
+                    previous_checkpoint_version: None,
+                },
+            },
+        )
+        .await?
+        .expect("applied worker shard should stop stale pod on lease loss");
+
+    assert_eq!(
+        output.commands,
+        vec![WorkerShardCommand::StopWorker {
+            owner_id: owner_id.clone(),
+            owner_epoch: 1,
+        }]
+    );
+    assert_eq!(
+        output.plan.block_reason,
+        Some(ReconcileBlockReason::LeaseOwnerConflict)
+    );
+
+    wait_for_pod_deleted(&pod_api, &first_pod_name).await?;
+    let replacement_identity = runtime_identity_from_worker_shard(&shard, &owner_id, 2)?;
+    let replacement_pod_name = worker_shard_pod_name_for_identity(&replacement_identity);
+    assert!(
+        pod_api.get_opt(&replacement_pod_name).await?.is_none(),
+        "lease-lost worker should not start a replacement Pod"
+    );
+    assert!(
+        epoch_store
+            .read(&key.stream_id, key.partition_id, 2)
+            .await?
+            .is_none(),
+        "lease-lost worker should not persist an epoch record for a conflicting holder"
+    );
+
+    lease_client
+        .release(&key, &other_owner_id, 2, unix_ms()?)
         .await?;
     delete_lease(client, &key).await?;
 
