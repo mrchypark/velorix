@@ -349,6 +349,71 @@ fn stream_watch_exposes_startup_component_kubernetes_runtime() {
 }
 
 #[test]
+fn worker_shard_exposes_startup_component_kubernetes_runtime() {
+    let source_code = include_str!("../src/worker_shard.rs");
+    let runtime_body = function_body(
+        source_code,
+        "pub fn build_kubernetes_worker_shard_operator_runtime(",
+    )
+    .expect("worker-shard runtime assembly function should exist");
+    let watch_body = function_body(
+        source_code,
+        "pub async fn watch_worker_shards_with_kubernetes_runtime(",
+    )
+    .expect("worker-shard watch runtime wrapper should exist");
+    let resync_body = function_body(
+        source_code,
+        "pub async fn resync_worker_shards_before_watch_with_kubernetes_runtime(",
+    )
+    .expect("worker-shard startup resync runtime wrapper should exist");
+    let resync_then_watch_body = function_body(
+        source_code,
+        "pub async fn watch_worker_shards_with_kubernetes_runtime_after_initial_resync(",
+    )
+    .expect("worker-shard resync-then-watch runtime wrapper should exist");
+
+    assert!(
+        runtime_body.contains("startup_components: &OperatorAuthorityStartupComponents"),
+        "worker-shard runtime assembly must take checked startup components"
+    );
+    assert!(
+        runtime_body.contains("startup_components.worker_shard_epoch_store()?"),
+        "worker-shard runtime assembly must build the epoch store from startup components"
+    );
+    assert!(
+        runtime_body
+            .contains("KubernetesPartitionLeaseClient::new(KubeLeaseApi::new(client.clone()))"),
+        "worker-shard runtime assembly must wire Kubernetes Lease coordination"
+    );
+    assert!(
+        runtime_body.contains(
+            "KubernetesPodWorkerShardScopedCommandExecutor::new(client, namespace, pod_template)"
+        ),
+        "worker-shard runtime assembly must wire the scoped Kubernetes Pod executor"
+    );
+    assert!(
+        runtime_body.contains("startup_components.authority().clone()"),
+        "worker-shard runtime assembly must keep the validated authority on the runtime"
+    );
+    assert!(
+        !runtime_body.contains("CheckpointPublisher::new_checked("),
+        "worker-shard runtime assembly must not bypass startup components for ownership epoch construction"
+    );
+
+    for (name, body) in [
+        ("watch", watch_body),
+        ("startup resync", resync_body),
+        ("resync then watch", resync_then_watch_body),
+    ] {
+        assert!(
+            body.contains("build_kubernetes_worker_shard_operator_runtime(")
+                || body.contains("resync_worker_shards_before_watch_with_kubernetes_runtime("),
+            "{name} worker-shard Kubernetes wrapper must use the startup-component runtime assembly"
+        );
+    }
+}
+
+#[test]
 fn k8s_src_runtime_assembly_does_not_call_direct_production_constructors() {
     let forbidden = [
         "RelationCatalogSnapshotProvider::for_production",
@@ -380,6 +445,25 @@ fn strip_line_comments(source: &str) -> String {
         .map(|line| line.split_once("//").map_or(line, |(code, _comment)| code))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn function_body<'a>(source: &'a str, signature: &str) -> Option<&'a str> {
+    let signature_start = source.find(signature)?;
+    let body_start = source[signature_start..].find('{')? + signature_start;
+    let mut depth = 0usize;
+    for (offset, byte) in source[body_start..].bytes().enumerate() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(&source[signature_start..=body_start + offset]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn temp_store() -> (TempDir, Arc<dyn ObjectStore>) {

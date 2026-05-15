@@ -20,6 +20,17 @@ surface, so production-style tests and runtime assembly must construct
 relation-snapshot, stream-watch status, ingest-admission, and worker-epoch-store
 components through the shared startup component object.
 
+Object-store capability evidence note, 2026-05-15: the Kubernetes source
+contract now also pins the worker-shard runtime assembly surface itself:
+`build_kubernetes_worker_shard_operator_runtime`,
+`watch_worker_shards_with_kubernetes_runtime`,
+`resync_worker_shards_before_watch_with_kubernetes_runtime`, and the
+resync-then-watch wrapper must route ownership epoch-store construction through
+`OperatorAuthorityStartupComponents` and keep the validated authority on the
+runtime. This narrows the remaining runtime-construction bypass risk without
+marking the row complete; deployed runtime assembly and non-local/live authority
+evidence are still required.
+
 Ownership evidence note, 2026-05-15: the Kubernetes worker-shard runtime now has
 a narrow startup-resync entrypoint that is constructed from
 `OperatorAuthorityStartupComponents`, runs the bounded `VelorixWorkerShard`
