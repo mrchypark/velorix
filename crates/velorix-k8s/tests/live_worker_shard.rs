@@ -547,6 +547,159 @@ async fn live_worker_shard_stops_pod_without_replacement_when_lease_moves_to_oth
 }
 
 #[tokio::test]
+async fn live_worker_shard_hands_off_between_two_runtime_owners_when_enabled(
+) -> Result<(), Box<dyn Error>> {
+    if env::var("VELORIX_K8S_INTEGRATION").as_deref() != Ok("1") {
+        eprintln!(
+            "skipping live Kubernetes worker shard leader-handoff test; set VELORIX_K8S_INTEGRATION=1"
+        );
+        return Ok(());
+    }
+
+    let namespace =
+        env::var("VELORIX_K8S_NAMESPACE").unwrap_or_else(|_| "velorix-live".to_string());
+    let worker_image = env::var("VELORIX_K8S_WORKER_IMAGE")
+        .unwrap_or_else(|_| "registry.k8s.io/pause:3.10".to_string());
+    let suffix = unique_suffix()?;
+    let owner_a = format!("handoff-a-{suffix}");
+    let owner_b = format!("handoff-b-{suffix}");
+    let client = Client::try_default().await?;
+    ensure_namespace(client.clone(), &namespace).await?;
+
+    let authority = LiveWorkerShardAuthority::new(&suffix)?;
+    let components_a = authority.startup_components().await?;
+    let runtime_a = build_kubernetes_worker_shard_operator_runtime(
+        client.clone(),
+        &namespace,
+        &components_a,
+        WorkerShardPodTemplate::new(worker_image.clone())?,
+    )?;
+    let shard_a = worker_shard_with_owner(&namespace, &suffix, &owner_a);
+    let key = partition_lease_key_from_worker_shard(&shard_a)?;
+
+    let first_output = runtime_a
+        .handle_event(
+            WorkerShardEvent::Applied(shard_a.clone()),
+            WorkerShardReconcileInput {
+                now_unix_ms: unix_ms()?,
+                ttl_ms: 60_000,
+                running_worker: None,
+                config: WorkerShardReconcileConfig {
+                    created_at: "2026-05-12T17:33:23Z".to_string(),
+                    previous_checkpoint_version: None,
+                },
+            },
+        )
+        .await?
+        .expect("first runtime should acquire ownership and start owner A");
+    assert_eq!(
+        first_output.commands,
+        vec![
+            WorkerShardCommand::AcquireLease {
+                owner_id: owner_a.clone(),
+            },
+            WorkerShardCommand::PersistEpochRecord {
+                owner_id: owner_a.clone(),
+                owner_epoch: 1,
+            },
+            WorkerShardCommand::StartWorker {
+                owner_id: owner_a.clone(),
+                owner_epoch: 1,
+            },
+        ]
+    );
+
+    let first_identity = runtime_identity_from_worker_shard(&shard_a, &owner_a, 1)?;
+    let first_pod_name = worker_shard_pod_name_for_identity(&first_identity);
+    let pod_api: Api<Pod> = Api::namespaced(client.clone(), &namespace);
+    wait_for_pod(&pod_api, &first_pod_name).await?;
+
+    let lease_client = KubernetesPartitionLeaseClient::new(KubeLeaseApi::new(client.clone()));
+    lease_client.release(&key, &owner_a, 1, unix_ms()?).await?;
+
+    let components_b = authority.startup_components().await?;
+    let epoch_store_b = components_b.worker_shard_epoch_store()?;
+    let runtime_b = build_kubernetes_worker_shard_operator_runtime(
+        client.clone(),
+        &namespace,
+        &components_b,
+        WorkerShardPodTemplate::new(worker_image.clone())?,
+    )?;
+    let shard_b = worker_shard_with_owner(&namespace, &suffix, &owner_b);
+
+    let handoff_output = runtime_b
+        .handle_event(
+            WorkerShardEvent::Applied(shard_b.clone()),
+            WorkerShardReconcileInput {
+                now_unix_ms: unix_ms()?,
+                ttl_ms: 60_000,
+                running_worker: Some(WorkerFact {
+                    owner_id: owner_a.clone(),
+                    owner_epoch: 1,
+                }),
+                config: WorkerShardReconcileConfig {
+                    created_at: "2026-05-12T17:33:23Z".to_string(),
+                    previous_checkpoint_version: None,
+                },
+            },
+        )
+        .await?
+        .expect("second runtime should stop owner A and start owner B");
+    assert_eq!(
+        handoff_output.commands,
+        vec![
+            WorkerShardCommand::StopWorker {
+                owner_id: owner_a.clone(),
+                owner_epoch: 1,
+            },
+            WorkerShardCommand::AcquireLease {
+                owner_id: owner_b.clone(),
+            },
+            WorkerShardCommand::PersistEpochRecord {
+                owner_id: owner_b.clone(),
+                owner_epoch: 2,
+            },
+            WorkerShardCommand::StartWorker {
+                owner_id: owner_b.clone(),
+                owner_epoch: 2,
+            },
+        ]
+    );
+
+    wait_for_pod_deleted(&pod_api, &first_pod_name).await?;
+    let second_identity = runtime_identity_from_worker_shard(&shard_b, &owner_b, 2)?;
+    let second_pod_name = worker_shard_pod_name_for_identity(&second_identity);
+    let second_pod = wait_for_pod(&pod_api, &second_pod_name).await?;
+    let container = second_pod
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.containers.first())
+        .ok_or("handoff worker Pod is missing its first container")?;
+    assert_eq!(
+        container_env_value(container, "VELORIX_WORKER_OWNER_ID"),
+        Some(owner_b.as_str())
+    );
+    assert_eq!(
+        container_env_value(container, "VELORIX_WORKER_OWNER_EPOCH"),
+        Some("2")
+    );
+
+    let record = epoch_store_b
+        .read(&key.stream_id, key.partition_id, 2)
+        .await?
+        .expect("handoff epoch record should be persisted by the second runtime");
+    assert_eq!(record.owner_id, owner_b);
+    assert_eq!(record.lease_identity, partition_lease_identity(&key));
+
+    delete_pod_if_present(&pod_api, &second_pod_name).await?;
+    wait_for_pod_deleted(&pod_api, &second_pod_name).await?;
+    lease_client.release(&key, &owner_b, 2, unix_ms()?).await?;
+    delete_lease(client, &key).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn live_worker_shard_watch_loop_creates_worker_pod_when_enabled() -> Result<(), Box<dyn Error>>
 {
     if env::var("VELORIX_K8S_INTEGRATION").as_deref() != Ok("1") {

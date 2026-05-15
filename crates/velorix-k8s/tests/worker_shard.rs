@@ -1296,6 +1296,70 @@ async fn scoped_kubernetes_pod_executor_stops_stale_pod_before_replacement_start
 }
 
 #[tokio::test]
+async fn scoped_worker_shard_leader_handoff_stops_old_owner_and_starts_new_owner() {
+    let lease = FakeLeaseClient::default().with_acquired(grant("worker-b", 2));
+    let epoch_store = FakeEpochStore::default();
+    let executor = FakeCommandExecutor::default();
+    let shard = shard_with_desired_owner("worker-b");
+
+    let output = handle_worker_shard_event_with_scoped_command_executor_and_authority(
+        WorkerShardEvent::Applied(shard.clone()),
+        &lease,
+        &epoch_store,
+        input(Some(WorkerFact {
+            owner_id: "worker-a".to_string(),
+            owner_epoch: 1,
+        })),
+        &executor,
+        Some(&authority()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(
+        output.commands,
+        vec![
+            WorkerShardCommand::StopWorker {
+                owner_id: "worker-a".to_string(),
+                owner_epoch: 1,
+            },
+            WorkerShardCommand::AcquireLease {
+                owner_id: "worker-b".to_string(),
+            },
+            WorkerShardCommand::PersistEpochRecord {
+                owner_id: "worker-b".to_string(),
+                owner_epoch: 2,
+            },
+            WorkerShardCommand::StartWorker {
+                owner_id: "worker-b".to_string(),
+                owner_epoch: 2,
+            },
+        ]
+    );
+    assert_eq!(
+        executor.actions(),
+        vec![
+            ExecutedWorkerCommand::Stop {
+                owner_id: "worker-a".to_string(),
+                owner_epoch: 1,
+            },
+            ExecutedWorkerCommand::Start {
+                owner_id: "worker-b".to_string(),
+                owner_epoch: 2,
+            },
+        ]
+    );
+    assert_eq!(
+        epoch_store
+            .read(&shard.spec.stream_id, shard.spec.partition_id, 2)
+            .await
+            .unwrap(),
+        Some(epoch_record("worker-b", 2))
+    );
+}
+
+#[tokio::test]
 async fn scoped_kubernetes_pod_executor_stops_running_pod_on_lease_loss_without_replacement_start()
 {
     let lease = FakeLeaseClient::default().with_current(None);
@@ -2490,6 +2554,13 @@ fn shard() -> VelorixWorkerShard {
     );
     shard.metadata.namespace = Some("default".to_string());
     shard.metadata.generation = Some(2);
+    shard
+}
+
+fn shard_with_desired_owner(owner_id: &str) -> VelorixWorkerShard {
+    let mut shard = shard();
+    shard.spec.worker_id = owner_id.to_string();
+    shard.spec.desired_owner_id = owner_id.to_string();
     shard
 }
 
