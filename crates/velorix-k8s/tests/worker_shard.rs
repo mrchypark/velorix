@@ -3,6 +3,7 @@ use std::{
     convert::Infallible,
     fs,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -35,15 +36,17 @@ use velorix_k8s::{
         handle_worker_shard_event_with_output_sink,
         handle_worker_shard_event_with_scoped_command_executor_and_authority,
         reconcile_worker_shard, resync_worker_shards_before_watch_with_kubernetes_runtime,
-        resync_worker_shards_once_with_operator_runtime, runtime_identity_from_worker_shard,
-        worker_shard_pod_name, worker_shard_pod_name_for_identity, worker_shard_watch_event,
+        resync_worker_shards_once_with_operator_runtime,
+        resync_worker_shards_periodically_with_kubernetes_runtime,
+        runtime_identity_from_worker_shard, worker_shard_pod_name,
+        worker_shard_pod_name_for_identity, worker_shard_watch_event,
         KubernetesPodWorkerShardCommandExecutor, KubernetesPodWorkerShardScopedCommandExecutor,
         ProcessWorkerShardCommandExecutor, WorkerShardCommand, WorkerShardCommandExecutor,
         WorkerShardCommandExecutorError, WorkerShardEpochStore, WorkerShardError, WorkerShardEvent,
-        WorkerShardOperatorRuntime, WorkerShardPodTemplate, WorkerShardProcessCommand,
-        WorkerShardReconcileConfig, WorkerShardReconcileInput, WorkerShardReconcileOutput,
-        WorkerShardResyncOptions, WorkerShardResyncSummary, WorkerShardRuntimeIdentity,
-        WorkerShardScopedCommandExecutor,
+        WorkerShardOperatorRuntime, WorkerShardPeriodicResyncOptions, WorkerShardPodTemplate,
+        WorkerShardProcessCommand, WorkerShardReconcileConfig, WorkerShardReconcileInput,
+        WorkerShardReconcileOutput, WorkerShardResyncOptions, WorkerShardResyncSummary,
+        WorkerShardRuntimeIdentity, WorkerShardScopedCommandExecutor,
     },
 };
 use velorix_storage::ownership::OwnershipEpochRecord;
@@ -1052,6 +1055,77 @@ async fn kubernetes_worker_shard_startup_resync_bound_failure_does_not_enter_wor
         other => panic!("expected resync bound error, got {other:?}"),
     }
     assert!(requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn kubernetes_worker_shard_periodic_resync_requeues_bounded_authority_checks() {
+    let validated_authority = validate_operator_authority(
+        authority(),
+        Arc::new(InMemory::new()),
+        "worker-shard-periodic-resync-authority",
+        "v1/probes/worker-shard-periodic-resync",
+    )
+    .await
+    .unwrap();
+    let components =
+        OperatorAuthorityStartupComponents::from_validated_authority(validated_authority);
+    let (client, requests) = fake_worker_shard_startup_resync_client(vec![
+        list_page(vec![shard()], None),
+        list_page(Vec::new(), None),
+    ]);
+
+    let summaries = resync_worker_shards_periodically_with_kubernetes_runtime(
+        client,
+        "default",
+        &components,
+        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+        |_| input(None),
+        WorkerShardPeriodicResyncOptions {
+            interval: Duration::from_millis(1),
+            resync: WorkerShardResyncOptions::default(),
+            max_cycles: Some(2),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        summaries,
+        vec![
+            WorkerShardResyncSummary {
+                listed: 1,
+                applied: 1,
+            },
+            WorkerShardResyncSummary {
+                listed: 0,
+                applied: 0,
+            },
+        ]
+    );
+    assert_eq!(
+        components
+            .worker_shard_epoch_store()
+            .unwrap()
+            .read("orders", 0, 1)
+            .await
+            .unwrap(),
+        Some(epoch_record("worker-a", 1))
+    );
+
+    let requests = requests.lock().unwrap();
+    let list_requests = requests
+        .iter()
+        .filter(|request| {
+            request.method == Method::GET
+                && request
+                    .path
+                    .ends_with("/namespaces/default/velorixworkershards")
+        })
+        .count();
+    assert_eq!(list_requests, 2);
+    assert_eq!(requests[0].method, Method::GET);
+    assert_eq!(requests[4].method, Method::POST);
+    assert_eq!(requests[4].path, "/api/v1/namespaces/default/pods");
 }
 
 #[test]

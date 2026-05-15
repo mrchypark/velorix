@@ -371,6 +371,11 @@ fn worker_shard_exposes_startup_component_kubernetes_runtime() {
         "pub async fn watch_worker_shards_with_kubernetes_runtime_after_initial_resync(",
     )
     .expect("worker-shard resync-then-watch runtime wrapper should exist");
+    let periodic_resync_body = function_body(
+        source_code,
+        "pub async fn resync_worker_shards_periodically_with_kubernetes_runtime(",
+    )
+    .expect("worker-shard periodic resync runtime wrapper should exist");
 
     assert!(
         runtime_body.contains("startup_components: &OperatorAuthorityStartupComponents"),
@@ -404,6 +409,7 @@ fn worker_shard_exposes_startup_component_kubernetes_runtime() {
         ("watch", watch_body),
         ("startup resync", resync_body),
         ("resync then watch", resync_then_watch_body),
+        ("periodic resync", periodic_resync_body),
     ] {
         assert!(
             body.contains("build_kubernetes_worker_shard_operator_runtime(")

@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -12,7 +12,10 @@ use kube::{
     Client, ResourceExt,
 };
 use thiserror::Error;
-use tokio::process::Command;
+use tokio::{
+    process::Command,
+    time::{self, MissedTickBehavior},
+};
 use velorix_control::{
     control_plane_contract::{
         ContractMetadata, VelorixView, VelorixViewSpec, VelorixViewStatus, WorkerIntent,
@@ -1218,6 +1221,23 @@ pub struct WorkerShardResyncSummary {
     pub applied: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkerShardPeriodicResyncOptions {
+    pub interval: Duration,
+    pub resync: WorkerShardResyncOptions,
+    pub max_cycles: Option<usize>,
+}
+
+impl Default for WorkerShardPeriodicResyncOptions {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(60),
+            resync: WorkerShardResyncOptions::default(),
+            max_cycles: None,
+        }
+    }
+}
+
 impl<L, E, X> WorkerShardOperatorRuntime<L, E, X>
 where
     L: PartitionLeaseClient,
@@ -1355,6 +1375,52 @@ where
     Ok(WorkerShardResyncSummary { listed, applied })
 }
 
+pub async fn resync_worker_shards_periodically_with_operator_runtime<L, E, X>(
+    client: Client,
+    namespace: &str,
+    runtime: &WorkerShardOperatorRuntime<L, E, X>,
+    mut input_for_shard: impl FnMut(&VelorixWorkerShard) -> WorkerShardReconcileInput + Send,
+    options: WorkerShardPeriodicResyncOptions,
+) -> Result<Vec<WorkerShardResyncSummary>, WorkerShardError>
+where
+    L: PartitionLeaseClient,
+    E: WorkerShardEpochStore,
+    X: WorkerShardScopedCommandExecutor,
+{
+    runtime.require_authority()?;
+    if options.interval.is_zero() {
+        return Err(WorkerShardError::ResyncBoundExceeded {
+            bound: "worker shard periodic resync interval",
+            limit: 0,
+        });
+    }
+
+    let mut interval = time::interval(options.interval);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut summaries = Vec::new();
+
+    loop {
+        interval.tick().await;
+        summaries.push(
+            resync_worker_shards_once_with_operator_runtime(
+                client.clone(),
+                namespace,
+                runtime,
+                &mut input_for_shard,
+                options.resync.clone(),
+            )
+            .await?,
+        );
+
+        if options
+            .max_cycles
+            .is_some_and(|max_cycles| summaries.len() >= max_cycles)
+        {
+            return Ok(summaries);
+        }
+    }
+}
+
 fn worker_shard_resync_order(
     left: &VelorixWorkerShard,
     right: &VelorixWorkerShard,
@@ -1421,6 +1487,30 @@ pub async fn resync_worker_shards_before_watch_with_kubernetes_runtime(
     .await?;
 
     Ok((runtime, summary))
+}
+
+pub async fn resync_worker_shards_periodically_with_kubernetes_runtime(
+    client: Client,
+    namespace: &str,
+    startup_components: &OperatorAuthorityStartupComponents,
+    pod_template: WorkerShardPodTemplate,
+    input_for_shard: impl FnMut(&VelorixWorkerShard) -> WorkerShardReconcileInput + Send,
+    periodic_options: WorkerShardPeriodicResyncOptions,
+) -> Result<Vec<WorkerShardResyncSummary>, WorkerShardError> {
+    let runtime = build_kubernetes_worker_shard_operator_runtime(
+        client.clone(),
+        namespace,
+        startup_components,
+        pod_template,
+    )?;
+    resync_worker_shards_periodically_with_operator_runtime(
+        client,
+        namespace,
+        &runtime,
+        input_for_shard,
+        periodic_options,
+    )
+    .await
 }
 
 pub async fn watch_worker_shards_with_kubernetes_runtime_after_initial_resync(

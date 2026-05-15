@@ -32,10 +32,11 @@ use velorix_k8s::{
         build_kubernetes_worker_shard_operator_runtime, handle_worker_shard_event,
         partition_lease_key_from_worker_shard,
         resync_worker_shards_before_watch_with_kubernetes_runtime,
+        resync_worker_shards_periodically_with_kubernetes_runtime,
         runtime_identity_from_worker_shard, watch_worker_shards_with_kubernetes_runtime,
         worker_shard_pod_name_for_identity, WorkerShardCommand, WorkerShardEpochStore,
-        WorkerShardEvent, WorkerShardPodTemplate, WorkerShardReconcileConfig,
-        WorkerShardReconcileInput, WorkerShardResyncOptions,
+        WorkerShardEvent, WorkerShardPeriodicResyncOptions, WorkerShardPodTemplate,
+        WorkerShardReconcileConfig, WorkerShardReconcileInput, WorkerShardResyncOptions,
     },
 };
 use velorix_storage::ownership::OwnershipEpochRecord;
@@ -729,6 +730,87 @@ async fn live_worker_shard_startup_resync_reconciles_existing_shard_when_enabled
         .read(&key.stream_id, key.partition_id, 1)
         .await?
         .expect("startup resync should persist epoch record before watcher events are required");
+    assert_eq!(record.owner_id, owner_id);
+    assert_eq!(record.lease_identity, partition_lease_identity(&key));
+
+    shard_api
+        .delete(shard.name_any().as_str(), &DeleteParams::default())
+        .await?;
+    delete_pod_if_present(&pod_api, &pod_name).await?;
+    wait_for_pod_deleted(&pod_api, &pod_name).await?;
+    let lease_client = KubernetesPartitionLeaseClient::new(KubeLeaseApi::new(client.clone()));
+    lease_client
+        .release(&key, &record.owner_id, 1, unix_ms()?)
+        .await?;
+    delete_lease(client, &key).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn live_worker_shard_periodic_resync_reconciles_existing_shard_when_enabled(
+) -> Result<(), Box<dyn Error>> {
+    if env::var("VELORIX_K8S_INTEGRATION").as_deref() != Ok("1") {
+        eprintln!(
+            "skipping live Kubernetes worker shard periodic-resync test; set VELORIX_K8S_INTEGRATION=1"
+        );
+        return Ok(());
+    }
+
+    let namespace =
+        env::var("VELORIX_K8S_NAMESPACE").unwrap_or_else(|_| "velorix-live".to_string());
+    let worker_image = env::var("VELORIX_K8S_WORKER_IMAGE")
+        .unwrap_or_else(|_| "registry.k8s.io/pause:3.10".to_string());
+    let suffix = unique_suffix()?;
+    let owner_id = "worker-a".to_string();
+    let client = Client::try_default().await?;
+    ensure_namespace(client.clone(), &namespace).await?;
+
+    let shard = worker_shard_with_owner(&namespace, &suffix, &owner_id);
+    let key = partition_lease_key_from_worker_shard(&shard)?;
+    let shard_api: Api<VelorixWorkerShard> = Api::namespaced(client.clone(), &namespace);
+    shard_api.create(&PostParams::default(), &shard).await?;
+    wait_for_worker_shard_listed(&shard_api, &shard.name_any()).await?;
+
+    let authority = LiveWorkerShardAuthority::new(&suffix)?;
+    let components = authority.startup_components().await?;
+    let epoch_store_for_assert = components.worker_shard_epoch_store()?;
+
+    let summaries = resync_worker_shards_periodically_with_kubernetes_runtime(
+        client.clone(),
+        &namespace,
+        &components,
+        WorkerShardPodTemplate::new(worker_image.clone())?,
+        |_| WorkerShardReconcileInput {
+            now_unix_ms: unix_ms().expect("system clock should be after Unix epoch"),
+            ttl_ms: 60_000,
+            running_worker: None,
+            config: WorkerShardReconcileConfig {
+                created_at: "2026-05-12T17:33:23Z".to_string(),
+                previous_checkpoint_version: None,
+            },
+        },
+        WorkerShardPeriodicResyncOptions {
+            interval: Duration::from_millis(1),
+            resync: WorkerShardResyncOptions::default(),
+            max_cycles: Some(1),
+        },
+    )
+    .await?;
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].listed, 1);
+    assert_eq!(summaries[0].applied, 1);
+
+    let identity = runtime_identity_from_worker_shard(&shard, &owner_id, 1)?;
+    let pod_name = worker_shard_pod_name_for_identity(&identity);
+    let pod_api: Api<Pod> = Api::namespaced(client.clone(), &namespace);
+    let pod = wait_for_pod(&pod_api, &pod_name).await?;
+    assert_eq!(pod.metadata.name.as_deref(), Some(pod_name.as_str()));
+
+    let record = epoch_store_for_assert
+        .read(&key.stream_id, key.partition_id, 1)
+        .await?
+        .expect("periodic resync should persist epoch record without a fresh watch event");
     assert_eq!(record.owner_id, owner_id);
     assert_eq!(record.lease_identity, partition_lease_identity(&key));
 
