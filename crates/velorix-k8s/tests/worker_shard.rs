@@ -34,9 +34,9 @@ use velorix_k8s::{
         handle_worker_shard_event, handle_worker_shard_event_with_command_executor,
         handle_worker_shard_event_with_output_sink,
         handle_worker_shard_event_with_scoped_command_executor_and_authority,
-        reconcile_worker_shard, resync_worker_shards_once_with_operator_runtime,
-        runtime_identity_from_worker_shard, worker_shard_pod_name,
-        worker_shard_pod_name_for_identity, worker_shard_watch_event,
+        reconcile_worker_shard, resync_worker_shards_before_watch_with_kubernetes_runtime,
+        resync_worker_shards_once_with_operator_runtime, runtime_identity_from_worker_shard,
+        worker_shard_pod_name, worker_shard_pod_name_for_identity, worker_shard_watch_event,
         KubernetesPodWorkerShardCommandExecutor, KubernetesPodWorkerShardScopedCommandExecutor,
         ProcessWorkerShardCommandExecutor, WorkerShardCommand, WorkerShardCommandExecutor,
         WorkerShardCommandExecutorError, WorkerShardEpochStore, WorkerShardError, WorkerShardEvent,
@@ -773,6 +773,39 @@ async fn worker_shard_resync_pass_sorts_listed_shards_before_reconcile() {
 }
 
 #[tokio::test]
+async fn worker_shard_resync_pass_treats_empty_continue_token_as_terminal_page() {
+    let (client, requests) =
+        fake_worker_shard_list_client(vec![list_page(vec![shard()], Some(""))]);
+    let runtime = WorkerShardOperatorRuntime::with_authority(
+        FakeLeaseClient::default()
+            .with_current(None)
+            .with_acquired(grant("worker-a", 1)),
+        FakeEpochStore::default(),
+        FakeCommandExecutor::default(),
+        authority(),
+    );
+
+    let summary = resync_worker_shards_once_with_operator_runtime(
+        client,
+        "default",
+        &runtime,
+        |_| input(None),
+        WorkerShardResyncOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        summary,
+        WorkerShardResyncSummary {
+            listed: 1,
+            applied: 1,
+        }
+    );
+    assert_eq!(requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn worker_shard_resync_pass_rejects_unvalidated_runtime_before_listing() {
     let (client, requests) = fake_worker_shard_list_client(vec![list_page(vec![shard()], None)]);
     let runtime = WorkerShardOperatorRuntime::new(
@@ -867,6 +900,158 @@ async fn worker_shard_resync_pass_fails_closed_when_page_bound_is_exceeded() {
         other => panic!("expected resync bound error, got {other:?}"),
     }
     assert_eq!(requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn kubernetes_worker_shard_startup_resync_reconciles_before_watch_entry() {
+    let validated_authority = validate_operator_authority(
+        authority(),
+        Arc::new(InMemory::new()),
+        "worker-shard-startup-resync-authority",
+        "v1/probes/worker-shard-startup-resync",
+    )
+    .await
+    .unwrap();
+    let components =
+        OperatorAuthorityStartupComponents::from_validated_authority(validated_authority);
+    let (client, requests) =
+        fake_worker_shard_startup_resync_client(vec![list_page(vec![shard()], None)]);
+
+    let (_runtime, summary) = resync_worker_shards_before_watch_with_kubernetes_runtime(
+        client,
+        "default",
+        &components,
+        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+        |_| input(None),
+        WorkerShardResyncOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        summary,
+        WorkerShardResyncSummary {
+            listed: 1,
+            applied: 1,
+        }
+    );
+    assert_eq!(
+        components
+            .worker_shard_epoch_store()
+            .unwrap()
+            .read("orders", 0, 1)
+            .await
+            .unwrap(),
+        Some(epoch_record("worker-a", 1))
+    );
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests[0].method, Method::GET);
+    assert_eq!(
+        requests[0].path,
+        "/apis/control.velorix.io/v1alpha1/namespaces/default/velorixworkershards"
+    );
+    assert_eq!(requests[1].method, Method::GET);
+    assert!(requests[1]
+        .path
+        .starts_with("/apis/coordination.k8s.io/v1/namespaces/default/leases/velorix-"));
+    assert_eq!(requests[2].method, Method::GET);
+    assert!(requests[2]
+        .path
+        .starts_with("/apis/coordination.k8s.io/v1/namespaces/default/leases/velorix-"));
+    assert_eq!(requests[3].method, Method::POST);
+    assert_eq!(
+        requests[3].path,
+        "/apis/coordination.k8s.io/v1/namespaces/default/leases"
+    );
+    assert_eq!(requests[4].method, Method::POST);
+    assert_eq!(requests[4].path, "/api/v1/namespaces/default/pods");
+}
+
+#[tokio::test]
+async fn kubernetes_worker_shard_startup_resync_rejects_authority_mismatch_before_worker_start() {
+    let validated_authority = validate_operator_authority(
+        ObjectStoreAuthorityRef::default(),
+        Arc::new(InMemory::new()),
+        "worker-shard-startup-resync-authority-mismatch",
+        "v1/probes/worker-shard-startup-resync-mismatch",
+    )
+    .await
+    .unwrap();
+    let components =
+        OperatorAuthorityStartupComponents::from_validated_authority(validated_authority);
+    let (client, requests) =
+        fake_worker_shard_startup_resync_client(vec![list_page(vec![shard()], None)]);
+
+    let err = match resync_worker_shards_before_watch_with_kubernetes_runtime(
+        client,
+        "default",
+        &components,
+        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+        |_| input(None),
+        WorkerShardResyncOptions::default(),
+    )
+    .await
+    {
+        Ok(_) => panic!("expected startup resync authority mismatch"),
+        Err(err) => err,
+    };
+
+    match err {
+        WorkerShardError::AuthorityMismatch { actual, expected } => {
+            assert_eq!(actual, authority());
+            assert_eq!(expected, ObjectStoreAuthorityRef::default());
+        }
+        other => panic!("expected authority mismatch, got {other:?}"),
+    }
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].path,
+        "/apis/control.velorix.io/v1alpha1/namespaces/default/velorixworkershards"
+    );
+}
+
+#[tokio::test]
+async fn kubernetes_worker_shard_startup_resync_bound_failure_does_not_enter_worker_execution() {
+    let validated_authority = validate_operator_authority(
+        authority(),
+        Arc::new(InMemory::new()),
+        "worker-shard-startup-resync-bound-authority",
+        "v1/probes/worker-shard-startup-resync-bound",
+    )
+    .await
+    .unwrap();
+    let components =
+        OperatorAuthorityStartupComponents::from_validated_authority(validated_authority);
+    let (client, requests) =
+        fake_worker_shard_startup_resync_client(vec![list_page(vec![shard()], None)]);
+
+    let err = match resync_worker_shards_before_watch_with_kubernetes_runtime(
+        client,
+        "default",
+        &components,
+        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+        |_| input(None),
+        WorkerShardResyncOptions {
+            max_pages: 0,
+            ..WorkerShardResyncOptions::default()
+        },
+    )
+    .await
+    {
+        Ok(_) => panic!("expected startup resync bound failure"),
+        Err(err) => err,
+    };
+
+    match err {
+        WorkerShardError::ResyncBoundExceeded { bound, limit } => {
+            assert_eq!(bound, "worker shard list pages");
+            assert_eq!(limit, 0);
+        }
+        other => panic!("expected resync bound error, got {other:?}"),
+    }
+    assert!(requests.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -1877,6 +2062,106 @@ fn fake_worker_shard_runtime_client() -> (kube::Client, Arc<Mutex<Vec<RecordedKu
                 });
 
                 let (status, response_body) = match (method, path.as_str()) {
+                    (Method::GET, path)
+                        if path.starts_with(
+                            "/apis/coordination.k8s.io/v1/namespaces/default/leases/",
+                        ) =>
+                    {
+                        (
+                            StatusCode::NOT_FOUND,
+                            json!({
+                                "apiVersion": "v1",
+                                "kind": "Status",
+                                "metadata": {},
+                                "status": "Failure",
+                                "message": "fake lease not found",
+                                "reason": "NotFound",
+                                "code": 404
+                            }),
+                        )
+                    }
+                    (Method::POST, "/apis/coordination.k8s.io/v1/namespaces/default/leases") => {
+                        (StatusCode::CREATED, body)
+                    }
+                    (Method::POST, "/api/v1/namespaces/default/pods") => {
+                        (StatusCode::CREATED, body)
+                    }
+                    _ => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        json!({
+                            "apiVersion": "v1",
+                            "kind": "Status",
+                            "metadata": {},
+                            "status": "Failure",
+                            "message": "unexpected fake kubernetes request",
+                            "reason": "InternalError",
+                            "code": 500
+                        }),
+                    ),
+                };
+
+                Ok::<_, Infallible>(
+                    Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&response_body).unwrap()))
+                        .unwrap(),
+                )
+            }
+        }
+    });
+
+    (ClientBuilder::new(service, "default").build(), requests)
+}
+
+fn fake_worker_shard_startup_resync_client(
+    pages: Vec<WorkerShardListPage>,
+) -> (kube::Client, Arc<Mutex<Vec<RecordedKubeRequest>>>) {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let pages = Arc::new(Mutex::new(pages.into_iter()));
+    let service = tower::service_fn({
+        let requests = Arc::clone(&requests);
+        let pages = Arc::clone(&pages);
+        move |request: Request<Body>| {
+            let requests = Arc::clone(&requests);
+            let pages = Arc::clone(&pages);
+            async move {
+                let method = request.method().clone();
+                let path = request.uri().path().to_string();
+                let body_bytes = request.into_body().collect_bytes().await.unwrap();
+                let body: Value = if body_bytes.is_empty() {
+                    Value::Null
+                } else {
+                    serde_json::from_slice(&body_bytes).unwrap()
+                };
+                requests.lock().unwrap().push(RecordedKubeRequest {
+                    method: method.clone(),
+                    path: path.clone(),
+                    body: body.clone(),
+                });
+
+                let (status, response_body) = match (method, path.as_str()) {
+                    (
+                        Method::GET,
+                        "/apis/control.velorix.io/v1alpha1/namespaces/default/velorixworkershards",
+                    ) => {
+                        let page = pages
+                            .lock()
+                            .unwrap()
+                            .next()
+                            .unwrap_or_else(|| list_page(Vec::new(), None));
+                        (
+                            StatusCode::OK,
+                            json!({
+                                "apiVersion": "control.velorix.io/v1alpha1",
+                                "kind": "VelorixWorkerShardList",
+                                "metadata": {
+                                    "continue": page.continue_token,
+                                },
+                                "items": page.items,
+                            }),
+                        )
+                    }
                     (Method::GET, path)
                         if path.starts_with(
                             "/apis/coordination.k8s.io/v1/namespaces/default/leases/",

@@ -16,7 +16,7 @@ use k8s_openapi::{
     apimachinery::pkg::apis::meta::v1::ObjectMeta,
 };
 use kube::{
-    api::{Api, DeleteParams, PostParams},
+    api::{Api, DeleteParams, ListParams, PostParams},
     Client, ResourceExt,
 };
 use object_store::local::LocalFileSystem;
@@ -27,10 +27,12 @@ use velorix_k8s::{
     startup::{validate_operator_authority, OperatorAuthorityStartupComponents},
     worker_shard::{
         build_kubernetes_worker_shard_operator_runtime, handle_worker_shard_event,
-        partition_lease_key_from_worker_shard, runtime_identity_from_worker_shard,
-        watch_worker_shards_with_kubernetes_runtime, worker_shard_pod_name_for_identity,
-        WorkerShardCommand, WorkerShardEpochStore, WorkerShardEvent, WorkerShardPodTemplate,
-        WorkerShardReconcileConfig, WorkerShardReconcileInput,
+        partition_lease_key_from_worker_shard,
+        resync_worker_shards_before_watch_with_kubernetes_runtime,
+        runtime_identity_from_worker_shard, watch_worker_shards_with_kubernetes_runtime,
+        worker_shard_pod_name_for_identity, WorkerShardCommand, WorkerShardEpochStore,
+        WorkerShardEvent, WorkerShardPodTemplate, WorkerShardReconcileConfig,
+        WorkerShardReconcileInput, WorkerShardResyncOptions,
     },
 };
 use velorix_storage::ownership::OwnershipEpochRecord;
@@ -382,6 +384,100 @@ async fn live_worker_shard_watch_loop_creates_worker_pod_when_enabled() -> Resul
     Ok(())
 }
 
+#[tokio::test]
+async fn live_worker_shard_startup_resync_reconciles_existing_shard_when_enabled(
+) -> Result<(), Box<dyn Error>> {
+    if env::var("VELORIX_K8S_INTEGRATION").as_deref() != Ok("1") {
+        eprintln!(
+            "skipping live Kubernetes worker shard startup-resync test; set VELORIX_K8S_INTEGRATION=1"
+        );
+        return Ok(());
+    }
+
+    let namespace =
+        env::var("VELORIX_K8S_NAMESPACE").unwrap_or_else(|_| "velorix-live".to_string());
+    let worker_image = env::var("VELORIX_K8S_WORKER_IMAGE")
+        .unwrap_or_else(|_| "registry.k8s.io/pause:3.10".to_string());
+    let suffix = unique_suffix()?;
+    let owner_id = "worker-a".to_string();
+    let client = Client::try_default().await?;
+    ensure_namespace(client.clone(), &namespace).await?;
+
+    let shard = worker_shard_with_owner(&namespace, &suffix, &owner_id);
+    let key = partition_lease_key_from_worker_shard(&shard)?;
+    let shard_api: Api<VelorixWorkerShard> = Api::namespaced(client.clone(), &namespace);
+    shard_api.create(&PostParams::default(), &shard).await?;
+    wait_for_worker_shard_listed(&shard_api, &shard.name_any()).await?;
+
+    let authority = LiveWorkerShardAuthority::new(&suffix)?;
+    let components = authority.startup_components().await?;
+    let epoch_store_for_assert = components.worker_shard_epoch_store()?;
+
+    let (_runtime, summary) = resync_worker_shards_before_watch_with_kubernetes_runtime(
+        client.clone(),
+        &namespace,
+        &components,
+        WorkerShardPodTemplate::new(worker_image.clone())?,
+        |_| WorkerShardReconcileInput {
+            now_unix_ms: unix_ms().expect("system clock should be after Unix epoch"),
+            ttl_ms: 60_000,
+            running_worker: None,
+            config: WorkerShardReconcileConfig {
+                created_at: "2026-05-12T17:33:23Z".to_string(),
+                previous_checkpoint_version: None,
+            },
+        },
+        WorkerShardResyncOptions::default(),
+    )
+    .await?;
+    assert_eq!(summary.listed, 1);
+    assert_eq!(summary.applied, 1);
+
+    let identity = runtime_identity_from_worker_shard(&shard, &owner_id, 1)?;
+    let pod_name = worker_shard_pod_name_for_identity(&identity);
+    let pod_api: Api<Pod> = Api::namespaced(client.clone(), &namespace);
+    let pod = wait_for_pod(&pod_api, &pod_name).await?;
+    assert_eq!(pod.metadata.name.as_deref(), Some(pod_name.as_str()));
+    let container = pod
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.containers.first())
+        .ok_or("worker Pod is missing its first container")?;
+    assert_eq!(container.image.as_deref(), Some(worker_image.as_str()));
+    assert_eq!(
+        container_env_value(container, "VELORIX_WORKER_OWNER_ID"),
+        Some(owner_id.as_str())
+    );
+    assert_eq!(
+        container_env_value(container, "VELORIX_WORKER_OWNER_EPOCH"),
+        Some("1")
+    );
+    assert_eq!(
+        container_env_value(container, "VELORIX_WORKER_STREAM_ID"),
+        Some(key.stream_id.as_str())
+    );
+
+    let record = epoch_store_for_assert
+        .read(&key.stream_id, key.partition_id, 1)
+        .await?
+        .expect("startup resync should persist epoch record before watcher events are required");
+    assert_eq!(record.owner_id, owner_id);
+    assert_eq!(record.lease_identity, partition_lease_identity(&key));
+
+    shard_api
+        .delete(shard.name_any().as_str(), &DeleteParams::default())
+        .await?;
+    delete_pod_if_present(&pod_api, &pod_name).await?;
+    wait_for_pod_deleted(&pod_api, &pod_name).await?;
+    let lease_client = KubernetesPartitionLeaseClient::new(KubeLeaseApi::new(client.clone()));
+    lease_client
+        .release(&key, &record.owner_id, 1, unix_ms()?)
+        .await?;
+    delete_lease(client, &key).await?;
+
+    Ok(())
+}
+
 struct LiveWorkerShardAuthority {
     suffix: String,
     temp_dir: tempfile::TempDir,
@@ -456,14 +552,33 @@ fn container_env_value<'a>(
 }
 
 async fn wait_for_pod(pod_api: &Api<Pod>, pod_name: &str) -> Result<Pod, Box<dyn Error>> {
-    for _ in 0..100 {
+    for _ in 0..400 {
         if let Some(pod) = pod_api.get_opt(pod_name).await? {
             return Ok(pod);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    Err(format!("worker Pod {pod_name} was not created within 10s").into())
+    Err(format!("worker Pod {pod_name} was not created within 40s").into())
+}
+
+async fn wait_for_worker_shard_listed(
+    shard_api: &Api<VelorixWorkerShard>,
+    shard_name: &str,
+) -> Result<(), Box<dyn Error>> {
+    for _ in 0..100 {
+        let listed = shard_api.list(&ListParams::default()).await?;
+        if listed
+            .items
+            .iter()
+            .any(|shard| shard.name_any() == shard_name)
+        {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    Err(format!("worker shard {shard_name} was not listed within 10s").into())
 }
 
 async fn delete_pod_if_present(pod_api: &Api<Pod>, pod_name: &str) -> Result<(), Box<dyn Error>> {

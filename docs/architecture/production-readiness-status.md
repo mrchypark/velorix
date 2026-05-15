@@ -20,6 +20,17 @@ surface, so production-style tests and runtime assembly must construct
 relation-snapshot, stream-watch status, ingest-admission, and worker-epoch-store
 components through the shared startup component object.
 
+Ownership evidence note, 2026-05-15: the Kubernetes worker-shard runtime now has
+a narrow startup-resync entrypoint that is constructed from
+`OperatorAuthorityStartupComponents`, runs the bounded `VelorixWorkerShard`
+resync once before watch entry, rejects authority mismatches and resync bounds
+before worker Pod execution, and then hands the same checked runtime to the
+existing watcher path. This is startup/watch-entry scheduling evidence only; the
+ownership row remains partial for live lease-loss/stale Pod lifecycle evidence,
+periodic or restart-bound requeue beyond startup resync, broader operator
+runtime lifecycle management, and production S3-compatible/non-local authority
+evidence.
+
 Velorix 1.0 also includes the cross-cutting API serving scope in
 `api-serving-scope-v1.md`: governed endpoints, parameter validation,
 response-shape contracts, OpenAPI-compatible catalog metadata, query/cost

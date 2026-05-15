@@ -1329,7 +1329,7 @@ where
             }
             shards.push(shard);
         }
-        continue_token = page.metadata.continue_;
+        continue_token = page.metadata.continue_.filter(|token| !token.is_empty());
         if continue_token.is_none() {
             break;
         }
@@ -1388,6 +1388,58 @@ pub async fn watch_worker_shards_with_kubernetes_runtime(
         startup_components,
         pod_template,
     )?;
+    watch_worker_shards_with_operator_runtime(client, namespace, runtime, input_for_shard).await
+}
+
+pub async fn resync_worker_shards_before_watch_with_kubernetes_runtime(
+    client: Client,
+    namespace: &str,
+    startup_components: &OperatorAuthorityStartupComponents,
+    pod_template: WorkerShardPodTemplate,
+    input_for_shard: impl FnMut(&VelorixWorkerShard) -> WorkerShardReconcileInput + Send,
+    resync_options: WorkerShardResyncOptions,
+) -> Result<
+    (
+        KubernetesWorkerShardOperatorRuntime,
+        WorkerShardResyncSummary,
+    ),
+    WorkerShardError,
+> {
+    let runtime = build_kubernetes_worker_shard_operator_runtime(
+        client.clone(),
+        namespace,
+        startup_components,
+        pod_template,
+    )?;
+    let summary = resync_worker_shards_once_with_operator_runtime(
+        client,
+        namespace,
+        &runtime,
+        input_for_shard,
+        resync_options,
+    )
+    .await?;
+
+    Ok((runtime, summary))
+}
+
+pub async fn watch_worker_shards_with_kubernetes_runtime_after_initial_resync(
+    client: Client,
+    namespace: &str,
+    startup_components: &OperatorAuthorityStartupComponents,
+    pod_template: WorkerShardPodTemplate,
+    mut input_for_shard: impl FnMut(&VelorixWorkerShard) -> WorkerShardReconcileInput + Send,
+    resync_options: WorkerShardResyncOptions,
+) -> Result<(), WorkerShardError> {
+    let (runtime, _) = resync_worker_shards_before_watch_with_kubernetes_runtime(
+        client.clone(),
+        namespace,
+        startup_components,
+        pod_template,
+        &mut input_for_shard,
+        resync_options,
+    )
+    .await?;
     watch_worker_shards_with_operator_runtime(client, namespace, runtime, input_for_shard).await
 }
 
