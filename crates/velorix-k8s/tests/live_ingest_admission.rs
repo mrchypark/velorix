@@ -1,18 +1,31 @@
 use std::{env, error::Error, sync::Arc, time::SystemTime};
 
+use arrow::{
+    array::{ArrayRef, Int64Array, StringArray},
+    datatypes::{DataType, Field, Schema},
+    record_batch::RecordBatch,
+};
+use bytes::Bytes;
 use k8s_openapi::{api::core::v1::Namespace, apimachinery::pkg::apis::meta::v1::ObjectMeta};
 use kube::{
     api::{Api, PostParams},
     Client,
 };
 use object_store::{local::LocalFileSystem, path::Path, ObjectStore, PutMode};
+use serde_json::json;
 use tempfile::TempDir;
 use velorix_k8s::{
     crd::ObjectStoreAuthorityRef,
+    ingest_writer::DeployedIngestWriterRuntime,
     startup::{validate_operator_authority, OperatorAuthorityStartupComponents},
     stream_watch::StreamWatchError,
 };
-use velorix_storage::{log::DurableIngestAdmissionRecordV1, object_key::ObjectKey};
+use velorix_storage::{
+    ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
+    log::{AppendValidatedEnvelopeOutcome, DurableIngestAdmissionRecordV1},
+    object_key::ObjectKey,
+    relation_catalog_registry::RelationCatalogRegistry,
+};
 
 #[tokio::test]
 async fn live_vind_gated_ingest_admission_startup_preflight_runs_when_enabled(
@@ -143,6 +156,53 @@ async fn live_vind_gated_ingest_admission_startup_preflight_runs_when_enabled(
     Ok(())
 }
 
+#[tokio::test]
+async fn live_vind_deployed_ingest_writer_runtime_appends_after_startup_preflight(
+) -> Result<(), Box<dyn Error>> {
+    if env::var("VELORIX_K8S_INTEGRATION").as_deref() != Ok("1") {
+        eprintln!(
+            "skipping live Kubernetes deployed ingest writer runtime; set VELORIX_K8S_INTEGRATION=1"
+        );
+        return Ok(());
+    }
+
+    let namespace =
+        env::var("VELORIX_K8S_NAMESPACE").unwrap_or_else(|_| "velorix-live".to_string());
+    let suffix = unique_suffix()?;
+    let client = Client::try_default().await?;
+    ensure_namespace(client, &namespace).await?;
+    let (_temp_dir, store) = temp_store();
+    create_vind_relation_catalog(&store).await?;
+
+    let validated = validate_operator_authority(
+        authority(&namespace),
+        Arc::clone(&store),
+        "vind-ingest-authority",
+        &format!("v1/vind-ingest-writer-probes/{suffix}/clean"),
+    )
+    .await?;
+    let components = OperatorAuthorityStartupComponents::from_validated_authority(validated);
+    let runtime = DeployedIngestWriterRuntime::from_startup_components(&components).await?;
+
+    assert_eq!(runtime.authority(), components.authority());
+    assert_eq!(runtime.startup_report().active_admission_records, 0);
+    assert_eq!(runtime.startup_report().expired_orphan_admission_records, 0);
+
+    let outcome = runtime
+        .append_catalog_validated_envelope(catalog_envelope_bytes_for(0, 10))
+        .await?;
+    assert!(matches!(
+        outcome,
+        AppendValidatedEnvelopeOutcome::Appended { descriptor }
+            if descriptor.stream_id == "vind"
+                && descriptor.partition_id == 0
+                && descriptor.start_offset_inclusive == 0
+                && descriptor.end_offset_exclusive == 10
+    ));
+
+    Ok(())
+}
+
 async fn ensure_namespace(client: Client, namespace: &str) -> Result<(), Box<dyn Error>> {
     let api: Api<Namespace> = Api::all(client);
     let namespace = Namespace {
@@ -165,6 +225,108 @@ fn temp_store() -> (TempDir, Arc<dyn ObjectStore>) {
     let store = LocalFileSystem::new_with_prefix(temp_dir.path()).unwrap();
 
     (temp_dir, Arc::new(store))
+}
+
+async fn create_vind_relation_catalog(store: &Arc<dyn ObjectStore>) -> Result<(), Box<dyn Error>> {
+    let catalog = serde_json::from_value(json!({
+        "schema_version": 1,
+        "relation_schema": {
+            "relation_id": "deposits",
+            "relation_name": "deposits",
+            "relation_version": "1",
+            "columns": [
+                {
+                    "column_id": "deposit_id",
+                    "name": "deposit_id",
+                    "logical_type": { "kind": "utf8" },
+                    "physical_arrow_type": { "kind": "utf8" },
+                    "nullable": false,
+                    "ordinal": 0,
+                    "semantic_role": "primary_key",
+                },
+                {
+                    "column_id": "amount",
+                    "name": "amount",
+                    "logical_type": { "kind": "int64" },
+                    "physical_arrow_type": { "kind": "int64" },
+                    "nullable": false,
+                    "ordinal": 1,
+                    "semantic_role": "value",
+                },
+                {
+                    "column_id": "weight",
+                    "name": "weight",
+                    "logical_type": { "kind": "int64" },
+                    "physical_arrow_type": { "kind": "int64" },
+                    "nullable": false,
+                    "ordinal": 2,
+                    "semantic_role": "weight",
+                },
+            ],
+            "primary_key_column_ids": ["deposit_id"],
+            "weight_column_id": "weight",
+            "allowed_operations": ["insert", "delete"],
+            "event_time_column_id": null,
+        },
+        "schema_fingerprint": deposits_schema_fingerprint(),
+        "datafusion_registration": {
+            "name": "deposits",
+            "mode": "table",
+        },
+        "feldera_relation": {
+            "relation_id": "deposits",
+            "schema_fingerprint": deposits_schema_fingerprint(),
+        },
+        "incremental_adapter": {
+            "adapter_id": "incremental-adapter-single-key-sum-count-v1",
+        },
+    }))?;
+    RelationCatalogRegistry::new(Arc::clone(store))
+        .create(&catalog)
+        .await?;
+    Ok(())
+}
+
+fn catalog_envelope_bytes_for(start_offset_inclusive: u64, end_offset_exclusive: u64) -> Bytes {
+    IngestEnvelope::encode_batches(
+        IngestEnvelopeEncodeRequest {
+            relation_id: "deposits".to_string(),
+            relation_version: "1".to_string(),
+            schema_fingerprint: deposits_schema_fingerprint(),
+            stream_id: "vind".to_string(),
+            partition_id: 0,
+            start_offset_inclusive,
+            end_offset_exclusive,
+        },
+        &[valid_batch()],
+    )
+    .unwrap()
+}
+
+fn valid_batch() -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("deposit_id", DataType::Utf8, false),
+        Field::new("amount", DataType::Int64, false),
+        Field::new("weight", DataType::Int64, false),
+    ]));
+
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["dep-1", "dep-2"])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![10, 20])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![1, -1])) as ArrayRef,
+        ],
+    )
+    .unwrap()
+}
+
+fn deposits_schema_fingerprint() -> String {
+    "sha256:9b09fa82241fce3bb9025911ed78168799ad384fe68f065258afe09eca6ede62".to_string()
+}
+
+fn orphan_schema_fingerprint() -> String {
+    format!("sha256:{}", "2".repeat(64))
 }
 
 fn authority(namespace: &str) -> ObjectStoreAuthorityRef {
@@ -202,7 +364,7 @@ fn durable_orphan_admission_record(
         payload_digest: format!("sha256:{}", "1".repeat(64)),
         relation_id: "vind_relation".to_string(),
         relation_version: "live-ingest-admission-test".to_string(),
-        schema_fingerprint: format!("sha256:{}", "2".repeat(64)),
+        schema_fingerprint: orphan_schema_fingerprint(),
         admission_mode: "process_local_serialized".to_string(),
     })
 }

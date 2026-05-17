@@ -233,6 +233,7 @@ evidence = {
     "readiness_evidence_kind": [
         "s3_compatible",
         "s3_compatible_integration_harness",
+        "s3_compatible_ingest_admission_crash_restart",
     ],
     "endpoint": f"http://127.0.0.1:{port}",
     "bucket": bucket,

@@ -6,7 +6,8 @@ harnesses talk to a RustFS server through the normal S3 API rather than an
 in-process or filesystem fake.
 
 The generated evidence records both readiness evidence kinds it exercises:
-`s3_compatible` and `s3_compatible_integration_harness`.
+`s3_compatible`, `s3_compatible_integration_harness`, and
+`s3_compatible_ingest_admission_crash_restart`.
 
 Prerequisites:
 

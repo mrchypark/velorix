@@ -149,8 +149,12 @@ same-host OS processes mark themselves ready after store/coordinator/payload
 setup, are released together into overlapping appends with zero artificial
 post-release delay, and admit exactly one append with the loser returning
 `range_overlap_reserved`; the same target also proves adjacent ranges produce a
-valid chained index. Crash/restart and deployed writer/operator topology
-evidence are still separate ingest row blockers.
+valid chained index. It additionally simulates an indexed admission crash window
+by deleting the committed batch after admission, reconstructing from the same
+S3-compatible authority prefix, writing the digest-bound expiry decision,
+proving stale retries return `admission_expired` without a new transition, and
+then appending an adjacent range with the chained index preserved. Deployed
+writer/operator topology evidence remains a separate ingest row blocker.
 
 The benchmark step can be skipped with `VELORIX_RUSTFS_RUN_BENCHMARK=0`. The
 script writes `target/velorix-s3/rustfs-s3-gate-evidence.json` and deletes the
@@ -168,9 +172,11 @@ gate on a GitHub-hosted runner and uploads the JSON as
 Its benchmark input defaults off so the fast storage/runtime API behavior gate
 can be reviewed separately from slower benchmark output. The generated artifact
 records the `s3_compatible` and `s3_compatible_integration_harness` readiness
-evidence kinds. RustFS evidence counts as live S3-compatible evidence for
-Velorix readiness when it is produced through the S3 API, with local filesystem
-and generic emulator evidence still rejected by readiness validators.
+evidence kinds plus `s3_compatible_ingest_admission_crash_restart` for the
+indexed admission crash/restart path. RustFS evidence counts as live
+S3-compatible evidence for Velorix readiness when it is produced through the S3
+API, with local filesystem and generic emulator evidence still rejected by
+readiness validators.
 
 ## GCS Emulator Boundary
 

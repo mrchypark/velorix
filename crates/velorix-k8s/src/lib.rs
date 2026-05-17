@@ -9,6 +9,7 @@
 
 pub mod controller;
 pub mod crd;
+pub mod ingest_writer;
 pub mod lease;
 pub mod startup;
 pub mod status;

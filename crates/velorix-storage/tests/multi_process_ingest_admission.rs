@@ -525,6 +525,103 @@ async fn s3_compatible_multi_process_admission_rejects_overlap_and_allows_adjace
     assert_eq!(committed.len(), 2);
 }
 
+#[cfg(feature = "s3-compat-tests")]
+#[tokio::test]
+async fn s3_compatible_indexed_admission_orphan_expiry_survives_restart_and_blocks_stale_retry() {
+    let Some(config) = live_config() else {
+        println!(
+            "skipping S3-compatible indexed ingest admission crash/restart harness; set VELORIX_S3_COMPAT=1 and configure AWS_ENDPOINT_URL, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, and VELORIX_S3_BUCKET to enable"
+        );
+        return;
+    };
+
+    let config = config.scenario("indexed-crash-restart");
+    let store = live_authority_store(&config).unwrap();
+    let catalog = create_orders_relation_catalog(&store).await;
+    let capabilities = complete_capabilities();
+    let coordinator =
+        IngestAdmissionCoordinator::new_checked(Arc::clone(&store), &capabilities).unwrap();
+
+    let appended = coordinator
+        .append_catalog_validated_envelope(catalog_envelope_bytes_for(&catalog, 0, 100))
+        .await
+        .unwrap();
+    let AppendValidatedEnvelopeOutcome::Appended { descriptor } = appended else {
+        panic!("expected initial append, got {appended:?}");
+    };
+
+    store
+        .delete(&ObjectStorePath::from(descriptor.object_key.as_str()))
+        .await
+        .unwrap();
+
+    let restarted =
+        IngestAdmissionCoordinator::new_checked(Arc::clone(&store), &capabilities).unwrap();
+    let report = restarted.reconstruct_active_admissions().await.unwrap();
+    assert_eq!(report.active_admission_records, 1);
+    assert_eq!(report.expired_orphan_admission_records, 0);
+
+    let decision = restarted
+        .expire_orphan_admission(
+            "orders",
+            7,
+            0,
+            100,
+            "s3-indexed-crash-restart-expiry",
+            "batch_append_failed_after_admission",
+            "s3-compatible-ingest-admission-test",
+        )
+        .await
+        .unwrap();
+    store
+        .get(&ObjectStorePath::from(
+            decision.expiry_decision_key.as_str(),
+        ))
+        .await
+        .unwrap();
+
+    let restarted_after_expiry =
+        IngestAdmissionCoordinator::new_checked(Arc::clone(&store), &capabilities).unwrap();
+    let report = restarted_after_expiry
+        .reconstruct_active_admissions()
+        .await
+        .unwrap();
+    assert_eq!(report.active_admission_records, 0);
+    assert_eq!(report.expired_orphan_admission_records, 1);
+    let transitions_before_stale_retry = index_transition_bodies(&store).await;
+    assert_eq!(transitions_before_stale_retry.len(), 1);
+
+    let stale_retry = restarted_after_expiry
+        .append_catalog_validated_envelope(catalog_envelope_bytes_for(&catalog, 0, 100))
+        .await
+        .unwrap();
+    assert!(matches!(
+        stale_retry,
+        AppendValidatedEnvelopeOutcome::Conflict {
+            reason: "admission_expired",
+            ..
+        }
+    ));
+    assert_eq!(
+        index_transition_bodies(&store).await,
+        transitions_before_stale_retry
+    );
+
+    let adjacent = restarted_after_expiry
+        .append_catalog_validated_envelope(catalog_envelope_bytes_for(&catalog, 100, 150))
+        .await
+        .unwrap();
+    assert!(matches!(
+        adjacent,
+        AppendValidatedEnvelopeOutcome::Appended { descriptor }
+            if descriptor.object_key == ObjectKey::ingest_batch("orders", 7, 100, 150).unwrap()
+    ));
+    assert_chained_index_transitions(
+        &index_transition_bodies(&store).await,
+        &[(0, 100), (100, 150)],
+    );
+}
+
 #[test]
 fn multi_process_ingest_admission_child() {
     if env::var_os(CHILD_MODE_ENV).is_none() {

@@ -1,6 +1,12 @@
 use std::{fmt, fs, sync::Arc};
 
+use arrow::{
+    array::{ArrayRef, Int64Array, StringArray},
+    datatypes::{DataType, Field, Schema},
+    record_batch::RecordBatch,
+};
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures::stream::BoxStream;
 use object_store::{
     local::LocalFileSystem, path::Path, GetOptions, GetResult, ListResult, MultipartUpload,
@@ -12,6 +18,7 @@ use tempfile::TempDir;
 use velorix_k8s::{
     controller::{reconcile_stream, ControllerAction},
     crd::{ObjectStoreAuthorityRef, RelationVersionRef, VelorixStream, VelorixStreamSpec},
+    ingest_writer::DeployedIngestWriterRuntime,
     startup::{
         validate_operator_authority, OperatorAuthorityStartupComponents, OperatorStartupError,
     },
@@ -23,6 +30,8 @@ use velorix_storage::{
         AuthoritativeNamespace, AuthoritativeObjectStoreCapabilityProbeError,
         ObjectStoreCapabilityProbeError, RequiredObjectStoreCapability,
     },
+    ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
+    log::AppendValidatedEnvelopeOutcome,
     ownership::OwnershipEpochRecord,
     relation_catalog_registry::RelationCatalogRegistry,
 };
@@ -290,6 +299,76 @@ async fn operator_authority_startup_components_preflight_fails_before_component_
 
     let err = components
         .ingest_admission_startup_preflight()
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, velorix_k8s::stream_watch::StreamWatchError::Snapshot { message }
+        if message.contains("unexpected object under v1/ingest-admission"))
+    );
+}
+
+#[tokio::test]
+async fn deployed_ingest_writer_runtime_preflights_before_append() {
+    let (_temp_dir, store) = temp_store();
+    create_relation_catalog(&store).await;
+    let validated = validate_operator_authority(
+        authority(),
+        Arc::clone(&store),
+        "local-k8s-authority",
+        "v1/operator-startup-probes",
+    )
+    .await
+    .unwrap();
+    let components = OperatorAuthorityStartupComponents::from_validated_authority(validated);
+
+    let runtime = DeployedIngestWriterRuntime::from_startup_components(&components)
+        .await
+        .unwrap();
+    assert_eq!(runtime.authority(), components.authority());
+    assert_eq!(runtime.startup_report().active_admission_records, 0);
+    assert_eq!(runtime.startup_report().expired_orphan_admission_records, 0);
+
+    let outcome = runtime
+        .append_catalog_validated_envelope(catalog_envelope_bytes_for(0, 100))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        outcome,
+        AppendValidatedEnvelopeOutcome::Appended { descriptor }
+            if descriptor.stream_id == "deposits"
+                && descriptor.partition_id == 0
+                && descriptor.start_offset_inclusive == 0
+                && descriptor.end_offset_exclusive == 100
+    ));
+}
+
+#[tokio::test]
+async fn deployed_ingest_writer_runtime_rejects_malformed_admission_before_append() {
+    let (_temp_dir, store) = temp_store();
+    create_relation_catalog(&store).await;
+    store
+        .put_opts(
+            &Path::from(
+                "v1/ingest-admission/deposits/p=0000000000/ranges/00000000000000000000-00000000000000000010/notes.txt",
+            ),
+            "unexpected admission namespace object".into(),
+            PutMode::Create.into(),
+        )
+        .await
+        .unwrap();
+    let validated = validate_operator_authority(
+        authority(),
+        Arc::clone(&store),
+        "local-k8s-authority",
+        "v1/operator-startup-probes",
+    )
+    .await
+    .unwrap();
+    let components = OperatorAuthorityStartupComponents::from_validated_authority(validated);
+
+    let err = DeployedIngestWriterRuntime::from_startup_components(&components)
         .await
         .unwrap_err();
 
@@ -578,6 +657,40 @@ fn relation_catalog_json() -> Value {
             "adapter_id": "incremental-adapter-single-key-sum-count-v1",
         },
     })
+}
+
+fn catalog_envelope_bytes_for(start_offset_inclusive: u64, end_offset_exclusive: u64) -> Bytes {
+    IngestEnvelope::encode_batches(
+        IngestEnvelopeEncodeRequest {
+            relation_id: "deposits".to_string(),
+            relation_version: "1".to_string(),
+            schema_fingerprint: relation().schema_fingerprint,
+            stream_id: "deposits".to_string(),
+            partition_id: 0,
+            start_offset_inclusive,
+            end_offset_exclusive,
+        },
+        &[valid_batch()],
+    )
+    .unwrap()
+}
+
+fn valid_batch() -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("deposit_id", DataType::Utf8, false),
+        Field::new("amount", DataType::Int64, false),
+        Field::new("weight", DataType::Int64, false),
+    ]));
+
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["dep-1", "dep-2"])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![10, 20])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![1, -1])) as ArrayRef,
+        ],
+    )
+    .unwrap()
 }
 
 fn ownership_epoch_record() -> OwnershipEpochRecord {

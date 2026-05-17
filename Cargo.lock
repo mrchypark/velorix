@@ -4698,7 +4698,9 @@ dependencies = [
 name = "velorix-k8s"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "async-trait",
+ "bytes",
  "futures",
  "http",
  "http-body-util",

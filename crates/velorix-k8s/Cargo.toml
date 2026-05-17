@@ -6,6 +6,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 async-trait = { workspace = true }
+bytes = { workspace = true }
 futures = { workspace = true }
 k8s-openapi = { workspace = true, features = ["v1_35", "schemars"] }
 kube = { workspace = true, features = ["client", "derive", "ring", "runtime", "rustls-tls"] }
@@ -19,6 +20,7 @@ velorix-control = { path = "../velorix-control" }
 velorix-storage = { path = "../velorix-storage" }
 
 [dev-dependencies]
+arrow = { workspace = true, features = ["ipc"] }
 http = "1"
 http-body-util = "0.1"
 tempfile = { workspace = true }

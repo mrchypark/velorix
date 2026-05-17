@@ -60,8 +60,9 @@ VELORIX_K8S_INTEGRATION=1 VELORIX_K8S_NAMESPACE=velorix-live \
   cargo test -p velorix-k8s --test live_worker_shard -- --nocapture --test-threads=1
 ```
 
-Run the env-gated ingest-admission startup preflight and run-local orphan
-expiry/restart reconstruction check against the active vind context:
+Run the env-gated ingest-admission startup preflight, deployed writer runtime,
+and run-local orphan expiry/restart reconstruction checks against the active vind
+context:
 
 ```bash
 VELORIX_K8S_INTEGRATION=1 VELORIX_K8S_NAMESPACE=velorix-live \
@@ -70,9 +71,11 @@ VELORIX_K8S_INTEGRATION=1 VELORIX_K8S_NAMESPACE=velorix-live \
 
 This checks Kubernetes API reachability, exercises
 `IngestAdmissionCoordinatorProvider::startup()` against a run-local object-store
-authority, persists a run-local orphan expiry decision, and verifies a
-restarted production provider reconstructs the expired orphan as non-active. It
-does not exercise distributed or multi-pod admission races.
+authority, constructs `DeployedIngestWriterRuntime` from
+`OperatorAuthorityStartupComponents` before catalog-backed append, persists a
+run-local orphan expiry decision, and verifies a restarted production provider
+reconstructs the expired orphan as non-active. It does not exercise distributed
+or multi-pod admission races.
 
 Run the full vind gate:
 
