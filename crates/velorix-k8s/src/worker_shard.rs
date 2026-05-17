@@ -1,7 +1,7 @@
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use futures::StreamExt;
+use futures::{FutureExt, Stream, StreamExt};
 use k8s_openapi::{
     api::core::v1::{Container, EnvVar, Pod, PodSpec},
     apimachinery::pkg::apis::meta::v1::ObjectMeta,
@@ -14,7 +14,7 @@ use kube::{
 use thiserror::Error;
 use tokio::{
     process::Command,
-    time::{self, MissedTickBehavior},
+    time::{self, Instant, MissedTickBehavior},
 };
 use velorix_control::{
     control_plane_contract::{
@@ -1215,6 +1215,24 @@ impl Default for WorkerShardResyncOptions {
     }
 }
 
+impl WorkerShardResyncOptions {
+    fn validate(&self) -> Result<(), WorkerShardError> {
+        if self.max_pages == 0 {
+            return Err(WorkerShardError::ResyncBoundExceeded {
+                bound: "worker shard list pages",
+                limit: self.max_pages,
+            });
+        }
+        if self.max_shards == 0 {
+            return Err(WorkerShardError::ResyncBoundExceeded {
+                bound: "worker shards",
+                limit: self.max_shards,
+            });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkerShardResyncSummary {
     pub listed: usize,
@@ -1233,9 +1251,83 @@ impl Default for WorkerShardPeriodicResyncOptions {
         Self {
             interval: Duration::from_secs(60),
             resync: WorkerShardResyncOptions::default(),
-            max_cycles: None,
+            max_cycles: Some(1),
         }
     }
+}
+
+impl WorkerShardPeriodicResyncOptions {
+    fn validate(&self) -> Result<(), WorkerShardError> {
+        if self.max_cycles.is_none() {
+            return Err(WorkerShardError::ResyncBoundExceeded {
+                bound: "worker shard periodic resync cycles",
+                limit: 0,
+            });
+        }
+        if self.interval.is_zero() {
+            return Err(WorkerShardError::ResyncBoundExceeded {
+                bound: "worker shard periodic resync interval",
+                limit: 0,
+            });
+        }
+        self.resync.validate()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkerShardPeriodicResyncSchedule {
+    pub interval: Duration,
+    pub resync: WorkerShardResyncOptions,
+}
+
+impl Default for WorkerShardPeriodicResyncSchedule {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(60),
+            resync: WorkerShardResyncOptions::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkerShardLifecycleOptions {
+    pub initial_resync: WorkerShardResyncOptions,
+    pub periodic_resync: Option<WorkerShardPeriodicResyncSchedule>,
+}
+
+impl Default for WorkerShardLifecycleOptions {
+    fn default() -> Self {
+        Self {
+            initial_resync: WorkerShardResyncOptions::default(),
+            periodic_resync: Some(WorkerShardPeriodicResyncSchedule::default()),
+        }
+    }
+}
+
+impl WorkerShardLifecycleOptions {
+    fn validate(&self) -> Result<(), WorkerShardError> {
+        self.initial_resync.validate()?;
+        if self
+            .periodic_resync
+            .as_ref()
+            .is_some_and(|periodic| periodic.interval.is_zero())
+        {
+            return Err(WorkerShardError::ResyncBoundExceeded {
+                bound: "worker shard periodic resync interval",
+                limit: 0,
+            });
+        }
+        if let Some(periodic) = &self.periodic_resync {
+            periodic.resync.validate()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorkerShardLifecycleExit {
+    Shutdown,
+    WatchEnded,
 }
 
 impl<L, E, X> WorkerShardOperatorRuntime<L, E, X>
@@ -1321,12 +1413,7 @@ where
     X: WorkerShardScopedCommandExecutor,
 {
     runtime.require_authority()?;
-    if options.max_pages == 0 {
-        return Err(WorkerShardError::ResyncBoundExceeded {
-            bound: "worker shard list pages",
-            limit: options.max_pages,
-        });
-    }
+    options.validate()?;
 
     let api: Api<VelorixWorkerShard> = Api::namespaced(client, namespace);
     let mut shards = Vec::new();
@@ -1388,11 +1475,9 @@ where
     X: WorkerShardScopedCommandExecutor,
 {
     runtime.require_authority()?;
-    if options.interval.is_zero() {
-        return Err(WorkerShardError::ResyncBoundExceeded {
-            bound: "worker shard periodic resync interval",
-            limit: 0,
-        });
+    options.validate()?;
+    if options.max_cycles == Some(0) {
+        return Ok(Vec::new());
     }
 
     let mut interval = time::interval(options.interval);
@@ -1417,6 +1502,171 @@ where
             .is_some_and(|max_cycles| summaries.len() >= max_cycles)
         {
             return Ok(summaries);
+        }
+    }
+}
+
+pub async fn run_worker_shard_lifecycle_with_operator_event_stream<L, E, X, S, Shutdown>(
+    client: Client,
+    namespace: &str,
+    runtime: &WorkerShardOperatorRuntime<L, E, X>,
+    mut input_for_shard: impl FnMut(&VelorixWorkerShard) -> WorkerShardReconcileInput + Send,
+    options: WorkerShardLifecycleOptions,
+    events: S,
+    shutdown: Shutdown,
+) -> Result<WorkerShardLifecycleExit, WorkerShardError>
+where
+    L: PartitionLeaseClient,
+    E: WorkerShardEpochStore,
+    X: WorkerShardScopedCommandExecutor,
+    S: Stream<Item = Result<WorkerShardEvent, WorkerShardError>>,
+    Shutdown: Future<Output = ()>,
+{
+    options.validate()?;
+    runtime.require_authority()?;
+    let mut events = std::pin::pin!(events);
+    let mut shutdown = std::pin::pin!(shutdown);
+
+    if shutdown_ready(shutdown.as_mut()) {
+        return Ok(WorkerShardLifecycleExit::Shutdown);
+    }
+
+    resync_worker_shards_once_with_operator_runtime(
+        client.clone(),
+        namespace,
+        runtime,
+        &mut input_for_shard,
+        options.initial_resync,
+    )
+    .await?;
+
+    match options.periodic_resync {
+        Some(periodic_options) => {
+            run_worker_shard_lifecycle_with_periodic_resync(
+                client,
+                namespace,
+                runtime,
+                &mut input_for_shard,
+                events.as_mut(),
+                shutdown.as_mut(),
+                periodic_options,
+            )
+            .await
+        }
+        None => {
+            run_worker_shard_lifecycle_without_periodic_resync(
+                runtime,
+                &mut input_for_shard,
+                events.as_mut(),
+                shutdown.as_mut(),
+            )
+            .await
+        }
+    }
+}
+
+async fn run_worker_shard_lifecycle_with_periodic_resync<L, E, X, F, S, Shutdown>(
+    client: Client,
+    namespace: &str,
+    runtime: &WorkerShardOperatorRuntime<L, E, X>,
+    input_for_shard: &mut F,
+    mut events: Pin<&mut S>,
+    mut shutdown: Pin<&mut Shutdown>,
+    periodic_options: WorkerShardPeriodicResyncSchedule,
+) -> Result<WorkerShardLifecycleExit, WorkerShardError>
+where
+    L: PartitionLeaseClient,
+    E: WorkerShardEpochStore,
+    X: WorkerShardScopedCommandExecutor,
+    F: FnMut(&VelorixWorkerShard) -> WorkerShardReconcileInput + Send,
+    S: Stream<Item = Result<WorkerShardEvent, WorkerShardError>>,
+    Shutdown: Future<Output = ()>,
+{
+    let mut interval = time::interval_at(
+        Instant::now() + periodic_options.interval,
+        periodic_options.interval,
+    );
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    loop {
+        if shutdown_ready(shutdown.as_mut()) {
+            return Ok(WorkerShardLifecycleExit::Shutdown);
+        }
+
+        let mut next_event_stream = events.as_mut();
+        let event = next_event_stream.next();
+        let tick = interval.tick();
+        tokio::pin!(event);
+        tokio::pin!(tick);
+
+        tokio::select! {
+            biased;
+            _ = shutdown.as_mut() => return Ok(WorkerShardLifecycleExit::Shutdown),
+            _ = &mut tick => {
+                resync_worker_shards_once_with_operator_runtime(
+                    client.clone(),
+                    namespace,
+                    runtime,
+                    &mut *input_for_shard,
+                    periodic_options.resync.clone(),
+                )
+                .await?;
+            }
+            event = &mut event => match event {
+                Some(Ok(event)) => {
+                    let input = match &event {
+                        WorkerShardEvent::Applied(shard) | WorkerShardEvent::Deleted(shard) => {
+                            input_for_shard(shard)
+                        }
+                    };
+                    runtime.handle_event(event, input).await?;
+                    tokio::task::yield_now().await;
+                }
+                Some(Err(error)) => return Err(error),
+                None => return Ok(WorkerShardLifecycleExit::WatchEnded),
+            },
+        }
+    }
+}
+
+async fn run_worker_shard_lifecycle_without_periodic_resync<L, E, X, F, S, Shutdown>(
+    runtime: &WorkerShardOperatorRuntime<L, E, X>,
+    input_for_shard: &mut F,
+    mut events: Pin<&mut S>,
+    mut shutdown: Pin<&mut Shutdown>,
+) -> Result<WorkerShardLifecycleExit, WorkerShardError>
+where
+    L: PartitionLeaseClient,
+    E: WorkerShardEpochStore,
+    X: WorkerShardScopedCommandExecutor,
+    F: FnMut(&VelorixWorkerShard) -> WorkerShardReconcileInput + Send,
+    S: Stream<Item = Result<WorkerShardEvent, WorkerShardError>>,
+    Shutdown: Future<Output = ()>,
+{
+    loop {
+        if shutdown_ready(shutdown.as_mut()) {
+            return Ok(WorkerShardLifecycleExit::Shutdown);
+        }
+
+        let mut next_event_stream = events.as_mut();
+        let event = next_event_stream.next();
+        tokio::pin!(event);
+
+        tokio::select! {
+            biased;
+            _ = shutdown.as_mut() => return Ok(WorkerShardLifecycleExit::Shutdown),
+            event = &mut event => match event {
+                Some(Ok(event)) => {
+                    let input = match &event {
+                        WorkerShardEvent::Applied(shard) | WorkerShardEvent::Deleted(shard) => {
+                            input_for_shard(shard)
+                        }
+                    };
+                    runtime.handle_event(event, input).await?;
+                }
+                Some(Err(error)) => return Err(error),
+                None => return Ok(WorkerShardLifecycleExit::WatchEnded),
+            },
         }
     }
 }
@@ -1511,6 +1761,52 @@ pub async fn resync_worker_shards_periodically_with_kubernetes_runtime(
         periodic_options,
     )
     .await
+}
+
+pub async fn run_worker_shards_with_kubernetes_runtime_lifecycle<Shutdown>(
+    client: Client,
+    namespace: &str,
+    startup_components: &OperatorAuthorityStartupComponents,
+    pod_template: WorkerShardPodTemplate,
+    input_for_shard: impl FnMut(&VelorixWorkerShard) -> WorkerShardReconcileInput + Send,
+    lifecycle_options: WorkerShardLifecycleOptions,
+    shutdown: Shutdown,
+) -> Result<WorkerShardLifecycleExit, WorkerShardError>
+where
+    Shutdown: Future<Output = ()>,
+{
+    lifecycle_options.validate()?;
+    let runtime = build_kubernetes_worker_shard_operator_runtime(
+        client.clone(),
+        namespace,
+        startup_components,
+        pod_template,
+    )?;
+    let api: Api<VelorixWorkerShard> = Api::namespaced(client.clone(), namespace);
+    let events = watcher::watcher(api, watcher::Config::default()).filter_map(|event| async {
+        match event {
+            Ok(event) => worker_shard_watch_event(event).map(Ok),
+            Err(error) => Some(Err(WorkerShardError::watcher(error))),
+        }
+    });
+
+    run_worker_shard_lifecycle_with_operator_event_stream(
+        client,
+        namespace,
+        &runtime,
+        input_for_shard,
+        lifecycle_options,
+        events,
+        shutdown,
+    )
+    .await
+}
+
+fn shutdown_ready<Shutdown>(shutdown: Pin<&mut Shutdown>) -> bool
+where
+    Shutdown: Future<Output = ()>,
+{
+    shutdown.now_or_never().is_some()
 }
 
 pub async fn watch_worker_shards_with_kubernetes_runtime_after_initial_resync(

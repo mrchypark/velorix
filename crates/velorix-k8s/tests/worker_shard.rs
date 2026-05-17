@@ -7,6 +7,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use futures::{channel::oneshot, stream, FutureExt};
 use http::{Method, Request, Response, StatusCode};
 use kube::{
     client::{Body, ClientBuilder},
@@ -38,15 +39,16 @@ use velorix_k8s::{
         reconcile_worker_shard, resync_worker_shards_before_watch_with_kubernetes_runtime,
         resync_worker_shards_once_with_operator_runtime,
         resync_worker_shards_periodically_with_kubernetes_runtime,
-        runtime_identity_from_worker_shard, worker_shard_pod_name,
-        worker_shard_pod_name_for_identity, worker_shard_watch_event,
+        run_worker_shard_lifecycle_with_operator_event_stream, runtime_identity_from_worker_shard,
+        worker_shard_pod_name, worker_shard_pod_name_for_identity, worker_shard_watch_event,
         KubernetesPodWorkerShardCommandExecutor, KubernetesPodWorkerShardScopedCommandExecutor,
         ProcessWorkerShardCommandExecutor, WorkerShardCommand, WorkerShardCommandExecutor,
         WorkerShardCommandExecutorError, WorkerShardEpochStore, WorkerShardError, WorkerShardEvent,
-        WorkerShardOperatorRuntime, WorkerShardPeriodicResyncOptions, WorkerShardPodTemplate,
-        WorkerShardProcessCommand, WorkerShardReconcileConfig, WorkerShardReconcileInput,
-        WorkerShardReconcileOutput, WorkerShardResyncOptions, WorkerShardResyncSummary,
-        WorkerShardRuntimeIdentity, WorkerShardScopedCommandExecutor,
+        WorkerShardLifecycleExit, WorkerShardLifecycleOptions, WorkerShardOperatorRuntime,
+        WorkerShardPeriodicResyncOptions, WorkerShardPeriodicResyncSchedule,
+        WorkerShardPodTemplate, WorkerShardProcessCommand, WorkerShardReconcileConfig,
+        WorkerShardReconcileInput, WorkerShardReconcileOutput, WorkerShardResyncOptions,
+        WorkerShardResyncSummary, WorkerShardRuntimeIdentity, WorkerShardScopedCommandExecutor,
     },
 };
 use velorix_storage::ownership::OwnershipEpochRecord;
@@ -868,7 +870,7 @@ async fn worker_shard_resync_pass_fails_closed_when_object_bound_is_exceeded() {
         }
         other => panic!("expected resync bound error, got {other:?}"),
     }
-    assert_eq!(requests.lock().unwrap().len(), 1);
+    assert!(requests.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1126,6 +1128,676 @@ async fn kubernetes_worker_shard_periodic_resync_requeues_bounded_authority_chec
     assert_eq!(requests[0].method, Method::GET);
     assert_eq!(requests[4].method, Method::POST);
     assert_eq!(requests[4].path, "/api/v1/namespaces/default/pods");
+}
+
+#[tokio::test]
+async fn kubernetes_worker_shard_periodic_resync_rejects_unbounded_summary_collection_before_listing(
+) {
+    let validated_authority = validate_operator_authority(
+        authority(),
+        Arc::new(InMemory::new()),
+        "worker-shard-periodic-resync-unbounded-authority",
+        "v1/probes/worker-shard-periodic-resync-unbounded",
+    )
+    .await
+    .unwrap();
+    let components =
+        OperatorAuthorityStartupComponents::from_validated_authority(validated_authority);
+    let (client, requests) =
+        fake_worker_shard_startup_resync_client(vec![list_page(vec![shard()], None)]);
+
+    let error = resync_worker_shards_periodically_with_kubernetes_runtime(
+        client,
+        "default",
+        &components,
+        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+        |_| input(None),
+        WorkerShardPeriodicResyncOptions {
+            interval: Duration::from_millis(1),
+            resync: WorkerShardResyncOptions::default(),
+            max_cycles: None,
+        },
+    )
+    .await
+    .unwrap_err();
+
+    match error {
+        WorkerShardError::ResyncBoundExceeded { bound, limit } => {
+            assert_eq!(bound, "worker shard periodic resync cycles");
+            assert_eq!(limit, 0);
+        }
+        other => panic!("expected resync bound error, got {other:?}"),
+    }
+    assert!(requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn worker_shard_lifecycle_runs_initial_resync_before_stream_events() {
+    let validated_authority = validate_operator_authority(
+        authority(),
+        Arc::new(InMemory::new()),
+        "worker-shard-lifecycle-supervisor-authority",
+        "v1/probes/worker-shard-lifecycle-supervisor",
+    )
+    .await
+    .unwrap();
+    let components =
+        OperatorAuthorityStartupComponents::from_validated_authority(validated_authority);
+    let (client, requests) =
+        fake_worker_shard_startup_resync_client(vec![list_page(vec![shard()], None)]);
+    let runtime = build_kubernetes_worker_shard_operator_runtime(
+        client.clone(),
+        "default",
+        &components,
+        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+    )
+    .unwrap();
+
+    let exit = run_worker_shard_lifecycle_with_operator_event_stream(
+        client,
+        "default",
+        &runtime,
+        |_| input(None),
+        WorkerShardLifecycleOptions {
+            initial_resync: WorkerShardResyncOptions::default(),
+            periodic_resync: None,
+        },
+        stream::iter(vec![Ok(WorkerShardEvent::Applied(
+            shard_with_stream_partition("payments", 1),
+        ))]),
+        std::future::pending::<()>(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(exit, WorkerShardLifecycleExit::WatchEnded);
+    assert_eq!(
+        components
+            .worker_shard_epoch_store()
+            .unwrap()
+            .read("orders", 0, 1)
+            .await
+            .unwrap(),
+        Some(epoch_record("worker-a", 1))
+    );
+    assert_eq!(
+        components
+            .worker_shard_epoch_store()
+            .unwrap()
+            .read("payments", 1, 1)
+            .await
+            .unwrap(),
+        Some(epoch_record_for("payments", 1, "worker-a", 1))
+    );
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests[0].method, Method::GET);
+    assert_eq!(
+        requests[0].path,
+        "/apis/control.velorix.io/v1alpha1/namespaces/default/velorixworkershards"
+    );
+    let pod_create_names = requests
+        .iter()
+        .filter(|request| {
+            request.method == Method::POST && request.path == "/api/v1/namespaces/default/pods"
+        })
+        .map(|request| {
+            request
+                .body
+                .pointer("/metadata/name")
+                .and_then(Value::as_str)
+                .unwrap()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        pod_create_names,
+        vec![
+            worker_shard_pod_name_for_identity(
+                &runtime_identity_from_worker_shard(&shard(), "worker-a", 1).unwrap()
+            ),
+            worker_shard_pod_name_for_identity(
+                &runtime_identity_from_worker_shard(
+                    &shard_with_stream_partition("payments", 1),
+                    "worker-a",
+                    1,
+                )
+                .unwrap()
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn worker_shard_lifecycle_rejects_zero_periodic_interval_before_initial_resync() {
+    let validated_authority = validate_operator_authority(
+        authority(),
+        Arc::new(InMemory::new()),
+        "worker-shard-lifecycle-zero-interval-authority",
+        "v1/probes/worker-shard-lifecycle-zero-interval",
+    )
+    .await
+    .unwrap();
+    let components =
+        OperatorAuthorityStartupComponents::from_validated_authority(validated_authority);
+    let (client, requests) =
+        fake_worker_shard_startup_resync_client(vec![list_page(vec![shard()], None)]);
+    let runtime = build_kubernetes_worker_shard_operator_runtime(
+        client.clone(),
+        "default",
+        &components,
+        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+    )
+    .unwrap();
+
+    let error = match run_worker_shard_lifecycle_with_operator_event_stream(
+        client,
+        "default",
+        &runtime,
+        |_| input(None),
+        WorkerShardLifecycleOptions {
+            initial_resync: WorkerShardResyncOptions::default(),
+            periodic_resync: Some(WorkerShardPeriodicResyncSchedule {
+                interval: Duration::ZERO,
+                resync: WorkerShardResyncOptions::default(),
+            }),
+        },
+        Box::pin(stream::pending()),
+        std::future::pending::<()>(),
+    )
+    .await
+    {
+        Ok(_) => panic!("expected lifecycle zero interval failure"),
+        Err(error) => error,
+    };
+
+    match error {
+        WorkerShardError::ResyncBoundExceeded { bound, limit } => {
+            assert_eq!(bound, "worker shard periodic resync interval");
+            assert_eq!(limit, 0);
+        }
+        other => panic!("expected periodic interval bound error, got {other:?}"),
+    }
+    assert!(requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn worker_shard_lifecycle_rejects_initial_object_bound_before_initial_resync() {
+    let validated_authority = validate_operator_authority(
+        authority(),
+        Arc::new(InMemory::new()),
+        "worker-shard-lifecycle-initial-bound-authority",
+        "v1/probes/worker-shard-lifecycle-initial-bound",
+    )
+    .await
+    .unwrap();
+    let components =
+        OperatorAuthorityStartupComponents::from_validated_authority(validated_authority);
+    let (client, requests) =
+        fake_worker_shard_startup_resync_client(vec![list_page(vec![shard()], None)]);
+    let runtime = build_kubernetes_worker_shard_operator_runtime(
+        client.clone(),
+        "default",
+        &components,
+        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+    )
+    .unwrap();
+
+    let error = match run_worker_shard_lifecycle_with_operator_event_stream(
+        client,
+        "default",
+        &runtime,
+        |_| input(None),
+        WorkerShardLifecycleOptions {
+            initial_resync: WorkerShardResyncOptions {
+                max_shards: 0,
+                ..WorkerShardResyncOptions::default()
+            },
+            periodic_resync: None,
+        },
+        Box::pin(stream::pending()),
+        std::future::pending::<()>(),
+    )
+    .await
+    {
+        Ok(_) => panic!("expected lifecycle initial resync bound failure"),
+        Err(error) => error,
+    };
+
+    match error {
+        WorkerShardError::ResyncBoundExceeded { bound, limit } => {
+            assert_eq!(bound, "worker shards");
+            assert_eq!(limit, 0);
+        }
+        other => panic!("expected resync bound error, got {other:?}"),
+    }
+    assert!(requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn worker_shard_lifecycle_shutdown_before_startup_skips_kubernetes_side_effects() {
+    let validated_authority = validate_operator_authority(
+        authority(),
+        Arc::new(InMemory::new()),
+        "worker-shard-lifecycle-startup-shutdown-authority",
+        "v1/probes/worker-shard-lifecycle-startup-shutdown",
+    )
+    .await
+    .unwrap();
+    let components =
+        OperatorAuthorityStartupComponents::from_validated_authority(validated_authority);
+    let (client, requests) =
+        fake_worker_shard_startup_resync_client(vec![list_page(vec![shard()], None)]);
+    let runtime = build_kubernetes_worker_shard_operator_runtime(
+        client.clone(),
+        "default",
+        &components,
+        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+    )
+    .unwrap();
+
+    let exit = run_worker_shard_lifecycle_with_operator_event_stream(
+        client,
+        "default",
+        &runtime,
+        |_| input(None),
+        WorkerShardLifecycleOptions {
+            initial_resync: WorkerShardResyncOptions::default(),
+            periodic_resync: None,
+        },
+        Box::pin(stream::pending()),
+        std::future::ready(()),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(exit, WorkerShardLifecycleExit::Shutdown);
+    assert!(requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn worker_shard_lifecycle_ready_shutdown_still_requires_validated_authority() {
+    let (client, requests) =
+        fake_worker_shard_startup_resync_client(vec![list_page(vec![shard()], None)]);
+    let runtime = WorkerShardOperatorRuntime::new(
+        FakeLeaseClient::default(),
+        FakeEpochStore::default(),
+        FakeCommandExecutor::default(),
+    );
+
+    let error = run_worker_shard_lifecycle_with_operator_event_stream(
+        client,
+        "default",
+        &runtime,
+        |_| input(None),
+        WorkerShardLifecycleOptions {
+            initial_resync: WorkerShardResyncOptions::default(),
+            periodic_resync: None,
+        },
+        Box::pin(stream::pending()),
+        std::future::ready(()),
+    )
+    .await
+    .unwrap_err();
+
+    match error {
+        WorkerShardError::Authority { message } => {
+            assert!(message.contains("validated operator authority"));
+        }
+        other => panic!("expected authority error, got {other:?}"),
+    }
+    assert!(requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn worker_shard_lifecycle_accepts_and_polls_non_unpin_stream() {
+    let validated_authority = validate_operator_authority(
+        authority(),
+        Arc::new(InMemory::new()),
+        "worker-shard-lifecycle-non-unpin-authority",
+        "v1/probes/worker-shard-lifecycle-non-unpin",
+    )
+    .await
+    .unwrap();
+    let components =
+        OperatorAuthorityStartupComponents::from_validated_authority(validated_authority);
+    let (client, requests) =
+        fake_worker_shard_startup_resync_client(vec![list_page(vec![shard()], None)]);
+    let runtime = build_kubernetes_worker_shard_operator_runtime(
+        client.clone(),
+        "default",
+        &components,
+        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+    )
+    .unwrap();
+    let event_polled = Arc::new(Mutex::new(false));
+    let events = stream::unfold(
+        (false, Arc::clone(&event_polled)),
+        |(emitted, event_polled)| async move {
+            if emitted {
+                None
+            } else {
+                *event_polled.lock().unwrap() = true;
+                Some((Ok(WorkerShardEvent::Deleted(shard())), (true, event_polled)))
+            }
+        },
+    );
+    let shutdown = std::future::pending::<()>();
+
+    let exit = run_worker_shard_lifecycle_with_operator_event_stream(
+        client,
+        "default",
+        &runtime,
+        |_| input(None),
+        WorkerShardLifecycleOptions {
+            initial_resync: WorkerShardResyncOptions::default(),
+            periodic_resync: None,
+        },
+        events,
+        shutdown,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(exit, WorkerShardLifecycleExit::WatchEnded);
+    assert!(*event_polled.lock().unwrap());
+    assert_eq!(worker_shard_list_request_count(&requests), 1);
+}
+
+#[tokio::test]
+async fn worker_shard_lifecycle_periodic_resync_waits_interval_after_initial_resync() {
+    let validated_authority = validate_operator_authority(
+        authority(),
+        Arc::new(InMemory::new()),
+        "worker-shard-lifecycle-periodic-delay-authority",
+        "v1/probes/worker-shard-lifecycle-periodic-delay",
+    )
+    .await
+    .unwrap();
+    let components =
+        OperatorAuthorityStartupComponents::from_validated_authority(validated_authority);
+    let (client, requests) =
+        fake_worker_shard_startup_resync_client(vec![list_page(Vec::new(), None)]);
+    let runtime = build_kubernetes_worker_shard_operator_runtime(
+        client.clone(),
+        "default",
+        &components,
+        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+    )
+    .unwrap();
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let mut shutdown_tx = Some(shutdown_tx);
+    let requests_for_stream = Arc::clone(&requests);
+    let events = stream::poll_fn(move |_context| {
+        assert_eq!(worker_shard_list_request_count(&requests_for_stream), 1);
+        if let Some(shutdown_tx) = shutdown_tx.take() {
+            let _ = shutdown_tx.send(());
+        }
+        std::task::Poll::Pending::<Option<Result<WorkerShardEvent, WorkerShardError>>>
+    });
+
+    let exit = run_worker_shard_lifecycle_with_operator_event_stream(
+        client,
+        "default",
+        &runtime,
+        |_| input(None),
+        WorkerShardLifecycleOptions {
+            initial_resync: WorkerShardResyncOptions::default(),
+            periodic_resync: Some(WorkerShardPeriodicResyncSchedule {
+                interval: Duration::from_secs(60),
+                resync: WorkerShardResyncOptions::default(),
+            }),
+        },
+        events,
+        async {
+            let _ = shutdown_rx.await;
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(exit, WorkerShardLifecycleExit::Shutdown);
+    assert_eq!(worker_shard_list_request_count(&requests), 1);
+}
+
+#[tokio::test]
+async fn worker_shard_lifecycle_periodic_resync_runs_until_shutdown_without_summary_growth() {
+    let validated_authority = validate_operator_authority(
+        authority(),
+        Arc::new(InMemory::new()),
+        "worker-shard-lifecycle-periodic-authority",
+        "v1/probes/worker-shard-lifecycle-periodic",
+    )
+    .await
+    .unwrap();
+    let components =
+        OperatorAuthorityStartupComponents::from_validated_authority(validated_authority);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let shutdown_tx = Arc::new(Mutex::new(Some(shutdown_tx)));
+    let (client, requests) = fake_worker_shard_startup_resync_client_with_list_observer(
+        vec![list_page(Vec::new(), None)],
+        {
+            let shutdown_tx = Arc::clone(&shutdown_tx);
+            move |list_requests| {
+                if list_requests >= 2 {
+                    if let Some(shutdown_tx) = shutdown_tx.lock().unwrap().take() {
+                        let _ = shutdown_tx.send(());
+                    }
+                }
+            }
+        },
+    );
+    let runtime = build_kubernetes_worker_shard_operator_runtime(
+        client.clone(),
+        "default",
+        &components,
+        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+    )
+    .unwrap();
+
+    let exit = tokio::time::timeout(
+        Duration::from_secs(1),
+        run_worker_shard_lifecycle_with_operator_event_stream(
+            client,
+            "default",
+            &runtime,
+            |_| input(None),
+            WorkerShardLifecycleOptions {
+                initial_resync: WorkerShardResyncOptions::default(),
+                periodic_resync: Some(WorkerShardPeriodicResyncSchedule {
+                    interval: Duration::from_millis(1),
+                    resync: WorkerShardResyncOptions::default(),
+                }),
+            },
+            stream::pending(),
+            async {
+                let _ = shutdown_rx.await;
+            },
+        ),
+    )
+    .await
+    .expect("periodic lifecycle should shut down after the second list request")
+    .unwrap();
+
+    assert_eq!(exit, WorkerShardLifecycleExit::Shutdown);
+    assert!(
+        worker_shard_list_request_count(&requests) > 1,
+        "periodic lifecycle resync should keep running until shutdown"
+    );
+}
+
+#[tokio::test]
+async fn worker_shard_lifecycle_due_periodic_resync_is_not_starved_by_ready_events() {
+    let lease = FakeLeaseClient::default();
+    let runtime = WorkerShardOperatorRuntime::with_authority(
+        lease,
+        FakeEpochStore::default(),
+        FakeCommandExecutor::default(),
+        authority(),
+    );
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let shutdown_tx = Arc::new(Mutex::new(Some(shutdown_tx)));
+    let (client, requests) = fake_worker_shard_startup_resync_client_with_list_observer(
+        vec![list_page(Vec::new(), None)],
+        {
+            let shutdown_tx = Arc::clone(&shutdown_tx);
+            move |list_requests| {
+                if list_requests >= 2 {
+                    if let Some(shutdown_tx) = shutdown_tx.lock().unwrap().take() {
+                        let _ = shutdown_tx.send(());
+                    }
+                }
+            }
+        },
+    );
+
+    let exit = tokio::time::timeout(
+        Duration::from_secs(1),
+        run_worker_shard_lifecycle_with_operator_event_stream(
+            client,
+            "default",
+            &runtime,
+            |_| input(None),
+            WorkerShardLifecycleOptions {
+                initial_resync: WorkerShardResyncOptions::default(),
+                periodic_resync: Some(WorkerShardPeriodicResyncSchedule {
+                    interval: Duration::from_millis(1),
+                    resync: WorkerShardResyncOptions::default(),
+                }),
+            },
+            stream::repeat_with(|| Ok(WorkerShardEvent::Deleted(shard()))),
+            async {
+                let _ = shutdown_rx.await;
+            },
+        ),
+    )
+    .await
+    .expect("due periodic resync should not be starved by ready events")
+    .unwrap();
+
+    assert_eq!(exit, WorkerShardLifecycleExit::Shutdown);
+    assert!(
+        worker_shard_list_request_count(&requests) > 1,
+        "periodic lifecycle resync should run even while watch events are always ready"
+    );
+}
+
+#[tokio::test]
+async fn worker_shard_lifecycle_drains_in_flight_event_reconcile_before_shutdown() {
+    let lease = FakeLeaseClient::default()
+        .with_current(None)
+        .with_acquired(grant("worker-a", 1));
+    let epoch_store = FakeEpochStore::default();
+    let (started_tx, started_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let executor = DrainingScopedCommandExecutor::new(started_tx, release_rx);
+    let runtime = WorkerShardOperatorRuntime::with_authority(
+        lease,
+        epoch_store,
+        executor.clone(),
+        authority(),
+    );
+    let (client, requests) =
+        fake_worker_shard_startup_resync_client(vec![list_page(Vec::new(), None)]);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let lifecycle = run_worker_shard_lifecycle_with_operator_event_stream(
+        client,
+        "default",
+        &runtime,
+        |_| input(None),
+        WorkerShardLifecycleOptions {
+            initial_resync: WorkerShardResyncOptions::default(),
+            periodic_resync: None,
+        },
+        stream::iter(vec![Ok(WorkerShardEvent::Applied(shard()))]),
+        async {
+            let _ = shutdown_rx.await;
+        },
+    );
+    tokio::pin!(lifecycle);
+
+    tokio::select! {
+        result = &mut lifecycle => {
+            panic!("lifecycle completed before the start command blocked: {result:?}");
+        }
+        started = started_rx => {
+            started.expect("start command should begin");
+        }
+    }
+    shutdown_tx.send(()).unwrap();
+    assert!(
+        lifecycle.as_mut().now_or_never().is_none(),
+        "shutdown must not complete lifecycle while event reconcile is draining"
+    );
+
+    release_tx.send(()).unwrap();
+    let exit = lifecycle.await.unwrap();
+
+    assert_eq!(exit, WorkerShardLifecycleExit::Shutdown);
+    assert!(executor.completed());
+    assert_eq!(
+        executor.actions(),
+        vec![ExecutedWorkerCommand::Start {
+            owner_id: "worker-a".to_string(),
+            owner_epoch: 1,
+        }]
+    );
+    assert_eq!(worker_shard_list_request_count(&requests), 1);
+}
+
+#[tokio::test]
+async fn worker_shard_lifecycle_authority_mismatch_fails_before_pod_create() {
+    let validated_authority = validate_operator_authority(
+        ObjectStoreAuthorityRef::default(),
+        Arc::new(InMemory::new()),
+        "worker-shard-lifecycle-authority-mismatch",
+        "v1/probes/worker-shard-lifecycle-authority-mismatch",
+    )
+    .await
+    .unwrap();
+    let components =
+        OperatorAuthorityStartupComponents::from_validated_authority(validated_authority);
+    let (client, requests) =
+        fake_worker_shard_startup_resync_client(vec![list_page(vec![shard()], None)]);
+    let runtime = build_kubernetes_worker_shard_operator_runtime(
+        client.clone(),
+        "default",
+        &components,
+        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+    )
+    .unwrap();
+
+    let error = match run_worker_shard_lifecycle_with_operator_event_stream(
+        client,
+        "default",
+        &runtime,
+        |_| input(None),
+        WorkerShardLifecycleOptions {
+            initial_resync: WorkerShardResyncOptions::default(),
+            periodic_resync: None,
+        },
+        stream::iter(Vec::new()),
+        std::future::pending::<()>(),
+    )
+    .await
+    {
+        Ok(_) => panic!("expected lifecycle authority mismatch"),
+        Err(error) => error,
+    };
+
+    match error {
+        WorkerShardError::AuthorityMismatch { actual, expected } => {
+            assert_eq!(actual, authority());
+            assert_eq!(expected, ObjectStoreAuthorityRef::default());
+        }
+        other => panic!("expected authority mismatch, got {other:?}"),
+    }
+    let requests = requests.lock().unwrap();
+    assert!(requests
+        .iter()
+        .all(|request| !(request.method == Method::POST
+            && request.path == "/api/v1/namespaces/default/pods")));
 }
 
 #[test]
@@ -2042,6 +2714,20 @@ struct RecordedKubeRequest {
     body: Value,
 }
 
+fn worker_shard_list_request_count(requests: &Arc<Mutex<Vec<RecordedKubeRequest>>>) -> usize {
+    requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| {
+            request.method == Method::GET
+                && request
+                    .path
+                    .ends_with("/namespaces/default/velorixworkershards")
+        })
+        .count()
+}
+
 fn fake_pod_client(
     response_status: StatusCode,
 ) -> (kube::Client, Arc<Mutex<Vec<RecordedKubeRequest>>>) {
@@ -2255,14 +2941,27 @@ fn fake_worker_shard_runtime_client() -> (kube::Client, Arc<Mutex<Vec<RecordedKu
 fn fake_worker_shard_startup_resync_client(
     pages: Vec<WorkerShardListPage>,
 ) -> (kube::Client, Arc<Mutex<Vec<RecordedKubeRequest>>>) {
+    fake_worker_shard_startup_resync_client_with_list_observer(pages, |_| {})
+}
+
+fn fake_worker_shard_startup_resync_client_with_list_observer(
+    pages: Vec<WorkerShardListPage>,
+    on_list_request: impl Fn(usize) + Send + Sync + 'static,
+) -> (kube::Client, Arc<Mutex<Vec<RecordedKubeRequest>>>) {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let pages = Arc::new(Mutex::new(pages.into_iter()));
+    let list_requests = Arc::new(Mutex::new(0usize));
+    let on_list_request = Arc::new(on_list_request);
     let service = tower::service_fn({
         let requests = Arc::clone(&requests);
         let pages = Arc::clone(&pages);
+        let list_requests = Arc::clone(&list_requests);
+        let on_list_request = Arc::clone(&on_list_request);
         move |request: Request<Body>| {
             let requests = Arc::clone(&requests);
             let pages = Arc::clone(&pages);
+            let list_requests = Arc::clone(&list_requests);
+            let on_list_request = Arc::clone(&on_list_request);
             async move {
                 let method = request.method().clone();
                 let path = request.uri().path().to_string();
@@ -2283,6 +2982,12 @@ fn fake_worker_shard_startup_resync_client(
                         Method::GET,
                         "/apis/control.velorix.io/v1alpha1/namespaces/default/velorixworkershards",
                     ) => {
+                        let list_request_count = {
+                            let mut list_requests = list_requests.lock().unwrap();
+                            *list_requests += 1;
+                            *list_requests
+                        };
+                        on_list_request(list_request_count);
                         let page = pages
                             .lock()
                             .unwrap()
@@ -2540,6 +3245,72 @@ impl WorkerShardScopedCommandExecutor for FakeCommandExecutor {
     }
 }
 
+#[derive(Clone)]
+struct DrainingScopedCommandExecutor {
+    actions: Arc<Mutex<Vec<ExecutedWorkerCommand>>>,
+    start_started: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    start_release: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+    completed: Arc<Mutex<bool>>,
+}
+
+impl DrainingScopedCommandExecutor {
+    fn new(start_started: oneshot::Sender<()>, start_release: oneshot::Receiver<()>) -> Self {
+        Self {
+            actions: Arc::new(Mutex::new(Vec::new())),
+            start_started: Arc::new(Mutex::new(Some(start_started))),
+            start_release: Arc::new(Mutex::new(Some(start_release))),
+            completed: Arc::new(Mutex::new(false)),
+        }
+    }
+
+    fn actions(&self) -> Vec<ExecutedWorkerCommand> {
+        self.actions.lock().unwrap().clone()
+    }
+
+    fn completed(&self) -> bool {
+        *self.completed.lock().unwrap()
+    }
+}
+
+#[async_trait]
+impl WorkerShardScopedCommandExecutor for DrainingScopedCommandExecutor {
+    async fn stop_worker(
+        &self,
+        identity: &WorkerShardRuntimeIdentity,
+    ) -> Result<(), WorkerShardCommandExecutorError> {
+        self.actions
+            .lock()
+            .unwrap()
+            .push(ExecutedWorkerCommand::Stop {
+                owner_id: identity.owner_id.clone(),
+                owner_epoch: identity.owner_epoch,
+            });
+        Ok(())
+    }
+
+    async fn start_worker(
+        &self,
+        identity: &WorkerShardRuntimeIdentity,
+    ) -> Result<(), WorkerShardCommandExecutorError> {
+        self.actions
+            .lock()
+            .unwrap()
+            .push(ExecutedWorkerCommand::Start {
+                owner_id: identity.owner_id.clone(),
+                owner_epoch: identity.owner_epoch,
+            });
+        if let Some(start_started) = self.start_started.lock().unwrap().take() {
+            let _ = start_started.send(());
+        }
+        let start_release = self.start_release.lock().unwrap().take();
+        if let Some(start_release) = start_release {
+            let _ = start_release.await;
+        }
+        *self.completed.lock().unwrap() = true;
+        Ok(())
+    }
+}
+
 fn shard() -> VelorixWorkerShard {
     let mut shard = VelorixWorkerShard::new(
         "orders-p0",
@@ -2622,12 +3393,27 @@ fn grant(owner_id: &str, owner_epoch: u64) -> PartitionLeaseGrant {
 }
 
 fn epoch_record(owner_id: &str, owner_epoch: u64) -> OwnershipEpochRecord {
+    epoch_record_for("orders", 0, owner_id, owner_epoch)
+}
+
+fn epoch_record_for(
+    stream_id: &str,
+    partition_id: u32,
+    owner_id: &str,
+    owner_epoch: u64,
+) -> OwnershipEpochRecord {
+    let key = PartitionLeaseKey {
+        namespace: "default".to_string(),
+        view_id: "balances_by_account".to_string(),
+        stream_id: stream_id.to_string(),
+        partition_id,
+    };
     OwnershipEpochRecord {
-        stream_id: "orders".to_string(),
-        partition_id: 0,
+        stream_id: stream_id.to_string(),
+        partition_id,
         owner_id: owner_id.to_string(),
         owner_epoch,
-        lease_identity: velorix_k8s::lease::partition_lease_identity(&key()),
+        lease_identity: velorix_k8s::lease::partition_lease_identity(&key),
         created_at: "2026-05-06T00:00:00Z".to_string(),
         previous_epoch: owner_epoch.checked_sub(1),
         previous_checkpoint_version: Some(8),
