@@ -94,12 +94,13 @@ provider's raw coordinator constructor is not a public production API.
 `scripts/run-vind-k8s-gate.sh` now includes a live Kubernetes check that seeds a
 run-local orphan admission record, persists a run-local expiry
 decision, and verifies a restarted production provider reconstructs the expired
-orphan as non-active. This is local vind evidence over a run-local authority
-store, not live writer cutover evidence. The remaining row-closing evidence
-requires a deployed writer/coordinator path that calls the preflight before
-serving writers, plus floci/vind multi-process or multi-pod overlap races,
-adjacent range races, crash/retry windows, restart reconstruction, and leader
-handoff before this contract can close.
+orphan as non-active. The vind run counts as live Kubernetes evidence for the
+operator path it exercises, while the run-local authority store portion remains
+object-store-local. Row-closing writer evidence requires a deployed
+writer/coordinator path running on vind that calls the preflight before serving
+writers, plus RustFS/S3-compatible and vind multi-process or multi-pod
+overlap races, adjacent range races, crash/retry windows, restart
+reconstruction, and leader handoff before this contract can close.
 
 ## Conflict Semantics
 

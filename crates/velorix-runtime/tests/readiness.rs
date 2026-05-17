@@ -48,6 +48,14 @@ fn readiness_report_blocks_local_dev_authority_store_id() {
 }
 
 #[test]
+fn readiness_report_accepts_vind_named_s3_authority_store_id() {
+    let report = report_with_identity("prod-a", "s3://velorix-vind-release");
+
+    assert!(report.production_ready);
+    assert!(report.blocking_reasons.is_empty());
+}
+
+#[test]
 fn readiness_report_blocks_pass_check_with_blank_evidence() {
     let report = report_with_evidence("capability_status", " \t\n");
 
@@ -448,17 +456,22 @@ fn readiness_report_blocks_pass_check_with_floci_evidence_text() {
 }
 
 #[test]
-fn readiness_report_blocks_pass_check_with_vind_evidence_text() {
+fn readiness_report_accepts_vind_evidence_text() {
+    let report = report_with_evidence("kubernetes_status", "vind/vCluster Kubernetes gate passed");
+
+    assert!(report.production_ready);
+    assert!(report.blocking_reasons.is_empty());
+}
+
+#[test]
+fn readiness_report_accepts_rustfs_evidence_text() {
     let report = report_with_evidence(
-        "kubernetes_status",
-        "local vind/vCluster Kubernetes gate passed",
+        "s3_compatible_test_status",
+        "RustFS S3-compatible integration harness passed against configured S3 API",
     );
 
-    assert!(!report.production_ready);
-    assert_eq!(
-        report.blocking_reasons,
-        vec!["kubernetes_status uses local vind Kubernetes evidence"]
-    );
+    assert!(report.production_ready);
+    assert!(report.blocking_reasons.is_empty());
 }
 
 #[test]

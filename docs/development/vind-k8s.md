@@ -1,8 +1,11 @@
-# Local Kubernetes Testing With vind
+# Kubernetes Testing With vind
 
-`vind` is vCluster's Docker driver mode. It gives Velorix a disposable local
-Kubernetes API for CRD apply and k8s crate smoke testing without making Kubernetes
-the database authority.
+`vind` is vCluster's Docker driver mode. It gives Velorix a disposable
+Kubernetes API for CRD apply and k8s crate smoke testing without making
+Kubernetes the database authority. Velorix treats vind gate runs as live
+Kubernetes evidence for the exercised operator paths; object-store authority
+evidence still has to come from RustFS/S3-compatible storage instead of the
+run-local filesystem slices used by some tests.
 
 Prerequisites:
 
@@ -71,7 +74,7 @@ authority, persists a run-local orphan expiry decision, and verifies a
 restarted production provider reconstructs the expired orphan as non-active. It
 does not exercise distributed or multi-pod admission races.
 
-Run the full local vind gate:
+Run the full vind gate:
 
 ```bash
 scripts/run-vind-k8s-gate.sh
@@ -81,8 +84,9 @@ By default, the gate creates a run-owned `velorix-vind-*` vCluster, deletes
 that cluster on exit, and writes
 `target/velorix-k8s/vind-k8s-gate-evidence.json` with the cluster context,
 namespace, applied CRDs, tool versions, and live k8s test set. The artifact is
-local Kubernetes evidence only; it is not 1.0 completion evidence and does not
-claim multi-pod production ingest-admission readiness. On failure, the gate
+writes live Kubernetes evidence for the exercised paths, but it does not by
+itself claim multi-pod production ingest-admission readiness or RustFS/S3-backed
+object-store authority. On failure, the gate
 writes `target/velorix-k8s/vind-k8s-gate-diagnostics.txt` before cleaning up
 owned resources.
 

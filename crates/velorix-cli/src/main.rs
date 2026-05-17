@@ -885,7 +885,7 @@ fn validate_production_gc_run_evidence_artifact(
 fn reject_local_readiness_artifact(evidence_kind: &str, path: &Path) -> anyhow::Result<()> {
     if matches!(
         evidence_kind,
-        "floci_s3_compatible_gate" | "kubernetes_vind_gate" | "local_benchmark_gate"
+        "floci_s3_compatible_gate" | "local_benchmark_gate"
     ) {
         bail!(
             "{} is local-scoped evidence ({evidence_kind}) and cannot satisfy release readiness",
@@ -3758,6 +3758,15 @@ mod tests {
         .unwrap_err();
 
         assert!(format!("{error:#}").contains("local-scoped evidence"));
+    }
+
+    #[test]
+    fn readiness_release_artifact_filter_accepts_kubernetes_vind_gate_evidence() {
+        reject_local_readiness_artifact(
+            "kubernetes_vind_gate",
+            Path::new("target/velorix-k8s/vind-k8s-gate-evidence.json"),
+        )
+        .unwrap();
     }
 
     #[test]

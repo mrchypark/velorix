@@ -107,62 +107,61 @@ evidence independent:
 - If neither benchmark JSON nor live S3-compatible tests are configured, the
   nightly gate fails closed instead of passing without S3 evidence.
 
-## Local Floci S3 Emulator Gate
+## RustFS S3-Compatible Gate
 
-For local S3 API compatibility checks, `scripts/run-floci-s3-gate.sh` starts a
-Floci container, creates a test bucket through the AWS S3 API, and runs the same
-env-gated storage/runtime harnesses against `http://127.0.0.1:4566`.
+For RustFS-backed S3 API compatibility checks,
+`scripts/run-rustfs-s3-gate.sh` starts a RustFS container, creates a test bucket
+through the AWS S3 API, and runs the same env-gated storage/runtime harnesses
+against `http://127.0.0.1:9000`.
 Before setup, it creates a disposable Docker bridge network and runs a
 short-lived AWS CLI container on that network so Docker network-store or
 container-attach failures fail before evidence artifacts are written.
 
 ```bash
-scripts/run-floci-s3-gate.sh
+scripts/run-rustfs-s3-gate.sh
 ```
 
 The script sets the normal live harness environment:
 
 ```text
 VELORIX_S3_COMPAT=1
-AWS_ENDPOINT_URL=http://127.0.0.1:4566
-AWS_ACCESS_KEY_ID=test
-AWS_SECRET_ACCESS_KEY=test
+AWS_ENDPOINT_URL=http://127.0.0.1:9000
+AWS_ACCESS_KEY_ID=rustfsadmin
+AWS_SECRET_ACCESS_KEY=rustfsadmin
 AWS_REGION=us-east-1
-VELORIX_S3_BUCKET=velorix-floci
-VELORIX_S3_PREFIX=floci-s3-gate/<timestamp>
+VELORIX_S3_BUCKET=velorix-rustfs
+VELORIX_S3_PREFIX=rustfs-s3-gate/<timestamp>
 ```
 
 It runs:
 
 ```bash
 cargo test -p velorix-storage --test s3_compat --features s3-compat-tests
+cargo test -p velorix-storage --test multi_process_ingest_admission --features s3-compat-tests
 cargo test -p velorix-runtime --test s3_compat_query --features s3-compat-tests
 cargo bench -p velorix-runtime --bench s3_incremental --features s3-compat-tests
-cargo run -p velorix-cli -- benchmark-validate --result target/velorix-bench/floci-s3-nightly.json
+cargo run -p velorix-cli -- benchmark-validate --result target/velorix-bench/rustfs-s3-nightly.json
 ```
 
-The benchmark step can be skipped with `VELORIX_FLOCI_RUN_BENCHMARK=0`. The
-script writes `target/velorix-s3/floci-s3-gate-evidence.json` and deletes the
-Floci container/network by default. Set `VELORIX_FLOCI_CLEANUP=0` to keep the
-container for debugging.
+The benchmark step can be skipped with `VELORIX_RUSTFS_RUN_BENCHMARK=0`. The
+script writes `target/velorix-s3/rustfs-s3-gate-evidence.json` and deletes the
+RustFS container/network/volume by default. Set `VELORIX_RUSTFS_CLEANUP=0` to
+keep the container for debugging.
 When the benchmark step runs, it marks the benchmark JSON with
-`backend_evidence_scope=local_emulator`; validation can still check the file
-shape, but S3-compatible nightly/release benchmark gates reject that local
-emulator scope. S3-compatible benchmark gate results must include an explicit
-`backend_evidence_scope`; omitted scope remains backward-compatible for old
-baselines but is rejected for current S3-compatible gate evidence.
+`backend_evidence_scope=live_or_native`; S3-compatible benchmark gate results
+must include an explicit `backend_evidence_scope`; omitted scope remains
+backward-compatible for old baselines but is rejected for current S3-compatible
+gate evidence.
 
-The manual `Floci S3 Emulator Gate` workflow runs this same local emulator gate
-on a GitHub-hosted runner and uploads the JSON as `floci-s3-emulator-evidence`.
+The manual `RustFS S3-Compatible Gate` workflow runs this same RustFS-backed
+gate on a GitHub-hosted runner and uploads the JSON as
+`rustfs-s3-compatible-evidence`.
 Its benchmark input defaults off so the fast storage/runtime API behavior gate
-can be reviewed separately from slower local benchmark output. The generated
-artifact records the local `s3_compatible` and
-`s3_compatible_integration_harness` readiness evidence kinds.
-
-Floci is useful fast local S3-compatible evidence because it speaks the AWS
-wire protocol and exercises the same `object_store` clients as the nightly
-harness. It is still emulator evidence, not a replacement for measured
-release-quality S3-compatible backend baselines.
+can be reviewed separately from slower benchmark output. The generated artifact
+records the `s3_compatible` and `s3_compatible_integration_harness` readiness
+evidence kinds. RustFS evidence counts as live S3-compatible evidence for
+Velorix readiness when it is produced through the S3 API, with local filesystem
+and generic emulator evidence still rejected by readiness validators.
 
 ## GCS Emulator Boundary
 

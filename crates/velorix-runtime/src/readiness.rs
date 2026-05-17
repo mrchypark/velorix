@@ -543,8 +543,6 @@ fn push_placeholder_evidence_check(
         ("local only", "local-only"),
         ("local filesystem", "local filesystem"),
         ("floci", "local Floci emulator"),
-        ("vind", "local vind Kubernetes"),
-        ("vcluster", "local Kubernetes vCluster"),
         ("emulator", "emulator"),
     ] {
         if evidence.contains(marker) {
@@ -562,8 +560,6 @@ fn is_local_dev_authority_store(authority_store_id: &str) -> bool {
         "localhost",
         "127.0.0.1",
         "floci",
-        "vind",
-        "vcluster",
         "emulator",
         "local-only",
         "local only",
