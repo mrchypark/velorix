@@ -179,6 +179,13 @@ read-only diagnosis. For lineage diagnostics, a structurally valid parent
 manifest remains usable as parent evidence even when that older manifest's own
 raw state/output payloads have been GC-deleted; each manifest's own payload
 availability still determines whether that manifest is reported valid. After a
+local admin inspection identifies valid checkpoints,
+`velorix-cli checkpoint-repair-local` can rewrite missing, corrupt, or
+digest-mismatched `published` lifecycle records for those validated manifests
+and rebuild the advisory latest-candidate marker from the latest validated
+manifest. It does not repair or delete immutable checkpoint manifests and does
+not create retention, GC transition, or recovery transition records.
+After a
 GC run evidence object is written and read back successfully, GC also writes
 append-only retention evidence for non-retained checkpoints whose raw
 state/output payloads were deleted or whose SlateDB logical state refs were

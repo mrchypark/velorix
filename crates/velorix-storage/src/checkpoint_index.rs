@@ -115,6 +115,13 @@ pub struct CheckpointAdminInspection {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct CheckpointAdminRepairReport {
+    pub lifecycle_records_repaired: Vec<CheckpointLifecycleRecord>,
+    pub latest_candidate_marker: Option<LatestCandidateMarker>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CheckpointManifestInspection {
     pub checkpoint_version: u64,
     pub manifest_key: ObjectKey,

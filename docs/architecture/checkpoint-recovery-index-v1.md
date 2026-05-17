@@ -75,6 +75,13 @@ records. When GC leaves an older parent manifest listed but
 deletes that parent's raw state/output payloads, inspection may still use the parent
 manifest body as structural lineage evidence for newer retained checkpoints;
 the older manifest itself is reported invalid if its own payloads are missing.
+`velorix-cli checkpoint-repair-local --object-store-dir <path>` is the local
+admin repair path for digest-bound status and advisory lookup metadata. It
+rewrites missing, corrupt, or digest-mismatched `published` lifecycle records
+only for manifests that pass admin inspection plus state/output payload
+validation, then rebuilds `v1/checkpoint-index/latest-candidate.json` from the
+latest validated manifest. It does not rewrite manifests, retention records, GC
+transitions, or recovery transitions.
 When a GC run has successfully persisted and read back its `GcRunV1` evidence,
 inspection also reports digest-matched retention evidence from:
 
@@ -129,6 +136,9 @@ policy.
   manifest without invalidating a newer retained child checkpoint whose own
   payloads remain available.
 - Local CLI admin inspect prints deterministic read-only checkpoint diagnostics.
+- Local CLI checkpoint repair restores digest-bound `published` lifecycle
+  records for validated manifests and rewrites only the advisory latest marker
+  from the latest validated manifest.
 - Published lifecycle records are readable and digest-bound to their manifest.
 - Retention evidence is readable after successful GC evidence read-back and is
   attached only when digest-bound to the inspected manifest.

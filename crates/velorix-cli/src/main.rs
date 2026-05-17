@@ -65,8 +65,9 @@ use velorix_runtime::recovery::{RecoveredRuntime, ORDERS_SUM_COUNT_OWNER};
 use velorix_storage::{
     capability::probe_authoritative_object_store_capabilities,
     checkpoint_index::{
-        CheckpointAdminInspection, CheckpointGcTransitionRecordV1, CheckpointLifecycleStatus,
-        CheckpointManifestInspectionStatus, CheckpointRetentionRecordV1,
+        CheckpointAdminInspection, CheckpointAdminRepairReport, CheckpointGcTransitionRecordV1,
+        CheckpointLifecycleRecord, CheckpointLifecycleStatus, CheckpointManifestInspectionStatus,
+        CheckpointRetentionRecordV1, LatestCandidateMarker,
     },
     gc::{GarbageCollectionPlan, GarbageCollectionPolicy, GarbageCollectionRunV1},
     relation_catalog_registry::RelationCatalogRegistry,
@@ -108,6 +109,18 @@ enum Command {
         checkpoint_version: Option<u64>,
     },
     CheckpointInspectLocal {
+        #[arg(long)]
+        object_store_dir: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    CheckpointRepairLatestLocal {
+        #[arg(long)]
+        object_store_dir: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    CheckpointRepairLocal {
         #[arg(long)]
         object_store_dir: PathBuf,
         #[arg(long)]
@@ -249,6 +262,36 @@ async fn main() -> anyhow::Result<()> {
                 println!("{}", format_checkpoint_inspection_json(&inspection)?);
             } else {
                 print!("{}", format_checkpoint_inspection(&inspection));
+            }
+        }
+        Some(Command::CheckpointRepairLatestLocal {
+            object_store_dir,
+            json,
+        }) => {
+            let store = local_object_store(&object_store_dir)?;
+            let marker = repair_local_latest_checkpoint_marker(store)
+                .await
+                .context("failed to repair local latest checkpoint marker")?;
+
+            if json {
+                println!("{}", format_checkpoint_latest_repair_json(marker.as_ref())?);
+            } else {
+                print!("{}", format_checkpoint_latest_repair(marker.as_ref()));
+            }
+        }
+        Some(Command::CheckpointRepairLocal {
+            object_store_dir,
+            json,
+        }) => {
+            let store = local_object_store(&object_store_dir)?;
+            let report = repair_local_checkpoint_admin_records(store)
+                .await
+                .context("failed to repair local checkpoint admin records")?;
+
+            if json {
+                println!("{}", format_checkpoint_repair_json(&report)?);
+            } else {
+                print!("{}", format_checkpoint_repair(&report));
             }
         }
         Some(Command::GcPlanLocal {
@@ -1979,6 +2022,24 @@ async fn inspect_local_checkpoints(
         .await?)
 }
 
+async fn repair_local_latest_checkpoint_marker(
+    store: Arc<dyn ObjectStore>,
+) -> anyhow::Result<Option<LatestCandidateMarker>> {
+    Ok(checked_local_admin_checkpoint_publisher(store)
+        .await?
+        .repair_latest_candidate_marker()
+        .await?)
+}
+
+async fn repair_local_checkpoint_admin_records(
+    store: Arc<dyn ObjectStore>,
+) -> anyhow::Result<CheckpointAdminRepairReport> {
+    Ok(checked_local_admin_checkpoint_publisher(store)
+        .await?
+        .repair_checkpoint_admin_records()
+        .await?)
+}
+
 async fn plan_local_garbage_collection(
     store: Arc<dyn ObjectStore>,
     policy: GarbageCollectionPolicy,
@@ -2039,6 +2100,60 @@ fn format_checkpoint_inspection_json(
         inspection,
     })
     .context("failed to serialize checkpoint inspection")
+}
+
+fn format_checkpoint_latest_repair(marker: Option<&LatestCandidateMarker>) -> String {
+    marker.map_or_else(
+        || "latest_candidate_marker=none\n".to_string(),
+        |marker| {
+            format!(
+                "latest_candidate_marker=checkpoint {} key={} digest={}\n",
+                marker.checkpoint_version, marker.manifest_key, marker.manifest_digest
+            )
+        },
+    )
+}
+
+fn format_checkpoint_latest_repair_json(
+    marker: Option<&LatestCandidateMarker>,
+) -> anyhow::Result<String> {
+    #[derive(Serialize)]
+    struct CheckpointLatestRepairReport<'a> {
+        schema_version: u16,
+        latest_candidate_marker: Option<&'a LatestCandidateMarker>,
+    }
+
+    serde_json::to_string_pretty(&CheckpointLatestRepairReport {
+        schema_version: 1,
+        latest_candidate_marker: marker,
+    })
+    .context("failed to serialize checkpoint latest repair")
+}
+
+fn format_checkpoint_repair(report: &CheckpointAdminRepairReport) -> String {
+    let latest = report.latest_candidate_marker.as_ref().map_or_else(
+        || "none".to_string(),
+        |marker| marker.checkpoint_version.to_string(),
+    );
+    format!(
+        "lifecycle_records_repaired={}\nlatest_candidate_marker={latest}\n",
+        report.lifecycle_records_repaired.len()
+    )
+}
+
+fn format_checkpoint_repair_json(report: &CheckpointAdminRepairReport) -> anyhow::Result<String> {
+    #[derive(Serialize)]
+    struct CheckpointRepairReport<'a> {
+        schema_version: u16,
+        #[serde(flatten)]
+        report: &'a CheckpointAdminRepairReport,
+    }
+
+    serde_json::to_string_pretty(&CheckpointRepairReport {
+        schema_version: 1,
+        report,
+    })
+    .context("failed to serialize checkpoint repair")
 }
 
 fn format_gc_plan(plan: &GarbageCollectionPlan) -> String {
@@ -3375,6 +3490,52 @@ mod tests {
 
         assert_eq!(object_store_dir, PathBuf::from("/tmp/velorix"));
         assert_eq!(retain_latest_manifests, 2);
+        assert!(json);
+    }
+
+    #[test]
+    fn checkpoint_repair_latest_cli_parses_json_command() {
+        let cli = Cli::try_parse_from([
+            "velorix-cli",
+            "checkpoint-repair-latest-local",
+            "--object-store-dir",
+            "/tmp/velorix",
+            "--json",
+        ])
+        .unwrap();
+
+        let Some(Command::CheckpointRepairLatestLocal {
+            object_store_dir,
+            json,
+        }) = cli.command
+        else {
+            panic!("expected checkpoint-repair-latest-local command");
+        };
+
+        assert_eq!(object_store_dir, PathBuf::from("/tmp/velorix"));
+        assert!(json);
+    }
+
+    #[test]
+    fn checkpoint_repair_cli_parses_json_command() {
+        let cli = Cli::try_parse_from([
+            "velorix-cli",
+            "checkpoint-repair-local",
+            "--object-store-dir",
+            "/tmp/velorix",
+            "--json",
+        ])
+        .unwrap();
+
+        let Some(Command::CheckpointRepairLocal {
+            object_store_dir,
+            json,
+        }) = cli.command
+        else {
+            panic!("expected checkpoint-repair-local command");
+        };
+
+        assert_eq!(object_store_dir, PathBuf::from("/tmp/velorix"));
         assert!(json);
     }
 
@@ -4739,6 +4900,47 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_latest_repair_formatter_reports_repaired_marker() {
+        let marker = latest_candidate_marker(7);
+
+        assert_eq!(
+            format_checkpoint_latest_repair(Some(&marker)),
+            "latest_candidate_marker=checkpoint 7 key=v1/checkpoints/00000000000000000007.manifest digest=sha256:manifest\n"
+        );
+        assert_eq!(
+            format_checkpoint_latest_repair(None),
+            "latest_candidate_marker=none\n"
+        );
+
+        let json = format_checkpoint_latest_repair_json(Some(&marker)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["latest_candidate_marker"]["checkpoint_version"], 7);
+    }
+
+    #[test]
+    fn checkpoint_repair_formatter_reports_lifecycle_and_latest_repairs() {
+        let report = CheckpointAdminRepairReport {
+            lifecycle_records_repaired: vec![checkpoint_lifecycle_record(7)],
+            latest_candidate_marker: Some(latest_candidate_marker(7)),
+        };
+
+        assert_eq!(
+            format_checkpoint_repair(&report),
+            "lifecycle_records_repaired=1\nlatest_candidate_marker=7\n"
+        );
+
+        let json = format_checkpoint_repair_json(&report).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(
+            value["lifecycle_records_repaired"][0]["checkpoint_version"],
+            7
+        );
+        assert_eq!(value["latest_candidate_marker"]["checkpoint_version"], 7);
+    }
+
+    #[test]
     fn gc_plan_json_uses_stable_schema_version() {
         let plan = GarbageCollectionPlan {
             retained_manifest_versions: vec![7, 8],
@@ -4837,6 +5039,28 @@ mod tests {
                     },
                 },
             ],
+        }
+    }
+
+    fn latest_candidate_marker(checkpoint_version: u64) -> LatestCandidateMarker {
+        LatestCandidateMarker {
+            schema_version: 1,
+            checkpoint_version,
+            manifest_key: ObjectKey::checkpoint_manifest(checkpoint_version),
+            manifest_digest: "sha256:manifest".to_string(),
+            validated_parent_checkpoint: checkpoint_version.checked_sub(1),
+            updated_at: "unix:0.000000001".to_string(),
+        }
+    }
+
+    fn checkpoint_lifecycle_record(checkpoint_version: u64) -> CheckpointLifecycleRecord {
+        CheckpointLifecycleRecord {
+            schema_version: 1,
+            checkpoint_version,
+            manifest_key: ObjectKey::checkpoint_manifest(checkpoint_version),
+            manifest_digest: "sha256:manifest".to_string(),
+            status: CheckpointLifecycleStatus::Published,
+            status_updated_at: "unix:0.000000001".to_string(),
         }
     }
 

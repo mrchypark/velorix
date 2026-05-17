@@ -2152,6 +2152,76 @@ async fn checkpoint_read_published_manifest_rejects_lifecycle_digest_mismatch() 
 }
 
 #[tokio::test]
+async fn checkpoint_repair_lifecycle_records_restores_missing_published_lifecycle() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let state = state_write(0, "state-0001", b"state-0");
+    let manifest = manifest(0, publisher.write_state_object(&state).await.unwrap());
+
+    publisher.publish_manifest(&manifest).await.unwrap();
+    store
+        .delete(&Path::from(
+            ObjectKey::checkpoint_lifecycle_record(0).as_str(),
+        ))
+        .await
+        .unwrap();
+
+    let repaired = publisher
+        .repair_checkpoint_lifecycle_records()
+        .await
+        .unwrap();
+    let record = publisher.read_checkpoint_lifecycle_record(0).await.unwrap();
+
+    assert_eq!(repaired.len(), 1);
+    assert_eq!(repaired[0], record);
+    assert_eq!(record.checkpoint_version, 0);
+    assert_eq!(record.manifest_key, manifest.object_key());
+    assert_eq!(record.status, CheckpointLifecycleStatus::Published);
+    publisher
+        .read_published_checkpoint_manifest(0)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn checkpoint_repair_lifecycle_records_rewrites_digest_mismatch() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let state = state_write(0, "state-0001", b"state-0");
+    let manifest = manifest(0, publisher.write_state_object(&state).await.unwrap());
+    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+
+    publisher.publish_manifest(&manifest).await.unwrap();
+    let mut mismatched_record = CheckpointLifecycleRecord::published(
+        &manifest,
+        &manifest_bytes,
+        "2026-05-03T00:00:01Z".to_string(),
+    );
+    mismatched_record.manifest_digest = "sha256:mismatched".to_string();
+    store
+        .put(
+            &Path::from(ObjectKey::checkpoint_lifecycle_record(0).as_str()),
+            Bytes::from(serde_json::to_vec(&mismatched_record).unwrap()).into(),
+        )
+        .await
+        .unwrap();
+
+    let repaired = publisher
+        .repair_checkpoint_lifecycle_records()
+        .await
+        .unwrap();
+    let record = publisher.read_checkpoint_lifecycle_record(0).await.unwrap();
+
+    assert_eq!(repaired.len(), 1);
+    assert_ne!(record.manifest_digest, "sha256:mismatched");
+    assert_eq!(repaired[0], record);
+    publisher
+        .read_published_checkpoint_manifest(0)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn checkpoint_recovery_transition_record_is_digest_bound_and_create_only() {
     let (_temp_dir, store) = temp_store();
     let publisher = CheckpointPublisher::new(store);
@@ -2716,6 +2786,90 @@ async fn checkpoint_publish_latest_manifest_falls_back_when_marker_is_stale() {
         .await
         .unwrap();
 
+    assert_eq!(publisher.latest_manifest().await.unwrap(), Some(manifest_1));
+}
+
+#[tokio::test]
+async fn checkpoint_repair_latest_candidate_marker_rewrites_stale_marker() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let state_0 = state_write(0, "state-0001", b"state-0");
+    let state_1 = state_write(1, "state-0002", b"state-1");
+    let manifest_0 = manifest(0, publisher.write_state_object(&state_0).await.unwrap());
+    let manifest_1 = manifest(1, publisher.write_state_object(&state_1).await.unwrap());
+
+    publisher.publish_manifest(&manifest_0).await.unwrap();
+    let stale_marker = LatestCandidateMarker::for_manifest(
+        &manifest_0,
+        &serde_json::to_vec(&manifest_0).unwrap(),
+        "2026-05-03T00:00:01Z".to_string(),
+    );
+    publisher.publish_manifest(&manifest_1).await.unwrap();
+    store
+        .put(
+            &Path::from(ObjectKey::checkpoint_latest_candidate_marker().as_str()),
+            Bytes::from(serde_json::to_vec(&stale_marker).unwrap()).into(),
+        )
+        .await
+        .unwrap();
+
+    let repaired = publisher.repair_latest_candidate_marker().await.unwrap();
+    let marker_bytes = store
+        .get(&Path::from(
+            ObjectKey::checkpoint_latest_candidate_marker().as_str(),
+        ))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let marker = serde_json::from_slice::<LatestCandidateMarker>(&marker_bytes).unwrap();
+
+    assert_eq!(repaired.as_ref().unwrap().checkpoint_version, 1);
+    assert_eq!(marker.checkpoint_version, 1);
+    assert_eq!(marker.manifest_key, manifest_1.object_key());
+}
+
+#[tokio::test]
+async fn checkpoint_repair_admin_records_repairs_lifecycle_then_latest_marker() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let state_0 = state_write(0, "state-0001", b"state-0");
+    let state_1 = state_write(1, "state-0002", b"state-1");
+    let manifest_0 = manifest(0, publisher.write_state_object(&state_0).await.unwrap());
+    let manifest_1 = manifest(1, publisher.write_state_object(&state_1).await.unwrap());
+
+    publisher.publish_manifest(&manifest_0).await.unwrap();
+    publisher.publish_manifest(&manifest_1).await.unwrap();
+    store
+        .delete(&Path::from(
+            ObjectKey::checkpoint_lifecycle_record(1).as_str(),
+        ))
+        .await
+        .unwrap();
+    store
+        .put(
+            &Path::from(ObjectKey::checkpoint_latest_candidate_marker().as_str()),
+            Bytes::from_static(b"{not valid json").into(),
+        )
+        .await
+        .unwrap();
+
+    let report = publisher.repair_checkpoint_admin_records().await.unwrap();
+
+    assert_eq!(report.lifecycle_records_repaired.len(), 1);
+    assert_eq!(
+        report
+            .latest_candidate_marker
+            .as_ref()
+            .unwrap()
+            .checkpoint_version,
+        1
+    );
+    publisher
+        .read_published_checkpoint_manifest(1)
+        .await
+        .unwrap();
     assert_eq!(publisher.latest_manifest().await.unwrap(), Some(manifest_1));
 }
 

@@ -17,8 +17,8 @@ use crate::{
     },
     checkpoint_index::{
         manifest_digest, marker_updated_at_now, recovery_transition_id_now,
-        CheckpointAdminInspection, CheckpointGcTransitionRecordV1, CheckpointLifecycleRecord,
-        CheckpointLifecycleStatus, CheckpointManifestInspection,
+        CheckpointAdminInspection, CheckpointAdminRepairReport, CheckpointGcTransitionRecordV1,
+        CheckpointLifecycleRecord, CheckpointLifecycleStatus, CheckpointManifestInspection,
         CheckpointManifestInspectionStatus, CheckpointRecoveryMode,
         CheckpointRecoveryTransitionRecordV1, CheckpointRetentionRecordV1, LatestCandidateMarker,
     },
@@ -915,6 +915,110 @@ impl CheckpointPublisher {
         Ok(CheckpointAdminInspection {
             latest_valid_checkpoint,
             manifests: inspections,
+        })
+    }
+
+    pub async fn repair_latest_candidate_marker(
+        &self,
+    ) -> Result<Option<LatestCandidateMarker>, CheckpointPublishError> {
+        let inspection = self.inspect_checkpoints().await?;
+        let Some(checkpoint_version) = inspection.latest_valid_checkpoint else {
+            return Ok(None);
+        };
+
+        let manifest_key = ObjectKey::checkpoint_manifest(checkpoint_version);
+        let manifest_path = Path::from(manifest_key.as_str());
+        let manifest_bytes = self.store.get(&manifest_path).await?.bytes().await?;
+        let manifest = serde_json::from_slice::<CheckpointManifest>(&manifest_bytes)?;
+        manifest.validate()?;
+        let body_key = manifest.object_key();
+        if manifest_key != body_key {
+            return Err(CheckpointPublishError::ManifestKeyMismatch {
+                object_key: manifest_key,
+                body_key,
+            });
+        }
+        self.validate_parent_manifest_visible(&manifest).await?;
+        self.validate_state_objects_exist(&manifest).await?;
+        self.validate_output_objects_exist(&manifest).await?;
+
+        let marker = LatestCandidateMarker::for_manifest(
+            &manifest,
+            &manifest_bytes,
+            marker_updated_at_now(),
+        );
+        let marker_key = ObjectKey::checkpoint_latest_candidate_marker();
+        self.store
+            .put(
+                &Path::from(marker_key.as_str()),
+                Bytes::from(serde_json::to_vec(&marker)?).into(),
+            )
+            .await?;
+
+        Ok(Some(marker))
+    }
+
+    pub async fn repair_checkpoint_lifecycle_records(
+        &self,
+    ) -> Result<Vec<CheckpointLifecycleRecord>, CheckpointPublishError> {
+        let inspection = self.inspect_checkpoints().await?;
+        let mut repaired = Vec::new();
+
+        for manifest_inspection in inspection
+            .manifests
+            .iter()
+            .filter(|manifest| manifest.status == CheckpointManifestInspectionStatus::Valid)
+        {
+            let checkpoint_version = manifest_inspection.checkpoint_version;
+            let manifest_key = ObjectKey::checkpoint_manifest(checkpoint_version);
+            let manifest_bytes = self
+                .store
+                .get(&Path::from(manifest_key.as_str()))
+                .await?
+                .bytes()
+                .await?;
+            let manifest = serde_json::from_slice::<CheckpointManifest>(&manifest_bytes)?;
+            manifest.validate()?;
+            let expected = CheckpointLifecycleRecord::published(
+                &manifest,
+                &manifest_bytes,
+                marker_updated_at_now(),
+            );
+            let object_key = ObjectKey::checkpoint_lifecycle_record(checkpoint_version);
+            let needs_repair = match self
+                .read_checkpoint_lifecycle_record(checkpoint_version)
+                .await
+            {
+                Ok(existing) => !same_lifecycle_causal_fields(&existing, &expected),
+                Err(CheckpointPublishError::ObjectStore(object_store::Error::NotFound {
+                    ..
+                })) => true,
+                Err(_) => true,
+            };
+
+            if needs_repair {
+                self.store
+                    .put(
+                        &Path::from(object_key.as_str()),
+                        Bytes::from(serde_json::to_vec(&expected)?).into(),
+                    )
+                    .await?;
+                repaired.push(expected);
+            }
+        }
+
+        Ok(repaired)
+    }
+
+    pub async fn repair_checkpoint_admin_records(
+        &self,
+    ) -> Result<CheckpointAdminRepairReport, CheckpointPublishError> {
+        let lifecycle_records_repaired = self.repair_checkpoint_lifecycle_records().await?;
+        let latest_candidate_marker = self.repair_latest_candidate_marker().await?;
+
+        Ok(CheckpointAdminRepairReport {
+            lifecycle_records_repaired,
+            latest_candidate_marker,
         })
     }
 
@@ -2718,6 +2822,17 @@ fn same_retention_causal_fields(
         && left.policy == right.policy
         && left.retained_manifest_versions == right.retained_manifest_versions
         && left.deleted_candidate_keys == right.deleted_candidate_keys
+}
+
+fn same_lifecycle_causal_fields(
+    left: &CheckpointLifecycleRecord,
+    right: &CheckpointLifecycleRecord,
+) -> bool {
+    left.schema_version == right.schema_version
+        && left.checkpoint_version == right.checkpoint_version
+        && left.manifest_key == right.manifest_key
+        && left.manifest_digest == right.manifest_digest
+        && left.status == right.status
 }
 
 fn validate_checkpoint_publisher_authoritative_namespaces(
