@@ -22,6 +22,7 @@ pub struct ObjectStoreCapabilityProfile {
 pub enum AuthoritativeNamespace {
     Ingest,
     IngestAdmission,
+    IngestAdmissionIndex,
     State,
     Output,
     Checkpoint,
@@ -386,10 +387,11 @@ fn unique_probe_key(prefix: &str) -> String {
 }
 
 impl AuthoritativeNamespace {
-    pub fn all() -> [Self; 18] {
+    pub fn all() -> [Self; 19] {
         [
             Self::Ingest,
             Self::IngestAdmission,
+            Self::IngestAdmissionIndex,
             Self::State,
             Self::Output,
             Self::Checkpoint,
@@ -426,6 +428,7 @@ impl fmt::Display for AuthoritativeNamespace {
         match self {
             Self::Ingest => write!(f, "ingest"),
             Self::IngestAdmission => write!(f, "ingest-admission"),
+            Self::IngestAdmissionIndex => write!(f, "ingest-admission-index"),
             Self::State => write!(f, "state"),
             Self::Output => write!(f, "output"),
             Self::Checkpoint => write!(f, "checkpoint"),

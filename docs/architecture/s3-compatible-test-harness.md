@@ -143,6 +143,15 @@ cargo bench -p velorix-runtime --bench s3_incremental --features s3-compat-tests
 cargo run -p velorix-cli -- benchmark-validate --result target/velorix-bench/rustfs-s3-nightly.json
 ```
 
+The `multi_process_ingest_admission` target exercises the checked
+`RangeAdmissionIndexV1` coordinator path against RustFS through the S3 API: two
+same-host OS processes mark themselves ready after store/coordinator/payload
+setup, are released together into overlapping appends with zero artificial
+post-release delay, and admit exactly one append with the loser returning
+`range_overlap_reserved`; the same target also proves adjacent ranges produce a
+valid chained index. Crash/restart and deployed writer/operator topology
+evidence are still separate ingest row blockers.
+
 The benchmark step can be skipped with `VELORIX_RUSTFS_RUN_BENCHMARK=0`. The
 script writes `target/velorix-s3/rustfs-s3-gate-evidence.json` and deletes the
 RustFS container/network/volume by default. Set `VELORIX_RUSTFS_CLEANUP=0` to

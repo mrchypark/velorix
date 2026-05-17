@@ -14,6 +14,7 @@ manifest publication.
 | --- | --- | --- |
 | `v1/ingest` | Create-only object writes; no overwrite fallback. | Read-after-create, partition/range listing, metadata or ETag. |
 | `v1/ingest-admission` | Create-only serialized admission evidence writes; no overwrite fallback. | Read-after-create and stream/partition/range listing. |
+| `v1/ingest-admission-index` | Create-only range-admission index transition writes; no overwrite fallback. | Read-after-create and stream/partition index listing. |
 | `v1/state/raw` | Create-only raw bootstrap state writes. | Read-after-create, metadata or ETag. |
 | SlateDB state | SlateDB-required object semantics. | Owned by the SlateDB adapter. |
 | `v1/outputs` | Create-only output writes. | Read-after-create, metadata or ETag. |
@@ -52,9 +53,10 @@ telemetry.
 Phase 2.3 records declared capability profiles as
 `AuthoritativeObjectStoreCapabilitiesV1`, keyed by these authoritative
 namespaces: ingest, ingest admission, state, output, checkpoint,
-checkpoint index, checkpoint lifecycle, checkpoint retention, checkpoint GC
-transitions, checkpoint recovery, ownership, table catalog, relation catalog,
-artifact catalog, benchmark evidence, GC runs, queries, and query policy.
+ingest admission index, checkpoint index, checkpoint lifecycle, checkpoint
+retention, checkpoint GC transitions, checkpoint recovery, ownership, table
+catalog, relation catalog, artifact catalog, benchmark evidence, GC runs,
+queries, and query policy.
 
 Startup validation rejects a missing namespace profile and rejects any namespace
 whose `ObjectStoreCapabilityProfile` is missing a required durability

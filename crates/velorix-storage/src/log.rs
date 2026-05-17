@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 
@@ -26,6 +26,9 @@ const INGEST_PREFIX: &str = "v1/ingest";
 const INGEST_ADMISSION_RECORD_KIND_V1: &str = "ingest_range_admission_v1";
 const INGEST_ADMISSION_EXPIRY_DECISION_RECORD_KIND_V1: &str =
     "ingest_admission_orphan_expiry_decision_v1";
+const INGEST_ADMISSION_INDEX_TRANSITION_RECORD_KIND_V1: &str =
+    "ingest_admission_index_transition_v1";
+const INGEST_ADMISSION_INDEX_MAX_ADVANCES: usize = 10_000;
 
 #[derive(Clone, Debug)]
 pub struct IngestLog {
@@ -36,6 +39,7 @@ pub struct IngestLog {
 #[derive(Clone, Debug)]
 struct DurableIngestAdmission {
     log: IngestLog,
+    reserve_before_committed_overlap: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -101,6 +105,34 @@ pub struct DurableIngestAdmissionExpiryDecisionRecordV1 {
     pub operator_id: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct RangeAdmissionIndexTransitionRecordV1 {
+    schema_version: u16,
+    record_kind: String,
+    stream_id: String,
+    partition_id: u32,
+    previous_state_digest: String,
+    next_state_digest: String,
+    admitted: DurableIngestAdmissionRecordV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct RangeAdmissionIndexStateDigestV1<'a> {
+    schema_version: u16,
+    record_kind: &'static str,
+    stream_id: &'a str,
+    partition_id: u32,
+    active_admissions: &'a [DurableIngestAdmissionRecordV1],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RangeAdmissionIndexState {
+    indexed_admissions: Vec<DurableIngestAdmissionRecordV1>,
+    active_admissions: Vec<DurableIngestAdmissionRecordV1>,
+    indexed_expired_admission_keys: HashSet<ObjectKey>,
+    state_digest: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IngestAdmissionReconstructionReport {
     pub active_admission_records: usize,
@@ -147,6 +179,8 @@ pub enum IngestLogError {
     MalformedIngestAdmissionRecord { key: String, reason: String },
     #[error("malformed durable ingest admission expiry decision `{key}`: {reason}")]
     MalformedIngestAdmissionExpiryDecision { key: String, reason: String },
+    #[error("malformed durable ingest admission index transition `{key}`: {reason}")]
+    MalformedIngestAdmissionIndexTransition { key: String, reason: String },
     #[error("ingest admission expiry decision `{expiry_decision_key}` already exists with a different body")]
     IngestAdmissionExpiryDecisionConflict { expiry_decision_key: ObjectKey },
     #[error(
@@ -253,14 +287,18 @@ impl AdmissionSerializationGuard {
 }
 
 impl DurableIngestAdmission {
-    fn new(log: IngestLog) -> Self {
-        Self { log }
+    fn new(log: IngestLog, reserve_before_committed_overlap: bool) -> Self {
+        Self {
+            log,
+            reserve_before_committed_overlap,
+        }
     }
 
-    /// Records durable serialized admission evidence, then appends the
-    /// canonical ingest object. The supplied guard is the serialization
-    /// boundary; this facade deliberately does not claim that object-store range
-    /// records alone can reject arbitrary concurrent overlaps.
+    /// Reserves the durable range-admission index, records materialized
+    /// admission evidence, then appends the canonical ingest object. The
+    /// supplied guard keeps in-process callers from doing redundant work for the
+    /// same partition while the object-store index remains the cross-process
+    /// admission fence.
     async fn admit_validated_batch(
         &self,
         batch: IngestBatch,
@@ -269,25 +307,66 @@ impl DurableIngestAdmission {
         let descriptor = batch.descriptor();
         guard.validate(&descriptor)?;
 
-        for committed in self.log.list_committed().await? {
-            if committed.object_key == descriptor.object_key {
-                continue;
-            }
-            if ranges_overlap(&committed, &descriptor) {
-                return Ok(AppendValidatedEnvelopeOutcome::Conflict {
-                    descriptor,
-                    object_key: committed.object_key,
-                    reason: "range_overlap_committed",
-                });
-            }
+        if self.reserve_before_committed_overlap {
+            return self
+                .admit_validated_batch_indexed_before_committed_fallback(batch, descriptor)
+                .await;
         }
 
+        if let Some(conflict) = self.committed_overlap_conflict(&descriptor).await? {
+            return Ok(conflict);
+        }
+        self.reserve_then_append_validated_batch(batch, descriptor)
+            .await
+    }
+
+    async fn admit_validated_batch_indexed_before_committed_fallback(
+        &self,
+        batch: IngestBatch,
+        descriptor: IngestBatchDescriptor,
+    ) -> Result<AppendValidatedEnvelopeOutcome, IngestLogError> {
         if let Some(existing) = self.log.existing_batch_conflict(&batch).await? {
             return Ok(existing);
         }
 
-        let record = admission_record_for_batch(&batch)?;
-        match self.reserve_admission_record(&record).await? {
+        if let Some(conflict) = self
+            .indexed_or_committed_overlap_conflict(&descriptor)
+            .await?
+        {
+            return Ok(conflict);
+        }
+
+        match self.reserve_then_materialize_admission(&batch).await? {
+            AdmissionReservationOutcome::Admitted | AdmissionReservationOutcome::Duplicate => {}
+            AdmissionReservationOutcome::Conflict { object_key, reason } => {
+                return Ok(AppendValidatedEnvelopeOutcome::Conflict {
+                    descriptor,
+                    object_key,
+                    reason,
+                });
+            }
+        }
+
+        if let Some(conflict) = self
+            .indexed_or_committed_overlap_conflict(&descriptor)
+            .await?
+        {
+            return Ok(conflict);
+        }
+
+        self.log.append_validated_batch(batch).await
+    }
+
+    async fn reserve_then_append_validated_batch(
+        &self,
+        batch: IngestBatch,
+        descriptor: IngestBatchDescriptor,
+    ) -> Result<AppendValidatedEnvelopeOutcome, IngestLogError> {
+        if let Some(existing) = self.log.existing_batch_conflict(&batch).await? {
+            return Ok(existing);
+        }
+
+        match self.reserve_then_materialize_admission(&batch).await? {
             AdmissionReservationOutcome::Admitted | AdmissionReservationOutcome::Duplicate => {}
             AdmissionReservationOutcome::Conflict { object_key, reason } => {
                 return Ok(AppendValidatedEnvelopeOutcome::Conflict {
@@ -301,34 +380,154 @@ impl DurableIngestAdmission {
         self.log.append_validated_batch(batch).await
     }
 
-    async fn reserve_admission_record(
+    async fn reserve_then_materialize_admission(
+        &self,
+        batch: &IngestBatch,
+    ) -> Result<AdmissionReservationOutcome, IngestLogError> {
+        let record = admission_record_for_batch(batch)?;
+        if let Some(conflict) = self
+            .expired_materialized_admission_conflict(&record)
+            .await?
+        {
+            return Ok(conflict);
+        }
+        match self.reserve_range_admission_index(&record).await? {
+            AdmissionReservationOutcome::Admitted | AdmissionReservationOutcome::Duplicate => {}
+            conflict @ AdmissionReservationOutcome::Conflict { .. } => return Ok(conflict),
+        }
+        match self.materialize_admission_record(&record).await? {
+            AdmissionReservationOutcome::Admitted | AdmissionReservationOutcome::Duplicate => {}
+            conflict @ AdmissionReservationOutcome::Conflict { .. } => return Ok(conflict),
+        }
+
+        Ok(AdmissionReservationOutcome::Admitted)
+    }
+
+    async fn expired_materialized_admission_conflict(
         &self,
         record: &DurableIngestAdmissionRecordV1,
-    ) -> Result<AdmissionReservationOutcome, IngestLogError> {
-        let descriptor = record.descriptor()?;
-        let existing = self.log.list_active_admission_records().await?;
+    ) -> Result<Option<AdmissionReservationOutcome>, IngestLogError> {
+        let expiry_decisions = self.log.list_admission_expiry_decisions().await?;
+        let Some((existing_bytes, existing)) = self
+            .log
+            .list_admission_record_bodies()
+            .await?
+            .into_iter()
+            .find(|(_, existing)| existing.admission_record_key == record.admission_record_key)
+        else {
+            return Ok(None);
+        };
 
-        for candidate in &existing {
-            let candidate_descriptor = candidate.descriptor()?;
-            if candidate.admission_record_key == record.admission_record_key {
-                if candidate == record {
-                    return Ok(AdmissionReservationOutcome::Duplicate);
-                }
+        if expiry_decisions
+            .iter()
+            .any(|decision| decision.expires_admission(&existing_bytes, &existing))
+            && !self.log.object_exists(&existing.batch_key).await?
+        {
+            return Ok(Some(AdmissionReservationOutcome::Conflict {
+                object_key: existing.batch_key,
+                reason: "admission_expired",
+            }));
+        }
 
-                return Ok(AdmissionReservationOutcome::Conflict {
-                    object_key: candidate.batch_key.clone(),
-                    reason: "same_range_different_digest_reserved",
-                });
+        Ok(None)
+    }
+
+    async fn committed_overlap_conflict(
+        &self,
+        descriptor: &IngestBatchDescriptor,
+    ) -> Result<Option<AppendValidatedEnvelopeOutcome>, IngestLogError> {
+        for committed in self.log.list_committed().await? {
+            if committed.object_key == descriptor.object_key {
+                continue;
             }
-
-            if ranges_overlap(&candidate_descriptor, &descriptor) {
-                return Ok(AdmissionReservationOutcome::Conflict {
-                    object_key: candidate.batch_key.clone(),
-                    reason: "range_overlap_reserved",
-                });
+            if ranges_overlap(&committed, descriptor) {
+                return Ok(Some(AppendValidatedEnvelopeOutcome::Conflict {
+                    descriptor: descriptor.clone(),
+                    object_key: committed.object_key,
+                    reason: "range_overlap_committed",
+                }));
             }
         }
 
+        Ok(None)
+    }
+
+    async fn indexed_or_committed_overlap_conflict(
+        &self,
+        descriptor: &IngestBatchDescriptor,
+    ) -> Result<Option<AppendValidatedEnvelopeOutcome>, IngestLogError> {
+        let Some(committed_conflict) = self.committed_overlap_conflict(descriptor).await? else {
+            return Ok(None);
+        };
+
+        let state = self
+            .log
+            .load_range_admission_index_state_for_partition(
+                &descriptor.stream_id,
+                descriptor.partition_id,
+                false,
+            )
+            .await?;
+        if let AdmissionReservationOutcome::Conflict { object_key, reason } = admission_conflict(
+            &state.active_admissions,
+            &index_probe_record_for_descriptor(descriptor)?,
+        )? {
+            return Ok(Some(AppendValidatedEnvelopeOutcome::Conflict {
+                descriptor: descriptor.clone(),
+                object_key,
+                reason,
+            }));
+        }
+
+        Ok(Some(committed_conflict))
+    }
+
+    async fn reserve_range_admission_index(
+        &self,
+        record: &DurableIngestAdmissionRecordV1,
+    ) -> Result<AdmissionReservationOutcome, IngestLogError> {
+        for _ in 0..INGEST_ADMISSION_INDEX_MAX_ADVANCES {
+            let state = self.log.load_range_admission_index_state(record).await?;
+            match admission_conflict(&state.active_admissions, record)? {
+                AdmissionReservationOutcome::Admitted => {}
+                outcome => return Ok(outcome),
+            }
+
+            let transition = range_admission_index_transition(record, &state)?;
+            let transition_key = range_admission_index_transition_key(
+                &transition.stream_id,
+                transition.partition_id,
+                &transition.previous_state_digest,
+            )?;
+            let bytes = Bytes::from(serde_json::to_vec(&transition)?);
+            match self
+                .log
+                .store
+                .put_opts(
+                    &Path::from(transition_key.as_str()),
+                    bytes.into(),
+                    PutMode::Create.into(),
+                )
+                .await
+            {
+                Ok(_) => return Ok(AdmissionReservationOutcome::Admitted),
+                Err(object_store::Error::AlreadyExists { .. }) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        Err(IngestLogError::MalformedIngestAdmissionIndexTransition {
+            key: range_admission_index_partition_prefix(&record.stream_id, record.partition_id),
+            reason: format!(
+                "admission index exceeded {INGEST_ADMISSION_INDEX_MAX_ADVANCES} advances"
+            ),
+        })
+    }
+
+    async fn materialize_admission_record(
+        &self,
+        record: &DurableIngestAdmissionRecordV1,
+    ) -> Result<AdmissionReservationOutcome, IngestLogError> {
         let bytes = Bytes::from(serde_json::to_vec(record)?);
         match self
             .log
@@ -363,8 +562,15 @@ impl DurableIngestAdmission {
                         reason: "admission_expired",
                     });
                 }
-                if &existing == record {
+
+                if &existing == record && existing_bytes == bytes {
                     Ok(AdmissionReservationOutcome::Duplicate)
+                } else if &existing == record {
+                    Err(IngestLogError::MalformedIngestAdmissionRecord {
+                        key: record.admission_record_key.to_string(),
+                        reason: "materialized admission bytes do not match indexed transition"
+                            .to_string(),
+                    })
                 } else {
                     Ok(AdmissionReservationOutcome::Conflict {
                         object_key: existing.batch_key,
@@ -375,7 +581,9 @@ impl DurableIngestAdmission {
             Err(error) => Err(error.into()),
         }
     }
+}
 
+impl DurableIngestAdmission {
     async fn expire_orphan_admission(
         &self,
         stream_id: &str,
@@ -653,6 +861,116 @@ impl DurableIngestAdmissionExpiryDecisionRecordV1 {
     }
 }
 
+impl RangeAdmissionIndexTransitionRecordV1 {
+    fn validate_key(&self, key: &str) -> Result<(), IngestLogError> {
+        self.admitted.validate_key()?;
+
+        if self.schema_version != 1 {
+            return Err(IngestLogError::MalformedIngestAdmissionIndexTransition {
+                key: key.to_string(),
+                reason: format!("unsupported schema_version {}", self.schema_version),
+            });
+        }
+        if self.record_kind != INGEST_ADMISSION_INDEX_TRANSITION_RECORD_KIND_V1 {
+            return Err(IngestLogError::MalformedIngestAdmissionIndexTransition {
+                key: key.to_string(),
+                reason: format!("unsupported record_kind `{}`", self.record_kind),
+            });
+        }
+        if self.stream_id != self.admitted.stream_id {
+            return Err(IngestLogError::MalformedIngestAdmissionIndexTransition {
+                key: key.to_string(),
+                reason: "transition stream_id does not match admitted record".to_string(),
+            });
+        }
+        if self.partition_id != self.admitted.partition_id {
+            return Err(IngestLogError::MalformedIngestAdmissionIndexTransition {
+                key: key.to_string(),
+                reason: "transition partition_id does not match admitted record".to_string(),
+            });
+        }
+        if !is_sha256_digest(&self.previous_state_digest) {
+            return Err(IngestLogError::MalformedIngestAdmissionIndexTransition {
+                key: key.to_string(),
+                reason: "previous_state_digest must be sha256:<64 hex chars>".to_string(),
+            });
+        }
+        if !is_sha256_digest(&self.next_state_digest) {
+            return Err(IngestLogError::MalformedIngestAdmissionIndexTransition {
+                key: key.to_string(),
+                reason: "next_state_digest must be sha256:<64 hex chars>".to_string(),
+            });
+        }
+
+        let expected_key = range_admission_index_transition_key(
+            &self.stream_id,
+            self.partition_id,
+            &self.previous_state_digest,
+        )?;
+        if key != expected_key {
+            return Err(IngestLogError::MalformedIngestAdmissionIndexTransition {
+                key: key.to_string(),
+                reason: format!("stored path does not match expected `{expected_key}`"),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn apply_to_state(&self, state: &mut RangeAdmissionIndexState) -> Result<(), IngestLogError> {
+        let key = range_admission_index_transition_key(
+            &self.stream_id,
+            self.partition_id,
+            &self.previous_state_digest,
+        )?;
+        self.validate_key(&key)?;
+        if self.previous_state_digest != state.state_digest {
+            return Err(IngestLogError::MalformedIngestAdmissionIndexTransition {
+                key,
+                reason: format!(
+                    "previous_state_digest does not match current head `{}`",
+                    state.state_digest
+                ),
+            });
+        }
+        let expired = state
+            .indexed_expired_admission_keys
+            .contains(&self.admitted.admission_record_key);
+        if !expired
+            && !matches!(
+                admission_conflict(&state.active_admissions, &self.admitted)?,
+                AdmissionReservationOutcome::Admitted
+            )
+        {
+            return Err(IngestLogError::MalformedIngestAdmissionIndexTransition {
+                key,
+                reason: "transition admits an overlapping active range".to_string(),
+            });
+        }
+
+        state.indexed_admissions.push(self.admitted.clone());
+        sort_admission_records(&mut state.indexed_admissions);
+        let next_digest = range_admission_index_state_digest(
+            &self.stream_id,
+            self.partition_id,
+            &state.indexed_admissions,
+        )?;
+        if self.next_state_digest != next_digest {
+            return Err(IngestLogError::MalformedIngestAdmissionIndexTransition {
+                key,
+                reason: format!("next_state_digest does not match computed digest `{next_digest}`"),
+            });
+        }
+        if !expired {
+            state.active_admissions.push(self.admitted.clone());
+            sort_admission_records(&mut state.active_admissions);
+        }
+        state.state_digest = next_digest;
+
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum AdmissionReservationOutcome {
     Admitted,
@@ -666,7 +984,7 @@ enum AdmissionReservationOutcome {
 impl IngestAdmissionCoordinator {
     pub fn new(log: IngestLog) -> Self {
         Self {
-            durable_admission: DurableIngestAdmission::new(log.clone()),
+            durable_admission: DurableIngestAdmission::new(log.clone(), false),
             log,
             admission_locks: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -680,18 +998,22 @@ impl IngestAdmissionCoordinator {
         capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
     ) -> Result<Self, AuthoritativeObjectStoreCapabilityError> {
         capabilities.validate_namespace(AuthoritativeNamespace::IngestAdmission)?;
+        capabilities.validate_namespace(AuthoritativeNamespace::IngestAdmissionIndex)?;
         let log = IngestLog::new_catalog_checked(store, capabilities)?;
 
-        Ok(Self::new(log))
+        Ok(Self {
+            durable_admission: DurableIngestAdmission::new(log.clone(), true),
+            log,
+            admission_locks: Arc::new(Mutex::new(HashMap::new())),
+        })
     }
 
-    /// Catalog-aware process-local coordinated admission with durable
-    /// serialized admission evidence.
+    /// Catalog-aware admission with a durable range-admission index.
     ///
-    /// This serializes range checks for each stream/partition inside this
-    /// coordinator instance and records a Velorix-owned admission record before
-    /// appending. It is useful storage plumbing for a deployed coordinator, but
-    /// it is not itself a distributed admission index across processes or pods.
+    /// This serializes redundant range checks for each stream/partition inside
+    /// this coordinator instance, reserves a create-only transition in the
+    /// object-store admission index, and records Velorix-owned materialized
+    /// admission evidence before appending.
     pub async fn append_catalog_validated_envelope(
         &self,
         payload: Bytes,
@@ -724,9 +1046,21 @@ impl IngestAdmissionCoordinator {
         &self,
     ) -> Result<IngestAdmissionReconstructionReport, IngestLogError> {
         let reconstruction = self.log.reconstruct_admission_namespace().await?;
+        let indexed_active_records = self
+            .log
+            .reconstruct_range_admission_index_active_records()
+            .await?;
+        let mut active_records_by_key = reconstruction
+            .active_records
+            .iter()
+            .map(|record| (record.admission_record_key.clone(), record.clone()))
+            .collect::<HashMap<_, _>>();
+        for record in indexed_active_records {
+            active_records_by_key.insert(record.admission_record_key.clone(), record);
+        }
 
         Ok(IngestAdmissionReconstructionReport {
-            active_admission_records: reconstruction.active_records.len(),
+            active_admission_records: active_records_by_key.len(),
             expired_orphan_admission_records: reconstruction.expired_orphan_admission_records,
         })
     }
@@ -1151,6 +1485,248 @@ impl IngestLog {
             .map(|reconstruction| reconstruction.active_records)
     }
 
+    async fn list_range_admission_index_transitions(
+        &self,
+        stream_id: &str,
+        partition_id: u32,
+        require_materialized_admission: bool,
+    ) -> Result<Vec<RangeAdmissionIndexTransitionRecordV1>, IngestLogError> {
+        let prefix = range_admission_index_partition_prefix(stream_id, partition_id);
+        let mut objects = self
+            .store
+            .list(Some(&Path::from(prefix.as_str())))
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        objects.sort_by(|left, right| left.location.cmp(&right.location));
+
+        let mut transitions = Vec::with_capacity(objects.len());
+        for object in objects {
+            let key = object.location.to_string();
+            if !key.ends_with(".transition.json") {
+                return Err(IngestLogError::MalformedIngestAdmissionIndexTransition {
+                    key,
+                    reason: "unexpected object under v1/ingest-admission-index".to_string(),
+                });
+            }
+
+            let bytes = self.store.get(&object.location).await?.bytes().await?;
+            let transition: RangeAdmissionIndexTransitionRecordV1 = serde_json::from_slice(&bytes)?;
+            transition.validate_key(&key)?;
+            self.validate_index_transition_materialized_admission(
+                &transition,
+                require_materialized_admission,
+            )
+            .await?;
+            transitions.push(transition);
+        }
+
+        Ok(transitions)
+    }
+
+    async fn validate_index_transition_materialized_admission(
+        &self,
+        transition: &RangeAdmissionIndexTransitionRecordV1,
+        require_materialized_admission: bool,
+    ) -> Result<(), IngestLogError> {
+        let path = Path::from(transition.admitted.admission_record_key.as_str());
+        let bytes = match self.store.get(&path).await {
+            Ok(result) => result.bytes().await?,
+            Err(object_store::Error::NotFound { .. }) if !require_materialized_admission => {
+                return Ok(());
+            }
+            Err(object_store::Error::NotFound { .. }) => {
+                return Err(IngestLogError::MalformedIngestAdmissionIndexTransition {
+                    key: range_admission_index_transition_key(
+                        &transition.stream_id,
+                        transition.partition_id,
+                        &transition.previous_state_digest,
+                    )?,
+                    reason: "indexed transition is missing materialized admission".to_string(),
+                });
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let materialized: DurableIngestAdmissionRecordV1 = serde_json::from_slice(&bytes)?;
+        materialized.validate_key()?;
+        let expected_bytes = Bytes::from(serde_json::to_vec(&transition.admitted)?);
+
+        if materialized != transition.admitted || bytes != expected_bytes {
+            return Err(IngestLogError::MalformedIngestAdmissionIndexTransition {
+                key: range_admission_index_transition_key(
+                    &transition.stream_id,
+                    transition.partition_id,
+                    &transition.previous_state_digest,
+                )?,
+                reason: "materialized admission does not match indexed transition".to_string(),
+            });
+        }
+
+        Ok(())
+    }
+
+    async fn load_range_admission_index_state(
+        &self,
+        record: &DurableIngestAdmissionRecordV1,
+    ) -> Result<RangeAdmissionIndexState, IngestLogError> {
+        record.validate_key()?;
+        self.load_range_admission_index_state_for_partition(
+            &record.stream_id,
+            record.partition_id,
+            false,
+        )
+        .await
+    }
+
+    async fn load_range_admission_index_state_for_partition(
+        &self,
+        stream_id: &str,
+        partition_id: u32,
+        require_materialized_admission: bool,
+    ) -> Result<RangeAdmissionIndexState, IngestLogError> {
+        let transitions = self
+            .list_range_admission_index_transitions(
+                stream_id,
+                partition_id,
+                require_materialized_admission,
+            )
+            .await?;
+        let indexed_expired_admission_keys = self
+            .list_expired_orphan_admission_keys(stream_id, partition_id)
+            .await?;
+        let indexed_admission_keys = transitions
+            .iter()
+            .map(|transition| transition.admitted.admission_record_key.clone())
+            .collect::<HashSet<_>>();
+        let mut indexed_admissions = self
+            .list_admission_records()
+            .await?
+            .into_iter()
+            .filter(|admission| {
+                admission.stream_id == stream_id
+                    && admission.partition_id == partition_id
+                    && !indexed_admission_keys.contains(&admission.admission_record_key)
+            })
+            .collect::<Vec<_>>();
+        sort_admission_records(&mut indexed_admissions);
+        let mut active_admissions = self
+            .list_active_admission_records()
+            .await?
+            .into_iter()
+            .filter(|active| {
+                active.stream_id == stream_id
+                    && active.partition_id == partition_id
+                    && !indexed_admission_keys.contains(&active.admission_record_key)
+            })
+            .collect::<Vec<_>>();
+        sort_admission_records(&mut active_admissions);
+        let mut state = RangeAdmissionIndexState {
+            state_digest: range_admission_index_state_digest(
+                stream_id,
+                partition_id,
+                &indexed_admissions,
+            )?,
+            indexed_admissions,
+            active_admissions,
+            indexed_expired_admission_keys,
+        };
+
+        let mut transitions_by_previous = HashMap::with_capacity(transitions.len());
+        for transition in transitions {
+            if transitions_by_previous
+                .insert(transition.previous_state_digest.clone(), transition)
+                .is_some()
+            {
+                return Err(IngestLogError::MalformedIngestAdmissionIndexTransition {
+                    key: range_admission_index_partition_prefix(stream_id, partition_id),
+                    reason: "multiple transitions share previous_state_digest".to_string(),
+                });
+            }
+        }
+
+        let transition_count = transitions_by_previous.len();
+        let mut applied = 0;
+        while let Some(transition) = transitions_by_previous.remove(&state.state_digest) {
+            transition.apply_to_state(&mut state)?;
+            applied += 1;
+        }
+
+        if applied != transition_count {
+            return Err(IngestLogError::MalformedIngestAdmissionIndexTransition {
+                key: range_admission_index_partition_prefix(stream_id, partition_id),
+                reason: "admission index contains unreachable transition objects".to_string(),
+            });
+        }
+
+        Ok(state)
+    }
+
+    async fn reconstruct_range_admission_index_active_records(
+        &self,
+    ) -> Result<Vec<DurableIngestAdmissionRecordV1>, IngestLogError> {
+        let mut records_by_key = HashMap::new();
+        for (stream_id, partition_id) in self.list_range_admission_index_partitions().await? {
+            let state = self
+                .load_range_admission_index_state_for_partition(&stream_id, partition_id, true)
+                .await?;
+            for record in state.active_admissions {
+                records_by_key.insert(record.admission_record_key.clone(), record);
+            }
+        }
+
+        let mut records = records_by_key.into_values().collect::<Vec<_>>();
+        sort_admission_records(&mut records);
+        Ok(records)
+    }
+
+    async fn list_range_admission_index_partitions(
+        &self,
+    ) -> Result<Vec<(String, u32)>, IngestLogError> {
+        let mut objects = self
+            .store
+            .list(Some(&Path::from("v1/ingest-admission-index")))
+            .try_collect::<Vec<_>>()
+            .await?;
+        objects.sort_by(|left, right| left.location.cmp(&right.location));
+
+        let mut partitions = HashSet::new();
+        for object in objects {
+            partitions.insert(parse_range_admission_index_partition(
+                object.location.as_ref(),
+            )?);
+        }
+
+        let mut partitions = partitions.into_iter().collect::<Vec<_>>();
+        partitions.sort();
+        Ok(partitions)
+    }
+
+    async fn list_expired_orphan_admission_keys(
+        &self,
+        stream_id: &str,
+        partition_id: u32,
+    ) -> Result<HashSet<ObjectKey>, IngestLogError> {
+        let expiry_decisions = self.list_admission_expiry_decisions().await?;
+        let mut expired = HashSet::new();
+
+        for (admission_bytes, admission) in self.list_admission_record_bodies().await? {
+            if admission.stream_id != stream_id || admission.partition_id != partition_id {
+                continue;
+            }
+            if self.object_exists(&admission.batch_key).await? {
+                continue;
+            }
+            if expiry_decisions
+                .iter()
+                .any(|decision| decision.expires_admission(&admission_bytes, &admission))
+            {
+                expired.insert(admission.admission_record_key);
+            }
+        }
+
+        Ok(expired)
+    }
+
     async fn reconstruct_admission_namespace(
         &self,
     ) -> Result<IngestAdmissionReconstruction, IngestLogError> {
@@ -1376,6 +1952,208 @@ fn ranges_overlap(previous: &IngestBatchDescriptor, current: &IngestBatchDescrip
         && previous.start_offset_inclusive < current.end_offset_exclusive
         && current.start_offset_inclusive < previous.end_offset_exclusive
         && previous.object_key != current.object_key
+}
+
+fn admission_conflict(
+    active_admissions: &[DurableIngestAdmissionRecordV1],
+    record: &DurableIngestAdmissionRecordV1,
+) -> Result<AdmissionReservationOutcome, IngestLogError> {
+    let descriptor = record.descriptor()?;
+    for candidate in active_admissions {
+        let candidate_descriptor = candidate.descriptor()?;
+        if candidate.admission_record_key == record.admission_record_key {
+            if candidate == record {
+                return Ok(AdmissionReservationOutcome::Duplicate);
+            }
+
+            return Ok(AdmissionReservationOutcome::Conflict {
+                object_key: candidate.batch_key.clone(),
+                reason: "same_range_different_digest_reserved",
+            });
+        }
+
+        if candidate_descriptor.stream_id == descriptor.stream_id
+            && candidate_descriptor.partition_id == descriptor.partition_id
+            && candidate_descriptor.start_offset_inclusive < descriptor.end_offset_exclusive
+            && descriptor.start_offset_inclusive < candidate_descriptor.end_offset_exclusive
+        {
+            return Ok(AdmissionReservationOutcome::Conflict {
+                object_key: candidate.batch_key.clone(),
+                reason: "range_overlap_reserved",
+            });
+        }
+    }
+
+    Ok(AdmissionReservationOutcome::Admitted)
+}
+
+fn index_probe_record_for_descriptor(
+    descriptor: &IngestBatchDescriptor,
+) -> Result<DurableIngestAdmissionRecordV1, IngestLogError> {
+    let record = DurableIngestAdmissionRecordV1 {
+        schema_version: 1,
+        record_kind: INGEST_ADMISSION_RECORD_KIND_V1.to_string(),
+        stream_id: descriptor.stream_id.clone(),
+        partition_id: descriptor.partition_id,
+        start_offset_inclusive: descriptor.start_offset_inclusive,
+        end_offset_exclusive: descriptor.end_offset_exclusive,
+        batch_key: descriptor.object_key.clone(),
+        admission_record_key: ObjectKey::ingest_admission_record(
+            &descriptor.stream_id,
+            descriptor.partition_id,
+            descriptor.start_offset_inclusive,
+            descriptor.end_offset_exclusive,
+        )?,
+        payload_digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            .to_string(),
+        relation_id: "index_probe".to_string(),
+        relation_version: "index_probe".to_string(),
+        schema_fingerprint:
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+        admission_mode: "process_local_serialized".to_string(),
+    };
+    record.validate_key()?;
+    Ok(record)
+}
+
+fn range_admission_index_transition(
+    record: &DurableIngestAdmissionRecordV1,
+    state: &RangeAdmissionIndexState,
+) -> Result<RangeAdmissionIndexTransitionRecordV1, IngestLogError> {
+    let mut indexed_admissions = state.indexed_admissions.clone();
+    indexed_admissions.push(record.clone());
+    sort_admission_records(&mut indexed_admissions);
+    let next_state_digest = range_admission_index_state_digest(
+        &record.stream_id,
+        record.partition_id,
+        &indexed_admissions,
+    )?;
+
+    Ok(RangeAdmissionIndexTransitionRecordV1 {
+        schema_version: 1,
+        record_kind: INGEST_ADMISSION_INDEX_TRANSITION_RECORD_KIND_V1.to_string(),
+        stream_id: record.stream_id.clone(),
+        partition_id: record.partition_id,
+        previous_state_digest: state.state_digest.clone(),
+        next_state_digest,
+        admitted: record.clone(),
+    })
+}
+
+fn range_admission_index_state_digest(
+    stream_id: &str,
+    partition_id: u32,
+    active_admissions: &[DurableIngestAdmissionRecordV1],
+) -> Result<String, IngestLogError> {
+    let state = RangeAdmissionIndexStateDigestV1 {
+        schema_version: 1,
+        record_kind: "ingest_admission_index_state_v1",
+        stream_id,
+        partition_id,
+        active_admissions,
+    };
+    Ok(digest_bytes(&Bytes::from(serde_json::to_vec(&state)?)))
+}
+
+fn range_admission_index_partition_prefix(stream_id: &str, partition_id: u32) -> String {
+    format!("v1/ingest-admission-index/{stream_id}/p={partition_id:010}/advances")
+}
+
+fn parse_range_admission_index_partition(key: &str) -> Result<(String, u32), IngestLogError> {
+    let segments = key.split('/').collect::<Vec<_>>();
+    let ["v1", "ingest-admission-index", stream_id, partition, "advances", transition_file] =
+        segments.as_slice()
+    else {
+        return Err(IngestLogError::MalformedIngestAdmissionIndexTransition {
+            key: key.to_string(),
+            reason: "unexpected object under v1/ingest-admission-index".to_string(),
+        });
+    };
+    if stream_id.is_empty() {
+        return Err(IngestLogError::MalformedIngestAdmissionIndexTransition {
+            key: key.to_string(),
+            reason: "stream_id must be nonempty".to_string(),
+        });
+    }
+    let Some(partition) = partition.strip_prefix("p=") else {
+        return Err(IngestLogError::MalformedIngestAdmissionIndexTransition {
+            key: key.to_string(),
+            reason: "partition segment must start with p=".to_string(),
+        });
+    };
+    if partition.len() != 10 || !partition.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(IngestLogError::MalformedIngestAdmissionIndexTransition {
+            key: key.to_string(),
+            reason: "partition segment must be p=<10 digits>".to_string(),
+        });
+    }
+    if transition_file
+        .strip_suffix(".transition.json")
+        .filter(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .is_none()
+    {
+        return Err(IngestLogError::MalformedIngestAdmissionIndexTransition {
+            key: key.to_string(),
+            reason: "transition file must be <64 hex chars>.transition.json".to_string(),
+        });
+    }
+
+    Ok((
+        (*stream_id).to_string(),
+        partition.parse::<u32>().map_err(|error| {
+            IngestLogError::MalformedIngestAdmissionIndexTransition {
+                key: key.to_string(),
+                reason: format!("invalid partition id: {error}"),
+            }
+        })?,
+    ))
+}
+
+fn range_admission_index_transition_key(
+    stream_id: &str,
+    partition_id: u32,
+    previous_state_digest: &str,
+) -> Result<String, IngestLogError> {
+    let Some(previous_state_digest_hex) = previous_state_digest.strip_prefix("sha256:") else {
+        return Err(IngestLogError::MalformedIngestAdmissionIndexTransition {
+            key: range_admission_index_partition_prefix(stream_id, partition_id),
+            reason: "previous_state_digest must be sha256:<64 hex chars>".to_string(),
+        });
+    };
+    if previous_state_digest_hex.len() != 64
+        || !previous_state_digest_hex
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(IngestLogError::MalformedIngestAdmissionIndexTransition {
+            key: range_admission_index_partition_prefix(stream_id, partition_id),
+            reason: "previous_state_digest must be sha256:<64 hex chars>".to_string(),
+        });
+    }
+
+    Ok(format!(
+        "{}/{previous_state_digest_hex}.transition.json",
+        range_admission_index_partition_prefix(stream_id, partition_id)
+    ))
+}
+
+fn sort_admission_records(records: &mut [DurableIngestAdmissionRecordV1]) {
+    records.sort_by(|left, right| {
+        (
+            &left.stream_id,
+            left.partition_id,
+            left.start_offset_inclusive,
+            left.end_offset_exclusive,
+            &left.admission_record_key,
+        )
+            .cmp(&(
+                &right.stream_id,
+                right.partition_id,
+                right.start_offset_inclusive,
+                right.end_offset_exclusive,
+                &right.admission_record_key,
+            ))
+    });
 }
 
 fn admission_record_for_batch(

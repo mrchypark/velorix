@@ -78,10 +78,11 @@ fn assert_capability_error(
     assert_eq!(err.required_capability(), expected);
 }
 
-fn expected_authoritative_namespaces() -> [AuthoritativeNamespace; 18] {
+fn expected_authoritative_namespaces() -> [AuthoritativeNamespace; 19] {
     [
         AuthoritativeNamespace::Ingest,
         AuthoritativeNamespace::IngestAdmission,
+        AuthoritativeNamespace::IngestAdmissionIndex,
         AuthoritativeNamespace::State,
         AuthoritativeNamespace::Output,
         AuthoritativeNamespace::Checkpoint,
@@ -494,6 +495,28 @@ fn capability_gate_rejects_missing_ingest_admission_capability_for_ingest_admiss
         err,
         AuthoritativeObjectStoreCapabilityError::MissingNamespace {
             namespace: AuthoritativeNamespace::IngestAdmission
+        }
+    ));
+}
+
+#[test]
+fn capability_gate_rejects_missing_ingest_admission_index_capability_for_ingest_admission_coordinator(
+) {
+    let (_temp_dir, store) = temp_store();
+    let mut profiles = all_namespace_profiles();
+    profiles.remove(&AuthoritativeNamespace::IngestAdmissionIndex);
+    let capabilities = AuthoritativeObjectStoreCapabilitiesV1::new(profiles);
+
+    let Err(err) = IngestAdmissionCoordinator::new_checked(store, &capabilities) else {
+        panic!(
+            "expected ingest-admission-index capability validation to reject coordinator construction"
+        );
+    };
+
+    assert!(matches!(
+        err,
+        AuthoritativeObjectStoreCapabilityError::MissingNamespace {
+            namespace: AuthoritativeNamespace::IngestAdmissionIndex
         }
     ));
 }

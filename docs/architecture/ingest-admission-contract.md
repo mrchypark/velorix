@@ -27,15 +27,31 @@ validate Arrow batch schemas against the catalog. The older
 `append_validated_envelope` variants remain bootstrap/dev compatibility
 surfaces and do not prove relation-catalog admission.
 
-`IngestAdmissionCoordinator` is a process-local write coordinator for
-catalog-aware envelopes. It serializes admission per `(stream_id, partition_id)`
-inside one coordinator instance, records immutable Velorix-owned serialized
-admission evidence under `v1/ingest-admission/...`, rechecks committed and
-reserved ranges while guarded, rejects visible overlaps, permits adjacent
-ranges, and preserves same-digest retry idempotency. This is storage plumbing
-for deployed admission and local/runtime coordinator evidence only; object-store
-range records alone do not provide a distributed admission index across
-processes or pods.
+`IngestAdmissionCoordinator` is the catalog-aware admission facade. When
+constructed through `new_checked`, it validates startup object-store capability
+evidence, reserves a `RangeAdmissionIndexV1` transition, records immutable
+Velorix-owned materialized admission evidence under `v1/ingest-admission/...`,
+rechecks committed and reserved ranges while guarded, rejects visible overlaps,
+permits adjacent ranges, and preserves same-digest retry idempotency. The
+unchecked constructor remains bootstrap/dev compatibility and must not be used
+as production evidence.
+
+`RangeAdmissionIndexV1` is a create-only, single-successor partition index under
+`v1/ingest-admission-index/{stream_id}/p={partition_id}/advances/{previous_state_digest}.transition.json`.
+For one `(stream_id, partition_id)` head, concurrent writers compete on the same
+transition key. The winning transition records the admitted range and the next
+state digest; losers reload the winning transition, recompute the head, and
+retry or return `range_overlap_reserved`. Reconstruction fails closed if
+transitions are unreachable, if more than one successor exists for one previous
+state digest, if a transition admits an overlapping active range, if a
+transition lacks its materialized `v1/ingest-admission` record at checked
+startup/reconstruction, or if that materialized record diverges from the indexed
+transition. Live reservation reloads may still treat a just-written transition
+as in-flight during the short transition-before-materialization window, but that
+state is not restart-safe until the materialized admission exists. Legacy
+materialized admissions seed the index digest so existing authority history
+remains reachable, while digest-bound expiry decisions remove only the active
+reservation from conflict checks.
 
 Production `Coordinated` mode uses a deployed write coordinator as the
 serialization authority and `v1/ingest-admission` records as durable database
@@ -52,6 +68,10 @@ An admission-before-batch orphan is a `v1/ingest-admission/...` record whose
 canonical `v1/ingest/...` batch object is not visible. Checked recovery must
 not replay that reservation as data. The deployed coordinator must treat the
 record as a reservation until an operator explicitly repairs or expires it.
+An indexed transition without its materialized `v1/ingest-admission` record is
+not an expirable ordinary orphan; checked startup/reconstruction fails closed
+until an operator repairs the materialized record or otherwise resolves the
+authority-store state.
 
 Before live writer cutover, operators must run an admission-repair inspection
 against the same authority store and namespace prefix used by the deployed
@@ -96,19 +116,22 @@ run-local orphan admission record, persists a run-local expiry
 decision, and verifies a restarted production provider reconstructs the expired
 orphan as non-active. The vind run counts as live Kubernetes evidence for the
 operator path it exercises, while the run-local authority store portion remains
-object-store-local. Row-closing writer evidence requires a deployed
+object-store-local. Row-closing writer evidence still requires a deployed
 writer/coordinator path running on vind that calls the preflight before serving
-writers, plus RustFS/S3-compatible and vind multi-process or multi-pod
-overlap races, adjacent range races, crash/retry windows, restart
-reconstruction, and leader handoff before this contract can close.
+writers, plus RustFS/S3-compatible crash/retry and restart reconstruction
+evidence and vind multi-pod overlap races, adjacent range races, crash/retry
+windows, restart reconstruction, and leader handoff before this contract can
+close.
 
 ## Conflict Semantics
 
 Create-only object writes only reject identical-key conflicts. They do not
 atomically reject different-key overlapping ranges such as `[0, 100)` and
-`[50, 150)`. Production multi-writer ingest must not advertise range-overlap
-`409 Conflict` until `RangeAdmissionIndexV1` or an equivalent write coordinator
-exists.
+`[50, 150)`. Checked catalog-aware coordinator admission now uses
+`RangeAdmissionIndexV1` for that storage-level partition fence, but production
+multi-writer ingest must not advertise the guarantee until the deployed
+writer/operator path routes through the checked coordinator and has RustFS plus
+vind live evidence for the exercised deployment topology.
 
 Conflict reasons must be explicit:
 
@@ -123,14 +146,19 @@ Conflict reasons must be explicit:
 ## Verification
 
 - Concurrent `[0,100)` and `[50,150)` admission rejects one request in the
-  process-local coordinator.
+  checked coordinator through `RangeAdmissionIndexV1`; the local and RustFS
+  S3-compatible multi-process harnesses mark child processes ready only after
+  store/coordinator/payload setup, then release them together into append with
+  zero artificial post-release delay.
+- Adjacent ranges produce chained `RangeAdmissionIndexV1` transitions and both
+  append.
 - A separate coordinator rejects a range already reserved by durable serialized
   admission evidence before any batch object is committed.
 - Admission-before-batch orphans are inspectable, remain reserved by default,
   and can be released only by a digest-bound durable expiry/repair decision read
   during coordinator restart reconstruction.
 - A stale ordinary ingest retry of an expired orphan returns `admission_expired`
-  and does not write the canonical batch.
+  before creating a new index transition and does not write the canonical batch.
 - The same race is not claimed safe in create-only-only mode.
 - Adjacent ranges are allowed.
 - Crash-after-create-before-response retry returns `200 OK` for same digest.

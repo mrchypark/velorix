@@ -16,14 +16,12 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use bytes::Bytes;
-use object_store::local::LocalFileSystem;
-#[cfg(not(feature = "s3-compat-tests"))]
-use object_store::ObjectStore;
+use futures::TryStreamExt;
 #[cfg(feature = "s3-compat-tests")]
-use object_store::{
-    aws::AmazonS3Builder, path::Path as ObjectStorePath, prefix::PrefixStore, ObjectStore,
-};
+use object_store::{aws::AmazonS3Builder, prefix::PrefixStore};
+use object_store::{local::LocalFileSystem, path::Path as ObjectStorePath, ObjectStore, PutMode};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tempfile::TempDir;
 use velorix_core::relation::{
     ArrowPhysicalTypeV1, DataFusionRegistrationModeV1, DataFusionRegistrationV1,
@@ -37,7 +35,10 @@ use velorix_storage::{
         ObjectStoreCapabilityProfile,
     },
     ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
-    log::{AppendValidatedEnvelopeOutcome, IngestAdmissionCoordinator, IngestLog},
+    log::{
+        AppendValidatedEnvelopeOutcome, DurableIngestAdmissionRecordV1, IngestAdmissionCoordinator,
+        IngestBatch, IngestLog,
+    },
     object_key::ObjectKey,
     relation_catalog_registry::RelationCatalogRegistry,
 };
@@ -55,7 +56,7 @@ const STORE_BACKEND_ENV: &str = "VELORIX_STORAGE_MULTI_PROCESS_STORE_BACKEND";
 const S3_AUTHORITY_PREFIX_ENV: &str = "VELORIX_STORAGE_MULTI_PROCESS_S3_AUTHORITY_PREFIX";
 
 #[tokio::test]
-async fn local_filesystem_serialized_multi_process_admission_rejects_one_overlapping_range() {
+async fn local_filesystem_simultaneous_multi_process_admission_rejects_one_overlapping_range() {
     let (_temp_dir, authority_root, store) = temp_authority_store();
     create_orders_relation_catalog(&store).await;
     let scratch = tempfile::tempdir().unwrap();
@@ -77,9 +78,7 @@ async fn local_filesystem_serialized_multi_process_admission_rejects_one_overlap
         &scratch.path().join("overlapping.json"),
         50,
         150,
-        // This proves a second OS process observes durable admission evidence
-        // from the first process; it is not a simultaneous range-race proof.
-        250,
+        0,
     );
 
     release_children(
@@ -123,13 +122,11 @@ async fn local_filesystem_serialized_multi_process_admission_rejects_one_overlap
         .find(|outcome| outcome.kind == "conflict")
         .unwrap();
     assert_eq!(conflict.conflict_object_key, appended.object_key);
-    assert!(matches!(
-        conflict.reason.as_deref(),
-        Some("range_overlap_reserved" | "range_overlap_committed")
-    ));
+    assert_eq!(conflict.reason.as_deref(), Some("range_overlap_reserved"));
 
     let capabilities = complete_capabilities();
-    let committed = IngestLog::new_catalog_checked(store, &capabilities)
+    assert_eq!(index_transition_bodies(&store).await.len(), 1);
+    let committed = IngestLog::new_catalog_checked(Arc::clone(&store), &capabilities)
         .unwrap()
         .list_committed()
         .await
@@ -182,7 +179,7 @@ async fn local_filesystem_multi_process_admission_allows_adjacent_ranges() {
         .all(|outcome| outcome.kind == "appended" && outcome.error.is_none()),);
 
     let capabilities = complete_capabilities();
-    let committed = IngestLog::new_catalog_checked(store, &capabilities)
+    let committed = IngestLog::new_catalog_checked(Arc::clone(&store), &capabilities)
         .unwrap()
         .list_committed()
         .await
@@ -202,6 +199,248 @@ async fn local_filesystem_multi_process_admission_allows_adjacent_ranges() {
                 .to_string(),
         ]
     );
+    assert_chained_index_transitions(
+        &index_transition_bodies(&store).await,
+        &[(0, 100), (100, 150)],
+    );
+}
+
+#[tokio::test]
+async fn local_filesystem_reconstruction_fails_closed_when_index_transition_lacks_materialized_admission(
+) {
+    let (_temp_dir, authority_root, store) = temp_authority_store();
+    let catalog = create_orders_relation_catalog(&store).await;
+    let capabilities = complete_capabilities();
+    let coordinator =
+        IngestAdmissionCoordinator::new_checked(Arc::clone(&store), &capabilities).unwrap();
+
+    coordinator
+        .append_catalog_validated_envelope(catalog_envelope_bytes_for(&catalog, 0, 100))
+        .await
+        .unwrap();
+    fs::remove_file(
+        authority_root.join(
+            ObjectKey::ingest_batch("orders", 7, 0, 100)
+                .unwrap()
+                .as_str(),
+        ),
+    )
+    .unwrap();
+    fs::remove_file(
+        authority_root.join(
+            ObjectKey::ingest_admission_record("orders", 7, 0, 100)
+                .unwrap()
+                .as_str(),
+        ),
+    )
+    .unwrap();
+
+    let error = coordinator
+        .reconstruct_active_admissions()
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("indexed transition is missing materialized admission"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn local_filesystem_indexed_admission_reports_reserved_overlap_before_committed_fallback() {
+    let (_temp_dir, _authority_root, store) = temp_authority_store();
+    let catalog = create_orders_relation_catalog(&store).await;
+    let capabilities = complete_capabilities();
+    let coordinator =
+        IngestAdmissionCoordinator::new_checked(Arc::clone(&store), &capabilities).unwrap();
+
+    coordinator
+        .append_catalog_validated_envelope(catalog_envelope_bytes_for(&catalog, 0, 100))
+        .await
+        .unwrap();
+    let outcome = coordinator
+        .append_catalog_validated_envelope(catalog_envelope_bytes_for(&catalog, 50, 150))
+        .await
+        .unwrap();
+
+    let AppendValidatedEnvelopeOutcome::Conflict { reason, .. } = outcome else {
+        panic!("expected conflict, got {outcome:?}");
+    };
+    assert_eq!(reason, "range_overlap_reserved");
+}
+
+#[tokio::test]
+async fn local_filesystem_checked_overlap_with_legacy_committed_does_not_poison_adjacent_append() {
+    let (_temp_dir, _authority_root, store) = temp_authority_store();
+    let catalog = create_orders_relation_catalog(&store).await;
+    let capabilities = complete_capabilities();
+    let legacy_log = IngestLog::new_catalog_checked(Arc::clone(&store), &capabilities).unwrap();
+    legacy_log
+        .append_catalog_validated_envelope(catalog_envelope_bytes_for(&catalog, 0, 100))
+        .await
+        .unwrap();
+
+    let coordinator =
+        IngestAdmissionCoordinator::new_checked(Arc::clone(&store), &capabilities).unwrap();
+    let overlap = coordinator
+        .append_catalog_validated_envelope(catalog_envelope_bytes_for(&catalog, 50, 150))
+        .await
+        .unwrap();
+    assert!(matches!(
+        overlap,
+        AppendValidatedEnvelopeOutcome::Conflict {
+            reason: "range_overlap_committed",
+            ..
+        }
+    ));
+    assert!(index_transition_bodies(&store).await.is_empty());
+
+    let adjacent = coordinator
+        .append_catalog_validated_envelope(catalog_envelope_bytes_for(&catalog, 100, 150))
+        .await
+        .unwrap();
+    assert!(matches!(
+        adjacent,
+        AppendValidatedEnvelopeOutcome::Appended { descriptor }
+            if descriptor.object_key == ObjectKey::ingest_batch("orders", 7, 100, 150).unwrap()
+    ));
+    assert_chained_index_transitions(&index_transition_bodies(&store).await, &[(100, 150)]);
+}
+
+#[tokio::test]
+async fn local_filesystem_expiring_legacy_orphan_preserves_index_history_digest_for_later_append() {
+    let (_temp_dir, _authority_root, store) = temp_authority_store();
+    let catalog = create_orders_relation_catalog(&store).await;
+    let capabilities = complete_capabilities();
+    put_legacy_materialized_admission(&store, &catalog, 0, 100).await;
+
+    let coordinator =
+        IngestAdmissionCoordinator::new_checked(Arc::clone(&store), &capabilities).unwrap();
+    let adjacent = coordinator
+        .append_catalog_validated_envelope(catalog_envelope_bytes_for(&catalog, 100, 150))
+        .await
+        .unwrap();
+    assert!(matches!(
+        adjacent,
+        AppendValidatedEnvelopeOutcome::Appended { descriptor }
+            if descriptor.object_key == ObjectKey::ingest_batch("orders", 7, 100, 150).unwrap()
+    ));
+
+    coordinator
+        .expire_orphan_admission(
+            "orders",
+            7,
+            0,
+            100,
+            "legacy-orphan-expiry",
+            "legacy_orphan_expired",
+            "multi-process-test",
+        )
+        .await
+        .unwrap();
+    coordinator.reconstruct_active_admissions().await.unwrap();
+
+    let next = coordinator
+        .append_catalog_validated_envelope(catalog_envelope_bytes_for(&catalog, 150, 200))
+        .await
+        .unwrap();
+    assert!(matches!(
+        next,
+        AppendValidatedEnvelopeOutcome::Appended { descriptor }
+            if descriptor.object_key == ObjectKey::ingest_batch("orders", 7, 150, 200).unwrap()
+    ));
+    assert_chained_index_transitions(
+        &index_transition_bodies(&store).await,
+        &[(100, 150), (150, 200)],
+    );
+}
+
+#[tokio::test]
+async fn local_filesystem_stale_retry_of_expired_indexed_orphan_does_not_write_transition() {
+    let (_temp_dir, authority_root, store) = temp_authority_store();
+    let catalog = create_orders_relation_catalog(&store).await;
+    let capabilities = complete_capabilities();
+    let coordinator =
+        IngestAdmissionCoordinator::new_checked(Arc::clone(&store), &capabilities).unwrap();
+
+    coordinator
+        .append_catalog_validated_envelope(catalog_envelope_bytes_for(&catalog, 0, 100))
+        .await
+        .unwrap();
+    fs::remove_file(
+        authority_root.join(
+            ObjectKey::ingest_batch("orders", 7, 0, 100)
+                .unwrap()
+                .as_str(),
+        ),
+    )
+    .unwrap();
+    coordinator
+        .expire_orphan_admission(
+            "orders",
+            7,
+            0,
+            100,
+            "indexed-orphan-expiry",
+            "indexed_orphan_expired",
+            "multi-process-test",
+        )
+        .await
+        .unwrap();
+    let transitions_before = index_transition_bodies(&store).await;
+    assert_eq!(transitions_before.len(), 1);
+
+    let stale_retry = coordinator
+        .append_catalog_validated_envelope(catalog_envelope_bytes_for(&catalog, 0, 100))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        stale_retry,
+        AppendValidatedEnvelopeOutcome::Conflict {
+            reason: "admission_expired",
+            ..
+        }
+    ));
+    assert_eq!(index_transition_bodies(&store).await, transitions_before);
+}
+
+#[tokio::test]
+async fn local_filesystem_reconstruction_fails_closed_when_materialized_admission_differs_from_index(
+) {
+    let (_temp_dir, authority_root, store) = temp_authority_store();
+    let catalog = create_orders_relation_catalog(&store).await;
+    let capabilities = complete_capabilities();
+    let coordinator =
+        IngestAdmissionCoordinator::new_checked(Arc::clone(&store), &capabilities).unwrap();
+
+    coordinator
+        .append_catalog_validated_envelope(catalog_envelope_bytes_for(&catalog, 0, 100))
+        .await
+        .unwrap();
+    let admission_path = authority_root.join(
+        ObjectKey::ingest_admission_record("orders", 7, 0, 100)
+            .unwrap()
+            .as_str(),
+    );
+    let materialized: Value = serde_json::from_slice(&fs::read(&admission_path).unwrap()).unwrap();
+    fs::write(
+        &admission_path,
+        serde_json::to_vec_pretty(&materialized).unwrap(),
+    )
+    .unwrap();
+
+    let error = coordinator
+        .reconstruct_active_admissions()
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("materialized admission does not match indexed transition"),
+        "{error}"
+    );
 }
 
 #[cfg(feature = "s3-compat-tests")]
@@ -220,7 +459,7 @@ async fn s3_compatible_multi_process_admission_rejects_overlap_and_allows_adjace
     let overlap_outcomes = run_s3_children(
         &overlap_config,
         "s3-overlap",
-        &[(0, 100, 0, "first"), (50, 150, 250, "overlapping")],
+        &[(0, 100, 0, "first"), (50, 150, 0, "overlapping")],
     );
     assert_eq!(
         overlap_outcomes
@@ -251,12 +490,10 @@ async fn s3_compatible_multi_process_admission_rejects_overlap_and_allows_adjace
         .find(|outcome| outcome.kind == "conflict")
         .unwrap();
     assert_eq!(conflict.conflict_object_key, appended.object_key);
-    assert!(matches!(
-        conflict.reason.as_deref(),
-        Some("range_overlap_reserved" | "range_overlap_committed")
-    ));
+    assert_eq!(conflict.reason.as_deref(), Some("range_overlap_reserved"));
 
     let capabilities = complete_capabilities();
+    assert_eq!(index_transition_bodies(&overlap_store).await.len(), 1);
     let committed = IngestLog::new_catalog_checked(Arc::clone(&overlap_store), &capabilities)
         .unwrap()
         .list_committed()
@@ -276,6 +513,10 @@ async fn s3_compatible_multi_process_admission_rejects_overlap_and_allows_adjace
         .iter()
         .all(|outcome| outcome.kind == "appended" && outcome.error.is_none()),);
 
+    assert_chained_index_transitions(
+        &index_transition_bodies(&adjacent_store).await,
+        &[(0, 100), (100, 150)],
+    );
     let committed = IngestLog::new_catalog_checked(adjacent_store, &capabilities)
         .unwrap()
         .list_committed()
@@ -303,16 +544,16 @@ async fn run_child() {
     let end_offset = integer_from_env(END_OFFSET_ENV);
     let post_start_delay_ms = integer_from_env(POST_START_DELAY_MS_ENV);
 
+    let store = child_authority_store();
+    let capabilities = complete_capabilities();
+    let coordinator = IngestAdmissionCoordinator::new_checked(store, &capabilities).unwrap();
+    let payload = catalog_envelope_bytes_for(&orders_relation_catalog(), start_offset, end_offset);
     fs::write(&ready_file, b"ready").unwrap();
     wait_for_file(&start_marker);
     if post_start_delay_ms > 0 {
         thread::sleep(Duration::from_millis(post_start_delay_ms));
     }
 
-    let store = child_authority_store();
-    let capabilities = complete_capabilities();
-    let coordinator = IngestAdmissionCoordinator::new_checked(store, &capabilities).unwrap();
-    let payload = catalog_envelope_bytes_for(&orders_relation_catalog(), start_offset, end_offset);
     let outcome = match coordinator.append_catalog_validated_envelope(payload).await {
         Ok(AppendValidatedEnvelopeOutcome::Appended { descriptor }) => {
             ChildOutcome::for_descriptor("appended", descriptor.object_key.to_string())
@@ -470,6 +711,121 @@ fn read_outcomes(outcome_files: &[PathBuf]) -> Vec<ChildOutcome> {
 fn assert_child_success(child: &mut Child) {
     let status = child.wait().unwrap();
     assert!(status.success(), "child exited with {status}");
+}
+
+async fn index_transition_bodies(store: &Arc<dyn ObjectStore>) -> Vec<Value> {
+    let mut objects = store
+        .list(Some(&ObjectStorePath::from("v1/ingest-admission-index")))
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    objects.sort_by(|left, right| left.location.cmp(&right.location));
+
+    let mut transitions = Vec::new();
+    for object in objects {
+        if !object.location.as_ref().ends_with(".transition.json") {
+            continue;
+        }
+        let bytes = store
+            .get(&object.location)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        transitions.push(serde_json::from_slice(&bytes).unwrap());
+    }
+
+    transitions
+}
+
+async fn put_legacy_materialized_admission(
+    store: &Arc<dyn ObjectStore>,
+    catalog: &VelorixRelationCatalogV1,
+    start_offset_inclusive: u64,
+    end_offset_exclusive: u64,
+) {
+    let payload = catalog_envelope_bytes_for(catalog, start_offset_inclusive, end_offset_exclusive);
+    let batch = IngestBatch::from_validated_envelope(payload.clone()).unwrap();
+    let descriptor = batch.descriptor();
+    let envelope = IngestEnvelope::decode(payload).unwrap();
+    let record = DurableIngestAdmissionRecordV1 {
+        schema_version: 1,
+        record_kind: "ingest_range_admission_v1".to_string(),
+        stream_id: descriptor.stream_id.clone(),
+        partition_id: descriptor.partition_id,
+        start_offset_inclusive: descriptor.start_offset_inclusive,
+        end_offset_exclusive: descriptor.end_offset_exclusive,
+        batch_key: descriptor.object_key,
+        admission_record_key: ObjectKey::ingest_admission_record(
+            &descriptor.stream_id,
+            descriptor.partition_id,
+            descriptor.start_offset_inclusive,
+            descriptor.end_offset_exclusive,
+        )
+        .unwrap(),
+        payload_digest: envelope.header().payload_digest.clone(),
+        relation_id: envelope.header().relation_id.clone(),
+        relation_version: envelope.header().relation_version.clone(),
+        schema_fingerprint: envelope.header().schema_fingerprint.clone(),
+        admission_mode: "process_local_serialized".to_string(),
+    };
+    store
+        .put_opts(
+            &ObjectStorePath::from(record.admission_record_key.as_str()),
+            Bytes::from(serde_json::to_vec(&record).unwrap()).into(),
+            PutMode::Create.into(),
+        )
+        .await
+        .unwrap();
+}
+
+fn assert_chained_index_transitions(transitions: &[Value], expected_ranges: &[(u64, u64)]) {
+    assert_eq!(transitions.len(), expected_ranges.len(), "{transitions:?}");
+    let observed_ranges = transitions
+        .iter()
+        .map(|transition| {
+            (
+                transition["admitted"]["start_offset_inclusive"]
+                    .as_u64()
+                    .unwrap(),
+                transition["admitted"]["end_offset_exclusive"]
+                    .as_u64()
+                    .unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    for expected_range in expected_ranges {
+        assert!(
+            observed_ranges.contains(expected_range),
+            "missing {expected_range:?} in {observed_ranges:?}"
+        );
+    }
+
+    let previous_digests = transitions
+        .iter()
+        .map(|transition| transition["previous_state_digest"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    let next_digests = transitions
+        .iter()
+        .map(|transition| transition["next_state_digest"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        previous_digests
+            .iter()
+            .filter(|previous| !next_digests.contains(previous))
+            .count()
+            == 1,
+        "expected one chain genesis: previous={previous_digests:?} next={next_digests:?}"
+    );
+    assert!(
+        next_digests
+            .iter()
+            .filter(|next| !previous_digests.contains(next))
+            .count()
+            == 1,
+        "expected one chain head: previous={previous_digests:?} next={next_digests:?}"
+    );
 }
 
 fn wait_for_file(path: &Path) {
@@ -631,8 +987,9 @@ fn join_prefixes(base: &str, run: &str) -> String {
     }
 }
 
-async fn create_orders_relation_catalog(store: &Arc<dyn ObjectStore>) {
+async fn create_orders_relation_catalog(store: &Arc<dyn ObjectStore>) -> VelorixRelationCatalogV1 {
     let capabilities = complete_capabilities();
+    let catalog = orders_relation_catalog();
     RelationCatalogRegistry::new_checked(
         Arc::clone(store),
         capabilities
@@ -640,9 +997,10 @@ async fn create_orders_relation_catalog(store: &Arc<dyn ObjectStore>) {
             .unwrap(),
     )
     .unwrap()
-    .create(&orders_relation_catalog())
+    .create(&catalog)
     .await
     .unwrap();
+    catalog
 }
 
 fn complete_capabilities() -> AuthoritativeObjectStoreCapabilitiesV1 {
