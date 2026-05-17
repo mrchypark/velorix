@@ -6,6 +6,7 @@ use std::{
 use bytes::Bytes;
 use futures::TryStreamExt;
 use object_store::{path::Path, ObjectStore, PutMode};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
@@ -16,8 +17,9 @@ use crate::{
     },
     checkpoint_index::{
         manifest_digest, marker_updated_at_now, recovery_transition_id_now,
-        CheckpointAdminInspection, CheckpointLifecycleRecord, CheckpointLifecycleStatus,
-        CheckpointManifestInspection, CheckpointManifestInspectionStatus, CheckpointRecoveryMode,
+        CheckpointAdminInspection, CheckpointGcTransitionRecordV1, CheckpointLifecycleRecord,
+        CheckpointLifecycleStatus, CheckpointManifestInspection,
+        CheckpointManifestInspectionStatus, CheckpointRecoveryMode,
         CheckpointRecoveryTransitionRecordV1, CheckpointRetentionRecordV1, LatestCandidateMarker,
     },
     gc::{
@@ -48,6 +50,7 @@ pub struct CheckpointPublisher {
 struct InspectableCheckpointManifest {
     manifest: CheckpointManifest,
     lifecycle_status: Option<CheckpointLifecycleStatus>,
+    gc_transition_records: Vec<CheckpointGcTransitionRecordV1>,
     retention_record: Option<CheckpointRetentionRecordV1>,
     recovery_transition_records: Vec<CheckpointRecoveryTransitionRecordV1>,
     payload_status: Result<(), String>,
@@ -109,6 +112,10 @@ pub enum CheckpointPublishError {
     ManifestAlreadyExists(ObjectKey),
     #[error("checkpoint recovery transition record `{0}` already exists")]
     CheckpointRecoveryTransitionAlreadyExists(ObjectKey),
+    #[error(
+        "checkpoint lifecycle transition record `{0}` already exists with different causal fields"
+    )]
+    CheckpointGcTransitionConflict(ObjectKey),
     #[error("garbage collection run evidence `{0}` already exists")]
     GarbageCollectionRunAlreadyExists(ObjectKey),
     #[error(
@@ -253,6 +260,18 @@ impl CheckpointPublisher {
         Ok(Self::new(store))
     }
 
+    /// Constructs a checkpoint publisher after validating every authoritative
+    /// namespace used by checkpoint publication, GC retention, and admin
+    /// inspection evidence.
+    pub fn new_authoritative(
+        store: Arc<dyn ObjectStore>,
+        capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
+    ) -> Result<Self, CheckpointPublishError> {
+        validate_checkpoint_publisher_authoritative_namespaces(capabilities)?;
+
+        Ok(Self::new(store))
+    }
+
     /// Constructs a checkpoint publisher with a caller-supplied state store
     /// without object-store capability validation. Production/durable callers
     /// should use [`Self::with_state_store_checked`].
@@ -315,6 +334,12 @@ impl CheckpointPublisher {
     ) -> Result<Self, CheckpointPublishError> {
         capabilities.validate_namespace(AuthoritativeNamespace::Checkpoint)?;
         capabilities.validate_namespace(AuthoritativeNamespace::State)?;
+        capabilities.validate_namespace(AuthoritativeNamespace::CheckpointIndex)?;
+        capabilities.validate_namespace(AuthoritativeNamespace::CheckpointLifecycle)?;
+        capabilities.validate_namespace(AuthoritativeNamespace::CheckpointRetention)?;
+        capabilities.validate_namespace(AuthoritativeNamespace::CheckpointGcTransition)?;
+        capabilities.validate_namespace(AuthoritativeNamespace::CheckpointRecovery)?;
+        capabilities.validate_namespace(AuthoritativeNamespace::GcRuns)?;
 
         Self::with_slatedb_state_store(store, db_path).await
     }
@@ -613,6 +638,99 @@ impl CheckpointPublisher {
         Ok(record)
     }
 
+    pub async fn read_checkpoint_gc_transition_record(
+        &self,
+        checkpoint_version: u64,
+        transition_id: &str,
+    ) -> Result<CheckpointGcTransitionRecordV1, CheckpointPublishError> {
+        let object_key =
+            ObjectKey::checkpoint_gc_transition_record(checkpoint_version, transition_id)?;
+        let bytes = self
+            .store
+            .get(&Path::from(object_key.as_str()))
+            .await?
+            .bytes()
+            .await?;
+        let record = serde_json::from_slice::<CheckpointGcTransitionRecordV1>(&bytes)?;
+        self.validate_gc_transition_record(&object_key, &record)?;
+        let manifest_bytes = self
+            .store
+            .get(&Path::from(record.manifest_key.as_str()))
+            .await?
+            .bytes()
+            .await?;
+        if record.manifest_digest != manifest_digest(&manifest_bytes) {
+            return Err(CheckpointPublishError::ObjectKey(
+                ObjectKeyError::InvalidExternalKey(format!(
+                    "checkpoint GC transition manifest digest mismatch for checkpoint {} transition {}: expected {}, actual {}",
+                    record.checkpoint_version,
+                    record.transition_id,
+                    manifest_digest(&manifest_bytes),
+                    record.manifest_digest
+                )),
+            ));
+        }
+        let gc_run_bytes = self
+            .store
+            .get(&Path::from(record.gc_run_key.as_str()))
+            .await?
+            .bytes()
+            .await?;
+        let expected_gc_run_digest =
+            checkpoint_admin_record_digest("velorix.gc-run.v1", &gc_run_bytes);
+        if record.gc_run_digest != expected_gc_run_digest {
+            return Err(CheckpointPublishError::ObjectKey(
+                ObjectKeyError::InvalidExternalKey(format!(
+                    "checkpoint GC transition run digest mismatch for checkpoint {} transition {}: expected {}, actual {}",
+                    record.checkpoint_version,
+                    record.transition_id,
+                    expected_gc_run_digest,
+                    record.gc_run_digest
+                )),
+            ));
+        }
+        let run = serde_json::from_slice::<GarbageCollectionRunV1>(&gc_run_bytes)?;
+        Self::validate_garbage_collection_run_evidence(
+            &record.gc_run_key,
+            &record.gc_run_id,
+            &run,
+        )?;
+        let retention_record_bytes = self
+            .store
+            .get(&Path::from(record.retention_record_key.as_str()))
+            .await?
+            .bytes()
+            .await?;
+        let expected_retention_digest = checkpoint_admin_record_digest(
+            "velorix.checkpoint-retention.v1",
+            &retention_record_bytes,
+        );
+        if record.retention_record_digest != expected_retention_digest {
+            return Err(CheckpointPublishError::ObjectKey(
+                ObjectKeyError::InvalidExternalKey(format!(
+                    "checkpoint GC transition retention digest mismatch for checkpoint {} transition {}: expected {}, actual {}",
+                    record.checkpoint_version,
+                    record.transition_id,
+                    expected_retention_digest,
+                    record.retention_record_digest
+                )),
+            ));
+        }
+        let retention_record =
+            serde_json::from_slice::<CheckpointRetentionRecordV1>(&retention_record_bytes)?;
+        self.validate_retention_record(&record.retention_record_key, &retention_record)?;
+        if !gc_transition_matches_retention_record(&record, &retention_record) {
+            return Err(CheckpointPublishError::ObjectKey(
+                ObjectKeyError::InvalidExternalKey(format!(
+                    "checkpoint GC transition causal fields do not match retention record for checkpoint {} transition {}",
+                    record.checkpoint_version, record.transition_id
+                )),
+            ));
+        }
+
+        Ok(record)
+    }
+
     pub async fn write_checkpoint_recovery_transition_record(
         &self,
         checkpoint_version: u64,
@@ -748,6 +866,7 @@ impl CheckpointPublisher {
                 Ok(inspectable) => {
                     let checkpoint_version = inspectable.manifest.checkpoint_version;
                     let lifecycle_status = inspectable.lifecycle_status;
+                    let gc_transition_records = inspectable.gc_transition_records;
                     let retention_record = inspectable.retention_record;
                     let recovery_transition_records = inspectable.recovery_transition_records;
                     let payload_status = inspectable.payload_status;
@@ -763,6 +882,7 @@ impl CheckpointPublisher {
                                 checkpoint_version,
                                 manifest_key,
                                 lifecycle_status,
+                                gc_transition_records,
                                 retention_record,
                                 recovery_transition_records,
                                 status: CheckpointManifestInspectionStatus::Valid,
@@ -772,6 +892,7 @@ impl CheckpointPublisher {
                             checkpoint_version,
                             manifest_key,
                             lifecycle_status,
+                            gc_transition_records,
                             retention_record,
                             recovery_transition_records,
                             status: CheckpointManifestInspectionStatus::Invalid { reason },
@@ -782,6 +903,7 @@ impl CheckpointPublisher {
                     checkpoint_version,
                     manifest_key,
                     lifecycle_status: None,
+                    gc_transition_records: vec![],
                     retention_record: None,
                     recovery_transition_records: vec![],
                     status: CheckpointManifestInspectionStatus::Invalid { reason },
@@ -999,6 +1121,8 @@ impl CheckpointPublisher {
         }
         self.validate_no_conflicting_retention_records(run_id, policy, plan)
             .await?;
+        self.validate_no_conflicting_gc_transition_records(run_id, policy, plan)
+            .await?;
 
         let report = self.execute_garbage_collection_plan(plan).await?;
         let run = GarbageCollectionRunV1 {
@@ -1213,7 +1337,10 @@ impl CheckpointPublisher {
             )
             .await?
         {
-            self.write_checkpoint_retention_record(record).await?;
+            self.write_checkpoint_retention_record(record.clone())
+                .await?;
+            self.write_payload_released_gc_transition_for_retention_record(record)
+                .await?;
         }
 
         Ok(())
@@ -1251,6 +1378,45 @@ impl CheckpointPublisher {
             };
             if !same_retention_causal_fields(&existing, &expected) {
                 return Err(retention_conflict_error(expected.checkpoint_version));
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn validate_no_conflicting_gc_transition_records(
+        &self,
+        run_id: &str,
+        policy: GarbageCollectionPolicy,
+        plan: &GarbageCollectionPlan,
+    ) -> Result<(), CheckpointPublishError> {
+        let candidate_keys = plan
+            .candidates
+            .iter()
+            .map(|candidate| candidate.object_key.clone())
+            .collect::<HashSet<_>>();
+        let transition_id = checkpoint_gc_transition_id_for_gc_run(run_id)?;
+        for expected in self
+            .retention_records_for_deleted_keys(
+                run_id,
+                policy,
+                &plan.retained_manifest_versions,
+                &candidate_keys,
+            )
+            .await?
+        {
+            let object_key = ObjectKey::checkpoint_gc_transition_record(
+                expected.checkpoint_version,
+                &transition_id,
+            )?;
+            match self.store.head(&Path::from(object_key.as_str())).await {
+                Ok(_) => {
+                    return Err(CheckpointPublishError::CheckpointGcTransitionConflict(
+                        object_key,
+                    ))
+                }
+                Err(object_store::Error::NotFound { .. }) => {}
+                Err(err) => return Err(err.into()),
             }
         }
 
@@ -1344,6 +1510,78 @@ impl CheckpointPublisher {
                 } else {
                     Err(retention_conflict_error(record.checkpoint_version))
                 }
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    async fn write_payload_released_gc_transition_for_retention_record(
+        &self,
+        retention: CheckpointRetentionRecordV1,
+    ) -> Result<(), CheckpointPublishError> {
+        let transition_id = checkpoint_gc_transition_id_for_gc_run(&retention.gc_run_id)?;
+        let gc_run_key = ObjectKey::garbage_collection_run(&retention.gc_run_id)?;
+        let gc_run_bytes = self
+            .store
+            .get(&Path::from(gc_run_key.as_str()))
+            .await?
+            .bytes()
+            .await?;
+        let retention_record_key =
+            ObjectKey::checkpoint_retention_record(retention.checkpoint_version);
+        let retention_record_bytes = self
+            .store
+            .get(&Path::from(retention_record_key.as_str()))
+            .await?
+            .bytes()
+            .await?;
+        let record = CheckpointGcTransitionRecordV1::payload_released_from_retention_record(
+            &retention,
+            transition_id,
+            checkpoint_admin_record_digest("velorix.gc-run.v1", &gc_run_bytes),
+            checkpoint_admin_record_digest(
+                "velorix.checkpoint-retention.v1",
+                &retention_record_bytes,
+            ),
+            marker_updated_at_now(),
+            "checkpoint-publisher-gc".to_string(),
+        );
+        let object_key = ObjectKey::checkpoint_gc_transition_record(
+            record.checkpoint_version,
+            &record.transition_id,
+        )?;
+        self.validate_gc_transition_record(&object_key, &record)?;
+        let bytes = serde_json::to_vec(&record)?;
+
+        match self
+            .store
+            .put_opts(
+                &Path::from(object_key.as_str()),
+                Bytes::from(bytes).into(),
+                PutMode::Create.into(),
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                let Ok(existing) = self
+                    .read_checkpoint_gc_transition_record(
+                        record.checkpoint_version,
+                        &record.transition_id,
+                    )
+                    .await
+                else {
+                    return Err(CheckpointPublishError::CheckpointGcTransitionConflict(
+                        object_key,
+                    ));
+                };
+                if same_gc_transition_causal_fields(&existing, &record) {
+                    return Ok(());
+                }
+
+                Err(CheckpointPublishError::CheckpointGcTransitionConflict(
+                    object_key,
+                ))
             }
             Err(err) => Err(err.into()),
         }
@@ -1659,6 +1897,10 @@ impl CheckpointPublisher {
             Some(record) if self.retention_record_matches_gc_run(&record).await => Some(record),
             _ => None,
         };
+        let gc_transition_records = self
+            .list_checkpoint_gc_transition_records(&manifest, &bytes, retention_record.as_ref())
+            .await
+            .unwrap_or_default();
         let recovery_transition_records = self
             .list_checkpoint_recovery_transition_records(&manifest, &bytes)
             .await
@@ -1667,10 +1909,81 @@ impl CheckpointPublisher {
         Ok(InspectableCheckpointManifest {
             manifest,
             lifecycle_status,
+            gc_transition_records,
             retention_record,
             recovery_transition_records,
             payload_status,
         })
+    }
+
+    async fn list_checkpoint_gc_transition_records(
+        &self,
+        manifest: &CheckpointManifest,
+        manifest_bytes: &[u8],
+        retention_record: Option<&CheckpointRetentionRecordV1>,
+    ) -> Result<Vec<CheckpointGcTransitionRecordV1>, CheckpointPublishError> {
+        let Some(retention_record) = retention_record else {
+            return Ok(Vec::new());
+        };
+        let prefix = checkpoint_gc_transition_prefix(manifest.checkpoint_version)?;
+        let objects = self
+            .store
+            .list(Some(&Path::from(prefix.as_str())))
+            .try_collect::<Vec<_>>()
+            .await?;
+        let expected_digest = manifest_digest(manifest_bytes);
+        let expected_manifest_key = manifest.object_key();
+        let gc_run_key = ObjectKey::garbage_collection_run(&retention_record.gc_run_id)?;
+        let gc_run_bytes = self
+            .store
+            .get(&Path::from(gc_run_key.as_str()))
+            .await?
+            .bytes()
+            .await?;
+        let gc_run_digest = checkpoint_admin_record_digest("velorix.gc-run.v1", &gc_run_bytes);
+        let retention_record_key =
+            ObjectKey::checkpoint_retention_record(retention_record.checkpoint_version);
+        let retention_record_bytes = self
+            .store
+            .get(&Path::from(retention_record_key.as_str()))
+            .await?
+            .bytes()
+            .await?;
+        let retention_record_digest = checkpoint_admin_record_digest(
+            "velorix.checkpoint-retention.v1",
+            &retention_record_bytes,
+        );
+        let mut records = Vec::new();
+
+        for object in objects {
+            let Ok(object_key) = ObjectKey::parse(object.location.to_string()) else {
+                continue;
+            };
+            let bytes = self.store.get(&object.location).await?.bytes().await?;
+            let Ok(record) = serde_json::from_slice::<CheckpointGcTransitionRecordV1>(&bytes)
+            else {
+                continue;
+            };
+            if self
+                .validate_gc_transition_record(&object_key, &record)
+                .is_err()
+            {
+                continue;
+            }
+            if record.manifest_key == expected_manifest_key
+                && record.manifest_digest == expected_digest
+                && record.gc_run_key == gc_run_key
+                && record.gc_run_digest == gc_run_digest
+                && record.retention_record_key == retention_record_key
+                && record.retention_record_digest == retention_record_digest
+                && gc_transition_matches_retention_record(&record, retention_record)
+            {
+                records.push(record);
+            }
+        }
+
+        records.sort_by(|left, right| left.transition_id.cmp(&right.transition_id));
+        Ok(records)
     }
 
     async fn list_checkpoint_recovery_transition_records(
@@ -1778,6 +2091,70 @@ impl CheckpointPublisher {
                 ObjectKeyError::InvalidExternalKey(format!(
                     "checkpoint recovery transition manifest key `{}` does not match checkpoint {}",
                     record.manifest_key, record.checkpoint_version
+                )),
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn validate_gc_transition_record(
+        &self,
+        object_key: &ObjectKey,
+        record: &CheckpointGcTransitionRecordV1,
+    ) -> Result<(), CheckpointPublishError> {
+        if !record.validate_schema() {
+            return Err(CheckpointPublishError::ObjectKey(
+                ObjectKeyError::InvalidExternalKey(format!(
+                    "unsupported checkpoint GC transition schema version {}",
+                    record.schema_version
+                )),
+            ));
+        }
+        if *object_key
+            != ObjectKey::checkpoint_gc_transition_record(
+                record.checkpoint_version,
+                &record.transition_id,
+            )?
+        {
+            return Err(CheckpointPublishError::ObjectKey(
+                ObjectKeyError::InvalidExternalKey(format!(
+                    "checkpoint GC transition key `{object_key}` does not match body checkpoint {} transition {}",
+                    record.checkpoint_version, record.transition_id
+                )),
+            ));
+        }
+        if record.manifest_key != ObjectKey::checkpoint_manifest(record.checkpoint_version) {
+            return Err(CheckpointPublishError::ObjectKey(
+                ObjectKeyError::InvalidExternalKey(format!(
+                    "checkpoint GC transition manifest key `{}` does not match checkpoint {}",
+                    record.manifest_key, record.checkpoint_version
+                )),
+            ));
+        }
+        if record.gc_run_key != ObjectKey::garbage_collection_run(&record.gc_run_id)? {
+            return Err(CheckpointPublishError::ObjectKey(
+                ObjectKeyError::InvalidExternalKey(format!(
+                    "checkpoint GC transition run key `{}` does not match run id {}",
+                    record.gc_run_key, record.gc_run_id
+                )),
+            ));
+        }
+        if record.retention_record_key
+            != ObjectKey::checkpoint_retention_record(record.checkpoint_version)
+        {
+            return Err(CheckpointPublishError::ObjectKey(
+                ObjectKeyError::InvalidExternalKey(format!(
+                    "checkpoint GC transition retention key `{}` does not match checkpoint {}",
+                    record.retention_record_key, record.checkpoint_version
+                )),
+            ));
+        }
+        if record.emitter.is_empty() || record.emitter.contains('/') {
+            return Err(CheckpointPublishError::ObjectKey(
+                ObjectKeyError::InvalidExternalKey(format!(
+                    "checkpoint GC transition emitter `{}` is invalid",
+                    record.emitter
                 )),
             ));
         }
@@ -2343,6 +2720,71 @@ fn same_retention_causal_fields(
         && left.deleted_candidate_keys == right.deleted_candidate_keys
 }
 
+fn validate_checkpoint_publisher_authoritative_namespaces(
+    capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
+) -> Result<(), AuthoritativeObjectStoreCapabilityError> {
+    for namespace in [
+        AuthoritativeNamespace::Checkpoint,
+        AuthoritativeNamespace::CheckpointIndex,
+        AuthoritativeNamespace::CheckpointLifecycle,
+        AuthoritativeNamespace::CheckpointRetention,
+        AuthoritativeNamespace::CheckpointGcTransition,
+        AuthoritativeNamespace::CheckpointRecovery,
+        AuthoritativeNamespace::GcRuns,
+    ] {
+        capabilities.validate_namespace(namespace)?;
+    }
+
+    Ok(())
+}
+
+fn same_gc_transition_causal_fields(
+    left: &CheckpointGcTransitionRecordV1,
+    right: &CheckpointGcTransitionRecordV1,
+) -> bool {
+    left.schema_version == right.schema_version
+        && left.checkpoint_version == right.checkpoint_version
+        && left.transition_id == right.transition_id
+        && left.manifest_key == right.manifest_key
+        && left.manifest_digest == right.manifest_digest
+        && left.transition == right.transition
+        && left.gc_run_id == right.gc_run_id
+        && left.gc_run_key == right.gc_run_key
+        && left.gc_run_digest == right.gc_run_digest
+        && left.retention_record_key == right.retention_record_key
+        && left.retention_record_digest == right.retention_record_digest
+        && left.retained_manifest_versions == right.retained_manifest_versions
+        && left.released_payload_keys == right.released_payload_keys
+        && left.emitter == right.emitter
+}
+
+fn gc_transition_matches_retention_record(
+    transition: &CheckpointGcTransitionRecordV1,
+    retention: &CheckpointRetentionRecordV1,
+) -> bool {
+    transition.checkpoint_version == retention.checkpoint_version
+        && transition.manifest_key == retention.manifest_key
+        && transition.manifest_digest == retention.manifest_digest
+        && transition.gc_run_id == retention.gc_run_id
+        && transition.retained_manifest_versions == retention.retained_manifest_versions
+        && transition.released_payload_keys == retention.deleted_candidate_keys
+}
+
+fn checkpoint_gc_transition_id_for_gc_run(run_id: &str) -> Result<String, ObjectKeyError> {
+    ObjectKey::garbage_collection_run(run_id)?;
+
+    Ok(format!("gc-retired-{run_id}"))
+}
+
+fn checkpoint_admin_record_digest(label: &str, bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(label.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(bytes);
+
+    format!("sha256:{:x}", hasher.finalize())
+}
+
 fn retention_conflict_error(checkpoint_version: u64) -> CheckpointPublishError {
     CheckpointPublishError::ObjectKey(ObjectKeyError::InvalidExternalKey(format!(
         "checkpoint retention record already exists with different causal fields for checkpoint {checkpoint_version}"
@@ -2367,6 +2809,15 @@ fn checkpoint_recovery_transition_prefix(
     checkpoint_version: u64,
 ) -> Result<String, ObjectKeyError> {
     let probe = ObjectKey::checkpoint_recovery_transition_record(checkpoint_version, "probe")?;
+    let Some(prefix) = probe.as_str().strip_suffix("probe.transition.json") else {
+        return Err(ObjectKeyError::InvalidExternalKey(probe.to_string()));
+    };
+
+    Ok(prefix.to_string())
+}
+
+fn checkpoint_gc_transition_prefix(checkpoint_version: u64) -> Result<String, ObjectKeyError> {
+    let probe = ObjectKey::checkpoint_gc_transition_record(checkpoint_version, "probe")?;
     let Some(prefix) = probe.as_str().strip_suffix("probe.transition.json") else {
         return Err(ObjectKeyError::InvalidExternalKey(probe.to_string()));
     };

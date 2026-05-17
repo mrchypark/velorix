@@ -18,6 +18,12 @@ manifest publication.
 | SlateDB state | SlateDB-required object semantics. | Owned by the SlateDB adapter. |
 | `v1/outputs` | Create-only output writes. | Read-after-create, metadata or ETag. |
 | `v1/checkpoints` | Create-only manifest writes. | Read-after-create, listing, full reads. |
+| `v1/checkpoint-index` | Create-only or compare-safe advisory index writes. | Read-after-create and listing for diagnostics. |
+| `v1/checkpoint-lifecycle` | Create-only lifecycle status evidence writes. | Read-after-create. |
+| `v1/checkpoint-retention` | Create-only GC retention evidence writes. | Read-after-create and listing for admin inspection. |
+| `v1/checkpoint-gc-transitions` | Create-only GC transition evidence writes. | Read-after-create and listing for admin inspection. |
+| `v1/checkpoint-recovery` | Create-only recovery transition evidence writes. | Read-after-create and listing for admin inspection. |
+| `v1/gc-runs` | Create-only GC run evidence writes. | Read-after-create and listing for release evidence checks. |
 | `v1/queries` | Create-only catalog writes. | Read-after-create. |
 | `v1/tables` | Create-only catalog writes. | Read-after-create. |
 | `v1/relations` | Create-only relation catalog writes. | Read-after-create. |
@@ -45,8 +51,10 @@ telemetry.
 
 Phase 2.3 records declared capability profiles as
 `AuthoritativeObjectStoreCapabilitiesV1`, keyed by these authoritative
-namespaces: ingest, state, output, checkpoint, ownership, table catalog,
-relation catalog, artifact catalog, ingest admission, and benchmark evidence.
+namespaces: ingest, ingest admission, state, output, checkpoint,
+checkpoint index, checkpoint lifecycle, checkpoint retention, checkpoint GC
+transitions, checkpoint recovery, ownership, table catalog, relation catalog,
+artifact catalog, benchmark evidence, GC runs, queries, and query policy.
 
 Startup validation rejects a missing namespace profile and rejects any namespace
 whose `ObjectStoreCapabilityProfile` is missing a required durability

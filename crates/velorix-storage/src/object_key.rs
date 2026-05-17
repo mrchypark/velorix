@@ -158,6 +158,17 @@ impl ObjectKey {
         ))
     }
 
+    pub fn checkpoint_gc_transition_record(
+        checkpoint_version: u64,
+        transition_id: &str,
+    ) -> Result<Self, ObjectKeyError> {
+        validate_segment("transition_id", transition_id)?;
+
+        Ok(Self(format!(
+            "v1/checkpoint-gc-transitions/{checkpoint_version:0CHECKPOINT_WIDTH$}/transitions/{transition_id}.transition.json"
+        )))
+    }
+
     pub fn checkpoint_retention_record(checkpoint_version: u64) -> Self {
         Self(format!(
             "v1/checkpoint-retention/{checkpoint_version:0CHECKPOINT_WIDTH$}.retention.json"
@@ -358,6 +369,13 @@ fn validate_known_layout(value: &str) -> Result<(), ObjectKeyError> {
                 .strip_suffix(".status.json")
                 .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
             parse_fixed_u64("checkpoint_version", checkpoint, CHECKPOINT_WIDTH)?;
+        }
+        ["v1", "checkpoint-gc-transitions", checkpoint, "transitions", transition_file] => {
+            parse_fixed_u64("checkpoint_version", checkpoint, CHECKPOINT_WIDTH)?;
+            let transition_id = transition_file
+                .strip_suffix(".transition.json")
+                .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+            validate_segment("transition_id", transition_id)?;
         }
         ["v1", "checkpoint-retention", retention_file] => {
             let checkpoint = retention_file
@@ -797,6 +815,20 @@ mod tests {
         assert_eq!(
             key.as_str(),
             "v1/checkpoint-recovery/00000000000000000009/transitions/recovery-test-0001.transition.json"
+        );
+        assert_eq!(key, restarted);
+        assert_eq!(ObjectKey::parse(key.as_str()).unwrap(), key);
+    }
+
+    #[test]
+    fn checkpoint_gc_transition_record_key_is_deterministic_and_parseable() {
+        let key = ObjectKey::checkpoint_gc_transition_record(9, "gc-retired-run-0001").unwrap();
+        let restarted =
+            ObjectKey::checkpoint_gc_transition_record(9, "gc-retired-run-0001").unwrap();
+
+        assert_eq!(
+            key.as_str(),
+            "v1/checkpoint-gc-transitions/00000000000000000009/transitions/gc-retired-run-0001.transition.json"
         );
         assert_eq!(key, restarted);
         assert_eq!(ObjectKey::parse(key.as_str()).unwrap(), key);

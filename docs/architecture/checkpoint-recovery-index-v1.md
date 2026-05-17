@@ -69,8 +69,9 @@ records do not make a valid manifest invalid.
 `velorix-cli checkpoint-inspect-local --object-store-dir <path>` exposes the
 read-only admin inspection path for local object-store directories. It reports
 the latest valid checkpoint and each visible manifest with lifecycle/status
-diagnostics. JSON inspection output uses `schema_version=2` when reporting
-recovery transition records. When GC leaves an older parent manifest listed but
+diagnostics. JSON inspection output uses `schema_version=3` when reporting
+diagnostics, retention evidence, GC transition records, and recovery transition
+records. When GC leaves an older parent manifest listed but
 deletes that parent's raw state/output payloads, inspection may still use the parent
 manifest body as structural lineage evidence for newer retained checkpoints;
 the older manifest itself is reported invalid if its own payloads are missing.
@@ -84,6 +85,23 @@ v1/checkpoint-retention/{checkpoint_version:020}.retention.json
 Retention evidence is an admin surface only. It records which GC run and policy
 removed payloads for a non-retained checkpoint; it does not repair, rewrite,
 delete, or recover from a checkpoint.
+
+After retention evidence is written, GC may also emit deterministic append-only
+GC transition evidence:
+
+```text
+v1/checkpoint-gc-transitions/{checkpoint_version:020}/transitions/{transition_id}.transition.json
+```
+
+The transition id is deterministic for the GC run so retries cannot inflate
+admin evidence. The transition record is digest-bound to the checkpoint
+manifest, the verified `GcRunV1` body, and the retention record body. Admin
+inspection attaches it only when the matching GC run and retention record are
+still readable and digest-matched. It is inspection evidence only:
+latest-checkpoint lookup continues to depend on manifest lineage and payload
+visibility, while selected-checkpoint recovery validity depends on the immutable
+checkpoint manifest plus the `published` lifecycle status record, not on GC
+transition presence.
 
 Successful checked recovery from a published checkpoint writes append-only
 recovery transition evidence:
@@ -114,6 +132,9 @@ policy.
 - Published lifecycle records are readable and digest-bound to their manifest.
 - Retention evidence is readable after successful GC evidence read-back and is
   attached only when digest-bound to the inspected manifest.
+- GC transition evidence is deterministic, digest-bound to the manifest, GC run,
+  and retention record, and ignored by inspection when causal evidence is absent
+  or mismatched.
 - Selected-checkpoint recovery requires a matching published lifecycle digest
   record and validates referenced state/output payload visibility.
 - Checked recovery writes digest-bound append-only recovery transition evidence

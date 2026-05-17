@@ -11,9 +11,9 @@ use tempfile::TempDir;
 use tokio::sync::Barrier;
 use velorix_storage::{
     checkpoint_index::{
-        CheckpointLifecycleRecord, CheckpointLifecycleStatus, CheckpointManifestInspectionStatus,
-        CheckpointRecoveryMode, CheckpointRecoveryTransitionRecordV1, CheckpointRetentionRecordV1,
-        LatestCandidateMarker,
+        CheckpointGcTransition, CheckpointGcTransitionRecordV1, CheckpointLifecycleRecord,
+        CheckpointLifecycleStatus, CheckpointManifestInspectionStatus, CheckpointRecoveryMode,
+        CheckpointRecoveryTransitionRecordV1, CheckpointRetentionRecordV1, LatestCandidateMarker,
     },
     gc::{
         GarbageCollectionCandidate, GarbageCollectionCandidateKind, GarbageCollectionPlan,
@@ -944,6 +944,25 @@ async fn gc_execution_writes_retention_evidence_after_run_evidence_readback() {
         run.report.deleted[0].object_key,
         state_0.object_key().clone()
     );
+    let transition = publisher
+        .read_checkpoint_gc_transition_record(0, "gc-retired-run-0001")
+        .await
+        .unwrap();
+    assert_eq!(
+        transition,
+        CheckpointGcTransitionRecordV1::payload_released_from_retention_record(
+            &record,
+            "gc-retired-run-0001".to_string(),
+            transition.gc_run_digest.clone(),
+            transition.retention_record_digest.clone(),
+            transition.created_at.clone(),
+            transition.emitter.clone(),
+        )
+    );
+    assert_eq!(
+        transition.transition,
+        CheckpointGcTransition::PayloadReleased
+    );
     assert!(matches!(
         publisher.read_checkpoint_retention_record(1).await,
         Err(CheckpointPublishError::ObjectStore(
@@ -1171,6 +1190,15 @@ async fn checkpoint_admin_inspect_reports_retention_evidence_for_gc_retired_mani
         retired.retention_record.as_ref().unwrap().gc_run_id,
         "run-0001"
     );
+    assert_eq!(retired.gc_transition_records.len(), 1);
+    assert_eq!(
+        retired.gc_transition_records[0].transition_id,
+        "gc-retired-run-0001"
+    );
+    assert_eq!(
+        retired.gc_transition_records[0].transition,
+        CheckpointGcTransition::PayloadReleased
+    );
     assert!(matches!(
         retired.status,
         CheckpointManifestInspectionStatus::Invalid { .. }
@@ -1179,6 +1207,87 @@ async fn checkpoint_admin_inspect_reports_retention_evidence_for_gc_retired_mani
     assert!(matches!(
         report.manifests[1].status,
         CheckpointManifestInspectionStatus::Valid
+    ));
+}
+
+#[tokio::test]
+async fn checkpoint_admin_inspect_ignores_gc_transition_without_verified_causal_evidence() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let state = state_write(0, "state-0001", b"state-0");
+    let state_ref = publisher.write_state_object(&state).await.unwrap();
+    let manifest = manifest(0, state_ref);
+    publisher.publish_manifest(&manifest).await.unwrap();
+
+    let transition = CheckpointGcTransitionRecordV1::payload_released_from_retention_record(
+        &retention_record_for_test(&manifest, vec![state.object_key().clone()]),
+        "gc-retired-run-0001".to_string(),
+        "sha256:gc-run".to_string(),
+        "sha256:retention".to_string(),
+        "unix:0.000000009".to_string(),
+        "checkpoint-publisher-gc".to_string(),
+    );
+    store
+        .put(
+            &Path::from(
+                ObjectKey::checkpoint_gc_transition_record(0, "gc-retired-run-0001")
+                    .unwrap()
+                    .as_str(),
+            ),
+            Bytes::from(serde_json::to_vec(&transition).unwrap()).into(),
+        )
+        .await
+        .unwrap();
+
+    let report = publisher.inspect_checkpoints().await.unwrap();
+
+    assert!(report.manifests[0].retention_record.is_none());
+    assert!(report.manifests[0].gc_transition_records.is_empty());
+}
+
+#[tokio::test]
+async fn checkpoint_admin_inspect_degrades_when_gc_transition_record_read_fails() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let policy = GarbageCollectionPolicy {
+        retain_latest_manifests: 1,
+    };
+    let state_0 = state_write(0, "state-0001", b"state-0");
+    let state_1 = state_write(1, "state-0002", b"state-1");
+
+    let state_ref_0 = publisher.write_state_object(&state_0).await.unwrap();
+    publisher
+        .publish_manifest(&manifest(0, state_ref_0))
+        .await
+        .unwrap();
+    let state_ref_1 = publisher.write_state_object(&state_1).await.unwrap();
+    publisher
+        .publish_manifest(&manifest(1, state_ref_1))
+        .await
+        .unwrap();
+    let plan = publisher.plan_garbage_collection(policy).await.unwrap();
+    publisher
+        .execute_garbage_collection_plan_with_evidence("run-0001", policy, &plan)
+        .await
+        .unwrap();
+
+    let reader = CheckpointPublisher::new(Arc::new(ReadFailsStore::new(
+        Arc::clone(&store),
+        "v1/checkpoint-gc-transitions/00000000000000000000/transitions/gc-retired-run-0001.transition.json",
+    )));
+    let report = reader.inspect_checkpoints().await.unwrap();
+    let retired = report
+        .manifests
+        .iter()
+        .find(|manifest| manifest.checkpoint_version == 0)
+        .unwrap();
+
+    assert_eq!(report.latest_valid_checkpoint, Some(1));
+    assert!(retired.retention_record.is_some());
+    assert!(retired.gc_transition_records.is_empty());
+    assert!(matches!(
+        retired.status,
+        CheckpointManifestInspectionStatus::Invalid { .. }
     ));
 }
 
@@ -2097,6 +2206,153 @@ async fn checkpoint_recovery_transition_record_is_digest_bound_and_create_only()
     assert!(matches!(
         duplicate,
         CheckpointPublishError::CheckpointRecoveryTransitionAlreadyExists(_)
+    ));
+}
+
+#[tokio::test]
+async fn checkpoint_gc_transition_record_is_digest_bound() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let policy = GarbageCollectionPolicy {
+        retain_latest_manifests: 1,
+    };
+    let state_0 = state_write(0, "state-0001", b"state-0");
+    let state_1 = state_write(1, "state-0002", b"state-1");
+
+    let state_ref_0 = publisher.write_state_object(&state_0).await.unwrap();
+    let manifest_0 = manifest(0, state_ref_0);
+    publisher.publish_manifest(&manifest_0).await.unwrap();
+    let state_ref_1 = publisher.write_state_object(&state_1).await.unwrap();
+    publisher
+        .publish_manifest(&manifest(1, state_ref_1))
+        .await
+        .unwrap();
+
+    let plan = publisher.plan_garbage_collection(policy).await.unwrap();
+    publisher
+        .execute_garbage_collection_plan_with_evidence("run-0001", policy, &plan)
+        .await
+        .unwrap();
+
+    let transition = publisher
+        .read_checkpoint_gc_transition_record(0, "gc-retired-run-0001")
+        .await
+        .unwrap();
+    assert_eq!(
+        transition.manifest_digest,
+        manifest_digest_for_test(&manifest_0)
+    );
+
+    let object_key = ObjectKey::checkpoint_gc_transition_record(0, "gc-retired-run-0001").unwrap();
+    let mut mismatched = transition.clone();
+    mismatched.manifest_digest = "sha256:mismatched".to_string();
+    store
+        .put(
+            &Path::from(object_key.as_str()),
+            Bytes::from(serde_json::to_vec(&mismatched).unwrap()).into(),
+        )
+        .await
+        .unwrap();
+
+    let err = publisher
+        .read_checkpoint_gc_transition_record(0, "gc-retired-run-0001")
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("manifest digest"));
+
+    let mut mismatched = transition.clone();
+    mismatched.gc_run_digest = "sha256:mismatched".to_string();
+    store
+        .put(
+            &Path::from(object_key.as_str()),
+            Bytes::from(serde_json::to_vec(&mismatched).unwrap()).into(),
+        )
+        .await
+        .unwrap();
+
+    let err = publisher
+        .read_checkpoint_gc_transition_record(0, "gc-retired-run-0001")
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("run digest"));
+
+    let mut mismatched = transition;
+    mismatched.retention_record_digest = "sha256:mismatched".to_string();
+    store
+        .put(
+            &Path::from(object_key.as_str()),
+            Bytes::from(serde_json::to_vec(&mismatched).unwrap()).into(),
+        )
+        .await
+        .unwrap();
+
+    let err = publisher
+        .read_checkpoint_gc_transition_record(0, "gc-retired-run-0001")
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("retention digest"));
+}
+
+#[tokio::test]
+async fn gc_execution_rejects_conflicting_gc_transition_record() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let policy = GarbageCollectionPolicy {
+        retain_latest_manifests: 1,
+    };
+    let state_0 = state_write(0, "state-0001", b"state-0");
+    let state_1 = state_write(1, "state-0002", b"state-1");
+
+    let state_ref_0 = publisher.write_state_object(&state_0).await.unwrap();
+    let manifest_0 = manifest(0, state_ref_0);
+    publisher.publish_manifest(&manifest_0).await.unwrap();
+    let state_ref_1 = publisher.write_state_object(&state_1).await.unwrap();
+    publisher
+        .publish_manifest(&manifest(1, state_ref_1))
+        .await
+        .unwrap();
+
+    let mut conflicting = CheckpointGcTransitionRecordV1::payload_released_from_retention_record(
+        &retention_record_for_test(&manifest_0, vec![state_0.object_key().clone()]),
+        "gc-retired-run-0001".to_string(),
+        "sha256:gc-run".to_string(),
+        "sha256:retention".to_string(),
+        "unix:0.000000009".to_string(),
+        "checkpoint-publisher-gc".to_string(),
+    );
+    conflicting.gc_run_id = "run-9999".to_string();
+    conflicting.gc_run_key = ObjectKey::garbage_collection_run("run-9999").unwrap();
+    store
+        .put(
+            &Path::from(
+                ObjectKey::checkpoint_gc_transition_record(0, "gc-retired-run-0001")
+                    .unwrap()
+                    .as_str(),
+            ),
+            Bytes::from(serde_json::to_vec(&conflicting).unwrap()).into(),
+        )
+        .await
+        .unwrap();
+
+    let plan = publisher.plan_garbage_collection(policy).await.unwrap();
+    let err = publisher
+        .execute_garbage_collection_plan_with_evidence("run-0001", policy, &plan)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        CheckpointPublishError::CheckpointGcTransitionConflict(_)
+    ));
+    assert!(object_exists(store.as_ref(), state_0.object_key()).await);
+    assert!(matches!(
+        publisher.read_checkpoint_retention_record(0).await,
+        Err(CheckpointPublishError::ObjectStore(
+            object_store::Error::NotFound { .. }
+        ))
     ));
 }
 

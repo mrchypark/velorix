@@ -78,7 +78,7 @@ fn assert_capability_error(
     assert_eq!(err.required_capability(), expected);
 }
 
-fn expected_authoritative_namespaces() -> [AuthoritativeNamespace; 17] {
+fn expected_authoritative_namespaces() -> [AuthoritativeNamespace; 18] {
     [
         AuthoritativeNamespace::Ingest,
         AuthoritativeNamespace::IngestAdmission,
@@ -88,6 +88,7 @@ fn expected_authoritative_namespaces() -> [AuthoritativeNamespace; 17] {
         AuthoritativeNamespace::CheckpointIndex,
         AuthoritativeNamespace::CheckpointLifecycle,
         AuthoritativeNamespace::CheckpointRetention,
+        AuthoritativeNamespace::CheckpointGcTransition,
         AuthoritativeNamespace::CheckpointRecovery,
         AuthoritativeNamespace::Ownership,
         AuthoritativeNamespace::TableCatalog,
@@ -435,6 +436,26 @@ fn capability_gate_rejects_each_missing_capability_for_ingest_log() {
 
         assert_capability_error(err, &profile, required_capability);
     }
+}
+
+#[test]
+fn authoritative_capability_gate_rejects_missing_checkpoint_gc_transition_namespace_for_checkpoint_publisher(
+) {
+    let (_temp_dir, store) = temp_store();
+    let mut profiles = all_namespace_profiles();
+    profiles.remove(&AuthoritativeNamespace::CheckpointGcTransition);
+    let capabilities = AuthoritativeObjectStoreCapabilitiesV1::new(profiles);
+
+    let err = CheckpointPublisher::new_authoritative(store, &capabilities).unwrap_err();
+
+    assert!(matches!(
+        err,
+        CheckpointPublishError::AuthoritativeObjectStoreCapabilities(
+            AuthoritativeObjectStoreCapabilityError::MissingNamespace {
+                namespace: AuthoritativeNamespace::CheckpointGcTransition
+            }
+        )
+    ));
 }
 
 #[test]

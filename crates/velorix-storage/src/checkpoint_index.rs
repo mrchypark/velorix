@@ -10,6 +10,7 @@ use crate::{gc::GarbageCollectionPolicy, manifest::CheckpointManifest, object_ke
 
 pub const LATEST_CANDIDATE_SCHEMA_VERSION: u16 = 1;
 pub const CHECKPOINT_LIFECYCLE_SCHEMA_VERSION: u16 = 1;
+pub const CHECKPOINT_GC_TRANSITION_SCHEMA_VERSION: u16 = 1;
 pub const CHECKPOINT_RETENTION_SCHEMA_VERSION: u16 = 1;
 pub const CHECKPOINT_RECOVERY_TRANSITION_SCHEMA_VERSION: u16 = 1;
 
@@ -53,6 +54,26 @@ pub struct CheckpointRetentionRecordV1 {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct CheckpointGcTransitionRecordV1 {
+    pub schema_version: u16,
+    pub checkpoint_version: u64,
+    pub transition_id: String,
+    pub manifest_key: ObjectKey,
+    pub manifest_digest: String,
+    pub transition: CheckpointGcTransition,
+    pub gc_run_id: String,
+    pub gc_run_key: ObjectKey,
+    pub gc_run_digest: String,
+    pub retention_record_key: ObjectKey,
+    pub retention_record_digest: String,
+    pub retained_manifest_versions: Vec<u64>,
+    pub released_payload_keys: Vec<ObjectKey>,
+    pub created_at: String,
+    pub emitter: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CheckpointRecoveryTransitionRecordV1 {
     pub schema_version: u16,
     pub checkpoint_version: u64,
@@ -69,6 +90,12 @@ pub struct CheckpointRecoveryTransitionRecordV1 {
 #[serde(rename_all = "snake_case")]
 pub enum CheckpointLifecycleStatus {
     Published,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointGcTransition {
+    PayloadReleased,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +119,7 @@ pub struct CheckpointManifestInspection {
     pub checkpoint_version: u64,
     pub manifest_key: ObjectKey,
     pub lifecycle_status: Option<CheckpointLifecycleStatus>,
+    pub gc_transition_records: Vec<CheckpointGcTransitionRecordV1>,
     pub retention_record: Option<CheckpointRetentionRecordV1>,
     pub recovery_transition_records: Vec<CheckpointRecoveryTransitionRecordV1>,
     pub status: CheckpointManifestInspectionStatus,
@@ -171,6 +199,42 @@ impl CheckpointRetentionRecordV1 {
 
     pub fn validate_schema(&self) -> bool {
         self.schema_version == CHECKPOINT_RETENTION_SCHEMA_VERSION
+    }
+}
+
+impl CheckpointGcTransitionRecordV1 {
+    pub fn payload_released_from_retention_record(
+        retention: &CheckpointRetentionRecordV1,
+        transition_id: String,
+        gc_run_digest: String,
+        retention_record_digest: String,
+        created_at: String,
+        emitter: String,
+    ) -> Self {
+        Self {
+            schema_version: CHECKPOINT_GC_TRANSITION_SCHEMA_VERSION,
+            checkpoint_version: retention.checkpoint_version,
+            transition_id,
+            manifest_key: retention.manifest_key.clone(),
+            manifest_digest: retention.manifest_digest.clone(),
+            transition: CheckpointGcTransition::PayloadReleased,
+            gc_run_id: retention.gc_run_id.clone(),
+            gc_run_key: ObjectKey::garbage_collection_run(&retention.gc_run_id)
+                .expect("validated retention records have valid GC run ids"),
+            gc_run_digest,
+            retention_record_key: ObjectKey::checkpoint_retention_record(
+                retention.checkpoint_version,
+            ),
+            retention_record_digest,
+            retained_manifest_versions: retention.retained_manifest_versions.clone(),
+            released_payload_keys: retention.deleted_candidate_keys.clone(),
+            created_at,
+            emitter,
+        }
+    }
+
+    pub fn validate_schema(&self) -> bool {
+        self.schema_version == CHECKPOINT_GC_TRANSITION_SCHEMA_VERSION
     }
 }
 
