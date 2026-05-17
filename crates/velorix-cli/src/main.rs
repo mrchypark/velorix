@@ -885,7 +885,7 @@ fn validate_production_gc_run_evidence_artifact(
 fn reject_local_readiness_artifact(evidence_kind: &str, path: &Path) -> anyhow::Result<()> {
     if matches!(
         evidence_kind,
-        "floci_s3_compatible_gate" | "local_benchmark_gate"
+        "local_s3_compatible_gate" | "generic_local_s3_compatible_gate" | "local_benchmark_gate"
     ) {
         bail!(
             "{} is local-scoped evidence ({evidence_kind}) and cannot satisfy release readiness",
@@ -953,7 +953,6 @@ fn is_local_dev_authority_store_id(value: &str) -> bool {
         "file://",
         "localhost",
         "127.0.0.1",
-        "floci",
         "vind",
         "vcluster",
         "emulator",
@@ -3728,21 +3727,21 @@ mod tests {
     }
 
     #[test]
-    fn readiness_report_rejects_floci_artifact_as_s3_release_benchmark_evidence() {
+    fn readiness_report_rejects_generic_local_s3_artifact_as_s3_release_benchmark_evidence() {
         let dir = tempdir().unwrap();
         let readiness = dir.path().join("readiness.json");
-        let s3_gate = dir.path().join("floci.json");
+        let s3_gate = dir.path().join("local-s3-gate.json");
         fs::write(&readiness, readiness_json()).unwrap();
         fs::write(
             &s3_gate,
             serde_json::json!({
                 "schema_version": 1,
-                "evidence_kind": "floci_s3_compatible_gate",
+                "evidence_kind": "local_s3_compatible_gate",
                 "readiness_evidence_kind": [
                     "s3_compatible",
                     "s3_compatible_integration_harness"
                 ],
-                "scope": "local floci S3-compatible emulator evidence"
+                "scope": "local S3-compatible emulator evidence"
             })
             .to_string(),
         )
@@ -3767,6 +3766,28 @@ mod tests {
             Path::new("target/velorix-k8s/vind-k8s-gate-evidence.json"),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn readiness_release_artifact_filter_accepts_rustfs_gate_evidence() {
+        reject_local_readiness_artifact(
+            "rustfs_s3_compatible_gate",
+            Path::new("target/velorix-s3/rustfs-s3-gate-evidence.json"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn readiness_report_accepts_rustfs_named_s3_release_benchmark_evidence() {
+        let dir = tempdir().unwrap();
+        let s3_gate = dir.path().join("rustfs-s3-release.json");
+        let mut artifact: serde_json::Value =
+            serde_json::from_str(&s3_release_benchmark_gate_json()).unwrap();
+        artifact["scope"] =
+            serde_json::json!("RustFS S3-compatible live evidence through the configured S3 API");
+        fs::write(&s3_gate, artifact.to_string()).unwrap();
+
+        validate_s3_release_benchmark_gate_evidence_artifact(&s3_gate).unwrap();
     }
 
     #[test]

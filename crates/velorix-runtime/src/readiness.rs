@@ -542,7 +542,6 @@ fn push_placeholder_evidence_check(
         ("local-only", "local-only"),
         ("local only", "local-only"),
         ("local filesystem", "local filesystem"),
-        ("floci", "local Floci emulator"),
         ("emulator", "emulator"),
     ] {
         if evidence.contains(marker) {
@@ -559,7 +558,6 @@ fn is_local_dev_authority_store(authority_store_id: &str) -> bool {
         "file://",
         "localhost",
         "127.0.0.1",
-        "floci",
         "emulator",
         "local-only",
         "local only",

@@ -8,6 +8,19 @@ or a claim that Velorix is production-ready today.
 
 Status values are limited to `complete`, `partial`, and `missing`.
 
+Ingest blocker marker, 2026-05-18: the remaining ingest row blocker is live
+Kubernetes-deployed writer/operator evidence, not another local/provider-only
+startup preflight. The row can move only after a real writer/operator topology
+uses `DeployedIngestWriterRuntime` before serving writer Pods and the configured
+vind gate records that topology in `target/velorix-k8s/vind-k8s-gate-evidence.json`
+from `scripts/run-vind-k8s-gate.sh` with a deployable writer image/config such
+as `VELORIX_K8S_INGEST_WRITER_IMAGE`; RustFS-backed S3 evidence must come from
+`scripts/run-rustfs-s3-gate.sh` and
+`target/velorix-s3/rustfs-s3-gate-evidence.json`. The existing test-process
+runtime append and run-local authority checks stay useful diagnostics but do not
+close the deployed writer/operator or multi-pod overlap/adjacent/crash/restart/
+leader-handoff requirement.
+
 Object-store capability evidence note, 2026-05-15: the live
 vind-gated Kubernetes ingest-admission and worker-shard test entrypoints now
 route provider and epoch-store construction through

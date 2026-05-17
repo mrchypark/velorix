@@ -33,7 +33,7 @@ fn readiness_report_blocks_local_dev_authority_store_id() {
         "file:///tmp/velorix",
         "http://localhost:9000/velorix",
         "http://127.0.0.1:9000/velorix",
-        "floci://velorix",
+        "local-emulator://velorix",
         "local filesystem authority",
     ] {
         let report = report_with_identity("prod-a", authority_store_id);
@@ -442,16 +442,13 @@ fn readiness_report_blocks_pass_check_with_local_only_evidence_text() {
 }
 
 #[test]
-fn readiness_report_blocks_pass_check_with_floci_evidence_text() {
-    let report = report_with_evidence(
-        "capability_status",
-        "Floci S3-compatible emulator gate passed",
-    );
+fn readiness_report_blocks_pass_check_with_generic_emulator_evidence_text() {
+    let report = report_with_evidence("capability_status", "S3-compatible emulator gate passed");
 
     assert!(!report.production_ready);
     assert_eq!(
         report.blocking_reasons,
-        vec!["capability_status uses local Floci emulator evidence"]
+        vec!["capability_status uses emulator evidence"]
     );
 }
 

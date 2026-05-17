@@ -397,7 +397,7 @@ async fn applied_worker_shard_event_wires_reconciled_start_to_kubernetes_pod_exe
     let executor = KubernetesPodWorkerShardCommandExecutor::new(
         client,
         "workers",
-        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+        WorkerShardPodTemplate::new("ghcr.io/velorix/velorix-worker:1.0.0").unwrap(),
     );
 
     let output = handle_worker_shard_event_with_command_executor(
@@ -560,7 +560,7 @@ async fn kubernetes_worker_shard_operator_runtime_uses_checked_epoch_store_from_
         client,
         "default",
         &components,
-        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+        WorkerShardPodTemplate::new("ghcr.io/velorix/velorix-worker:1.0.0").unwrap(),
     )
     .unwrap();
 
@@ -638,7 +638,7 @@ async fn kubernetes_worker_shard_operator_runtime_rejects_shard_authority_mismat
         client,
         "default",
         &components,
-        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+        WorkerShardPodTemplate::new("ghcr.io/velorix/velorix-worker:1.0.0").unwrap(),
     )
     .unwrap();
 
@@ -926,7 +926,7 @@ async fn kubernetes_worker_shard_startup_resync_reconciles_before_watch_entry() 
         client,
         "default",
         &components,
-        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+        WorkerShardPodTemplate::new("ghcr.io/velorix/velorix-worker:1.0.0").unwrap(),
         |_| input(None),
         WorkerShardResyncOptions::default(),
     )
@@ -992,7 +992,7 @@ async fn kubernetes_worker_shard_startup_resync_rejects_authority_mismatch_befor
         client,
         "default",
         &components,
-        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+        WorkerShardPodTemplate::new("ghcr.io/velorix/velorix-worker:1.0.0").unwrap(),
         |_| input(None),
         WorkerShardResyncOptions::default(),
     )
@@ -1036,7 +1036,7 @@ async fn kubernetes_worker_shard_startup_resync_bound_failure_does_not_enter_wor
         client,
         "default",
         &components,
-        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+        WorkerShardPodTemplate::new("ghcr.io/velorix/velorix-worker:1.0.0").unwrap(),
         |_| input(None),
         WorkerShardResyncOptions {
             max_pages: 0,
@@ -1080,7 +1080,7 @@ async fn kubernetes_worker_shard_periodic_resync_requeues_bounded_authority_chec
         client,
         "default",
         &components,
-        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+        WorkerShardPodTemplate::new("ghcr.io/velorix/velorix-worker:1.0.0").unwrap(),
         |_| input(None),
         WorkerShardPeriodicResyncOptions {
             interval: Duration::from_millis(1),
@@ -1150,7 +1150,7 @@ async fn kubernetes_worker_shard_periodic_resync_rejects_unbounded_summary_colle
         client,
         "default",
         &components,
-        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+        WorkerShardPodTemplate::new("ghcr.io/velorix/velorix-worker:1.0.0").unwrap(),
         |_| input(None),
         WorkerShardPeriodicResyncOptions {
             interval: Duration::from_millis(1),
@@ -1189,7 +1189,7 @@ async fn worker_shard_lifecycle_runs_initial_resync_before_stream_events() {
         client.clone(),
         "default",
         &components,
-        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+        WorkerShardPodTemplate::new("ghcr.io/velorix/velorix-worker:1.0.0").unwrap(),
     )
     .unwrap();
 
@@ -1286,7 +1286,7 @@ async fn worker_shard_lifecycle_rejects_zero_periodic_interval_before_initial_re
         client.clone(),
         "default",
         &components,
-        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+        WorkerShardPodTemplate::new("ghcr.io/velorix/velorix-worker:1.0.0").unwrap(),
     )
     .unwrap();
 
@@ -1339,7 +1339,7 @@ async fn worker_shard_lifecycle_rejects_initial_object_bound_before_initial_resy
         client.clone(),
         "default",
         &components,
-        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+        WorkerShardPodTemplate::new("ghcr.io/velorix/velorix-worker:1.0.0").unwrap(),
     )
     .unwrap();
 
@@ -1392,7 +1392,7 @@ async fn worker_shard_lifecycle_shutdown_before_startup_skips_kubernetes_side_ef
         client.clone(),
         "default",
         &components,
-        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+        WorkerShardPodTemplate::new("ghcr.io/velorix/velorix-worker:1.0.0").unwrap(),
     )
     .unwrap();
 
@@ -1467,7 +1467,7 @@ async fn worker_shard_lifecycle_accepts_and_polls_non_unpin_stream() {
         client.clone(),
         "default",
         &components,
-        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+        WorkerShardPodTemplate::new("ghcr.io/velorix/velorix-worker:1.0.0").unwrap(),
     )
     .unwrap();
     let event_polled = Arc::new(Mutex::new(false));
@@ -1522,7 +1522,7 @@ async fn worker_shard_lifecycle_periodic_resync_waits_interval_after_initial_res
         client.clone(),
         "default",
         &components,
-        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+        WorkerShardPodTemplate::new("ghcr.io/velorix/velorix-worker:1.0.0").unwrap(),
     )
     .unwrap();
 
@@ -1592,7 +1592,7 @@ async fn worker_shard_lifecycle_periodic_resync_runs_until_shutdown_without_summ
         client.clone(),
         "default",
         &components,
-        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+        WorkerShardPodTemplate::new("ghcr.io/velorix/velorix-worker:1.0.0").unwrap(),
     )
     .unwrap();
 
@@ -1764,7 +1764,7 @@ async fn worker_shard_lifecycle_authority_mismatch_fails_before_pod_create() {
         client.clone(),
         "default",
         &components,
-        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+        WorkerShardPodTemplate::new("ghcr.io/velorix/velorix-worker:1.0.0").unwrap(),
     )
     .unwrap();
 
@@ -1818,7 +1818,7 @@ fn worker_shard_scoped_pod_name_separates_same_owner_epoch_across_shards() {
 
 #[tokio::test]
 async fn scoped_kubernetes_pod_executor_rejects_conflicting_existing_pod_identity() {
-    let template = WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap();
+    let template = WorkerShardPodTemplate::new("ghcr.io/velorix/velorix-worker:1.0.0").unwrap();
     let requested = runtime_identity_from_worker_shard(&shard(), "worker-a", 1).unwrap();
     let conflicting = runtime_identity_from_worker_shard(
         &shard_with_stream_partition("orders-west", 1),
@@ -1842,7 +1842,7 @@ async fn kubernetes_pod_worker_shard_executor_deletes_stop_pod_by_owner_epoch_na
     let executor = KubernetesPodWorkerShardCommandExecutor::new(
         client,
         "workers",
-        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+        WorkerShardPodTemplate::new("ghcr.io/velorix/velorix-worker:1.0.0").unwrap(),
     );
 
     executor.stop_worker("Worker_A/West", 42).await.unwrap();
@@ -1866,7 +1866,7 @@ async fn kubernetes_pod_worker_shard_executor_treats_duplicate_start_as_idempote
     let executor = KubernetesPodWorkerShardCommandExecutor::new(
         client,
         "workers",
-        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+        WorkerShardPodTemplate::new("ghcr.io/velorix/velorix-worker:1.0.0").unwrap(),
     );
 
     executor.start_worker("worker-a", 1).await.unwrap();
@@ -1878,7 +1878,7 @@ async fn kubernetes_pod_worker_shard_executor_treats_missing_stop_as_idempotent(
     let executor = KubernetesPodWorkerShardCommandExecutor::new(
         client,
         "workers",
-        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+        WorkerShardPodTemplate::new("ghcr.io/velorix/velorix-worker:1.0.0").unwrap(),
     );
 
     executor.stop_worker("worker-a", 1).await.unwrap();
@@ -1890,7 +1890,7 @@ async fn kubernetes_pod_worker_shard_executor_maps_api_failure_to_typed_error() 
     let executor = KubernetesPodWorkerShardCommandExecutor::new(
         client,
         "workers",
-        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+        WorkerShardPodTemplate::new("ghcr.io/velorix/velorix-worker:1.0.0").unwrap(),
     );
 
     let error = executor.start_worker("worker-a", 1).await.unwrap_err();
@@ -1910,7 +1910,7 @@ async fn scoped_kubernetes_pod_executor_stops_stale_pod_before_replacement_start
     let executor = KubernetesPodWorkerShardScopedCommandExecutor::new(
         client,
         "workers",
-        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+        WorkerShardPodTemplate::new("ghcr.io/velorix/velorix-worker:1.0.0").unwrap(),
     );
 
     let output = handle_worker_shard_event_with_scoped_command_executor_and_authority(
@@ -2040,7 +2040,7 @@ async fn scoped_kubernetes_pod_executor_stops_running_pod_on_lease_loss_without_
     let executor = KubernetesPodWorkerShardScopedCommandExecutor::new(
         client,
         "workers",
-        WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0").unwrap(),
+        WorkerShardPodTemplate::new("ghcr.io/velorix/velorix-worker:1.0.0").unwrap(),
     );
 
     let error = handle_worker_shard_event_with_scoped_command_executor_and_authority(
@@ -2616,7 +2616,7 @@ fn worker_shard_pod_name_is_stable_dns_label_for_unsafe_owner_id() {
 
 #[test]
 fn worker_shard_pod_template_builds_start_pod_with_owner_context() {
-    let template = WorkerShardPodTemplate::new("ghcr.io/floci-io/velorix-worker:1.0.0")
+    let template = WorkerShardPodTemplate::new("ghcr.io/velorix/velorix-worker:1.0.0")
         .unwrap()
         .with_command(["velorix-worker"])
         .with_args(["serve"])
@@ -2642,7 +2642,7 @@ fn worker_shard_pod_template_builds_start_pod_with_owner_context() {
     assert_eq!(container.name, "velorix-worker");
     assert_eq!(
         container.image.as_deref(),
-        Some("ghcr.io/floci-io/velorix-worker:1.0.0")
+        Some("ghcr.io/velorix/velorix-worker:1.0.0")
     );
     assert_eq!(
         container.command.as_deref(),
