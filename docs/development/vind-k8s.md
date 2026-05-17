@@ -72,10 +72,11 @@ VELORIX_K8S_INTEGRATION=1 VELORIX_K8S_NAMESPACE=velorix-live \
 This checks Kubernetes API reachability, exercises
 `IngestAdmissionCoordinatorProvider::startup()` against a run-local object-store
 authority, constructs `DeployedIngestWriterRuntime` from
-`OperatorAuthorityStartupComponents` before catalog-backed append, persists a
-run-local orphan expiry decision, and verifies a restarted production provider
-reconstructs the expired orphan as non-active. It does not exercise distributed
-or multi-pod admission races.
+`OperatorAuthorityStartupComponents` before catalog-backed append in the test
+process, persists a run-local orphan expiry decision, and verifies a restarted
+production provider reconstructs the expired orphan as non-active. It does not
+exercise a Kubernetes-deployed writer Pod/operator topology, distributed
+admission races, or multi-pod admission races.
 
 Run the full vind gate:
 

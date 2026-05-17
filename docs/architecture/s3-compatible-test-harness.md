@@ -172,11 +172,11 @@ gate on a GitHub-hosted runner and uploads the JSON as
 Its benchmark input defaults off so the fast storage/runtime API behavior gate
 can be reviewed separately from slower benchmark output. The generated artifact
 records the `s3_compatible` and `s3_compatible_integration_harness` readiness
-evidence kinds plus `s3_compatible_ingest_admission_crash_restart` for the
-indexed admission crash/restart path. RustFS evidence counts as live
-S3-compatible evidence for Velorix readiness when it is produced through the S3
-API, with local filesystem and generic emulator evidence still rejected by
-readiness validators.
+evidence kinds plus gate-local detail
+`s3_compatible_ingest_admission_crash_restart` for the indexed admission
+crash/restart path. RustFS evidence counts as live S3-compatible evidence for
+Velorix readiness when it is produced through the S3 API, with local filesystem
+and generic emulator evidence still rejected by readiness validators.
 
 ## GCS Emulator Boundary
 

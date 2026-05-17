@@ -224,8 +224,10 @@ evidence = {
         "kubernetes_worker_shard_live_lease_loss_stop_without_replacement",
         "kubernetes_worker_shard_local_filesystem_durable_epoch_restart_read_back",
         "kubernetes_ingest_admission_startup_preflight",
-        "kubernetes_ingest_admission_run_local_expiry_restart",
-        "kubernetes_deployed_ingest_writer_preflight"
+        "kubernetes_ingest_admission_run_local_expiry_restart"
+    ],
+    "gate_detail_kind": [
+        "kubernetes_ingest_writer_runtime_preflight"
     ],
     "cluster": cluster,
     "context": context,
