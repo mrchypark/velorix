@@ -379,6 +379,103 @@ async fn deployed_ingest_writer_runtime_rejects_malformed_admission_before_appen
 }
 
 #[test]
+fn deployed_ingest_writer_runtime_source_requires_startup_components() {
+    let source_code = include_str!("../src/ingest_writer.rs");
+    let runtime_body = function_body(source_code, "pub async fn from_startup_components(")
+        .expect("deployed ingest writer runtime assembly function should exist");
+
+    assert!(
+        runtime_body.contains("startup_components: &OperatorAuthorityStartupComponents"),
+        "deployed ingest writer runtime assembly must require checked startup components"
+    );
+    assert!(
+        runtime_body.contains("startup_components.ingest_admission_coordinator_provider()"),
+        "deployed ingest writer runtime must construct admission from startup components"
+    );
+    assert!(
+        runtime_body.contains("provider.coordinator_after_startup_reconstruction().await?"),
+        "deployed ingest writer runtime must reconstruct admission before append is exposed"
+    );
+    for forbidden_call in [
+        "IngestAdmissionCoordinator::new_checked(",
+        "IngestAdmissionCoordinatorProvider::from_authority_parts(",
+        "validate_operator_authority(",
+    ] {
+        assert!(
+            !runtime_body.contains(forbidden_call),
+            "deployed ingest writer runtime must not bypass OperatorAuthorityStartupComponents with {forbidden_call}",
+        );
+    }
+}
+
+#[test]
+fn k8s_authority_part_factories_are_startup_token_gated() {
+    let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let startup_source = strip_line_comments(
+        &fs::read_to_string(src_dir.join("startup.rs")).expect("read startup source"),
+    );
+    let stream_watch_source = strip_line_comments(
+        &fs::read_to_string(src_dir.join("stream_watch.rs")).expect("read stream-watch source"),
+    );
+    let worker_shard_source = strip_line_comments(
+        &fs::read_to_string(src_dir.join("worker_shard.rs")).expect("read worker-shard source"),
+    );
+
+    assert!(
+        startup_source.contains("pub(crate) struct ValidatedStartupAuthorityToken"),
+        "startup module must own the crate-visible validated startup token type"
+    );
+    assert!(
+        startup_source.contains("fn new() -> Self")
+            && !startup_source.contains("pub(crate) fn new() -> Self"),
+        "validated startup token construction must remain private to startup.rs"
+    );
+    assert!(
+        stream_watch_source
+            .matches("_token: ValidatedStartupAuthorityToken")
+            .count()
+            >= 2,
+        "stream-watch authority-part factories must require the startup token"
+    );
+    assert!(
+        worker_shard_source
+            .matches("_token: ValidatedStartupAuthorityToken")
+            .count()
+            >= 1,
+        "worker-shard authority-part factory must require the startup token"
+    );
+
+    let mut violations = Vec::new();
+    for entry in fs::read_dir(&src_dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
+            continue;
+        }
+        if path.file_name().and_then(|name| name.to_str()) == Some("startup.rs") {
+            continue;
+        }
+
+        let source_code = strip_line_comments(&fs::read_to_string(&path).unwrap());
+        for (line_number, line) in source_code.lines().enumerate() {
+            if line.contains("from_authority_parts(") && !line.contains("fn from_authority_parts(")
+            {
+                violations.push(format!(
+                    "{}:{} calls crate-local authority-part factory outside startup.rs",
+                    path.strip_prefix(&src_dir).unwrap_or(&path).display(),
+                    line_number + 1
+                ));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "k8s authority-part factories must only be called by OperatorAuthorityStartupComponents:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
 fn live_gate_sources_construct_production_components_through_operator_startup_components() {
     for (path, source, forbidden) in [
         (

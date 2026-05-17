@@ -21,7 +21,7 @@ use velorix_storage::{
 use crate::{
     controller::{reconcile_stream, AuthoritySnapshot, ControllerAction},
     crd::{CheckpointRef, ObjectStoreAuthorityRef, RelationVersionRef, VelorixStream},
-    startup::OperatorAuthorityStartupComponents,
+    startup::{OperatorAuthorityStartupComponents, ValidatedStartupAuthorityToken},
     status::{KubeStreamStatusApi, KubernetesStatusError, StreamStatusApi, StreamStatusWriter},
 };
 
@@ -55,6 +55,7 @@ pub struct IngestAdmissionCoordinatorProvider {
 
 impl RelationCatalogSnapshotProvider {
     pub(crate) fn from_authority_parts(
+        _token: ValidatedStartupAuthorityToken,
         authority: ObjectStoreAuthorityRef,
         store: Arc<dyn object_store::ObjectStore>,
         capabilities: Arc<AuthoritativeObjectStoreCapabilitiesV1>,
@@ -73,6 +74,7 @@ impl RelationCatalogSnapshotProvider {
 
 impl IngestAdmissionCoordinatorProvider {
     pub(crate) fn from_authority_parts(
+        _token: ValidatedStartupAuthorityToken,
         authority: ObjectStoreAuthorityRef,
         store: Arc<dyn object_store::ObjectStore>,
         capabilities: Arc<AuthoritativeObjectStoreCapabilitiesV1>,

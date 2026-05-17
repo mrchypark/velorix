@@ -40,8 +40,13 @@ contract now also pins the worker-shard runtime assembly surface itself:
 `resync_worker_shards_before_watch_with_kubernetes_runtime`,
 `resync_worker_shards_periodically_with_kubernetes_runtime`, and the
 resync-then-watch wrapper must route ownership epoch-store construction through
-`OperatorAuthorityStartupComponents` and keep the validated authority on the
-runtime. This narrows the remaining runtime-construction bypass risk without
+`OperatorAuthorityStartupComponents`; deployed ingest-writer runtime assembly
+now has the same source contract and must reconstruct admission from those
+startup components before exposing append. The crate-local authority-part
+factories for relation snapshots, ingest admission, and worker-shard epoch
+stores also require a private startup token so new k8s runtime code cannot call
+them directly with caller-supplied store/capability pairs. This narrows the
+remaining runtime-construction bypass risk without
 marking the row complete; deployed runtime assembly and non-local/live authority
 evidence are still required.
 

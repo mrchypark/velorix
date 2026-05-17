@@ -41,7 +41,7 @@ use crate::{
         ownership_epoch_record_from_grant, partition_lease_identity, KubeLeaseApi,
         KubernetesPartitionLeaseClient,
     },
-    startup::OperatorAuthorityStartupComponents,
+    startup::{OperatorAuthorityStartupComponents, ValidatedStartupAuthorityToken},
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -790,6 +790,7 @@ impl CheckpointPublisherEpochStore {
     }
 
     pub(crate) fn from_authority_parts(
+        _token: ValidatedStartupAuthorityToken,
         store: Arc<dyn object_store::ObjectStore>,
         capabilities: Arc<AuthoritativeObjectStoreCapabilitiesV1>,
     ) -> Result<Self, WorkerShardError> {

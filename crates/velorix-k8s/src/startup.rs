@@ -73,6 +73,17 @@ pub struct OperatorAuthorityStartupComponents {
     capabilities: Arc<AuthoritativeObjectStoreCapabilitiesV1>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ValidatedStartupAuthorityToken {
+    _private: (),
+}
+
+impl ValidatedStartupAuthorityToken {
+    fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct OperatorAuthorityStartupReport {
     pub ingest_admission: velorix_storage::log::IngestAdmissionReconstructionReport,
@@ -98,6 +109,7 @@ impl OperatorAuthorityStartupComponents {
 
     pub fn relation_snapshot_provider(&self) -> RelationCatalogSnapshotProvider {
         RelationCatalogSnapshotProvider::from_authority_parts(
+            ValidatedStartupAuthorityToken::new(),
             self.authority.clone(),
             Arc::clone(&self.store),
             Arc::clone(&self.capabilities),
@@ -106,6 +118,7 @@ impl OperatorAuthorityStartupComponents {
 
     pub fn ingest_admission_coordinator_provider(&self) -> IngestAdmissionCoordinatorProvider {
         IngestAdmissionCoordinatorProvider::from_authority_parts(
+            ValidatedStartupAuthorityToken::new(),
             self.authority.clone(),
             Arc::clone(&self.store),
             Arc::clone(&self.capabilities),
@@ -116,6 +129,7 @@ impl OperatorAuthorityStartupComponents {
         &self,
     ) -> Result<CheckpointPublisherEpochStore, WorkerShardError> {
         CheckpointPublisherEpochStore::from_authority_parts(
+            ValidatedStartupAuthorityToken::new(),
             Arc::clone(&self.store),
             Arc::clone(&self.capabilities),
         )
