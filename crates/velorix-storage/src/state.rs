@@ -204,6 +204,15 @@ pub enum CheckpointPublishError {
         object_id: String,
         ref_type: StateRefType,
     },
+    #[error(
+        "production checkpoint {checkpoint_version} cannot extend checkpoint {parent_checkpoint} with state object `{object_id}` using `{ref_type:?}` lineage"
+    )]
+    ProductionMixedRawSlateDbLineage {
+        checkpoint_version: u64,
+        parent_checkpoint: u64,
+        object_id: String,
+        ref_type: StateRefType,
+    },
     #[error("referenced output object `{0}` is missing")]
     MissingOutputObject(ObjectKey),
     #[error("state object `{object_key}` owner claim mismatch: expected `{expected}`, actual `{actual:?}`")]
@@ -520,6 +529,8 @@ impl CheckpointPublisher {
         self.validate_manifest_production_owner_claims_current(manifest, owner_claim)
             .await?;
         self.validate_production_state_refs_are_slatedb_checkpoints(manifest)?;
+        self.validate_production_lineage_state_refs_are_slatedb_checkpoints(manifest)
+            .await?;
 
         self.publish_manifest(manifest).await
     }
@@ -1886,6 +1897,34 @@ impl CheckpointPublisher {
                     },
                 );
             }
+        }
+
+        Ok(())
+    }
+
+    async fn validate_production_lineage_state_refs_are_slatedb_checkpoints(
+        &self,
+        manifest: &CheckpointManifest,
+    ) -> Result<(), CheckpointPublishError> {
+        let mut ancestor_checkpoint = manifest.parent_checkpoint;
+
+        while let Some(parent_checkpoint) = ancestor_checkpoint {
+            let parent = self
+                .read_parent_manifest(manifest.checkpoint_version, parent_checkpoint)
+                .await?;
+
+            for state_ref in &parent.state_objects {
+                if state_ref.ref_type != StateRefType::SlateDbCheckpoint {
+                    return Err(CheckpointPublishError::ProductionMixedRawSlateDbLineage {
+                        checkpoint_version: manifest.checkpoint_version,
+                        parent_checkpoint,
+                        object_id: state_ref.object_id.clone(),
+                        ref_type: state_ref.ref_type,
+                    });
+                }
+            }
+
+            ancestor_checkpoint = parent.parent_checkpoint;
         }
 
         Ok(())

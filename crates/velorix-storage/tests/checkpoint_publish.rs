@@ -3609,6 +3609,51 @@ async fn checkpoint_publish_production_fenced_publish_succeeds_with_slatedb_stat
 }
 
 #[tokio::test]
+async fn checkpoint_publish_production_fenced_manifest_rejects_raw_parent_lineage_before_write() {
+    let (_temp_dir, store) = temp_store();
+    let bootstrap_publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let parent_state = state_write(0, "state-0001", b"state-0");
+    let parent_ref = bootstrap_publisher
+        .write_state_object(&parent_state)
+        .await
+        .unwrap();
+    let parent = manifest(0, parent_ref);
+    bootstrap_publisher.publish_manifest(&parent).await.unwrap();
+
+    let production_publisher =
+        CheckpointPublisher::with_slatedb_state_store(Arc::clone(&store), "v1/slatedb/state")
+            .await
+            .unwrap();
+    let claim = owner_claim("worker-a", 1);
+    production_publisher
+        .create_ownership_epoch_record(&ownership_record("orders", 0, "worker-a", 1))
+        .await
+        .unwrap();
+    let child_state = fenced_state_write(1, "state-0002", claim.clone(), b"state-1");
+    let child_ref = production_publisher
+        .write_state_object_fenced_production(&child_state, "orders", &claim)
+        .await
+        .unwrap();
+    let child = manifest(1, child_ref);
+
+    let err = production_publisher
+        .publish_manifest_fenced_production(&child, &claim)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        CheckpointPublishError::ProductionMixedRawSlateDbLineage {
+            checkpoint_version: 1,
+            parent_checkpoint: 0,
+            ref object_id,
+            ref_type: StateRefType::RawObject
+        } if object_id == "state-0001"
+    ));
+    assert!(!object_exists(store.as_ref(), &child.object_key()).await);
+}
+
+#[tokio::test]
 async fn checkpoint_publish_rejects_stale_owner_when_newer_output_owner_claim_is_published() {
     let (_temp_dir, store) = temp_store();
     let publisher = CheckpointPublisher::new(Arc::clone(&store));

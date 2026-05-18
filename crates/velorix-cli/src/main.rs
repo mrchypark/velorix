@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    env,
     fmt::Write as _,
     fs,
     path::Path,
@@ -12,7 +13,10 @@ use std::{
 
 use anyhow::{bail, Context};
 use clap::{CommandFactory, Parser, Subcommand};
-use object_store::{local::LocalFileSystem, ObjectStore};
+use object_store::{
+    aws::AmazonS3Builder, local::LocalFileSystem, path::Path as ObjectStorePath,
+    prefix::PrefixStore, ObjectStore,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use velorix_runtime::benchmark_gate::{
@@ -141,6 +145,16 @@ enum Command {
         retain_latest_manifests: usize,
         #[arg(long)]
         run_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    GcProductionEvidence {
+        #[arg(long)]
+        deployment_id: String,
+        #[arg(long)]
+        authority_store_id: String,
+        #[arg(long)]
+        gc_run_id: String,
         #[arg(long)]
         json: bool,
     },
@@ -333,6 +347,30 @@ async fn main() -> anyhow::Result<()> {
                 println!("{}", format_gc_run_json(&run)?);
             } else {
                 print!("{}", format_gc_run(&run));
+            }
+        }
+        Some(Command::GcProductionEvidence {
+            deployment_id,
+            authority_store_id,
+            gc_run_id,
+            json,
+        }) => {
+            validate_production_gc_authority_store_id(&authority_store_id)?;
+            let store = production_gc_authority_store_from_env()
+                .context("failed to construct S3-compatible production GC authority store")?;
+            let artifact = generate_production_gc_run_evidence(
+                store,
+                deployment_id,
+                authority_store_id,
+                gc_run_id,
+            )
+            .await
+            .context("failed to verify production GC run evidence")?;
+
+            if json {
+                println!("{}", format_production_gc_run_evidence_json(&artifact)?);
+            } else {
+                print!("{}", format_production_gc_run_evidence(&artifact));
             }
         }
         Some(Command::BenchmarkValidate { result }) => {
@@ -542,7 +580,11 @@ fn validate_readiness_release_artifacts(
         &artifacts.feldera_artifact_hash_evidence,
         &artifacts.feldera_release_provenance_evidence,
     ) {
-        validate_feldera_release_evidence_artifacts(hash_path, provenance_path)?;
+        validate_feldera_release_evidence_artifacts(
+            hash_path,
+            provenance_path,
+            artifacts.release_commit.as_deref(),
+        )?;
     } else if artifacts.feldera_artifact_hash_evidence.is_some()
         || artifacts.feldera_release_provenance_evidence.is_some()
     {
@@ -687,6 +729,7 @@ fn validate_dependency_governance_evidence_artifact(
 fn validate_feldera_release_evidence_artifacts(
     hash_path: &Path,
     provenance_path: &Path,
+    release_commit: Option<&str>,
 ) -> anyhow::Result<()> {
     let hash: FelderaArtifactHashVerifiedEvidenceV1 = read_json_artifact(hash_path)?;
     let provenance: FelderaArtifactReleaseProvenanceEvidenceV1 =
@@ -738,6 +781,27 @@ fn validate_feldera_release_evidence_artifacts(
         || hash.generated_rust_abi_version != provenance.generated_rust_abi_version
     {
         bail!("Feldera hash and release provenance evidence do not describe the same artifact");
+    }
+    let source_revision = provenance.source_revision.trim();
+    if is_placeholder_commit(source_revision) {
+        bail!(
+            "{} Feldera release provenance uses blank or placeholder source_revision",
+            provenance_path.display()
+        );
+    }
+    let Some(release_commit) = release_commit
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        bail!(
+            "readiness-report with --feldera-release-provenance-evidence requires --release-commit"
+        );
+    };
+    if source_revision != release_commit {
+        bail!(
+            "{} Feldera release provenance source_revision does not match release commit",
+            provenance_path.display()
+        );
     }
 
     Ok(())
@@ -1005,6 +1069,137 @@ fn is_local_dev_authority_store_id(value: &str) -> bool {
     ]
     .iter()
     .any(|marker| value.contains(marker))
+}
+
+fn validate_production_gc_authority_store_id(authority_store_id: &str) -> anyhow::Result<()> {
+    if authority_store_id.trim().is_empty() || is_local_dev_authority_store_id(authority_store_id) {
+        bail!("gc-production-evidence rejects local/dev authority_store_id");
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProductionGcS3Config {
+    endpoint: String,
+    access_key_id: String,
+    secret_access_key: String,
+    region: String,
+    bucket: String,
+    prefix: String,
+    allow_http: bool,
+}
+
+fn production_gc_s3_config_from_env() -> anyhow::Result<ProductionGcS3Config> {
+    production_gc_s3_config_from_lookup(|name| env::var(name).ok())
+}
+
+fn production_gc_s3_config_from_lookup(
+    mut lookup: impl FnMut(&str) -> Option<String>,
+) -> anyhow::Result<ProductionGcS3Config> {
+    if lookup("VELORIX_S3_COMPAT").as_deref() != Some("1") {
+        bail!("gc-production-evidence requires VELORIX_S3_COMPAT=1");
+    }
+
+    let endpoint = required_production_gc_env(&mut lookup, "AWS_ENDPOINT_URL")?;
+    let allow_http = endpoint.starts_with("http://");
+
+    Ok(ProductionGcS3Config {
+        endpoint,
+        access_key_id: required_production_gc_env(&mut lookup, "AWS_ACCESS_KEY_ID")?,
+        secret_access_key: required_production_gc_env(&mut lookup, "AWS_SECRET_ACCESS_KEY")?,
+        region: required_production_gc_env(&mut lookup, "AWS_REGION")?,
+        bucket: required_production_gc_env(&mut lookup, "VELORIX_S3_BUCKET")?,
+        prefix: lookup("VELORIX_S3_PREFIX").unwrap_or_default(),
+        allow_http,
+    })
+}
+
+fn required_production_gc_env(
+    lookup: &mut impl FnMut(&str) -> Option<String>,
+    name: &str,
+) -> anyhow::Result<String> {
+    lookup(name)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .with_context(|| format!("gc-production-evidence requires {name}"))
+}
+
+fn production_gc_authority_store_from_env() -> anyhow::Result<Arc<dyn ObjectStore>> {
+    production_gc_authority_store(production_gc_s3_config_from_env()?)
+}
+
+fn production_gc_authority_store(
+    config: ProductionGcS3Config,
+) -> anyhow::Result<Arc<dyn ObjectStore>> {
+    let store = AmazonS3Builder::new()
+        .with_endpoint(config.endpoint)
+        .with_access_key_id(config.access_key_id)
+        .with_secret_access_key(config.secret_access_key)
+        .with_region(config.region)
+        .with_bucket_name(config.bucket)
+        .with_allow_http(config.allow_http)
+        .build()
+        .map_err(anyhow::Error::from)?;
+
+    let prefix = config.prefix.trim().trim_matches('/').to_string();
+    if prefix.is_empty() {
+        Ok(Arc::new(store))
+    } else {
+        Ok(Arc::new(PrefixStore::new(
+            store,
+            ObjectStorePath::from(prefix),
+        )))
+    }
+}
+
+async fn generate_production_gc_run_evidence(
+    store: Arc<dyn ObjectStore>,
+    deployment_id: String,
+    authority_store_id: String,
+    gc_run_id: String,
+) -> anyhow::Result<ProductionGcRunEvidenceArtifactV1> {
+    validate_production_gc_authority_store_id(&authority_store_id)?;
+    if deployment_id.trim().is_empty() {
+        bail!("gc-production-evidence requires --deployment-id");
+    }
+    if gc_run_id.trim().is_empty() {
+        bail!("gc-production-evidence requires --gc-run-id");
+    }
+
+    CheckpointPublisher::new(store)
+        .verify_garbage_collection_run_retention_evidence(&gc_run_id)
+        .await?;
+
+    Ok(ProductionGcRunEvidenceArtifactV1 {
+        schema_version: 1,
+        status: "pass".to_string(),
+        evidence_kind: "production_gc_run_evidence".to_string(),
+        deployment_id,
+        authority_store_id,
+        gc_run_id,
+        listing_consistency_checked: true,
+        checkpoint_retention_records_checked: true,
+        _extra: BTreeMap::new(),
+    })
+}
+
+fn format_production_gc_run_evidence_json(
+    artifact: &ProductionGcRunEvidenceArtifactV1,
+) -> anyhow::Result<String> {
+    serde_json::to_string_pretty(artifact).map_err(anyhow::Error::from)
+}
+
+fn format_production_gc_run_evidence(artifact: &ProductionGcRunEvidenceArtifactV1) -> String {
+    format!(
+        "production_gc_run_evidence status={} deployment_id={} authority_store_id={} gc_run_id={} listing_consistency_checked={} checkpoint_retention_records_checked={}\n",
+        artifact.status,
+        artifact.deployment_id,
+        artifact.authority_store_id,
+        artifact.gc_run_id,
+        artifact.listing_consistency_checked,
+        artifact.checkpoint_retention_records_checked
+    )
 }
 
 fn validate_release_status_file(path: &Path) -> anyhow::Result<()> {
@@ -1412,7 +1607,7 @@ struct BenchmarkGateEvidenceArtifactV1 {
     _extra: BTreeMap<String, serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct ProductionGcRunEvidenceArtifactV1 {
     schema_version: u16,
     status: String,
@@ -3571,6 +3766,62 @@ mod tests {
     }
 
     #[test]
+    fn gc_production_evidence_cli_parses_json_command() {
+        let cli = Cli::try_parse_from([
+            "velorix-cli",
+            "gc-production-evidence",
+            "--deployment-id",
+            "prod-a",
+            "--authority-store-id",
+            "s3://velorix-prod",
+            "--gc-run-id",
+            "gc-run-20260513T000000Z",
+            "--json",
+        ])
+        .unwrap();
+
+        let Some(Command::GcProductionEvidence {
+            deployment_id,
+            authority_store_id,
+            gc_run_id,
+            json,
+        }) = cli.command
+        else {
+            panic!("expected gc-production-evidence command");
+        };
+
+        assert_eq!(deployment_id, "prod-a");
+        assert_eq!(authority_store_id, "s3://velorix-prod");
+        assert_eq!(gc_run_id, "gc-run-20260513T000000Z");
+        assert!(json);
+    }
+
+    #[test]
+    fn gc_production_evidence_rejects_local_dev_authority_store_id() {
+        let error = validate_production_gc_authority_store_id("file:///tmp/velorix").unwrap_err();
+
+        assert!(format!("{error:#}").contains("local/dev authority_store_id"));
+    }
+
+    #[test]
+    fn gc_production_evidence_config_rejects_missing_s3_compat_gate() {
+        let error = production_gc_s3_config_from_lookup(|_| None).unwrap_err();
+
+        assert!(format!("{error:#}").contains("VELORIX_S3_COMPAT=1"));
+    }
+
+    #[test]
+    fn gc_production_evidence_formats_text_summary() {
+        let artifact: ProductionGcRunEvidenceArtifactV1 =
+            serde_json::from_str(&production_gc_run_evidence_json()).unwrap();
+
+        assert_eq!(
+            format_production_gc_run_evidence(&artifact),
+            "production_gc_run_evidence status=pass deployment_id=prod-a authority_store_id=s3://velorix-prod gc_run_id=gc-run-20260513T000000Z listing_consistency_checked=true checkpoint_retention_records_checked=true\n"
+        );
+    }
+
+    #[test]
     fn readiness_report_formatter_is_not_json() {
         let report = ProductionReadinessEvidenceV1::from_json_str(&readiness_json()).unwrap();
         let summary = format_readiness_report(&report.try_into_report().unwrap());
@@ -4061,6 +4312,62 @@ mod tests {
         .unwrap_err();
 
         assert!(format!("{error:#}").contains("do not describe the same artifact"));
+    }
+
+    #[test]
+    fn readiness_report_rejects_feldera_release_provenance_for_different_commit() {
+        let dir = tempdir().unwrap();
+        let readiness = dir.path().join("readiness.json");
+        let feldera_hash = dir.path().join("feldera-hash.json");
+        let feldera_provenance = dir.path().join("feldera-provenance.json");
+        fs::write(&readiness, readiness_json()).unwrap();
+        fs::write(&feldera_hash, feldera_hash_evidence_json()).unwrap();
+        fs::write(&feldera_provenance, feldera_provenance_evidence_json()).unwrap();
+
+        let error = read_readiness_report(
+            &readiness,
+            &ReadinessReleaseArtifactPaths {
+                release_commit: Some("abcdefabcdefabcdefabcdefabcdefabcdefabcd".to_string()),
+                feldera_artifact_hash_evidence: Some(feldera_hash),
+                feldera_release_provenance_evidence: Some(feldera_provenance),
+                ..ReadinessReleaseArtifactPaths::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("source_revision does not match release commit"));
+    }
+
+    #[test]
+    fn readiness_report_rejects_feldera_release_provenance_placeholder_source_revision() {
+        for source_revision in ["", "placeholder-feldera-release-commit"] {
+            let dir = tempdir().unwrap();
+            let readiness = dir.path().join("readiness.json");
+            let feldera_hash = dir.path().join("feldera-hash.json");
+            let feldera_provenance = dir.path().join("feldera-provenance.json");
+            let mut provenance_json: serde_json::Value =
+                serde_json::from_str(&feldera_provenance_evidence_json()).unwrap();
+            provenance_json["source_revision"] = serde_json::json!(source_revision);
+            fs::write(&readiness, readiness_json()).unwrap();
+            fs::write(&feldera_hash, feldera_hash_evidence_json()).unwrap();
+            fs::write(&feldera_provenance, provenance_json.to_string()).unwrap();
+
+            let error = read_readiness_report(
+                &readiness,
+                &ReadinessReleaseArtifactPaths {
+                    release_commit: Some(TEST_RELEASE_COMMIT.to_string()),
+                    feldera_artifact_hash_evidence: Some(feldera_hash),
+                    feldera_release_provenance_evidence: Some(feldera_provenance),
+                    ..ReadinessReleaseArtifactPaths::default()
+                },
+            )
+            .unwrap_err();
+
+            assert!(
+                format!("{error:#}").contains("placeholder source_revision"),
+                "source_revision={source_revision:?} produced unexpected error: {error:#}"
+            );
+        }
     }
 
     #[test]

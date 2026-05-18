@@ -80,14 +80,15 @@ guard, not a retention handle.
   SlateDB store, keeps retained SlateDB refs readable, and records digest-bound
   retention evidence for the released state key.
 - Production publication rejects raw state refs without a bootstrap flag.
+- Production publication rejects a SlateDB child checkpoint when any visible
+  parent or ancestor manifest in its lineage still carries raw/bootstrap state
+  refs.
 - Local admin recovery rejects raw state refs unless `recover-local` is invoked
   with the explicit `--allow-bootstrap-raw-state` bootstrap/migration flag.
 - `ref_type` is required outside migration mode.
 
 ## Remaining Gaps
 
-- Mixed raw-to-SlateDB lineage remains a migration concern and is not a general
-  production recovery path.
 - The current V1 handle is intentionally narrow: it proves recoverable state
   bytes and manifest metadata integrity, not a full multi-handle SlateDB
   checkpoint retention protocol.
