@@ -1,4 +1,4 @@
-use std::{fmt, fs, sync::Arc};
+use std::{convert::Infallible, fmt, fs, sync::Arc};
 
 use arrow::{
     array::{ArrayRef, Int64Array, StringArray},
@@ -8,6 +8,9 @@ use arrow::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
+use http::{Method, Request, Response, StatusCode};
+use k8s_openapi::api::core::v1::EnvVar;
+use kube::client::{Body, ClientBuilder};
 use object_store::{
     local::LocalFileSystem, path::Path, GetOptions, GetResult, ListResult, MultipartUpload,
     ObjectMeta, ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
@@ -18,7 +21,10 @@ use tempfile::TempDir;
 use velorix_k8s::{
     controller::{reconcile_stream, ControllerAction},
     crd::{ObjectStoreAuthorityRef, RelationVersionRef, VelorixStream, VelorixStreamSpec},
-    ingest_writer::DeployedIngestWriterRuntime,
+    ingest_writer::{
+        build_kubernetes_ingest_writer_operator_runtime, ingest_writer_pod_name_for_identity,
+        DeployedIngestWriterRuntime, IngestWriterPodTemplate, IngestWriterRuntimeIdentity,
+    },
     startup::{
         validate_operator_authority, OperatorAuthorityStartupComponents, OperatorStartupError,
     },
@@ -375,6 +381,213 @@ async fn deployed_ingest_writer_runtime_rejects_malformed_admission_before_appen
     assert!(
         matches!(err, velorix_k8s::stream_watch::StreamWatchError::Snapshot { message }
         if message.contains("unexpected object under v1/ingest-admission"))
+    );
+}
+
+#[test]
+fn deployed_ingest_writer_pod_template_builds_deterministic_identity_bound_pod() {
+    let template = IngestWriterPodTemplate::new("ghcr.io/velorix/velorix-ingest-writer:1.0.0")
+        .unwrap()
+        .with_command(["velorix-ingest-writer"])
+        .with_args(["serve"])
+        .with_label("control.velorix.io/custom", "startup-preflighted")
+        .with_service_account_name("velorix-ingest-writer");
+    let identity = IngestWriterRuntimeIdentity {
+        namespace: "analytics".to_string(),
+        authority: authority(),
+        operator_id: "Operator_A/West".to_string(),
+        writer_id: "Writer_A/0".to_string(),
+    };
+
+    let first = template.pod_for_identity(&identity);
+    let second = template.pod_for_identity(&identity);
+    assert_eq!(first, second);
+
+    let labels = first.metadata.labels.unwrap();
+    let spec = first.spec.unwrap();
+    let container = spec.containers.into_iter().next().unwrap();
+
+    assert_eq!(
+        first.metadata.name.as_deref(),
+        Some(ingest_writer_pod_name_for_identity(&identity).as_str())
+    );
+    assert_eq!(labels["app.kubernetes.io/name"], "velorix-ingest-writer");
+    assert_eq!(labels["app.kubernetes.io/component"], "ingest-writer");
+    assert_eq!(labels["control.velorix.io/operator-id"], "operator-a-west");
+    assert_eq!(labels["control.velorix.io/writer-id"], "writer-a-0");
+    assert_eq!(labels["control.velorix.io/authority-store-id"], "primary");
+    assert_eq!(
+        labels["control.velorix.io/authority-namespace"],
+        "analytics"
+    );
+    assert_eq!(labels["control.velorix.io/custom"], "startup-preflighted");
+    assert_eq!(spec.restart_policy.as_deref(), Some("Never"));
+    assert_eq!(
+        spec.service_account_name.as_deref(),
+        Some("velorix-ingest-writer")
+    );
+    assert_eq!(container.name, "velorix-ingest-writer");
+    assert_eq!(
+        container.image.as_deref(),
+        Some("ghcr.io/velorix/velorix-ingest-writer:1.0.0")
+    );
+    assert_eq!(
+        container.command.as_deref(),
+        Some(["velorix-ingest-writer".to_string()].as_slice())
+    );
+    assert_eq!(
+        container.args.as_deref(),
+        Some(["serve".to_string()].as_slice())
+    );
+    assert_eq!(
+        container.env.unwrap(),
+        vec![
+            env_var("VELORIX_INGEST_WRITER_NAMESPACE", "analytics"),
+            env_var("VELORIX_INGEST_WRITER_AUTHORITY_STORE_ID", "primary"),
+            env_var("VELORIX_INGEST_WRITER_AUTHORITY_NAMESPACE", "analytics"),
+            env_var("VELORIX_INGEST_WRITER_OPERATOR_ID", "Operator_A/West"),
+            env_var("VELORIX_INGEST_WRITER_ID", "Writer_A/0"),
+        ]
+    );
+}
+
+#[test]
+fn deployed_ingest_writer_pod_template_rejects_empty_image() {
+    let error = IngestWriterPodTemplate::new(" ").unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("ingest writer pod image must not be empty"));
+}
+
+#[tokio::test]
+async fn deployed_ingest_writer_kubernetes_runtime_exposes_pod_executor_after_checked_runtime() {
+    let (_temp_dir, store) = temp_store();
+    let validated = validate_operator_authority(
+        authority(),
+        Arc::clone(&store),
+        "local-k8s-authority",
+        "v1/operator-startup-probes",
+    )
+    .await
+    .unwrap();
+    let components = OperatorAuthorityStartupComponents::from_validated_authority(validated);
+
+    let runtime = build_kubernetes_ingest_writer_operator_runtime(
+        fake_kube_client(),
+        "analytics",
+        &components,
+        IngestWriterPodTemplate::new("ghcr.io/velorix/velorix-ingest-writer:1.0.0").unwrap(),
+        "operator-a",
+        "writer-a",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        runtime.deployed_runtime().authority(),
+        components.authority()
+    );
+    assert_eq!(runtime.pod_executor().identity().authority, authority());
+    assert_eq!(runtime.pod_executor().identity().namespace, "analytics");
+    assert_eq!(runtime.pod_executor().identity().operator_id, "operator-a");
+    assert_eq!(runtime.pod_executor().identity().writer_id, "writer-a");
+}
+
+#[tokio::test]
+async fn deployed_ingest_writer_kubernetes_runtime_rejects_malformed_admission_before_pod_executor()
+{
+    let (_temp_dir, store) = temp_store();
+    store
+        .put_opts(
+            &Path::from(
+                "v1/ingest-admission/deposits/p=0000000000/ranges/00000000000000000000-00000000000000000010/notes.txt",
+            ),
+            "unexpected admission namespace object".into(),
+            PutMode::Create.into(),
+        )
+        .await
+        .unwrap();
+    let validated = validate_operator_authority(
+        authority(),
+        Arc::clone(&store),
+        "local-k8s-authority",
+        "v1/operator-startup-probes",
+    )
+    .await
+    .unwrap();
+    let components = OperatorAuthorityStartupComponents::from_validated_authority(validated);
+
+    let err = build_kubernetes_ingest_writer_operator_runtime(
+        fake_kube_client(),
+        "analytics",
+        &components,
+        IngestWriterPodTemplate::new("ghcr.io/velorix/velorix-ingest-writer:1.0.0").unwrap(),
+        "operator-a",
+        "writer-a",
+    )
+    .await
+    .unwrap_err();
+
+    assert!(err
+        .to_string()
+        .contains("unexpected object under v1/ingest-admission"));
+}
+
+#[tokio::test]
+async fn deployed_ingest_writer_pod_executor_rejects_conflicting_existing_pod() {
+    let template = IngestWriterPodTemplate::new("ghcr.io/velorix/velorix-ingest-writer:1.0.0")
+        .unwrap()
+        .with_args(["serve"]);
+    let requested = IngestWriterRuntimeIdentity {
+        namespace: "analytics".to_string(),
+        authority: authority(),
+        operator_id: "operator-a".to_string(),
+        writer_id: "writer-a".to_string(),
+    };
+    let conflicting = IngestWriterRuntimeIdentity {
+        namespace: "analytics".to_string(),
+        authority: authority(),
+        operator_id: "operator-a".to_string(),
+        writer_id: "writer-b".to_string(),
+    };
+    let mut existing_pod = template.pod_for_identity(&conflicting);
+    existing_pod.metadata.name = Some(ingest_writer_pod_name_for_identity(&requested));
+    let client = fake_ingest_writer_pod_create_conflict_then_get_client(existing_pod);
+    let executor = velorix_k8s::ingest_writer::KubernetesPodIngestWriterExecutor::new(
+        client,
+        "analytics",
+        template,
+        requested,
+    );
+
+    let err = executor.create_writer_pod().await.unwrap_err();
+
+    assert!(err.to_string().contains("identity mismatch"));
+}
+
+#[test]
+fn deployed_ingest_writer_kubernetes_runtime_source_gates_pod_executor_after_preflight() {
+    let source_code = include_str!("../src/ingest_writer.rs");
+    let runtime_body = function_body(
+        source_code,
+        "pub async fn build_kubernetes_ingest_writer_operator_runtime(",
+    )
+    .expect("deployed ingest writer Kubernetes assembly function should exist");
+
+    assert!(
+        runtime_body.contains("startup_components: &OperatorAuthorityStartupComponents"),
+        "Kubernetes ingest writer runtime assembly must require checked startup components"
+    );
+    let checked_runtime_index = runtime_body
+        .find("DeployedIngestWriterRuntime::from_startup_components(startup_components).await?")
+        .expect("assembly must construct checked ingest writer runtime first");
+    let pod_executor_index = runtime_body
+        .find("KubernetesPodIngestWriterExecutor::new(")
+        .expect("assembly must expose a Kubernetes pod executor");
+    assert!(
+        checked_runtime_index < pod_executor_index,
+        "pod executor must not be constructed before ingest admission startup preflight succeeds"
     );
 }
 
@@ -801,6 +1014,91 @@ fn ownership_epoch_record() -> OwnershipEpochRecord {
         previous_epoch: None,
         previous_checkpoint_version: None,
     }
+}
+
+fn env_var(name: &str, value: &str) -> EnvVar {
+    EnvVar {
+        name: name.to_string(),
+        value: Some(value.to_string()),
+        value_from: None,
+    }
+}
+
+fn fake_kube_client() -> kube::Client {
+    let service = tower::service_fn(|_request: Request<Body>| async move {
+        Ok::<_, Infallible>(
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "apiVersion": "v1",
+                        "kind": "Status",
+                        "metadata": {},
+                        "status": "Failure",
+                        "message": "fake client should not be called during assembly",
+                        "reason": "InternalError",
+                        "code": 500
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+    });
+
+    ClientBuilder::new(service, "default").build()
+}
+
+fn fake_ingest_writer_pod_create_conflict_then_get_client(
+    existing_pod: k8s_openapi::api::core::v1::Pod,
+) -> kube::Client {
+    let existing_pod = Arc::new(existing_pod);
+    let service = tower::service_fn({
+        let existing_pod = Arc::clone(&existing_pod);
+        move |request: Request<Body>| {
+            let existing_pod = Arc::clone(&existing_pod);
+            async move {
+                let response_body = match *request.method() {
+                    Method::POST => json!({
+                        "apiVersion": "v1",
+                        "kind": "Status",
+                        "metadata": {},
+                        "status": "Failure",
+                        "message": "already exists",
+                        "reason": "AlreadyExists",
+                        "code": 409
+                    }),
+                    Method::GET => serde_json::to_value(&*existing_pod).unwrap(),
+                    _ => json!({
+                        "apiVersion": "v1",
+                        "kind": "Status",
+                        "metadata": {},
+                        "status": "Failure",
+                        "message": "unexpected fake kubernetes request",
+                        "reason": "InternalError",
+                        "code": 500
+                    }),
+                };
+                let status = if *request.method() == Method::POST {
+                    StatusCode::CONFLICT
+                } else if *request.method() == Method::GET {
+                    StatusCode::OK
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                };
+
+                Ok::<_, Infallible>(
+                    Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&response_body).unwrap()))
+                        .unwrap(),
+                )
+            }
+        }
+    });
+
+    ClientBuilder::new(service, "default").build()
 }
 
 #[derive(Debug)]

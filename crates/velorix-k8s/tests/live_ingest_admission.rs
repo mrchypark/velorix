@@ -6,9 +6,12 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use bytes::Bytes;
-use k8s_openapi::{api::core::v1::Namespace, apimachinery::pkg::apis::meta::v1::ObjectMeta};
+use k8s_openapi::{
+    api::core::v1::{Namespace, Pod},
+    apimachinery::pkg::apis::meta::v1::ObjectMeta,
+};
 use kube::{
-    api::{Api, PostParams},
+    api::{Api, DeleteParams, PostParams},
     Client,
 };
 use object_store::{local::LocalFileSystem, path::Path, ObjectStore, PutMode};
@@ -16,7 +19,10 @@ use serde_json::json;
 use tempfile::TempDir;
 use velorix_k8s::{
     crd::ObjectStoreAuthorityRef,
-    ingest_writer::DeployedIngestWriterRuntime,
+    ingest_writer::{
+        build_kubernetes_ingest_writer_operator_runtime, DeployedIngestWriterRuntime,
+        IngestWriterPodTemplate,
+    },
     startup::{validate_operator_authority, OperatorAuthorityStartupComponents},
     stream_watch::StreamWatchError,
 };
@@ -199,6 +205,85 @@ async fn live_vind_deployed_ingest_writer_runtime_appends_after_startup_prefligh
                 && descriptor.start_offset_inclusive == 0
                 && descriptor.end_offset_exclusive == 10
     ));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn live_vind_deployed_ingest_writer_pod_created_after_startup_preflight(
+) -> Result<(), Box<dyn Error>> {
+    if env::var("VELORIX_K8S_INTEGRATION").as_deref() != Ok("1") {
+        eprintln!(
+            "skipping live Kubernetes deployed ingest writer pod; set VELORIX_K8S_INTEGRATION=1"
+        );
+        return Ok(());
+    }
+    let image = match env::var("VELORIX_K8S_INGEST_WRITER_IMAGE") {
+        Ok(image) => image,
+        Err(_) => {
+            eprintln!(
+                "skipping live Kubernetes deployed ingest writer pod; set VELORIX_K8S_INGEST_WRITER_IMAGE"
+            );
+            return Ok(());
+        }
+    };
+
+    let namespace =
+        env::var("VELORIX_K8S_NAMESPACE").unwrap_or_else(|_| "velorix-live".to_string());
+    let suffix = unique_suffix()?;
+    let client = Client::try_default().await?;
+    ensure_namespace(client.clone(), &namespace).await?;
+    let (_temp_dir, store) = temp_store();
+    create_vind_relation_catalog(&store).await?;
+
+    let validated = validate_operator_authority(
+        authority(&namespace),
+        Arc::clone(&store),
+        "vind-ingest-authority",
+        &format!("v1/vind-ingest-writer-pod-probes/{suffix}/clean"),
+    )
+    .await?;
+    let components = OperatorAuthorityStartupComponents::from_validated_authority(validated);
+    let runtime = build_kubernetes_ingest_writer_operator_runtime(
+        client.clone(),
+        &namespace,
+        &components,
+        IngestWriterPodTemplate::new(image)?,
+        "live-ingest-admission-test",
+        format!("vind-writer-{suffix}"),
+    )
+    .await?;
+
+    runtime.pod_executor().create_writer_pod().await?;
+
+    let pod_api: Api<Pod> = Api::namespaced(client, &namespace);
+    let pod_name = runtime.pod_executor().pod_name();
+    let pod = pod_api.get(&pod_name).await?;
+    let env = pod
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.containers.first())
+        .and_then(|container| container.env.as_ref())
+        .expect("ingest writer pod should carry identity env");
+
+    assert_eq!(
+        env_value(env, "VELORIX_INGEST_WRITER_NAMESPACE"),
+        Some(namespace.as_str())
+    );
+    assert_eq!(
+        env_value(env, "VELORIX_INGEST_WRITER_AUTHORITY_STORE_ID"),
+        Some("primary")
+    );
+    assert_eq!(
+        env_value(env, "VELORIX_INGEST_WRITER_AUTHORITY_NAMESPACE"),
+        Some(namespace.as_str())
+    );
+    assert_eq!(
+        env_value(env, "VELORIX_INGEST_WRITER_OPERATOR_ID"),
+        Some("live-ingest-admission-test")
+    );
+
+    let _ = pod_api.delete(&pod_name, &DeleteParams::default()).await;
 
     Ok(())
 }
@@ -388,4 +473,10 @@ async fn put_durable_admission_record(
 fn unique_suffix() -> Result<String, Box<dyn Error>> {
     let elapsed = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?;
     Ok(format!("{}-{}", std::process::id(), elapsed.as_millis()))
+}
+
+fn env_value<'a>(env: &'a [k8s_openapi::api::core::v1::EnvVar], name: &str) -> Option<&'a str> {
+    env.iter()
+        .find(|var| var.name == name)
+        .and_then(|var| var.value.as_deref())
 }

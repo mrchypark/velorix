@@ -191,6 +191,7 @@ kubectl --context "$context" get velorixdatabases,velorixstreams,velorixworkersh
 
 python3 - "$evidence_path" "$diagnostics_path" "$cluster" "$context" "$namespace" "$cleanup" "$created_cluster" "$reuse_existing" <<'PY'
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -210,6 +211,12 @@ def run(command):
     created_cluster,
     reuse_existing,
 ) = sys.argv[1:]
+ingest_writer_image = os.environ.get("VELORIX_K8S_INGEST_WRITER_IMAGE", "").strip()
+gate_detail_kind = [
+    "kubernetes_ingest_writer_runtime_preflight"
+]
+if ingest_writer_image:
+    gate_detail_kind.append("kubernetes_ingest_writer_pod_topology_preflight")
 evidence = {
     "schema_version": 1,
     "evidence_kind": "kubernetes_vind_gate",
@@ -226,9 +233,8 @@ evidence = {
         "kubernetes_ingest_admission_startup_preflight",
         "kubernetes_ingest_admission_run_local_expiry_restart"
     ],
-    "gate_detail_kind": [
-        "kubernetes_ingest_writer_runtime_preflight"
-    ],
+    "gate_detail_kind": gate_detail_kind,
+    "ingest_writer_image_configured": bool(ingest_writer_image),
     "cluster": cluster,
     "context": context,
     "namespace": namespace,
@@ -258,6 +264,7 @@ evidence = {
         "worker-shard stale Pod replacement is exercised after release/reacquire against vind Kubernetes but does not prove RustFS/S3-compatible authority behavior",
         "worker-shard lease-loss cleanup is exercised after a conflicting owner acquires the Lease against vind Kubernetes but does not prove multi-pod leader election or RustFS/S3-compatible authority behavior",
         "worker-shard restart read-back recreates checked startup components over the same local filesystem authority root",
+        "ingest writer Pod topology evidence only proves controller-created Pod spec/env after checked runtime assembly; it does not prove the Pod process used checked ingest runtime or completed an append",
         "does not exercise distributed or multi-pod admission races",
         "does not prove worker-shard epoch durability on a RustFS/S3-compatible authority, multi-pod restart, or broader operator lifecycle management",
     ],
