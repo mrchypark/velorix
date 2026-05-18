@@ -31,9 +31,11 @@ Generic query policy catalog `create`/`get` remains bootstrap-compatible and
 admits `QueryExecutionPolicyV1::default()`. Production table-scan admission uses
 the explicit catalog production methods, which fail closed unless
 `QueryExecutionPolicyV1::validate_production_table_scan` sees all required
-single-query production boundary fields. Tenant/global concurrency admission
-remains a shared-runtime responsibility because setting `max_concurrent_queries`
-without a shared limiter intentionally fails query execution.
+single-query production boundary fields. Tenant/global concurrency admission now
+has a narrow production runtime-owned limiter boundary for the persisted table,
+persisted view, and recovered-query scan paths. Setting
+`max_concurrent_queries` without a compatible runtime limiter still fails query
+execution.
 
 Current DataFusion 53 wiring:
 
@@ -65,12 +67,14 @@ DataFusion 53 memory exhaustion now has version-specific runtime evidence for
 a grouped aggregate over the public object-backed Parquet query path.
 Object-backed scan preflight timeout evidence also proves that cancellation
 drops the stalled list stream and releases the shared query limiter permit.
-The same `QueryExecutionLimiter` instance now has local evidence across two
-public runtime query surfaces: an object-backed query can hold the only permit
-while a production recovered materialized-view query fails immediately with
-`ConcurrencyLimitExceeded` before recovery setup runs.
+`ProductionQueryRuntime` now owns the shared concurrency limiter derived from a
+`QueryPolicy` and exposes compatible limiter handles to production query
+wrappers. Local evidence shows one runtime can let an object-backed query hold
+the only permit while a production recovered materialized-view query fails
+immediately with `ConcurrencyLimitExceeded` before recovery setup runs.
 Version-specific spill failure tests, broader tenant/global shared runtime
-semantics, and Velorix-owned typed memory/spill errors remain future work.
+semantics beyond this local runtime slice, and Velorix-owned typed memory/spill
+errors remain future work.
 
 ## Typed Errors
 
@@ -88,5 +92,6 @@ error shape is DataFusion-version-dependent.
 - DataFusion 53 returns `ResourcesExhausted` for an object-backed grouped
   aggregate that exceeds `memory_limit_bytes`.
 - `LIMIT 1` does not bypass scan byte or object request limits.
-- Concurrent queries cannot exceed concurrency pools; shared memory semantics
-  require a future shared runtime boundary.
+- Concurrent queries cannot exceed the runtime-owned local concurrency pool for
+  the covered production query wrappers; broader tenant/global shared runtime
+  and shared memory semantics remain future work.

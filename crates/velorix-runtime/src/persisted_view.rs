@@ -14,7 +14,10 @@ use crate::{
         PersistedTableError, PersistedTableFormat, PersistedTableStore,
         ProductionPersistedTableSpec,
     },
-    query::{query_object_backed_input_with_policy, QueryExecutionLimiter, RuntimeQueryError},
+    query::{
+        query_object_backed_input_with_policy, ProductionQueryRuntime, QueryExecutionLimiter,
+        RuntimeQueryError,
+    },
     query_policy_catalog::QueryPolicyCatalogStore,
     storage_registry::StorageRegistry,
 };
@@ -152,6 +155,74 @@ pub async fn query_production_persisted_object_backed_view_with_limiter(
         &query.sql,
         production_policy,
         request.limiter,
+    )
+    .await
+    .map_err(|error| match error {
+        PersistedTableError::RuntimeQuery(error) => PersistedViewError::RuntimeQuery(error),
+        error => PersistedViewError::TableCatalog(error),
+    })
+}
+
+pub async fn query_production_persisted_object_backed_view_with_runtime(
+    catalog_store: Arc<dyn ObjectStore>,
+    relation_catalog_store: Arc<dyn ObjectStore>,
+    policy_catalog_store: Arc<dyn ObjectStore>,
+    registry: &StorageRegistry,
+    startup_capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
+    tenant_id: &str,
+    table_id: &str,
+    query_id: &str,
+    runtime: &ProductionQueryRuntime,
+) -> Result<Vec<RecordBatch>, PersistedViewError> {
+    let query_catalog =
+        PersistedQueryStore::new_checked(Arc::clone(&catalog_store), startup_capabilities)
+            .map_err(PersistedViewError::QueryCatalog)?;
+    let table = PersistedTableStore::new_checked(Arc::clone(&catalog_store), startup_capabilities)
+        .map_err(PersistedViewError::TableCatalog)?
+        .get_production(table_id)
+        .await
+        .map_err(PersistedViewError::TableCatalog)?;
+    reject_cross_tenant_production_view(tenant_id, &table)
+        .map_err(PersistedViewError::TableCatalog)?;
+    registry
+        .production_capabilities(&table.store_id)
+        .map_err(PersistedTableError::from)
+        .map_err(PersistedViewError::TableCatalog)?;
+    let relation_catalog = read_pinned_relation_catalog(
+        Arc::clone(&relation_catalog_store),
+        startup_capabilities,
+        &table,
+    )
+    .await
+    .map_err(PersistedViewError::TableCatalog)?;
+    let production_policy = QueryPolicyCatalogStore::new_checked(
+        Arc::clone(&policy_catalog_store),
+        startup_capabilities,
+    )
+    .map_err(PersistedTableError::from)
+    .map_err(PersistedViewError::TableCatalog)?
+    .get_for_production_table_scan(&table.tenant_id, &table.query_policy_id)
+    .await
+    .map_err(PersistedTableError::from)
+    .map_err(PersistedViewError::TableCatalog)?
+    .policy;
+    let query = query_catalog
+        .get_for_production_relation_with_policy(query_id, &relation_catalog, production_policy)
+        .await
+        .map_err(PersistedViewError::QueryCatalog)?;
+    let limiter = runtime
+        .compatible_limiter(production_policy)
+        .map_err(RuntimeQueryError::from)
+        .map_err(PersistedViewError::RuntimeQuery)?;
+
+    query_production_spec_with_policy(
+        registry,
+        tenant_id,
+        table,
+        relation_catalog,
+        &query.sql,
+        production_policy,
+        limiter,
     )
     .await
     .map_err(|error| match error {

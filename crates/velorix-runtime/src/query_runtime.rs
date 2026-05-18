@@ -134,6 +134,45 @@ impl QueryExecutionLimiter {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct ProductionQueryRuntime {
+    limiter: Option<QueryExecutionLimiter>,
+}
+
+impl ProductionQueryRuntime {
+    pub fn from_policy(policy: QueryPolicy) -> Self {
+        Self {
+            limiter: QueryExecutionLimiter::from_policy(policy),
+        }
+    }
+
+    pub fn compatible_limiter(
+        &self,
+        policy: QueryPolicy,
+    ) -> Result<Option<QueryExecutionLimiter>, QueryError> {
+        policy.validate().map_err(QueryError::from)?;
+        match (policy.max_concurrent_queries, self.limiter.as_ref()) {
+            (Some(max_concurrent_queries), None) => {
+                Err(QueryPolicyError::ConcurrencyLimiterRequired {
+                    max_concurrent_queries,
+                }
+                .into())
+            }
+            (Some(required_max_concurrent_queries), Some(limiter))
+                if limiter.max_concurrent_queries() != required_max_concurrent_queries =>
+            {
+                Err(QueryPolicyError::ConcurrencyLimiterPolicyMismatch {
+                    required_max_concurrent_queries,
+                    actual_max_concurrent_queries: limiter.max_concurrent_queries(),
+                }
+                .into())
+            }
+            (Some(_), Some(limiter)) | (None, Some(limiter)) => Ok(Some(limiter.clone())),
+            (None, None) => Ok(None),
+        }
+    }
+}
+
 async fn run_with_timeout<T, F>(
     timeout_ms: u64,
     timeout_error: fn(u64) -> QueryPolicyError,
@@ -243,5 +282,27 @@ mod tests {
                 .contains("used disk space during the spilling process has exceeded"),
             "expected DataFusion disk-manager spill quota error, got {error:?}"
         );
+    }
+
+    #[test]
+    fn production_query_runtime_keeps_policy_validation_error_precedence() {
+        let runtime = ProductionQueryRuntime::from_policy(QueryPolicy {
+            max_concurrent_queries: Some(1),
+            ..QueryPolicy::default()
+        });
+
+        let error = runtime
+            .compatible_limiter(QueryPolicy {
+                max_concurrent_queries: Some(0),
+                ..QueryPolicy::default()
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            QueryError::Policy(QueryPolicyError::InvalidZeroConcurrency {
+                field: "max_concurrent_queries"
+            })
+        ));
     }
 }

@@ -29,8 +29,8 @@ use velorix_core::query::{
 
 use crate::benchmark_gate::ObjectRequestMetricsV1;
 use crate::object_meter::{object_request_policy_error, MeteredObjectStore, ObjectStoreMeter};
-pub use crate::query_runtime::QueryExecutionLimiter;
 use crate::query_runtime::{DataFusionSessionFactory, QueryRuntimeLimits};
+pub use crate::query_runtime::{ProductionQueryRuntime, QueryExecutionLimiter};
 use crate::recovery::{
     RecoveredRuntime, RecoveryError, ORDERS_SUM_COUNT_OWNER, ORDERS_SUM_COUNT_RELATION_ID,
     ORDERS_SUM_COUNT_RELATION_VERSION,
@@ -127,6 +127,30 @@ pub async fn query_production_recovered_materialized_view_with_policy_and_limite
     collect_recovered_materialized_view(recovered, sql, policy)
         .await
         .map_err(Into::into)
+}
+
+pub async fn query_production_recovered_materialized_view_with_policy_and_runtime(
+    store: Arc<dyn ObjectStore>,
+    slatedb_state_path: impl Into<Path>,
+    relation_id: &str,
+    relation_version: &str,
+    capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
+    sql: &str,
+    policy: QueryPolicy,
+    runtime: &ProductionQueryRuntime,
+) -> Result<Vec<RecordBatch>, RuntimeQueryError> {
+    let limiter = runtime.compatible_limiter(policy)?;
+    query_production_recovered_materialized_view_with_policy_and_limiter(
+        store,
+        slatedb_state_path,
+        relation_id,
+        relation_version,
+        capabilities,
+        sql,
+        policy,
+        limiter,
+    )
+    .await
 }
 
 async fn collect_recovered_materialized_view(
@@ -276,6 +300,17 @@ pub async fn query_object_backed_input_with_policy_and_limiter(
         store, table_url, sql, policy, limiter, None,
     )
     .await
+}
+
+pub async fn query_object_backed_input_with_policy_and_runtime(
+    store: Arc<dyn DataFusionObjectStore>,
+    table_url: &str,
+    sql: &str,
+    policy: QueryPolicy,
+    runtime: &ProductionQueryRuntime,
+) -> Result<Vec<RecordBatch>, RuntimeQueryError> {
+    let limiter = runtime.compatible_limiter(policy)?;
+    query_object_backed_input_with_policy_and_limiter(store, table_url, sql, policy, limiter).await
 }
 
 async fn query_object_backed_input_with_policy_and_limiter_and_meter(

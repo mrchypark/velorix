@@ -29,8 +29,10 @@ use velorix_runtime::{
     query::{
         query_bootstrap_recovered_materialized_view_with_policy,
         query_object_backed_input_with_policy, query_object_backed_input_with_policy_and_limiter,
+        query_object_backed_input_with_policy_and_runtime,
         query_production_recovered_materialized_view_with_policy_and_limiter,
-        QueryExecutionLimiter, RuntimeQueryError,
+        query_production_recovered_materialized_view_with_policy_and_runtime,
+        ProductionQueryRuntime, QueryExecutionLimiter, RuntimeQueryError,
     },
     recovery::{ORDERS_SUM_COUNT_RELATION_ID, ORDERS_SUM_COUNT_RELATION_VERSION},
 };
@@ -275,6 +277,75 @@ async fn query_execution_limiter_gates_object_backed_and_production_recovered_qu
     )
     .await
     .expect("production recovered query should fail without waiting for recovery")
+    .unwrap_err();
+
+    first_query.abort();
+
+    assert!(matches!(
+        error,
+        RuntimeQueryError::Query(QueryError::Policy(
+            QueryPolicyError::ConcurrencyLimitExceeded {
+                max_concurrent_queries: 1
+            }
+        ))
+    ));
+}
+
+#[tokio::test]
+async fn production_query_runtime_gates_object_backed_and_production_recovered_query_surfaces() {
+    let inner_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
+    put_parquet_input(
+        &inner_store,
+        "input/part-000.parquet",
+        &parquet_input_batch(&["\"account-a\""], &["10"], &[1]),
+    )
+    .await;
+
+    let first_query_reached_list = Arc::new(Barrier::new(2));
+    let blocking_store: Arc<dyn DataFusionObjectStore> = Arc::new(BlockingListStore {
+        inner: Arc::clone(&inner_store),
+        first_query_reached_list: Arc::clone(&first_query_reached_list),
+        list_cancellation: None,
+    });
+    let policy = QueryPolicy {
+        max_concurrent_queries: Some(1),
+        ..QueryPolicy::default()
+    };
+    let runtime = ProductionQueryRuntime::from_policy(policy);
+    let query_policy_without_own_concurrency_limit = QueryPolicy::default();
+
+    let first_runtime = runtime.clone();
+    let first_query = tokio::spawn(async move {
+        query_object_backed_input_with_policy_and_runtime(
+            Arc::clone(&blocking_store),
+            "memory://velorix/input/",
+            "select key_json, value_json, weight from input",
+            query_policy_without_own_concurrency_limit,
+            &first_runtime,
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), first_query_reached_list.wait())
+        .await
+        .expect("first query should acquire the runtime limiter and reach object listing");
+
+    let recovery_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let error = tokio::time::timeout(
+        Duration::from_millis(50),
+        query_production_recovered_materialized_view_with_policy_and_runtime(
+            Arc::clone(&recovery_store),
+            "v1/slatedb/state",
+            ORDERS_SUM_COUNT_RELATION_ID,
+            ORDERS_SUM_COUNT_RELATION_VERSION,
+            &local_capabilities(),
+            "select key_json, value_json, weight from input",
+            QueryPolicy::default(),
+            &runtime,
+        ),
+    )
+    .await
+    .expect("production recovered query should fail before recovery setup")
     .unwrap_err();
 
     first_query.abort();
