@@ -4653,6 +4653,7 @@ name = "velorix-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arrow",
  "bytes",
  "clap",
  "object_store 0.12.5",
@@ -4661,6 +4662,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "velorix-k8s",
  "velorix-runtime",
  "velorix-storage",
 ]

@@ -6,15 +6,17 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 anyhow = { workspace = true }
+bytes = { workspace = true }
 clap = { workspace = true }
 object_store = { workspace = true, features = ["aws"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true }
+velorix-k8s = { path = "../velorix-k8s" }
 velorix-runtime = { path = "../velorix-runtime" }
 velorix-storage = { path = "../velorix-storage" }
 
 [dev-dependencies]
-bytes = { workspace = true }
+arrow = { workspace = true, features = ["ipc"] }
 tempfile = { workspace = true }

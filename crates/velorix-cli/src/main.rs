@@ -12,6 +12,7 @@ use std::{
 };
 
 use anyhow::{bail, Context};
+use bytes::Bytes;
 use clap::{CommandFactory, Parser, Subcommand};
 use object_store::{
     aws::AmazonS3Builder, local::LocalFileSystem, path::Path as ObjectStorePath,
@@ -19,6 +20,11 @@ use object_store::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use velorix_k8s::{
+    crd::ObjectStoreAuthorityRef,
+    ingest_writer::DeployedIngestWriterRuntime,
+    startup::{validate_operator_authority, OperatorAuthorityStartupComponents},
+};
 use velorix_runtime::benchmark_gate::{
     BenchmarkBackend, BenchmarkBudgetV1, BenchmarkEvidenceScope, BenchmarkGateLevel,
     BenchmarkGateResultV1,
@@ -75,6 +81,7 @@ use velorix_storage::{
         CheckpointManifestInspectionStatus, CheckpointRetentionRecordV1, LatestCandidateMarker,
     },
     gc::{GarbageCollectionPlan, GarbageCollectionPolicy, GarbageCollectionRunV1},
+    log::{AppendValidatedEnvelopeOutcome, IngestBatchDescriptor},
     relation_catalog_registry::RelationCatalogRegistry,
     state::CheckpointPublisher,
 };
@@ -156,6 +163,20 @@ enum Command {
         authority_store_id: String,
         #[arg(long)]
         gc_run_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    IngestWriterAppend {
+        #[arg(long)]
+        payload_file: PathBuf,
+        #[arg(long)]
+        authority_store_id: String,
+        #[arg(long)]
+        authority_namespace: String,
+        #[arg(long)]
+        operator_id: String,
+        #[arg(long)]
+        writer_id: String,
         #[arg(long)]
         json: bool,
     },
@@ -372,6 +393,41 @@ async fn main() -> anyhow::Result<()> {
                 println!("{}", format_production_gc_run_evidence_json(&artifact)?);
             } else {
                 print!("{}", format_production_gc_run_evidence(&artifact));
+            }
+        }
+        Some(Command::IngestWriterAppend {
+            payload_file,
+            authority_store_id,
+            authority_namespace,
+            operator_id,
+            writer_id,
+            json,
+        }) => {
+            let store = s3_compatible_authority_store_from_env()
+                .context("failed to construct S3-compatible ingest writer authority store")?;
+            let payload = fs::read(&payload_file).with_context(|| {
+                format!(
+                    "failed to read ingest payload from {}",
+                    payload_file.display()
+                )
+            })?;
+            let artifact = run_ingest_writer_append(
+                store,
+                IngestWriterAppendRequest {
+                    authority_store_id,
+                    authority_namespace,
+                    operator_id,
+                    writer_id,
+                    payload: Bytes::from(payload),
+                },
+            )
+            .await
+            .context("failed to append ingest payload through checked writer runtime")?;
+
+            if json {
+                println!("{}", format_ingest_writer_append_json(&artifact)?);
+            } else {
+                print!("{}", format_ingest_writer_append(&artifact));
             }
         }
         Some(Command::BenchmarkValidate { result }) => {
@@ -1242,6 +1298,268 @@ fn format_production_gc_run_evidence(artifact: &ProductionGcRunEvidenceArtifactV
         artifact.listing_consistency_checked,
         artifact.checkpoint_retention_records_checked
     )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct S3CompatibleAuthorityConfig {
+    endpoint: String,
+    access_key_id: String,
+    secret_access_key: String,
+    region: String,
+    bucket: String,
+    prefix: String,
+    allow_http: bool,
+}
+
+fn s3_compatible_authority_config_from_env() -> anyhow::Result<S3CompatibleAuthorityConfig> {
+    s3_compatible_authority_config_from_lookup(|name| env::var(name).ok())
+}
+
+fn s3_compatible_authority_config_from_lookup(
+    mut lookup: impl FnMut(&str) -> Option<String>,
+) -> anyhow::Result<S3CompatibleAuthorityConfig> {
+    if lookup("VELORIX_S3_COMPAT").as_deref() != Some("1") {
+        bail!("S3-compatible authority requires VELORIX_S3_COMPAT=1");
+    }
+
+    let endpoint = required_s3_compatible_authority_env(&mut lookup, "AWS_ENDPOINT_URL")?;
+    let allow_http = endpoint.starts_with("http://");
+
+    Ok(S3CompatibleAuthorityConfig {
+        endpoint,
+        access_key_id: required_s3_compatible_authority_env(&mut lookup, "AWS_ACCESS_KEY_ID")?,
+        secret_access_key: required_s3_compatible_authority_env(
+            &mut lookup,
+            "AWS_SECRET_ACCESS_KEY",
+        )?,
+        region: required_s3_compatible_authority_env(&mut lookup, "AWS_REGION")?,
+        bucket: required_s3_compatible_authority_env(&mut lookup, "VELORIX_S3_BUCKET")?,
+        prefix: lookup("VELORIX_S3_PREFIX").unwrap_or_default(),
+        allow_http,
+    })
+}
+
+fn required_s3_compatible_authority_env(
+    lookup: &mut impl FnMut(&str) -> Option<String>,
+    name: &str,
+) -> anyhow::Result<String> {
+    lookup(name)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .with_context(|| format!("S3-compatible authority requires {name}"))
+}
+
+fn s3_compatible_authority_store_from_env() -> anyhow::Result<Arc<dyn ObjectStore>> {
+    s3_compatible_authority_store(s3_compatible_authority_config_from_env()?)
+}
+
+fn s3_compatible_authority_store(
+    config: S3CompatibleAuthorityConfig,
+) -> anyhow::Result<Arc<dyn ObjectStore>> {
+    let store = AmazonS3Builder::new()
+        .with_endpoint(config.endpoint)
+        .with_access_key_id(config.access_key_id)
+        .with_secret_access_key(config.secret_access_key)
+        .with_region(config.region)
+        .with_bucket_name(config.bucket)
+        .with_allow_http(config.allow_http)
+        .build()
+        .map_err(anyhow::Error::from)?;
+
+    let prefix = config.prefix.trim().trim_matches('/').to_string();
+    if prefix.is_empty() {
+        Ok(Arc::new(store))
+    } else {
+        Ok(Arc::new(PrefixStore::new(
+            store,
+            ObjectStorePath::from(prefix),
+        )))
+    }
+}
+
+struct IngestWriterAppendRequest {
+    authority_store_id: String,
+    authority_namespace: String,
+    operator_id: String,
+    writer_id: String,
+    payload: Bytes,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct IngestWriterAppendArtifactV1 {
+    schema_version: u16,
+    evidence_kind: String,
+    status: String,
+    authority_store_id: String,
+    authority_namespace: String,
+    operator_id: String,
+    writer_id: String,
+    startup_active_admission_records: usize,
+    startup_expired_orphan_admission_records: usize,
+    outcome: String,
+    descriptor: IngestWriterAppendDescriptorV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct IngestWriterAppendDescriptorV1 {
+    stream_id: String,
+    partition_id: u32,
+    start_offset_inclusive: u64,
+    end_offset_exclusive: u64,
+    object_key: String,
+}
+
+async fn run_ingest_writer_append(
+    store: Arc<dyn ObjectStore>,
+    request: IngestWriterAppendRequest,
+) -> anyhow::Result<IngestWriterAppendArtifactV1> {
+    validate_ingest_writer_authority_store_id(&request.authority_store_id)?;
+    if request.authority_namespace.trim().is_empty() {
+        bail!("ingest-writer-append requires --authority-namespace");
+    }
+    if request.operator_id.trim().is_empty() {
+        bail!("ingest-writer-append requires --operator-id");
+    }
+    if request.writer_id.trim().is_empty() {
+        bail!("ingest-writer-append requires --writer-id");
+    }
+    if request.payload.is_empty() {
+        bail!("ingest-writer-append requires a non-empty --payload-file");
+    }
+
+    let probe_id = sanitize_probe_id(&format!("{}-{}", request.operator_id, request.writer_id));
+    let validated = validate_operator_authority(
+        ObjectStoreAuthorityRef {
+            store_id: request.authority_store_id.clone(),
+            namespace: request.authority_namespace.clone(),
+        },
+        store,
+        "ingest-writer-append",
+        format!("v1/ingest-writer-capability-probes/{probe_id}"),
+    )
+    .await
+    .map_err(anyhow::Error::from)?;
+    let components = OperatorAuthorityStartupComponents::from_validated_authority(validated);
+    let runtime = DeployedIngestWriterRuntime::from_startup_components(&components)
+        .await
+        .map_err(anyhow::Error::from)?;
+    let startup_report = runtime.startup_report().clone();
+    let outcome = runtime
+        .append_catalog_validated_envelope(request.payload)
+        .await
+        .map_err(anyhow::Error::from)?;
+    let (outcome, descriptor) = ingest_writer_append_outcome_parts(outcome)?;
+
+    Ok(IngestWriterAppendArtifactV1 {
+        schema_version: 1,
+        evidence_kind: "ingest_writer_checked_runtime_append".to_string(),
+        status: "pass".to_string(),
+        authority_store_id: request.authority_store_id,
+        authority_namespace: request.authority_namespace,
+        operator_id: request.operator_id,
+        writer_id: request.writer_id,
+        startup_active_admission_records: startup_report.active_admission_records,
+        startup_expired_orphan_admission_records: startup_report.expired_orphan_admission_records,
+        outcome,
+        descriptor,
+    })
+}
+
+fn validate_ingest_writer_authority_store_id(authority_store_id: &str) -> anyhow::Result<()> {
+    let trimmed = authority_store_id.trim();
+    if trimmed.is_empty() {
+        bail!("ingest-writer-append requires --authority-store-id");
+    }
+    if trimmed.starts_with("file:")
+        || trimmed.starts_with("local:")
+        || trimmed.eq_ignore_ascii_case("local")
+        || trimmed.eq_ignore_ascii_case("dev")
+    {
+        bail!(
+            "ingest-writer-append authority_store_id must not be local/dev: {authority_store_id}"
+        );
+    }
+    Ok(())
+}
+
+fn ingest_writer_append_outcome_parts(
+    outcome: AppendValidatedEnvelopeOutcome,
+) -> anyhow::Result<(String, IngestWriterAppendDescriptorV1)> {
+    match outcome {
+        AppendValidatedEnvelopeOutcome::Appended { descriptor } => Ok((
+            "appended".to_string(),
+            ingest_writer_descriptor(&descriptor),
+        )),
+        AppendValidatedEnvelopeOutcome::Duplicate { descriptor } => Ok((
+            "duplicate".to_string(),
+            ingest_writer_descriptor(&descriptor),
+        )),
+        AppendValidatedEnvelopeOutcome::Conflict {
+            descriptor,
+            object_key,
+            reason,
+        } => bail!(
+            "ingest-writer-append conflicted before append: stream={} partition={} offsets={}-{} object_key={} reason={}",
+            descriptor.stream_id,
+            descriptor.partition_id,
+            descriptor.start_offset_inclusive,
+            descriptor.end_offset_exclusive,
+            object_key.as_str(),
+            reason
+        ),
+    }
+}
+
+fn ingest_writer_descriptor(descriptor: &IngestBatchDescriptor) -> IngestWriterAppendDescriptorV1 {
+    IngestWriterAppendDescriptorV1 {
+        stream_id: descriptor.stream_id.clone(),
+        partition_id: descriptor.partition_id,
+        start_offset_inclusive: descriptor.start_offset_inclusive,
+        end_offset_exclusive: descriptor.end_offset_exclusive,
+        object_key: descriptor.object_key.as_str().to_string(),
+    }
+}
+
+fn format_ingest_writer_append_json(
+    artifact: &IngestWriterAppendArtifactV1,
+) -> anyhow::Result<String> {
+    serde_json::to_string_pretty(artifact).map_err(anyhow::Error::from)
+}
+
+fn format_ingest_writer_append(artifact: &IngestWriterAppendArtifactV1) -> String {
+    format!(
+        "ingest_writer_append status={} outcome={} authority_store_id={} authority_namespace={} operator_id={} writer_id={} stream_id={} partition_id={} offsets={}-{} object_key={}\n",
+        artifact.status,
+        artifact.outcome,
+        artifact.authority_store_id,
+        artifact.authority_namespace,
+        artifact.operator_id,
+        artifact.writer_id,
+        artifact.descriptor.stream_id,
+        artifact.descriptor.partition_id,
+        artifact.descriptor.start_offset_inclusive,
+        artifact.descriptor.end_offset_exclusive,
+        artifact.descriptor.object_key
+    )
+}
+
+fn sanitize_probe_id(value: &str) -> String {
+    let probe_id = value
+        .trim()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    if probe_id.is_empty() {
+        "unknown".to_string()
+    } else {
+        probe_id
+    }
 }
 
 fn validate_release_status_file(path: &Path) -> anyhow::Result<()> {
@@ -2738,10 +3056,16 @@ mod tests {
     use std::{fs, sync::Arc};
 
     use super::*;
+    use arrow::{
+        array::{ArrayRef, Int64Array, StringArray},
+        datatypes::{DataType, Field, Schema},
+        record_batch::RecordBatch,
+    };
     use bytes::Bytes;
     use object_store::path::Path as ObjectStorePath;
     use tempfile::tempdir;
     use velorix_runtime::recovery::{orders_sum_count_relation_catalog, RecoveryError};
+    use velorix_storage::ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest};
     use velorix_storage::{
         checkpoint_index::{
             CheckpointAdminInspection, CheckpointGcTransitionRecordV1, CheckpointLifecycleRecord,
@@ -3840,6 +4164,45 @@ mod tests {
     }
 
     #[test]
+    fn ingest_writer_append_cli_parses_payload_and_authority_flags() {
+        let cli = Cli::try_parse_from([
+            "velorix-cli",
+            "ingest-writer-append",
+            "--payload-file",
+            "payload.vlxingest",
+            "--authority-store-id",
+            "s3://velorix-prod",
+            "--authority-namespace",
+            "prod-a",
+            "--operator-id",
+            "operator-a",
+            "--writer-id",
+            "writer-a",
+            "--json",
+        ])
+        .unwrap();
+
+        let Some(Command::IngestWriterAppend {
+            payload_file,
+            authority_store_id,
+            authority_namespace,
+            operator_id,
+            writer_id,
+            json,
+        }) = cli.command
+        else {
+            panic!("expected ingest-writer-append command");
+        };
+
+        assert_eq!(payload_file, PathBuf::from("payload.vlxingest"));
+        assert_eq!(authority_store_id, "s3://velorix-prod");
+        assert_eq!(authority_namespace, "prod-a");
+        assert_eq!(operator_id, "operator-a");
+        assert_eq!(writer_id, "writer-a");
+        assert!(json);
+    }
+
+    #[test]
     fn gc_production_evidence_rejects_local_dev_authority_store_id() {
         let error = validate_production_gc_authority_store_id("file:///tmp/velorix").unwrap_err();
 
@@ -3854,6 +4217,93 @@ mod tests {
     }
 
     #[test]
+    fn ingest_writer_append_config_rejects_missing_s3_compat_gate() {
+        let error = s3_compatible_authority_config_from_lookup(|_| None).unwrap_err();
+
+        assert!(format!("{error:#}").contains("VELORIX_S3_COMPAT=1"));
+    }
+
+    #[tokio::test]
+    async fn ingest_writer_append_uses_checked_startup_runtime_before_append() {
+        let dir = tempdir().unwrap();
+        let store = local_object_store(dir.path()).unwrap();
+        let catalog = orders_sum_count_relation_catalog().unwrap();
+        RelationCatalogRegistry::new(Arc::clone(&store))
+            .create(&catalog)
+            .await
+            .unwrap();
+
+        let artifact = run_ingest_writer_append(
+            store,
+            IngestWriterAppendRequest {
+                authority_store_id: "s3://velorix-test".to_string(),
+                authority_namespace: "test".to_string(),
+                operator_id: "operator-a".to_string(),
+                writer_id: "writer-a".to_string(),
+                payload: orders_envelope_bytes_for(catalog.schema_fingerprint.as_str(), 0, 2),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(artifact.status, "pass");
+        assert_eq!(
+            artifact.evidence_kind,
+            "ingest_writer_checked_runtime_append"
+        );
+        assert_eq!(artifact.outcome, "appended");
+        assert_eq!(artifact.startup_active_admission_records, 0);
+        assert_eq!(artifact.startup_expired_orphan_admission_records, 0);
+        assert_eq!(artifact.descriptor.stream_id, "orders");
+        assert_eq!(artifact.descriptor.partition_id, 0);
+        assert_eq!(artifact.descriptor.start_offset_inclusive, 0);
+        assert_eq!(artifact.descriptor.end_offset_exclusive, 2);
+        assert_eq!(
+            artifact.descriptor.object_key,
+            "v1/ingest/orders/p=0000000000/00000000000000000000-00000000000000000002.batch"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_writer_append_rejects_conflict_as_failed_evidence() {
+        let dir = tempdir().unwrap();
+        let store = local_object_store(dir.path()).unwrap();
+        let catalog = orders_sum_count_relation_catalog().unwrap();
+        RelationCatalogRegistry::new(Arc::clone(&store))
+            .create(&catalog)
+            .await
+            .unwrap();
+
+        run_ingest_writer_append(
+            Arc::clone(&store),
+            IngestWriterAppendRequest {
+                authority_store_id: "s3://velorix-test".to_string(),
+                authority_namespace: "test".to_string(),
+                operator_id: "operator-a".to_string(),
+                writer_id: "writer-a".to_string(),
+                payload: orders_envelope_bytes_for(catalog.schema_fingerprint.as_str(), 0, 2),
+            },
+        )
+        .await
+        .unwrap();
+
+        let error = run_ingest_writer_append(
+            store,
+            IngestWriterAppendRequest {
+                authority_store_id: "s3://velorix-test".to_string(),
+                authority_namespace: "test".to_string(),
+                operator_id: "operator-a".to_string(),
+                writer_id: "writer-b".to_string(),
+                payload: orders_envelope_bytes_for(catalog.schema_fingerprint.as_str(), 1, 3),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("conflicted before append"));
+    }
+
+    #[test]
     fn gc_production_evidence_formats_text_summary() {
         let artifact: ProductionGcRunEvidenceArtifactV1 =
             serde_json::from_str(&production_gc_run_evidence_json()).unwrap();
@@ -3861,6 +4311,36 @@ mod tests {
         assert_eq!(
             format_production_gc_run_evidence(&artifact),
             "production_gc_run_evidence status=pass deployment_id=prod-a authority_store_id=s3://velorix-prod gc_run_id=gc-run-20260513T000000Z listing_consistency_checked=true checkpoint_retention_records_checked=true\n"
+        );
+    }
+
+    #[test]
+    fn ingest_writer_append_formats_stable_text_summary() {
+        let artifact = IngestWriterAppendArtifactV1 {
+            schema_version: 1,
+            evidence_kind: "ingest_writer_checked_runtime_append".to_string(),
+            status: "pass".to_string(),
+            authority_store_id: "s3://velorix-prod".to_string(),
+            authority_namespace: "prod-a".to_string(),
+            operator_id: "operator-a".to_string(),
+            writer_id: "writer-a".to_string(),
+            startup_active_admission_records: 0,
+            startup_expired_orphan_admission_records: 0,
+            outcome: "appended".to_string(),
+            descriptor: IngestWriterAppendDescriptorV1 {
+                stream_id: "orders".to_string(),
+                partition_id: 0,
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 2,
+                object_key:
+                    "v1/ingest/orders/p=0000000000/00000000000000000000-00000000000000000002.batch"
+                        .to_string(),
+            },
+        };
+
+        assert_eq!(
+            format_ingest_writer_append(&artifact),
+            "ingest_writer_append status=pass outcome=appended authority_store_id=s3://velorix-prod authority_namespace=prod-a operator_id=operator-a writer_id=writer-a stream_id=orders partition_id=0 offsets=0-2 object_key=v1/ingest/orders/p=0000000000/00000000000000000000-00000000000000000002.batch\n"
         );
     }
 
@@ -5434,6 +5914,44 @@ mod tests {
             .unwrap()],
             retained_at: "unix:0.000000001".to_string(),
         }
+    }
+
+    fn orders_envelope_bytes_for(
+        schema_fingerprint: &str,
+        start_offset_inclusive: u64,
+        end_offset_exclusive: u64,
+    ) -> Bytes {
+        IngestEnvelope::encode_batches(
+            IngestEnvelopeEncodeRequest {
+                relation_id: "orders".to_string(),
+                relation_version: "2026-05-05.v1".to_string(),
+                schema_fingerprint: schema_fingerprint.to_string(),
+                stream_id: "orders".to_string(),
+                partition_id: 0,
+                start_offset_inclusive,
+                end_offset_exclusive,
+            },
+            &[orders_batch()],
+        )
+        .unwrap()
+    }
+
+    fn orders_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("account_id", DataType::Utf8, false),
+            Field::new("amount", DataType::Int64, false),
+            Field::new("weight", DataType::Int64, false),
+        ]));
+
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["acct-1", "acct-2"])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![10, 20])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1, -1])) as ArrayRef,
+            ],
+        )
+        .unwrap()
     }
 
     fn checkpoint_gc_transition_record(checkpoint_version: u64) -> CheckpointGcTransitionRecordV1 {
