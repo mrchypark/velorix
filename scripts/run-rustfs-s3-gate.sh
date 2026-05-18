@@ -236,6 +236,7 @@ evidence = {
     ],
     "gate_detail_kind": [
         "s3_compatible_ingest_admission_crash_restart",
+        "s3_compatible_gc_execution_retention",
     ],
     "endpoint": f"http://127.0.0.1:{port}",
     "bucket": bucket,

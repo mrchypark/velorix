@@ -143,6 +143,14 @@ cargo bench -p velorix-runtime --bench s3_incremental --features s3-compat-tests
 cargo run -p velorix-cli -- benchmark-validate --result target/velorix-bench/rustfs-s3-nightly.json
 ```
 
+The `s3_compat` target also executes a manifest-retiring GC run inside an
+isolated S3-compatible prefix after probing authoritative startup capabilities
+and constructing `CheckpointPublisher::new_authoritative`; the test verifies the
+listed `GcRunV1`, checkpoint-retention records, and checkpoint-GC-transition
+records before the RustFS gate can report success. Release readiness still
+requires the separate `gc-production-evidence` artifact for the selected
+deployment and authority store.
+
 The `multi_process_ingest_admission` target exercises the checked
 `RangeAdmissionIndexV1` coordinator path against RustFS through the S3 API: two
 same-host OS processes mark themselves ready after store/coordinator/payload

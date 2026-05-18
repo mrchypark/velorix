@@ -1,12 +1,21 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use bytes::Bytes;
 use futures::TryStreamExt;
 use object_store::{
-    aws::AmazonS3Builder, path::Path, Error as ObjectStoreError, ObjectStore, PutMode,
+    aws::AmazonS3Builder, path::Path, prefix::PrefixStore, Error as ObjectStoreError, ObjectStore,
+    PutMode,
 };
 use velorix_storage::capability::{
     probe_authoritative_object_store_capabilities, AuthoritativeNamespace,
+};
+use velorix_storage::{
+    gc::GarbageCollectionPolicy,
+    manifest::{CheckpointManifest, InputRange},
+    state::{CheckpointPublisher, StateObjectWrite},
 };
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
@@ -67,6 +76,71 @@ async fn s3_compatible_store_supports_authoritative_namespace_startup_capabiliti
     Ok(())
 }
 
+#[tokio::test]
+async fn s3_compatible_gc_execution_persists_listed_run_and_retention_evidence() -> TestResult {
+    let Some(config) = live_config() else {
+        println!("skipping S3-compatible GC execution harness; set VELORIX_S3_COMPAT=1 to enable");
+        return Ok(());
+    };
+
+    let store: Arc<dyn ObjectStore> = Arc::new(PrefixStore::new(
+        live_store(&config)?,
+        Path::from(config.run_prefix),
+    ));
+    let capabilities = probe_authoritative_object_store_capabilities(
+        store.as_ref(),
+        "s3-compatible-gc",
+        "authoritative-gc-capabilities",
+    )
+    .await?;
+    capabilities.validate_for_startup()?;
+    let publisher = CheckpointPublisher::new_authoritative(Arc::clone(&store), &capabilities)?;
+    let state_0 = StateObjectWrite::new(
+        "s3_compatible_gc",
+        0,
+        0,
+        "state-0000",
+        Bytes::from_static(b"s3-compatible-gc-state-0"),
+    )?;
+    let state_ref_0 = publisher.write_state_object(&state_0).await?;
+    publisher
+        .publish_manifest(&gc_manifest(0, 0, 1, None, vec![state_ref_0]))
+        .await?;
+    let state_1 = StateObjectWrite::new(
+        "s3_compatible_gc",
+        0,
+        1,
+        "state-0001",
+        Bytes::from_static(b"s3-compatible-gc-state-1"),
+    )?;
+    let state_ref_1 = publisher.write_state_object(&state_1).await?;
+    publisher
+        .publish_manifest(&gc_manifest(1, 0, 2, Some(0), vec![state_ref_1]))
+        .await?;
+
+    let policy = GarbageCollectionPolicy {
+        retain_latest_manifests: 1,
+    };
+    let plan = publisher.plan_garbage_collection(policy).await?;
+    let run = publisher
+        .execute_garbage_collection_plan_with_evidence("s3-compatible-gc-run", policy, &plan)
+        .await?;
+    let verified = publisher
+        .verify_garbage_collection_run_retention_evidence("s3-compatible-gc-run")
+        .await?;
+
+    if run != verified {
+        return Err(test_error("verified GC run differed from executed run"));
+    }
+    if verified.report.deleted.is_empty() {
+        return Err(test_error(
+            "S3-compatible GC run did not delete any candidates",
+        ));
+    }
+
+    Ok(())
+}
+
 async fn validate_written_object(
     store: &dyn ObjectStore,
     key: &Path,
@@ -110,6 +184,29 @@ async fn validate_written_object(
 
 fn test_error(message: impl Into<String>) -> TestError {
     Box::new(std::io::Error::other(message.into()))
+}
+
+fn gc_manifest(
+    checkpoint_version: u64,
+    start_offset_inclusive: u64,
+    end_offset_exclusive: u64,
+    parent_checkpoint: Option<u64>,
+    state_objects: Vec<velorix_storage::manifest::StateObjectRef>,
+) -> CheckpointManifest {
+    CheckpointManifest {
+        schema_version: 1,
+        checkpoint_version,
+        input_ranges: vec![InputRange {
+            stream_id: "s3-compatible-gc".to_string(),
+            partition_id: 0,
+            start_offset_inclusive,
+            end_offset_exclusive,
+        }],
+        state_objects,
+        output_objects: vec![],
+        parent_checkpoint,
+        created_at: "2026-05-18T00:00:00Z".to_string(),
+    }
 }
 
 fn live_store(config: &LiveConfig) -> object_store::Result<impl ObjectStore> {
