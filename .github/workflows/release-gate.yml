@@ -122,7 +122,15 @@ jobs:
           test -f "$FELDERA_METADATA_PATH"
           test -f "$FELDERA_ARTIFACT_PACKAGE_PATH"
           test -f "$FELDERA_PROVENANCE_PATH"
-          mkdir -p target/release-evidence
+          mkdir -p target/release-evidence/feldera-inputs
+          cp "$FELDERA_SPEC_PATH" target/release-evidence/feldera-inputs/standing-view-spec.json
+          cp "$FELDERA_METADATA_PATH" target/release-evidence/feldera-inputs/compile-artifact-metadata.json
+          cp "$FELDERA_ARTIFACT_PACKAGE_PATH" target/release-evidence/feldera-inputs/artifact-package
+          cp "$FELDERA_PROVENANCE_PATH" target/release-evidence/feldera-inputs/release-provenance.json
+          (
+            cd target/release-evidence/feldera-inputs
+            sha256sum standing-view-spec.json compile-artifact-metadata.json artifact-package release-provenance.json > SHA256SUMS
+          )
           cargo run -p velorix-cli -- feldera-artifact-verify \
             --spec "$FELDERA_SPEC_PATH" \
             --metadata "$FELDERA_METADATA_PATH" \
@@ -184,4 +192,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: release-evidence
-          path: target/release-evidence/*.json
+          path: |
+            target/release-evidence/*.json
+            target/release-evidence/feldera-inputs/**

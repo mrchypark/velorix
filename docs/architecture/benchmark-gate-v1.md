@@ -70,9 +70,11 @@ benchmark results:
 - `gc_dry_run_planning`
 - `gc_execution_evidence`
 
-S3-compatible benchmark gates do not currently require `gc_execution_evidence`,
-which remains local-only until S3-compatible GC execution evidence is
-implemented.
+S3-compatible benchmark gates do not require `gc_execution_evidence`, because
+live GC deletion is a separate release artifact path rather than a timing
+workload. Use `velorix-cli gc-execute-s3-compatible` to create the live
+S3-compatible `GcRunV1`, then `gc-production-evidence` to emit the release-bound
+production GC evidence artifact.
 
 ## Broader Benchmark Coverage
 

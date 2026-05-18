@@ -156,6 +156,16 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    GcExecuteS3Compatible {
+        #[arg(long)]
+        authority_store_id: String,
+        #[arg(long)]
+        retain_latest_manifests: usize,
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        json: bool,
+    },
     GcProductionEvidence {
         #[arg(long)]
         deployment_id: String,
@@ -364,6 +374,31 @@ async fn main() -> anyhow::Result<()> {
             let run = execute_local_garbage_collection(store, &run_id, policy)
                 .await
                 .context("failed to execute local garbage collection")?;
+
+            if json {
+                println!("{}", format_gc_run_json(&run)?);
+            } else {
+                print!("{}", format_gc_run(&run));
+            }
+        }
+        Some(Command::GcExecuteS3Compatible {
+            authority_store_id,
+            retain_latest_manifests,
+            run_id,
+            json,
+        }) => {
+            let store = production_gc_authority_store_from_env()?;
+            let policy = GarbageCollectionPolicy {
+                retain_latest_manifests,
+            };
+            let run = execute_s3_compatible_garbage_collection(
+                store,
+                &authority_store_id,
+                &run_id,
+                policy,
+            )
+            .await
+            .context("failed to execute S3-compatible garbage collection")?;
 
             if json {
                 println!("{}", format_gc_run_json(&run)?);
@@ -1247,6 +1282,32 @@ async fn generate_production_gc_run_evidence(
         checkpoint_gc_transition_records_checked: true,
         _extra: BTreeMap::new(),
     })
+}
+
+async fn execute_s3_compatible_garbage_collection(
+    store: Arc<dyn ObjectStore>,
+    authority_store_id: &str,
+    run_id: &str,
+    policy: GarbageCollectionPolicy,
+) -> anyhow::Result<GarbageCollectionRunV1> {
+    validate_production_gc_authority_store_id(authority_store_id)?;
+    if run_id.trim().is_empty() {
+        bail!("gc-execute-s3-compatible requires --run-id");
+    }
+
+    let publisher = production_gc_checkpoint_publisher(store, run_id).await?;
+    let plan = publisher.plan_garbage_collection(policy).await?;
+    let run = publisher
+        .execute_garbage_collection_plan_with_evidence(run_id, policy, &plan)
+        .await?;
+    let verified = publisher
+        .verify_garbage_collection_run_retention_evidence(run_id)
+        .await?;
+    if verified != run {
+        bail!("verified S3-compatible GC run differs from executed run");
+    }
+
+    Ok(verified)
 }
 
 async fn production_gc_checkpoint_publisher(
@@ -4142,6 +4203,37 @@ mod tests {
     }
 
     #[test]
+    fn gc_execute_s3_compatible_cli_parses_json_command() {
+        let cli = Cli::try_parse_from([
+            "velorix-cli",
+            "gc-execute-s3-compatible",
+            "--authority-store-id",
+            "s3://velorix-prod",
+            "--retain-latest-manifests",
+            "2",
+            "--run-id",
+            "run-0001",
+            "--json",
+        ])
+        .unwrap();
+
+        let Some(Command::GcExecuteS3Compatible {
+            authority_store_id,
+            retain_latest_manifests,
+            run_id,
+            json,
+        }) = cli.command
+        else {
+            panic!("expected gc-execute-s3-compatible command");
+        };
+
+        assert_eq!(authority_store_id, "s3://velorix-prod");
+        assert_eq!(retain_latest_manifests, 2);
+        assert_eq!(run_id, "run-0001");
+        assert!(json);
+    }
+
+    #[test]
     fn gc_production_evidence_cli_parses_json_command() {
         let cli = Cli::try_parse_from([
             "velorix-cli",
@@ -4223,6 +4315,87 @@ mod tests {
         let error = production_gc_s3_config_from_lookup(|_| None).unwrap_err();
 
         assert!(format!("{error:#}").contains("VELORIX_S3_COMPAT=1"));
+    }
+
+    #[tokio::test]
+    async fn gc_execute_s3_compatible_persists_run_for_production_evidence_verifier() {
+        let dir = tempdir().unwrap();
+        let store = local_object_store(dir.path()).unwrap();
+        let seeder = CheckpointPublisher::new(Arc::clone(&store));
+        let state_0 = StateObjectWrite::new(
+            ORDERS_SUM_COUNT_OWNER,
+            0,
+            0,
+            "state-0000",
+            Bytes::from_static(b"state-0"),
+        )
+        .unwrap();
+        let state_ref_0 = seeder.write_state_object(&state_0).await.unwrap();
+        seeder
+            .publish_manifest(&CheckpointManifest {
+                schema_version: 1,
+                checkpoint_version: 0,
+                input_ranges: vec![InputRange {
+                    stream_id: "orders".to_string(),
+                    partition_id: 0,
+                    start_offset_inclusive: 0,
+                    end_offset_exclusive: 1,
+                }],
+                state_objects: vec![state_ref_0],
+                output_objects: vec![],
+                parent_checkpoint: None,
+                created_at: "2026-05-06T00:00:00Z".to_string(),
+            })
+            .await
+            .unwrap();
+        let state_1 = StateObjectWrite::new(
+            ORDERS_SUM_COUNT_OWNER,
+            0,
+            1,
+            "state-0001",
+            Bytes::from_static(b"state-1"),
+        )
+        .unwrap();
+        let state_ref_1 = seeder.write_state_object(&state_1).await.unwrap();
+        seeder
+            .publish_manifest(&CheckpointManifest {
+                schema_version: 1,
+                checkpoint_version: 1,
+                input_ranges: vec![InputRange {
+                    stream_id: "orders".to_string(),
+                    partition_id: 0,
+                    start_offset_inclusive: 0,
+                    end_offset_exclusive: 2,
+                }],
+                state_objects: vec![state_ref_1],
+                output_objects: vec![],
+                parent_checkpoint: Some(0),
+                created_at: "2026-05-06T00:01:00Z".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let run = execute_s3_compatible_garbage_collection(
+            Arc::clone(&store),
+            "s3://velorix-test",
+            "run-0001",
+            GarbageCollectionPolicy {
+                retain_latest_manifests: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let verifier = production_gc_checkpoint_publisher(store, "run-0001")
+            .await
+            .unwrap();
+        let verified = verifier
+            .verify_garbage_collection_run_retention_evidence("run-0001")
+            .await
+            .unwrap();
+
+        assert_eq!(run.run_id, "run-0001");
+        assert_eq!(run.report.deleted.len(), 1);
+        assert_eq!(verified.run_id, "run-0001");
     }
 
     #[test]
