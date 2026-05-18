@@ -35,10 +35,11 @@ use velorix_runtime::{
         query_production_persisted_object_backed_input_with_limiter,
         query_production_persisted_object_backed_input_with_limiter_and_metrics,
         query_production_persisted_object_backed_input_with_metrics,
+        query_production_persisted_object_backed_input_with_runtime_and_metrics,
         CreateProductionPersistedTableSpecRequest, PersistedTableError, PersistedTableFormat,
         PersistedTableStore, ProductionPersistedTableFormat, ProductionPersistedTableQueryRequest,
     },
-    query::{QueryExecutionLimiter, RuntimeQueryError},
+    query::{ProductionQueryRuntime, QueryExecutionLimiter, RuntimeQueryError},
     query_policy_catalog::{
         QueryPolicyCatalogError, QueryPolicyCatalogRecord, QueryPolicyCatalogStore,
         QUERY_POLICY_CATALOG_SCHEMA_VERSION,
@@ -1647,6 +1648,56 @@ async fn production_object_backed_table_query_with_metrics_accepts_shared_limite
             sql: "select account_id, value, weight from orders",
             limiter: QueryExecutionLimiter::from_policy(policy),
         },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(output.batches.len(), 1);
+    assert_eq!(output.batches[0].num_rows(), 1);
+    assert!(output.object_requests.list_count >= 1);
+}
+
+#[tokio::test]
+async fn production_object_backed_table_query_with_metrics_accepts_runtime_owned_limiter_when_catalog_concurrency_limit_is_set(
+) {
+    let (_temp_dir, catalog_store) = temp_store();
+    let scan_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
+    put_parquet_input(
+        &scan_store,
+        "tenants/tenant-a/tables/orders/snapshots/0001/part-000.parquet",
+        &parquet_orders_batch(&["account-a"], &[10], &[1]),
+    )
+    .await;
+    let mut registry = StorageRegistry::new();
+    register_production_scan_store(
+        &mut registry,
+        Arc::clone(&scan_store),
+        Arc::clone(&catalog_store),
+    )
+    .await;
+    let policy = production_policy_with(QueryPolicy {
+        max_concurrent_queries: Some(1),
+        ..QueryPolicy::default()
+    });
+    create_production_table_with_policy(
+        &catalog_store,
+        "primary",
+        "tenants/tenant-a/tables/orders",
+        policy,
+    )
+    .await;
+    let runtime = ProductionQueryRuntime::from_policy(policy);
+
+    let output = query_production_persisted_object_backed_input_with_runtime_and_metrics(
+        Arc::clone(&catalog_store),
+        Arc::clone(&catalog_store),
+        Arc::clone(&catalog_store),
+        &registry,
+        &all_namespace_capabilities(),
+        "tenant-a",
+        "orders-current",
+        "select account_id, value, weight from orders",
+        &runtime,
     )
     .await
     .unwrap();

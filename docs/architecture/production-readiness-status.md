@@ -179,6 +179,13 @@ SlateDB recovery path. This tightens the release gate while keeping the row
 partial for live RustFS/S3-compatible checked SlateDB recovery evidence and the
 explicitly design-blocked broader SlateDB retention-handle protocol.
 
+DataFusion policy evidence note, 2026-05-18: the production persisted-table
+metrics query path now has a `ProductionQueryRuntime` entrypoint that derives
+the compatible limiter from the stored query policy before executing the same
+object-request-metered scan path. This closes the local gap where metrics scans
+could only prove concurrency through a caller-supplied limiter handle; broader
+tenant/global shared-runtime and operator-level spill evidence remain blockers.
+
 DataFusion policy evidence note, 2026-05-18: `ProductionQueryRuntime` now owns a
 shared limiter derived from `QueryPolicy`; direct object-backed and direct
 production recovered-query wrappers request compatible limiter handles from that

@@ -510,6 +510,49 @@ pub async fn query_production_persisted_object_backed_input_with_runtime(
     .await
 }
 
+pub async fn query_production_persisted_object_backed_input_with_runtime_and_metrics(
+    catalog_store: Arc<dyn ObjectStore>,
+    relation_catalog_store: Arc<dyn ObjectStore>,
+    policy_catalog_store: Arc<dyn ObjectStore>,
+    registry: &StorageRegistry,
+    startup_capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
+    tenant_id: &str,
+    table_id: &str,
+    sql: &str,
+    runtime: &ProductionQueryRuntime,
+) -> Result<ObjectBackedQueryResult, PersistedTableError> {
+    let catalog = PersistedTableStore::new_checked(catalog_store, startup_capabilities)?;
+    let spec = catalog.get_production(table_id).await?;
+    reject_cross_tenant_production_query(tenant_id, &spec)?;
+    registry.production_capabilities(&spec.store_id)?;
+    let relation_catalog = read_matching_relation_catalog(
+        relation_catalog_store,
+        startup_capabilities,
+        &spec.relation_id,
+        &spec.relation_version,
+        &spec.schema_fingerprint,
+    )
+    .await?;
+    let policy = QueryPolicyCatalogStore::new_checked(policy_catalog_store, startup_capabilities)?
+        .get_for_production_table_scan(&spec.tenant_id, &spec.query_policy_id)
+        .await?
+        .policy;
+    let limiter = runtime
+        .compatible_limiter(policy)
+        .map_err(RuntimeQueryError::from)?;
+
+    query_production_spec_with_policy_and_metrics(
+        registry,
+        tenant_id,
+        spec,
+        relation_catalog,
+        sql,
+        policy,
+        limiter,
+    )
+    .await
+}
+
 pub(crate) async fn query_production_spec_with_policy(
     registry: &StorageRegistry,
     tenant_id: &str,
