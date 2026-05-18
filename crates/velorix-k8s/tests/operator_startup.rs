@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use http::{Method, Request, Response, StatusCode};
-use k8s_openapi::api::core::v1::EnvVar;
+use k8s_openapi::api::core::v1::{ConfigMapVolumeSource, EnvVar, Volume, VolumeMount};
 use kube::client::{Body, ClientBuilder};
 use object_store::{
     local::LocalFileSystem, path::Path, GetOptions, GetResult, ListResult, MultipartUpload,
@@ -452,12 +452,169 @@ fn deployed_ingest_writer_pod_template_builds_deterministic_identity_bound_pod()
 }
 
 #[test]
+fn deployed_ingest_writer_pod_template_builds_wrapper_append_entrypoint_from_identity() {
+    let template = IngestWriterPodTemplate::new("ghcr.io/velorix/velorix-cli:1.0.0")
+        .unwrap()
+        .with_checked_append_entrypoint("/var/run/velorix/payload.vlxingest")
+        .unwrap();
+    let identity = IngestWriterRuntimeIdentity {
+        namespace: "analytics".to_string(),
+        authority: authority(),
+        operator_id: "Operator_A/West".to_string(),
+        writer_id: "Writer_A/0".to_string(),
+    };
+
+    let pod = template.pod_for_identity(&identity);
+    let container = pod.spec.unwrap().containers.into_iter().next().unwrap();
+
+    assert_eq!(
+        container.command.as_deref(),
+        Some(["/usr/local/bin/velorix-ingest-writer-entrypoint".to_string()].as_slice())
+    );
+    assert_eq!(container.args, None);
+    assert!(container.env.unwrap().contains(&env_var(
+        "VELORIX_INGEST_WRITER_PAYLOAD_FILE",
+        "/var/run/velorix/payload.vlxingest"
+    )));
+}
+
+#[test]
+fn deployed_ingest_writer_pod_template_includes_cli_s3_env_wiring() {
+    let template = IngestWriterPodTemplate::new("ghcr.io/velorix/velorix-cli:1.0.0")
+        .unwrap()
+        .with_checked_append_entrypoint("/var/run/velorix/payload.vlxingest")
+        .unwrap()
+        .with_env_var(env_var("VELORIX_S3_COMPAT", "1"))
+        .with_env_var(env_var("AWS_REGION", "us-east-1"))
+        .with_env_var(env_var("VELORIX_S3_BUCKET", "velorix-prod"));
+    let identity = IngestWriterRuntimeIdentity {
+        namespace: "analytics".to_string(),
+        authority: authority(),
+        operator_id: "Operator_A/West".to_string(),
+        writer_id: "Writer_A/0".to_string(),
+    };
+
+    let pod = template.pod_for_identity(&identity);
+    let env = pod
+        .spec
+        .unwrap()
+        .containers
+        .into_iter()
+        .next()
+        .unwrap()
+        .env
+        .unwrap();
+
+    assert!(env.contains(&env_var("VELORIX_INGEST_WRITER_ID", "Writer_A/0")));
+    assert!(env.contains(&env_var("VELORIX_S3_COMPAT", "1")));
+    assert!(env.contains(&env_var("AWS_REGION", "us-east-1")));
+    assert!(env.contains(&env_var("VELORIX_S3_BUCKET", "velorix-prod")));
+}
+
+#[test]
 fn deployed_ingest_writer_pod_template_rejects_empty_image() {
     let error = IngestWriterPodTemplate::new(" ").unwrap_err();
 
     assert!(error
         .to_string()
         .contains("ingest writer pod image must not be empty"));
+}
+
+#[test]
+fn deployed_ingest_writer_pod_template_can_run_checked_append_entrypoint() {
+    let template = IngestWriterPodTemplate::new("ghcr.io/velorix/velorix-ingest-writer:1.0.0")
+        .unwrap()
+        .with_checked_append_entrypoint("/var/run/velorix/payload.vlxingest")
+        .unwrap()
+        .with_env_var(env_var("VELORIX_S3_COMPAT", "1"))
+        .with_env_var(env_var("AWS_ENDPOINT_URL", "http://rustfs:9000"))
+        .with_env_var(env_var("AWS_REGION", "us-east-1"))
+        .with_volume_mount(VolumeMount {
+            name: "ingest-payload".to_string(),
+            mount_path: "/var/run/velorix".to_string(),
+            read_only: Some(true),
+            ..VolumeMount::default()
+        })
+        .with_volume(Volume {
+            name: "ingest-payload".to_string(),
+            config_map: Some(ConfigMapVolumeSource {
+                name: "ingest-payload".to_string(),
+                ..ConfigMapVolumeSource::default()
+            }),
+            ..Volume::default()
+        })
+        .with_service_account_name("velorix-ingest-writer");
+    let identity = IngestWriterRuntimeIdentity {
+        namespace: "analytics".to_string(),
+        authority: ObjectStoreAuthorityRef {
+            store_id: "s3://velorix-live".to_string(),
+            namespace: "prod-a".to_string(),
+        },
+        operator_id: "operator-a".to_string(),
+        writer_id: "writer-a".to_string(),
+    };
+
+    let pod = template.pod_for_identity(&identity);
+    let spec = pod.spec.unwrap();
+    let container = spec.containers.first().unwrap().clone();
+
+    assert_eq!(
+        container.command.as_deref(),
+        Some(["/usr/local/bin/velorix-ingest-writer-entrypoint".to_string()].as_slice())
+    );
+    assert_eq!(container.args, None);
+    assert_eq!(
+        container.env.unwrap(),
+        vec![
+            env_var("VELORIX_INGEST_WRITER_NAMESPACE", "analytics"),
+            env_var(
+                "VELORIX_INGEST_WRITER_AUTHORITY_STORE_ID",
+                "s3://velorix-live"
+            ),
+            env_var("VELORIX_INGEST_WRITER_AUTHORITY_NAMESPACE", "prod-a"),
+            env_var("VELORIX_INGEST_WRITER_OPERATOR_ID", "operator-a"),
+            env_var("VELORIX_INGEST_WRITER_ID", "writer-a"),
+            env_var(
+                "VELORIX_INGEST_WRITER_PAYLOAD_FILE",
+                "/var/run/velorix/payload.vlxingest",
+            ),
+            env_var("VELORIX_S3_COMPAT", "1"),
+            env_var("AWS_ENDPOINT_URL", "http://rustfs:9000"),
+            env_var("AWS_REGION", "us-east-1"),
+        ]
+    );
+    assert_eq!(
+        container.volume_mounts.unwrap(),
+        vec![VolumeMount {
+            name: "ingest-payload".to_string(),
+            mount_path: "/var/run/velorix".to_string(),
+            read_only: Some(true),
+            ..VolumeMount::default()
+        }]
+    );
+    assert_eq!(
+        spec.volumes.unwrap(),
+        vec![Volume {
+            name: "ingest-payload".to_string(),
+            config_map: Some(ConfigMapVolumeSource {
+                name: "ingest-payload".to_string(),
+                ..ConfigMapVolumeSource::default()
+            }),
+            ..Volume::default()
+        }]
+    );
+}
+
+#[test]
+fn deployed_ingest_writer_pod_template_rejects_empty_append_payload_path() {
+    let error = IngestWriterPodTemplate::new("ghcr.io/velorix/velorix-ingest-writer:1.0.0")
+        .unwrap()
+        .with_checked_append_entrypoint(" ")
+        .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("ingest writer payload file must not be empty"));
 }
 
 #[tokio::test]

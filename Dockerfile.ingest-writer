@@ -1,0 +1,19 @@
+FROM rust:1.88.0-bookworm AS builder
+
+WORKDIR /workspace
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN cargo build --release -p velorix-cli --locked
+
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /workspace/target/release/velorix-cli /usr/local/bin/velorix-cli
+COPY scripts/velorix-ingest-writer-entrypoint.sh /usr/local/bin/velorix-ingest-writer-entrypoint
+RUN chmod 0755 /usr/local/bin/velorix-ingest-writer-entrypoint
+
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/velorix-ingest-writer-entrypoint"]

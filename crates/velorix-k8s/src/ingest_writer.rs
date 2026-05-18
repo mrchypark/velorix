@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, fmt};
 use async_trait::async_trait;
 use bytes::Bytes;
 use k8s_openapi::{
-    api::core::v1::{Container, EnvVar, Pod, PodSpec},
+    api::core::v1::{Container, EnvVar, Pod, PodSpec, Volume, VolumeMount},
     apimachinery::pkg::apis::meta::v1::ObjectMeta,
 };
 use kube::{
@@ -28,11 +28,14 @@ pub struct IngestWriterRuntimeIdentity {
     pub writer_id: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct IngestWriterPodTemplate {
     image: String,
     command: Option<Vec<String>>,
     args: Option<Vec<String>>,
+    env: Vec<EnvVar>,
+    volume_mounts: Vec<VolumeMount>,
+    volumes: Vec<Volume>,
     labels: BTreeMap<String, String>,
     service_account_name: Option<String>,
 }
@@ -50,6 +53,9 @@ impl IngestWriterPodTemplate {
             image,
             command: None,
             args: None,
+            env: Vec::new(),
+            volume_mounts: Vec::new(),
+            volumes: Vec::new(),
             labels: BTreeMap::new(),
             service_account_name: None,
         })
@@ -62,6 +68,37 @@ impl IngestWriterPodTemplate {
 
     pub fn with_args(mut self, args: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.args = Some(args.into_iter().map(Into::into).collect());
+        self
+    }
+
+    pub fn with_checked_append_entrypoint(
+        self,
+        payload_file: impl Into<String>,
+    ) -> Result<Self, IngestWriterPodError> {
+        let payload_file = payload_file.into();
+        if payload_file.trim().is_empty() {
+            return Err(IngestWriterPodError::InvalidTemplate {
+                message: "ingest writer payload file must not be empty".to_string(),
+            });
+        }
+
+        Ok(self
+            .with_command(["/usr/local/bin/velorix-ingest-writer-entrypoint"])
+            .with_env_var(env_var("VELORIX_INGEST_WRITER_PAYLOAD_FILE", &payload_file)))
+    }
+
+    pub fn with_env_var(mut self, env: EnvVar) -> Self {
+        self.env.push(env);
+        self
+    }
+
+    pub fn with_volume_mount(mut self, mount: VolumeMount) -> Self {
+        self.volume_mounts.push(mount);
+        self
+    }
+
+    pub fn with_volume(mut self, volume: Volume) -> Self {
+        self.volumes.push(volume);
         self
     }
 
@@ -88,11 +125,21 @@ impl IngestWriterPodTemplate {
                     image: Some(self.image.clone()),
                     command: self.command.clone(),
                     args: self.args.clone(),
-                    env: Some(env_for_identity(identity)),
+                    env: Some(self.env_for_identity(identity)),
+                    volume_mounts: if self.volume_mounts.is_empty() {
+                        None
+                    } else {
+                        Some(self.volume_mounts.clone())
+                    },
                     ..Container::default()
                 }],
                 restart_policy: Some("Never".to_string()),
                 service_account_name: self.service_account_name.clone(),
+                volumes: if self.volumes.is_empty() {
+                    None
+                } else {
+                    Some(self.volumes.clone())
+                },
                 ..PodSpec::default()
             }),
             status: None,
@@ -133,6 +180,12 @@ impl IngestWriterPodTemplate {
             ingest_writer_identity_hash(identity),
         );
         labels
+    }
+
+    fn env_for_identity(&self, identity: &IngestWriterRuntimeIdentity) -> Vec<EnvVar> {
+        let mut env = env_for_identity(identity);
+        env.extend(self.env.clone());
+        env
     }
 }
 
@@ -344,11 +397,27 @@ fn pod_matches_identity(
     if container.image != Some(template.image.clone())
         || container.command != template.command
         || container.args != template.args
+        || container.volume_mounts
+            != if template.volume_mounts.is_empty() {
+                None
+            } else {
+                Some(template.volume_mounts.clone())
+            }
     {
         return false;
     }
 
-    let expected_env = env_for_identity(identity);
+    if spec.volumes
+        != if template.volumes.is_empty() {
+            None
+        } else {
+            Some(template.volumes.clone())
+        }
+    {
+        return false;
+    }
+
+    let expected_env = template.env_for_identity(identity);
     let Some(env) = container.env.as_ref() else {
         return false;
     };
