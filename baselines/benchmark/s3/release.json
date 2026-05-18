@@ -1,124 +1,125 @@
 {
   "schema_version": 1,
-  "commit": "placeholder-s3-release-baseline",
+  "commit": "1d477916d9341a478473e4cee0c4d63eb84e968b",
   "gate_level": "release",
   "backend": "s3_compatible",
+  "backend_evidence_scope": "live_or_native",
   "workload": "s3_incremental",
   "metrics": {
-    "rows_per_second": 1.0,
-    "bytes_per_row": 1000000000.0,
-    "put_per_gib": 1000000000.0,
+    "rows_per_second": 36.692297640120344,
+    "bytes_per_row": 222.34375,
+    "put_per_gib": 1240311.4007027408,
     "object_requests": {
-      "put_count": 1000000,
-      "get_count": 1000000,
-      "list_count": 1000000,
-      "range_read_count": 1000000,
-      "bytes_written": 1000000000000,
-      "bytes_read": 1000000000000
+      "put_count": 263,
+      "get_count": 16830,
+      "list_count": 775,
+      "range_read_count": 14,
+      "bytes_written": 227680,
+      "bytes_read": 16212960
     },
-    "checkpoint_p50_ms": 600000.0,
-    "checkpoint_p95_ms": 600000.0,
-    "recovery_p95_ms": 600000.0,
-    "peak_rss_bytes": 1099511627776,
-    "spill_bytes": 1099511627776,
-    "scan_bytes": 1099511627776
+    "checkpoint_p50_ms": 7.479625,
+    "checkpoint_p95_ms": 7.479625,
+    "recovery_p95_ms": 127.96416599999999,
+    "peak_rss_bytes": 57360384,
+    "spill_bytes": 0,
+    "scan_bytes": 1084
   },
   "workload_metrics": [
     {
       "name": "object_store_capability_probe",
-      "p50_ms": 600000.0,
-      "p95_ms": 600000.0,
+      "p50_ms": 148.597125,
+      "p95_ms": 148.597125,
       "object_requests": {
-        "put_count": 1000000,
-        "get_count": 1000000,
-        "list_count": 1000000,
-        "range_read_count": 1000000,
-        "bytes_written": 1000000000000,
-        "bytes_read": 1000000000000
+        "put_count": 38,
+        "get_count": 19,
+        "list_count": 19,
+        "range_read_count": 0,
+        "bytes_written": 1520,
+        "bytes_read": 760
       },
       "scan_bytes": 0
     },
     {
       "name": "ingest_envelope_validation",
-      "p50_ms": 600000.0,
-      "p95_ms": 600000.0,
+      "p50_ms": 438.245167,
+      "p95_ms": 815.249416,
       "object_requests": {
-        "put_count": 1000000,
-        "get_count": 0,
-        "list_count": 0,
+        "put_count": 195,
+        "get_count": 16705,
+        "list_count": 715,
         "range_read_count": 0,
-        "bytes_written": 1000000000000,
-        "bytes_read": 0
+        "bytes_written": 218308,
+        "bytes_read": 16152282
       },
       "scan_bytes": 0
     },
     {
       "name": "checkpoint_publish",
-      "p50_ms": 600000.0,
-      "p95_ms": 600000.0,
+      "p50_ms": 7.479625,
+      "p95_ms": 7.479625,
       "object_requests": {
-        "put_count": 1000000,
+        "put_count": 4,
         "get_count": 0,
         "list_count": 0,
         "range_read_count": 0,
-        "bytes_written": 1000000000000,
+        "bytes_written": 2128,
         "bytes_read": 0
       },
       "scan_bytes": 0
     },
     {
       "name": "checkpoint_recovery",
-      "p50_ms": 600000.0,
-      "p95_ms": 600000.0,
+      "p50_ms": 127.96416599999999,
+      "p95_ms": 127.96416599999999,
       "object_requests": {
-        "put_count": 0,
-        "get_count": 1000000,
-        "list_count": 1000000,
-        "range_read_count": 1000000,
-        "bytes_written": 0,
-        "bytes_read": 1000000000000
+        "put_count": 1,
+        "get_count": 73,
+        "list_count": 3,
+        "range_read_count": 0,
+        "bytes_written": 393,
+        "bytes_read": 49182
       },
       "scan_bytes": 0
     },
     {
       "name": "datafusion_table_scan",
-      "p50_ms": 600000.0,
-      "p95_ms": 600000.0,
+      "p50_ms": 28.796583000000002,
+      "p95_ms": 28.796583000000002,
       "object_requests": {
         "put_count": 0,
-        "get_count": 1000000,
-        "list_count": 1000000,
-        "range_read_count": 1000000,
+        "get_count": 3,
+        "list_count": 3,
+        "range_read_count": 1,
         "bytes_written": 0,
-        "bytes_read": 1000000000000
+        "bytes_read": 2034
       },
-      "scan_bytes": 1099511627776
+      "scan_bytes": 1084
     },
     {
       "name": "slatedb_state_reopen",
-      "p50_ms": 600000.0,
-      "p95_ms": 600000.0,
+      "p50_ms": 168.087166,
+      "p95_ms": 168.087166,
       "object_requests": {
-        "put_count": 1000000,
-        "get_count": 1000000,
-        "list_count": 1000000,
-        "range_read_count": 1000000,
-        "bytes_written": 1000000000000,
-        "bytes_read": 1000000000000
+        "put_count": 15,
+        "get_count": 22,
+        "list_count": 32,
+        "range_read_count": 13,
+        "bytes_written": 2000,
+        "bytes_read": 3430
       },
       "scan_bytes": 0
     },
     {
       "name": "gc_dry_run_planning",
-      "p50_ms": 600000.0,
-      "p95_ms": 600000.0,
+      "p50_ms": 6.459040999999999,
+      "p95_ms": 6.459040999999999,
       "object_requests": {
-        "put_count": 1000000,
-        "get_count": 1000000,
-        "list_count": 1000000,
-        "range_read_count": 1000000,
-        "bytes_written": 1000000000000,
-        "bytes_read": 1000000000000
+        "put_count": 0,
+        "get_count": 2,
+        "list_count": 3,
+        "range_read_count": 0,
+        "bytes_written": 0,
+        "bytes_read": 1264
       },
       "scan_bytes": 0
     }

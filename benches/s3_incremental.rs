@@ -326,7 +326,7 @@ mod live_s3 {
         Ok(BenchmarkGateResultV1 {
             schema_version: 1,
             commit: git_commit()?,
-            gate_level: BenchmarkGateLevel::NightlyIntegration,
+            gate_level: benchmark_gate_level_from_env()?,
             backend: BenchmarkBackend::S3Compatible,
             backend_evidence_scope: benchmark_evidence_scope_from_env()?,
             workload: "s3_incremental".to_string(),
@@ -404,6 +404,23 @@ mod live_s3 {
             Err(std::env::VarError::NotPresent) => Ok(BenchmarkEvidenceScope::LiveOrNative),
             Err(error) => Err(bench_error(format!(
                 "failed to read VELORIX_BENCHMARK_EVIDENCE_SCOPE: {error}"
+            ))),
+        }
+    }
+
+    fn benchmark_gate_level_from_env() -> BenchResult<BenchmarkGateLevel> {
+        match std::env::var("VELORIX_BENCHMARK_GATE_LEVEL") {
+            Ok(value) if value == "nightly_integration" || value == "nightly-integration" => {
+                Ok(BenchmarkGateLevel::NightlyIntegration)
+            }
+            Ok(value) if value == "release" => Ok(BenchmarkGateLevel::Release),
+            Ok(value) if value.trim().is_empty() => Ok(BenchmarkGateLevel::NightlyIntegration),
+            Ok(value) => Err(bench_error(format!(
+                "unsupported VELORIX_BENCHMARK_GATE_LEVEL={value}; expected nightly-integration or release"
+            ))),
+            Err(std::env::VarError::NotPresent) => Ok(BenchmarkGateLevel::NightlyIntegration),
+            Err(error) => Err(bench_error(format!(
+                "failed to read VELORIX_BENCHMARK_GATE_LEVEL: {error}"
             ))),
         }
     }

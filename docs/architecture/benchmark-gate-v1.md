@@ -30,7 +30,11 @@ The committed local PR-smoke baseline is a non-placeholder, conservative
 threshold derived from a measured local run. It checks schema, required workload
 coverage, non-placeholder commit provenance, and gate wiring, not stable local
 machine performance. S3-compatible nightly and release baselines require live
-measured S3-compatible evidence and must not use placeholders.
+measured S3-compatible evidence and must not use placeholders. The committed
+S3-compatible baselines were refreshed from the RustFS-backed live S3 API gate
+on 2026-05-18 at commit `1d477916d9341a478473e4cee0c4d63eb84e968b`; the
+nightly and release gate artifacts both compare the generated result against
+the matching committed baseline with `backend_evidence_scope=live_or_native`.
 
 `local_incremental` is a bootstrap harness, not production readiness evidence.
 It currently emits real local workload details for the authoritative
@@ -101,12 +105,15 @@ implemented.
 - PR smoke writes `target/velorix-bench/local-pr-smoke.json`, gates it against
   `baselines/benchmark/local/pr-smoke.json`, and uploads the result artifact.
 - Nightly S3-compatible gating fails closed when no S3-compatible result path is
-  configured or when the S3-compatible baseline is still a placeholder.
+  configured or when the S3-compatible result regresses against the live
+  baseline.
 - Release gating fails closed when no S3-compatible result path is provided or
-  when the S3-compatible baseline is still a placeholder.
+  when the S3-compatible result regresses against the live baseline.
 - `s3_incremental` fails closed unless `VELORIX_S3_COMPAT=1` is set. With the
   flag set, it still requires real S3-compatible object-store configuration.
   When explicitly enabled, it emits S3-compatible benchmark JSON for the
   authoritative object-store capability probe, ingest envelope validation,
   checkpoint publication, checkpoint recovery, bounded DataFusion Parquet scan,
-  SlateDB state reopen, and GC dry-run planning.
+  SlateDB state reopen, and GC dry-run planning. Set
+  `VELORIX_BENCHMARK_GATE_LEVEL=release` to emit release-level benchmark JSON;
+  the default is nightly integration.

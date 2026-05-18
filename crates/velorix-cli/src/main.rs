@@ -67,11 +67,12 @@ const REQUIRED_RELEASE_CONTRACTS: &[&str] = &[
 ];
 use velorix_runtime::recovery::{RecoveredRuntime, ORDERS_SUM_COUNT_OWNER};
 use velorix_storage::{
-    capability::probe_authoritative_object_store_capabilities,
+    capability::{
+        probe_authoritative_object_store_capabilities, AuthoritativeObjectStoreCapabilitiesV1,
+    },
     checkpoint_index::{
-        CheckpointAdminInspection, CheckpointAdminRepairReport, CheckpointGcTransitionRecordV1,
-        CheckpointLifecycleRecord, CheckpointLifecycleStatus, CheckpointManifestInspectionStatus,
-        CheckpointRetentionRecordV1, LatestCandidateMarker,
+        CheckpointAdminInspection, CheckpointAdminRepairReport, CheckpointLifecycleStatus,
+        CheckpointManifestInspectionStatus, CheckpointRetentionRecordV1, LatestCandidateMarker,
     },
     gc::{GarbageCollectionPlan, GarbageCollectionPolicy, GarbageCollectionRunV1},
     relation_catalog_registry::RelationCatalogRegistry,
@@ -1167,7 +1168,8 @@ async fn generate_production_gc_run_evidence(
         bail!("gc-production-evidence requires --gc-run-id");
     }
 
-    CheckpointPublisher::new(store)
+    let publisher = production_gc_checkpoint_publisher(Arc::clone(&store), &gc_run_id).await?;
+    publisher
         .verify_garbage_collection_run_retention_evidence(&gc_run_id)
         .await?;
 
@@ -1182,6 +1184,46 @@ async fn generate_production_gc_run_evidence(
         checkpoint_retention_records_checked: true,
         _extra: BTreeMap::new(),
     })
+}
+
+async fn production_gc_checkpoint_publisher(
+    store: Arc<dyn ObjectStore>,
+    gc_run_id: &str,
+) -> anyhow::Result<CheckpointPublisher> {
+    let capabilities = production_gc_authoritative_capabilities(store.as_ref(), gc_run_id).await?;
+    capabilities
+        .validate_for_startup()
+        .map_err(anyhow::Error::from)?;
+    CheckpointPublisher::new_authoritative(store, &capabilities).map_err(anyhow::Error::from)
+}
+
+async fn production_gc_authoritative_capabilities(
+    store: &dyn ObjectStore,
+    gc_run_id: &str,
+) -> anyhow::Result<AuthoritativeObjectStoreCapabilitiesV1> {
+    let probe_id = gc_run_id
+        .trim()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let probe_id = if probe_id.is_empty() {
+        "unknown-gc-run".to_string()
+    } else {
+        probe_id
+    };
+    probe_authoritative_object_store_capabilities(
+        store,
+        "gc-production-evidence",
+        format!("v1/gc-production-evidence-capability-probes/{probe_id}"),
+    )
+    .await
+    .map_err(anyhow::Error::from)
 }
 
 fn format_production_gc_run_evidence_json(
@@ -2702,7 +2744,8 @@ mod tests {
     use velorix_runtime::recovery::{orders_sum_count_relation_catalog, RecoveryError};
     use velorix_storage::{
         checkpoint_index::{
-            CheckpointAdminInspection, CheckpointLifecycleStatus, CheckpointManifestInspection,
+            CheckpointAdminInspection, CheckpointGcTransitionRecordV1, CheckpointLifecycleRecord,
+            CheckpointLifecycleStatus, CheckpointManifestInspection,
             CheckpointManifestInspectionStatus, CheckpointRecoveryMode,
             CheckpointRecoveryTransitionRecordV1,
         },
