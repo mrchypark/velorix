@@ -160,6 +160,17 @@ immutable checkpoint manifests remain the authority, and the row remains partial
 for broader repair commands, deployed recovery/GC transition evidence, and
 manifest deletion or compaction policy.
 
+Checkpoint lifecycle evidence note, 2026-05-18: production GC run evidence now
+requires each checkpoint-retention record implied by the GC run to have its
+deterministic checkpoint GC transition record present and readable through the
+same digest-bound validation path used by admin inspection. The
+`production_gc_run_evidence` artifact now records
+`checkpoint_gc_transition_records_checked=true`, and release readiness rejects
+artifacts that omit or falsify that check. This narrows the deployed GC
+evidence gate definition without fabricating repair records or claiming the row
+complete; actual RustFS/vind production GC and recovery transition artifacts are
+still required.
+
 DataFusion policy evidence note, 2026-05-18: `ProductionQueryRuntime` now owns a
 shared limiter derived from `QueryPolicy`; direct object-backed and direct
 production recovered-query wrappers request compatible limiter handles from that

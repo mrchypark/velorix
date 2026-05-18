@@ -1335,6 +1335,7 @@ impl CheckpointPublisher {
             .iter()
             .map(|candidate| candidate.object_key.clone())
             .collect::<HashSet<_>>();
+        let transition_id = checkpoint_gc_transition_id_for_gc_run(&run.run_id)?;
         for expected in self
             .retention_records_for_deleted_keys(
                 &run.run_id,
@@ -1375,6 +1376,27 @@ impl CheckpointPublisher {
                     ),
                     },
                 );
+            }
+
+            match self
+                .read_checkpoint_gc_transition_record(expected.checkpoint_version, &transition_id)
+                .await
+            {
+                Ok(_) => {}
+                Err(CheckpointPublishError::ObjectStore(object_store::Error::NotFound {
+                    ..
+                })) => {
+                    return Err(
+                        CheckpointPublishError::InvalidGarbageCollectionRunEvidence {
+                            object_key: object_key.clone(),
+                            reason: format!(
+                                "missing checkpoint GC transition record for checkpoint {}",
+                                expected.checkpoint_version
+                            ),
+                        },
+                    );
+                }
+                Err(err) => return Err(err),
             }
         }
 

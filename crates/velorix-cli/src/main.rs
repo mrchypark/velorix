@@ -1042,6 +1042,12 @@ fn validate_production_gc_run_evidence_artifact(
             path.display()
         );
     }
+    if !artifact.checkpoint_gc_transition_records_checked {
+        bail!(
+            "{} production GC evidence did not check checkpoint GC transition records",
+            path.display()
+        );
+    }
 
     Ok(())
 }
@@ -1238,6 +1244,7 @@ async fn generate_production_gc_run_evidence(
         gc_run_id,
         listing_consistency_checked: true,
         checkpoint_retention_records_checked: true,
+        checkpoint_gc_transition_records_checked: true,
         _extra: BTreeMap::new(),
     })
 }
@@ -1290,13 +1297,14 @@ fn format_production_gc_run_evidence_json(
 
 fn format_production_gc_run_evidence(artifact: &ProductionGcRunEvidenceArtifactV1) -> String {
     format!(
-        "production_gc_run_evidence status={} deployment_id={} authority_store_id={} gc_run_id={} listing_consistency_checked={} checkpoint_retention_records_checked={}\n",
+        "production_gc_run_evidence status={} deployment_id={} authority_store_id={} gc_run_id={} listing_consistency_checked={} checkpoint_retention_records_checked={} checkpoint_gc_transition_records_checked={}\n",
         artifact.status,
         artifact.deployment_id,
         artifact.authority_store_id,
         artifact.gc_run_id,
         artifact.listing_consistency_checked,
-        artifact.checkpoint_retention_records_checked
+        artifact.checkpoint_retention_records_checked,
+        artifact.checkpoint_gc_transition_records_checked
     )
 }
 
@@ -1977,6 +1985,7 @@ struct ProductionGcRunEvidenceArtifactV1 {
     gc_run_id: String,
     listing_consistency_checked: bool,
     checkpoint_retention_records_checked: bool,
+    checkpoint_gc_transition_records_checked: bool,
     #[serde(flatten)]
     _extra: BTreeMap<String, serde_json::Value>,
 }
@@ -4310,7 +4319,21 @@ mod tests {
 
         assert_eq!(
             format_production_gc_run_evidence(&artifact),
-            "production_gc_run_evidence status=pass deployment_id=prod-a authority_store_id=s3://velorix-prod gc_run_id=gc-run-20260513T000000Z listing_consistency_checked=true checkpoint_retention_records_checked=true\n"
+            "production_gc_run_evidence status=pass deployment_id=prod-a authority_store_id=s3://velorix-prod gc_run_id=gc-run-20260513T000000Z listing_consistency_checked=true checkpoint_retention_records_checked=true checkpoint_gc_transition_records_checked=true\n"
+        );
+    }
+
+    #[test]
+    fn gc_production_evidence_json_includes_gc_transition_check() {
+        let artifact: ProductionGcRunEvidenceArtifactV1 =
+            serde_json::from_str(&production_gc_run_evidence_json()).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&format_production_gc_run_evidence_json(&artifact).unwrap())
+                .unwrap();
+
+        assert_eq!(
+            value["checkpoint_gc_transition_records_checked"],
+            serde_json::json!(true)
         );
     }
 
@@ -4659,6 +4682,33 @@ mod tests {
         .unwrap_err();
 
         assert!(format!("{error:#}").contains("deployment_id does not match"));
+    }
+
+    #[test]
+    fn readiness_report_rejects_production_gc_evidence_without_gc_transition_check() {
+        let dir = tempdir().unwrap();
+        let readiness = dir.path().join("readiness.json");
+        let production_gc = dir.path().join("production-gc.json");
+        fs::write(&readiness, readiness_json()).unwrap();
+        fs::write(
+            &production_gc,
+            production_gc_run_evidence_json().replace(
+                r#""checkpoint_gc_transition_records_checked":true"#,
+                r#""checkpoint_gc_transition_records_checked":false"#,
+            ),
+        )
+        .unwrap();
+
+        let error = read_readiness_report(
+            &readiness,
+            &ReadinessReleaseArtifactPaths {
+                production_gc_run_evidence: Some(production_gc),
+                ..ReadinessReleaseArtifactPaths::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("did not check checkpoint GC transition records"));
     }
 
     #[test]
@@ -6181,7 +6231,8 @@ mod tests {
             "authority_store_id": "s3://velorix-prod",
             "gc_run_id": "gc-run-20260513T000000Z",
             "listing_consistency_checked": true,
-            "checkpoint_retention_records_checked": true
+            "checkpoint_retention_records_checked": true,
+            "checkpoint_gc_transition_records_checked": true
         })
         .to_string()
     }
