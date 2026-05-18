@@ -6086,8 +6086,8 @@ mod tests {
             },
             "state_status": {
                 "status": "pass",
-                "evidence": "SlateDB checkpoint ref",
-                "evidence_kind": ["slate_db_checkpoint_ref"]
+                "evidence": "SlateDB checkpoint ref and checked recovery",
+                "evidence_kind": ["slate_db_checkpoint_ref", "slate_db_checked_recovery"]
             },
             "query_policy_status": {
                 "status": "pass",

@@ -62,6 +62,7 @@ pub enum ReadinessEvidenceKind {
     RelationCatalogClosedAdapterScope,
     RelationCatalogUnsupportedAdapterFailClosed,
     SlateDbCheckpointRef,
+    SlateDbCheckedRecovery,
     QueryPolicyCatalog,
     RegistryBackedTableCatalog,
     FelderaArtifactRegistry,
@@ -319,6 +320,13 @@ impl ProductionReadinessEvidenceV1 {
         {
             blocking_reasons
                 .push("state_status missing slate_db_checkpoint_ref evidence".to_string());
+        }
+        if !self
+            .state_status
+            .has_evidence(ReadinessEvidenceKind::SlateDbCheckedRecovery)
+        {
+            blocking_reasons
+                .push("state_status missing slate_db_checked_recovery evidence".to_string());
         }
         if !self
             .query_policy_status

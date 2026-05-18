@@ -193,6 +193,24 @@ fn readiness_report_blocks_when_slate_db_checkpoint_ref_evidence_is_missing() {
 }
 
 #[test]
+fn readiness_report_blocks_when_slate_db_checked_recovery_evidence_is_missing() {
+    let report = ProductionReadinessEvidenceV1::from_json_str(&readiness_json(
+        &["slate_db_checked_recovery"],
+        false,
+        &[],
+    ))
+    .unwrap()
+    .try_into_report()
+    .unwrap();
+
+    assert!(!report.production_ready);
+    assert_eq!(
+        report.blocking_reasons,
+        vec!["state_status missing slate_db_checked_recovery evidence"]
+    );
+}
+
+#[test]
 fn readiness_report_blocks_when_s3_compatible_benchmark_gate_evidence_is_missing() {
     let report = ProductionReadinessEvidenceV1::from_json_str(&readiness_json(
         &["s3_compatible_benchmark_gate"],
@@ -579,7 +597,7 @@ fn readiness_evidence_rejects_unknown_json_fields() {
             "checkpoint_status": { "status": "pass", "evidence": "published checkpoint lifecycle and recovery transition", "evidence_kind": ["published_checkpoint_lifecycle_record", "checkpoint_recovery_transition_record"] },
             "ingest_status": { "status": "pass", "evidence": "catalog-backed deployed ingest admission", "evidence_kind": ["catalog_backed_ingest_admission", "deployed_ingest_admission"] },
             "relation_catalog_status": { "status": "pass", "evidence": "durable relation catalog record, registry, closed adapter scope, and fail-closed unsupported adapters", "evidence_kind": ["relation_catalog_record", "relation_catalog_registry", "relation_catalog_closed_adapter_scope", "relation_catalog_unsupported_adapter_fail_closed"] },
-            "state_status": { "status": "pass", "evidence": "SlateDB checkpoint ref", "evidence_kind": ["slate_db_checkpoint_ref"] },
+            "state_status": { "status": "pass", "evidence": "SlateDB checkpoint ref and checked recovery", "evidence_kind": ["slate_db_checkpoint_ref", "slate_db_checked_recovery"] },
             "query_policy_status": { "status": "pass", "evidence": "bounded DataFusion policy", "evidence_kind": ["query_policy_catalog"] },
             "table_catalog_status": { "status": "pass", "evidence": "registry-backed table catalog", "evidence_kind": ["registry_backed_table_catalog"] },
             "feldera_artifact_status": { "status": "pass", "evidence": "trusted artifact metadata", "evidence_kind": ["feldera_artifact_registry", "feldera_artifact_hash_verified"] },
@@ -682,6 +700,9 @@ fn readiness_json(
     if !missing_evidence.contains(&"slate_db_checkpoint_ref") {
         state_evidence_kind.push("slate_db_checkpoint_ref");
     }
+    if !missing_evidence.contains(&"slate_db_checked_recovery") {
+        state_evidence_kind.push("slate_db_checked_recovery");
+    }
     let state_kind = if state_evidence_kind.is_empty() {
         String::new()
     } else {
@@ -750,7 +771,7 @@ fn readiness_json(
             "checkpoint_status": {{ "status": "pass", "evidence": "published checkpoint lifecycle and recovery transition"{checkpoint_kind} }},
             "ingest_status": {{ "status": "{ingest_status}", "evidence": "{ingest_evidence}"{ingest_kind} }},
             "relation_catalog_status": {{ "status": "{relation_catalog_status}", "evidence": "{relation_catalog_evidence}"{relation_catalog_kind} }},
-            "state_status": {{ "status": "pass", "evidence": "SlateDB checkpoint ref"{state_kind} }},
+            "state_status": {{ "status": "pass", "evidence": "SlateDB checkpoint ref and checked recovery"{state_kind} }},
             "query_policy_status": {{ "status": "pass", "evidence": "bounded DataFusion policy"{query_policy_kind} }},
             "table_catalog_status": {{ "status": "pass", "evidence": "registry-backed table catalog"{table_catalog_kind} }},
             "feldera_artifact_status": {{ "status": "pass", "evidence": "trusted artifact metadata"{feldera_artifact_kind} }},

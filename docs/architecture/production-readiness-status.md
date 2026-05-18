@@ -171,6 +171,14 @@ evidence gate definition without fabricating repair records or claiming the row
 complete; actual RustFS/vind production GC and recovery transition artifacts are
 still required.
 
+State substrate evidence note, 2026-05-18: production readiness now requires
+`state_status` to carry both `slate_db_checkpoint_ref` and
+`slate_db_checked_recovery` evidence, so a readiness report cannot pass state
+substrate checks solely by naming a SlateDB handle without proving the checked
+SlateDB recovery path. This tightens the release gate while keeping the row
+partial for live RustFS/S3-compatible checked SlateDB recovery evidence and the
+explicitly design-blocked broader SlateDB retention-handle protocol.
+
 DataFusion policy evidence note, 2026-05-18: `ProductionQueryRuntime` now owns a
 shared limiter derived from `QueryPolicy`; direct object-backed and direct
 production recovered-query wrappers request compatible limiter handles from that
