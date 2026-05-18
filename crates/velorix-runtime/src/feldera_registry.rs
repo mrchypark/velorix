@@ -14,8 +14,7 @@ use velorix_core::{
 use velorix_storage::{
     capability::{
         AuthoritativeNamespace, AuthoritativeObjectStoreCapabilitiesV1,
-        AuthoritativeObjectStoreCapabilityError, ObjectStoreCapabilityError,
-        ObjectStoreCapabilityProfile,
+        AuthoritativeObjectStoreCapabilityError,
     },
     feldera_artifact_registry::{
         FelderaArtifactRegistry, FelderaArtifactRegistryError, RegisterFelderaArtifactOutcome,
@@ -54,17 +53,13 @@ pub enum RuntimeFelderaArtifactError {
 }
 
 impl RuntimeFelderaArtifactRegistry {
-    pub fn new(store: Arc<dyn ObjectStore>) -> Self {
+    /// Builds a runtime artifact registry without startup object-store capability evidence.
+    ///
+    /// This is only for local bootstrap and development paths. Production runtime construction
+    /// should use `new_with_startup_capabilities` so object-store requirements are validated from
+    /// authoritative startup evidence.
+    pub fn for_local_bootstrap_unchecked(store: Arc<dyn ObjectStore>) -> Self {
         Self::from_storage_registry(FelderaArtifactRegistry::new(store))
-    }
-
-    pub fn new_checked(
-        store: Arc<dyn ObjectStore>,
-        profile: &ObjectStoreCapabilityProfile,
-    ) -> Result<Self, ObjectStoreCapabilityError> {
-        Ok(Self::from_storage_registry(
-            FelderaArtifactRegistry::new_checked(store, profile)?,
-        ))
     }
 
     pub fn new_with_startup_capabilities(
@@ -87,7 +82,7 @@ impl RuntimeFelderaArtifactRegistry {
         ))
     }
 
-    pub fn from_storage_registry(storage: FelderaArtifactRegistry) -> Self {
+    fn from_storage_registry(storage: FelderaArtifactRegistry) -> Self {
         Self { storage }
     }
 

@@ -59,6 +59,21 @@ remaining runtime-construction bypass risk without
 marking the row complete; deployed runtime assembly and non-local/live authority
 evidence are still required.
 
+Object-store capability evidence note, 2026-05-18: the runtime Feldera artifact
+registry no longer exposes an ambiguous unchecked `new` constructor, caller
+profile-only `new_checked` constructor, or public raw storage-registry wrapper;
+local/dev fixtures must call `for_local_bootstrap_unchecked`, while external
+production assembly has only `new_with_startup_capabilities` for startup
+capability-backed construction. The table-registry production source contract
+also rejects new ad hoc callers of
+`StorageRegistry::register_production_with_probe` outside the storage-registry
+owner API, so production-like table-scan surfaces must reuse already validated
+startup capability evidence instead of introducing per-call authority probes.
+This removes another local direct-construction bypass risk, but the object-store
+capability row remains partial until deployed runtime assembly and required
+live RustFS/vind evidence prove the production topology has no remaining direct
+authority-construction paths.
+
 Ownership evidence note, 2026-05-15: the Kubernetes worker-shard runtime now has
 a narrow startup-resync entrypoint that is constructed from
 `OperatorAuthorityStartupComponents`, runs the bounded `VelorixWorkerShard`

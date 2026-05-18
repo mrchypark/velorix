@@ -90,6 +90,27 @@ fn production_source_contract_forbids_default_unchecked_storage_registry_registr
 }
 
 #[test]
+fn production_source_contract_forbids_ad_hoc_production_registry_probe_callers() {
+    let workspace = Path::new("/workspace");
+    let source = workspace.join("benches/local_incremental.rs");
+    let lines = [
+        "    let mut registry = StorageRegistry::new();",
+        "    registry.register_production_with_probe(",
+        "        \"primary\",",
+        "        \"memory://velorix/\",",
+        "        scan_store,",
+        "        authority_store,",
+        "        \"benchmark-table-scan\",",
+        "    ).await?;",
+    ];
+
+    assert_eq!(
+        forbidden_bootstrap_table_scan_use(workspace, &source, &lines, 1),
+        Some("register_production_with_probe(")
+    );
+}
+
+#[test]
 fn production_source_contract_does_not_link_register_receivers_across_functions() {
     let workspace = Path::new("/workspace");
     let source = workspace.join("benches/local_incremental.rs");
@@ -194,6 +215,7 @@ fn forbidden_bootstrap_table_scan_patterns() -> &'static [&'static str] {
         "query_object_backed_input_with_policy_and_limiter(",
         "query_object_backed_input_with_policy_and_metrics(",
         "StorageRegistry::register(",
+        "register_production_with_probe(",
     ]
 }
 

@@ -69,6 +69,23 @@ fn capabilities_with_weak_namespace(
     AuthoritativeObjectStoreCapabilitiesV1::new(profiles)
 }
 
+#[test]
+fn runtime_feldera_artifact_registry_source_keeps_unchecked_bootstrap_explicit() {
+    let source = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("feldera_registry.rs"),
+    )
+    .unwrap();
+
+    assert!(source.contains("pub fn new_with_startup_capabilities("));
+    assert!(source.contains("pub fn for_local_bootstrap_unchecked("));
+    assert!(!source.contains("\n    pub fn new("));
+    assert!(!source.contains("pub fn new_checked("));
+    assert!(!source.contains("pub fn from_storage_registry("));
+    assert!(!source.contains("RuntimeFelderaArtifactRegistry::new("));
+}
+
 fn fixture_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -202,7 +219,7 @@ fn release_provenance_for_artifact(
 #[tokio::test]
 async fn feldera_runtime_registry_selects_valid_registered_artifact_for_catalog() {
     let (_temp_dir, store) = temp_store();
-    let registry = RuntimeFelderaArtifactRegistry::new(store);
+    let registry = RuntimeFelderaArtifactRegistry::for_local_bootstrap_unchecked(store);
     let (catalog, spec, artifact) = catalog_valid_fixture_parts();
 
     let registered = registry
@@ -291,7 +308,7 @@ fn feldera_runtime_registry_rejects_weak_artifact_catalog_startup_capability() {
 #[tokio::test]
 async fn feldera_runtime_registry_release_provenance_verified_path_keeps_execution_disabled() {
     let (_temp_dir, store) = temp_store();
-    let registry = RuntimeFelderaArtifactRegistry::new(store);
+    let registry = RuntimeFelderaArtifactRegistry::for_local_bootstrap_unchecked(store);
     let (catalog, spec, mut artifact) = catalog_valid_fixture_parts();
     let artifact_bytes = b"compiled release artifact bytes";
     artifact.artifact_hash = feldera_artifact_bytes_hash(artifact_bytes);
@@ -336,7 +353,7 @@ async fn feldera_runtime_registry_release_provenance_verified_path_keeps_executi
 #[tokio::test]
 async fn feldera_runtime_registry_release_provenance_mismatch_does_not_persist() {
     let (_temp_dir, store) = temp_store();
-    let registry = RuntimeFelderaArtifactRegistry::new(store);
+    let registry = RuntimeFelderaArtifactRegistry::for_local_bootstrap_unchecked(store);
     let (catalog, spec, mut artifact) = catalog_valid_fixture_parts();
     let artifact_bytes = b"compiled release artifact bytes";
     artifact.artifact_hash = feldera_artifact_bytes_hash(artifact_bytes);
@@ -382,7 +399,7 @@ async fn feldera_runtime_registry_release_provenance_mismatch_does_not_persist()
 #[tokio::test]
 async fn feldera_runtime_registry_release_provenance_selection_revalidates_stored_identity() {
     let (_temp_dir, store) = temp_store();
-    let registry = RuntimeFelderaArtifactRegistry::new(store);
+    let registry = RuntimeFelderaArtifactRegistry::for_local_bootstrap_unchecked(store);
     let (catalog, spec, mut artifact) = catalog_valid_fixture_parts();
     let artifact_bytes = b"compiled release artifact bytes";
     artifact.artifact_hash = feldera_artifact_bytes_hash(artifact_bytes);
@@ -444,7 +461,7 @@ async fn feldera_runtime_registry_release_provenance_selection_revalidates_store
 #[tokio::test]
 async fn feldera_runtime_registry_treats_duplicate_registration_as_idempotent() {
     let (_temp_dir, store) = temp_store();
-    let registry = RuntimeFelderaArtifactRegistry::new(store);
+    let registry = RuntimeFelderaArtifactRegistry::for_local_bootstrap_unchecked(store);
     let (catalog, spec, artifact) = catalog_valid_fixture_parts();
 
     registry
@@ -466,7 +483,7 @@ async fn feldera_runtime_registry_treats_duplicate_registration_as_idempotent() 
 #[tokio::test]
 async fn feldera_runtime_registry_rejects_relation_fingerprint_mismatch() {
     let (_temp_dir, store) = temp_store();
-    let registry = RuntimeFelderaArtifactRegistry::new(store);
+    let registry = RuntimeFelderaArtifactRegistry::for_local_bootstrap_unchecked(store);
     let (catalog, mut spec, mut artifact) = catalog_valid_fixture_parts();
     spec.input_relations[0].schema_fingerprint = format!("sha256:{}", "1".repeat(64));
     artifact.input_schemas = spec.input_relations.clone();
@@ -488,7 +505,7 @@ async fn feldera_runtime_registry_rejects_relation_fingerprint_mismatch() {
 #[tokio::test]
 async fn feldera_runtime_registry_rejects_unknown_generated_rust_abi() {
     let (_temp_dir, store) = temp_store();
-    let registry = RuntimeFelderaArtifactRegistry::new(store);
+    let registry = RuntimeFelderaArtifactRegistry::for_local_bootstrap_unchecked(store);
     let (catalog, spec, mut artifact) = catalog_valid_fixture_parts();
     artifact.generated_rust =
         load_artifact("compile_artifact_unsupported_generated_rust_abi").generated_rust;
@@ -509,7 +526,7 @@ async fn feldera_runtime_registry_rejects_unknown_generated_rust_abi() {
 #[tokio::test]
 async fn feldera_runtime_registry_rejects_selection_when_catalog_changes() {
     let (_temp_dir, store) = temp_store();
-    let registry = RuntimeFelderaArtifactRegistry::new(store);
+    let registry = RuntimeFelderaArtifactRegistry::for_local_bootstrap_unchecked(store);
     let (catalog, spec, artifact) = catalog_valid_fixture_parts();
 
     registry
@@ -545,7 +562,7 @@ async fn feldera_runtime_registry_rejects_selection_when_catalog_changes() {
 #[tokio::test]
 async fn feldera_runtime_registry_keeps_direct_execution_disabled() {
     let (_temp_dir, store) = temp_store();
-    let registry = RuntimeFelderaArtifactRegistry::new(store);
+    let registry = RuntimeFelderaArtifactRegistry::for_local_bootstrap_unchecked(store);
     let (catalog, spec, artifact) = catalog_valid_fixture_parts();
 
     let selected = registry
@@ -562,7 +579,7 @@ async fn feldera_runtime_registry_keeps_direct_execution_disabled() {
 #[tokio::test]
 async fn feldera_runtime_registry_admits_hash_verified_artifact_without_direct_execution() {
     let (_temp_dir, store) = temp_store();
-    let registry = RuntimeFelderaArtifactRegistry::new(store);
+    let registry = RuntimeFelderaArtifactRegistry::for_local_bootstrap_unchecked(store);
     let (catalog, spec, mut artifact) = catalog_valid_fixture_parts();
     let artifact_bytes = b"compiled artifact bytes";
     artifact.artifact_hash = feldera_artifact_bytes_hash(artifact_bytes);
@@ -585,7 +602,7 @@ async fn feldera_runtime_registry_admits_hash_verified_artifact_without_direct_e
 #[tokio::test]
 async fn feldera_runtime_registry_rejects_hash_mismatch_without_persisting_artifact() {
     let (_temp_dir, store) = temp_store();
-    let registry = RuntimeFelderaArtifactRegistry::new(store);
+    let registry = RuntimeFelderaArtifactRegistry::for_local_bootstrap_unchecked(store);
     let (catalog, spec, mut artifact) = catalog_valid_fixture_parts();
     artifact.artifact_hash = feldera_artifact_bytes_hash(b"expected artifact bytes");
 
