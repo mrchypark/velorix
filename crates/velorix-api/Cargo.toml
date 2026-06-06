@@ -1,0 +1,31 @@
+[package]
+name = "velorix-api"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = { workspace = true }
+arrow = { workspace = true, features = ["ipc"] }
+axum = { workspace = true }
+axum-server = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+object_store = { workspace = true, features = ["aws"] }
+rustls = { version = "0.23", features = ["ring"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+velorix-core = { path = "../velorix-core" }
+velorix-generated-scores-by-user = { path = "../velorix-generated-scores-by-user" }
+velorix-k8s = { path = "../velorix-k8s" }
+velorix-meta = { path = "../velorix-meta" }
+velorix-runtime = { path = "../velorix-runtime" }
+velorix-storage = { path = "../velorix-storage" }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tempfile = { workspace = true }
+tokio-stream = { workspace = true, features = ["net"] }
+tonic = { workspace = true }
+tower = { workspace = true, features = ["util"] }

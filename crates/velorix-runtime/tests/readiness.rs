@@ -247,11 +247,38 @@ fn readiness_report_blocks_when_dependency_governance_evidence_is_missing() {
 }
 
 #[test]
+fn readiness_report_blocks_when_standing_runtime_fencing_evidence_is_missing() {
+    let report = ProductionReadinessEvidenceV1::from_json_str(&readiness_json(
+        &[
+            "standing_runtime_fencing_capability",
+            "multi_replica_standing_runtime_fencing_smoke",
+            "local_api_pod_failover_smoke",
+        ],
+        false,
+        &[],
+    ))
+    .unwrap()
+    .try_into_report()
+    .unwrap();
+
+    assert!(!report.production_ready);
+    assert_eq!(
+        report.blocking_reasons,
+        vec![
+            "standing_runtime_status missing standing_runtime_fencing_capability evidence",
+            "standing_runtime_status missing multi_replica_standing_runtime_fencing_smoke evidence",
+            "standing_runtime_status missing local_api_pod_failover_smoke evidence",
+        ]
+    );
+}
+
+#[test]
 fn readiness_report_blocks_when_gc_evidence_is_missing() {
     let report = ProductionReadinessEvidenceV1::from_json_str(&readiness_json(
         &[
             "gc_run_evidence",
             "production_gc_run_evidence",
+            "rustfs_production_gc_evidence_family_validated",
             "checkpoint_retention_record",
         ],
         false,
@@ -267,6 +294,7 @@ fn readiness_report_blocks_when_gc_evidence_is_missing() {
         vec![
             "gc_status missing gc_run_evidence evidence",
             "gc_status missing production_gc_run_evidence evidence",
+            "gc_status missing rustfs_production_gc_evidence_family_validated evidence",
             "gc_status missing checkpoint_retention_record evidence",
         ]
     );
@@ -275,7 +303,10 @@ fn readiness_report_blocks_when_gc_evidence_is_missing() {
 #[test]
 fn readiness_report_blocks_when_gc_has_only_local_admin_evidence() {
     let report = ProductionReadinessEvidenceV1::from_json_str(&readiness_json(
-        &["production_gc_run_evidence"],
+        &[
+            "production_gc_run_evidence",
+            "rustfs_production_gc_evidence_family_validated",
+        ],
         false,
         &[],
     ))
@@ -286,7 +317,10 @@ fn readiness_report_blocks_when_gc_has_only_local_admin_evidence() {
     assert!(!report.production_ready);
     assert_eq!(
         report.blocking_reasons,
-        vec!["gc_status missing production_gc_run_evidence evidence"]
+        vec![
+            "gc_status missing production_gc_run_evidence evidence",
+            "gc_status missing rustfs_production_gc_evidence_family_validated evidence",
+        ]
     );
 }
 
@@ -296,6 +330,7 @@ fn readiness_report_blocks_when_ingest_and_relation_catalog_evidence_is_missing(
         &[
             "catalog_backed_ingest_admission",
             "deployed_ingest_admission",
+            "ingest_writer_lifecycle_attestation",
             "relation_catalog_record",
             "relation_catalog_registry",
             "relation_catalog_closed_adapter_scope",
@@ -314,6 +349,7 @@ fn readiness_report_blocks_when_ingest_and_relation_catalog_evidence_is_missing(
         vec![
             "ingest_status missing catalog_backed_ingest_admission evidence",
             "ingest_status missing deployed_ingest_admission evidence",
+            "ingest_status missing ingest_writer_lifecycle_attestation evidence",
             "relation_catalog_status missing relation_catalog_record evidence",
             "relation_catalog_status missing relation_catalog_registry evidence",
             "relation_catalog_status missing relation_catalog_closed_adapter_scope evidence",
@@ -337,6 +373,24 @@ fn readiness_report_blocks_when_deployed_ingest_admission_evidence_is_missing() 
     assert_eq!(
         report.blocking_reasons,
         vec!["ingest_status missing deployed_ingest_admission evidence"]
+    );
+}
+
+#[test]
+fn readiness_report_blocks_when_ingest_writer_lifecycle_attestation_is_missing() {
+    let report = ProductionReadinessEvidenceV1::from_json_str(&readiness_json(
+        &["ingest_writer_lifecycle_attestation"],
+        false,
+        &[],
+    ))
+    .unwrap()
+    .try_into_report()
+    .unwrap();
+
+    assert!(!report.production_ready);
+    assert_eq!(
+        report.blocking_reasons,
+        vec!["ingest_status missing ingest_writer_lifecycle_attestation evidence"]
     );
 }
 
@@ -536,7 +590,7 @@ fn readiness_report_blocks_when_feldera_artifact_hash_verified_evidence_is_missi
 }
 
 #[test]
-fn readiness_report_blocks_when_feldera_artifact_release_provenance_evidence_is_missing() {
+fn readiness_report_allows_feldera_artifact_release_provenance_to_remain_diagnostic() {
     let report = ProductionReadinessEvidenceV1::from_json_str(&readiness_json(
         &["feldera_artifact_release_provenance"],
         false,
@@ -546,11 +600,26 @@ fn readiness_report_blocks_when_feldera_artifact_release_provenance_evidence_is_
     .try_into_report()
     .unwrap();
 
-    assert!(!report.production_ready);
-    assert_eq!(
-        report.blocking_reasons,
-        vec!["feldera_artifact_status missing feldera_artifact_release_provenance evidence"]
-    );
+    assert!(report.production_ready);
+    assert!(report.blocking_reasons.is_empty());
+}
+
+#[test]
+fn first_e2e_readiness_report_allows_feldera_release_artifacts_to_remain_follow_up() {
+    let report = ProductionReadinessEvidenceV1::from_json_str(&readiness_json(
+        &[
+            "feldera_artifact_hash_verified",
+            "feldera_artifact_release_provenance",
+        ],
+        false,
+        &[],
+    ))
+    .unwrap()
+    .try_into_first_e2e_report()
+    .unwrap();
+
+    assert!(report.production_ready);
+    assert!(report.blocking_reasons.is_empty());
 }
 
 #[test]
@@ -588,14 +657,15 @@ fn feldera_release_provenance_verifier_outputs_stable_readiness_evidence() {
 fn readiness_evidence_rejects_unknown_json_fields() {
     let error = ProductionReadinessEvidenceV1::from_json_str(
         r#"{
-            "schema_version": 4,
+            "schema_version": 5,
             "deployment_id": "prod-a",
             "authority_store_id": "s3://velorix-prod",
             "capability_status": { "status": "pass", "evidence": "s3-compatible capability probe", "evidence_kind": ["s3_compatible"] },
             "s3_compatible_test_status": { "status": "pass", "evidence": "S3-compatible integration harness", "evidence_kind": ["s3_compatible_integration_harness"] },
             "ownership_status": { "status": "pass", "evidence": "durable epoch record", "evidence_kind": ["durable_ownership_epoch_record"] },
             "checkpoint_status": { "status": "pass", "evidence": "published checkpoint lifecycle and recovery transition", "evidence_kind": ["published_checkpoint_lifecycle_record", "checkpoint_recovery_transition_record"] },
-            "ingest_status": { "status": "pass", "evidence": "catalog-backed deployed ingest admission", "evidence_kind": ["catalog_backed_ingest_admission", "deployed_ingest_admission"] },
+            "ingest_status": { "status": "pass", "evidence": "catalog-backed deployed ingest admission", "evidence_kind": ["catalog_backed_ingest_admission", "deployed_ingest_admission", "ingest_writer_lifecycle_attestation"] },
+            "standing_runtime_status": { "status": "pass", "evidence": "standing-runtime fencing capability and deployed multi-replica fencing smoke", "evidence_kind": ["standing_runtime_fencing_capability", "multi_replica_standing_runtime_fencing_smoke", "local_api_pod_failover_smoke"] },
             "relation_catalog_status": { "status": "pass", "evidence": "durable relation catalog record, registry, closed adapter scope, and fail-closed unsupported adapters", "evidence_kind": ["relation_catalog_record", "relation_catalog_registry", "relation_catalog_closed_adapter_scope", "relation_catalog_unsupported_adapter_fail_closed"] },
             "state_status": { "status": "pass", "evidence": "SlateDB checkpoint ref and checked recovery", "evidence_kind": ["slate_db_checkpoint_ref", "slate_db_checked_recovery"] },
             "query_policy_status": { "status": "pass", "evidence": "bounded DataFusion policy", "evidence_kind": ["query_policy_catalog"] },
@@ -616,7 +686,7 @@ fn readiness_evidence_rejects_unknown_json_fields() {
 #[test]
 fn readiness_report_rejects_unsupported_schema_version() {
     let error = ProductionReadinessEvidenceV1::from_json_str(
-        &readiness_json(&[], false, &[]).replace("\"schema_version\": 4", "\"schema_version\": 3"),
+        &readiness_json(&[], false, &[]).replace("\"schema_version\": 5", "\"schema_version\": 3"),
     )
     .unwrap()
     .try_into_report()
@@ -670,10 +740,28 @@ fn readiness_json(
     if !missing_evidence.contains(&"deployed_ingest_admission") {
         ingest_evidence_kind.push("deployed_ingest_admission");
     }
+    if !missing_evidence.contains(&"ingest_writer_lifecycle_attestation") {
+        ingest_evidence_kind.push("ingest_writer_lifecycle_attestation");
+    }
     let ingest_kind = if ingest_evidence_kind.is_empty() {
         String::new()
     } else {
         format!(r#", "evidence_kind": {:?}"#, ingest_evidence_kind)
+    };
+    let mut standing_runtime_evidence_kind = Vec::new();
+    if !missing_evidence.contains(&"standing_runtime_fencing_capability") {
+        standing_runtime_evidence_kind.push("standing_runtime_fencing_capability");
+    }
+    if !missing_evidence.contains(&"multi_replica_standing_runtime_fencing_smoke") {
+        standing_runtime_evidence_kind.push("multi_replica_standing_runtime_fencing_smoke");
+    }
+    if !missing_evidence.contains(&"local_api_pod_failover_smoke") {
+        standing_runtime_evidence_kind.push("local_api_pod_failover_smoke");
+    }
+    let standing_runtime_kind = if standing_runtime_evidence_kind.is_empty() {
+        String::new()
+    } else {
+        format!(r#", "evidence_kind": {:?}"#, standing_runtime_evidence_kind)
     };
     let mut relation_catalog_evidence_kind = Vec::new();
     if !missing_evidence.contains(&"relation_catalog_record") {
@@ -725,9 +813,6 @@ fn readiness_json(
     if !missing_evidence.contains(&"feldera_artifact_hash_verified") {
         feldera_artifact_evidence_kind.push("feldera_artifact_hash_verified");
     }
-    if !missing_evidence.contains(&"feldera_artifact_release_provenance") {
-        feldera_artifact_evidence_kind.push("feldera_artifact_release_provenance");
-    }
     let feldera_artifact_kind = if feldera_artifact_evidence_kind.is_empty() {
         String::new()
     } else {
@@ -751,6 +836,9 @@ fn readiness_json(
     if !missing_evidence.contains(&"production_gc_run_evidence") {
         gc_evidence_kind.push("production_gc_run_evidence");
     }
+    if !missing_evidence.contains(&"rustfs_production_gc_evidence_family_validated") {
+        gc_evidence_kind.push("rustfs_production_gc_evidence_family_validated");
+    }
     if !missing_evidence.contains(&"checkpoint_retention_record") {
         gc_evidence_kind.push("checkpoint_retention_record");
     }
@@ -762,7 +850,7 @@ fn readiness_json(
 
     format!(
         r#"{{
-            "schema_version": 4,
+            "schema_version": 5,
             "deployment_id": "prod-a",
             "authority_store_id": "s3://velorix-prod",
             "capability_status": {{ "status": "pass", "evidence": "s3-compatible capability probe"{capability_kind} }},
@@ -770,6 +858,7 @@ fn readiness_json(
             "ownership_status": {{ "status": "pass", "evidence": "durable epoch record"{ownership_kind} }},
             "checkpoint_status": {{ "status": "pass", "evidence": "published checkpoint lifecycle and recovery transition"{checkpoint_kind} }},
             "ingest_status": {{ "status": "{ingest_status}", "evidence": "{ingest_evidence}"{ingest_kind} }},
+            "standing_runtime_status": {{ "status": "pass", "evidence": "standing-runtime fencing capability and deployed multi-replica fencing smoke"{standing_runtime_kind} }},
             "relation_catalog_status": {{ "status": "{relation_catalog_status}", "evidence": "{relation_catalog_evidence}"{relation_catalog_kind} }},
             "state_status": {{ "status": "pass", "evidence": "SlateDB checkpoint ref and checked recovery"{state_kind} }},
             "query_policy_status": {{ "status": "pass", "evidence": "bounded DataFusion policy"{query_policy_kind} }},

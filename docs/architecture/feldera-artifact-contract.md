@@ -1,5 +1,12 @@
 # Feldera Compile Artifact Contract
 
+This contract now describes the static release-bound artifact path, not the
+primary Velorix product runtime path. The primary direction is package-first
+Feldera runtime integration: reuse Feldera public Rust package layers such as
+`dbsp`, `feldera-sqllib`, `feldera-ir`, and `feldera-types` where they fit the
+Velorix standing-program boundary. See
+[Feldera Package-First Runtime Design](../superpowers/specs/2026-05-27-feldera-package-first-runtime-design.md).
+
 Velorix does not compile standing-view SQL itself. Feldera owns SQL-to-DBSP
 compilation through the Java/Calcite SQL compiler in
 `sql-to-dbsp-compiler/SQL-compiler` and the surrounding Feldera pipeline
@@ -53,12 +60,12 @@ relation fingerprint differs from the cataloged input relation fingerprint. See
 
 ## Trust Boundary
 
-Generated Rust is trusted only as a build/release artifact. A future release
-pipeline can compile Feldera-generated Rust into a Velorix engine package after
+Generated Rust is trusted only as a build/release artifact. The release
+pipeline compiles Feldera-generated Rust into a Velorix engine package after
 reviewing the metadata, pinning compiler identity, and verifying the artifact
-hash and the SHA-256 `spec_hash`. The running Velorix process should select
-among already-built, release-trusted artifacts; it should not compile or
-dynamically load arbitrary generated source from object storage.
+hash and the SHA-256 `spec_hash`. The running Velorix process selects among
+already-built, release-trusted artifacts; it does not compile or dynamically
+load arbitrary generated source from object storage.
 `velorix-core::feldera_artifact` exposes artifact hash verification helpers
 that reuse the metadata/spec validation and compare supplied artifact bytes
 against `FelderaCompileArtifactMetadata.artifact_hash`; they do not invoke
@@ -99,20 +106,24 @@ against the supplied `StandingViewSpec` with
 schema fingerprints, state codec, epoch policy, and generated Rust ABI checks
 remain owned by `velorix-core`. Reads deserialize with unknown-field rejection
 from the core wire type and reject a stored body whose artifact identity does
-not match the requested key. This registry does not compile, load, or execute
-Feldera/DBSP artifacts.
+not match the requested key. This registry does not compile, load, or
+dynamically execute Feldera/DBSP artifacts.
 
 The runtime facade in `velorix-runtime::feldera_registry` delegates durable
 storage to that registry and does not define another object-key scheme.
 Registering or selecting an artifact validates the metadata against the
 provided `VelorixRelationCatalogV1` with
-`validate_feldera_compile_artifact_for_catalog`, then returns only trusted
-metadata plus a disabled direct-execution status. A tenant/artifact-id lookup
+`validate_feldera_compile_artifact_for_catalog`, then checks whether the
+generated Rust package identity is registered with the running Velorix binary.
+If the package is present, selection returns `DirectExecutionEnabled`; if it is
+missing, selection returns `DirectExecutionDisabled` and product APIs fail
+closed before creating an artifact-backed view. A tenant/artifact-id lookup
 index remains deferred; if product semantics later require one, it should be a
 separate create-only index object rather than replacing the artifact id/hash
 registry key.
 Runtime hash-verified registration can require matching artifact bytes before
-persisting metadata, but it still returns direct execution disabled.
+persisting metadata, and still requires a package match before direct execution
+can be enabled.
 
 ## Runtime Direction
 
@@ -121,16 +132,47 @@ cataloged typed Arrow relations, not durable JSON `DeltaBatch`. Any remaining
 `DeltaBatch` query path is bootstrap-only and must not define Feldera artifact
 compatibility.
 
-Feldera owns standing-view SQL compilation. The phase-0 artifact contract gives
-Velorix a stable handoff point for future `FelderaPipelineEngine` work:
+Feldera owns standing-view SQL compilation. The artifact contract gives
+Velorix a stable handoff point for `FelderaPipelineEngine` work:
 
 1. Velorix records a `StandingViewSpec` for the view.
 2. External Feldera tooling compiles that spec into a DBSP/Rust artifact.
 3. Build/release automation verifies `FelderaCompileArtifactMetadata`.
-4. A future engine maps the trusted artifact id/hash to a compiled execution
+4. The runtime maps the trusted artifact id/hash to a compiled execution
    package and persists state using the declared codec, schema version, and
    epoch policy.
 
-Direct runtime Feldera integration, direct `dbsp` crate adoption, Feldera REST
-API usage, Java/Maven compiler invocation, and generated Rust compilation are
-all outside this phase.
+The first runtime DBSP slice is deliberately narrower than generated artifact
+loading. `velorix-core::dbsp_engine::DbspSingleKeySumCountEngine` remains
+quarantined behind the internal `dbsp-spike` compilation boundary, but
+`velorix-runtime` enables its `dbsp-runtime` integration by default. The public
+runtime backend name is `Dbsp`, not `FelderaDbsp`. Default recovery uses DBSP
+for the single `Utf8` primary-key plus `Int64` sum/count materialized-view shape
+and falls back to the prototype engine for relation shapes this DBSP slice does
+not yet support. Explicit `IncrementalEngineBackend::Dbsp` or
+`VELORIX_INCREMENTAL_ENGINE=dbsp` requests fail closed if the catalog is outside
+that supported DBSP shape.
+
+Materialized view definitions are durable `StandingViewSpec` records stored by
+the materialized-view registry under
+`v1/views/{view_id}/spec-sha256/{spec_hash}.view.json`. The record
+is create-only and content-addressed by the canonical Feldera spec hash, so a
+view definition can be registered and recovered independently of generated Rust
+artifact release provenance.
+
+`POST /v1/views` can attach a generated artifact by supplying
+`artifact.metadata`. In that mode Velorix builds the `StandingViewSpec` using
+the artifact output schema, validates the artifact against the catalog/spec,
+registers the metadata, requires an executable package match, and stores the
+selected artifact identity on the active view record. Artifact-backed views are
+therefore allowed to use Feldera SQL outside the hand-coded single-relation
+sum/count DBSP SQL validator. The durable active record includes artifact
+id/hash, generated Rust crate name, state codec/schema version, and execution
+status.
+
+Feldera REST API usage, Java/Maven compiler invocation, dynamic generated Rust
+loading, and arbitrary artifact execution from object storage remain outside
+this static artifact slice. The runtime DBSP backend is a package-backed spike
+for the bootstrap `IncrementalEngine` boundary. It must be superseded by a
+standing-program runtime boundary before Velorix claims broad Feldera-backed
+materialized view support.

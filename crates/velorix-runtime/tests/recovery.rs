@@ -25,6 +25,8 @@ use velorix_core::{
         CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID, RELATION_SCHEMA_VERSION_V1,
     },
 };
+#[cfg(feature = "dbsp-runtime")]
+use velorix_runtime::recovery::IncrementalEngineBackend;
 use velorix_runtime::recovery::{
     orders_sum_count_relation_catalog, RecoveredRuntime, RecoveryError,
     ORDERS_SUM_COUNT_ADAPTER_ID, ORDERS_SUM_COUNT_OWNER, ORDERS_SUM_COUNT_RELATION_ID,
@@ -1162,6 +1164,154 @@ async fn catalog_backed_recovery_reads_catalog_record_and_replays_catalog_aware_
         vec![DeltaRecord::new(
             DeltaKey::from_json(json!("account-a")),
             DeltaValue::from_json(json!({"count": 1, "sum": 4})),
+            1,
+        )]
+    );
+}
+
+#[cfg(feature = "dbsp-runtime")]
+#[tokio::test]
+async fn catalog_backed_recovery_can_replay_with_dbsp_backend() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = orders_sum_count_relation_catalog().unwrap();
+    RelationCatalogRegistry::new(Arc::clone(&store))
+        .create(&catalog)
+        .await
+        .unwrap();
+    let input = input_batch([
+        input_delta("account-a", 4, 1),
+        input_delta("account-a", 6, 1),
+    ]);
+    let ingest_coordinator = local_ingest_coordinator(Arc::clone(&store));
+    append_ingest_envelope(
+        &ingest_coordinator,
+        ingest_envelope_bytes(
+            ORDERS_SUM_COUNT_RELATION_VERSION,
+            catalog.schema_fingerprint.as_str(),
+            &input,
+        ),
+    )
+    .await;
+
+    let recovered =
+        RecoveredRuntime::recover_bootstrap_with_owner_and_relation_catalog_record_using_engine_backend(
+            Arc::clone(&store),
+            ORDERS_SUM_COUNT_OWNER,
+            ORDERS_SUM_COUNT_RELATION_ID,
+            ORDERS_SUM_COUNT_RELATION_VERSION,
+            IncrementalEngineBackend::Dbsp,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(recovered.engine_backend(), IncrementalEngineBackend::Dbsp);
+    assert_eq!(recovered.replayed_batch_count(), 1);
+    assert_eq!(recovered.logical_epoch(), 1);
+    assert_eq!(
+        recovered.materialized_state().net_rows().unwrap(),
+        vec![DeltaRecord::new(
+            DeltaKey::from_json(json!("account-a")),
+            DeltaValue::from_json(json!({"count": 2, "sum": 10})),
+            1,
+        )]
+    );
+}
+
+#[cfg(feature = "dbsp-runtime")]
+#[tokio::test]
+async fn catalog_backed_recovery_uses_dbsp_backend_by_default() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = orders_sum_count_relation_catalog().unwrap();
+    RelationCatalogRegistry::new(Arc::clone(&store))
+        .create(&catalog)
+        .await
+        .unwrap();
+    let input = input_batch([input_delta("account-a", 4, 1)]);
+    let ingest_coordinator = local_ingest_coordinator(Arc::clone(&store));
+    append_ingest_envelope(
+        &ingest_coordinator,
+        ingest_envelope_bytes(
+            ORDERS_SUM_COUNT_RELATION_VERSION,
+            catalog.schema_fingerprint.as_str(),
+            &input,
+        ),
+    )
+    .await;
+
+    let recovered = RecoveredRuntime::recover_bootstrap_with_owner_and_relation_catalog_record(
+        Arc::clone(&store),
+        ORDERS_SUM_COUNT_OWNER,
+        ORDERS_SUM_COUNT_RELATION_ID,
+        ORDERS_SUM_COUNT_RELATION_VERSION,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(recovered.engine_backend(), IncrementalEngineBackend::Dbsp);
+    assert_eq!(
+        recovered.materialized_state().net_rows().unwrap(),
+        vec![DeltaRecord::new(
+            DeltaKey::from_json(json!("account-a")),
+            DeltaValue::from_json(json!({"count": 1, "sum": 4})),
+            1,
+        )]
+    );
+}
+
+#[cfg(feature = "dbsp-runtime")]
+#[tokio::test]
+async fn catalog_backed_recovery_uses_dbsp_backend_for_generic_catalog_keys() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = int64_account_relation_catalog();
+    RelationCatalogRegistry::new(Arc::clone(&store))
+        .create(&catalog)
+        .await
+        .unwrap();
+    let input = input_batch([
+        DeltaRecord::new(
+            DeltaKey::from_json(json!(1001)),
+            DeltaValue::from_json(json!(4)),
+            1,
+        ),
+        DeltaRecord::new(
+            DeltaKey::from_json(json!(1001)),
+            DeltaValue::from_json(json!(6)),
+            1,
+        ),
+    ]);
+    let ingest_coordinator = local_ingest_coordinator(Arc::clone(&store));
+    append_ingest_envelope(
+        &ingest_coordinator,
+        ingest_envelope_bytes_with_batches(
+            IngestEnvelopeEncodeRequest {
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                schema_fingerprint: catalog.schema_fingerprint.as_str().to_string(),
+                stream_id: "accounts".to_string(),
+                partition_id: 0,
+                start_offset_inclusive: 0,
+                end_offset_exclusive: input.records().len() as u64,
+            },
+            &[ingest_int64_key_record_batch(&input)],
+        ),
+    )
+    .await;
+
+    let recovered = RecoveredRuntime::recover_bootstrap_with_owner_and_relation_catalog_record(
+        Arc::clone(&store),
+        ORDERS_SUM_COUNT_OWNER,
+        catalog.relation_schema.relation_id.as_str(),
+        catalog.relation_schema.relation_version.as_str(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(recovered.engine_backend(), IncrementalEngineBackend::Dbsp);
+    assert_eq!(
+        recovered.materialized_state().net_rows().unwrap(),
+        vec![DeltaRecord::new(
+            DeltaKey::from_json(json!(1001)),
+            DeltaValue::from_json(json!({"count": 2, "sum": 10})),
             1,
         )]
     );

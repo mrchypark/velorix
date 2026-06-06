@@ -167,6 +167,7 @@ fn storage_registry_rejects_prevalidated_capabilities_with_weak_profile() {
         ObjectStoreCapabilityProfile {
             backend_name: "weak-profile".to_string(),
             conditional_create: false,
+            conditional_update: true,
             atomic_visibility: true,
             list_after_write: true,
             read_after_write: true,

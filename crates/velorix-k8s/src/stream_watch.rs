@@ -99,6 +99,12 @@ impl IngestAdmissionCoordinatorProvider {
             .map_err(|error| StreamWatchError::snapshot(error.to_string()))
     }
 
+    pub fn coordinator_without_startup_reconstruction(
+        &self,
+    ) -> Result<IngestAdmissionCoordinator, StreamWatchError> {
+        self.coordinator()
+    }
+
     pub async fn coordinator_after_startup_reconstruction(
         &self,
     ) -> Result<

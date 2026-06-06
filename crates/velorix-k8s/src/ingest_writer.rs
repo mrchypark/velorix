@@ -12,7 +12,8 @@ use kube::{
 };
 use thiserror::Error;
 use velorix_storage::log::{
-    AppendValidatedEnvelopeOutcome, IngestAdmissionCoordinator, IngestAdmissionReconstructionReport,
+    AppendValidatedEnvelopeOutcome, IngestAdmissionCoordinator,
+    IngestAdmissionReconstructionReport, IngestCommitGuard,
 };
 
 use crate::{
@@ -511,6 +512,23 @@ impl DeployedIngestWriterRuntime {
         })
     }
 
+    pub fn from_startup_components_without_reconstruction(
+        startup_components: &OperatorAuthorityStartupComponents,
+    ) -> Result<Self, StreamWatchError> {
+        let provider = startup_components.ingest_admission_coordinator_provider();
+        let coordinator = provider.coordinator_without_startup_reconstruction()?;
+        let startup_report = IngestAdmissionReconstructionReport {
+            active_admission_records: 0,
+            expired_orphan_admission_records: 0,
+        };
+
+        Ok(Self {
+            authority: startup_components.authority().clone(),
+            coordinator,
+            startup_report,
+        })
+    }
+
     pub fn authority(&self) -> &ObjectStoreAuthorityRef {
         &self.authority
     }
@@ -525,6 +543,37 @@ impl DeployedIngestWriterRuntime {
     ) -> Result<AppendValidatedEnvelopeOutcome, StreamWatchError> {
         self.coordinator
             .append_catalog_validated_envelope(payload)
+            .await
+            .map_err(|error| StreamWatchError::snapshot(error.to_string()))
+    }
+
+    pub async fn append_catalog_validated_envelope_with_commit_guard(
+        &self,
+        payload: Bytes,
+        commit_guard: &dyn IngestCommitGuard,
+    ) -> Result<AppendValidatedEnvelopeOutcome, StreamWatchError> {
+        self.coordinator
+            .append_catalog_validated_envelope_with_commit_guard(payload, commit_guard)
+            .await
+            .map_err(|error| StreamWatchError::snapshot(error.to_string()))
+    }
+
+    pub async fn append_catalog_validated_envelope_after_external_admission(
+        &self,
+        payload: Bytes,
+    ) -> Result<AppendValidatedEnvelopeOutcome, StreamWatchError> {
+        self.coordinator
+            .append_catalog_validated_envelope_after_external_admission(payload)
+            .await
+            .map_err(|error| StreamWatchError::snapshot(error.to_string()))
+    }
+
+    pub async fn append_validated_envelope_after_external_admission(
+        &self,
+        payload: Bytes,
+    ) -> Result<AppendValidatedEnvelopeOutcome, StreamWatchError> {
+        self.coordinator
+            .append_validated_envelope_after_external_admission(payload)
             .await
             .map_err(|error| StreamWatchError::snapshot(error.to_string()))
     }

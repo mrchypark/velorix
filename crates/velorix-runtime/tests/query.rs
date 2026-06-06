@@ -31,7 +31,11 @@ use velorix_runtime::{
         query_bootstrap_recovered_materialized_view,
         query_bootstrap_recovered_materialized_view_with_policy,
         query_object_backed_input_with_policy, query_object_backed_input_with_policy_and_metrics,
-        query_production_recovered_materialized_view_with_policy_and_limiter, RuntimeQueryError,
+        query_production_recovered_materialized_view_table_with_bindings_and_policy_and_limiter,
+        query_production_recovered_materialized_view_with_policy_and_limiter,
+        query_record_batches_table_with_bindings_and_policy_and_limiter,
+        validate_record_batch_table_query_with_bindings_and_policy, QueryBindValue,
+        RuntimeQueryError,
     },
     recovery::{
         orders_sum_count_relation_catalog, RecoveredRuntime, RecoveryError,
@@ -582,6 +586,156 @@ async fn query_production_recovered_materialized_view_reads_slatedb_checkpoint_w
 }
 
 #[tokio::test]
+async fn query_production_recovered_materialized_view_binds_positional_parameters() {
+    let (_temp_dir, store) = temp_store();
+    let capabilities = probed_query_capabilities(store.as_ref()).await;
+    let ingest_coordinator = IngestAdmissionCoordinator::new(IngestLog::new(Arc::clone(&store)));
+    let publisher =
+        CheckpointPublisher::with_slatedb_state_store(Arc::clone(&store), "v1/slatedb/state")
+            .await
+            .unwrap();
+
+    let checkpoint_input = batch([input_delta("account-a", 10, 1)]);
+    let replay_input = batch([input_delta("account-b", 7, 1)]);
+
+    append_ingest_envelope(
+        Arc::clone(&store),
+        &ingest_coordinator,
+        "orders",
+        0,
+        0,
+        1,
+        &checkpoint_input,
+    )
+    .await;
+    append_ingest_envelope(
+        Arc::clone(&store),
+        &ingest_coordinator,
+        "orders",
+        0,
+        1,
+        2,
+        &replay_input,
+    )
+    .await;
+
+    let mut checkpointed_view = KeyedSumCountAggregate::new();
+    checkpointed_view.apply(&checkpoint_input).unwrap();
+    let state_ref = write_checkpoint_state(
+        &publisher,
+        "state-production-query-bindings",
+        1,
+        &checkpointed_view.state(),
+    )
+    .await;
+    publisher
+        .publish_manifest(&manifest(1, state_ref))
+        .await
+        .unwrap();
+
+    let output =
+        query_production_recovered_materialized_view_table_with_bindings_and_policy_and_limiter(
+            Arc::clone(&store),
+            "v1/slatedb/state",
+            ORDERS_SUM_COUNT_RELATION_ID,
+            ORDERS_SUM_COUNT_RELATION_VERSION,
+            "input",
+            &capabilities,
+            "select key_json, value_json, weight from input where key_json = $1 order by key_json",
+            &[QueryBindValue::Utf8("\"account-a\"".to_string())],
+            QueryPolicy::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].num_rows(), 1);
+    assert_eq!(string_value(&output[0], 0, 0), "\"account-a\"");
+    assert_eq!(string_value(&output[0], 1, 0), "{\"count\":1,\"sum\":10}");
+}
+
+#[tokio::test]
+async fn query_record_batches_table_binds_positional_parameters() {
+    let batches = vec![RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("sum", DataType::Int64, false),
+            Field::new("count", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["u1", "u2"])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![12, 11])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![2, 1])) as ArrayRef,
+        ],
+    )
+    .unwrap()];
+
+    let output = query_record_batches_table_with_bindings_and_policy_and_limiter(
+        "scores_by_user",
+        batches,
+        "select user_id, sum, count from scores_by_user where user_id = $1 order by user_id",
+        &[QueryBindValue::Utf8("u1".to_string())],
+        QueryPolicy::default(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].num_rows(), 1);
+    assert_eq!(string_value(&output[0], 0, 0), "u1");
+    assert_eq!(int64_value(&output[0], 1, 0), 12);
+    assert_eq!(int64_value(&output[0], 2, 0), 2);
+}
+
+#[tokio::test]
+async fn query_record_batches_table_rejects_missing_batch_schema() {
+    let error = query_record_batches_table_with_bindings_and_policy_and_limiter(
+        "scores_by_user",
+        Vec::new(),
+        "select user_id from scores_by_user",
+        &[],
+        QueryPolicy::default(),
+        None,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("materialized view page returned no record batches"),
+        "error: {error}"
+    );
+}
+
+#[tokio::test]
+async fn validate_record_batch_table_query_rejects_constant_expression_without_table_scan() {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "user_id",
+        DataType::Utf8,
+        false,
+    )]));
+    let error = validate_record_batch_table_query_with_bindings_and_policy(
+        "scores_by_user",
+        schema,
+        "select 'scores_by_user' as user_id",
+        &[],
+        QueryPolicy::default(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("must scan table `scores_by_user`"),
+        "error: {error}"
+    );
+}
+
+#[tokio::test]
 async fn query_production_recovered_materialized_view_fails_closed_when_relation_catalog_is_missing(
 ) {
     let (_temp_dir, store) = temp_store();
@@ -631,6 +785,34 @@ async fn query_production_recovered_materialized_view_validates_sql_before_recov
                 if datafusion_error.to_string().contains("missing_column")
         ),
         "expected SQL planning to reject missing_column before recovery, got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn query_production_recovered_materialized_view_rejects_constant_expression_without_table_scan(
+) {
+    let (_temp_dir, store) = temp_store();
+
+    let error = query_production_recovered_materialized_view_with_policy_and_limiter(
+        Arc::clone(&store),
+        "v1/slatedb/state",
+        ORDERS_SUM_COUNT_RELATION_ID,
+        ORDERS_SUM_COUNT_RELATION_VERSION,
+        &local_capabilities(),
+        "select 1 as synthetic",
+        QueryPolicy::default(),
+        None,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(
+            error,
+            RuntimeQueryError::Query(QueryError::DataFusion(ref datafusion_error))
+                if datafusion_error.to_string().contains("must scan table `input`")
+        ),
+        "expected SQL planning to reject constant expression before recovery, got {error:?}"
     );
 }
 
@@ -714,7 +896,9 @@ async fn recovery_rejects_json_bytes_under_valid_v1_ingest_key() {
     let input = batch([input_delta("account-a", 4, 1)]);
 
     ingest_log
-        .append(&IngestBatch::new("orders", 0, 0, 1, batch_bytes(&input)).unwrap())
+        .append(
+            &IngestBatch::new_bootstrap_unchecked("orders", 0, 0, 1, batch_bytes(&input)).unwrap(),
+        )
         .await
         .unwrap();
 

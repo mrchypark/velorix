@@ -36,6 +36,15 @@ pub struct OwnershipEpochRecordKeyParts {
     pub owner_epoch: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StandingRuntimeCheckpointKeyParts {
+    pub tenant_id: String,
+    pub program_id: String,
+    pub view_id: String,
+    pub logical_epoch: u64,
+    pub content_hash: String,
+}
+
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum ObjectKeyError {
     #[error("object key segment `{0}` is empty")]
@@ -237,6 +246,61 @@ impl ObjectKey {
         )))
     }
 
+    pub fn materialized_view(view_id: &str, spec_hash: &str) -> Result<Self, ObjectKeyError> {
+        validate_segment("view_id", view_id)?;
+        let hash = parse_feldera_spec_hash_segment(spec_hash)?;
+
+        Ok(Self(format!(
+            "v1/views/{view_id}/spec-sha256/{hash}.view.json"
+        )))
+    }
+
+    pub fn active_materialized_view(view_id: &str) -> Result<Self, ObjectKeyError> {
+        validate_segment("view_id", view_id)?;
+
+        Ok(Self(format!("v1/views/{view_id}/active.json")))
+    }
+
+    pub fn view_compile_deploy_job(view_id: &str, spec_hash: &str) -> Result<Self, ObjectKeyError> {
+        validate_segment("view_id", view_id)?;
+        let hash = parse_feldera_spec_hash_segment(spec_hash)?;
+
+        Ok(Self(format!(
+            "v1/view-compile-deploy-jobs/{view_id}/spec-sha256/{hash}.job.json"
+        )))
+    }
+
+    pub fn standing_runtime_checkpoint(
+        tenant_id: &str,
+        program_id: &str,
+        view_id: &str,
+        logical_epoch: u64,
+        content_hash: &str,
+    ) -> Result<Self, ObjectKeyError> {
+        validate_segment("tenant_id", tenant_id)?;
+        validate_segment("program_id", program_id)?;
+        validate_segment("view_id", view_id)?;
+        let hash = parse_sha256_hash_segment(content_hash)?;
+
+        Ok(Self(format!(
+            "v1/standing-runtime-checkpoints/{tenant_id}/{program_id}/{view_id}/epochs/{logical_epoch:0CHECKPOINT_WIDTH$}/sha256/{hash}.checkpoint.json"
+        )))
+    }
+
+    pub fn standing_runtime_latest_checkpoint(
+        tenant_id: &str,
+        program_id: &str,
+        view_id: &str,
+    ) -> Result<Self, ObjectKeyError> {
+        validate_segment("tenant_id", tenant_id)?;
+        validate_segment("program_id", program_id)?;
+        validate_segment("view_id", view_id)?;
+
+        Ok(Self(format!(
+            "v1/standing-runtime-checkpoints/{tenant_id}/{program_id}/{view_id}/latest.json"
+        )))
+    }
+
     pub fn relation_catalog(
         relation_id: &str,
         relation_version: &str,
@@ -289,6 +353,16 @@ impl ObjectKey {
         let value = value.into();
         let key = Self::parse(value.clone())?;
         let parts = parse_ownership_epoch_record_layout(&value)?;
+
+        Ok((key, parts))
+    }
+
+    pub fn parse_standing_runtime_checkpoint(
+        value: impl Into<String>,
+    ) -> Result<(Self, StandingRuntimeCheckpointKeyParts), ObjectKeyError> {
+        let value = value.into();
+        let key = Self::parse(value.clone())?;
+        let parts = parse_standing_runtime_checkpoint_layout(&value)?;
 
         Ok((key, parts))
     }
@@ -426,6 +500,41 @@ fn validate_known_layout(value: &str) -> Result<(), ObjectKeyError> {
             validate_sha256_hex(hash)
                 .map_err(|_| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
         }
+        ["v1", "views", view_id, "active.json"] => {
+            validate_segment("view_id", view_id)?;
+        }
+        ["v1", "views", view_id, "spec-sha256", view_file] => {
+            validate_segment("view_id", view_id)?;
+            let hash = view_file
+                .strip_suffix(".view.json")
+                .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+            validate_sha256_hex(hash)
+                .map_err(|_| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+        }
+        ["v1", "view-compile-deploy-jobs", view_id, "spec-sha256", job_file] => {
+            validate_segment("view_id", view_id)?;
+            let hash = job_file
+                .strip_suffix(".job.json")
+                .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+            validate_sha256_hex(hash)
+                .map_err(|_| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+        }
+        ["v1", "standing-runtime-checkpoints", tenant_id, program_id, view_id, "epochs", logical_epoch, "sha256", checkpoint_file] =>
+        {
+            parse_standing_runtime_checkpoint_parts(
+                value,
+                tenant_id,
+                program_id,
+                view_id,
+                logical_epoch,
+                checkpoint_file,
+            )?;
+        }
+        ["v1", "standing-runtime-checkpoints", tenant_id, program_id, view_id, "latest.json"] => {
+            validate_segment("tenant_id", tenant_id)?;
+            validate_segment("program_id", program_id)?;
+            validate_segment("view_id", view_id)?;
+        }
         ["v1", "relations", relation_id, "versions", relation_file] => {
             validate_segment("relation_id", relation_id)?;
             let relation_version = relation_file
@@ -473,6 +582,27 @@ fn parse_ownership_epoch_record_layout(
     parse_ownership_epoch_record_parts(value, stream_id, partition, epoch_file)
 }
 
+fn parse_standing_runtime_checkpoint_layout(
+    value: &str,
+) -> Result<StandingRuntimeCheckpointKeyParts, ObjectKeyError> {
+    let segments: Vec<_> = value.split('/').collect();
+
+    let ["v1", "standing-runtime-checkpoints", tenant_id, program_id, view_id, "epochs", logical_epoch, "sha256", checkpoint_file] =
+        segments.as_slice()
+    else {
+        return Err(ObjectKeyError::InvalidExternalKey(value.to_string()));
+    };
+
+    parse_standing_runtime_checkpoint_parts(
+        value,
+        tenant_id,
+        program_id,
+        view_id,
+        logical_epoch,
+        checkpoint_file,
+    )
+}
+
 fn parse_ingest_batch_parts(
     value: &str,
     stream_id: &str,
@@ -492,6 +622,32 @@ fn parse_ingest_batch_parts(
         partition_id,
         start_offset_inclusive,
         end_offset_exclusive,
+    })
+}
+
+fn parse_standing_runtime_checkpoint_parts(
+    value: &str,
+    tenant_id: &str,
+    program_id: &str,
+    view_id: &str,
+    logical_epoch: &str,
+    checkpoint_file: &str,
+) -> Result<StandingRuntimeCheckpointKeyParts, ObjectKeyError> {
+    validate_segment("tenant_id", tenant_id)?;
+    validate_segment("program_id", program_id)?;
+    validate_segment("view_id", view_id)?;
+    let logical_epoch = parse_fixed_u64("logical_epoch", logical_epoch, CHECKPOINT_WIDTH)?;
+    let hash = checkpoint_file
+        .strip_suffix(".checkpoint.json")
+        .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+    validate_sha256_hex(hash).map_err(|_| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+
+    Ok(StandingRuntimeCheckpointKeyParts {
+        tenant_id: tenant_id.to_string(),
+        program_id: program_id.to_string(),
+        view_id: view_id.to_string(),
+        logical_epoch,
+        content_hash: format!("sha256:{hash}"),
     })
 }
 
@@ -650,6 +806,21 @@ fn parse_sha256_hash_segment(artifact_hash: &str) -> Result<&str, ObjectKeyError
         });
     };
     validate_sha256_hex(hash)?;
+
+    Ok(hash)
+}
+
+fn parse_feldera_spec_hash_segment(spec_hash: &str) -> Result<&str, ObjectKeyError> {
+    let Some(hash) = spec_hash.strip_prefix("velorix-feldera-spec-sha256-v1:") else {
+        return Err(ObjectKeyError::UnsafeSegment {
+            name: "spec_hash",
+            value: spec_hash.to_string(),
+        });
+    };
+    validate_sha256_hex(hash).map_err(|_| ObjectKeyError::UnsafeSegment {
+        name: "spec_hash",
+        value: hash.to_string(),
+    })?;
 
     Ok(hash)
 }
@@ -942,6 +1113,89 @@ mod tests {
     }
 
     #[test]
+    fn materialized_view_key_is_deterministic_and_parseable() {
+        let spec_hash = format!("velorix-feldera-spec-sha256-v1:{}", "a".repeat(64));
+        let key = ObjectKey::materialized_view("orders-by-region", &spec_hash).unwrap();
+        let restarted = ObjectKey::materialized_view("orders-by-region", &spec_hash).unwrap();
+
+        assert_eq!(
+            key.as_str(),
+            "v1/views/orders-by-region/spec-sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.view.json"
+        );
+        assert_eq!(key, restarted);
+        assert_eq!(ObjectKey::parse(key.as_str()).unwrap(), key);
+    }
+
+    #[test]
+    fn materialized_view_key_rejects_unsafe_identity() {
+        for (view_id, spec_hash) in [
+            (
+                "",
+                "velorix-feldera-spec-sha256-v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            (
+                "orders/current",
+                "velorix-feldera-spec-sha256-v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            (
+                "orders",
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            ("orders", "velorix-feldera-spec-sha256-v1:not-hex"),
+        ] {
+            assert!(
+                ObjectKey::materialized_view(view_id, spec_hash).is_err(),
+                "accepted invalid materialized view identity: {view_id}/{spec_hash}"
+            );
+        }
+    }
+
+    #[test]
+    fn standing_runtime_checkpoint_keys_are_deterministic_and_parseable() {
+        let content_hash = format!("sha256:{}", "d".repeat(64));
+        let checkpoint = ObjectKey::standing_runtime_checkpoint(
+            "tenant-a",
+            "program-a",
+            "scores-by-user",
+            42,
+            &content_hash,
+        )
+        .unwrap();
+        let restarted = ObjectKey::standing_runtime_checkpoint(
+            "tenant-a",
+            "program-a",
+            "scores-by-user",
+            42,
+            &content_hash,
+        )
+        .unwrap();
+        let latest = ObjectKey::standing_runtime_latest_checkpoint(
+            "tenant-a",
+            "program-a",
+            "scores-by-user",
+        )
+        .unwrap();
+
+        assert_eq!(
+            checkpoint.as_str(),
+            "v1/standing-runtime-checkpoints/tenant-a/program-a/scores-by-user/epochs/00000000000000000042/sha256/dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd.checkpoint.json"
+        );
+        assert_eq!(checkpoint, restarted);
+        assert_eq!(ObjectKey::parse(checkpoint.as_str()).unwrap(), checkpoint);
+        let (_, parts) = ObjectKey::parse_standing_runtime_checkpoint(checkpoint.as_str()).unwrap();
+        assert_eq!(parts.tenant_id, "tenant-a");
+        assert_eq!(parts.program_id, "program-a");
+        assert_eq!(parts.view_id, "scores-by-user");
+        assert_eq!(parts.logical_epoch, 42);
+        assert_eq!(parts.content_hash, content_hash);
+        assert_eq!(
+            latest.as_str(),
+            "v1/standing-runtime-checkpoints/tenant-a/program-a/scores-by-user/latest.json"
+        );
+        assert_eq!(ObjectKey::parse(latest.as_str()).unwrap(), latest);
+    }
+
+    #[test]
     fn relation_catalog_key_is_deterministic_and_parseable() {
         let key = ObjectKey::relation_catalog("orders", "2026-05-05.v1").unwrap();
         let restarted = ObjectKey::relation_catalog("orders", "2026-05-05.v1").unwrap();
@@ -1014,6 +1268,9 @@ mod tests {
             "v1/query-policy/tenant-a/standard/base.json",
             "v1/feldera-artifacts/orders/sha256/not-hex.artifact.json",
             "v1/feldera-artifacts/orders/sha512/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.artifact.json",
+            "v1/views/orders/spec-sha256/not-hex.view.json",
+            "v1/views/orders/sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.view.json",
+            "v1/views/orders/spec-sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json",
             "v1/relations/orders/versions/.relation.json",
             "v1/relations/orders/versions/2026/05/05.relation.json",
             "v1/relations/orders/versions/2026-05-05.v1.json",

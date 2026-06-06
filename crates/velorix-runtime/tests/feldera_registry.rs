@@ -16,7 +16,7 @@ use velorix_core::{
     },
 };
 use velorix_runtime::feldera_registry::{
-    RuntimeFelderaArtifactError, RuntimeFelderaArtifactRegistry,
+    GeneratedRustArtifactPackage, RuntimeFelderaArtifactError, RuntimeFelderaArtifactRegistry,
     RuntimeFelderaArtifactSelectionStatus,
 };
 use velorix_storage::capability::{
@@ -61,6 +61,7 @@ fn capabilities_with_weak_namespace(
         ObjectStoreCapabilityProfile {
             backend_name: "weak-artifact-catalog".to_string(),
             conditional_create: false,
+            conditional_update: true,
             atomic_visibility: true,
             list_after_write: true,
             read_after_write: true,
@@ -245,6 +246,44 @@ async fn feldera_runtime_registry_selects_valid_registered_artifact_for_catalog(
         selected.status,
         RuntimeFelderaArtifactSelectionStatus::DirectExecutionDisabled
     );
+}
+
+#[tokio::test]
+async fn feldera_runtime_registry_selects_executable_artifact_when_package_is_registered() {
+    let (_temp_dir, store) = temp_store();
+    let (catalog, spec, artifact) = catalog_valid_fixture_parts();
+    let registry = RuntimeFelderaArtifactRegistry::for_local_bootstrap_with_generated_packages(
+        store,
+        [GeneratedRustArtifactPackage {
+            abi_version: artifact.generated_rust.abi_version.clone(),
+            crate_name: artifact.generated_rust.crate_name.clone(),
+        }],
+    );
+
+    let registered = registry
+        .register_trusted_artifact(&catalog, &spec, &artifact)
+        .await
+        .unwrap();
+    let selected = registry
+        .select_trusted_artifact(
+            &catalog,
+            &spec,
+            &artifact.artifact_id,
+            &artifact.artifact_hash,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        registered.status,
+        RuntimeFelderaArtifactSelectionStatus::DirectExecutionEnabled {
+            package: GeneratedRustArtifactPackage {
+                abi_version: artifact.generated_rust.abi_version.clone(),
+                crate_name: artifact.generated_rust.crate_name.clone(),
+            }
+        }
+    );
+    assert_eq!(selected.status, registered.status);
 }
 
 #[tokio::test]

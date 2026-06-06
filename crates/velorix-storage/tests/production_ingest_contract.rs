@@ -13,7 +13,7 @@ fn production_sources_do_not_call_bootstrap_ingest_apis() {
         ".append_validated_envelope_single_writer(",
         ".replay_from(",
         ".replay_validated_envelopes_from(",
-        "IngestBatch::new(",
+        "IngestBatch::new_bootstrap_unchecked(",
     ];
 
     let mut violations = Vec::new();
@@ -288,6 +288,24 @@ fn production_source_contract_forbids_unchecked_ingest_log_constructors() {
 }
 
 #[test]
+fn unchecked_ingest_batch_constructor_name_is_bootstrap_explicit() {
+    let workspace = workspace_root();
+    let log_source = fs::read_to_string(workspace.join("crates/velorix-storage/src/log.rs"))
+        .expect("read storage log source");
+    let ingest_batch_impl =
+        function_body(&log_source, "impl IngestBatch {").expect("IngestBatch impl exists");
+
+    assert!(
+        ingest_batch_impl.contains("pub fn new_bootstrap_unchecked("),
+        "unchecked opaque ingest batch constructor must advertise bootstrap scope"
+    );
+    assert!(
+        !ingest_batch_impl.contains("\n    pub fn new("),
+        "IngestBatch::new must not be exposed as a production-looking unchecked constructor"
+    );
+}
+
+#[test]
 fn production_source_contract_allows_intentional_json_deltabatch_rejection_fixture() {
     let workspace = Path::new("/workspace");
     let source = workspace.join("tests/e2e/local_recovery.rs");
@@ -295,7 +313,7 @@ fn production_source_contract_allows_intentional_json_deltabatch_rejection_fixtu
         "#[tokio::test]",
         "async fn local_recovery_rejects_json_deltabatch_ingest_object() {",
         "    let ingest_log = IngestLog::new(store);",
-        "    let legacy_batch = IngestBatch::new(\"orders\", 0, 0, 1, bytes).unwrap();",
+        "    let legacy_batch = IngestBatch::new_bootstrap_unchecked(\"orders\", 0, 0, 1, bytes).unwrap();",
         "    ingest_log.append(&legacy_batch).await.unwrap();",
         "}",
     ];
@@ -305,7 +323,7 @@ fn production_source_contract_allows_intentional_json_deltabatch_rejection_fixtu
         &source,
         &lines,
         3,
-        "IngestBatch::new("
+        "IngestBatch::new_bootstrap_unchecked("
     ));
     assert!(allowed_bootstrap_ingest_use(
         workspace,
@@ -540,7 +558,7 @@ fn allowed_bootstrap_ingest_use(
     }
 
     let local_recovery_e2e = workspace.join("tests/e2e/local_recovery.rs");
-    if source == local_recovery_e2e && pattern == "IngestBatch::new(" {
+    if source == local_recovery_e2e && pattern == "IngestBatch::new_bootstrap_unchecked(" {
         return line_is_inside_function(
             lines,
             line_number,

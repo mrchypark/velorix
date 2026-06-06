@@ -162,6 +162,7 @@ fn capabilities_missing_required(
     let mut profile = ObjectStoreCapabilityProfile::local_development();
     match required_capability {
         RequiredObjectStoreCapability::ConditionalCreate => profile.conditional_create = false,
+        RequiredObjectStoreCapability::ConditionalUpdate => profile.conditional_update = false,
         RequiredObjectStoreCapability::AtomicVisibility => profile.atomic_visibility = false,
         RequiredObjectStoreCapability::ListAfterWrite => profile.list_after_write = false,
         RequiredObjectStoreCapability::ReadAfterWrite => profile.read_after_write = false,

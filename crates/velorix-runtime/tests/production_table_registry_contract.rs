@@ -148,6 +148,23 @@ fn production_source_scan_includes_top_level_benchmarks() {
 }
 
 #[test]
+fn production_source_scan_includes_top_level_e2e_tests() {
+    let workspace = workspace_root();
+    let sources = production_source_scan_sources(&workspace);
+
+    for test_source in all_rust_files_under(&workspace.join("tests")) {
+        assert!(
+            sources.iter().any(|source| source == &test_source),
+            "production table registry contract should scan {}",
+            test_source
+                .strip_prefix(&workspace)
+                .unwrap_or(&test_source)
+                .display()
+        );
+    }
+}
+
+#[test]
 fn incremental_benchmarks_use_production_table_helpers() {
     let workspace = workspace_root();
     for benchmark in [
@@ -185,6 +202,7 @@ fn workspace_root() -> PathBuf {
 fn production_source_scan_sources(workspace: &Path) -> Vec<PathBuf> {
     let mut sources = rust_sources_under(&workspace.join("crates"));
     sources.extend(top_level_rust_files(&workspace.join("benches")));
+    sources.extend(all_rust_files_under(&workspace.join("tests")));
     sources.sort();
     sources
 }
@@ -369,6 +387,13 @@ fn rust_sources_under(root: &Path) -> Vec<PathBuf> {
     sources
 }
 
+fn all_rust_files_under(root: &Path) -> Vec<PathBuf> {
+    let mut sources = Vec::new();
+    collect_all_rust_files(root, &mut sources);
+    sources.sort();
+    sources
+}
+
 fn top_level_rust_files(root: &Path) -> Vec<PathBuf> {
     let mut sources = Vec::new();
     let entries = fs::read_dir(root).expect("read benchmark directory");
@@ -396,6 +421,21 @@ fn collect_rust_sources(path: &Path, sources: &mut Vec<PathBuf>) {
                 .components()
                 .any(|component| component.as_os_str() == "src")
         {
+            sources.push(path);
+        }
+    }
+}
+
+fn collect_all_rust_files(path: &Path, sources: &mut Vec<PathBuf>) {
+    let entries = fs::read_dir(path).expect("read source tree");
+    for entry in entries {
+        let path = entry.expect("read directory entry").path();
+        if path.is_dir() {
+            if path.file_name().is_some_and(|name| name == "target") {
+                continue;
+            }
+            collect_all_rust_files(&path, sources);
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
             sources.push(path);
         }
     }

@@ -26,6 +26,7 @@ fn weak_profile() -> ObjectStoreCapabilityProfile {
     ObjectStoreCapabilityProfile {
         backend_name: "weak-relation-catalog-store".to_string(),
         conditional_create: false,
+        conditional_update: true,
         atomic_visibility: true,
         list_after_write: true,
         read_after_write: true,

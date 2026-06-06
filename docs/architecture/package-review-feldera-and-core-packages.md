@@ -26,6 +26,15 @@ Velorix should keep the current package ownership model and make it sharper:
 
 ## Feldera
 
+2026-05-27 realignment: Velorix's primary Feldera direction is now
+package-first runtime integration, not release-image generated artifact
+activation. See
+[Feldera Package-First Runtime Design](../superpowers/specs/2026-05-27-feldera-package-first-runtime-design.md).
+The static generated artifact path remains useful for release-bound fixtures
+and provenance experiments, but it is not the main product path for REST-defined
+views. Descriptor/executable/checkpoint identity is still required in the first
+package-first proof; only release-image artifact activation is demoted.
+
 Feldera is the best match for standing-view incremental execution. Its README
 describes pipelines as SQL tables and views that process inserts, updates, and
 deletes incrementally. It also documents full SQL support, DBSP theory,
@@ -35,7 +44,15 @@ connectors, fault tolerance, and ad hoc queries evaluated through DataFusion.
 
 - SQL-to-DBSP compilation as the standing-view compiler.
 - DBSP semantics as the correctness model for incremental view maintenance.
-- The Rust `dbsp` crate only after the existing adoption gates pass.
+- The Rust `dbsp` crate as the first in-process runtime representation to test,
+  behind an explicit toolchain/MSRV gate.
+- `feldera-sqllib` for SQL runtime types where standing-view inputs and outputs
+  need typed SQL values instead of Velorix JSON-only bootstrap rows.
+- `feldera-ir` and `feldera-types` as compiled-program descriptor, lifecycle,
+  coordination, checkpoint, and comparison-adapter vocabulary where they fit
+  without taking over Velorix durable authority.
+- Opaque Feldera program descriptors for validation and diagnostics. Velorix
+  must not execute by interpreting Feldera IR or Calcite plan nodes.
 - The distinction between incremental pipeline execution and ad hoc DataFusion
   queries.
 - Connector/checkpoint test ideas from Feldera's Python test suite, especially
@@ -56,14 +73,18 @@ connectors, fault tolerance, and ad hoc queries evaluated through DataFusion.
 
 Before direct runtime Feldera or `dbsp` adoption, Velorix needs:
 
-1. A concrete embedded execution API experiment.
-2. A state codec mapping from DBSP/Feldera state to object-backed Velorix state
+1. A concrete package-first `StandingProgramRuntime` compatibility proof.
+2. A proven Feldera-owned executable runtime mechanism; a compiled descriptor
+   alone is not enough.
+3. A schema/type mapping from `VelorixRelationCatalogV1` to Feldera SQL runtime
+   values and view output schemas.
+4. A state codec mapping from DBSP/Feldera state to object-backed Velorix state
    refs.
-3. Recovery tests proving manifest checkpoint version and engine logical epoch
+5. Recovery tests proving manifest checkpoint version and engine logical epoch
    remain distinct.
-4. A release artifact registry mapping Velorix `artifact_id` and hash to a
-   trusted binary/package.
-5. Resource tests for memory, spill, CPU, and object-store write amplification.
+6. Resource tests for memory, spill, CPU, and object-store write amplification.
+7. A release artifact registry mapping Velorix `artifact_id` and hash to a
+   trusted binary/package only after the runtime compatibility proof passes.
 
 The existing `feldera_artifact` phase-0 contract remains the right boundary.
 
@@ -242,8 +263,10 @@ affect correctness and supply-chain risk.
 
 | Area | Preferred package or source | Adopt now? | Notes |
 | --- | --- | --- | --- |
-| Standing-view SQL compilation | Feldera SQL-to-DBSP | Contract only | Current artifact validation is correct; direct runtime integration remains gated |
-| Incremental semantics | Feldera DBSP / `dbsp` | Gate | Use as model until embedded API/state/resource proof exists |
+| Standing-view SQL compilation | Feldera SQL-to-DBSP | Design now | Primary path should validate compiled Feldera descriptors, not Velorix-owned SQL shape parsing |
+| Incremental semantics | Feldera DBSP / `dbsp` | Gate with compatibility proof | First prove a package-first `StandingProgramRuntime`; current sum/count DBSP code is a spike |
+| SQL runtime values | `feldera-sqllib` | Gate with schema/type tests | Prefer Feldera SQL runtime types over JSON-only standing-view rows |
+| Feldera program descriptors | `feldera-ir` / `feldera-types` | Research now | Use for compiled-program metadata and comparison adapters; do not make them durable authority without an RFC |
 | Ad hoc SQL | DataFusion | Yes | Keep narrow, add resource policy |
 | Object-backed table scans | DataFusion + Parquet + `object_store` | Yes | Keep raw URL specs dev-only; production needs registry-backed table layout |
 | Internal materialized table/state authority | Velorix object-storage manifests | Yes | Default for input/state/output manifests and checkpoint publication |
@@ -273,5 +296,7 @@ affect correctness and supply-chain risk.
    interoperability/export/import surface.
 8. Add connector catalog/status contracts.
 9. Add dependency governance CI.
-10. Only then evaluate direct Feldera/DBSP runtime execution with a small
-   artifact-backed vertical slice.
+10. Evaluate package-first Feldera/DBSP runtime execution with a small
+   `StandingProgramRuntime` vertical slice.
+11. Only after that, promote release-bound artifact hash/provenance gates for
+   static generated package builds.

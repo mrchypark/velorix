@@ -4,12 +4,34 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
+[features]
+default = []
+feldera-package-compat = [
+  "dep:feldera-ir",
+  "dep:feldera-sqllib",
+  "dep:feldera-types",
+]
+dbsp-spike = [
+  "feldera-package-compat",
+  "dep:dbsp",
+  "dep:feldera-macros",
+  "dep:rkyv",
+  "dep:size-of",
+]
+
 [dependencies]
 arrow = { workspace = true }
 datafusion = { workspace = true }
+dbsp = { version = "0.299.0", optional = true }
+feldera-ir = { version = "0.299.0", optional = true }
+feldera-macros = { version = "0.299.0", optional = true }
+feldera-sqllib = { version = "0.299.0", optional = true }
+feldera-types = { version = "0.299.0", optional = true }
+rkyv = { version = "0.7.45", features = ["std", "size_64", "validation"], default-features = false, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+size-of = { package = "feldera-size-of", version = "0.1.7", optional = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 

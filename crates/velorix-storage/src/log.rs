@@ -3,6 +3,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{lock::Mutex as AsyncMutex, TryStreamExt};
 use object_store::{path::Path, ObjectStore, PutMode};
@@ -86,6 +87,17 @@ pub struct DurableIngestAdmissionRecordV1 {
     pub relation_version: String,
     pub schema_fingerprint: String,
     pub admission_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_guard_binding: Option<IngestCommitGuardBindingV1>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IngestCommitGuardBindingV1 {
+    pub schema_version: u16,
+    pub binding_kind: String,
+    pub subject: String,
+    pub owner_id: String,
+    pub owner_epoch: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,7 +157,7 @@ struct IngestAdmissionReconstruction {
     expired_orphan_admission_records: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplayCheckpoint {
     pub stream_id: String,
     pub partition_id: u32,
@@ -165,6 +177,47 @@ pub enum AppendValidatedEnvelopeOutcome {
         object_key: ObjectKey,
         reason: &'static str,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReserveIngestRangeAdmissionOutcome {
+    Reserved,
+    Duplicate,
+    Conflict {
+        object_key: ObjectKey,
+        reason: &'static str,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IngestCommitGuardPhase {
+    BeforeAdmission,
+    BeforeCommit,
+}
+
+impl IngestCommitGuardPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BeforeAdmission => "before_admission",
+            Self::BeforeCommit => "before_commit",
+        }
+    }
+}
+
+#[async_trait]
+pub trait IngestCommitGuard: Send + Sync {
+    async fn verify(
+        &self,
+        phase: IngestCommitGuardPhase,
+        descriptor: &IngestBatchDescriptor,
+    ) -> Result<(), String>;
+
+    fn admission_binding(
+        &self,
+        _descriptor: &IngestBatchDescriptor,
+    ) -> Option<IngestCommitGuardBindingV1> {
+        None
+    }
 }
 
 #[derive(Debug, Error)]
@@ -198,6 +251,17 @@ pub enum IngestLogError {
         guard_partition_id: u32,
         stream_id: String,
         partition_id: u32,
+    },
+    #[error(
+        "ingest commit guard rejected {stream_id}/p={partition_id} {start_offset_inclusive}-{end_offset_exclusive} at {phase}: {reason}"
+    )]
+    IngestCommitGuardRejected {
+        stream_id: String,
+        partition_id: u32,
+        start_offset_inclusive: u64,
+        end_offset_exclusive: u64,
+        phase: &'static str,
+        reason: String,
     },
     #[error(
         "overlapping committed ingest ranges for {stream_id}/p={partition_id}: `{previous}` overlaps `{current}`"
@@ -299,24 +363,35 @@ impl DurableIngestAdmission {
     /// supplied guard keeps in-process callers from doing redundant work for the
     /// same partition while the object-store index remains the cross-process
     /// admission fence.
-    async fn admit_validated_batch(
+    async fn admit_validated_batch_with_commit_guard(
         &self,
         batch: IngestBatch,
         guard: &AdmissionSerializationGuard,
+        commit_guard: Option<&dyn IngestCommitGuard>,
     ) -> Result<AppendValidatedEnvelopeOutcome, IngestLogError> {
         let descriptor = batch.descriptor();
         guard.validate(&descriptor)?;
+        verify_ingest_commit_guard(
+            commit_guard,
+            IngestCommitGuardPhase::BeforeAdmission,
+            &descriptor,
+        )
+        .await?;
 
         if self.reserve_before_committed_overlap {
             return self
-                .admit_validated_batch_indexed_before_committed_fallback(batch, descriptor)
+                .admit_validated_batch_indexed_before_committed_fallback(
+                    batch,
+                    descriptor,
+                    commit_guard,
+                )
                 .await;
         }
 
         if let Some(conflict) = self.committed_overlap_conflict(&descriptor).await? {
             return Ok(conflict);
         }
-        self.reserve_then_append_validated_batch(batch, descriptor)
+        self.reserve_then_append_validated_batch(batch, descriptor, commit_guard)
             .await
     }
 
@@ -324,6 +399,7 @@ impl DurableIngestAdmission {
         &self,
         batch: IngestBatch,
         descriptor: IngestBatchDescriptor,
+        commit_guard: Option<&dyn IngestCommitGuard>,
     ) -> Result<AppendValidatedEnvelopeOutcome, IngestLogError> {
         if let Some(existing) = self.log.existing_batch_conflict(&batch).await? {
             return Ok(existing);
@@ -336,7 +412,10 @@ impl DurableIngestAdmission {
             return Ok(conflict);
         }
 
-        match self.reserve_then_materialize_admission(&batch).await? {
+        match self
+            .reserve_then_materialize_admission(&batch, commit_guard)
+            .await?
+        {
             AdmissionReservationOutcome::Admitted | AdmissionReservationOutcome::Duplicate => {}
             AdmissionReservationOutcome::Conflict { object_key, reason } => {
                 return Ok(AppendValidatedEnvelopeOutcome::Conflict {
@@ -354,6 +433,12 @@ impl DurableIngestAdmission {
             return Ok(conflict);
         }
 
+        verify_ingest_commit_guard(
+            commit_guard,
+            IngestCommitGuardPhase::BeforeCommit,
+            &descriptor,
+        )
+        .await?;
         self.log.append_validated_batch(batch).await
     }
 
@@ -361,12 +446,16 @@ impl DurableIngestAdmission {
         &self,
         batch: IngestBatch,
         descriptor: IngestBatchDescriptor,
+        commit_guard: Option<&dyn IngestCommitGuard>,
     ) -> Result<AppendValidatedEnvelopeOutcome, IngestLogError> {
         if let Some(existing) = self.log.existing_batch_conflict(&batch).await? {
             return Ok(existing);
         }
 
-        match self.reserve_then_materialize_admission(&batch).await? {
+        match self
+            .reserve_then_materialize_admission(&batch, commit_guard)
+            .await?
+        {
             AdmissionReservationOutcome::Admitted | AdmissionReservationOutcome::Duplicate => {}
             AdmissionReservationOutcome::Conflict { object_key, reason } => {
                 return Ok(AppendValidatedEnvelopeOutcome::Conflict {
@@ -377,30 +466,82 @@ impl DurableIngestAdmission {
             }
         }
 
+        verify_ingest_commit_guard(
+            commit_guard,
+            IngestCommitGuardPhase::BeforeCommit,
+            &descriptor,
+        )
+        .await?;
+        self.log.append_validated_batch(batch).await
+    }
+
+    async fn reserve_then_materialize_admission_record(
+        &self,
+        record: &DurableIngestAdmissionRecordV1,
+    ) -> Result<AdmissionReservationOutcome, IngestLogError> {
+        if let Some(conflict) = self.expired_materialized_admission_conflict(record).await? {
+            return Ok(conflict);
+        }
+        let mut duplicate = false;
+        match self.reserve_range_admission_index(record).await? {
+            AdmissionReservationOutcome::Admitted => {}
+            AdmissionReservationOutcome::Duplicate => duplicate = true,
+            conflict @ AdmissionReservationOutcome::Conflict { .. } => return Ok(conflict),
+        }
+        match self.materialize_admission_record(record).await? {
+            AdmissionReservationOutcome::Admitted => {}
+            AdmissionReservationOutcome::Duplicate => duplicate = true,
+            conflict @ AdmissionReservationOutcome::Conflict { .. } => return Ok(conflict),
+        }
+
+        if duplicate {
+            Ok(AdmissionReservationOutcome::Duplicate)
+        } else {
+            Ok(AdmissionReservationOutcome::Admitted)
+        }
+    }
+
+    async fn materialize_external_admission_then_append_validated_batch(
+        &self,
+        batch: IngestBatch,
+        descriptor: IngestBatchDescriptor,
+        commit_guard: Option<&dyn IngestCommitGuard>,
+    ) -> Result<AppendValidatedEnvelopeOutcome, IngestLogError> {
+        if let Some(existing) = self.log.existing_batch_conflict(&batch).await? {
+            return Ok(existing);
+        }
+
+        match self
+            .materialize_admission_record(&admission_record_for_batch(&batch)?)
+            .await?
+        {
+            AdmissionReservationOutcome::Admitted | AdmissionReservationOutcome::Duplicate => {}
+            AdmissionReservationOutcome::Conflict { object_key, reason } => {
+                return Ok(AppendValidatedEnvelopeOutcome::Conflict {
+                    descriptor,
+                    object_key,
+                    reason,
+                });
+            }
+        }
+
+        verify_ingest_commit_guard(
+            commit_guard,
+            IngestCommitGuardPhase::BeforeCommit,
+            &descriptor,
+        )
+        .await?;
         self.log.append_validated_batch(batch).await
     }
 
     async fn reserve_then_materialize_admission(
         &self,
         batch: &IngestBatch,
+        commit_guard: Option<&dyn IngestCommitGuard>,
     ) -> Result<AdmissionReservationOutcome, IngestLogError> {
-        let record = admission_record_for_batch(batch)?;
-        if let Some(conflict) = self
-            .expired_materialized_admission_conflict(&record)
-            .await?
-        {
-            return Ok(conflict);
-        }
-        match self.reserve_range_admission_index(&record).await? {
-            AdmissionReservationOutcome::Admitted | AdmissionReservationOutcome::Duplicate => {}
-            conflict @ AdmissionReservationOutcome::Conflict { .. } => return Ok(conflict),
-        }
-        match self.materialize_admission_record(&record).await? {
-            AdmissionReservationOutcome::Admitted | AdmissionReservationOutcome::Duplicate => {}
-            conflict @ AdmissionReservationOutcome::Conflict { .. } => return Ok(conflict),
-        }
-
-        Ok(AdmissionReservationOutcome::Admitted)
+        let record = admission_record_for_batch_with_commit_guard(batch, commit_guard)?;
+        self.reserve_then_materialize_admission_record(&record)
+            .await
     }
 
     async fn expired_materialized_admission_conflict(
@@ -667,6 +808,50 @@ impl DurableIngestAdmission {
 }
 
 impl DurableIngestAdmissionRecordV1 {
+    pub fn for_external_admission(
+        stream_id: impl Into<String>,
+        partition_id: u32,
+        start_offset_inclusive: u64,
+        end_offset_exclusive: u64,
+        payload_digest: impl Into<String>,
+        relation_id: impl Into<String>,
+        relation_version: impl Into<String>,
+        schema_fingerprint: impl Into<String>,
+    ) -> Result<Self, IngestLogError> {
+        let stream_id = stream_id.into();
+        let batch_key = ObjectKey::ingest_batch(
+            &stream_id,
+            partition_id,
+            start_offset_inclusive,
+            end_offset_exclusive,
+        )?;
+        let admission_record_key = ObjectKey::ingest_admission_record(
+            &stream_id,
+            partition_id,
+            start_offset_inclusive,
+            end_offset_exclusive,
+        )?;
+        let record = Self {
+            schema_version: 1,
+            record_kind: INGEST_ADMISSION_RECORD_KIND_V1.to_string(),
+            stream_id,
+            partition_id,
+            start_offset_inclusive,
+            end_offset_exclusive,
+            batch_key,
+            admission_record_key,
+            payload_digest: payload_digest.into(),
+            relation_id: relation_id.into(),
+            relation_version: relation_version.into(),
+            schema_fingerprint: schema_fingerprint.into(),
+            admission_mode: "process_local_serialized".to_string(),
+            commit_guard_binding: None,
+        };
+        record.validate_key()?;
+
+        Ok(record)
+    }
+
     fn descriptor(&self) -> Result<IngestBatchDescriptor, IngestLogError> {
         self.validate_key()?;
 
@@ -747,6 +932,64 @@ impl DurableIngestAdmissionRecordV1 {
             return Err(IngestLogError::MalformedIngestAdmissionRecord {
                 key: self.admission_record_key.to_string(),
                 reason: format!("unsupported admission_mode `{}`", self.admission_mode),
+            });
+        }
+        if let Some(binding) = &self.commit_guard_binding {
+            binding.validate(&self.admission_record_key)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl IngestCommitGuardBindingV1 {
+    pub fn new(
+        binding_kind: impl Into<String>,
+        subject: impl Into<String>,
+        owner_id: impl Into<String>,
+        owner_epoch: u64,
+    ) -> Self {
+        Self {
+            schema_version: 1,
+            binding_kind: binding_kind.into(),
+            subject: subject.into(),
+            owner_id: owner_id.into(),
+            owner_epoch,
+        }
+    }
+
+    fn validate(&self, admission_record_key: &ObjectKey) -> Result<(), IngestLogError> {
+        if self.schema_version != 1 {
+            return Err(IngestLogError::MalformedIngestAdmissionRecord {
+                key: admission_record_key.to_string(),
+                reason: format!(
+                    "commit_guard_binding has unsupported schema_version {}",
+                    self.schema_version
+                ),
+            });
+        }
+        if self.binding_kind.trim().is_empty() {
+            return Err(IngestLogError::MalformedIngestAdmissionRecord {
+                key: admission_record_key.to_string(),
+                reason: "commit_guard_binding.binding_kind must be nonempty".to_string(),
+            });
+        }
+        if self.subject.trim().is_empty() {
+            return Err(IngestLogError::MalformedIngestAdmissionRecord {
+                key: admission_record_key.to_string(),
+                reason: "commit_guard_binding.subject must be nonempty".to_string(),
+            });
+        }
+        if self.owner_id.trim().is_empty() {
+            return Err(IngestLogError::MalformedIngestAdmissionRecord {
+                key: admission_record_key.to_string(),
+                reason: "commit_guard_binding.owner_id must be nonempty".to_string(),
+            });
+        }
+        if self.owner_epoch == 0 {
+            return Err(IngestLogError::MalformedIngestAdmissionRecord {
+                key: admission_record_key.to_string(),
+                reason: "commit_guard_binding.owner_epoch must be greater than zero".to_string(),
             });
         }
 
@@ -981,6 +1224,26 @@ enum AdmissionReservationOutcome {
     },
 }
 
+async fn verify_ingest_commit_guard(
+    guard: Option<&dyn IngestCommitGuard>,
+    phase: IngestCommitGuardPhase,
+    descriptor: &IngestBatchDescriptor,
+) -> Result<(), IngestLogError> {
+    let Some(guard) = guard else {
+        return Ok(());
+    };
+    guard.verify(phase, descriptor).await.map_err(|reason| {
+        IngestLogError::IngestCommitGuardRejected {
+            stream_id: descriptor.stream_id.clone(),
+            partition_id: descriptor.partition_id,
+            start_offset_inclusive: descriptor.start_offset_inclusive,
+            end_offset_exclusive: descriptor.end_offset_exclusive,
+            phase: phase.as_str(),
+            reason,
+        }
+    })
+}
+
 impl IngestAdmissionCoordinator {
     pub fn new(log: IngestLog) -> Self {
         Self {
@@ -988,6 +1251,10 @@ impl IngestAdmissionCoordinator {
             log,
             admission_locks: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn new_object_store_meta_authority(store: Arc<dyn ObjectStore>) -> Self {
+        Self::new(IngestLog::new(store))
     }
 
     /// Constructs an ingest admission coordinator from the shared startup
@@ -1018,6 +1285,27 @@ impl IngestAdmissionCoordinator {
         &self,
         payload: Bytes,
     ) -> Result<AppendValidatedEnvelopeOutcome, IngestLogError> {
+        self.append_catalog_validated_envelope_with_optional_commit_guard(payload, None)
+            .await
+    }
+
+    pub async fn append_catalog_validated_envelope_with_commit_guard(
+        &self,
+        payload: Bytes,
+        commit_guard: &dyn IngestCommitGuard,
+    ) -> Result<AppendValidatedEnvelopeOutcome, IngestLogError> {
+        self.append_catalog_validated_envelope_with_optional_commit_guard(
+            payload,
+            Some(commit_guard),
+        )
+        .await
+    }
+
+    async fn append_catalog_validated_envelope_with_optional_commit_guard(
+        &self,
+        payload: Bytes,
+        commit_guard: Option<&dyn IngestCommitGuard>,
+    ) -> Result<AppendValidatedEnvelopeOutcome, IngestLogError> {
         let batch = self.log.catalog_validated_batch(payload).await?;
         let descriptor = batch.descriptor();
         let admission_lock = self.admission_lock(&descriptor);
@@ -1028,8 +1316,81 @@ impl IngestAdmissionCoordinator {
         );
 
         self.durable_admission
-            .admit_validated_batch(batch, &serialization_guard)
+            .admit_validated_batch_with_commit_guard(batch, &serialization_guard, commit_guard)
             .await
+    }
+
+    /// Appends a catalog-validated envelope after a separate authoritative
+    /// admission service has already reserved the range.
+    pub async fn append_catalog_validated_envelope_after_external_admission(
+        &self,
+        payload: Bytes,
+    ) -> Result<AppendValidatedEnvelopeOutcome, IngestLogError> {
+        let batch = self.log.catalog_validated_batch(payload).await?;
+        let descriptor = batch.descriptor();
+
+        self.durable_admission
+            .materialize_external_admission_then_append_validated_batch(batch, descriptor, None)
+            .await
+    }
+
+    /// Appends an already catalog-validated envelope after a separate
+    /// authoritative admission service has reserved the range.
+    ///
+    /// Metadata-backed API ingest uses this after validating the request
+    /// against the metadata relation catalog and reserving the range through
+    /// the metadata service. It intentionally does not re-read the object-store
+    /// relation catalog materialization, because that record is a cache/evidence
+    /// copy in metadata-backed mode rather than the ingest authority.
+    pub async fn append_validated_envelope_after_external_admission(
+        &self,
+        payload: Bytes,
+    ) -> Result<AppendValidatedEnvelopeOutcome, IngestLogError> {
+        let batch = IngestBatch::from_validated_envelope(payload)?;
+        let descriptor = batch.descriptor();
+
+        self.durable_admission
+            .materialize_external_admission_then_append_validated_batch(batch, descriptor, None)
+            .await
+    }
+
+    pub async fn reserve_external_ingest_range_admission(
+        &self,
+        record: DurableIngestAdmissionRecordV1,
+    ) -> Result<ReserveIngestRangeAdmissionOutcome, IngestLogError> {
+        let descriptor = record.descriptor()?;
+        let admission_lock = self.admission_lock(&descriptor);
+        let _guard = admission_lock.lock().await;
+
+        if let Some(conflict) = self
+            .durable_admission
+            .committed_overlap_conflict(&descriptor)
+            .await?
+        {
+            let AppendValidatedEnvelopeOutcome::Conflict {
+                object_key, reason, ..
+            } = conflict
+            else {
+                unreachable!("committed_overlap_conflict only returns conflicts")
+            };
+            return Ok(ReserveIngestRangeAdmissionOutcome::Conflict { object_key, reason });
+        }
+
+        match self
+            .durable_admission
+            .reserve_then_materialize_admission_record(&record)
+            .await?
+        {
+            AdmissionReservationOutcome::Admitted => {
+                Ok(ReserveIngestRangeAdmissionOutcome::Reserved)
+            }
+            AdmissionReservationOutcome::Duplicate => {
+                Ok(ReserveIngestRangeAdmissionOutcome::Duplicate)
+            }
+            AdmissionReservationOutcome::Conflict { object_key, reason } => {
+                Ok(ReserveIngestRangeAdmissionOutcome::Conflict { object_key, reason })
+            }
+        }
     }
 
     pub async fn list_committed(&self) -> Result<Vec<IngestBatchDescriptor>, IngestLogError> {
@@ -1594,18 +1955,12 @@ impl IngestLog {
         let indexed_expired_admission_keys = self
             .list_expired_orphan_admission_keys(stream_id, partition_id)
             .await?;
-        let indexed_admission_keys = transitions
-            .iter()
-            .map(|transition| transition.admitted.admission_record_key.clone())
-            .collect::<HashSet<_>>();
         let mut indexed_admissions = self
             .list_admission_records()
             .await?
             .into_iter()
             .filter(|admission| {
-                admission.stream_id == stream_id
-                    && admission.partition_id == partition_id
-                    && !indexed_admission_keys.contains(&admission.admission_record_key)
+                admission.stream_id == stream_id && admission.partition_id == partition_id
             })
             .collect::<Vec<_>>();
         sort_admission_records(&mut indexed_admissions);
@@ -1613,11 +1968,7 @@ impl IngestLog {
             .list_active_admission_records()
             .await?
             .into_iter()
-            .filter(|active| {
-                active.stream_id == stream_id
-                    && active.partition_id == partition_id
-                    && !indexed_admission_keys.contains(&active.admission_record_key)
-            })
+            .filter(|active| active.stream_id == stream_id && active.partition_id == partition_id)
             .collect::<Vec<_>>();
         sort_admission_records(&mut active_admissions);
         let mut state = RangeAdmissionIndexState {
@@ -1631,31 +1982,26 @@ impl IngestLog {
             indexed_expired_admission_keys,
         };
 
-        let mut transitions_by_previous = HashMap::with_capacity(transitions.len());
+        let mut transitions_by_previous: HashMap<
+            String,
+            Vec<RangeAdmissionIndexTransitionRecordV1>,
+        > = HashMap::with_capacity(transitions.len());
         for transition in transitions {
-            if transitions_by_previous
-                .insert(transition.previous_state_digest.clone(), transition)
-                .is_some()
-            {
+            transitions_by_previous
+                .entry(transition.previous_state_digest.clone())
+                .or_default()
+                .push(transition);
+        }
+
+        while let Some(mut transitions) = transitions_by_previous.remove(&state.state_digest) {
+            if transitions.len() > 1 {
                 return Err(IngestLogError::MalformedIngestAdmissionIndexTransition {
                     key: range_admission_index_partition_prefix(stream_id, partition_id),
                     reason: "multiple transitions share previous_state_digest".to_string(),
                 });
             }
-        }
-
-        let transition_count = transitions_by_previous.len();
-        let mut applied = 0;
-        while let Some(transition) = transitions_by_previous.remove(&state.state_digest) {
+            let transition = transitions.pop().expect("transition bucket is nonempty");
             transition.apply_to_state(&mut state)?;
-            applied += 1;
-        }
-
-        if applied != transition_count {
-            return Err(IngestLogError::MalformedIngestAdmissionIndexTransition {
-                key: range_admission_index_partition_prefix(stream_id, partition_id),
-                reason: "admission index contains unreachable transition objects".to_string(),
-            });
         }
 
         Ok(state)
@@ -2011,6 +2357,7 @@ fn index_probe_record_for_descriptor(
         schema_fingerprint:
             "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_string(),
         admission_mode: "process_local_serialized".to_string(),
+        commit_guard_binding: None,
     };
     record.validate_key()?;
     Ok(record)
@@ -2159,9 +2506,17 @@ fn sort_admission_records(records: &mut [DurableIngestAdmissionRecordV1]) {
 fn admission_record_for_batch(
     batch: &IngestBatch,
 ) -> Result<DurableIngestAdmissionRecordV1, IngestLogError> {
+    admission_record_for_batch_with_commit_guard(batch, None)
+}
+
+fn admission_record_for_batch_with_commit_guard(
+    batch: &IngestBatch,
+    commit_guard: Option<&dyn IngestCommitGuard>,
+) -> Result<DurableIngestAdmissionRecordV1, IngestLogError> {
     let envelope = IngestEnvelope::decode(batch.payload.clone())?;
     let header = envelope.header();
     let descriptor = batch.descriptor();
+    let commit_guard_binding = commit_guard.and_then(|guard| guard.admission_binding(&descriptor));
     let admission_record_key = ObjectKey::ingest_admission_record(
         &descriptor.stream_id,
         descriptor.partition_id,
@@ -2183,6 +2538,7 @@ fn admission_record_for_batch(
         relation_version: header.relation_version.clone(),
         schema_fingerprint: header.schema_fingerprint.clone(),
         admission_mode: "process_local_serialized".to_string(),
+        commit_guard_binding,
     };
     record.validate_key()?;
 
@@ -2392,7 +2748,7 @@ impl IngestBatch {
     /// This remains for bootstrap/local compatibility while runtime replay
     /// still supports the pre-envelope JSON path. Production durable ingest
     /// callers should use [`Self::from_validated_envelope`] instead.
-    pub fn new(
+    pub fn new_bootstrap_unchecked(
         stream_id: impl Into<String>,
         partition_id: u32,
         start_offset_inclusive: u64,

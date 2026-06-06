@@ -610,7 +610,8 @@ async fn local_recovery_rejects_json_deltabatch_ingest_object() {
     let (_temp_dir, store) = temp_store();
     let ingest_log = IngestLog::new(Arc::clone(&store));
     let input = batch([input_delta("account-a", 4, 1)]);
-    let legacy_batch = IngestBatch::new("orders", 0, 0, 1, batch_bytes(&input)).unwrap();
+    let legacy_batch =
+        IngestBatch::new_bootstrap_unchecked("orders", 0, 0, 1, batch_bytes(&input)).unwrap();
 
     ingest_log.append(&legacy_batch).await.unwrap();
 

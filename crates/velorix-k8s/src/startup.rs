@@ -107,6 +107,10 @@ impl OperatorAuthorityStartupComponents {
         &self.capabilities
     }
 
+    pub fn store(&self) -> Arc<dyn object_store::ObjectStore> {
+        Arc::clone(&self.store)
+    }
+
     pub fn relation_snapshot_provider(&self) -> RelationCatalogSnapshotProvider {
         RelationCatalogSnapshotProvider::from_authority_parts(
             ValidatedStartupAuthorityToken::new(),

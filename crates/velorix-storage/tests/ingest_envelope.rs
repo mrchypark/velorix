@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 
 use arrow::{
     array::{ArrayRef, Int64Array, StringArray},
@@ -6,6 +9,7 @@ use arrow::{
     ipc::writer::StreamWriter,
     record_batch::RecordBatch,
 };
+use async_trait::async_trait;
 use bytes::Bytes;
 use object_store::{local::LocalFileSystem, path::Path, ObjectStore, PutMode};
 use serde_json::Value;
@@ -25,7 +29,8 @@ use velorix_storage::{
     log::{
         AppendValidatedEnvelopeOutcome, DurableIngestAdmissionExpiryDecisionRecordV1,
         DurableIngestAdmissionRecordV1, IngestAdmissionCoordinator, IngestBatch,
-        IngestBatchDescriptor, IngestLog, IngestLogError, ReplayCheckpoint,
+        IngestBatchDescriptor, IngestCommitGuard, IngestCommitGuardBindingV1,
+        IngestCommitGuardPhase, IngestLog, IngestLogError, ReplayCheckpoint,
     },
     object_key::ObjectKey,
     relation_catalog_registry::{RelationCatalogRegistry, RelationCatalogRegistryError},
@@ -64,6 +69,40 @@ fn ranges_overlap_for_test(left: &IngestBatchDescriptor, right: &IngestBatchDesc
         && left.partition_id == right.partition_id
         && left.start_offset_inclusive < right.end_offset_exclusive
         && right.start_offset_inclusive < left.end_offset_exclusive
+}
+
+#[derive(Debug)]
+struct PhaseRejectingCommitGuard {
+    reject_phase: IngestCommitGuardPhase,
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl IngestCommitGuard for PhaseRejectingCommitGuard {
+    async fn verify(
+        &self,
+        phase: IngestCommitGuardPhase,
+        _descriptor: &IngestBatchDescriptor,
+    ) -> Result<(), String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if phase == self.reject_phase {
+            Err(format!("lease revoked at {}", phase.as_str()))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn admission_binding(
+        &self,
+        descriptor: &IngestBatchDescriptor,
+    ) -> Option<IngestCommitGuardBindingV1> {
+        Some(IngestCommitGuardBindingV1::new(
+            "test_commit_guard",
+            format!("{}/p{}", descriptor.stream_id, descriptor.partition_id),
+            "test-owner",
+            7,
+        ))
+    }
 }
 
 fn valid_batch() -> RecordBatch {
@@ -220,6 +259,7 @@ fn durable_admission_record_for_payload(payload: Bytes) -> DurableIngestAdmissio
         relation_version: envelope.header().relation_version.clone(),
         schema_fingerprint: envelope.header().schema_fingerprint.clone(),
         admission_mode: "process_local_serialized".to_string(),
+        commit_guard_binding: None,
     }
 }
 
@@ -680,8 +720,8 @@ fn ingest_envelope_digest_covers_canonical_header_without_payload_digest() {
 }
 
 #[test]
-fn ingest_envelope_rejects_missing_weight_column() {
-    let err = IngestEnvelope::encode_batches(
+fn ingest_envelope_accepts_payload_without_literal_weight_column() {
+    let bytes = IngestEnvelope::encode_batches(
         IngestEnvelopeEncodeRequest {
             relation_id: "orders_relation".to_string(),
             relation_version: "2026-05-05".to_string(),
@@ -695,22 +735,36 @@ fn ingest_envelope_rejects_missing_weight_column() {
         },
         &[batch_without_weight()],
     )
-    .unwrap_err();
+    .unwrap();
 
-    assert!(matches!(err, IngestEnvelopeError::MissingWeightColumn));
+    let envelope = IngestEnvelope::decode(bytes).unwrap();
+    assert_eq!(envelope.header().relation_id, "orders_relation");
+    assert_eq!(
+        envelope.record_batches().unwrap()[0]
+            .schema()
+            .fields()
+            .len(),
+        1
+    );
 }
 
 #[test]
-fn ingest_envelope_rejects_decoded_payload_missing_weight_column() {
+fn ingest_envelope_decodes_payload_without_literal_weight_column() {
     let payload = raw_arrow_ipc(&batch_without_weight());
-    let err = IngestEnvelope::decode(raw_envelope_with_payload(&payload)).unwrap_err();
+    let envelope = IngestEnvelope::decode(raw_envelope_with_payload(&payload)).unwrap();
 
-    assert!(matches!(err, IngestEnvelopeError::MissingWeightColumn));
+    assert_eq!(
+        envelope.record_batches().unwrap()[0]
+            .schema()
+            .fields()
+            .len(),
+        1
+    );
 }
 
 #[test]
-fn ingest_envelope_rejects_non_int64_weight_column() {
-    let err = IngestEnvelope::encode_batches(
+fn ingest_envelope_accepts_non_int64_literal_weight_column() {
+    let bytes = IngestEnvelope::encode_batches(
         IngestEnvelopeEncodeRequest {
             relation_id: "orders_relation".to_string(),
             relation_version: "2026-05-05".to_string(),
@@ -724,23 +778,30 @@ fn ingest_envelope_rejects_non_int64_weight_column() {
         },
         &[batch_with_unsigned_weight()],
     )
-    .unwrap_err();
+    .unwrap();
 
-    assert!(matches!(
-        err,
-        IngestEnvelopeError::InvalidWeightColumn { data_type } if data_type == DataType::UInt64
-    ));
+    let envelope = IngestEnvelope::decode(bytes).unwrap();
+    assert_eq!(
+        envelope.record_batches().unwrap()[0]
+            .schema()
+            .field(0)
+            .data_type(),
+        &DataType::UInt64
+    );
 }
 
 #[test]
-fn ingest_envelope_rejects_decoded_payload_with_non_int64_weight_column() {
+fn ingest_envelope_decodes_non_int64_literal_weight_column() {
     let payload = raw_arrow_ipc(&batch_with_unsigned_weight());
-    let err = IngestEnvelope::decode(raw_envelope_with_payload(&payload)).unwrap_err();
+    let envelope = IngestEnvelope::decode(raw_envelope_with_payload(&payload)).unwrap();
 
-    assert!(matches!(
-        err,
-        IngestEnvelopeError::InvalidWeightColumn { data_type } if data_type == DataType::UInt64
-    ));
+    assert_eq!(
+        envelope.record_batches().unwrap()[0]
+            .schema()
+            .field(0)
+            .data_type(),
+        &DataType::UInt64
+    );
 }
 
 #[test]
@@ -1033,6 +1094,49 @@ async fn process_local_coordinated_catalog_admission_allows_adjacent_ranges() {
 }
 
 #[tokio::test]
+async fn commit_guard_rejects_catalog_append_before_batch_commit_when_revoked() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = create_orders_relation_catalog(&store).await;
+    let coordinator = IngestAdmissionCoordinator::new(IngestLog::new(Arc::clone(&store)));
+    let guard = PhaseRejectingCommitGuard {
+        reject_phase: IngestCommitGuardPhase::BeforeCommit,
+        calls: AtomicUsize::new(0),
+    };
+
+    let err = coordinator
+        .append_catalog_validated_envelope_with_commit_guard(
+            catalog_envelope_bytes_for(&catalog, 0, 100),
+            &guard,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        IngestLogError::IngestCommitGuardRejected {
+            phase: "before_commit",
+            ..
+        }
+    ));
+    assert_eq!(guard.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(coordinator.list_committed().await.unwrap(), Vec::new());
+    let active_admissions = IngestLog::new(Arc::clone(&store))
+        .reconstruct_active_admissions()
+        .await
+        .unwrap();
+    assert_eq!(active_admissions.len(), 1);
+    assert_eq!(
+        active_admissions[0].commit_guard_binding,
+        Some(IngestCommitGuardBindingV1::new(
+            "test_commit_guard",
+            "orders/p7",
+            "test-owner",
+            7,
+        ))
+    );
+}
+
+#[tokio::test]
 async fn process_local_coordinated_catalog_admission_keeps_same_digest_retry_idempotent() {
     let (_temp_dir, store) = temp_store();
     let catalog = create_orders_relation_catalog(&store).await;
@@ -1085,6 +1189,7 @@ async fn durable_serialized_catalog_admission_rejects_overlap_reserved_by_separa
         relation_version: reserved_envelope.header().relation_version.clone(),
         schema_fingerprint: reserved_envelope.header().schema_fingerprint.clone(),
         admission_mode: "process_local_serialized".to_string(),
+        commit_guard_binding: None,
     };
 
     store
@@ -1145,6 +1250,7 @@ async fn durable_serialized_catalog_admission_fails_closed_on_record_body_key_mi
         relation_version: reserved_envelope.header().relation_version.clone(),
         schema_fingerprint: reserved_envelope.header().schema_fingerprint.clone(),
         admission_mode: "process_local_serialized".to_string(),
+        commit_guard_binding: None,
     };
     let wrong_path = ObjectKey::ingest_admission_record(
         &reserved_descriptor.stream_id,

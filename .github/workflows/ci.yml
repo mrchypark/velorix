@@ -25,6 +25,32 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
+  script-contracts:
+    name: script contracts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check shell syntax
+        run: |
+          bash -n scripts/run-first-e2e-readiness.sh
+          bash -n scripts/run-vind-product.sh
+          bash -n scripts/check-first-e2e-readiness-contract.sh
+          bash -n scripts/check-vind-product-contract.sh
+          bash -n scripts/check-release-evidence-copy-contract.sh
+          bash -n scripts/check-feldera-release-inputs-contract.sh
+          bash -n scripts/check-rustfs-s3-gate-contract.sh
+          python3 -m py_compile scripts/copy-readiness-sibling-evidence.py
+
+      - name: Check first-E2E readiness contract
+        run: |
+          scripts/check-first-e2e-readiness-contract.sh
+          scripts/check-vind-product-contract.sh
+          scripts/check-release-evidence-copy-contract.sh
+          scripts/check-feldera-release-inputs-contract.sh
+          scripts/check-rustfs-s3-gate-contract.sh
+
   msrv:
     name: MSRV check
     runs-on: ubuntu-latest
@@ -32,8 +58,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust 1.88.0
-        uses: dtolnay/rust-toolchain@1.88.0
+      - name: Install Rust 1.93.1
+        uses: dtolnay/rust-toolchain@1.93.1
 
       - name: Cache cargo build artifacts
         uses: Swatinem/rust-cache@v2
@@ -74,6 +100,22 @@ jobs:
 
       - name: Run workspace tests
         run: cargo test --workspace
+
+  feldera-package-compat:
+    name: Feldera package compatibility tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.93.1
+        uses: dtolnay/rust-toolchain@1.93.1
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Feldera package compatibility tests
+        run: cargo test -p velorix-core --features feldera-package-compat --locked
 
   deny:
     name: cargo deny

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use object_store::ObjectStore;
 use thiserror::Error;
@@ -24,6 +24,7 @@ use velorix_storage::{
 #[derive(Clone, Debug)]
 pub struct RuntimeFelderaArtifactRegistry {
     storage: FelderaArtifactRegistry,
+    generated_packages: BTreeSet<GeneratedRustArtifactPackage>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -39,9 +40,18 @@ pub struct RuntimeFelderaArtifactSelection {
     pub status: RuntimeFelderaArtifactSelectionStatus,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeFelderaArtifactSelectionStatus {
     DirectExecutionDisabled,
+    DirectExecutionEnabled {
+        package: GeneratedRustArtifactPackage,
+    },
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct GeneratedRustArtifactPackage {
+    pub abi_version: String,
+    pub crate_name: String,
 }
 
 #[derive(Debug, Error)]
@@ -62,9 +72,27 @@ impl RuntimeFelderaArtifactRegistry {
         Self::from_storage_registry(FelderaArtifactRegistry::new(store))
     }
 
+    pub fn for_local_bootstrap_with_generated_packages(
+        store: Arc<dyn ObjectStore>,
+        packages: impl IntoIterator<Item = GeneratedRustArtifactPackage>,
+    ) -> Self {
+        Self::from_storage_registry_with_generated_packages(
+            FelderaArtifactRegistry::new(store),
+            packages,
+        )
+    }
+
     pub fn new_with_startup_capabilities(
         store: Arc<dyn ObjectStore>,
         capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
+    ) -> Result<Self, AuthoritativeObjectStoreCapabilityError> {
+        Self::new_with_startup_capabilities_and_generated_packages(store, capabilities, [])
+    }
+
+    pub fn new_with_startup_capabilities_and_generated_packages(
+        store: Arc<dyn ObjectStore>,
+        capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
+        packages: impl IntoIterator<Item = GeneratedRustArtifactPackage>,
     ) -> Result<Self, AuthoritativeObjectStoreCapabilityError> {
         capabilities.validate_for_startup()?;
         let profile = capabilities
@@ -72,18 +100,44 @@ impl RuntimeFelderaArtifactRegistry {
             .get(&AuthoritativeNamespace::ArtifactCatalog)
             .expect("startup capability validation guarantees artifact catalog evidence");
 
-        Ok(Self::from_storage_registry(
+        Ok(Self::from_storage_registry_with_generated_packages(
             FelderaArtifactRegistry::new_checked(store, profile).map_err(|source| {
                 AuthoritativeObjectStoreCapabilityError::NamespaceProfile {
                     namespace: AuthoritativeNamespace::ArtifactCatalog,
                     source,
                 }
             })?,
+            packages,
         ))
     }
 
     fn from_storage_registry(storage: FelderaArtifactRegistry) -> Self {
-        Self { storage }
+        Self::from_storage_registry_with_generated_packages(storage, [])
+    }
+
+    fn from_storage_registry_with_generated_packages(
+        storage: FelderaArtifactRegistry,
+        packages: impl IntoIterator<Item = GeneratedRustArtifactPackage>,
+    ) -> Self {
+        Self {
+            storage,
+            generated_packages: packages.into_iter().collect(),
+        }
+    }
+
+    fn selection_status(
+        &self,
+        artifact: &FelderaCompileArtifactMetadata,
+    ) -> RuntimeFelderaArtifactSelectionStatus {
+        let package = GeneratedRustArtifactPackage {
+            abi_version: artifact.generated_rust.abi_version.clone(),
+            crate_name: artifact.generated_rust.crate_name.clone(),
+        };
+        if self.generated_packages.contains(&package) {
+            RuntimeFelderaArtifactSelectionStatus::DirectExecutionEnabled { package }
+        } else {
+            RuntimeFelderaArtifactSelectionStatus::DirectExecutionDisabled
+        }
     }
 
     pub async fn register_trusted_artifact(
@@ -98,7 +152,7 @@ impl RuntimeFelderaArtifactRegistry {
 
         Ok(RegisteredRuntimeFelderaArtifact {
             metadata: artifact.clone(),
-            status: RuntimeFelderaArtifactSelectionStatus::DirectExecutionDisabled,
+            status: self.selection_status(artifact),
             register_outcome,
         })
     }
@@ -121,7 +175,7 @@ impl RuntimeFelderaArtifactRegistry {
 
         Ok(RegisteredRuntimeFelderaArtifact {
             metadata: artifact.clone(),
-            status: RuntimeFelderaArtifactSelectionStatus::DirectExecutionDisabled,
+            status: self.selection_status(artifact),
             register_outcome,
         })
     }
@@ -146,7 +200,7 @@ impl RuntimeFelderaArtifactRegistry {
 
         Ok(RegisteredRuntimeFelderaArtifact {
             metadata: artifact.clone(),
-            status: RuntimeFelderaArtifactSelectionStatus::DirectExecutionDisabled,
+            status: self.selection_status(artifact),
             register_outcome,
         })
     }
@@ -162,8 +216,8 @@ impl RuntimeFelderaArtifactRegistry {
         validate_feldera_compile_artifact_for_catalog(catalog, spec, &metadata)?;
 
         Ok(RuntimeFelderaArtifactSelection {
+            status: self.selection_status(&metadata),
             metadata,
-            status: RuntimeFelderaArtifactSelectionStatus::DirectExecutionDisabled,
         })
     }
 
@@ -180,8 +234,8 @@ impl RuntimeFelderaArtifactRegistry {
         validate_feldera_release_artifact_provenance(&metadata, provenance)?;
 
         Ok(RuntimeFelderaArtifactSelection {
+            status: self.selection_status(&metadata),
             metadata,
-            status: RuntimeFelderaArtifactSelectionStatus::DirectExecutionDisabled,
         })
     }
 }

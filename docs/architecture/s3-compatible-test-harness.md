@@ -116,6 +116,13 @@ against `http://127.0.0.1:9000`.
 Before setup, it creates a disposable Docker bridge network and runs a
 short-lived AWS CLI container on that network so Docker network-store or
 container-attach failures fail before evidence artifacts are written.
+It also checks repository-filesystem free space before starting Docker/Cargo
+work and exits early when it is below `VELORIX_RUSTFS_MIN_FREE_KIB`, avoiding
+partial mid-compile failures. Cargo builds run in `target/rustfs-s3-gate` by
+default so live-gate compilation stays inside the repository's local target tree
+while remaining separate from default development profile artifacts; set
+`VELORIX_RUSTFS_CARGO_TARGET_DIR` when a different local target cache is
+desired.
 
 ```bash
 scripts/run-rustfs-s3-gate.sh
@@ -126,8 +133,8 @@ The script sets the normal live harness environment:
 ```text
 VELORIX_S3_COMPAT=1
 AWS_ENDPOINT_URL=http://127.0.0.1:9000
-AWS_ACCESS_KEY_ID=rustfsadmin
-AWS_SECRET_ACCESS_KEY=rustfsadmin
+AWS_ACCESS_KEY_ID=<run-local non-default RustFS access key>
+AWS_SECRET_ACCESS_KEY=<run-local non-default RustFS secret key>
 AWS_REGION=us-east-1
 VELORIX_S3_BUCKET=velorix-rustfs
 VELORIX_S3_PREFIX=rustfs-s3-gate/<timestamp>
@@ -147,9 +154,20 @@ The `s3_compat` target also executes a manifest-retiring GC run inside an
 isolated S3-compatible prefix after probing authoritative startup capabilities
 and constructing `CheckpointPublisher::new_authoritative`; the test verifies the
 listed `GcRunV1`, checkpoint-retention records, and checkpoint-GC-transition
-records before the RustFS gate can report success. Release readiness still
-requires the separate `gc-production-evidence` artifact for the selected
-deployment and authority store.
+records before the RustFS gate can report success. When
+`scripts/run-rustfs-s3-gate.sh` leaves `VELORIX_RUSTFS_RUN_PRODUCTION_GC_EVIDENCE=1`
+at its default, that GC run uses a deterministic RustFS prefix and run id, then
+the gate runs `velorix-cli gc-production-evidence --json` against the same
+prefix and writes `target/release-evidence/rustfs-production-gc.json`. Release
+readiness also records
+`target/release-evidence/rustfs-production-gc-validation.json` from
+`rustfs-production-gc-evidence-validate`, proving the gate JSON, seed fixture,
+executed `GcRunV1`, and production verifier artifact all refer to the same live
+run by matching the canonical persisted-run digest and seed-declared full
+deleted object keys. The fixed release-smoke fixture keeps
+`retain_latest_manifests=1` because it seeds exactly two checkpoints. The full
+readiness report still has to validate this production GC artifact together with
+the selected deployment and authority store.
 
 The `multi_process_ingest_admission` target exercises the checked
 `RangeAdmissionIndexV1` coordinator path against RustFS through the S3 API: two
@@ -164,8 +182,12 @@ proving stale retries return `admission_expired` without a new transition, and
 then appending an adjacent range with the chained index preserved. Deployed
 writer/operator topology evidence remains a separate ingest row blocker.
 
-The benchmark step can be skipped with `VELORIX_RUSTFS_RUN_BENCHMARK=0`. The
-script writes `target/velorix-s3/rustfs-s3-gate-evidence.json` and deletes the
+The benchmark step can be skipped with `VELORIX_RUSTFS_RUN_BENCHMARK=0`, and the
+production GC verifier artifact can be skipped for fast diagnostics with
+`VELORIX_RUSTFS_RUN_PRODUCTION_GC_EVIDENCE=0`. The script writes
+`target/velorix-s3/rustfs-s3-gate-evidence.json`, conditionally writes
+`target/release-evidence/rustfs-production-gc.json` plus
+`target/release-evidence/rustfs-production-gc-validation.json`, and deletes the
 RustFS container/network/volume by default. Set `VELORIX_RUSTFS_CLEANUP=0` to
 keep the container for debugging.
 When the benchmark step runs, it marks the benchmark JSON with

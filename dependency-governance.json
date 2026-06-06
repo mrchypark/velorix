@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "msrv": {
-    "minimum_rust_version": "1.88.0",
-    "policy": "CI and package updates keep the workspace buildable on the declared MSRV; the current floor follows DataFusion 53.1.0 and kube 3.1.0."
+    "minimum_rust_version": "1.93.1",
+    "policy": "CI and package updates keep the workspace buildable on the declared MSRV; the current floor follows Feldera/DBSP 0.299.0, DataFusion 53.1.0, and kube 3.1.0."
   },
   "package_reviews": [
     {
@@ -54,15 +54,58 @@
       "replacement_plan": "Replace or disable Foyer if cache behavior conflicts with authority-path object storage or SlateDB ownership."
     },
     {
+      "subject": "hiqlite",
+      "owner": "metadata",
+      "reviewed_on": "2026-05-31",
+      "audit_status": "local_reviewed_local_checkout_until_upstream_main_contains_authority_time",
+      "feature_policy": "Prefer sebadob/hiqlite main as the configured metadata service backend once it contains Velorix's required authority-time API. Keep the local checkout bridge while verified upstream main lacks that API. Do not claim production standing-runtime fencing until backend-authoritative time and multi-replica adversarial evidence are proven.",
+      "replacement_plan": "Switch to upstream main after the authority-time API is visible there, then switch to the upstream released hiqlite version after a release includes the required support. Re-run cargo-deny plus metadata capability tests after each switch."
+    },
+    {
       "subject": "feldera_artifacts",
       "owner": "standing-views",
       "reviewed_on": "2026-05-07",
       "audit_status": "local_reviewed_until_external_audit",
-      "feature_policy": "Treat Feldera/DBSP output as trusted only through Velorix artifact metadata, relation fingerprints, and release provenance gates.",
+      "feature_policy": "Treat Feldera/DBSP output as trusted only through Velorix artifact metadata, relation fingerprints, artifact hash verification, and runtime state/resource/recovery gates. Release provenance is optional diagnostic evidence, not a product-readiness blocker.",
       "replacement_plan": "Keep direct execution disabled until artifact, state, resource, and recovery contracts are proven."
+    },
+    {
+      "subject": "dbsp",
+      "owner": "standing-views",
+      "reviewed_on": "2026-05-24",
+      "audit_status": "local_reviewed_until_external_audit",
+      "feature_policy": "Use the public dbsp crate only behind the optional dbsp-spike feature while validating fit against the Velorix IncrementalEngine boundary; do not make it the default engine or load generated Feldera Rust artifacts yet.",
+      "replacement_plan": "Keep prototype operators as the default path until DBSP state, resource, recovery, dependency, and release-artifact contracts are proven."
     }
   ],
   "exceptions": [
+    {
+      "kind": "duplicate",
+      "crate": "ahash",
+      "owner": "standing-views",
+      "expires_on": "2026-08-31",
+      "reason": "The optional dbsp-spike graph introduces rkyv/feldera-storage ahash 0.7 while Arrow/DataFusion use ahash 0.8.",
+      "replacement_plan": "Remove the dbsp-spike dependency from default readiness or upgrade DBSP/Feldera when upstream dependencies converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "arrow-schema",
+      "owner": "standing-views",
+      "expires_on": "2026-08-31",
+      "reason": "The optional dbsp-spike graph pulls Feldera packages that still depend on Arrow schema 57 while Velorix/DataFusion use Arrow 58.",
+      "replacement_plan": "Upgrade or remove the dbsp-spike dependency when Feldera and DataFusion Arrow versions converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "block-buffer",
+      "owner": "standing-views",
+      "expires_on": "2026-08-31",
+      "reason": "The optional dbsp-spike graph introduces digest-family versions that differ from existing crypto dependencies.",
+      "replacement_plan": "Upgrade DBSP/Feldera and crypto dependencies when upstream ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
     {
       "kind": "duplicate",
       "crate": "cpufeatures",
@@ -70,6 +113,60 @@
       "expires_on": "2026-08-31",
       "reason": "Duplicate versions are introduced by sha2 and DataFusion/object_store transitive dependencies while upstream graphs converge.",
       "replacement_plan": "Upgrade sha2/DataFusion/object_store dependency ranges when upstream graphs converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "crypto-common",
+      "owner": "standing-views",
+      "expires_on": "2026-08-31",
+      "reason": "The optional dbsp-spike graph introduces digest-family versions that differ from existing crypto dependencies.",
+      "replacement_plan": "Upgrade DBSP/Feldera and crypto dependencies when upstream ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "dashmap",
+      "owner": "standing-views",
+      "expires_on": "2026-08-31",
+      "reason": "The optional dbsp-spike graph introduces Feldera/DBSP dependencies on dashmap versions that differ from current workspace transitive dependencies.",
+      "replacement_plan": "Upgrade DBSP/Feldera and related runtime dependencies when upstream ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "derive_more",
+      "owner": "standing-views",
+      "expires_on": "2026-08-31",
+      "reason": "The optional dbsp-spike graph introduces Feldera/DBSP dependencies on derive_more versions that differ from actix-related transitive dependencies.",
+      "replacement_plan": "Upgrade DBSP/Feldera and actix-related dependencies when upstream ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "derive_more-impl",
+      "owner": "standing-views",
+      "expires_on": "2026-08-31",
+      "reason": "The optional dbsp-spike graph introduces Feldera/DBSP dependencies on derive_more versions that differ from actix-related transitive dependencies.",
+      "replacement_plan": "Upgrade DBSP/Feldera and actix-related dependencies when upstream ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "digest",
+      "owner": "standing-views",
+      "expires_on": "2026-08-31",
+      "reason": "The optional dbsp-spike graph introduces digest-family versions that differ from existing crypto dependencies.",
+      "replacement_plan": "Upgrade DBSP/Feldera and crypto dependencies when upstream ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "fixedbitset",
+      "owner": "standing-views",
+      "expires_on": "2026-08-31",
+      "reason": "The optional dbsp-spike graph introduces Feldera/DBSP petgraph dependencies with a different fixedbitset line.",
+      "replacement_plan": "Upgrade DBSP/Feldera and graph dependencies when upstream ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
@@ -92,6 +189,15 @@
     },
     {
       "kind": "duplicate",
+      "crate": "h2",
+      "owner": "standing-views",
+      "expires_on": "2026-08-31",
+      "reason": "The optional dbsp-spike graph introduces actix/hyper dependencies that carry h2 versions alongside the existing HTTP stack.",
+      "replacement_plan": "Upgrade DBSP/Feldera and HTTP dependencies when upstream ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
       "crate": "hashbrown",
       "owner": "runtime",
       "expires_on": "2026-08-31",
@@ -110,11 +216,65 @@
     },
     {
       "kind": "duplicate",
+      "crate": "http",
+      "owner": "standing-views",
+      "expires_on": "2026-08-31",
+      "reason": "The optional dbsp-spike graph introduces actix/hyper dependencies that carry http 0.2 alongside the existing HTTP stack.",
+      "replacement_plan": "Upgrade DBSP/Feldera and HTTP dependencies when upstream ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "nix",
+      "owner": "standing-views",
+      "expires_on": "2026-08-31",
+      "reason": "The optional dbsp-spike graph introduces Feldera/DBSP dependencies on nix versions that differ from existing transitive dependencies.",
+      "replacement_plan": "Upgrade DBSP/Feldera and platform dependencies when upstream ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
       "crate": "object_store",
       "owner": "runtime",
       "expires_on": "2026-08-31",
       "reason": "Velorix intentionally carries object_store 0.12 for authority paths and DataFusion's object_store 0.13 for scan paths until the version boundary can be unified.",
       "replacement_plan": "Unify authority and scan object_store clients when DataFusion and Velorix authority paths can share one compatible version.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "ordered-float",
+      "owner": "standing-views",
+      "expires_on": "2026-08-31",
+      "reason": "The optional dbsp-spike graph introduces DBSP/Feldera ordered-float versions in addition to DataFusion-related versions.",
+      "replacement_plan": "Upgrade DBSP/Feldera and DataFusion dependencies when upstream ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "petgraph",
+      "owner": "standing-views",
+      "expires_on": "2026-08-31",
+      "reason": "The optional dbsp-spike graph introduces Feldera/DBSP petgraph versions alongside existing graph dependencies.",
+      "replacement_plan": "Upgrade DBSP/Feldera and graph dependencies when upstream ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "ptr_meta",
+      "owner": "standing-views",
+      "expires_on": "2026-08-31",
+      "reason": "The optional dbsp-spike graph introduces rkyv/ptr_meta versions alongside existing archive dependencies.",
+      "replacement_plan": "Upgrade DBSP/Feldera and archive dependencies when upstream ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "ptr_meta_derive",
+      "owner": "standing-views",
+      "expires_on": "2026-08-31",
+      "reason": "The optional dbsp-spike graph introduces rkyv/ptr_meta versions alongside existing archive dependencies.",
+      "replacement_plan": "Upgrade DBSP/Feldera and archive dependencies when upstream ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
@@ -137,11 +297,47 @@
     },
     {
       "kind": "duplicate",
+      "crate": "rand_chacha",
+      "owner": "standing-views",
+      "expires_on": "2026-08-31",
+      "reason": "The optional dbsp-spike graph introduces random dependency versions that differ from existing random/crypto families.",
+      "replacement_plan": "Upgrade DBSP/Feldera and random dependencies when upstream ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
       "crate": "rand_core",
       "owner": "runtime",
       "expires_on": "2026-08-31",
       "reason": "Duplicate versions are introduced by current random/crypto dependency families while upstream graphs converge.",
       "replacement_plan": "Upgrade random/crypto dependency families when upstream ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "sha1",
+      "owner": "standing-views",
+      "expires_on": "2026-08-31",
+      "reason": "The optional dbsp-spike graph introduces actix/zip-related sha1 versions alongside existing crypto dependencies.",
+      "replacement_plan": "Upgrade DBSP/Feldera and crypto dependencies when upstream ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "socket2",
+      "owner": "standing-views",
+      "expires_on": "2026-08-31",
+      "reason": "The optional dbsp-spike graph introduces actix/HTTP socket2 versions alongside existing networking dependencies.",
+      "replacement_plan": "Upgrade DBSP/Feldera and networking dependencies when upstream ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "syn",
+      "owner": "standing-views",
+      "expires_on": "2026-08-31",
+      "reason": "The optional dbsp-spike graph introduces proc-macro dependencies that still carry syn 1 alongside current syn 2 users.",
+      "replacement_plan": "Upgrade DBSP/Feldera and proc-macro dependencies when upstream ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
@@ -164,11 +360,173 @@
     },
     {
       "kind": "duplicate",
+      "crate": "unicode-width",
+      "owner": "standing-views",
+      "expires_on": "2026-08-31",
+      "reason": "The optional dbsp-spike graph introduces textwrap/unicode-width versions alongside existing terminal formatting dependencies.",
+      "replacement_plan": "Upgrade DBSP/Feldera and text formatting dependencies when upstream ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
       "crate": "winnow",
       "owner": "runtime",
       "expires_on": "2026-08-31",
       "reason": "Duplicate versions are introduced by SlateDB/figment/toml transitive dependencies while upstream graphs converge.",
       "replacement_plan": "Upgrade SlateDB/figment/toml dependency ranges when upstream graphs converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "aws-lc-sys",
+      "owner": "metadata",
+      "expires_on": "2026-08-31",
+      "reason": "The sebadob/hiqlite metadata backend and existing TLS/S3 dependency graph introduce multiple aws-lc-sys lines while upstream crypto dependencies converge.",
+      "replacement_plan": "Upgrade hiqlite and TLS/S3 dependencies, or switch to upstream hiqlite, when the aws-lc-sys dependency ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "base64",
+      "owner": "metadata",
+      "expires_on": "2026-08-31",
+      "reason": "The sebadob/hiqlite metadata backend and existing HTTP/TLS dependency graph introduce base64 versions from multiple upstream stacks.",
+      "replacement_plan": "Upgrade hiqlite and HTTP/TLS dependencies when upstream base64 dependency ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "chacha20",
+      "owner": "metadata",
+      "expires_on": "2026-08-31",
+      "reason": "The sebadob/hiqlite metadata backend introduces crypto transitive dependencies that differ from existing crypto-family versions.",
+      "replacement_plan": "Upgrade hiqlite and crypto dependencies when upstream crypto-family ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "constant_time_eq",
+      "owner": "metadata",
+      "expires_on": "2026-08-31",
+      "reason": "The sebadob/hiqlite metadata backend introduces constant_time_eq versions alongside existing crypto/storage transitive dependencies.",
+      "replacement_plan": "Upgrade hiqlite and crypto/storage dependencies when upstream ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "itertools",
+      "owner": "standing-views",
+      "expires_on": "2026-08-31",
+      "reason": "The Feldera/DBSP and metadata dependency graphs introduce itertools versions alongside existing DataFusion/runtime transitive dependencies.",
+      "replacement_plan": "Upgrade Feldera/DBSP, hiqlite, and DataFusion/runtime dependencies when upstream ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "reqwest",
+      "owner": "metadata",
+      "expires_on": "2026-08-31",
+      "reason": "The sebadob/hiqlite metadata backend introduces a reqwest line alongside the existing HTTP client graph.",
+      "replacement_plan": "Upgrade hiqlite and HTTP client dependencies when upstream reqwest ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "rustls-platform-verifier",
+      "owner": "metadata",
+      "expires_on": "2026-08-31",
+      "reason": "The sebadob/hiqlite metadata backend and existing TLS clients introduce multiple rustls-platform-verifier lines while upstream TLS ranges converge.",
+      "replacement_plan": "Upgrade hiqlite and TLS dependencies when upstream rustls-platform-verifier ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "sha2",
+      "owner": "metadata",
+      "expires_on": "2026-08-31",
+      "reason": "The sebadob/hiqlite metadata backend introduces a sha2 line alongside existing hashing dependencies.",
+      "replacement_plan": "Upgrade hiqlite and hashing dependencies when upstream sha2 ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "untrusted",
+      "owner": "metadata",
+      "expires_on": "2026-08-31",
+      "reason": "The sebadob/hiqlite metadata backend and existing rustls/ring graph introduce multiple untrusted versions while TLS dependencies converge.",
+      "replacement_plan": "Upgrade hiqlite and TLS dependencies when upstream untrusted ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "cookie",
+      "owner": "metadata",
+      "expires_on": "2026-08-31",
+      "reason": "The sebadob/hiqlite full client feature set must match the server stream API and introduces axum-extra/cookie alongside existing HTTP transitive dependencies.",
+      "replacement_plan": "Upgrade hiqlite and HTTP dependencies, or switch to upstream hiqlite, when the cookie dependency ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "const-oid",
+      "owner": "release",
+      "expires_on": "2026-08-31",
+      "reason": "Sigstore bundle verification currently introduces const-oid 0.9 while the Feldera/DBSP HTTP dependency graph introduces const-oid 0.10.",
+      "replacement_plan": "Upgrade sigstore/Fulcio/TSA and Feldera/DBSP/HTTP dependency ranges when upstream const-oid versions converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "phf",
+      "owner": "metadata",
+      "expires_on": "2026-08-31",
+      "reason": "The sebadob/hiqlite full client feature set must match the server stream API and introduces server-side transitive dependencies that carry phf alongside existing parsers.",
+      "replacement_plan": "Upgrade hiqlite and parser/HTTP dependencies when upstream phf dependency ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "phf_shared",
+      "owner": "metadata",
+      "expires_on": "2026-08-31",
+      "reason": "The sebadob/hiqlite full client feature set must match the server stream API and follows the phf duplicate introduced by server-compatible features.",
+      "replacement_plan": "Upgrade alongside phf when upstream dependency ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "serde_spanned",
+      "owner": "metadata",
+      "expires_on": "2026-08-31",
+      "reason": "The sebadob/hiqlite full client feature set must match the server stream API and introduces toml 1.x dependencies alongside existing toml 0.8 users.",
+      "replacement_plan": "Upgrade hiqlite and toml/figment users when their dependency ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "toml",
+      "owner": "metadata",
+      "expires_on": "2026-08-31",
+      "reason": "The sebadob/hiqlite full client feature set must match the server stream API and introduces toml 1.x alongside existing toml 0.8 users.",
+      "replacement_plan": "Upgrade hiqlite and toml/figment users when their dependency ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "toml_datetime",
+      "owner": "metadata",
+      "expires_on": "2026-08-31",
+      "reason": "The sebadob/hiqlite full client feature set must match the server stream API and follows the toml duplicate introduced by server-compatible features.",
+      "replacement_plan": "Upgrade alongside toml when upstream dependency ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "unmaintained",
+      "crate": "bincode",
+      "owner": "metadata",
+      "expires_on": "2026-08-31",
+      "reason": "The Hiqlite metadata backend currently introduces a bincode advisory while the metadata backend is still using a local checkout bridge.",
+      "replacement_plan": "Upgrade hiqlite or switch to upstream hiqlite main/release when its dependency graph removes the bincode advisory.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
@@ -178,6 +536,24 @@
       "expires_on": "2026-08-31",
       "reason": "Temporary allowance for a transitive unmaintained advisory while upstream replacement options are tracked.",
       "replacement_plan": "Remove the transitive paste dependency through upstream package upgrades or replace the dependent package before expiry.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "unmaintained",
+      "crate": "proc-macro-error",
+      "owner": "standing-views",
+      "expires_on": "2026-08-31",
+      "reason": "The optional dbsp-spike graph introduces utoipa/proc-macro-error through Feldera packages while DBSP fit is still being evaluated.",
+      "replacement_plan": "Remove the dbsp-spike dependency from default readiness or upgrade Feldera/DBSP when upstream replaces proc-macro-error.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "unmaintained",
+      "crate": "rustls-pemfile",
+      "owner": "standing-views",
+      "expires_on": "2026-08-31",
+      "reason": "The optional dbsp-spike graph and current object-store/SlateDB paths introduce rustls-pemfile while upstream migration to rustls-pki-types is pending.",
+      "replacement_plan": "Upgrade object_store/SlateDB/Feldera dependencies when upstream removes rustls-pemfile.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     }
   ]

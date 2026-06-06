@@ -1,17 +1,27 @@
-FROM rust:1.88.0-bookworm AS builder
+# syntax=docker/dockerfile:1.7
+FROM rust:1.93.1-bookworm@sha256:7c4ae649a84014c467d79319bbf17ce2632ae8b8be123ac2fb2ea5be46823f31 AS builder
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN cargo build --release -p velorix-cli --locked
+COPY --from=velorix-hiqlite-source . /hiqlite
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/workspace/target,sharing=locked \
+    RUSTFLAGS="-C strip=symbols" cargo build --release -p velorix-ingest-writer --locked \
+    && cp /workspace/target/release/velorix-ingest-writer /workspace/velorix-ingest-writer
 
-FROM debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim@sha256:0104b334637a5f19aa9c983a91b54c89887c0984081f2068983107a6f6c21eeb AS runtime
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /workspace/target/release/velorix-cli /usr/local/bin/velorix-cli
+COPY --from=builder /workspace/velorix-ingest-writer /usr/local/bin/velorix-ingest-writer
 COPY scripts/velorix-ingest-writer-entrypoint.sh /usr/local/bin/velorix-ingest-writer-entrypoint
 RUN chmod 0755 /usr/local/bin/velorix-ingest-writer-entrypoint
 

@@ -33,6 +33,10 @@ manifest publication.
 Production startup must reject unsupported conditional create or CAS behavior.
 Overwrite-based emulation is forbidden in production. Local filesystem or fake
 object-store emulation is dev/test only and must require an explicit local mode.
+Active view lifecycle records additionally require conditional update support
+(`PutMode::Update` / ETag CAS) in product `velorix-api` startup, because view
+activation must not fall back to last-writer-wins on shared RustFS/S3-compatible
+storage.
 
 All storage users must be created through one shared object-store registry.
 Velorix storage, DataFusion scans, SlateDB integration, and Foyer fetch-through
@@ -61,8 +65,9 @@ queries, and query policy.
 Startup validation rejects a missing namespace profile and rejects any namespace
 whose `ObjectStoreCapabilityProfile` is missing a required durability
 capability. A minimal S3-compatible storage harness now validates create-only,
-read-after-write, list-after-write, range-read behavior, and startup
-capabilities for every authoritative namespace when explicitly enabled.
+conditional-update conflict behavior, read-after-write, list-after-write,
+range-read behavior, and startup capabilities for every authoritative namespace
+when explicitly enabled.
 Capability diagnostics expose the backend name, namespace, and missing
 durability capabilities for every authoritative namespace.
 
@@ -99,7 +104,8 @@ durability capabilities for every authoritative namespace.
   table-catalog, relation-catalog, and query-policy authority checks before
   writing a production table spec.
 - Env-gated S3-compatible storage evidence validates create-only conflict,
-  read-after-write, list-after-write, and range-read behavior.
+  conditional-update conflict behavior, read-after-write, list-after-write, and
+  range-read behavior.
 - Env-gated S3-compatible capability evidence validates startup capabilities for
   every authoritative namespace.
 

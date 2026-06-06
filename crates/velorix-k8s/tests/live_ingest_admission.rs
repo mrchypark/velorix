@@ -451,6 +451,7 @@ fn durable_orphan_admission_record(
         relation_version: "live-ingest-admission-test".to_string(),
         schema_fingerprint: orphan_schema_fingerprint(),
         admission_mode: "process_local_serialized".to_string(),
+        commit_guard_binding: None,
     })
 }
 

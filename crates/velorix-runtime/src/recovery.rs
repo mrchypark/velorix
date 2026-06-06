@@ -1,7 +1,9 @@
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 
 use object_store::{path::Path, ObjectStore};
 use thiserror::Error;
+#[cfg(feature = "dbsp-runtime")]
+use velorix_core::dbsp_engine::DbspSingleKeySumCountEngine;
 use velorix_core::{
     delta::DeltaBatch,
     engine::{
@@ -38,12 +40,137 @@ pub const ORDERS_SUM_COUNT_RELATION_ID: &str = "orders";
 pub const ORDERS_SUM_COUNT_RELATION_VERSION: &str = "2026-05-05.v1";
 pub const ORDERS_SUM_COUNT_ADAPTER_ID: &str = ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID;
 
-#[derive(Clone, Debug)]
 pub struct RecoveredRuntime {
-    materialized: PrototypeIncrementalEngine,
+    materialized: RuntimeIncrementalEngine,
     replay_checkpoints: Vec<ReplayCheckpoint>,
     replayed_batch_count: usize,
     latest_checkpoint_version: Option<u64>,
+}
+
+impl fmt::Debug for RecoveredRuntime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RecoveredRuntime")
+            .field("engine_backend", &self.engine_backend())
+            .field("logical_epoch", &self.logical_epoch())
+            .field("replay_checkpoints", &self.replay_checkpoints)
+            .field("replayed_batch_count", &self.replayed_batch_count)
+            .field("latest_checkpoint_version", &self.latest_checkpoint_version)
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IncrementalEngineBackend {
+    Prototype,
+    Dbsp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IncrementalEngineBackendSelection {
+    Default,
+    Explicit(IncrementalEngineBackend),
+}
+
+enum RuntimeIncrementalEngine {
+    Prototype(PrototypeIncrementalEngine),
+    #[cfg(feature = "dbsp-runtime")]
+    Dbsp(DbspSingleKeySumCountEngine),
+}
+
+impl RuntimeIncrementalEngine {
+    fn new_for_catalog(
+        backend: IncrementalEngineBackend,
+        relation_catalog: &VelorixRelationCatalogV1,
+        aggregate_value_mode: AggregateValueMode,
+    ) -> Result<Self, RecoveryError> {
+        match backend {
+            IncrementalEngineBackend::Prototype => Ok(Self::Prototype(
+                PrototypeIncrementalEngine::with_aggregate_value_mode(aggregate_value_mode),
+            )),
+            IncrementalEngineBackend::Dbsp => {
+                validate_dbsp_runtime_catalog_scope(relation_catalog, aggregate_value_mode)?;
+                #[cfg(feature = "dbsp-runtime")]
+                {
+                    Ok(Self::Dbsp(DbspSingleKeySumCountEngine::new()))
+                }
+                #[cfg(not(feature = "dbsp-runtime"))]
+                {
+                    Err(RecoveryError::UnsupportedIncrementalEngineBackend {
+                        backend,
+                        reason: "velorix-runtime was not built with `dbsp-runtime`".to_string(),
+                    })
+                }
+            }
+        }
+    }
+
+    fn from_checkpoint_for_catalog(
+        backend: IncrementalEngineBackend,
+        relation_catalog: &VelorixRelationCatalogV1,
+        aggregate_value_mode: AggregateValueMode,
+        checkpoint: EngineCheckpoint,
+    ) -> Result<Self, RecoveryError> {
+        match backend {
+            IncrementalEngineBackend::Prototype => Ok(Self::Prototype(
+                PrototypeIncrementalEngine::from_checkpoint_with_aggregate_value_mode(
+                    checkpoint,
+                    aggregate_value_mode,
+                )?,
+            )),
+            IncrementalEngineBackend::Dbsp => {
+                validate_dbsp_runtime_catalog_scope(relation_catalog, aggregate_value_mode)?;
+                #[cfg(feature = "dbsp-runtime")]
+                {
+                    Ok(Self::Dbsp(DbspSingleKeySumCountEngine::from_checkpoint(
+                        checkpoint,
+                    )?))
+                }
+                #[cfg(not(feature = "dbsp-runtime"))]
+                {
+                    Err(RecoveryError::UnsupportedIncrementalEngineBackend {
+                        backend,
+                        reason: "velorix-runtime was not built with `dbsp-runtime`".to_string(),
+                    })
+                }
+            }
+        }
+    }
+
+    fn backend(&self) -> IncrementalEngineBackend {
+        match self {
+            Self::Prototype(_) => IncrementalEngineBackend::Prototype,
+            #[cfg(feature = "dbsp-runtime")]
+            Self::Dbsp(_) => IncrementalEngineBackend::Dbsp,
+        }
+    }
+
+    fn logical_epoch(&self) -> LogicalEpoch {
+        match self {
+            Self::Prototype(engine) => engine.logical_epoch(),
+            #[cfg(feature = "dbsp-runtime")]
+            Self::Dbsp(engine) => engine.logical_epoch(),
+        }
+    }
+
+    fn push_changes(
+        &mut self,
+        logical_epoch: LogicalEpoch,
+        signed_input_changes: &DeltaBatch,
+    ) -> Result<DeltaBatch, EngineError> {
+        match self {
+            Self::Prototype(engine) => engine.push_changes(logical_epoch, signed_input_changes),
+            #[cfg(feature = "dbsp-runtime")]
+            Self::Dbsp(engine) => engine.push_changes(logical_epoch, signed_input_changes),
+        }
+    }
+
+    fn materialized_state(&self) -> DeltaBatch {
+        match self {
+            Self::Prototype(engine) => engine.materialized_state(),
+            #[cfg(feature = "dbsp-runtime")]
+            Self::Dbsp(engine) => engine.materialized_state(),
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -85,6 +212,11 @@ pub enum RecoveryError {
     },
     #[error("unsupported incremental adapter `{adapter_id}`")]
     UnsupportedIncrementalAdapter { adapter_id: String },
+    #[error("unsupported incremental engine backend `{backend:?}`: {reason}")]
+    UnsupportedIncrementalEngineBackend {
+        backend: IncrementalEngineBackend,
+        reason: String,
+    },
     #[error("malformed prototype Arrow ingest envelope: {reason}")]
     MalformedPrototypeArrowIngest { reason: String },
 }
@@ -133,14 +265,49 @@ impl RecoveredRuntime {
         relation_id: &str,
         relation_version: &str,
     ) -> Result<Self, RecoveryError> {
+        Self::recover_bootstrap_with_owner_and_relation_catalog_record_using_engine_backend_selection(
+            store,
+            expected_owner,
+            relation_id,
+            relation_version,
+            default_incremental_engine_backend_selection(),
+        )
+        .await
+    }
+
+    pub async fn recover_bootstrap_with_owner_and_relation_catalog_record_using_engine_backend(
+        store: Arc<dyn ObjectStore>,
+        expected_owner: &str,
+        relation_id: &str,
+        relation_version: &str,
+        engine_backend: IncrementalEngineBackend,
+    ) -> Result<Self, RecoveryError> {
+        Self::recover_bootstrap_with_owner_and_relation_catalog_record_using_engine_backend_selection(
+            store,
+            expected_owner,
+            relation_id,
+            relation_version,
+            IncrementalEngineBackendSelection::Explicit(engine_backend),
+        )
+        .await
+    }
+
+    async fn recover_bootstrap_with_owner_and_relation_catalog_record_using_engine_backend_selection(
+        store: Arc<dyn ObjectStore>,
+        expected_owner: &str,
+        relation_id: &str,
+        relation_version: &str,
+        engine_backend: IncrementalEngineBackendSelection,
+    ) -> Result<Self, RecoveryError> {
         let relation_catalog = RelationCatalogRegistry::new(Arc::clone(&store))
             .read(relation_id, relation_version)
             .await?;
 
-        Self::recover_bootstrap_with_owner_and_relation_catalog(
+        Self::recover_bootstrap_with_owner_and_relation_catalog_using_engine_backend_selection(
             store,
             expected_owner,
             relation_catalog,
+            engine_backend,
         )
         .await
     }
@@ -174,13 +341,44 @@ impl RecoveredRuntime {
         expected_owner: &str,
         relation_catalog: VelorixRelationCatalogV1,
     ) -> Result<Self, RecoveryError> {
+        Self::recover_bootstrap_with_owner_and_relation_catalog_using_engine_backend_selection(
+            store,
+            expected_owner,
+            relation_catalog,
+            default_incremental_engine_backend_selection(),
+        )
+        .await
+    }
+
+    pub async fn recover_bootstrap_with_owner_and_relation_catalog_using_engine_backend(
+        store: Arc<dyn ObjectStore>,
+        expected_owner: &str,
+        relation_catalog: VelorixRelationCatalogV1,
+        engine_backend: IncrementalEngineBackend,
+    ) -> Result<Self, RecoveryError> {
+        Self::recover_bootstrap_with_owner_and_relation_catalog_using_engine_backend_selection(
+            store,
+            expected_owner,
+            relation_catalog,
+            IncrementalEngineBackendSelection::Explicit(engine_backend),
+        )
+        .await
+    }
+
+    async fn recover_bootstrap_with_owner_and_relation_catalog_using_engine_backend_selection(
+        store: Arc<dyn ObjectStore>,
+        expected_owner: &str,
+        relation_catalog: VelorixRelationCatalogV1,
+        engine_backend: IncrementalEngineBackendSelection,
+    ) -> Result<Self, RecoveryError> {
         let publisher = CheckpointPublisher::new(Arc::clone(&store));
 
-        Self::recover_with_publisher_and_relation_catalog(
+        Self::recover_with_publisher_and_relation_catalog_using_engine_backend(
             store,
             publisher,
             expected_owner,
             relation_catalog,
+            engine_backend,
         )
         .await
     }
@@ -207,6 +405,7 @@ impl RecoveredRuntime {
             expected_owner,
             relation_catalog,
             ReplayAdmissionEvidence::DurableAdmissionRequired,
+            default_incremental_engine_backend_selection(),
         )
         .await?;
         Self::write_checked_recovery_transition(
@@ -322,6 +521,7 @@ impl RecoveredRuntime {
             expected_owner,
             relation_catalog,
             ReplayAdmissionEvidence::DurableAdmissionRequired,
+            default_incremental_engine_backend_selection(),
         )
         .await?;
         Self::write_checked_recovery_transition(
@@ -410,6 +610,7 @@ impl RecoveredRuntime {
             expected_owner,
             relation_catalog,
             ReplayAdmissionEvidence::DurableAdmissionRequired,
+            default_incremental_engine_backend_selection(),
         )
         .await?;
         Self::write_checked_recovery_transition(
@@ -488,6 +689,7 @@ impl RecoveredRuntime {
             expected_owner,
             relation_catalog,
             ReplayAdmissionEvidence::DurableAdmissionRequired,
+            default_incremental_engine_backend_selection(),
         )
         .await?;
         Self::write_checked_recovery_transition(
@@ -551,6 +753,23 @@ impl RecoveredRuntime {
         expected_owner: &str,
         relation_catalog: VelorixRelationCatalogV1,
     ) -> Result<Self, RecoveryError> {
+        Self::recover_with_publisher_and_relation_catalog_using_engine_backend(
+            store,
+            publisher,
+            expected_owner,
+            relation_catalog,
+            default_incremental_engine_backend_selection(),
+        )
+        .await
+    }
+
+    async fn recover_with_publisher_and_relation_catalog_using_engine_backend(
+        store: Arc<dyn ObjectStore>,
+        publisher: CheckpointPublisher,
+        expected_owner: &str,
+        relation_catalog: VelorixRelationCatalogV1,
+        engine_backend: IncrementalEngineBackendSelection,
+    ) -> Result<Self, RecoveryError> {
         let ingest_log = IngestLog::new(store);
         Self::recover_with_publisher_log_and_relation_catalog(
             publisher,
@@ -558,6 +777,7 @@ impl RecoveredRuntime {
             expected_owner,
             relation_catalog,
             ReplayAdmissionEvidence::EnvelopeOnly,
+            engine_backend,
         )
         .await
     }
@@ -568,6 +788,7 @@ impl RecoveredRuntime {
         expected_owner: &str,
         relation_catalog: VelorixRelationCatalogV1,
         replay_admission_evidence: ReplayAdmissionEvidence,
+        engine_backend: IncrementalEngineBackendSelection,
     ) -> Result<Self, RecoveryError> {
         validate_recovery_incremental_adapter_scope(&relation_catalog)?;
         let latest_manifest = publisher.latest_manifest().await?;
@@ -578,6 +799,7 @@ impl RecoveredRuntime {
             expected_owner,
             relation_catalog,
             replay_admission_evidence,
+            engine_backend,
         )
         .await
     }
@@ -597,6 +819,7 @@ impl RecoveredRuntime {
             expected_owner,
             relation_catalog,
             ReplayAdmissionEvidence::EnvelopeOnly,
+            default_incremental_engine_backend_selection(),
         )
         .await
     }
@@ -608,6 +831,7 @@ impl RecoveredRuntime {
         expected_owner: &str,
         relation_catalog: VelorixRelationCatalogV1,
         replay_admission_evidence: ReplayAdmissionEvidence,
+        engine_backend: IncrementalEngineBackendSelection,
     ) -> Result<Self, RecoveryError> {
         relation_catalog.validate()?;
         Self::recover_from_manifest_and_relation_catalog(
@@ -617,6 +841,7 @@ impl RecoveredRuntime {
             expected_owner,
             relation_catalog,
             replay_admission_evidence,
+            engine_backend,
         )
         .await
     }
@@ -628,11 +853,20 @@ impl RecoveredRuntime {
         expected_owner: &str,
         relation_catalog: VelorixRelationCatalogV1,
         replay_admission_evidence: ReplayAdmissionEvidence,
+        engine_backend: IncrementalEngineBackendSelection,
     ) -> Result<Self, RecoveryError> {
         validate_recovery_incremental_adapter_scope(&relation_catalog)?;
         let aggregate_value_mode = aggregate_value_mode_for_sum_count_catalog(&relation_catalog)?;
-        let mut materialized =
-            PrototypeIncrementalEngine::with_aggregate_value_mode(aggregate_value_mode);
+        let engine_backend = resolve_incremental_engine_backend(
+            engine_backend,
+            &relation_catalog,
+            aggregate_value_mode,
+        );
+        let mut materialized = RuntimeIncrementalEngine::new_for_catalog(
+            engine_backend,
+            &relation_catalog,
+            aggregate_value_mode,
+        )?;
 
         if let Some(manifest) = manifest.as_ref() {
             let mut checkpointed_state = DeltaBatch::default();
@@ -668,9 +902,11 @@ impl RecoveredRuntime {
                 }
             }
             let logical_epoch = checkpoint_logical_epoch.unwrap_or(manifest.checkpoint_version);
-            materialized = PrototypeIncrementalEngine::from_checkpoint_with_aggregate_value_mode(
-                EngineCheckpoint::new(logical_epoch, checkpointed_state),
+            materialized = RuntimeIncrementalEngine::from_checkpoint_for_catalog(
+                engine_backend,
+                &relation_catalog,
                 aggregate_value_mode,
+                EngineCheckpoint::new(logical_epoch, checkpointed_state),
             )?;
         }
 
@@ -710,6 +946,10 @@ impl RecoveredRuntime {
 
     pub fn materialized_state(&self) -> DeltaBatch {
         self.materialized.materialized_state()
+    }
+
+    pub fn engine_backend(&self) -> IncrementalEngineBackend {
+        self.materialized.backend()
     }
 
     pub fn logical_epoch(&self) -> LogicalEpoch {
@@ -891,6 +1131,62 @@ fn aggregate_value_mode_for_sum_count_catalog(
             ),
         }),
     }
+}
+
+fn default_incremental_engine_backend_selection() -> IncrementalEngineBackendSelection {
+    match std::env::var("VELORIX_INCREMENTAL_ENGINE").ok().as_deref() {
+        Some("prototype") => {
+            IncrementalEngineBackendSelection::Explicit(IncrementalEngineBackend::Prototype)
+        }
+        Some("feldera-dbsp") | Some("dbsp") => {
+            IncrementalEngineBackendSelection::Explicit(IncrementalEngineBackend::Dbsp)
+        }
+        _ => IncrementalEngineBackendSelection::Default,
+    }
+}
+
+#[cfg(feature = "dbsp-runtime")]
+fn resolve_incremental_engine_backend(
+    selection: IncrementalEngineBackendSelection,
+    catalog: &VelorixRelationCatalogV1,
+    aggregate_value_mode: AggregateValueMode,
+) -> IncrementalEngineBackend {
+    match selection {
+        IncrementalEngineBackendSelection::Explicit(backend) => backend,
+        IncrementalEngineBackendSelection::Default => {
+            if validate_dbsp_runtime_catalog_scope(catalog, aggregate_value_mode).is_ok() {
+                IncrementalEngineBackend::Dbsp
+            } else {
+                IncrementalEngineBackend::Prototype
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "dbsp-runtime"))]
+fn resolve_incremental_engine_backend(
+    selection: IncrementalEngineBackendSelection,
+    _catalog: &VelorixRelationCatalogV1,
+    _aggregate_value_mode: AggregateValueMode,
+) -> IncrementalEngineBackend {
+    match selection {
+        IncrementalEngineBackendSelection::Explicit(backend) => backend,
+        IncrementalEngineBackendSelection::Default => IncrementalEngineBackend::Prototype,
+    }
+}
+
+fn validate_dbsp_runtime_catalog_scope(
+    _catalog: &VelorixRelationCatalogV1,
+    aggregate_value_mode: AggregateValueMode,
+) -> Result<(), RecoveryError> {
+    if aggregate_value_mode != AggregateValueMode::Integer {
+        return Err(RecoveryError::UnsupportedIncrementalEngineBackend {
+            backend: IncrementalEngineBackend::Dbsp,
+            reason: "DBSP runtime currently supports only Int64 sum/count values".to_string(),
+        });
+    }
+
+    Ok(())
 }
 
 fn validate_recovery_incremental_adapter_scope(

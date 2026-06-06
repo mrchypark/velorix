@@ -237,19 +237,7 @@ pub fn validate_feldera_compile_artifact(
         });
     }
 
-    require_non_empty("spec.view_id", &spec.view_id)?;
-    require_non_empty("spec.sql", &spec.sql)?;
-
-    if spec.input_relations.is_empty() {
-        return Err(FelderaArtifactError::MissingSchema {
-            field: "spec.input_relations",
-        });
-    }
-    if spec.output_relations.is_empty() {
-        return Err(FelderaArtifactError::MissingSchema {
-            field: "spec.output_relations",
-        });
-    }
+    validate_materialized_standing_view_spec(spec)?;
     if artifact.input_schemas.is_empty() {
         return Err(FelderaArtifactError::MissingSchema {
             field: "input_schemas",
@@ -261,16 +249,12 @@ pub fn validate_feldera_compile_artifact(
         });
     }
 
-    if spec.shape.multi_input || spec.input_relations.len() > 1 || artifact.input_schemas.len() > 1
-    {
+    if artifact.input_schemas.len() > 1 {
         return Err(FelderaArtifactError::UnsupportedShape {
             shape: "multi_input",
         });
     }
-    if spec.shape.multi_output
-        || spec.output_relations.len() > 1
-        || artifact.output_schemas.len() > 1
-    {
+    if artifact.output_schemas.len() > 1 {
         return Err(FelderaArtifactError::UnsupportedShape {
             shape: "multi_output",
         });
@@ -333,6 +317,44 @@ pub fn validate_feldera_compile_artifact(
             field: "output_schemas",
         });
     }
+
+    Ok(())
+}
+
+pub fn validate_materialized_standing_view_spec(
+    spec: &StandingViewSpec,
+) -> Result<(), FelderaArtifactError> {
+    require_non_empty("spec.view_id", &spec.view_id)?;
+    require_non_empty("spec.sql", &spec.sql)?;
+
+    if spec.input_relations.is_empty() {
+        return Err(FelderaArtifactError::MissingSchema {
+            field: "spec.input_relations",
+        });
+    }
+    if spec.output_relations.is_empty() {
+        return Err(FelderaArtifactError::MissingSchema {
+            field: "spec.output_relations",
+        });
+    }
+    if !spec.shape.is_materialized {
+        return Err(FelderaArtifactError::UnsupportedShape {
+            shape: "spec.shape.is_materialized",
+        });
+    }
+    if spec.shape.multi_input || spec.input_relations.len() > 1 {
+        return Err(FelderaArtifactError::UnsupportedShape {
+            shape: "multi_input",
+        });
+    }
+    if spec.shape.multi_output || spec.output_relations.len() > 1 {
+        return Err(FelderaArtifactError::UnsupportedShape {
+            shape: "multi_output",
+        });
+    }
+
+    validate_relation_schemas(&spec.input_relations)?;
+    validate_relation_schemas(&spec.output_relations)?;
 
     Ok(())
 }

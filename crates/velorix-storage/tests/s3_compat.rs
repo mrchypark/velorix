@@ -6,8 +6,10 @@ use std::{
 use bytes::Bytes;
 use futures::TryStreamExt;
 use object_store::{
-    aws::AmazonS3Builder, path::Path, prefix::PrefixStore, Error as ObjectStoreError, ObjectStore,
-    PutMode,
+    aws::{AmazonS3Builder, S3ConditionalPut},
+    path::Path,
+    prefix::PrefixStore,
+    Error as ObjectStoreError, ObjectStore, PutMode,
 };
 use velorix_storage::capability::{
     probe_authoritative_object_store_capabilities, AuthoritativeNamespace,
@@ -82,10 +84,11 @@ async fn s3_compatible_gc_execution_persists_listed_run_and_retention_evidence()
         println!("skipping S3-compatible GC execution harness; set VELORIX_S3_COMPAT=1 to enable");
         return Ok(());
     };
+    let gc_config = live_gc_config(&config);
 
     let store: Arc<dyn ObjectStore> = Arc::new(PrefixStore::new(
         live_store(&config)?,
-        Path::from(config.run_prefix),
+        Path::from(gc_config.run_prefix),
     ));
     let capabilities = probe_authoritative_object_store_capabilities(
         store.as_ref(),
@@ -123,10 +126,10 @@ async fn s3_compatible_gc_execution_persists_listed_run_and_retention_evidence()
     };
     let plan = publisher.plan_garbage_collection(policy).await?;
     let run = publisher
-        .execute_garbage_collection_plan_with_evidence("s3-compatible-gc-run", policy, &plan)
+        .execute_garbage_collection_plan_with_evidence(&gc_config.run_id, policy, &plan)
         .await?;
     let verified = publisher
-        .verify_garbage_collection_run_retention_evidence("s3-compatible-gc-run")
+        .verify_garbage_collection_run_retention_evidence(&gc_config.run_id)
         .await?;
 
     if run != verified {
@@ -217,6 +220,7 @@ fn live_store(config: &LiveConfig) -> object_store::Result<impl ObjectStore> {
         .with_region(config.region.clone())
         .with_bucket_name(config.bucket.clone())
         .with_allow_http(config.allow_http)
+        .with_conditional_put(S3ConditionalPut::ETagMatch)
         .build()
 }
 
@@ -228,6 +232,71 @@ struct LiveConfig {
     bucket: String,
     allow_http: bool,
     run_prefix: String,
+}
+
+struct LiveGcConfig {
+    run_prefix: String,
+    run_id: String,
+}
+
+fn live_gc_config(config: &LiveConfig) -> LiveGcConfig {
+    live_gc_config_from_lookup(config, |name| std::env::var(name).ok())
+}
+
+fn live_gc_config_from_lookup(
+    config: &LiveConfig,
+    mut lookup: impl FnMut(&str) -> Option<String>,
+) -> LiveGcConfig {
+    let run_prefix = lookup("VELORIX_S3_GC_PREFIX")
+        .map(|prefix| prefix.trim().trim_matches('/').to_string())
+        .filter(|prefix| !prefix.is_empty())
+        .unwrap_or_else(|| config.run_prefix.clone());
+    let run_id = lookup("VELORIX_S3_GC_RUN_ID")
+        .map(|run_id| run_id.trim().to_string())
+        .filter(|run_id| !run_id.is_empty())
+        .unwrap_or_else(|| "s3-compatible-gc-run".to_string());
+
+    LiveGcConfig { run_prefix, run_id }
+}
+
+#[test]
+fn s3_compatible_gc_config_accepts_known_prefix_and_run_id_for_release_evidence() {
+    let config = LiveConfig {
+        endpoint: "http://127.0.0.1:9000".to_string(),
+        access_key_id: "rustfsadmin".to_string(),
+        secret_access_key: "rustfsadmin".to_string(),
+        region: "us-east-1".to_string(),
+        bucket: "velorix-rustfs".to_string(),
+        allow_http: true,
+        run_prefix: "generated/test-prefix".to_string(),
+    };
+
+    let gc_config = live_gc_config_from_lookup(&config, |name| match name {
+        "VELORIX_S3_GC_PREFIX" => Some("/rustfs-s3-gate/run-1/production-gc/".to_string()),
+        "VELORIX_S3_GC_RUN_ID" => Some("rustfs-production-gc-run-1".to_string()),
+        _ => None,
+    });
+
+    assert_eq!(gc_config.run_prefix, "rustfs-s3-gate/run-1/production-gc");
+    assert_eq!(gc_config.run_id, "rustfs-production-gc-run-1");
+}
+
+#[test]
+fn s3_compatible_gc_config_defaults_to_isolated_test_prefix() {
+    let config = LiveConfig {
+        endpoint: "http://127.0.0.1:9000".to_string(),
+        access_key_id: "rustfsadmin".to_string(),
+        secret_access_key: "rustfsadmin".to_string(),
+        region: "us-east-1".to_string(),
+        bucket: "velorix-rustfs".to_string(),
+        allow_http: true,
+        run_prefix: "generated/test-prefix".to_string(),
+    };
+
+    let gc_config = live_gc_config_from_lookup(&config, |_| None);
+
+    assert_eq!(gc_config.run_prefix, "generated/test-prefix");
+    assert_eq!(gc_config.run_id, "s3-compatible-gc-run");
 }
 
 fn live_config() -> Option<LiveConfig> {

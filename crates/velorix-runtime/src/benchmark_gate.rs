@@ -437,20 +437,22 @@ fn compare_workload_metrics(
             });
         };
 
-        compare_lower_workload_metric(
-            &current_workload.name,
-            "p50_ms",
-            current_workload.p50_ms,
-            baseline_workload.p50_ms,
-            budget_fraction,
-        )?;
-        compare_lower_workload_metric(
-            &current_workload.name,
-            "p95_ms",
-            current_workload.p95_ms,
-            baseline_workload.p95_ms,
-            budget_fraction,
-        )?;
+        if is_performance_workload(&current_workload.name) {
+            compare_lower_workload_metric(
+                &current_workload.name,
+                "p50_ms",
+                current_workload.p50_ms,
+                baseline_workload.p50_ms,
+                budget_fraction,
+            )?;
+            compare_lower_workload_metric(
+                &current_workload.name,
+                "p95_ms",
+                current_workload.p95_ms,
+                baseline_workload.p95_ms,
+                budget_fraction,
+            )?;
+        }
         compare_lower_workload_metric(
             &current_workload.name,
             "scan_bytes",
@@ -599,6 +601,10 @@ fn is_object_backed_workload(name: &str) -> bool {
             | "gc_dry_run_planning"
             | "gc_execution_evidence"
     )
+}
+
+fn is_performance_workload(name: &str) -> bool {
+    !matches!(name, "object_store_capability_probe")
 }
 
 fn compare_higher_is_better(

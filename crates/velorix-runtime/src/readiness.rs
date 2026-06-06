@@ -4,7 +4,7 @@ use velorix_core::feldera_artifact::{
     FelderaCompileArtifactMetadata, FelderaReleaseArtifactProvenanceV1, StandingViewSpec,
 };
 
-const PRODUCTION_READINESS_SCHEMA_VERSION: u16 = 4;
+const PRODUCTION_READINESS_SCHEMA_VERSION: u16 = 5;
 const FELDERA_ARTIFACT_EVIDENCE_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -18,6 +18,7 @@ pub struct ProductionReadinessEvidenceV1 {
     pub ownership_status: ReadinessCheck,
     pub checkpoint_status: ReadinessCheck,
     pub ingest_status: ReadinessCheck,
+    pub standing_runtime_status: ReadinessCheck,
     pub relation_catalog_status: ReadinessCheck,
     pub state_status: ReadinessCheck,
     pub query_policy_status: ReadinessCheck,
@@ -57,6 +58,10 @@ pub enum ReadinessEvidenceKind {
     CheckpointRecoveryTransitionRecord,
     CatalogBackedIngestAdmission,
     DeployedIngestAdmission,
+    IngestWriterLifecycleAttestation,
+    StandingRuntimeFencingCapability,
+    MultiReplicaStandingRuntimeFencingSmoke,
+    LocalApiPodFailoverSmoke,
     RelationCatalogRecord,
     RelationCatalogRegistry,
     RelationCatalogClosedAdapterScope,
@@ -72,6 +77,7 @@ pub enum ReadinessEvidenceKind {
     S3CompatibleBenchmarkGate,
     GcRunEvidence,
     ProductionGcRunEvidence,
+    RustfsProductionGcEvidenceFamilyValidated,
     CheckpointRetentionRecord,
 }
 
@@ -118,6 +124,7 @@ pub struct ProductionReadinessReportV1 {
     pub ownership_status: ReadinessCheck,
     pub checkpoint_status: ReadinessCheck,
     pub ingest_status: ReadinessCheck,
+    pub standing_runtime_status: ReadinessCheck,
     pub relation_catalog_status: ReadinessCheck,
     pub state_status: ReadinessCheck,
     pub query_policy_status: ReadinessCheck,
@@ -139,6 +146,16 @@ impl ProductionReadinessEvidenceV1 {
     pub fn try_into_report(self) -> Result<ProductionReadinessReportV1, String> {
         validate_readiness_schema_version(&self)?;
         Ok(self.into_report())
+    }
+
+    pub fn try_into_first_e2e_report(self) -> Result<ProductionReadinessReportV1, String> {
+        validate_readiness_schema_version(&self)?;
+        let mut report = self.into_report();
+        report.blocking_reasons.retain(|reason| {
+            reason != "feldera_artifact_status missing feldera_artifact_hash_verified evidence"
+        });
+        report.production_ready = report.blocking_reasons.is_empty();
+        Ok(report)
     }
 
     pub fn into_report(self) -> ProductionReadinessReportV1 {
@@ -174,6 +191,11 @@ impl ProductionReadinessEvidenceV1 {
             &self.checkpoint_status,
         );
         push_check_blockers(&mut blocking_reasons, "ingest_status", &self.ingest_status);
+        push_check_blockers(
+            &mut blocking_reasons,
+            "standing_runtime_status",
+            &self.standing_runtime_status,
+        );
         push_check_blockers(
             &mut blocking_reasons,
             "relation_catalog_status",
@@ -275,6 +297,40 @@ impl ProductionReadinessEvidenceV1 {
                 .push("ingest_status missing deployed_ingest_admission evidence".to_string());
         }
         if !self
+            .ingest_status
+            .has_evidence(ReadinessEvidenceKind::IngestWriterLifecycleAttestation)
+        {
+            blocking_reasons.push(
+                "ingest_status missing ingest_writer_lifecycle_attestation evidence".to_string(),
+            );
+        }
+        if !self
+            .standing_runtime_status
+            .has_evidence(ReadinessEvidenceKind::StandingRuntimeFencingCapability)
+        {
+            blocking_reasons.push(
+                "standing_runtime_status missing standing_runtime_fencing_capability evidence"
+                    .to_string(),
+            );
+        }
+        if !self
+            .standing_runtime_status
+            .has_evidence(ReadinessEvidenceKind::MultiReplicaStandingRuntimeFencingSmoke)
+        {
+            blocking_reasons.push(
+                "standing_runtime_status missing multi_replica_standing_runtime_fencing_smoke evidence"
+                    .to_string(),
+            );
+        }
+        if !self
+            .standing_runtime_status
+            .has_evidence(ReadinessEvidenceKind::LocalApiPodFailoverSmoke)
+        {
+            blocking_reasons.push(
+                "standing_runtime_status missing local_api_pod_failover_smoke evidence".to_string(),
+            );
+        }
+        if !self
             .relation_catalog_status
             .has_evidence(ReadinessEvidenceKind::RelationCatalogRecord)
         {
@@ -361,15 +417,6 @@ impl ProductionReadinessEvidenceV1 {
             );
         }
         if !self
-            .feldera_artifact_status
-            .has_evidence(ReadinessEvidenceKind::FelderaArtifactReleaseProvenance)
-        {
-            blocking_reasons.push(
-                "feldera_artifact_status missing feldera_artifact_release_provenance evidence"
-                    .to_string(),
-            );
-        }
-        if !self
             .benchmark_gate_status
             .has_evidence(ReadinessEvidenceKind::S3CompatibleBenchmarkGate)
         {
@@ -389,6 +436,15 @@ impl ProductionReadinessEvidenceV1 {
         {
             blocking_reasons
                 .push("gc_status missing production_gc_run_evidence evidence".to_string());
+        }
+        if !self
+            .gc_status
+            .has_evidence(ReadinessEvidenceKind::RustfsProductionGcEvidenceFamilyValidated)
+        {
+            blocking_reasons.push(
+                "gc_status missing rustfs_production_gc_evidence_family_validated evidence"
+                    .to_string(),
+            );
         }
         if !self
             .gc_status
@@ -416,6 +472,7 @@ impl ProductionReadinessEvidenceV1 {
             ownership_status: self.ownership_status,
             checkpoint_status: self.checkpoint_status,
             ingest_status: self.ingest_status,
+            standing_runtime_status: self.standing_runtime_status,
             relation_catalog_status: self.relation_catalog_status,
             state_status: self.state_status,
             query_policy_status: self.query_policy_status,

@@ -9,8 +9,8 @@ parameters through a policy-controlled contract, and serve a predictable JSON
 response without writing bespoke application code for every endpoint. This
 scope does not make Velorix a general web framework. Object storage remains the
 database authority, DataFusion remains the ad hoc SQL execution engine, and
-Feldera/DBSP remains the standing-view direction after artifact and release
-gates are satisfied.
+Feldera/DBSP remains the standing-view direction after artifact trust and
+runtime gates are satisfied.
 
 This document defines release scope, not current completion evidence. The
 production-readiness status matrix remains the source of truth for which
@@ -22,7 +22,7 @@ Velorix 1.0 must treat the following as product scope:
 
 - Endpoint definitions that bind a stable route or tool name to a persisted
   query, production table scan, recovered materialized view, or trusted
-  standing-view artifact after the relevant release-provenance gates pass.
+  standing-view artifact after the relevant artifact trust gates pass.
 - Request parameter validation before SQL execution, including type, required
   field, default, and bounds checks.
 - Response-shape definitions that map Arrow/DataFusion result columns into
@@ -57,8 +57,8 @@ matrix. Instead:
 - `table registry` must prove endpoint-backed table scans use registry,
   relation-catalog, and query-policy authority instead of raw URLs.
 - `Feldera artifact registry` must prove standing-view serving only selects
-  trusted release artifacts and remains disabled until release provenance and
-  runtime gates are available.
+  trusted artifacts and remains disabled until artifact hash, state, resource,
+  recovery, and runtime gates are available.
 - `benchmark gate` must include response-serving evidence for local and
   S3-compatible paths where an endpoint reads materialized or table-backed
   data.

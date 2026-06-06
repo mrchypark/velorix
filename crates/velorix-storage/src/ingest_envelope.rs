@@ -100,8 +100,6 @@ impl IngestEnvelope {
             }
         })?;
 
-        validate_weight_column(schema.as_ref())?;
-
         for batch in batches {
             if batch.schema() != schema {
                 return Err(IngestEnvelopeError::MalformedEnvelope {
@@ -155,7 +153,7 @@ impl IngestEnvelope {
 
         validate_header_without_digest(&header_without_digest)?;
 
-        let (schema, batch_count) = validate_arrow_ipc_stream(&payload)?;
+        let batch_count = validate_arrow_ipc_stream(&payload)?;
         if batch_count == 0 {
             return Err(IngestEnvelopeError::MalformedArrowIpc {
                 source: ArrowError::ParseError(
@@ -163,7 +161,6 @@ impl IngestEnvelope {
                 ),
             });
         }
-        validate_weight_column(schema.as_ref())?;
 
         Ok(Self { header, payload })
     }
@@ -441,12 +438,9 @@ fn decode_arrow_ipc_stream(payload: &Bytes) -> Result<Vec<RecordBatch>, IngestEn
         .map_err(|source| IngestEnvelopeError::MalformedArrowIpc { source })
 }
 
-fn validate_arrow_ipc_stream(
-    payload: &Bytes,
-) -> Result<(arrow::datatypes::SchemaRef, usize), IngestEnvelopeError> {
+fn validate_arrow_ipc_stream(payload: &Bytes) -> Result<usize, IngestEnvelopeError> {
     let reader = StreamReader::try_new(Cursor::new(payload.clone()), None)
         .map_err(|source| IngestEnvelopeError::MalformedArrowIpc { source })?;
-    let schema = reader.schema();
     let mut batch_count = 0;
 
     for batch in reader {
@@ -454,18 +448,5 @@ fn validate_arrow_ipc_stream(
         batch_count += 1;
     }
 
-    Ok((schema, batch_count))
-}
-
-fn validate_weight_column(schema: &arrow::datatypes::Schema) -> Result<(), IngestEnvelopeError> {
-    let field = schema
-        .field_with_name("weight")
-        .map_err(|_| IngestEnvelopeError::MissingWeightColumn)?;
-    if field.data_type() != &DataType::Int64 {
-        return Err(IngestEnvelopeError::InvalidWeightColumn {
-            data_type: field.data_type().clone(),
-        });
-    }
-
-    Ok(())
+    Ok(batch_count)
 }

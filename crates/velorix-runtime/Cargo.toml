@@ -24,6 +24,8 @@ velorix-control = { path = "../velorix-control" }
 velorix-storage = { path = "../velorix-storage" }
 
 [features]
+default = ["dbsp-runtime"]
+dbsp-runtime = ["velorix-core/dbsp-spike"]
 s3-compat-tests = ["object_store/aws", "object_store_13"]
 
 [[test]]

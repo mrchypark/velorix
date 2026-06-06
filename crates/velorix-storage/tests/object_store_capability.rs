@@ -1,11 +1,17 @@
-use std::{fmt, sync::Arc};
+use std::{
+    fmt,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use object_store::{
-    local::LocalFileSystem, path::Path, GetOptions, GetResult, ListResult, MultipartUpload,
-    ObjectMeta, ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    memory::InMemory, path::Path, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
     Result as ObjectStoreResult,
 };
 use tempfile::TempDir;
@@ -26,7 +32,7 @@ use velorix_storage::{
 
 fn temp_store() -> (TempDir, Arc<dyn ObjectStore>) {
     let temp_dir = tempfile::tempdir().unwrap();
-    let store = LocalFileSystem::new_with_prefix(temp_dir.path()).unwrap();
+    let store = InMemory::new();
 
     (temp_dir, Arc::new(store))
 }
@@ -35,6 +41,7 @@ fn complete_profile(backend_name: &str) -> ObjectStoreCapabilityProfile {
     ObjectStoreCapabilityProfile {
         backend_name: backend_name.to_string(),
         conditional_create: true,
+        conditional_update: true,
         atomic_visibility: true,
         list_after_write: true,
         read_after_write: true,
@@ -61,6 +68,7 @@ fn profile_missing(
 
     match required_capability {
         RequiredObjectStoreCapability::ConditionalCreate => profile.conditional_create = false,
+        RequiredObjectStoreCapability::ConditionalUpdate => profile.conditional_update = false,
         RequiredObjectStoreCapability::AtomicVisibility => profile.atomic_visibility = false,
         RequiredObjectStoreCapability::ListAfterWrite => profile.list_after_write = false,
         RequiredObjectStoreCapability::ReadAfterWrite => profile.read_after_write = false,
@@ -105,6 +113,134 @@ fn expected_authoritative_namespaces() -> [AuthoritativeNamespace; 19] {
 #[derive(Debug)]
 struct OverwriteCreateStore {
     inner: Arc<dyn ObjectStore>,
+}
+
+#[derive(Debug)]
+struct GenericErrorOnDuplicateCreateStore {
+    inner: Arc<dyn ObjectStore>,
+    create_count: AtomicUsize,
+}
+
+#[derive(Debug)]
+struct GenericErrorOnStaleUpdateStore {
+    inner: Arc<dyn ObjectStore>,
+    update_count: AtomicUsize,
+}
+
+impl fmt::Display for GenericErrorOnDuplicateCreateStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "GenericErrorOnDuplicateCreateStore")
+    }
+}
+
+#[async_trait]
+impl ObjectStore for GenericErrorOnDuplicateCreateStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> ObjectStoreResult<PutResult> {
+        if matches!(opts.mode, PutMode::Create)
+            && self.create_count.fetch_add(1, Ordering::SeqCst) > 0
+        {
+            return Err(object_store::Error::Generic {
+                store: "generic-duplicate-create",
+                source: "simulated non-conflict duplicate create error".into(),
+            });
+        }
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> ObjectStoreResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn delete(&self, location: &Path) -> ObjectStoreResult<()> {
+        self.inner.delete(location).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
+impl fmt::Display for GenericErrorOnStaleUpdateStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "GenericErrorOnStaleUpdateStore")
+    }
+}
+
+#[async_trait]
+impl ObjectStore for GenericErrorOnStaleUpdateStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> ObjectStoreResult<PutResult> {
+        if matches!(opts.mode, PutMode::Update(_))
+            && self.update_count.fetch_add(1, Ordering::SeqCst) > 0
+        {
+            return Err(object_store::Error::Generic {
+                store: "generic-stale-update",
+                source: "simulated non-precondition stale update error".into(),
+            });
+        }
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> ObjectStoreResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn delete(&self, location: &Path) -> ObjectStoreResult<()> {
+        self.inner.delete(location).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
 }
 
 impl fmt::Display for OverwriteCreateStore {
@@ -189,6 +325,7 @@ async fn object_store_capability_probe_observes_create_read_and_list_behavior() 
     assert_eq!(report.backend_name, "local-test");
     assert!(report.probe_key.starts_with("v1/capability-probes/"));
     assert!(report.conditional_create);
+    assert!(report.conditional_update);
     assert!(report.atomic_visibility);
     assert!(report.list_after_write);
     assert!(report.read_after_write);
@@ -225,6 +362,36 @@ async fn production_capability_probe_rejects_store_without_create_only_behavior(
         }
         other => panic!("expected capability error, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn object_store_capability_probe_rejects_non_conflict_duplicate_create_errors() {
+    let (_temp_dir, inner) = temp_store();
+    let store = GenericErrorOnDuplicateCreateStore {
+        inner,
+        create_count: AtomicUsize::new(0),
+    };
+
+    let err = probe_object_store_capabilities(&store, "generic-duplicate-create", "v1/probes")
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, ObjectStoreCapabilityProbeError::Write { .. }));
+}
+
+#[tokio::test]
+async fn object_store_capability_probe_rejects_non_precondition_stale_update_errors() {
+    let (_temp_dir, inner) = temp_store();
+    let store = GenericErrorOnStaleUpdateStore {
+        inner,
+        update_count: AtomicUsize::new(0),
+    };
+
+    let err = probe_object_store_capabilities(&store, "generic-stale-update", "v1/probes")
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, ObjectStoreCapabilityProbeError::Write { .. }));
 }
 
 #[tokio::test]
@@ -729,7 +896,9 @@ async fn local_development_profile_allows_ingest_checked_construction_and_create
     let (_temp_dir, store) = temp_store();
     let log =
         IngestLog::new_checked(store, &ObjectStoreCapabilityProfile::local_development()).unwrap();
-    let batch = IngestBatch::new("orders", 0, 0, 10, Bytes::from_static(b"orders")).unwrap();
+    let batch =
+        IngestBatch::new_bootstrap_unchecked("orders", 0, 0, 10, Bytes::from_static(b"orders"))
+            .unwrap();
 
     log.append(&batch).await.unwrap();
     let err = log.append(&batch).await.unwrap_err();

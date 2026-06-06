@@ -174,9 +174,12 @@ async fn local_filesystem_multi_process_admission_allows_adjacent_ranges() {
         scratch.path().join("first.json"),
         scratch.path().join("adjacent.json"),
     ]);
-    assert!(outcomes
-        .iter()
-        .all(|outcome| outcome.kind == "appended" && outcome.error.is_none()),);
+    assert!(
+        outcomes
+            .iter()
+            .all(|outcome| outcome.kind == "appended" && outcome.error.is_none()),
+        "{outcomes:?}"
+    );
 
     let capabilities = complete_capabilities();
     let committed = IngestLog::new_catalog_checked(Arc::clone(&store), &capabilities)
@@ -404,6 +407,53 @@ async fn local_filesystem_stale_retry_of_expired_indexed_orphan_does_not_write_t
         }
     ));
     assert_eq!(index_transition_bodies(&store).await, transitions_before);
+}
+
+#[tokio::test]
+async fn local_filesystem_reconstruction_ignores_unreachable_index_transition_when_head_chain_is_valid(
+) {
+    let (_temp_dir, _authority_root, store) = temp_authority_store();
+    let catalog = create_orders_relation_catalog(&store).await;
+    let capabilities = complete_capabilities();
+    let coordinator =
+        IngestAdmissionCoordinator::new_checked(Arc::clone(&store), &capabilities).unwrap();
+
+    coordinator
+        .append_catalog_validated_envelope(catalog_envelope_bytes_for(&catalog, 0, 100))
+        .await
+        .unwrap();
+    let mut stale_transition = index_transition_bodies(&store)
+        .await
+        .into_iter()
+        .next()
+        .unwrap();
+    let stale_previous_digest_hex = "1".repeat(64);
+    stale_transition["previous_state_digest"] =
+        Value::String(format!("sha256:{stale_previous_digest_hex}"));
+    stale_transition["next_state_digest"] = Value::String(format!("sha256:{}", "2".repeat(64)));
+    store
+        .put_opts(
+            &ObjectStorePath::from(format!(
+                "v1/ingest-admission-index/orders/p=0000000007/advances/{stale_previous_digest_hex}.transition.json"
+            )),
+            Bytes::from(serde_json::to_vec(&stale_transition).unwrap()).into(),
+            PutMode::Create.into(),
+        )
+        .await
+        .unwrap();
+
+    let report = coordinator.reconstruct_active_admissions().await.unwrap();
+    assert_eq!(report.active_admission_records, 1);
+
+    let adjacent = coordinator
+        .append_catalog_validated_envelope(catalog_envelope_bytes_for(&catalog, 100, 150))
+        .await
+        .unwrap();
+    assert!(matches!(
+        adjacent,
+        AppendValidatedEnvelopeOutcome::Appended { descriptor }
+            if descriptor.object_key == ObjectKey::ingest_batch("orders", 7, 100, 150).unwrap()
+    ));
 }
 
 #[tokio::test]
@@ -866,6 +916,7 @@ async fn put_legacy_materialized_admission(
         relation_version: envelope.header().relation_version.clone(),
         schema_fingerprint: envelope.header().schema_fingerprint.clone(),
         admission_mode: "process_local_serialized".to_string(),
+        commit_guard_binding: None,
     };
     store
         .put_opts(
@@ -1110,6 +1161,7 @@ fn complete_capabilities() -> AuthoritativeObjectStoreCapabilitiesV1 {
                     ObjectStoreCapabilityProfile {
                         backend_name: format!("local-multiprocess-{namespace}"),
                         conditional_create: true,
+                        conditional_update: true,
                         atomic_visibility: true,
                         list_after_write: true,
                         read_after_write: true,

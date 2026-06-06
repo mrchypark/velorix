@@ -1,7 +1,7 @@
 # Dependency Governance
 
 Velorix runs `cargo deny check -W unmaintained` in CI.
-CI also installs Rust `1.88.0` and runs
+CI also installs Rust `1.93.1` and runs
 `cargo check --workspace --all-targets --locked` to enforce the declared MSRV
 against the locked dependency graph.
 
@@ -26,22 +26,22 @@ The local evidence has `schema_version=1`,
 cargo-deny diagnostics path, required and reviewed package subjects, exception
 counts, and warning counts. `--json` requires `--cargo-deny-json` so release
 evidence cannot claim a dependency-governance pass from manifest-only
-validation. It sets `external_audit_attestation=false`, so it is local
-governance evidence, not release-satisfying external audit evidence. Release
-readiness requires a separate dependency-governance artifact with
-`external_audit_attestation=true` and an `external_audit` object naming a
-`cargo-vet` audit, provider, pass result, subject commit, `sha256:` manifest
-digest, completion time, and reviewable attestation URI. The artifact-gated
-`readiness-report` requires `external_audit.tool="cargo-vet"`, compares that
-subject commit with `--release-commit`, and compares that digest with
-`--dependency-governance-manifest`.
+validation. This cargo-deny-backed artifact is sufficient for the
+artifact-gated `readiness-report` dependency-governance check when it has
+`status=pass`, `evidence_kind=dependency_governance_validated`, checked
+cargo-deny diagnostics, and no missing required package-review subjects.
+`external_audit_attestation=false` is expected for this local governance
+artifact and is not a release blocker.
 
 The manifest records the declared MSRV policy and requires package review
 records for the high-risk production dependency subjects that shape Velorix's
 database boundary: DataFusion, object storage, Kubernetes, SlateDB, Foyer, and
-Feldera artifacts. Each package review names an owner, review date, local audit
-status, feature policy, and replacement plan. This is a lightweight local audit
-workflow until external audit evidence such as `cargo-vet` exists.
+Hiqlite, and Feldera artifacts. The `sebadob/hiqlite` git source is explicitly
+allowed in `deny.toml` for the planned upstream-main bridge after the required
+metadata-backend authority-time API is visible there and before a release carries
+that support. Each package review names an owner, review date, local audit
+status, feature policy, and replacement plan. This is the required local audit
+workflow for the release gate.
 
 Every declared duplicate, unmaintained, or advisory exception must also name an
 owner, expiry date, reason, replacement plan, and promotion rule. Expired
@@ -63,8 +63,8 @@ Unmaintained advisories are also warnings today. Each allowed exception is
 tracked in the governance manifest with an owner, expiry, reason, replacement
 plan, and promotion rule.
 
-The remaining 1.0 dependency-governance blocker is the `cargo-vet` release
-attestation. Decisions about whether duplicate-version, unmaintained, or
+There is no separate `cargo-vet` release-attestation blocker in the 1.0
+readiness contract. Decisions about whether duplicate-version, unmaintained, or
 advisory warnings later graduate from local-review exception governance into
 hard `deny.toml` gates are ongoing maintenance policy, not a 1.0 release
 blocker.

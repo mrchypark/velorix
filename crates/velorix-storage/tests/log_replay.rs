@@ -66,13 +66,28 @@ async fn log_replay_returns_committed_batches_in_deterministic_order() {
     let (_temp_dir, store) = temp_store();
     let log = IngestLog::new(store);
 
-    let late_orders =
-        IngestBatch::new("orders", 0, 10, 20, Bytes::from_static(b"orders-10-20")).unwrap();
-    let early_orders =
-        IngestBatch::new("orders", 0, 0, 10, Bytes::from_static(b"orders-0-10")).unwrap();
+    let late_orders = IngestBatch::new_bootstrap_unchecked(
+        "orders",
+        0,
+        10,
+        20,
+        Bytes::from_static(b"orders-10-20"),
+    )
+    .unwrap();
+    let early_orders = IngestBatch::new_bootstrap_unchecked(
+        "orders",
+        0,
+        0,
+        10,
+        Bytes::from_static(b"orders-0-10"),
+    )
+    .unwrap();
     let other_partition =
-        IngestBatch::new("orders", 1, 0, 5, Bytes::from_static(b"orders-p1")).unwrap();
-    let payments = IngestBatch::new("payments", 0, 0, 3, Bytes::from_static(b"payments")).unwrap();
+        IngestBatch::new_bootstrap_unchecked("orders", 1, 0, 5, Bytes::from_static(b"orders-p1"))
+            .unwrap();
+    let payments =
+        IngestBatch::new_bootstrap_unchecked("payments", 0, 0, 3, Bytes::from_static(b"payments"))
+            .unwrap();
 
     log.append(&late_orders).await.unwrap();
     log.append(&payments).await.unwrap();
@@ -104,12 +119,28 @@ async fn log_replay_skips_batches_covered_by_checkpoint_boundary() {
     let (_temp_dir, store) = temp_store();
     let log = IngestLog::new(store);
 
-    let covered = IngestBatch::new("orders", 0, 0, 10, Bytes::from_static(b"covered")).unwrap();
-    let next = IngestBatch::new("orders", 0, 10, 20, Bytes::from_static(b"next")).unwrap();
-    let other_partition =
-        IngestBatch::new("orders", 1, 0, 7, Bytes::from_static(b"other-partition")).unwrap();
-    let other_stream =
-        IngestBatch::new("payments", 0, 0, 3, Bytes::from_static(b"other-stream")).unwrap();
+    let covered =
+        IngestBatch::new_bootstrap_unchecked("orders", 0, 0, 10, Bytes::from_static(b"covered"))
+            .unwrap();
+    let next =
+        IngestBatch::new_bootstrap_unchecked("orders", 0, 10, 20, Bytes::from_static(b"next"))
+            .unwrap();
+    let other_partition = IngestBatch::new_bootstrap_unchecked(
+        "orders",
+        1,
+        0,
+        7,
+        Bytes::from_static(b"other-partition"),
+    )
+    .unwrap();
+    let other_stream = IngestBatch::new_bootstrap_unchecked(
+        "payments",
+        0,
+        0,
+        3,
+        Bytes::from_static(b"other-stream"),
+    )
+    .unwrap();
 
     log.append(&covered).await.unwrap();
     log.append(&next).await.unwrap();
@@ -129,7 +160,9 @@ async fn log_replay_ignores_output_namespace_objects_with_matching_ranges() {
     let (_temp_dir, store) = temp_store();
     let log = IngestLog::new(Arc::clone(&store));
 
-    let input = IngestBatch::new("orders", 0, 0, 10, Bytes::from_static(b"input")).unwrap();
+    let input =
+        IngestBatch::new_bootstrap_unchecked("orders", 0, 0, 10, Bytes::from_static(b"input"))
+            .unwrap();
     let output_key = ObjectKey::output_object("orders", 0, 0, 10, 20, "out-0001").unwrap();
 
     log.append(&input).await.unwrap();
@@ -204,15 +237,20 @@ async fn log_replay_rejects_duplicate_checkpoints_for_same_stream_partition() {
 async fn log_replay_rejects_overwrites_and_invalid_ranges() {
     let (_temp_dir, store) = temp_store();
     let log = IngestLog::new(store);
-    let batch = IngestBatch::new("orders", 0, 0, 10, Bytes::from_static(b"first")).unwrap();
+    let batch =
+        IngestBatch::new_bootstrap_unchecked("orders", 0, 0, 10, Bytes::from_static(b"first"))
+            .unwrap();
 
     log.append(&batch).await.unwrap();
 
-    let duplicate = IngestBatch::new("orders", 0, 0, 10, Bytes::from_static(b"second")).unwrap();
+    let duplicate =
+        IngestBatch::new_bootstrap_unchecked("orders", 0, 0, 10, Bytes::from_static(b"second"))
+            .unwrap();
     let err = log.append(&duplicate).await.unwrap_err();
     assert!(err.to_string().contains("already exists"));
 
-    let invalid = IngestBatch::new("orders", 0, 10, 10, Bytes::new()).unwrap_err();
+    let invalid =
+        IngestBatch::new_bootstrap_unchecked("orders", 0, 10, 10, Bytes::new()).unwrap_err();
     assert!(invalid
         .to_string()
         .contains("offset range must be nonempty"));

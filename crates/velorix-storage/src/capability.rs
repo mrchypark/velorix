@@ -6,13 +6,14 @@ use std::{
 
 use bytes::Bytes;
 use futures::TryStreamExt;
-use object_store::{path::Path, ObjectStore, PutMode};
+use object_store::{path::Path, ObjectStore, PutMode, UpdateVersion};
 use thiserror::Error;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObjectStoreCapabilityProfile {
     pub backend_name: String,
     pub conditional_create: bool,
+    pub conditional_update: bool,
     pub atomic_visibility: bool,
     pub list_after_write: bool,
     pub read_after_write: bool,
@@ -58,6 +59,7 @@ pub struct ObjectStoreCapabilityProbeReport {
     pub backend_name: String,
     pub probe_key: String,
     pub conditional_create: bool,
+    pub conditional_update: bool,
     pub atomic_visibility: bool,
     pub list_after_write: bool,
     pub read_after_write: bool,
@@ -66,6 +68,7 @@ pub struct ObjectStoreCapabilityProbeReport {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RequiredObjectStoreCapability {
     ConditionalCreate,
+    ConditionalUpdate,
     AtomicVisibility,
     ListAfterWrite,
     ReadAfterWrite,
@@ -114,6 +117,12 @@ pub enum ObjectStoreCapabilityProbeError {
     },
     #[error("object-store capability probe `{probe_key}` returned different bytes after create")]
     ReadMismatch { probe_key: String },
+    #[error("object-store capability probe `{probe_key}` allowed a stale conditional update")]
+    StaleUpdateAccepted { probe_key: String },
+    #[error(
+        "object-store capability probe `{probe_key}` changed bytes during stale conditional update"
+    )]
+    StaleUpdateMutatedObject { probe_key: String },
     #[error(transparent)]
     Capability(#[from] ObjectStoreCapabilityError),
 }
@@ -135,6 +144,7 @@ impl ObjectStoreCapabilityProfile {
         Self {
             backend_name: "local-development".to_string(),
             conditional_create: true,
+            conditional_update: true,
             atomic_visibility: true,
             list_after_write: true,
             read_after_write: true,
@@ -144,6 +154,7 @@ impl ObjectStoreCapabilityProfile {
     pub fn production(
         backend_name: impl Into<String>,
         conditional_create: bool,
+        conditional_update: bool,
         atomic_visibility: bool,
         list_after_write: bool,
         read_after_write: bool,
@@ -151,6 +162,7 @@ impl ObjectStoreCapabilityProfile {
         let profile = Self {
             backend_name: backend_name.into(),
             conditional_create,
+            conditional_update,
             atomic_visibility,
             list_after_write,
             read_after_write,
@@ -161,7 +173,7 @@ impl ObjectStoreCapabilityProfile {
     }
 
     pub fn validate_for_velorix_durability(&self) -> Result<(), ObjectStoreCapabilityError> {
-        for required_capability in RequiredObjectStoreCapability::all() {
+        for required_capability in RequiredObjectStoreCapability::velorix_durability() {
             if !self.has(required_capability) {
                 return Err(ObjectStoreCapabilityError {
                     backend_name: self.backend_name.clone(),
@@ -173,9 +185,21 @@ impl ObjectStoreCapabilityProfile {
         Ok(())
     }
 
+    pub fn validate_for_conditional_update(&self) -> Result<(), ObjectStoreCapabilityError> {
+        if !self.conditional_update {
+            return Err(ObjectStoreCapabilityError {
+                backend_name: self.backend_name.clone(),
+                required_capability: RequiredObjectStoreCapability::ConditionalUpdate,
+            });
+        }
+
+        Ok(())
+    }
+
     fn has(&self, required_capability: RequiredObjectStoreCapability) -> bool {
         match required_capability {
             RequiredObjectStoreCapability::ConditionalCreate => self.conditional_create,
+            RequiredObjectStoreCapability::ConditionalUpdate => self.conditional_update,
             RequiredObjectStoreCapability::AtomicVisibility => self.atomic_visibility,
             RequiredObjectStoreCapability::ListAfterWrite => self.list_after_write,
             RequiredObjectStoreCapability::ReadAfterWrite => self.read_after_write,
@@ -183,7 +207,7 @@ impl ObjectStoreCapabilityProfile {
     }
 
     fn missing_capabilities(&self) -> Vec<RequiredObjectStoreCapability> {
-        RequiredObjectStoreCapability::all()
+        RequiredObjectStoreCapability::velorix_durability()
             .into_iter()
             .filter(|capability| !self.has(*capability))
             .collect()
@@ -235,7 +259,8 @@ impl AuthoritativeObjectStoreCapabilitiesV1 {
                 None => ObjectStoreCapabilityDiagnostic {
                     namespace,
                     backend_name: None,
-                    missing_capabilities: RequiredObjectStoreCapability::all().to_vec(),
+                    missing_capabilities: RequiredObjectStoreCapability::velorix_durability()
+                        .to_vec(),
                 },
             })
             .collect()
@@ -247,6 +272,7 @@ impl ObjectStoreCapabilityProbeReport {
         ObjectStoreCapabilityProfile {
             backend_name: self.backend_name.clone(),
             conditional_create: self.conditional_create,
+            conditional_update: self.conditional_update,
             atomic_visibility: self.atomic_visibility,
             list_after_write: self.list_after_write,
             read_after_write: self.read_after_write,
@@ -273,19 +299,22 @@ pub async fn probe_object_store_capabilities(
             source,
         })?;
 
-    let read_bytes = store
-        .get(&path)
-        .await
-        .map_err(|source| ObjectStoreCapabilityProbeError::Read {
-            probe_key: probe_key.clone(),
-            source,
-        })?
-        .bytes()
-        .await
-        .map_err(|source| ObjectStoreCapabilityProbeError::Read {
-            probe_key: probe_key.clone(),
-            source,
-        })?;
+    let get_result =
+        store
+            .get(&path)
+            .await
+            .map_err(|source| ObjectStoreCapabilityProbeError::Read {
+                probe_key: probe_key.clone(),
+                source,
+            })?;
+    let read_bytes =
+        get_result
+            .bytes()
+            .await
+            .map_err(|source| ObjectStoreCapabilityProbeError::Read {
+                probe_key: probe_key.clone(),
+                source,
+            })?;
 
     let read_after_write = read_bytes == payload;
     if !read_after_write {
@@ -296,7 +325,92 @@ pub async fn probe_object_store_capabilities(
     let duplicate_create = store
         .put_opts(&path, payload.clone().into(), PutMode::Create.into())
         .await;
-    let conditional_create = duplicate_create.is_err();
+    let conditional_create = match duplicate_create {
+        Err(object_store::Error::AlreadyExists { .. }) => true,
+        Ok(_) => false,
+        Err(source) => {
+            let _ = store.delete(&path).await;
+            return Err(ObjectStoreCapabilityProbeError::Write {
+                probe_key: probe_key.clone(),
+                source,
+            });
+        }
+    };
+
+    let current_get_result =
+        store
+            .get(&path)
+            .await
+            .map_err(|source| ObjectStoreCapabilityProbeError::Read {
+                probe_key: probe_key.clone(),
+                source,
+            })?;
+    let update_version = UpdateVersion {
+        e_tag: current_get_result.meta.e_tag.clone(),
+        version: current_get_result.meta.version.clone(),
+    };
+    let updated_payload = Bytes::from_static(b"velorix-object-store-capability-probe-v2");
+    let update_result = store
+        .put_opts(
+            &path,
+            updated_payload.clone().into(),
+            PutMode::Update(update_version.clone()).into(),
+        )
+        .await;
+    let conditional_update = match update_result {
+        Ok(_) => match store
+            .put_opts(
+                &path,
+                Bytes::from_static(b"velorix-object-store-stale-update").into(),
+                PutMode::Update(update_version).into(),
+            )
+            .await
+        {
+            Err(object_store::Error::Precondition { .. }) => true,
+            Ok(_) => {
+                let _ = store.delete(&path).await;
+                return Err(ObjectStoreCapabilityProbeError::StaleUpdateAccepted {
+                    probe_key: probe_key.clone(),
+                });
+            }
+            Err(source) => {
+                let _ = store.delete(&path).await;
+                return Err(ObjectStoreCapabilityProbeError::Write {
+                    probe_key: probe_key.clone(),
+                    source,
+                });
+            }
+        },
+        Err(object_store::Error::NotImplemented) => false,
+        Err(source) => {
+            let _ = store.delete(&path).await;
+            return Err(ObjectStoreCapabilityProbeError::Write {
+                probe_key: probe_key.clone(),
+                source,
+            });
+        }
+    };
+    if conditional_update {
+        let post_stale_bytes = store
+            .get(&path)
+            .await
+            .map_err(|source| ObjectStoreCapabilityProbeError::Read {
+                probe_key: probe_key.clone(),
+                source,
+            })?
+            .bytes()
+            .await
+            .map_err(|source| ObjectStoreCapabilityProbeError::Read {
+                probe_key: probe_key.clone(),
+                source,
+            })?;
+        if post_stale_bytes != updated_payload {
+            let _ = store.delete(&path).await;
+            return Err(ObjectStoreCapabilityProbeError::StaleUpdateMutatedObject {
+                probe_key: probe_key.clone(),
+            });
+        }
+    }
 
     let listed = store
         .list(Some(&Path::from(probe_prefix.as_str())))
@@ -315,6 +429,7 @@ pub async fn probe_object_store_capabilities(
         backend_name,
         probe_key,
         conditional_create,
+        conditional_update,
         atomic_visibility: read_after_write,
         list_after_write: listed,
         read_after_write,
@@ -413,7 +528,7 @@ impl AuthoritativeNamespace {
 }
 
 impl RequiredObjectStoreCapability {
-    fn all() -> [Self; 4] {
+    fn velorix_durability() -> [Self; 4] {
         [
             Self::ConditionalCreate,
             Self::AtomicVisibility,
@@ -453,6 +568,7 @@ impl fmt::Display for RequiredObjectStoreCapability {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ConditionalCreate => write!(f, "conditional_create"),
+            Self::ConditionalUpdate => write!(f, "conditional_update"),
             Self::AtomicVisibility => write!(f, "atomic_visibility"),
             Self::ListAfterWrite => write!(f, "list_after_write"),
             Self::ReadAfterWrite => write!(f, "read_after_write"),

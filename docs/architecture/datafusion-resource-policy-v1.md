@@ -31,9 +31,12 @@ Generic query policy catalog `create`/`get` remains bootstrap-compatible and
 admits `QueryExecutionPolicyV1::default()`. Production table-scan admission uses
 the explicit catalog production methods, which fail closed unless
 `QueryExecutionPolicyV1::validate_production_table_scan` sees all required
-single-query production boundary fields. Tenant/global concurrency admission now
-has a narrow production runtime-owned limiter boundary for the persisted table,
-persisted view, and recovered-query scan paths. Setting
+single-query production boundary fields. The product REST surface for
+`/v1/query-policies` uses the production catalog methods, so a policy that can
+be linked to a served `/v1/api/*` view must carry those bounds when created and
+when read back. Tenant/global concurrency admission now has a narrow production
+runtime-owned limiter boundary for the persisted table, persisted view, and
+recovered-query scan paths. Setting
 `max_concurrent_queries` without a compatible runtime limiter still fails query
 execution.
 

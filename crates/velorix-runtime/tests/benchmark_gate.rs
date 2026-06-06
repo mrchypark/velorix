@@ -270,10 +270,22 @@ fn benchmark_comparison_fails_when_synthetic_regression_exceeds_budget() {
 }
 
 #[test]
-fn benchmark_comparison_fails_when_workload_latency_regresses_over_budget() {
+fn benchmark_comparison_ignores_capability_probe_latency_regression() {
     let mut current = local_smoke_result();
     let baseline = local_smoke_result();
-    current.workload_metrics[0].p95_ms = baseline.workload_metrics[0].p95_ms * 1.20;
+    current.workload_metrics[0].p50_ms = baseline.workload_metrics[0].p50_ms * 10.0;
+    current.workload_metrics[0].p95_ms = baseline.workload_metrics[0].p95_ms * 10.0;
+
+    current
+        .compare_against(&baseline, BenchmarkBudgetV1::relative(0.10))
+        .unwrap();
+}
+
+#[test]
+fn benchmark_comparison_fails_when_performance_workload_latency_regresses_over_budget() {
+    let mut current = local_smoke_result();
+    let baseline = local_smoke_result();
+    current.workload_metrics[1].p95_ms = baseline.workload_metrics[1].p95_ms * 1.20;
 
     let error = current
         .compare_against(&baseline, BenchmarkBudgetV1::relative(0.10))
@@ -284,6 +296,35 @@ fn benchmark_comparison_fails_when_workload_latency_regresses_over_budget() {
         BenchmarkGateError::WorkloadRegression {
             workload,
             metric: "p95_ms",
+            ..
+        } if workload == "ingest_envelope_validation"
+    ));
+}
+
+#[test]
+fn benchmark_comparison_still_checks_capability_probe_object_requests() {
+    let mut current = local_smoke_result();
+    let baseline = local_smoke_result();
+    current.workload_metrics[0]
+        .object_requests
+        .as_mut()
+        .unwrap()
+        .put_count = baseline.workload_metrics[0]
+        .object_requests
+        .as_ref()
+        .unwrap()
+        .put_count
+        + 1;
+
+    let error = current
+        .compare_against(&baseline, BenchmarkBudgetV1::relative(0.10))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        BenchmarkGateError::WorkloadRegression {
+            workload,
+            metric: "put_count",
             ..
         } if workload == "object_store_capability_probe"
     ));
