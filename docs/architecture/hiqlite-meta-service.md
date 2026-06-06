@@ -33,7 +33,7 @@ The current implementation has:
 - a `GrpcMetaStore` client used by `velorix-api`
 - an `OssMetaStore` backend for standalone or low-cost deployments
 - a `HiqliteMetaStore` backend behind the `hiqlite-backend` feature, pinned to
-  `mrchypark/hiqlite@b1dbcb3572558ac1fc09cc1eac080a5578600452` until upstream
+  `mrchypark/hiqlite@26c6d22a72d7bd0a1e2de073fc4c076ddad4e588` until upstream
   main/release exposes the required API
 
 The in-memory backend is not durable and must not be used as the production

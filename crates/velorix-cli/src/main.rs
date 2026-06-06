@@ -17495,7 +17495,7 @@ mod tests {
             "transport_security": "cluster-private-mtls",
             "backup_restore_configured": true,
             "image_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-            "source_revision": "mrchypark/hiqlite@b1dbcb3572558ac1fc09cc1eac080a5578600452",
+            "source_revision": "mrchypark/hiqlite@26c6d22a72d7bd0a1e2de073fc4c076ddad4e588",
             "no_pvc_evidence_files": {
                 "namespace_pvc_list": "no-pvc-namespace.json",
                 "hiqlite_statefulset": "no-pvc-hiqlite-statefulset.json",
@@ -17643,7 +17643,7 @@ mod tests {
                     "transport_security": "cluster-private-mtls",
                     "backup_restore_configured": true,
                     "image_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-                    "source_revision": "mrchypark/hiqlite@b1dbcb3572558ac1fc09cc1eac080a5578600452",
+                    "source_revision": "mrchypark/hiqlite@26c6d22a72d7bd0a1e2de073fc4c076ddad4e588",
                     "no_pvc_evidence_files": {
                         "namespace_pvc_list": "no-pvc-namespace.json",
                         "hiqlite_statefulset": "no-pvc-hiqlite-statefulset.json",

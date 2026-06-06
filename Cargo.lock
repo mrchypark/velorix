@@ -3827,7 +3827,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 [[package]]
 name = "hiqlite"
 version = "0.14.0-202606024"
-source = "git+https://github.com/mrchypark/hiqlite.git?rev=b1dbcb3572558ac1fc09cc1eac080a5578600452#b1dbcb3572558ac1fc09cc1eac080a5578600452"
+source = "git+https://github.com/mrchypark/hiqlite.git?rev=26c6d22a72d7bd0a1e2de073fc4c076ddad4e588#26c6d22a72d7bd0a1e2de073fc4c076ddad4e588"
 dependencies = [
  "argon2",
  "axum",
@@ -3886,7 +3886,7 @@ dependencies = [
 [[package]]
 name = "hiqlite-derive"
 version = "0.14.0-202606024"
-source = "git+https://github.com/mrchypark/hiqlite.git?rev=b1dbcb3572558ac1fc09cc1eac080a5578600452#b1dbcb3572558ac1fc09cc1eac080a5578600452"
+source = "git+https://github.com/mrchypark/hiqlite.git?rev=26c6d22a72d7bd0a1e2de073fc4c076ddad4e588#26c6d22a72d7bd0a1e2de073fc4c076ddad4e588"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3896,7 +3896,7 @@ dependencies = [
 [[package]]
 name = "hiqlite-wal"
 version = "0.14.0-202606024"
-source = "git+https://github.com/mrchypark/hiqlite.git?rev=b1dbcb3572558ac1fc09cc1eac080a5578600452#b1dbcb3572558ac1fc09cc1eac080a5578600452"
+source = "git+https://github.com/mrchypark/hiqlite.git?rev=26c6d22a72d7bd0a1e2de073fc4c076ddad4e588#26c6d22a72d7bd0a1e2de073fc4c076ddad4e588"
 dependencies = [
  "bincode",
  "byteorder",
@@ -4072,7 +4072,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "tokio",
  "tower-service",
  "tracing",
@@ -6071,7 +6071,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -6111,7 +6111,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "tracing",
  "windows-sys 0.59.0",
 ]
