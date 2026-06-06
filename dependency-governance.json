@@ -57,9 +57,9 @@
       "subject": "hiqlite",
       "owner": "metadata",
       "reviewed_on": "2026-05-31",
-      "audit_status": "local_reviewed_local_checkout_until_upstream_main_contains_authority_time",
-      "feature_policy": "Prefer sebadob/hiqlite main as the configured metadata service backend once it contains Velorix's required authority-time API. Keep the local checkout bridge while verified upstream main lacks that API. Do not claim production standing-runtime fencing until backend-authoritative time and multi-replica adversarial evidence are proven.",
-      "replacement_plan": "Switch to upstream main after the authority-time API is visible there, then switch to the upstream released hiqlite version after a release includes the required support. Re-run cargo-deny plus metadata capability tests after each switch."
+      "audit_status": "local_reviewed_pinned_fork_main_until_upstream_release_contains_authority_time",
+      "feature_policy": "Use the pinned mrchypark/hiqlite fork-main commit that contains Velorix's required authority-time API. Do not claim production standing-runtime fencing until backend-authoritative time and multi-replica adversarial evidence are proven.",
+      "replacement_plan": "Switch to the upstream released hiqlite version after a release includes the required authority-time support. Re-run cargo-deny plus metadata capability tests after each switch."
     },
     {
       "subject": "feldera_artifacts",
@@ -381,7 +381,7 @@
       "crate": "aws-lc-sys",
       "owner": "metadata",
       "expires_on": "2026-08-31",
-      "reason": "The sebadob/hiqlite metadata backend and existing TLS/S3 dependency graph introduce multiple aws-lc-sys lines while upstream crypto dependencies converge.",
+      "reason": "The pinned mrchypark/hiqlite metadata backend and existing TLS/S3 dependency graph introduce multiple aws-lc-sys lines while upstream crypto dependencies converge.",
       "replacement_plan": "Upgrade hiqlite and TLS/S3 dependencies, or switch to upstream hiqlite, when the aws-lc-sys dependency ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
@@ -390,7 +390,7 @@
       "crate": "base64",
       "owner": "metadata",
       "expires_on": "2026-08-31",
-      "reason": "The sebadob/hiqlite metadata backend and existing HTTP/TLS dependency graph introduce base64 versions from multiple upstream stacks.",
+      "reason": "The pinned mrchypark/hiqlite metadata backend and existing HTTP/TLS dependency graph introduce base64 versions from multiple upstream stacks.",
       "replacement_plan": "Upgrade hiqlite and HTTP/TLS dependencies when upstream base64 dependency ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
@@ -399,7 +399,7 @@
       "crate": "chacha20",
       "owner": "metadata",
       "expires_on": "2026-08-31",
-      "reason": "The sebadob/hiqlite metadata backend introduces crypto transitive dependencies that differ from existing crypto-family versions.",
+      "reason": "The pinned mrchypark/hiqlite metadata backend introduces crypto transitive dependencies that differ from existing crypto-family versions.",
       "replacement_plan": "Upgrade hiqlite and crypto dependencies when upstream crypto-family ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
@@ -408,8 +408,17 @@
       "crate": "constant_time_eq",
       "owner": "metadata",
       "expires_on": "2026-08-31",
-      "reason": "The sebadob/hiqlite metadata backend introduces constant_time_eq versions alongside existing crypto/storage transitive dependencies.",
+      "reason": "The pinned mrchypark/hiqlite metadata backend introduces constant_time_eq versions alongside existing crypto/storage transitive dependencies.",
       "replacement_plan": "Upgrade hiqlite and crypto/storage dependencies when upstream ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "fs4",
+      "owner": "state",
+      "expires_on": "2026-08-31",
+      "reason": "The current SlateDB/object-store and metadata dependency graph introduces fs4 versions from multiple storage stacks while upstream ranges converge.",
+      "replacement_plan": "Upgrade SlateDB, object_store, and metadata dependencies when their fs4 dependency ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
@@ -426,7 +435,7 @@
       "crate": "reqwest",
       "owner": "metadata",
       "expires_on": "2026-08-31",
-      "reason": "The sebadob/hiqlite metadata backend introduces a reqwest line alongside the existing HTTP client graph.",
+      "reason": "The pinned mrchypark/hiqlite metadata backend introduces a reqwest line alongside the existing HTTP client graph.",
       "replacement_plan": "Upgrade hiqlite and HTTP client dependencies when upstream reqwest ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
@@ -435,7 +444,7 @@
       "crate": "rustls-platform-verifier",
       "owner": "metadata",
       "expires_on": "2026-08-31",
-      "reason": "The sebadob/hiqlite metadata backend and existing TLS clients introduce multiple rustls-platform-verifier lines while upstream TLS ranges converge.",
+      "reason": "The pinned mrchypark/hiqlite metadata backend and existing TLS clients introduce multiple rustls-platform-verifier lines while upstream TLS ranges converge.",
       "replacement_plan": "Upgrade hiqlite and TLS dependencies when upstream rustls-platform-verifier ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
@@ -444,7 +453,7 @@
       "crate": "sha2",
       "owner": "metadata",
       "expires_on": "2026-08-31",
-      "reason": "The sebadob/hiqlite metadata backend introduces a sha2 line alongside existing hashing dependencies.",
+      "reason": "The pinned mrchypark/hiqlite metadata backend introduces a sha2 line alongside existing hashing dependencies.",
       "replacement_plan": "Upgrade hiqlite and hashing dependencies when upstream sha2 ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
@@ -453,7 +462,7 @@
       "crate": "untrusted",
       "owner": "metadata",
       "expires_on": "2026-08-31",
-      "reason": "The sebadob/hiqlite metadata backend and existing rustls/ring graph introduce multiple untrusted versions while TLS dependencies converge.",
+      "reason": "The pinned mrchypark/hiqlite metadata backend and existing rustls/ring graph introduce multiple untrusted versions while TLS dependencies converge.",
       "replacement_plan": "Upgrade hiqlite and TLS dependencies when upstream untrusted ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
@@ -462,7 +471,7 @@
       "crate": "cookie",
       "owner": "metadata",
       "expires_on": "2026-08-31",
-      "reason": "The sebadob/hiqlite full client feature set must match the server stream API and introduces axum-extra/cookie alongside existing HTTP transitive dependencies.",
+      "reason": "The pinned mrchypark/hiqlite full client feature set must match the server stream API and introduces axum-extra/cookie alongside existing HTTP transitive dependencies.",
       "replacement_plan": "Upgrade hiqlite and HTTP dependencies, or switch to upstream hiqlite, when the cookie dependency ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
@@ -480,7 +489,7 @@
       "crate": "phf",
       "owner": "metadata",
       "expires_on": "2026-08-31",
-      "reason": "The sebadob/hiqlite full client feature set must match the server stream API and introduces server-side transitive dependencies that carry phf alongside existing parsers.",
+      "reason": "The pinned mrchypark/hiqlite full client feature set must match the server stream API and introduces server-side transitive dependencies that carry phf alongside existing parsers.",
       "replacement_plan": "Upgrade hiqlite and parser/HTTP dependencies when upstream phf dependency ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
@@ -489,7 +498,7 @@
       "crate": "phf_shared",
       "owner": "metadata",
       "expires_on": "2026-08-31",
-      "reason": "The sebadob/hiqlite full client feature set must match the server stream API and follows the phf duplicate introduced by server-compatible features.",
+      "reason": "The pinned mrchypark/hiqlite full client feature set must match the server stream API and follows the phf duplicate introduced by server-compatible features.",
       "replacement_plan": "Upgrade alongside phf when upstream dependency ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
@@ -498,7 +507,7 @@
       "crate": "serde_spanned",
       "owner": "metadata",
       "expires_on": "2026-08-31",
-      "reason": "The sebadob/hiqlite full client feature set must match the server stream API and introduces toml 1.x dependencies alongside existing toml 0.8 users.",
+      "reason": "The pinned mrchypark/hiqlite full client feature set must match the server stream API and introduces toml 1.x dependencies alongside existing toml 0.8 users.",
       "replacement_plan": "Upgrade hiqlite and toml/figment users when their dependency ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
@@ -507,7 +516,7 @@
       "crate": "toml",
       "owner": "metadata",
       "expires_on": "2026-08-31",
-      "reason": "The sebadob/hiqlite full client feature set must match the server stream API and introduces toml 1.x alongside existing toml 0.8 users.",
+      "reason": "The pinned mrchypark/hiqlite full client feature set must match the server stream API and introduces toml 1.x alongside existing toml 0.8 users.",
       "replacement_plan": "Upgrade hiqlite and toml/figment users when their dependency ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
@@ -516,7 +525,7 @@
       "crate": "toml_datetime",
       "owner": "metadata",
       "expires_on": "2026-08-31",
-      "reason": "The sebadob/hiqlite full client feature set must match the server stream API and follows the toml duplicate introduced by server-compatible features.",
+      "reason": "The pinned mrchypark/hiqlite full client feature set must match the server stream API and follows the toml duplicate introduced by server-compatible features.",
       "replacement_plan": "Upgrade alongside toml when upstream dependency ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },

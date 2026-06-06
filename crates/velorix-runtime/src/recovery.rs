@@ -74,7 +74,7 @@ enum IncrementalEngineBackendSelection {
 enum RuntimeIncrementalEngine {
     Prototype(PrototypeIncrementalEngine),
     #[cfg(feature = "dbsp-runtime")]
-    Dbsp(DbspSingleKeySumCountEngine),
+    Dbsp(Box<DbspSingleKeySumCountEngine>),
 }
 
 impl RuntimeIncrementalEngine {
@@ -91,7 +91,7 @@ impl RuntimeIncrementalEngine {
                 validate_dbsp_runtime_catalog_scope(relation_catalog, aggregate_value_mode)?;
                 #[cfg(feature = "dbsp-runtime")]
                 {
-                    Ok(Self::Dbsp(DbspSingleKeySumCountEngine::new()))
+                    Ok(Self::Dbsp(Box::new(DbspSingleKeySumCountEngine::new())))
                 }
                 #[cfg(not(feature = "dbsp-runtime"))]
                 {
@@ -121,9 +121,9 @@ impl RuntimeIncrementalEngine {
                 validate_dbsp_runtime_catalog_scope(relation_catalog, aggregate_value_mode)?;
                 #[cfg(feature = "dbsp-runtime")]
                 {
-                    Ok(Self::Dbsp(DbspSingleKeySumCountEngine::from_checkpoint(
-                        checkpoint,
-                    )?))
+                    Ok(Self::Dbsp(Box::new(
+                        DbspSingleKeySumCountEngine::from_checkpoint(checkpoint)?,
+                    )))
                 }
                 #[cfg(not(feature = "dbsp-runtime"))]
                 {

@@ -2823,7 +2823,7 @@ fn validate_hiqlite_backend_time_failover_evidence(
         )?;
     }
     let smoke_observed_failover =
-        require_json_u64(&failover_path, &failover, "/observed_failover_ms")?;
+        require_json_u64(failover_path, failover, "/observed_failover_ms")?;
     if smoke_observed_failover != observed_failover {
         bail!(
             "{} standing-runtime failover smoke observed_failover_ms does not match backend-time attestation",
@@ -17495,7 +17495,7 @@ mod tests {
             "transport_security": "cluster-private-mtls",
             "backup_restore_configured": true,
             "image_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-            "source_revision": "sebadob/hiqlite@abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "source_revision": "mrchypark/hiqlite@b1dbcb3572558ac1fc09cc1eac080a5578600452",
             "no_pvc_evidence_files": {
                 "namespace_pvc_list": "no-pvc-namespace.json",
                 "hiqlite_statefulset": "no-pvc-hiqlite-statefulset.json",
@@ -17643,7 +17643,7 @@ mod tests {
                     "transport_security": "cluster-private-mtls",
                     "backup_restore_configured": true,
                     "image_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-                    "source_revision": "sebadob/hiqlite@abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                    "source_revision": "mrchypark/hiqlite@b1dbcb3572558ac1fc09cc1eac080a5578600452",
                     "no_pvc_evidence_files": {
                         "namespace_pvc_list": "no-pvc-namespace.json",
                         "hiqlite_statefulset": "no-pvc-hiqlite-statefulset.json",

@@ -862,7 +862,7 @@ fn generic_catalog_incremental_input_accepts_decimal128_primary_key_as_canonical
             0_i128,
             12_i128,
             -12_i128,
-            1_234_00_i128,
+            123_400_i128,
         ],
         &[500, 125, 0, 12, -12, 123],
         &[1, -1, 1, 1, 1, 1],

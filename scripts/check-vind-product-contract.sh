@@ -1459,7 +1459,10 @@ checks = {
         and 'git -C "$hiqlite_local_source_dir" rev-parse --short HEAD' in script
         and 'git -C "$hiqlite_local_source_dir" status --porcelain' in script
         and 'hiqlite_source_dirty="+dirty"' in script
+        and '"source_revision": "mrchypark/hiqlite@b1dbcb3572558ac1fc09cc1eac080a5578600452"' in cli
         and '"source_revision": "sebadob/hiqlite@3e2112c"' not in script
+        and '"source_revision": "sebadob/hiqlite@abcdefabcdefabcdefabcdefabcdefabcdefabcd"'
+        not in cli
     ),
     "release readiness treats Feldera artifact hash as optional diagnostic": (
         "release gate requires inputs.feldera-spec-path" not in release_gate

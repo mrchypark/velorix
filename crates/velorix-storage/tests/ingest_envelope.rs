@@ -1033,7 +1033,7 @@ async fn process_local_coordinated_catalog_admission_rejects_one_concurrent_over
     });
 
     start.wait().await;
-    let outcomes = vec![
+    let outcomes = [
         first_task.await.unwrap().unwrap(),
         overlapping_task.await.unwrap().unwrap(),
     ];

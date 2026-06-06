@@ -388,7 +388,8 @@ Velorix keeps role-specific images as the product default:
   for diagnostics.
 
 Velorix now pins `crates/velorix-meta` to the `mrchypark/hiqlite` fork commit
-that carries the required Raft-serialized timestamp API. Product runs must
+`b1dbcb3572558ac1fc09cc1eac080a5578600452`, which carries the required
+Raft-serialized timestamp API. Product runs must
 continue to verify that the resolved package exposes
 `txn_with_raft_serialized_timestamp` and `Param::raft_serialized_unix_ms()`
 before treating it as the authority-time source. After `sebadob/hiqlite`

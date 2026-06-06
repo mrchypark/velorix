@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
@@ -753,7 +755,7 @@ pub(crate) fn production_relation_catalog_registry(
 ) -> Result<RelationCatalogRegistry, PersistedTableError> {
     let profile = startup_capabilities
         .validate_namespace(AuthoritativeNamespace::RelationCatalog)
-        .map_err(|source| StorageRegistryError::ObjectStoreCapabilities(source))?;
+        .map_err(StorageRegistryError::ObjectStoreCapabilities)?;
 
     RelationCatalogRegistry::new_checked(relation_catalog_store, profile).map_err(|source| {
         StorageRegistryError::ObjectStoreCapabilities(

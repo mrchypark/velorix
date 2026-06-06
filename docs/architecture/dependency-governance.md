@@ -35,13 +35,13 @@ artifact and is not a release blocker.
 
 The manifest records the declared MSRV policy and requires package review
 records for the high-risk production dependency subjects that shape Velorix's
-database boundary: DataFusion, object storage, Kubernetes, SlateDB, Foyer, and
-Hiqlite, and Feldera artifacts. The `sebadob/hiqlite` git source is explicitly
-allowed in `deny.toml` for the planned upstream-main bridge after the required
-metadata-backend authority-time API is visible there and before a release carries
-that support. Each package review names an owner, review date, local audit
-status, feature policy, and replacement plan. This is the required local audit
-workflow for the release gate.
+database boundary: DataFusion, object storage, Kubernetes, SlateDB, Foyer,
+Hiqlite, and Feldera artifacts. The `mrchypark/hiqlite` git source is explicitly
+allowed in `deny.toml` while Velorix uses the pinned fork-main commit that carries
+the required metadata-backend authority-time API before an upstream release
+carries that support. Each package review names an owner, review date, local
+audit status, feature policy, and replacement plan. This is the required local
+audit workflow for the release gate.
 
 Every declared duplicate, unmaintained, or advisory exception must also name an
 owner, expiry date, reason, replacement plan, and promotion rule. Expired

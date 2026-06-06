@@ -31,6 +31,8 @@ const INGEST_ADMISSION_INDEX_TRANSITION_RECORD_KIND_V1: &str =
     "ingest_admission_index_transition_v1";
 const INGEST_ADMISSION_INDEX_MAX_ADVANCES: usize = 10_000;
 
+type AdmissionLockMap = HashMap<(String, u32), Arc<AsyncMutex<()>>>;
+
 #[derive(Clone, Debug)]
 pub struct IngestLog {
     store: Arc<dyn ObjectStore>,
@@ -54,7 +56,7 @@ struct AdmissionSerializationGuard {
 pub struct IngestAdmissionCoordinator {
     log: IngestLog,
     durable_admission: DurableIngestAdmission,
-    admission_locks: Arc<Mutex<HashMap<(String, u32), Arc<AsyncMutex<()>>>>>,
+    admission_locks: Arc<Mutex<AdmissionLockMap>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -725,6 +727,10 @@ impl DurableIngestAdmission {
 }
 
 impl DurableIngestAdmission {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Expiry decisions mirror the durable admission identity plus operator audit fields."
+    )]
     async fn expire_orphan_admission(
         &self,
         stream_id: &str,
@@ -808,6 +814,10 @@ impl DurableIngestAdmission {
 }
 
 impl DurableIngestAdmissionRecordV1 {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Admission records are constructed from explicit durable identity and catalog fields."
+    )]
     pub fn for_external_admission(
         stream_id: impl Into<String>,
         partition_id: u32,
@@ -1426,6 +1436,10 @@ impl IngestAdmissionCoordinator {
         })
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Coordinator expiry API keeps the durable admission identity explicit at call sites."
+    )]
     pub async fn expire_orphan_admission(
         &self,
         stream_id: &str,

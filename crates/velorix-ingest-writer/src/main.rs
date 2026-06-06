@@ -1724,13 +1724,13 @@ fn lease_grant_evidence(grant: &PartitionLeaseGrant) -> LeaseGrantEvidenceV1 {
 }
 
 fn unix_ms() -> anyhow::Result<u64> {
-    Ok(u64::try_from(
+    u64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .with_context(|| "system clock is before Unix epoch")?
             .as_millis(),
     )
-    .with_context(|| "current Unix timestamp does not fit in u64 milliseconds")?)
+    .with_context(|| "current Unix timestamp does not fit in u64 milliseconds")
 }
 
 fn encode_default_scores_payload(

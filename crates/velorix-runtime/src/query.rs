@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use std::sync::Arc;
 
 use arrow::{
@@ -401,9 +403,7 @@ async fn collect_recovered_materialized_view_as_table_with_bindings(
         })
         .await?;
 
-    collect_with_policy(dataframe, policy, limits)
-        .await
-        .map_err(Into::into)
+    collect_with_policy(dataframe, policy, limits).await
 }
 
 async fn validate_materialized_table_query_with_bindings_and_policy(

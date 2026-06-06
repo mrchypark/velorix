@@ -2556,7 +2556,7 @@ async fn ingest_rows(
             start_offset_inclusive: request.start_offset_inclusive,
             end_offset_exclusive,
         },
-        &[batch.clone()],
+        std::slice::from_ref(&batch),
     )
     .map_err(ApiError::bad_request)?;
     ensure_standing_runtimes_for_ingest(&state, &request).await?;
@@ -2715,11 +2715,7 @@ async fn apply_standing_runtime_ingest(
             .as_ref()
             .map(|record| record.replay_checkpoints.as_slice())
             .unwrap_or(&[]);
-        if let Err(error) =
-            replay_committed_ingest_into_standing_runtime(state, &active, replay_checkpoints).await
-        {
-            return Err(error);
-        }
+        replay_committed_ingest_into_standing_runtime(state, &active, replay_checkpoints).await?;
     }
 
     Ok(())
@@ -4052,9 +4048,7 @@ fn arrow_data_type_from_sql_data_type(data_type: &SqlDataType) -> Result<DataTyp
         SqlDataType::Int64 => Ok(DataType::Int64),
         SqlDataType::Float64 => Ok(DataType::Float64),
         SqlDataType::Decimal { precision, scale } => Ok(DataType::Decimal128(
-            (*precision).try_into().map_err(|_| {
-                ApiError::bad_request("decimal precision does not fit Arrow Decimal128")
-            })?,
+            *precision,
             (*scale).try_into().map_err(|_| {
                 ApiError::bad_request("decimal scale does not fit Arrow Decimal128")
             })?,
@@ -5221,6 +5215,10 @@ fn active_view_response(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The API response helper combines the durable view record with resolved runtime metadata."
+)]
 fn view_response(
     spec: &StandingViewSpec,
     spec_hash: String,
@@ -5841,20 +5839,18 @@ fn meta_error_to_api(error: MetaStoreError) -> ApiError {
 
 fn materialized_view_registry_error_to_api(error: MaterializedViewRegistryError) -> ApiError {
     match error {
-        MaterializedViewRegistryError::InvalidExecutionMode { view_id, reason }
-            if reason == InvalidExecutionModeReason::StandingRuntimeMissingIdentity =>
-        {
-            ApiError::conflict(format!(
-                "artifact-backed view `{view_id}` is missing standing runtime identity"
-            ))
-        }
-        MaterializedViewRegistryError::InvalidExecutionMode { view_id, reason }
-            if reason == InvalidExecutionModeReason::StandingRuntimeMissingArtifact =>
-        {
-            ApiError::conflict(format!(
-                "standing runtime view `{view_id}` is missing artifact binding"
-            ))
-        }
+        MaterializedViewRegistryError::InvalidExecutionMode {
+            view_id,
+            reason: InvalidExecutionModeReason::StandingRuntimeMissingIdentity,
+        } => ApiError::conflict(format!(
+            "artifact-backed view `{view_id}` is missing standing runtime identity"
+        )),
+        MaterializedViewRegistryError::InvalidExecutionMode {
+            view_id,
+            reason: InvalidExecutionModeReason::StandingRuntimeMissingArtifact,
+        } => ApiError::conflict(format!(
+            "standing runtime view `{view_id}` is missing artifact binding"
+        )),
         error @ (MaterializedViewRegistryError::RecordConflict { .. }
         | MaterializedViewRegistryError::ActiveRecordConflict { .. }
         | MaterializedViewRegistryError::InvalidExecutionMode { .. }

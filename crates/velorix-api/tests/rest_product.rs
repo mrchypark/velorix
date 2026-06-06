@@ -933,13 +933,10 @@ async fn rest_product_creates_view_and_queries_view_materialized_state() {
         .starts_with(velorix_core::feldera_artifact::FELDERA_SPEC_HASH_PREFIX));
     assert_eq!(view.1["description"], "Score totals by user");
     assert_eq!(view.1["request"][0]["fieldName"], "user_id");
-    assert_eq!(
-        view.1["sql_template"]
-            .as_str()
-            .unwrap()
-            .contains("context.params.user_id"),
-        true
-    );
+    assert!(view.1["sql_template"]
+        .as_str()
+        .unwrap()
+        .contains("context.params.user_id"));
     assert_eq!(view.1["response_schema"]["columns"][0]["name"], "user_id");
 
     let catalog = request_json(app.clone(), Method::GET, "/v1/views", None).await;

@@ -350,21 +350,24 @@ impl MetaStore for InMemoryMetaStore {
     async fn read_meta_store_capabilities(&self) -> Result<MetaStoreCapabilities, MetaStoreError> {
         Ok(MetaStoreCapabilities {
             standing_runtime_fencing: standing_runtime_fencing_capability(
-                "in-memory",
-                true,
-                false,
-                false,
-                STANDING_RUNTIME_BACKEND_TIME_SOURCE_PROCESS_CLOCK,
-                "in_memory_process_clock_not_backend_authority",
-                STANDING_RUNTIME_LEASE_AUTHORITY_KIND_PROCESS_LOCAL,
-                STANDING_RUNTIME_LEASE_EXPIRY_SEMANTICS_PROCESS_CLOCK_TTL,
-                false,
-                true,
-                true,
-                true,
-                true,
-                true,
-                false,
+                StandingRuntimeFencingCapabilityInput {
+                    backend_name: "in-memory",
+                    linearizable_owner_lease: true,
+                    durable_monotonic_owner_epoch: false,
+                    authoritative_backend_time: false,
+                    backend_time_source_kind: STANDING_RUNTIME_BACKEND_TIME_SOURCE_PROCESS_CLOCK,
+                    backend_time_blocked_reason: "in_memory_process_clock_not_backend_authority",
+                    lease_authority_kind: STANDING_RUNTIME_LEASE_AUTHORITY_KIND_PROCESS_LOCAL,
+                    lease_expiry_semantics:
+                        STANDING_RUNTIME_LEASE_EXPIRY_SEMANTICS_PROCESS_CLOCK_TTL,
+                    bounded_wall_clock_failover: false,
+                    owner_validated_checkpoint_publish: true,
+                    publish_checks_owner_and_latest_atomically: true,
+                    publish_rejects_expired_owner: true,
+                    latest_read_linearizable: true,
+                    publish_rejects_scope_mismatch: true,
+                    control_plane_auth_enforced: false,
+                },
             ),
         })
     }
@@ -582,21 +585,24 @@ impl MetaStore for OssMetaStore {
     async fn read_meta_store_capabilities(&self) -> Result<MetaStoreCapabilities, MetaStoreError> {
         Ok(MetaStoreCapabilities {
             standing_runtime_fencing: standing_runtime_fencing_capability(
-                "oss",
-                false,
-                false,
-                false,
-                STANDING_RUNTIME_BACKEND_TIME_SOURCE_UNAVAILABLE,
-                "oss_backend_has_no_standing_runtime_lease_authority",
-                STANDING_RUNTIME_LEASE_AUTHORITY_KIND_NONE,
-                STANDING_RUNTIME_LEASE_EXPIRY_SEMANTICS_UNAVAILABLE,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
+                StandingRuntimeFencingCapabilityInput {
+                    backend_name: "oss",
+                    linearizable_owner_lease: false,
+                    durable_monotonic_owner_epoch: false,
+                    authoritative_backend_time: false,
+                    backend_time_source_kind: STANDING_RUNTIME_BACKEND_TIME_SOURCE_UNAVAILABLE,
+                    backend_time_blocked_reason:
+                        "oss_backend_has_no_standing_runtime_lease_authority",
+                    lease_authority_kind: STANDING_RUNTIME_LEASE_AUTHORITY_KIND_NONE,
+                    lease_expiry_semantics: STANDING_RUNTIME_LEASE_EXPIRY_SEMANTICS_UNAVAILABLE,
+                    bounded_wall_clock_failover: false,
+                    owner_validated_checkpoint_publish: false,
+                    publish_checks_owner_and_latest_atomically: false,
+                    publish_rejects_expired_owner: false,
+                    latest_read_linearizable: false,
+                    publish_rejects_scope_mismatch: false,
+                    control_plane_auth_enforced: false,
+                },
             ),
         })
     }
@@ -871,15 +877,15 @@ fn validate_current_standing_runtime_owner(
     Ok(())
 }
 
-fn standing_runtime_fencing_capability(
-    backend_name: impl Into<String>,
+struct StandingRuntimeFencingCapabilityInput {
+    backend_name: &'static str,
     linearizable_owner_lease: bool,
     durable_monotonic_owner_epoch: bool,
     authoritative_backend_time: bool,
-    backend_time_source_kind: impl Into<String>,
-    backend_time_blocked_reason: impl Into<String>,
-    lease_authority_kind: impl Into<String>,
-    lease_expiry_semantics: impl Into<String>,
+    backend_time_source_kind: &'static str,
+    backend_time_blocked_reason: &'static str,
+    lease_authority_kind: &'static str,
+    lease_expiry_semantics: &'static str,
     bounded_wall_clock_failover: bool,
     owner_validated_checkpoint_publish: bool,
     publish_checks_owner_and_latest_atomically: bool,
@@ -887,39 +893,45 @@ fn standing_runtime_fencing_capability(
     latest_read_linearizable: bool,
     publish_rejects_scope_mismatch: bool,
     control_plane_auth_enforced: bool,
+}
+
+fn standing_runtime_fencing_capability(
+    input: StandingRuntimeFencingCapabilityInput,
 ) -> StandingRuntimeFencingCapability {
-    let multi_writer_fencing_safe = linearizable_owner_lease
-        && durable_monotonic_owner_epoch
-        && owner_validated_checkpoint_publish
-        && publish_checks_owner_and_latest_atomically
-        && publish_rejects_expired_owner
-        && latest_read_linearizable
-        && publish_rejects_scope_mismatch
-        && control_plane_auth_enforced;
-    let production_bounded_failover_safe =
-        multi_writer_fencing_safe && authoritative_backend_time && bounded_wall_clock_failover;
+    let multi_writer_fencing_safe = input.linearizable_owner_lease
+        && input.durable_monotonic_owner_epoch
+        && input.owner_validated_checkpoint_publish
+        && input.publish_checks_owner_and_latest_atomically
+        && input.publish_rejects_expired_owner
+        && input.latest_read_linearizable
+        && input.publish_rejects_scope_mismatch
+        && input.control_plane_auth_enforced;
+    let production_bounded_failover_safe = multi_writer_fencing_safe
+        && input.authoritative_backend_time
+        && input.bounded_wall_clock_failover;
     let production_multi_writer_safe = production_bounded_failover_safe;
     StandingRuntimeFencingCapability {
         capability_schema_version: STANDING_RUNTIME_FENCING_CAPABILITY_SCHEMA_VERSION,
-        backend_name: backend_name.into(),
+        backend_name: input.backend_name.to_string(),
         owner_scope_kind: STANDING_RUNTIME_OWNER_SCOPE_KIND_TENANT_PROGRAM_VIEW.to_string(),
-        linearizable_owner_lease,
-        durable_monotonic_owner_epoch,
-        authoritative_backend_time,
-        owner_validated_checkpoint_publish,
-        publish_checks_owner_and_latest_atomically,
-        publish_rejects_expired_owner,
-        latest_read_linearizable,
-        publish_rejects_scope_mismatch,
+        linearizable_owner_lease: input.linearizable_owner_lease,
+        durable_monotonic_owner_epoch: input.durable_monotonic_owner_epoch,
+        authoritative_backend_time: input.authoritative_backend_time,
+        owner_validated_checkpoint_publish: input.owner_validated_checkpoint_publish,
+        publish_checks_owner_and_latest_atomically: input
+            .publish_checks_owner_and_latest_atomically,
+        publish_rejects_expired_owner: input.publish_rejects_expired_owner,
+        latest_read_linearizable: input.latest_read_linearizable,
+        publish_rejects_scope_mismatch: input.publish_rejects_scope_mismatch,
         max_owner_ttl_ms: MAX_STANDING_RUNTIME_OWNER_TTL_MS,
-        control_plane_auth_enforced,
+        control_plane_auth_enforced: input.control_plane_auth_enforced,
         production_multi_writer_safe,
-        backend_time_source_kind: backend_time_source_kind.into(),
-        backend_time_blocked_reason: backend_time_blocked_reason.into(),
-        lease_authority_kind: lease_authority_kind.into(),
-        lease_expiry_semantics: lease_expiry_semantics.into(),
-        bounded_wall_clock_failover,
-        failover_time_bound_ms: if bounded_wall_clock_failover {
+        backend_time_source_kind: input.backend_time_source_kind.to_string(),
+        backend_time_blocked_reason: input.backend_time_blocked_reason.to_string(),
+        lease_authority_kind: input.lease_authority_kind.to_string(),
+        lease_expiry_semantics: input.lease_expiry_semantics.to_string(),
+        bounded_wall_clock_failover: input.bounded_wall_clock_failover,
+        failover_time_bound_ms: if input.bounded_wall_clock_failover {
             MAX_STANDING_RUNTIME_OWNER_TTL_MS
         } else {
             0
@@ -954,23 +966,23 @@ fn hiqlite_standing_runtime_fencing_capability(
 ) -> StandingRuntimeFencingCapability {
     // Hiqlite owner expiry and checkpoint publish consume the Raft-serialized
     // Unix timestamp inside the same Raft write transaction.
-    standing_runtime_fencing_capability(
-        "hiqlite",
-        true,
-        true,
-        true,
-        STANDING_RUNTIME_BACKEND_TIME_SOURCE_RAFT_REPLICATED,
-        "",
-        STANDING_RUNTIME_LEASE_AUTHORITY_KIND_RAFT_REPLICATED_TIME,
-        STANDING_RUNTIME_LEASE_EXPIRY_SEMANTICS_BACKEND_WALL_CLOCK_TTL,
-        true,
-        true,
-        true,
-        true,
-        true,
-        true,
+    standing_runtime_fencing_capability(StandingRuntimeFencingCapabilityInput {
+        backend_name: "hiqlite",
+        linearizable_owner_lease: true,
+        durable_monotonic_owner_epoch: true,
+        authoritative_backend_time: true,
+        backend_time_source_kind: STANDING_RUNTIME_BACKEND_TIME_SOURCE_RAFT_REPLICATED,
+        backend_time_blocked_reason: "",
+        lease_authority_kind: STANDING_RUNTIME_LEASE_AUTHORITY_KIND_RAFT_REPLICATED_TIME,
+        lease_expiry_semantics: STANDING_RUNTIME_LEASE_EXPIRY_SEMANTICS_BACKEND_WALL_CLOCK_TTL,
+        bounded_wall_clock_failover: true,
+        owner_validated_checkpoint_publish: true,
+        publish_checks_owner_and_latest_atomically: true,
+        publish_rejects_expired_owner: true,
+        latest_read_linearizable: true,
+        publish_rejects_scope_mismatch: true,
         control_plane_auth_enforced,
-    )
+    })
 }
 
 fn unix_time_ms() -> Result<u64, MetaStoreError> {

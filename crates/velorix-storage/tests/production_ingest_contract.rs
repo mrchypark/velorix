@@ -618,7 +618,7 @@ fn current_function_previous_lines<'a>(
     lines[..line_number]
         .iter()
         .rev()
-        .map(|line| *line)
+        .copied()
         .take_while(|line| !is_function_signature(line))
 }
 

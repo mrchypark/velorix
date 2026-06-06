@@ -19,13 +19,19 @@ with open(doc_path, "r", encoding="utf-8") as f:
     doc = f.read()
 
 checks = {
-    "workflow requires Feldera input dispatch fields": (
+    "workflow declares optional Feldera input dispatch fields": (
         "feldera-spec-path:" in workflow
         and "feldera-metadata-path:" in workflow
         and "feldera-artifact-package-path:" in workflow
-        and "release gate requires inputs.feldera-spec-path" in workflow
-        and "release gate requires inputs.feldera-metadata-path" in workflow
-        and "release gate requires inputs.feldera-artifact-package-path" in workflow
+    ),
+    "workflow keeps Feldera artifact hash inputs optional": (
+        "release gate requires inputs.feldera-spec-path" not in workflow
+        and "release gate requires inputs.feldera-metadata-path" not in workflow
+        and "release gate requires inputs.feldera-artifact-package-path" not in workflow
+        and "Feldera artifact hash verification is optional, but requires all three inputs when enabled"
+        in workflow
+        and "${{ inputs.feldera-spec-path != '' || inputs.feldera-metadata-path != '' || inputs.feldera-artifact-package-path != '' }}"
+        in workflow
     ),
     "workflow maps Feldera input env vars": (
         "FELDERA_SPEC_PATH: ${{ inputs.feldera-spec-path }}" in workflow
@@ -61,6 +67,11 @@ checks = {
         and "> target/release-evidence/feldera-artifact-hash.json" in workflow
     ),
     "workflow passes hash evidence to readiness report": (
+        "FELDERA_READINESS_ARGS=()" in workflow
+        and 'if [ -f target/release-evidence/feldera-artifact-hash.json ]; then'
+        in workflow
+        and '"${FELDERA_READINESS_ARGS[@]}"' in workflow
+        and
         "--feldera-artifact-hash-evidence target/release-evidence/feldera-artifact-hash.json"
         in workflow
     ),

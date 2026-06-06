@@ -13,7 +13,7 @@ async-trait = { workspace = true }
 # Pin the fork commit that contains Raft-serialized timestamp transactions.
 # The remote client and standalone server must compile the same streaming API
 # enum shape. The server image uses `--features server`, which enables `full`.
-hiqlite = { git = "https://github.com/mrchypark/hiqlite.git", rev = "5f5e83ea85ece9cf4592d9836ad23245f06d7ee2", package = "hiqlite", default-features = false, features = ["full"], optional = true }
+hiqlite = { git = "https://github.com/mrchypark/hiqlite.git", rev = "b1dbcb3572558ac1fc09cc1eac080a5578600452", package = "hiqlite", default-features = false, features = ["full"], optional = true }
 object_store = { workspace = true, features = ["aws"] }
 prost = { workspace = true }
 serde = { workspace = true }
@@ -26,10 +26,11 @@ velorix-core = { path = "../velorix-core" }
 velorix-storage = { path = "../velorix-storage" }
 
 # Durable backend target:
-# Use the pinned fork commit until sebadob/hiqlite includes the same
-# Raft-serialized timestamp API in a release, then switch to that release.
+# Use mrchypark/hiqlite at b1dbcb3572558ac1fc09cc1eac080a5578600452 until
+# sebadob/hiqlite includes the same Raft-serialized timestamp API in a release.
 
 [build-dependencies]
+protoc-bin-vendored = { workspace = true }
 tonic-prost-build = { workspace = true }
 
 [dev-dependencies]
