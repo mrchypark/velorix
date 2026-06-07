@@ -1,5 +1,6 @@
+use serde_json::json;
 use velorix_core::{
-    dbsp_view_plan::{validate_supported_dbsp_view_sql, DbspViewPlanError},
+    dbsp_view_plan::{validate_supported_dbsp_view_sql, DbspPredicateOp, DbspViewPlanError},
     relation::{
         ArrowPhysicalTypeV1, DataFusionRegistrationModeV1, DataFusionRegistrationV1,
         FelderaRelationBindingV1, IncrementalAdapterBindingV1, RelationColumnV1,
@@ -22,28 +23,97 @@ fn supported_dbsp_view_sql_accepts_catalog_backed_sum_count_shape() {
     assert_eq!(plan.input_relation_id, "scores");
     assert_eq!(plan.group_key_column_id, "user_id");
     assert_eq!(plan.sum_value_column_id, "score");
+    assert_eq!(plan.predicate, None);
 }
 
 #[test]
-fn supported_dbsp_view_sql_rejects_filter_until_predicate_execution_is_wired() {
+fn supported_dbsp_view_sql_accepts_single_literal_comparison_filter() {
+    let catalog = scores_catalog();
+
+    let plan = validate_supported_dbsp_view_sql(
+        "select user_id, sum(score) as sum, count(*) as count from scores where score > -1 group by user_id",
+        &catalog,
+    )
+    .unwrap();
+
+    let predicate = plan.predicate.unwrap();
+    assert_eq!(predicate.column_id, "score");
+    assert_eq!(predicate.op, DbspPredicateOp::Gt);
+    assert_eq!(predicate.literal, json!(-1));
+}
+
+#[test]
+fn supported_dbsp_view_sql_rejects_join_until_multi_input_runtime_is_wired() {
     let catalog = scores_catalog();
 
     let error = validate_supported_dbsp_view_sql(
-        "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id",
+        "select s.user_id, sum(s.score) as sum, count(*) as count from scores s join users u on s.user_id = u.user_id group by s.user_id",
         &catalog,
     )
     .unwrap_err();
 
-    assert!(
-        matches!(error, DbspViewPlanError::UnsupportedShape { .. }),
-        "unexpected error: {error}"
-    );
-    assert!(
-        error
-            .to_string()
-            .contains("only plain SELECT/FROM/GROUP BY sum/count views are supported"),
-        "unexpected error: {error}"
-    );
+    assert!(matches!(error, DbspViewPlanError::UnsupportedShape { .. }));
+    assert!(error.to_string().contains("joins are not supported"));
+}
+
+#[test]
+fn supported_dbsp_view_sql_rejects_filter_on_non_runtime_visible_column() {
+    let mut catalog = scores_catalog();
+    catalog.relation_schema.columns.push(RelationColumnV1 {
+        column_id: "status".to_string(),
+        name: "status".to_string(),
+        logical_type: VelorixLogicalTypeV1::Utf8,
+        physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+        nullable: false,
+        ordinal: 3,
+        semantic_role: RelationSemanticRoleV1::Metadata,
+    });
+    catalog.schema_fingerprint =
+        SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema).unwrap();
+    catalog.feldera_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
+
+    let error = validate_supported_dbsp_view_sql(
+        "select user_id, sum(score) as sum, count(*) as count from scores where status = 'paid' group by user_id",
+        &catalog,
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, DbspViewPlanError::UnsupportedShape { .. }));
+    assert!(error
+        .to_string()
+        .contains("WHERE column must be the primary key or value column"));
+}
+
+#[test]
+fn supported_dbsp_view_sql_rejects_filter_on_weight_column() {
+    let catalog = scores_catalog();
+
+    let error = validate_supported_dbsp_view_sql(
+        "select user_id, sum(score) as sum, count(*) as count from scores where delta = 1 group by user_id",
+        &catalog,
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, DbspViewPlanError::UnsupportedShape { .. }));
+    assert!(error
+        .to_string()
+        .contains("WHERE column must be the primary key or value column"));
+}
+
+#[test]
+fn supported_dbsp_view_sql_rejects_qualified_column_references_for_now() {
+    let catalog = scores_catalog();
+
+    let error = validate_supported_dbsp_view_sql(
+        "select s.user_id, sum(s.score) as sum, count(*) as count from scores as s group by s.user_id",
+        &catalog,
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, DbspViewPlanError::UnsupportedShape { .. }));
+    assert!(error
+        .to_string()
+        .contains("GROUP BY key must be the catalog primary key column"));
 }
 
 fn scores_catalog() -> VelorixRelationCatalogV1 {

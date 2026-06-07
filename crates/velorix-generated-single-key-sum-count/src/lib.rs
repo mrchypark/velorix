@@ -11,7 +11,10 @@ use arrow::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use velorix_core::{
-    delta::DeltaBatch,
+    dbsp_view_plan::{
+        validate_supported_dbsp_view_sql, DbspPredicateOp, DbspRowPredicate, SupportedDbspViewPlan,
+    },
+    delta::{DeltaBatch, DeltaRecord},
     engine::{
         AggregateValueMode, EngineCheckpointPayload, IncrementalEngine, LogicalEpoch,
         PrototypeIncrementalEngine,
@@ -51,6 +54,26 @@ pub fn create_standing_runtime(
     .map_err(|error| error.to_string())
 }
 
+pub fn create_standing_runtime_with_sql(
+    identity: &StandingProgramIdentity,
+    catalog: &VelorixRelationCatalogV1,
+    sql: &str,
+    input_schemas: &[RelationSchema],
+    output_schemas: &[RelationSchema],
+) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
+    let plan = validate_supported_dbsp_view_sql(sql, catalog).map_err(|error| error.to_string())?;
+    SingleKeySumCountGeneratedRuntime::new_with_plan(
+        identity.clone(),
+        catalog.clone(),
+        only_schema(input_schemas, "input_schemas").map_err(|error| error.to_string())?,
+        only_schema(output_schemas, "output_schemas").map_err(|error| error.to_string())?,
+        sql.to_string(),
+        plan,
+    )
+    .map(|runtime| Box::new(runtime) as Box<dyn StandingProgramRuntime + Send>)
+    .map_err(|error| error.to_string())
+}
+
 pub fn restore_standing_runtime(
     checkpoint: RuntimeCheckpoint,
 ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
@@ -65,6 +88,8 @@ pub struct SingleKeySumCountGeneratedRuntime {
     catalog: VelorixRelationCatalogV1,
     input_schema: RelationSchema,
     output_schema: RelationSchema,
+    view_sql: String,
+    plan: SupportedDbspViewPlan,
     engine: PrototypeIncrementalEngine,
     input_frontiers: Vec<RelationFrontier>,
     applied_epochs: BTreeMap<String, LogicalEpoch>,
@@ -77,6 +102,12 @@ struct GenericCheckpointPayload {
     catalog: VelorixRelationCatalogV1,
     input_schema: RelationSchema,
     output_schema: RelationSchema,
+    #[serde(default)]
+    view_sql: Option<String>,
+    #[serde(default)]
+    plan: Option<SupportedDbspViewPlan>,
+    #[serde(default)]
+    input_frontiers: Option<Vec<RelationFrontier>>,
     engine: EngineCheckpointPayload,
     applied_epochs: Vec<GenericAppliedEpoch>,
 }
@@ -95,15 +126,54 @@ impl SingleKeySumCountGeneratedRuntime {
         input_schema: RelationSchema,
         output_schema: RelationSchema,
     ) -> Result<Self, StandingProgramRuntimeError> {
+        let view_sql = default_sql_for_catalog(&catalog)?;
+        let plan = validate_supported_dbsp_view_sql(view_sql.as_str(), &catalog).map_err(|_| {
+            StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "generic_view_plan",
+            }
+        })?;
+        Self::new_with_plan(
+            identity,
+            catalog,
+            input_schema,
+            output_schema,
+            view_sql,
+            plan,
+        )
+    }
+
+    pub fn new_with_plan(
+        identity: StandingProgramIdentity,
+        catalog: VelorixRelationCatalogV1,
+        input_schema: RelationSchema,
+        output_schema: RelationSchema,
+        view_sql: String,
+        plan: SupportedDbspViewPlan,
+    ) -> Result<Self, StandingProgramRuntimeError> {
         identity.validate()?;
         validate_runtime_package(&identity)?;
+        validate_view_sql_hash(&identity, view_sql.as_str())?;
         validate_supported_schemas(&catalog, &input_schema, &output_schema)?;
+        let compiled_plan =
+            validate_supported_dbsp_view_sql(view_sql.as_str(), &catalog).map_err(|_| {
+                StandingProgramRuntimeError::InvalidProgramIdentity {
+                    field: "generic_view_plan",
+                }
+            })?;
+        if compiled_plan != plan {
+            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "generic_view_plan",
+            });
+        }
+        validate_plan_matches_catalog(&plan, &catalog)?;
         let value_mode = aggregate_value_mode_for_catalog(&catalog)?;
         Ok(Self {
             identity,
             catalog,
             input_schema,
             output_schema,
+            view_sql,
+            plan,
             engine: PrototypeIncrementalEngine::with_aggregate_value_mode(value_mode),
             input_frontiers: Vec::new(),
             applied_epochs: BTreeMap::new(),
@@ -167,6 +237,9 @@ impl SingleKeySumCountGeneratedRuntime {
             catalog: self.catalog.clone(),
             input_schema: self.input_schema.clone(),
             output_schema: self.output_schema.clone(),
+            view_sql: Some(self.view_sql.clone()),
+            plan: Some(self.plan.clone()),
+            input_frontiers: Some(self.input_frontiers.clone()),
             engine: self.engine.checkpoint_state().to_payload(),
             applied_epochs: self
                 .applied_epochs
@@ -285,6 +358,7 @@ impl StandingProgramRuntime for SingleKeySumCountGeneratedRuntime {
             .map_err(|_| StandingProgramRuntimeError::InvalidProgramIdentity {
                 field: "generic_input_batch",
             })?;
+            let delta = filter_delta_batch_for_plan(&delta, &self.plan, &self.catalog)?;
             combined = combined.combine(&delta);
             if let Some(frontier) = input_frontiers.iter_mut().find(|frontier| {
                 frontier.relation_id == input.relation_id
@@ -388,6 +462,32 @@ impl StandingProgramRuntime for SingleKeySumCountGeneratedRuntime {
             return Err(invalid_checkpoint());
         }
         let value_mode = aggregate_value_mode_for_catalog(&payload.catalog)?;
+        if let Some(payload_frontiers) = &payload.input_frontiers {
+            if payload_frontiers != &checkpoint.input_frontiers {
+                return Err(invalid_checkpoint());
+            }
+        }
+        let view_sql = match payload.view_sql {
+            Some(view_sql) => {
+                validate_view_sql_hash(&checkpoint.identity, view_sql.as_str())?;
+                view_sql
+            }
+            None => default_sql_for_catalog(&payload.catalog)?,
+        };
+        let plan = match payload.plan {
+            Some(plan) => {
+                let compiled =
+                    validate_supported_dbsp_view_sql(view_sql.as_str(), &payload.catalog)
+                        .map_err(|_| invalid_checkpoint())?;
+                if compiled != plan {
+                    return Err(invalid_checkpoint());
+                }
+                plan
+            }
+            None => validate_supported_dbsp_view_sql(view_sql.as_str(), &payload.catalog)
+                .map_err(|_| invalid_checkpoint())?,
+        };
+        validate_plan_matches_catalog(&plan, &payload.catalog)?;
         let engine = PrototypeIncrementalEngine::from_checkpoint_with_aggregate_value_mode(
             engine_checkpoint,
             value_mode,
@@ -398,6 +498,8 @@ impl StandingProgramRuntime for SingleKeySumCountGeneratedRuntime {
             catalog: payload.catalog,
             input_schema: payload.input_schema,
             output_schema: payload.output_schema,
+            view_sql,
+            plan,
             engine,
             input_frontiers: checkpoint.input_frontiers,
             applied_epochs: payload
@@ -509,6 +611,256 @@ fn validate_supported_schemas(
         });
     }
     Ok(())
+}
+
+fn validate_plan_matches_catalog(
+    plan: &SupportedDbspViewPlan,
+    catalog: &VelorixRelationCatalogV1,
+) -> Result<(), StandingProgramRuntimeError> {
+    if plan.input_relation_id != catalog.relation_schema.relation_id
+        || plan.group_key_column_id != catalog_primary_key_column(catalog)?.column_id
+        || plan.sum_value_column_id != aggregate_value_column(catalog)?.column_id
+    {
+        return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+            field: "generic_view_plan",
+        });
+    }
+    if let Some(predicate) = &plan.predicate {
+        let column = catalog_column(catalog, &predicate.column_id)?;
+        if column.column_id != catalog_primary_key_column(catalog)?.column_id
+            && column.column_id != aggregate_value_column(catalog)?.column_id
+        {
+            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "generic_view_plan.predicate.column",
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_view_sql_hash(
+    identity: &StandingProgramIdentity,
+    view_sql: &str,
+) -> Result<(), StandingProgramRuntimeError> {
+    let sql_hash = feldera_artifact_bytes_hash(view_sql.as_bytes());
+    if sql_hash == identity.sql_hash {
+        Ok(())
+    } else {
+        Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+            field: "generic_view_sql",
+        })
+    }
+}
+
+fn default_sql_for_catalog(
+    catalog: &VelorixRelationCatalogV1,
+) -> Result<String, StandingProgramRuntimeError> {
+    let key_column = catalog_primary_key_column(catalog)?;
+    let value_column = aggregate_value_column(catalog)?;
+    Ok(format!(
+        "select {}, sum({}) as sum, count(*) as count from {} group by {}",
+        key_column.name, value_column.name, catalog.datafusion_registration.name, key_column.name
+    ))
+}
+
+fn catalog_column<'a>(
+    catalog: &'a VelorixRelationCatalogV1,
+    column_id: &str,
+) -> Result<&'a velorix_core::relation::RelationColumnV1, StandingProgramRuntimeError> {
+    catalog
+        .relation_schema
+        .columns
+        .iter()
+        .find(|column| column.column_id == column_id)
+        .ok_or(StandingProgramRuntimeError::InvalidProgramIdentity {
+            field: "generic_view_plan.predicate",
+        })
+}
+
+fn predicate_matches_record(
+    predicate: &DbspRowPredicate,
+    catalog: &VelorixRelationCatalogV1,
+    record: &DeltaRecord,
+) -> Result<bool, StandingProgramRuntimeError> {
+    let column = catalog_column(catalog, &predicate.column_id)?;
+    let actual = if column.column_id == catalog_primary_key_column(catalog)?.column_id {
+        record.key.as_json()
+    } else if column.column_id == aggregate_value_column(catalog)?.column_id {
+        record.value.as_json()
+    } else {
+        return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+            field: "generic_view_plan.predicate.column",
+        });
+    };
+    compare_catalog_scalar(column, actual, predicate.op, &predicate.literal)
+}
+
+fn filter_delta_batch_for_plan(
+    delta: &DeltaBatch,
+    plan: &SupportedDbspViewPlan,
+    catalog: &VelorixRelationCatalogV1,
+) -> Result<DeltaBatch, StandingProgramRuntimeError> {
+    let Some(predicate) = &plan.predicate else {
+        return Ok(delta.clone());
+    };
+    let mut records = Vec::new();
+    for record in delta.records() {
+        if predicate_matches_record(predicate, catalog, record)? {
+            records.push(record.clone());
+        }
+    }
+    Ok(DeltaBatch::from_records(records))
+}
+
+fn compare_catalog_scalar(
+    column: &velorix_core::relation::RelationColumnV1,
+    actual: &Value,
+    op: DbspPredicateOp,
+    literal: &Value,
+) -> Result<bool, StandingProgramRuntimeError> {
+    match &column.physical_arrow_type {
+        ArrowPhysicalTypeV1::Int64
+        | ArrowPhysicalTypeV1::Date32
+        | ArrowPhysicalTypeV1::TimestampNanosecond { .. } => {
+            return Ok(compare_ord(
+                actual_i128(actual)?,
+                op,
+                literal_i128(literal)?,
+            ));
+        }
+        ArrowPhysicalTypeV1::Decimal128 { precision, scale } => {
+            let actual = decimal_value_i128(actual, *precision, *scale)?;
+            let expected = decimal_value_i128(literal, *precision, *scale)?;
+            return Ok(compare_ord(actual, op, expected));
+        }
+        ArrowPhysicalTypeV1::Float64 => {
+            return Ok(compare_ord(actual_f64(actual)?, op, literal_f64(literal)?));
+        }
+        _ => {}
+    }
+
+    match (actual, literal) {
+        (Value::Number(actual), Value::Number(expected)) => Ok(compare_ord(
+            actual.as_i64().ok_or_else(invalid_runtime_state)?,
+            op,
+            expected
+                .as_i64()
+                .ok_or(StandingProgramRuntimeError::InvalidProgramIdentity {
+                    field: "generic_view_plan.predicate.literal",
+                })?,
+        )),
+        (Value::String(actual), Value::String(expected)) => Ok(compare_ord(actual, op, expected)),
+        (Value::Bool(actual), Value::Bool(expected)) => Ok(match op {
+            DbspPredicateOp::Eq => actual == expected,
+            DbspPredicateOp::NotEq => actual != expected,
+            _ => {
+                return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                    field: "generic_view_plan.predicate.op",
+                })
+            }
+        }),
+        _ => Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+            field: "generic_view_plan.predicate.literal",
+        }),
+    }
+}
+
+fn actual_i128(value: &Value) -> Result<i128, StandingProgramRuntimeError> {
+    value
+        .as_i64()
+        .map(i128::from)
+        .ok_or_else(invalid_runtime_state)
+}
+
+fn literal_i128(value: &Value) -> Result<i128, StandingProgramRuntimeError> {
+    match value {
+        Value::Number(value) => value.as_i64().map(i128::from).ok_or(
+            StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "generic_view_plan.predicate.literal",
+            },
+        ),
+        Value::String(value) => {
+            value
+                .parse::<i128>()
+                .map_err(|_| StandingProgramRuntimeError::InvalidProgramIdentity {
+                    field: "generic_view_plan.predicate.literal",
+                })
+        }
+        _ => Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+            field: "generic_view_plan.predicate.literal",
+        }),
+    }
+}
+
+fn actual_f64(value: &Value) -> Result<f64, StandingProgramRuntimeError> {
+    value.as_f64().ok_or_else(invalid_runtime_state)
+}
+
+fn literal_f64(value: &Value) -> Result<f64, StandingProgramRuntimeError> {
+    match value {
+        Value::Number(value) => {
+            value
+                .as_f64()
+                .ok_or(StandingProgramRuntimeError::InvalidProgramIdentity {
+                    field: "generic_view_plan.predicate.literal",
+                })
+        }
+        Value::String(value) => {
+            value
+                .parse::<f64>()
+                .map_err(|_| StandingProgramRuntimeError::InvalidProgramIdentity {
+                    field: "generic_view_plan.predicate.literal",
+                })
+        }
+        _ => Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+            field: "generic_view_plan.predicate.literal",
+        }),
+    }
+}
+
+fn decimal_value_i128(
+    value: &Value,
+    precision: u8,
+    scale: u8,
+) -> Result<i128, StandingProgramRuntimeError> {
+    match value {
+        Value::String(value) => parse_decimal128(value, precision, scale).ok_or(
+            StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "generic_view_plan.predicate.literal",
+            },
+        ),
+        Value::Number(value) => {
+            let Some(value) = value.as_i64() else {
+                return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                    field: "generic_view_plan.predicate.literal",
+                });
+            };
+            let factor = 10_i128.checked_pow(u32::from(scale)).ok_or(
+                StandingProgramRuntimeError::InvalidProgramIdentity {
+                    field: "generic_view_plan.predicate.literal",
+                },
+            )?;
+            i128::from(value).checked_mul(factor).ok_or(
+                StandingProgramRuntimeError::InvalidProgramIdentity {
+                    field: "generic_view_plan.predicate.literal",
+                },
+            )
+        }
+        _ => Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+            field: "generic_view_plan.predicate.literal",
+        }),
+    }
+}
+
+fn compare_ord<T: PartialOrd + PartialEq>(actual: T, op: DbspPredicateOp, expected: T) -> bool {
+    match op {
+        DbspPredicateOp::Eq => actual == expected,
+        DbspPredicateOp::NotEq => actual != expected,
+        DbspPredicateOp::Gt => actual > expected,
+        DbspPredicateOp::GtEq => actual >= expected,
+        DbspPredicateOp::Lt => actual < expected,
+        DbspPredicateOp::LtEq => actual <= expected,
+    }
 }
 
 fn catalog_primary_key_column(

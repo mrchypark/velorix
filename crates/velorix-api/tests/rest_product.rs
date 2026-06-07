@@ -2784,8 +2784,144 @@ async fn rest_product_worker_activates_catalog_backed_orders_sum_count_view() {
 }
 
 #[tokio::test]
-async fn rest_product_worker_keeps_unsupported_catalog_view_pending() {
-    let (state, _store) = api_state_memory("catalog-backed-unsupported-view-worker").await;
+async fn rest_product_worker_activates_catalog_backed_filtered_orders_sum_count_view_and_restores()
+{
+    let (state, store) = api_state_memory("catalog-backed-filtered-view-worker").await;
+    let initial_app = app(state);
+    let catalog = orders_sum_count_relation_catalog();
+
+    let relation = request_json(
+        initial_app.clone(),
+        Method::POST,
+        "/v1/relations",
+        Some(json!({ "catalog": catalog })),
+    )
+    .await;
+    assert_eq!(
+        relation.0,
+        StatusCode::CREATED,
+        "relation body: {}",
+        relation.1
+    );
+
+    let view = request_json(
+        initial_app.clone(),
+        Method::POST,
+        "/v1/views",
+        Some(json!({
+            "view_id": "large_orders_by_account",
+            "urlPath": "/orders/large-by-account",
+            "input_relation_id": "orders",
+            "input_relation_version": "2026-06-06.v1",
+            "sql": "select account_id, sum(amount) as sum, count(*) as count from orders where amount > -1 group by account_id",
+            "response_formats": ["json"]
+        })),
+    )
+    .await;
+    assert_eq!(view.0, StatusCode::ACCEPTED, "view body: {}", view.1);
+    assert_eq!(view.1["execution_mode"], "feldera_compile_pending");
+
+    let ingest = request_json(
+        initial_app,
+        Method::POST,
+        "/v1/ingest",
+        Some(
+            serde_json::to_value(IngestRowsRequest {
+                relation_id: "orders".to_string(),
+                relation_version: "2026-06-06.v1".to_string(),
+                stream_id: "orders".to_string(),
+                partition_id: 0,
+                start_offset_inclusive: 0,
+                rows: vec![
+                    json!({ "account_id": "acct-a", "amount": 10, "delta": 1 }),
+                    json!({ "account_id": "acct-a", "amount": -30, "delta": 1 }),
+                    json!({ "account_id": "acct-b", "amount": 7, "delta": 1 }),
+                    json!({ "account_id": "acct-a", "amount": 4, "delta": 1 }),
+                    json!({ "account_id": "acct-a", "amount": 4, "delta": -1 }),
+                ],
+            })
+            .unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(ingest.0, StatusCode::CREATED, "ingest body: {}", ingest.1);
+
+    let restarted_state =
+        api_state_from_store("catalog-backed-filtered-view-worker", Arc::clone(&store)).await;
+    let worker_app = app(restarted_state);
+    let worker = request_json(
+        worker_app.clone(),
+        Method::POST,
+        "/v1/view-compile-deploy/run-once",
+        None,
+    )
+    .await;
+    assert_eq!(worker.0, StatusCode::OK, "worker body: {}", worker.1);
+    assert_eq!(worker.1["pending_jobs"], 1, "worker body: {}", worker.1);
+    assert_eq!(worker.1["activated"], 1, "worker body: {}", worker.1);
+    assert_eq!(worker.1["skipped"], 0, "worker body: {}", worker.1);
+    assert_eq!(worker.1["failed"], 0, "worker body: {}", worker.1);
+
+    let detail = request_json(
+        worker_app.clone(),
+        Method::GET,
+        "/v1/views/large_orders_by_account",
+        None,
+    )
+    .await;
+    assert_eq!(detail.0, StatusCode::OK, "detail body: {}", detail.1);
+    assert_eq!(detail.1["execution_mode"], "standing_runtime");
+    assert_eq!(detail.1["query_enabled"], true);
+
+    let query = request_json(
+        worker_app,
+        Method::GET,
+        "/v1/api/orders/large-by-account",
+        None,
+    )
+    .await;
+    assert_eq!(query.0, StatusCode::OK, "query body: {}", query.1);
+    assert_eq!(
+        query.1["rows"],
+        json!([
+            { "account_id": "acct-a", "sum": 10, "count": 1 },
+            { "account_id": "acct-b", "sum": 7, "count": 1 }
+        ])
+    );
+
+    let restored_state =
+        api_state_from_store("catalog-backed-filtered-view-worker", Arc::clone(&store)).await;
+    let restored = restored_state
+        .restore_standing_program_runtimes_from_active_views()
+        .await
+        .unwrap();
+    assert_eq!(restored, 1);
+    let restored_app = app(restored_state);
+    let restored_query = request_json(
+        restored_app,
+        Method::GET,
+        "/v1/views/large_orders_by_account/query",
+        None,
+    )
+    .await;
+    assert_eq!(
+        restored_query.0,
+        StatusCode::OK,
+        "restored query body: {}",
+        restored_query.1
+    );
+    assert_eq!(
+        restored_query.1["rows"],
+        json!([
+            { "account_id": "acct-a", "sum": 10, "count": 1 },
+            { "account_id": "acct-b", "sum": 7, "count": 1 }
+        ])
+    );
+}
+
+#[tokio::test]
+async fn rest_product_worker_keeps_join_catalog_view_pending_until_multi_input_runtime_exists() {
+    let (state, _store) = api_state_memory("catalog-backed-join-view-worker").await;
     let app = app(state);
     let catalog = orders_sum_count_relation_catalog();
 
@@ -2808,11 +2944,11 @@ async fn rest_product_worker_keeps_unsupported_catalog_view_pending() {
         Method::POST,
         "/v1/views",
         Some(json!({
-            "view_id": "large_orders_by_account",
-            "urlPath": "/orders/large-by-account",
+            "view_id": "joined_orders_by_account",
+            "urlPath": "/orders/joined-by-account",
             "input_relation_id": "orders",
             "input_relation_version": "2026-06-06.v1",
-            "sql": "select account_id, sum(amount) as sum, count(*) as count from orders where amount > 0 group by account_id",
+            "sql": "select o.account_id, sum(o.amount) as sum, count(*) as count from orders o join accounts a on o.account_id = a.account_id group by o.account_id",
             "response_formats": ["json"]
         })),
     )
@@ -2832,9 +2968,12 @@ async fn rest_product_worker_keeps_unsupported_catalog_view_pending() {
     assert_eq!(worker.1["activated"], 0, "worker body: {}", worker.1);
     assert_eq!(worker.1["skipped"], 1, "worker body: {}", worker.1);
     assert_eq!(worker.1["failed"], 0, "worker body: {}", worker.1);
-    assert_eq!(worker.1["outcomes"][0]["status"], "skipped");
+    assert!(worker.1["outcomes"][0]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("joins are not supported"));
 
-    let detail = request_json(app, Method::GET, "/v1/views/large_orders_by_account", None).await;
+    let detail = request_json(app, Method::GET, "/v1/views/joined_orders_by_account", None).await;
     assert_eq!(detail.0, StatusCode::OK, "detail body: {}", detail.1);
     assert_eq!(detail.1["execution_mode"], "feldera_compile_pending");
     assert_eq!(detail.1["query_enabled"], false);
@@ -2869,7 +3008,7 @@ async fn rest_product_worker_activates_decimal_value_date_key_sum_count_view() {
             "urlPath": "/daily-revenue/by-date",
             "input_relation_id": "daily_revenue",
             "input_relation_version": "2026-06-06.v1",
-            "sql": "select business_date, sum(amount) as sum, count(*) as count from daily_revenue group by business_date",
+            "sql": "select business_date, sum(amount) as sum, count(*) as count from daily_revenue where amount > -1.00 group by business_date",
             "response_formats": ["json"]
         })),
     )
@@ -2890,6 +3029,7 @@ async fn rest_product_worker_activates_decimal_value_date_key_sum_count_view() {
                 start_offset_inclusive: 0,
                 rows: vec![
                     json!({ "business_date": 20510, "amount": "10.25", "row_weight": 1 }),
+                    json!({ "business_date": 20510, "amount": "-99.99", "row_weight": 1 }),
                     json!({ "business_date": 20510, "amount": "1.25", "row_weight": 1 }),
                     json!({ "business_date": 20510, "amount": "1.25", "row_weight": -1 }),
                     json!({ "business_date": 20511, "amount": "2.50", "row_weight": 1 }),

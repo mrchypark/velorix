@@ -1,10 +1,13 @@
 use datafusion::sql::{
     parser::{DFParser, Statement as DataFusionStatement},
     sqlparser::ast::{
-        Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, ObjectName, Query,
-        Select, SelectItem, SetExpr, Statement as SqlStatement, TableFactor,
+        BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
+        ObjectName, Query, Select, SelectItem, SetExpr, Statement as SqlStatement, TableFactor,
+        UnaryOperator, Value as SqlValue,
     },
 };
+use serde::{Deserialize, Serialize};
+use serde_json::{Number as JsonNumber, Value as JsonValue};
 use thiserror::Error;
 
 use crate::relation::{
@@ -12,11 +15,32 @@ use crate::relation::{
     VelorixRelationCatalogV1,
 };
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SupportedDbspViewPlan {
     pub input_relation_id: String,
     pub group_key_column_id: String,
     pub sum_value_column_id: String,
+    pub predicate: Option<DbspRowPredicate>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DbspRowPredicate {
+    pub column_id: String,
+    pub op: DbspPredicateOp,
+    pub literal: JsonValue,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DbspPredicateOp {
+    Eq,
+    NotEq,
+    Gt,
+    GtEq,
+    Lt,
+    LtEq,
 }
 
 #[derive(Debug, Error)]
@@ -55,6 +79,7 @@ pub fn validate_supported_dbsp_view_sql(
     let select = supported_plain_select(&query)?;
 
     validate_from_relation(select, catalog)?;
+    let predicate = validate_selection(select, catalog, key_column, value_column)?;
     validate_group_by_key(select, key_column)?;
     validate_projection(select, key_column, value_column)?;
 
@@ -62,6 +87,7 @@ pub fn validate_supported_dbsp_view_sql(
         input_relation_id: catalog.relation_schema.relation_id.clone(),
         group_key_column_id: key_column.column_id.clone(),
         sum_value_column_id: value_column.column_id.clone(),
+        predicate,
     })
 }
 
@@ -101,7 +127,6 @@ fn validate_from_relation(
         || select.into.is_some()
         || !select.lateral_views.is_empty()
         || select.prewhere.is_some()
-        || select.selection.is_some()
         || !select.connect_by.is_empty()
         || !select.cluster_by.is_empty()
         || !select.distribute_by.is_empty()
@@ -165,6 +190,146 @@ fn validate_from_relation(
     } else {
         unsupported("FROM relation does not match the view input relation catalog")
     }
+}
+
+fn validate_selection(
+    select: &Select,
+    catalog: &VelorixRelationCatalogV1,
+    key_column: &RelationColumnV1,
+    value_column: &RelationColumnV1,
+) -> Result<Option<DbspRowPredicate>, DbspViewPlanError> {
+    let Some(selection) = &select.selection else {
+        return Ok(None);
+    };
+    let Expr::BinaryOp { left, op, right } = selection else {
+        return unsupported("WHERE currently supports one column/literal comparison");
+    };
+    let (column_expr, literal_expr, op) = if expression_is_literal(right) {
+        (left.as_ref(), right.as_ref(), op.clone())
+    } else if expression_is_literal(left) {
+        let Some(op) = reverse_predicate_op(op.clone()) else {
+            return unsupported("WHERE comparison operator is not supported");
+        };
+        (right.as_ref(), left.as_ref(), op)
+    } else {
+        return unsupported("WHERE comparison must compare a catalog column to a literal");
+    };
+    let Some(column) = expression_catalog_column(column_expr, catalog) else {
+        return unsupported("WHERE column must reference a registered relation column");
+    };
+    if !predicate_column_is_runtime_visible(column, key_column, value_column) {
+        return unsupported(
+            "WHERE column must be the primary key or value column for this generated runtime",
+        );
+    }
+    let Some(op) = predicate_op(op) else {
+        return unsupported("WHERE comparison operator is not supported");
+    };
+    let literal = predicate_literal(literal_expr)?;
+    Ok(Some(DbspRowPredicate {
+        column_id: column.column_id.clone(),
+        op,
+        literal,
+    }))
+}
+
+fn expression_catalog_column<'a>(
+    expr: &Expr,
+    catalog: &'a VelorixRelationCatalogV1,
+) -> Option<&'a RelationColumnV1> {
+    catalog
+        .relation_schema
+        .columns
+        .iter()
+        .find(|column| expression_references_column(expr, column))
+}
+
+fn expression_is_literal(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Value(_)
+            | Expr::UnaryOp {
+                op: UnaryOperator::Minus,
+                expr: _
+            }
+    )
+}
+
+fn predicate_op(op: BinaryOperator) -> Option<DbspPredicateOp> {
+    match op {
+        BinaryOperator::Eq => Some(DbspPredicateOp::Eq),
+        BinaryOperator::NotEq => Some(DbspPredicateOp::NotEq),
+        BinaryOperator::Gt => Some(DbspPredicateOp::Gt),
+        BinaryOperator::GtEq => Some(DbspPredicateOp::GtEq),
+        BinaryOperator::Lt => Some(DbspPredicateOp::Lt),
+        BinaryOperator::LtEq => Some(DbspPredicateOp::LtEq),
+        _ => None,
+    }
+}
+
+fn reverse_predicate_op(op: BinaryOperator) -> Option<BinaryOperator> {
+    match op {
+        BinaryOperator::Eq => Some(BinaryOperator::Eq),
+        BinaryOperator::NotEq => Some(BinaryOperator::NotEq),
+        BinaryOperator::Gt => Some(BinaryOperator::Lt),
+        BinaryOperator::GtEq => Some(BinaryOperator::LtEq),
+        BinaryOperator::Lt => Some(BinaryOperator::Gt),
+        BinaryOperator::LtEq => Some(BinaryOperator::GtEq),
+        _ => None,
+    }
+}
+
+fn predicate_literal(expr: &Expr) -> Result<JsonValue, DbspViewPlanError> {
+    match expr {
+        Expr::Value(value) => predicate_literal_value(&value.value, false),
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => {
+            let Expr::Value(value) = expr.as_ref() else {
+                return unsupported("WHERE comparison literal is not supported");
+            };
+            predicate_literal_value(&value.value, true)
+        }
+        _ => unsupported("WHERE comparison literal is not supported"),
+    }
+}
+
+fn predicate_literal_value(
+    value: &SqlValue,
+    negative: bool,
+) -> Result<JsonValue, DbspViewPlanError> {
+    match value {
+        SqlValue::Number(value, _) => {
+            let value = if negative {
+                format!("-{value}")
+            } else {
+                value.clone()
+            };
+            if value.contains('.') {
+                return Ok(JsonValue::String(value));
+            }
+            let number = JsonNumber::from(value.parse::<i64>().map_err(|_| {
+                DbspViewPlanError::UnsupportedShape {
+                    reason: "WHERE numeric literal is not supported".to_string(),
+                }
+            })?);
+            Ok(JsonValue::Number(number))
+        }
+        SqlValue::SingleQuotedString(value)
+        | SqlValue::DoubleQuotedString(value)
+        | SqlValue::NationalStringLiteral(value) => Ok(JsonValue::String(value.clone())),
+        SqlValue::Boolean(value) => Ok(JsonValue::Bool(*value)),
+        _ => unsupported("WHERE comparison literal is not supported"),
+    }
+}
+
+fn predicate_column_is_runtime_visible(
+    column: &RelationColumnV1,
+    key_column: &RelationColumnV1,
+    value_column: &RelationColumnV1,
+) -> bool {
+    column.column_id == key_column.column_id || column.column_id == value_column.column_id
 }
 
 fn validate_group_by_key(
@@ -274,9 +439,6 @@ fn select_item_is_count_star(item: &SelectItem) -> bool {
 fn expression_references_column(expr: &Expr, column: &RelationColumnV1) -> bool {
     match expr {
         Expr::Identifier(ident) => column_identifier_eq(column, ident.value.as_str()),
-        Expr::CompoundIdentifier(parts) => parts
-            .last()
-            .is_some_and(|ident| column_identifier_eq(column, ident.value.as_str())),
         _ => false,
     }
 }

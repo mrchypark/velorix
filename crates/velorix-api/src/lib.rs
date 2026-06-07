@@ -208,6 +208,17 @@ pub trait StandingProgramRuntimeFactory: Send + Sync + 'static {
         self.create_with_schemas(identity, input_schemas, output_schemas)
     }
 
+    fn create_with_catalog_and_spec(
+        &self,
+        identity: &StandingProgramIdentity,
+        catalog: &VelorixRelationCatalogV1,
+        _spec: &StandingViewSpec,
+        input_schemas: &[RelationSchema],
+        output_schemas: &[RelationSchema],
+    ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
+        self.create_with_catalog(identity, catalog, input_schemas, output_schemas)
+    }
+
     fn restore(
         &self,
         checkpoint: RuntimeCheckpoint,
@@ -302,6 +313,23 @@ impl StandingProgramRuntimeFactory for GeneratedSingleKeySumCountRuntimeFactory 
         velorix_generated_single_key_sum_count::create_standing_runtime(
             identity,
             catalog,
+            input_schemas,
+            output_schemas,
+        )
+    }
+
+    fn create_with_catalog_and_spec(
+        &self,
+        identity: &StandingProgramIdentity,
+        catalog: &VelorixRelationCatalogV1,
+        spec: &StandingViewSpec,
+        input_schemas: &[RelationSchema],
+        output_schemas: &[RelationSchema],
+    ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
+        velorix_generated_single_key_sum_count::create_standing_runtime_with_sql(
+            identity,
+            catalog,
+            spec.sql.as_str(),
             input_schemas,
             output_schemas,
         )
@@ -750,14 +778,8 @@ impl ApiState {
             let Some(artifact) = active.artifact.as_ref() else {
                 continue;
             };
-            if let Some(replay_checkpoints) = ensure_standing_runtime_for_artifact(
-                self,
-                &active.spec.view_id,
-                artifact,
-                &active.spec.input_relations,
-                &active.spec.output_relations,
-            )
-            .await?
+            if let Some(replay_checkpoints) =
+                ensure_standing_runtime_for_artifact(self, &active.spec, artifact).await?
             {
                 replay_committed_ingest_into_standing_runtime(self, &active, &replay_checkpoints)
                     .await?;
@@ -947,7 +969,7 @@ impl ApiState {
         let replay_checkpoints = if let Some((runtime, replay_checkpoints)) =
             restore_or_build_standing_runtime_for_artifact(
                 self,
-                &active.spec.view_id,
+                &active.spec,
                 &artifact,
                 &artifact_metadata.input_schemas,
                 &artifact_metadata.output_schemas,
@@ -2353,7 +2375,7 @@ async fn create_view(
     {
         build_standing_runtime_for_artifact(
             &state,
-            &spec.view_id,
+            &spec,
             artifact,
             &catalog,
             &artifact_metadata.input_schemas,
@@ -2518,7 +2540,7 @@ async fn complete_pending_view_compile_deploy_job(
     let replay_checkpoints = if let Some((runtime, replay_checkpoints)) =
         restore_or_build_standing_runtime_for_artifact(
             state,
-            &active.spec.view_id,
+            &active.spec,
             &artifact,
             &artifact_metadata.input_schemas,
             &artifact_metadata.output_schemas,
@@ -2640,34 +2662,32 @@ fn standing_program_identity_from_artifact(
 
 async fn ensure_standing_runtime_for_artifact(
     state: &ApiState,
-    view_id: &str,
+    spec: &StandingViewSpec,
     artifact: &MaterializedViewArtifactBinding,
-    expected_input_schemas: &[RelationSchema],
-    expected_output_schemas: &[RelationSchema],
 ) -> Result<Option<Vec<ReplayCheckpoint>>, ApiError> {
     let Some((runtime, replay_checkpoints)) = restore_or_build_standing_runtime_for_artifact(
         state,
-        view_id,
+        spec,
         artifact,
-        expected_input_schemas,
-        expected_output_schemas,
+        &spec.input_relations,
+        &spec.output_relations,
     )
     .await
-    .map_err(|error| active_artifact_runtime_unavailable_error(view_id, artifact, error))?
+    .map_err(|error| active_artifact_runtime_unavailable_error(&spec.view_id, artifact, error))?
     else {
         return Ok(None);
     };
     let committed_checkpoint =
-        read_latest_standing_runtime_checkpoint(state, runtime.program_identity(), view_id)
+        read_latest_standing_runtime_checkpoint(state, runtime.program_identity(), &spec.view_id)
             .await?
             .as_ref()
             .map(standing_runtime_checkpoint_pointer_from_record);
     state.set_standing_runtime_committed_checkpoint(
         runtime.program_identity(),
-        view_id,
+        &spec.view_id,
         committed_checkpoint,
     )?;
-    insert_standing_runtime(state, view_id, runtime)?;
+    insert_standing_runtime(state, &spec.view_id, runtime)?;
     Ok(Some(replay_checkpoints))
 }
 
@@ -2691,7 +2711,7 @@ fn active_artifact_runtime_unavailable_error(
 
 fn build_standing_runtime_for_artifact(
     state: &ApiState,
-    view_id: &str,
+    spec: &StandingViewSpec,
     artifact: &MaterializedViewArtifactBinding,
     catalog: &VelorixRelationCatalogV1,
     expected_input_schemas: &[RelationSchema],
@@ -2700,7 +2720,7 @@ fn build_standing_runtime_for_artifact(
     let Some(identity) = artifact.standing_program_identity.as_ref() else {
         return Ok(None);
     };
-    if state.standing_runtime(identity, view_id)?.is_some() {
+    if state.standing_runtime(identity, &spec.view_id)?.is_some() {
         return Ok(None);
     }
     let Some(factory) = state.standing_runtime_factory(&artifact.generated_rust_crate_name)? else {
@@ -2710,9 +2730,10 @@ fn build_standing_runtime_for_artifact(
         )));
     };
     let runtime = factory
-        .create_with_catalog(
+        .create_with_catalog_and_spec(
             identity,
             catalog,
+            spec,
             expected_input_schemas,
             expected_output_schemas,
         )
@@ -2735,7 +2756,7 @@ fn build_standing_runtime_for_artifact(
 
 async fn restore_or_build_standing_runtime_for_artifact(
     state: &ApiState,
-    view_id: &str,
+    spec: &StandingViewSpec,
     artifact: &MaterializedViewArtifactBinding,
     expected_input_schemas: &[RelationSchema],
     expected_output_schemas: &[RelationSchema],
@@ -2749,7 +2770,7 @@ async fn restore_or_build_standing_runtime_for_artifact(
     let Some(identity) = artifact.standing_program_identity.as_ref() else {
         return Ok(None);
     };
-    if state.standing_runtime(identity, view_id)?.is_some() {
+    if state.standing_runtime(identity, &spec.view_id)?.is_some() {
         return Ok(None);
     }
     let Some(factory) = state.standing_runtime_factory(&artifact.generated_rust_crate_name)? else {
@@ -2767,7 +2788,7 @@ async fn restore_or_build_standing_runtime_for_artifact(
         .await?;
 
     let (runtime, replay_checkpoints) = if let Some(record) =
-        read_latest_standing_runtime_checkpoint(state, identity, view_id).await?
+        read_latest_standing_runtime_checkpoint(state, identity, &spec.view_id).await?
     {
         record
             .checkpoint
@@ -2783,9 +2804,10 @@ async fn restore_or_build_standing_runtime_for_artifact(
         } else {
             (
                 factory
-                    .create_with_catalog(
+                    .create_with_catalog_and_spec(
                         identity,
                         &catalog,
+                        spec,
                         expected_input_schemas,
                         expected_output_schemas,
                     )
@@ -2796,9 +2818,10 @@ async fn restore_or_build_standing_runtime_for_artifact(
     } else {
         (
             factory
-                .create_with_catalog(
+                .create_with_catalog_and_spec(
                     identity,
                     &catalog,
+                    spec,
                     expected_input_schemas,
                     expected_output_schemas,
                 )
@@ -4183,14 +4206,7 @@ async fn standing_runtime_page(
         .standing_runtime(identity, &active.spec.view_id)?
         .is_none()
     {
-        let _ = ensure_standing_runtime_for_artifact(
-            state,
-            &active.spec.view_id,
-            artifact,
-            &active.spec.input_relations,
-            &active.spec.output_relations,
-        )
-        .await?;
+        let _ = ensure_standing_runtime_for_artifact(state, &active.spec, artifact).await?;
     }
     let operation_lock = state.standing_runtime_operation_lock(identity, &active.spec.view_id)?;
     let _operation_guard = operation_lock.lock().await;
