@@ -276,8 +276,8 @@ Main overrides:
   VELORIX_API_REPLICA_COUNT=1
   VELORIX_STANDING_RUNTIME_FENCING=unsafe-dev-only  # or logical-fencing / required
   # Optional override. By default the API exposes linked generated packages,
-  # including scores_by_user_generated.
-  VELORIX_GENERATED_ARTIFACT_PACKAGES=scores_by_user_generated
+  # including scores_by_user_generated and single_key_sum_count_generated.
+  VELORIX_GENERATED_ARTIFACT_PACKAGES=scores_by_user_generated,single_key_sum_count_generated
 EOF
 }
 
@@ -2507,7 +2507,7 @@ compile_deploy_smoke_effective_generated_packages() {
   if [ -n "$generated_artifact_packages" ]; then
     printf '%s\n' "$generated_artifact_packages"
   else
-    printf '%s\n' "scores_by_user_generated"
+    printf '%s\n' "scores_by_user_generated,single_key_sum_count_generated"
   fi
 }
 
