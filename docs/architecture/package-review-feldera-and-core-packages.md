@@ -95,7 +95,7 @@ already uses it for:
 
 - Bootstrap SQL over in-memory `DeltaBatch` input, scheduled to give way to
   cataloged typed Arrow relations.
-- recovered materialized state query surfaces.
+- generated standing-runtime view page query surfaces.
 - direct object-backed Parquet scans.
 - persisted query validation and execution.
 

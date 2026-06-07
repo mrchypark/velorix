@@ -73,11 +73,10 @@ drops the stalled list stream and releases the shared query limiter permit.
 `ProductionQueryRuntime` now owns the shared concurrency limiter derived from a
 `QueryPolicy` and exposes compatible limiter handles to production query
 wrappers. Local evidence shows one runtime can let an object-backed query hold
-the only permit while a production recovered materialized-view query fails
-immediately with `ConcurrencyLimitExceeded` before recovery setup runs.
-Version-specific spill failure tests, broader tenant/global shared runtime
-semantics beyond this local runtime slice, and Velorix-owned typed memory/spill
-errors remain future work.
+the only permit while a second object-backed query fails immediately with
+`ConcurrencyLimitExceeded` before table setup runs. Version-specific spill
+failure tests, broader tenant/global shared runtime semantics beyond this local
+runtime slice, and Velorix-owned typed memory/spill errors remain future work.
 
 ## Typed Errors
 

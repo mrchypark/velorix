@@ -28,9 +28,8 @@ disposable, scaling horizontally without state migration as the runtime matures.
   fetch-through
 - Experimental SlateDB-backed state store for checkpoint-versioned state
   payloads, with Velorix manifests still owning publication and progress
-- Minimal DataFusion SQL/query planning and execution over in-memory Arrow
-  batches for ad hoc `DeltaBatch` query input, recovered materialized runtime
-  state, and direct Parquet object-backed `input` scans
+- Minimal DataFusion SQL/query planning and execution over generated
+  standing-runtime view pages and direct Parquet object-backed `input` scans
 - Persisted query service v0 for object-backed query specs, with DataFusion
   validation before create-only catalog writes
 - Persisted table catalog v0 for deterministic object-backed Parquet scan URLs
@@ -65,14 +64,12 @@ packages already fit the problem:
   manifest semantics, and runtime recovery orchestration around the substrate.
   Broader durable state layout, LSM/SST policy, compaction tuning, and state
   lifecycle design remain future work.
-- **Apache DataFusion** currently owns the minimal ad hoc SQL/query planning
-  and execution boundary. Velorix converts `DeltaBatch` records into an
-  in-memory Arrow/DataFusion table and returns Arrow `RecordBatch` output.
-  Runtime code can now recover the latest object-backed checkpoint state,
-  replay uncovered ingest batches, and query that recovered materialized state
-  through the same DataFusion boundary. Runtime also has a minimal direct
-  Parquet object-backed scan boundary that registers caller-provided object
-  storage as DataFusion's `input` table. Persisted query service v0 stores
+- **Apache DataFusion** currently owns the minimal SQL/query planning and
+  execution boundary for standing-runtime view pages and object-backed scans.
+  Velorix returns Arrow `RecordBatch` output through this boundary. Runtime
+  also has a minimal direct Parquet object-backed scan boundary that registers
+  caller-provided object storage as DataFusion's `input` table. Persisted query
+  service v0 stores
   validated query specs in object storage with create-only writes. Persisted
   table catalog v0 stores deterministic Parquet scan URL specs under object
   keys and composes them with the direct scan path without validating table
@@ -117,13 +114,11 @@ The intended system shape is:
    operators today and allows DBSP/Feldera-shaped execution to replace them
    after the integration gates are cleared.
 3. **Ad hoc query execution:** DataFusion currently plans and executes SQL over
-   an in-memory Arrow table built from `DeltaBatch` input and returns Arrow
-   `RecordBatch` output. Runtime query calls can recover the latest
-   object-backed checkpoint, replay uncovered ingest batches, and query the
-   recovered materialized state. Runtime also exposes a direct Parquet
-   object-backed scan boundary by registering caller-provided object storage and
-   Parquet object URLs as DataFusion's `input` table. Minimal policy covers SQL
-   text size, output row caps, DataFusion batch size, and target partitions.
+   generated standing-runtime view pages and returns Arrow `RecordBatch`
+   output. Runtime also exposes a direct Parquet object-backed scan boundary by
+   registering caller-provided object storage and Parquet object URLs as
+   DataFusion's `input` table. Minimal policy covers SQL text size, output row
+   caps, DataFusion batch size, and target partitions.
    Persisted query service v0 stores JSON query specs under deterministic
    object keys after DataFusion validation. Persisted table catalog v0 stores
    JSON Parquet scan URL specs under deterministic `v1/tables/...` object keys
@@ -185,19 +180,18 @@ SlateDB layout, compaction, and lifecycle work remain gated follow-on work.
    the authority.
 10. **Use DataFusion for ad hoc query surfaces:** keep runtime query planning
     and Arrow execution routed through DataFusion. The current implementation
-    runs SQL over an in-memory `MemTable` built from `DeltaBatch` input,
-    exposes a recovered-state query boundary that first rebuilds materialized
-    state from object-backed checkpoints and replay, and includes a minimal
-    direct Parquet object-backed scan boundary. Persisted query service v0 adds
-    create/read JSON specs in object storage and executes stored SQL through the
-    recovered-state boundary. Persisted table catalog v0 adds create/read JSON
+    executes generated standing-runtime view pages through a bounded
+    DataFusion batch query boundary, and includes a minimal direct Parquet
+    object-backed scan boundary. Persisted query service v0 adds create/read
+    JSON specs in object storage for cataloged query definitions. Persisted
+    table catalog v0 adds create/read JSON
     specs for Parquet scan URLs and composes them with the direct scan boundary.
     Persisted view access v0 composes stored query specs with stored
     object-backed Parquet table specs. The 1.0 product scope also includes a
     governed API serving layer over these surfaces: endpoint definitions,
     parameter validation, response-shape contracts, OpenAPI-compatible catalog
     metadata, query/cost policy linkage, and immediate-response paths from
-    materialized or checkpoint-recovered state where available. Future work is
+    trusted standing-runtime materialized state where available. Future work is
     broader table layout, scheduler/versioning, permissions, no-code API
     builders, dashboards, and broader resource policy.
 11. **Use Feldera for standing-view SQL compilation:** validate Feldera

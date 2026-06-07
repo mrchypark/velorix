@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, error::Error, num::NonZeroUsize, sync::Arc};
+use std::{error::Error, num::NonZeroUsize, sync::Arc};
 
 use arrow::array::{ArrayRef, Int64Array, StringArray, StringViewArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -17,9 +17,7 @@ use serde_json::json;
 use tempfile::TempDir;
 use velorix_core::{
     delta::{DeltaBatch, DeltaKey, DeltaRecord, DeltaValue},
-    engine::EngineCheckpoint,
     feldera_artifact::catalog_input_relation_schema,
-    operator::KeyedSumCountAggregate,
     query::{QueryError, QueryPolicy, QueryPolicyError},
     relation::{
         datafusion_schema_from_catalog, DATAFUSION_RELATION_ID_METADATA_KEY,
@@ -28,11 +26,7 @@ use velorix_core::{
 };
 use velorix_runtime::{
     query::{
-        query_bootstrap_recovered_materialized_view,
-        query_bootstrap_recovered_materialized_view_with_policy,
         query_object_backed_input_with_policy, query_object_backed_input_with_policy_and_metrics,
-        query_production_recovered_materialized_view_table_with_bindings_and_policy_and_limiter,
-        query_production_recovered_materialized_view_with_policy_and_limiter,
         query_record_batches_table_with_bindings_and_policy_and_limiter,
         validate_record_batch_table_query_with_bindings_and_policy, QueryBindValue,
         RuntimeQueryError,
@@ -43,59 +37,16 @@ use velorix_runtime::{
     },
 };
 use velorix_storage::{
-    capability::{
-        probe_authoritative_object_store_capabilities, AuthoritativeNamespace,
-        AuthoritativeObjectStoreCapabilitiesV1, AuthoritativeObjectStoreCapabilityError,
-        ObjectStoreCapabilityProfile,
-    },
     ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
     log::{IngestAdmissionCoordinator, IngestBatch, IngestLog, IngestLogError},
-    manifest::{CheckpointManifest, InputRange, StateObjectRef},
     relation_catalog_registry::{RelationCatalogRegistry, RelationCatalogRegistryError},
-    state::{CheckpointPublishError, CheckpointPublisher, StateObjectWrite},
 };
-
-const RECOVERY_OWNER: &str = "orders_sum_count";
 
 fn temp_store() -> (TempDir, Arc<dyn ObjectStore>) {
     let temp_dir = tempfile::tempdir().unwrap();
     let store = LocalFileSystem::new_with_prefix(temp_dir.path()).unwrap();
 
     (temp_dir, Arc::new(store))
-}
-
-fn local_capabilities() -> AuthoritativeObjectStoreCapabilitiesV1 {
-    let profile = ObjectStoreCapabilityProfile::local_development();
-    AuthoritativeObjectStoreCapabilitiesV1::new(
-        AuthoritativeNamespace::all()
-            .into_iter()
-            .map(|namespace| (namespace, profile.clone()))
-            .collect::<BTreeMap<_, _>>(),
-    )
-}
-
-fn capabilities_missing(
-    namespace: AuthoritativeNamespace,
-) -> AuthoritativeObjectStoreCapabilitiesV1 {
-    let profile = ObjectStoreCapabilityProfile::local_development();
-    let mut profiles = AuthoritativeNamespace::all()
-        .into_iter()
-        .map(|namespace| (namespace, profile.clone()))
-        .collect::<BTreeMap<_, _>>();
-    profiles.remove(&namespace);
-    AuthoritativeObjectStoreCapabilitiesV1::new(profiles)
-}
-
-async fn probed_query_capabilities(
-    store: &dyn ObjectStore,
-) -> AuthoritativeObjectStoreCapabilitiesV1 {
-    probe_authoritative_object_store_capabilities(
-        store,
-        "local-query-test",
-        "v1/query-capability-probes",
-    )
-    .await
-    .unwrap()
 }
 
 fn input_delta(account: &str, amount: i64, weight: i64) -> DeltaRecord {
@@ -270,391 +221,6 @@ async fn put_parquet_input(
         .unwrap();
 }
 
-fn input_range(end_offset_exclusive: u64) -> InputRange {
-    InputRange {
-        stream_id: "orders".to_string(),
-        partition_id: 0,
-        start_offset_inclusive: 0,
-        end_offset_exclusive,
-    }
-}
-
-fn manifest(input_end: u64, state_ref: StateObjectRef) -> CheckpointManifest {
-    CheckpointManifest {
-        schema_version: 1,
-        checkpoint_version: 0,
-        input_ranges: vec![input_range(input_end)],
-        state_objects: vec![state_ref],
-        output_objects: vec![],
-        parent_checkpoint: None,
-        created_at: "2026-05-04T00:00:00Z".to_string(),
-    }
-}
-
-async fn write_checkpoint_state(
-    publisher: &CheckpointPublisher,
-    object_id: &str,
-    logical_epoch: u64,
-    state: &DeltaBatch,
-) -> StateObjectRef {
-    let checkpoint = EngineCheckpoint::new(logical_epoch, state.clone());
-    let state = StateObjectWrite::new(
-        RECOVERY_OWNER,
-        0,
-        0,
-        object_id,
-        Bytes::from(serde_json::to_vec(&checkpoint.to_payload()).unwrap()),
-    )
-    .unwrap();
-
-    publisher.write_state_object(&state).await.unwrap()
-}
-
-#[tokio::test]
-async fn query_bootstrap_recovered_materialized_view_reads_checkpointed_state_and_replayed_ingest()
-{
-    let (_temp_dir, store) = temp_store();
-    let ingest_coordinator = IngestAdmissionCoordinator::new(IngestLog::new(Arc::clone(&store)));
-    let publisher = CheckpointPublisher::new(Arc::clone(&store));
-
-    let checkpoint_input = batch([
-        input_delta("account-a", 10, 1),
-        input_delta("account-a", 5, 1),
-    ]);
-    let replay_input = batch([
-        input_delta("account-a", 3, 1),
-        input_delta("account-b", 7, 1),
-    ]);
-
-    append_ingest_envelope(
-        Arc::clone(&store),
-        &ingest_coordinator,
-        "orders",
-        0,
-        0,
-        2,
-        &checkpoint_input,
-    )
-    .await;
-    append_ingest_envelope(
-        Arc::clone(&store),
-        &ingest_coordinator,
-        "orders",
-        0,
-        2,
-        4,
-        &replay_input,
-    )
-    .await;
-
-    let mut checkpointed_view = KeyedSumCountAggregate::new();
-    checkpointed_view.apply(&checkpoint_input).unwrap();
-    let state_ref =
-        write_checkpoint_state(&publisher, "state-query", 2, &checkpointed_view.state()).await;
-    publisher
-        .publish_manifest(&manifest(2, state_ref))
-        .await
-        .unwrap();
-
-    let output = query_bootstrap_recovered_materialized_view(
-        Arc::clone(&store),
-        "select key_json, value_json, weight from input order by key_json",
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(output.len(), 1);
-    assert_eq!(output[0].num_rows(), 2);
-    assert_eq!(string_value(&output[0], 0, 0), "\"account-a\"");
-    assert_eq!(string_value(&output[0], 1, 0), "{\"count\":3,\"sum\":18}");
-    assert_eq!(int64_value(&output[0], 2, 0), 1);
-    assert_eq!(string_value(&output[0], 0, 1), "\"account-b\"");
-    assert_eq!(string_value(&output[0], 1, 1), "{\"count\":1,\"sum\":7}");
-    assert_eq!(int64_value(&output[0], 2, 1), 1);
-}
-
-#[tokio::test]
-async fn query_bootstrap_recovered_materialized_view_requires_relation_catalog_record() {
-    let (_temp_dir, store) = temp_store();
-
-    let error = query_bootstrap_recovered_materialized_view(
-        Arc::clone(&store),
-        "select key_json, value_json, weight from input",
-    )
-    .await
-    .unwrap_err();
-
-    assert!(matches!(
-        error,
-        RuntimeQueryError::Recovery(RecoveryError::RelationCatalogRegistry(
-            RelationCatalogRegistryError::ObjectStore(object_store::Error::NotFound { .. })
-        ))
-    ));
-}
-
-#[tokio::test]
-async fn query_bootstrap_recovered_materialized_view_with_policy_applies_row_limit_to_recovered_state(
-) {
-    let (_temp_dir, store) = temp_store();
-    let ingest_coordinator = IngestAdmissionCoordinator::new(IngestLog::new(Arc::clone(&store)));
-    let publisher = CheckpointPublisher::new(Arc::clone(&store));
-
-    let checkpoint_input = batch([
-        input_delta("account-a", 10, 1),
-        input_delta("account-a", 5, 1),
-    ]);
-    let replay_input = batch([input_delta("account-b", 7, 1)]);
-
-    append_ingest_envelope(
-        Arc::clone(&store),
-        &ingest_coordinator,
-        "orders",
-        0,
-        0,
-        2,
-        &checkpoint_input,
-    )
-    .await;
-    append_ingest_envelope(
-        Arc::clone(&store),
-        &ingest_coordinator,
-        "orders",
-        0,
-        2,
-        3,
-        &replay_input,
-    )
-    .await;
-
-    let mut checkpointed_view = KeyedSumCountAggregate::new();
-    checkpointed_view.apply(&checkpoint_input).unwrap();
-    let state_ref = write_checkpoint_state(
-        &publisher,
-        "state-query-policy",
-        2,
-        &checkpointed_view.state(),
-    )
-    .await;
-    publisher
-        .publish_manifest(&manifest(2, state_ref))
-        .await
-        .unwrap();
-
-    let error = query_bootstrap_recovered_materialized_view_with_policy(
-        Arc::clone(&store),
-        "select key_json, value_json, weight from input order by key_json",
-        QueryPolicy {
-            max_output_rows: Some(1),
-            ..QueryPolicy::default()
-        },
-    )
-    .await
-    .unwrap_err();
-
-    assert!(matches!(
-        error,
-        RuntimeQueryError::Query(QueryError::Policy(QueryPolicyError::OutputRowsExceeded {
-            observed_rows: 2,
-            max_rows: 1
-        }))
-    ));
-}
-
-#[tokio::test]
-async fn query_bootstrap_recovered_materialized_view_with_policy_applies_byte_limit_under_row_limit(
-) {
-    let (_temp_dir, store) = temp_store();
-    let ingest_coordinator = IngestAdmissionCoordinator::new(IngestLog::new(Arc::clone(&store)));
-    let publisher = CheckpointPublisher::new(Arc::clone(&store));
-
-    let checkpoint_input = batch([input_delta("account-with-wide-output", 10, 1)]);
-
-    append_ingest_envelope(
-        Arc::clone(&store),
-        &ingest_coordinator,
-        "orders",
-        0,
-        0,
-        1,
-        &checkpoint_input,
-    )
-    .await;
-
-    let mut checkpointed_view = KeyedSumCountAggregate::new();
-    checkpointed_view.apply(&checkpoint_input).unwrap();
-    let state_ref = write_checkpoint_state(
-        &publisher,
-        "state-query-byte-policy",
-        1,
-        &checkpointed_view.state(),
-    )
-    .await;
-    publisher
-        .publish_manifest(&manifest(1, state_ref))
-        .await
-        .unwrap();
-
-    let error = query_bootstrap_recovered_materialized_view_with_policy(
-        Arc::clone(&store),
-        "select key_json, value_json, weight from input",
-        QueryPolicy {
-            max_output_rows: Some(10),
-            max_output_bytes: Some(1),
-            ..QueryPolicy::default()
-        },
-    )
-    .await
-    .unwrap_err();
-
-    assert!(matches!(
-        error,
-        RuntimeQueryError::Query(QueryError::Policy(QueryPolicyError::OutputBytesExceeded {
-            observed_bytes,
-            max_bytes: 1,
-        })) if observed_bytes > 1
-    ));
-}
-
-#[tokio::test]
-async fn query_production_recovered_materialized_view_reads_slatedb_checkpoint_with_catalog_record()
-{
-    let (_temp_dir, store) = temp_store();
-    let capabilities = probed_query_capabilities(store.as_ref()).await;
-    let ingest_coordinator = IngestAdmissionCoordinator::new(IngestLog::new(Arc::clone(&store)));
-    let publisher =
-        CheckpointPublisher::with_slatedb_state_store(Arc::clone(&store), "v1/slatedb/state")
-            .await
-            .unwrap();
-
-    let checkpoint_input = batch([input_delta("account-a", 10, 1)]);
-    let replay_input = batch([input_delta("account-b", 7, 1)]);
-
-    append_ingest_envelope(
-        Arc::clone(&store),
-        &ingest_coordinator,
-        "orders",
-        0,
-        0,
-        1,
-        &checkpoint_input,
-    )
-    .await;
-    append_ingest_envelope(
-        Arc::clone(&store),
-        &ingest_coordinator,
-        "orders",
-        0,
-        1,
-        2,
-        &replay_input,
-    )
-    .await;
-
-    let mut checkpointed_view = KeyedSumCountAggregate::new();
-    checkpointed_view.apply(&checkpoint_input).unwrap();
-    let state_ref = write_checkpoint_state(
-        &publisher,
-        "state-production-query",
-        1,
-        &checkpointed_view.state(),
-    )
-    .await;
-    publisher
-        .publish_manifest(&manifest(1, state_ref))
-        .await
-        .unwrap();
-
-    let output = query_production_recovered_materialized_view_with_policy_and_limiter(
-        Arc::clone(&store),
-        "v1/slatedb/state",
-        ORDERS_SUM_COUNT_RELATION_ID,
-        ORDERS_SUM_COUNT_RELATION_VERSION,
-        &capabilities,
-        "select key_json, value_json, weight from input order by key_json",
-        QueryPolicy::default(),
-        None,
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(output.len(), 1);
-    assert_eq!(output[0].num_rows(), 2);
-    assert_eq!(string_value(&output[0], 0, 0), "\"account-a\"");
-    assert_eq!(string_value(&output[0], 1, 0), "{\"count\":1,\"sum\":10}");
-    assert_eq!(string_value(&output[0], 0, 1), "\"account-b\"");
-    assert_eq!(string_value(&output[0], 1, 1), "{\"count\":1,\"sum\":7}");
-}
-
-#[tokio::test]
-async fn query_production_recovered_materialized_view_binds_positional_parameters() {
-    let (_temp_dir, store) = temp_store();
-    let capabilities = probed_query_capabilities(store.as_ref()).await;
-    let ingest_coordinator = IngestAdmissionCoordinator::new(IngestLog::new(Arc::clone(&store)));
-    let publisher =
-        CheckpointPublisher::with_slatedb_state_store(Arc::clone(&store), "v1/slatedb/state")
-            .await
-            .unwrap();
-
-    let checkpoint_input = batch([input_delta("account-a", 10, 1)]);
-    let replay_input = batch([input_delta("account-b", 7, 1)]);
-
-    append_ingest_envelope(
-        Arc::clone(&store),
-        &ingest_coordinator,
-        "orders",
-        0,
-        0,
-        1,
-        &checkpoint_input,
-    )
-    .await;
-    append_ingest_envelope(
-        Arc::clone(&store),
-        &ingest_coordinator,
-        "orders",
-        0,
-        1,
-        2,
-        &replay_input,
-    )
-    .await;
-
-    let mut checkpointed_view = KeyedSumCountAggregate::new();
-    checkpointed_view.apply(&checkpoint_input).unwrap();
-    let state_ref = write_checkpoint_state(
-        &publisher,
-        "state-production-query-bindings",
-        1,
-        &checkpointed_view.state(),
-    )
-    .await;
-    publisher
-        .publish_manifest(&manifest(1, state_ref))
-        .await
-        .unwrap();
-
-    let output =
-        query_production_recovered_materialized_view_table_with_bindings_and_policy_and_limiter(
-            Arc::clone(&store),
-            "v1/slatedb/state",
-            ORDERS_SUM_COUNT_RELATION_ID,
-            ORDERS_SUM_COUNT_RELATION_VERSION,
-            "input",
-            &capabilities,
-            "select key_json, value_json, weight from input where key_json = $1 order by key_json",
-            &[QueryBindValue::Utf8("\"account-a\"".to_string())],
-            QueryPolicy::default(),
-            None,
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(output.len(), 1);
-    assert_eq!(output[0].num_rows(), 1);
-    assert_eq!(string_value(&output[0], 0, 0), "\"account-a\"");
-    assert_eq!(string_value(&output[0], 1, 0), "{\"count\":1,\"sum\":10}");
-}
-
 #[tokio::test]
 async fn query_record_batches_table_binds_positional_parameters() {
     let batches = vec![RecordBatch::try_new(
@@ -733,160 +299,6 @@ async fn validate_record_batch_table_query_rejects_constant_expression_without_t
             .contains("must scan table `scores_by_user`"),
         "error: {error}"
     );
-}
-
-#[tokio::test]
-async fn query_production_recovered_materialized_view_fails_closed_when_relation_catalog_is_missing(
-) {
-    let (_temp_dir, store) = temp_store();
-
-    let error = query_production_recovered_materialized_view_with_policy_and_limiter(
-        Arc::clone(&store),
-        "v1/slatedb/state",
-        ORDERS_SUM_COUNT_RELATION_ID,
-        ORDERS_SUM_COUNT_RELATION_VERSION,
-        &local_capabilities(),
-        "select key_json, value_json, weight from input",
-        QueryPolicy::default(),
-        None,
-    )
-    .await
-    .unwrap_err();
-
-    assert!(matches!(
-        error,
-        RuntimeQueryError::Recovery(RecoveryError::RelationCatalogRegistry(
-            RelationCatalogRegistryError::ObjectStore(object_store::Error::NotFound { .. })
-        ))
-    ));
-}
-
-#[tokio::test]
-async fn query_production_recovered_materialized_view_validates_sql_before_recovery() {
-    let (_temp_dir, store) = temp_store();
-
-    let error = query_production_recovered_materialized_view_with_policy_and_limiter(
-        Arc::clone(&store),
-        "v1/slatedb/state",
-        ORDERS_SUM_COUNT_RELATION_ID,
-        ORDERS_SUM_COUNT_RELATION_VERSION,
-        &local_capabilities(),
-        "select missing_column from input",
-        QueryPolicy::default(),
-        None,
-    )
-    .await
-    .unwrap_err();
-
-    assert!(
-        matches!(
-            error,
-            RuntimeQueryError::Query(QueryError::DataFusion(ref datafusion_error))
-                if datafusion_error.to_string().contains("missing_column")
-        ),
-        "expected SQL planning to reject missing_column before recovery, got {error:?}"
-    );
-}
-
-#[tokio::test]
-async fn query_production_recovered_materialized_view_rejects_constant_expression_without_table_scan(
-) {
-    let (_temp_dir, store) = temp_store();
-
-    let error = query_production_recovered_materialized_view_with_policy_and_limiter(
-        Arc::clone(&store),
-        "v1/slatedb/state",
-        ORDERS_SUM_COUNT_RELATION_ID,
-        ORDERS_SUM_COUNT_RELATION_VERSION,
-        &local_capabilities(),
-        "select 1 as synthetic",
-        QueryPolicy::default(),
-        None,
-    )
-    .await
-    .unwrap_err();
-
-    assert!(
-        matches!(
-            error,
-            RuntimeQueryError::Query(QueryError::DataFusion(ref datafusion_error))
-                if datafusion_error.to_string().contains("must scan table `input`")
-        ),
-        "expected SQL planning to reject constant expression before recovery, got {error:?}"
-    );
-}
-
-#[tokio::test]
-async fn query_production_recovered_materialized_view_fails_closed_when_capability_profile_is_missing(
-) {
-    let (_temp_dir, store) = temp_store();
-    let capabilities = capabilities_missing(AuthoritativeNamespace::Ingest);
-
-    let error = query_production_recovered_materialized_view_with_policy_and_limiter(
-        Arc::clone(&store),
-        "v1/slatedb/state",
-        ORDERS_SUM_COUNT_RELATION_ID,
-        ORDERS_SUM_COUNT_RELATION_VERSION,
-        &capabilities,
-        "select key_json, value_json, weight from input",
-        QueryPolicy::default(),
-        None,
-    )
-    .await
-    .unwrap_err();
-
-    assert!(matches!(
-        error,
-        RuntimeQueryError::Recovery(RecoveryError::AuthoritativeObjectStoreCapabilities(
-            AuthoritativeObjectStoreCapabilityError::MissingNamespace {
-                namespace: AuthoritativeNamespace::Ingest
-            }
-        ))
-    ));
-}
-
-#[tokio::test]
-async fn query_production_recovered_materialized_view_fails_closed_for_raw_state_checkpoint() {
-    let (_temp_dir, store) = temp_store();
-    RelationCatalogRegistry::new(Arc::clone(&store))
-        .create(&orders_sum_count_relation_catalog().unwrap())
-        .await
-        .unwrap();
-    let publisher = CheckpointPublisher::new(Arc::clone(&store));
-    let checkpoint_input = batch([input_delta("account-a", 10, 1)]);
-    let mut checkpointed_view = KeyedSumCountAggregate::new();
-    checkpointed_view.apply(&checkpoint_input).unwrap();
-    let state_ref = write_checkpoint_state(
-        &publisher,
-        "state-raw-production-query",
-        1,
-        &checkpointed_view.state(),
-    )
-    .await;
-    publisher
-        .publish_manifest(&manifest(1, state_ref))
-        .await
-        .unwrap();
-
-    let error = query_production_recovered_materialized_view_with_policy_and_limiter(
-        Arc::clone(&store),
-        "v1/slatedb/state",
-        ORDERS_SUM_COUNT_RELATION_ID,
-        ORDERS_SUM_COUNT_RELATION_VERSION,
-        &local_capabilities(),
-        "select key_json, value_json, weight from input",
-        QueryPolicy::default(),
-        None,
-    )
-    .await
-    .unwrap_err();
-
-    assert!(matches!(
-        error,
-        RuntimeQueryError::Recovery(RecoveryError::Checkpoint(
-            CheckpointPublishError::MissingStateObject(_)
-        ))
-    ));
 }
 
 #[tokio::test]
@@ -992,14 +404,16 @@ async fn arrow_ingest_datafusion_and_feldera_use_the_same_catalog_identity() {
     let bytes = ingest_envelope_bytes("orders", 0, 0, 1, &input);
     let envelope = IngestEnvelope::decode(bytes.clone()).unwrap();
 
-    RelationCatalogRegistry::new(Arc::clone(&store))
-        .create(&catalog)
-        .await
-        .unwrap();
-    ingest_coordinator
-        .append_catalog_validated_envelope(bytes)
-        .await
-        .unwrap();
+    append_ingest_envelope(
+        Arc::clone(&store),
+        &ingest_coordinator,
+        "orders",
+        0,
+        0,
+        1,
+        &input,
+    )
+    .await;
     let recovered = RecoveredRuntime::recover_bootstrap(Arc::clone(&store))
         .await
         .unwrap();
@@ -1043,33 +457,6 @@ async fn arrow_ingest_datafusion_and_feldera_use_the_same_catalog_identity() {
         feldera_schema.schema_fingerprint,
         catalog.schema_fingerprint.as_str()
     );
-}
-
-#[tokio::test]
-async fn query_bootstrap_recovered_materialized_view_propagates_datafusion_errors() {
-    let (_temp_dir, store) = temp_store();
-    let ingest_coordinator = IngestAdmissionCoordinator::new(IngestLog::new(Arc::clone(&store)));
-    let input = batch([input_delta("account-a", 4, 1)]);
-
-    append_ingest_envelope(
-        Arc::clone(&store),
-        &ingest_coordinator,
-        "orders",
-        0,
-        0,
-        1,
-        &input,
-    )
-    .await;
-
-    let error = query_bootstrap_recovered_materialized_view(
-        Arc::clone(&store),
-        "select missing_column from input",
-    )
-    .await
-    .unwrap_err();
-
-    assert!(error.to_string().contains("missing_column"));
 }
 
 #[tokio::test]

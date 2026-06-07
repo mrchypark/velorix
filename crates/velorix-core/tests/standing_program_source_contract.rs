@@ -127,7 +127,7 @@ fn feldera_package_compatibility_gate_is_non_default() {
 }
 
 #[test]
-fn product_view_api_still_marks_legacy_sql_shape_validator_as_bootstrap_only() {
+fn product_view_api_does_not_call_legacy_sql_shape_validator() {
     let api = read(repo_root().join("crates/velorix-api/src/lib.rs"));
     let docs = read(
         repo_root()
@@ -135,12 +135,8 @@ fn product_view_api_still_marks_legacy_sql_shape_validator_as_bootstrap_only() {
     );
 
     assert!(
-        api.contains("validate_supported_dbsp_view_sql"),
-        "this guard should be revisited if the legacy validator is removed"
-    );
-    assert!(
-        docs.contains("bootstrap guard only"),
-        "design must classify validate_supported_dbsp_view_sql as bootstrap-only"
+        !api.contains("validate_supported_dbsp_view_sql"),
+        "product view API must not route through the removed legacy SQL shape validator"
     );
     assert!(
         docs.contains("does not construct DBSP relational operators outside a"),

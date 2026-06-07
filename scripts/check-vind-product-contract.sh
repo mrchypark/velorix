@@ -354,7 +354,6 @@ def external_s3_out_of_scope_fixture_completes_required_gates():
             "evidence_kind": "velorix_product_slice_evidence",
             "rest_callable": True,
             "api": {
-                "generic_query_enabled": False,
                 "openapi": {
                     "catalog_smoke_passed": True,
                     "promoted_api_path": "/v1/api/scores/positive",
@@ -436,7 +435,6 @@ def external_s3_out_of_scope_fixture_completes_required_gates():
         }
         rest_smoke = {
             "status": "pass",
-            "generic_query_disabled": True,
             "ingested_positive_sum": 25,
             "ingested_positive_count": 2,
         }
@@ -507,7 +505,6 @@ def public_ingress_out_of_scope_local_tls_boundary_fixture():
             "evidence_kind": "velorix_product_slice_evidence",
             "rest_callable": True,
             "api": {
-                "generic_query_enabled": False,
                 "openapi": {
                     "catalog_smoke_passed": True,
                     "promoted_api_path": "/v1/api/scores/positive",
@@ -585,7 +582,6 @@ def public_ingress_out_of_scope_local_tls_boundary_fixture():
         }
         rest_smoke = {
             "status": "pass",
-            "generic_query_disabled": True,
             "ingested_positive_sum": 25,
             "ingested_positive_count": 2,
         }
@@ -1618,8 +1614,6 @@ checks = {
         and "VELORIX_API_URL/v1/relations/scores-default" in rest_api_smoke
         and "VELORIX_API_URL/v1/query-policies/interactive" in rest_api_smoke
         and "VELORIX_API_URL/v1/views/positive_scores_by_user" in rest_api_smoke
-        and "VELORIX_API_URL/v1/query" in rest_api_smoke
-        and "generic_query_disabled" in rest_api_smoke
         and "VELORIX_API_URL/v1/standing-runtime/owners" in rest_api_smoke
         and "VELORIX_API_URL/v1/ingest" in rest_api_smoke
         and "VELORIX_API_URL/v1/views/positive_scores_by_user/query?max_rows=1000" in rest_api_smoke

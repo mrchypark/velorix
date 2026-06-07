@@ -65,6 +65,13 @@ pub fn validate_supported_dbsp_view_sql(
     })
 }
 
+pub fn validate_catalog_backed_sum_count_view_sql(
+    sql: &str,
+    catalog: &VelorixRelationCatalogV1,
+) -> Result<SupportedDbspViewPlan, DbspViewPlanError> {
+    validate_supported_dbsp_view_sql(sql, catalog)
+}
+
 fn supported_plain_select(query: &Query) -> Result<&Select, DbspViewPlanError> {
     if query.with.is_some()
         || query.order_by.is_some()

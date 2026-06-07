@@ -5,7 +5,7 @@ use velorix_core::feldera_artifact::{
     validate_feldera_compile_artifact, validate_feldera_compile_artifact_for_catalog,
     validate_feldera_compile_artifact_hash, validate_feldera_release_artifact_provenance,
     FelderaArtifactError, FelderaCompileArtifactMetadata, FelderaReleaseArtifactProvenanceV1,
-    StandingViewSpec,
+    SqlDataType, SqlStructField, StandingViewSpec,
 };
 use velorix_core::relation::{
     ArrowPhysicalTypeV1, DataFusionRegistrationModeV1, DataFusionRegistrationV1,
@@ -137,6 +137,126 @@ fn feldera_catalog_validation_accepts_artifact_derived_from_catalog() {
 }
 
 #[test]
+fn feldera_artifact_rejects_excessively_deep_nested_sql_types() {
+    let catalog = orders_relation_catalog();
+    let mut spec = catalog_backed_standing_view_spec(&catalog);
+    spec.output_relations[0].columns[1].data_type = nested_array_type(18);
+    let artifact = catalog_backed_artifact(&spec);
+
+    let error =
+        validate_feldera_compile_artifact_for_catalog(&catalog, &spec, &artifact).unwrap_err();
+
+    assert!(matches!(
+        error,
+        FelderaArtifactError::InvalidRelationSchema {
+            field: "sql_type.depth"
+        }
+    ));
+}
+
+#[test]
+fn feldera_artifact_accepts_nested_sql_types_within_limits() {
+    let catalog = orders_relation_catalog();
+    let mut spec = catalog_backed_standing_view_spec(&catalog);
+    spec.output_relations[0].columns[1].data_type = SqlDataType::Struct {
+        fields: vec![SqlStructField {
+            name: "totals".to_string(),
+            data_type: nested_array_type(3),
+            nullable: false,
+        }],
+    };
+    let artifact = catalog_backed_artifact(&spec);
+
+    validate_feldera_compile_artifact_for_catalog(&catalog, &spec, &artifact).unwrap();
+}
+
+#[test]
+fn feldera_artifact_rejects_oversized_struct_types() {
+    let catalog = orders_relation_catalog();
+    let mut spec = catalog_backed_standing_view_spec(&catalog);
+    spec.output_relations[0].columns[1].data_type = SqlDataType::Struct {
+        fields: (0..257)
+            .map(|index| SqlStructField {
+                name: format!("field_{index}"),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            })
+            .collect(),
+    };
+    let artifact = catalog_backed_artifact(&spec);
+
+    let error =
+        validate_feldera_compile_artifact_for_catalog(&catalog, &spec, &artifact).unwrap_err();
+
+    assert!(matches!(
+        error,
+        FelderaArtifactError::InvalidRelationSchema {
+            field: "struct.fields"
+        }
+    ));
+}
+
+#[test]
+fn feldera_artifact_rejects_oversized_relation_column_sets() {
+    let catalog = orders_relation_catalog();
+    let mut spec = catalog_backed_standing_view_spec(&catalog);
+    spec.output_relations[0].columns = (0..1025)
+        .map(|index| velorix_core::feldera_artifact::ColumnSchema {
+            name: format!("c_{index}"),
+            data_type: SqlDataType::Int64,
+            nullable: false,
+        })
+        .collect();
+    let artifact = catalog_backed_artifact(&spec);
+
+    let error =
+        validate_feldera_compile_artifact_for_catalog(&catalog, &spec, &artifact).unwrap_err();
+
+    assert!(matches!(
+        error,
+        FelderaArtifactError::InvalidRelationSchema { field: "columns" }
+    ));
+}
+
+#[test]
+fn feldera_artifact_rejects_oversized_sql_type_trees() {
+    let catalog = orders_relation_catalog();
+    let mut spec = catalog_backed_standing_view_spec(&catalog);
+    spec.output_relations[0].columns[1].data_type = balanced_map_type(12);
+    let artifact = catalog_backed_artifact(&spec);
+
+    let error =
+        validate_feldera_compile_artifact_for_catalog(&catalog, &spec, &artifact).unwrap_err();
+
+    assert!(matches!(
+        error,
+        FelderaArtifactError::InvalidRelationSchema {
+            field: "sql_type.nodes"
+        }
+    ));
+}
+
+#[test]
+fn feldera_artifact_rejects_oversized_timezone_strings() {
+    let catalog = orders_relation_catalog();
+    let mut spec = catalog_backed_standing_view_spec(&catalog);
+    spec.output_relations[0].columns[1].data_type = SqlDataType::Timestamp {
+        timezone: Some("A".repeat(129)),
+    };
+    let artifact = catalog_backed_artifact(&spec);
+
+    let error =
+        validate_feldera_compile_artifact_for_catalog(&catalog, &spec, &artifact).unwrap_err();
+
+    assert!(matches!(
+        error,
+        FelderaArtifactError::InvalidRelationSchema {
+            field: "timestamp.timezone"
+        }
+    ));
+}
+
+#[test]
 fn feldera_artifact_rejects_unsupported_metadata_version() {
     let spec = load_spec("standing_view_spec_valid");
     let artifact = load_artifact("compile_artifact_invalid_version");
@@ -147,6 +267,23 @@ fn feldera_artifact_rejects_unsupported_metadata_version() {
         error,
         FelderaArtifactError::UnsupportedMetadataVersion { version: 2 }
     ));
+}
+
+fn nested_array_type(depth: usize) -> SqlDataType {
+    (0..depth).fold(SqlDataType::Int64, |element_type, _| SqlDataType::Array {
+        element_type: Box::new(element_type),
+    })
+}
+
+fn balanced_map_type(depth: usize) -> SqlDataType {
+    if depth == 0 {
+        return SqlDataType::Int64;
+    }
+    let child = balanced_map_type(depth - 1);
+    SqlDataType::Map {
+        key_type: Box::new(child.clone()),
+        value_type: Box::new(child),
+    }
 }
 
 fn orders_relation_catalog() -> VelorixRelationCatalogV1 {

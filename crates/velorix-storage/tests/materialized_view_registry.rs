@@ -203,11 +203,11 @@ async fn materialized_view_registry_reads_active_definition_by_view_id() {
     assert_eq!(active.spec, spec);
     assert_eq!(
         active.execution_mode,
-        MaterializedViewExecutionMode::LegacyRecoveredSql
+        MaterializedViewExecutionMode::FelderaCompilePending
     );
     assert_eq!(
         active.lifecycle,
-        MaterializedViewLifecycleStatus::legacy_recovered_sql()
+        MaterializedViewLifecycleStatus::feldera_compile_pending(None)
     );
 }
 
@@ -482,7 +482,7 @@ async fn materialized_view_registry_derives_execution_mode_for_old_active_record
 
     assert_eq!(
         legacy_active.execution_mode,
-        MaterializedViewExecutionMode::LegacyRecoveredSql
+        MaterializedViewExecutionMode::FelderaCompilePending
     );
 }
 
@@ -547,7 +547,7 @@ async fn materialized_view_registry_rejects_standing_runtime_mode_without_artifa
 }
 
 #[tokio::test]
-async fn materialized_view_registry_rejects_legacy_mode_with_artifact() {
+async fn materialized_view_registry_rejects_legacy_mode_records() {
     let (_temp_dir, store) = temp_store();
     let registry = MaterializedViewRegistry::new(Arc::clone(&store));
     let spec = load_spec("standing_view_spec_valid");
@@ -569,10 +569,7 @@ async fn materialized_view_registry_rejects_legacy_mode_with_artifact() {
 
     let error = registry.read_active(&spec.view_id).await.unwrap_err();
 
-    assert!(matches!(
-        error,
-        MaterializedViewRegistryError::InvalidExecutionMode { .. }
-    ));
+    assert!(matches!(error, MaterializedViewRegistryError::Serde(_)));
 }
 
 #[tokio::test]

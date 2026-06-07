@@ -5856,8 +5856,6 @@ evidence = {
     "api": {
         "replica_count": int(api_replica_count),
         "standing_runtime_fencing": standing_runtime_fencing,
-        "generic_query_enabled": False,
-        "legacy_recovered_sql_views_allowed": False,
         "openapi": {
             "catalog_smoke_passed": api_openapi_catalog_smoke_passed == "1",
             "evidence_file": "openapi.json"
@@ -7003,10 +7001,6 @@ ${api_auth_env}
               value: "${standing_runtime_fencing}"
             - name: VELORIX_STANDING_RUNTIME_OWNER_TTL_MS
               value: "${standing_runtime_owner_ttl_ms}"
-            - name: VELORIX_ALLOW_LEGACY_RECOVERED_SQL_VIEWS
-              value: "0"
-            - name: VELORIX_ENABLE_GENERIC_QUERY
-              value: "0"
 ${api_meta_env}
             - name: VELORIX_GENERATED_ARTIFACT_PACKAGES
               value: "${generated_artifact_packages}"
@@ -7091,10 +7085,6 @@ if api_auth.get("mode") != api_auth_mode:
 admin_auth = readyz.get("admin_auth") or {}
 if admin_auth.get("mode") != api_auth_mode:
     raise SystemExit(f"admin auth mode mismatch: expected {api_auth_mode}, got {admin_auth}")
-if readyz.get("legacy_recovered_sql_views_allowed") is not False:
-    raise SystemExit(f"legacy recovered SQL views must be disabled in product mode: {readyz}")
-if readyz.get("generic_query_enabled") is not False:
-    raise SystemExit(f"generic /v1/query must be disabled in product mode: {readyz}")
 if readyz.get("standing_runtime_fencing_mode") != fencing:
     raise SystemExit(
         f"standing runtime fencing mode mismatch: expected {fencing}, got {readyz}"
@@ -7209,24 +7199,6 @@ if [ "$api_auth_mode" = "bearer-token" ]; then
   if [ "$product_smoke" = "1" ]; then
   curl_api -X POST "http://127.0.0.1:${api_local_port}/v1/relations/scores-default" \
     | tee "${output_dir}/scores-relation.json" >/dev/null
-  generic_query_status="$(curl_api_status "${output_dir}/generic-query-disabled.json" \
-    -X POST "http://127.0.0.1:${api_local_port}/v1/query" \
-    -H 'content-type: application/json' \
-    -d '{"relation_id":"scores","relation_version":"2026-05-24.v1","sql":"select key, value, weight from input"}')"
-  if [ "$generic_query_status" != "409" ]; then
-    echo "expected generic /v1/query to fail with 409, got ${generic_query_status}" >&2
-    cat "${output_dir}/generic-query-disabled.json" >&2 || true
-    exit 1
-  fi
-  python3 - "${output_dir}/generic-query-disabled.json" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], "r", encoding="utf-8") as f:
-    body = json.load(f)
-if "generic_query_disabled" not in body.get("error", ""):
-    raise SystemExit(f"unexpected generic query disabled response: {body}")
-PY
   interactive_policy_status="$(curl_api_status "${output_dir}/query-policy-interactive-create.json" \
     -X POST "http://127.0.0.1:${api_local_port}/v1/query-policies" \
     -H 'content-type: application/json' \

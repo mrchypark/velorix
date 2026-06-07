@@ -18,10 +18,10 @@ manifests. Iceberg is optional external interoperability, export, or import
 work only after a narrow adoption RFC.
 
 This note distinguishes current implementation from target direction. The
-runtime object cache is currently Foyer-backed, ad hoc SQL/query planning and
-execution currently use DataFusion for bootstrap `DeltaBatch` validation and
-recovered materialized-state query boundaries, and persisted query service v0
-stores validated JSON query specs in object storage. The accepted production
+runtime object cache is currently Foyer-backed, and SQL/query planning and
+execution use DataFusion for typed relation validation, standing-runtime view
+page queries, and object-backed scans. Persisted query service v0 stores
+validated JSON query specs in object storage. The accepted production
 query/input direction is typed Arrow relations driven by
 [Relation Contract V1](relation-contract-v1.md), with execution guarded by
 [DataFusion Resource Policy V1](datafusion-resource-policy-v1.md). Persisted
@@ -88,9 +88,9 @@ contract. The accepted boundary is cataloged typed Arrow relation input derived
 from [Relation Contract V1](relation-contract-v1.md). DataFusion owns SQL
 parsing, query planning, physical execution, and Arrow `RecordBatch` output.
 
-Velorix runtime's recovered-state query path is a bootstrap bridge. Production
-query registration must be driven by cataloged relation schemas rather than
-`key_json`/`value_json` inference.
+Production query registration must be driven by cataloged relation schemas and
+trusted standing-runtime view artifacts rather than `key_json`/`value_json`
+recovery inference.
 
 Velorix runtime also exposes a phase-0 direct object-backed DataFusion scan
 boundary for Parquet input. Caller-provided Parquet URLs are dev-only. Production
@@ -99,9 +99,10 @@ policy.
 
 Persisted query service v0 stores `PersistedQuerySpec` JSON objects under
 deterministic `v1/queries/{query_id}.query.json` keys. Query ids use the shared
-`ObjectKey` segment rules, SQL is validated by DataFusion against an empty
-`input` table before a create-only catalog write, and execution loads the stored
-SQL/policy before calling the recovered materialized-state query boundary.
+`ObjectKey` segment rules, and SQL is validated by DataFusion before a
+create-only catalog write. Recovered materialized-state execution wrappers have
+been removed; product view execution is routed through trusted standing-runtime
+view artifacts and `/v1/views` promoted APIs.
 
 Persisted table catalog v0 stores `PersistedTableSpec` JSON objects under
 deterministic `v1/tables/{table_id}.table.json` keys for the direct Parquet scan

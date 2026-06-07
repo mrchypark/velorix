@@ -14,6 +14,12 @@ pub const FELDERA_SPEC_HASH_PREFIX: &str = "velorix-feldera-spec-sha256-v1";
 pub const SUPPORTED_STATE_CODEC: &str = "feldera-dbsp-state-v1";
 pub const SUPPORTED_EPOCH_POLICY: &str = "monotonic-logical-epoch-v1";
 pub const SUPPORTED_GENERATED_RUST_ABI_VERSION: &str = "feldera-generated-rust-abi-v1";
+pub const MAX_RELATION_COLUMNS: usize = 1024;
+pub const MAX_SQL_TYPE_NESTING_DEPTH: usize = 16;
+pub const MAX_SQL_TYPE_NODES: usize = 4096;
+pub const MAX_SQL_STRUCT_FIELDS: usize = 256;
+pub const MAX_SQL_STRUCT_FIELD_NAME_BYTES: usize = 128;
+pub const MAX_SQL_TIMEZONE_BYTES: usize = 128;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -73,13 +79,76 @@ pub struct ColumnSchema {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SqlDataType {
     Bool,
+    Int8,
+    Int16,
+    Int32,
     Int64,
+    UInt8,
+    UInt16,
+    UInt32,
+    UInt64,
+    Float32,
     Float64,
-    Decimal { precision: u8, scale: u8 },
+    Decimal {
+        precision: u8,
+        scale: u8,
+    },
+    Char {
+        length: Option<u32>,
+    },
     Utf8,
+    Binary {
+        length: u32,
+    },
+    Varbinary,
+    Time,
     Date,
-    Timestamp { timezone: Option<String> },
+    Timestamp {
+        timezone: Option<String>,
+    },
+    Interval {
+        unit: SqlIntervalUnit,
+    },
+    Array {
+        element_type: Box<SqlDataType>,
+    },
+    Struct {
+        fields: Vec<SqlStructField>,
+    },
+    Map {
+        key_type: Box<SqlDataType>,
+        value_type: Box<SqlDataType>,
+    },
+    Null,
+    Uuid,
     Json,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub enum SqlIntervalUnit {
+    Day,
+    DayToHour,
+    DayToMinute,
+    DayToSecond,
+    Hour,
+    HourToMinute,
+    HourToSecond,
+    Minute,
+    MinuteToSecond,
+    Month,
+    Second,
+    Year,
+    YearToMonth,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SqlStructField {
+    pub name: String,
+    pub data_type: SqlDataType,
+    pub nullable: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -667,7 +736,7 @@ fn validate_relation_schema(schema: &RelationSchema) -> Result<(), FelderaArtifa
         });
     }
     validate_schema_fingerprint("schema_fingerprint", &schema.schema_fingerprint)?;
-    if schema.columns.is_empty() {
+    if schema.columns.is_empty() || schema.columns.len() > MAX_RELATION_COLUMNS {
         return Err(FelderaArtifactError::InvalidRelationSchema { field: "columns" });
     }
 
@@ -746,27 +815,112 @@ fn validate_artifact_hash(
 }
 
 fn validate_sql_data_type(data_type: &SqlDataType) -> Result<(), FelderaArtifactError> {
+    let mut type_nodes = 0;
+    validate_sql_data_type_with_limits(data_type, 0, &mut type_nodes)
+}
+
+fn validate_sql_data_type_with_limits(
+    data_type: &SqlDataType,
+    depth: usize,
+    type_nodes: &mut usize,
+) -> Result<(), FelderaArtifactError> {
+    if depth > MAX_SQL_TYPE_NESTING_DEPTH {
+        return Err(FelderaArtifactError::InvalidRelationSchema {
+            field: "sql_type.depth",
+        });
+    }
+    *type_nodes += 1;
+    if *type_nodes > MAX_SQL_TYPE_NODES {
+        return Err(FelderaArtifactError::InvalidRelationSchema {
+            field: "sql_type.nodes",
+        });
+    }
     match data_type {
         SqlDataType::Decimal { precision, scale } => {
-            if *precision == 0 || *scale > *precision {
+            if *precision == 0 || *precision > 38 || *scale > *precision {
                 return Err(FelderaArtifactError::InvalidRelationSchema { field: "decimal" });
             }
         }
-        SqlDataType::Timestamp { timezone } => {
-            if timezone
-                .as_deref()
-                .is_some_and(|timezone| timezone.trim().is_empty())
-            {
+        SqlDataType::Char {
+            length: Some(length),
+        } => {
+            if *length == 0 {
                 return Err(FelderaArtifactError::InvalidRelationSchema {
-                    field: "timestamp.timezone",
+                    field: "char.length",
                 });
             }
         }
+        SqlDataType::Binary { length } => {
+            if *length == 0 {
+                return Err(FelderaArtifactError::InvalidRelationSchema {
+                    field: "binary.length",
+                });
+            }
+        }
+        SqlDataType::Timestamp { timezone } => {
+            if let Some(timezone) = timezone.as_deref() {
+                if timezone.trim().is_empty() || timezone.len() > MAX_SQL_TIMEZONE_BYTES {
+                    return Err(FelderaArtifactError::InvalidRelationSchema {
+                        field: "timestamp.timezone",
+                    });
+                }
+            }
+        }
+        SqlDataType::Array { element_type } => {
+            validate_sql_data_type_with_limits(element_type, depth + 1, type_nodes)?
+        }
+        SqlDataType::Struct { fields } => {
+            if fields.is_empty() || fields.len() > MAX_SQL_STRUCT_FIELDS {
+                return Err(FelderaArtifactError::InvalidRelationSchema {
+                    field: "struct.fields",
+                });
+            }
+            let mut names = BTreeSet::new();
+            for field in fields {
+                if field.name.trim().is_empty() {
+                    return Err(FelderaArtifactError::InvalidRelationSchema {
+                        field: "struct.field.name",
+                    });
+                }
+                if field.name.len() > MAX_SQL_STRUCT_FIELD_NAME_BYTES {
+                    return Err(FelderaArtifactError::InvalidRelationSchema {
+                        field: "struct.field.name",
+                    });
+                }
+                if !names.insert(field.name.as_str()) {
+                    return Err(FelderaArtifactError::InvalidRelationSchema {
+                        field: "struct.field.name",
+                    });
+                }
+                validate_sql_data_type_with_limits(&field.data_type, depth + 1, type_nodes)?;
+            }
+        }
+        SqlDataType::Map {
+            key_type,
+            value_type,
+        } => {
+            validate_sql_data_type_with_limits(key_type, depth + 1, type_nodes)?;
+            validate_sql_data_type_with_limits(value_type, depth + 1, type_nodes)?;
+        }
         SqlDataType::Bool
+        | SqlDataType::Int8
+        | SqlDataType::Int16
+        | SqlDataType::Int32
         | SqlDataType::Int64
+        | SqlDataType::UInt8
+        | SqlDataType::UInt16
+        | SqlDataType::UInt32
+        | SqlDataType::UInt64
+        | SqlDataType::Float32
         | SqlDataType::Float64
+        | SqlDataType::Char { length: None }
         | SqlDataType::Utf8
+        | SqlDataType::Varbinary
+        | SqlDataType::Time
         | SqlDataType::Date
+        | SqlDataType::Interval { .. }
+        | SqlDataType::Null
+        | SqlDataType::Uuid
         | SqlDataType::Json => {}
     }
 

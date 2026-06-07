@@ -1603,8 +1603,6 @@ fn validate_standing_runtime_product_evidence_artifact(
     })?;
 
     require_json_true(path, &artifact, "/rest_callable")?;
-    require_json_false(path, &artifact, "/api/generic_query_enabled")?;
-    require_json_false(path, &artifact, "/api/legacy_recovered_sql_views_allowed")?;
     validate_product_api_auth_evidence(path, &artifact)?;
     require_json_true(path, &artifact, "/api/openapi/catalog_smoke_passed")?;
     if require_json_str(path, &artifact, "/api/openapi/evidence_file")? != "openapi.json" {
@@ -17733,8 +17731,6 @@ mod tests {
             },
             "api": {
                 "replica_count": if configured_mode == "unsafe-dev-only" { 1 } else { 2 },
-                "generic_query_enabled": false,
-                "legacy_recovered_sql_views_allowed": false,
                 "openapi": {
                     "catalog_smoke_passed": true,
                     "evidence_file": "openapi.json",

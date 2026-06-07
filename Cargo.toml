@@ -10,6 +10,7 @@ members = [
   "crates/velorix-api",
   "crates/velorix-meta",
   "crates/velorix-generated-scores-by-user",
+  "crates/velorix-generated-single-key-sum-count",
 ]
 resolver = "2"
 

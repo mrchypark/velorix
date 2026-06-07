@@ -12,8 +12,9 @@ use velorix_storage::{
         MaterializedViewLifecycleStatus,
     },
     view_compile_deploy_job_registry::{
-        view_compile_deploy_job_id, RegisterViewCompileDeployJobOutcome,
-        ViewCompileDeployJobRegistry, ViewCompileDeployJobRegistryError,
+        view_compile_deploy_job_id, CompleteViewCompileDeployJobOutcome,
+        RegisterViewCompileDeployJobOutcome, ViewCompileDeployJobRegistry,
+        ViewCompileDeployJobRegistryError,
     },
 };
 
@@ -311,4 +312,42 @@ async fn view_compile_deploy_job_registry_does_not_mark_terminal_failure_running
         record.deployment_status,
         MaterializedViewDeploymentStatus::Failed
     );
+}
+
+#[tokio::test]
+async fn view_compile_deploy_job_registry_marks_running_idempotently() {
+    let (_temp_dir, store) = temp_store();
+    let registry = ViewCompileDeployJobRegistry::new(store);
+    let spec_hash = format!("velorix-feldera-spec-sha256-v1:{}", "9".repeat(64));
+    let lifecycle = MaterializedViewLifecycleStatus::feldera_compile_pending(None);
+
+    registry
+        .register_pending("scores_by_user", &spec_hash, &lifecycle)
+        .await
+        .unwrap();
+    let completed = registry
+        .mark_running("scores_by_user", &spec_hash, Some("activated".to_string()))
+        .await
+        .unwrap();
+    let duplicate = registry
+        .mark_running(
+            "scores_by_user",
+            &spec_hash,
+            Some("activated again".to_string()),
+        )
+        .await
+        .unwrap();
+    let record = registry.read("scores_by_user", &spec_hash).await.unwrap();
+
+    assert_eq!(completed, CompleteViewCompileDeployJobOutcome::Completed);
+    assert_eq!(duplicate, CompleteViewCompileDeployJobOutcome::Duplicate);
+    assert_eq!(
+        record.compile_status,
+        MaterializedViewCompileStatus::Success
+    );
+    assert_eq!(
+        record.deployment_status,
+        MaterializedViewDeploymentStatus::Running
+    );
+    assert_eq!(record.message.as_deref(), Some("activated"));
 }

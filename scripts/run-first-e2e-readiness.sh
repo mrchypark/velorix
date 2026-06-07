@@ -757,10 +757,6 @@ if product is not None:
     if product.get("rest_callable") is not True:
         raise SystemExit(f"product evidence does not prove REST callability: {product_path}")
     api = product.get("api") or {}
-    if api.get("generic_query_enabled") is not False:
-        raise SystemExit(f"product evidence must keep generic /v1/query disabled: {product_path}")
-    if api.get("legacy_recovered_sql_views_allowed") is not False:
-        raise SystemExit(f"product evidence must keep legacy recovered SQL views disabled: {product_path}")
     auth = api.get("auth") or {}
     if auth.get("mode") != "bearer-token":
         raise SystemExit(f"product evidence must use bearer-token API auth: {product_path}")

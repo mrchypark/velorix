@@ -208,7 +208,6 @@ handoff_action = command(
 
 rest_api_pass = (
     product.get("rest_callable") is True
-    and pointer(product, "/api/generic_query_enabled") is False
     and pointer(product, "/api/openapi/catalog_smoke_passed") is True
     and pointer(product, "/api/query_policy/catalog_smoke_passed") is True
 )
@@ -240,7 +239,6 @@ if rest_smoke is None:
 else:
     rest_smoke_pass = (
         rest_smoke.get("status") == "pass"
-        and rest_smoke.get("generic_query_disabled") is True
         and rest_smoke.get("ingested_positive_sum") == 25
         and rest_smoke.get("ingested_positive_count") == 2
     )

@@ -8426,6 +8426,7 @@ dependencies = [
  "tower",
  "velorix-core",
  "velorix-generated-scores-by-user",
+ "velorix-generated-single-key-sum-count",
  "velorix-k8s",
  "velorix-meta",
  "velorix-runtime",
@@ -8495,6 +8496,16 @@ dependencies = [
 
 [[package]]
 name = "velorix-generated-scores-by-user"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "serde",
+ "serde_json",
+ "velorix-core",
+]
+
+[[package]]
+name = "velorix-generated-single-key-sum-count"
 version = "0.1.0"
 dependencies = [
  "arrow",

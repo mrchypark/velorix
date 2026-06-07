@@ -6,9 +6,14 @@ use std::{
 #[test]
 fn production_sources_do_not_call_bootstrap_recovery_apis() {
     let workspace = workspace_root();
+    let contract_source =
+        workspace.join("crates/velorix-runtime/tests/production_recovery_contract.rs");
 
     let mut violations = Vec::new();
     for source in production_source_scan_sources(&workspace) {
+        if source == contract_source {
+            continue;
+        }
         let contents = fs::read_to_string(&source).expect("read Rust source");
         let lines = contents.lines().collect::<Vec<_>>();
         for line_number in 0..lines.len() {
@@ -221,56 +226,20 @@ fn production_recovery_contract_forbids_direct_bootstrap_recovery_callers() {
 }
 
 #[test]
-fn production_recovery_contract_forbids_bootstrap_recovered_query_helper_callers() {
-    let workspace = Path::new("/workspace");
-    let source = workspace.join("crates/velorix-runtime/src/production_surface.rs");
-    for (line, pattern) in [
-        (
-            "    query_bootstrap_recovered_materialized_view(store, sql).await?;",
-            "query_bootstrap_recovered_materialized_view",
-        ),
-        (
-            "    query_bootstrap_recovered_materialized_view_with_policy(store, sql, policy).await?;",
-            "query_bootstrap_recovered_materialized_view_with_policy",
-        ),
-        (
-            "    query_bootstrap_recovered_materialized_view_with_policy_and_limiter(store, sql, policy, limiter).await?;",
-            "query_bootstrap_recovered_materialized_view_with_policy_and_limiter",
-        ),
-        (
-            "    query_bootstrap_persisted_recovered_materialized_view(store, query_id).await?;",
-            "query_bootstrap_persisted_recovered_materialized_view",
-        ),
-        (
-            "    query_bootstrap_persisted_recovered_materialized_view_with_limiter(store, query_id, limiter).await?;",
-            "query_bootstrap_persisted_recovered_materialized_view_with_limiter",
-        ),
-        (
-            "use velorix_runtime::query::query_bootstrap_recovered_materialized_view as recover;",
-            "query_bootstrap_recovered_materialized_view",
-        ),
-    ] {
-        assert_eq!(
-            forbidden_bootstrap_recovered_query_use(workspace, &source, &[line], 0),
-            Some(pattern)
-        );
-    }
-}
-
-#[test]
-fn production_sources_do_not_call_bootstrap_recovered_query_helpers() {
+fn production_sources_do_not_define_or_call_recovered_query_helpers() {
     let workspace = workspace_root();
 
     let mut violations = Vec::new();
     for source in production_source_scan_sources(&workspace) {
         let contents = fs::read_to_string(&source).expect("read Rust source");
-        let lines = contents.lines().collect::<Vec<_>>();
-        for line_number in 0..lines.len() {
-            if let Some(pattern) =
-                forbidden_bootstrap_recovered_query_use(&workspace, &source, &lines, line_number)
+        for (line_number, line) in contents.lines().enumerate() {
+            if let Some(pattern) = recovered_query_helper_patterns()
+                .iter()
+                .copied()
+                .find(|pattern| line_mentions_rust_identifier(line, pattern))
             {
                 violations.push(format!(
-                    "{}:{} calls bootstrap recovered-query helper `{pattern}`",
+                    "{}:{} defines or calls removed recovered-query helper `{pattern}`",
                     source.strip_prefix(&workspace).unwrap_or(&source).display(),
                     line_number + 1
                 ));
@@ -280,7 +249,7 @@ fn production_sources_do_not_call_bootstrap_recovered_query_helpers() {
 
     assert!(
         violations.is_empty(),
-        "production source must not call bootstrap recovered-query helpers:\n{}",
+        "production source must not define or call removed recovered-query helpers:\n{}",
         violations.join("\n")
     );
 }
@@ -334,40 +303,27 @@ fn production_source_scan_sources(workspace: &Path) -> Vec<PathBuf> {
     sources
 }
 
-fn forbidden_bootstrap_recovered_query_use(
-    workspace: &Path,
-    source: &Path,
-    lines: &[&str],
-    line_number: usize,
-) -> Option<&'static str> {
-    let line = lines[line_number];
-    forbidden_bootstrap_recovered_query_patterns()
-        .iter()
-        .copied()
-        .find(|pattern| {
-            line_mentions_bootstrap_recovered_query_helper(line, pattern)
-                && !line.trim_start().starts_with("pub async fn")
-                && !allowed_bootstrap_recovered_query_use(
-                    workspace,
-                    source,
-                    lines,
-                    line_number,
-                    pattern,
-                )
-        })
-}
-
-fn forbidden_bootstrap_recovered_query_patterns() -> &'static [&'static str] {
+fn recovered_query_helper_patterns() -> &'static [&'static str] {
     &[
+        "query_production_recovered_materialized_view_with_policy_and_runtime",
+        "query_production_recovered_materialized_view_table_with_bindings_and_policy_and_limiter",
+        "query_production_recovered_materialized_view_table_with_catalog_and_policy_and_limiter",
+        "query_production_recovered_materialized_view_table_with_policy_and_limiter",
+        "query_production_recovered_materialized_view_with_catalog_and_policy_and_limiter",
+        "query_production_recovered_materialized_view_with_policy_and_limiter",
         "query_bootstrap_recovered_materialized_view_with_policy_and_limiter",
         "query_bootstrap_recovered_materialized_view_with_policy",
         "query_bootstrap_recovered_materialized_view",
+        "query_production_persisted_recovered_materialized_view_with_runtime",
+        "query_production_persisted_recovered_materialized_view_with_limiter",
+        "query_production_persisted_recovered_materialized_view",
         "query_bootstrap_persisted_recovered_materialized_view_with_limiter",
         "query_bootstrap_persisted_recovered_materialized_view",
+        "get_for_production_recovered_materialized_view",
     ]
 }
 
-fn line_mentions_bootstrap_recovered_query_helper(line: &str, pattern: &str) -> bool {
+fn line_mentions_rust_identifier(line: &str, pattern: &str) -> bool {
     let trimmed = line.trim_start();
     if trimmed.starts_with("//") || trimmed.starts_with("///") {
         return false;
@@ -382,52 +338,6 @@ fn line_mentions_bootstrap_recovered_query_helper(line: &str, pattern: &str) -> 
 
 fn is_rust_ident_char(character: Option<char>) -> bool {
     character.is_some_and(|character| character == '_' || character.is_ascii_alphanumeric())
-}
-
-fn allowed_bootstrap_recovered_query_use(
-    workspace: &Path,
-    source: &Path,
-    lines: &[&str],
-    line_number: usize,
-    pattern: &str,
-) -> bool {
-    if source == workspace.join("crates/velorix-runtime/src/query.rs") {
-        return [
-            "pub async fn query_bootstrap_recovered_materialized_view(",
-            "pub async fn query_bootstrap_recovered_materialized_view_with_policy(",
-            "pub async fn query_bootstrap_recovered_materialized_view_with_policy_and_limiter(",
-        ]
-        .iter()
-        .any(|signature| line_is_inside_function(lines, line_number, signature));
-    }
-
-    if source == workspace.join("crates/velorix-runtime/src/persisted_query.rs") {
-        if pattern == "query_bootstrap_recovered_materialized_view_with_policy_and_limiter"
-            && lines[line_number].trim() == format!("{pattern},")
-        {
-            return true;
-        }
-
-        return match pattern {
-            "query_bootstrap_persisted_recovered_materialized_view_with_limiter" => {
-                line_is_inside_function(
-                    lines,
-                    line_number,
-                    "pub async fn query_bootstrap_persisted_recovered_materialized_view(",
-                )
-            }
-            "query_bootstrap_recovered_materialized_view_with_policy_and_limiter" => {
-                line_is_inside_function(
-                    lines,
-                    line_number,
-                    "pub async fn query_bootstrap_persisted_recovered_materialized_view_with_limiter(",
-                )
-            }
-            _ => false,
-        };
-    }
-
-    false
 }
 
 fn forbidden_bootstrap_recovery_use(
@@ -581,17 +491,6 @@ fn allowed_bootstrap_recovery_use(
     pattern: &str,
 ) -> bool {
     if source == workspace.join("crates/velorix-runtime/src/recovery.rs") {
-        return true;
-    }
-
-    if source == workspace.join("crates/velorix-runtime/src/query.rs")
-        && pattern == "RecoveredRuntime::recover_bootstrap_with_owner_and_relation_catalog_record("
-        && line_is_inside_function(
-            lines,
-            line_number,
-            "pub async fn query_bootstrap_recovered_materialized_view_with_policy_and_limiter(",
-        )
-    {
         return true;
     }
 

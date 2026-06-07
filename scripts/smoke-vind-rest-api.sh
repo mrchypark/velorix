@@ -176,7 +176,6 @@ view_file="${output_dir}/positive-scores-view.json"
 view_create_file="${output_dir}/positive-scores-view-create.json"
 views_file="${output_dir}/views.json"
 openapi_file="${output_dir}/openapi.json"
-generic_query_file="${output_dir}/generic-query-disabled.json"
 owner_acquire_file="${output_dir}/standing-runtime-owner-acquire.json"
 owner_report_file="${output_dir}/standing-runtime-owner-report.json"
 ingest_file="${output_dir}/scores-ingest.json"
@@ -235,16 +234,6 @@ if [ "$view_status" != "200" ]; then
   esac
 else
   cp "$view_file" "$view_create_file"
-fi
-
-generic_query_status="$(curl_api_status "$generic_query_file" \
-  -X POST "$VELORIX_API_URL/v1/query" \
-  -H 'content-type: application/json' \
-  -d '{"relation_id":"scores","relation_version":"2026-05-24.v1","sql":"select key, value, weight from input"}')"
-if [ "$generic_query_status" != "409" ]; then
-  echo "expected generic /v1/query to fail with 409, got ${generic_query_status}" >&2
-  cat "$generic_query_file" >&2 || true
-  exit 1
 fi
 
 if [ -n "${VELORIX_ADMIN_AUTH_HEADER:-}" ]; then
@@ -311,7 +300,6 @@ python3 - \
   "$view_file" \
   "$views_file" \
   "$openapi_file" \
-  "$generic_query_file" \
   "$owner_acquire_file" \
   "$owner_report_file" \
   "$ingest_file" \
@@ -334,7 +322,6 @@ from datetime import datetime, timezone
     view_path,
     views_path,
     openapi_path,
-    generic_query_path,
     owner_acquire_path,
     owner_report_path,
     ingest_path,
@@ -349,10 +336,6 @@ def read_json(path):
 readyz = read_json(readyz_path)
 if readyz.get("status") != "ready":
     raise SystemExit(f"readyz is not ready: {readyz}")
-if readyz.get("generic_query_enabled") is not False:
-    raise SystemExit(f"generic query must stay disabled in product smoke: {readyz}")
-if readyz.get("legacy_recovered_sql_views_allowed") is not False:
-    raise SystemExit(f"legacy recovered SQL views must stay disabled: {readyz}")
 if not (readyz.get("metadata_store") or {}).get("configured"):
     raise SystemExit(f"metadata store is not configured: {readyz}")
 
@@ -405,10 +388,6 @@ if positive_get.get("x-velorix-query-policy-id") != "interactive":
 if positive_get.get("x-velorix-view-id") != "positive_scores_by_user":
     raise SystemExit(f"promoted API does not point at positive_scores_by_user: {positive_get}")
 
-generic_query = read_json(generic_query_path)
-if "generic_query_disabled" not in generic_query.get("error", ""):
-    raise SystemExit(f"generic query rejection did not prove disabled policy: {generic_query}")
-
 owner = read_json(owner_report_path)
 owner_status = "skipped"
 owner_matches = None
@@ -439,7 +418,6 @@ payload = {
     "user_id": user_id,
     "view_id": "positive_scores_by_user",
     "promoted_api_path": "/v1/api/scores/positive",
-    "generic_query_disabled": True,
     "interactive_query_policy_verified": True,
     "standing_runtime_owner_status": owner_status,
     "standing_runtime_owner_matches_local_process": owner_matches,
@@ -454,7 +432,6 @@ payload = {
         "view": view_path,
         "views": views_path,
         "openapi": openapi_path,
-        "generic_query_disabled": generic_query_path,
         "standing_runtime_owner_acquire": owner_acquire_path,
         "standing_runtime_owner_report": owner_report_path,
         "ingest": ingest_path,

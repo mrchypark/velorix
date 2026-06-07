@@ -13,6 +13,7 @@ use arrow::{
     },
     datatypes::{
         ArrowDictionaryKeyType, DataType, Field, Int16Type, Int32Type, Int64Type, Int8Type, Schema,
+        TimeUnit,
     },
     record_batch::RecordBatch,
 };
@@ -37,14 +38,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 use velorix_core::{
-    dbsp_view_plan::validate_supported_dbsp_view_sql,
+    dbsp_view_plan::validate_catalog_backed_sum_count_view_sql,
     feldera_artifact::{
         catalog_input_relation_schema, feldera_artifact_bytes_hash, feldera_spec_hash,
         ColumnSchema, FelderaCompileArtifactMetadata, FelderaCompilerIdentity,
         GeneratedRustIdentity, RelationSchema, SqlDataType, SqlDialect, SqlSourceKind,
-        StandingViewShape, StandingViewSpec, SUPPORTED_GENERATED_RUST_ABI_VERSION,
+        StandingViewShape, StandingViewSpec, FELDERA_ARTIFACT_METADATA_VERSION,
+        SUPPORTED_EPOCH_POLICY, SUPPORTED_GENERATED_RUST_ABI_VERSION, SUPPORTED_STATE_CODEC,
     },
-    generated_view_descriptor::TrustedGeneratedViewDescriptor,
+    generated_view_descriptor::{DynamicGeneratedViewBinding, TrustedGeneratedViewDescriptor},
     query::QueryPolicy,
     relation::{
         datafusion_schema_from_catalog, ArrowPhysicalTypeV1, DataFusionRegistrationModeV1,
@@ -86,9 +88,6 @@ use velorix_runtime::feldera_registry::{
     RuntimeFelderaArtifactSelectionStatus,
 };
 use velorix_runtime::query::{
-    query_production_recovered_materialized_view_table_with_bindings_and_policy_and_limiter,
-    query_production_recovered_materialized_view_with_catalog_and_policy_and_limiter,
-    query_production_recovered_materialized_view_with_policy_and_limiter,
     query_record_batches_table_with_bindings_and_policy_and_limiter,
     validate_record_batch_table_query_with_bindings_and_policy, ProductionQueryRuntime,
     QueryBindValue, QueryExecutionLimiter,
@@ -132,9 +131,6 @@ pub struct ApiState {
     admin_bearer_token: Option<Arc<str>>,
     max_request_body_bytes: usize,
     max_ingest_rows: usize,
-    allow_legacy_recovered_sql_views: bool,
-    enable_generic_query: bool,
-    state_path: String,
     generated_artifact_packages: Arc<Vec<GeneratedRustArtifactPackage>>,
     trusted_generated_view_descriptors: Arc<Vec<TrustedGeneratedViewDescriptor>>,
     standing_runtimes: Arc<StandingRuntimeRegistry>,
@@ -170,10 +166,47 @@ struct StandingRuntimeLocalState {
 }
 
 pub trait StandingProgramRuntimeFactory: Send + Sync + 'static {
+    fn output_schemas_for_view_request(
+        &self,
+        _view_id: &str,
+        _sql: &str,
+        _catalog: &VelorixRelationCatalogV1,
+        _input_schema_fingerprint: &str,
+    ) -> Result<Option<Vec<RelationSchema>>, ApiError> {
+        Ok(None)
+    }
+
+    fn compile_artifact_for_spec(
+        &self,
+        _catalog: &VelorixRelationCatalogV1,
+        _spec: &StandingViewSpec,
+    ) -> Result<Option<FelderaCompileArtifactMetadata>, ApiError> {
+        Ok(None)
+    }
+
     fn create(
         &self,
         identity: &StandingProgramIdentity,
     ) -> Result<Box<dyn StandingProgramRuntime + Send>, String>;
+
+    fn create_with_schemas(
+        &self,
+        identity: &StandingProgramIdentity,
+        _input_schemas: &[RelationSchema],
+        _output_schemas: &[RelationSchema],
+    ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
+        self.create(identity)
+    }
+
+    fn create_with_catalog(
+        &self,
+        identity: &StandingProgramIdentity,
+        _catalog: &VelorixRelationCatalogV1,
+        input_schemas: &[RelationSchema],
+        output_schemas: &[RelationSchema],
+    ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
+        self.create_with_schemas(identity, input_schemas, output_schemas)
+    }
 
     fn restore(
         &self,
@@ -214,6 +247,74 @@ impl StandingProgramRuntimeFactory for GeneratedScoresByUserRuntimeFactory {
     }
 }
 
+#[derive(Clone, Debug)]
+struct GeneratedSingleKeySumCountRuntimeFactory;
+
+impl StandingProgramRuntimeFactory for GeneratedSingleKeySumCountRuntimeFactory {
+    fn output_schemas_for_view_request(
+        &self,
+        view_id: &str,
+        sql: &str,
+        catalog: &VelorixRelationCatalogV1,
+        _input_schema_fingerprint: &str,
+    ) -> Result<Option<Vec<RelationSchema>>, ApiError> {
+        if validate_catalog_backed_sum_count_view_sql(sql, catalog).is_err() {
+            return Ok(None);
+        }
+        if validate_generic_single_key_sum_count_runtime_scope(catalog).is_err() {
+            return Ok(None);
+        }
+        single_key_sum_count_output_schema(view_id, catalog).map(|schema| Some(vec![schema]))
+    }
+
+    fn compile_artifact_for_spec(
+        &self,
+        catalog: &VelorixRelationCatalogV1,
+        spec: &StandingViewSpec,
+    ) -> Result<Option<FelderaCompileArtifactMetadata>, ApiError> {
+        generic_single_key_sum_count_artifact_for_spec(catalog, spec)
+    }
+
+    fn create(
+        &self,
+        _identity: &StandingProgramIdentity,
+    ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
+        Err("single-key sum/count runtime requires input/output schemas".to_string())
+    }
+
+    fn create_with_schemas(
+        &self,
+        identity: &StandingProgramIdentity,
+        _input_schemas: &[RelationSchema],
+        _output_schemas: &[RelationSchema],
+    ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
+        let _ = identity;
+        Err("single-key sum/count runtime requires relation catalog".to_string())
+    }
+
+    fn create_with_catalog(
+        &self,
+        identity: &StandingProgramIdentity,
+        catalog: &VelorixRelationCatalogV1,
+        input_schemas: &[RelationSchema],
+        output_schemas: &[RelationSchema],
+    ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
+        velorix_generated_single_key_sum_count::create_standing_runtime(
+            identity,
+            catalog,
+            input_schemas,
+            output_schemas,
+        )
+    }
+
+    fn restore(
+        &self,
+        checkpoint: RuntimeCheckpoint,
+    ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
+        velorix_generated_single_key_sum_count::restore_standing_runtime(checkpoint)
+    }
+}
+
 impl ApiState {
     pub async fn from_validated_authority(
         validated: ValidatedOperatorAuthority,
@@ -231,7 +332,7 @@ impl ApiState {
 
     pub async fn from_validated_authority_with_ingest_admission_startup(
         validated: ValidatedOperatorAuthority,
-        state_path: impl Into<String>,
+        _state_path: impl Into<String>,
         operator_id: impl Into<String>,
         reconstruct_ingest_admission: bool,
     ) -> Result<Self, ApiError> {
@@ -262,9 +363,6 @@ impl ApiState {
             admin_bearer_token: None,
             max_request_body_bytes: 1024 * 1024,
             max_ingest_rows: 10_000,
-            allow_legacy_recovered_sql_views: false,
-            enable_generic_query: false,
-            state_path: state_path.into(),
             generated_artifact_packages: Arc::new(default_generated_artifact_packages()),
             trusted_generated_view_descriptors: Arc::new(
                 default_trusted_generated_view_descriptors(),
@@ -326,16 +424,6 @@ impl ApiState {
     pub fn with_request_limits(mut self, max_body_bytes: usize, max_ingest_rows: usize) -> Self {
         self.max_request_body_bytes = max_body_bytes;
         self.max_ingest_rows = max_ingest_rows;
-        self
-    }
-
-    pub fn with_legacy_recovered_sql_views_allowed(mut self, allowed: bool) -> Self {
-        self.allow_legacy_recovered_sql_views = allowed;
-        self
-    }
-
-    pub fn with_generic_query_enabled(mut self, enabled: bool) -> Self {
-        self.enable_generic_query = enabled;
         self
     }
 
@@ -600,6 +688,53 @@ impl ApiState {
         Ok(factories.get(generated_rust_crate_name).cloned())
     }
 
+    fn generated_package_output_schemas_for_view_request(
+        &self,
+        view_id: &str,
+        sql: &str,
+        catalog: &VelorixRelationCatalogV1,
+        input_schema_fingerprint: &str,
+    ) -> Result<Option<Vec<RelationSchema>>, ApiError> {
+        let factories = self
+            .standing_runtime_factories
+            .factories
+            .lock()
+            .map_err(|_| ApiError::internal("standing runtime factory registry lock poisoned"))?;
+        for package in self.generated_artifact_packages.iter() {
+            if let Some(factory) = factories.get(&package.crate_name) {
+                if let Some(output) = factory.output_schemas_for_view_request(
+                    view_id,
+                    sql,
+                    catalog,
+                    input_schema_fingerprint,
+                )? {
+                    return Ok(Some(output));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn generated_package_artifact_for_spec(
+        &self,
+        catalog: &VelorixRelationCatalogV1,
+        spec: &StandingViewSpec,
+    ) -> Result<Option<FelderaCompileArtifactMetadata>, ApiError> {
+        let factories = self
+            .standing_runtime_factories
+            .factories
+            .lock()
+            .map_err(|_| ApiError::internal("standing runtime factory registry lock poisoned"))?;
+        for package in self.generated_artifact_packages.iter() {
+            if let Some(factory) = factories.get(&package.crate_name) {
+                if let Some(artifact) = factory.compile_artifact_for_spec(catalog, spec)? {
+                    return Ok(Some(artifact));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     pub async fn restore_standing_program_runtimes_from_active_views(
         &self,
     ) -> Result<usize, ApiError> {
@@ -750,21 +885,30 @@ impl ApiState {
             .ok_or_else(|| ApiError::bad_request("pending view has no input relation"))?;
         let catalog =
             read_relation_catalog(self, &input.relation_id, &input.relation_version).await?;
-        let Some(descriptor) = trusted_generated_descriptor_for_spec(self, &catalog, &active.spec)?
-        else {
-            return Ok(ViewCompileDeployJobStatus::Skipped(
-                "no trusted generated descriptor matches this pending view".to_string(),
-            ));
-        };
-        if !state_has_generated_descriptor_package(self, &descriptor) {
-            return Ok(ViewCompileDeployJobStatus::Skipped(format!(
-                "generated Rust package `{}` is not registered with this Velorix binary",
-                descriptor.generated_rust.crate_name
-            )));
-        }
-
         self.validate_standing_runtime_fencing_or_evict().await?;
-        let artifact_metadata = generated_view_artifact_for_descriptor(&descriptor, &catalog)?;
+        let artifact_metadata = if let Some(descriptor) =
+            trusted_generated_descriptor_for_spec(self, &catalog, &active.spec)?
+        {
+            if !state_has_generated_descriptor_package(self, &descriptor) {
+                return Ok(ViewCompileDeployJobStatus::Skipped(format!(
+                    "generated Rust package `{}` is not registered with this Velorix binary",
+                    descriptor.generated_rust.crate_name
+                )));
+            }
+            generated_view_artifact_for_descriptor(&descriptor, &catalog)?
+        } else {
+            match self.generated_package_artifact_for_spec(&catalog, &active.spec) {
+                Ok(Some(artifact)) => artifact,
+                Ok(None) => {
+                    return Ok(ViewCompileDeployJobStatus::Skipped(
+                        "no trusted generated descriptor matches this pending view".to_string(),
+                    ));
+                }
+                Err(error) => {
+                    return Ok(ViewCompileDeployJobStatus::Skipped(error.to_string()));
+                }
+            }
+        };
         let (artifact, should_activate_deploying) = match active.execution_mode {
             MaterializedViewExecutionMode::FelderaCompilePending => (
                 register_view_artifact(self, &catalog, &active.spec, &artifact_metadata).await?,
@@ -794,11 +938,6 @@ impl ApiState {
                     .map_err(view_compile_deploy_job_registry_error_to_api)?;
                 return Ok(ViewCompileDeployJobStatus::Duplicate);
             }
-            MaterializedViewExecutionMode::LegacyRecoveredSql => {
-                return Ok(ViewCompileDeployJobStatus::Skipped(
-                    "active view is legacy_recovered_sql".to_string(),
-                ));
-            }
         };
         let identity = artifact
             .standing_program_identity
@@ -827,6 +966,13 @@ impl ApiState {
             Some("catching up committed ingest before query activation".to_string()),
         );
         let activation = if should_activate_deploying {
+            let api_metadata = active.api.clone().unwrap_or_default();
+            validate_standing_runtime_create_api_metadata(
+                &active.spec.view_id,
+                &api_metadata,
+                &artifact_metadata.output_schemas,
+            )
+            .await?;
             self.view_registry()?
                 .activate_pending_with_artifact(
                     &active.spec.view_id,
@@ -948,7 +1094,6 @@ pub fn app(state: ApiState) -> Router {
             post(create_default_scores_relation),
         )
         .route("/v1/ingest", post(ingest_rows))
-        .route("/v1/query", post(query_rows))
         .route("/v1/query-policies", post(create_query_policy))
         .route(
             "/v1/query-policies/{query_policy_id}",
@@ -974,6 +1119,10 @@ pub fn app(state: ApiState) -> Router {
         .route(
             "/v1/view-compile-deploy/jobs",
             get(list_view_compile_deploy_jobs),
+        )
+        .route(
+            "/v1/view-compile-deploy/jobs/{view_id}/complete",
+            post(complete_view_compile_deploy_job),
         )
         .route(
             "/v1/view-compile-deploy/run-once",
@@ -1050,14 +1199,25 @@ fn register_builtin_standing_runtime_factory(state: &ApiState, generated_rust_cr
             generated_rust_crate_name,
             GeneratedScoresByUserRuntimeFactory,
         );
+    } else if generated_rust_crate_name == velorix_generated_single_key_sum_count::CRATE_NAME {
+        state.register_standing_program_runtime_factory(
+            generated_rust_crate_name,
+            GeneratedSingleKeySumCountRuntimeFactory,
+        );
     }
 }
 
 fn default_generated_artifact_packages() -> Vec<GeneratedRustArtifactPackage> {
-    vec![GeneratedRustArtifactPackage {
-        abi_version: SUPPORTED_GENERATED_RUST_ABI_VERSION.to_string(),
-        crate_name: velorix_generated_scores_by_user::CRATE_NAME.to_string(),
-    }]
+    vec![
+        GeneratedRustArtifactPackage {
+            abi_version: SUPPORTED_GENERATED_RUST_ABI_VERSION.to_string(),
+            crate_name: velorix_generated_scores_by_user::CRATE_NAME.to_string(),
+        },
+        GeneratedRustArtifactPackage {
+            abi_version: SUPPORTED_GENERATED_RUST_ABI_VERSION.to_string(),
+            crate_name: velorix_generated_single_key_sum_count::CRATE_NAME.to_string(),
+        },
+    ]
 }
 
 fn default_trusted_generated_view_descriptors() -> Vec<TrustedGeneratedViewDescriptor> {
@@ -1087,6 +1247,7 @@ const DEFAULT_POSITIVE_SCORES_VIEW_ID: &str = "positive_scores_by_user";
 const PENDING_SCORES_COMPILE_DEPLOY_VIEW_ID: &str = "pending_scores_by_user";
 const MULTI_REPLICA_POSITIVE_SCORES_VIEW_ID: &str = "multi_replica_positive_scores_by_user";
 const DEFAULT_POSITIVE_SCORES_SQL: &str = "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id";
+const POSITIVE_SCORES_DYNAMIC_SHAPE_ID: &str = "scores.positive-scores-by-user.v1";
 
 fn trusted_positive_scores_generated_descriptor(
     view_id: &str,
@@ -1098,6 +1259,9 @@ fn trusted_positive_scores_generated_descriptor(
         input_relation_id: DEFAULT_SCORES_RELATION_ID.to_string(),
         input_relation_version: DEFAULT_SCORES_RELATION_VERSION.to_string(),
         sql: DEFAULT_POSITIVE_SCORES_SQL.to_string(),
+        dynamic_view_binding: Some(DynamicGeneratedViewBinding {
+            shape_id: POSITIVE_SCORES_DYNAMIC_SHAPE_ID.to_string(),
+        }),
         artifact_id: artifact_id.to_string(),
         artifact_identity_bytes,
         compiler: FelderaCompilerIdentity {
@@ -1201,12 +1365,88 @@ fn generated_view_artifact_for_descriptor(
         .map_err(ApiError::bad_request)
 }
 
+fn generic_single_key_sum_count_artifact_for_spec(
+    catalog: &VelorixRelationCatalogV1,
+    spec: &StandingViewSpec,
+) -> Result<Option<FelderaCompileArtifactMetadata>, ApiError> {
+    if catalog.relation_schema.relation_id == DEFAULT_SCORES_RELATION_ID
+        && catalog.relation_schema.relation_version == DEFAULT_SCORES_RELATION_VERSION
+    {
+        return Ok(None);
+    }
+    if let Err(error) = validate_catalog_backed_sum_count_view_sql(&spec.sql, catalog) {
+        return Err(ApiError::bad_request(error));
+    }
+    validate_generic_single_key_sum_count_runtime_scope(catalog)?;
+    let spec_hash = feldera_spec_hash(spec).map_err(ApiError::bad_request)?;
+    let spec_hash_segment = spec_hash
+        .strip_prefix("velorix-feldera-spec-sha256-v1:")
+        .unwrap_or(spec_hash.as_str());
+    let artifact_id = format!(
+        "builtin-single-key-sum-count-{}-{}",
+        spec.view_id, spec_hash_segment
+    );
+    let artifact_identity_bytes = serde_json::to_vec(&json!({
+        "runtime": velorix_generated_single_key_sum_count::CRATE_NAME,
+        "view_id": spec.view_id,
+        "spec_hash": spec_hash,
+        "input_schema_fingerprint": catalog.schema_fingerprint.as_str(),
+        "output_schemas": spec.output_relations,
+    }))
+    .map_err(|source| ApiError::internal(source.to_string()))?;
+
+    Ok(Some(FelderaCompileArtifactMetadata {
+        metadata_version: FELDERA_ARTIFACT_METADATA_VERSION,
+        view_id: spec.view_id.clone(),
+        spec_hash,
+        artifact_id,
+        artifact_hash: feldera_artifact_bytes_hash(&artifact_identity_bytes),
+        compiler: FelderaCompilerIdentity {
+            name: "velorix-linked-generic-single-key-sum-count".to_string(),
+            version: "builtin-v1".to_string(),
+            source: "velorix-relation-catalog".to_string(),
+        },
+        generated_rust: GeneratedRustIdentity {
+            abi_version: SUPPORTED_GENERATED_RUST_ABI_VERSION.to_string(),
+            crate_name: velorix_generated_single_key_sum_count::CRATE_NAME.to_string(),
+        },
+        input_schemas: spec.input_relations.clone(),
+        output_schemas: spec.output_relations.clone(),
+        state_codec: SUPPORTED_STATE_CODEC.to_string(),
+        state_schema_version: 1,
+        epoch_policy: SUPPORTED_EPOCH_POLICY.to_string(),
+    }))
+}
+
+fn validate_user_supplied_generic_single_key_sum_count_artifact(
+    state: &ApiState,
+    catalog: &VelorixRelationCatalogV1,
+    spec: &StandingViewSpec,
+    artifact: &FelderaCompileArtifactMetadata,
+) -> Result<(), ApiError> {
+    if artifact.generated_rust.crate_name != velorix_generated_single_key_sum_count::CRATE_NAME {
+        return Ok(());
+    }
+    let Some(expected) = state.generated_package_artifact_for_spec(catalog, spec)? else {
+        return Err(ApiError::bad_request(
+            "generic single-key sum/count artifact is not supported for this view spec/catalog",
+        ));
+    };
+    if artifact == &expected {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request(
+            "generic single-key sum/count artifact metadata must exactly match the validated catalog-backed view spec",
+        ))
+    }
+}
+
 fn trusted_generated_descriptor_for_request(
     state: &ApiState,
     catalog: &VelorixRelationCatalogV1,
     request: &CreateViewRequest,
 ) -> Result<Option<TrustedGeneratedViewDescriptor>, ApiError> {
-    if request.artifact.is_some() || state.allow_legacy_recovered_sql_views {
+    if request.artifact.is_some() {
         return Ok(None);
     }
     Ok(trusted_generated_descriptor_for_shape(
@@ -1259,21 +1499,28 @@ fn trusted_generated_descriptor_for_shape(
                 sql,
             )
         })
-        .map(|descriptor| trusted_generated_descriptor_with_catalog_outputs(descriptor, catalog))
+        .map(|descriptor| {
+            trusted_generated_descriptor_for_request_view(descriptor, catalog, view_id)
+        })
 }
 
-fn trusted_generated_descriptor_with_catalog_outputs(
+fn trusted_generated_descriptor_for_request_view(
     descriptor: &TrustedGeneratedViewDescriptor,
     catalog: &VelorixRelationCatalogV1,
+    view_id: &str,
 ) -> TrustedGeneratedViewDescriptor {
     let mut descriptor = descriptor.clone();
+    if descriptor.view_id != view_id {
+        descriptor.view_id = view_id.to_string();
+        descriptor.artifact_id = format!("{}-view-binding-{view_id}", descriptor.artifact_id);
+    }
     if descriptor.generated_rust.crate_name == velorix_generated_scores_by_user::CRATE_NAME
         && descriptor.input_relation_id == DEFAULT_SCORES_RELATION_ID
         && descriptor.input_relation_version == DEFAULT_SCORES_RELATION_VERSION
         && descriptor.sql == DEFAULT_POSITIVE_SCORES_SQL
     {
         descriptor.output_schemas = vec![positive_scores_output_schema(
-            &descriptor.view_id,
+            view_id,
             catalog.schema_fingerprint.as_str(),
         )];
     }
@@ -1292,8 +1539,8 @@ fn trusted_generated_descriptor_matches(
         && input_relation_version == descriptor.input_relation_version
         && catalog.relation_schema.relation_id == descriptor.input_relation_id
         && catalog.relation_schema.relation_version == descriptor.input_relation_version
-        && view_id == descriptor.view_id
-        && descriptor.matches_view_request(view_id, input_relation_id, input_relation_version, sql)
+        && (view_id == descriptor.view_id || descriptor.dynamic_view_binding.is_some())
+        && descriptor.matches_view_shape(input_relation_id, input_relation_version, sql)
 }
 
 fn state_has_generated_descriptor_package(
@@ -1384,8 +1631,6 @@ pub async fn run_from_env() -> anyhow::Result<()> {
     .await?;
     state = state
         .with_request_limits(config.max_request_body_bytes, config.max_ingest_rows)
-        .with_legacy_recovered_sql_views_allowed(config.allow_legacy_recovered_sql_views)
-        .with_generic_query_enabled(config.enable_generic_query)
         .with_standing_runtime_fencing_mode(config.standing_runtime_fencing)
         .with_standing_runtime_owner_ttl_ms(config.standing_runtime_owner_ttl_ms);
     if let Some(token) = config.api_bearer_token {
@@ -1469,13 +1714,6 @@ pub struct IngestRowsRequest {
     pub partition_id: u32,
     pub start_offset_inclusive: u64,
     pub rows: Vec<Value>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct QueryRequest {
-    pub relation_id: String,
-    pub relation_version: String,
-    pub sql: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1670,6 +1908,13 @@ enum ViewCompileDeployJobStatus {
     Skipped(String),
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompleteViewCompileDeployRequest {
+    spec_hash: String,
+    artifact: FelderaCompileArtifactMetadata,
+}
+
 async fn healthz() -> Json<Value> {
     Json(json!({ "status": "ok" }))
 }
@@ -1695,8 +1940,6 @@ async fn readyz(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> 
         "status": "ready",
         "standing_runtime_fencing_required": state.standing_runtime_fencing_required,
         "standing_runtime_fencing_mode": state.standing_runtime_fencing_mode.as_str(),
-        "legacy_recovered_sql_views_allowed": state.allow_legacy_recovered_sql_views,
-        "generic_query_enabled": state.enable_generic_query,
         "object_store": object_store_capabilities_json(state.capabilities.as_ref()),
         "api_auth": {
             "configured": state.api_bearer_token.is_some(),
@@ -1891,6 +2134,21 @@ async fn list_view_compile_deploy_jobs(
     }))
 }
 
+async fn complete_view_compile_deploy_job(
+    State(state): State<ApiState>,
+    AxumPath(view_id): AxumPath<String>,
+    Json(request): Json<CompleteViewCompileDeployRequest>,
+) -> Result<Json<ViewResponse>, ApiError> {
+    let response = complete_pending_view_compile_deploy_job(
+        &state,
+        &view_id,
+        &request.spec_hash,
+        &request.artifact,
+    )
+    .await?;
+    Ok(Json(response))
+}
+
 async fn get_standing_runtime_owners(
     State(state): State<ApiState>,
 ) -> Result<Json<StandingRuntimeOwnerReportResponse>, ApiError> {
@@ -2062,20 +2320,19 @@ async fn create_view(
         .as_ref()
         .map(|artifact_request| &artifact_request.metadata)
         .or(trusted_generated_artifact.as_ref());
-    let spec = view_spec_from_request(&request, &catalog, selected_artifact_metadata)?;
+    let spec = view_spec_from_request(&state, &request, &catalog, selected_artifact_metadata)?;
     let artifact = if let Some(artifact_request) = &request.artifact {
         state.validate_standing_runtime_fencing_or_evict().await?;
+        validate_user_supplied_generic_single_key_sum_count_artifact(
+            &state,
+            &catalog,
+            &spec,
+            &artifact_request.metadata,
+        )?;
         Some(register_view_artifact(&state, &catalog, &spec, &artifact_request.metadata).await?)
     } else if let Some(artifact_metadata) = &trusted_static_artifact {
         state.validate_standing_runtime_fencing_or_evict().await?;
         Some(register_view_artifact(&state, &catalog, &spec, artifact_metadata).await?)
-    } else if state.allow_legacy_recovered_sql_views {
-        validate_supported_dbsp_view_sql(&spec.sql, &catalog).map_err(|error| {
-            ApiError::bad_request(format!(
-                "legacy_recovered_sql DBSP bootstrap guard rejected view SQL: {error}. Product generated-package views can support wider SQL only when a trusted generated package is available"
-            ))
-        })?;
-        None
     } else {
         None
     };
@@ -2098,6 +2355,7 @@ async fn create_view(
             &state,
             &spec.view_id,
             artifact,
+            &catalog,
             &artifact_metadata.input_schemas,
             &artifact_metadata.output_schemas,
         )?
@@ -2106,8 +2364,6 @@ async fn create_view(
     };
     let execution_mode = if artifact.is_some() {
         MaterializedViewExecutionMode::StandingRuntime
-    } else if state.allow_legacy_recovered_sql_views {
-        MaterializedViewExecutionMode::LegacyRecoveredSql
     } else {
         MaterializedViewExecutionMode::FelderaCompilePending
     };
@@ -2167,7 +2423,6 @@ async fn create_view(
             spec_hash,
             execution_mode,
             lifecycle,
-            state.allow_legacy_recovered_sql_views,
             Some(api_metadata),
             artifact,
             Some(outcome_text),
@@ -2209,6 +2464,150 @@ async fn register_view_artifact(
             catalog, spec, artifact,
         )?),
     })
+}
+
+async fn complete_pending_view_compile_deploy_job(
+    state: &ApiState,
+    view_id: &str,
+    spec_hash: &str,
+    artifact_metadata: &FelderaCompileArtifactMetadata,
+) -> Result<ViewResponse, ApiError> {
+    let active = state
+        .view_registry()?
+        .read_active(view_id)
+        .await
+        .map_err(materialized_view_registry_error_to_api)?;
+    if active.spec_hash != spec_hash {
+        return Err(ApiError::conflict(format!(
+            "active view spec hash does not match completion request: active={}, request={}",
+            active.spec_hash, spec_hash
+        )));
+    }
+    if active.execution_mode != MaterializedViewExecutionMode::FelderaCompilePending {
+        return Err(ApiError::conflict(format!(
+            "view `{view_id}` is not waiting for Feldera compile/deploy completion"
+        )));
+    }
+    let job = read_pending_compile_deploy_job(state, view_id, spec_hash).await?;
+    if !compile_job_request_matches_active_spec(&job, &active.spec) {
+        return Err(ApiError::conflict(
+            "compile/deploy job compiler_request does not match active view spec",
+        ));
+    }
+
+    let input = active
+        .spec
+        .input_relations
+        .first()
+        .ok_or_else(|| ApiError::bad_request("pending view has no input relation"))?;
+    let catalog = read_relation_catalog(state, &input.relation_id, &input.relation_version).await?;
+    state.validate_standing_runtime_fencing_or_evict().await?;
+    let artifact = register_view_artifact(state, &catalog, &active.spec, artifact_metadata).await?;
+    let identity = artifact
+        .standing_program_identity
+        .as_ref()
+        .ok_or_else(|| ApiError::conflict("generated artifact is missing runtime identity"))?
+        .clone();
+    let api_metadata = active.api.clone().unwrap_or_default();
+    validate_standing_runtime_create_api_metadata(
+        &active.spec.view_id,
+        &api_metadata,
+        &artifact_metadata.output_schemas,
+    )
+    .await?;
+    let replay_checkpoints = if let Some((runtime, replay_checkpoints)) =
+        restore_or_build_standing_runtime_for_artifact(
+            state,
+            &active.spec.view_id,
+            &artifact,
+            &artifact_metadata.input_schemas,
+            &artifact_metadata.output_schemas,
+        )
+        .await?
+    {
+        insert_standing_runtime(state, &active.spec.view_id, runtime)?;
+        replay_checkpoints
+    } else {
+        read_latest_standing_runtime_checkpoint(state, &identity, &active.spec.view_id)
+            .await?
+            .map(|record| record.replay_checkpoints)
+            .unwrap_or_default()
+    };
+    let deploying_lifecycle = MaterializedViewLifecycleStatus::standing_runtime_deploying(Some(
+        "catching up committed ingest before query activation".to_string(),
+    ));
+    let activation = state
+        .view_registry()?
+        .activate_pending_with_artifact(
+            &active.spec.view_id,
+            &active.spec_hash,
+            artifact.clone(),
+            deploying_lifecycle.clone(),
+        )
+        .await
+        .map_err(materialized_view_registry_error_to_api)?;
+    let replay_active = ActiveMaterializedView {
+        spec_hash: active.spec_hash.clone(),
+        spec: active.spec.clone(),
+        execution_mode: MaterializedViewExecutionMode::StandingRuntime,
+        api: active.api.clone(),
+        artifact: Some(artifact),
+        lifecycle: deploying_lifecycle,
+    };
+    replay_committed_ingest_into_standing_runtime(state, &replay_active, &replay_checkpoints)
+        .await?;
+    let lifecycle = MaterializedViewLifecycleStatus::standing_runtime();
+    let lifecycle_update = state
+        .view_registry()?
+        .update_standing_runtime_lifecycle(&active.spec.view_id, &active.spec_hash, lifecycle)
+        .await
+        .map_err(materialized_view_registry_error_to_api)?;
+    state
+        .view_compile_deploy_job_registry()?
+        .mark_running(
+            &active.spec.view_id,
+            &active.spec_hash,
+            Some("standing runtime activated from completed Feldera artifact".to_string()),
+        )
+        .await
+        .map_err(view_compile_deploy_job_registry_error_to_api)?;
+    let outcome = match (activation, lifecycle_update) {
+        (ActivateMaterializedViewOutcome::Activated, _) => "activated",
+        (
+            ActivateMaterializedViewOutcome::Duplicate,
+            UpdateMaterializedViewLifecycleOutcome::Updated,
+        ) => "activated",
+        (
+            ActivateMaterializedViewOutcome::Duplicate,
+            UpdateMaterializedViewLifecycleOutcome::Duplicate,
+        ) => "duplicate",
+    };
+    let active = state
+        .view_registry()?
+        .read_active(&active.spec.view_id)
+        .await
+        .map_err(materialized_view_registry_error_to_api)?;
+    active_view_response(&active, Some(outcome))
+}
+
+async fn read_pending_compile_deploy_job(
+    state: &ApiState,
+    view_id: &str,
+    spec_hash: &str,
+) -> Result<ViewCompileDeployJobRecord, ApiError> {
+    match state
+        .view_compile_deploy_job_registry()?
+        .read(view_id, spec_hash)
+        .await
+    {
+        Ok(job) => Ok(job),
+        Err(ViewCompileDeployJobRegistryError::ObjectStore(object_store::Error::NotFound {
+            ..
+        })) => Err(ApiError::conflict(format!(
+            "compile/deploy job does not exist for view `{view_id}` and spec hash `{spec_hash}`"
+        ))),
+        Err(error) => Err(view_compile_deploy_job_registry_error_to_api(error)),
+    }
 }
 
 fn standing_program_identity_from_artifact(
@@ -2294,6 +2693,7 @@ fn build_standing_runtime_for_artifact(
     state: &ApiState,
     view_id: &str,
     artifact: &MaterializedViewArtifactBinding,
+    catalog: &VelorixRelationCatalogV1,
     expected_input_schemas: &[RelationSchema],
     expected_output_schemas: &[RelationSchema],
 ) -> Result<Option<Box<dyn StandingProgramRuntime + Send>>, ApiError> {
@@ -2309,7 +2709,14 @@ fn build_standing_runtime_for_artifact(
             artifact.generated_rust_crate_name
         )));
     };
-    let runtime = factory.create(identity).map_err(ApiError::internal)?;
+    let runtime = factory
+        .create_with_catalog(
+            identity,
+            catalog,
+            expected_input_schemas,
+            expected_output_schemas,
+        )
+        .map_err(ApiError::internal)?;
     if runtime.program_identity() != identity {
         return Err(ApiError::bad_request(
             StandingProgramRuntimeError::ProgramIdentityMismatch {
@@ -2351,6 +2758,13 @@ async fn restore_or_build_standing_runtime_for_artifact(
             artifact.generated_rust_crate_name
         )));
     };
+    let catalog = expected_input_schemas
+        .first()
+        .map(|schema| async {
+            read_relation_catalog(state, &schema.relation_id, &schema.relation_version).await
+        })
+        .ok_or_else(|| ApiError::bad_request("standing runtime artifact has no input schema"))?
+        .await?;
 
     let (runtime, replay_checkpoints) = if let Some(record) =
         read_latest_standing_runtime_checkpoint(state, identity, view_id).await?
@@ -2368,13 +2782,27 @@ async fn restore_or_build_standing_runtime_for_artifact(
             )
         } else {
             (
-                factory.create(identity).map_err(ApiError::internal)?,
+                factory
+                    .create_with_catalog(
+                        identity,
+                        &catalog,
+                        expected_input_schemas,
+                        expected_output_schemas,
+                    )
+                    .map_err(ApiError::internal)?,
                 Vec::new(),
             )
         }
     } else {
         (
-            factory.create(identity).map_err(ApiError::internal)?,
+            factory
+                .create_with_catalog(
+                    identity,
+                    &catalog,
+                    expected_input_schemas,
+                    expected_output_schemas,
+                )
+                .map_err(ApiError::internal)?,
             Vec::new(),
         )
     };
@@ -2509,7 +2937,7 @@ async fn list_views(State(state): State<ApiState>) -> Result<Json<ViewCatalogRes
         .await
         .map_err(materialized_view_registry_error_to_api)?
         .iter()
-        .map(|view| active_view_response(&state, view, None))
+        .map(|view| active_view_response(view, None))
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(Json(ViewCatalogResponse { views }))
@@ -2525,7 +2953,7 @@ async fn get_view(
         .await
         .map_err(materialized_view_registry_error_to_api)?;
 
-    Ok(Json(active_view_response(&state, &active, None)?))
+    Ok(Json(active_view_response(&active, None)?))
 }
 
 async fn ingest_rows(
@@ -3381,49 +3809,6 @@ fn query_policy_response(
     }
 }
 
-async fn query_rows(
-    State(state): State<ApiState>,
-    Json(request): Json<QueryRequest>,
-) -> Result<Json<QueryResponse>, ApiError> {
-    if !state.enable_generic_query {
-        return Err(generic_query_disabled_error());
-    }
-    let sql = normalize_product_query_sql(&request.sql);
-    let batches = if state.meta_store.is_some() {
-        let catalog =
-            read_relation_catalog(&state, &request.relation_id, &request.relation_version).await?;
-        query_production_recovered_materialized_view_with_catalog_and_policy_and_limiter(
-            Arc::clone(&state.store),
-            ObjectPath::from(state.state_path.clone()),
-            catalog,
-            &state.capabilities,
-            &sql,
-            QueryPolicy::default(),
-            None,
-        )
-        .await
-        .map_err(ApiError::bad_request)?
-    } else {
-        query_production_recovered_materialized_view_with_policy_and_limiter(
-            Arc::clone(&state.store),
-            ObjectPath::from(state.state_path.clone()),
-            &request.relation_id,
-            &request.relation_version,
-            &state.capabilities,
-            &sql,
-            QueryPolicy::default(),
-            None,
-        )
-        .await
-        .map_err(ApiError::bad_request)?
-    };
-    Ok(Json(QueryResponse {
-        rows: record_batches_to_json_rows(&batches)?,
-        logical_epoch: None,
-        next_page_token: None,
-    }))
-}
-
 async fn query_view_rows_get(
     State(state): State<ApiState>,
     AxumPath(view_id): AxumPath<String>,
@@ -3477,7 +3862,7 @@ async fn query_view_api_get(
 ) -> Result<Json<QueryResponse>, ApiError> {
     let page_request = extract_snapshot_page_request(&mut query)?;
     let (active, mut parameters) = read_active_view_by_api_path(&state, &api_path).await?;
-    ensure_view_execution_allowed(&state, &active)?;
+    ensure_view_execution_allowed(&active)?;
     let api = active.api.clone().unwrap_or_default();
     for (name, value) in query
         .into_iter()
@@ -3518,7 +3903,7 @@ async fn query_view_rows_post(
         .read_active(&view_id)
         .await
         .map_err(materialized_view_registry_error_to_api)?;
-    ensure_view_execution_allowed(&state, &active)?;
+    ensure_view_execution_allowed(&active)?;
     validate_direct_view_query_parameter_sources(&active, &request.parameters)?;
     query_active_view_rows_impl(
         state,
@@ -3582,61 +3967,13 @@ async fn query_active_view_rows_impl(
     parameters: BTreeMap<String, Value>,
     page_request: SnapshotPageRequest,
 ) -> Result<Json<QueryResponse>, ApiError> {
-    ensure_view_execution_allowed(&state, &active)?;
+    ensure_view_execution_allowed(&active)?;
     let view_id = active.spec.view_id.clone();
-    let input = active
-        .spec
-        .input_relations
-        .first()
-        .ok_or_else(|| ApiError::bad_request("view has no input relation"))?;
     let api = active.api.clone().unwrap_or_default();
     let parameters = resolve_request_parameters(&api.request, &parameters)?;
     let query_policy = query_policy_for_view_api(&state, &api).await?;
 
     match active.execution_mode {
-        MaterializedViewExecutionMode::LegacyRecoveredSql => {
-            let bound_sql = if let Some(sql) = request_sql.as_deref() {
-                render_view_sql_template(
-                    &normalize_view_query_sql(sql, &view_id),
-                    &api.request,
-                    &parameters,
-                )?
-            } else if let Some(sql) = api.sql_template.as_deref() {
-                render_view_sql_template(
-                    &normalize_view_query_sql(sql, &view_id),
-                    &api.request,
-                    &parameters,
-                )?
-            } else {
-                default_view_query_sql(&view_id)
-            };
-            let batches =
-                query_production_recovered_materialized_view_table_with_bindings_and_policy_and_limiter(
-                    Arc::clone(&state.store),
-                    ObjectPath::from(state.state_path.clone()),
-                    &input.relation_id,
-                    &input.relation_version,
-                    &view_id,
-                    &state.capabilities,
-                    &bound_sql.sql,
-                    &bound_sql.bind_values,
-                    query_policy.policy,
-                    query_policy.limiter.clone(),
-                )
-                .await
-                .map_err(ApiError::bad_request)?;
-            let rows = record_batches_to_json_rows(&batches)?;
-            let rows = match &api.response_schema {
-                Some(response_schema) => materialized_rows_to_api_rows(&rows, response_schema)?,
-                None => rows,
-            };
-
-            Ok(Json(QueryResponse {
-                rows,
-                logical_epoch: None,
-                next_page_token: None,
-            }))
-        }
         MaterializedViewExecutionMode::StandingRuntime => {
             validate_standing_runtime_query_contract(
                 &active.spec.view_id,
@@ -3674,20 +4011,20 @@ async fn query_active_view_rows_impl(
     }
 }
 
-fn ensure_view_execution_allowed(
-    state: &ApiState,
-    active: &ActiveMaterializedView,
-) -> Result<(), ApiError> {
+fn ensure_view_execution_allowed(active: &ActiveMaterializedView) -> Result<(), ApiError> {
     if active.execution_mode == MaterializedViewExecutionMode::FelderaCompilePending {
         return Err(ApiError::service_unavailable(format!(
             "feldera_compile_pending: view `{}` is accepted but not deployed yet",
             active.spec.view_id
         )));
     }
-    if active.execution_mode == MaterializedViewExecutionMode::LegacyRecoveredSql
-        && !state.allow_legacy_recovered_sql_views
+    if active.lifecycle.compile_status != MaterializedViewCompileStatus::Success
+        || active.lifecycle.deployment_status != MaterializedViewDeploymentStatus::Running
     {
-        return Err(legacy_recovered_sql_views_disabled_error());
+        return Err(ApiError::service_unavailable(format!(
+            "standing_runtime_not_deployed: view `{}` is not running yet",
+            active.spec.view_id
+        )));
     }
     Ok(())
 }
@@ -3929,12 +4266,7 @@ async fn openapi_json(State(state): State<ApiState>) -> Result<Json<Value>, ApiE
     );
 
     for view in views {
-        if !state.allow_legacy_recovered_sql_views
-            && view.execution_mode == MaterializedViewExecutionMode::LegacyRecoveredSql
-        {
-            continue;
-        }
-        let response = active_view_response(&state, &view, None)?;
+        let response = active_view_response(&view, None)?;
         if !response.query_enabled {
             continue;
         }
@@ -3984,19 +4316,6 @@ async fn openapi_json(State(state): State<ApiState>) -> Result<Json<Value>, ApiE
         },
         "paths": Value::Object(paths)
     })))
-}
-
-fn normalize_product_query_sql(sql: &str) -> String {
-    match sql.trim().to_ascii_lowercase().as_str() {
-        "select key, value, weight from input" => {
-            "select key_json as key, value_json as value, weight from input".to_string()
-        }
-        "select key, value, weight from input order by key" => {
-            "select key_json as key, value_json as value, weight from input order by key_json"
-                .to_string()
-        }
-        _ => sql.to_string(),
-    }
 }
 
 fn normalize_view_query_sql(sql: &str, view_id: &str) -> String {
@@ -4059,13 +4378,9 @@ fn arrow_data_type_from_sql_data_type(data_type: &SqlDataType) -> Result<DataTyp
             arrow::datatypes::TimeUnit::Nanosecond,
             None,
         )),
-    }
-}
-
-fn default_view_query_sql(view_id: &str) -> BoundViewSql {
-    BoundViewSql {
-        sql: format!("select key_json, value_json, weight from {view_id} order by key_json"),
-        bind_values: Vec::new(),
+        unsupported => Err(ApiError::bad_request(format!(
+            "Feldera SQL type `{unsupported:?}` is not supported by the current Velorix Arrow execution path"
+        ))),
     }
 }
 
@@ -5199,7 +5514,6 @@ fn runtime_artifact_status_text(status: &RuntimeFelderaArtifactSelectionStatus) 
 }
 
 fn active_view_response(
-    state: &ApiState,
     active: &ActiveMaterializedView,
     outcome: Option<&str>,
 ) -> Result<ViewResponse, ApiError> {
@@ -5208,23 +5522,17 @@ fn active_view_response(
         active.spec_hash.clone(),
         active.execution_mode.clone(),
         active.lifecycle.clone(),
-        state.allow_legacy_recovered_sql_views,
         active.api.clone(),
         active.artifact.clone(),
         outcome,
     )
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The API response helper combines the durable view record with resolved runtime metadata."
-)]
 fn view_response(
     spec: &StandingViewSpec,
     spec_hash: String,
     execution_mode: MaterializedViewExecutionMode,
     lifecycle: MaterializedViewLifecycleStatus,
-    allow_legacy_recovered_sql_views: bool,
     api: Option<MaterializedViewApiMetadata>,
     artifact: Option<MaterializedViewArtifactBinding>,
     outcome: Option<&str>,
@@ -5238,11 +5546,7 @@ fn view_response(
         ..MaterializedViewApiMetadata::default()
     });
 
-    let (query_enabled, disabled_reason) = view_query_availability(
-        &execution_mode,
-        &lifecycle,
-        allow_legacy_recovered_sql_views,
-    );
+    let (query_enabled, disabled_reason) = view_query_availability(&execution_mode, &lifecycle);
     let compile_job_id = if execution_mode == MaterializedViewExecutionMode::FelderaCompilePending {
         Some(view_compile_deploy_job_id(&spec.view_id, &spec_hash))
     } else {
@@ -5280,9 +5584,6 @@ fn lifecycle_for_create_view_execution(
     execution_mode: &MaterializedViewExecutionMode,
 ) -> MaterializedViewLifecycleStatus {
     match execution_mode {
-        MaterializedViewExecutionMode::LegacyRecoveredSql => {
-            MaterializedViewLifecycleStatus::legacy_recovered_sql()
-        }
         MaterializedViewExecutionMode::StandingRuntime => {
             MaterializedViewLifecycleStatus::standing_runtime()
         }
@@ -5298,19 +5599,8 @@ fn lifecycle_for_create_view_execution(
 fn view_query_availability(
     execution_mode: &MaterializedViewExecutionMode,
     lifecycle: &MaterializedViewLifecycleStatus,
-    allow_legacy_recovered_sql_views: bool,
 ) -> (bool, Option<String>) {
     match execution_mode {
-        MaterializedViewExecutionMode::LegacyRecoveredSql => {
-            if allow_legacy_recovered_sql_views {
-                (true, None)
-            } else {
-                (
-                    false,
-                    Some("legacy_recovered_sql_views_disabled".to_string()),
-                )
-            }
-        }
         MaterializedViewExecutionMode::FelderaCompilePending => {
             (false, Some("feldera_compile_pending".to_string()))
         }
@@ -5327,32 +5617,136 @@ fn view_query_availability(
 }
 
 fn view_spec_from_request(
+    state: &ApiState,
     request: &CreateViewRequest,
     catalog: &VelorixRelationCatalogV1,
     artifact: Option<&FelderaCompileArtifactMetadata>,
 ) -> Result<StandingViewSpec, ApiError> {
     let input = catalog_input_relation_schema(catalog).map_err(ApiError::bad_request)?;
+    let output_relations = if let Some(artifact_request) = &request.artifact {
+        artifact_request.metadata.output_schemas.clone()
+    } else if let Some(artifact) = artifact {
+        artifact.output_schemas.clone()
+    } else if let Some(output) = state.generated_package_output_schemas_for_view_request(
+        request.view_id.as_str(),
+        request.sql.as_str(),
+        catalog,
+        input.schema_fingerprint.as_str(),
+    )? {
+        output
+    } else {
+        vec![generic_materialized_view_output_schema(
+            request.view_id.as_str(),
+            input.schema_fingerprint.as_str(),
+        )]
+    };
     Ok(StandingViewSpec {
         view_id: request.view_id.clone(),
         sql: request.sql.clone(),
         dialect: SqlDialect::FelderaSql,
         source_kind: SqlSourceKind::StandingView,
         input_relations: vec![input.clone()],
-        output_relations: request
-            .artifact
-            .as_ref()
-            .map(|artifact_request| artifact_request.metadata.output_schemas.clone())
-            .or_else(|| artifact.map(|artifact| artifact.output_schemas.clone()))
-            .unwrap_or_else(|| {
-                vec![generic_materialized_view_output_schema(
-                    request.view_id.as_str(),
-                    input.schema_fingerprint.as_str(),
-                )]
-            }),
+        output_relations,
         shape: StandingViewShape {
             is_materialized: true,
             multi_input: false,
             multi_output: false,
+        },
+    })
+}
+
+fn single_key_sum_count_output_schema(
+    view_id: &str,
+    catalog: &VelorixRelationCatalogV1,
+) -> Result<RelationSchema, ApiError> {
+    let [primary_key_id] = catalog.relation_schema.primary_key_column_ids.as_slice() else {
+        return Err(ApiError::bad_request(
+            "single-key sum/count view requires exactly one primary key column",
+        ));
+    };
+    let key_column = catalog
+        .relation_schema
+        .columns
+        .iter()
+        .find(|column| &column.column_id == primary_key_id)
+        .ok_or_else(|| ApiError::bad_request("primary key column is missing from catalog"))?;
+    let key_type = sql_type_from_catalog_column(key_column)?;
+    let sum_type = generic_single_key_sum_count_sum_type(catalog)?;
+    Ok(RelationSchema {
+        relation_id: view_id.to_string(),
+        relation_name: view_id.to_string(),
+        relation_version: "v1".to_string(),
+        schema_fingerprint: catalog.schema_fingerprint.to_string(),
+        columns: vec![
+            ColumnSchema {
+                name: key_column.name.clone(),
+                data_type: key_type,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "sum".to_string(),
+                data_type: sum_type,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "count".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec![key_column.name.clone()],
+    })
+}
+
+fn validate_generic_single_key_sum_count_runtime_scope(
+    catalog: &VelorixRelationCatalogV1,
+) -> Result<(), ApiError> {
+    generic_single_key_sum_count_sum_type(catalog).map(|_| ())
+}
+
+fn generic_single_key_sum_count_sum_type(
+    catalog: &VelorixRelationCatalogV1,
+) -> Result<SqlDataType, ApiError> {
+    let mut value_columns = catalog
+        .relation_schema
+        .columns
+        .iter()
+        .filter(|column| column.semantic_role == RelationSemanticRoleV1::Value);
+    let value = value_columns.next().ok_or_else(|| {
+        ApiError::bad_request("single-key sum/count view requires one value column")
+    })?;
+    if value_columns.next().is_some() {
+        return Err(ApiError::bad_request(
+            "single-key sum/count view supports exactly one value column",
+        ));
+    }
+    match &value.physical_arrow_type {
+        ArrowPhysicalTypeV1::Int64 => Ok(SqlDataType::Int64),
+        ArrowPhysicalTypeV1::Decimal128 { precision, scale } => Ok(SqlDataType::Decimal {
+            precision: *precision,
+            scale: *scale,
+        }),
+        _ => Err(ApiError::bad_request(format!(
+            "single-key sum/count generated runtime value column `{}` must be Int64 or Decimal128",
+            value.name
+        ))),
+    }
+}
+
+fn sql_type_from_catalog_column(column: &RelationColumnV1) -> Result<SqlDataType, ApiError> {
+    Ok(match &column.logical_type {
+        VelorixLogicalTypeV1::Bool => SqlDataType::Bool,
+        VelorixLogicalTypeV1::Int64 => SqlDataType::Int64,
+        VelorixLogicalTypeV1::Float64 => SqlDataType::Float64,
+        VelorixLogicalTypeV1::Utf8 => SqlDataType::Utf8,
+        VelorixLogicalTypeV1::Json => SqlDataType::Json,
+        VelorixLogicalTypeV1::Date => SqlDataType::Date,
+        VelorixLogicalTypeV1::Timestamp { timezone } => SqlDataType::Timestamp {
+            timezone: timezone.clone(),
+        },
+        VelorixLogicalTypeV1::Decimal { precision, scale } => SqlDataType::Decimal {
+            precision: *precision,
+            scale: *scale,
         },
     })
 }
@@ -5747,10 +6141,47 @@ fn arrow_value_to_json(column: &ArrayRef, row_index: usize) -> Result<Value, Api
             .downcast_ref::<BooleanArray>()
             .ok_or_else(|| ApiError::internal("invalid Boolean Arrow column"))?
             .value(row_index))),
+        DataType::Decimal128(_precision, scale) => {
+            let value = column
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .ok_or_else(|| ApiError::internal("invalid Decimal128 Arrow column"))?
+                .value(row_index);
+            Ok(Value::String(format_decimal128_for_json(value, *scale)))
+        }
+        DataType::Date32 => Ok(json!(column
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .ok_or_else(|| ApiError::internal("invalid Date32 Arrow column"))?
+            .value(row_index))),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => Ok(json!(column
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .ok_or_else(|| ApiError::internal("invalid TimestampNanosecond Arrow column"))?
+            .value(row_index))),
         other => Err(ApiError::internal(format!(
             "unsupported query result Arrow type {other:?}"
         ))),
     }
+}
+
+fn format_decimal128_for_json(value: i128, scale: i8) -> String {
+    let magnitude = value.unsigned_abs();
+    let mut digits = magnitude.to_string();
+    let scale = usize::try_from(scale.max(0)).expect("non-negative i8 fits usize");
+    let mut decimal = if scale == 0 {
+        digits
+    } else if digits.len() <= scale {
+        let leading_zeroes = "0".repeat(scale - digits.len());
+        format!("0.{leading_zeroes}{digits}")
+    } else {
+        let fractional = digits.split_off(digits.len() - scale);
+        format!("{digits}.{fractional}")
+    };
+    if value.is_negative() {
+        decimal.insert(0, '-');
+    }
+    decimal
 }
 
 #[derive(Debug)]
@@ -5801,18 +6232,6 @@ impl ApiError {
             message: error.to_string(),
         }
     }
-}
-
-fn legacy_recovered_sql_views_disabled_error() -> ApiError {
-    ApiError::conflict(
-        "legacy_recovered_sql_views_disabled: legacy recovered SQL views require VELORIX_ALLOW_LEGACY_RECOVERED_SQL_VIEWS=1",
-    )
-}
-
-fn generic_query_disabled_error() -> ApiError {
-    ApiError::conflict(
-        "generic_query_disabled: /v1/query requires VELORIX_ENABLE_GENERIC_QUERY=1 and is not part of the default product API surface",
-    )
 }
 
 fn meta_error_to_api(error: MetaStoreError) -> ApiError {
@@ -5941,8 +6360,6 @@ struct ApiConfig {
     admin_bearer_token: Option<String>,
     max_request_body_bytes: usize,
     max_ingest_rows: usize,
-    allow_legacy_recovered_sql_views: bool,
-    enable_generic_query: bool,
     standing_runtime_fencing: StandingRuntimeFencingMode,
     standing_runtime_owner_ttl_ms: u64,
 }
@@ -6015,9 +6432,6 @@ impl ApiConfig {
         let max_request_body_bytes =
             parse_positive_usize_env("VELORIX_API_MAX_REQUEST_BODY_BYTES", 1024 * 1024)?;
         let max_ingest_rows = parse_positive_usize_env("VELORIX_API_MAX_INGEST_ROWS", 10_000)?;
-        let allow_legacy_recovered_sql_views =
-            parse_bool_env("VELORIX_ALLOW_LEGACY_RECOVERED_SQL_VIEWS", false)?;
-        let enable_generic_query = parse_bool_env("VELORIX_ENABLE_GENERIC_QUERY", false)?;
         let api_replica_count =
             parse_api_replica_count(std::env::var("VELORIX_API_REPLICA_COUNT").ok().as_deref())?;
         let standing_runtime_fencing = StandingRuntimeFencingMode::from_env(
@@ -6051,8 +6465,6 @@ impl ApiConfig {
             admin_bearer_token,
             max_request_body_bytes,
             max_ingest_rows,
-            allow_legacy_recovered_sql_views,
-            enable_generic_query,
             standing_runtime_fencing,
             standing_runtime_owner_ttl_ms,
         })

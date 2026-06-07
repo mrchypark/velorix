@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use object_store::{path::Path, ObjectStore, PutMode};
 use serde::{Deserialize, Serialize};
@@ -21,13 +20,6 @@ use velorix_storage::{
     },
     object_key::{ObjectKey, ObjectKeyError},
 };
-
-use crate::query::{
-    query_bootstrap_recovered_materialized_view_with_policy_and_limiter,
-    query_production_recovered_materialized_view_with_policy_and_limiter, ProductionQueryRuntime,
-    QueryExecutionLimiter, RuntimeQueryError,
-};
-use crate::recovery::RecoveryError;
 
 pub const PERSISTED_QUERY_SCHEMA_VERSION: u32 = 1;
 
@@ -50,8 +42,6 @@ pub enum PersistedQueryError {
     Query(#[from] QueryError),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
-    #[error(transparent)]
-    RuntimeQuery(#[from] RuntimeQueryError),
     #[error(transparent)]
     RelationSchema(#[from] RelationSchemaError),
     #[error(transparent)]
@@ -189,17 +179,6 @@ impl PersistedQueryStore {
         Ok(spec)
     }
 
-    pub async fn get_for_production_recovered_materialized_view(
-        &self,
-        query_id: &str,
-    ) -> Result<PersistedQuerySpec, PersistedQueryError> {
-        self.require_production_authority()?;
-        let spec = self.get(query_id).await?;
-        validate_input_query_with_policy(&spec.sql, spec.policy).await?;
-
-        Ok(spec)
-    }
-
     fn require_production_authority(&self) -> Result<(), PersistedQueryError> {
         if self.production_authority_validated {
             Ok(())
@@ -231,129 +210,4 @@ async fn validate_production_relation_query(
     .await?;
 
     Ok(())
-}
-
-/// Bootstrap/dev persisted recovered-query helper backed by raw object-state
-/// recovery and unchecked persisted-query catalog reads.
-///
-/// Production callers must use
-/// [`query_production_persisted_recovered_materialized_view`].
-pub async fn query_bootstrap_persisted_recovered_materialized_view(
-    store: Arc<dyn ObjectStore>,
-    query_id: &str,
-) -> Result<Vec<RecordBatch>, PersistedQueryError> {
-    query_bootstrap_persisted_recovered_materialized_view_with_limiter(store, query_id, None).await
-}
-
-/// Bootstrap/dev persisted recovered-query helper backed by raw object-state
-/// recovery and unchecked persisted-query catalog reads.
-///
-/// Production callers must use
-/// [`query_production_persisted_recovered_materialized_view_with_limiter`].
-pub async fn query_bootstrap_persisted_recovered_materialized_view_with_limiter(
-    store: Arc<dyn ObjectStore>,
-    query_id: &str,
-    limiter: Option<QueryExecutionLimiter>,
-) -> Result<Vec<RecordBatch>, PersistedQueryError> {
-    let catalog = PersistedQueryStore::new(Arc::clone(&store));
-    let spec = catalog.get(query_id).await?;
-
-    Ok(
-        query_bootstrap_recovered_materialized_view_with_policy_and_limiter(
-            store,
-            &spec.sql,
-            spec.policy,
-            limiter,
-        )
-        .await?,
-    )
-}
-
-pub async fn query_production_persisted_recovered_materialized_view(
-    store: Arc<dyn ObjectStore>,
-    query_id: &str,
-    slatedb_state_path: impl Into<Path>,
-    relation_id: &str,
-    relation_version: &str,
-    capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
-) -> Result<Vec<RecordBatch>, PersistedQueryError> {
-    query_production_persisted_recovered_materialized_view_with_limiter(
-        store,
-        query_id,
-        slatedb_state_path,
-        relation_id,
-        relation_version,
-        capabilities,
-        None,
-    )
-    .await
-}
-
-pub async fn query_production_persisted_recovered_materialized_view_with_limiter(
-    store: Arc<dyn ObjectStore>,
-    query_id: &str,
-    slatedb_state_path: impl Into<Path>,
-    relation_id: &str,
-    relation_version: &str,
-    capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
-    limiter: Option<QueryExecutionLimiter>,
-) -> Result<Vec<RecordBatch>, PersistedQueryError> {
-    let catalog = PersistedQueryStore::new_checked(Arc::clone(&store), capabilities)?;
-    capabilities
-        .validate_for_startup()
-        .map_err(RecoveryError::from)
-        .map_err(RuntimeQueryError::from)?;
-    let spec = catalog
-        .get_for_production_recovered_materialized_view(query_id)
-        .await?;
-
-    Ok(
-        query_production_recovered_materialized_view_with_policy_and_limiter(
-            store,
-            slatedb_state_path,
-            relation_id,
-            relation_version,
-            capabilities,
-            &spec.sql,
-            spec.policy,
-            limiter,
-        )
-        .await?,
-    )
-}
-
-pub async fn query_production_persisted_recovered_materialized_view_with_runtime(
-    store: Arc<dyn ObjectStore>,
-    query_id: &str,
-    slatedb_state_path: impl Into<Path>,
-    relation_id: &str,
-    relation_version: &str,
-    capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
-    runtime: &ProductionQueryRuntime,
-) -> Result<Vec<RecordBatch>, PersistedQueryError> {
-    let catalog = PersistedQueryStore::new_checked(Arc::clone(&store), capabilities)?;
-    capabilities
-        .validate_for_startup()
-        .map_err(RecoveryError::from)
-        .map_err(RuntimeQueryError::from)?;
-    let spec = catalog
-        .get_for_production_recovered_materialized_view(query_id)
-        .await?;
-    let limiter = runtime
-        .compatible_limiter(spec.policy)
-        .map_err(RuntimeQueryError::from)?;
-
-    Ok(
-        query_production_recovered_materialized_view_with_policy_and_limiter(
-            store,
-            slatedb_state_path,
-            relation_id,
-            relation_version,
-            capabilities,
-            &spec.sql,
-            spec.policy,
-            limiter,
-        )
-        .await?,
-    )
 }

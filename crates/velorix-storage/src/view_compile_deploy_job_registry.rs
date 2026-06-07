@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::TryStreamExt;
-use object_store::{path::Path, ObjectStore, PutMode};
+use object_store::{path::Path, ObjectStore, PutMode, UpdateVersion};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -219,7 +219,15 @@ impl ViewCompileDeployJobRegistry {
         message: Option<String>,
     ) -> Result<CompleteViewCompileDeployJobOutcome, ViewCompileDeployJobRegistryError> {
         let object_key = self.object_key(view_id, spec_hash)?;
-        let existing = self.read(view_id, spec_hash).await?;
+        let path = Path::from(object_key.as_str());
+        let get_result = self.store.get(&path).await?;
+        let update_version = UpdateVersion {
+            e_tag: get_result.meta.e_tag.clone(),
+            version: get_result.meta.version.clone(),
+        };
+        let bytes = get_result.bytes().await?;
+        let existing: ViewCompileDeployJobRecord = serde_json::from_slice(&bytes)?;
+        validate_record_identity(&object_key, &existing)?;
         if existing.compile_status == MaterializedViewCompileStatus::Success
             && existing.deployment_status == MaterializedViewDeploymentStatus::Running
         {
@@ -241,12 +249,24 @@ impl ViewCompileDeployJobRegistry {
             deployment_status: MaterializedViewDeploymentStatus::Running,
             message,
         };
-        self.store
-            .put(
-                &Path::from(object_key.as_str()),
-                Bytes::from(serde_json::to_vec(&record)?).into(),
-            )
-            .await?;
+        let bytes = Bytes::from(serde_json::to_vec(&record)?);
+        if update_version.e_tag.is_some() || update_version.version.is_some() {
+            let update_result = self
+                .store
+                .put_opts(&path, bytes.into(), PutMode::Update(update_version).into())
+                .await;
+            match update_result {
+                Ok(_) => {}
+                Err(object_store::Error::NotImplemented) => {
+                    self.store
+                        .put(&path, Bytes::from(serde_json::to_vec(&record)?).into())
+                        .await?;
+                }
+                Err(error) => return Err(job_update_error_to_registry(error, object_key.clone())),
+            }
+        } else {
+            self.store.put(&path, bytes.into()).await?;
+        }
         Ok(CompleteViewCompileDeployJobOutcome::Completed)
     }
 }
@@ -273,6 +293,18 @@ fn validate_record_identity(
     }
 
     Ok(())
+}
+
+fn job_update_error_to_registry(
+    error: object_store::Error,
+    object_key: ObjectKey,
+) -> ViewCompileDeployJobRegistryError {
+    match error {
+        object_store::Error::Precondition { .. } => {
+            ViewCompileDeployJobRegistryError::RecordConflict { object_key }
+        }
+        error => ViewCompileDeployJobRegistryError::ObjectStore(error),
+    }
 }
 
 fn validate_compiler_request_identity(

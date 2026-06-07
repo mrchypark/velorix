@@ -52,7 +52,6 @@ pub enum UpdateMaterializedViewLifecycleOutcome {
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "snake_case")]
 pub enum MaterializedViewExecutionMode {
-    LegacyRecoveredSql,
     StandingRuntime,
     FelderaCompilePending,
 }
@@ -94,15 +93,6 @@ pub struct MaterializedViewLifecycleStatus {
 }
 
 impl MaterializedViewLifecycleStatus {
-    pub fn legacy_recovered_sql() -> Self {
-        Self {
-            compiler_backend: "legacy_recovered_sql".to_string(),
-            compile_status: MaterializedViewCompileStatus::NotRequired,
-            deployment_status: MaterializedViewDeploymentStatus::Running,
-            message: None,
-        }
-    }
-
     pub fn standing_runtime() -> Self {
         Self {
             compiler_backend: "linked_generated_package".to_string(),
@@ -249,7 +239,6 @@ pub struct MaterializedViewResponseColumnSpec {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InvalidExecutionModeReason {
-    LegacyRecoveredSqlWithArtifact,
     StandingRuntimeMissingArtifact,
     StandingRuntimeMissingIdentity,
     FelderaCompilePendingWithArtifact,
@@ -259,9 +248,6 @@ pub enum InvalidExecutionModeReason {
 impl std::fmt::Display for InvalidExecutionModeReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::LegacyRecoveredSqlWithArtifact => {
-                write!(f, "legacy_recovered_sql cannot have an artifact binding")
-            }
             Self::StandingRuntimeMissingArtifact => {
                 write!(f, "standing_runtime requires an artifact binding")
             }
@@ -811,7 +797,7 @@ impl MaterializedViewRegistry {
         let mode = if artifact.is_some() {
             MaterializedViewExecutionMode::StandingRuntime
         } else {
-            MaterializedViewExecutionMode::LegacyRecoveredSql
+            MaterializedViewExecutionMode::FelderaCompilePending
         };
         self.validate_execution_mode(view_id, &mode, artifact)?;
         Ok(mode)
@@ -827,7 +813,7 @@ impl MaterializedViewRegistry {
                 if record.artifact.is_some() {
                     MaterializedViewExecutionMode::StandingRuntime
                 } else {
-                    MaterializedViewExecutionMode::LegacyRecoveredSql
+                    MaterializedViewExecutionMode::FelderaCompilePending
                 }
             }
             None => {
@@ -859,9 +845,6 @@ impl MaterializedViewRegistry {
         mode: &MaterializedViewExecutionMode,
     ) -> MaterializedViewLifecycleStatus {
         match mode {
-            MaterializedViewExecutionMode::LegacyRecoveredSql => {
-                MaterializedViewLifecycleStatus::legacy_recovered_sql()
-            }
             MaterializedViewExecutionMode::StandingRuntime => {
                 MaterializedViewLifecycleStatus::standing_runtime()
             }
@@ -878,14 +861,6 @@ impl MaterializedViewRegistry {
         artifact: &Option<MaterializedViewArtifactBinding>,
     ) -> Result<(), MaterializedViewRegistryError> {
         match mode {
-            MaterializedViewExecutionMode::LegacyRecoveredSql => {
-                if artifact.is_some() {
-                    return Err(MaterializedViewRegistryError::InvalidExecutionMode {
-                        view_id: view_id.to_string(),
-                        reason: InvalidExecutionModeReason::LegacyRecoveredSqlWithArtifact,
-                    });
-                }
-            }
             MaterializedViewExecutionMode::StandingRuntime => {
                 let Some(artifact) = artifact else {
                     return Err(MaterializedViewRegistryError::InvalidExecutionMode {

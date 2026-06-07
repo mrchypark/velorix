@@ -17,12 +17,18 @@ pub struct TrustedGeneratedViewDescriptor {
     pub input_relation_id: String,
     pub input_relation_version: String,
     pub sql: String,
+    pub dynamic_view_binding: Option<DynamicGeneratedViewBinding>,
     pub artifact_id: String,
     pub artifact_identity_bytes: Vec<u8>,
     pub compiler: FelderaCompilerIdentity,
     pub generated_rust: GeneratedRustIdentity,
     pub output_schemas: Vec<RelationSchema>,
     pub state_schema_version: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DynamicGeneratedViewBinding {
+    pub shape_id: String,
 }
 
 impl TrustedGeneratedViewDescriptor {
@@ -34,7 +40,16 @@ impl TrustedGeneratedViewDescriptor {
         sql: &str,
     ) -> bool {
         self.view_id == view_id
-            && self.input_relation_id == input_relation_id
+            && self.matches_view_shape(input_relation_id, input_relation_version, sql)
+    }
+
+    pub fn matches_view_shape(
+        &self,
+        input_relation_id: &str,
+        input_relation_version: &str,
+        sql: &str,
+    ) -> bool {
+        self.input_relation_id == input_relation_id
             && self.input_relation_version == input_relation_version
             && normalize_sql_text(&self.sql) == normalize_sql_text(sql)
     }

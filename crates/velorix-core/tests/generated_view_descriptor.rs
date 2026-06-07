@@ -3,7 +3,7 @@ use velorix_core::{
         feldera_spec_hash, ColumnSchema, FelderaCompilerIdentity, GeneratedRustIdentity,
         RelationSchema, SqlDataType, SUPPORTED_GENERATED_RUST_ABI_VERSION,
     },
-    generated_view_descriptor::TrustedGeneratedViewDescriptor,
+    generated_view_descriptor::{DynamicGeneratedViewBinding, TrustedGeneratedViewDescriptor},
     relation::{
         ArrowPhysicalTypeV1, DataFusionRegistrationModeV1, DataFusionRegistrationV1,
         FelderaRelationBindingV1, IncrementalAdapterBindingV1, RelationColumnV1,
@@ -59,6 +59,23 @@ fn trusted_generated_view_descriptor_matches_request_sql_whitespace_case_insensi
 }
 
 #[test]
+fn trusted_generated_view_descriptor_matches_shape_without_binding_view_identity() {
+    let catalog = scores_catalog();
+    let descriptor = descriptor(&catalog);
+
+    assert!(descriptor.matches_view_shape(
+        "scores",
+        "2026-05-24.v1",
+        "SELECT user_id, sum(score) AS sum, count(*) AS count FROM scores WHERE score > 0 GROUP BY user_id",
+    ));
+    assert!(!descriptor.matches_view_shape(
+        "scores",
+        "2026-05-24.v1",
+        "select user_id, sum(score) as sum, count(*) as count from scores group by user_id",
+    ));
+}
+
+#[test]
 fn trusted_generated_view_descriptor_rejects_wrong_input_catalog() {
     let catalog = scores_catalog();
     let mut wrong_catalog = catalog.clone();
@@ -76,6 +93,9 @@ fn descriptor(catalog: &VelorixRelationCatalogV1) -> TrustedGeneratedViewDescrip
         input_relation_id: "scores".to_string(),
         input_relation_version: "2026-05-24.v1".to_string(),
         sql: "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id".to_string(),
+        dynamic_view_binding: Some(DynamicGeneratedViewBinding {
+            shape_id: "scores.positive-scores-by-user.v1".to_string(),
+        }),
         artifact_id: "builtin-positive-scores-by-user".to_string(),
         artifact_identity_bytes: b"velorix-builtin-scores-by-user-generated-package".to_vec(),
         compiler: FelderaCompilerIdentity {

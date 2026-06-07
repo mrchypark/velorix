@@ -21,8 +21,8 @@ serving-related contracts are still partial.
 Velorix 1.0 must treat the following as product scope:
 
 - Endpoint definitions that bind a stable route or tool name to a persisted
-  query, production table scan, recovered materialized view, or trusted
-  standing-view artifact after the relevant artifact trust gates pass.
+  query, production table scan, or trusted standing-view artifact after the
+  relevant artifact trust gates pass.
 - Request parameter validation before SQL execution, including type, required
   field, default, and bounds checks.
 - Response-shape definitions that map Arrow/DataFusion result columns into

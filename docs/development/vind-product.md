@@ -20,10 +20,8 @@ http://127.0.0.1:8080
 ```
 
 The script also runs a small REST smoke by default: it checks `/readyz`,
-asserts legacy recovered SQL views and the generic SQL query endpoint are
-disabled, registers the default scores relation, verifies a no-artifact view is
-accepted as a durable Feldera compile/deploy pending record while
-`POST /v1/query` is rejected, creates and reads a durable query policy, verifies
+registers the default scores relation, verifies a no-artifact view is accepted
+as a durable Feldera compile/deploy pending record, creates and reads a durable query policy, verifies
 views that reference a missing query policy fail closed, creates the default
 generated view linked to that query policy, ingests three rows, queries the view
 by id, queries the promoted API route, checks the generated OpenAPI path, runs
@@ -533,7 +531,7 @@ The smoke reads `api-auth.env`, recreates the local port-forward with
 `scripts/attach-vind-product-rest.sh` only when `/healthz` is not reachable,
 then exercises the live REST product surface: `/readyz`, default `scores`
 relation admission, the durable `interactive` query policy, the
-`positive_scores_by_user` standing-runtime view, generic `/v1/query` rejection,
+`positive_scores_by_user` standing-runtime view,
 admin standing-runtime owner acquisition/reporting when an admin token is
 available, REST ingest into `scores`, `/v1/views/positive_scores_by_user/query`,
 the promoted `GET /v1/api/scores/positive` route, `GET /v1/views`, and
@@ -1008,8 +1006,8 @@ example,
 `POST /v1/query-policies` creates a durable query policy under the default
 tenant's query-policy catalog. `POST /v1/views` can then reference that policy
 by `query_policy_id`; view queries read the catalog record and pass the policy
-to the same DataFusion execution path used by recovered materialized views and
-standing-runtime template scans. For example:
+to the same DataFusion execution path used by standing-runtime template scans.
+For example:
 
 ```bash
 curl -X POST "$VELORIX_API_URL/v1/query-policies" \
@@ -1080,6 +1078,43 @@ curl -X POST "$VELORIX_API_URL/v1/view-compile-deploy/run-once" \
   -H "$VELORIX_ADMIN_AUTH_HEADER"
 ```
 
+An external compiler/deploy plane can also complete one durable job directly:
+
+```bash
+curl -X POST "$VELORIX_API_URL/v1/view-compile-deploy/jobs/$VIEW_ID/complete" \
+  -H "$VELORIX_ADMIN_AUTH_HEADER" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "spec_hash": "velorix-feldera-spec-sha256-v1:...",
+    "artifact": {
+      "metadata_version": 1,
+      "view_id": "'$VIEW_ID'",
+      "spec_hash": "velorix-feldera-spec-sha256-v1:...",
+      "artifact_id": "...",
+      "artifact_hash": "sha256:...",
+      "compiler": { "name": "...", "version": "...", "source": "..." },
+      "generated_rust": {
+        "abi_version": "feldera-generated-rust-abi-v1",
+        "crate_name": "..."
+      },
+      "input_schemas": [],
+      "output_schemas": [],
+      "state_codec": "feldera-dbsp-state-v1",
+      "state_schema_version": 1,
+      "epoch_policy": "monotonic-logical-epoch-v1"
+    }
+  }'
+```
+
+The completion route is an admin route. It rejects unknown request fields,
+unknown or already-active views, stale `spec_hash` values, missing durable job
+records, stored compiler requests that no longer match the active pending view,
+artifact schema/spec mismatches, and generated Rust crates that are not linked
+into the current Velorix binary. On success it replays committed ingest before
+marking the view `success`/`running`, marks the job terminal, and returns the
+same `ViewResponse` shape as `GET /v1/views/{view_id}` with
+`execution_mode: "standing_runtime"` and `query_enabled: true`.
+
 The product smoke now calls the job catalog route after creating the
 no-artifact pending view and stores the response as
 `view-compile-deploy-jobs.json`; it then calls the admin worker route, stores
@@ -1123,20 +1158,12 @@ artifact in a separate compiler/build plane; `deploy` means a validated runner
 instance is started and atomically marked active in metadata. The built-in
 generated-package endpoint such as `POST /v1/views/scores-positive-default`
 remains a static release fixture for exercising the standing-runtime path.
-No-artifact legacy recovered SQL views are a development compatibility path
-only. `velorix-api` defaults `VELORIX_ALLOW_LEGACY_RECOVERED_SQL_VIEWS` to
-`false`; existing `legacy_recovered_sql` view records remain visible for
-migration/debugging but report `query_enabled: false`, their query endpoints
-fail closed, and their promoted `/v1/api/*` routes are omitted from OpenAPI.
-
-`POST /v1/query` is also disabled by default in product mode. It is a generic
-ad hoc SQL endpoint over recovered DataFusion state, not a named Feldera/DBSP
-view API. Leaving it enabled would let callers bypass the product contract where
-relations are ingest targets and views are the predefined materialized
-computation/query surface. Use the promoted `GET /v1/api/*` routes or
-`/v1/views/{view_id}/query` for product queries. Set
-`VELORIX_ENABLE_GENERIC_QUERY=1` only for development compatibility or local
-diagnostics where that broader SQL surface is intentionally accepted.
+No-artifact views are accepted only as durable Feldera compile/deploy pending
+records until a trusted generated package or compiler/deploy worker promotes
+them. Legacy recovered SQL views and the generic `POST /v1/query` recovered
+DataFusion endpoint have been removed from the product API surface. Use the
+promoted `GET /v1/api/*` routes or `/v1/views/{view_id}/query` for product
+queries.
 
 Artifact-backed generated runtime views support committed-epoch cursor
 pagination on GET query endpoints. The response includes `logical_epoch` for
@@ -1248,12 +1275,11 @@ from <relation>
 group by <primary_key>
 ```
 
-When `VELORIX_ALLOW_LEGACY_RECOVERED_SQL_VIEWS=1` and no trusted generated
-package matches the view, `POST /v1/views` rejects SQL outside that legacy
-materialization scope, such as joins, filters, windows, nested queries, or
-arbitrary projections. This is intentional: unsupported SQL must fail at
-definition time instead of silently falling back to a non-incremental full scan
-or storing an unfiltered aggregate while the view definition says it is
+When no trusted generated package matches the view, `POST /v1/views` stores the
+definition as Feldera compile/deploy pending rather than creating a callable
+legacy recovered SQL view. Unsupported SQL must not silently fall back to a
+non-incremental full scan or store an unfiltered aggregate while the view
+definition says it is
 filtered.
 
 Linked generated-package views are the first product Feldera package path. They
@@ -1277,10 +1303,11 @@ is an optional operator override for restricting or replacing that effective
 package list; it is not required to enable the default Feldera/generated runtime
 path.
 
-For the default package, `POST /v1/views` with the built-in spec below creates
-the REST-callable materialized view without requiring the caller to hand-author
-artifact metadata. It registers `positive_scores_by_user`, backed by the linked
-`scores_by_user_generated` package, over:
+For the default package, `POST /v1/views` can create REST-callable
+materialized views without requiring the caller to hand-author artifact
+metadata when the requested SQL shape is supported by the linked generated
+package. The current linked package is `scores_by_user_generated`; it supports
+positive score totals by user over:
 
 ```sql
 select user_id, sum(score) as sum, count(*) as count
@@ -1289,7 +1316,62 @@ where score > 0
 group by user_id
 ```
 
-You can query it either by view id:
+The materialized view id and promoted API path are user-defined. For example,
+this creates a custom aggregate endpoint; it is not the built-in shortcut:
+
+```bash
+curl -X POST "$VELORIX_API_URL/v1/views" \
+  -H "$VELORIX_API_AUTH_HEADER" \
+  -H 'content-type: application/json' \
+  -d '{
+    "view_id": "top_customer_scores",
+    "urlPath": "/analytics/scores/top-customers",
+    "input_relation_id": "scores",
+    "input_relation_version": "2026-05-24.v1",
+    "sql": "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id",
+    "sql_template": "select user_id, sum, count from top_customer_scores order by user_id",
+    "response_formats": ["json"]
+  }'
+
+curl "$VELORIX_API_URL/v1/api/analytics/scores/top-customers" \
+  -H "$VELORIX_API_AUTH_HEADER"
+```
+
+This creates another materialized view from the same generated SQL shape, but
+promotes a parameterized root-style API:
+
+```bash
+curl -X POST "$VELORIX_API_URL/v1/views" \
+  -H "$VELORIX_API_AUTH_HEADER" \
+  -H 'content-type: application/json' \
+  -d '{
+    "view_id": "user_score_summary",
+    "urlPath": "/analytics/users/:user_id/scores",
+    "input_relation_id": "scores",
+    "input_relation_version": "2026-05-24.v1",
+    "sql": "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id",
+    "request": [
+      {
+        "fieldName": "user_id",
+        "fieldIn": "path",
+        "type": "string",
+        "validators": ["required", "string"]
+      }
+    ],
+    "sql_template": "select user_id, sum, count from user_score_summary where user_id = {{ context.params.user_id | is_required | is_string }} order by user_id",
+    "response_formats": ["json"]
+  }'
+
+curl "$VELORIX_API_URL/v1/api/analytics/users/u2/scores" \
+  -H "$VELORIX_API_AUTH_HEADER"
+```
+
+The generated package scope is still enforced. A no-artifact view whose SQL
+does not match the linked generated shape is accepted as
+`feldera_compile_pending` instead of being executed by the wrong runtime.
+
+The built-in shortcut still creates `positive_scores_by_user` with
+`urlPath=/scores/positive`. You can query it either by view id:
 
 ```bash
 curl "$VELORIX_API_URL/v1/views/positive_scores_by_user/query" \
@@ -1315,8 +1397,8 @@ Abbreviated request shape:
 }
 ```
 
-For a custom promoted artifact-backed endpoint filtered by user, define the
-API template against the generated output columns:
+For a custom promoted linked-package-backed endpoint filtered by user, define
+the API template against the generated output columns:
 
 ```json
 {
@@ -1880,10 +1962,6 @@ not-ready state, or a matching `NoSchedule`/`NoExecute` taint, the run exits as
 a local environment blocker before producing product-complete evidence. Free
 Docker/Colima/vCluster ephemeral storage or recreate the local vCluster and
 rerun; do not add PVCs to bypass this no-PVC product path.
-`/readyz` also reports `legacy_recovered_sql_views_allowed`; the product script
-requires this value and `generic_query_enabled` to be `false` and injects
-`VELORIX_ALLOW_LEGACY_RECOVERED_SQL_VIEWS=0` plus
-`VELORIX_ENABLE_GENERIC_QUERY=0` into the API Deployment.
 First-E2E product evidence also requires `api.auth.mode=bearer-token`,
 `missing_token_rejected=true`, `wrong_token_rejected=true`,
 `correct_token_smoke_passed=true`,

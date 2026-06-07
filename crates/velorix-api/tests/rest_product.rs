@@ -15,7 +15,7 @@ use tempfile::TempDir;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use tower::ServiceExt as _;
-use velorix_api::{app, ApiState, IngestRowsRequest, QueryRequest, StandingProgramRuntimeFactory};
+use velorix_api::{app, ApiState, IngestRowsRequest, StandingProgramRuntimeFactory};
 use velorix_core::{
     feldera_artifact::{
         catalog_input_relation_schema, feldera_artifact_bytes_hash, feldera_spec_hash,
@@ -43,158 +43,12 @@ use velorix_meta::{
     proto::velorix_meta_server::VelorixMetaServer, GrpcMetaStore, InMemoryMetaStore,
     MetaGrpcService,
 };
-use velorix_runtime::recovery::orders_sum_count_relation_catalog;
 use velorix_storage::{
     ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
     log::{IngestAdmissionCoordinator, IngestLog},
+    materialized_view_registry::{MaterializedViewLifecycleStatus, MaterializedViewRegistry},
+    view_compile_deploy_job_registry::{view_compile_deploy_job_id, ViewCompileDeployJobRegistry},
 };
-
-#[tokio::test]
-async fn rest_product_ingests_and_queries_materialized_state_against_checked_authority() {
-    let temp = TempDir::new().unwrap();
-    let store = Arc::new(LocalFileSystem::new_with_prefix(temp.path()).unwrap());
-    let validated = validate_operator_authority(
-        ObjectStoreAuthorityRef {
-            store_id: "s3://rustfs/velorix-product".to_string(),
-            namespace: "velorix".to_string(),
-        },
-        store,
-        "velorix-api-test",
-        "v1/api-test-probes/rest-product",
-    )
-    .await
-    .unwrap();
-    let state = ApiState::from_validated_authority(validated, "v1/state/slatedb", "api-test")
-        .await
-        .unwrap()
-        .with_generic_query_enabled(true);
-    let app = app(state);
-
-    let health = request_json(app.clone(), Method::GET, "/healthz", None).await;
-    assert_eq!(health.0, StatusCode::OK);
-    assert_eq!(health.1["status"], "ok");
-
-    let relation = request_json(
-        app.clone(),
-        Method::POST,
-        "/v1/relations",
-        Some(json!({ "catalog": orders_sum_count_relation_catalog().unwrap() })),
-    )
-    .await;
-    assert_eq!(relation.0, StatusCode::CREATED);
-    assert_eq!(relation.1["relation_id"], "orders");
-
-    let ingest = request_json(
-        app.clone(),
-        Method::POST,
-        "/v1/ingest",
-        Some(
-            serde_json::to_value(IngestRowsRequest {
-                relation_id: "orders".to_string(),
-                relation_version: "2026-05-05.v1".to_string(),
-                stream_id: "orders".to_string(),
-                partition_id: 0,
-                start_offset_inclusive: 0,
-                rows: vec![
-                    json!({ "account_id": "acct-a", "amount": 10, "weight": 1 }),
-                    json!({ "account_id": "acct-a", "amount": 7, "weight": 1 }),
-                    json!({ "account_id": "acct-b", "amount": 3, "weight": 1 }),
-                ],
-            })
-            .unwrap(),
-        ),
-    )
-    .await;
-    assert_eq!(ingest.0, StatusCode::CREATED);
-    assert_eq!(ingest.1["outcome"], "appended");
-
-    let query = request_json(
-        app,
-        Method::POST,
-        "/v1/query",
-        Some(
-            serde_json::to_value(QueryRequest {
-                relation_id: "orders".to_string(),
-                relation_version: "2026-05-05.v1".to_string(),
-                sql: "select key, value, weight from input order by key".to_string(),
-            })
-            .unwrap(),
-        ),
-    )
-    .await;
-    assert_eq!(query.0, StatusCode::OK, "query body: {}", query.1);
-    assert_eq!(
-        query.1["rows"],
-        json!([
-            { "key": "\"acct-a\"", "value": "{\"count\":2,\"sum\":17}", "weight": 1 },
-            { "key": "\"acct-b\"", "value": "{\"count\":1,\"sum\":3}", "weight": 1 }
-        ])
-    );
-}
-
-#[tokio::test]
-async fn rest_product_ingests_rows_using_registered_relation_schema_column_names() {
-    let (state, _temp) = api_state("generic-schema").await;
-    let app = app(state.with_generic_query_enabled(true));
-    let catalog = scores_sum_count_relation_catalog();
-
-    let relation = request_json(
-        app.clone(),
-        Method::POST,
-        "/v1/relations",
-        Some(json!({ "catalog": catalog })),
-    )
-    .await;
-    assert_eq!(relation.0, StatusCode::CREATED);
-    assert_eq!(relation.1["relation_id"], "scores");
-
-    let ingest = request_json(
-        app.clone(),
-        Method::POST,
-        "/v1/ingest",
-        Some(
-            serde_json::to_value(IngestRowsRequest {
-                relation_id: "scores".to_string(),
-                relation_version: "2026-05-24.v1".to_string(),
-                stream_id: "scores".to_string(),
-                partition_id: 0,
-                start_offset_inclusive: 0,
-                rows: vec![
-                    json!({ "user_id": "u1", "score": 5, "delta": 1 }),
-                    json!({ "user_id": "u1", "score": 7, "delta": 1 }),
-                    json!({ "user_id": "u2", "score": 11, "delta": 1 }),
-                ],
-            })
-            .unwrap(),
-        ),
-    )
-    .await;
-    assert_eq!(ingest.0, StatusCode::CREATED, "ingest body: {}", ingest.1);
-    assert_eq!(ingest.1["outcome"], "appended");
-
-    let query = request_json(
-        app,
-        Method::POST,
-        "/v1/query",
-        Some(
-            serde_json::to_value(QueryRequest {
-                relation_id: "scores".to_string(),
-                relation_version: "2026-05-24.v1".to_string(),
-                sql: "select key, value, weight from input order by key".to_string(),
-            })
-            .unwrap(),
-        ),
-    )
-    .await;
-    assert_eq!(query.0, StatusCode::OK, "query body: {}", query.1);
-    assert_eq!(
-        query.1["rows"],
-        json!([
-            { "key": "\"u1\"", "value": "{\"count\":2,\"sum\":12}", "weight": 1 },
-            { "key": "\"u2\"", "value": "{\"count\":1,\"sum\":11}", "weight": 1 }
-        ])
-    );
-}
 
 #[tokio::test]
 async fn rest_product_required_fencing_rejects_unsafe_metadata_before_standing_runtime_activation()
@@ -245,7 +99,6 @@ async fn rest_product_readyz_reports_authenticated_grpc_metadata_capability() {
     assert_eq!(ready.1["status"], "ready");
     assert_eq!(ready.1["standing_runtime_fencing_required"], false);
     assert_eq!(ready.1["standing_runtime_fencing_mode"], "unsafe-dev-only");
-    assert_eq!(ready.1["legacy_recovered_sql_views_allowed"], false);
     assert_eq!(ready.1["metadata_store"]["configured"], true);
     assert_eq!(
         ready.1["metadata_store"]["endpoint"],
@@ -665,13 +518,13 @@ async fn rest_product_accepts_view_as_feldera_compile_pending_when_no_artifact()
 }
 
 #[tokio::test]
-async fn rest_product_rejects_generic_query_when_disabled() {
-    let (state, _temp) = api_state("generic-query-disabled").await;
+async fn rest_product_openapi_omits_removed_generic_query_route() {
+    let (state, _temp) = api_state("generic-query-removed").await;
     let app = app(state);
 
     let ready = request_json(app.clone(), Method::GET, "/readyz", None).await;
     assert_eq!(ready.0, StatusCode::OK, "ready body: {}", ready.1);
-    assert_eq!(ready.1["generic_query_enabled"], false);
+    assert!(ready.1.get("generic_query_enabled").is_none());
 
     let openapi = request_json(app.clone(), Method::GET, "/v1/openapi.json", None).await;
     assert_eq!(openapi.0, StatusCode::OK, "openapi body: {}", openapi.1);
@@ -679,391 +532,6 @@ async fn rest_product_rejects_generic_query_when_disabled() {
         .as_object()
         .unwrap()
         .contains_key("/v1/query"));
-
-    let query = request_json(
-        app,
-        Method::POST,
-        "/v1/query",
-        Some(
-            serde_json::to_value(QueryRequest {
-                relation_id: "scores".to_string(),
-                relation_version: "2026-05-24.v1".to_string(),
-                sql: "select key, value, weight from input".to_string(),
-            })
-            .unwrap(),
-        ),
-    )
-    .await;
-    assert_eq!(query.0, StatusCode::CONFLICT, "query body: {}", query.1);
-    assert!(query.1["error"]
-        .as_str()
-        .unwrap()
-        .contains("generic_query_disabled"));
-}
-
-#[tokio::test]
-async fn rest_product_rejects_existing_legacy_view_execution_when_disabled() {
-    let (initial_state, temp) = api_state("legacy-view-query-disabled").await;
-    let initial_app = app(initial_state.with_legacy_recovered_sql_views_allowed(true));
-    let catalog = scores_sum_count_relation_catalog();
-
-    let relation = request_json(
-        initial_app.clone(),
-        Method::POST,
-        "/v1/relations",
-        Some(json!({ "catalog": catalog })),
-    )
-    .await;
-    assert_eq!(relation.0, StatusCode::CREATED);
-
-    let view_request = json!({
-        "view_id": "scores_by_user",
-        "urlPath": "/scores/by-user",
-        "input_relation_id": "scores",
-        "input_relation_version": "2026-05-24.v1",
-        "sql": "select user_id, sum(score) as sum, count(*) as count from scores group by user_id"
-    });
-    let view = request_json(
-        initial_app.clone(),
-        Method::POST,
-        "/v1/views",
-        Some(view_request.clone()),
-    )
-    .await;
-    assert_eq!(view.0, StatusCode::CREATED, "view body: {}", view.1);
-    assert_eq!(view.1["execution_mode"], "legacy_recovered_sql");
-    assert_eq!(view.1["query_enabled"], true);
-
-    let restarted_state = api_state_from_path("legacy-view-query-disabled", temp.path()).await;
-    let restarted_app = app(restarted_state);
-
-    let duplicate = request_json(
-        restarted_app.clone(),
-        Method::POST,
-        "/v1/views",
-        Some(view_request),
-    )
-    .await;
-    assert_eq!(
-        duplicate.0,
-        StatusCode::CONFLICT,
-        "duplicate body: {}",
-        duplicate.1
-    );
-    assert!(duplicate.1["error"]
-        .as_str()
-        .unwrap()
-        .contains("active materialized view record conflict"));
-
-    let detail = request_json(
-        restarted_app.clone(),
-        Method::GET,
-        "/v1/views/scores_by_user",
-        None,
-    )
-    .await;
-    assert_eq!(detail.0, StatusCode::OK, "detail body: {}", detail.1);
-    assert_eq!(detail.1["execution_mode"], "legacy_recovered_sql");
-    assert_eq!(detail.1["query_enabled"], false);
-    assert_eq!(
-        detail.1["disabled_reason"],
-        "legacy_recovered_sql_views_disabled"
-    );
-
-    let openapi = request_json(restarted_app.clone(), Method::GET, "/v1/openapi.json", None).await;
-    assert_eq!(openapi.0, StatusCode::OK, "openapi body: {}", openapi.1);
-    assert!(!openapi.1["paths"]
-        .as_object()
-        .unwrap()
-        .contains_key("/v1/api/scores/by-user"));
-
-    for (method, path, body) in [
-        (Method::GET, "/v1/views/scores_by_user/query", None),
-        (
-            Method::POST,
-            "/v1/views/scores_by_user/query",
-            Some(json!({ "parameters": { "user_id": "u1" } })),
-        ),
-        (Method::GET, "/v1/api/scores/by-user", None),
-    ] {
-        let response = request_json(restarted_app.clone(), method, path, body).await;
-        assert_eq!(response.0, StatusCode::CONFLICT, "body: {}", response.1);
-        assert!(response.1["error"]
-            .as_str()
-            .unwrap()
-            .contains("legacy_recovered_sql_views_disabled"));
-    }
-}
-
-#[tokio::test]
-async fn rest_product_creates_view_and_queries_view_materialized_state() {
-    let (state, _temp) = api_state("view-api").await;
-    let app = app(state.with_legacy_recovered_sql_views_allowed(true));
-    let catalog = scores_sum_count_relation_catalog();
-
-    let relation = request_json(
-        app.clone(),
-        Method::POST,
-        "/v1/relations",
-        Some(json!({ "catalog": catalog })),
-    )
-    .await;
-    assert_eq!(relation.0, StatusCode::CREATED);
-
-    let missing_policy_view = request_json(
-        app.clone(),
-        Method::POST,
-        "/v1/views",
-        Some(json!({
-            "view_id": "scores_by_user_missing_policy",
-            "urlPath": "/scores/missing-policy",
-            "input_relation_id": "scores",
-            "input_relation_version": "2026-05-24.v1",
-            "sql": "select user_id, sum(score) as sum, count(*) as count from scores group by user_id",
-            "query_policy_id": "missing_policy"
-        })),
-    )
-    .await;
-    assert_eq!(
-        missing_policy_view.0,
-        StatusCode::BAD_REQUEST,
-        "missing policy body: {}",
-        missing_policy_view.1
-    );
-    assert!(
-        missing_policy_view.1["error"]
-            .as_str()
-            .unwrap()
-            .contains("query policy not found"),
-        "missing policy body: {}",
-        missing_policy_view.1
-    );
-
-    let ingest = request_json(
-        app.clone(),
-        Method::POST,
-        "/v1/ingest",
-        Some(
-            serde_json::to_value(IngestRowsRequest {
-                relation_id: "scores".to_string(),
-                relation_version: "2026-05-24.v1".to_string(),
-                stream_id: "scores".to_string(),
-                partition_id: 0,
-                start_offset_inclusive: 0,
-                rows: vec![
-                    json!({ "user_id": "u1", "score": 5, "delta": 1 }),
-                    json!({ "user_id": "u1", "score": 7, "delta": 1 }),
-                    json!({ "user_id": "u2", "score": 11, "delta": 1 }),
-                ],
-            })
-            .unwrap(),
-        ),
-    )
-    .await;
-    assert_eq!(ingest.0, StatusCode::CREATED, "ingest body: {}", ingest.1);
-
-    let view = request_json(
-        app.clone(),
-        Method::POST,
-        "/v1/views",
-        Some(json!({
-            "view_id": "scores_by_user",
-            "urlPath": "/scores/by-user/:user_id",
-            "input_relation_id": "scores",
-            "input_relation_version": "2026-05-24.v1",
-            "sql": "select user_id, sum(score) as sum, count(*) as count from scores group by user_id",
-            "sql_template": "select key_json, value_json, weight from scores_by_user where key_json = {{ context.params.user_id | is_required | is_string | to_json }} and {{ context.params.min_sum | is_integer(min=10) }} >= 10 order by key_json",
-            "description": "Score totals by user",
-            "request": [
-                {
-                    "fieldName": "user_id",
-                    "fieldIn": "path",
-                    "type": "string",
-                    "description": "User id",
-                    "validators": ["required", "string"]
-                },
-                {
-                    "fieldName": "min_sum",
-                    "fieldIn": "query",
-                    "type": "integer",
-                    "description": "Minimum sum",
-                    "defaultValue": 10,
-                    "validators": ["required", "integer(min=10)"]
-                }
-            ],
-            "response_schema": {
-                "columns": [
-                    {
-                        "name": "user_id",
-                        "type": "string",
-                        "source": "key_json",
-                        "description": "User id"
-                    },
-                    {
-                        "name": "sum",
-                        "type": "int64",
-                        "source": "value_json.sum",
-                        "description": "Total score"
-                    },
-                    {
-                        "name": "count",
-                        "type": "int64",
-                        "source": "value_json.count",
-                        "description": "Score row count"
-                    },
-                    {
-                        "name": "weight",
-                        "type": "int64",
-                        "source": "weight"
-                    }
-                ]
-            },
-            "response_formats": ["json"]
-        })),
-    )
-    .await;
-    assert_eq!(view.0, StatusCode::CREATED, "view body: {}", view.1);
-    assert_eq!(view.1["view_id"], "scores_by_user");
-    assert_eq!(view.1["execution_mode"], "legacy_recovered_sql");
-    assert_eq!(view.1["input_relation_id"], "scores");
-    assert_eq!(view.1["input_relation_version"], "2026-05-24.v1");
-    assert!(view.1["spec_hash"]
-        .as_str()
-        .unwrap()
-        .starts_with(velorix_core::feldera_artifact::FELDERA_SPEC_HASH_PREFIX));
-    assert_eq!(view.1["description"], "Score totals by user");
-    assert_eq!(view.1["request"][0]["fieldName"], "user_id");
-    assert!(view.1["sql_template"]
-        .as_str()
-        .unwrap()
-        .contains("context.params.user_id"));
-    assert_eq!(view.1["response_schema"]["columns"][0]["name"], "user_id");
-
-    let catalog = request_json(app.clone(), Method::GET, "/v1/views", None).await;
-    assert_eq!(catalog.0, StatusCode::OK, "catalog body: {}", catalog.1);
-    assert_eq!(catalog.1["views"][0]["view_id"], "scores_by_user");
-    assert_eq!(catalog.1["views"][0]["description"], "Score totals by user");
-
-    let detail = request_json(app.clone(), Method::GET, "/v1/views/scores_by_user", None).await;
-    assert_eq!(detail.0, StatusCode::OK, "detail body: {}", detail.1);
-    assert_eq!(detail.1["view_id"], "scores_by_user");
-    assert_eq!(
-        detail.1["query_endpoint"],
-        "/v1/api/scores/by-user/:user_id"
-    );
-
-    let openapi = request_json(app.clone(), Method::GET, "/v1/openapi.json", None).await;
-    assert_eq!(openapi.0, StatusCode::OK, "openapi body: {}", openapi.1);
-    assert_eq!(openapi.1["openapi"], "3.0.3");
-    assert!(openapi.1["paths"]
-        .as_object()
-        .unwrap()
-        .contains_key("/v1/api/scores/by-user/{user_id}"));
-    assert_eq!(
-        openapi.1["paths"]["/v1/api/scores/by-user/{user_id}"]["get"]["responses"]["200"]
-            ["content"]["application/json"]["schema"]["properties"]["rows"]["items"]["properties"]
-            ["sum"]["type"],
-        "integer"
-    );
-
-    let query = request_json(app.clone(), Method::GET, "/v1/api/scores/by-user/u1", None).await;
-    assert_eq!(query.0, StatusCode::OK, "query body: {}", query.1);
-    assert_eq!(
-        query.1["rows"],
-        json!([
-            { "user_id": "u1", "sum": 12, "count": 2, "weight": 1 }
-        ])
-    );
-    assert_eq!(
-        openapi.1["paths"]["/v1/api/scores/by-user/{user_id}"]["get"]["parameters"][1]["schema"]
-            ["default"],
-        json!(10)
-    );
-
-    let invalid_parameter = request_json(
-        app.clone(),
-        Method::GET,
-        "/v1/api/scores/by-user/u1?min_sum=9",
-        None,
-    )
-    .await;
-    assert_eq!(invalid_parameter.0, StatusCode::BAD_REQUEST);
-    assert!(
-        invalid_parameter.1["error"]
-            .as_str()
-            .unwrap()
-            .contains("parameter `min_sum` must pass is_integer"),
-        "invalid parameter body: {}",
-        invalid_parameter.1
-    );
-
-    let caller_sql = request_json(
-        app,
-        Method::POST,
-        "/v1/views/scores_by_user/query",
-        Some(json!({
-            "sql": "select key_json, value_json, weight from scores_by_user",
-            "parameters": { "user_id": "u1", "min_sum": 10 }
-        })),
-    )
-    .await;
-    assert_eq!(caller_sql.0, StatusCode::BAD_REQUEST);
-    assert!(
-        caller_sql.1["error"]
-            .as_str()
-            .unwrap()
-            .contains("caller-supplied SQL is not allowed"),
-        "caller sql body: {}",
-        caller_sql.1
-    );
-}
-
-#[tokio::test]
-async fn rest_product_legacy_recovered_sql_rejects_filter_shape_until_predicate_execution_is_wired()
-{
-    let (state, _temp) = api_state("view-sql-scope").await;
-    let app = app(state.with_legacy_recovered_sql_views_allowed(true));
-    let catalog = scores_sum_count_relation_catalog();
-
-    let relation = request_json(
-        app.clone(),
-        Method::POST,
-        "/v1/relations",
-        Some(json!({ "catalog": catalog })),
-    )
-    .await;
-    assert_eq!(relation.0, StatusCode::CREATED);
-
-    let view = request_json(
-        app.clone(),
-        Method::POST,
-        "/v1/views",
-        Some(json!({
-            "view_id": "positive_scores_by_user",
-            "input_relation_id": "scores",
-            "input_relation_version": "2026-05-24.v1",
-            "sql": "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id"
-        })),
-    )
-    .await;
-
-    assert_eq!(view.0, StatusCode::BAD_REQUEST);
-    assert!(
-        view.1["error"]
-            .as_str()
-            .unwrap()
-            .contains("legacy_recovered_sql DBSP bootstrap guard"),
-        "view body: {}",
-        view.1
-    );
-    assert!(
-        view.1["error"]
-            .as_str()
-            .unwrap()
-            .contains("DBSP view SQL is outside the supported materialization scope"),
-        "view body: {}",
-        view.1
-    );
 }
 
 #[tokio::test]
@@ -1119,7 +587,7 @@ async fn rest_product_rejects_request_default_value_that_violates_validators() {
 #[tokio::test]
 async fn rest_product_rejects_unbounded_query_policy_for_view_api_catalog() {
     let (state, _temp) = api_state("view-query-policy-unbounded").await;
-    let app = app(state.with_legacy_recovered_sql_views_allowed(true));
+    let app = app(state);
 
     let policy = request_json(
         app,
@@ -1154,7 +622,7 @@ async fn rest_product_rejects_unbounded_query_policy_for_view_api_catalog() {
 #[tokio::test]
 async fn rest_product_enforces_query_policy_catalog_for_view_api() {
     let (state, _temp) = api_state("view-query-policy").await;
-    let app = app(state.with_legacy_recovered_sql_views_allowed(true));
+    let app = app(state);
     let catalog = scores_sum_count_relation_catalog();
 
     let policy = request_json(
@@ -1204,6 +672,25 @@ async fn rest_product_enforces_query_policy_catalog_for_view_api() {
     .await;
     assert_eq!(relation.0, StatusCode::CREATED);
 
+    let view = request_json(
+        app.clone(),
+        Method::POST,
+        "/v1/views",
+        Some(json!({
+            "view_id": "positive_scores_by_user",
+            "urlPath": "/scores/policy-limited",
+            "input_relation_id": "scores",
+            "input_relation_version": "2026-05-24.v1",
+            "sql": "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id",
+            "sql_template": "select user_id, sum, count from positive_scores_by_user order by user_id",
+            "query_policy_id": "one_row"
+        })),
+    )
+    .await;
+    assert_eq!(view.0, StatusCode::CREATED, "view body: {}", view.1);
+    assert_eq!(view.1["execution_mode"], "standing_runtime");
+    assert_eq!(view.1["query_policy_id"], "one_row");
+
     let ingest = request_json(
         app.clone(),
         Method::POST,
@@ -1225,23 +712,6 @@ async fn rest_product_enforces_query_policy_catalog_for_view_api() {
     )
     .await;
     assert_eq!(ingest.0, StatusCode::CREATED, "ingest body: {}", ingest.1);
-
-    let view = request_json(
-        app.clone(),
-        Method::POST,
-        "/v1/views",
-        Some(json!({
-            "view_id": "scores_by_user_policy_limited",
-            "urlPath": "/scores/policy-limited",
-            "input_relation_id": "scores",
-            "input_relation_version": "2026-05-24.v1",
-            "sql": "select user_id, sum(score) as sum, count(*) as count from scores group by user_id",
-            "query_policy_id": "one_row"
-        })),
-    )
-    .await;
-    assert_eq!(view.0, StatusCode::CREATED, "view body: {}", view.1);
-    assert_eq!(view.1["query_policy_id"], "one_row");
 
     let openapi = request_json(app.clone(), Method::GET, "/v1/openapi.json", None).await;
     assert_eq!(openapi.0, StatusCode::OK, "openapi body: {}", openapi.1);
@@ -2112,7 +1582,13 @@ async fn rest_product_auto_deploys_trusted_linked_generated_view_without_client_
     .await;
     assert_eq!(ingest.0, StatusCode::CREATED, "ingest body: {}", ingest.1);
 
-    let query = request_json(app, Method::GET, "/v1/api/scores/positive", None).await;
+    let query = request_json(
+        app,
+        Method::GET,
+        "/v1/api/scores/positive?max_rows=100",
+        None,
+    )
+    .await;
     assert_eq!(query.0, StatusCode::OK, "query body: {}", query.1);
     assert_eq!(
         query.1["rows"],
@@ -2120,6 +1596,202 @@ async fn rest_product_auto_deploys_trusted_linked_generated_view_without_client_
             { "user_id": "u1", "sum": 12, "count": 2 }
         ])
     );
+}
+
+#[tokio::test]
+async fn rest_product_auto_deploys_multiple_dynamic_generated_view_apis_without_client_artifacts() {
+    let (state, _temp) = api_state("dynamic-generated-view-apis").await;
+    let app = app(state);
+
+    let relation = request_json(
+        app.clone(),
+        Method::POST,
+        "/v1/relations/scores-default",
+        None,
+    )
+    .await;
+    assert_eq!(
+        relation.0,
+        StatusCode::CREATED,
+        "relation body: {}",
+        relation.1
+    );
+
+    let dynamic_views = [
+        (
+            "top_customer_scores",
+            "/analytics/scores/top-customers",
+            "select user_id, sum, count from top_customer_scores order by user_id",
+        ),
+        (
+            "user_score_summary",
+            "/analytics/users/:user_id/scores",
+            "select user_id, sum, count from user_score_summary where user_id = {{ context.params.user_id | is_required | is_string }} order by user_id",
+        ),
+    ];
+    let mut generated_artifact_ids = Vec::new();
+    let mut generated_artifact_hashes = Vec::new();
+    for (view_id, url_path, sql_template) in dynamic_views {
+        let request = if view_id == "user_score_summary" {
+            json!([
+                {
+                    "fieldName": "user_id",
+                    "fieldIn": "path",
+                    "type": "string",
+                    "validators": ["required", "string"]
+                }
+            ])
+        } else {
+            json!([])
+        };
+        let view = request_json(
+            app.clone(),
+            Method::POST,
+            "/v1/views",
+            Some(json!({
+                "view_id": view_id,
+                "urlPath": url_path,
+                "input_relation_id": "scores",
+                "input_relation_version": "2026-05-24.v1",
+                "sql": "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id",
+                "request": request,
+                "sql_template": sql_template,
+                "response_formats": ["json"]
+            })),
+        )
+        .await;
+        assert_eq!(
+            view.0,
+            StatusCode::CREATED,
+            "dynamic view {view_id} body: {}",
+            view.1
+        );
+        assert_eq!(view.1["view_id"], view_id);
+        assert_eq!(view.1["execution_mode"], "standing_runtime");
+        assert_eq!(view.1["query_enabled"], true);
+        assert_eq!(
+            view.1["artifact"]["generated_rust_crate_name"],
+            "scores_by_user_generated"
+        );
+        assert_eq!(
+            view.1["artifact"]["standing_program_identity"]["program_id"],
+            view_id
+        );
+        generated_artifact_ids.push(view.1["artifact"]["artifact_id"].clone());
+        generated_artifact_hashes.push(view.1["artifact"]["artifact_hash"].clone());
+    }
+    assert_ne!(generated_artifact_ids[0], generated_artifact_ids[1]);
+    assert_eq!(generated_artifact_hashes[0], generated_artifact_hashes[1]);
+
+    let unsupported_view = request_json(
+        app.clone(),
+        Method::POST,
+        "/v1/views",
+        Some(json!({
+            "view_id": "all_customer_scores",
+            "urlPath": "/analytics/scores/all",
+            "input_relation_id": "scores",
+            "input_relation_version": "2026-05-24.v1",
+            "sql": "select user_id, sum(score) as sum, count(*) as count from scores where score >= 0 group by user_id",
+            "sql_template": "select user_id, sum, count from all_customer_scores order by user_id",
+            "response_formats": ["json"]
+        })),
+    )
+    .await;
+    assert_eq!(
+        unsupported_view.0,
+        StatusCode::ACCEPTED,
+        "unsupported view body: {}",
+        unsupported_view.1
+    );
+    assert_eq!(
+        unsupported_view.1["execution_mode"],
+        "feldera_compile_pending"
+    );
+    assert_eq!(unsupported_view.1["query_enabled"], false);
+    assert!(unsupported_view.1.get("artifact").is_none());
+
+    let ingest = request_json(
+        app.clone(),
+        Method::POST,
+        "/v1/ingest",
+        Some(
+            serde_json::to_value(IngestRowsRequest {
+                relation_id: "scores".to_string(),
+                relation_version: "2026-05-24.v1".to_string(),
+                stream_id: "scores".to_string(),
+                partition_id: 0,
+                start_offset_inclusive: 0,
+                rows: vec![
+                    json!({ "user_id": "u1", "score": 5, "delta": 1 }),
+                    json!({ "user_id": "u1", "score": 7, "delta": 1 }),
+                    json!({ "user_id": "u2", "score": 11, "delta": 1 }),
+                    json!({ "user_id": "u3", "score": -100, "delta": 1 }),
+                ],
+            })
+            .unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(ingest.0, StatusCode::CREATED, "ingest body: {}", ingest.1);
+
+    let all_scores = request_json(
+        app.clone(),
+        Method::GET,
+        "/v1/api/analytics/scores/top-customers",
+        None,
+    )
+    .await;
+    assert_eq!(all_scores.0, StatusCode::OK, "query body: {}", all_scores.1);
+    assert_eq!(
+        all_scores.1["rows"],
+        json!([
+            { "user_id": "u1", "sum": 12, "count": 2 },
+            { "user_id": "u2", "sum": 11, "count": 1 }
+        ])
+    );
+
+    let user_scores = request_json(
+        app.clone(),
+        Method::GET,
+        "/v1/api/analytics/users/u2/scores",
+        None,
+    )
+    .await;
+    assert_eq!(
+        user_scores.0,
+        StatusCode::OK,
+        "user query body: {}",
+        user_scores.1
+    );
+    assert_eq!(
+        user_scores.1["rows"],
+        json!([
+            { "user_id": "u2", "sum": 11, "count": 1 }
+        ])
+    );
+
+    let openapi = request_json(app.clone(), Method::GET, "/v1/openapi.json", None).await;
+    assert_eq!(openapi.0, StatusCode::OK, "openapi body: {}", openapi.1);
+    let openapi_paths = openapi.1["paths"].as_object().unwrap();
+    assert!(openapi_paths.contains_key("/v1/api/analytics/scores/top-customers"));
+    assert!(openapi_paths.contains_key("/v1/api/analytics/users/{user_id}/scores"));
+    assert!(!openapi_paths.contains_key("/v1/api/analytics/scores/all"));
+
+    let direct_query = request_json(
+        app,
+        Method::GET,
+        "/v1/views/top_customer_scores/query",
+        None,
+    )
+    .await;
+    assert_eq!(
+        direct_query.0,
+        StatusCode::OK,
+        "direct query body: {}",
+        direct_query.1
+    );
+    assert_eq!(direct_query.1["logical_epoch"], json!(4));
 }
 
 #[tokio::test]
@@ -2160,7 +1832,13 @@ async fn rest_product_keeps_generated_view_pending_when_linked_package_is_disabl
     assert_eq!(view.1["query_enabled"], false);
     assert_eq!(view.1["disabled_reason"], "feldera_compile_pending");
 
-    let query = request_json(app, Method::GET, "/v1/api/scores/positive", None).await;
+    let query = request_json(
+        app,
+        Method::GET,
+        "/v1/api/scores/positive?max_rows=100",
+        None,
+    )
+    .await;
     assert_eq!(
         query.0,
         StatusCode::SERVICE_UNAVAILABLE,
@@ -2327,6 +2005,990 @@ async fn rest_product_worker_activates_pending_generated_view_when_package_becom
             { "user_id": "u3", "sum": 11, "count": 1 }
         ])
     );
+}
+
+#[tokio::test]
+async fn rest_product_complete_compile_deploy_job_activates_pending_view_from_artifact() {
+    let (state, store) = api_state_memory("trusted-linked-generated-view-complete").await;
+    let initial_app = app(state.with_generated_artifact_packages(std::iter::empty::<&str>()));
+
+    let relation = request_json(
+        initial_app.clone(),
+        Method::POST,
+        "/v1/relations/scores-default",
+        None,
+    )
+    .await;
+    assert_eq!(
+        relation.0,
+        StatusCode::CREATED,
+        "relation body: {}",
+        relation.1
+    );
+
+    let view = request_json(
+        initial_app.clone(),
+        Method::POST,
+        "/v1/views",
+        Some(json!({
+            "view_id": "positive_scores_by_user",
+            "urlPath": "/scores/positive",
+            "input_relation_id": "scores",
+            "input_relation_version": "2026-05-24.v1",
+            "sql": "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id",
+            "response_formats": ["json"]
+        })),
+    )
+    .await;
+    assert_eq!(view.0, StatusCode::ACCEPTED, "view body: {}", view.1);
+    assert_eq!(view.1["execution_mode"], "feldera_compile_pending");
+
+    let pending_ingest = request_json(
+        initial_app,
+        Method::POST,
+        "/v1/ingest",
+        Some(
+            serde_json::to_value(IngestRowsRequest {
+                relation_id: "scores".to_string(),
+                relation_version: "2026-05-24.v1".to_string(),
+                stream_id: "scores".to_string(),
+                partition_id: 0,
+                start_offset_inclusive: 0,
+                rows: vec![
+                    json!({ "user_id": "u1", "score": 5, "delta": 1 }),
+                    json!({ "user_id": "u1", "score": 7, "delta": 1 }),
+                    json!({ "user_id": "u2", "score": -1, "delta": 1 }),
+                ],
+            })
+            .unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(
+        pending_ingest.0,
+        StatusCode::CREATED,
+        "pending ingest body: {}",
+        pending_ingest.1
+    );
+
+    let restarted_state =
+        api_state_from_store("trusted-linked-generated-view-complete", Arc::clone(&store)).await;
+    let completion_app = app(restarted_state);
+    let artifact = artifact_for_scores_view(
+        &scores_sum_count_relation_catalog(),
+        "positive_scores_by_user",
+        "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id",
+    );
+    let complete = request_json(
+        completion_app.clone(),
+        Method::POST,
+        "/v1/view-compile-deploy/jobs/positive_scores_by_user/complete",
+        Some(json!({
+            "spec_hash": view.1["spec_hash"],
+            "artifact": artifact,
+        })),
+    )
+    .await;
+    assert_eq!(complete.0, StatusCode::OK, "complete body: {}", complete.1);
+    assert_eq!(complete.1["execution_mode"], "standing_runtime");
+    assert_eq!(complete.1["query_enabled"], true);
+    assert_eq!(complete.1["lifecycle"]["compile_status"], "success");
+    assert_eq!(complete.1["lifecycle"]["deployment_status"], "running");
+
+    let query = request_json(completion_app, Method::GET, "/v1/api/scores/positive", None).await;
+    assert_eq!(query.0, StatusCode::OK, "query body: {}", query.1);
+    assert_eq!(
+        query.1["rows"],
+        json!([
+            { "user_id": "u1", "sum": 12, "count": 2 }
+        ])
+    );
+}
+
+#[tokio::test]
+async fn rest_product_complete_compile_deploy_job_rejects_wrong_spec_hash() {
+    let (state, _store) =
+        api_state_memory("trusted-linked-generated-view-complete-wrong-hash").await;
+    let app = app(state.with_generated_artifact_packages(std::iter::empty::<&str>()));
+
+    let relation = request_json(
+        app.clone(),
+        Method::POST,
+        "/v1/relations/scores-default",
+        None,
+    )
+    .await;
+    assert_eq!(
+        relation.0,
+        StatusCode::CREATED,
+        "relation body: {}",
+        relation.1
+    );
+
+    let view = request_json(
+        app.clone(),
+        Method::POST,
+        "/v1/views",
+        Some(json!({
+            "view_id": "positive_scores_by_user",
+            "urlPath": "/scores/positive",
+            "input_relation_id": "scores",
+            "input_relation_version": "2026-05-24.v1",
+            "sql": "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id",
+            "response_formats": ["json"]
+        })),
+    )
+    .await;
+    assert_eq!(view.0, StatusCode::ACCEPTED, "view body: {}", view.1);
+
+    let artifact = artifact_for_scores_view(
+        &scores_sum_count_relation_catalog(),
+        "positive_scores_by_user",
+        "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id",
+    );
+    let complete = request_json(
+        app,
+        Method::POST,
+        "/v1/view-compile-deploy/jobs/positive_scores_by_user/complete",
+        Some(json!({
+            "spec_hash": "velorix-feldera-spec-sha256-v1:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "artifact": artifact,
+        })),
+    )
+    .await;
+    assert_eq!(
+        complete.0,
+        StatusCode::CONFLICT,
+        "complete body: {}",
+        complete.1
+    );
+    assert!(complete.1["error"].as_str().unwrap().contains("spec hash"));
+}
+
+#[tokio::test]
+async fn rest_product_complete_compile_deploy_job_rejects_artifact_schema_mismatch() {
+    let (state, store) = api_state_memory("trusted-linked-generated-view-complete-schema").await;
+    let initial_app = app(state.with_generated_artifact_packages(std::iter::empty::<&str>()));
+
+    let relation = request_json(
+        initial_app.clone(),
+        Method::POST,
+        "/v1/relations/scores-default",
+        None,
+    )
+    .await;
+    assert_eq!(
+        relation.0,
+        StatusCode::CREATED,
+        "relation body: {}",
+        relation.1
+    );
+
+    let view = request_json(
+        initial_app,
+        Method::POST,
+        "/v1/views",
+        Some(json!({
+            "view_id": "positive_scores_by_user",
+            "urlPath": "/scores/positive",
+            "input_relation_id": "scores",
+            "input_relation_version": "2026-05-24.v1",
+            "sql": "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id",
+            "response_formats": ["json"]
+        })),
+    )
+    .await;
+    assert_eq!(view.0, StatusCode::ACCEPTED, "view body: {}", view.1);
+
+    let restarted_state = api_state_from_store(
+        "trusted-linked-generated-view-complete-schema",
+        Arc::clone(&store),
+    )
+    .await;
+    let completion_app = app(restarted_state);
+    let mut artifact = artifact_for_scores_view(
+        &scores_sum_count_relation_catalog(),
+        "positive_scores_by_user",
+        "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id",
+    );
+    artifact.output_schemas[0].columns[1].name = "total".to_string();
+    let complete = request_json(
+        completion_app,
+        Method::POST,
+        "/v1/view-compile-deploy/jobs/positive_scores_by_user/complete",
+        Some(json!({
+            "spec_hash": view.1["spec_hash"],
+            "artifact": artifact,
+        })),
+    )
+    .await;
+    assert_eq!(
+        complete.0,
+        StatusCode::BAD_REQUEST,
+        "complete body: {}",
+        complete.1
+    );
+    assert!(complete.1["error"].as_str().unwrap().contains("schema"));
+}
+
+#[tokio::test]
+async fn rest_product_complete_compile_deploy_job_rejects_active_view() {
+    let (state, _store) = api_state_memory("trusted-linked-generated-view-complete-active").await;
+    let app = app(state);
+
+    let relation = request_json(
+        app.clone(),
+        Method::POST,
+        "/v1/relations/scores-default",
+        None,
+    )
+    .await;
+    assert_eq!(
+        relation.0,
+        StatusCode::CREATED,
+        "relation body: {}",
+        relation.1
+    );
+
+    let view = request_json(
+        app.clone(),
+        Method::POST,
+        "/v1/views/scores-positive-default",
+        None,
+    )
+    .await;
+    assert_eq!(view.0, StatusCode::CREATED, "view body: {}", view.1);
+    assert_eq!(view.1["execution_mode"], "standing_runtime");
+
+    let artifact = artifact_for_scores_view(
+        &scores_sum_count_relation_catalog(),
+        "positive_scores_by_user",
+        "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id",
+    );
+    let complete = request_json(
+        app,
+        Method::POST,
+        "/v1/view-compile-deploy/jobs/positive_scores_by_user/complete",
+        Some(json!({
+            "spec_hash": view.1["spec_hash"],
+            "artifact": artifact,
+        })),
+    )
+    .await;
+    assert_eq!(
+        complete.0,
+        StatusCode::CONFLICT,
+        "complete body: {}",
+        complete.1
+    );
+    assert!(complete.1["error"]
+        .as_str()
+        .unwrap()
+        .contains("not waiting"));
+}
+
+#[tokio::test]
+async fn rest_product_complete_compile_deploy_job_rejects_missing_pending_job() {
+    let (state, store) =
+        api_state_memory("trusted-linked-generated-view-complete-missing-job").await;
+    let app = app(state.with_generated_artifact_packages(std::iter::empty::<&str>()));
+
+    let relation = request_json(
+        app.clone(),
+        Method::POST,
+        "/v1/relations/scores-default",
+        None,
+    )
+    .await;
+    assert_eq!(
+        relation.0,
+        StatusCode::CREATED,
+        "relation body: {}",
+        relation.1
+    );
+
+    let view = request_json(
+        app.clone(),
+        Method::POST,
+        "/v1/views",
+        Some(json!({
+            "view_id": "positive_scores_by_user",
+            "urlPath": "/scores/positive",
+            "input_relation_id": "scores",
+            "input_relation_version": "2026-05-24.v1",
+            "sql": "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id",
+            "response_formats": ["json"]
+        })),
+    )
+    .await;
+    assert_eq!(view.0, StatusCode::ACCEPTED, "view body: {}", view.1);
+    let spec_hash = view.1["spec_hash"].as_str().unwrap();
+    let job_registry = ViewCompileDeployJobRegistry::new(Arc::clone(&store));
+    let object_key = job_registry
+        .object_key("positive_scores_by_user", spec_hash)
+        .unwrap();
+    store
+        .delete(&Path::from(object_key.as_str()))
+        .await
+        .unwrap();
+
+    let artifact = artifact_for_scores_view(
+        &scores_sum_count_relation_catalog(),
+        "positive_scores_by_user",
+        "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id",
+    );
+    let complete = request_json(
+        app,
+        Method::POST,
+        "/v1/view-compile-deploy/jobs/positive_scores_by_user/complete",
+        Some(json!({
+            "spec_hash": spec_hash,
+            "artifact": artifact,
+        })),
+    )
+    .await;
+    assert_eq!(
+        complete.0,
+        StatusCode::CONFLICT,
+        "complete body: {}",
+        complete.1
+    );
+    assert!(complete.1["error"]
+        .as_str()
+        .unwrap()
+        .contains("does not exist"));
+}
+
+#[tokio::test]
+async fn rest_product_complete_compile_deploy_job_rejects_mismatched_compiler_request() {
+    let (state, temp) = api_state("trusted-linked-generated-view-complete-stale-job").await;
+    let app = app(state.with_generated_artifact_packages(std::iter::empty::<&str>()));
+
+    let relation = request_json(
+        app.clone(),
+        Method::POST,
+        "/v1/relations/scores-default",
+        None,
+    )
+    .await;
+    assert_eq!(
+        relation.0,
+        StatusCode::CREATED,
+        "relation body: {}",
+        relation.1
+    );
+
+    let view = request_json(
+        app.clone(),
+        Method::POST,
+        "/v1/views",
+        Some(json!({
+            "view_id": "positive_scores_by_user",
+            "urlPath": "/scores/positive",
+            "input_relation_id": "scores",
+            "input_relation_version": "2026-05-24.v1",
+            "sql": "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id",
+            "response_formats": ["json"]
+        })),
+    )
+    .await;
+    assert_eq!(view.0, StatusCode::ACCEPTED, "view body: {}", view.1);
+    let spec_hash = view.1["spec_hash"].as_str().unwrap();
+    let job_registry = ViewCompileDeployJobRegistry::new(Arc::new(
+        LocalFileSystem::new_with_prefix(temp.path()).unwrap(),
+    ));
+    let object_key = job_registry
+        .object_key("positive_scores_by_user", spec_hash)
+        .unwrap();
+    let path = temp.path().join(object_key.as_str());
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "job_id": view_compile_deploy_job_id("positive_scores_by_user", spec_hash),
+            "view_id": "positive_scores_by_user",
+            "spec_hash": spec_hash,
+            "compiler_backend": "feldera_compiler",
+            "compiler_request": {
+                "request_kind": "feldera_standing_view_compile_request_v1",
+                "view_id": "positive_scores_by_user",
+                "spec_hash": spec_hash,
+                "sql": "select user_id from scores",
+                "input_relations": artifact_for_scores_view(
+                    &scores_sum_count_relation_catalog(),
+                    "positive_scores_by_user",
+                    "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id",
+                ).input_schemas,
+                "output_relations": artifact_for_scores_view(
+                    &scores_sum_count_relation_catalog(),
+                    "positive_scores_by_user",
+                    "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id",
+                ).output_schemas,
+                "shape": {
+                    "is_materialized": true,
+                    "multi_input": false,
+                    "multi_output": false
+                }
+            },
+            "compile_status": "pending",
+            "deployment_status": "not_deployed"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let artifact = artifact_for_scores_view(
+        &scores_sum_count_relation_catalog(),
+        "positive_scores_by_user",
+        "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id",
+    );
+    let complete = request_json(
+        app,
+        Method::POST,
+        "/v1/view-compile-deploy/jobs/positive_scores_by_user/complete",
+        Some(json!({
+            "spec_hash": spec_hash,
+            "artifact": artifact,
+        })),
+    )
+    .await;
+    assert_eq!(
+        complete.0,
+        StatusCode::CONFLICT,
+        "complete body: {}",
+        complete.1
+    );
+    assert!(complete.1["error"]
+        .as_str()
+        .unwrap()
+        .contains("compiler_request"));
+}
+
+#[tokio::test]
+async fn rest_product_complete_compile_deploy_job_rejects_unlinked_runtime_package() {
+    let (state, _store) = api_state_memory("trusted-linked-generated-view-complete-unlinked").await;
+    let app = app(state.with_generated_artifact_packages(std::iter::empty::<&str>()));
+
+    let relation = request_json(
+        app.clone(),
+        Method::POST,
+        "/v1/relations/scores-default",
+        None,
+    )
+    .await;
+    assert_eq!(
+        relation.0,
+        StatusCode::CREATED,
+        "relation body: {}",
+        relation.1
+    );
+
+    let view = request_json(
+        app.clone(),
+        Method::POST,
+        "/v1/views",
+        Some(json!({
+            "view_id": "positive_scores_by_user",
+            "urlPath": "/scores/positive",
+            "input_relation_id": "scores",
+            "input_relation_version": "2026-05-24.v1",
+            "sql": "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id",
+            "response_formats": ["json"]
+        })),
+    )
+    .await;
+    assert_eq!(view.0, StatusCode::ACCEPTED, "view body: {}", view.1);
+
+    let artifact = artifact_for_scores_view(
+        &scores_sum_count_relation_catalog(),
+        "positive_scores_by_user",
+        "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id",
+    );
+    let complete = request_json(
+        app,
+        Method::POST,
+        "/v1/view-compile-deploy/jobs/positive_scores_by_user/complete",
+        Some(json!({
+            "spec_hash": view.1["spec_hash"],
+            "artifact": artifact,
+        })),
+    )
+    .await;
+    assert_eq!(
+        complete.0,
+        StatusCode::BAD_REQUEST,
+        "complete body: {}",
+        complete.1
+    );
+    assert!(complete.1["error"]
+        .as_str()
+        .unwrap()
+        .contains("is not registered"));
+}
+
+#[tokio::test]
+async fn rest_product_complete_compile_deploy_job_rejects_unknown_request_fields() {
+    let (state, _store) = api_state_memory("trusted-linked-generated-view-complete-unknown").await;
+    let app = app(state);
+    let artifact = artifact_for_scores_view(
+        &scores_sum_count_relation_catalog(),
+        "positive_scores_by_user",
+        "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id",
+    );
+    let response = request_raw_json(
+        app,
+        Method::POST,
+        "/v1/view-compile-deploy/jobs/positive_scores_by_user/complete",
+        json!({
+            "spec_hash": "velorix-feldera-spec-sha256-v1:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "artifact": artifact,
+            "unexpected": true
+        }),
+    )
+    .await;
+
+    assert_eq!(response.0, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(response.1.contains("unknown field"));
+}
+
+#[tokio::test]
+async fn rest_product_query_rejects_standing_runtime_before_lifecycle_is_running() {
+    let (state, store) = api_state_memory("standing-runtime-deploying-query").await;
+    let app = app(state);
+
+    let relation = request_json(
+        app.clone(),
+        Method::POST,
+        "/v1/relations/scores-default",
+        None,
+    )
+    .await;
+    assert_eq!(
+        relation.0,
+        StatusCode::CREATED,
+        "relation body: {}",
+        relation.1
+    );
+
+    let view = request_json(
+        app.clone(),
+        Method::POST,
+        "/v1/views",
+        Some(json!({
+            "view_id": "positive_scores_by_user",
+            "urlPath": "/scores/positive",
+            "input_relation_id": "scores",
+            "input_relation_version": "2026-05-24.v1",
+            "sql": "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id",
+            "response_formats": ["json"]
+        })),
+    )
+    .await;
+    assert_eq!(view.0, StatusCode::CREATED, "view body: {}", view.1);
+    assert_eq!(view.1["execution_mode"], "standing_runtime");
+    assert_eq!(view.1["query_enabled"], true);
+
+    MaterializedViewRegistry::new(Arc::clone(&store))
+        .update_standing_runtime_lifecycle(
+            "positive_scores_by_user",
+            view.1["spec_hash"].as_str().unwrap(),
+            MaterializedViewLifecycleStatus::standing_runtime_deploying(Some(
+                "test deploy in progress".to_string(),
+            )),
+        )
+        .await
+        .unwrap();
+
+    let api_query = request_json(app.clone(), Method::GET, "/v1/api/scores/positive", None).await;
+    assert_eq!(
+        api_query.0,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "api query body: {}",
+        api_query.1
+    );
+    assert!(api_query.1["error"]
+        .as_str()
+        .unwrap()
+        .contains("standing_runtime_not_deployed"));
+
+    let direct_query = request_json(
+        app,
+        Method::GET,
+        "/v1/views/positive_scores_by_user/query",
+        None,
+    )
+    .await;
+    assert_eq!(
+        direct_query.0,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "direct query body: {}",
+        direct_query.1
+    );
+    assert!(direct_query.1["error"]
+        .as_str()
+        .unwrap()
+        .contains("standing_runtime_not_deployed"));
+}
+
+#[tokio::test]
+async fn rest_product_worker_activates_catalog_backed_orders_sum_count_view() {
+    let (state, store) = api_state_memory("catalog-backed-orders-view-worker").await;
+    let initial_app = app(state);
+    let catalog = orders_sum_count_relation_catalog();
+
+    let relation = request_json(
+        initial_app.clone(),
+        Method::POST,
+        "/v1/relations",
+        Some(json!({ "catalog": catalog })),
+    )
+    .await;
+    assert_eq!(
+        relation.0,
+        StatusCode::CREATED,
+        "relation body: {}",
+        relation.1
+    );
+
+    let view = request_json(
+        initial_app.clone(),
+        Method::POST,
+        "/v1/views",
+        Some(json!({
+            "view_id": "orders_by_account",
+            "urlPath": "/orders/by-account",
+            "input_relation_id": "orders",
+            "input_relation_version": "2026-06-06.v1",
+            "sql": "select account_id, sum(amount) as sum, count(*) as count from orders group by account_id",
+            "response_formats": ["json"]
+        })),
+    )
+    .await;
+    assert_eq!(view.0, StatusCode::ACCEPTED, "view body: {}", view.1);
+    assert_eq!(view.1["execution_mode"], "feldera_compile_pending");
+    assert_eq!(view.1["query_enabled"], false);
+    assert_eq!(view.1["disabled_reason"], "feldera_compile_pending");
+
+    let pending_ingest = request_json(
+        initial_app,
+        Method::POST,
+        "/v1/ingest",
+        Some(
+            serde_json::to_value(IngestRowsRequest {
+                relation_id: "orders".to_string(),
+                relation_version: "2026-06-06.v1".to_string(),
+                stream_id: "orders".to_string(),
+                partition_id: 0,
+                start_offset_inclusive: 0,
+                rows: vec![
+                    json!({ "account_id": "acct-a", "amount": 10, "delta": 1 }),
+                    json!({ "account_id": "acct-a", "amount": 4, "delta": 1 }),
+                    json!({ "account_id": "acct-b", "amount": 7, "delta": 1 }),
+                    json!({ "account_id": "acct-a", "amount": 4, "delta": -1 }),
+                ],
+            })
+            .unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(
+        pending_ingest.0,
+        StatusCode::CREATED,
+        "pending ingest body: {}",
+        pending_ingest.1
+    );
+
+    let restarted_state =
+        api_state_from_store("catalog-backed-orders-view-worker", Arc::clone(&store)).await;
+    let worker_app = app(restarted_state);
+    let worker = request_json(
+        worker_app.clone(),
+        Method::POST,
+        "/v1/view-compile-deploy/run-once",
+        None,
+    )
+    .await;
+    assert_eq!(worker.0, StatusCode::OK, "worker body: {}", worker.1);
+    assert_eq!(worker.1["pending_jobs"], 1, "worker body: {}", worker.1);
+    assert_eq!(worker.1["activated"], 1, "worker body: {}", worker.1);
+    assert_eq!(worker.1["skipped"], 0, "worker body: {}", worker.1);
+    assert_eq!(worker.1["failed"], 0, "worker body: {}", worker.1);
+
+    let detail = request_json(
+        worker_app.clone(),
+        Method::GET,
+        "/v1/views/orders_by_account",
+        None,
+    )
+    .await;
+    assert_eq!(detail.0, StatusCode::OK, "detail body: {}", detail.1);
+    assert_eq!(detail.1["execution_mode"], "standing_runtime");
+    assert_eq!(detail.1["query_enabled"], true);
+
+    let query = request_json(
+        worker_app.clone(),
+        Method::GET,
+        "/v1/api/orders/by-account",
+        None,
+    )
+    .await;
+    assert_eq!(query.0, StatusCode::OK, "query body: {}", query.1);
+    assert_eq!(
+        query.1["rows"],
+        json!([
+            { "account_id": "acct-a", "sum": 10, "count": 1 },
+            { "account_id": "acct-b", "sum": 7, "count": 1 }
+        ])
+    );
+
+    let post_activation_ingest = request_json(
+        worker_app.clone(),
+        Method::POST,
+        "/v1/ingest",
+        Some(
+            serde_json::to_value(IngestRowsRequest {
+                relation_id: "orders".to_string(),
+                relation_version: "2026-06-06.v1".to_string(),
+                stream_id: "orders".to_string(),
+                partition_id: 0,
+                start_offset_inclusive: 4,
+                rows: vec![json!({ "account_id": "acct-b", "amount": 2, "delta": 1 })],
+            })
+            .unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(
+        post_activation_ingest.0,
+        StatusCode::CREATED,
+        "post-activation ingest body: {}",
+        post_activation_ingest.1
+    );
+
+    let query = request_json(
+        worker_app,
+        Method::GET,
+        "/v1/views/orders_by_account/query",
+        None,
+    )
+    .await;
+    assert_eq!(query.0, StatusCode::OK, "query body: {}", query.1);
+    assert_eq!(
+        query.1["rows"],
+        json!([
+            { "account_id": "acct-a", "sum": 10, "count": 1 },
+            { "account_id": "acct-b", "sum": 9, "count": 2 }
+        ])
+    );
+}
+
+#[tokio::test]
+async fn rest_product_worker_keeps_unsupported_catalog_view_pending() {
+    let (state, _store) = api_state_memory("catalog-backed-unsupported-view-worker").await;
+    let app = app(state);
+    let catalog = orders_sum_count_relation_catalog();
+
+    let relation = request_json(
+        app.clone(),
+        Method::POST,
+        "/v1/relations",
+        Some(json!({ "catalog": catalog })),
+    )
+    .await;
+    assert_eq!(
+        relation.0,
+        StatusCode::CREATED,
+        "relation body: {}",
+        relation.1
+    );
+
+    let view = request_json(
+        app.clone(),
+        Method::POST,
+        "/v1/views",
+        Some(json!({
+            "view_id": "large_orders_by_account",
+            "urlPath": "/orders/large-by-account",
+            "input_relation_id": "orders",
+            "input_relation_version": "2026-06-06.v1",
+            "sql": "select account_id, sum(amount) as sum, count(*) as count from orders where amount > 0 group by account_id",
+            "response_formats": ["json"]
+        })),
+    )
+    .await;
+    assert_eq!(view.0, StatusCode::ACCEPTED, "view body: {}", view.1);
+    assert_eq!(view.1["execution_mode"], "feldera_compile_pending");
+
+    let worker = request_json(
+        app.clone(),
+        Method::POST,
+        "/v1/view-compile-deploy/run-once",
+        None,
+    )
+    .await;
+    assert_eq!(worker.0, StatusCode::OK, "worker body: {}", worker.1);
+    assert_eq!(worker.1["pending_jobs"], 1, "worker body: {}", worker.1);
+    assert_eq!(worker.1["activated"], 0, "worker body: {}", worker.1);
+    assert_eq!(worker.1["skipped"], 1, "worker body: {}", worker.1);
+    assert_eq!(worker.1["failed"], 0, "worker body: {}", worker.1);
+    assert_eq!(worker.1["outcomes"][0]["status"], "skipped");
+
+    let detail = request_json(app, Method::GET, "/v1/views/large_orders_by_account", None).await;
+    assert_eq!(detail.0, StatusCode::OK, "detail body: {}", detail.1);
+    assert_eq!(detail.1["execution_mode"], "feldera_compile_pending");
+    assert_eq!(detail.1["query_enabled"], false);
+}
+
+#[tokio::test]
+async fn rest_product_worker_activates_decimal_value_date_key_sum_count_view() {
+    let (state, store) = api_state_memory("catalog-backed-decimal-date-view-worker").await;
+    let initial_app = app(state);
+    let catalog = daily_revenue_sum_count_relation_catalog();
+
+    let relation = request_json(
+        initial_app.clone(),
+        Method::POST,
+        "/v1/relations",
+        Some(json!({ "catalog": catalog })),
+    )
+    .await;
+    assert_eq!(
+        relation.0,
+        StatusCode::CREATED,
+        "relation body: {}",
+        relation.1
+    );
+
+    let view = request_json(
+        initial_app.clone(),
+        Method::POST,
+        "/v1/views",
+        Some(json!({
+            "view_id": "daily_revenue_by_date",
+            "urlPath": "/daily-revenue/by-date",
+            "input_relation_id": "daily_revenue",
+            "input_relation_version": "2026-06-06.v1",
+            "sql": "select business_date, sum(amount) as sum, count(*) as count from daily_revenue group by business_date",
+            "response_formats": ["json"]
+        })),
+    )
+    .await;
+    assert_eq!(view.0, StatusCode::ACCEPTED, "view body: {}", view.1);
+    assert_eq!(view.1["execution_mode"], "feldera_compile_pending");
+
+    let ingest = request_json(
+        initial_app,
+        Method::POST,
+        "/v1/ingest",
+        Some(
+            serde_json::to_value(IngestRowsRequest {
+                relation_id: "daily_revenue".to_string(),
+                relation_version: "2026-06-06.v1".to_string(),
+                stream_id: "daily_revenue".to_string(),
+                partition_id: 0,
+                start_offset_inclusive: 0,
+                rows: vec![
+                    json!({ "business_date": 20510, "amount": "10.25", "row_weight": 1 }),
+                    json!({ "business_date": 20510, "amount": "1.25", "row_weight": 1 }),
+                    json!({ "business_date": 20510, "amount": "1.25", "row_weight": -1 }),
+                    json!({ "business_date": 20511, "amount": "2.50", "row_weight": 1 }),
+                ],
+            })
+            .unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(ingest.0, StatusCode::CREATED, "ingest body: {}", ingest.1);
+
+    let restarted_state = api_state_from_store(
+        "catalog-backed-decimal-date-view-worker",
+        Arc::clone(&store),
+    )
+    .await;
+    let worker_app = app(restarted_state);
+    let worker = request_json(
+        worker_app.clone(),
+        Method::POST,
+        "/v1/view-compile-deploy/run-once",
+        None,
+    )
+    .await;
+    assert_eq!(worker.0, StatusCode::OK, "worker body: {}", worker.1);
+    assert_eq!(worker.1["activated"], 1, "worker body: {}", worker.1);
+    assert_eq!(worker.1["failed"], 0, "worker body: {}", worker.1);
+
+    let query = request_json(
+        worker_app,
+        Method::GET,
+        "/v1/api/daily-revenue/by-date",
+        None,
+    )
+    .await;
+    assert_eq!(query.0, StatusCode::OK, "query body: {}", query.1);
+    assert_eq!(
+        query.1["rows"],
+        json!([
+            { "business_date": 20510, "sum": "10.25", "count": 1 },
+            { "business_date": 20511, "sum": "2.50", "count": 1 }
+        ])
+    );
+}
+
+#[tokio::test]
+async fn rest_product_worker_keeps_float_value_catalog_view_pending() {
+    let (state, _store) = api_state_memory("catalog-backed-float-value-view-worker").await;
+    let app = app(state);
+    let catalog = float_value_sum_count_relation_catalog();
+
+    let relation = request_json(
+        app.clone(),
+        Method::POST,
+        "/v1/relations",
+        Some(json!({ "catalog": catalog })),
+    )
+    .await;
+    assert_eq!(
+        relation.0,
+        StatusCode::CREATED,
+        "relation body: {}",
+        relation.1
+    );
+
+    let view = request_json(
+        app.clone(),
+        Method::POST,
+        "/v1/views",
+        Some(json!({
+            "view_id": "float_orders_by_account",
+            "urlPath": "/float-orders/by-account",
+            "input_relation_id": "float_orders",
+            "input_relation_version": "2026-06-06.v1",
+            "sql": "select account_id, sum(amount) as sum, count(*) as count from float_orders group by account_id",
+            "response_formats": ["json"]
+        })),
+    )
+    .await;
+    assert_eq!(view.0, StatusCode::ACCEPTED, "view body: {}", view.1);
+    assert_eq!(view.1["execution_mode"], "feldera_compile_pending");
+
+    let worker = request_json(
+        app.clone(),
+        Method::POST,
+        "/v1/view-compile-deploy/run-once",
+        None,
+    )
+    .await;
+    assert_eq!(worker.0, StatusCode::OK, "worker body: {}", worker.1);
+    assert_eq!(worker.1["pending_jobs"], 1, "worker body: {}", worker.1);
+    assert_eq!(worker.1["activated"], 0, "worker body: {}", worker.1);
+    assert_eq!(worker.1["skipped"], 1, "worker body: {}", worker.1);
+    assert_eq!(worker.1["failed"], 0, "worker body: {}", worker.1);
+
+    let detail = request_json(app, Method::GET, "/v1/views/float_orders_by_account", None).await;
+    assert_eq!(detail.0, StatusCode::OK, "detail body: {}", detail.1);
+    assert_eq!(detail.1["execution_mode"], "feldera_compile_pending");
+    assert_eq!(detail.1["query_enabled"], false);
 }
 
 #[tokio::test]
@@ -5155,9 +5817,7 @@ async fn rest_product_uses_grpc_meta_service_for_relation_catalog_and_ingest_adm
     let endpoint = spawn_meta_service().await;
     let meta_store = GrpcMetaStore::connect(endpoint).await.unwrap();
     let (state, _temp) = api_state("grpc-meta").await;
-    let app = app(state
-        .with_meta_store(Arc::new(meta_store))
-        .with_generic_query_enabled(true));
+    let app = app(state.with_meta_store(Arc::new(meta_store)));
     let catalog = scores_sum_count_relation_catalog();
 
     let relation = request_json(
@@ -5169,6 +5829,15 @@ async fn rest_product_uses_grpc_meta_service_for_relation_catalog_and_ingest_adm
     .await;
     assert_eq!(relation.0, StatusCode::CREATED);
     assert_eq!(relation.1["relation_id"], "scores");
+
+    let view = request_json(
+        app.clone(),
+        Method::POST,
+        "/v1/views/scores-positive-default",
+        None,
+    )
+    .await;
+    assert_eq!(view.0, StatusCode::CREATED, "view body: {}", view.1);
 
     let ingest = request_json(
         app.clone(),
@@ -5225,24 +5894,17 @@ async fn rest_product_uses_grpc_meta_service_for_relation_catalog_and_ingest_adm
 
     let query = request_json(
         app,
-        Method::POST,
-        "/v1/query",
-        Some(
-            serde_json::to_value(QueryRequest {
-                relation_id: "scores".to_string(),
-                relation_version: "2026-05-24.v1".to_string(),
-                sql: "select key, value, weight from input order by key".to_string(),
-            })
-            .unwrap(),
-        ),
+        Method::GET,
+        "/v1/api/scores/positive?max_rows=100",
+        None,
     )
     .await;
     assert_eq!(query.0, StatusCode::OK, "query body: {}", query.1);
     assert_eq!(
         query.1["rows"],
         json!([
-            { "key": "\"u1\"", "value": "{\"count\":1,\"sum\":5}", "weight": 1 },
-            { "key": "\"u2\"", "value": "{\"count\":1,\"sum\":7}", "weight": 1 }
+            { "user_id": "u1", "sum": 5, "count": 1 },
+            { "user_id": "u2", "sum": 7, "count": 1 }
         ])
     );
 }
@@ -5256,9 +5918,7 @@ async fn rest_product_uses_metadata_catalog_when_object_store_materialization_fa
             .join("v1/relations/scores/versions/2026-05-24.v1.relation.json"),
     )
     .unwrap();
-    let app = app(state
-        .with_meta_store(meta_store)
-        .with_generic_query_enabled(true));
+    let app = app(state.with_meta_store(meta_store));
 
     let relation = request_json(
         app.clone(),
@@ -5273,6 +5933,15 @@ async fn rest_product_uses_metadata_catalog_when_object_store_materialization_fa
         "relation body: {}",
         relation.1
     );
+
+    let view = request_json(
+        app.clone(),
+        Method::POST,
+        "/v1/views/scores-positive-default",
+        None,
+    )
+    .await;
+    assert_eq!(view.0, StatusCode::CREATED, "view body: {}", view.1);
 
     let ingest = request_json(
         app.clone(),
@@ -5298,24 +5967,17 @@ async fn rest_product_uses_metadata_catalog_when_object_store_materialization_fa
 
     let query = request_json(
         app,
-        Method::POST,
-        "/v1/query",
-        Some(
-            serde_json::to_value(QueryRequest {
-                relation_id: "scores".to_string(),
-                relation_version: "2026-05-24.v1".to_string(),
-                sql: "select key, value, weight from input order by key".to_string(),
-            })
-            .unwrap(),
-        ),
+        Method::GET,
+        "/v1/api/scores/positive?max_rows=100",
+        None,
     )
     .await;
     assert_eq!(query.0, StatusCode::OK, "query body: {}", query.1);
     assert_eq!(
         query.1["rows"],
         json!([
-            { "key": "\"u1\"", "value": "{\"count\":1,\"sum\":5}", "weight": 1 },
-            { "key": "\"u2\"", "value": "{\"count\":1,\"sum\":7}", "weight": 1 }
+            { "user_id": "u1", "sum": 5, "count": 1 },
+            { "user_id": "u2", "sum": 7, "count": 1 }
         ])
     );
 }
@@ -5406,6 +6068,189 @@ fn scores_sum_count_relation_catalog() -> VelorixRelationCatalogV1 {
         },
         feldera_relation: FelderaRelationBindingV1 {
             relation_id: "scores".to_string(),
+            schema_fingerprint,
+        },
+        incremental_adapter: IncrementalAdapterBindingV1 {
+            adapter_id: CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID.to_string(),
+        },
+    }
+}
+
+fn orders_sum_count_relation_catalog() -> VelorixRelationCatalogV1 {
+    let relation_schema = VelorixRelationSchemaV1 {
+        relation_id: "orders".to_string(),
+        relation_name: "orders".to_string(),
+        relation_version: "2026-06-06.v1".to_string(),
+        columns: vec![
+            RelationColumnV1 {
+                column_id: "account_id".to_string(),
+                name: "account_id".to_string(),
+                logical_type: VelorixLogicalTypeV1::Utf8,
+                physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+                nullable: false,
+                ordinal: 0,
+                semantic_role: RelationSemanticRoleV1::PrimaryKey,
+            },
+            RelationColumnV1 {
+                column_id: "amount".to_string(),
+                name: "amount".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 1,
+                semantic_role: RelationSemanticRoleV1::Value,
+            },
+            RelationColumnV1 {
+                column_id: "delta".to_string(),
+                name: "delta".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 2,
+                semantic_role: RelationSemanticRoleV1::Weight,
+            },
+        ],
+        primary_key_column_ids: vec!["account_id".to_string()],
+        weight_column_id: "delta".to_string(),
+        allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+        event_time_column_id: None,
+    };
+    let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
+
+    VelorixRelationCatalogV1 {
+        schema_version: RELATION_SCHEMA_VERSION_V1,
+        relation_schema,
+        schema_fingerprint: schema_fingerprint.clone(),
+        datafusion_registration: DataFusionRegistrationV1 {
+            name: "orders".to_string(),
+            mode: DataFusionRegistrationModeV1::Table,
+        },
+        feldera_relation: FelderaRelationBindingV1 {
+            relation_id: "orders".to_string(),
+            schema_fingerprint,
+        },
+        incremental_adapter: IncrementalAdapterBindingV1 {
+            adapter_id: CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID.to_string(),
+        },
+    }
+}
+
+fn daily_revenue_sum_count_relation_catalog() -> VelorixRelationCatalogV1 {
+    let relation_schema = VelorixRelationSchemaV1 {
+        relation_id: "daily_revenue".to_string(),
+        relation_name: "daily_revenue".to_string(),
+        relation_version: "2026-06-06.v1".to_string(),
+        columns: vec![
+            RelationColumnV1 {
+                column_id: "business_date".to_string(),
+                name: "business_date".to_string(),
+                logical_type: VelorixLogicalTypeV1::Date,
+                physical_arrow_type: ArrowPhysicalTypeV1::Date32,
+                nullable: false,
+                ordinal: 0,
+                semantic_role: RelationSemanticRoleV1::PrimaryKey,
+            },
+            RelationColumnV1 {
+                column_id: "amount".to_string(),
+                name: "amount".to_string(),
+                logical_type: VelorixLogicalTypeV1::Decimal {
+                    precision: 38,
+                    scale: 2,
+                },
+                physical_arrow_type: ArrowPhysicalTypeV1::Decimal128 {
+                    precision: 38,
+                    scale: 2,
+                },
+                nullable: false,
+                ordinal: 1,
+                semantic_role: RelationSemanticRoleV1::Value,
+            },
+            RelationColumnV1 {
+                column_id: "row_weight".to_string(),
+                name: "row_weight".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 2,
+                semantic_role: RelationSemanticRoleV1::Weight,
+            },
+        ],
+        primary_key_column_ids: vec!["business_date".to_string()],
+        weight_column_id: "row_weight".to_string(),
+        allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+        event_time_column_id: None,
+    };
+    let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
+
+    VelorixRelationCatalogV1 {
+        schema_version: RELATION_SCHEMA_VERSION_V1,
+        relation_schema,
+        schema_fingerprint: schema_fingerprint.clone(),
+        datafusion_registration: DataFusionRegistrationV1 {
+            name: "daily_revenue".to_string(),
+            mode: DataFusionRegistrationModeV1::Table,
+        },
+        feldera_relation: FelderaRelationBindingV1 {
+            relation_id: "daily_revenue".to_string(),
+            schema_fingerprint,
+        },
+        incremental_adapter: IncrementalAdapterBindingV1 {
+            adapter_id: CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID.to_string(),
+        },
+    }
+}
+
+fn float_value_sum_count_relation_catalog() -> VelorixRelationCatalogV1 {
+    let relation_schema = VelorixRelationSchemaV1 {
+        relation_id: "float_orders".to_string(),
+        relation_name: "float_orders".to_string(),
+        relation_version: "2026-06-06.v1".to_string(),
+        columns: vec![
+            RelationColumnV1 {
+                column_id: "account_id".to_string(),
+                name: "account_id".to_string(),
+                logical_type: VelorixLogicalTypeV1::Utf8,
+                physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+                nullable: false,
+                ordinal: 0,
+                semantic_role: RelationSemanticRoleV1::PrimaryKey,
+            },
+            RelationColumnV1 {
+                column_id: "amount".to_string(),
+                name: "amount".to_string(),
+                logical_type: VelorixLogicalTypeV1::Float64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Float64,
+                nullable: false,
+                ordinal: 1,
+                semantic_role: RelationSemanticRoleV1::Value,
+            },
+            RelationColumnV1 {
+                column_id: "delta".to_string(),
+                name: "delta".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 2,
+                semantic_role: RelationSemanticRoleV1::Weight,
+            },
+        ],
+        primary_key_column_ids: vec!["account_id".to_string()],
+        weight_column_id: "delta".to_string(),
+        allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+        event_time_column_id: None,
+    };
+    let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
+
+    VelorixRelationCatalogV1 {
+        schema_version: RELATION_SCHEMA_VERSION_V1,
+        relation_schema,
+        schema_fingerprint: schema_fingerprint.clone(),
+        datafusion_registration: DataFusionRegistrationV1 {
+            name: "float_orders".to_string(),
+            mode: DataFusionRegistrationModeV1::Table,
+        },
+        feldera_relation: FelderaRelationBindingV1 {
+            relation_id: "float_orders".to_string(),
             schema_fingerprint,
         },
         incremental_adapter: IncrementalAdapterBindingV1 {
@@ -5797,6 +6642,24 @@ async fn request_json_with_headers(
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     let body = serde_json::from_slice(&bytes).unwrap();
     (status, body)
+}
+
+async fn request_raw_json(
+    app: axum::Router,
+    method: Method,
+    uri: &str,
+    body: Value,
+) -> (StatusCode, String) {
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&bytes).to_string())
 }
 
 async fn spawn_meta_service() -> String {

@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeMap,
     fmt,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -25,122 +24,11 @@ use futures::{stream, stream::BoxStream, StreamExt};
 use parquet::arrow::ArrowWriter;
 use tokio::sync::{Barrier, Notify};
 use velorix_core::query::{QueryError, QueryPolicy, QueryPolicyError};
-use velorix_runtime::{
-    query::{
-        query_bootstrap_recovered_materialized_view_with_policy,
-        query_object_backed_input_with_policy, query_object_backed_input_with_policy_and_limiter,
-        query_object_backed_input_with_policy_and_runtime,
-        query_production_recovered_materialized_view_with_policy_and_limiter,
-        query_production_recovered_materialized_view_with_policy_and_runtime,
-        ProductionQueryRuntime, QueryExecutionLimiter, RuntimeQueryError,
-    },
-    recovery::{ORDERS_SUM_COUNT_RELATION_ID, ORDERS_SUM_COUNT_RELATION_VERSION},
+use velorix_runtime::query::{
+    query_object_backed_input_with_policy, query_object_backed_input_with_policy_and_limiter,
+    query_object_backed_input_with_policy_and_runtime, ProductionQueryRuntime,
+    QueryExecutionLimiter, RuntimeQueryError,
 };
-use velorix_storage::capability::{
-    AuthoritativeNamespace, AuthoritativeObjectStoreCapabilitiesV1, ObjectStoreCapabilityProfile,
-};
-
-fn local_capabilities() -> AuthoritativeObjectStoreCapabilitiesV1 {
-    let profile = ObjectStoreCapabilityProfile::local_development();
-    AuthoritativeObjectStoreCapabilitiesV1::new(
-        AuthoritativeNamespace::all()
-            .into_iter()
-            .map(|namespace| (namespace, profile.clone()))
-            .collect::<BTreeMap<_, _>>(),
-    )
-}
-
-#[tokio::test]
-async fn query_bootstrap_recovered_materialized_view_requires_shared_limiter_when_concurrency_limit_is_set(
-) {
-    let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-
-    let error = query_bootstrap_recovered_materialized_view_with_policy(
-        Arc::clone(&store),
-        "select key_json, value_json, weight from input",
-        QueryPolicy {
-            max_concurrent_queries: Some(1),
-            ..QueryPolicy::default()
-        },
-    )
-    .await
-    .unwrap_err();
-
-    assert!(matches!(
-        error,
-        RuntimeQueryError::Query(QueryError::Policy(
-            QueryPolicyError::ConcurrencyLimiterRequired {
-                max_concurrent_queries: 1
-            }
-        ))
-    ));
-}
-
-#[tokio::test]
-async fn production_recovered_query_requires_shared_limiter_when_concurrency_limit_is_set() {
-    let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-
-    let error = query_production_recovered_materialized_view_with_policy_and_limiter(
-        Arc::clone(&store),
-        "v1/slatedb/state",
-        ORDERS_SUM_COUNT_RELATION_ID,
-        ORDERS_SUM_COUNT_RELATION_VERSION,
-        &local_capabilities(),
-        "select key_json, value_json, weight from input",
-        QueryPolicy {
-            max_concurrent_queries: Some(1),
-            ..QueryPolicy::default()
-        },
-        None,
-    )
-    .await
-    .unwrap_err();
-
-    assert!(matches!(
-        error,
-        RuntimeQueryError::Query(QueryError::Policy(
-            QueryPolicyError::ConcurrencyLimiterRequired {
-                max_concurrent_queries: 1
-            }
-        ))
-    ));
-}
-
-#[tokio::test]
-async fn production_recovered_query_rejects_limiter_that_does_not_match_policy() {
-    let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-    let limiter = QueryExecutionLimiter::from_policy(QueryPolicy {
-        max_concurrent_queries: Some(2),
-        ..QueryPolicy::default()
-    })
-    .unwrap();
-
-    let error = query_production_recovered_materialized_view_with_policy_and_limiter(
-        Arc::clone(&store),
-        "v1/slatedb/state",
-        ORDERS_SUM_COUNT_RELATION_ID,
-        ORDERS_SUM_COUNT_RELATION_VERSION,
-        &local_capabilities(),
-        "select key_json, value_json, weight from input",
-        QueryPolicy {
-            max_concurrent_queries: Some(1),
-            ..QueryPolicy::default()
-        },
-        Some(limiter),
-    )
-    .await
-    .unwrap_err();
-
-    assert!(matches!(
-        error,
-        RuntimeQueryError::Query(QueryError::Policy(
-            QueryPolicyError::ConcurrencyLimiterPolicyMismatch {
-                required_max_concurrent_queries: 1,
-                actual_max_concurrent_queries: 2
-            }
-        ))
-    ));
-}
 
 #[tokio::test]
 async fn query_object_backed_input_requires_shared_limiter_when_concurrency_limit_is_set() {
@@ -228,7 +116,7 @@ async fn query_object_backed_input_fails_immediately_when_shared_limiter_is_alre
 }
 
 #[tokio::test]
-async fn query_execution_limiter_gates_object_backed_and_production_recovered_query_surfaces() {
+async fn query_execution_limiter_gates_object_backed_query_surfaces() {
     let inner_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
     put_parquet_input(
         &inner_store,
@@ -260,23 +148,18 @@ async fn query_execution_limiter_gates_object_backed_and_production_recovered_qu
         .await
         .expect("first query should acquire the limiter and reach object listing");
 
-    let recovery_store: Arc<dyn object_store::ObjectStore> =
-        Arc::new(object_store::memory::InMemory::new());
     let error = tokio::time::timeout(
         Duration::from_millis(50),
-        query_production_recovered_materialized_view_with_policy_and_limiter(
-            Arc::clone(&recovery_store),
-            "v1/slatedb/state",
-            ORDERS_SUM_COUNT_RELATION_ID,
-            ORDERS_SUM_COUNT_RELATION_VERSION,
-            &local_capabilities(),
+        query_object_backed_input_with_policy_and_limiter(
+            Arc::clone(&inner_store),
+            "memory://velorix/input/",
             "select key_json, value_json, weight from input",
             policy,
             Some(limiter),
         ),
     )
     .await
-    .expect("production recovered query should fail without waiting for recovery")
+    .expect("second object-backed query should fail without waiting for a permit")
     .unwrap_err();
 
     first_query.abort();
@@ -292,7 +175,7 @@ async fn query_execution_limiter_gates_object_backed_and_production_recovered_qu
 }
 
 #[tokio::test]
-async fn production_query_runtime_gates_object_backed_and_production_recovered_query_surfaces() {
+async fn production_query_runtime_gates_object_backed_query_surfaces() {
     let inner_store: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
     put_parquet_input(
         &inner_store,
@@ -329,23 +212,18 @@ async fn production_query_runtime_gates_object_backed_and_production_recovered_q
         .await
         .expect("first query should acquire the runtime limiter and reach object listing");
 
-    let recovery_store: Arc<dyn object_store::ObjectStore> =
-        Arc::new(object_store::memory::InMemory::new());
     let error = tokio::time::timeout(
         Duration::from_millis(50),
-        query_production_recovered_materialized_view_with_policy_and_runtime(
-            Arc::clone(&recovery_store),
-            "v1/slatedb/state",
-            ORDERS_SUM_COUNT_RELATION_ID,
-            ORDERS_SUM_COUNT_RELATION_VERSION,
-            &local_capabilities(),
+        query_object_backed_input_with_policy_and_runtime(
+            Arc::clone(&inner_store),
+            "memory://velorix/input/",
             "select key_json, value_json, weight from input",
             QueryPolicy::default(),
             &runtime,
         ),
     )
     .await
-    .expect("production recovered query should fail before recovery setup")
+    .expect("second object-backed query should fail before table setup")
     .unwrap_err();
 
     first_query.abort();

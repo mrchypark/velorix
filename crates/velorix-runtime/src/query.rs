@@ -2,11 +2,7 @@
 
 use std::sync::Arc;
 
-use arrow::{
-    array::{ArrayRef, Int64Array, StringArray},
-    datatypes::{DataType, Field, Schema},
-    record_batch::RecordBatch,
-};
+use arrow::{datatypes::Schema, record_batch::RecordBatch};
 use datafusion::{
     common::ScalarValue,
     dataframe::DataFrame,
@@ -19,8 +15,6 @@ use datafusion::{
     prelude::{ParquetReadOptions, SessionContext},
 };
 use futures::TryStreamExt;
-use object_store::path::Path;
-use object_store::ObjectStore;
 use parquet::arrow::{
     arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions},
     async_reader::ParquetObjectReader,
@@ -29,17 +23,12 @@ use parquet::errors::ParquetError;
 use thiserror::Error;
 use url::Url;
 use velorix_core::query::{QueryError, QueryPolicy, QueryPolicyError, INPUT_TABLE_NAME};
-use velorix_core::relation::VelorixRelationCatalogV1;
 
 use crate::benchmark_gate::ObjectRequestMetricsV1;
 use crate::object_meter::{object_request_policy_error, MeteredObjectStore, ObjectStoreMeter};
 use crate::query_runtime::{DataFusionSessionFactory, QueryRuntimeLimits};
 pub use crate::query_runtime::{ProductionQueryRuntime, QueryExecutionLimiter};
-use crate::recovery::{
-    RecoveredRuntime, RecoveryError, ORDERS_SUM_COUNT_OWNER, ORDERS_SUM_COUNT_RELATION_ID,
-    ORDERS_SUM_COUNT_RELATION_VERSION,
-};
-use velorix_storage::capability::AuthoritativeObjectStoreCapabilitiesV1;
+use crate::recovery::RecoveryError;
 
 #[derive(Debug, Error)]
 pub enum RuntimeQueryError {
@@ -55,207 +44,6 @@ pub enum QueryBindValue {
     Int64(i64),
     Float64(f64),
     Boolean(bool),
-}
-
-/// Bootstrap/dev recovered-query helper backed by raw object-state recovery.
-///
-/// Production callers must use
-/// [`query_production_recovered_materialized_view_with_policy_and_limiter`],
-/// which requires shared startup object-store capability evidence and checked
-/// SlateDB/catalog recovery.
-pub async fn query_bootstrap_recovered_materialized_view(
-    store: Arc<dyn ObjectStore>,
-    sql: &str,
-) -> Result<Vec<RecordBatch>, RuntimeQueryError> {
-    query_bootstrap_recovered_materialized_view_with_policy(store, sql, QueryPolicy::default())
-        .await
-}
-
-/// Bootstrap/dev recovered-query helper backed by raw object-state recovery.
-///
-/// Production callers must use
-/// [`query_production_recovered_materialized_view_with_policy_and_limiter`].
-pub async fn query_bootstrap_recovered_materialized_view_with_policy(
-    store: Arc<dyn ObjectStore>,
-    sql: &str,
-    policy: QueryPolicy,
-) -> Result<Vec<RecordBatch>, RuntimeQueryError> {
-    query_bootstrap_recovered_materialized_view_with_policy_and_limiter(store, sql, policy, None)
-        .await
-}
-
-/// Bootstrap/dev recovered-query helper backed by raw object-state recovery.
-///
-/// Production callers must use
-/// [`query_production_recovered_materialized_view_with_policy_and_limiter`].
-pub async fn query_bootstrap_recovered_materialized_view_with_policy_and_limiter(
-    store: Arc<dyn ObjectStore>,
-    sql: &str,
-    policy: QueryPolicy,
-    limiter: Option<QueryExecutionLimiter>,
-) -> Result<Vec<RecordBatch>, RuntimeQueryError> {
-    policy.validate().map_err(QueryError::from)?;
-    validate_sql_text_policy(sql, policy).map_err(QueryError::from)?;
-
-    let _permit = acquire_query_permit(policy, limiter.as_ref())?;
-    let recovered = RecoveredRuntime::recover_bootstrap_with_owner_and_relation_catalog_record(
-        store,
-        ORDERS_SUM_COUNT_OWNER,
-        ORDERS_SUM_COUNT_RELATION_ID,
-        ORDERS_SUM_COUNT_RELATION_VERSION,
-    )
-    .await?;
-
-    collect_recovered_materialized_view(recovered, sql, policy)
-        .await
-        .map_err(Into::into)
-}
-
-pub async fn query_production_recovered_materialized_view_with_policy_and_limiter(
-    store: Arc<dyn ObjectStore>,
-    slatedb_state_path: impl Into<Path>,
-    relation_id: &str,
-    relation_version: &str,
-    capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
-    sql: &str,
-    policy: QueryPolicy,
-    limiter: Option<QueryExecutionLimiter>,
-) -> Result<Vec<RecordBatch>, RuntimeQueryError> {
-    query_production_recovered_materialized_view_table_with_policy_and_limiter(
-        store,
-        slatedb_state_path,
-        relation_id,
-        relation_version,
-        INPUT_TABLE_NAME,
-        capabilities,
-        sql,
-        policy,
-        limiter,
-    )
-    .await
-}
-
-pub async fn query_production_recovered_materialized_view_with_catalog_and_policy_and_limiter(
-    store: Arc<dyn ObjectStore>,
-    slatedb_state_path: impl Into<Path>,
-    relation_catalog: VelorixRelationCatalogV1,
-    capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
-    sql: &str,
-    policy: QueryPolicy,
-    limiter: Option<QueryExecutionLimiter>,
-) -> Result<Vec<RecordBatch>, RuntimeQueryError> {
-    query_production_recovered_materialized_view_table_with_catalog_and_policy_and_limiter(
-        store,
-        slatedb_state_path,
-        relation_catalog,
-        INPUT_TABLE_NAME,
-        capabilities,
-        sql,
-        policy,
-        limiter,
-    )
-    .await
-}
-
-pub async fn query_production_recovered_materialized_view_table_with_policy_and_limiter(
-    store: Arc<dyn ObjectStore>,
-    slatedb_state_path: impl Into<Path>,
-    relation_id: &str,
-    relation_version: &str,
-    table_name: &str,
-    capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
-    sql: &str,
-    policy: QueryPolicy,
-    limiter: Option<QueryExecutionLimiter>,
-) -> Result<Vec<RecordBatch>, RuntimeQueryError> {
-    query_production_recovered_materialized_view_table_with_bindings_and_policy_and_limiter(
-        store,
-        slatedb_state_path,
-        relation_id,
-        relation_version,
-        table_name,
-        capabilities,
-        sql,
-        &[],
-        policy,
-        limiter,
-    )
-    .await
-}
-
-pub async fn query_production_recovered_materialized_view_table_with_catalog_and_policy_and_limiter(
-    store: Arc<dyn ObjectStore>,
-    slatedb_state_path: impl Into<Path>,
-    relation_catalog: VelorixRelationCatalogV1,
-    table_name: &str,
-    capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
-    sql: &str,
-    policy: QueryPolicy,
-    limiter: Option<QueryExecutionLimiter>,
-) -> Result<Vec<RecordBatch>, RuntimeQueryError> {
-    policy.validate().map_err(QueryError::from)?;
-    validate_sql_text_policy(sql, policy).map_err(QueryError::from)?;
-
-    let _permit = acquire_query_permit(policy, limiter.as_ref())?;
-    validate_materialized_table_query_with_bindings_and_policy(sql, table_name, &[], policy)
-        .await?;
-    let recovered =
-        RecoveredRuntime::recover_with_slatedb_state_store_and_relation_catalog_checked(
-            store,
-            slatedb_state_path,
-            ORDERS_SUM_COUNT_OWNER,
-            relation_catalog,
-            capabilities,
-        )
-        .await?;
-
-    collect_recovered_materialized_view_as_table(recovered, table_name, sql, policy)
-        .await
-        .map_err(Into::into)
-}
-
-pub async fn query_production_recovered_materialized_view_table_with_bindings_and_policy_and_limiter(
-    store: Arc<dyn ObjectStore>,
-    slatedb_state_path: impl Into<Path>,
-    relation_id: &str,
-    relation_version: &str,
-    table_name: &str,
-    capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
-    sql: &str,
-    bind_values: &[QueryBindValue],
-    policy: QueryPolicy,
-    limiter: Option<QueryExecutionLimiter>,
-) -> Result<Vec<RecordBatch>, RuntimeQueryError> {
-    policy.validate().map_err(QueryError::from)?;
-    validate_sql_text_policy(sql, policy).map_err(QueryError::from)?;
-
-    let _permit = acquire_query_permit(policy, limiter.as_ref())?;
-    validate_materialized_table_query_with_bindings_and_policy(
-        sql,
-        table_name,
-        bind_values,
-        policy,
-    )
-    .await?;
-    let recovered = RecoveredRuntime::recover_with_slatedb_state_store_and_catalog_record_checked(
-        store,
-        slatedb_state_path,
-        ORDERS_SUM_COUNT_OWNER,
-        relation_id,
-        relation_version,
-        capabilities,
-    )
-    .await?;
-
-    collect_recovered_materialized_view_as_table_with_bindings(
-        recovered,
-        table_name,
-        sql,
-        bind_values,
-        policy,
-    )
-    .await
-    .map_err(Into::into)
 }
 
 pub async fn query_record_batches_table_with_bindings_and_policy_and_limiter(
@@ -309,120 +97,6 @@ pub async fn validate_record_batch_table_query_with_bindings_and_policy(
         })
         .await
         .map_err(Into::into)
-}
-
-pub async fn query_production_recovered_materialized_view_with_policy_and_runtime(
-    store: Arc<dyn ObjectStore>,
-    slatedb_state_path: impl Into<Path>,
-    relation_id: &str,
-    relation_version: &str,
-    capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
-    sql: &str,
-    policy: QueryPolicy,
-    runtime: &ProductionQueryRuntime,
-) -> Result<Vec<RecordBatch>, RuntimeQueryError> {
-    let limiter = runtime.compatible_limiter(policy)?;
-    query_production_recovered_materialized_view_with_policy_and_limiter(
-        store,
-        slatedb_state_path,
-        relation_id,
-        relation_version,
-        capabilities,
-        sql,
-        policy,
-        limiter,
-    )
-    .await
-}
-
-async fn collect_recovered_materialized_view(
-    recovered: RecoveredRuntime,
-    sql: &str,
-    policy: QueryPolicy,
-) -> Result<Vec<RecordBatch>, QueryError> {
-    collect_recovered_materialized_view_as_table(recovered, INPUT_TABLE_NAME, sql, policy).await
-}
-
-async fn collect_recovered_materialized_view_as_table(
-    recovered: RecoveredRuntime,
-    table_name: &str,
-    sql: &str,
-    policy: QueryPolicy,
-) -> Result<Vec<RecordBatch>, QueryError> {
-    collect_recovered_materialized_view_as_table_with_bindings(
-        recovered,
-        table_name,
-        sql,
-        &[],
-        policy,
-    )
-    .await
-}
-
-async fn collect_recovered_materialized_view_as_table_with_bindings(
-    recovered: RecoveredRuntime,
-    table_name: &str,
-    sql: &str,
-    bind_values: &[QueryBindValue],
-    policy: QueryPolicy,
-) -> Result<Vec<RecordBatch>, QueryError> {
-    let materialized = recovered.materialized_state();
-    let input = RecordBatch::try_new(
-        input_schema(),
-        vec![
-            Arc::new(StringArray::from(
-                materialized
-                    .records()
-                    .iter()
-                    .map(|record| record.key.as_json().to_string())
-                    .collect::<Vec<_>>(),
-            )) as ArrayRef,
-            Arc::new(StringArray::from(
-                materialized
-                    .records()
-                    .iter()
-                    .map(|record| record.value.as_json().to_string())
-                    .collect::<Vec<_>>(),
-            )) as ArrayRef,
-            Arc::new(Int64Array::from(
-                materialized
-                    .records()
-                    .iter()
-                    .map(|record| record.weight)
-                    .collect::<Vec<_>>(),
-            )) as ArrayRef,
-        ],
-    )
-    .map_err(QueryError::from)?;
-    let context = materialized_context(table_name, vec![input], policy)?;
-    let limits = QueryRuntimeLimits::from_policy(policy);
-    let dataframe = limits
-        .run_planning(async {
-            let dataframe = context.sql(sql).await.map_err(QueryError::from)?;
-            apply_bind_values(dataframe, bind_values)
-        })
-        .await?;
-
-    collect_with_policy(dataframe, policy, limits).await
-}
-
-async fn validate_materialized_table_query_with_bindings_and_policy(
-    sql: &str,
-    table_name: &str,
-    bind_values: &[QueryBindValue],
-    policy: QueryPolicy,
-) -> Result<(), QueryError> {
-    let input = RecordBatch::new_empty(input_schema());
-    let context = materialized_context(table_name, vec![input], policy)?;
-    let limits = QueryRuntimeLimits::from_policy(policy);
-    limits
-        .run_planning(async {
-            let dataframe = context.sql(sql).await.map_err(QueryError::from)?;
-            let plan = apply_bind_values(dataframe, bind_values)?.into_optimized_plan()?;
-            validate_logical_plan_scans_only_table(&plan, table_name)?;
-            Ok(())
-        })
-        .await
 }
 
 fn apply_bind_values(
@@ -765,26 +439,6 @@ fn validate_sql_text_policy(sql: &str, policy: QueryPolicy) -> Result<(), QueryP
     }
 
     Ok(())
-}
-
-fn input_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("key_json", DataType::Utf8, false),
-        Field::new("value_json", DataType::Utf8, false),
-        Field::new("weight", DataType::Int64, false),
-    ]))
-}
-
-fn materialized_context(
-    table_name: &str,
-    input_batches: Vec<RecordBatch>,
-    policy: QueryPolicy,
-) -> Result<SessionContext, QueryError> {
-    let table = MemTable::try_new(input_schema(), vec![input_batches])?;
-    let context = session_context(policy)?;
-    context.register_table(table_name, Arc::new(table))?;
-
-    Ok(context)
 }
 
 fn record_batches_context(

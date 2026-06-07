@@ -2,11 +2,13 @@
 
 use std::collections::BTreeMap;
 
-use feldera_types::program_schema::{ColumnType, Field, ProgramSchema, Relation, SqlIdentifier};
+use feldera_types::program_schema::{
+    ColumnType, Field, IntervalUnit, ProgramSchema, Relation, SqlIdentifier, SqlType,
+};
 use velorix_core::{
     feldera_artifact::{
-        ColumnSchema, RelationSchema, SqlDataType, SqlDialect, SqlSourceKind, StandingViewShape,
-        StandingViewSpec,
+        ColumnSchema, RelationSchema, SqlDataType, SqlDialect, SqlIntervalUnit, SqlSourceKind,
+        SqlStructField, StandingViewShape, StandingViewSpec,
     },
     feldera_program_descriptor::{FelderaProgramDescriptor, FelderaProgramDescriptorError},
 };
@@ -265,7 +267,7 @@ fn feldera_program_descriptor_rejects_timestamp_timezone_when_descriptor_has_no_
 }
 
 #[test]
-fn feldera_program_descriptor_rejects_unsupported_descriptor_type_explicitly() {
+fn feldera_program_descriptor_rejects_supported_array_descriptor_type_drift() {
     let descriptor = FelderaProgramDescriptor::new(program_schema(
         relation(
             "events",
@@ -302,16 +304,17 @@ fn feldera_program_descriptor_rejects_unsupported_descriptor_type_explicitly() {
 
     assert_eq!(
         error,
-        FelderaProgramDescriptorError::UnsupportedColumnType {
+        FelderaProgramDescriptorError::ColumnTypeMismatch {
             relation: "events".to_string(),
             column: "payload".to_string(),
+            expected: "Variant".to_string(),
             actual: "Array<Varchar>".to_string(),
         }
     );
 }
 
 #[test]
-fn feldera_program_descriptor_rejects_narrow_integer_descriptor_type_explicitly() {
+fn feldera_program_descriptor_rejects_supported_narrow_integer_descriptor_type_drift() {
     let descriptor = FelderaProgramDescriptor::new(program_schema(
         relation(
             "scores",
@@ -341,12 +344,110 @@ fn feldera_program_descriptor_rejects_narrow_integer_descriptor_type_explicitly(
 
     assert_eq!(
         error,
-        FelderaProgramDescriptorError::UnsupportedColumnType {
+        FelderaProgramDescriptorError::ColumnTypeMismatch {
             relation: "scores".to_string(),
             column: "score".to_string(),
+            expected: "Int64".to_string(),
             actual: "Int32".to_string(),
         }
     );
+}
+
+#[test]
+fn feldera_program_descriptor_accepts_expanded_feldera_sql_type_surface() {
+    let descriptor = FelderaProgramDescriptor::new(program_schema(
+        relation(
+            "wide_events",
+            vec![
+                field("id", ColumnType::varchar(false)),
+                field("i8_value", ColumnType::tinyint(false)),
+                field("i16_value", ColumnType::smallint(false)),
+                field("i32_value", ColumnType::int(false)),
+                field("u8_value", ColumnType::utinyint(false)),
+                field("u16_value", ColumnType::usmallint(false)),
+                field("u32_value", ColumnType::uint(false)),
+                field("u64_value", ColumnType::ubigint(false)),
+                field("f32_value", ColumnType::real(false)),
+                field(
+                    "char_value",
+                    ColumnType {
+                        typ: SqlType::Char,
+                        nullable: true,
+                        precision: Some(8),
+                        scale: None,
+                        component: None,
+                        fields: None,
+                        key: None,
+                        value: None,
+                    },
+                ),
+                field("binary_value", ColumnType::fixed(16, true)),
+                field("bytes_value", ColumnType::varbinary(true)),
+                field("time_value", ColumnType::time(true)),
+                field(
+                    "interval_value",
+                    ColumnType {
+                        typ: SqlType::Interval(IntervalUnit::DayToSecond),
+                        nullable: true,
+                        precision: None,
+                        scale: None,
+                        component: None,
+                        fields: None,
+                        key: None,
+                        value: None,
+                    },
+                ),
+                field("tags", ColumnType::array(true, ColumnType::varchar(false))),
+                field(
+                    "attributes",
+                    ColumnType::map(true, ColumnType::varchar(false), ColumnType::bigint(true)),
+                ),
+                field(
+                    "nested",
+                    ColumnType::structure(
+                        true,
+                        &[
+                            field("inner_name", ColumnType::varchar(false)),
+                            field("inner_count", ColumnType::bigint(true)),
+                        ],
+                    ),
+                ),
+                field("uuid_value", ColumnType::uuid(true)),
+                field(
+                    "null_value",
+                    ColumnType {
+                        typ: SqlType::Null,
+                        nullable: true,
+                        precision: None,
+                        scale: None,
+                        component: None,
+                        fields: None,
+                        key: None,
+                        value: None,
+                    },
+                ),
+            ],
+            false,
+            &["id"],
+        ),
+        relation(
+            "wide_events_view",
+            vec![
+                field("id", ColumnType::varchar(false)),
+                field("tags", ColumnType::array(true, ColumnType::varchar(false))),
+                field("uuid_value", ColumnType::uuid(true)),
+            ],
+            true,
+            &["id"],
+        ),
+    ));
+
+    let validation = descriptor
+        .validate_standing_view_spec(&expanded_feldera_type_standing_view_spec())
+        .unwrap();
+
+    assert_eq!(validation.input_relations, vec!["wide_events"]);
+    assert_eq!(validation.output_relations, vec!["wide_events_view"]);
 }
 
 fn program_schema(input: Relation, output: Relation) -> ProgramSchema {
@@ -524,5 +625,109 @@ fn scalar_type_standing_view_spec(timezone: Option<&str>) -> StandingViewSpec {
             multi_input: false,
             multi_output: false,
         },
+    }
+}
+
+fn expanded_feldera_type_standing_view_spec() -> StandingViewSpec {
+    StandingViewSpec {
+        view_id: "wide_events_view".to_string(),
+        sql: "select id, tags, uuid_value from wide_events".to_string(),
+        dialect: SqlDialect::FelderaSql,
+        source_kind: SqlSourceKind::StandingView,
+        input_relations: vec![RelationSchema {
+            relation_id: "wide_events".to_string(),
+            relation_name: "wide_events".to_string(),
+            relation_version: "2026-06-07.v1".to_string(),
+            schema_fingerprint: format!("sha256:{}", "5".repeat(64)),
+            columns: vec![
+                column("id", SqlDataType::Utf8, false),
+                column("i8_value", SqlDataType::Int8, false),
+                column("i16_value", SqlDataType::Int16, false),
+                column("i32_value", SqlDataType::Int32, false),
+                column("u8_value", SqlDataType::UInt8, false),
+                column("u16_value", SqlDataType::UInt16, false),
+                column("u32_value", SqlDataType::UInt32, false),
+                column("u64_value", SqlDataType::UInt64, false),
+                column("f32_value", SqlDataType::Float32, false),
+                column("char_value", SqlDataType::Char { length: Some(8) }, true),
+                column("binary_value", SqlDataType::Binary { length: 16 }, true),
+                column("bytes_value", SqlDataType::Varbinary, true),
+                column("time_value", SqlDataType::Time, true),
+                column(
+                    "interval_value",
+                    SqlDataType::Interval {
+                        unit: SqlIntervalUnit::DayToSecond,
+                    },
+                    true,
+                ),
+                column(
+                    "tags",
+                    SqlDataType::Array {
+                        element_type: Box::new(SqlDataType::Utf8),
+                    },
+                    true,
+                ),
+                column(
+                    "attributes",
+                    SqlDataType::Map {
+                        key_type: Box::new(SqlDataType::Utf8),
+                        value_type: Box::new(SqlDataType::Int64),
+                    },
+                    true,
+                ),
+                column(
+                    "nested",
+                    SqlDataType::Struct {
+                        fields: vec![
+                            SqlStructField {
+                                name: "inner_name".to_string(),
+                                data_type: SqlDataType::Utf8,
+                                nullable: false,
+                            },
+                            SqlStructField {
+                                name: "inner_count".to_string(),
+                                data_type: SqlDataType::Int64,
+                                nullable: true,
+                            },
+                        ],
+                    },
+                    true,
+                ),
+                column("uuid_value", SqlDataType::Uuid, true),
+                column("null_value", SqlDataType::Null, true),
+            ],
+            primary_key: vec!["id".to_string()],
+        }],
+        output_relations: vec![RelationSchema {
+            relation_id: "wide_events_view".to_string(),
+            relation_name: "wide_events_view".to_string(),
+            relation_version: "v1".to_string(),
+            schema_fingerprint: format!("sha256:{}", "6".repeat(64)),
+            columns: vec![
+                column("id", SqlDataType::Utf8, false),
+                column(
+                    "tags",
+                    SqlDataType::Array {
+                        element_type: Box::new(SqlDataType::Utf8),
+                    },
+                    true,
+                ),
+                column("uuid_value", SqlDataType::Uuid, true),
+            ],
+            primary_key: vec!["id".to_string()],
+        }],
+        shape: StandingViewShape {
+            is_materialized: true,
+            multi_input: false,
+            multi_output: false,
+        },
+    }
+}
+
+fn column(name: &str, data_type: SqlDataType, nullable: bool) -> ColumnSchema {
+    ColumnSchema {
+        name: name.to_string(),
+        data_type,
+        nullable,
     }
 }
