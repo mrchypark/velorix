@@ -3,7 +3,8 @@
 use std::collections::BTreeMap;
 
 use feldera_types::program_schema::{
-    ColumnType, Field, IntervalUnit, ProgramSchema, Relation, SqlIdentifier, SqlType,
+    ColumnType, Field, IntervalUnit, ProgramSchema, PropertyValue, Relation, SourcePosition,
+    SqlIdentifier, SqlType,
 };
 use velorix_core::{
     feldera_artifact::{
@@ -69,6 +70,38 @@ fn feldera_program_schema_rejects_timezone_timestamp_mapping_until_feldera_descr
 }
 
 #[test]
+fn feldera_program_schema_rejects_geometry_mapping_until_feldera_descriptor_supports_it() {
+    let error =
+        velorix_core::feldera_program_descriptor::feldera_program_schema_for_standing_view_spec(
+            &geometry_type_standing_view_spec(),
+        )
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        FelderaProgramDescriptorError::UnsupportedVelorixColumnType {
+            relation: "shapes".to_string(),
+            column: "shape".to_string(),
+            data_type: "Geometry".to_string(),
+        }
+    );
+}
+
+#[test]
+fn feldera_types_column_type_rejects_geometry_descriptor_json_until_sqltype_exists() {
+    let error = serde_json::from_value::<ColumnType>(serde_json::json!({
+        "type": "GEOMETRY",
+        "nullable": true
+    }))
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("Unknown SQL type: GEOMETRY"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
 fn feldera_program_descriptor_accepts_matching_standing_view_spec() {
     let descriptor = FelderaProgramDescriptor::new(program_schema(
         relation(
@@ -99,6 +132,94 @@ fn feldera_program_descriptor_accepts_matching_standing_view_spec() {
 
     assert_eq!(validation.input_relations, vec!["scores"]);
     assert_eq!(validation.output_relations, vec!["scores_by_user"]);
+}
+
+#[test]
+fn feldera_program_descriptor_rejects_unexpected_input_relation() {
+    let descriptor = FelderaProgramDescriptor::new(ProgramSchema {
+        inputs: vec![
+            relation(
+                "scores",
+                vec![
+                    field("user_id", ColumnType::varchar(false)),
+                    field("score", ColumnType::bigint(false)),
+                    field("delta", ColumnType::bigint(false)),
+                ],
+                false,
+                &["user_id"],
+            ),
+            relation(
+                "external_scores",
+                vec![field("payload", ColumnType::varchar(false))],
+                false,
+                &[],
+            ),
+        ],
+        outputs: vec![relation(
+            "scores_by_user",
+            vec![
+                field("user_id", ColumnType::varchar(false)),
+                field("sum", ColumnType::bigint(false)),
+                field("count", ColumnType::bigint(false)),
+            ],
+            true,
+            &["user_id"],
+        )],
+    });
+
+    let error = descriptor
+        .validate_standing_view_spec(&standing_view_spec())
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        FelderaProgramDescriptorError::UnexpectedRelation {
+            kind: "input",
+            relation: "external_scores".to_string(),
+        }
+    );
+}
+
+#[test]
+fn feldera_program_descriptor_rejects_relation_properties_as_unmanaged_io() {
+    let mut properties = BTreeMap::new();
+    properties.insert("connectors".to_string(), property_value("kafka://scores"));
+    let descriptor = FelderaProgramDescriptor::new(ProgramSchema {
+        inputs: vec![relation_with_properties(
+            "scores",
+            vec![
+                field("user_id", ColumnType::varchar(false)),
+                field("score", ColumnType::bigint(false)),
+                field("delta", ColumnType::bigint(false)),
+            ],
+            false,
+            &["user_id"],
+            properties,
+        )],
+        outputs: vec![relation(
+            "scores_by_user",
+            vec![
+                field("user_id", ColumnType::varchar(false)),
+                field("sum", ColumnType::bigint(false)),
+                field("count", ColumnType::bigint(false)),
+            ],
+            true,
+            &["user_id"],
+        )],
+    });
+
+    let error = descriptor
+        .validate_standing_view_spec(&standing_view_spec())
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        FelderaProgramDescriptorError::RelationHasProperties {
+            kind: "input",
+            relation: "scores".to_string(),
+            properties: vec!["connectors".to_string()],
+        }
+    );
 }
 
 #[test]
@@ -458,21 +579,40 @@ fn program_schema(input: Relation, output: Relation) -> ProgramSchema {
 }
 
 fn relation(name: &str, fields: Vec<Field>, materialized: bool, primary_key: &[&str]) -> Relation {
+    relation_with_properties(name, fields, materialized, primary_key, BTreeMap::new())
+}
+
+fn relation_with_properties(
+    name: &str,
+    fields: Vec<Field>,
+    materialized: bool,
+    primary_key: &[&str],
+    properties: BTreeMap<String, PropertyValue>,
+) -> Relation {
     let ids = primary_key
         .iter()
         .map(|name| SqlIdentifier::from(*name))
         .collect::<Vec<_>>();
-    Relation::new(
-        SqlIdentifier::from(name),
-        fields,
-        materialized,
-        BTreeMap::new(),
-    )
-    .with_primary_key(&ids)
+    Relation::new(SqlIdentifier::from(name), fields, materialized, properties)
+        .with_primary_key(&ids)
 }
 
 fn field(name: &str, columntype: ColumnType) -> Field {
     Field::new(SqlIdentifier::from(name), columntype)
+}
+
+fn property_value(value: &str) -> PropertyValue {
+    let position = SourcePosition {
+        start_line_number: 0,
+        start_column: 0,
+        end_line_number: 0,
+        end_column: 0,
+    };
+    PropertyValue {
+        value: value.to_string(),
+        key_position: position,
+        value_position: position,
+    }
 }
 
 fn standing_view_spec() -> StandingViewSpec {
@@ -482,6 +622,7 @@ fn standing_view_spec() -> StandingViewSpec {
             .to_string(),
         dialect: SqlDialect::FelderaSql,
         source_kind: SqlSourceKind::StandingView,
+        rust_extension: Default::default(),
         input_relations: vec![RelationSchema {
             relation_id: "scores".to_string(),
             relation_name: "scores".to_string(),
@@ -544,6 +685,7 @@ fn scalar_type_standing_view_spec(timezone: Option<&str>) -> StandingViewSpec {
         sql: "select event_id, amount, payload from events".to_string(),
         dialect: SqlDialect::FelderaSql,
         source_kind: SqlSourceKind::StandingView,
+        rust_extension: Default::default(),
         input_relations: vec![RelationSchema {
             relation_id: "events".to_string(),
             relation_name: "events".to_string(),
@@ -634,6 +776,7 @@ fn expanded_feldera_type_standing_view_spec() -> StandingViewSpec {
         sql: "select id, tags, uuid_value from wide_events".to_string(),
         dialect: SqlDialect::FelderaSql,
         source_kind: SqlSourceKind::StandingView,
+        rust_extension: Default::default(),
         input_relations: vec![RelationSchema {
             relation_id: "wide_events".to_string(),
             relation_name: "wide_events".to_string(),
@@ -715,6 +858,43 @@ fn expanded_feldera_type_standing_view_spec() -> StandingViewSpec {
                 column("uuid_value", SqlDataType::Uuid, true),
             ],
             primary_key: vec!["id".to_string()],
+        }],
+        shape: StandingViewShape {
+            is_materialized: true,
+            multi_input: false,
+            multi_output: false,
+        },
+    }
+}
+
+fn geometry_type_standing_view_spec() -> StandingViewSpec {
+    StandingViewSpec {
+        view_id: "shapes_by_id".to_string(),
+        sql: "select shape_id, shape from shapes".to_string(),
+        dialect: SqlDialect::FelderaSql,
+        source_kind: SqlSourceKind::StandingView,
+        rust_extension: Default::default(),
+        input_relations: vec![RelationSchema {
+            relation_id: "shapes".to_string(),
+            relation_name: "shapes".to_string(),
+            relation_version: "2026-06-10.v1".to_string(),
+            schema_fingerprint: format!("sha256:{}", "7".repeat(64)),
+            columns: vec![
+                column("shape_id", SqlDataType::Utf8, false),
+                column("shape", SqlDataType::Geometry, true),
+            ],
+            primary_key: vec!["shape_id".to_string()],
+        }],
+        output_relations: vec![RelationSchema {
+            relation_id: "shapes_by_id".to_string(),
+            relation_name: "shapes_by_id".to_string(),
+            relation_version: "v1".to_string(),
+            schema_fingerprint: format!("sha256:{}", "8".repeat(64)),
+            columns: vec![
+                column("shape_id", SqlDataType::Utf8, false),
+                column("shape", SqlDataType::Geometry, true),
+            ],
+            primary_key: vec!["shape_id".to_string()],
         }],
         shape: StandingViewShape {
             is_materialized: true,

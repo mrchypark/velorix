@@ -35,6 +35,7 @@ jobs:
       - name: Check shell syntax
         run: |
           bash -n scripts/run-first-e2e-readiness.sh
+          bash -n scripts/run-live-feldera-pipeline-manager.sh
           bash -n scripts/run-vind-product.sh
           bash -n scripts/check-first-e2e-readiness-contract.sh
           bash -n scripts/check-vind-product-contract.sh

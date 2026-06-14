@@ -2,8 +2,9 @@ use thiserror::Error;
 
 use crate::{
     feldera_artifact::{
-        catalog_input_relation_schema, feldera_artifact_bytes_hash, feldera_spec_hash,
-        FelderaArtifactError, FelderaCompileArtifactMetadata, FelderaCompilerIdentity,
+        catalog_input_relation_schema, feldera_artifact_bytes_hash, feldera_compile_request_hash,
+        feldera_spec_hash, FelderaArtifactError, FelderaCompileArtifactMetadata,
+        FelderaCompileRequestV1, FelderaCompilerIdentity, FelderaRustExtensionV1,
         GeneratedRustIdentity, RelationSchema, SqlDialect, SqlSourceKind, StandingViewShape,
         StandingViewSpec, FELDERA_ARTIFACT_METADATA_VERSION, SUPPORTED_EPOCH_POLICY,
         SUPPORTED_STATE_CODEC,
@@ -65,6 +66,7 @@ impl TrustedGeneratedViewDescriptor {
             sql: self.sql.clone(),
             dialect: SqlDialect::FelderaSql,
             source_kind: SqlSourceKind::StandingView,
+            rust_extension: FelderaRustExtensionV1::default(),
             input_relations: vec![input],
             output_relations: self.output_schemas.clone(),
             shape: StandingViewShape {
@@ -90,6 +92,9 @@ impl TrustedGeneratedViewDescriptor {
             metadata_version: FELDERA_ARTIFACT_METADATA_VERSION,
             view_id: self.view_id.clone(),
             spec_hash: feldera_spec_hash(&spec)?,
+            compile_request_hash: Some(feldera_compile_request_hash(
+                &FelderaCompileRequestV1::infer_output_from_standing_view_spec(&spec),
+            )?),
             artifact_id: self.artifact_id.clone(),
             artifact_hash: feldera_artifact_bytes_hash(&self.artifact_identity_bytes),
             compiler: self.compiler.clone(),

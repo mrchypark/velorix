@@ -677,6 +677,9 @@ checks = {
     )
     and '"job_catalog_evidence_file": "view-compile-deploy-jobs.json"' in script
     and '"worker_run_verified": api_compile_deploy_worker_run_verified == "1"' in script
+    and '"jarless_product_backend_verified": feldera_jarless_product_backend_verified' in script
+    and '"pipeline_manager_compatibility_trusted_for_product_complete": False' in script
+    and "jarless Feldera package backend did not produce product runtime evidence" in script
     and '"run_once_evidence_file": "view-compile-deploy-run-once.json"' in script
     and '"activated_view_id": api_compile_deploy_activated_view_id' in script
     and '"activated_execution_mode": "standing_runtime"' in script,

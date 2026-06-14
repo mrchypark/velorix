@@ -418,6 +418,89 @@ images unless you explicitly build and run the all-in-one image yourself.
 All Velorix-owned runtime images run as UID/GID `65532`. The product script
 adds restricted security contexts to the API, meta, and ingest-writer
 containers: no privilege escalation, read-only root filesystem, `RuntimeDefault`
+
+The Feldera compiler/deploy control plane has its own image target:
+
+```bash
+DOCKER_BUILDKIT=1 docker build \
+  -f Dockerfile.feldera-compiler-worker \
+  -t velorix-feldera-compiler-worker:local \
+  .
+```
+
+Without a Feldera backend URL, the worker uses the default jarless Feldera
+package backend:
+
+```bash
+velorix-feldera-compiler-worker once \
+  --api-url "$VELORIX_API_URL" \
+  --admin-auth-header "$VELORIX_ADMIN_AUTH_HEADER" \
+  --worker-id compiler-worker-a
+```
+
+The default compiler backend is `feldera-package-jarless`. That is the product
+direction and it runs in-process against public Feldera Rust package descriptor
+APIs. It does not infer output schemas from SQL. For pending jobs whose compiler
+request uses `output_contract=must_match`, it validates the declared
+input/output schemas and reports `compiled_schema_only_not_deployed`; the view
+remains not queryable. For pending jobs whose compiler request uses
+`output_contract=infer`, it reports `unsupported_by_selected_backend` with
+`requires_java_sql_compiler=true`.
+
+When this backend eventually produces an executable product runtime, the worker
+must complete the job with `product_runtime`, not with the legacy generated
+`artifact` metadata and not with pipeline-manager `runtime_deployment`. The
+`product_runtime` descriptor is the jarless contract: it carries Feldera package
+backend identity, runtime factory binding, standing-program identity,
+input/output schemas, state codec, and the compile request hash that Velorix
+revalidates before enabling queries.
+The local REST test
+`rest_product_worker_activates_pending_view_from_jarless_product_runtime_descriptor`
+exercises this activation contract end to end with a test compiler backend and
+a registered standing runtime factory: relation creation, pending view creation,
+compile/deploy worker run-once, `product_runtime` activation, ingest, and
+promoted API query. That test proves the API/runtime boundary is wired; it does
+not yet prove that the default `feldera-package-jarless` worker can synthesize
+the descriptor from Feldera package APIs.
+
+For a diagnostic claim/lease/fencing pass without a compatibility backend, opt
+in explicitly:
+
+```bash
+velorix-feldera-compiler-worker once \
+  --api-url "$VELORIX_API_URL" \
+  --admin-auth-header "$VELORIX_ADMIN_AUTH_HEADER" \
+  --worker-id compiler-worker-a \
+  --compiler-backend compatibility-pipeline-manager \
+  --claim-without-backend
+```
+
+That mode calls `POST /v1/view-compile-deploy/jobs/{view_id}/claim`, then
+reports `claimed_not_compiled`.
+
+To exercise the compatibility fixture through a live Feldera pipeline-manager
+backend:
+
+```bash
+velorix-feldera-compiler-worker once \
+  --api-url "$VELORIX_API_URL" \
+  --admin-auth-header "$VELORIX_ADMIN_AUTH_HEADER" \
+  --worker-id compiler-worker-a \
+  --compiler-backend compatibility-pipeline-manager \
+  --feldera-pipeline-manager-url "http://127.0.0.1:18082" \
+  --feldera-program-profile dev \
+  --feldera-pipeline-workers 1
+```
+
+This path calls Feldera `PUT /v0/pipelines/{pipeline_name}`, polls the pipeline
+until `program_status=Success`, resolves output schemas from
+`program_info.schema.outputs`, and completes the job with
+`runtime_deployment.mode=external_managed`. Velorix API remains the activation
+authority and revalidates the claim proof, compile request hash, resolved spec,
+and deterministic pipeline name. Because this backend relies on the upstream
+SQL compiler jar, it is compatibility evidence only; it is not proof that the
+jarless product path is complete.
+`/v1/view-compile-deploy/jobs/{view_id}/complete` contract.
 seccomp, and all Linux capabilities dropped. Third-party helper images are not
 force-patched with those settings because their filesystem/user assumptions are
 owned by their upstream images.
@@ -992,16 +1075,147 @@ generic DataFusion convenience path; custom relations registered through
 `POST /v1/relations` can ingest rows with their own column names as long as the
 registered incremental adapter scope is supported.
 
+`POST /v1/ingest/epoch` accepts `{ "batches": [...] }` where each batch has the
+same shape as `POST /v1/ingest`. Use it when one logical change spans multiple
+relations, for example an `accounts` batch and an `orders` batch that feed the
+same Feldera join view. Velorix validates and appends each relation envelope,
+then applies the matching batches to each active standing runtime in one
+`apply_changes` call and one checkpoint. This gives multi-relation Feldera
+views a native runtime epoch boundary instead of advancing once per relation.
+Every batch must contain at least one row. Within one epoch request, Velorix
+rejects duplicate or overlapping ranges for the same canonical source
+`relation_id`, `relation_version`, `schema_fingerprint`, `stream_id`, and
+`partition_id` before appending any epoch batch. Runtime idempotency keys are
+derived from a canonical digest over the view id, source identity, offsets, and
+payload digests, so batch order does not change the logical runtime epoch
+identity. The response includes `epoch_manifest_id` and `epoch_manifest_key`.
+Velorix writes the durable manifest as a create-only object under
+`v1/ingest-epochs/sha256/<epoch_manifest_hash>.epoch.json` before appending the
+epoch batches. The manifest records the canonical batch list, source identity,
+offsets, object-store batch keys, and payload digests. This is the durable
+reference point for retry/restart convergence. After a matching active standing
+runtime checkpoints the epoch, Velorix writes a per-view convergence record
+under
+`v1/ingest-epoch-convergence/sha256/<epoch_manifest_hash>/<tenant_id>/<program_id>/<view_id>.convergence.json`.
+That record binds the epoch manifest id to the view checkpoint key, logical
+epoch, checkpoint content hash, and replay frontiers. Duplicate or retry
+requests read these convergence records, verify the referenced checkpoint
+object is readable and matches the recorded logical epoch/content hash, and then
+skip already converged views while replaying missing ones. If the convergence
+record points at a missing or corrupt checkpoint, the retry fails closed instead
+of silently trusting stale convergence evidence. Full epoch-level metadata
+transaction and stronger multi-view partial-failure injection coverage remain
+production blockers.
+
 `POST /v1/views` creates a named materialized view API over a registered
 relation. The optional `urlPath`, `description`, `request`, `response_schema`,
 `sql_template`, `response_formats`, and `query_policy_id` fields are returned
 by `GET /v1/views`, `GET /v1/views/{view_id}`, and `GET /v1/openapi.json` so
-clients can discover available Data APIs. OpenAPI view operations expose the
+clients can discover available Data APIs. View responses also expose
+`source_kind`, so clients can distinguish the default `standing_view` wrapper
+from a raw Feldera `feldera_program` body. OpenAPI view operations expose the
 linked policy as `x-velorix-query-policy-id`. `urlPath` promotes the view into a
 GET Data API under `/v1/api/*`; `:name` segments become path parameters. For
 example,
 `/orders/by-account/:account_id` becomes
 `GET /v1/api/orders/by-account/acct-a?min_sum=0`.
+
+For a view that reads more than one registered relation, prefer
+`input_relation_refs` over copying full `input_relations` schema JSON. Each ref
+names a durable relation catalog entry by `relation_id` and `relation_version`.
+Velorix reads those catalogs, derives canonical Feldera input schemas, and keeps
+the array order as the compiler request/table declaration order. Duplicate refs
+or mixed selector styles are rejected:
+
+```json
+{
+  "view_id": "scores_by_tier",
+  "urlPath": "/scores/by-tier",
+  "input_relation_refs": [
+    { "relation_id": "scores", "relation_version": "live.v1" },
+    { "relation_id": "profiles", "relation_version": "live.v1" }
+  ],
+  "sql": "select p.tier, sum(s.score) as total_score, count(*) as event_count from scores s join profiles p on s.user_id = p.user_id group by p.tier",
+  "response_formats": ["json"]
+}
+```
+
+By default, `sql` is a standing-view query body when it starts with a query such
+as `SELECT`: Velorix prepends catalog-owned Feldera `CREATE TABLE` declarations
+and wraps the body as `CREATE MATERIALIZED VIEW "{view_id}" AS ...`. To submit
+Feldera output declarations directly, set `"source_kind": "feldera_program"`.
+Velorix also treats omitted `source_kind` as `feldera_program` when the supplied
+SQL starts with `CREATE` after leading whitespace or SQL comments, so full
+Feldera program bodies are not accidentally wrapped as a single view. In program
+mode Velorix still prepends catalog-owned input `CREATE TABLE` declarations, but
+it does not wrap the supplied SQL; the SQL must contain the Feldera
+`CREATE VIEW`/`CREATE MATERIALIZED VIEW` declarations to compile. Velorix now
+asks the Feldera compiler to discover the program outputs from
+`program_info.schema.outputs`, so `output_relation_ids` is optional. You can
+still include it as an admission-time hint when you want the pending response to
+show expected output ids before the compiler has resolved concrete schemas.
+For Rust-backed Feldera UDFs or user-defined aggregates, include `udf_rust` and
+optionally `udf_toml` on the same `POST /v1/views` request. Velorix stores those
+fields in the durable compile request, includes them in the compile-request
+hash, and forwards them to the Feldera pipeline-manager `PUT /v0/pipelines`
+payload as `udf_rust` and `udf_toml`; changing the Rust implementation therefore
+creates a distinct compile/deploy job identity. Velorix currently admits inline
+Rust payloads and an empty `udf_toml` `[dependencies]` table only. Non-empty
+external Rust crate dependencies are rejected at view admission until dependency
+provenance and runtime security policy are defined.
+Compiler-returned input relation and field identifiers are matched back to the
+registered relation catalog, including Feldera case-insensitive identifiers; an
+unregistered input, connector-bearing input, or input type/key mismatch fails
+compile admission before a runtime is started.
+Because Velorix does not lower this SQL locally, constructs such as CTEs,
+`HAVING`, set operations, windows, and Feldera-specific syntax are accepted or
+rejected by the Feldera compiler/runtime rather than by Velorix's linked
+generated fixture parser.
+
+```bash
+curl -X POST "$VELORIX_API_URL/v1/views" \
+  -H "$VELORIX_API_AUTH_HEADER" \
+  -H 'content-type: application/json' \
+  -d '{
+    "view_id": "score_program",
+    "input_relation_id": "scores",
+    "input_relation_version": "2026-05-24.v1",
+    "source_kind": "feldera_program",
+    "output_relation_ids": ["scores_by_user", "scores_by_region"],
+    "sql": "CREATE MATERIALIZED VIEW scores_by_user AS SELECT user_id, SUM(score) AS total_score FROM scores GROUP BY user_id; CREATE MATERIALIZED VIEW scores_by_region AS SELECT region, COUNT(*) AS count FROM scores GROUP BY region"
+  }'
+```
+
+Rust UDA example:
+
+```bash
+curl -X POST "$VELORIX_API_URL/v1/views" \
+  -H "$VELORIX_API_AUTH_HEADER" \
+  -H 'content-type: application/json' \
+  -d '{
+    "view_id": "scores_rust_uda",
+    "input_relation_id": "scores",
+    "input_relation_version": "2026-05-24.v1",
+    "source_kind": "feldera_program",
+    "sql": "CREATE LINEAR AGGREGATE signed_sum(value BIGINT) RETURNS BIGINT; CREATE MATERIALIZED VIEW by_user AS SELECT user_id, signed_sum(score) AS total_score FROM scores GROUP BY user_id",
+    "udf_rust": "use feldera_sqllib::*;\npub type signed_sum_accumulator_type = i64;\npub fn signed_sum_map(value: i64) -> signed_sum_accumulator_type { value }\npub fn signed_sum_post(value: signed_sum_accumulator_type) -> i64 { value }\n"
+  }'
+```
+
+When omitted, the compile/deploy worker replaces the pending placeholder output
+with the actual Feldera output relations returned by the compiler. A promoted
+API route can expose one of those outputs by setting `outputRelationId` (or
+`output_relation_id`). This is required when `urlPath` is set on a multi-output
+view, because `/v1/api/*` is one concrete Data API surface, not an ambiguous
+program-level query:
+
+```json
+{
+  "view_id": "score_program_by_user_api",
+  "urlPath": "/scores/by-user",
+  "outputRelationId": "scores_by_user"
+}
+```
 
 `POST /v1/query-policies` creates a durable query policy under the default
 tenant's query-policy catalog. `POST /v1/views` can then reference that policy
@@ -1061,14 +1275,17 @@ If no linked package matches, `velorix-api` stores the view spec and returns
 `202 Accepted` with `execution_mode: "feldera_compile_pending"`,
 `lifecycle.compile_status: "pending"`, and `lifecycle.deployment_status:
 "not_deployed"`. It also writes a create-only compile/deploy job record under
-`v1/view-compile-deploy-jobs/{view_id}/spec-sha256/...` and returns
-`compile_job_id` so a worker can pick up the durable request. The job record is
+`v1/view-compile-deploy-jobs/{view_id}/compile-request-sha256/...` and returns
+`compile_job_id` in `{view_id}:velorix-feldera-compile-request-sha256-v1:<hex>`
+form so a worker can pick up the durable request. The older
+`spec-sha256/...` job key is a legacy fallback only. The job record is
 self-contained for the compiler boundary: it carries
-`compiler_request.request_kind`, `view_id`, `spec_hash`, SQL, input relation
-schemas, output relation schemas, and the materialized view shape. The worker
-compares that embedded request with the active pending view before activation
-and skips the job if they diverge. A linked-package activation worker can be run
-with:
+`compiler_request.request_kind`, `view_id`, `compile_request_hash`, transitional
+`spec_hash`, SQL, input relation schemas, an output schema contract, and the
+materialized view shape. For `output_contract: { "kind": "infer" }`, pending
+jobs store an empty `output_relations` snapshot. The worker compares that
+embedded request with the active pending view before activation and skips the
+job if they diverge. A linked-package activation worker can be run with:
 
 ```bash
 curl "$VELORIX_API_URL/v1/view-compile-deploy/jobs" \
@@ -1081,15 +1298,38 @@ curl -X POST "$VELORIX_API_URL/v1/view-compile-deploy/run-once" \
 An external compiler/deploy plane can also complete one durable job directly:
 
 ```bash
+curl -X POST "$VELORIX_API_URL/v1/view-compile-deploy/jobs/$VIEW_ID/claim" \
+  -H "$VELORIX_ADMIN_AUTH_HEADER" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "worker_id": "compiler-worker-a",
+    "lease_duration_ms": 300000
+  }'
+```
+
+The claim response returns `tenant_id`, `view_id`, `job_generation`,
+`compile_request_hash`, `lease_id`, `fencing_token`, `worker_id`,
+`claimed_at_ms`, and `lease_expires_at_ms`. If a claim exists, completion must
+echo the matching `tenant_id`, `job_generation`, `worker_id`, `lease_id`, and
+`fencing_token`; stale or mismatched completion is rejected before artifact or
+runtime activation.
+
+```bash
 curl -X POST "$VELORIX_API_URL/v1/view-compile-deploy/jobs/$VIEW_ID/complete" \
   -H "$VELORIX_ADMIN_AUTH_HEADER" \
   -H "Content-Type: application/json" \
   -d '{
-    "spec_hash": "velorix-feldera-spec-sha256-v1:...",
+    "compile_request_hash": "velorix-feldera-compile-request-sha256-v1:...",
+    "tenant_id": "default",
+    "job_generation": 1,
+    "worker_id": "compiler-worker-a",
+    "lease_id": "velorix-feldera-compile-lease-sha256-v1:...",
+    "fencing_token": 1,
     "artifact": {
-      "metadata_version": 1,
+      "metadata_version": 2,
       "view_id": "'$VIEW_ID'",
       "spec_hash": "velorix-feldera-spec-sha256-v1:...",
+      "compile_request_hash": "velorix-feldera-compile-request-sha256-v1:...",
       "artifact_id": "...",
       "artifact_hash": "sha256:...",
       "compiler": { "name": "...", "version": "...", "source": "..." },
@@ -1102,6 +1342,57 @@ curl -X POST "$VELORIX_API_URL/v1/view-compile-deploy/jobs/$VIEW_ID/complete" \
       "state_codec": "feldera-dbsp-state-v1",
       "state_schema_version": 1,
       "epoch_policy": "monotonic-logical-epoch-v1"
+    },
+    "resolved_spec": {
+      "view_id": "'$VIEW_ID'",
+      "sql": "...",
+      "dialect": "feldera_sql",
+      "source_kind": "standing_view",
+      "input_relations": [],
+      "output_relations": [],
+      "shape": {
+        "is_materialized": true,
+        "multi_input": false,
+        "multi_output": false
+      }
+    }
+  }'
+```
+
+If the external compiler worker has deployed a Feldera pipeline-manager runtime
+instead of producing a linked/generated artifact, the same completion route uses
+`runtime_deployment` in place of `artifact`. The request must include exactly
+one of those two fields. `velorix-api` still validates the pending
+`compile_request_hash`, resolved output schema, runtime factory binding, query
+API metadata, and replay activation before the view becomes queryable:
+
+```bash
+curl -X POST "$VELORIX_API_URL/v1/view-compile-deploy/jobs/$VIEW_ID/complete" \
+  -H "$VELORIX_ADMIN_AUTH_HEADER" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "compile_request_hash": "velorix-feldera-compile-request-sha256-v1:...",
+    "tenant_id": "default",
+    "job_generation": 1,
+    "worker_id": "compiler-worker-a",
+    "lease_id": "velorix-feldera-compile-lease-sha256-v1:...",
+    "fencing_token": 1,
+    "resolved_spec": {
+      "view_id": "'$VIEW_ID'",
+      "sql": "...",
+      "dialect": "feldera_sql",
+      "source_kind": "standing_view",
+      "input_relations": [],
+      "output_relations": [],
+      "shape": {
+        "is_materialized": true,
+        "multi_input": true,
+        "multi_output": false
+      }
+    },
+    "runtime_deployment": {
+      "pipeline_name": "velorix_view_runtime_name",
+      "mode": "external_managed"
     }
   }'
 ```
@@ -1165,6 +1456,496 @@ DataFusion endpoint have been removed from the product API surface. Use the
 promoted `GET /v1/api/*` routes or `/v1/views/{view_id}/query` for product
 queries.
 
+`velorix-api` can now use a real Feldera pipeline-manager as the compiler
+validation backend. Configure:
+
+```bash
+export VELORIX_FELDERA_PIPELINE_MANAGER_URL="http://feldera:8080"
+export VELORIX_FELDERA_BEARER_TOKEN="..." # optional
+export VELORIX_FELDERA_COMPILER_PROFILE="dev" # optional, default dev
+export VELORIX_FELDERA_COMPILER_WORKERS=1 # optional
+export VELORIX_FELDERA_COMPILER_POLL_INTERVAL_MS=1000 # optional
+export VELORIX_FELDERA_COMPILER_TIMEOUT_MS=3600000 # optional in runtime mode; schema-only default is 120000
+export VELORIX_FELDERA_PIPELINE_MANAGER_RUNTIME_MODE=pipeline_manager_local_volatile # dev default when URL is set
+# Required only when enabling external-managed runtime with production fencing:
+# export VELORIX_FELDERA_PIPELINE_MANAGER_RUNTIME_PRODUCTION_ENABLE=1
+```
+
+With this configured, `POST /v1/view-compile-deploy/run-once` submits the
+generated Feldera `program_code` to `PUT /v0/pipelines/{pipeline_name}`, polls
+`GET /v0/pipelines/{pipeline_name}`, reads `program_info.schema.outputs`, and
+updates the durable view spec with the compiler-resolved output schema. In
+compiler-only mode, `program_status: "SqlCompiled"` or a later
+`"CompilingRust"` status with `program_info` is sufficient because the schema
+has already been resolved and Velorix does not need a runnable Rust binary. In
+pipeline-manager runtime mode, Velorix still waits for
+`program_status: "Success"` before activation because ingest/query requires the
+compiled executable. By default, when a pipeline-manager URL is configured and
+standing-runtime fencing is not `required`, Velorix treats this as
+`pipeline_manager_local_volatile`: a local execution path that exercises Feldera
+runtime behavior through the product API, but deletes/clears the Feldera
+pipeline on runtime drop and is not production-ready durability evidence. When
+`VELORIX_STANDING_RUNTIME_FENCING=required`, the default changes back to
+compile/schema validation only. Required-fencing profiles reject
+`pipeline_manager_local_volatile` even if
+`VELORIX_FELDERA_PIPELINE_MANAGER_RUNTIME_PRODUCTION_ENABLE=1` is set, because
+local volatile cleanup semantics are intentionally not a production contract.
+Use `VELORIX_FELDERA_PIPELINE_MANAGER_RUNTIME_MODE=pipeline_manager_external_managed`
+when an externally managed Feldera pipeline-manager should remain the runtime
+execution plane; with required fencing, that mode also requires
+`VELORIX_FELDERA_PIPELINE_MANAGER_RUNTIME_PRODUCTION_ENABLE=1` as an explicit
+operator acknowledgement. Set
+`VELORIX_FELDERA_PIPELINE_MANAGER_RUNTIME_MODE=compiler_only` when a release, CI,
+or diagnostic run should validate compilation/schema only and leave queries
+disabled as `compile_status: "success"` / `deployment_status: "not_deployed"`.
+
+Runtime mode waits for Feldera to produce a runnable Rust executable, not only
+the SQL-resolved schema. A cold Feldera open-source container may spend tens of
+minutes compiling the internal Rust workspace the first time a pipeline runtime
+is requested. For this reason Velorix keeps the compiler-only/schema default
+timeout at 120 seconds, but raises the runtime-mode default to 3600000 ms. For
+local work, keep the Feldera container alive and preserve
+`/home/ubuntu/.feldera/compiler/rust-compilation` between runs when possible;
+otherwise every fresh container can pay the cold Rust build cost again.
+
+In runtime mode, the backend is also registered as a pipeline-manager
+standing-runtime factory:
+activation starts the Feldera pipeline with
+`POST /v0/pipelines/{pipeline_name}/start`, relation ingest is forwarded to
+`POST /v0/pipelines/{pipeline_name}/ingress/{table_name}`, and view reads issue
+`GET /v0/pipelines/{pipeline_name}/query` with `SELECT * FROM "<output_id>"`.
+For a single-output view, `/v1/views/{view_id}/query` selects that output
+automatically. For a Feldera program with multiple output views, query an output
+explicitly with `/v1/views/{view_id}/outputs/{output_id}/query`; `GET
+/v1/views/{view_id}` exposes `output_relations` and `output_query_endpoints` so
+callers can discover the available output ids. Promoted `/v1/api/*` routes use
+their configured `outputRelationId` and `sql_template`; explicit
+`/v1/views/{view_id}/outputs/{output_id}/query` routes ignore the promoted API
+template and read the requested output directly, so one output's API template
+cannot be used as a tunnel to query another output.
+Pipeline-manager compile accepts multi-input Feldera programs and records the
+compiler-resolved output schemas. In both local volatile and external-managed
+runtime modes, Velorix activates those multi-input programs, starts the Feldera
+pipeline, and routes each relation batch to the relation-specific Feldera
+ingress table. When an ingest epoch touches more than one input relation,
+Velorix wraps those Feldera ingress requests in the Feldera
+`start_transaction` / `commit_transaction` API and waits for
+`global_metrics.transaction_status` to return to `NoTransaction` before
+publishing the Velorix checkpoint. This lets join-style views commit related
+multi-table changes as one Feldera transaction instead of exposing intermediate
+view states. If a transaction-started runtime apply fails before convergence is
+published, Velorix writes a durable per-epoch/view runtime failure marker and
+blocks automatic retry before runtime restore/replay; this avoids silently
+double-applying committed ingest log records into an external Feldera pipeline
+whose transaction state is uncertain. After the operator has rebuilt or cleared
+the external Feldera runtime, the admin-only
+`POST /v1/standing-runtime/ingest-epoch-failures/repair` endpoint can remove
+the marker. The request must identify the epoch/view and set
+`confirm_external_runtime_rebuilt=true` with a non-empty `repair_reason`; the
+handler validates the active standing-runtime identity, deletes the marker, and
+evicts any in-process runtime cache before the epoch is retried. If committed
+ingest log replay already covers the epoch batches, Velorix repairs the
+per-epoch convergence record from that checkpoint instead of applying the same
+epoch a second time. Local volatile mode proves the HTTP runtime boundary for
+multi-relation Feldera SQL through the product API, but it is not
+product-complete production evidence:
+the local restore path now rehydrates the pipeline-manager runtime from the
+published Velorix checkpoint payload, preserves logical epoch, idempotency keys,
+and replay frontiers, and skips ingest batches already covered by that
+checkpoint. If a Feldera ingress call fails, the pipeline-manager runtime marks
+itself poisoned and rejects later apply/query/checkpoint attempts instead of
+serving a possibly partial external state. External-managed mode uses the same
+compile/ingest/query adapter but does not clear or delete the Feldera pipeline
+on runtime drop, so it is the intended boundary for externally operated Feldera
+pipeline-manager deployments. Pipeline-manager runtime checkpoints use
+`feldera-pipeline-manager-state-v2` and include the deployment mode in the
+checkpoint payload; restore rejects a checkpoint written for a different mode so
+an externally managed pipeline cannot be accidentally reopened as local volatile
+and deleted by cleanup semantics. Product promotion still requires live Feldera
+compatibility tests, external Feldera durable-state validation, deterministic
+operator-runbook evidence for rebuild or repair after transaction-started
+partial HTTP failure because Feldera transactions currently do not provide
+rollback/abort, and delete/update semantics beyond the current insert/delete
+event mapping.
+Runtime
+reads now apply the linked query policy to both templated and non-templated
+standing-runtime queries; non-templated reads also push `max_output_rows + 1`
+into the runtime page request when that policy bound is present so oversized
+reads can fail closed without requesting an unbounded snapshot. The volatile
+runtime now treats the Velorix weight column as change metadata rather than
+Feldera row data:
+pipeline-manager `program_code` input `CREATE TABLE` declarations exclude that
+column, ingest strips it from row payloads, `1` emits `{"insert": row}`, and
+`-1` emits `{"delete": row}` only for relations that can generate delete events:
+direct `Delete`, full-row `Update`, or full-row `Upsert` with a supplied
+`before` image. Insert-only relations still reject `-1`, and non-unit weights remain
+fail-closed until explicit mappings are implemented. Relations may declare
+`Update` or `Upsert` capabilities without blocking pipeline-manager activation,
+but the current signed-weight ingest shape still sends only Feldera
+insert/delete events. For callers that want to express operations explicitly,
+`POST /v1/ingest` and `POST /v1/ingest/epoch` also accept operation envelopes
+inside `rows`:
+
+```json
+[
+  { "operation": "insert", "row": { "user_id": "u1", "score": 5 } },
+  { "operation": "delete", "row": { "user_id": "u1", "score": 5 } },
+  {
+    "operation": "update",
+    "before": { "user_id": "u1", "score": 5 },
+    "after": { "user_id": "u1", "score": 7 }
+  },
+  {
+    "operation": "upsert",
+    "before": { "user_id": "u2", "score": 3 },
+    "row": { "user_id": "u2", "score": 9 }
+  }
+]
+```
+
+Velorix normalizes these envelopes before durable admission: `insert` becomes
+one signed `+1` row, `delete` becomes one signed `-1` row, `update` becomes
+`-1 before` followed by `+1 after`, and `upsert` becomes `-1 before` when
+`before` is supplied plus `+1 row`/`+1 after`. The normalized signed rows are
+what advance ingest offsets, enter the durable Arrow envelope, replay into
+standing runtimes, and are forwarded to Feldera as `insert_delete` events.
+Envelope payloads must not include the relation weight column; Velorix adds it
+during normalization. A caller still needs the relation's direct `Delete`
+capability to submit a `delete` envelope; `Update` and `Upsert` only authorize
+the internal delete event needed to represent the before image.
+This is intentional rather than a missing toggle: Feldera's HTTP JSON ingress is
+kept on insert/delete events, so Velorix requires enough row data to build those
+events deterministically. A SQL-table update can be represented safely today
+when the caller submits the previous full row and the new full row. Key-only
+native `Update` or stateful `Upsert` event payloads still require a future
+ingest envelope contract before the pipeline-manager runtime can infer previous
+rows by itself.
+For promoted `GET /v1/api/*` routes backed by the pipeline-manager runtime,
+`sql_template` is rendered after the declared request validators pass and then
+sent to Feldera `/query`; Velorix validates template placeholders, declared
+parameters, and the selected output binding. Template placeholders are
+recognized only in normal SQL text outside SQL strings, quoted identifiers, and
+comments. Velorix does not run the rendered SQL through DataFusion, require a
+local table-reference match against the bound output relation, apply the legacy
+`key_json`/`value_json` snapshot rewrite, or otherwise pre-validate Feldera query
+grammar for this runtime. View-scoped
+`POST /v1/views/{view_id}/query` and
+`POST /v1/views/{view_id}/outputs/{output_id}/query` may also include a raw
+`sql` string for pipeline-manager runtimes; Velorix renders optional
+`{{ context.params.<name> | ... }}` placeholders from the request `parameters`
+map into Feldera ad hoc `PREPARE velorix_query AS ...; EXECUTE
+velorix_query(...)` SQL, then sends that request-local prepared statement to
+Feldera `/query` without local SQL parsing. Values are not spliced into the
+query body; placeholders become `$1`, `$2`, ... and values are rendered only as
+the matching `EXECUTE` arguments. Supported ad hoc filters are the same
+validator-style filters used by view API templates: `is_required`, `is_string`,
+`is_integer(...)`, `is_number(...)`, `is_boolean`,
+`is_array(element=string|integer|number|boolean|date|time|timestamp|uuid|decimal|binary_hex|json)`,
+`is_date`, `is_time`, `is_timestamp`, `is_uuid`, `is_decimal`, `is_binary_hex`,
+`is_json`, and `to_json`. JSON parameters are validated and canonicalized before
+they are passed to Feldera. In the current pipeline-manager `/query` path they
+are rendered as canonical SQL string literals, which supports JSON stored in
+text columns and avoids claiming unsupported ad hoc `VARIANT` literal binding.
+Feldera result `VARIANT` values are still preserved at the query response
+boundary, but request-time `VARIANT` bind literals remain disabled until the
+pinned Feldera `/query` surface accepts a stable JSON-to-`VARIANT` expression
+such as `parse_json(...)` or `CAST(... AS VARIANT)`. View API admission now
+rejects request fields declared as `type: "variant"` and template filters named
+`is_variant` with that `/query` limitation in the error message, instead of
+silently treating them as JSON strings. For Feldera-compatible
+membership filters, write array parameters as
+`column in unnest({{ context.params.<name> | is_array(element=...) }})`;
+Velorix lowers that shape to `column IN ($1, $2, ...)` and keeps each array
+element as a request-local `EXECUTE` argument instead of splicing values into the
+SQL body. Promoted GET APIs accept `type: "array"` query parameters as JSON
+array strings such as
+`?user_ids=["u1","u2"]`, after URL encoding by the client. Extra
+parameters that are not referenced by the SQL are rejected. Parameterized
+caller/template SQL must be a single SQL statement so Velorix can wrap it in one
+Feldera `PREPARE`; raw caller SQL with no Velorix parameters is passed through
+unchanged. Even when parameters are present, Velorix only renders placeholders
+whose expression starts with `context.params.` and only when the placeholder
+appears in normal SQL text outside SQL strings, quoted identifiers, and
+comments; other `{{`/`}}` blocks remain Feldera-owned SQL text. When
+`parameters` is empty or omitted, Velorix does not scan the SQL for
+placeholders, so Feldera SQL strings or JSON literals containing `{{`/`}}` pass
+through unchanged. This is
+intentionally not a generic `/v1/query`: the caller must address an active
+view/output endpoint, and static linked/generated runtimes still reject
+caller-supplied SQL because they do not execute through Feldera `/query`.
+For caller/template SQL, `max_rows=<n>` and `page_token=offset:<row_offset>` are
+supported on the pipeline-manager runtime by wrapping the query body with a
+Feldera `LIMIT <max_rows + 1>` and optional `OFFSET <row_offset>` before
+submission. Parameterized templates are paginated inside the request-local
+`PREPARE`, so values still travel only through the matching `EXECUTE`
+arguments. Multi-statement raw SQL is rejected when pagination is requested.
+Feldera JSON row fields named `rows`, `data`, or `records` are preserved as row
+columns, not treated as Velorix response envelopes. Scalar Feldera query
+columns named `insert` or `delete` are also preserved, so raw SQL such as
+`SELECT 'literal' AS insert` returns `{ "insert": "literal" }`. Velorix still
+unwraps Feldera change rows shaped as `{ "insert": { ... } }` and rejects
+delete change rows shaped as `{ "delete": { ... } }` when reading a snapshot
+query response.
+Linked generated/local runtimes still use the snapshot/DataFusion template path.
+
+Live Feldera compatibility coverage is opt-in because it needs a running
+pipeline-manager. The repeatable local entry point is:
+
+```bash
+scripts/run-live-feldera-pipeline-manager.sh
+```
+
+This compatibility path is deliberately not the final product image shape.
+It has no default backend image because the upstream Feldera pipeline-manager
+path requires the SQL compiler jar, and the Velorix product target is jarless
+Feldera package usage. The upstream Feldera all-in-one image is available only
+as an explicit compatibility fixture and must be enabled with
+`VELORIX_LIVE_FELDERA_ALLOW_OFFICIAL_IMAGE=1`. The product image direction is
+split in
+[Feldera Compiler Worker Split](../architecture/feldera-compiler-worker.md):
+`velorix-api` remains a lean API/runtime image, while an optional
+`velorix-feldera-compiler-worker` owns Feldera compilation outside the API
+process and completes pending jobs through the admin
+`/v1/view-compile-deploy/jobs/{view_id}/complete` contract. Do not add PVCs or
+bundle the Feldera all-in-one image into `velorix-api` to make dynamic views
+pass.
+
+The script defaults to `http://127.0.0.1:18082`. If that endpoint is already
+healthy, it uses it. Otherwise, when the `colima-velorix-live` Docker context is
+available, it starts a dedicated `velorix-feldera-live` container with the
+Feldera compiler cache mounted from
+`target/feldera-compiler-cache.ext4` as a Colima-mounted ext4 loop filesystem
+and waits for `GET /v0/pipelines`. It writes a small evidence file under
+`target/velorix-feldera-live/<run-id>/live-feldera-pipeline-manager-evidence.json`.
+Read this evidence as an execution record, not as a test manifest. A passing
+compile-only run has `status: "passed"`, `runtime_enabled: false`,
+`compile_test_filters` populated, `runtime_test_filters: []`,
+`executed_test_filters` equal to the compile filters, and
+`skipped_runtime_test_filters` listing the runtime SQL-family tests that were
+not run. A passing full runtime run has `runtime_enabled: true`,
+`runtime_test_filters` populated from the runner's runtime test array,
+`executed_test_filters` equal to compile plus runtime filters, and
+`skipped_runtime_test_filters: []`. `available_runtime_test_filters` is the
+runner's full runtime coverage list in both modes; it is not itself proof that
+those tests executed.
+The evidence also declares `evidence_scope: "compatibility_fixture"`,
+`product_evidence: false`, `backend_kind: "pipeline_manager"`, and
+`jarless_backend_attested: false`. That is intentional: this file can validate
+Velorix/Feldera API compatibility, but product-complete evidence must come from
+the jarless package-backed backend.
+For the same reason, `product-evidence.json` keeps
+`api.compile_deploy.jarless_product_backend_verified=false` and retains a
+`product_complete_blockers` entry until the jarless Feldera package backend
+produces product-runtime evidence. Pipeline-manager and linked generated
+fixtures can keep compatibility coverage green, but they do not clear this
+product gate.
+If the runner exits nonzero, it still attempts to write the same evidence file.
+`status: "blocked"` with `failure_kind: "local_environment_blocker"` means a
+local preflight or environment constraint, such as insufficient host or compiler
+cache disk space, prevented the suite from running. `status: "failed"` with
+`failure_kind: "test_failure"` means the runner reached a test or setup step
+that failed. In both cases, `exit_code` records the script exit status and the
+test filter fields remain useful for identifying the intended coverage.
+Validate the evidence before citing it as coverage:
+
+```bash
+scripts/validate-live-feldera-evidence.py \
+  target/velorix-feldera-live/<run-id>/live-feldera-pipeline-manager-evidence.json
+```
+
+For the full SQL-family runtime claim, require runtime execution explicitly:
+
+```bash
+scripts/validate-live-feldera-evidence.py --require-runtime \
+  target/velorix-feldera-live/<run-id>/live-feldera-pipeline-manager-evidence.json
+```
+
+The validator exits `0` for sufficient passed evidence, `65` when the evidence
+is well-formed but does not satisfy `--require-runtime`, `75` for local
+environment blockers, and nonzero for failed or malformed evidence.
+The `source_audit` test suite exercises compile-only, full-runtime, and blocked
+sample evidence so those validator exit-code semantics remain covered locally.
+
+The tests submit Velorix-generated Feldera SQL for materialized standing views
+to the configured pipeline-manager and assert that
+`program_info.schema.outputs` round-trips into Velorix output schema metadata.
+With `LIVE_FELDERA=1`, current live coverage includes the original grouped
+`sum`/`count` view, a projection plus filter query, grouped `min`/`max`/`avg`
+aggregates, PIVOT and UNPIVOT table-expression output, `JOIN ... USING`, and a
+two-table join aggregate through the same compiler-backed path. It also includes an invalid-SQL check that expects
+the Feldera compiler error to surface as a Velorix admission error instead of
+falling back to a linked/generated fixture. Compile fail-closed coverage also
+tracks Feldera-documented unsupported SQL families such as `INTERSECT ALL`,
+`EXCEPT ALL`, `MATCH_RECOGNIZE`, `NTILE`, and `ROWS` window frames: these must
+return compiler/admission errors until Feldera supports them, not silently run
+through a Velorix-specific fake generic implementation. The compile/schema
+tests can complete after Feldera SQL compilation once `program_info` is present.
+
+Runtime live coverage is a heavier check because it waits for Feldera Rust
+compilation and starts the volatile pipeline-manager runtime. To run the full
+runtime SQL-family set through the same script, add:
+
+```bash
+LIVE_FELDERA_RUNTIME=1 scripts/run-live-feldera-pipeline-manager.sh
+```
+
+For a local Docker smoke run outside the script, start Feldera on a
+non-conflicting port and mount a compiler target cache. Direct macOS bind mounts
+are acceptable for lightweight compile-only checks, but full runtime runs should
+use the script's default ext4 loop image because Rust's generated target
+directory needs Linux filesystem semantics:
+
+```bash
+mkdir -p target/feldera-compiler-cache
+docker run --rm --name velorix-feldera-live \
+  -p 18081:8080 \
+  -v "$PWD/target/feldera-compiler-cache:/home/ubuntu/.feldera/compiler/rust-compilation" \
+  "$VELORIX_LIVE_FELDERA_IMAGE"
+```
+
+If the default Docker/Colima store is unhealthy or shared with other work, use a
+dedicated Colima profile instead of restarting the default profile:
+
+```bash
+colima start --profile velorix-live --cpus 4 --memory 8 --disk 160 \
+  --runtime docker --activate=false
+mkdir -p target/feldera-compiler-cache
+docker --context colima-velorix-live run -d --name velorix-feldera-live \
+  -p 18082:8080 \
+  -v "$PWD/target/feldera-compiler-cache:/home/ubuntu/.feldera/compiler/rust-compilation" \
+  "$VELORIX_LIVE_FELDERA_IMAGE"
+```
+
+For an upstream-image compatibility fixture only:
+
+```bash
+VELORIX_LIVE_FELDERA_ALLOW_OFFICIAL_IMAGE=1 \
+VELORIX_LIVE_FELDERA_IMAGE=images.feldera.com/feldera/pipeline-manager:latest \
+scripts/run-live-feldera-pipeline-manager.sh
+```
+
+This fixture is useful for checking Velorix request/response compatibility
+against Feldera, but it is not proof that the jarless product path is complete.
+
+The runtime suite compiles real Rust pipelines inside Feldera. Use a larger
+dedicated profile for repeated full-suite runs, or run individual SQL-family
+tests. `scripts/run-live-feldera-pipeline-manager.sh` runs the runtime tests one
+by one and, by default, clears stale compiled pipeline binaries from the
+target-backed ext4 cache between runtime cases to avoid exhausting smaller local
+Colima disks. In loop mode the cleanup also runs `fstrim` inside the Colima VM
+so APFS can reclaim sparse-image blocks that ext4 has freed. The legacy Docker
+named volume path is still available by setting
+`VELORIX_LIVE_FELDERA_COMPILER_CACHE_VOLUME`, and a direct host directory bind is
+available with `VELORIX_LIVE_FELDERA_COMPILER_CACHE_MODE=bind`, but the
+target-backed ext4 image default is preferred because it keeps cache data under
+the repository's `target` while avoiding macOS bind-mount permission semantics:
+
+```bash
+VELORIX_LIVE_FELDERA_CLEAN_BETWEEN_RUNTIME_TESTS=0 \
+LIVE_FELDERA_RUNTIME=1 \
+scripts/run-live-feldera-pipeline-manager.sh
+```
+
+To run the underlying cargo checks manually, verify the schema boundary first:
+
+```bash
+LIVE_FELDERA=1 \
+VELORIX_FELDERA_PIPELINE_MANAGER_URL="http://127.0.0.1:18081" \
+cargo test -p velorix-api --test live_feldera_pipeline_manager \
+  live_feldera_pipeline_manager_compiles -- --nocapture
+```
+
+Run runtime checks separately after the Feldera compiler cache is warm, or with
+the default runtime timeout:
+
+```bash
+LIVE_FELDERA=1 \
+LIVE_FELDERA_RUNTIME=1 \
+VELORIX_FELDERA_PIPELINE_MANAGER_URL="http://127.0.0.1:18081" \
+cargo test -p velorix-api --test live_feldera_pipeline_manager \
+  live_feldera_pipeline_manager_runtime_ingests_and_queries_velorix_program -- --nocapture
+```
+
+The runtime tests ingest signed relation batches through Feldera
+`insert_delete`, query materialized outputs through the Velorix runtime adapter,
+checkpoint the Velorix adapter, restore it with the active view metadata, and
+query the output again through the restored runtime. The live `scores` fixture
+uses a distinct `event_id` primary key so multiple score events for the same
+`user_id` retain multiset aggregation semantics in Feldera. They also verify
+pipeline-manager runtime cursor pagination for materialized output reads,
+view-scoped SQL-pushdown reads, and promoted `GET /v1/api/*` template reads
+with `max_rows` plus `page_token=offset:<row_offset>`, cover
+CTE/`HAVING`/`UNION ALL`, PIVOT, UNPIVOT, and `JOIN ... USING` SQL through
+runtime ingest/query, and exercise a raw `source_kind: "feldera_program"` multi-output program
+through compile, ingest, and explicit output queries. The raw Feldera program
+runtime coverage also includes `CREATE FUNCTION`, Rust-backed
+`CREATE LINEAR AGGREGATE`, `CREATE TYPE` record aliases, and `CREATE INDEX` on
+an output materialized view, proving these program-level statements pass
+through the Feldera compiler/runtime boundary rather than a Velorix query-body
+parser. A REST product-path live smoke also registers a
+relation through `POST /v1/relations`, creates a view
+through `POST /v1/views`, activates it through
+`POST /v1/view-compile-deploy/run-once`, ingests rows through `POST /v1/ingest`,
+and queries the promoted `GET /v1/api/*` route against the same live Feldera
+pipeline-manager runtime; the product-path smoke now uses `input_relation_refs`
+to create and query a two-relation join view, verifies scalar and typed-array
+query parameters for promoted templates, and also covers a raw
+`source_kind: "feldera_program"` multi-output view through the REST product
+path: promoted `GET /v1/api/*` binds to one output with `outputRelationId`,
+while `/v1/views/{view_id}/outputs/{output_id}/query` reads another output. A
+separate live REST smoke omits `output_relation_ids` entirely and verifies that
+Velorix replaces the pending placeholder outputs with Feldera compiler
+discovered outputs before ingest and query. Runtime live coverage now also
+checks Feldera-native result expressions for array literals, named `ROW` values,
+`MAP(SELECT ...)`, `VARIANT`, `UUID`, binary literals, `CASE`, and `COALESCE`
+through the same compiler/runtime/query path. The live `MAP` smoke also covers
+Feldera's duplicate-key aggregate behavior by keeping the largest value for a
+repeated key. The live tests serialize Feldera compile/run work
+inside the test process. With `LIVE_FELDERA_RUNTIME=1`, their
+default `VELORIX_FELDERA_COMPILER_TIMEOUT_MS` is 3600000 because a local
+Feldera Rust compile can exceed 30 minutes on a cold image. Without
+`LIVE_FELDERA=1`, the tests print skip messages and succeed without network
+access.
+
+The Feldera query response conversion path now accepts the supported scalar
+output types that Feldera can expose through JSON for local validation:
+booleans; signed and unsigned 8/16/32/64-bit integers; 32/64-bit floats;
+decimal; documented Feldera aliases such as `INT2`, `INT4`, `INT8`/`INT64`,
+`FLOAT4`/`FLOAT32`, `FLOAT8`/`FLOAT64`, `DATETIME`, and `BINARY VARYING`;
+`CHAR`/`VARCHAR`/`STRING`/`TEXT`; `UUID`; `VARIANT` as canonical JSON text;
+`GEOMETRY` as Feldera JSON text; `BINARY`/`VARBINARY` in Feldera `c_hex`
+output form; and `DATE`/`TIME`/`TIMESTAMP` strings. It also maps `ARRAY`,
+`ROW`/`STRUCT`, and `MAP` JSON results through Arrow nested arrays and preserves
+map entries whose values are `null`; `INTERVAL` results are preserved as
+Feldera JSON text rather than interpreted as Arrow interval arithmetic.
+`GEOMETRY` is accepted on the pipeline-manager DDL/output-schema/query path;
+the local in-process `feldera-types` descriptor adapter still fails closed for
+`GEOMETRY` because the `feldera-types` schema enum does not expose a geometry
+variant in the checked 0.299.0 dependency or the 0.306.0 crate surface.
+Relation catalogs and REST ingest now also accept Feldera scalar input
+columns for signed and unsigned 8/16/32/64-bit integers, 32/64-bit floats,
+fixed `CHAR`, `VARCHAR`, fixed and variable binary hex strings, `TIME`, `UUID`,
+`DATE`, `TIMESTAMP`, `DECIMAL`, `BOOLEAN`, and `VARIANT`/JSON. They now also accept
+nested `ARRAY`, `MAP`, and `ROW` input columns as non-key payload columns,
+converting REST JSON rows through Arrow nested arrays and generating Feldera
+DDL from the same relation catalog. Env-gated live compiler tests validate that
+both expanded scalar input catalogs and nested input catalogs are accepted by a
+real pipeline-manager. `INTERVAL` remains output-preservation-only in Velorix
+because the pinned Feldera compiler currently rejects `INTERVAL` as a table
+column type in `CREATE TABLE`. Nested primary keys remain fail-closed until a stable
+nested key serialization contract exists. Multi-output schema capture and
+explicit output query routing are
+implemented locally. The env-gated live
+pipeline-manager compile/schema test covers grouped aggregates,
+projection/filter, aggregate functions, and a two-relation join against a real
+Feldera server. The compile-only fail-closed suite also locks the current
+Feldera limitation boundary for documented unsupported SQL so the product goal
+remains "all Feldera-supported SQL through Feldera" rather than "all SQL via
+Velorix reimplementation." Runtime ingest/query/checkpoint/restore live
+coverage is available behind `LIVE_FELDERA_RUNTIME=1`. External Feldera durable-state
+restart evidence remains open because the current local volatile mode does not
+claim Feldera server state as Velorix durable authority.
+
 Artifact-backed generated runtime views support committed-epoch cursor
 pagination on GET query endpoints. The response includes `logical_epoch` for
 the returned materialized snapshot. Pass `epoch=<logical_epoch>` to read a
@@ -1175,12 +1956,18 @@ response contains `next_page_token`, pass it back as `page_token=<value>` to
 read the next page. `epoch`, `page_token`, and `max_rows` are reserved query
 parameters for view APIs and cannot be declared as custom request fields.
 When an artifact-backed view API has a `sql_template`, Velorix currently
-fetches the committed materialized snapshot from the linked standing runtime
-and applies the template through DataFusion prepared bindings over that Arrow
-snapshot. Cursor pagination with `page_token` or `max_rows` is rejected for
-this templated path until predicate/pagination pushdown exists in the standing
-runtime API. `epoch=<logical_epoch>` remains supported for the runtime's
-current committed epoch.
+fetches the committed materialized snapshot from linked generated/local
+standing runtimes and applies the template through DataFusion prepared bindings
+over that Arrow snapshot. Cursor pagination with `page_token` and row limits
+with `max_rows` are rejected for that snapshot-templated path until
+predicate/pagination pushdown exists in the standing runtime API. For
+pipeline-manager runtimes, templated APIs push the rendered SQL to Feldera and
+support `max_rows` and `page_token=offset:<row_offset>` by wrapping the query
+body with Feldera `LIMIT/OFFSET`. Materialized output reads use the same
+bounded-query pattern around the Velorix-generated `SELECT * FROM <output>`
+query.
+`epoch=<logical_epoch>` remains supported for the runtime's current committed
+epoch.
 
 After each successful artifact-backed ingest application, Velorix writes an
 immutable standing runtime checkpoint under
@@ -1198,9 +1985,11 @@ envelopes. A higher-epoch object-store checkpoint that did not win metadata
 publication is an orphan and is ignored by recovery. Without a `MetaStore`,
 local development continues to restore from the newest checkpoint object by
 epoch and writes a best-effort `latest.json` marker in the scoped directory.
-The checkpoint record also stores stream/partition replay frontiers, and restart
-replay begins after those frontiers instead of re-reading ingest objects already
-covered by the restored runtime checkpoint.
+The checkpoint record also stores relation-aware stream/partition replay
+frontiers. Restart replay begins at the earliest frontier required by any
+relation sharing a stream/partition, then skips replayed batches already covered
+by the restored relation-specific checkpoint frontier. This keeps multi-relation
+views safe even when different input relations use the same external stream.
 Within one `velorix-api` process, artifact-backed runtime apply, checkpoint
 creation, replay-frontier merge, checkpoint object write, and latest-marker
 write are serialized per `{tenant_id, program_id, view_id}`. That protects the
@@ -1260,11 +2049,25 @@ uses it when the caller omits the parameter, and includes it in the generated
 OpenAPI schema. Velorix enforces parameter provenance: `path` fields must
 appear in `urlPath` and must be supplied by the promoted API path, not by query
 string or the generic `/v1/views/{view_id}/query` endpoint. Query responses are
-shaped by `response_schema` when one is
-configured. Caller supplied SQL is rejected on view APIs; execution uses the
-registered `sql_template`. Template placeholders are compiled into DataFusion
-positional parameters (`$1`, `$2`, ...) and the caller values are passed
-separately as prepared bind values, not interpolated into SQL text.
+shaped by `response_schema` when one is configured. Response schema columns
+declare `name`, `type`, and `source`. Supported response types are `string`,
+`int64`/`integer`, `float64`/`number`, `bool`/`boolean`, `date`, `time`,
+`timestamp`, `uuid`, `decimal`, `binary_hex`, `array`, `object`, and `json`.
+`array` and `object` are intended for Feldera `ARRAY`, `ROW`/`STRUCT`, and
+`MAP` shaped outputs after the compiler-backed runtime has converted them to
+JSON values; canonical JSON strings are parsed when they are used as the
+response source. Feldera nullable output values are returned as JSON `null` for
+all response schema types, and OpenAPI marks declared response columns as
+nullable because `response_schema` does not currently carry per-column
+nullability. Unknown response types, duplicate response column names, blank
+names, and blank sources are rejected during view admission rather than
+deferred to query time. Static linked/generated view APIs reject
+caller-supplied SQL and
+execute the registered `sql_template` by compiling placeholders into DataFusion
+positional parameters (`$1`, `$2`, ...) with separate prepared bind values.
+Pipeline-manager view APIs may accept view-scoped caller SQL on the explicit
+query endpoints, and promoted API templates use the same Feldera request-local
+`PREPARE`/`EXECUTE` parameter path before being sent to Feldera `/query`.
 
 Legacy recovered SQL view materialization is DBSP-backed only for the
 development bootstrap single-relation sum/count shape:

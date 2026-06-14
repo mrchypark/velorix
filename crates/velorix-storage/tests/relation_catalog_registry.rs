@@ -6,7 +6,8 @@ use velorix_core::relation::{
     ArrowPhysicalTypeV1, DataFusionRegistrationModeV1, DataFusionRegistrationV1,
     FelderaRelationBindingV1, IncrementalAdapterBindingV1, RelationColumnV1, RelationOperationV1,
     RelationSemanticRoleV1, SchemaFingerprintV1, VelorixLogicalTypeV1, VelorixRelationCatalogV1,
-    VelorixRelationSchemaV1, ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID, RELATION_SCHEMA_VERSION_V1,
+    VelorixRelationSchemaV1, CATALOG_FELDERA_GENERIC_INCREMENTAL_ADAPTER_ID,
+    ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID, RELATION_SCHEMA_VERSION_V1,
 };
 use velorix_storage::{
     capability::{ObjectStoreCapabilityProfile, RequiredObjectStoreCapability},
@@ -98,6 +99,74 @@ fn orders_relation_catalog() -> VelorixRelationCatalogV1 {
     }
 }
 
+fn generic_activity_relation_catalog() -> VelorixRelationCatalogV1 {
+    let relation_schema = VelorixRelationSchemaV1 {
+        relation_id: "activity_events".to_string(),
+        relation_name: "activity_events".to_string(),
+        relation_version: "2026-06-11.v1".to_string(),
+        columns: vec![
+            RelationColumnV1 {
+                column_id: "event_id".to_string(),
+                name: "event_id".to_string(),
+                logical_type: VelorixLogicalTypeV1::Utf8,
+                physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+                nullable: false,
+                ordinal: 0,
+                semantic_role: RelationSemanticRoleV1::PrimaryKey,
+            },
+            RelationColumnV1 {
+                column_id: "user_id".to_string(),
+                name: "user_id".to_string(),
+                logical_type: VelorixLogicalTypeV1::Utf8,
+                physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+                nullable: false,
+                ordinal: 1,
+                semantic_role: RelationSemanticRoleV1::Metadata,
+            },
+            RelationColumnV1 {
+                column_id: "score".to_string(),
+                name: "score".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 2,
+                semantic_role: RelationSemanticRoleV1::Metadata,
+            },
+            RelationColumnV1 {
+                column_id: "delta".to_string(),
+                name: "delta".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 3,
+                semantic_role: RelationSemanticRoleV1::Weight,
+            },
+        ],
+        primary_key_column_ids: vec!["event_id".to_string()],
+        weight_column_id: "delta".to_string(),
+        allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+        event_time_column_id: None,
+    };
+    let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
+
+    VelorixRelationCatalogV1 {
+        schema_version: RELATION_SCHEMA_VERSION_V1,
+        relation_schema,
+        schema_fingerprint: schema_fingerprint.clone(),
+        datafusion_registration: DataFusionRegistrationV1 {
+            name: "activity_events".to_string(),
+            mode: DataFusionRegistrationModeV1::Table,
+        },
+        feldera_relation: FelderaRelationBindingV1 {
+            relation_id: "activity_events".to_string(),
+            schema_fingerprint,
+        },
+        incremental_adapter: IncrementalAdapterBindingV1 {
+            adapter_id: CATALOG_FELDERA_GENERIC_INCREMENTAL_ADAPTER_ID.to_string(),
+        },
+    }
+}
+
 #[tokio::test]
 async fn relation_catalog_registry_creates_and_reads_valid_catalog_record() {
     let (_temp_dir, store) = temp_store();
@@ -137,6 +206,25 @@ async fn relation_catalog_registry_treats_duplicate_same_record_as_idempotent() 
     let duplicate = registry.create(&catalog).await.unwrap();
 
     assert_eq!(duplicate, CreateRelationCatalogOutcome::Duplicate);
+}
+
+#[tokio::test]
+async fn relation_catalog_registry_accepts_generic_feldera_relation_without_value_shape() {
+    let (_temp_dir, store) = temp_store();
+    let registry = RelationCatalogRegistry::new(store);
+    let catalog = generic_activity_relation_catalog();
+
+    let outcome = registry.create(&catalog).await.unwrap();
+    let read_back = registry
+        .read(
+            &catalog.relation_schema.relation_id,
+            &catalog.relation_schema.relation_version,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, CreateRelationCatalogOutcome::Created);
+    assert_eq!(read_back, catalog);
 }
 
 #[tokio::test]

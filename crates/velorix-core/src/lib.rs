@@ -9,6 +9,7 @@ pub mod delta;
 pub mod engine;
 pub mod feldera_artifact;
 pub mod feldera_package_runtime;
+pub mod feldera_product_runtime;
 #[cfg(feature = "feldera-package-compat")]
 pub mod feldera_program_descriptor;
 pub mod generated_view_descriptor;

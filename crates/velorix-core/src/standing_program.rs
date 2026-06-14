@@ -1,5 +1,6 @@
 use arrow::record_batch::RecordBatch;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -230,6 +231,14 @@ pub struct MaterializedViewPage {
     pub next_page_token: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub struct MaterializedViewSqlPage {
+    pub view: ScopedViewId,
+    pub logical_epoch: LogicalEpoch,
+    pub rows: Vec<Value>,
+    pub next_page_token: Option<String>,
+}
+
 pub trait StandingProgramRuntime {
     fn program_identity(&self) -> &StandingProgramIdentity;
 
@@ -251,6 +260,18 @@ pub trait StandingProgramRuntime {
         view: ScopedViewId,
         page: SnapshotPageRequest,
     ) -> Result<MaterializedViewPage, StandingProgramRuntimeError>;
+
+    fn materialized_view_sql_page(
+        &self,
+        view: ScopedViewId,
+        sql: String,
+        page: SnapshotPageRequest,
+    ) -> Result<MaterializedViewSqlPage, StandingProgramRuntimeError> {
+        let _ = (view, sql, page);
+        Err(StandingProgramRuntimeError::ExternalRuntime {
+            reason: "standing runtime does not support SQL pushdown queries".to_string(),
+        })
+    }
 
     fn checkpoint(&self) -> Result<RuntimeCheckpoint, StandingProgramRuntimeError>;
 
@@ -290,6 +311,8 @@ pub enum StandingProgramRuntimeError {
     },
     #[error("unknown standing program view `{view_id}`")]
     UnknownView { view_id: String },
+    #[error("external standing runtime error: {reason}")]
+    ExternalRuntime { reason: String },
 }
 
 fn require_non_empty(field: &'static str, value: &str) -> Result<(), StandingProgramRuntimeError> {

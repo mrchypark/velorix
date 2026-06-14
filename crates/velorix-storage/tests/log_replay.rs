@@ -156,6 +156,46 @@ async fn log_replay_skips_batches_covered_by_checkpoint_boundary() {
 }
 
 #[tokio::test]
+async fn log_replay_uses_earliest_relation_checkpoint_for_shared_stream_partition() {
+    let (_temp_dir, store) = temp_store();
+    let log = IngestLog::new(store);
+
+    let covered_order =
+        IngestBatch::new_bootstrap_unchecked("ledger", 0, 0, 10, Bytes::from_static(b"order-0-10"))
+            .unwrap();
+    let next_order = IngestBatch::new_bootstrap_unchecked(
+        "ledger",
+        0,
+        10,
+        20,
+        Bytes::from_static(b"order-10-20"),
+    )
+    .unwrap();
+    let covered_account = IngestBatch::new_bootstrap_unchecked(
+        "ledger",
+        0,
+        90,
+        100,
+        Bytes::from_static(b"account-90-100"),
+    )
+    .unwrap();
+
+    log.append(&covered_order).await.unwrap();
+    log.append(&next_order).await.unwrap();
+    log.append(&covered_account).await.unwrap();
+
+    let replayed = log
+        .replay_from(&[
+            ReplayCheckpoint::for_relation("orders", "v1", "ledger", 0, 10),
+            ReplayCheckpoint::for_relation("accounts", "v1", "ledger", 0, 100),
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(replayed, vec![next_order, covered_account]);
+}
+
+#[tokio::test]
 async fn log_replay_ignores_output_namespace_objects_with_matching_ranges() {
     let (_temp_dir, store) = temp_store();
     let log = IngestLog::new(Arc::clone(&store));

@@ -1,5 +1,5 @@
 {
-  "metadata_version": 2,
+  "metadata_version": 999,
   "view_id": "standing_view_orders_by_region",
   "spec_hash": "velorix-feldera-spec-sha256-v1:0e24cbe06543d735a6d62868f230c4610fb9139cb91e5e8f72042f17da0ecbea",
   "artifact_id": "feldera-artifact-orders-by-region-20260503",

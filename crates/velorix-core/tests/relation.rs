@@ -2,8 +2,9 @@ use std::sync::Arc;
 
 use arrow::{
     array::{
-        ArrayRef, BooleanArray, Date32Array, Decimal128Array, DictionaryArray, Float64Array,
-        Int64Array, Int8Array, StringArray, StringDictionaryBuilder, TimestampNanosecondArray,
+        ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, DictionaryArray,
+        Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, ListArray, StringArray,
+        StringDictionaryBuilder, Time64NanosecondArray, TimestampNanosecondArray, UInt64Array,
     },
     datatypes::{DataType, Field, Int16Type, Int32Type, Int64Type, Int8Type, Schema, TimeUnit},
     record_batch::RecordBatch,
@@ -18,7 +19,8 @@ use velorix_core::relation::{
     DictionaryKeyTypeV1, FelderaRelationBindingV1, IncrementalAdapterBindingV1,
     IncrementalInputAdapterError, RelationColumnV1, RelationOperationV1, RelationSchemaError,
     RelationSemanticRoleV1, SchemaFingerprintV1, VelorixLogicalTypeV1, VelorixRelationCatalogV1,
-    VelorixRelationSchemaV1, CATALOG_ROW_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID,
+    VelorixRelationSchemaV1, CATALOG_FELDERA_GENERIC_INCREMENTAL_ADAPTER_ID,
+    CATALOG_ROW_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID,
     CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID, ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID,
     RELATION_SCHEMA_VERSION_V1,
 };
@@ -1053,6 +1055,59 @@ fn row_key_catalog_incremental_input_accepts_multi_column_key_as_column_id_objec
 }
 
 #[test]
+fn row_key_catalog_incremental_input_accepts_expanded_scalar_primary_key_types() {
+    let catalog = expanded_scalar_key_relation_catalog();
+    let batch = expanded_scalar_key_input_batch();
+
+    let delta = arrow_record_batches_to_single_key_sum_count_delta_batch(
+        &catalog,
+        catalog.relation_schema.relation_id.as_str(),
+        catalog.relation_schema.relation_version.as_str(),
+        catalog.schema_fingerprint.as_str(),
+        &[batch],
+    )
+    .unwrap();
+
+    assert_eq!(
+        delta.records(),
+        &[DeltaRecord::new(
+            DeltaKey::from_json(serde_json::json!({
+                "i8_key": -8,
+                "i16_key": -32000,
+                "i32_key": -123456,
+                "u64_key": 9_000_000_000_u64,
+                "binary_key": "0x0a0bff",
+                "time_key": 3_723_004_005_006_i64,
+                "char_key": "ABCD"
+            })),
+            DeltaValue::from_json(serde_json::json!(42)),
+            1,
+        )]
+    );
+}
+
+#[test]
+fn incremental_input_rejects_nested_primary_key_types_until_key_serialization_exists() {
+    let catalog = nested_key_relation_catalog();
+    let batch = nested_key_input_batch();
+
+    let error = arrow_record_batches_to_single_key_sum_count_delta_batch(
+        &catalog,
+        catalog.relation_schema.relation_id.as_str(),
+        catalog.relation_schema.relation_version.as_str(),
+        catalog.schema_fingerprint.as_str(),
+        &[batch],
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        IncrementalInputAdapterError::MalformedArrowInput { reason }
+            if reason == "`scores` column uses a nested Arrow type that is not supported as an incremental key"
+    ));
+}
+
+#[test]
 fn single_key_catalog_incremental_input_still_rejects_multi_column_key() {
     let mut catalog = account_balance_by_currency_relation_catalog();
     catalog.incremental_adapter.adapter_id =
@@ -1129,6 +1184,53 @@ fn catalog_incremental_input_rejects_unsupported_adapter() {
     assert!(matches!(
         error,
         IncrementalInputAdapterError::UnsupportedIncrementalAdapter { .. }
+    ));
+}
+
+#[test]
+fn feldera_generic_relation_admission_accepts_multi_payload_columns_without_value_role() {
+    let catalog = feldera_generic_activity_relation_catalog();
+
+    let spec = catalog.validate_feldera_ingest_adapter_scope().unwrap();
+
+    assert_eq!(
+        spec,
+        velorix_core::relation::SupportedIncrementalAdapterSpec::FelderaGeneric
+    );
+}
+
+#[test]
+fn feldera_generic_relation_stays_out_of_legacy_incremental_delta_adapter() {
+    let catalog = feldera_generic_activity_relation_catalog();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("event_id", DataType::Utf8, false),
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("score", DataType::Int64, false),
+            Field::new("delta", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["e1"])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["u1"])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![7])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+
+    let error = arrow_record_batches_to_single_key_sum_count_delta_batch(
+        &catalog,
+        catalog.relation_schema.relation_id.as_str(),
+        catalog.relation_schema.relation_version.as_str(),
+        catalog.schema_fingerprint.as_str(),
+        &[batch],
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        IncrementalInputAdapterError::UnsupportedIncrementalAdapter { adapter_id }
+            if adapter_id == CATALOG_FELDERA_GENERIC_INCREMENTAL_ADAPTER_ID
     ));
 }
 
@@ -1321,6 +1423,74 @@ fn account_balance_relation_catalog() -> VelorixRelationCatalogV1 {
     }
 }
 
+fn feldera_generic_activity_relation_catalog() -> VelorixRelationCatalogV1 {
+    let relation_schema = VelorixRelationSchemaV1 {
+        relation_id: "activity_events".to_string(),
+        relation_name: "activity_events".to_string(),
+        relation_version: "2026-06-11.v1".to_string(),
+        columns: vec![
+            RelationColumnV1 {
+                column_id: "event_id".to_string(),
+                name: "event_id".to_string(),
+                logical_type: VelorixLogicalTypeV1::Utf8,
+                physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+                nullable: false,
+                ordinal: 0,
+                semantic_role: RelationSemanticRoleV1::PrimaryKey,
+            },
+            RelationColumnV1 {
+                column_id: "user_id".to_string(),
+                name: "user_id".to_string(),
+                logical_type: VelorixLogicalTypeV1::Utf8,
+                physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+                nullable: false,
+                ordinal: 1,
+                semantic_role: RelationSemanticRoleV1::Metadata,
+            },
+            RelationColumnV1 {
+                column_id: "score".to_string(),
+                name: "score".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 2,
+                semantic_role: RelationSemanticRoleV1::Metadata,
+            },
+            RelationColumnV1 {
+                column_id: "delta".to_string(),
+                name: "delta".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 3,
+                semantic_role: RelationSemanticRoleV1::Weight,
+            },
+        ],
+        primary_key_column_ids: vec!["event_id".to_string()],
+        weight_column_id: "delta".to_string(),
+        allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+        event_time_column_id: None,
+    };
+    let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
+
+    VelorixRelationCatalogV1 {
+        schema_version: RELATION_SCHEMA_VERSION_V1,
+        relation_schema,
+        schema_fingerprint: schema_fingerprint.clone(),
+        datafusion_registration: DataFusionRegistrationV1 {
+            name: "activity_events".to_string(),
+            mode: DataFusionRegistrationModeV1::Table,
+        },
+        feldera_relation: FelderaRelationBindingV1 {
+            relation_id: "activity_events".to_string(),
+            schema_fingerprint,
+        },
+        incremental_adapter: IncrementalAdapterBindingV1 {
+            adapter_id: CATALOG_FELDERA_GENERIC_INCREMENTAL_ADAPTER_ID.to_string(),
+        },
+    }
+}
+
 fn account_balance_by_currency_relation_catalog() -> VelorixRelationCatalogV1 {
     let relation_schema = VelorixRelationSchemaV1 {
         relation_id: "account_balances_by_currency".to_string(),
@@ -1386,6 +1556,234 @@ fn account_balance_by_currency_relation_catalog() -> VelorixRelationCatalogV1 {
         incremental_adapter: IncrementalAdapterBindingV1 {
             adapter_id: CATALOG_ROW_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID.to_string(),
         },
+    }
+}
+
+fn expanded_scalar_key_relation_catalog() -> VelorixRelationCatalogV1 {
+    let relation_schema = VelorixRelationSchemaV1 {
+        relation_id: "expanded_scalar_keys".to_string(),
+        relation_name: "expanded_scalar_keys".to_string(),
+        relation_version: "2026-06-09.v1".to_string(),
+        columns: vec![
+            relation_column(
+                "i8_key",
+                VelorixLogicalTypeV1::Int8,
+                ArrowPhysicalTypeV1::Int8,
+                RelationSemanticRoleV1::PrimaryKey,
+                0,
+            ),
+            relation_column(
+                "i16_key",
+                VelorixLogicalTypeV1::Int16,
+                ArrowPhysicalTypeV1::Int16,
+                RelationSemanticRoleV1::PrimaryKey,
+                1,
+            ),
+            relation_column(
+                "i32_key",
+                VelorixLogicalTypeV1::Int32,
+                ArrowPhysicalTypeV1::Int32,
+                RelationSemanticRoleV1::PrimaryKey,
+                2,
+            ),
+            relation_column(
+                "u64_key",
+                VelorixLogicalTypeV1::UInt64,
+                ArrowPhysicalTypeV1::UInt64,
+                RelationSemanticRoleV1::PrimaryKey,
+                3,
+            ),
+            relation_column(
+                "binary_key",
+                VelorixLogicalTypeV1::Varbinary,
+                ArrowPhysicalTypeV1::Binary,
+                RelationSemanticRoleV1::PrimaryKey,
+                4,
+            ),
+            relation_column(
+                "time_key",
+                VelorixLogicalTypeV1::Time,
+                ArrowPhysicalTypeV1::Time64Nanosecond,
+                RelationSemanticRoleV1::PrimaryKey,
+                5,
+            ),
+            relation_column(
+                "char_key",
+                VelorixLogicalTypeV1::Char { length: Some(4) },
+                ArrowPhysicalTypeV1::Utf8,
+                RelationSemanticRoleV1::PrimaryKey,
+                6,
+            ),
+            relation_column(
+                "amount",
+                VelorixLogicalTypeV1::Int64,
+                ArrowPhysicalTypeV1::Int64,
+                RelationSemanticRoleV1::Value,
+                7,
+            ),
+            relation_column(
+                "row_delta",
+                VelorixLogicalTypeV1::Int64,
+                ArrowPhysicalTypeV1::Int64,
+                RelationSemanticRoleV1::Weight,
+                8,
+            ),
+        ],
+        primary_key_column_ids: vec![
+            "i8_key".to_string(),
+            "i16_key".to_string(),
+            "i32_key".to_string(),
+            "u64_key".to_string(),
+            "binary_key".to_string(),
+            "time_key".to_string(),
+            "char_key".to_string(),
+        ],
+        weight_column_id: "row_delta".to_string(),
+        allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+        event_time_column_id: None,
+    };
+    let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
+
+    VelorixRelationCatalogV1 {
+        schema_version: RELATION_SCHEMA_VERSION_V1,
+        relation_schema,
+        schema_fingerprint: schema_fingerprint.clone(),
+        datafusion_registration: DataFusionRegistrationV1 {
+            name: "expanded_scalar_keys".to_string(),
+            mode: DataFusionRegistrationModeV1::Table,
+        },
+        feldera_relation: FelderaRelationBindingV1 {
+            relation_id: "expanded_scalar_keys".to_string(),
+            schema_fingerprint,
+        },
+        incremental_adapter: IncrementalAdapterBindingV1 {
+            adapter_id: CATALOG_ROW_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID.to_string(),
+        },
+    }
+}
+
+fn expanded_scalar_key_input_batch() -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("i8_key", DataType::Int8, false),
+            Field::new("i16_key", DataType::Int16, false),
+            Field::new("i32_key", DataType::Int32, false),
+            Field::new("u64_key", DataType::UInt64, false),
+            Field::new("binary_key", DataType::Binary, false),
+            Field::new("time_key", DataType::Time64(TimeUnit::Nanosecond), false),
+            Field::new("char_key", DataType::Utf8, false),
+            Field::new("amount", DataType::Int64, false),
+            Field::new("row_delta", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(Int8Array::from(vec![-8])) as ArrayRef,
+            Arc::new(Int16Array::from(vec![-32000])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![-123456])) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![9_000_000_000_u64])) as ArrayRef,
+            Arc::new(BinaryArray::from_iter_values([&[0x0a, 0x0b, 0xff][..]])) as ArrayRef,
+            Arc::new(Time64NanosecondArray::from(vec![3_723_004_005_006_i64])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["ABCD"])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![42])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+        ],
+    )
+    .unwrap()
+}
+
+fn nested_key_relation_catalog() -> VelorixRelationCatalogV1 {
+    let relation_schema = VelorixRelationSchemaV1 {
+        relation_id: "nested_key_scores".to_string(),
+        relation_name: "nested_key_scores".to_string(),
+        relation_version: "2026-06-10.v1".to_string(),
+        columns: vec![
+            relation_column(
+                "scores",
+                VelorixLogicalTypeV1::Array {
+                    element_type: Box::new(VelorixLogicalTypeV1::Int64),
+                },
+                ArrowPhysicalTypeV1::List {
+                    element_type: Box::new(ArrowPhysicalTypeV1::Int64),
+                },
+                RelationSemanticRoleV1::PrimaryKey,
+                0,
+            ),
+            relation_column(
+                "amount",
+                VelorixLogicalTypeV1::Int64,
+                ArrowPhysicalTypeV1::Int64,
+                RelationSemanticRoleV1::Value,
+                1,
+            ),
+            relation_column(
+                "row_delta",
+                VelorixLogicalTypeV1::Int64,
+                ArrowPhysicalTypeV1::Int64,
+                RelationSemanticRoleV1::Weight,
+                2,
+            ),
+        ],
+        primary_key_column_ids: vec!["scores".to_string()],
+        weight_column_id: "row_delta".to_string(),
+        allowed_operations: vec![RelationOperationV1::Insert],
+        event_time_column_id: None,
+    };
+    let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
+
+    VelorixRelationCatalogV1 {
+        schema_version: RELATION_SCHEMA_VERSION_V1,
+        relation_schema,
+        schema_fingerprint: schema_fingerprint.clone(),
+        datafusion_registration: DataFusionRegistrationV1 {
+            name: "nested_key_scores".to_string(),
+            mode: DataFusionRegistrationModeV1::Table,
+        },
+        feldera_relation: FelderaRelationBindingV1 {
+            relation_id: "nested_key_scores".to_string(),
+            schema_fingerprint,
+        },
+        incremental_adapter: IncrementalAdapterBindingV1 {
+            adapter_id: CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID.to_string(),
+        },
+    }
+}
+
+fn nested_key_input_batch() -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new(
+                "scores",
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+                false,
+            ),
+            Field::new("amount", DataType::Int64, false),
+            Field::new("row_delta", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+                Some(vec![Some(10), Some(20)]),
+            ])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![42])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+        ],
+    )
+    .unwrap()
+}
+
+fn relation_column(
+    name: &str,
+    logical_type: VelorixLogicalTypeV1,
+    physical_arrow_type: ArrowPhysicalTypeV1,
+    semantic_role: RelationSemanticRoleV1,
+    ordinal: u32,
+) -> RelationColumnV1 {
+    RelationColumnV1 {
+        column_id: name.to_string(),
+        name: name.to_string(),
+        logical_type,
+        physical_arrow_type,
+        nullable: false,
+        ordinal,
+        semantic_role,
     }
 }
 

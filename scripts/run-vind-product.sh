@@ -5623,6 +5623,7 @@ if ingest_writer_lifecycle_attestation_file:
     }
 
 product_complete_blockers = []
+feldera_jarless_product_backend_verified = False
 if not production_multi_writer_safe:
     if multi_writer_fencing_safe and not production_bounded_failover_safe:
         product_complete_blockers.append(
@@ -5709,6 +5710,10 @@ elif ingest_writer_lifecycle_attestation_source != "generated":
 if api_compile_deploy_worker_run_verified != "1":
     product_complete_blockers.append(
         "view compile/deploy worker did not activate the pending Feldera/DBSP view into a standing runtime"
+    )
+if not feldera_jarless_product_backend_verified:
+    product_complete_blockers.append(
+        "jarless Feldera package backend did not produce product runtime evidence; pipeline-manager and linked generated fixtures are compatibility evidence only"
     )
 if not api_image_digest:
     product_complete_blockers.append("velorix-api deployed image digest was not recorded")
@@ -5899,6 +5904,8 @@ evidence = {
             "compiler_request_embedded": api_compile_deploy_job_catalog_verified == "1",
             "admin_route": "/v1/view-compile-deploy/jobs",
             "worker_run_verified": api_compile_deploy_worker_run_verified == "1",
+            "jarless_product_backend_verified": feldera_jarless_product_backend_verified,
+            "pipeline_manager_compatibility_trusted_for_product_complete": False,
             "run_once_admin_route": "/v1/view-compile-deploy/run-once",
             "run_once_evidence_file": "view-compile-deploy-run-once.json"
             if api_compile_deploy_worker_run_verified == "1"
@@ -7321,7 +7328,7 @@ if body.get("execution_mode") != "feldera_compile_pending":
     raise SystemExit(f"unexpected execution mode for no-artifact view: {body}")
 if body.get("query_enabled") is not False:
     raise SystemExit(f"pending compile view must not be query enabled: {body}")
-if not str(body.get("compile_job_id", "")).startswith("pending_scores_by_user:velorix-feldera-spec-sha256-v1:"):
+if not str(body.get("compile_job_id", "")).startswith("pending_scores_by_user:velorix-feldera-compile-request-sha256-v1:"):
     raise SystemExit(f"pending compile view is missing compile_job_id: {body}")
 lifecycle = body.get("lifecycle") or {}
 if lifecycle.get("compile_status") != "pending" or lifecycle.get("deployment_status") != "not_deployed":
@@ -7361,8 +7368,11 @@ if compiler_request.get("view_id") != "pending_scores_by_user":
 sql = compiler_request.get("sql") or ""
 if "sum(score)" not in sql or "group by user_id" not in sql.lower():
     raise SystemExit(f"compile/deploy compiler_request SQL mismatch:{already_active_context} {body}")
-if not compiler_request.get("input_relations") or not compiler_request.get("output_relations"):
-    raise SystemExit(f"compile/deploy compiler_request is missing schemas:{already_active_context} {body}")
+if not compiler_request.get("input_relations"):
+    raise SystemExit(f"compile/deploy compiler_request is missing input schemas:{already_active_context} {body}")
+output_contract = compiler_request.get("output_contract") or {}
+if not compiler_request.get("output_relations") and output_contract.get("kind") != "infer":
+    raise SystemExit(f"compile/deploy compiler_request is missing output schema contract:{already_active_context} {body}")
 shape = compiler_request.get("shape") or {}
 if shape.get("is_materialized") is not True:
     raise SystemExit(f"compile/deploy compiler_request shape mismatch:{already_active_context} {body}")

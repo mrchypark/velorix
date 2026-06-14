@@ -63,7 +63,7 @@ impl RelationCatalogRegistry {
         &self,
         catalog: &VelorixRelationCatalogV1,
     ) -> Result<CreateRelationCatalogOutcome, RelationCatalogRegistryError> {
-        catalog.validate_supported_incremental_adapter_scope()?;
+        catalog.validate_feldera_ingest_adapter_scope()?;
 
         let object_key = self.object_key(
             &catalog.relation_schema.relation_id,
@@ -101,7 +101,7 @@ impl RelationCatalogRegistry {
         let object_key = self.object_key(relation_id, relation_version)?;
         let record = self.read_object(&object_key).await?;
 
-        record.validate_supported_incremental_adapter_scope()?;
+        record.validate_feldera_ingest_adapter_scope()?;
         self.validate_record_identity(&object_key, &record)?;
 
         Ok(record)

@@ -7,14 +7,18 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 anyhow = { workspace = true }
 arrow = { workspace = true, features = ["ipc"] }
+async-trait = { workspace = true }
 axum = { workspace = true }
 axum-server = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 object_store = { workspace = true, features = ["aws"] }
+percent-encoding = { workspace = true }
 rustls = { version = "0.23", features = ["ring"] }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true }
 velorix-core = { path = "../velorix-core" }
 velorix-generated-scores-by-user = { path = "../velorix-generated-scores-by-user" }

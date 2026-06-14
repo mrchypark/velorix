@@ -107,6 +107,44 @@ impl ObjectKey {
         )))
     }
 
+    pub fn ingest_epoch_manifest(epoch_manifest_id: &str) -> Result<Self, ObjectKeyError> {
+        let hash = parse_sha256_hash_segment(epoch_manifest_id)?;
+
+        Ok(Self(format!("v1/ingest-epochs/sha256/{hash}.epoch.json")))
+    }
+
+    pub fn ingest_epoch_view_convergence(
+        epoch_manifest_id: &str,
+        tenant_id: &str,
+        program_id: &str,
+        view_id: &str,
+    ) -> Result<Self, ObjectKeyError> {
+        let hash = parse_sha256_hash_segment(epoch_manifest_id)?;
+        validate_segment("tenant_id", tenant_id)?;
+        validate_segment("program_id", program_id)?;
+        validate_segment("view_id", view_id)?;
+
+        Ok(Self(format!(
+            "v1/ingest-epoch-convergence/sha256/{hash}/{tenant_id}/{program_id}/{view_id}.convergence.json"
+        )))
+    }
+
+    pub fn ingest_epoch_view_runtime_failure(
+        epoch_manifest_id: &str,
+        tenant_id: &str,
+        program_id: &str,
+        view_id: &str,
+    ) -> Result<Self, ObjectKeyError> {
+        let hash = parse_sha256_hash_segment(epoch_manifest_id)?;
+        validate_segment("tenant_id", tenant_id)?;
+        validate_segment("program_id", program_id)?;
+        validate_segment("view_id", view_id)?;
+
+        Ok(Self(format!(
+            "v1/ingest-epoch-runtime-failures/sha256/{hash}/{tenant_id}/{program_id}/{view_id}.failure.json"
+        )))
+    }
+
     pub fn state_object(
         owner: &str,
         partition_id: u32,
@@ -270,6 +308,30 @@ impl ObjectKey {
         )))
     }
 
+    pub fn view_compile_deploy_job_for_compile_request(
+        view_id: &str,
+        compile_request_hash: &str,
+    ) -> Result<Self, ObjectKeyError> {
+        validate_segment("view_id", view_id)?;
+        let hash = parse_feldera_compile_request_hash_segment(compile_request_hash)?;
+
+        Ok(Self(format!(
+            "v1/view-compile-deploy-jobs/{view_id}/compile-request-sha256/{hash}.job.json"
+        )))
+    }
+
+    pub fn view_compile_deploy_job_claim_for_compile_request(
+        view_id: &str,
+        compile_request_hash: &str,
+    ) -> Result<Self, ObjectKeyError> {
+        validate_segment("view_id", view_id)?;
+        let hash = parse_feldera_compile_request_hash_segment(compile_request_hash)?;
+
+        Ok(Self(format!(
+            "v1/view-compile-deploy-job-claims/{view_id}/compile-request-sha256/{hash}.claim.json"
+        )))
+    }
+
     pub fn standing_runtime_checkpoint(
         tenant_id: &str,
         program_id: &str,
@@ -413,6 +475,35 @@ fn validate_known_layout(value: &str) -> Result<(), ObjectKeyError> {
                 .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
             validate_segment("decision_id", decision_id)?;
         }
+        ["v1", "ingest-epochs", "sha256", manifest_file] => {
+            let hash = manifest_file
+                .strip_suffix(".epoch.json")
+                .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+            validate_sha256_hex(hash)
+                .map_err(|_| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+        }
+        ["v1", "ingest-epoch-convergence", "sha256", hash, tenant_id, program_id, convergence_file] =>
+        {
+            validate_sha256_hex(hash)
+                .map_err(|_| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+            validate_segment("tenant_id", tenant_id)?;
+            validate_segment("program_id", program_id)?;
+            let view_id = convergence_file
+                .strip_suffix(".convergence.json")
+                .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+            validate_segment("view_id", view_id)?;
+        }
+        ["v1", "ingest-epoch-runtime-failures", "sha256", hash, tenant_id, program_id, failure_file] =>
+        {
+            validate_sha256_hex(hash)
+                .map_err(|_| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+            validate_segment("tenant_id", tenant_id)?;
+            validate_segment("program_id", program_id)?;
+            let view_id = failure_file
+                .strip_suffix(".failure.json")
+                .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+            validate_segment("view_id", view_id)?;
+        }
         ["v1", "state", owner, partition, checkpoint, object_file] => {
             validate_segment("owner", owner)?;
             parse_prefixed_u32("partition_id", partition, "p=", PARTITION_WIDTH)?;
@@ -512,6 +603,14 @@ fn validate_known_layout(value: &str) -> Result<(), ObjectKeyError> {
                 .map_err(|_| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
         }
         ["v1", "view-compile-deploy-jobs", view_id, "spec-sha256", job_file] => {
+            validate_segment("view_id", view_id)?;
+            let hash = job_file
+                .strip_suffix(".job.json")
+                .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+            validate_sha256_hex(hash)
+                .map_err(|_| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+        }
+        ["v1", "view-compile-deploy-jobs", view_id, "compile-request-sha256", job_file] => {
             validate_segment("view_id", view_id)?;
             let hash = job_file
                 .strip_suffix(".job.json")
@@ -825,6 +924,25 @@ fn parse_feldera_spec_hash_segment(spec_hash: &str) -> Result<&str, ObjectKeyErr
     Ok(hash)
 }
 
+fn parse_feldera_compile_request_hash_segment(
+    compile_request_hash: &str,
+) -> Result<&str, ObjectKeyError> {
+    let Some(hash) =
+        compile_request_hash.strip_prefix("velorix-feldera-compile-request-sha256-v1:")
+    else {
+        return Err(ObjectKeyError::UnsafeSegment {
+            name: "compile_request_hash",
+            value: compile_request_hash.to_string(),
+        });
+    };
+    validate_sha256_hex(hash).map_err(|_| ObjectKeyError::UnsafeSegment {
+        name: "compile_request_hash",
+        value: hash.to_string(),
+    })?;
+
+    Ok(hash)
+}
+
 fn validate_sha256_hex(hash: &str) -> Result<(), ObjectKeyError> {
     if hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         Ok(())
@@ -873,6 +991,54 @@ mod tests {
         assert_eq!(
             key.as_str(),
             "v1/ingest-admission/orders/p=0000000007/ranges/00000000000000000042-00000000000000000100/expiry-decisions/repair-1.expiry.json"
+        );
+        assert_eq!(ObjectKey::parse(key.as_str()).unwrap(), key);
+    }
+
+    #[test]
+    fn ingest_epoch_manifest_key_is_content_addressed_and_parseable() {
+        let key = ObjectKey::ingest_epoch_manifest(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap();
+
+        assert_eq!(
+            key.as_str(),
+            "v1/ingest-epochs/sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.epoch.json"
+        );
+        assert_eq!(ObjectKey::parse(key.as_str()).unwrap(), key);
+    }
+
+    #[test]
+    fn ingest_epoch_view_convergence_key_is_manifest_and_view_scoped() {
+        let key = ObjectKey::ingest_epoch_view_convergence(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "tenant-a",
+            "program-a",
+            "view-a",
+        )
+        .unwrap();
+
+        assert_eq!(
+            key.as_str(),
+            "v1/ingest-epoch-convergence/sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/tenant-a/program-a/view-a.convergence.json"
+        );
+        assert_eq!(ObjectKey::parse(key.as_str()).unwrap(), key);
+    }
+
+    #[test]
+    fn ingest_epoch_view_runtime_failure_key_is_manifest_and_view_scoped() {
+        let key = ObjectKey::ingest_epoch_view_runtime_failure(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "tenant-a",
+            "program-a",
+            "view-a",
+        )
+        .unwrap();
+
+        assert_eq!(
+            key.as_str(),
+            "v1/ingest-epoch-runtime-failures/sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/tenant-a/program-a/view-a.failure.json"
         );
         assert_eq!(ObjectKey::parse(key.as_str()).unwrap(), key);
     }
@@ -1146,6 +1312,62 @@ mod tests {
             assert!(
                 ObjectKey::materialized_view(view_id, spec_hash).is_err(),
                 "accepted invalid materialized view identity: {view_id}/{spec_hash}"
+            );
+        }
+    }
+
+    #[test]
+    fn view_compile_deploy_job_compile_request_key_is_deterministic_and_parseable() {
+        let compile_request_hash = format!(
+            "velorix-feldera-compile-request-sha256-v1:{}",
+            "b".repeat(64)
+        );
+        let key = ObjectKey::view_compile_deploy_job_for_compile_request(
+            "orders-by-region",
+            &compile_request_hash,
+        )
+        .unwrap();
+        let restarted = ObjectKey::view_compile_deploy_job_for_compile_request(
+            "orders-by-region",
+            &compile_request_hash,
+        )
+        .unwrap();
+
+        assert_eq!(
+            key.as_str(),
+            "v1/view-compile-deploy-jobs/orders-by-region/compile-request-sha256/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.job.json"
+        );
+        assert_eq!(key, restarted);
+        assert_eq!(ObjectKey::parse(key.as_str()).unwrap(), key);
+    }
+
+    #[test]
+    fn view_compile_deploy_job_compile_request_key_rejects_unsafe_identity() {
+        for (view_id, compile_request_hash) in [
+            (
+                "",
+                "velorix-feldera-compile-request-sha256-v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            (
+                "orders/current",
+                "velorix-feldera-compile-request-sha256-v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            (
+                "orders",
+                "velorix-feldera-spec-sha256-v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            (
+                "orders",
+                "velorix-feldera-compile-request-sha256-v1:not-hex",
+            ),
+        ] {
+            assert!(
+                ObjectKey::view_compile_deploy_job_for_compile_request(
+                    view_id,
+                    compile_request_hash
+                )
+                .is_err(),
+                "accepted invalid compile/deploy job identity: {view_id}/{compile_request_hash}"
             );
         }
     }

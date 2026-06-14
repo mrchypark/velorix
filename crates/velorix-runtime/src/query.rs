@@ -2,7 +2,13 @@
 
 use std::sync::Arc;
 
-use arrow::{datatypes::Schema, record_batch::RecordBatch};
+use arrow::{
+    array::{
+        BinaryBuilder, BooleanBuilder, Float64Builder, Int64Builder, ListBuilder, StringBuilder,
+    },
+    datatypes::Schema,
+    record_batch::RecordBatch,
+};
 use datafusion::{
     common::ScalarValue,
     dataframe::DataFrame,
@@ -41,9 +47,27 @@ pub enum RuntimeQueryError {
 #[derive(Clone, Debug, PartialEq)]
 pub enum QueryBindValue {
     Utf8(String),
+    Json(String),
     Int64(i64),
     Float64(f64),
     Boolean(bool),
+    Date(String),
+    Time(String),
+    Timestamp(String),
+    Uuid(String),
+    Decimal(String),
+    Binary(Vec<u8>),
+    Utf8Array(Vec<String>),
+    JsonArray(Vec<String>),
+    Int64Array(Vec<i64>),
+    Float64Array(Vec<f64>),
+    BooleanArray(Vec<bool>),
+    DateArray(Vec<String>),
+    TimeArray(Vec<String>),
+    TimestampArray(Vec<String>),
+    UuidArray(Vec<String>),
+    DecimalArray(Vec<String>),
+    BinaryArray(Vec<Vec<u8>>),
 }
 
 pub async fn query_record_batches_table_with_bindings_and_policy_and_limiter(
@@ -120,9 +144,76 @@ impl QueryBindValue {
     fn to_scalar_value(&self) -> ScalarValue {
         match self {
             Self::Utf8(value) => ScalarValue::Utf8(Some(value.clone())),
+            Self::Json(value) => ScalarValue::Utf8(Some(value.clone())),
             Self::Int64(value) => ScalarValue::Int64(Some(*value)),
             Self::Float64(value) => ScalarValue::Float64(Some(*value)),
             Self::Boolean(value) => ScalarValue::Boolean(Some(*value)),
+            Self::Date(value)
+            | Self::Time(value)
+            | Self::Timestamp(value)
+            | Self::Uuid(value)
+            | Self::Decimal(value) => ScalarValue::Utf8(Some(value.clone())),
+            Self::Binary(value) => ScalarValue::Binary(Some(value.clone())),
+            Self::Utf8Array(values) => {
+                let mut builder = ListBuilder::new(StringBuilder::new());
+                for value in values {
+                    builder.values().append_value(value);
+                }
+                builder.append(true);
+                ScalarValue::List(Arc::new(builder.finish()))
+            }
+            Self::JsonArray(values) => {
+                let mut builder = ListBuilder::new(StringBuilder::new());
+                for value in values {
+                    builder.values().append_value(value);
+                }
+                builder.append(true);
+                ScalarValue::List(Arc::new(builder.finish()))
+            }
+            Self::Int64Array(values) => {
+                let mut builder = ListBuilder::new(Int64Builder::new());
+                for value in values {
+                    builder.values().append_value(*value);
+                }
+                builder.append(true);
+                ScalarValue::List(Arc::new(builder.finish()))
+            }
+            Self::Float64Array(values) => {
+                let mut builder = ListBuilder::new(Float64Builder::new());
+                for value in values {
+                    builder.values().append_value(*value);
+                }
+                builder.append(true);
+                ScalarValue::List(Arc::new(builder.finish()))
+            }
+            Self::BooleanArray(values) => {
+                let mut builder = ListBuilder::new(BooleanBuilder::new());
+                for value in values {
+                    builder.values().append_value(*value);
+                }
+                builder.append(true);
+                ScalarValue::List(Arc::new(builder.finish()))
+            }
+            Self::DateArray(values)
+            | Self::TimeArray(values)
+            | Self::TimestampArray(values)
+            | Self::UuidArray(values)
+            | Self::DecimalArray(values) => {
+                let mut builder = ListBuilder::new(StringBuilder::new());
+                for value in values {
+                    builder.values().append_value(value);
+                }
+                builder.append(true);
+                ScalarValue::List(Arc::new(builder.finish()))
+            }
+            Self::BinaryArray(values) => {
+                let mut builder = ListBuilder::new(BinaryBuilder::new());
+                for value in values {
+                    builder.values().append_value(value);
+                }
+                builder.append(true);
+                ScalarValue::List(Arc::new(builder.finish()))
+            }
         }
     }
 }

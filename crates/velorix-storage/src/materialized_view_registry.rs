@@ -119,6 +119,15 @@ impl MaterializedViewLifecycleStatus {
             message,
         }
     }
+
+    pub fn feldera_compile_validated(message: Option<String>) -> Self {
+        Self {
+            compiler_backend: "feldera_compiler".to_string(),
+            compile_status: MaterializedViewCompileStatus::Success,
+            deployment_status: MaterializedViewDeploymentStatus::NotDeployed,
+            message,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -181,6 +190,8 @@ pub struct MaterializedViewApiMetadata {
         skip_serializing_if = "Option::is_none"
     )]
     pub url_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_relation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub request: Vec<MaterializedViewRequestFieldSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -531,6 +542,175 @@ impl MaterializedViewRegistry {
             .await?;
 
         Ok(ActivateMaterializedViewOutcome::Activated)
+    }
+
+    pub async fn activate_pending_with_resolved_spec_artifact(
+        &self,
+        pending_view_id: &str,
+        pending_spec_hash: &str,
+        resolved_spec: &StandingViewSpec,
+        artifact: MaterializedViewArtifactBinding,
+        lifecycle: MaterializedViewLifecycleStatus,
+    ) -> Result<ActivateMaterializedViewOutcome, MaterializedViewRegistryError> {
+        validate_materialized_standing_view_spec(resolved_spec)?;
+        if resolved_spec.view_id != pending_view_id {
+            return Err(MaterializedViewRegistryError::ActiveRecordConflict {
+                object_key: self.active_object_key(pending_view_id)?,
+            });
+        }
+        let resolved_spec_hash = feldera_spec_hash(resolved_spec)?;
+        let spec_object_key = self.object_key(&resolved_spec.view_id, &resolved_spec_hash)?;
+        let spec_bytes = Bytes::from(serde_json::to_vec(resolved_spec)?);
+        match self
+            .store
+            .put_opts(
+                &Path::from(spec_object_key.as_str()),
+                spec_bytes.into(),
+                PutMode::Create.into(),
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                let existing = self.read_object(&spec_object_key).await?;
+                if existing != *resolved_spec {
+                    return Err(MaterializedViewRegistryError::RecordConflict {
+                        object_key: spec_object_key,
+                    });
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+
+        let active_object_key = self.active_object_key(pending_view_id)?;
+        let get_result = self
+            .store
+            .get(&Path::from(active_object_key.as_str()))
+            .await?;
+        let update_version = UpdateVersion {
+            e_tag: get_result.meta.e_tag.clone(),
+            version: get_result.meta.version.clone(),
+        };
+        let bytes = get_result.bytes().await?;
+        let existing: ActiveMaterializedViewRecord = serde_json::from_slice(&bytes)?;
+        self.validate_active_record_identity(pending_view_id, &existing, &active_object_key)?;
+        let existing_mode = self.normalized_execution_mode(&existing)?;
+
+        let record = ActiveMaterializedViewRecord {
+            schema_version: ACTIVE_MATERIALIZED_VIEW_SCHEMA_VERSION,
+            view_id: pending_view_id.to_string(),
+            spec_hash: resolved_spec_hash,
+            execution_mode: Some(MaterializedViewExecutionMode::StandingRuntime),
+            api: existing.api.clone(),
+            artifact: Some(artifact),
+            lifecycle: Some(lifecycle),
+        };
+        self.validate_execution_mode(
+            pending_view_id,
+            &MaterializedViewExecutionMode::StandingRuntime,
+            &record.artifact,
+        )?;
+
+        if existing == record {
+            return Ok(ActivateMaterializedViewOutcome::Duplicate);
+        }
+        if existing.spec_hash != pending_spec_hash
+            || existing_mode != MaterializedViewExecutionMode::FelderaCompilePending
+            || existing.artifact.is_some()
+        {
+            return Err(MaterializedViewRegistryError::ActiveRecordConflict {
+                object_key: active_object_key,
+            });
+        }
+
+        self.put_active_record_update(&active_object_key, update_version, &record)
+            .await?;
+
+        Ok(ActivateMaterializedViewOutcome::Activated)
+    }
+
+    pub async fn mark_pending_compile_validated_with_resolved_spec(
+        &self,
+        pending_view_id: &str,
+        pending_spec_hash: &str,
+        resolved_spec: &StandingViewSpec,
+        lifecycle: MaterializedViewLifecycleStatus,
+    ) -> Result<UpdateMaterializedViewLifecycleOutcome, MaterializedViewRegistryError> {
+        validate_materialized_standing_view_spec(resolved_spec)?;
+        if resolved_spec.view_id != pending_view_id {
+            return Err(MaterializedViewRegistryError::ActiveRecordConflict {
+                object_key: self.active_object_key(pending_view_id)?,
+            });
+        }
+        let resolved_spec_hash = feldera_spec_hash(resolved_spec)?;
+        let spec_object_key = self.object_key(&resolved_spec.view_id, &resolved_spec_hash)?;
+        let spec_bytes = Bytes::from(serde_json::to_vec(resolved_spec)?);
+        match self
+            .store
+            .put_opts(
+                &Path::from(spec_object_key.as_str()),
+                spec_bytes.into(),
+                PutMode::Create.into(),
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                let existing = self.read_object(&spec_object_key).await?;
+                if existing != *resolved_spec {
+                    return Err(MaterializedViewRegistryError::RecordConflict {
+                        object_key: spec_object_key,
+                    });
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+
+        let active_object_key = self.active_object_key(pending_view_id)?;
+        let get_result = self
+            .store
+            .get(&Path::from(active_object_key.as_str()))
+            .await?;
+        let update_version = UpdateVersion {
+            e_tag: get_result.meta.e_tag.clone(),
+            version: get_result.meta.version.clone(),
+        };
+        let bytes = get_result.bytes().await?;
+        let existing: ActiveMaterializedViewRecord = serde_json::from_slice(&bytes)?;
+        self.validate_active_record_identity(pending_view_id, &existing, &active_object_key)?;
+        let existing_mode = self.normalized_execution_mode(&existing)?;
+
+        let record = ActiveMaterializedViewRecord {
+            schema_version: ACTIVE_MATERIALIZED_VIEW_SCHEMA_VERSION,
+            view_id: pending_view_id.to_string(),
+            spec_hash: resolved_spec_hash,
+            execution_mode: Some(MaterializedViewExecutionMode::FelderaCompilePending),
+            api: existing.api.clone(),
+            artifact: None,
+            lifecycle: Some(lifecycle),
+        };
+        self.validate_execution_mode(
+            pending_view_id,
+            &MaterializedViewExecutionMode::FelderaCompilePending,
+            &record.artifact,
+        )?;
+
+        if existing == record {
+            return Ok(UpdateMaterializedViewLifecycleOutcome::Duplicate);
+        }
+        if existing.spec_hash != pending_spec_hash
+            || existing_mode != MaterializedViewExecutionMode::FelderaCompilePending
+            || existing.artifact.is_some()
+        {
+            return Err(MaterializedViewRegistryError::ActiveRecordConflict {
+                object_key: active_object_key,
+            });
+        }
+
+        self.put_active_record_update(&active_object_key, update_version, &record)
+            .await?;
+
+        Ok(UpdateMaterializedViewLifecycleOutcome::Updated)
     }
 
     pub async fn update_standing_runtime_lifecycle(

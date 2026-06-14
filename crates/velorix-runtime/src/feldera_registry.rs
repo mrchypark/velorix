@@ -5,6 +5,7 @@ use thiserror::Error;
 use velorix_core::{
     feldera_artifact::{
         validate_feldera_compile_artifact_for_catalog,
+        validate_feldera_compile_artifact_for_catalogs,
         validate_feldera_compile_artifact_hash_for_catalog,
         validate_feldera_release_artifact_provenance, FelderaArtifactError,
         FelderaCompileArtifactMetadata, FelderaReleaseArtifactProvenanceV1, StandingViewSpec,
@@ -147,6 +148,23 @@ impl RuntimeFelderaArtifactRegistry {
         artifact: &FelderaCompileArtifactMetadata,
     ) -> Result<RegisteredRuntimeFelderaArtifact, RuntimeFelderaArtifactError> {
         validate_feldera_compile_artifact_for_catalog(catalog, spec, artifact)?;
+
+        let register_outcome = self.storage.register(spec, artifact).await?;
+
+        Ok(RegisteredRuntimeFelderaArtifact {
+            metadata: artifact.clone(),
+            status: self.selection_status(artifact),
+            register_outcome,
+        })
+    }
+
+    pub async fn register_trusted_artifact_for_catalogs(
+        &self,
+        catalogs: &[VelorixRelationCatalogV1],
+        spec: &StandingViewSpec,
+        artifact: &FelderaCompileArtifactMetadata,
+    ) -> Result<RegisteredRuntimeFelderaArtifact, RuntimeFelderaArtifactError> {
+        validate_feldera_compile_artifact_for_catalogs(catalogs, spec, artifact)?;
 
         let register_outcome = self.storage.register(spec, artifact).await?;
 

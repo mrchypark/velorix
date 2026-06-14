@@ -129,18 +129,38 @@ def scan_source(source_root: Path) -> dict:
         ]
     )
     authority_time_transaction_api = (
-        "pub async fn txn_with_authority_time" in transaction_rs
-        and "QueryWrite::TransactionWithAuthorityTime" in transaction_rs
+        (
+            "pub async fn txn_with_authority_time" in transaction_rs
+            and "QueryWrite::TransactionWithAuthorityTime" in transaction_rs
+        )
+        or (
+            "pub async fn txn_with_raft_serialized_timestamp" in transaction_rs
+            and "QueryWrite::TransactionWithRaftSerializedTimestamp" in transaction_rs
+        )
     )
     authority_unix_ms_param = (
-        "AuthorityUnixMs" in param_rs
-        and "pub fn authority_unix_ms()" in param_rs
-        and "lookup_authority_unix_ms" in transaction_env_rs
+        (
+            "AuthorityUnixMs" in param_rs
+            and "pub fn authority_unix_ms()" in param_rs
+            and "lookup_authority_unix_ms" in transaction_env_rs
+        )
+        or (
+            "RaftSerializedUnixMs" in param_rs
+            and "pub fn raft_serialized_unix_ms()" in param_rs
+            and "lookup_raft_serialized_unix_ms" in transaction_env_rs
+        )
     )
     raft_replicated_authority_time_payload = (
-        "pub struct AuthorityTime" in state_machine_rs
-        and "TransactionWithAuthorityTime" in state_machine_rs
-        and "authority_unix_ms" in state_machine_rs
+        (
+            "pub struct AuthorityTime" in state_machine_rs
+            and "TransactionWithAuthorityTime" in state_machine_rs
+            and "authority_unix_ms" in state_machine_rs
+        )
+        or (
+            "pub struct RaftSerializedTimestamp" in state_machine_rs
+            and "TransactionWithRaftSerializedTimestamp" in state_machine_rs
+            and "unix_ms" in state_machine_rs
+        )
     )
 
     public_time_api_pattern = re.compile(
@@ -253,26 +273,46 @@ def scan_velorix_meta_source(repo_root: Path) -> dict:
         "async fn read_standing_runtime_checkpoint",
     )
 
+    def authority_txn_call_present(source: str) -> bool:
+        return (
+            ".txn_with_authority_time([" in source
+            or ".txn_with_raft_serialized_timestamp([" in source
+        )
+
+    def authority_time_param_present(source: str) -> bool:
+        return (
+            "hiqlite::Param::authority_unix_ms()" in source
+            or "hiqlite::Param::raft_serialized_unix_ms()" in source
+        )
+
     owner_acquire_uses_authority_time = (
-        ".txn_with_authority_time([" in acquire_impl
-        and "hiqlite::Param::authority_unix_ms()" in acquire_impl
+        authority_txn_call_present(acquire_impl)
+        and authority_time_param_present(acquire_impl)
         and "expires_at_unix_ms > $5" in acquire_impl
         and "unix_time_ms()?" not in acquire_impl
     )
     owner_read_uses_authority_time = (
-        ".txn_with_authority_time([" in read_impl
-        and "authority_time.unix_ms" in read_impl
+        authority_txn_call_present(read_impl)
+        and ("authority_time.unix_ms" in read_impl or "txn.timestamp.unix_ms" in read_impl)
         and ".filter(|claim| claim.expires_at_unix_ms > now)" in read_impl
         and "unix_time_ms()?" not in read_impl
     )
     checkpoint_publish_update_uses_authority_time = (
-        ".txn_with_authority_time([" in publish_impl
-        and "hiqlite::Param::authority_unix_ms()" in publish_impl
+        authority_txn_call_present(publish_impl)
+        and authority_time_param_present(publish_impl)
         and "owner.expires_at_unix_ms > $12" in publish_impl
     )
     checkpoint_publish_insert_uses_authority_time = (
-        publish_impl.count(".txn_with_authority_time([") >= 2
-        and publish_impl.count("hiqlite::Param::authority_unix_ms()") >= 2
+        (
+            publish_impl.count(".txn_with_authority_time([")
+            + publish_impl.count(".txn_with_raft_serialized_timestamp([")
+        )
+        >= 2
+        and (
+            publish_impl.count("hiqlite::Param::authority_unix_ms()")
+            + publish_impl.count("hiqlite::Param::raft_serialized_unix_ms()")
+        )
+        >= 2
         and "owner.expires_at_unix_ms > $9" in publish_impl
     )
     checkpoint_publish_rejects_scope_mismatch = (
@@ -408,9 +448,9 @@ assessment = {
     "missing_capabilities": missing_capabilities,
     "unsafe_substitutes_rejected": unsafe_substitutes_rejected,
     "verdict": (
-        "The hiqlite package exposes an authority-time transaction API and an "
-        "AuthorityUnixMs transaction parameter that can bind the Raft-serialized "
-        "authority wall-clock timestamp into Velorix standing-runtime lease SQL."
+            "The hiqlite package exposes a Raft-serialized timestamp transaction API "
+            "and transaction parameter that can bind the serialized wall-clock "
+            "timestamp into Velorix standing-runtime lease SQL."
         if required_mode_supported
         else (
             "The pinned hiqlite package exposes Raft-serialized SQL writes, transactions, "

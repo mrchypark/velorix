@@ -3,8 +3,10 @@ use std::fmt;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, BooleanArray, Date32Array, Decimal128Array, DictionaryArray, Float64Array, Int64Array,
-    StringArray, TimestampNanosecondArray,
+    Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, DictionaryArray, Float32Array,
+    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, StringArray,
+    Time64NanosecondArray, TimestampNanosecondArray, UInt16Array, UInt32Array, UInt64Array,
+    UInt8Array,
 };
 use arrow::datatypes::{
     DataType, Field, Int16Type, Int32Type, Int64Type, Int8Type, Schema, TimeUnit,
@@ -30,11 +32,16 @@ pub const CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID: &str =
 pub const CATALOG_ROW_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID: &str =
     "incremental-adapter-row-key-sum-count-v1";
 pub const ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID: &str = "incremental-adapter-orders-sum-count-v1";
+pub const CATALOG_FELDERA_GENERIC_INCREMENTAL_ADAPTER_ID: &str =
+    "incremental-adapter-feldera-generic-v1";
+const MAX_RELATION_TYPE_NESTING_DEPTH: usize = 16;
+const MAX_RELATION_STRUCT_FIELDS: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SupportedIncrementalAdapterSpec {
     ScalarSumCount,
     RowKeySumCount,
+    FelderaGeneric,
 }
 
 pub fn supported_incremental_adapter_spec(
@@ -47,6 +54,9 @@ pub fn supported_incremental_adapter_spec(
         }
         CATALOG_ROW_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID => {
             Some(SupportedIncrementalAdapterSpec::RowKeySumCount)
+        }
+        CATALOG_FELDERA_GENERIC_INCREMENTAL_ADAPTER_ID => {
+            Some(SupportedIncrementalAdapterSpec::FelderaGeneric)
         }
         _ => None,
     }
@@ -126,7 +136,36 @@ impl VelorixRelationCatalogV1 {
                     field: "incremental_adapter.primary_key_column_ids",
                 })
             }
-            _ => validate_single_value_column_for_adapter(&self.relation_schema).map(|()| spec),
+            SupportedIncrementalAdapterSpec::ScalarSumCount
+            | SupportedIncrementalAdapterSpec::RowKeySumCount => {
+                validate_single_value_column_for_adapter(&self.relation_schema).map(|()| spec)
+            }
+            SupportedIncrementalAdapterSpec::FelderaGeneric => {
+                validate_feldera_generic_ingest_relation(&self.relation_schema).map(|()| spec)
+            }
+        }
+    }
+
+    pub fn validate_feldera_ingest_adapter_scope(
+        &self,
+    ) -> Result<SupportedIncrementalAdapterSpec, RelationSchemaError> {
+        self.validate()?;
+
+        let spec = supported_incremental_adapter_spec(&self.incremental_adapter.adapter_id).ok_or(
+            RelationSchemaError::InvalidRelationSchema {
+                field: "incremental_adapter.adapter_id",
+            },
+        )?;
+
+        match spec {
+            SupportedIncrementalAdapterSpec::ScalarSumCount
+            | SupportedIncrementalAdapterSpec::RowKeySumCount => {
+                self.validate_supported_incremental_adapter_scope()
+            }
+            SupportedIncrementalAdapterSpec::FelderaGeneric => {
+                validate_feldera_generic_ingest_relation(&self.relation_schema)?;
+                Ok(spec)
+            }
         }
     }
 }
@@ -245,39 +284,131 @@ impl RelationColumnV1 {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum VelorixLogicalTypeV1 {
     Bool,
+    Int8,
+    Int16,
+    Int32,
     Int64,
+    UInt8,
+    UInt16,
+    UInt32,
+    UInt64,
+    Float32,
     Float64,
-    Decimal { precision: u8, scale: u8 },
+    Decimal {
+        precision: u8,
+        scale: u8,
+    },
+    Char {
+        length: Option<u32>,
+    },
     Utf8,
+    Binary {
+        length: u32,
+    },
+    Varbinary,
     Date,
-    Timestamp { timezone: Option<String> },
+    Time,
+    Timestamp {
+        timezone: Option<String>,
+    },
+    Uuid,
     Json,
+    Array {
+        element_type: Box<VelorixLogicalTypeV1>,
+    },
+    Struct {
+        fields: Vec<VelorixStructFieldV1>,
+    },
+    Map {
+        key_type: Box<VelorixLogicalTypeV1>,
+        value_type: Box<VelorixLogicalTypeV1>,
+    },
 }
 
 impl VelorixLogicalTypeV1 {
     fn validate(&self) -> Result<(), RelationSchemaError> {
+        self.validate_with_depth(0)
+    }
+
+    fn validate_with_depth(&self, depth: usize) -> Result<(), RelationSchemaError> {
+        if depth > MAX_RELATION_TYPE_NESTING_DEPTH {
+            return Err(RelationSchemaError::InvalidRelationSchema {
+                field: "logical_type.depth",
+            });
+        }
         match self {
             Self::Decimal { precision, scale } => validate_decimal(*precision, *scale),
+            Self::Char { length: Some(0) } => Err(RelationSchemaError::InvalidRelationSchema {
+                field: "char_length",
+            }),
             Self::Timestamp { timezone } => validate_timezone(timezone.as_deref()),
-            Self::Bool | Self::Int64 | Self::Float64 | Self::Utf8 | Self::Date | Self::Json => {
-                Ok(())
+            Self::Binary { length } if *length == 0 => {
+                Err(RelationSchemaError::InvalidRelationSchema {
+                    field: "binary_length",
+                })
             }
+            Self::Array { element_type } => element_type.validate_with_depth(depth + 1),
+            Self::Struct { fields } => validate_logical_struct_fields(fields, depth),
+            Self::Map {
+                key_type,
+                value_type,
+            } => {
+                key_type.validate_with_depth(depth + 1)?;
+                value_type.validate_with_depth(depth + 1)
+            }
+            Self::Bool
+            | Self::Int8
+            | Self::Int16
+            | Self::Int32
+            | Self::Int64
+            | Self::UInt8
+            | Self::UInt16
+            | Self::UInt32
+            | Self::UInt64
+            | Self::Float32
+            | Self::Float64
+            | Self::Char { .. }
+            | Self::Utf8
+            | Self::Binary { .. }
+            | Self::Varbinary
+            | Self::Date
+            | Self::Time
+            | Self::Uuid
+            | Self::Json => Ok(()),
         }
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct VelorixStructFieldV1 {
+    pub name: String,
+    pub logical_type: VelorixLogicalTypeV1,
+    pub nullable: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ArrowPhysicalTypeV1 {
     Boolean,
+    Int8,
+    Int16,
+    Int32,
     Int64,
+    UInt8,
+    UInt16,
+    UInt32,
+    UInt64,
+    Float32,
     Float64,
     Decimal128 {
         precision: u8,
         scale: u8,
     },
     Utf8,
+    Binary,
     Date32,
+    Time64Nanosecond,
     TimestampNanosecond {
         timezone: Option<String>,
     },
@@ -286,22 +417,68 @@ pub enum ArrowPhysicalTypeV1 {
         ordered: bool,
     },
     JsonUtf8,
+    List {
+        element_type: Box<ArrowPhysicalTypeV1>,
+    },
+    Struct {
+        fields: Vec<ArrowStructFieldV1>,
+    },
+    Map {
+        key_type: Box<ArrowPhysicalTypeV1>,
+        value_type: Box<ArrowPhysicalTypeV1>,
+    },
 }
 
 impl ArrowPhysicalTypeV1 {
     fn validate(&self) -> Result<(), RelationSchemaError> {
+        self.validate_with_depth(0)
+    }
+
+    fn validate_with_depth(&self, depth: usize) -> Result<(), RelationSchemaError> {
+        if depth > MAX_RELATION_TYPE_NESTING_DEPTH {
+            return Err(RelationSchemaError::InvalidRelationSchema {
+                field: "physical_arrow_type.depth",
+            });
+        }
         match self {
             Self::Decimal128 { precision, scale } => validate_decimal(*precision, *scale),
             Self::TimestampNanosecond { timezone } => validate_timezone(timezone.as_deref()),
+            Self::List { element_type } => element_type.validate_with_depth(depth + 1),
+            Self::Struct { fields } => validate_arrow_struct_fields(fields, depth),
+            Self::Map {
+                key_type,
+                value_type,
+            } => {
+                key_type.validate_with_depth(depth + 1)?;
+                value_type.validate_with_depth(depth + 1)
+            }
             Self::Boolean
+            | Self::Int8
+            | Self::Int16
+            | Self::Int32
             | Self::Int64
+            | Self::UInt8
+            | Self::UInt16
+            | Self::UInt32
+            | Self::UInt64
+            | Self::Float32
             | Self::Float64
             | Self::Utf8
+            | Self::Binary
             | Self::Date32
+            | Self::Time64Nanosecond
             | Self::DictionaryUtf8 { .. }
             | Self::JsonUtf8 => Ok(()),
         }
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArrowStructFieldV1 {
+    pub name: String,
+    pub physical_arrow_type: ArrowPhysicalTypeV1,
+    pub nullable: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -556,6 +733,13 @@ pub fn arrow_record_batches_to_single_key_sum_count_delta_batch(
         SupportedIncrementalAdapterSpec::RowKeySumCount => {
             primary_key_columns(&catalog.relation_schema)?
         }
+        SupportedIncrementalAdapterSpec::FelderaGeneric => {
+            return Err(
+                IncrementalInputAdapterError::UnsupportedIncrementalAdapter {
+                    adapter_id: catalog.incremental_adapter.adapter_id.clone(),
+                },
+            );
+        }
     };
     let value_column = single_value_column(&catalog.relation_schema)?;
     let weight_column = relation_column(
@@ -656,7 +840,15 @@ fn data_type_for_arrow_physical_type(
 ) -> Result<DataType, RelationSchemaError> {
     Ok(match physical_type {
         ArrowPhysicalTypeV1::Boolean => DataType::Boolean,
+        ArrowPhysicalTypeV1::Int8 => DataType::Int8,
+        ArrowPhysicalTypeV1::Int16 => DataType::Int16,
+        ArrowPhysicalTypeV1::Int32 => DataType::Int32,
         ArrowPhysicalTypeV1::Int64 => DataType::Int64,
+        ArrowPhysicalTypeV1::UInt8 => DataType::UInt8,
+        ArrowPhysicalTypeV1::UInt16 => DataType::UInt16,
+        ArrowPhysicalTypeV1::UInt32 => DataType::UInt32,
+        ArrowPhysicalTypeV1::UInt64 => DataType::UInt64,
+        ArrowPhysicalTypeV1::Float32 => DataType::Float32,
         ArrowPhysicalTypeV1::Float64 => DataType::Float64,
         ArrowPhysicalTypeV1::Decimal128 { precision, scale } => {
             let scale =
@@ -666,13 +858,54 @@ fn data_type_for_arrow_physical_type(
             DataType::Decimal128(*precision, scale)
         }
         ArrowPhysicalTypeV1::Utf8 | ArrowPhysicalTypeV1::JsonUtf8 => DataType::Utf8,
+        ArrowPhysicalTypeV1::Binary => DataType::Binary,
         ArrowPhysicalTypeV1::Date32 => DataType::Date32,
+        ArrowPhysicalTypeV1::Time64Nanosecond => DataType::Time64(TimeUnit::Nanosecond),
         ArrowPhysicalTypeV1::TimestampNanosecond { timezone } => {
             DataType::Timestamp(TimeUnit::Nanosecond, timezone.clone().map(Into::into))
         }
         ArrowPhysicalTypeV1::DictionaryUtf8 { key_type, .. } => DataType::Dictionary(
             Box::new(dictionary_key_data_type(key_type)),
             Box::new(DataType::Utf8),
+        ),
+        ArrowPhysicalTypeV1::List { element_type } => DataType::List(Arc::new(Field::new(
+            "item",
+            data_type_for_arrow_physical_type(element_type)?,
+            true,
+        ))),
+        ArrowPhysicalTypeV1::Struct { fields } => DataType::Struct(
+            fields
+                .iter()
+                .map(|field| {
+                    Ok(Field::new(
+                        field.name.as_str(),
+                        data_type_for_arrow_physical_type(&field.physical_arrow_type)?,
+                        field.nullable,
+                    ))
+                })
+                .collect::<Result<Vec<_>, RelationSchemaError>>()?
+                .into(),
+        ),
+        ArrowPhysicalTypeV1::Map {
+            key_type,
+            value_type,
+        } => DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Field::new("keys", data_type_for_arrow_physical_type(key_type)?, false),
+                        Field::new(
+                            "values",
+                            data_type_for_arrow_physical_type(value_type)?,
+                            true,
+                        ),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
         ),
     })
 }
@@ -797,6 +1030,58 @@ fn validate_single_value_column_for_adapter(
     Ok(())
 }
 
+fn validate_feldera_generic_ingest_relation(
+    schema: &VelorixRelationSchemaV1,
+) -> Result<(), RelationSchemaError> {
+    let weight_column = schema
+        .columns
+        .iter()
+        .find(|column| column.column_id == schema.weight_column_id)
+        .ok_or(RelationSchemaError::InvalidRelationSchema {
+            field: "weight_column_id",
+        })?;
+    if weight_column.semantic_role != RelationSemanticRoleV1::Weight {
+        return Err(RelationSchemaError::InvalidRelationSchema {
+            field: "feldera_generic.weight_column.semantic_role",
+        });
+    }
+    if !matches!(weight_column.logical_type, VelorixLogicalTypeV1::Int64)
+        || !matches!(
+            weight_column.physical_arrow_type,
+            ArrowPhysicalTypeV1::Int64
+        )
+    {
+        return Err(RelationSchemaError::InvalidRelationSchema {
+            field: "feldera_generic.weight_column.type",
+        });
+    }
+    if weight_column.nullable {
+        return Err(RelationSchemaError::InvalidRelationSchema {
+            field: "feldera_generic.weight_column.nullable",
+        });
+    }
+    if schema
+        .primary_key_column_ids
+        .iter()
+        .any(|column_id| column_id == &schema.weight_column_id)
+    {
+        return Err(RelationSchemaError::InvalidRelationSchema {
+            field: "feldera_generic.weight_column.primary_key",
+        });
+    }
+    if !schema
+        .allowed_operations
+        .iter()
+        .any(|operation| operation == &RelationOperationV1::Insert)
+    {
+        return Err(RelationSchemaError::InvalidRelationSchema {
+            field: "feldera_generic.allowed_operations.insert",
+        });
+    }
+
+    Ok(())
+}
+
 fn delta_key_from_columns(
     columns: &[(&RelationColumnV1, IncrementalKeyColumn<'_>)],
     row: usize,
@@ -835,10 +1120,20 @@ enum IncrementalKeyColumn<'a> {
     Boolean(&'a BooleanArray),
     Utf8(&'a StringArray),
     JsonUtf8(&'a StringArray),
+    Int8(&'a Int8Array),
+    Int16(&'a Int16Array),
+    Int32(&'a Int32Array),
     Int64(&'a Int64Array),
+    UInt8(&'a UInt8Array),
+    UInt16(&'a UInt16Array),
+    UInt32(&'a UInt32Array),
+    UInt64(&'a UInt64Array),
+    Float32(&'a Float32Array),
     Float64(&'a Float64Array),
+    Binary(&'a BinaryArray),
     Decimal128(&'a Decimal128Array, u8, u8),
     Date32(&'a Date32Array),
+    Time64Nanosecond(&'a Time64NanosecondArray),
     TimestampNanosecond(&'a TimestampNanosecondArray),
     DictionaryUtf8Int8(&'a DictionaryArray<Int8Type>, &'a StringArray),
     DictionaryUtf8Int16(&'a DictionaryArray<Int16Type>, &'a StringArray),
@@ -858,10 +1153,20 @@ impl IncrementalKeyColumn<'_> {
             Self::Boolean(column) => column.is_null(row),
             Self::Utf8(column) => column.is_null(row),
             Self::JsonUtf8(column) => column.is_null(row),
+            Self::Int8(column) => column.is_null(row),
+            Self::Int16(column) => column.is_null(row),
+            Self::Int32(column) => column.is_null(row),
             Self::Int64(column) => column.is_null(row),
+            Self::UInt8(column) => column.is_null(row),
+            Self::UInt16(column) => column.is_null(row),
+            Self::UInt32(column) => column.is_null(row),
+            Self::UInt64(column) => column.is_null(row),
+            Self::Float32(column) => column.is_null(row),
             Self::Float64(column) => column.is_null(row),
+            Self::Binary(column) => column.is_null(row),
             Self::Decimal128(column, _, _) => column.is_null(row),
             Self::Date32(column) => column.is_null(row),
+            Self::Time64Nanosecond(column) => column.is_null(row),
             Self::TimestampNanosecond(column) => column.is_null(row),
             Self::DictionaryUtf8Int8(column, values) => {
                 dictionary_utf8_is_null(column, values, row)
@@ -891,7 +1196,24 @@ impl IncrementalKeyColumn<'_> {
                     reason: format!("JsonUtf8 key column contains invalid JSON: {error}"),
                 }
             }),
+            Self::Int8(column) => Ok(json!(column.value(row))),
+            Self::Int16(column) => Ok(json!(column.value(row))),
+            Self::Int32(column) => Ok(json!(column.value(row))),
             Self::Int64(column) => Ok(json!(column.value(row))),
+            Self::UInt8(column) => Ok(json!(column.value(row))),
+            Self::UInt16(column) => Ok(json!(column.value(row))),
+            Self::UInt32(column) => Ok(json!(column.value(row))),
+            Self::UInt64(column) => Ok(json!(column.value(row))),
+            Self::Float32(column) => {
+                let value = column.value(row);
+                if !value.is_finite() {
+                    return Err(IncrementalInputAdapterError::MalformedArrowInput {
+                        reason: "Float32 key column must contain only finite values".to_string(),
+                    });
+                }
+
+                Ok(json!(value))
+            }
             Self::Float64(column) => {
                 let value = column.value(row);
                 if !value.is_finite() {
@@ -907,7 +1229,9 @@ impl IncrementalKeyColumn<'_> {
                 *precision,
                 *scale
             )?)),
+            Self::Binary(column) => Ok(json!(format_hex_binary(column.value(row)))),
             Self::Date32(column) => Ok(json!(column.value(row))),
+            Self::Time64Nanosecond(column) => Ok(json!(column.value(row))),
             Self::TimestampNanosecond(column) => Ok(json!(column.value(row))),
             Self::DictionaryUtf8Int8(column, values) => {
                 Ok(json!(dictionary_utf8_value(column, values, row)))
@@ -968,6 +1292,15 @@ fn incremental_key_column<'a>(
         ArrowPhysicalTypeV1::Boolean => {
             boolean_column(batch, column.name.as_str()).map(IncrementalKeyColumn::Boolean)
         }
+        ArrowPhysicalTypeV1::Int8 => {
+            int8_column(batch, column.name.as_str()).map(IncrementalKeyColumn::Int8)
+        }
+        ArrowPhysicalTypeV1::Int16 => {
+            int16_column(batch, column.name.as_str()).map(IncrementalKeyColumn::Int16)
+        }
+        ArrowPhysicalTypeV1::Int32 => {
+            int32_column(batch, column.name.as_str()).map(IncrementalKeyColumn::Int32)
+        }
         ArrowPhysicalTypeV1::Utf8 => {
             string_column(batch, column.name.as_str()).map(IncrementalKeyColumn::Utf8)
         }
@@ -977,8 +1310,26 @@ fn incremental_key_column<'a>(
         ArrowPhysicalTypeV1::Int64 => {
             int64_column(batch, column.name.as_str()).map(IncrementalKeyColumn::Int64)
         }
+        ArrowPhysicalTypeV1::UInt8 => {
+            uint8_column(batch, column.name.as_str()).map(IncrementalKeyColumn::UInt8)
+        }
+        ArrowPhysicalTypeV1::UInt16 => {
+            uint16_column(batch, column.name.as_str()).map(IncrementalKeyColumn::UInt16)
+        }
+        ArrowPhysicalTypeV1::UInt32 => {
+            uint32_column(batch, column.name.as_str()).map(IncrementalKeyColumn::UInt32)
+        }
+        ArrowPhysicalTypeV1::UInt64 => {
+            uint64_column(batch, column.name.as_str()).map(IncrementalKeyColumn::UInt64)
+        }
+        ArrowPhysicalTypeV1::Float32 => {
+            float32_column(batch, column.name.as_str()).map(IncrementalKeyColumn::Float32)
+        }
         ArrowPhysicalTypeV1::Float64 => {
             float64_column(batch, column.name.as_str()).map(IncrementalKeyColumn::Float64)
+        }
+        ArrowPhysicalTypeV1::Binary => {
+            binary_column(batch, column.name.as_str()).map(IncrementalKeyColumn::Binary)
         }
         ArrowPhysicalTypeV1::Decimal128 { precision, scale } => {
             decimal128_column(batch, column.name.as_str())
@@ -987,12 +1338,26 @@ fn incremental_key_column<'a>(
         ArrowPhysicalTypeV1::Date32 => {
             date32_column(batch, column.name.as_str()).map(IncrementalKeyColumn::Date32)
         }
+        ArrowPhysicalTypeV1::Time64Nanosecond => {
+            time64_nanosecond_column(batch, column.name.as_str())
+                .map(IncrementalKeyColumn::Time64Nanosecond)
+        }
         ArrowPhysicalTypeV1::TimestampNanosecond { .. } => {
             timestamp_nanosecond_column(batch, column.name.as_str())
                 .map(IncrementalKeyColumn::TimestampNanosecond)
         }
         ArrowPhysicalTypeV1::DictionaryUtf8 { key_type, .. } => {
             dictionary_utf8_column(batch, column.name.as_str(), key_type)
+        }
+        ArrowPhysicalTypeV1::List { .. }
+        | ArrowPhysicalTypeV1::Struct { .. }
+        | ArrowPhysicalTypeV1::Map { .. } => {
+            Err(IncrementalInputAdapterError::MalformedArrowInput {
+                reason: format!(
+                "`{}` column uses a nested Arrow type that is not supported as an incremental key",
+                column.name
+            ),
+            })
         }
     }
 }
@@ -1036,6 +1401,41 @@ fn boolean_column<'a>(
             reason: format!("`{name}` column must be Boolean"),
         })
 }
+
+macro_rules! primitive_column_reader {
+    ($fn_name:ident, $array_type:ty, $type_name:literal) => {
+        fn $fn_name<'a>(
+            batch: &'a RecordBatch,
+            name: &str,
+        ) -> Result<&'a $array_type, IncrementalInputAdapterError> {
+            batch
+                .column_by_name(name)
+                .ok_or_else(|| IncrementalInputAdapterError::MalformedArrowInput {
+                    reason: format!("missing `{name}` column"),
+                })?
+                .as_any()
+                .downcast_ref::<$array_type>()
+                .ok_or_else(|| IncrementalInputAdapterError::MalformedArrowInput {
+                    reason: format!("`{name}` column must be {}", $type_name),
+                })
+        }
+    };
+}
+
+primitive_column_reader!(int8_column, Int8Array, "Int8");
+primitive_column_reader!(int16_column, Int16Array, "Int16");
+primitive_column_reader!(int32_column, Int32Array, "Int32");
+primitive_column_reader!(uint8_column, UInt8Array, "UInt8");
+primitive_column_reader!(uint16_column, UInt16Array, "UInt16");
+primitive_column_reader!(uint32_column, UInt32Array, "UInt32");
+primitive_column_reader!(uint64_column, UInt64Array, "UInt64");
+primitive_column_reader!(float32_column, Float32Array, "Float32");
+primitive_column_reader!(binary_column, BinaryArray, "Binary");
+primitive_column_reader!(
+    time64_nanosecond_column,
+    Time64NanosecondArray,
+    "Time64(Nanosecond)"
+);
 
 fn dictionary_utf8_column<'a>(
     batch: &'a RecordBatch,
@@ -1185,6 +1585,15 @@ fn decimal128_digit_count(value: u128) -> u8 {
     }
 }
 
+fn format_hex_binary(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(2 + bytes.len() * 2);
+    output.push_str("0x");
+    for byte in bytes {
+        output.push_str(&format!("{byte:02x}"));
+    }
+    output
+}
+
 fn date32_column<'a>(
     batch: &'a RecordBatch,
     name: &str,
@@ -1227,7 +1636,15 @@ fn validate_logical_physical_type_pair(
 ) -> Result<(), RelationSchemaError> {
     let matches = match (logical_type, physical_type) {
         (VelorixLogicalTypeV1::Bool, ArrowPhysicalTypeV1::Boolean) => true,
+        (VelorixLogicalTypeV1::Int8, ArrowPhysicalTypeV1::Int8) => true,
+        (VelorixLogicalTypeV1::Int16, ArrowPhysicalTypeV1::Int16) => true,
+        (VelorixLogicalTypeV1::Int32, ArrowPhysicalTypeV1::Int32) => true,
         (VelorixLogicalTypeV1::Int64, ArrowPhysicalTypeV1::Int64) => true,
+        (VelorixLogicalTypeV1::UInt8, ArrowPhysicalTypeV1::UInt8) => true,
+        (VelorixLogicalTypeV1::UInt16, ArrowPhysicalTypeV1::UInt16) => true,
+        (VelorixLogicalTypeV1::UInt32, ArrowPhysicalTypeV1::UInt32) => true,
+        (VelorixLogicalTypeV1::UInt64, ArrowPhysicalTypeV1::UInt64) => true,
+        (VelorixLogicalTypeV1::Float32, ArrowPhysicalTypeV1::Float32) => true,
         (VelorixLogicalTypeV1::Float64, ArrowPhysicalTypeV1::Float64) => true,
         (
             VelorixLogicalTypeV1::Decimal {
@@ -1241,7 +1658,13 @@ fn validate_logical_physical_type_pair(
         ) => logical_precision == physical_precision && logical_scale == physical_scale,
         (VelorixLogicalTypeV1::Utf8, ArrowPhysicalTypeV1::Utf8) => true,
         (VelorixLogicalTypeV1::Utf8, ArrowPhysicalTypeV1::DictionaryUtf8 { .. }) => true,
+        (VelorixLogicalTypeV1::Char { .. }, ArrowPhysicalTypeV1::Utf8) => true,
+        (VelorixLogicalTypeV1::Char { .. }, ArrowPhysicalTypeV1::DictionaryUtf8 { .. }) => true,
+        (VelorixLogicalTypeV1::Uuid, ArrowPhysicalTypeV1::Utf8) => true,
+        (VelorixLogicalTypeV1::Binary { .. }, ArrowPhysicalTypeV1::Binary) => true,
+        (VelorixLogicalTypeV1::Varbinary, ArrowPhysicalTypeV1::Binary) => true,
         (VelorixLogicalTypeV1::Date, ArrowPhysicalTypeV1::Date32) => true,
+        (VelorixLogicalTypeV1::Time, ArrowPhysicalTypeV1::Time64Nanosecond) => true,
         (
             VelorixLogicalTypeV1::Timestamp {
                 timezone: logical_timezone,
@@ -1251,6 +1674,35 @@ fn validate_logical_physical_type_pair(
             },
         ) => logical_timezone == physical_timezone,
         (VelorixLogicalTypeV1::Json, ArrowPhysicalTypeV1::JsonUtf8) => true,
+        (
+            VelorixLogicalTypeV1::Array {
+                element_type: logical_element,
+            },
+            ArrowPhysicalTypeV1::List {
+                element_type: physical_element,
+            },
+        ) => validate_logical_physical_type_pair(logical_element, physical_element).is_ok(),
+        (
+            VelorixLogicalTypeV1::Struct {
+                fields: logical_fields,
+            },
+            ArrowPhysicalTypeV1::Struct {
+                fields: physical_fields,
+            },
+        ) => logical_struct_fields_match_physical(logical_fields, physical_fields),
+        (
+            VelorixLogicalTypeV1::Map {
+                key_type: logical_key,
+                value_type: logical_value,
+            },
+            ArrowPhysicalTypeV1::Map {
+                key_type: physical_key,
+                value_type: physical_value,
+            },
+        ) => {
+            validate_logical_physical_type_pair(logical_key, physical_key).is_ok()
+                && validate_logical_physical_type_pair(logical_value, physical_value).is_ok()
+        }
         _ => false,
     };
 
@@ -1261,6 +1713,69 @@ fn validate_logical_physical_type_pair(
             field: "logical_physical_type",
         })
     }
+}
+
+fn validate_logical_struct_fields(
+    fields: &[VelorixStructFieldV1],
+    depth: usize,
+) -> Result<(), RelationSchemaError> {
+    if fields.is_empty() || fields.len() > MAX_RELATION_STRUCT_FIELDS {
+        return Err(RelationSchemaError::InvalidRelationSchema {
+            field: "logical_type.struct.fields",
+        });
+    }
+    let mut names = BTreeSet::new();
+    for field in fields {
+        require_non_empty("logical_type.struct.field.name", &field.name)?;
+        if !names.insert(field.name.as_str()) {
+            return Err(RelationSchemaError::InvalidRelationSchema {
+                field: "logical_type.struct.field.name",
+            });
+        }
+        field.logical_type.validate_with_depth(depth + 1)?;
+    }
+    Ok(())
+}
+
+fn validate_arrow_struct_fields(
+    fields: &[ArrowStructFieldV1],
+    depth: usize,
+) -> Result<(), RelationSchemaError> {
+    if fields.is_empty() || fields.len() > MAX_RELATION_STRUCT_FIELDS {
+        return Err(RelationSchemaError::InvalidRelationSchema {
+            field: "physical_arrow_type.struct.fields",
+        });
+    }
+    let mut names = BTreeSet::new();
+    for field in fields {
+        require_non_empty("physical_arrow_type.struct.field.name", &field.name)?;
+        if !names.insert(field.name.as_str()) {
+            return Err(RelationSchemaError::InvalidRelationSchema {
+                field: "physical_arrow_type.struct.field.name",
+            });
+        }
+        field.physical_arrow_type.validate_with_depth(depth + 1)?;
+    }
+    Ok(())
+}
+
+fn logical_struct_fields_match_physical(
+    logical_fields: &[VelorixStructFieldV1],
+    physical_fields: &[ArrowStructFieldV1],
+) -> bool {
+    logical_fields.len() == physical_fields.len()
+        && logical_fields
+            .iter()
+            .zip(physical_fields)
+            .all(|(logical, physical)| {
+                logical.name == physical.name
+                    && logical.nullable == physical.nullable
+                    && validate_logical_physical_type_pair(
+                        &logical.logical_type,
+                        &physical.physical_arrow_type,
+                    )
+                    .is_ok()
+            })
 }
 
 fn require_non_empty(field: &'static str, value: &str) -> Result<(), RelationSchemaError> {

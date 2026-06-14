@@ -161,6 +161,10 @@ struct IngestAdmissionReconstruction {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplayCheckpoint {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relation_version: Option<String>,
     pub stream_id: String,
     pub partition_id: u32,
     pub end_offset_exclusive: u64,
@@ -2844,6 +2848,24 @@ impl IngestBatch {
 impl ReplayCheckpoint {
     pub fn new(stream_id: impl Into<String>, partition_id: u32, end_offset_exclusive: u64) -> Self {
         Self {
+            relation_id: None,
+            relation_version: None,
+            stream_id: stream_id.into(),
+            partition_id,
+            end_offset_exclusive,
+        }
+    }
+
+    pub fn for_relation(
+        relation_id: impl Into<String>,
+        relation_version: impl Into<String>,
+        stream_id: impl Into<String>,
+        partition_id: u32,
+        end_offset_exclusive: u64,
+    ) -> Self {
+        Self {
+            relation_id: Some(relation_id.into()),
+            relation_version: Some(relation_version.into()),
             stream_id: stream_id.into(),
             partition_id,
             end_offset_exclusive,
@@ -2895,19 +2917,28 @@ fn validate_non_overlapping_ranges(
 fn validate_checkpoints(
     checkpoints: &[ReplayCheckpoint],
 ) -> Result<HashMap<(String, u32), u64>, IngestLogError> {
-    let mut checkpoint_offsets = HashMap::new();
+    let mut checkpoint_offsets: HashMap<(String, u32), u64> = HashMap::new();
+    let mut seen_checkpoints = HashSet::new();
 
     for checkpoint in checkpoints {
-        let key = (checkpoint.stream_id.clone(), checkpoint.partition_id);
-        if checkpoint_offsets
-            .insert(key.clone(), checkpoint.end_offset_exclusive)
-            .is_some()
-        {
+        let replay_key = (
+            checkpoint.stream_id.clone(),
+            checkpoint.partition_id,
+            checkpoint.relation_id.clone(),
+            checkpoint.relation_version.clone(),
+        );
+        if !seen_checkpoints.insert(replay_key) {
             return Err(IngestLogError::DuplicateReplayCheckpoint {
-                stream_id: key.0,
-                partition_id: key.1,
+                stream_id: checkpoint.stream_id.clone(),
+                partition_id: checkpoint.partition_id,
             });
         }
+        checkpoint_offsets
+            .entry((checkpoint.stream_id.clone(), checkpoint.partition_id))
+            .and_modify(|checkpoint_end| {
+                *checkpoint_end = (*checkpoint_end).min(checkpoint.end_offset_exclusive);
+            })
+            .or_insert(checkpoint.end_offset_exclusive);
     }
 
     Ok(checkpoint_offsets)

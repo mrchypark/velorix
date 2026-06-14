@@ -60,6 +60,34 @@ impl FelderaProgramDescriptor {
         actual: &[FelderaRelation],
         require_materialized: bool,
     ) -> Result<Vec<String>, FelderaProgramDescriptorError> {
+        let expected_names = expected
+            .iter()
+            .map(|relation| relation.relation_name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut actual_names = std::collections::BTreeSet::new();
+        for actual_relation in actual {
+            let actual_name = actual_relation.name.name();
+            if !actual_names.insert(actual_name.clone()) {
+                return Err(FelderaProgramDescriptorError::DuplicateRelation {
+                    kind,
+                    relation: actual_name,
+                });
+            }
+            if !actual_relation.properties.is_empty() {
+                return Err(FelderaProgramDescriptorError::RelationHasProperties {
+                    kind,
+                    relation: actual_name,
+                    properties: actual_relation.properties.keys().cloned().collect(),
+                });
+            }
+            if !expected_names.contains(actual_name.as_str()) {
+                return Err(FelderaProgramDescriptorError::UnexpectedRelation {
+                    kind,
+                    relation: actual_name,
+                });
+            }
+        }
+
         expected
             .iter()
             .map(|expected_relation| {
@@ -147,6 +175,24 @@ pub enum FelderaProgramDescriptorError {
     MissingRelation {
         kind: &'static str,
         relation: String,
+    },
+    #[error("Feldera descriptor contains unexpected {kind} relation `{relation}`")]
+    UnexpectedRelation {
+        kind: &'static str,
+        relation: String,
+    },
+    #[error("Feldera descriptor contains duplicate {kind} relation `{relation}`")]
+    DuplicateRelation {
+        kind: &'static str,
+        relation: String,
+    },
+    #[error(
+        "Feldera descriptor {kind} relation `{relation}` contains unmanaged properties: {properties:?}"
+    )]
+    RelationHasProperties {
+        kind: &'static str,
+        relation: String,
+        properties: Vec<String>,
     },
     #[error("Feldera output relation `{relation}` is not materialized")]
     OutputNotMaterialized { relation: String },
@@ -330,6 +376,7 @@ fn velorix_type_signature(data_type: &SqlDataType) -> String {
         SqlDataType::Null => "Null".to_string(),
         SqlDataType::Uuid => "Uuid".to_string(),
         SqlDataType::Json => "Variant".to_string(),
+        SqlDataType::Geometry => "Geometry".to_string(),
     }
 }
 
@@ -422,6 +469,15 @@ fn feldera_column_type(
         },
         SqlDataType::Uuid => ColumnType::uuid(nullable),
         SqlDataType::Json => ColumnType::variant(nullable),
+        SqlDataType::Geometry => {
+            return Err(
+                FelderaProgramDescriptorError::UnsupportedVelorixColumnType {
+                    relation: relation.to_string(),
+                    column: column.to_string(),
+                    data_type: "Geometry".to_string(),
+                },
+            )
+        }
     })
 }
 

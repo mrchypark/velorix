@@ -22,6 +22,7 @@ use velorix_storage::{
         MaterializedViewLifecycleStatus, MaterializedViewRegistry, MaterializedViewRegistryError,
         MaterializedViewRequestFieldSpec, MaterializedViewResponseColumnSpec,
         MaterializedViewResponseSchema, RegisterMaterializedViewOutcome,
+        UpdateMaterializedViewLifecycleOutcome,
     },
 };
 
@@ -354,6 +355,90 @@ async fn materialized_view_registry_activates_pending_view_with_artifact() {
         active.lifecycle,
         MaterializedViewLifecycleStatus::standing_runtime()
     );
+}
+
+#[tokio::test]
+async fn materialized_view_registry_activates_pending_view_with_resolved_spec_artifact() {
+    let (_temp_dir, store) = temp_store();
+    let registry = MaterializedViewRegistry::new(store);
+    let pending_spec = load_spec("standing_view_spec_valid");
+    let pending_spec_hash = feldera_spec_hash(&pending_spec).unwrap();
+    let mut resolved_spec = pending_spec.clone();
+    resolved_spec.output_relations[0].columns[1].name = "resolved_total_score".to_string();
+    let resolved_spec_hash = feldera_spec_hash(&resolved_spec).unwrap();
+    assert_ne!(pending_spec_hash, resolved_spec_hash);
+    let pending_lifecycle = MaterializedViewLifecycleStatus::feldera_compile_pending(Some(
+        "compile worker not configured".to_string(),
+    ));
+    let artifact = artifact_binding(&resolved_spec);
+
+    registry
+        .register_with_api_metadata_artifact_execution(
+            &pending_spec,
+            None,
+            None,
+            Some(MaterializedViewExecutionMode::FelderaCompilePending),
+            Some(pending_lifecycle),
+        )
+        .await
+        .unwrap();
+    let outcome = registry
+        .activate_pending_with_resolved_spec_artifact(
+            &pending_spec.view_id,
+            &pending_spec_hash,
+            &resolved_spec,
+            artifact.clone(),
+            MaterializedViewLifecycleStatus::standing_runtime(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, ActivateMaterializedViewOutcome::Activated);
+    let active = registry.read_active(&pending_spec.view_id).await.unwrap();
+    assert_eq!(active.spec_hash, resolved_spec_hash);
+    assert_eq!(active.spec, resolved_spec);
+    assert_eq!(active.artifact, Some(artifact));
+    registry
+        .read(&pending_spec.view_id, &pending_spec_hash)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn materialized_view_registry_marks_pending_compile_validated_with_resolved_spec_without_artifact(
+) {
+    let (_temp_dir, store) = temp_store();
+    let registry = MaterializedViewRegistry::new(store);
+    let pending_spec = load_spec("standing_view_spec_valid");
+    let pending_spec_hash = feldera_spec_hash(&pending_spec).unwrap();
+    let mut resolved_spec = load_spec("standing_view_spec_valid");
+    resolved_spec.output_relations[0].relation_version = "2026-05-05.resolved".to_string();
+    let resolved_spec_hash = feldera_spec_hash(&resolved_spec).unwrap();
+    let lifecycle = MaterializedViewLifecycleStatus::feldera_compile_validated(Some(
+        "compiler resolved schemas".to_string(),
+    ));
+
+    registry.register(&pending_spec).await.unwrap();
+    let outcome = registry
+        .mark_pending_compile_validated_with_resolved_spec(
+            &pending_spec.view_id,
+            &pending_spec_hash,
+            &resolved_spec,
+            lifecycle.clone(),
+        )
+        .await
+        .unwrap();
+    let active = registry.read_active(&pending_spec.view_id).await.unwrap();
+
+    assert_eq!(outcome, UpdateMaterializedViewLifecycleOutcome::Updated);
+    assert_eq!(active.spec_hash, resolved_spec_hash);
+    assert_eq!(active.spec, resolved_spec);
+    assert_eq!(
+        active.execution_mode,
+        MaterializedViewExecutionMode::FelderaCompilePending
+    );
+    assert_eq!(active.artifact, None);
+    assert_eq!(active.lifecycle, lifecycle);
 }
 
 #[tokio::test]
