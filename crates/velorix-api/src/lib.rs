@@ -56,10 +56,10 @@ use velorix_core::{
     },
     standing_program::{
         EpochIdempotencyKey, InputEventTimeWatermark, MaterializedViewPage,
-        MaterializedViewSqlPage, NativeCodePolicy, RelationInputBatch, RuntimeCheckpoint,
-        RuntimeCheckpointStatePayload, RuntimePackageIdentity, ScopedViewId, SnapshotPageRequest,
-        StandingProgramIdentity, StandingProgramRuntime, StandingProgramRuntimeError,
-        ViewOutputDelta,
+        MaterializedViewSqlPage, NativeCodePolicy, RelationFrontier, RelationInputBatch,
+        RuntimeCheckpoint, RuntimeCheckpointStatePayload, RuntimePackageIdentity, ScopedViewId,
+        SnapshotPageRequest, StandingProgramIdentity, StandingProgramRuntime,
+        StandingProgramRuntimeError, ViewOutputDelta,
     },
     view_contract::{
         catalog_input_relation_schema, stable_bytes_hash, validate_materialized_standing_view_spec,
@@ -173,6 +173,7 @@ const API_PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
 #[derive(Clone, Default)]
 struct StandingRuntimeReplayPlan {
     replay_checkpoints: Vec<ReplayCheckpoint>,
+    input_frontiers: Vec<RelationFrontier>,
 }
 
 #[derive(Default)]
@@ -3858,12 +3859,7 @@ async fn apply_standing_runtime_ingest_epoch(
             .iter()
             .filter(|prepared| view_uses_prepared_ingest_batch(&active, prepared))
             .collect::<Vec<_>>();
-        let input_batches = matching_prepared_batches
-            .iter()
-            .copied()
-            .map(relation_input_batch_from_prepared_ingest)
-            .collect::<Vec<_>>();
-        if input_batches.is_empty() {
+        if matching_prepared_batches.is_empty() {
             continue;
         }
         if read_ingest_epoch_view_convergence(state, epoch_manifest, identity, &active.spec.view_id)
@@ -3885,40 +3881,42 @@ async fn apply_standing_runtime_ingest_epoch(
                 &failure,
             ));
         }
-        let replay_checkpoints = matching_prepared_batches
+        let epoch_replay_checkpoints = matching_prepared_batches
             .iter()
             .copied()
-            .map(|prepared| {
-                ReplayCheckpoint::for_relation(
-                    prepared.request.relation_id.clone(),
-                    prepared.request.relation_version.clone(),
-                    prepared.request.stream_id.clone(),
-                    prepared.request.partition_id,
-                    prepared.end_offset_exclusive,
-                )
-            })
+            .map(replay_checkpoint_from_prepared_ingest)
             .collect::<Vec<_>>();
         let operation_lock =
             state.standing_runtime_operation_lock(identity, &active.spec.view_id)?;
         let _operation_guard = operation_lock.lock().await;
+        let mut uncovered_prepared_batches = matching_prepared_batches.clone();
         if let Some(latest_checkpoint) =
             read_latest_standing_runtime_checkpoint(state, identity, &active.spec.view_id).await?
         {
             let replay_plan = standing_runtime_replay_plan_from_record_ref(&latest_checkpoint);
-            if prepared_batches_are_covered_by_replay_checkpoints(
-                &replay_plan.replay_checkpoints,
-                &matching_prepared_batches,
-            ) {
+            if prepared_batches_are_covered_by_replay_plan(&replay_plan, &matching_prepared_batches)
+            {
                 persist_ingest_epoch_view_convergence(
                     state,
                     epoch_manifest,
                     &active.spec.view_id,
                     &latest_checkpoint.checkpoint,
-                    replay_checkpoints,
+                    epoch_replay_checkpoints,
                 )
                 .await?;
                 continue;
             }
+            uncovered_prepared_batches.retain(|prepared| {
+                !prepared_batch_is_covered_by_replay_plan(&replay_plan, prepared)
+            });
+        }
+        let input_batches = uncovered_prepared_batches
+            .iter()
+            .copied()
+            .map(relation_input_batch_from_prepared_ingest)
+            .collect::<Vec<_>>();
+        if input_batches.is_empty() {
+            continue;
         }
         let runtime = state
             .standing_runtime(identity, &active.spec.view_id)?
@@ -3933,7 +3931,7 @@ async fn apply_standing_runtime_ingest_epoch(
             .await?;
         let idempotency_key = epoch_ingest_idempotency_key(
             &active.spec.view_id,
-            matching_prepared_batches.iter().copied(),
+            uncovered_prepared_batches.iter().copied(),
         )
         .map_err(ApiError::bad_request)?;
         let apply_result = apply_standing_runtime_changes_and_checkpoint_many(
@@ -3952,7 +3950,7 @@ async fn apply_standing_runtime_ingest_epoch(
                     identity,
                     &active.spec.view_id,
                     error.message.clone(),
-                    replay_checkpoints.clone(),
+                    epoch_replay_checkpoints.clone(),
                 )
                 .await?;
                 remove_standing_runtime(state, identity, &active.spec.view_id)?;
@@ -3964,7 +3962,7 @@ async fn apply_standing_runtime_ingest_epoch(
             &active.spec.view_id,
             &apply_result.checkpoint,
             &apply_result.output_deltas,
-            replay_checkpoints.clone(),
+            epoch_replay_checkpoints.clone(),
             owner,
         )
         .await
@@ -3977,7 +3975,7 @@ async fn apply_standing_runtime_ingest_epoch(
             epoch_manifest,
             &active.spec.view_id,
             &apply_result.checkpoint,
-            replay_checkpoints,
+            epoch_replay_checkpoints,
         )
         .await?;
     }
@@ -4013,6 +4011,16 @@ fn relation_input_batch_from_prepared_ingest(prepared: &PreparedIngestBatch) -> 
         event_time_watermark: prepared.event_time_watermark.clone(),
         batches: vec![prepared.record_batch.clone()],
     }
+}
+
+fn replay_checkpoint_from_prepared_ingest(prepared: &PreparedIngestBatch) -> ReplayCheckpoint {
+    ReplayCheckpoint::for_relation(
+        prepared.request.relation_id.clone(),
+        prepared.request.relation_version.clone(),
+        prepared.request.stream_id.clone(),
+        prepared.request.partition_id,
+        prepared.end_offset_exclusive,
+    )
 }
 
 fn epoch_ingest_idempotency_key<'a>(
@@ -4706,6 +4714,7 @@ fn standing_runtime_replay_plan_from_record_ref(
 ) -> StandingRuntimeReplayPlan {
     StandingRuntimeReplayPlan {
         replay_checkpoints: record.replay_checkpoints.clone(),
+        input_frontiers: record.checkpoint.input_frontiers.clone(),
     }
 }
 
@@ -5551,37 +5560,48 @@ fn merged_standing_runtime_replay_checkpoints(
     replay_checkpoints
 }
 
-fn replay_checkpoints_cover_replayed_batch(
-    replay_checkpoints: &[ReplayCheckpoint],
+fn replay_plan_covers_replayed_batch(
+    replay_plan: &StandingRuntimeReplayPlan,
     relation_id: &str,
     relation_version: &str,
     stream_id: &str,
     partition_id: u32,
     batch_end_offset_exclusive: u64,
 ) -> bool {
-    replay_checkpoints.iter().any(|checkpoint| {
+    replay_plan.replay_checkpoints.iter().any(|checkpoint| {
         checkpoint.relation_id.as_deref() == Some(relation_id)
             && checkpoint.relation_version.as_deref() == Some(relation_version)
             && checkpoint.stream_id == stream_id
             && checkpoint.partition_id == partition_id
             && checkpoint.end_offset_exclusive >= batch_end_offset_exclusive
+    }) || replay_plan.input_frontiers.iter().any(|frontier| {
+        frontier.relation_id == relation_id
+            && frontier.relation_version == relation_version
+            && frontier.committed_offset_exclusive >= batch_end_offset_exclusive
     })
 }
 
-fn prepared_batches_are_covered_by_replay_checkpoints(
-    replay_checkpoints: &[ReplayCheckpoint],
+fn prepared_batches_are_covered_by_replay_plan(
+    replay_plan: &StandingRuntimeReplayPlan,
     prepared_batches: &[&PreparedIngestBatch],
 ) -> bool {
-    prepared_batches.iter().all(|prepared| {
-        replay_checkpoints_cover_replayed_batch(
-            replay_checkpoints,
-            prepared.request.relation_id.as_str(),
-            prepared.request.relation_version.as_str(),
-            prepared.request.stream_id.as_str(),
-            prepared.request.partition_id,
-            prepared.end_offset_exclusive,
-        )
-    })
+    prepared_batches
+        .iter()
+        .all(|prepared| prepared_batch_is_covered_by_replay_plan(replay_plan, prepared))
+}
+
+fn prepared_batch_is_covered_by_replay_plan(
+    replay_plan: &StandingRuntimeReplayPlan,
+    prepared: &PreparedIngestBatch,
+) -> bool {
+    replay_plan_covers_replayed_batch(
+        replay_plan,
+        prepared.request.relation_id.as_str(),
+        prepared.request.relation_version.as_str(),
+        prepared.request.stream_id.as_str(),
+        prepared.request.partition_id,
+        prepared.end_offset_exclusive,
+    )
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -5643,8 +5663,8 @@ async fn replay_committed_ingest_into_standing_runtime_limited(
         }) {
             continue;
         }
-        if replay_checkpoints_cover_replayed_batch(
-            &replay_plan.replay_checkpoints,
+        if replay_plan_covers_replayed_batch(
+            replay_plan,
             header.relation_id.as_str(),
             header.relation_version.as_str(),
             descriptor.stream_id.as_str(),
@@ -5748,8 +5768,8 @@ async fn committed_backfill_progress(
             continue;
         }
         total += 1;
-        if replay_checkpoints_cover_replayed_batch(
-            &replay_plan.replay_checkpoints,
+        if replay_plan_covers_replayed_batch(
+            &replay_plan,
             header.relation_id.as_str(),
             header.relation_version.as_str(),
             descriptor.stream_id.as_str(),
@@ -10081,11 +10101,11 @@ fn materialization_coverage_response(
         },
         request_scope: CoverageCapabilityResponse {
             status: "unsupported".to_string(),
-            reason: "request-scope backfill needs a durable input scope index; current ingest logs are checkpoint-contiguous by stream/partition".to_string(),
+            reason: "request-scope backfill needs a durable input scope index; current ingest logs are ordered for replay, not indexed by query predicate scope".to_string(),
         },
         range: CoverageCapabilityResponse {
             status: "unsupported".to_string(),
-            reason: "arbitrary range backfill would violate contiguous input frontier semantics without a new range/index contract".to_string(),
+            reason: "arbitrary range backfill needs a range-aware input index and materialized coverage contract".to_string(),
         },
         background_backfill: CoverageCapabilityResponse {
             status: "available".to_string(),
@@ -12514,6 +12534,39 @@ mod tests {
         .unwrap();
 
         assert_eq!(record.checkpoint.state_payload, expected_payload);
+    }
+
+    #[test]
+    fn standing_runtime_replay_plan_uses_input_frontier_when_replay_checkpoints_are_absent() {
+        let checkpoint = test_runtime_checkpoint(Vec::new());
+        let record = StandingRuntimeCheckpointRecord {
+            schema_version: 1,
+            record_kind: "standing_runtime_checkpoint_v1".to_string(),
+            view_id: "purchases_by_user".to_string(),
+            checkpoint_key: test_checkpoint_key(&checkpoint).as_str().to_string(),
+            previous_checkpoint: None,
+            checkpoint,
+            replay_checkpoints: Vec::new(),
+        };
+
+        let replay_plan = standing_runtime_replay_plan_from_record_ref(&record);
+
+        assert!(replay_plan_covers_replayed_batch(
+            &replay_plan,
+            "purchases",
+            "2026-05-24.v1",
+            "any-stream",
+            99,
+            11,
+        ));
+        assert!(!replay_plan_covers_replayed_batch(
+            &replay_plan,
+            "purchases",
+            "2026-05-24.v1",
+            "any-stream",
+            99,
+            12,
+        ));
     }
 
     #[tokio::test]

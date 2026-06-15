@@ -313,7 +313,7 @@ fn runtime_materializes_filtered_single_relation_aggregate_view() {
 }
 
 #[test]
-fn runtime_rejects_non_contiguous_input_offsets_without_advancing_frontier() {
+fn runtime_accepts_sparse_forward_offsets_and_rejects_overlapping_offsets() {
     let catalog = purchases_catalog_without_value_role();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
     let output_schema = purchases_output_schema();
@@ -351,7 +351,7 @@ fn runtime_rejects_non_contiguous_input_offsets_without_advancing_frontier() {
         3
     );
 
-    let err = runtime
+    let sparse_commit = runtime
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
@@ -365,14 +365,29 @@ fn runtime_rejects_non_contiguous_input_offsets_without_advancing_frontier() {
                 batches: vec![purchases_batch()],
             }],
         )
-        .unwrap_err();
+        .unwrap();
 
-    assert!(matches!(
-        err,
-        StandingProgramRuntimeError::InvalidProgramIdentity {
-            field: "input_frontier.offset_range"
-        }
-    ));
+    assert_eq!(sparse_commit.input_frontiers.len(), 1);
+    assert_eq!(
+        sparse_commit.input_frontiers[0].committed_offset_exclusive,
+        6
+    );
+
+    let err = runtime
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("epoch-3").unwrap(),
+            vec![RelationInputBatch {
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 5,
+                end_offset_exclusive: 7,
+                event_time_watermark: None,
+                batches: vec![purchases_batch()],
+            }],
+        )
+        .unwrap_err();
 
     let checkpoint = runtime.checkpoint().unwrap();
     assert_eq!(checkpoint.input_frontiers.len(), 1);
@@ -382,7 +397,14 @@ fn runtime_rejects_non_contiguous_input_offsets_without_advancing_frontier() {
         frontier.relation_version,
         catalog.relation_schema.relation_version
     );
-    assert_eq!(frontier.committed_offset_exclusive, 3);
+    assert_eq!(frontier.committed_offset_exclusive, 6);
+
+    assert!(matches!(
+        err,
+        StandingProgramRuntimeError::InvalidProgramIdentity {
+            field: "input_frontier.offset_range"
+        }
+    ));
 }
 
 #[test]

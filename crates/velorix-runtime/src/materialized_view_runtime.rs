@@ -1421,7 +1421,7 @@ fn advance_input_frontier(
         frontier.relation_id == input.relation_id
             && frontier.relation_version == input.relation_version
     }) {
-        if input.start_offset_inclusive != frontier.committed_offset_exclusive {
+        if input.start_offset_inclusive < frontier.committed_offset_exclusive {
             return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
                 field: "input_frontier.offset_range",
             });
