@@ -153,6 +153,7 @@ async fn append_ingest_envelope(
             partition_id,
             start_offset_inclusive,
             end_offset_exclusive,
+            event_time_watermark: None,
         },
         &[ingest_record_batch(input)],
     )

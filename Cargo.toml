@@ -5,13 +5,10 @@ members = [
   "crates/velorix-storage",
   "crates/velorix-runtime",
   "crates/velorix-cli",
-  "crates/velorix-feldera-compiler-worker",
   "crates/velorix-ingest-writer",
   "crates/velorix-k8s",
   "crates/velorix-api",
   "crates/velorix-meta",
-  "crates/velorix-generated-scores-by-user",
-  "crates/velorix-generated-single-key-sum-count",
 ]
 resolver = "2"
 

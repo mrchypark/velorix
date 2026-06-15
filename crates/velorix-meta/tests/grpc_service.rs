@@ -309,7 +309,12 @@ async fn grpc_meta_store_sends_bearer_token_to_authenticated_service() {
 async fn grpc_meta_store_publishes_standing_runtime_checkpoint_pointer() {
     let endpoint = spawn_meta_service().await;
     let store = GrpcMetaStore::connect(endpoint).await.unwrap();
-    let pointer = checkpoint_pointer(1, "a");
+    let mut pointer = checkpoint_pointer(1, "a");
+    let output_hash = "b".repeat(64);
+    pointer.output_manifest_refs = vec![format!(
+        "{}v1/standing-runtime-output-manifests/default/program/view/epochs/00000000000000000001/sha256/{output_hash}.output-manifest.json",
+        velorix_meta::STANDING_RUNTIME_OUTPUT_MANIFEST_REF_PREFIX,
+    )];
     let owner = match store
         .acquire_standing_runtime_owner(owner_request("owner-a"))
         .await
@@ -406,6 +411,7 @@ fn checkpoint_pointer(epoch: u64, hash_seed: &str) -> StandingRuntimeCheckpointP
         checkpoint_key: proto.checkpoint_key,
         logical_epoch: proto.logical_epoch,
         content_hash: proto.content_hash,
+        output_manifest_refs: proto.output_manifest_refs,
     }
 }
 
@@ -420,6 +426,7 @@ fn proto_checkpoint_pointer(epoch: u64, hash_seed: &str) -> ProtoCheckpointPoint
         ),
         logical_epoch: epoch,
         content_hash: format!("sha256:{hash}"),
+        output_manifest_refs: Vec::new(),
     }
 }
 

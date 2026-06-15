@@ -2,8 +2,6 @@ use std::{fmt, sync::Arc};
 
 use object_store::{path::Path, ObjectStore};
 use thiserror::Error;
-#[cfg(feature = "dbsp-runtime")]
-use velorix_core::dbsp_engine::DbspSingleKeySumCountEngine;
 use velorix_core::{
     delta::DeltaBatch,
     engine::{
@@ -14,8 +12,8 @@ use velorix_core::{
     relation::{
         arrow_record_batches_to_single_key_sum_count_delta_batch,
         supported_incremental_adapter_spec, ArrowPhysicalTypeV1, DataFusionRegistrationModeV1,
-        DataFusionRegistrationV1, FelderaRelationBindingV1, IncrementalAdapterBindingV1,
-        IncrementalInputAdapterError, RelationColumnV1, RelationOperationV1, RelationSchemaError,
+        DataFusionRegistrationV1, IncrementalAdapterBindingV1, IncrementalInputAdapterError,
+        IncrementalRelationBindingV1, RelationColumnV1, RelationOperationV1, RelationSchemaError,
         RelationSemanticRoleV1, SchemaFingerprintV1, VelorixLogicalTypeV1,
         VelorixRelationCatalogV1, VelorixRelationSchemaV1, ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID,
         RELATION_SCHEMA_VERSION_V1,
@@ -62,7 +60,6 @@ impl fmt::Debug for RecoveredRuntime {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IncrementalEngineBackend {
     Prototype,
-    Dbsp,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -73,40 +70,24 @@ enum IncrementalEngineBackendSelection {
 
 enum RuntimeIncrementalEngine {
     Prototype(PrototypeIncrementalEngine),
-    #[cfg(feature = "dbsp-runtime")]
-    Dbsp(Box<DbspSingleKeySumCountEngine>),
 }
 
 impl RuntimeIncrementalEngine {
     fn new_for_catalog(
         backend: IncrementalEngineBackend,
-        relation_catalog: &VelorixRelationCatalogV1,
+        _relation_catalog: &VelorixRelationCatalogV1,
         aggregate_value_mode: AggregateValueMode,
     ) -> Result<Self, RecoveryError> {
         match backend {
             IncrementalEngineBackend::Prototype => Ok(Self::Prototype(
                 PrototypeIncrementalEngine::with_aggregate_value_mode(aggregate_value_mode),
             )),
-            IncrementalEngineBackend::Dbsp => {
-                validate_dbsp_runtime_catalog_scope(relation_catalog, aggregate_value_mode)?;
-                #[cfg(feature = "dbsp-runtime")]
-                {
-                    Ok(Self::Dbsp(Box::new(DbspSingleKeySumCountEngine::new())))
-                }
-                #[cfg(not(feature = "dbsp-runtime"))]
-                {
-                    Err(RecoveryError::UnsupportedIncrementalEngineBackend {
-                        backend,
-                        reason: "velorix-runtime was not built with `dbsp-runtime`".to_string(),
-                    })
-                }
-            }
         }
     }
 
     fn from_checkpoint_for_catalog(
         backend: IncrementalEngineBackend,
-        relation_catalog: &VelorixRelationCatalogV1,
+        _relation_catalog: &VelorixRelationCatalogV1,
         aggregate_value_mode: AggregateValueMode,
         checkpoint: EngineCheckpoint,
     ) -> Result<Self, RecoveryError> {
@@ -117,38 +98,18 @@ impl RuntimeIncrementalEngine {
                     aggregate_value_mode,
                 )?,
             )),
-            IncrementalEngineBackend::Dbsp => {
-                validate_dbsp_runtime_catalog_scope(relation_catalog, aggregate_value_mode)?;
-                #[cfg(feature = "dbsp-runtime")]
-                {
-                    Ok(Self::Dbsp(Box::new(
-                        DbspSingleKeySumCountEngine::from_checkpoint(checkpoint)?,
-                    )))
-                }
-                #[cfg(not(feature = "dbsp-runtime"))]
-                {
-                    Err(RecoveryError::UnsupportedIncrementalEngineBackend {
-                        backend,
-                        reason: "velorix-runtime was not built with `dbsp-runtime`".to_string(),
-                    })
-                }
-            }
         }
     }
 
     fn backend(&self) -> IncrementalEngineBackend {
         match self {
             Self::Prototype(_) => IncrementalEngineBackend::Prototype,
-            #[cfg(feature = "dbsp-runtime")]
-            Self::Dbsp(_) => IncrementalEngineBackend::Dbsp,
         }
     }
 
     fn logical_epoch(&self) -> LogicalEpoch {
         match self {
             Self::Prototype(engine) => engine.logical_epoch(),
-            #[cfg(feature = "dbsp-runtime")]
-            Self::Dbsp(engine) => engine.logical_epoch(),
         }
     }
 
@@ -159,16 +120,12 @@ impl RuntimeIncrementalEngine {
     ) -> Result<DeltaBatch, EngineError> {
         match self {
             Self::Prototype(engine) => engine.push_changes(logical_epoch, signed_input_changes),
-            #[cfg(feature = "dbsp-runtime")]
-            Self::Dbsp(engine) => engine.push_changes(logical_epoch, signed_input_changes),
         }
     }
 
     fn materialized_state(&self) -> DeltaBatch {
         match self {
             Self::Prototype(engine) => engine.materialized_state(),
-            #[cfg(feature = "dbsp-runtime")]
-            Self::Dbsp(engine) => engine.materialized_state(),
         }
     }
 }
@@ -1019,7 +976,7 @@ pub fn orders_sum_count_relation_catalog() -> Result<VelorixRelationCatalogV1, R
             name: "orders".to_string(),
             mode: DataFusionRegistrationModeV1::Table,
         },
-        feldera_relation: FelderaRelationBindingV1 {
+        incremental_relation: IncrementalRelationBindingV1 {
             relation_id: ORDERS_SUM_COUNT_RELATION_ID.to_string(),
             schema_fingerprint,
         },
@@ -1138,32 +1095,10 @@ fn default_incremental_engine_backend_selection() -> IncrementalEngineBackendSel
         Some("prototype") => {
             IncrementalEngineBackendSelection::Explicit(IncrementalEngineBackend::Prototype)
         }
-        Some("feldera-dbsp") | Some("dbsp") => {
-            IncrementalEngineBackendSelection::Explicit(IncrementalEngineBackend::Dbsp)
-        }
         _ => IncrementalEngineBackendSelection::Default,
     }
 }
 
-#[cfg(feature = "dbsp-runtime")]
-fn resolve_incremental_engine_backend(
-    selection: IncrementalEngineBackendSelection,
-    catalog: &VelorixRelationCatalogV1,
-    aggregate_value_mode: AggregateValueMode,
-) -> IncrementalEngineBackend {
-    match selection {
-        IncrementalEngineBackendSelection::Explicit(backend) => backend,
-        IncrementalEngineBackendSelection::Default => {
-            if validate_dbsp_runtime_catalog_scope(catalog, aggregate_value_mode).is_ok() {
-                IncrementalEngineBackend::Dbsp
-            } else {
-                IncrementalEngineBackend::Prototype
-            }
-        }
-    }
-}
-
-#[cfg(not(feature = "dbsp-runtime"))]
 fn resolve_incremental_engine_backend(
     selection: IncrementalEngineBackendSelection,
     _catalog: &VelorixRelationCatalogV1,
@@ -1173,20 +1108,6 @@ fn resolve_incremental_engine_backend(
         IncrementalEngineBackendSelection::Explicit(backend) => backend,
         IncrementalEngineBackendSelection::Default => IncrementalEngineBackend::Prototype,
     }
-}
-
-fn validate_dbsp_runtime_catalog_scope(
-    _catalog: &VelorixRelationCatalogV1,
-    aggregate_value_mode: AggregateValueMode,
-) -> Result<(), RecoveryError> {
-    if aggregate_value_mode != AggregateValueMode::Integer {
-        return Err(RecoveryError::UnsupportedIncrementalEngineBackend {
-            backend: IncrementalEngineBackend::Dbsp,
-            reason: "DBSP runtime currently supports only Int64 sum/count values".to_string(),
-        });
-    }
-
-    Ok(())
 }
 
 fn validate_recovery_incremental_adapter_scope(

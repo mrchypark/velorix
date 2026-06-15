@@ -1,11 +1,6 @@
 use serde::{Deserialize, Serialize};
-use velorix_core::feldera_artifact::{
-    validate_feldera_compile_artifact_hash, validate_feldera_release_artifact_provenance,
-    FelderaCompileArtifactMetadata, FelderaReleaseArtifactProvenanceV1, StandingViewSpec,
-};
 
 const PRODUCTION_READINESS_SCHEMA_VERSION: u16 = 5;
-const FELDERA_ARTIFACT_EVIDENCE_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -23,7 +18,6 @@ pub struct ProductionReadinessEvidenceV1 {
     pub state_status: ReadinessCheck,
     pub query_policy_status: ReadinessCheck,
     pub table_catalog_status: ReadinessCheck,
-    pub feldera_artifact_status: ReadinessCheck,
     pub dependency_governance_status: ReadinessCheck,
     pub benchmark_gate_status: ReadinessCheck,
     pub gc_status: ReadinessCheck,
@@ -70,47 +64,12 @@ pub enum ReadinessEvidenceKind {
     SlateDbCheckedRecovery,
     QueryPolicyCatalog,
     RegistryBackedTableCatalog,
-    FelderaArtifactRegistry,
-    FelderaArtifactHashVerified,
-    FelderaArtifactReleaseProvenance,
     DependencyGovernanceValidated,
     S3CompatibleBenchmarkGate,
     GcRunEvidence,
     ProductionGcRunEvidence,
     RustfsProductionGcEvidenceFamilyValidated,
     CheckpointRetentionRecord,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FelderaArtifactHashVerifiedEvidenceV1 {
-    pub schema_version: u16,
-    pub status: ReadinessStatus,
-    pub evidence_kind: ReadinessEvidenceKind,
-    pub view_id: String,
-    pub artifact_id: String,
-    pub artifact_hash: String,
-    pub spec_hash: String,
-    pub generated_rust_abi_version: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FelderaArtifactReleaseProvenanceEvidenceV1 {
-    pub schema_version: u16,
-    pub status: ReadinessStatus,
-    pub evidence_kind: ReadinessEvidenceKind,
-    pub release_id: String,
-    pub release_version: String,
-    pub build_id: String,
-    pub builder_id: String,
-    pub artifact_id: String,
-    pub artifact_hash: String,
-    pub spec_hash: String,
-    pub generated_rust_abi_version: String,
-    pub generated_rust_crate_name: String,
-    pub source_repository: String,
-    pub source_revision: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,7 +88,6 @@ pub struct ProductionReadinessReportV1 {
     pub state_status: ReadinessCheck,
     pub query_policy_status: ReadinessCheck,
     pub table_catalog_status: ReadinessCheck,
-    pub feldera_artifact_status: ReadinessCheck,
     pub dependency_governance_status: ReadinessCheck,
     pub benchmark_gate_status: ReadinessCheck,
     pub gc_status: ReadinessCheck,
@@ -151,9 +109,6 @@ impl ProductionReadinessEvidenceV1 {
     pub fn try_into_first_e2e_report(self) -> Result<ProductionReadinessReportV1, String> {
         validate_readiness_schema_version(&self)?;
         let mut report = self.into_report();
-        report.blocking_reasons.retain(|reason| {
-            reason != "feldera_artifact_status missing feldera_artifact_hash_verified evidence"
-        });
         report.production_ready = report.blocking_reasons.is_empty();
         Ok(report)
     }
@@ -211,11 +166,6 @@ impl ProductionReadinessEvidenceV1 {
             &mut blocking_reasons,
             "table_catalog_status",
             &self.table_catalog_status,
-        );
-        push_check_blockers(
-            &mut blocking_reasons,
-            "feldera_artifact_status",
-            &self.feldera_artifact_status,
         );
         push_check_blockers(
             &mut blocking_reasons,
@@ -400,23 +350,6 @@ impl ProductionReadinessEvidenceV1 {
             );
         }
         if !self
-            .feldera_artifact_status
-            .has_evidence(ReadinessEvidenceKind::FelderaArtifactRegistry)
-        {
-            blocking_reasons.push(
-                "feldera_artifact_status missing feldera_artifact_registry evidence".to_string(),
-            );
-        }
-        if !self
-            .feldera_artifact_status
-            .has_evidence(ReadinessEvidenceKind::FelderaArtifactHashVerified)
-        {
-            blocking_reasons.push(
-                "feldera_artifact_status missing feldera_artifact_hash_verified evidence"
-                    .to_string(),
-            );
-        }
-        if !self
             .benchmark_gate_status
             .has_evidence(ReadinessEvidenceKind::S3CompatibleBenchmarkGate)
         {
@@ -477,7 +410,6 @@ impl ProductionReadinessEvidenceV1 {
             state_status: self.state_status,
             query_policy_status: self.query_policy_status,
             table_catalog_status: self.table_catalog_status,
-            feldera_artifact_status: self.feldera_artifact_status,
             dependency_governance_status: self.dependency_governance_status,
             benchmark_gate_status: self.benchmark_gate_status,
             gc_status: self.gc_status,
@@ -494,79 +426,10 @@ impl ProductionReadinessReportV1 {
     }
 }
 
-impl FelderaArtifactHashVerifiedEvidenceV1 {
-    pub fn to_json_pretty(&self) -> Result<String, serde_json::Error> {
-        serde_json::to_string_pretty(self)
-    }
-}
-
-impl FelderaArtifactReleaseProvenanceEvidenceV1 {
-    pub fn to_json_pretty(&self) -> Result<String, serde_json::Error> {
-        serde_json::to_string_pretty(self)
-    }
-}
-
 impl ReadinessCheck {
     fn has_evidence(&self, kind: ReadinessEvidenceKind) -> bool {
         self.evidence_kind.contains(&kind)
     }
-}
-
-pub fn verify_feldera_artifact_hash_evidence(
-    spec_json: &str,
-    metadata_json: &str,
-    artifact_bytes: &[u8],
-) -> Result<FelderaArtifactHashVerifiedEvidenceV1, String> {
-    let spec: StandingViewSpec = serde_json::from_str(spec_json)
-        .map_err(|error| format!("failed to parse Feldera standing view spec JSON: {error}"))?;
-    let artifact: FelderaCompileArtifactMetadata = serde_json::from_str(metadata_json)
-        .map_err(|error| format!("failed to parse Feldera artifact metadata JSON: {error}"))?;
-
-    validate_feldera_compile_artifact_hash(&spec, &artifact, artifact_bytes)
-        .map_err(|error| error.to_string())?;
-
-    Ok(FelderaArtifactHashVerifiedEvidenceV1 {
-        schema_version: FELDERA_ARTIFACT_EVIDENCE_SCHEMA_VERSION,
-        status: ReadinessStatus::Pass,
-        evidence_kind: ReadinessEvidenceKind::FelderaArtifactHashVerified,
-        view_id: artifact.view_id,
-        artifact_id: artifact.artifact_id,
-        artifact_hash: artifact.artifact_hash,
-        spec_hash: artifact.spec_hash,
-        generated_rust_abi_version: artifact.generated_rust.abi_version,
-    })
-}
-
-pub fn verify_feldera_artifact_release_provenance_evidence(
-    metadata_json: &str,
-    provenance_json: &str,
-) -> Result<FelderaArtifactReleaseProvenanceEvidenceV1, String> {
-    let artifact: FelderaCompileArtifactMetadata = serde_json::from_str(metadata_json)
-        .map_err(|error| format!("failed to parse Feldera artifact metadata JSON: {error}"))?;
-    let provenance: FelderaReleaseArtifactProvenanceV1 = serde_json::from_str(provenance_json)
-        .map_err(|error| {
-            format!("failed to parse Feldera release artifact provenance JSON: {error}")
-        })?;
-
-    validate_feldera_release_artifact_provenance(&artifact, &provenance)
-        .map_err(|error| error.to_string())?;
-
-    Ok(FelderaArtifactReleaseProvenanceEvidenceV1 {
-        schema_version: FELDERA_ARTIFACT_EVIDENCE_SCHEMA_VERSION,
-        status: ReadinessStatus::Pass,
-        evidence_kind: ReadinessEvidenceKind::FelderaArtifactReleaseProvenance,
-        release_id: provenance.release.release_id,
-        release_version: provenance.release.release_version,
-        build_id: provenance.build.build_id,
-        builder_id: provenance.build.builder_id,
-        artifact_id: provenance.build.artifact_id,
-        artifact_hash: provenance.build.artifact_hash,
-        spec_hash: provenance.build.spec_hash,
-        generated_rust_abi_version: provenance.build.generated_rust.abi_version,
-        generated_rust_crate_name: provenance.build.generated_rust.crate_name,
-        source_repository: provenance.provenance.source_repository,
-        source_revision: provenance.provenance.source_revision,
-    })
 }
 
 fn push_check_blockers(blocking_reasons: &mut Vec<String>, field: &str, check: &ReadinessCheck) {

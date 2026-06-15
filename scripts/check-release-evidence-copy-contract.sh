@@ -70,10 +70,6 @@ for filename in {
     "ingress-tls-auth-attestation.json",
     "openapi.json",
     "tls-auth-smoke.json",
-    "view-compile-deploy-jobs.json",
-    "view-compile-deploy-run-once.json",
-    "pending-scores-view-after-compile-deploy.json",
-    "pending-scores-query-after-compile-deploy.json",
     "external-s3-validate-job.json",
     "external-s3-validate.log",
     "ingest-writer-job-log.json",
@@ -142,12 +138,6 @@ product = {
             "ingress_tls_auth_attestation": {
                 "evidence": "ingress-tls-auth-attestation.json",
             },
-        },
-        "compile_deploy": {
-            "job_catalog_evidence_file": "view-compile-deploy-jobs.json",
-            "run_once_evidence_file": "view-compile-deploy-run-once.json",
-            "activated_view_evidence_file": "pending-scores-view-after-compile-deploy.json",
-            "activated_query_evidence_file": "pending-scores-query-after-compile-deploy.json",
         },
         "query_policy": {"evidence_files": query_policy_files},
     },
@@ -280,10 +270,6 @@ required = [
     out / "product" / "ingress-tls-auth-attestation.json",
     out / "product" / "openapi.json",
     out / "product" / "tls-auth-smoke.json",
-    out / "product" / "view-compile-deploy-jobs.json",
-    out / "product" / "view-compile-deploy-run-once.json",
-    out / "product" / "pending-scores-view-after-compile-deploy.json",
-    out / "product" / "pending-scores-query-after-compile-deploy.json",
     out / "product" / "external-s3-validate-job.json",
     out / "product" / "external-s3-validate.log",
     out / "product" / "ingest-writer-job-log.json",
@@ -312,46 +298,6 @@ run_helper_expect_fail(
         "standing-runtime-product-evidence.json",
     ],
     "query-policy-weak-rejection.json",
-)
-
-missing_compile_deploy_src = scratch_dir / "missing-compile-deploy-src"
-missing_compile_deploy_src.mkdir()
-for path in src.iterdir():
-    if path.is_file():
-        (missing_compile_deploy_src / path.name).write_bytes(path.read_bytes())
-(missing_compile_deploy_src / "view-compile-deploy-jobs.json").unlink()
-run_helper_expect_fail(
-    [
-        "--kind",
-        "product",
-        "--artifact",
-        str(missing_compile_deploy_src / "product.json"),
-        "--out-dir",
-        str(scratch_dir / "missing-compile-deploy-out"),
-        "--artifact-name",
-        "standing-runtime-product-evidence.json",
-    ],
-    "view-compile-deploy-jobs.json",
-)
-
-missing_compile_deploy_run_src = scratch_dir / "missing-compile-deploy-run-src"
-missing_compile_deploy_run_src.mkdir()
-for path in src.iterdir():
-    if path.is_file():
-        (missing_compile_deploy_run_src / path.name).write_bytes(path.read_bytes())
-(missing_compile_deploy_run_src / "view-compile-deploy-run-once.json").unlink()
-run_helper_expect_fail(
-    [
-        "--kind",
-        "product",
-        "--artifact",
-        str(missing_compile_deploy_run_src / "product.json"),
-        "--out-dir",
-        str(scratch_dir / "missing-compile-deploy-run-out"),
-        "--artifact-name",
-        "standing-runtime-product-evidence.json",
-    ],
-    "view-compile-deploy-run-once.json",
 )
 
 missing_no_pvc_src = scratch_dir / "missing-no-pvc-src"
@@ -514,58 +460,6 @@ run_helper_expect_fail(
         "standing-runtime-product-evidence.json",
     ],
     "product query-policy evidence_files.created must be query-policy-interactive.json",
-)
-
-invalid_compile_deploy_src = scratch_dir / "invalid-compile-deploy-src"
-invalid_compile_deploy_src.mkdir()
-for path in src.iterdir():
-    if path.is_file():
-        (invalid_compile_deploy_src / path.name).write_bytes(path.read_bytes())
-invalid_product = json.loads(
-    (invalid_compile_deploy_src / "product.json").read_text(encoding="utf-8")
-)
-invalid_product["api"]["compile_deploy"]["job_catalog_evidence_file"] = "../jobs.json"
-(invalid_compile_deploy_src / "product.json").write_text(
-    json.dumps(invalid_product), encoding="utf-8"
-)
-
-invalid_compile_deploy_run_src = scratch_dir / "invalid-compile-deploy-run-src"
-invalid_compile_deploy_run_src.mkdir()
-for path in src.iterdir():
-    if path.is_file():
-        (invalid_compile_deploy_run_src / path.name).write_bytes(path.read_bytes())
-invalid_product = json.loads(
-    (invalid_compile_deploy_run_src / "product.json").read_text(encoding="utf-8")
-)
-invalid_product["api"]["compile_deploy"]["run_once_evidence_file"] = "../run-once.json"
-(invalid_compile_deploy_run_src / "product.json").write_text(
-    json.dumps(invalid_product), encoding="utf-8"
-)
-run_helper_expect_fail(
-    [
-        "--kind",
-        "product",
-        "--artifact",
-        str(invalid_compile_deploy_run_src / "product.json"),
-        "--out-dir",
-        str(scratch_dir / "invalid-compile-deploy-run-out"),
-        "--artifact-name",
-        "standing-runtime-product-evidence.json",
-    ],
-    "product compile_deploy.run_once_evidence_file must be view-compile-deploy-run-once.json",
-)
-run_helper_expect_fail(
-    [
-        "--kind",
-        "product",
-        "--artifact",
-        str(invalid_compile_deploy_src / "product.json"),
-        "--out-dir",
-        str(scratch_dir / "invalid-compile-deploy-out"),
-        "--artifact-name",
-        "standing-runtime-product-evidence.json",
-    ],
-    "product compile_deploy.job_catalog_evidence_file must be view-compile-deploy-jobs.json",
 )
 
 invalid_no_pvc_src = scratch_dir / "invalid-no-pvc-src"

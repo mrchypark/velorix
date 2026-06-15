@@ -2,7 +2,7 @@
 
 Status: Accepted
 Applies to: ingest envelopes, relation catalog entries, DataFusion registration,
-and Feldera artifact validation.
+and materialized view validation.
 
 Velorix does not hash raw Arrow `Schema` bytes as the durable schema identity.
 It hashes a canonical relation schema model.
@@ -40,7 +40,7 @@ allowed operation changes.
 
 ## Cross-System Use
 
-Ingest envelopes, DataFusion table registration, Feldera `StandingViewSpec`, and
+Ingest envelopes, DataFusion table registration, Velorix `StandingViewSpec`, and
 the incremental-engine input adapter must use the same `relation_id`,
 `relation_version`, and `schema_fingerprint`. Mismatch fails closed before view
 activation, query execution, or checkpoint publication.
@@ -50,6 +50,6 @@ activation, query execution, or checkpoint publication.
 - Arrow metadata ordering does not change the fingerprint.
 - Column order, nullable, timezone, decimal precision/scale, primary key, and
   weight column changes do change the fingerprint.
-- Feldera artifact validation rejects input relation fingerprint mismatch.
+- View validation rejects input relation fingerprint mismatch.
 - DataFusion registration uses the cataloged relation schema, not ad hoc payload
   inference.

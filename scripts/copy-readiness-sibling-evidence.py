@@ -145,27 +145,6 @@ def product_siblings(artifact: Path, doc: dict) -> list[Path]:
             )
         )
 
-    compile_deploy = api.get("compile_deploy") or {}
-    if compile_deploy.get("job_catalog_evidence_file") != "view-compile-deploy-jobs.json":
-        raise SystemExit(
-            "product compile_deploy.job_catalog_evidence_file must be view-compile-deploy-jobs.json"
-        )
-    result.append(
-        sibling(
-            artifact,
-            "view-compile-deploy-jobs.json",
-            "product compile/deploy job evidence",
-        )
-    )
-    for key, expected in {
-        "run_once_evidence_file": "view-compile-deploy-run-once.json",
-        "activated_view_evidence_file": "pending-scores-view-after-compile-deploy.json",
-        "activated_query_evidence_file": "pending-scores-query-after-compile-deploy.json",
-    }.items():
-        if compile_deploy.get(key) != expected:
-            raise SystemExit(f"product compile_deploy.{key} must be {expected}")
-        result.append(sibling(artifact, expected, "product compile/deploy activation evidence"))
-
     query_policy = api.get("query_policy") or {}
     for key, expected in {
         "created": "query-policy-interactive.json",

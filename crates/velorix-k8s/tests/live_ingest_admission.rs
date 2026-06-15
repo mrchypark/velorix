@@ -358,7 +358,7 @@ async fn create_vind_relation_catalog(store: &Arc<dyn ObjectStore>) -> Result<()
             "name": "deposits",
             "mode": "table",
         },
-        "feldera_relation": {
+        "incremental_relation": {
             "relation_id": "deposits",
             "schema_fingerprint": deposits_schema_fingerprint(),
         },
@@ -382,6 +382,7 @@ fn catalog_envelope_bytes_for(start_offset_inclusive: u64, end_offset_exclusive:
             partition_id: 0,
             start_offset_inclusive,
             end_offset_exclusive,
+            event_time_watermark: None,
         },
         &[valid_batch()],
     )
@@ -434,6 +435,7 @@ fn durable_orphan_admission_record(
         partition_id,
         start_offset_inclusive,
         end_offset_exclusive,
+        event_time_watermark: None,
         batch_key: ObjectKey::ingest_batch(
             stream_id,
             partition_id,

@@ -12,14 +12,15 @@ use arrow::{
 use datafusion::prelude::SessionContext;
 use velorix_core::delta::{DeltaKey, DeltaRecord, DeltaValue};
 use velorix_core::relation::{
+    arrow_record_batches_to_key_value_delta_batch,
     arrow_record_batches_to_orders_sum_count_delta_batch,
     arrow_record_batches_to_single_key_sum_count_delta_batch, datafusion_schema_from_catalog,
     register_datafusion_catalog_batches, validate_record_batch_matches_catalog,
     ArrowPhysicalTypeV1, DataFusionRegistrationModeV1, DataFusionRegistrationV1,
-    DictionaryKeyTypeV1, FelderaRelationBindingV1, IncrementalAdapterBindingV1,
-    IncrementalInputAdapterError, RelationColumnV1, RelationOperationV1, RelationSchemaError,
+    DictionaryKeyTypeV1, IncrementalAdapterBindingV1, IncrementalInputAdapterError,
+    IncrementalRelationBindingV1, RelationColumnV1, RelationOperationV1, RelationSchemaError,
     RelationSemanticRoleV1, SchemaFingerprintV1, VelorixLogicalTypeV1, VelorixRelationCatalogV1,
-    VelorixRelationSchemaV1, CATALOG_FELDERA_GENERIC_INCREMENTAL_ADAPTER_ID,
+    VelorixRelationSchemaV1, CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID,
     CATALOG_ROW_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID,
     CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID, ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID,
     RELATION_SCHEMA_VERSION_V1,
@@ -198,7 +199,7 @@ fn relation_catalog_validation_requires_cataloged_schema_fingerprint() {
             name: "orders".to_string(),
             mode: DataFusionRegistrationModeV1::Table,
         },
-        feldera_relation: FelderaRelationBindingV1 {
+        incremental_relation: IncrementalRelationBindingV1 {
             relation_id: "orders".to_string(),
             schema_fingerprint: fingerprint,
         },
@@ -218,12 +219,12 @@ fn relation_catalog_validation_requires_cataloged_schema_fingerprint() {
         SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema).unwrap();
     catalog.validate().unwrap();
 
-    catalog.feldera_relation.relation_id = "customers".to_string();
+    catalog.incremental_relation.relation_id = "customers".to_string();
     let error = catalog.validate().unwrap_err();
     assert!(matches!(
         error,
         RelationSchemaError::RelationIdentityMismatch {
-            field: "feldera_relation.relation_id"
+            field: "incremental_relation.relation_id"
         }
     ));
 }
@@ -414,6 +415,47 @@ fn generic_catalog_incremental_input_uses_catalog_roles_for_non_orders_columns()
         catalog.relation_schema.relation_id.as_str(),
         catalog.relation_schema.relation_version.as_str(),
         catalog.schema_fingerprint.as_str(),
+        &[batch],
+    )
+    .unwrap();
+
+    assert_eq!(
+        delta.records(),
+        &[
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!("customer-a")),
+                DeltaValue::from_json(serde_json::json!(500)),
+                1,
+            ),
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!("customer-b")),
+                DeltaValue::from_json(serde_json::json!(125)),
+                -1,
+            ),
+        ]
+    );
+}
+
+#[test]
+fn key_value_incremental_input_uses_explicit_value_column_without_value_semantic_role() {
+    let mut catalog = customer_balance_relation_catalog();
+    for column in &mut catalog.relation_schema.columns {
+        if column.column_id == "customer_key" || column.column_id == "balance_cents" {
+            column.semantic_role = RelationSemanticRoleV1::Metadata;
+        }
+    }
+    catalog.schema_fingerprint =
+        SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema).unwrap();
+    catalog.incremental_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
+    let batch = customer_balance_input_batch(&["customer-a", "customer-b"], &[500, 125], &[1, -1]);
+
+    let delta = arrow_record_batches_to_key_value_delta_batch(
+        &catalog,
+        catalog.relation_schema.relation_id.as_str(),
+        catalog.relation_schema.relation_version.as_str(),
+        catalog.schema_fingerprint.as_str(),
+        &["customer_key".to_string()],
+        "balance_cents",
         &[batch],
     )
     .unwrap();
@@ -816,7 +858,7 @@ fn generic_catalog_incremental_input_rejects_dictionary_utf8_null_key() {
     catalog.relation_schema.columns[2].nullable = true;
     catalog.schema_fingerprint =
         SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema).unwrap();
-    catalog.feldera_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
+    catalog.incremental_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
     let mut key_builder = StringDictionaryBuilder::<Int8Type>::new();
     key_builder.append("customer-a").unwrap();
     key_builder.append_null();
@@ -929,7 +971,7 @@ fn generic_catalog_incremental_input_preserves_decimal128_scale_zero_as_string_i
     };
     catalog.schema_fingerprint =
         SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema).unwrap();
-    catalog.feldera_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
+    catalog.incremental_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
     let batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![
             Field::new("account_id", DataType::Decimal128(38, 0), false),
@@ -1188,20 +1230,20 @@ fn catalog_incremental_input_rejects_unsupported_adapter() {
 }
 
 #[test]
-fn feldera_generic_relation_admission_accepts_multi_payload_columns_without_value_role() {
-    let catalog = feldera_generic_activity_relation_catalog();
+fn generic_relation_admission_accepts_multi_payload_columns_without_value_role() {
+    let catalog = generic_activity_relation_catalog();
 
-    let spec = catalog.validate_feldera_ingest_adapter_scope().unwrap();
+    let spec = catalog.validate_ingest_adapter_scope().unwrap();
 
     assert_eq!(
         spec,
-        velorix_core::relation::SupportedIncrementalAdapterSpec::FelderaGeneric
+        velorix_core::relation::SupportedIncrementalAdapterSpec::Generic
     );
 }
 
 #[test]
-fn feldera_generic_relation_stays_out_of_legacy_incremental_delta_adapter() {
-    let catalog = feldera_generic_activity_relation_catalog();
+fn generic_relation_stays_out_of_legacy_incremental_delta_adapter() {
+    let catalog = generic_activity_relation_catalog();
     let batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![
             Field::new("event_id", DataType::Utf8, false),
@@ -1230,7 +1272,7 @@ fn feldera_generic_relation_stays_out_of_legacy_incremental_delta_adapter() {
     assert!(matches!(
         error,
         IncrementalInputAdapterError::UnsupportedIncrementalAdapter { adapter_id }
-            if adapter_id == CATALOG_FELDERA_GENERIC_INCREMENTAL_ADAPTER_ID
+            if adapter_id == CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID
     ));
 }
 
@@ -1272,7 +1314,7 @@ fn catalog_incremental_input_rejects_multiple_value_columns() {
     });
     catalog.schema_fingerprint =
         SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema).unwrap();
-    catalog.feldera_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
+    catalog.incremental_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
     let batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![
             Field::new("customer_key", DataType::Utf8, false),
@@ -1354,7 +1396,7 @@ fn orders_relation_catalog() -> VelorixRelationCatalogV1 {
             name: "orders".to_string(),
             mode: DataFusionRegistrationModeV1::Table,
         },
-        feldera_relation: FelderaRelationBindingV1 {
+        incremental_relation: IncrementalRelationBindingV1 {
             relation_id: "orders".to_string(),
             schema_fingerprint,
         },
@@ -1413,7 +1455,7 @@ fn account_balance_relation_catalog() -> VelorixRelationCatalogV1 {
             name: "account_balances".to_string(),
             mode: DataFusionRegistrationModeV1::Table,
         },
-        feldera_relation: FelderaRelationBindingV1 {
+        incremental_relation: IncrementalRelationBindingV1 {
             relation_id: "account_balances".to_string(),
             schema_fingerprint,
         },
@@ -1423,7 +1465,7 @@ fn account_balance_relation_catalog() -> VelorixRelationCatalogV1 {
     }
 }
 
-fn feldera_generic_activity_relation_catalog() -> VelorixRelationCatalogV1 {
+fn generic_activity_relation_catalog() -> VelorixRelationCatalogV1 {
     let relation_schema = VelorixRelationSchemaV1 {
         relation_id: "activity_events".to_string(),
         relation_name: "activity_events".to_string(),
@@ -1481,12 +1523,12 @@ fn feldera_generic_activity_relation_catalog() -> VelorixRelationCatalogV1 {
             name: "activity_events".to_string(),
             mode: DataFusionRegistrationModeV1::Table,
         },
-        feldera_relation: FelderaRelationBindingV1 {
+        incremental_relation: IncrementalRelationBindingV1 {
             relation_id: "activity_events".to_string(),
             schema_fingerprint,
         },
         incremental_adapter: IncrementalAdapterBindingV1 {
-            adapter_id: CATALOG_FELDERA_GENERIC_INCREMENTAL_ADAPTER_ID.to_string(),
+            adapter_id: CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.to_string(),
         },
     }
 }
@@ -1549,7 +1591,7 @@ fn account_balance_by_currency_relation_catalog() -> VelorixRelationCatalogV1 {
             name: "account_balances_by_currency".to_string(),
             mode: DataFusionRegistrationModeV1::Table,
         },
-        feldera_relation: FelderaRelationBindingV1 {
+        incremental_relation: IncrementalRelationBindingV1 {
             relation_id: "account_balances_by_currency".to_string(),
             schema_fingerprint,
         },
@@ -1652,7 +1694,7 @@ fn expanded_scalar_key_relation_catalog() -> VelorixRelationCatalogV1 {
             name: "expanded_scalar_keys".to_string(),
             mode: DataFusionRegistrationModeV1::Table,
         },
-        feldera_relation: FelderaRelationBindingV1 {
+        incremental_relation: IncrementalRelationBindingV1 {
             relation_id: "expanded_scalar_keys".to_string(),
             schema_fingerprint,
         },
@@ -1737,7 +1779,7 @@ fn nested_key_relation_catalog() -> VelorixRelationCatalogV1 {
             name: "nested_key_scores".to_string(),
             mode: DataFusionRegistrationModeV1::Table,
         },
-        feldera_relation: FelderaRelationBindingV1 {
+        incremental_relation: IncrementalRelationBindingV1 {
             relation_id: "nested_key_scores".to_string(),
             schema_fingerprint,
         },
@@ -1793,7 +1835,7 @@ fn boolean_account_balance_relation_catalog() -> VelorixRelationCatalogV1 {
     catalog.relation_schema.columns[0].physical_arrow_type = ArrowPhysicalTypeV1::Boolean;
     catalog.schema_fingerprint =
         SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema).unwrap();
-    catalog.feldera_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
+    catalog.incremental_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
     catalog
 }
 
@@ -1803,7 +1845,7 @@ fn float_account_balance_relation_catalog() -> VelorixRelationCatalogV1 {
     catalog.relation_schema.columns[1].physical_arrow_type = ArrowPhysicalTypeV1::Float64;
     catalog.schema_fingerprint =
         SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema).unwrap();
-    catalog.feldera_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
+    catalog.incremental_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
     catalog
 }
 
@@ -1813,7 +1855,7 @@ fn float_key_account_balance_relation_catalog() -> VelorixRelationCatalogV1 {
     catalog.relation_schema.columns[0].physical_arrow_type = ArrowPhysicalTypeV1::Float64;
     catalog.schema_fingerprint =
         SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema).unwrap();
-    catalog.feldera_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
+    catalog.incremental_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
     catalog
 }
 
@@ -1829,7 +1871,7 @@ fn decimal_key_account_balance_relation_catalog() -> VelorixRelationCatalogV1 {
     };
     catalog.schema_fingerprint =
         SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema).unwrap();
-    catalog.feldera_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
+    catalog.incremental_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
     catalog
 }
 
@@ -1845,7 +1887,7 @@ fn decimal_value_account_balance_relation_catalog() -> VelorixRelationCatalogV1 
     };
     catalog.schema_fingerprint =
         SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema).unwrap();
-    catalog.feldera_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
+    catalog.incremental_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
     catalog
 }
 
@@ -1855,7 +1897,7 @@ fn json_account_balance_relation_catalog() -> VelorixRelationCatalogV1 {
     catalog.relation_schema.columns[0].physical_arrow_type = ArrowPhysicalTypeV1::JsonUtf8;
     catalog.schema_fingerprint =
         SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema).unwrap();
-    catalog.feldera_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
+    catalog.incremental_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
     catalog
 }
 
@@ -1908,7 +1950,7 @@ fn daily_balance_relation_catalog() -> VelorixRelationCatalogV1 {
             name: "daily_balances".to_string(),
             mode: DataFusionRegistrationModeV1::Table,
         },
-        feldera_relation: FelderaRelationBindingV1 {
+        incremental_relation: IncrementalRelationBindingV1 {
             relation_id: "daily_balances".to_string(),
             schema_fingerprint,
         },
@@ -1967,7 +2009,7 @@ fn timestamped_balance_relation_catalog() -> VelorixRelationCatalogV1 {
             name: "timestamped_balances".to_string(),
             mode: DataFusionRegistrationModeV1::Table,
         },
-        feldera_relation: FelderaRelationBindingV1 {
+        incremental_relation: IncrementalRelationBindingV1 {
             relation_id: "timestamped_balances".to_string(),
             schema_fingerprint,
         },
@@ -2026,7 +2068,7 @@ fn customer_balance_relation_catalog() -> VelorixRelationCatalogV1 {
             name: "customer_balances".to_string(),
             mode: DataFusionRegistrationModeV1::Table,
         },
-        feldera_relation: FelderaRelationBindingV1 {
+        incremental_relation: IncrementalRelationBindingV1 {
             relation_id: "customer_balances".to_string(),
             schema_fingerprint,
         },
@@ -2046,7 +2088,7 @@ fn dictionary_customer_balance_relation_catalog(
     };
     catalog.schema_fingerprint =
         SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema).unwrap();
-    catalog.feldera_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
+    catalog.incremental_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
     catalog
 }
 

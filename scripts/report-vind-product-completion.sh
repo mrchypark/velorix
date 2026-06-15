@@ -818,18 +818,6 @@ gates.append(
     )
 )
 
-compile_deploy_pass = pointer(product, "/api/compile_deploy/worker_run_verified") is True
-gates.append(
-    gate(
-        "view_compile_deploy",
-        "pass" if compile_deploy_pass else "blocked",
-        "Feldera/DBSP view compile/deploy worker activation into standing runtime",
-        evidence={
-            "activated_view_id": pointer(product, "/api/compile_deploy/activated_view_id")
-        },
-    )
-)
-
 images = product.get("deployed_images") or {}
 if isinstance(images, dict) and images:
     missing_image_digests = [

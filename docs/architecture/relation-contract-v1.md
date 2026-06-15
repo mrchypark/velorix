@@ -1,7 +1,7 @@
 # Relation Contract V1
 
 Status: Accepted
-Applies to: ingest, replay, DataFusion ad hoc SQL, Feldera standing views, and
+Applies to: ingest, replay, DataFusion ad hoc SQL, internal materialized views, and
 incremental-engine input adapters.
 
 Velorix uses one relation catalog to connect typed ingest payloads, SQL query
@@ -34,7 +34,7 @@ Required fields:
 - `operation_model`, currently `signed_weight_delta`.
 - Arrow IPC ingest format.
 - DataFusion table registration name and mode.
-- Feldera relation id and required schema fingerprint.
+- view relation id and required schema fingerprint.
 - incremental-engine input adapter id.
 
 ## Contract
@@ -42,7 +42,7 @@ Required fields:
 - Ingest envelopes must include `relation_id`, `relation_version`, and
   `schema_fingerprint`.
 - DataFusion tables are registered from relation catalog schemas.
-- Feldera artifacts validate against relation catalog identity.
+- View specs validate against relation catalog identity.
 - For the closed Velorix 1.0 sum/count adapter scope, incremental execution
   converts catalog-validated Arrow batches into typed adapter inputs before
   runtime replay. Generic row-shaped or multi-value adapter inputs are not part
@@ -86,7 +86,7 @@ construction.
 
 - One Arrow ingest fixture produces equivalent net rows through DataFusion and
   the incremental input adapter.
-- Feldera artifact schema fingerprint mismatch fails activation.
+- View schema fingerprint mismatch fails activation.
 - DataFusion production input registration exposes typed columns, not
   `key_json`/`value_json`.
 - The row-key sum/count adapter preserves existing scalar single-key output and

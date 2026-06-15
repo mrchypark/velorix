@@ -55,6 +55,7 @@ fn envelope_bytes(
             partition_id,
             start_offset_inclusive,
             end_offset_exclusive,
+            event_time_watermark: None,
         },
         &[batch],
     )

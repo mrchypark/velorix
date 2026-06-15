@@ -63,7 +63,6 @@ product_evidence_level="${VELORIX_PRODUCT_EVIDENCE_LEVEL:-local-vind-only}"
 api_replica_count="${VELORIX_API_REPLICA_COUNT:-1}"
 standing_runtime_fencing="${VELORIX_STANDING_RUNTIME_FENCING:-unsafe-dev-only}"
 standing_runtime_owner_ttl_ms="${VELORIX_STANDING_RUNTIME_OWNER_TTL_MS:-5000}"
-generated_artifact_packages="${VELORIX_GENERATED_ARTIFACT_PACKAGES:-}"
 output_dir="${VELORIX_VIND_PRODUCT_DIR:-target/velorix-product}"
 local_disk_preflight="${VELORIX_LOCAL_DISK_PREFLIGHT:-1}"
 local_min_free_disk_gib="${VELORIX_LOCAL_MIN_FREE_DISK_GIB:-20}"
@@ -135,9 +134,6 @@ product_completion_report_file=""
 api_query_policy_smoke_passed=0
 api_query_policy_missing_policy_rejected=0
 api_query_policy_weak_policy_rejected=0
-api_compile_deploy_job_catalog_verified=0
-api_compile_deploy_worker_run_verified=0
-api_compile_deploy_activated_view_id=""
 api_openapi_catalog_smoke_passed=0
 object_store_namespace_count=0
 object_store_artifact_catalog_conditional_update=0
@@ -275,9 +271,6 @@ Main overrides:
   VELORIX_API_ALLOW_UNAUTHENTICATED_DEV=1  # explicit local dev opt-out only
   VELORIX_API_REPLICA_COUNT=1
   VELORIX_STANDING_RUNTIME_FENCING=unsafe-dev-only  # or logical-fencing / required
-  # Optional override. By default the API exposes linked generated packages,
-  # including scores_by_user_generated and single_key_sum_count_generated.
-  VELORIX_GENERATED_ARTIFACT_PACKAGES=scores_by_user_generated,single_key_sum_count_generated
 EOF
 }
 
@@ -664,7 +657,6 @@ for field in [
     "admin_auth_separate",
     "admin_route_missing_token_rejected",
     "admin_route_wrong_token_rejected",
-    "data_plane_token_rejected_on_admin_catalog_route",
     "admin_token_accepted_on_admin_route",
     "data_plane_token_rejected_on_admin_route",
 ]:
@@ -2501,71 +2493,6 @@ wait_for_api() {
   done
   echo "velorix-api did not answer ${url}" >&2
   exit 1
-}
-
-compile_deploy_smoke_effective_generated_packages() {
-  if [ -n "$generated_artifact_packages" ]; then
-    printf '%s\n' "$generated_artifact_packages"
-  else
-    printf '%s\n' "scores_by_user_generated,single_key_sum_count_generated"
-  fi
-}
-
-wait_for_api_generated_artifact_packages() {
-  local packages="$1"
-  local pods_json="${output_dir}/velorix-api-generated-packages-pods.json"
-  local deadline=$((SECONDS + 120))
-  while true; do
-    kubectl --context "$context" -n "$namespace" get pods \
-      -l app=velorix-api -o json >"$pods_json"
-    if python3 - "$pods_json" "$packages" <<'PY'
-import json
-import sys
-
-path, expected = sys.argv[1:]
-with open(path, "r", encoding="utf-8") as f:
-    body = json.load(f)
-items = body.get("items") or []
-if not items:
-    raise SystemExit(1)
-for pod in items:
-    if pod.get("metadata", {}).get("deletionTimestamp"):
-        raise SystemExit(1)
-    conditions = {
-        condition.get("type"): condition.get("status")
-        for condition in pod.get("status", {}).get("conditions", [])
-    }
-    if pod.get("status", {}).get("phase") != "Running" or conditions.get("Ready") != "True":
-        raise SystemExit(1)
-    containers = pod.get("spec", {}).get("containers", [])
-    api = next((container for container in containers if container.get("name") == "api"), None)
-    if api is None:
-        raise SystemExit(1)
-    env = {entry.get("name"): entry.get("value") for entry in api.get("env", [])}
-    if env.get("VELORIX_GENERATED_ARTIFACT_PACKAGES") != expected:
-        raise SystemExit(1)
-PY
-    then
-      return 0
-    fi
-    if [ "$SECONDS" -ge "$deadline" ]; then
-      echo "velorix-api pods did not converge to VELORIX_GENERATED_ARTIFACT_PACKAGES=${packages}" >&2
-      kubectl --context "$context" -n "$namespace" get pods -l app=velorix-api -o wide >&2 || true
-      exit 1
-    fi
-    sleep 1
-  done
-}
-
-set_api_generated_artifact_packages_for_compile_deploy_smoke() {
-  local packages="$1"
-  kubectl --context "$context" -n "$namespace" set env \
-    deployment/velorix-api \
-    "VELORIX_GENERATED_ARTIFACT_PACKAGES=${packages}" >/dev/null
-  wait_for_rollout velorix-api
-  wait_for_api_generated_artifact_packages "$packages"
-  start_api_port_forward
-  start_api_tls_port_forward
 }
 
 curl_api() {
@@ -5128,7 +5055,7 @@ run_api_tls_auth_smoke() {
     -H "authorization: Bearer definitely-wrong-token"
   check_api_auth_rejection "${output_dir}/tls-admin-auth-data-token-response.json" "TLS data-plane token on admin route" \
     --cacert "${output_dir}/api-tls.crt" \
-    -X POST "${tls_url}/v1/view-compile-deploy/run-once" \
+    "${tls_url}/v1/standing-runtime/owners" \
     -H "authorization: Bearer ${api_bearer_token}"
   curl -fsS --cacert "${output_dir}/api-tls.crt" \
     -H "authorization: Bearer ${api_bearer_token}" \
@@ -5201,9 +5128,6 @@ write_product_evidence() {
     "$api_query_policy_smoke_passed" \
     "$api_query_policy_missing_policy_rejected" \
     "$api_query_policy_weak_policy_rejected" \
-    "$api_compile_deploy_job_catalog_verified" \
-    "$api_compile_deploy_worker_run_verified" \
-    "$api_compile_deploy_activated_view_id" \
     "$api_openapi_catalog_smoke_passed" \
     "$ingest_writer_smoke" \
     "$ingest_writer_image" \
@@ -5292,9 +5216,6 @@ from datetime import datetime, timezone
     api_query_policy_smoke_passed,
     api_query_policy_missing_policy_rejected,
     api_query_policy_weak_policy_rejected,
-    api_compile_deploy_job_catalog_verified,
-    api_compile_deploy_worker_run_verified,
-    api_compile_deploy_activated_view_id,
     api_openapi_catalog_smoke_passed,
     ingest_writer_smoke,
     ingest_writer_image,
@@ -5542,9 +5463,6 @@ if ingress_tls_auth_attestation_file:
         "admin_route_wrong_token_rejected": raw_attestation.get(
             "admin_route_wrong_token_rejected"
         ),
-        "data_plane_token_rejected_on_admin_catalog_route": raw_attestation.get(
-            "data_plane_token_rejected_on_admin_catalog_route"
-        ),
         "admin_token_accepted_on_admin_route": raw_attestation.get(
             "admin_token_accepted_on_admin_route"
         ),
@@ -5623,7 +5541,6 @@ if ingest_writer_lifecycle_attestation_file:
     }
 
 product_complete_blockers = []
-feldera_jarless_product_backend_verified = False
 if not production_multi_writer_safe:
     if multi_writer_fencing_safe and not production_bounded_failover_safe:
         product_complete_blockers.append(
@@ -5706,14 +5623,6 @@ if ingest_writer_lifecycle_attestation_validated != "1":
 elif ingest_writer_lifecycle_attestation_source != "generated":
     product_complete_blockers.append(
         "deployed ingest-writer lifecycle attestation was externally supplied; only script-generated Kubernetes Job evidence can clear product-complete"
-    )
-if api_compile_deploy_worker_run_verified != "1":
-    product_complete_blockers.append(
-        "view compile/deploy worker did not activate the pending Feldera/DBSP view into a standing runtime"
-    )
-if not feldera_jarless_product_backend_verified:
-    product_complete_blockers.append(
-        "jarless Feldera package backend did not produce product runtime evidence; pipeline-manager and linked generated fixtures are compatibility evidence only"
     )
 if not api_image_digest:
     product_complete_blockers.append("velorix-api deployed image digest was not recorded")
@@ -5891,36 +5800,6 @@ evidence = {
                 "missing_policy_rejection": "query-policy-missing-view.json",
             }
             if api_query_policy_smoke_passed == "1"
-            else None,
-        },
-        "compile_deploy": {
-            "job_catalog_verified": api_compile_deploy_job_catalog_verified == "1",
-            "job_catalog_evidence_file": "view-compile-deploy-jobs.json"
-            if api_compile_deploy_job_catalog_verified == "1"
-            else None,
-            "pending_view_id": "pending_scores_by_user"
-            if api_compile_deploy_job_catalog_verified == "1"
-            else None,
-            "compiler_request_embedded": api_compile_deploy_job_catalog_verified == "1",
-            "admin_route": "/v1/view-compile-deploy/jobs",
-            "worker_run_verified": api_compile_deploy_worker_run_verified == "1",
-            "jarless_product_backend_verified": feldera_jarless_product_backend_verified,
-            "pipeline_manager_compatibility_trusted_for_product_complete": False,
-            "run_once_admin_route": "/v1/view-compile-deploy/run-once",
-            "run_once_evidence_file": "view-compile-deploy-run-once.json"
-            if api_compile_deploy_worker_run_verified == "1"
-            else None,
-            "activated_view_id": api_compile_deploy_activated_view_id
-            if api_compile_deploy_worker_run_verified == "1"
-            else None,
-            "activated_execution_mode": "standing_runtime"
-            if api_compile_deploy_worker_run_verified == "1"
-            else None,
-            "activated_view_evidence_file": "pending-scores-view-after-compile-deploy.json"
-            if api_compile_deploy_worker_run_verified == "1"
-            else None,
-            "activated_query_evidence_file": "pending-scores-query-after-compile-deploy.json"
-            if api_compile_deploy_worker_run_verified == "1"
             else None,
         },
         "auth": {
@@ -7009,8 +6888,6 @@ ${api_auth_env}
             - name: VELORIX_STANDING_RUNTIME_OWNER_TTL_MS
               value: "${standing_runtime_owner_ttl_ms}"
 ${api_meta_env}
-            - name: VELORIX_GENERATED_ARTIFACT_PACKAGES
-              value: "${generated_artifact_packages}"
           ports:
             - containerPort: 8080
 ${api_tls_ports}
@@ -7196,7 +7073,7 @@ if [ "$api_auth_mode" = "bearer-token" ]; then
     -H "authorization: Bearer definitely-wrong-token"
   api_auth_wrong_token_rejected=1
   check_api_auth_rejection "${output_dir}/admin-auth-data-token-response.json" "data-plane token on admin route" \
-    -X POST "http://127.0.0.1:${api_local_port}/v1/view-compile-deploy/run-once" \
+    "http://127.0.0.1:${api_local_port}/v1/standing-runtime/owners" \
     -H "authorization: Bearer ${api_bearer_token}"
   api_auth_data_plane_token_rejected_on_admin_route=1
   fi
@@ -7284,176 +7161,6 @@ if "query policy" not in missing.get("error", "").lower():
 PY
   api_query_policy_weak_policy_rejected=1
   api_query_policy_missing_policy_rejected=1
-  compile_deploy_smoke_runtime_packages="$(compile_deploy_smoke_effective_generated_packages)"
-  set_api_generated_artifact_packages_for_compile_deploy_smoke "__velorix_no_generated_packages__"
-  pending_already_active=0
-  pending_status="$(curl_api_status "${output_dir}/feldera-compile-pending-view.json" \
-    -X POST "http://127.0.0.1:${api_local_port}/v1/views" \
-    -H 'content-type: application/json' \
-    -d '{"view_id":"pending_scores_by_user","urlPath":"/pending/scores/by-user","input_relation_id":"scores","input_relation_version":"2026-05-24.v1","sql":"select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id"}')"
-  case "$pending_status" in
-    202) ;;
-    409)
-      if python3 - "${output_dir}/feldera-compile-pending-view.json" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], "r", encoding="utf-8") as f:
-    body = json.load(f)
-if "active materialized view record conflict" not in body.get("error", ""):
-    raise SystemExit(1)
-PY
-      then
-        pending_already_active=1
-      else
-        echo "unexpected pending_scores_by_user duplicate response" >&2
-        cat "${output_dir}/feldera-compile-pending-view.json" >&2 || true
-        exit 1
-      fi
-      ;;
-    *)
-      echo "expected no-artifact view creation to enter feldera compile pending with 202 or existing-active 409, got ${pending_status}" >&2
-      cat "${output_dir}/feldera-compile-pending-view.json" >&2 || true
-      exit 1
-      ;;
-  esac
-  if [ "$pending_already_active" = "0" ]; then
-  python3 - "${output_dir}/feldera-compile-pending-view.json" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], "r", encoding="utf-8") as f:
-    body = json.load(f)
-if body.get("execution_mode") != "feldera_compile_pending":
-    raise SystemExit(f"unexpected execution mode for no-artifact view: {body}")
-if body.get("query_enabled") is not False:
-    raise SystemExit(f"pending compile view must not be query enabled: {body}")
-if not str(body.get("compile_job_id", "")).startswith("pending_scores_by_user:velorix-feldera-compile-request-sha256-v1:"):
-    raise SystemExit(f"pending compile view is missing compile_job_id: {body}")
-lifecycle = body.get("lifecycle") or {}
-if lifecycle.get("compile_status") != "pending" or lifecycle.get("deployment_status") != "not_deployed":
-    raise SystemExit(f"unexpected pending compile lifecycle: {body}")
-PY
-  fi
-  curl_admin_api "http://127.0.0.1:${api_local_port}/v1/view-compile-deploy/jobs" \
-    | tee "${output_dir}/view-compile-deploy-jobs.json" >/dev/null
-  python3 - "${output_dir}/view-compile-deploy-jobs.json" "$pending_already_active" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], "r", encoding="utf-8") as f:
-    body = json.load(f)
-already_active = sys.argv[2] == "1"
-already_active_context = (
-    " pending_scores_by_user is already active, so this run cannot prove the "
-    "no-artifact compile/deploy queue unless the sibling catalog still contains "
-    "the pending_scores_by_user job; rerun with fresh product state or clear stale "
-    "view/job records."
-    if already_active
-    else ""
-)
-if body.get("pending_jobs") != 1:
-    raise SystemExit(f"expected exactly one pending compile/deploy job:{already_active_context} {body}")
-jobs = body.get("jobs")
-if not isinstance(jobs, list) or len(jobs) != 1:
-    raise SystemExit(f"expected one compile/deploy job body:{already_active_context} {body}")
-job = jobs[0]
-if job.get("view_id") != "pending_scores_by_user":
-    raise SystemExit(f"unexpected compile/deploy job view_id:{already_active_context} {body}")
-compiler_request = job.get("compiler_request") or {}
-if compiler_request.get("request_kind") != "feldera_standing_view_compile_request_v1":
-    raise SystemExit(f"compile/deploy job is missing compiler_request kind:{already_active_context} {body}")
-if compiler_request.get("view_id") != "pending_scores_by_user":
-    raise SystemExit(f"compile/deploy compiler_request view mismatch:{already_active_context} {body}")
-sql = compiler_request.get("sql") or ""
-if "sum(score)" not in sql or "group by user_id" not in sql.lower():
-    raise SystemExit(f"compile/deploy compiler_request SQL mismatch:{already_active_context} {body}")
-if not compiler_request.get("input_relations"):
-    raise SystemExit(f"compile/deploy compiler_request is missing input schemas:{already_active_context} {body}")
-output_contract = compiler_request.get("output_contract") or {}
-if not compiler_request.get("output_relations") and output_contract.get("kind") != "infer":
-    raise SystemExit(f"compile/deploy compiler_request is missing output schema contract:{already_active_context} {body}")
-shape = compiler_request.get("shape") or {}
-if shape.get("is_materialized") is not True:
-    raise SystemExit(f"compile/deploy compiler_request shape mismatch:{already_active_context} {body}")
-PY
-  api_compile_deploy_job_catalog_verified=1
-  set_api_generated_artifact_packages_for_compile_deploy_smoke "$compile_deploy_smoke_runtime_packages"
-  if [ "$pending_already_active" = "0" ]; then
-    curl_admin_api \
-      -X POST "http://127.0.0.1:${api_local_port}/v1/view-compile-deploy/run-once" \
-      | tee "${output_dir}/view-compile-deploy-run-once.json" >/dev/null
-    curl_api "http://127.0.0.1:${api_local_port}/v1/views/pending_scores_by_user" \
-      | tee "${output_dir}/pending-scores-view-after-compile-deploy.json" >/dev/null
-  else
-    curl_api "http://127.0.0.1:${api_local_port}/v1/views/pending_scores_by_user" \
-      | tee "${output_dir}/pending-scores-view-after-compile-deploy.json" >/dev/null
-    python3 - "${output_dir}/view-compile-deploy-run-once.json" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], "w", encoding="utf-8") as f:
-    json.dump(
-        {
-            "pending_jobs": 0,
-            "activated": 0,
-            "failed": 0,
-            "outcomes": [],
-            "preserved_active_view": "pending_scores_by_user",
-        },
-        f,
-        sort_keys=True,
-    )
-    f.write("\n")
-PY
-  fi
-  python3 - "${output_dir}/view-compile-deploy-run-once.json" "${output_dir}/pending-scores-view-after-compile-deploy.json" "$pending_already_active" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], "r", encoding="utf-8") as f:
-    report = json.load(f)
-already_active = sys.argv[3] == "1"
-if already_active and report.get("pending_jobs") == 0:
-    pass
-elif report.get("pending_jobs") != 1:
-    raise SystemExit(f"expected exactly one compile/deploy worker job: {report}")
-if already_active and report.get("pending_jobs") == 0:
-    pass
-elif report.get("activated") != 1:
-    raise SystemExit(f"expected compile/deploy worker to activate one view: {report}")
-if report.get("failed") != 0:
-    raise SystemExit(f"compile/deploy worker reported failed jobs: {report}")
-outcomes = report.get("outcomes") or []
-if already_active and report.get("pending_jobs") == 0 and not outcomes:
-    pass
-elif len(outcomes) != 1:
-    raise SystemExit(f"expected one compile/deploy worker outcome: {report}")
-if outcomes:
-    outcome = outcomes[0]
-    if outcome.get("view_id") != "pending_scores_by_user":
-        raise SystemExit(f"compile/deploy worker activated unexpected view: {report}")
-    if outcome.get("status") != "activated":
-        raise SystemExit(f"compile/deploy worker did not activate pending view: {report}")
-
-with open(sys.argv[2], "r", encoding="utf-8") as f:
-    view = json.load(f)
-if view.get("view_id") != "pending_scores_by_user":
-    raise SystemExit(f"activated view detail has unexpected view_id: {view}")
-if view.get("execution_mode") != "standing_runtime":
-    raise SystemExit(f"compile/deploy worker did not promote view to standing_runtime: {view}")
-if view.get("query_enabled") is not True:
-    raise SystemExit(f"compile/deploy worker did not enable view query: {view}")
-lifecycle = view.get("lifecycle") or {}
-if lifecycle.get("compile_status") != "success":
-    raise SystemExit(f"activated view compile status is not success: {view}")
-if lifecycle.get("deployment_status") != "running":
-    raise SystemExit(f"activated view deployment status is not running: {view}")
-if view.get("compile_job_id") is not None:
-    raise SystemExit(f"activated standing runtime view should not expose compile_job_id: {view}")
-PY
-  api_compile_deploy_worker_run_verified=1
-  api_compile_deploy_activated_view_id="pending_scores_by_user"
   positive_scores_view_status="$(curl_api_status "${output_dir}/positive-scores-view-create.json" \
     -X POST "http://127.0.0.1:${api_local_port}/v1/views" \
     -H 'content-type: application/json' \
@@ -7481,11 +7188,9 @@ PY
     | tee "${output_dir}/positive-scores-query.json" >/dev/null
   curl_api "http://127.0.0.1:${api_local_port}/v1/api/scores/positive" \
     | tee "${output_dir}/positive-scores-api.json" >/dev/null
-  curl_api "http://127.0.0.1:${api_local_port}/v1/views/pending_scores_by_user/query" \
-    | tee "${output_dir}/pending-scores-query-after-compile-deploy.json" >/dev/null
   curl_api "http://127.0.0.1:${api_local_port}/v1/openapi.json" \
     | tee "${output_dir}/openapi.json" >/dev/null
-  python3 - "${output_dir}/positive-scores-query.json" "${output_dir}/positive-scores-api.json" "${output_dir}/openapi.json" "${output_dir}/positive-scores-view.json" "${output_dir}/pending-scores-query-after-compile-deploy.json" <<'PY'
+  python3 - "${output_dir}/positive-scores-query.json" "${output_dir}/positive-scores-api.json" "${output_dir}/openapi.json" "${output_dir}/positive-scores-view.json" <<'PY'
 import json
 import sys
 
@@ -7512,12 +7217,6 @@ with open(sys.argv[4], "r", encoding="utf-8") as f:
     view = json.load(f)
 if view.get("query_policy_id") != "interactive":
     raise SystemExit(f"positive scores view is not linked to query policy: {view}")
-with open(sys.argv[5], "r", encoding="utf-8") as f:
-    pending_query = json.load(f)
-pending_rows = {row.get("user_id"): row for row in pending_query.get("rows") or []}
-pending_u1 = pending_rows.get("u1") or {}
-if pending_u1.get("sum", 0) < 12 or pending_u1.get("count", 0) < 2:
-    raise SystemExit(f"unexpected compile/deploy activated pending view rows: {pending_query}")
 PY
   api_openapi_catalog_smoke_passed=1
   api_query_policy_smoke_passed=1
@@ -7703,9 +7402,7 @@ if [ "$api_auth_mode" = "bearer-token" ]; then
   # shellcheck disable=SC2016
   echo '  curl "$VELORIX_API_URL/v1/api/scores/positive" -H "$VELORIX_API_AUTH_HEADER"'
   # shellcheck disable=SC2016
-  echo '  curl "$VELORIX_API_URL/v1/view-compile-deploy/jobs" -H "$VELORIX_ADMIN_AUTH_HEADER"'
-  # shellcheck disable=SC2016
-  echo '  curl -X POST "$VELORIX_API_URL/v1/view-compile-deploy/run-once" -H "$VELORIX_ADMIN_AUTH_HEADER"'
+  echo '  curl "$VELORIX_API_URL/v1/standing-runtime/owners" -H "$VELORIX_ADMIN_AUTH_HEADER"'
   echo "  VELORIX_VIND_PRODUCT_DIR=${output_dir} scripts/smoke-vind-rest-api.sh"
   echo "  VELORIX_VIND_PRODUCT_DIR=${output_dir} scripts/report-vind-product-completion.sh"
 else

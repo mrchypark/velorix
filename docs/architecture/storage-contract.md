@@ -28,14 +28,17 @@ segment.
 | Checkpoint manifest | `v1/checkpoints/{checkpoint_version:020}.manifest` | Authoritative progress marker |
 | Persisted query spec | `v1/queries/{query_id}.query.json` | Create-only query SQL/policy catalog object |
 | Persisted table spec | `v1/tables/{table_id}.table.json` | Create-only registry-backed table spec; raw Parquet URL specs are phase-0/dev-only |
-| Materialized view spec | `v1/views/{view_id}/spec-sha256/{spec_hash}.view.json` | Create-only `StandingViewSpec` definition for DBSP-backed materialized views |
-| View compile/deploy job | `v1/view-compile-deploy-jobs/{view_id}/compile-request-sha256/{compile_request_hash}.job.json` | Create-only pending Feldera compiler request keyed by `FelderaCompileRequestV1` hash; `spec-sha256` job keys are legacy fallback only |
+| Materialized view spec | `v1/views/{view_id}/spec-sha256/{spec_hash}.view.json` | Create-only `StandingViewSpec` definition for jarless materialized views |
 | Relation spec | `v1/relations/{relation_id}/versions/{relation_version}.relation.json` | Create-only relation catalog object |
 | Ownership claim | `v1/ownership/{stream_id}/p={partition_id:010}/epoch={owner_epoch:020}.claim` | Production distributed-writer epoch record |
 
 Structured constructors in `crates/velorix-storage/src/object_key.rs` own these
 formats. Call sites should not assemble storage paths with ad hoc string
 formatting.
+
+The former compile/deploy job key family is obsolete. Current product work must
+not create new async compiler queue records or treat that queue as materialized
+view activation authority.
 
 `v1/ingest` is reserved for committed input batches only. Internal
 materialized outputs must use `v1/outputs`, carry the manifest checkpoint
@@ -335,8 +338,8 @@ Foyer owns the runtime local memory/disk object-cache internals behind the
 Velorix cache wrapper. Cache reads verify object-store authority first, and
 cache contents never prove durable progress.
 
-Feldera DBSP semantics remain the target direction for incremental algebra. The
-current `IncrementalEngine` boundary is DBSP-shaped but backed by prototype
+internal materialized view semantics are maintained by the Velorix standing runtime. The
+current execution boundary is internal and checkpoint-backed
 operators until direct integration gates are satisfied.
 
 ## Garbage Collection

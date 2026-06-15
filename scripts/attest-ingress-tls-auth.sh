@@ -48,9 +48,8 @@ Localhost and Kubernetes service DNS are intentionally rejected by
 scripts/run-vind-product.sh when this evidence is consumed.
 
 The admin token is required as an operator input to attest that the deployment
-has a separate admin credential. This script intentionally does not send it to
-the mutating /v1/view-compile-deploy/run-once route; it proves separation by
-verifying that the data-plane token is rejected on that admin route.
+has a separate admin credential. This script proves separation by verifying
+that the data-plane token is rejected on the standing-runtime admin route.
 EOF
 }
 
@@ -257,19 +256,16 @@ wait_for_status 401 "missing bearer token" "${tmpdir}/missing-token.json" \
 check_status 401 "wrong bearer token" "${tmpdir}/wrong-token.json" \
   -X POST "${normalized_endpoint}/v1/relations/scores-default" \
   -H "authorization: Bearer definitely-wrong-token"
-check_status 401 "data-plane token on admin route" "${tmpdir}/data-token-admin.json" \
-  -X POST "${normalized_endpoint}/v1/view-compile-deploy/run-once" \
-  -H "authorization: Bearer ${api_token}"
-check_status 401 "missing bearer token on admin catalog route" "${tmpdir}/missing-token-admin-catalog.json" \
-  "${normalized_endpoint}/v1/view-compile-deploy/jobs"
-check_status 401 "wrong bearer token on admin catalog route" "${tmpdir}/wrong-token-admin-catalog.json" \
-  "${normalized_endpoint}/v1/view-compile-deploy/jobs" \
+check_status 401 "missing bearer token on admin route" "${tmpdir}/missing-token-admin.json" \
+  "${normalized_endpoint}/v1/standing-runtime/owners"
+check_status 401 "wrong bearer token on admin route" "${tmpdir}/wrong-token-admin.json" \
+  "${normalized_endpoint}/v1/standing-runtime/owners" \
   -H "authorization: Bearer definitely-wrong-token"
-check_status 401 "data-plane token on admin catalog route" "${tmpdir}/data-token-admin-catalog.json" \
-  "${normalized_endpoint}/v1/view-compile-deploy/jobs" \
+check_status 401 "data-plane token on admin route" "${tmpdir}/data-token-admin.json" \
+  "${normalized_endpoint}/v1/standing-runtime/owners" \
   -H "authorization: Bearer ${api_token}"
 check_status 200 "admin token on admin route" "${tmpdir}/admin-token-admin.json" \
-  "${normalized_endpoint}/v1/view-compile-deploy/jobs" \
+  "${normalized_endpoint}/v1/standing-runtime/owners" \
   -H "authorization: Bearer ${admin_token}"
 curl -fsS \
   -H "authorization: Bearer ${api_token}" \
@@ -320,7 +316,6 @@ attestation = {
     "admin_auth_separate": True,
     "admin_route_missing_token_rejected": True,
     "admin_route_wrong_token_rejected": True,
-    "data_plane_token_rejected_on_admin_catalog_route": True,
     "admin_token_accepted_on_admin_route": True,
     "data_plane_token_rejected_on_admin_route": True,
     "attested_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),

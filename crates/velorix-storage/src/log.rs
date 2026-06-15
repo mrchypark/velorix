@@ -3,6 +3,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use arrow::{
+    array::{Array, Date32Array, Int64Array, TimestampNanosecondArray},
+    record_batch::RecordBatch,
+};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{lock::Mutex as AsyncMutex, TryStreamExt};
@@ -10,7 +14,13 @@ use object_store::{path::Path, ObjectStore, PutMode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use velorix_core::relation::{validate_record_batch_matches_catalog, RelationSchemaError};
+use velorix_core::{
+    relation::{
+        validate_record_batch_matches_catalog, ArrowPhysicalTypeV1, RelationSchemaError,
+        VelorixRelationCatalogV1,
+    },
+    standing_program::InputEventTimeWatermark,
+};
 
 use crate::{
     capability::{
@@ -82,6 +92,8 @@ pub struct DurableIngestAdmissionRecordV1 {
     pub partition_id: u32,
     pub start_offset_inclusive: u64,
     pub end_offset_exclusive: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_time_watermark: Option<InputEventTimeWatermark>,
     pub batch_key: ObjectKey,
     pub admission_record_key: ObjectKey,
     pub payload_digest: String,
@@ -852,6 +864,7 @@ impl DurableIngestAdmissionRecordV1 {
             partition_id,
             start_offset_inclusive,
             end_offset_exclusive,
+            event_time_watermark: None,
             batch_key,
             admission_record_key,
             payload_digest: payload_digest.into(),
@@ -1635,7 +1648,9 @@ impl IngestLog {
             });
         }
 
-        for batch in envelope.record_batches()? {
+        let batches = envelope.record_batches()?;
+        validate_event_time_watermark_against_catalog_and_batches(header, &catalog, &batches)?;
+        for batch in batches {
             validate_record_batch_matches_catalog(&catalog, &batch)?;
         }
 
@@ -2361,6 +2376,7 @@ fn index_probe_record_for_descriptor(
         partition_id: descriptor.partition_id,
         start_offset_inclusive: descriptor.start_offset_inclusive,
         end_offset_exclusive: descriptor.end_offset_exclusive,
+        event_time_watermark: None,
         batch_key: descriptor.object_key.clone(),
         admission_record_key: ObjectKey::ingest_admission_record(
             &descriptor.stream_id,
@@ -2549,6 +2565,7 @@ fn admission_record_for_batch_with_commit_guard(
         partition_id: descriptor.partition_id,
         start_offset_inclusive: descriptor.start_offset_inclusive,
         end_offset_exclusive: descriptor.end_offset_exclusive,
+        event_time_watermark: header.event_time_watermark.clone(),
         batch_key: descriptor.object_key,
         admission_record_key,
         payload_digest: header.payload_digest.clone(),
@@ -2620,6 +2637,144 @@ fn batch_in_replay_window(
     }
 
     Ok(true)
+}
+
+fn validate_event_time_watermark_against_catalog_and_batches(
+    header: &crate::ingest_envelope::IngestEnvelopeHeader,
+    catalog: &VelorixRelationCatalogV1,
+    batches: &[RecordBatch],
+) -> Result<(), IngestLogError> {
+    let Some(watermark) = &header.event_time_watermark else {
+        return Ok(());
+    };
+    let Some(event_time_column_id) = &catalog.relation_schema.event_time_column_id else {
+        return Err(IngestLogError::RelationCatalogMismatch {
+            field: "event_time_watermark.event_time_column_id",
+            expected: "declared relation_schema.event_time_column_id".to_string(),
+            actual: watermark.event_time_column_id.clone(),
+        });
+    };
+    if watermark.event_time_column_id != *event_time_column_id {
+        return Err(IngestLogError::RelationCatalogMismatch {
+            field: "event_time_watermark.event_time_column_id",
+            expected: event_time_column_id.clone(),
+            actual: watermark.event_time_column_id.clone(),
+        });
+    }
+    let Some(column) = catalog
+        .relation_schema
+        .columns
+        .iter()
+        .find(|column| column.column_id == *event_time_column_id)
+    else {
+        return Err(IngestLogError::RelationCatalogMismatch {
+            field: "event_time_watermark.event_time_column_id",
+            expected: "catalog column".to_string(),
+            actual: watermark.event_time_column_id.clone(),
+        });
+    };
+    let actual_max = match &column.physical_arrow_type {
+        ArrowPhysicalTypeV1::Int64 => max_int64_column(batches, &column.name),
+        ArrowPhysicalTypeV1::Date32 => {
+            max_date32_column(batches, &column.name).map(|value| i64::from(value))
+        }
+        ArrowPhysicalTypeV1::TimestampNanosecond { .. } => {
+            max_timestamp_column(batches, &column.name)
+        }
+        other => {
+            return Err(IngestLogError::RelationCatalogMismatch {
+                field: "event_time_watermark.event_time_column_type",
+                expected: "Int64, Date32, or TimestampNanosecond".to_string(),
+                actual: format!("{other:?}"),
+            });
+        }
+    }?;
+    if watermark.max_observed_event_time_ns < actual_max {
+        return Err(IngestLogError::RelationCatalogMismatch {
+            field: "event_time_watermark.max_observed_event_time_ns",
+            expected: actual_max.to_string(),
+            actual: watermark.max_observed_event_time_ns.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn max_int64_column(batches: &[RecordBatch], name: &str) -> Result<i64, IngestLogError> {
+    let mut max_value = None;
+    for batch in batches {
+        let array = batch
+            .column_by_name(name)
+            .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+            .ok_or_else(|| IngestLogError::RelationCatalogMismatch {
+                field: "event_time_watermark.event_time_column",
+                expected: "Int64".to_string(),
+                actual: name.to_string(),
+            })?;
+        for row in 0..array.len() {
+            if !array.is_null(row) {
+                max_value = Some(max_value.map_or(array.value(row), |current: i64| {
+                    current.max(array.value(row))
+                }));
+            }
+        }
+    }
+    max_value.ok_or_else(|| IngestLogError::RelationCatalogMismatch {
+        field: "event_time_watermark.event_time_column",
+        expected: "at least one non-null event-time value".to_string(),
+        actual: name.to_string(),
+    })
+}
+
+fn max_date32_column(batches: &[RecordBatch], name: &str) -> Result<i32, IngestLogError> {
+    let mut max_value = None;
+    for batch in batches {
+        let array = batch
+            .column_by_name(name)
+            .and_then(|column| column.as_any().downcast_ref::<Date32Array>())
+            .ok_or_else(|| IngestLogError::RelationCatalogMismatch {
+                field: "event_time_watermark.event_time_column",
+                expected: "Date32".to_string(),
+                actual: name.to_string(),
+            })?;
+        for row in 0..array.len() {
+            if !array.is_null(row) {
+                max_value = Some(max_value.map_or(array.value(row), |current: i32| {
+                    current.max(array.value(row))
+                }));
+            }
+        }
+    }
+    max_value.ok_or_else(|| IngestLogError::RelationCatalogMismatch {
+        field: "event_time_watermark.event_time_column",
+        expected: "at least one non-null event-time value".to_string(),
+        actual: name.to_string(),
+    })
+}
+
+fn max_timestamp_column(batches: &[RecordBatch], name: &str) -> Result<i64, IngestLogError> {
+    let mut max_value = None;
+    for batch in batches {
+        let array = batch
+            .column_by_name(name)
+            .and_then(|column| column.as_any().downcast_ref::<TimestampNanosecondArray>())
+            .ok_or_else(|| IngestLogError::RelationCatalogMismatch {
+                field: "event_time_watermark.event_time_column",
+                expected: "TimestampNanosecond".to_string(),
+                actual: name.to_string(),
+            })?;
+        for row in 0..array.len() {
+            if !array.is_null(row) {
+                max_value = Some(max_value.map_or(array.value(row), |current: i64| {
+                    current.max(array.value(row))
+                }));
+            }
+        }
+    }
+    max_value.ok_or_else(|| IngestLogError::RelationCatalogMismatch {
+        field: "event_time_watermark.event_time_column",
+        expected: "at least one non-null event-time value".to_string(),
+        actual: name.to_string(),
+    })
 }
 
 fn admission_in_replay_window(
@@ -2716,6 +2871,17 @@ fn validate_admission_matches_replayed_batch(
         "schema_fingerprint",
         &header.schema_fingerprint,
         &admission.schema_fingerprint,
+    )?;
+    let expected_event_time_watermark =
+        serde_json::to_string(&header.event_time_watermark).map_err(IngestLogError::Json)?;
+    let actual_event_time_watermark =
+        serde_json::to_string(&admission.event_time_watermark).map_err(IngestLogError::Json)?;
+    validate_admission_field(
+        admission,
+        descriptor,
+        "event_time_watermark",
+        &expected_event_time_watermark,
+        &actual_event_time_watermark,
     )?;
     validate_admission_field(
         admission,

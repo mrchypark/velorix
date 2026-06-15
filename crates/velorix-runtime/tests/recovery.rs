@@ -18,15 +18,13 @@ use velorix_core::{
     engine::EngineCheckpoint,
     relation::{
         ArrowPhysicalTypeV1, DataFusionRegistrationModeV1, DataFusionRegistrationV1,
-        DictionaryKeyTypeV1, FelderaRelationBindingV1, IncrementalAdapterBindingV1,
+        DictionaryKeyTypeV1, IncrementalAdapterBindingV1, IncrementalRelationBindingV1,
         RelationColumnV1, RelationOperationV1, RelationSemanticRoleV1, SchemaFingerprintV1,
         VelorixLogicalTypeV1, VelorixRelationCatalogV1, VelorixRelationSchemaV1,
         CATALOG_ROW_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID,
         CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID, RELATION_SCHEMA_VERSION_V1,
     },
 };
-#[cfg(feature = "dbsp-runtime")]
-use velorix_runtime::recovery::IncrementalEngineBackend;
 use velorix_runtime::recovery::{
     orders_sum_count_relation_catalog, RecoveredRuntime, RecoveryError,
     ORDERS_SUM_COUNT_ADAPTER_ID, ORDERS_SUM_COUNT_OWNER, ORDERS_SUM_COUNT_RELATION_ID,
@@ -422,6 +420,7 @@ fn ingest_envelope_bytes(
             partition_id: 0,
             start_offset_inclusive: 0,
             end_offset_exclusive: input.records().len() as u64,
+            event_time_watermark: None,
         },
         &[ingest_record_batch(input)],
     )
@@ -526,7 +525,7 @@ fn int64_account_relation_catalog() -> VelorixRelationCatalogV1 {
             name: "accounts".to_string(),
             mode: DataFusionRegistrationModeV1::Table,
         },
-        feldera_relation: FelderaRelationBindingV1 {
+        incremental_relation: IncrementalRelationBindingV1 {
             relation_id: "accounts".to_string(),
             schema_fingerprint,
         },
@@ -594,7 +593,7 @@ fn account_currency_relation_catalog() -> VelorixRelationCatalogV1 {
             name: "account_currencies".to_string(),
             mode: DataFusionRegistrationModeV1::Table,
         },
-        feldera_relation: FelderaRelationBindingV1 {
+        incremental_relation: IncrementalRelationBindingV1 {
             relation_id: "account_currencies".to_string(),
             schema_fingerprint,
         },
@@ -653,7 +652,7 @@ fn boolean_account_relation_catalog() -> VelorixRelationCatalogV1 {
             name: "boolean_accounts".to_string(),
             mode: DataFusionRegistrationModeV1::Table,
         },
-        feldera_relation: FelderaRelationBindingV1 {
+        incremental_relation: IncrementalRelationBindingV1 {
             relation_id: "boolean_accounts".to_string(),
             schema_fingerprint,
         },
@@ -718,7 +717,7 @@ fn decimal_account_relation_catalog() -> VelorixRelationCatalogV1 {
             name: "decimal_accounts".to_string(),
             mode: DataFusionRegistrationModeV1::Table,
         },
-        feldera_relation: FelderaRelationBindingV1 {
+        incremental_relation: IncrementalRelationBindingV1 {
             relation_id: "decimal_accounts".to_string(),
             schema_fingerprint,
         },
@@ -783,7 +782,7 @@ fn decimal_value_relation_catalog() -> VelorixRelationCatalogV1 {
             name: "decimal_value_accounts".to_string(),
             mode: DataFusionRegistrationModeV1::Table,
         },
-        feldera_relation: FelderaRelationBindingV1 {
+        incremental_relation: IncrementalRelationBindingV1 {
             relation_id: "decimal_value_accounts".to_string(),
             schema_fingerprint,
         },
@@ -808,7 +807,7 @@ fn multiple_value_relation_catalog() -> VelorixRelationCatalogV1 {
     catalog.relation_schema.columns.push(extra_value);
     catalog.schema_fingerprint =
         SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema).unwrap();
-    catalog.feldera_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
+    catalog.incremental_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
     catalog
 }
 
@@ -825,7 +824,7 @@ fn scalar_adapter_multi_key_relation_catalog() -> VelorixRelationCatalogV1 {
         .push("store_id".to_string());
     catalog.schema_fingerprint =
         SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema).unwrap();
-    catalog.feldera_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
+    catalog.incremental_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
     catalog
 }
 
@@ -878,7 +877,7 @@ fn date32_daily_relation_catalog() -> VelorixRelationCatalogV1 {
             name: "daily_balances".to_string(),
             mode: DataFusionRegistrationModeV1::Table,
         },
-        feldera_relation: FelderaRelationBindingV1 {
+        incremental_relation: IncrementalRelationBindingV1 {
             relation_id: "daily_balances".to_string(),
             schema_fingerprint,
         },
@@ -937,7 +936,7 @@ fn timestamped_observation_relation_catalog() -> VelorixRelationCatalogV1 {
             name: "timestamped_observations".to_string(),
             mode: DataFusionRegistrationModeV1::Table,
         },
-        feldera_relation: FelderaRelationBindingV1 {
+        incremental_relation: IncrementalRelationBindingV1 {
             relation_id: "timestamped_observations".to_string(),
             schema_fingerprint,
         },
@@ -999,7 +998,7 @@ fn dictionary_account_relation_catalog() -> VelorixRelationCatalogV1 {
             name: "dictionary_accounts".to_string(),
             mode: DataFusionRegistrationModeV1::Table,
         },
-        feldera_relation: FelderaRelationBindingV1 {
+        incremental_relation: IncrementalRelationBindingV1 {
             relation_id: "dictionary_accounts".to_string(),
             schema_fingerprint,
         },
@@ -1058,7 +1057,7 @@ fn json_account_relation_catalog() -> VelorixRelationCatalogV1 {
             name: "json_accounts".to_string(),
             mode: DataFusionRegistrationModeV1::Table,
         },
-        feldera_relation: FelderaRelationBindingV1 {
+        incremental_relation: IncrementalRelationBindingV1 {
             relation_id: "json_accounts".to_string(),
             schema_fingerprint,
         },
@@ -1169,154 +1168,6 @@ async fn catalog_backed_recovery_reads_catalog_record_and_replays_catalog_aware_
     );
 }
 
-#[cfg(feature = "dbsp-runtime")]
-#[tokio::test]
-async fn catalog_backed_recovery_can_replay_with_dbsp_backend() {
-    let (_temp_dir, store) = temp_store();
-    let catalog = orders_sum_count_relation_catalog().unwrap();
-    RelationCatalogRegistry::new(Arc::clone(&store))
-        .create(&catalog)
-        .await
-        .unwrap();
-    let input = input_batch([
-        input_delta("account-a", 4, 1),
-        input_delta("account-a", 6, 1),
-    ]);
-    let ingest_coordinator = local_ingest_coordinator(Arc::clone(&store));
-    append_ingest_envelope(
-        &ingest_coordinator,
-        ingest_envelope_bytes(
-            ORDERS_SUM_COUNT_RELATION_VERSION,
-            catalog.schema_fingerprint.as_str(),
-            &input,
-        ),
-    )
-    .await;
-
-    let recovered =
-        RecoveredRuntime::recover_bootstrap_with_owner_and_relation_catalog_record_using_engine_backend(
-            Arc::clone(&store),
-            ORDERS_SUM_COUNT_OWNER,
-            ORDERS_SUM_COUNT_RELATION_ID,
-            ORDERS_SUM_COUNT_RELATION_VERSION,
-            IncrementalEngineBackend::Dbsp,
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(recovered.engine_backend(), IncrementalEngineBackend::Dbsp);
-    assert_eq!(recovered.replayed_batch_count(), 1);
-    assert_eq!(recovered.logical_epoch(), 1);
-    assert_eq!(
-        recovered.materialized_state().net_rows().unwrap(),
-        vec![DeltaRecord::new(
-            DeltaKey::from_json(json!("account-a")),
-            DeltaValue::from_json(json!({"count": 2, "sum": 10})),
-            1,
-        )]
-    );
-}
-
-#[cfg(feature = "dbsp-runtime")]
-#[tokio::test]
-async fn catalog_backed_recovery_uses_dbsp_backend_by_default() {
-    let (_temp_dir, store) = temp_store();
-    let catalog = orders_sum_count_relation_catalog().unwrap();
-    RelationCatalogRegistry::new(Arc::clone(&store))
-        .create(&catalog)
-        .await
-        .unwrap();
-    let input = input_batch([input_delta("account-a", 4, 1)]);
-    let ingest_coordinator = local_ingest_coordinator(Arc::clone(&store));
-    append_ingest_envelope(
-        &ingest_coordinator,
-        ingest_envelope_bytes(
-            ORDERS_SUM_COUNT_RELATION_VERSION,
-            catalog.schema_fingerprint.as_str(),
-            &input,
-        ),
-    )
-    .await;
-
-    let recovered = RecoveredRuntime::recover_bootstrap_with_owner_and_relation_catalog_record(
-        Arc::clone(&store),
-        ORDERS_SUM_COUNT_OWNER,
-        ORDERS_SUM_COUNT_RELATION_ID,
-        ORDERS_SUM_COUNT_RELATION_VERSION,
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(recovered.engine_backend(), IncrementalEngineBackend::Dbsp);
-    assert_eq!(
-        recovered.materialized_state().net_rows().unwrap(),
-        vec![DeltaRecord::new(
-            DeltaKey::from_json(json!("account-a")),
-            DeltaValue::from_json(json!({"count": 1, "sum": 4})),
-            1,
-        )]
-    );
-}
-
-#[cfg(feature = "dbsp-runtime")]
-#[tokio::test]
-async fn catalog_backed_recovery_uses_dbsp_backend_for_generic_catalog_keys() {
-    let (_temp_dir, store) = temp_store();
-    let catalog = int64_account_relation_catalog();
-    RelationCatalogRegistry::new(Arc::clone(&store))
-        .create(&catalog)
-        .await
-        .unwrap();
-    let input = input_batch([
-        DeltaRecord::new(
-            DeltaKey::from_json(json!(1001)),
-            DeltaValue::from_json(json!(4)),
-            1,
-        ),
-        DeltaRecord::new(
-            DeltaKey::from_json(json!(1001)),
-            DeltaValue::from_json(json!(6)),
-            1,
-        ),
-    ]);
-    let ingest_coordinator = local_ingest_coordinator(Arc::clone(&store));
-    append_ingest_envelope(
-        &ingest_coordinator,
-        ingest_envelope_bytes_with_batches(
-            IngestEnvelopeEncodeRequest {
-                relation_id: catalog.relation_schema.relation_id.clone(),
-                relation_version: catalog.relation_schema.relation_version.clone(),
-                schema_fingerprint: catalog.schema_fingerprint.as_str().to_string(),
-                stream_id: "accounts".to_string(),
-                partition_id: 0,
-                start_offset_inclusive: 0,
-                end_offset_exclusive: input.records().len() as u64,
-            },
-            &[ingest_int64_key_record_batch(&input)],
-        ),
-    )
-    .await;
-
-    let recovered = RecoveredRuntime::recover_bootstrap_with_owner_and_relation_catalog_record(
-        Arc::clone(&store),
-        ORDERS_SUM_COUNT_OWNER,
-        catalog.relation_schema.relation_id.as_str(),
-        catalog.relation_schema.relation_version.as_str(),
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(recovered.engine_backend(), IncrementalEngineBackend::Dbsp);
-    assert_eq!(
-        recovered.materialized_state().net_rows().unwrap(),
-        vec![DeltaRecord::new(
-            DeltaKey::from_json(json!(1001)),
-            DeltaValue::from_json(json!({"count": 2, "sum": 10})),
-            1,
-        )]
-    );
-}
-
 #[tokio::test]
 async fn catalog_backed_recovery_replays_int64_primary_key_relation() {
     let (_temp_dir, store) = temp_store();
@@ -1349,6 +1200,7 @@ async fn catalog_backed_recovery_replays_int64_primary_key_relation() {
                 partition_id: 0,
                 start_offset_inclusive: 0,
                 end_offset_exclusive: input.records().len() as u64,
+                event_time_watermark: None,
             },
             &[ingest_int64_key_record_batch(&input)],
         ),
@@ -1403,6 +1255,7 @@ async fn catalog_backed_recovery_replays_row_key_relation() {
                 partition_id: 0,
                 start_offset_inclusive: 0,
                 end_offset_exclusive: 2,
+                event_time_watermark: None,
             },
             &[ingest_row_key_record_batch(
                 &[1001, 1001],
@@ -1480,6 +1333,7 @@ async fn catalog_backed_recovery_replays_boolean_primary_key_relation() {
                 partition_id: 0,
                 start_offset_inclusive: 0,
                 end_offset_exclusive: input.records().len() as u64,
+                event_time_watermark: None,
             },
             &[ingest_boolean_key_record_batch(&input)],
         ),
@@ -1546,6 +1400,7 @@ async fn catalog_backed_recovery_replays_decimal128_primary_key_relation() {
                 partition_id: 0,
                 start_offset_inclusive: 0,
                 end_offset_exclusive: input.records().len() as u64,
+                event_time_watermark: None,
             },
             &[ingest_decimal_key_record_batch(
                 &[
@@ -1607,6 +1462,7 @@ async fn catalog_backed_recovery_replays_decimal128_value_relation_exactly() {
                 partition_id: 0,
                 start_offset_inclusive: 0,
                 end_offset_exclusive: 3,
+                event_time_watermark: None,
             },
             &[ingest_decimal_value_record_batch(
                 &["account-a", "account-a", "account-a"],
@@ -1670,6 +1526,7 @@ async fn catalog_backed_recovery_replays_date32_primary_key_relation() {
                 partition_id: 0,
                 start_offset_inclusive: 0,
                 end_offset_exclusive: input.records().len() as u64,
+                event_time_watermark: None,
             },
             &[ingest_date32_key_record_batch(&input)],
         ),
@@ -1736,6 +1593,7 @@ async fn catalog_backed_recovery_replays_timestamp_nanosecond_primary_key_relati
                 partition_id: 0,
                 start_offset_inclusive: 0,
                 end_offset_exclusive: input.records().len() as u64,
+                event_time_watermark: None,
             },
             &[ingest_timestamp_key_record_batch(&input)],
         ),
@@ -1802,6 +1660,7 @@ async fn catalog_backed_recovery_replays_dictionary_utf8_primary_key_relation() 
                 partition_id: 0,
                 start_offset_inclusive: 0,
                 end_offset_exclusive: input.records().len() as u64,
+                event_time_watermark: None,
             },
             &[ingest_dictionary_utf8_key_record_batch(&input)],
         ),
@@ -1868,6 +1727,7 @@ async fn catalog_backed_recovery_replays_json_utf8_primary_key_relation() {
                 partition_id: 0,
                 start_offset_inclusive: 0,
                 end_offset_exclusive: input.records().len() as u64,
+                event_time_watermark: None,
             },
             &[ingest_json_utf8_key_record_batch(&input)],
         ),
@@ -2084,6 +1944,7 @@ async fn checked_selected_checkpoint_recovery_rejects_post_checkpoint_ingest_wit
                 partition_id: 0,
                 start_offset_inclusive: 1,
                 end_offset_exclusive: 2,
+                event_time_watermark: None,
             },
             &[ingest_record_batch(&replay_input)],
         ),
@@ -2140,6 +2001,7 @@ async fn checked_selected_checkpoint_recovery_allows_pre_admission_batch_when_ch
                 partition_id: 0,
                 start_offset_inclusive: 0,
                 end_offset_exclusive: 1,
+                event_time_watermark: None,
             },
             &[ingest_record_batch(&checkpointed_input)],
         ),
@@ -2283,6 +2145,7 @@ async fn checked_selected_checkpoint_recovery_replays_catalog_aware_ingest() {
                 partition_id: 0,
                 start_offset_inclusive: 1,
                 end_offset_exclusive: 2,
+                event_time_watermark: None,
             },
             &[ingest_record_batch(&replay_input)],
         ),
@@ -2370,6 +2233,7 @@ async fn selected_checkpoint_recovery_hydrates_decimal128_value_state() {
                 partition_id: 0,
                 start_offset_inclusive: 1,
                 end_offset_exclusive: 2,
+                event_time_watermark: None,
             },
             &[ingest_decimal_value_record_batch(
                 &["account-a"],
@@ -2548,6 +2412,7 @@ async fn checked_selected_checkpoint_recovery_with_slatedb_state_replays_catalog
                 partition_id: 0,
                 start_offset_inclusive: 1,
                 end_offset_exclusive: 2,
+                event_time_watermark: None,
             },
             &[ingest_record_batch(&replay_input)],
         ),
@@ -2739,6 +2604,7 @@ async fn catalog_backed_recovery_reports_malformed_ingest_when_batch_schema_diff
                 partition_id: 0,
                 start_offset_inclusive: 0,
                 end_offset_exclusive: 1,
+                event_time_watermark: None,
             },
             &[wrong_batch],
         ))

@@ -267,6 +267,154 @@ fn operators_keyed_sum_count_aggregate_preserves_negative_count_state() {
 }
 
 #[test]
+fn operators_keyed_sum_count_aggregate_updates_min_max_when_extreme_is_retracted() {
+    let mut aggregate =
+        KeyedSumCountAggregate::with_value_mode_and_extrema(AggregateValueMode::Integer, true);
+
+    aggregate
+        .apply(&DeltaBatch::from_records([
+            record("acct:1", json!(10), 1),
+            record("acct:1", json!(5), 1),
+            record("acct:1", json!(7), 1),
+        ]))
+        .unwrap();
+
+    let output = aggregate
+        .apply(&DeltaBatch::from_records([record("acct:1", json!(10), -1)]))
+        .unwrap();
+
+    assert_eq!(
+        output.net_rows().unwrap(),
+        vec![
+            DeltaRecord::new(
+                DeltaKey::from_json(json!("acct:1")),
+                DeltaValue::from_json(json!({
+                    "sum": 12,
+                    "count": 2,
+                    "min": 5,
+                    "max": 7,
+                    "values": [
+                        { "value": 5, "weight": 1 },
+                        { "value": 7, "weight": 1 }
+                    ],
+                })),
+                1,
+            ),
+            DeltaRecord::new(
+                DeltaKey::from_json(json!("acct:1")),
+                DeltaValue::from_json(json!({
+                    "sum": 22,
+                    "count": 3,
+                    "min": 5,
+                    "max": 10,
+                    "values": [
+                        { "value": 5, "weight": 1 },
+                        { "value": 7, "weight": 1 },
+                        { "value": 10, "weight": 1 }
+                    ],
+                })),
+                -1,
+            ),
+        ]
+    );
+}
+
+#[test]
+fn operators_keyed_sum_count_aggregate_keeps_duplicate_extreme_after_partial_retract() {
+    let mut aggregate =
+        KeyedSumCountAggregate::with_value_mode_and_extrema(AggregateValueMode::Integer, true);
+
+    aggregate
+        .apply(&DeltaBatch::from_records([
+            record("acct:1", json!(10), 2),
+            record("acct:1", json!(5), 1),
+        ]))
+        .unwrap();
+
+    aggregate
+        .apply(&DeltaBatch::from_records([record("acct:1", json!(10), -1)]))
+        .unwrap();
+
+    assert_eq!(
+        aggregate.state().net_rows().unwrap(),
+        vec![DeltaRecord::new(
+            DeltaKey::from_json(json!("acct:1")),
+            DeltaValue::from_json(json!({
+                "sum": 15,
+                "count": 2,
+                "min": 5,
+                "max": 10,
+                "values": [
+                    { "value": 5, "weight": 1 },
+                    { "value": 10, "weight": 1 }
+                ],
+            })),
+            1,
+        )]
+    );
+}
+
+#[test]
+fn operators_keyed_sum_count_aggregate_hydrates_extrema_state() {
+    let checkpointed_state = DeltaBatch::from_records([DeltaRecord::new(
+        DeltaKey::from_json(json!("acct:1")),
+        DeltaValue::from_json(json!({
+            "sum": 22,
+            "count": 3,
+            "min": 5,
+            "max": 10,
+            "values": [
+                { "value": 5, "weight": 1 },
+                { "value": 7, "weight": 1 },
+                { "value": 10, "weight": 1 }
+            ],
+        })),
+        1,
+    )]);
+
+    let mut aggregate = KeyedSumCountAggregate::from_state_with_value_mode_and_extrema(
+        &checkpointed_state,
+        AggregateValueMode::Integer,
+        true,
+    )
+    .unwrap();
+    aggregate
+        .apply(&DeltaBatch::from_records([record("acct:1", json!(5), -1)]))
+        .unwrap();
+
+    assert_eq!(
+        aggregate.state().net_rows().unwrap(),
+        vec![DeltaRecord::new(
+            DeltaKey::from_json(json!("acct:1")),
+            DeltaValue::from_json(json!({
+                "sum": 17,
+                "count": 2,
+                "min": 7,
+                "max": 10,
+                "values": [
+                    { "value": 7, "weight": 1 },
+                    { "value": 10, "weight": 1 }
+                ],
+            })),
+            1,
+        )]
+    );
+}
+
+#[test]
+fn operators_keyed_sum_count_aggregate_rejects_unmatched_delete_when_extrema_are_tracked() {
+    let mut aggregate =
+        KeyedSumCountAggregate::with_value_mode_and_extrema(AggregateValueMode::Integer, true);
+
+    let error = aggregate
+        .apply(&DeltaBatch::from_records([record("acct:1", json!(5), -1)]))
+        .unwrap_err();
+
+    assert_eq!(error, OperatorError::InvalidAggregateStateValue);
+    assert!(aggregate.state().records().is_empty());
+}
+
+#[test]
 fn operators_keyed_sum_count_aggregate_hydrates_from_materialized_state() {
     let checkpointed_state = DeltaBatch::from_records([
         DeltaRecord::new(

@@ -835,36 +835,6 @@ if product is not None:
         if query_policy_files.get(key) != expected:
             raise SystemExit(f"product evidence query policy evidence file {key} must be {expected}: {product_path}")
         require_sibling_evidence_file(product_path, expected, "product query-policy evidence")
-    compile_deploy = api.get("compile_deploy") or {}
-    if compile_deploy.get("job_catalog_verified") is not True:
-        raise SystemExit(f"product evidence must prove compile/deploy job catalog verification: {product_path}")
-    if compile_deploy.get("job_catalog_evidence_file") != "view-compile-deploy-jobs.json":
-        raise SystemExit(f"product evidence must attach view-compile-deploy-jobs.json evidence: {product_path}")
-    require_sibling_evidence_file(product_path, "view-compile-deploy-jobs.json", "product compile/deploy job evidence")
-    if compile_deploy.get("pending_view_id") != "pending_scores_by_user":
-        raise SystemExit(f"product evidence compile/deploy smoke must use pending_scores_by_user: {product_path}")
-    if compile_deploy.get("compiler_request_embedded") is not True:
-        raise SystemExit(f"product evidence must prove compile/deploy compiler_request embedding: {product_path}")
-    if compile_deploy.get("admin_route") != "/v1/view-compile-deploy/jobs":
-        raise SystemExit(f"product evidence compile/deploy admin route mismatch: {product_path}")
-    if compile_deploy.get("worker_run_verified") is not True:
-        raise SystemExit(f"product evidence must prove compile/deploy worker run activation: {product_path}")
-    if compile_deploy.get("run_once_admin_route") != "/v1/view-compile-deploy/run-once":
-        raise SystemExit(f"product evidence compile/deploy run-once admin route mismatch: {product_path}")
-    if compile_deploy.get("run_once_evidence_file") != "view-compile-deploy-run-once.json":
-        raise SystemExit(f"product evidence must attach view-compile-deploy-run-once.json evidence: {product_path}")
-    require_sibling_evidence_file(product_path, "view-compile-deploy-run-once.json", "product compile/deploy run-once evidence")
-    if compile_deploy.get("activated_view_id") != "pending_scores_by_user":
-        raise SystemExit(f"product evidence compile/deploy worker must activate pending_scores_by_user: {product_path}")
-    if compile_deploy.get("activated_execution_mode") != "standing_runtime":
-        raise SystemExit(f"product evidence compile/deploy worker must promote standing_runtime: {product_path}")
-    for key, expected in {
-        "activated_view_evidence_file": "pending-scores-view-after-compile-deploy.json",
-        "activated_query_evidence_file": "pending-scores-query-after-compile-deploy.json",
-    }.items():
-        if compile_deploy.get(key) != expected:
-            raise SystemExit(f"product evidence compile/deploy {key} must be {expected}: {product_path}")
-        require_sibling_evidence_file(product_path, expected, "product compile/deploy activation evidence")
     product_ingest_writer = product.get("ingest_writer") or {}
     if product_ingest_writer.get("pod_internal_append_verified") is not True:
         raise SystemExit(f"product evidence must prove Pod-internal ingest-writer append: {product_path}")
@@ -1096,11 +1066,6 @@ readiness = {
         "status": "pass",
         "evidence": "registry-backed table catalog evidence through RustFS S3-compatible query harness",
         "evidence_kind": ["registry_backed_table_catalog"],
-    },
-    "feldera_artifact_status": {
-        "status": "pass",
-        "evidence": "trusted Feldera artifact metadata registry remains gated; DBSP IncrementalEngine spike verified separately",
-        "evidence_kind": ["feldera_artifact_registry"],
     },
     "dependency_governance_status": {
         "status": "pass",

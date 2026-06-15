@@ -1,23 +1,25 @@
 ## Generic Query and View Support
 
-When the user asks for generic SQL query or generic materialized view support,
-do not treat another hardcoded SQL-shape runtime slice as completion.
+Velorix is a jarless materialized view database/runtime. Do not add external
+compiler, runtime build/deploy, package-loading, or image-based execution paths
+for view creation.
 
-The target architecture is a Feldera compiler-backed dynamic view pipeline:
-registered Velorix relations plus user-provided Feldera SQL should be compiled
-through Feldera, bound to executable artifact metadata, loaded by Velorix, and
-run as a materialized view runtime. A narrow SQL fixture is acceptable only as a
-test case for that pipeline, not as the product implementation.
+The target product flow is:
 
-Completion for generic query/view support requires evidence that the pipeline
-handles multiple relation schemas and more than one SQL family. At minimum,
-verify filters, projections, group by, aggregates such as sum/count/min/max/avg,
-and a two-table join through the same compiler-backed path. Unsupported SQL must
-return compiler or admission errors rather than silently falling back to a fake
-generic implementation.
+- users register relations with explicit schemas
+- users ingest schema-bound rows into those relations
+- users define views over registered relations
+- supported views are admitted into the internal materialized view runtime
+- ingest updates the materialized output table automatically
+- queries read materialized output, not a full source recomputation
+- restart recovers from metadata and object/local storage checkpoints
 
-Do not expand Velorix-owned SQL lowering by adding one-off parser branches for
-each requested example unless the user explicitly asks for a temporary prototype.
-If Feldera compiler integration is not available yet, state that as the blocker
-and implement the compiler integration boundary instead of adding another
-example-specific generated runtime.
+Completion for generic query/view support requires evidence that the internal
+runtime handles multiple relation schemas and more than one SQL family. At
+minimum, verify filters, projections, group by, sum/count/min/max/avg, and a
+two-table join through the same admission and runtime path. Unsupported SQL or
+view shapes must fail closed during admission with a clear error.
+
+Do not expand Velorix-owned SQL support by silently adding fake fallbacks. If a
+SQL family is unsupported, return an admission error and implement the internal
+runtime capability deliberately.

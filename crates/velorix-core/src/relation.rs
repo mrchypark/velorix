@@ -32,8 +32,7 @@ pub const CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID: &str =
 pub const CATALOG_ROW_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID: &str =
     "incremental-adapter-row-key-sum-count-v1";
 pub const ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID: &str = "incremental-adapter-orders-sum-count-v1";
-pub const CATALOG_FELDERA_GENERIC_INCREMENTAL_ADAPTER_ID: &str =
-    "incremental-adapter-feldera-generic-v1";
+pub const CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID: &str = "incremental-adapter-generic-v1";
 const MAX_RELATION_TYPE_NESTING_DEPTH: usize = 16;
 const MAX_RELATION_STRUCT_FIELDS: usize = 256;
 
@@ -41,7 +40,7 @@ const MAX_RELATION_STRUCT_FIELDS: usize = 256;
 pub enum SupportedIncrementalAdapterSpec {
     ScalarSumCount,
     RowKeySumCount,
-    FelderaGeneric,
+    Generic,
 }
 
 pub fn supported_incremental_adapter_spec(
@@ -55,9 +54,7 @@ pub fn supported_incremental_adapter_spec(
         CATALOG_ROW_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID => {
             Some(SupportedIncrementalAdapterSpec::RowKeySumCount)
         }
-        CATALOG_FELDERA_GENERIC_INCREMENTAL_ADAPTER_ID => {
-            Some(SupportedIncrementalAdapterSpec::FelderaGeneric)
-        }
+        CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID => Some(SupportedIncrementalAdapterSpec::Generic),
         _ => None,
     }
 }
@@ -69,7 +66,7 @@ pub struct VelorixRelationCatalogV1 {
     pub relation_schema: VelorixRelationSchemaV1,
     pub schema_fingerprint: SchemaFingerprintV1,
     pub datafusion_registration: DataFusionRegistrationV1,
-    pub feldera_relation: FelderaRelationBindingV1,
+    pub incremental_relation: IncrementalRelationBindingV1,
     pub incremental_adapter: IncrementalAdapterBindingV1,
 }
 
@@ -93,20 +90,20 @@ impl VelorixRelationCatalogV1 {
         )?;
         validate_datafusion_registration_name(&self.datafusion_registration.name)?;
         require_non_empty(
-            "feldera_relation.relation_id",
-            &self.feldera_relation.relation_id,
+            "incremental_relation.relation_id",
+            &self.incremental_relation.relation_id,
         )?;
-        if self.feldera_relation.relation_id != self.relation_schema.relation_id {
+        if self.incremental_relation.relation_id != self.relation_schema.relation_id {
             return Err(RelationSchemaError::RelationIdentityMismatch {
-                field: "feldera_relation.relation_id",
+                field: "incremental_relation.relation_id",
             });
         }
-        self.feldera_relation
+        self.incremental_relation
             .schema_fingerprint
-            .validate("feldera_relation.schema_fingerprint")?;
-        if self.feldera_relation.schema_fingerprint != self.schema_fingerprint {
+            .validate("incremental_relation.schema_fingerprint")?;
+        if self.incremental_relation.schema_fingerprint != self.schema_fingerprint {
             return Err(RelationSchemaError::SchemaFingerprintMismatch {
-                field: "feldera_relation",
+                field: "incremental_relation",
             });
         }
         require_non_empty(
@@ -136,17 +133,17 @@ impl VelorixRelationCatalogV1 {
                     field: "incremental_adapter.primary_key_column_ids",
                 })
             }
-            SupportedIncrementalAdapterSpec::ScalarSumCount
-            | SupportedIncrementalAdapterSpec::RowKeySumCount => {
+            SupportedIncrementalAdapterSpec::ScalarSumCount => Ok(spec),
+            SupportedIncrementalAdapterSpec::RowKeySumCount => {
                 validate_single_value_column_for_adapter(&self.relation_schema).map(|()| spec)
             }
-            SupportedIncrementalAdapterSpec::FelderaGeneric => {
-                validate_feldera_generic_ingest_relation(&self.relation_schema).map(|()| spec)
+            SupportedIncrementalAdapterSpec::Generic => {
+                validate_generic_ingest_relation(&self.relation_schema).map(|()| spec)
             }
         }
     }
 
-    pub fn validate_feldera_ingest_adapter_scope(
+    pub fn validate_ingest_adapter_scope(
         &self,
     ) -> Result<SupportedIncrementalAdapterSpec, RelationSchemaError> {
         self.validate()?;
@@ -162,8 +159,8 @@ impl VelorixRelationCatalogV1 {
             | SupportedIncrementalAdapterSpec::RowKeySumCount => {
                 self.validate_supported_incremental_adapter_scope()
             }
-            SupportedIncrementalAdapterSpec::FelderaGeneric => {
-                validate_feldera_generic_ingest_relation(&self.relation_schema)?;
+            SupportedIncrementalAdapterSpec::Generic => {
+                validate_generic_ingest_relation(&self.relation_schema)?;
                 Ok(spec)
             }
         }
@@ -525,7 +522,7 @@ pub enum DataFusionRegistrationModeV1 {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct FelderaRelationBindingV1 {
+pub struct IncrementalRelationBindingV1 {
     pub relation_id: String,
     pub schema_fingerprint: SchemaFingerprintV1,
 }
@@ -733,7 +730,7 @@ pub fn arrow_record_batches_to_single_key_sum_count_delta_batch(
         SupportedIncrementalAdapterSpec::RowKeySumCount => {
             primary_key_columns(&catalog.relation_schema)?
         }
-        SupportedIncrementalAdapterSpec::FelderaGeneric => {
+        SupportedIncrementalAdapterSpec::Generic => {
             return Err(
                 IncrementalInputAdapterError::UnsupportedIncrementalAdapter {
                     adapter_id: catalog.incremental_adapter.adapter_id.clone(),
@@ -771,6 +768,163 @@ pub fn arrow_record_batches_to_single_key_sum_count_delta_batch(
             records.push(DeltaRecord::new(
                 delta_key_from_columns(&keys, row)?,
                 value.delta_value(row)?,
+                weight.value(row),
+            ));
+        }
+    }
+
+    Ok(DeltaBatch::from_records(records))
+}
+
+pub fn arrow_record_batches_to_key_value_delta_batch(
+    catalog: &VelorixRelationCatalogV1,
+    relation_id: &str,
+    relation_version: &str,
+    schema_fingerprint: &str,
+    key_column_ids: &[String],
+    value_column_id: &str,
+    batches: &[RecordBatch],
+) -> Result<DeltaBatch, IncrementalInputAdapterError> {
+    catalog.validate()?;
+    supported_incremental_adapter_spec(&catalog.incremental_adapter.adapter_id).ok_or_else(
+        || IncrementalInputAdapterError::UnsupportedIncrementalAdapter {
+            adapter_id: catalog.incremental_adapter.adapter_id.clone(),
+        },
+    )?;
+    validate_incremental_input_identity(
+        catalog,
+        relation_id,
+        relation_version,
+        schema_fingerprint,
+    )?;
+    if key_column_ids.is_empty() {
+        return Err(IncrementalInputAdapterError::MalformedArrowInput {
+            reason: "materialized view input must define at least one key column".to_string(),
+        });
+    }
+    if batches.is_empty() {
+        return Err(IncrementalInputAdapterError::MalformedArrowInput {
+            reason: "at least one Arrow record batch is required".to_string(),
+        });
+    }
+
+    let key_columns = key_column_ids
+        .iter()
+        .map(|column_id| relation_column(&catalog.relation_schema, column_id))
+        .collect::<Result<Vec<_>, _>>()?;
+    let value_column = relation_column(&catalog.relation_schema, value_column_id)?;
+    if value_column.column_id == catalog.relation_schema.weight_column_id {
+        return Err(IncrementalInputAdapterError::MalformedArrowInput {
+            reason: "materialized view value column must not be the weight column".to_string(),
+        });
+    }
+    let weight_column = relation_column(
+        &catalog.relation_schema,
+        catalog.relation_schema.weight_column_id.as_str(),
+    )?;
+    let mut records = Vec::new();
+
+    for batch in batches {
+        validate_record_batch_matches_catalog(catalog, batch)
+            .map_err(incremental_input_batch_schema_error)?;
+        let keys = key_columns
+            .iter()
+            .map(|column| incremental_key_column(batch, column).map(|key| (*column, key)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let value = incremental_value_column(batch, value_column)?;
+        let weight = int64_column(batch, weight_column.name.as_str())?;
+
+        for row in 0..batch.num_rows() {
+            if keys.iter().any(|(_, key)| key.is_null(row))
+                || value.is_null(row)
+                || weight.is_null(row)
+            {
+                return Err(IncrementalInputAdapterError::MalformedArrowInput {
+                    reason: "materialized view input columns must be non-null".to_string(),
+                });
+            }
+
+            records.push(DeltaRecord::new(
+                delta_key_from_columns(&keys, row)?,
+                value.delta_value(row)?,
+                weight.value(row),
+            ));
+        }
+    }
+
+    Ok(DeltaBatch::from_records(records))
+}
+
+pub fn arrow_record_batches_to_key_latest_by_delta_batch(
+    catalog: &VelorixRelationCatalogV1,
+    relation_id: &str,
+    relation_version: &str,
+    schema_fingerprint: &str,
+    key_column_id: &str,
+    value_column_id: &str,
+    ordering_column_id: &str,
+    batches: &[RecordBatch],
+) -> Result<DeltaBatch, IncrementalInputAdapterError> {
+    catalog.validate()?;
+    supported_incremental_adapter_spec(&catalog.incremental_adapter.adapter_id).ok_or_else(
+        || IncrementalInputAdapterError::UnsupportedIncrementalAdapter {
+            adapter_id: catalog.incremental_adapter.adapter_id.clone(),
+        },
+    )?;
+    validate_incremental_input_identity(
+        catalog,
+        relation_id,
+        relation_version,
+        schema_fingerprint,
+    )?;
+    if batches.is_empty() {
+        return Err(IncrementalInputAdapterError::MalformedArrowInput {
+            reason: "at least one Arrow record batch is required".to_string(),
+        });
+    }
+
+    let key_column = relation_column(&catalog.relation_schema, key_column_id)?;
+    let value_column = relation_column(&catalog.relation_schema, value_column_id)?;
+    let ordering_column = relation_column(&catalog.relation_schema, ordering_column_id)?;
+    if value_column.column_id == catalog.relation_schema.weight_column_id
+        || ordering_column.column_id == catalog.relation_schema.weight_column_id
+    {
+        return Err(IncrementalInputAdapterError::MalformedArrowInput {
+            reason: "latest-by-key value and ordering columns must not be the weight column"
+                .to_string(),
+        });
+    }
+    let weight_column = relation_column(
+        &catalog.relation_schema,
+        catalog.relation_schema.weight_column_id.as_str(),
+    )?;
+    let mut records = Vec::new();
+
+    for batch in batches {
+        validate_record_batch_matches_catalog(catalog, batch)
+            .map_err(incremental_input_batch_schema_error)?;
+        let key = incremental_key_column(batch, key_column)?;
+        let value = incremental_value_column(batch, value_column)?;
+        let ordering = incremental_key_column(batch, ordering_column)?;
+        let weight = int64_column(batch, weight_column.name.as_str())?;
+
+        for row in 0..batch.num_rows() {
+            if key.is_null(row)
+                || value.is_null(row)
+                || ordering.is_null(row)
+                || weight.is_null(row)
+            {
+                return Err(IncrementalInputAdapterError::MalformedArrowInput {
+                    reason: "materialized view input columns must be non-null".to_string(),
+                });
+            }
+
+            records.push(DeltaRecord::new(
+                key.delta_key(row)?,
+                DeltaValue::from_json(json!({
+                    "value": value.json_value(row)?,
+                    "ordering": ordering.json_value(row)?,
+                })),
                 weight.value(row),
             ));
         }
@@ -1030,7 +1184,7 @@ fn validate_single_value_column_for_adapter(
     Ok(())
 }
 
-fn validate_feldera_generic_ingest_relation(
+fn validate_generic_ingest_relation(
     schema: &VelorixRelationSchemaV1,
 ) -> Result<(), RelationSchemaError> {
     let weight_column = schema
@@ -1040,11 +1194,6 @@ fn validate_feldera_generic_ingest_relation(
         .ok_or(RelationSchemaError::InvalidRelationSchema {
             field: "weight_column_id",
         })?;
-    if weight_column.semantic_role != RelationSemanticRoleV1::Weight {
-        return Err(RelationSchemaError::InvalidRelationSchema {
-            field: "feldera_generic.weight_column.semantic_role",
-        });
-    }
     if !matches!(weight_column.logical_type, VelorixLogicalTypeV1::Int64)
         || !matches!(
             weight_column.physical_arrow_type,
@@ -1052,12 +1201,12 @@ fn validate_feldera_generic_ingest_relation(
         )
     {
         return Err(RelationSchemaError::InvalidRelationSchema {
-            field: "feldera_generic.weight_column.type",
+            field: "generic_adapter.weight_column.type",
         });
     }
     if weight_column.nullable {
         return Err(RelationSchemaError::InvalidRelationSchema {
-            field: "feldera_generic.weight_column.nullable",
+            field: "generic_adapter.weight_column.nullable",
         });
     }
     if schema
@@ -1066,7 +1215,7 @@ fn validate_feldera_generic_ingest_relation(
         .any(|column_id| column_id == &schema.weight_column_id)
     {
         return Err(RelationSchemaError::InvalidRelationSchema {
-            field: "feldera_generic.weight_column.primary_key",
+            field: "generic_adapter.weight_column.primary_key",
         });
     }
     if !schema
@@ -1075,7 +1224,7 @@ fn validate_feldera_generic_ingest_relation(
         .any(|operation| operation == &RelationOperationV1::Insert)
     {
         return Err(RelationSchemaError::InvalidRelationSchema {
-            field: "feldera_generic.allowed_operations.insert",
+            field: "generic_adapter.allowed_operations.insert",
         });
     }
 
@@ -1142,6 +1291,8 @@ enum IncrementalKeyColumn<'a> {
 }
 
 enum IncrementalValueColumn<'a> {
+    Boolean(&'a BooleanArray),
+    Utf8(&'a StringArray),
     Int64(&'a Int64Array),
     Float64(&'a Float64Array),
     Decimal128(&'a Decimal128Array, u8, u8),
@@ -1252,6 +1403,8 @@ impl IncrementalKeyColumn<'_> {
 impl IncrementalValueColumn<'_> {
     fn is_null(&self, row: usize) -> bool {
         match self {
+            Self::Boolean(column) => column.is_null(row),
+            Self::Utf8(column) => column.is_null(row),
             Self::Int64(column) => column.is_null(row),
             Self::Float64(column) => column.is_null(row),
             Self::Decimal128(column, _, _) => column.is_null(row),
@@ -1264,6 +1417,8 @@ impl IncrementalValueColumn<'_> {
 
     fn json_value(&self, row: usize) -> Result<Value, IncrementalInputAdapterError> {
         match self {
+            Self::Boolean(column) => Ok(json!(column.value(row))),
+            Self::Utf8(column) => Ok(json!(column.value(row))),
             Self::Int64(column) => Ok(json!(column.value(row))),
             Self::Float64(column) => {
                 let value = column.value(row);
@@ -1367,6 +1522,12 @@ fn incremental_value_column<'a>(
     column: &RelationColumnV1,
 ) -> Result<IncrementalValueColumn<'a>, IncrementalInputAdapterError> {
     match &column.physical_arrow_type {
+        ArrowPhysicalTypeV1::Boolean => {
+            boolean_column(batch, column.name.as_str()).map(IncrementalValueColumn::Boolean)
+        }
+        ArrowPhysicalTypeV1::Utf8 => {
+            string_column(batch, column.name.as_str()).map(IncrementalValueColumn::Utf8)
+        }
         ArrowPhysicalTypeV1::Int64 => {
             int64_column(batch, column.name.as_str()).map(IncrementalValueColumn::Int64)
         }
@@ -1379,7 +1540,7 @@ fn incremental_value_column<'a>(
         }
         _ => Err(IncrementalInputAdapterError::MalformedArrowInput {
             reason: format!(
-                "prototype adapter value column `{}` must be Int64, Float64, or Decimal128",
+                "prototype adapter value column `{}` must be Utf8, Int64, Float64, or Decimal128",
                 column.name
             ),
         }),

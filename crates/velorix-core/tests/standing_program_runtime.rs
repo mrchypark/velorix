@@ -6,14 +6,15 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use velorix_core::{
+    delta::DeltaBatch,
     engine::LogicalEpoch,
-    feldera_artifact::{ColumnSchema, RelationSchema, SqlDataType},
     standing_program::{
-        DurableStateRoot, EpochCommit, EpochIdempotencyKey, FelderaRuntimePackageIdentity,
-        NativeCodePolicy, RelationFrontier, RelationInputBatch, RuntimeCheckpoint, ScopedViewId,
+        DurableStateRoot, EpochCommit, EpochIdempotencyKey, NativeCodePolicy, RelationFrontier,
+        RelationInputBatch, RuntimeCheckpoint, RuntimePackageIdentity, ScopedViewId,
         SnapshotPageRequest, StandingProgramIdentity, StandingProgramRuntime,
-        StandingProgramRuntimeError, ViewFrontier, ViewOutputBatch,
+        StandingProgramRuntimeError, ViewFrontier, ViewOutputBatch, ViewOutputDelta,
     },
+    view_contract::{ColumnSchema, RelationSchema, SqlDataType},
 };
 
 fn valid_identity() -> StandingProgramIdentity {
@@ -24,13 +25,13 @@ fn valid_identity() -> StandingProgramIdentity {
         sql_hash: format!("sha256:{}", "1".repeat(64)),
         input_catalog_hash: format!("sha256:{}", "2".repeat(64)),
         output_schema_hash: format!("sha256:{}", "3".repeat(64)),
-        compiler_identity: "feldera-sql-compiler@0.299.0".to_string(),
-        runtime_packages: vec![FelderaRuntimePackageIdentity {
-            name: "dbsp".to_string(),
+        compiler_identity: "velorix-materialized-runtime@1".to_string(),
+        runtime_packages: vec![RuntimePackageIdentity {
+            name: "DAG".to_string(),
             version: "0.299.0".to_string(),
         }],
         package_feature_set: vec!["backend-mode".to_string()],
-        dbsp_runtime_compatibility: "dbsp-runtime-0.299.0".to_string(),
+        runtime_compatibility: "DAG-runtime-0.299.0".to_string(),
         checkpoint_codec_identity: "velorix-standing-program-checkpoint-v1".to_string(),
         native_code_policy: NativeCodePolicy::DisabledNoExternalDependencies,
     }
@@ -94,6 +95,7 @@ fn runtime_checkpoint_rejects_program_identity_mismatch() {
             relation_version: "2026-05-05.v1".to_string(),
             committed_offset_exclusive: 10,
         }],
+        input_event_time_frontiers: Vec::new(),
         output_frontiers: vec![ViewFrontier {
             view_id: "orders_by_region".to_string(),
             committed_epoch: 42,
@@ -162,6 +164,12 @@ impl StandingProgramRuntime for FakeStandingProgramRuntime {
                 relation_version: "2026-05-05.v1".to_string(),
                 committed_offset_exclusive: 1,
             }],
+            input_event_time_frontiers: Vec::new(),
+            output_deltas: vec![ViewOutputDelta {
+                view_id: "orders_by_region".to_string(),
+                schema_fingerprint: format!("sha256:{}", "5".repeat(64)),
+                delta: DeltaBatch::default(),
+            }],
             output_batches: vec![ViewOutputBatch {
                 view_id: "orders_by_region".to_string(),
                 schema_fingerprint: format!("sha256:{}", "5".repeat(64)),
@@ -191,6 +199,7 @@ impl StandingProgramRuntime for FakeStandingProgramRuntime {
             identity: self.identity.clone(),
             logical_epoch: self.epoch,
             input_frontiers: Vec::new(),
+            input_event_time_frontiers: Vec::new(),
             output_frontiers: Vec::new(),
             checkpoint_codec_identity: self.identity.checkpoint_codec_identity.clone(),
             state_root: DurableStateRoot {
@@ -230,12 +239,14 @@ fn standing_program_runtime_applies_relation_scoped_epoch_and_emits_view_scoped_
                 schema_fingerprint: format!("sha256:{}", "2".repeat(64)),
                 start_offset_inclusive: 0,
                 end_offset_exclusive: 1,
+                event_time_watermark: None,
                 batches: vec![sample_batch()],
             }],
         )
         .unwrap();
 
     assert_eq!(commit.logical_epoch, 1);
+    assert_eq!(commit.output_deltas[0].view_id, "orders_by_region");
     assert_eq!(commit.output_batches[0].view_id, "orders_by_region");
     assert_eq!(commit.output_batches[0].batches[0].num_rows(), 1);
 

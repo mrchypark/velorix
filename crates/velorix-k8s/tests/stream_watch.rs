@@ -624,7 +624,7 @@ fn relation_catalog_json() -> Value {
             "name": "deposits",
             "mode": "table",
         },
-        "feldera_relation": {
+        "incremental_relation": {
             "relation_id": "deposits",
             "schema_fingerprint": relation().schema_fingerprint,
         },

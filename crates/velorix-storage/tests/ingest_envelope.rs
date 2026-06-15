@@ -18,10 +18,12 @@ use tempfile::TempDir;
 use tokio::sync::Barrier;
 use velorix_core::relation::{
     ArrowPhysicalTypeV1, DataFusionRegistrationModeV1, DataFusionRegistrationV1,
-    FelderaRelationBindingV1, IncrementalAdapterBindingV1, RelationColumnV1, RelationOperationV1,
-    RelationSchemaError, RelationSemanticRoleV1, SchemaFingerprintV1, VelorixLogicalTypeV1,
-    VelorixRelationCatalogV1, VelorixRelationSchemaV1, RELATION_SCHEMA_VERSION_V1,
+    IncrementalAdapterBindingV1, IncrementalRelationBindingV1, RelationColumnV1,
+    RelationOperationV1, RelationSchemaError, RelationSemanticRoleV1, SchemaFingerprintV1,
+    VelorixLogicalTypeV1, VelorixRelationCatalogV1, VelorixRelationSchemaV1,
+    RELATION_SCHEMA_VERSION_V1,
 };
+use velorix_core::standing_program::InputEventTimeWatermark;
 use velorix_storage::{
     ingest_envelope::{
         IngestEnvelope, IngestEnvelopeEncodeRequest, IngestEnvelopeError, INGEST_ENVELOPE_MAGIC,
@@ -208,6 +210,7 @@ fn catalog_envelope_bytes_with_batches(
             partition_id: 7,
             start_offset_inclusive: 10,
             end_offset_exclusive: 12,
+            event_time_watermark: None,
         },
         batches,
     )
@@ -228,6 +231,7 @@ fn catalog_envelope_bytes_for(
             partition_id: 7,
             start_offset_inclusive,
             end_offset_exclusive,
+            event_time_watermark: None,
         },
         &[valid_batch()],
     )
@@ -246,6 +250,7 @@ fn durable_admission_record_for_payload(payload: Bytes) -> DurableIngestAdmissio
         partition_id: descriptor.partition_id,
         start_offset_inclusive: descriptor.start_offset_inclusive,
         end_offset_exclusive: descriptor.end_offset_exclusive,
+        event_time_watermark: None,
         batch_key: descriptor.object_key.clone(),
         admission_record_key: ObjectKey::ingest_admission_record(
             &descriptor.stream_id,
@@ -290,6 +295,27 @@ fn catalog_envelope_bytes_with_fingerprint(
             partition_id: 7,
             start_offset_inclusive: 10,
             end_offset_exclusive: 12,
+            event_time_watermark: None,
+        },
+        &[valid_batch()],
+    )
+    .unwrap()
+}
+
+fn catalog_envelope_bytes_with_watermark(
+    catalog: &VelorixRelationCatalogV1,
+    watermark: InputEventTimeWatermark,
+) -> Bytes {
+    IngestEnvelope::encode_batches(
+        IngestEnvelopeEncodeRequest {
+            relation_id: catalog.relation_schema.relation_id.clone(),
+            relation_version: catalog.relation_schema.relation_version.clone(),
+            schema_fingerprint: catalog.schema_fingerprint.as_str().to_string(),
+            stream_id: "orders".to_string(),
+            partition_id: 7,
+            start_offset_inclusive: 10,
+            end_offset_exclusive: 12,
+            event_time_watermark: Some(watermark),
         },
         &[valid_batch()],
     )
@@ -313,6 +339,7 @@ fn envelope_bytes_for(
             partition_id,
             start_offset_inclusive,
             end_offset_exclusive,
+            event_time_watermark: None,
         },
         &[valid_batch()],
     )
@@ -361,6 +388,7 @@ fn raw_envelope_with_payload(payload: &[u8]) -> Bytes {
         partition_id: 7,
         start_offset_inclusive: 10,
         end_offset_exclusive: 12,
+        event_time_watermark: None,
     };
     let header = serde_json::json!({
         "schema_version": 1,
@@ -484,7 +512,7 @@ fn orders_relation_catalog() -> VelorixRelationCatalogV1 {
             name: "orders".to_string(),
             mode: DataFusionRegistrationModeV1::Table,
         },
-        feldera_relation: FelderaRelationBindingV1 {
+        incremental_relation: IncrementalRelationBindingV1 {
             relation_id: "orders_relation".to_string(),
             schema_fingerprint,
         },
@@ -494,8 +522,30 @@ fn orders_relation_catalog() -> VelorixRelationCatalogV1 {
     }
 }
 
+fn event_time_orders_relation_catalog() -> VelorixRelationCatalogV1 {
+    let mut catalog = orders_relation_catalog();
+    catalog.relation_schema.event_time_column_id = Some("amount".to_string());
+    let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema)
+        .expect("event-time orders schema should fingerprint");
+    catalog.schema_fingerprint = schema_fingerprint.clone();
+    catalog.incremental_relation.schema_fingerprint = schema_fingerprint;
+    catalog
+}
+
 async fn create_orders_relation_catalog(store: &Arc<dyn ObjectStore>) -> VelorixRelationCatalogV1 {
     let catalog = orders_relation_catalog();
+    RelationCatalogRegistry::new(Arc::clone(store))
+        .create(&catalog)
+        .await
+        .unwrap();
+
+    catalog
+}
+
+async fn create_event_time_orders_relation_catalog(
+    store: &Arc<dyn ObjectStore>,
+) -> VelorixRelationCatalogV1 {
+    let catalog = event_time_orders_relation_catalog();
     RelationCatalogRegistry::new(Arc::clone(store))
         .create(&catalog)
         .await
@@ -614,6 +664,7 @@ fn ingest_envelope_rejects_missing_relation_identity() {
             partition_id: 0,
             start_offset_inclusive: 0,
             end_offset_exclusive: 1,
+            event_time_watermark: None,
         },
         &[valid_batch()],
     )
@@ -632,6 +683,7 @@ fn ingest_envelope_rejects_missing_relation_identity() {
             partition_id: 0,
             start_offset_inclusive: 0,
             end_offset_exclusive: 1,
+            event_time_watermark: None,
         },
         &[valid_batch()],
     )
@@ -651,6 +703,7 @@ fn ingest_envelope_rejects_malformed_relation_schema_fingerprint() {
             partition_id: 0,
             start_offset_inclusive: 0,
             end_offset_exclusive: 1,
+            event_time_watermark: None,
         },
         &[valid_batch()],
     )
@@ -684,6 +737,7 @@ fn ingest_envelope_accepts_supplied_relation_schema_fingerprint_without_arrow_de
             partition_id: 0,
             start_offset_inclusive: 0,
             end_offset_exclusive: 1,
+            event_time_watermark: None,
         },
         &[valid_batch()],
     )
@@ -692,6 +746,44 @@ fn ingest_envelope_accepts_supplied_relation_schema_fingerprint_without_arrow_de
     let envelope = IngestEnvelope::decode(bytes).unwrap();
 
     assert_eq!(envelope.header().schema_fingerprint, supplied);
+}
+
+#[test]
+fn ingest_envelope_preserves_event_time_watermark_and_covers_it_in_digest() {
+    let watermark = InputEventTimeWatermark {
+        stream_id: "orders".to_string(),
+        partition_id: 0,
+        event_time_column_id: "event_time".to_string(),
+        max_observed_event_time_ns: 1_700_000_000_000_000_100,
+        watermark_ns: 1_700_000_000_000_000_000,
+    };
+    let bytes = IngestEnvelope::encode_batches(
+        IngestEnvelopeEncodeRequest {
+            relation_id: "orders_relation".to_string(),
+            relation_version: "2026-05-05".to_string(),
+            schema_fingerprint:
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+            stream_id: "orders".to_string(),
+            partition_id: 0,
+            start_offset_inclusive: 0,
+            end_offset_exclusive: 1,
+            event_time_watermark: Some(watermark.clone()),
+        },
+        &[valid_batch()],
+    )
+    .unwrap();
+
+    let envelope = IngestEnvelope::decode(bytes.clone()).unwrap();
+
+    assert_eq!(envelope.header().event_time_watermark, Some(watermark));
+
+    let mutated = mutate_header(&bytes, |header| {
+        header["event_time_watermark"]["watermark_ns"] = Value::from(1_700_000_000_000_000_050i64);
+    });
+    let err = IngestEnvelope::decode(mutated).unwrap_err();
+
+    assert!(matches!(err, IngestEnvelopeError::DigestMismatch { .. }));
 }
 
 #[test]
@@ -732,6 +824,7 @@ fn ingest_envelope_accepts_payload_without_literal_weight_column() {
             partition_id: 0,
             start_offset_inclusive: 0,
             end_offset_exclusive: 1,
+            event_time_watermark: None,
         },
         &[batch_without_weight()],
     )
@@ -775,6 +868,7 @@ fn ingest_envelope_accepts_non_int64_literal_weight_column() {
             partition_id: 0,
             start_offset_inclusive: 0,
             end_offset_exclusive: 1,
+            event_time_watermark: None,
         },
         &[batch_with_unsigned_weight()],
     )
@@ -969,6 +1063,69 @@ async fn append_catalog_validated_envelope_rejects_batch_schema_mismatch_before_
         IngestLogError::RelationSchema(RelationSchemaError::InvalidRelationSchema {
             field: "batch_schema"
         })
+    ));
+    assert!(log.list_committed().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn append_catalog_validated_envelope_rejects_watermark_without_relation_event_time_column() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = create_orders_relation_catalog(&store).await;
+    let log = IngestLog::new(Arc::clone(&store));
+    let bytes = catalog_envelope_bytes_with_watermark(
+        &catalog,
+        InputEventTimeWatermark {
+            stream_id: "orders".to_string(),
+            partition_id: 7,
+            event_time_column_id: "amount".to_string(),
+            max_observed_event_time_ns: 20,
+            watermark_ns: 10,
+        },
+    );
+
+    let error = log
+        .append_catalog_validated_envelope(bytes)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        IngestLogError::RelationCatalogMismatch {
+            field: "event_time_watermark.event_time_column_id",
+            ..
+        }
+    ));
+    assert!(log.list_committed().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn append_catalog_validated_envelope_rejects_watermark_max_below_batch_event_time() {
+    let (_temp_dir, store) = temp_store();
+    let catalog = create_event_time_orders_relation_catalog(&store).await;
+    let log = IngestLog::new(Arc::clone(&store));
+    let bytes = catalog_envelope_bytes_with_watermark(
+        &catalog,
+        InputEventTimeWatermark {
+            stream_id: "orders".to_string(),
+            partition_id: 7,
+            event_time_column_id: "amount".to_string(),
+            max_observed_event_time_ns: 19,
+            watermark_ns: 10,
+        },
+    );
+
+    let error = log
+        .append_catalog_validated_envelope(bytes)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        IngestLogError::RelationCatalogMismatch {
+            field: "event_time_watermark.max_observed_event_time_ns",
+            expected,
+            actual,
+        } if expected == "20" && actual == "19"
     ));
     assert!(log.list_committed().await.unwrap().is_empty());
 }
@@ -1176,6 +1333,7 @@ async fn durable_serialized_catalog_admission_rejects_overlap_reserved_by_separa
         partition_id: reserved_descriptor.partition_id,
         start_offset_inclusive: reserved_descriptor.start_offset_inclusive,
         end_offset_exclusive: reserved_descriptor.end_offset_exclusive,
+        event_time_watermark: None,
         batch_key: reserved_descriptor.object_key.clone(),
         admission_record_key: ObjectKey::ingest_admission_record(
             &reserved_descriptor.stream_id,
@@ -1237,6 +1395,7 @@ async fn durable_serialized_catalog_admission_fails_closed_on_record_body_key_mi
         partition_id: reserved_descriptor.partition_id,
         start_offset_inclusive: reserved_descriptor.start_offset_inclusive,
         end_offset_exclusive: reserved_descriptor.end_offset_exclusive,
+        event_time_watermark: None,
         batch_key: reserved_descriptor.object_key.clone(),
         admission_record_key: ObjectKey::ingest_admission_record(
             &reserved_descriptor.stream_id,
@@ -1298,6 +1457,7 @@ async fn durable_serialized_catalog_admission_does_not_reserve_same_key_differen
             partition_id: 7,
             start_offset_inclusive: 0,
             end_offset_exclusive: 100,
+            event_time_watermark: None,
         },
         &[valid_batch_with_different_payload()],
     )
@@ -1579,6 +1739,7 @@ async fn active_admission_reconstruction_rejects_committed_batch_digest_mismatch
             partition_id: 7,
             start_offset_inclusive: 0,
             end_offset_exclusive: 100,
+            event_time_watermark: None,
         },
         &[valid_batch_with_different_payload()],
     )
@@ -1689,6 +1850,7 @@ async fn append_validated_envelope_reports_same_key_different_digest_conflict() 
             partition_id: 7,
             start_offset_inclusive: 10,
             end_offset_exclusive: 12,
+            event_time_watermark: None,
         },
         &[valid_batch()],
     )

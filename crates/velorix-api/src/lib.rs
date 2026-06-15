@@ -1,7 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     env,
-    future::Future,
     io::Cursor,
     net::SocketAddr,
     sync::{Arc, Mutex},
@@ -13,9 +12,8 @@ use arrow::{
     array::{
         new_empty_array, Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array,
         Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, ListArray,
-        MapArray, NullArray, StringArray, StringDictionaryBuilder, StructArray,
-        Time64NanosecondArray, TimestampNanosecondArray, UInt16Array, UInt32Array, UInt64Array,
-        UInt8Array,
+        MapArray, StringArray, StringDictionaryBuilder, StructArray, Time64NanosecondArray,
+        TimestampNanosecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
     },
     datatypes::{
         ArrowDictionaryKeyType, DataType, Field, Fields, Int16Type, Int32Type, Int64Type, Int8Type,
@@ -23,7 +21,6 @@ use arrow::{
     },
     record_batch::RecordBatch,
 };
-use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::{DefaultBodyLimit, Path as AxumPath, Query, State},
@@ -41,45 +38,41 @@ use object_store::{
     prefix::PrefixStore,
     ObjectStore, PutMode,
 };
-use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS, NON_ALPHANUMERIC};
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as AsyncMutex;
 use velorix_core::{
-    dbsp_view_plan::{
-        validate_catalog_backed_sum_count_view_sql, validate_supported_dbsp_join_view_sql,
-        SupportedDbspJoinViewPlan,
-    },
-    feldera_artifact::{
-        catalog_input_relation_schema, feldera_artifact_bytes_hash, feldera_compile_request_hash,
-        feldera_spec_hash, feldera_sql_program_for_compile_request,
-        validate_feldera_compile_artifact_for_compile_request, validate_feldera_compile_request,
-        ColumnSchema, FelderaCompileArtifactMetadata, FelderaCompileRequestV1,
-        FelderaCompilerIdentity, FelderaRustExtensionV1, GeneratedRustIdentity,
-        OutputSchemaContract, RelationSchema, SqlDataType, SqlDialect, SqlSourceKind,
-        SqlStructField, StandingViewShape, StandingViewSpec, FELDERA_ARTIFACT_METADATA_VERSION,
-        SUPPORTED_EPOCH_POLICY, SUPPORTED_GENERATED_RUST_ABI_VERSION, SUPPORTED_STATE_CODEC,
-    },
-    feldera_product_runtime::{
-        validate_feldera_package_runtime_descriptor, FelderaPackageRuntimeDescriptorV1,
-        FELDERA_PACKAGE_RUNTIME_EXECUTION_PATH,
-    },
-    generated_view_descriptor::{DynamicGeneratedViewBinding, TrustedGeneratedViewDescriptor},
+    delta::DeltaBatch,
     query::QueryPolicy,
     relation::{
         datafusion_schema_from_catalog, ArrowPhysicalTypeV1, DataFusionRegistrationModeV1,
-        DataFusionRegistrationV1, DictionaryKeyTypeV1, FelderaRelationBindingV1,
-        IncrementalAdapterBindingV1, RelationColumnV1, RelationOperationV1, RelationSemanticRoleV1,
-        SchemaFingerprintV1, VelorixLogicalTypeV1, VelorixRelationCatalogV1,
-        VelorixRelationSchemaV1, CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID,
-        RELATION_SCHEMA_VERSION_V1,
+        DataFusionRegistrationV1, DictionaryKeyTypeV1, IncrementalAdapterBindingV1,
+        IncrementalRelationBindingV1, RelationColumnV1, RelationOperationV1,
+        RelationSemanticRoleV1, SchemaFingerprintV1, VelorixLogicalTypeV1,
+        VelorixRelationCatalogV1, VelorixRelationSchemaV1,
+        CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID, RELATION_SCHEMA_VERSION_V1,
     },
     standing_program::{
-        DurableStateRoot, EpochCommit, EpochIdempotencyKey, FelderaRuntimePackageIdentity,
-        MaterializedViewPage, MaterializedViewSqlPage, NativeCodePolicy, RelationFrontier,
-        RelationInputBatch, RuntimeCheckpoint, ScopedViewId, SnapshotPageRequest,
-        StandingProgramIdentity, StandingProgramRuntime, StandingProgramRuntimeError, ViewFrontier,
+        EpochIdempotencyKey, InputEventTimeWatermark, MaterializedViewPage,
+        MaterializedViewSqlPage, NativeCodePolicy, RelationInputBatch, RuntimeCheckpoint,
+        RuntimeCheckpointStatePayload, RuntimePackageIdentity, ScopedViewId, SnapshotPageRequest,
+        StandingProgramIdentity, StandingProgramRuntime, StandingProgramRuntimeError,
+        ViewOutputDelta,
+    },
+    view_contract::{
+        catalog_input_relation_schema, stable_bytes_hash, validate_materialized_standing_view_spec,
+        view_spec_hash, ColumnSchema, RelationSchema, SqlDataType, SqlDialect, SqlSourceKind,
+        SqlStructField, StandingViewShape, StandingViewSpec,
+    },
+    view_plan::{
+        lower_supported_sql_to_logical_plan, supported_view_plan_aggregate_outputs,
+        validate_catalog_backed_sum_count_view_sql, validate_supported_join_view_sql,
+        validate_supported_latest_by_key_sql, validate_supported_tumbling_window_sql,
+        LogicalPlanAggregateFunctionV1, SupportedAggregateOutput, SupportedJoinViewPlan,
+        SupportedLatestByKeyPlan, SupportedTumblingWindowPlan, SupportedViewPlan,
+        VelorixLogicalViewPlanV1,
     },
 };
 use velorix_k8s::{
@@ -101,11 +94,8 @@ use velorix_meta::{
     STANDING_RUNTIME_LEASE_AUTHORITY_KIND_RAFT_REPLICATED_TIME,
     STANDING_RUNTIME_LEASE_EXPIRY_SEMANTICS_BACKEND_WALL_CLOCK_TTL,
     STANDING_RUNTIME_LEASE_EXPIRY_SEMANTICS_OPERATION_DRIVEN_LOGICAL,
+    STANDING_RUNTIME_OUTPUT_DELTA_REF_PREFIX, STANDING_RUNTIME_OUTPUT_MANIFEST_REF_PREFIX,
     STANDING_RUNTIME_OWNER_SCOPE_KIND_TENANT_PROGRAM_VIEW,
-};
-use velorix_runtime::feldera_registry::{
-    GeneratedRustArtifactPackage, RuntimeFelderaArtifactRegistry,
-    RuntimeFelderaArtifactSelectionStatus,
 };
 use velorix_runtime::query::{
     query_record_batches_table_with_bindings_and_policy_and_limiter,
@@ -120,21 +110,16 @@ use velorix_storage::{
     ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
     log::{AppendValidatedEnvelopeOutcome, IngestBatchDescriptor, IngestLog, ReplayCheckpoint},
     materialized_view_registry::{
-        ActivateMaterializedViewOutcome, ActiveMaterializedView, InvalidExecutionModeReason,
-        MaterializedViewApiMetadata, MaterializedViewArtifactBinding,
-        MaterializedViewCompileStatus, MaterializedViewDeploymentStatus,
-        MaterializedViewExecutionMode, MaterializedViewLifecycleStatus, MaterializedViewRegistry,
-        MaterializedViewRegistryError, MaterializedViewRequestFieldSpec,
-        MaterializedViewResponseColumnSpec, MaterializedViewResponseSchema,
-        RegisterMaterializedViewOutcome, UpdateMaterializedViewLifecycleOutcome,
+        ActiveMaterializedView, InvalidExecutionModeReason, MaterializedViewApiMetadata,
+        MaterializedViewArtifactBinding, MaterializedViewCompileStatus,
+        MaterializedViewDeploymentStatus, MaterializedViewExecutionMode,
+        MaterializedViewLifecycleStatus, MaterializedViewRegistry, MaterializedViewRegistryError,
+        MaterializedViewRequestFieldSpec, MaterializedViewResponseColumnSpec,
+        MaterializedViewResponseSchema, MaterializedViewRuntimeBinding,
+        RegisterMaterializedViewOutcome,
     },
     object_key::ObjectKey,
     relation_catalog_registry::{CreateRelationCatalogOutcome, RelationCatalogRegistry},
-    view_compile_deploy_job_registry::{
-        view_compile_deploy_compile_request_job_id, ViewCompileDeployJobClaimOutcome,
-        ViewCompileDeployJobClaimRecord, ViewCompileDeployJobRecord, ViewCompileDeployJobRegistry,
-        ViewCompileDeployJobRegistryError,
-    },
 };
 
 #[derive(Clone)]
@@ -152,10 +137,6 @@ pub struct ApiState {
     admin_bearer_token: Option<Arc<str>>,
     max_request_body_bytes: usize,
     max_ingest_rows: usize,
-    feldera_compiler_backend: Option<Arc<dyn FelderaCompilerBackend>>,
-    generated_artifact_packages: Arc<Vec<GeneratedRustArtifactPackage>>,
-    builtin_fixture_compile_worker_enabled: bool,
-    trusted_generated_view_descriptors: Arc<Vec<TrustedGeneratedViewDescriptor>>,
     standing_runtimes: Arc<StandingRuntimeRegistry>,
     standing_runtime_factories: Arc<StandingRuntimeFactoryRegistry>,
     query_runtimes: Arc<Mutex<HashMap<String, ProductionQueryRuntime>>>,
@@ -219,2569 +200,6 @@ struct StandingRuntimeLocalState {
     committed_checkpoint: Option<StandingRuntimeCheckpointPointer>,
 }
 
-#[derive(Clone, Debug)]
-pub struct FelderaCompilerBackendRequest {
-    pub job_id: String,
-    pub view_id: String,
-    pub spec_hash: String,
-    pub compile_request_hash: String,
-    pub program_code: String,
-    pub compiler_request: FelderaCompileRequestV1,
-    pub catalogs: Vec<VelorixRelationCatalogV1>,
-}
-
-#[derive(Clone, Debug)]
-pub struct FelderaCompilerBackendResponse {
-    pub resolved_spec: StandingViewSpec,
-    pub artifact: Option<FelderaCompileArtifactMetadata>,
-    pub product_runtime: Option<FelderaPackageRuntimeDescriptorV1>,
-    pub runtime_deployment: Option<FelderaPipelineManagerRuntimeDeployment>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct FelderaPipelineManagerRuntimeDeployment {
-    pub pipeline_name: String,
-    pub mode: FelderaPipelineManagerRuntimeDeploymentMode,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FelderaPipelineManagerRuntimeDeploymentMode {
-    LocalVolatile,
-    ExternalManaged,
-}
-
-impl FelderaPipelineManagerRuntimeDeploymentMode {
-    fn as_checkpoint_str(self) -> &'static str {
-        match self {
-            FelderaPipelineManagerRuntimeDeploymentMode::LocalVolatile => "local_volatile",
-            FelderaPipelineManagerRuntimeDeploymentMode::ExternalManaged => "external_managed",
-        }
-    }
-
-    fn from_checkpoint_str(value: &str) -> Option<Self> {
-        match value {
-            "local_volatile" => Some(FelderaPipelineManagerRuntimeDeploymentMode::LocalVolatile),
-            "external_managed" => {
-                Some(FelderaPipelineManagerRuntimeDeploymentMode::ExternalManaged)
-            }
-            _ => None,
-        }
-    }
-}
-
-impl FelderaPipelineManagerRuntimeDeployment {
-    fn supports_multi_input_activation(&self) -> bool {
-        matches!(
-            self.mode,
-            FelderaPipelineManagerRuntimeDeploymentMode::LocalVolatile
-                | FelderaPipelineManagerRuntimeDeploymentMode::ExternalManaged
-        )
-    }
-}
-
-#[async_trait]
-pub trait FelderaCompilerBackend: Send + Sync + 'static {
-    async fn compile(
-        &self,
-        request: FelderaCompilerBackendRequest,
-    ) -> Result<FelderaCompilerBackendResponse, ApiError>;
-}
-
-#[derive(Clone)]
-pub struct FelderaPipelineManagerCompilerBackend {
-    client: reqwest::Client,
-    base_url: String,
-    bearer_token: Option<Arc<str>>,
-    poll_interval: Duration,
-    poll_timeout: Duration,
-    program_profile: String,
-    workers: u32,
-    runtime_deployment_mode: Option<FelderaPipelineManagerRuntimeDeploymentMode>,
-}
-
-const FELDERA_PIPELINE_MANAGER_RUNTIME_PACKAGE_NAME: &str = "feldera-pipeline-manager-runtime";
-const FELDERA_PIPELINE_MANAGER_RUNTIME_PACKAGE_VERSION: &str =
-    "feldera-pipeline-manager-runtime-v1";
-const FELDERA_PIPELINE_MANAGER_STATE_CODEC: &str = "feldera-pipeline-manager-state-v2";
-const FELDERA_PIPELINE_MANAGER_LOCAL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
-const FELDERA_COMPILER_SQL_COMPILED_STALL_TIMEOUT: Duration = Duration::from_secs(120);
-const FELDERA_COMPILER_SCHEMA_TIMEOUT_DEFAULT_MS: u64 = 120_000;
-const FELDERA_COMPILER_RUNTIME_TIMEOUT_DEFAULT_MS: u64 = 3_600_000;
-
-impl FelderaPipelineManagerCompilerBackend {
-    pub fn new(
-        base_url: impl Into<String>,
-        bearer_token: Option<String>,
-        poll_interval: Duration,
-        poll_timeout: Duration,
-        program_profile: impl Into<String>,
-        workers: u32,
-    ) -> Result<Self, ApiError> {
-        let base_url = base_url.into();
-        let base_url = base_url.trim().trim_end_matches('/').to_string();
-        if base_url.is_empty() {
-            return Err(ApiError::bad_request("Feldera base URL must not be empty"));
-        }
-        if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
-            return Err(ApiError::bad_request(
-                "Feldera base URL must start with http:// or https://",
-            ));
-        }
-        if poll_interval.is_zero() {
-            return Err(ApiError::bad_request(
-                "Feldera compiler poll interval must be greater than zero",
-            ));
-        }
-        if poll_timeout < poll_interval {
-            return Err(ApiError::bad_request(
-                "Feldera compiler poll timeout must be greater than or equal to poll interval",
-            ));
-        }
-        if workers == 0 {
-            return Err(ApiError::bad_request(
-                "Feldera compiler workers must be greater than zero",
-            ));
-        }
-        let program_profile = program_profile.into();
-        if program_profile.trim().is_empty() {
-            return Err(ApiError::bad_request(
-                "Feldera compiler profile must not be empty",
-            ));
-        }
-        let bearer_token = match bearer_token {
-            Some(token) if !token.trim().is_empty() => Some(Arc::<str>::from(token)),
-            Some(_) => {
-                return Err(ApiError::bad_request(
-                    "Feldera bearer token must not be empty",
-                ));
-            }
-            None => None,
-        };
-        Ok(Self {
-            client: reqwest::Client::builder()
-                .timeout(poll_timeout)
-                .build()
-                .map_err(ApiError::internal)?,
-            base_url,
-            bearer_token,
-            poll_interval,
-            poll_timeout,
-            program_profile,
-            workers,
-            runtime_deployment_mode: None,
-        })
-    }
-
-    pub fn with_volatile_runtime_deployment(mut self) -> Self {
-        self.runtime_deployment_mode =
-            Some(FelderaPipelineManagerRuntimeDeploymentMode::LocalVolatile);
-        self
-    }
-
-    pub fn with_runtime_deployment_mode(
-        mut self,
-        mode: FelderaPipelineManagerRuntimeDeploymentMode,
-    ) -> Self {
-        self.runtime_deployment_mode = Some(mode);
-        self
-    }
-
-    fn request(&self, method: reqwest::Method, url: String) -> reqwest::RequestBuilder {
-        let request = self.client.request(method, url);
-        match self.bearer_token.as_deref() {
-            Some(token) => request.bearer_auth(token),
-            None => request,
-        }
-    }
-
-    fn pipeline_url(&self, pipeline_name: &str) -> String {
-        format!("{}/v0/pipelines/{}", self.base_url, pipeline_name)
-    }
-}
-
-#[async_trait]
-impl FelderaCompilerBackend for FelderaPipelineManagerCompilerBackend {
-    async fn compile(
-        &self,
-        request: FelderaCompilerBackendRequest,
-    ) -> Result<FelderaCompilerBackendResponse, ApiError> {
-        let pipeline_name = feldera_pipeline_name_for_compile_request(&request);
-        let pipeline_url = self.pipeline_url(&pipeline_name);
-        let compiler_request = feldera_pipeline_manager_sql_compile_request(
-            &request.compiler_request,
-            &request.catalogs,
-        )?;
-        let program_code = feldera_sql_program_for_compile_request(&compiler_request)
-            .map_err(|error| ApiError::bad_request(error.to_string()))?;
-        let mut body = json!({
-            "name": pipeline_name.clone(),
-            "description": format!("Velorix compile validation for {}", request.view_id),
-            "runtime_config": {
-                "workers": self.workers
-            },
-            "program_config": {
-                "profile": self.program_profile,
-                "cache": true
-            },
-            "program_code": program_code
-        });
-        if let Some(udf_rust) = compiler_request.rust_extension.udf_rust.as_ref() {
-            body["udf_rust"] = json!(udf_rust);
-        }
-        if let Some(udf_toml) = compiler_request.rust_extension.udf_toml.as_ref() {
-            body["udf_toml"] = json!(udf_toml);
-        }
-
-        let response = self
-            .request(reqwest::Method::PUT, pipeline_url.clone())
-            .json(&body)
-            .send()
-            .await
-            .map_err(|error| {
-                ApiError::service_unavailable(format!(
-                    "Feldera pipeline create/update failed: {error}"
-                ))
-            })?;
-        if !response.status().is_success() {
-            return Err(feldera_http_error("Feldera pipeline create/update", response).await);
-        }
-
-        let deadline = tokio::time::Instant::now() + self.poll_timeout;
-        let mut sql_compiled_stall_started_at = None;
-        loop {
-            let response = self
-                .request(reqwest::Method::GET, pipeline_url.clone())
-                .send()
-                .await
-                .map_err(|error| {
-                    ApiError::service_unavailable(format!(
-                        "Feldera pipeline status poll failed: {error}"
-                    ))
-                })?;
-            if !response.status().is_success() {
-                return Err(feldera_http_error("Feldera pipeline status poll", response).await);
-            }
-            let pipeline: FelderaPipelineStatusResponse =
-                response.json().await.map_err(|error| {
-                    ApiError::service_unavailable(format!(
-                        "Feldera pipeline status response is not valid JSON: {error}"
-                    ))
-                })?;
-            if let Some(warning) = feldera_semantic_warning_summary(pipeline.program_error.as_ref())
-            {
-                return Err(ApiError::bad_request(format!(
-                    "Feldera compiler returned unsupported semantic warning for view `{}`: {warning}",
-                    request.view_id
-                )));
-            }
-            let now = tokio::time::Instant::now();
-            if self.runtime_deployment_mode.is_some()
-                && feldera_pipeline_sql_compiled_without_runtime_artifact(&pipeline)
-            {
-                let started_at = *sql_compiled_stall_started_at.get_or_insert(now);
-                if now.duration_since(started_at)
-                    >= feldera_sql_compiled_stall_timeout(self.poll_timeout)
-                {
-                    return Err(ApiError::service_unavailable(format!(
-                        "Feldera compiler stalled after SQL compilation for view `{}`; runtime artifact was not produced and deployment_status={}",
-                        request.view_id,
-                        pipeline
-                            .deployment_status
-                            .as_deref()
-                            .unwrap_or("unknown")
-                    )));
-                }
-            } else {
-                sql_compiled_stall_started_at = None;
-            }
-            match pipeline.program_status.as_str() {
-                "Success" => {
-                    return feldera_compiler_backend_response_from_pipeline(
-                        &request,
-                        &pipeline,
-                        pipeline_name,
-                        self.runtime_deployment_mode,
-                    );
-                }
-                "SqlError" | "RustError" | "SystemError" => {
-                    return Err(ApiError::bad_request(format!(
-                        "Feldera compiler returned {} for view `{}`: {}",
-                        pipeline.program_status,
-                        request.view_id,
-                        feldera_program_error_summary(pipeline.program_error.as_ref())
-                    )));
-                }
-                "SqlCompiled" | "CompilingRust" if self.runtime_deployment_mode.is_none() => {
-                    return feldera_compiler_backend_response_from_pipeline(
-                        &request,
-                        &pipeline,
-                        pipeline_name,
-                        None,
-                    );
-                }
-                "Pending" | "CompilingSql" | "SqlCompiled" | "CompilingRust" => {
-                    if now >= deadline {
-                        return Err(ApiError::service_unavailable(format!(
-                            "Feldera compiler timed out waiting for `{}` to compile; last program_status={}",
-                            request.view_id, pipeline.program_status
-                        )));
-                    }
-                    tokio::time::sleep(self.poll_interval).await;
-                }
-                other => {
-                    return Err(ApiError::service_unavailable(format!(
-                        "Feldera pipeline status response contains unknown program_status `{other}`"
-                    )));
-                }
-            }
-        }
-    }
-}
-
-fn feldera_compiler_backend_response_from_pipeline(
-    request: &FelderaCompilerBackendRequest,
-    pipeline: &FelderaPipelineStatusResponse,
-    pipeline_name: String,
-    runtime_deployment_mode: Option<FelderaPipelineManagerRuntimeDeploymentMode>,
-) -> Result<FelderaCompilerBackendResponse, ApiError> {
-    if let Some(warning) = feldera_semantic_warning_summary(pipeline.program_error.as_ref()) {
-        return Err(ApiError::bad_request(format!(
-            "Feldera compiler returned unsupported semantic warning for view `{}`: {warning}",
-            request.view_id
-        )));
-    }
-    validate_feldera_program_info_admission(
-        &request.compiler_request,
-        pipeline.program_info.as_ref(),
-    )?;
-    let outputs = feldera_output_schemas_from_program_info(
-        request.view_id.as_str(),
-        pipeline.program_version,
-        pipeline.program_info.as_ref(),
-        request.compiler_request.shape.multi_output,
-    )?;
-    let mut resolved_spec = standing_view_spec_for_compile_request(&request.compiler_request);
-    resolved_spec.output_relations = outputs;
-    resolved_spec.shape.multi_output = resolved_spec.output_relations.len() > 1;
-    let runtime_deployment =
-        runtime_deployment_mode.map(|mode| FelderaPipelineManagerRuntimeDeployment {
-            pipeline_name,
-            mode,
-        });
-    Ok(FelderaCompilerBackendResponse {
-        resolved_spec,
-        artifact: None,
-        product_runtime: None,
-        runtime_deployment,
-    })
-}
-
-impl StandingProgramRuntimeFactory for FelderaPipelineManagerCompilerBackend {
-    fn create(
-        &self,
-        _identity: &StandingProgramIdentity,
-    ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
-        Err("Feldera pipeline-manager runtime requires view spec and schemas".to_string())
-    }
-
-    fn create_with_catalogs_and_spec(
-        &self,
-        identity: &StandingProgramIdentity,
-        catalogs: &[VelorixRelationCatalogV1],
-        spec: &StandingViewSpec,
-        input_schemas: &[RelationSchema],
-        output_schemas: &[RelationSchema],
-    ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
-        let pipeline_name =
-            feldera_pipeline_name_for_view_spec(spec).map_err(|error| error.to_string())?;
-        let runtime_deployment_mode = self.runtime_deployment_mode.ok_or_else(|| {
-            "Feldera pipeline-manager runtime deployment mode is not configured".to_string()
-        })?;
-        let runtime = FelderaPipelineManagerStandingRuntime::new(
-            identity.clone(),
-            input_schemas.to_vec(),
-            output_schemas.to_vec(),
-            catalogs.to_vec(),
-            self.base_url.clone(),
-            self.bearer_token.clone(),
-            pipeline_name,
-            runtime_deployment_mode,
-            self.poll_timeout,
-        )?;
-        Ok(Box::new(runtime))
-    }
-
-    fn restore(
-        &self,
-        checkpoint: RuntimeCheckpoint,
-    ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
-        Err(format!(
-            "Feldera pipeline-manager runtime restore requires active view metadata; checkpoint epoch={}",
-            checkpoint.logical_epoch
-        ))
-    }
-
-    fn restore_with_catalogs_and_spec(
-        &self,
-        checkpoint: RuntimeCheckpoint,
-        catalogs: &[VelorixRelationCatalogV1],
-        spec: &StandingViewSpec,
-        input_schemas: &[RelationSchema],
-        output_schemas: &[RelationSchema],
-    ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
-        let expected_pipeline_name =
-            feldera_pipeline_name_for_view_spec(spec).map_err(|error| error.to_string())?;
-        let runtime_deployment_mode = self.runtime_deployment_mode.ok_or_else(|| {
-            "Feldera pipeline-manager runtime deployment mode is not configured".to_string()
-        })?;
-        let runtime = FelderaPipelineManagerStandingRuntime::restore_with_metadata(
-            checkpoint,
-            input_schemas.to_vec(),
-            output_schemas.to_vec(),
-            catalogs.to_vec(),
-            self.base_url.clone(),
-            self.bearer_token.clone(),
-            expected_pipeline_name,
-            runtime_deployment_mode,
-            self.poll_timeout,
-        )?;
-        Ok(Box::new(runtime))
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct FelderaPipelineManagerCheckpointPayload {
-    pipeline_name: String,
-    logical_epoch: u64,
-    deployment_mode: String,
-    #[serde(default)]
-    applied_idempotency: HashMap<String, u64>,
-}
-
-struct FelderaPipelineManagerStandingRuntime {
-    identity: StandingProgramIdentity,
-    input_schemas: Vec<RelationSchema>,
-    output_schemas: Vec<RelationSchema>,
-    input_relation_names: HashMap<String, String>,
-    input_weight_column_names: HashMap<String, String>,
-    input_delete_capable_relation_ids: BTreeSet<String>,
-    input_catalogs: HashMap<String, VelorixRelationCatalogV1>,
-    base_url: String,
-    bearer_token: Option<Arc<str>>,
-    pipeline_name: String,
-    runtime_deployment_mode: FelderaPipelineManagerRuntimeDeploymentMode,
-    logical_epoch: u64,
-    applied_idempotency: HashMap<String, u64>,
-    input_frontiers: BTreeMap<(String, String), u64>,
-    poisoned_reason: Option<String>,
-    timeout: Duration,
-    cleanup_on_drop: bool,
-}
-
-impl FelderaPipelineManagerStandingRuntime {
-    fn new(
-        identity: StandingProgramIdentity,
-        input_schemas: Vec<RelationSchema>,
-        output_schemas: Vec<RelationSchema>,
-        catalogs: Vec<VelorixRelationCatalogV1>,
-        base_url: String,
-        bearer_token: Option<Arc<str>>,
-        pipeline_name: String,
-        runtime_deployment_mode: FelderaPipelineManagerRuntimeDeploymentMode,
-        timeout: Duration,
-    ) -> Result<Self, String> {
-        identity.validate().map_err(|error| error.to_string())?;
-        let (input_relation_names, input_weight_column_names, input_delete_capable_relation_ids) =
-            validate_feldera_pipeline_manager_runtime_catalogs(&catalogs)?;
-        let runtime = Self {
-            identity,
-            input_schemas,
-            output_schemas,
-            input_relation_names,
-            input_weight_column_names,
-            input_delete_capable_relation_ids,
-            input_catalogs: input_catalog_map(catalogs),
-            base_url,
-            bearer_token,
-            pipeline_name,
-            runtime_deployment_mode,
-            logical_epoch: 0,
-            applied_idempotency: HashMap::new(),
-            input_frontiers: BTreeMap::new(),
-            poisoned_reason: None,
-            timeout,
-            cleanup_on_drop: runtime_deployment_mode
-                == FelderaPipelineManagerRuntimeDeploymentMode::LocalVolatile,
-        };
-        runtime.start_pipeline()?;
-        Ok(runtime)
-    }
-
-    fn restore_with_metadata(
-        checkpoint: RuntimeCheckpoint,
-        input_schemas: Vec<RelationSchema>,
-        output_schemas: Vec<RelationSchema>,
-        catalogs: Vec<VelorixRelationCatalogV1>,
-        base_url: String,
-        bearer_token: Option<Arc<str>>,
-        expected_pipeline_name: String,
-        runtime_deployment_mode: FelderaPipelineManagerRuntimeDeploymentMode,
-        timeout: Duration,
-    ) -> Result<Self, String> {
-        if checkpoint.checkpoint_codec_identity != FELDERA_PIPELINE_MANAGER_STATE_CODEC {
-            return Err(format!(
-                "Feldera pipeline-manager checkpoint codec mismatch: expected `{}`, found `{}`",
-                FELDERA_PIPELINE_MANAGER_STATE_CODEC, checkpoint.checkpoint_codec_identity
-            ));
-        }
-        let payload = checkpoint.state_payload.as_ref().ok_or_else(|| {
-            "Feldera pipeline-manager checkpoint is missing state payload".to_string()
-        })?;
-        if payload.codec_identity != FELDERA_PIPELINE_MANAGER_STATE_CODEC {
-            return Err(format!(
-                "Feldera pipeline-manager checkpoint payload codec mismatch: expected `{}`, found `{}`",
-                FELDERA_PIPELINE_MANAGER_STATE_CODEC, payload.codec_identity
-            ));
-        }
-        let parsed: FelderaPipelineManagerCheckpointPayload =
-            serde_json::from_str(&payload.payload).map_err(|error| {
-                format!("Feldera pipeline-manager checkpoint payload is invalid: {error}")
-            })?;
-        if parsed.pipeline_name != expected_pipeline_name {
-            return Err(format!(
-                "Feldera pipeline-manager checkpoint pipeline mismatch: expected `{expected_pipeline_name}`, found `{}`",
-                parsed.pipeline_name
-            ));
-        }
-        if parsed.logical_epoch != checkpoint.logical_epoch {
-            return Err(format!(
-                "Feldera pipeline-manager checkpoint epoch mismatch: key/body epoch={} payload epoch={}",
-                checkpoint.logical_epoch, parsed.logical_epoch
-            ));
-        }
-        let checkpoint_mode = FelderaPipelineManagerRuntimeDeploymentMode::from_checkpoint_str(
-            parsed.deployment_mode.as_str(),
-        )
-        .ok_or_else(|| {
-            format!(
-                "Feldera pipeline-manager checkpoint deployment_mode `{}` is not supported",
-                parsed.deployment_mode
-            )
-        })?;
-        if checkpoint_mode != runtime_deployment_mode {
-            return Err(format!(
-                "Feldera pipeline-manager checkpoint deployment mode mismatch: expected `{}`, found `{}`",
-                runtime_deployment_mode.as_checkpoint_str(),
-                parsed.deployment_mode
-            ));
-        }
-        let (input_relation_names, input_weight_column_names, input_delete_capable_relation_ids) =
-            validate_feldera_pipeline_manager_runtime_catalogs(&catalogs)?;
-        let runtime = Self {
-            identity: checkpoint.identity,
-            input_schemas,
-            output_schemas,
-            input_relation_names,
-            input_weight_column_names,
-            input_delete_capable_relation_ids,
-            input_catalogs: input_catalog_map(catalogs),
-            base_url,
-            bearer_token,
-            pipeline_name: parsed.pipeline_name,
-            runtime_deployment_mode,
-            logical_epoch: checkpoint.logical_epoch,
-            applied_idempotency: parsed.applied_idempotency,
-            input_frontiers: checkpoint
-                .input_frontiers
-                .iter()
-                .map(|frontier| {
-                    (
-                        (
-                            frontier.relation_id.clone(),
-                            frontier.relation_version.clone(),
-                        ),
-                        frontier.committed_offset_exclusive,
-                    )
-                })
-                .collect(),
-            poisoned_reason: None,
-            timeout,
-            cleanup_on_drop: runtime_deployment_mode
-                == FelderaPipelineManagerRuntimeDeploymentMode::LocalVolatile,
-        };
-        runtime
-            .identity
-            .validate()
-            .map_err(|error| error.to_string())?;
-        runtime.start_pipeline()?;
-        Ok(runtime)
-    }
-
-    fn pipeline_url(&self, suffix: &str) -> String {
-        format!(
-            "{}/v0/pipelines/{}{}",
-            self.base_url, self.pipeline_name, suffix
-        )
-    }
-
-    fn start_pipeline(&self) -> Result<(), String> {
-        let start_url = self.pipeline_url("/start?initial=running");
-        let status_url = self.pipeline_url("");
-        let bearer_token = self.bearer_token.clone();
-        let timeout = self.timeout;
-        let pipeline_name = self.pipeline_name.clone();
-        run_feldera_runtime_http(timeout, move |client| async move {
-            let response = feldera_runtime_request(
-                &client,
-                bearer_token.as_deref(),
-                reqwest::Method::POST,
-                start_url,
-            )
-            .send()
-            .await
-            .map_err(|error| format!("Feldera pipeline start failed: {error}"))?;
-            if !response.status().is_success() {
-                return Err(feldera_runtime_http_error("Feldera pipeline start", response).await);
-            }
-
-            let deadline = tokio::time::Instant::now() + timeout;
-            loop {
-                let response = feldera_runtime_request(
-                    &client,
-                    bearer_token.as_deref(),
-                    reqwest::Method::GET,
-                    status_url.clone(),
-                )
-                .send()
-                .await
-                .map_err(|error| format!("Feldera pipeline status poll failed: {error}"))?;
-                if !response.status().is_success() {
-                    return Err(feldera_runtime_http_error(
-                        "Feldera pipeline status poll",
-                        response,
-                    )
-                    .await);
-                }
-                let value = response.json::<Value>().await.map_err(|error| {
-                    format!("Feldera pipeline status response is invalid: {error}")
-                })?;
-                let resources = value
-                    .get("deployment_resources_status")
-                    .and_then(Value::as_str);
-                let deployment = value.get("deployment_status").and_then(Value::as_str);
-                if resources.is_none()
-                    || resources == Some("Provisioned")
-                    || matches!(deployment, Some("Running" | "Paused"))
-                {
-                    return Ok(());
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(format!(
-                        "Feldera pipeline `{pipeline_name}` did not become provisioned before timeout"
-                    ));
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-    }
-
-    fn start_transaction(&self) -> Result<(), String> {
-        let transaction_url = self.pipeline_url("/start_transaction");
-        let bearer_token = self.bearer_token.clone();
-        run_feldera_runtime_http(self.timeout, move |client| async move {
-            let response = feldera_runtime_request(
-                &client,
-                bearer_token.as_deref(),
-                reqwest::Method::POST,
-                transaction_url,
-            )
-            .send()
-            .await
-            .map_err(|error| format!("Feldera transaction start failed: {error}"))?;
-            if !response.status().is_success() {
-                return Err(
-                    feldera_runtime_http_error("Feldera transaction start", response).await,
-                );
-            }
-            Ok(())
-        })
-    }
-
-    fn commit_transaction_and_wait(&self) -> Result<(), String> {
-        let commit_url = self.pipeline_url("/commit_transaction");
-        let stats_url = self.pipeline_url("/stats");
-        let bearer_token = self.bearer_token.clone();
-        let timeout = self.timeout;
-        let pipeline_name = self.pipeline_name.clone();
-        run_feldera_runtime_http(timeout, move |client| async move {
-            let response = feldera_runtime_request(
-                &client,
-                bearer_token.as_deref(),
-                reqwest::Method::POST,
-                commit_url,
-            )
-            .send()
-            .await
-            .map_err(|error| format!("Feldera transaction commit failed: {error}"))?;
-            if !response.status().is_success() {
-                return Err(
-                    feldera_runtime_http_error("Feldera transaction commit", response).await,
-                );
-            }
-
-            let deadline = tokio::time::Instant::now() + timeout;
-            loop {
-                let response = feldera_runtime_request(
-                    &client,
-                    bearer_token.as_deref(),
-                    reqwest::Method::GET,
-                    stats_url.clone(),
-                )
-                .send()
-                .await
-                .map_err(|error| format!("Feldera transaction status poll failed: {error}"))?;
-                if !response.status().is_success() {
-                    return Err(feldera_runtime_http_error(
-                        "Feldera transaction status poll",
-                        response,
-                    )
-                    .await);
-                }
-                let value = response.json::<Value>().await.map_err(|error| {
-                    format!("Feldera transaction status response is invalid: {error}")
-                })?;
-                let status = value
-                    .get("global_metrics")
-                    .and_then(|metrics| metrics.get("transaction_status"))
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        "Feldera transaction status response is missing global_metrics.transaction_status"
-                            .to_string()
-                    })?;
-                if status == "NoTransaction" {
-                    return Ok(());
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(format!(
-                        "Feldera pipeline `{pipeline_name}` transaction commit did not finish before timeout; last transaction_status={status}"
-                    ));
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-    }
-
-    fn ingest_relation_batch(&self, input: &RelationInputBatch) -> Result<(), String> {
-        let table_name = self
-            .input_relation_names
-            .get(&input.relation_id)
-            .ok_or_else(|| format!("unknown Feldera input relation `{}`", input.relation_id))?;
-        let catalog = self.input_catalogs.get(&input.relation_id).ok_or_else(|| {
-            format!(
-                "missing catalog for Feldera input relation `{}`",
-                input.relation_id
-            )
-        })?;
-        let rows = record_batches_to_feldera_ingress_json_rows_for_catalog(catalog, &input.batches)
-            .map_err(|error| error.to_string())?;
-        let weight_column = self
-            .input_weight_column_names
-            .get(&input.relation_id)
-            .ok_or_else(|| {
-                format!(
-                    "missing weight column for Feldera input relation `{}`",
-                    input.relation_id
-                )
-            })?;
-        let allow_delete = self
-            .input_delete_capable_relation_ids
-            .contains(&input.relation_id);
-        let events =
-            feldera_pipeline_manager_insert_delete_events(weight_column, allow_delete, rows)?;
-        let table_name = utf8_percent_encode(table_name, NON_ALPHANUMERIC).to_string();
-        let ingress_url = self.pipeline_url(&format!(
-            "/ingress/{table_name}?format=json&update_format=insert_delete&array=true"
-        ));
-        let bearer_token = self.bearer_token.clone();
-        run_feldera_runtime_http(self.timeout, move |client| async move {
-            let response = feldera_runtime_request(
-                &client,
-                bearer_token.as_deref(),
-                reqwest::Method::POST,
-                ingress_url,
-            )
-            .json(&events)
-            .send()
-            .await
-            .map_err(|error| format!("Feldera ingress failed: {error}"))?;
-            if !response.status().is_success() {
-                return Err(feldera_runtime_http_error("Feldera ingress", response).await);
-            }
-            Ok(())
-        })
-    }
-
-    fn ensure_not_poisoned(&self) -> Result<(), StandingProgramRuntimeError> {
-        if let Some(reason) = &self.poisoned_reason {
-            return Err(StandingProgramRuntimeError::ExternalRuntime {
-                reason: format!(
-                    "Feldera pipeline-manager runtime is poisoned after a failed Feldera ingress; rebuild or replay the runtime before serving queries: {reason}"
-                ),
-            });
-        }
-        Ok(())
-    }
-
-    fn query_sql_rows(
-        &self,
-        sql: String,
-        output_schema: Option<&RelationSchema>,
-    ) -> Result<Vec<Value>, String> {
-        let query_url = self.pipeline_url("/query");
-        let bearer_token = self.bearer_token.clone();
-        let output_column_names = output_schema.map(|schema| {
-            schema
-                .columns
-                .iter()
-                .map(|column| column.name.clone())
-                .collect::<BTreeSet<_>>()
-        });
-        run_feldera_runtime_http(self.timeout, move |client| async move {
-            let response = feldera_runtime_request(
-                &client,
-                bearer_token.as_deref(),
-                reqwest::Method::GET,
-                query_url,
-            )
-            .query(&[("sql", sql.as_str()), ("format", "json")])
-            .send()
-            .await
-            .map_err(|error| format!("Feldera query failed: {error}"))?;
-            if !response.status().is_success() {
-                return Err(feldera_runtime_http_error("Feldera query", response).await);
-            }
-            let text = response
-                .text()
-                .await
-                .map_err(|error| format!("Feldera query response read failed: {error}"))?;
-            feldera_query_rows_from_text(&text, output_column_names.as_ref())
-        })
-    }
-
-    fn cleanup_local_volatile_pipeline(&self) -> Result<(), String> {
-        let pipeline_url = self.pipeline_url("");
-        let stop_url = self.pipeline_url("/stop?force=true");
-        let clear_url = self.pipeline_url("/clear");
-        let bearer_token = self.bearer_token.clone();
-        run_feldera_runtime_http(
-            FELDERA_PIPELINE_MANAGER_LOCAL_CLEANUP_TIMEOUT,
-            move |client| async move {
-                let response = feldera_runtime_request(
-                    &client,
-                    bearer_token.as_deref(),
-                    reqwest::Method::GET,
-                    pipeline_url.clone(),
-                )
-                .send()
-                .await
-                .map_err(|error| format!("Feldera cleanup status poll failed: {error}"))?;
-                if response.status() == reqwest::StatusCode::NOT_FOUND {
-                    return Ok(());
-                }
-                if !response.status().is_success() {
-                    return Err(feldera_runtime_http_error(
-                        "Feldera cleanup status poll",
-                        response,
-                    )
-                    .await);
-                }
-                let value = response.json::<Value>().await.map_err(|error| {
-                    format!("Feldera cleanup status response is invalid: {error}")
-                })?;
-                let mut deployment = value
-                    .get("deployment_status")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Unknown")
-                    .to_string();
-
-                if deployment != "Stopped" {
-                    let response = feldera_runtime_request(
-                        &client,
-                        bearer_token.as_deref(),
-                        reqwest::Method::POST,
-                        stop_url,
-                    )
-                    .send()
-                    .await
-                    .map_err(|error| format!("Feldera cleanup force-stop failed: {error}"))?;
-                    if response.status() == reqwest::StatusCode::NOT_FOUND {
-                        return Ok(());
-                    }
-                    if !response.status().is_success()
-                        && response.status() != reqwest::StatusCode::SERVICE_UNAVAILABLE
-                    {
-                        return Err(feldera_runtime_http_error(
-                            "Feldera cleanup force-stop",
-                            response,
-                        )
-                        .await);
-                    }
-                }
-
-                let deadline =
-                    tokio::time::Instant::now() + FELDERA_PIPELINE_MANAGER_LOCAL_CLEANUP_TIMEOUT;
-                while deployment != "Stopped" {
-                    if tokio::time::Instant::now() >= deadline {
-                        return Err(format!(
-                            "Feldera cleanup timed out waiting for pipeline to stop; last deployment_status={deployment}"
-                        ));
-                    }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    let response = feldera_runtime_request(
-                        &client,
-                        bearer_token.as_deref(),
-                        reqwest::Method::GET,
-                        pipeline_url.clone(),
-                    )
-                    .send()
-                    .await
-                    .map_err(|error| format!("Feldera cleanup status poll failed: {error}"))?;
-                    if response.status() == reqwest::StatusCode::NOT_FOUND {
-                        return Ok(());
-                    }
-                    if !response.status().is_success() {
-                        return Err(feldera_runtime_http_error(
-                            "Feldera cleanup status poll",
-                            response,
-                        )
-                        .await);
-                    }
-                    let value = response.json::<Value>().await.map_err(|error| {
-                        format!("Feldera cleanup status response is invalid: {error}")
-                    })?;
-                    deployment = value
-                        .get("deployment_status")
-                        .and_then(Value::as_str)
-                        .unwrap_or("Unknown")
-                        .to_string();
-                }
-
-                let response = feldera_runtime_request(
-                    &client,
-                    bearer_token.as_deref(),
-                    reqwest::Method::POST,
-                    clear_url,
-                )
-                .send()
-                .await
-                .map_err(|error| format!("Feldera cleanup clear failed: {error}"))?;
-                if response.status() == reqwest::StatusCode::NOT_FOUND {
-                    return Ok(());
-                }
-                if !response.status().is_success() {
-                    return Err(
-                        feldera_runtime_http_error("Feldera cleanup clear", response).await,
-                    );
-                }
-
-                let deadline =
-                    tokio::time::Instant::now() + FELDERA_PIPELINE_MANAGER_LOCAL_CLEANUP_TIMEOUT;
-                loop {
-                    if tokio::time::Instant::now() >= deadline {
-                        return Err(
-                            "Feldera cleanup timed out waiting for pipeline storage to clear"
-                                .to_string(),
-                        );
-                    }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    let response = feldera_runtime_request(
-                        &client,
-                        bearer_token.as_deref(),
-                        reqwest::Method::GET,
-                        pipeline_url.clone(),
-                    )
-                    .send()
-                    .await
-                    .map_err(|error| format!("Feldera cleanup clear poll failed: {error}"))?;
-                    if response.status() == reqwest::StatusCode::NOT_FOUND {
-                        return Ok(());
-                    }
-                    if !response.status().is_success() {
-                        return Err(feldera_runtime_http_error(
-                            "Feldera cleanup clear poll",
-                            response,
-                        )
-                        .await);
-                    }
-                    let value = response.json::<Value>().await.map_err(|error| {
-                        format!("Feldera cleanup clear response is invalid: {error}")
-                    })?;
-                    if value
-                        .get("storage_status")
-                        .and_then(Value::as_str)
-                        .is_some_and(|status| status == "Cleared")
-                    {
-                        break;
-                    }
-                }
-
-                let response = feldera_runtime_request(
-                    &client,
-                    bearer_token.as_deref(),
-                    reqwest::Method::DELETE,
-                    pipeline_url,
-                )
-                .send()
-                .await
-                .map_err(|error| format!("Feldera cleanup delete failed: {error}"))?;
-                if response.status() == reqwest::StatusCode::NOT_FOUND
-                    || response.status().is_success()
-                {
-                    return Ok(());
-                }
-                Err(feldera_runtime_http_error("Feldera cleanup delete", response).await)
-            },
-        )
-    }
-}
-
-impl Drop for FelderaPipelineManagerStandingRuntime {
-    fn drop(&mut self) {
-        if self.cleanup_on_drop {
-            let _ = self.cleanup_local_volatile_pipeline();
-        }
-    }
-}
-
-fn validate_feldera_pipeline_manager_runtime_catalogs(
-    catalogs: &[VelorixRelationCatalogV1],
-) -> Result<
-    (
-        HashMap<String, String>,
-        HashMap<String, String>,
-        BTreeSet<String>,
-    ),
-    String,
-> {
-    let mut input_relation_names = HashMap::new();
-    let mut input_weight_column_names = HashMap::new();
-    let mut input_delete_capable_relation_ids = BTreeSet::new();
-    for catalog in catalogs {
-        let delete_capable = validate_feldera_pipeline_manager_relation_operations(catalog)?;
-        let weight_column = catalog
-            .relation_schema
-            .columns
-            .iter()
-            .find(|column| column.column_id == catalog.relation_schema.weight_column_id)
-            .ok_or_else(|| {
-                format!(
-                    "relation `{}` weight column `{}` is missing",
-                    catalog.relation_schema.relation_id, catalog.relation_schema.weight_column_id
-                )
-            })?;
-        if !matches!(
-            weight_column.physical_arrow_type,
-            ArrowPhysicalTypeV1::Int64
-        ) {
-            return Err(format!(
-                "Feldera pipeline-manager runtime requires Int64 weight column for relation `{}`",
-                catalog.relation_schema.relation_id
-            ));
-        }
-        if !matches!(weight_column.logical_type, VelorixLogicalTypeV1::Int64) {
-            return Err(format!(
-                "Feldera pipeline-manager runtime requires Int64 logical weight column for relation `{}`",
-                catalog.relation_schema.relation_id
-            ));
-        }
-        if weight_column.nullable {
-            return Err(format!(
-                "Feldera pipeline-manager runtime requires non-null weight column for relation `{}`",
-                catalog.relation_schema.relation_id
-            ));
-        }
-        if catalog
-            .relation_schema
-            .primary_key_column_ids
-            .iter()
-            .any(|column_id| column_id == &catalog.relation_schema.weight_column_id)
-        {
-            return Err(format!(
-                "Feldera pipeline-manager runtime does not allow the weight column in the primary key for relation `{}`",
-                catalog.relation_schema.relation_id
-            ));
-        }
-        input_relation_names.insert(
-            catalog.relation_schema.relation_id.clone(),
-            catalog.relation_schema.relation_name.clone(),
-        );
-        input_weight_column_names.insert(
-            catalog.relation_schema.relation_id.clone(),
-            weight_column.name.clone(),
-        );
-        if delete_capable {
-            input_delete_capable_relation_ids.insert(catalog.relation_schema.relation_id.clone());
-        }
-    }
-
-    Ok((
-        input_relation_names,
-        input_weight_column_names,
-        input_delete_capable_relation_ids,
-    ))
-}
-
-fn input_catalog_map(
-    catalogs: Vec<VelorixRelationCatalogV1>,
-) -> HashMap<String, VelorixRelationCatalogV1> {
-    catalogs
-        .into_iter()
-        .map(|catalog| (catalog.relation_schema.relation_id.clone(), catalog))
-        .collect()
-}
-
-fn validate_feldera_pipeline_manager_relation_operations(
-    catalog: &VelorixRelationCatalogV1,
-) -> Result<bool, String> {
-    let mut insert = false;
-    let mut delete = false;
-    let mut update = false;
-    let mut upsert = false;
-    for operation in &catalog.relation_schema.allowed_operations {
-        match operation {
-            RelationOperationV1::Insert if insert => {
-                return Err(format!(
-                    "Feldera pipeline-manager runtime rejects duplicate Insert relation operation; relation `{}` declares {:?}",
-                    catalog.relation_schema.relation_id,
-                    catalog.relation_schema.allowed_operations
-                ));
-            }
-            RelationOperationV1::Insert => insert = true,
-            RelationOperationV1::Delete if delete => {
-                return Err(format!(
-                    "Feldera pipeline-manager runtime rejects duplicate Delete relation operation; relation `{}` declares {:?}",
-                    catalog.relation_schema.relation_id,
-                    catalog.relation_schema.allowed_operations
-                ));
-            }
-            RelationOperationV1::Delete => delete = true,
-            RelationOperationV1::Update if update => {
-                return Err(format!(
-                    "Feldera pipeline-manager runtime rejects duplicate Update relation operation; relation `{}` declares {:?}",
-                    catalog.relation_schema.relation_id,
-                    catalog.relation_schema.allowed_operations
-                ));
-            }
-            RelationOperationV1::Update => update = true,
-            RelationOperationV1::Upsert if upsert => {
-                return Err(format!(
-                    "Feldera pipeline-manager runtime rejects duplicate Upsert relation operation; relation `{}` declares {:?}",
-                    catalog.relation_schema.relation_id,
-                    catalog.relation_schema.allowed_operations
-                ));
-            }
-            RelationOperationV1::Upsert => upsert = true,
-        }
-    }
-    if !insert {
-        return Err(format!(
-            "Feldera pipeline-manager runtime requires Insert relation operation; relation `{}` declares {:?}",
-            catalog.relation_schema.relation_id,
-            catalog.relation_schema.allowed_operations
-        ));
-    }
-    Ok(delete || update || upsert)
-}
-
-fn feldera_pipeline_manager_insert_delete_events(
-    weight_column: &str,
-    allow_delete: bool,
-    rows: Vec<Value>,
-) -> Result<Vec<Value>, String> {
-    let mut events = Vec::with_capacity(rows.len());
-    for (index, row) in rows.into_iter().enumerate() {
-        let mut data = row.as_object().cloned().ok_or_else(|| {
-            format!("Feldera input row {index} must be a JSON object before ingress")
-        })?;
-        let weight = data
-            .get(weight_column)
-            .and_then(Value::as_i64)
-            .ok_or_else(|| {
-                format!(
-                    "Feldera input row {index} is missing Int64 weight column `{weight_column}`"
-                )
-            })?;
-        data.remove(weight_column);
-        let data = Value::Object(data);
-        match weight {
-            1 => events.push(json!({ "insert": data })),
-            -1 if allow_delete => events.push(json!({ "delete": data })),
-            -1 => {
-                return Err(format!(
-                    "Feldera pipeline-manager runtime received delete weight `{weight_column}` = -1 for an insert-only relation at row {index}"
-                ));
-            }
-            _ => {
-                return Err(format!(
-                    "Feldera pipeline-manager runtime currently supports only signed unit weights with `{weight_column}` = 1 or -1; row {index} has {weight}"
-                ));
-            }
-        }
-    }
-
-    Ok(events)
-}
-
-impl StandingProgramRuntime for FelderaPipelineManagerStandingRuntime {
-    fn program_identity(&self) -> &StandingProgramIdentity {
-        &self.identity
-    }
-
-    fn input_schemas(&self) -> Vec<RelationSchema> {
-        self.input_schemas.clone()
-    }
-
-    fn output_schemas(&self) -> Vec<RelationSchema> {
-        self.output_schemas.clone()
-    }
-
-    fn logical_epoch(&self) -> u64 {
-        self.logical_epoch
-    }
-
-    fn apply_changes(
-        &mut self,
-        logical_epoch: u64,
-        idempotency_key: EpochIdempotencyKey,
-        input_changes: Vec<RelationInputBatch>,
-    ) -> Result<EpochCommit, StandingProgramRuntimeError> {
-        self.ensure_not_poisoned()?;
-        if logical_epoch <= self.logical_epoch {
-            return Err(StandingProgramRuntimeError::NonMonotonicLogicalEpoch {
-                current: self.logical_epoch,
-                attempted: logical_epoch,
-            });
-        }
-        if let Some(first_epoch) = self.applied_idempotency.get(idempotency_key.as_str()) {
-            return Err(StandingProgramRuntimeError::IdempotencyKeyConflict {
-                idempotency_key: idempotency_key.as_str().to_string(),
-                first_epoch: *first_epoch,
-                attempted_epoch: logical_epoch,
-            });
-        }
-        let transactional = input_changes.len() > 1;
-        if transactional {
-            if let Err(reason) = self.start_transaction() {
-                let reason = format!(
-                    "failed to start Feldera transaction for multi-input epoch {logical_epoch}: {reason}"
-                );
-                self.poisoned_reason = Some(reason.clone());
-                return Err(StandingProgramRuntimeError::ExternalRuntime { reason });
-            }
-        }
-        for input in &input_changes {
-            if let Err(reason) = self.ingest_relation_batch(input) {
-                let reason = format!(
-                    "relation `{}` version `{}` failed at offsets {}..{}: {reason}",
-                    input.relation_id,
-                    input.relation_version,
-                    input.start_offset_inclusive,
-                    input.end_offset_exclusive
-                );
-                self.poisoned_reason = Some(reason.clone());
-                return Err(StandingProgramRuntimeError::ExternalRuntime { reason });
-            }
-        }
-        if transactional {
-            if let Err(reason) = self.commit_transaction_and_wait() {
-                let reason = format!(
-                    "failed to commit Feldera transaction for multi-input epoch {logical_epoch}: {reason}"
-                );
-                self.poisoned_reason = Some(reason.clone());
-                return Err(StandingProgramRuntimeError::ExternalRuntime { reason });
-            }
-        }
-        self.logical_epoch = logical_epoch;
-        self.applied_idempotency
-            .insert(idempotency_key.as_str().to_string(), logical_epoch);
-        let input_frontiers: Vec<RelationFrontier> = input_changes
-            .into_iter()
-            .map(|input| RelationFrontier {
-                relation_id: input.relation_id,
-                relation_version: input.relation_version,
-                committed_offset_exclusive: input.end_offset_exclusive,
-            })
-            .collect();
-        for frontier in &input_frontiers {
-            self.input_frontiers.insert(
-                (
-                    frontier.relation_id.clone(),
-                    frontier.relation_version.clone(),
-                ),
-                frontier.committed_offset_exclusive,
-            );
-        }
-        Ok(EpochCommit {
-            logical_epoch,
-            idempotency_key,
-            input_frontiers,
-            output_batches: Vec::new(),
-        })
-    }
-
-    fn materialized_view_page(
-        &self,
-        view: ScopedViewId,
-        page: SnapshotPageRequest,
-    ) -> Result<MaterializedViewPage, StandingProgramRuntimeError> {
-        self.ensure_not_poisoned()?;
-        if !self
-            .identity
-            .view_ids
-            .iter()
-            .any(|view_id| view_id == &view.view_id)
-        {
-            return Err(StandingProgramRuntimeError::UnknownView {
-                view_id: view.view_id,
-            });
-        }
-        if let Some(requested) = page.committed_epoch {
-            if requested != self.logical_epoch {
-                return Err(StandingProgramRuntimeError::UnavailableCommittedEpoch {
-                    requested,
-                    current: self.logical_epoch,
-                });
-            }
-        }
-        let output_schema = self
-            .output_schemas
-            .iter()
-            .find(|schema| schema.relation_id == view.view_id)
-            .ok_or_else(|| StandingProgramRuntimeError::UnknownView {
-                view_id: view.view_id.clone(),
-            })?;
-        let sql = format!(
-            "SELECT * FROM {}",
-            feldera_sql_quoted_identifier(&output_schema.relation_name)
-        );
-        let (sql, page_offset, requested_rows) = feldera_sql_with_page(sql, &page)
-            .map_err(|reason| StandingProgramRuntimeError::ExternalRuntime { reason })?;
-        let rows = self
-            .query_sql_rows(sql, Some(output_schema))
-            .map_err(|reason| StandingProgramRuntimeError::ExternalRuntime { reason })?;
-        let (rows, next_page_token) =
-            feldera_apply_wrapped_page_bounds(rows, page_offset, requested_rows)
-                .map_err(|reason| StandingProgramRuntimeError::ExternalRuntime { reason })?;
-        let batch = feldera_rows_to_record_batch(output_schema, &rows)
-            .map_err(|reason| StandingProgramRuntimeError::ExternalRuntime { reason })?;
-        Ok(MaterializedViewPage {
-            view,
-            logical_epoch: self.logical_epoch,
-            schema_fingerprint: output_schema.schema_fingerprint.clone(),
-            batches: vec![batch],
-            next_page_token,
-        })
-    }
-
-    fn materialized_view_sql_page(
-        &self,
-        view: ScopedViewId,
-        sql: String,
-        page: SnapshotPageRequest,
-    ) -> Result<MaterializedViewSqlPage, StandingProgramRuntimeError> {
-        self.ensure_not_poisoned()?;
-        if !self
-            .identity
-            .view_ids
-            .iter()
-            .any(|view_id| view_id == &view.view_id)
-        {
-            return Err(StandingProgramRuntimeError::UnknownView {
-                view_id: view.view_id,
-            });
-        }
-        if let Some(requested) = page.committed_epoch {
-            if requested != self.logical_epoch {
-                return Err(StandingProgramRuntimeError::UnavailableCommittedEpoch {
-                    requested,
-                    current: self.logical_epoch,
-                });
-            }
-        }
-        let (sql, page_offset, requested_rows, page_mode) = feldera_sql_query_with_page(sql, &page)
-            .map_err(|reason| StandingProgramRuntimeError::ExternalRuntime { reason })?;
-        let rows = self
-            .query_sql_rows(sql, None)
-            .map_err(|reason| StandingProgramRuntimeError::ExternalRuntime { reason })?;
-        let (rows, next_page_token) = match page_mode {
-            FelderaSqlPageMode::Unwrapped => {
-                feldera_apply_unwrapped_page_bounds(rows, page_offset, requested_rows)
-            }
-            FelderaSqlPageMode::Wrapped => {
-                feldera_apply_wrapped_page_bounds(rows, page_offset, requested_rows)
-            }
-        }
-        .map_err(|reason| StandingProgramRuntimeError::ExternalRuntime { reason })?;
-        Ok(MaterializedViewSqlPage {
-            view,
-            logical_epoch: self.logical_epoch,
-            rows,
-            next_page_token,
-        })
-    }
-
-    fn checkpoint(&self) -> Result<RuntimeCheckpoint, StandingProgramRuntimeError> {
-        self.ensure_not_poisoned()?;
-        let payload = json!({
-            "pipeline_name": self.pipeline_name,
-            "logical_epoch": self.logical_epoch,
-            "deployment_mode": self.runtime_deployment_mode.as_checkpoint_str(),
-            "applied_idempotency": self.applied_idempotency
-        })
-        .to_string();
-        let content_hash = feldera_artifact_bytes_hash(payload.as_bytes());
-        Ok(RuntimeCheckpoint {
-            identity: self.identity.clone(),
-            logical_epoch: self.logical_epoch,
-            input_frontiers: self
-                .input_frontiers
-                .iter()
-                .map(
-                    |((relation_id, relation_version), committed_offset_exclusive)| {
-                        RelationFrontier {
-                            relation_id: relation_id.clone(),
-                            relation_version: relation_version.clone(),
-                            committed_offset_exclusive: *committed_offset_exclusive,
-                        }
-                    },
-                )
-                .collect(),
-            output_frontiers: self
-                .identity
-                .view_ids
-                .iter()
-                .map(|view_id| ViewFrontier {
-                    view_id: view_id.clone(),
-                    committed_epoch: self.logical_epoch,
-                })
-                .collect(),
-            checkpoint_codec_identity: FELDERA_PIPELINE_MANAGER_STATE_CODEC.to_string(),
-            state_root: DurableStateRoot {
-                object_key: format!("feldera-pipeline-manager://{}", self.pipeline_name),
-                content_hash,
-            },
-            state_payload: Some(
-                velorix_core::standing_program::RuntimeCheckpointStatePayload {
-                    codec_identity: FELDERA_PIPELINE_MANAGER_STATE_CODEC.to_string(),
-                    payload,
-                },
-            ),
-            output_manifest_refs: Vec::new(),
-            owner_epoch: None,
-        })
-    }
-
-    fn restore(_checkpoint: RuntimeCheckpoint) -> Result<Self, StandingProgramRuntimeError>
-    where
-        Self: Sized,
-    {
-        Err(StandingProgramRuntimeError::ExternalRuntime {
-            reason: "Feldera pipeline-manager runtime restore requires active view metadata"
-                .to_string(),
-        })
-    }
-}
-
-fn run_feldera_runtime_http<T, F, Fut>(timeout: Duration, operation: F) -> Result<T, String>
-where
-    T: Send + 'static,
-    F: FnOnce(reqwest::Client) -> Fut + Send + 'static,
-    Fut: Future<Output = Result<T, String>> + Send + 'static,
-{
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| format!("Feldera runtime HTTP executor failed to start: {error}"))?;
-        runtime.block_on(async move {
-            let client = reqwest::Client::builder()
-                .timeout(timeout)
-                .build()
-                .map_err(|error| format!("Feldera runtime HTTP client failed to build: {error}"))?;
-            operation(client).await
-        })
-    })
-    .join()
-    .map_err(|_| "Feldera runtime HTTP executor panicked".to_string())?
-}
-
-fn feldera_runtime_request(
-    client: &reqwest::Client,
-    bearer_token: Option<&str>,
-    method: reqwest::Method,
-    url: String,
-) -> reqwest::RequestBuilder {
-    let request = client.request(method, url);
-    match bearer_token {
-        Some(token) => request.bearer_auth(token),
-        None => request,
-    }
-}
-
-async fn feldera_runtime_http_error(
-    operation: &'static str,
-    response: reqwest::Response,
-) -> String {
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    if body.trim().is_empty() {
-        format!("{operation} returned HTTP {status}")
-    } else {
-        format!("{operation} returned HTTP {status}: {body}")
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct FelderaPipelineStatusResponse {
-    program_status: String,
-    #[serde(default)]
-    deployment_status: Option<String>,
-    #[serde(default)]
-    deployment_resources_status: Option<String>,
-    #[serde(default)]
-    program_version: u64,
-    #[serde(default)]
-    program_info: Option<Value>,
-    #[serde(default)]
-    program_error: Option<Value>,
-}
-
-fn feldera_pipeline_sql_compiled_without_runtime_artifact(
-    pipeline: &FelderaPipelineStatusResponse,
-) -> bool {
-    pipeline.program_status == "SqlCompiled"
-        && pipeline.deployment_status.as_deref() == Some("Stopped")
-        && pipeline.deployment_resources_status.as_deref() == Some("Stopped")
-        && pipeline
-            .program_error
-            .as_ref()
-            .and_then(|error| error.pointer("/rust_compilation"))
-            .is_none_or(Value::is_null)
-}
-
-fn feldera_sql_compiled_stall_timeout(poll_timeout: Duration) -> Duration {
-    poll_timeout.min(FELDERA_COMPILER_SQL_COMPILED_STALL_TIMEOUT)
-}
-
-fn standing_view_spec_for_compile_request(request: &FelderaCompileRequestV1) -> StandingViewSpec {
-    StandingViewSpec {
-        view_id: request.view_id.clone(),
-        sql: request.sql.clone(),
-        dialect: request.dialect.clone(),
-        source_kind: request.source_kind.clone(),
-        rust_extension: request.rust_extension.clone(),
-        input_relations: request.input_relations.clone(),
-        output_relations: match &request.output_contract {
-            OutputSchemaContract::Infer => Vec::new(),
-            OutputSchemaContract::MustMatch { output_relations } => output_relations.clone(),
-        },
-        shape: request.shape.clone(),
-    }
-}
-
-fn feldera_pipeline_manager_sql_compile_request(
-    request: &FelderaCompileRequestV1,
-    catalogs: &[VelorixRelationCatalogV1],
-) -> Result<FelderaCompileRequestV1, ApiError> {
-    let (_, input_weight_column_names, _) =
-        validate_feldera_pipeline_manager_runtime_catalogs(catalogs)
-            .map_err(ApiError::bad_request)?;
-    let mut request = request.clone();
-    for input in &mut request.input_relations {
-        let weight_column = input_weight_column_names
-            .get(&input.relation_id)
-            .ok_or_else(|| {
-                ApiError::bad_request(format!(
-                    "missing Feldera weight column metadata for input relation `{}`",
-                    input.relation_id
-                ))
-            })?;
-        if input
-            .primary_key
-            .iter()
-            .any(|column| column == weight_column)
-        {
-            return Err(ApiError::bad_request(format!(
-                "Feldera pipeline-manager compile request does not allow weight column `{weight_column}` in primary key for relation `{}`",
-                input.relation_id
-            )));
-        }
-        input.columns.retain(|column| column.name != *weight_column);
-        if input.columns.is_empty() {
-            return Err(ApiError::bad_request(format!(
-                "Feldera pipeline-manager compile request has no data columns after stripping weight column `{weight_column}` for relation `{}`",
-                input.relation_id
-            )));
-        }
-    }
-    Ok(request)
-}
-
-fn feldera_pipeline_name_for_compile_request(request: &FelderaCompilerBackendRequest) -> String {
-    feldera_pipeline_name_for_parts(&request.view_id, &request.compile_request_hash)
-}
-
-fn feldera_pipeline_name_for_view_spec(spec: &StandingViewSpec) -> Result<String, ApiError> {
-    let compile_request_hash = compile_request_hash_for_spec(spec)?;
-    Ok(feldera_pipeline_name_for_parts(
-        &spec.view_id,
-        &compile_request_hash,
-    ))
-}
-
-const FELDERA_PIPELINE_NAME_MAX_CHARS: usize = 63;
-
-fn feldera_pipeline_name_for_parts(view_id: &str, compile_request_hash: &str) -> String {
-    let hash_tail = compile_request_hash
-        .rsplit_once(':')
-        .map(|(_, tail)| tail)
-        .unwrap_or(compile_request_hash);
-    let hash_tail = hash_tail.chars().take(16).collect::<String>();
-    let view = view_id
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ch.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string();
-    let view = if view.is_empty() {
-        "view".to_string()
-    } else {
-        view
-    };
-    let max_view_chars =
-        FELDERA_PIPELINE_NAME_MAX_CHARS.saturating_sub("velorix--".len() + hash_tail.len());
-    let view = view.chars().take(max_view_chars).collect::<String>();
-    format!("velorix-{view}-{hash_tail}")
-}
-
-async fn feldera_http_error(operation: &'static str, response: reqwest::Response) -> ApiError {
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    let message = if body.trim().is_empty() {
-        format!("{operation} returned HTTP {status}")
-    } else {
-        format!("{operation} returned HTTP {status}: {body}")
-    };
-    if status.is_client_error() {
-        ApiError::bad_request(message)
-    } else {
-        ApiError::service_unavailable(message)
-    }
-}
-
-fn feldera_program_error_summary(error: Option<&Value>) -> String {
-    let Some(error) = error else {
-        return "no program_error returned".to_string();
-    };
-    if let Some(message) = error.get("message").and_then(Value::as_str) {
-        return message.to_string();
-    }
-    if let Some(messages) = error
-        .pointer("/sql_compilation/messages")
-        .and_then(Value::as_array)
-    {
-        let rendered = messages
-            .iter()
-            .filter_map(|message| message.get("message").and_then(Value::as_str))
-            .take(3)
-            .collect::<Vec<_>>()
-            .join("; ");
-        if !rendered.is_empty() {
-            return rendered;
-        }
-    }
-    serde_json::to_string(error).unwrap_or_else(|_| "unrenderable program_error".to_string())
-}
-
-fn feldera_semantic_warning_summary(error: Option<&Value>) -> Option<String> {
-    let messages = error?
-        .pointer("/sql_compilation/messages")
-        .and_then(Value::as_array)?;
-    messages.iter().find_map(|message| {
-        let warning = message
-            .get("warning")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if !warning {
-            return None;
-        }
-        let error_type = message
-            .get("error_type")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let text = message
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if error_type == "ORDER BY is ignored"
-            || text.contains("ORDER BY clause is currently ignored")
-        {
-            Some(if text.is_empty() {
-                error_type.to_string()
-            } else {
-                text.to_string()
-            })
-        } else {
-            None
-        }
-    })
-}
-
-fn feldera_sql_quoted_identifier(identifier: &str) -> String {
-    format!("\"{}\"", identifier.replace('"', "\"\""))
-}
-
-fn api_path_segment(segment: &str) -> String {
-    utf8_percent_encode(segment, API_PATH_SEGMENT_ENCODE_SET).to_string()
-}
-
-fn feldera_sql_with_page(
-    sql: String,
-    page: &SnapshotPageRequest,
-) -> Result<(String, usize, Option<usize>), String> {
-    let (offset, requested_rows) = feldera_sql_page_bounds(page)?;
-    let fetch_rows = requested_rows
-        .map(|requested_rows| {
-            requested_rows.checked_add(1).ok_or_else(|| {
-                "Feldera pipeline-manager max_rows is too large for pagination".to_string()
-            })
-        })
-        .transpose()?;
-    if fetch_rows.is_none() && offset == 0 {
-        return Ok((sql, offset, requested_rows));
-    }
-    let sql = sql.trim().trim_end_matches(';').trim();
-    let mut paged_sql = format!(
-        "SELECT * FROM ({sql}) AS {}",
-        feldera_sql_quoted_identifier("velorix_limited_query")
-    );
-    if let Some(fetch_rows) = fetch_rows {
-        paged_sql.push_str(&format!(" LIMIT {fetch_rows}"));
-    }
-    if offset > 0 {
-        paged_sql.push_str(&format!(" OFFSET {offset}"));
-    }
-    Ok((paged_sql, offset, requested_rows))
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FelderaSqlPageMode {
-    Unwrapped,
-    Wrapped,
-}
-
-fn feldera_sql_query_with_page(
-    sql: String,
-    page: &SnapshotPageRequest,
-) -> Result<(String, usize, Option<usize>, FelderaSqlPageMode), String> {
-    let (offset, requested_rows) = feldera_sql_page_bounds(page)?;
-    if requested_rows.is_none() && offset == 0 {
-        return Ok((sql, offset, requested_rows, FelderaSqlPageMode::Unwrapped));
-    }
-    if let Some((query_sql, execute_sql)) = split_velorix_feldera_prepared_query_sql(&sql) {
-        let (paged_query_sql, offset, requested_rows) =
-            feldera_sql_with_page(query_sql.to_string(), page)?;
-        return Ok((
-            format!("PREPARE {FELDERA_PREPARED_QUERY_NAME} AS {paged_query_sql};\n{execute_sql}"),
-            offset,
-            requested_rows,
-            FelderaSqlPageMode::Wrapped,
-        ));
-    }
-    let query_sql = trim_feldera_prepared_statement_sql(&sql);
-    if feldera_sql_has_statement_separator(query_sql) {
-        return Err(
-            "pagination for Feldera SQL query path requires a single SQL statement".to_string(),
-        );
-    }
-    let (sql, offset, requested_rows) = feldera_sql_with_page(query_sql.to_string(), page)?;
-    Ok((sql, offset, requested_rows, FelderaSqlPageMode::Wrapped))
-}
-
-fn split_velorix_feldera_prepared_query_sql(sql: &str) -> Option<(&str, String)> {
-    let trimmed = sql.trim();
-    let prefix = format!("PREPARE {FELDERA_PREPARED_QUERY_NAME} AS ");
-    let rest = trimmed.strip_prefix(&prefix)?;
-    let execute_prefix = format!("EXECUTE {FELDERA_PREPARED_QUERY_NAME}(");
-    let separator = format!(";\n{execute_prefix}");
-    let (query_sql, execute_args) = rest.split_once(&separator)?;
-    if !execute_args.ends_with(");") {
-        return None;
-    }
-    Some((query_sql.trim(), format!("{execute_prefix}{execute_args}")))
-}
-
-fn feldera_sql_page_bounds(page: &SnapshotPageRequest) -> Result<(usize, Option<usize>), String> {
-    let offset = feldera_page_token_offset(page.page_token.as_deref())?;
-    Ok((offset, page.max_rows))
-}
-
-fn feldera_page_token_offset(page_token: Option<&str>) -> Result<usize, String> {
-    let Some(page_token) = page_token else {
-        return Ok(0);
-    };
-    let Some(offset) = page_token.strip_prefix("offset:") else {
-        return Err(format!(
-            "invalid Feldera pipeline-manager page_token `{page_token}`; expected `offset:<row_offset>`"
-        ));
-    };
-    let parsed = offset.parse::<usize>().map_err(|_| {
-        format!(
-            "invalid Feldera pipeline-manager page_token `{page_token}`; expected `offset:<row_offset>`"
-        )
-    })?;
-    Ok(parsed)
-}
-
-fn feldera_apply_wrapped_page_bounds(
-    mut rows: Vec<Value>,
-    offset: usize,
-    requested_rows: Option<usize>,
-) -> Result<(Vec<Value>, Option<String>), String> {
-    let Some(requested_rows) = requested_rows else {
-        return Ok((rows, None));
-    };
-    if rows.len() <= requested_rows {
-        return Ok((rows, None));
-    }
-    rows.truncate(requested_rows);
-    let next_offset = offset.checked_add(requested_rows).ok_or_else(|| {
-        "Feldera pipeline-manager page offset overflow while building next_page_token".to_string()
-    })?;
-    Ok((rows, Some(format!("offset:{next_offset}"))))
-}
-
-fn feldera_apply_unwrapped_page_bounds(
-    mut rows: Vec<Value>,
-    offset: usize,
-    requested_rows: Option<usize>,
-) -> Result<(Vec<Value>, Option<String>), String> {
-    if offset > 0 {
-        if offset >= rows.len() {
-            return Ok((Vec::new(), None));
-        }
-        rows.drain(..offset);
-    }
-    feldera_apply_wrapped_page_bounds(rows, offset, requested_rows)
-}
-
-fn feldera_output_schemas_from_program_info(
-    view_id: &str,
-    program_version: u64,
-    program_info: Option<&Value>,
-    multi_output: bool,
-) -> Result<Vec<RelationSchema>, ApiError> {
-    let program_info = program_info.ok_or_else(|| {
-        ApiError::service_unavailable("Feldera compiled response is missing program_info")
-    })?;
-    let outputs = program_info
-        .pointer("/schema/outputs")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            ApiError::service_unavailable("Feldera program_info is missing schema.outputs")
-        })?;
-    if outputs.is_empty() {
-        return Err(ApiError::bad_request(
-            "Feldera compiled program does not contain output views",
-        ));
-    }
-    let mut output_names = BTreeSet::new();
-    for output in outputs {
-        let output_name = feldera_relation_name(output).ok_or_else(|| {
-            ApiError::service_unavailable(format!(
-                "Feldera compiled program for `{view_id}` contains an output without a name"
-            ))
-        })?;
-        if !output_names.insert(feldera_relation_name_key(output_name, output)) {
-            return Err(ApiError::bad_request(format!(
-                "Feldera compiled program contains duplicate output view `{output_name}`"
-            )));
-        }
-    }
-    if !multi_output {
-        let output = outputs
-            .iter()
-            .find(|output| feldera_relation_name_matches(view_id, output))
-            .ok_or_else(|| {
-                ApiError::bad_request(format!(
-                    "Feldera compiled program does not contain output view `{view_id}`"
-                ))
-            })?;
-        return Ok(vec![feldera_output_schema_from_program_output(
-            view_id,
-            program_version,
-            output,
-        )?]);
-    }
-    let materialized_outputs = outputs
-        .iter()
-        .filter(|output| feldera_relation_is_materialized(output))
-        .map(|output| feldera_output_schema_from_program_output(view_id, program_version, output))
-        .collect::<Result<Vec<_>, _>>()?;
-    if materialized_outputs.is_empty() {
-        return Err(ApiError::bad_request(
-            "Feldera compiled program does not contain materialized output views",
-        ));
-    }
-    Ok(materialized_outputs)
-}
-
-fn validate_feldera_program_info_admission(
-    request: &FelderaCompileRequestV1,
-    program_info: Option<&Value>,
-) -> Result<(), ApiError> {
-    if request.source_kind != SqlSourceKind::FelderaProgram {
-        return Ok(());
-    }
-    let program_info = program_info.ok_or_else(|| {
-        ApiError::service_unavailable("Feldera compiled response is missing program_info")
-    })?;
-    let inputs = program_info
-        .pointer("/schema/inputs")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            ApiError::bad_request(
-                "Feldera feldera_program compiled response is missing schema.inputs",
-            )
-        })?;
-    let expected = request.input_relations.iter().collect::<Vec<_>>();
-    let mut actual = BTreeSet::new();
-    let mut matched_expected = BTreeSet::new();
-    for input in inputs {
-        let name = feldera_relation_name(input).ok_or_else(|| {
-            ApiError::service_unavailable(
-                "Feldera feldera_program compiled response contains an input without a name",
-            )
-        })?;
-        if !actual.insert(feldera_relation_name_key(name, input)) {
-            return Err(ApiError::bad_request(format!(
-                "Feldera feldera_program compiled response contains duplicate input relation `{name}`"
-            )));
-        }
-        let unmanaged_properties = feldera_relation_unmanaged_io_properties(input);
-        if !unmanaged_properties.is_empty() {
-            return Err(ApiError::bad_request(format!(
-                "Feldera feldera_program input relation `{name}` contains unmanaged connector/external IO properties: {}",
-                unmanaged_properties.join(", ")
-            )));
-        }
-        let matching_expected = expected.iter().copied().find(|expected_schema| {
-            feldera_relation_name_matches(&expected_schema.relation_name, input)
-        });
-        let Some(matching_expected) = matching_expected else {
-            return Err(ApiError::bad_request(format!(
-                "Feldera feldera_program compiled response contains unregistered input relation `{name}`"
-            )));
-        };
-        validate_feldera_program_input_schema_matches(name, input, matching_expected)?;
-        matched_expected.insert(matching_expected.relation_name.as_str());
-    }
-    for expected_name in expected {
-        if !matched_expected.contains(expected_name.relation_name.as_str()) {
-            return Err(ApiError::bad_request(format!(
-                "Feldera feldera_program compiled response is missing registered input relation `{}`",
-                expected_name.relation_name
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn validate_feldera_program_input_schema_matches(
-    input_name: &str,
-    input: &Value,
-    expected: &RelationSchema,
-) -> Result<(), ApiError> {
-    let fields = input
-        .get("fields")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            ApiError::bad_request(format!(
-                "Feldera feldera_program input relation `{input_name}` is missing fields"
-            ))
-        })?;
-    let columns = fields
-        .iter()
-        .enumerate()
-        .map(|(index, field)| {
-            feldera_column_schema_from_relation_field("input relation", input_name, index, field)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    validate_feldera_program_relation_column_names(
-        "input relation",
-        input_name,
-        input,
-        fields,
-        &columns,
-    )?;
-
-    let mut expected_by_name = BTreeMap::new();
-    for expected_column in &expected.columns {
-        expected_by_name.insert(expected_column.name.to_ascii_lowercase(), expected_column);
-    }
-
-    let mut canonical_columns = Vec::with_capacity(columns.len());
-    for (index, (field, column)) in fields.iter().zip(columns.iter()).enumerate() {
-        let folded_name = column.name.to_ascii_lowercase();
-        let Some(expected_column) = expected_by_name.get(&folded_name) else {
-            return Err(ApiError::bad_request(format!(
-                "Feldera feldera_program input relation `{input_name}` column {index} `{}` is not registered by relation `{}`",
-                column.name, expected.relation_name
-            )));
-        };
-        let case_insensitive = feldera_identifier_case_insensitive(input, field);
-        let name_matches = if case_insensitive {
-            expected_column
-                .name
-                .eq_ignore_ascii_case(column.name.as_str())
-        } else {
-            expected_column.name == column.name
-        };
-        if !name_matches {
-            return Err(ApiError::bad_request(format!(
-                "Feldera feldera_program input relation `{input_name}` column {index} `{}` does not match registered column `{}`",
-                column.name, expected_column.name
-            )));
-        }
-        if column.data_type != expected_column.data_type
-            || column.nullable != expected_column.nullable
-        {
-            return Err(ApiError::bad_request(format!(
-                "Feldera feldera_program input relation `{input_name}` column `{}` type does not match registered column `{}`",
-                column.name, expected_column.name
-            )));
-        }
-        canonical_columns.push((*expected_column).clone());
-    }
-
-    if let Some(primary_key) = feldera_program_relation_primary_key_columns(
-        "input relation",
-        input_name,
-        input,
-        fields,
-        &canonical_columns,
-    )? {
-        if primary_key != expected.primary_key {
-            return Err(ApiError::bad_request(format!(
-                "Feldera feldera_program input relation `{input_name}` primary_key does not match registered relation `{}`",
-                expected.relation_name
-            )));
-        }
-    }
-
-    Ok(())
-}
-
-fn feldera_relation_unmanaged_io_properties(relation: &Value) -> Vec<String> {
-    let mut properties = Vec::new();
-    for key in [
-        "connector",
-        "connectors",
-        "connector_config",
-        "input_connectors",
-        "output_connectors",
-        "transport",
-        "format",
-    ] {
-        if relation
-            .get(key)
-            .is_some_and(|value| !value.is_null() && value != &json!([]) && value != &json!({}))
-        {
-            properties.push(key.to_string());
-        }
-    }
-    if let Some(object) = relation.get("properties").and_then(Value::as_object) {
-        properties.extend(
-            object
-                .keys()
-                .map(|key| format!("properties.{key}"))
-                .collect::<Vec<_>>(),
-        );
-    }
-    properties
-}
-
-fn feldera_output_schema_from_program_output(
-    view_id: &str,
-    program_version: u64,
-    output: &Value,
-) -> Result<RelationSchema, ApiError> {
-    let output_name = feldera_relation_name(output).ok_or_else(|| {
-        ApiError::service_unavailable(format!(
-            "Feldera compiled program for `{view_id}` contains an output without a name"
-        ))
-    })?;
-    if !feldera_relation_is_materialized(output) {
-        return Err(ApiError::bad_request(format!(
-            "Feldera output view `{output_name}` is not materialized"
-        )));
-    }
-    let unmanaged_properties = feldera_relation_unmanaged_io_properties(output);
-    if !unmanaged_properties.is_empty() {
-        return Err(ApiError::bad_request(format!(
-            "Feldera output view `{output_name}` contains unmanaged connector/external IO properties: {}",
-            unmanaged_properties.join(", ")
-        )));
-    }
-    let fields = output
-        .get("fields")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            ApiError::service_unavailable(format!(
-                "Feldera output view `{output_name}` is missing fields"
-            ))
-        })?;
-    let columns = fields
-        .iter()
-        .enumerate()
-        .map(|(index, field)| feldera_column_schema_from_field(output_name, index, field))
-        .collect::<Result<Vec<_>, _>>()?;
-    if columns.is_empty() {
-        return Err(ApiError::bad_request(format!(
-            "Feldera output view `{output_name}` has no columns"
-        )));
-    }
-    validate_feldera_program_relation_column_names(
-        "output view",
-        output_name,
-        output,
-        fields,
-        &columns,
-    )?;
-    let primary_key = feldera_program_relation_primary_key_columns(
-        "output view",
-        output_name,
-        output,
-        fields,
-        &columns,
-    )?
-    .unwrap_or_default();
-    let schema_fingerprint = feldera_compiled_output_schema_fingerprint(
-        output_name,
-        program_version,
-        &columns,
-        &primary_key,
-    )
-    .map_err(ApiError::service_unavailable)?;
-    Ok(RelationSchema {
-        relation_id: output_name.to_string(),
-        relation_name: output_name.to_string(),
-        relation_version: format!("feldera-program-v{program_version}"),
-        schema_fingerprint,
-        columns,
-        primary_key,
-    })
-}
-
-fn feldera_relation_is_materialized(relation: &Value) -> bool {
-    !relation
-        .get("materialized")
-        .and_then(Value::as_bool)
-        .is_some_and(|materialized| !materialized)
-}
-
-fn validate_feldera_program_relation_column_names(
-    relation_kind: &str,
-    output_name: &str,
-    output: &Value,
-    fields: &[Value],
-    columns: &[ColumnSchema],
-) -> Result<(), ApiError> {
-    let mut seen: Vec<(&str, bool)> = Vec::new();
-    for (field, column) in fields.iter().zip(columns) {
-        if column.name.trim().is_empty() {
-            return Err(ApiError::bad_request(format!(
-                "Feldera {relation_kind} `{output_name}` contains a blank field name"
-            )));
-        }
-        let case_insensitive = feldera_identifier_case_insensitive(output, field);
-        if seen.iter().any(|(seen_name, seen_case_insensitive)| {
-            feldera_identifiers_conflict(
-                seen_name,
-                *seen_case_insensitive,
-                &column.name,
-                case_insensitive,
-            )
-        }) {
-            return Err(ApiError::bad_request(format!(
-                "Feldera {relation_kind} `{output_name}` contains duplicate field `{}`",
-                column.name
-            )));
-        }
-        seen.push((&column.name, case_insensitive));
-    }
-    Ok(())
-}
-
-fn feldera_program_relation_primary_key_columns(
-    relation_kind: &str,
-    output_name: &str,
-    output: &Value,
-    fields: &[Value],
-    columns: &[ColumnSchema],
-) -> Result<Option<Vec<String>>, ApiError> {
-    let Some(primary_key) = output.get("primary_key") else {
-        return Ok(None);
-    };
-    let primary_key = primary_key.as_array().ok_or_else(|| {
-        ApiError::bad_request(format!(
-            "Feldera {relation_kind} `{output_name}` primary_key must be an array"
-        ))
-    })?;
-    let mut keys = Vec::with_capacity(primary_key.len());
-    let mut seen: Vec<(&str, bool)> = Vec::new();
-    let key_case_insensitive = feldera_relation_identifier_case_insensitive(output);
-    for (index, key) in primary_key.iter().enumerate() {
-        let key = key.as_str().ok_or_else(|| {
-            ApiError::bad_request(format!(
-                "Feldera {relation_kind} `{output_name}` primary_key entry {index} must be a string"
-            ))
-        })?;
-        if key.trim().is_empty() {
-            return Err(ApiError::bad_request(format!(
-                "Feldera {relation_kind} `{output_name}` contains a blank primary_key entry"
-            )));
-        }
-        if seen.iter().any(|(seen_key, seen_case_insensitive)| {
-            feldera_identifiers_conflict(
-                seen_key,
-                *seen_case_insensitive,
-                key,
-                key_case_insensitive,
-            )
-        }) {
-            return Err(ApiError::bad_request(format!(
-                "Feldera {relation_kind} `{output_name}` contains duplicate primary_key entry `{key}`"
-            )));
-        }
-        let matching_column = fields
-            .iter()
-            .zip(columns)
-            .find(|(field, column)| {
-                feldera_identifiers_conflict(
-                    key,
-                    key_case_insensitive,
-                    &column.name,
-                    feldera_identifier_case_insensitive(output, field),
-                )
-            })
-            .map(|(_, column)| column.name.clone())
-            .ok_or_else(|| {
-                ApiError::bad_request(format!(
-                    "Feldera {relation_kind} `{output_name}` primary_key entry `{key}` does not reference a field"
-                ))
-            })?;
-        keys.push(matching_column);
-        seen.push((key, key_case_insensitive));
-    }
-    Ok(Some(keys))
-}
-
-fn feldera_relation_identifier_case_insensitive(relation: &Value) -> bool {
-    relation
-        .get("case_sensitive")
-        .and_then(Value::as_bool)
-        .is_some_and(|case_sensitive| !case_sensitive)
-}
-
-fn feldera_identifier_case_insensitive(relation: &Value, identifier: &Value) -> bool {
-    identifier
-        .get("case_sensitive")
-        .and_then(Value::as_bool)
-        .map(|case_sensitive| !case_sensitive)
-        .unwrap_or_else(|| feldera_relation_identifier_case_insensitive(relation))
-}
-
-fn feldera_identifiers_conflict(
-    left: &str,
-    left_case_insensitive: bool,
-    right: &str,
-    right_case_insensitive: bool,
-) -> bool {
-    if left_case_insensitive || right_case_insensitive {
-        left.eq_ignore_ascii_case(right)
-    } else {
-        left == right
-    }
-}
-
-fn feldera_relation_name(relation: &Value) -> Option<&str> {
-    relation.get("name").and_then(Value::as_str)
-}
-
-fn feldera_relation_name_key(name: &str, relation: &Value) -> String {
-    if feldera_relation_identifier_case_insensitive(relation) {
-        name.to_ascii_lowercase()
-    } else {
-        name.to_string()
-    }
-}
-
-fn feldera_relation_name_matches(expected: &str, relation: &Value) -> bool {
-    let Some(actual) = feldera_relation_name(relation) else {
-        return false;
-    };
-    if feldera_relation_identifier_case_insensitive(relation) {
-        actual.eq_ignore_ascii_case(expected)
-    } else {
-        actual == expected
-    }
-}
-
-fn feldera_column_schema_from_field(
-    view_id: &str,
-    index: usize,
-    field: &Value,
-) -> Result<ColumnSchema, ApiError> {
-    feldera_column_schema_from_relation_field("output view", view_id, index, field)
-}
-
-fn feldera_column_schema_from_relation_field(
-    relation_kind: &str,
-    relation_name: &str,
-    index: usize,
-    field: &Value,
-) -> Result<ColumnSchema, ApiError> {
-    let name = field
-        .get("name")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            ApiError::service_unavailable(format!(
-                "Feldera {relation_kind} `{relation_name}` field {index} is missing name"
-            ))
-        })?
-        .to_string();
-    let columntype = field.get("columntype").unwrap_or(field);
-    let (data_type, nullable) =
-        feldera_sql_data_type_from_column_type(columntype).map_err(|error| {
-            ApiError::bad_request(format!(
-                "Feldera {relation_kind} `{relation_name}` field `{name}` has unsupported type: {error}"
-            ))
-        })?;
-    Ok(ColumnSchema {
-        name,
-        data_type,
-        nullable,
-    })
-}
-
-fn feldera_sql_data_type_from_column_type(value: &Value) -> Result<(SqlDataType, bool), String> {
-    match value {
-        Value::String(name) => Ok((
-            feldera_sql_data_type_from_name(name, None, None, value)?,
-            false,
-        )),
-        Value::Object(object) => {
-            let nullable = object
-                .get("nullable")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let type_name = object
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or_else(|| {
-                    if object.get("fields").is_some() {
-                        "STRUCT"
-                    } else {
-                        ""
-                    }
-                });
-            if type_name.is_empty() {
-                return Err("missing type".to_string());
-            }
-            let precision = object.get("precision").and_then(Value::as_i64);
-            let scale = object.get("scale").and_then(Value::as_i64);
-            Ok((
-                feldera_sql_data_type_from_name(type_name, precision, scale, value)?,
-                nullable,
-            ))
-        }
-        _ => Err("column type must be an object or string".to_string()),
-    }
-}
-
-fn feldera_sql_data_type_from_name(
-    raw_name: &str,
-    precision: Option<i64>,
-    scale: Option<i64>,
-    value: &Value,
-) -> Result<SqlDataType, String> {
-    let name = raw_name.trim().to_ascii_uppercase();
-    match name.as_str() {
-        "BOOLEAN" | "BOOL" => Ok(SqlDataType::Bool),
-        "TINYINT" => Ok(SqlDataType::Int8),
-        "SMALLINT" | "INT2" => Ok(SqlDataType::Int16),
-        "INTEGER" | "INT" | "SIGNED" | "INT4" => Ok(SqlDataType::Int32),
-        "BIGINT" | "INT8" | "INT64" => Ok(SqlDataType::Int64),
-        "UTINYINT" | "TINYINT UNSIGNED" => Ok(SqlDataType::UInt8),
-        "USMALLINT" | "SMALLINT UNSIGNED" => Ok(SqlDataType::UInt16),
-        "UINTEGER" | "INTEGER UNSIGNED" | "INT UNSIGNED" | "UNSIGNED" => Ok(SqlDataType::UInt32),
-        "UBIGINT" | "BIGINT UNSIGNED" => Ok(SqlDataType::UInt64),
-        "REAL" | "FLOAT4" | "FLOAT32" => Ok(SqlDataType::Float32),
-        "DOUBLE" | "DOUBLE PRECISION" | "FLOAT8" | "FLOAT64" => Ok(SqlDataType::Float64),
-        "DECIMAL" | "DEC" | "NUMERIC" | "NUMBER" => {
-            let precision = u8_from_optional_i64("precision", precision.unwrap_or(38))?;
-            let scale = u8_from_optional_i64("scale", scale.unwrap_or(0))?;
-            Ok(SqlDataType::Decimal { precision, scale })
-        }
-        "CHAR" | "CHARACTER" => {
-            let length = match precision {
-                Some(value) if value > 0 => Some(u32_from_i64("precision", value)?),
-                _ => None,
-            };
-            Ok(SqlDataType::Char { length })
-        }
-        "VARCHAR" | "CHARACTER VARYING" | "STRING" | "TEXT" => Ok(SqlDataType::Utf8),
-        "BINARY" => {
-            let length = u32_from_i64("precision", precision.unwrap_or(1))?;
-            Ok(SqlDataType::Binary { length })
-        }
-        "VARBINARY" | "BINARY VARYING" | "BYTEA" => Ok(SqlDataType::Varbinary),
-        "TIME" => Ok(SqlDataType::Time),
-        "DATE" => Ok(SqlDataType::Date),
-        "TIMESTAMP" | "DATETIME" => Ok(SqlDataType::Timestamp { timezone: None }),
-        "TIMESTAMP_TZ" => Ok(SqlDataType::Timestamp {
-            timezone: Some("UTC".to_string()),
-        }),
-        "ARRAY" => {
-            let component = value
-                .get("component")
-                .ok_or_else(|| "ARRAY is missing component".to_string())?;
-            let (element_type, _) = feldera_sql_data_type_from_column_type(component)?;
-            Ok(SqlDataType::Array {
-                element_type: Box::new(element_type),
-            })
-        }
-        "STRUCT" => {
-            let fields = value
-                .get("fields")
-                .and_then(Value::as_array)
-                .ok_or_else(|| "STRUCT is missing fields".to_string())?;
-            let fields = fields
-                .iter()
-                .enumerate()
-                .map(|(index, field)| {
-                    let name = field
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| format!("STRUCT field {index} is missing name"))?
-                        .to_string();
-                    let columntype = field.get("columntype").unwrap_or(field);
-                    let (data_type, nullable) = feldera_sql_data_type_from_column_type(columntype)?;
-                    Ok(velorix_core::feldera_artifact::SqlStructField {
-                        name,
-                        data_type,
-                        nullable,
-                    })
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            Ok(SqlDataType::Struct { fields })
-        }
-        "MAP" => {
-            let key = value
-                .get("key")
-                .ok_or_else(|| "MAP is missing key".to_string())?;
-            let map_value = value
-                .get("value")
-                .ok_or_else(|| "MAP is missing value".to_string())?;
-            let (key_type, _) = feldera_sql_data_type_from_column_type(key)?;
-            let (value_type, _) = feldera_sql_data_type_from_column_type(map_value)?;
-            Ok(SqlDataType::Map {
-                key_type: Box::new(key_type),
-                value_type: Box::new(value_type),
-            })
-        }
-        "NULL" => Ok(SqlDataType::Null),
-        "UUID" => Ok(SqlDataType::Uuid),
-        "VARIANT" => Ok(SqlDataType::Json),
-        "GEOMETRY" => Ok(SqlDataType::Geometry),
-        "INTERVAL_DAY" => Ok(SqlDataType::Interval {
-            unit: velorix_core::feldera_artifact::SqlIntervalUnit::Day,
-        }),
-        "INTERVAL_DAY_HOUR" => Ok(SqlDataType::Interval {
-            unit: velorix_core::feldera_artifact::SqlIntervalUnit::DayToHour,
-        }),
-        "INTERVAL_DAY_MINUTE" => Ok(SqlDataType::Interval {
-            unit: velorix_core::feldera_artifact::SqlIntervalUnit::DayToMinute,
-        }),
-        "INTERVAL_DAY_SECOND" => Ok(SqlDataType::Interval {
-            unit: velorix_core::feldera_artifact::SqlIntervalUnit::DayToSecond,
-        }),
-        "INTERVAL_HOUR" => Ok(SqlDataType::Interval {
-            unit: velorix_core::feldera_artifact::SqlIntervalUnit::Hour,
-        }),
-        "INTERVAL_HOUR_MINUTE" => Ok(SqlDataType::Interval {
-            unit: velorix_core::feldera_artifact::SqlIntervalUnit::HourToMinute,
-        }),
-        "INTERVAL_HOUR_SECOND" => Ok(SqlDataType::Interval {
-            unit: velorix_core::feldera_artifact::SqlIntervalUnit::HourToSecond,
-        }),
-        "INTERVAL_MINUTE" => Ok(SqlDataType::Interval {
-            unit: velorix_core::feldera_artifact::SqlIntervalUnit::Minute,
-        }),
-        "INTERVAL_MINUTE_SECOND" => Ok(SqlDataType::Interval {
-            unit: velorix_core::feldera_artifact::SqlIntervalUnit::MinuteToSecond,
-        }),
-        "INTERVAL_MONTH" => Ok(SqlDataType::Interval {
-            unit: velorix_core::feldera_artifact::SqlIntervalUnit::Month,
-        }),
-        "INTERVAL_SECOND" => Ok(SqlDataType::Interval {
-            unit: velorix_core::feldera_artifact::SqlIntervalUnit::Second,
-        }),
-        "INTERVAL_YEAR" => Ok(SqlDataType::Interval {
-            unit: velorix_core::feldera_artifact::SqlIntervalUnit::Year,
-        }),
-        "INTERVAL_YEAR_MONTH" => Ok(SqlDataType::Interval {
-            unit: velorix_core::feldera_artifact::SqlIntervalUnit::YearToMonth,
-        }),
-        _ => Err(format!("unknown Feldera SQL type `{raw_name}`")),
-    }
-}
-
-fn u8_from_optional_i64(field: &'static str, value: i64) -> Result<u8, String> {
-    u8::try_from(value).map_err(|_| format!("{field} is outside u8 range"))
-}
-
-fn u32_from_i64(field: &'static str, value: i64) -> Result<u32, String> {
-    u32::try_from(value).map_err(|_| format!("{field} is outside u32 range"))
-}
-
-fn feldera_compiled_output_schema_fingerprint(
-    view_id: &str,
-    program_version: u64,
-    columns: &[ColumnSchema],
-    primary_key: &[String],
-) -> Result<String, serde_json::Error> {
-    let canonical = serde_json::to_vec(&json!({
-        "domain": "velorix-feldera-compiled-output-schema-v1",
-        "view_id": view_id,
-        "program_version": program_version,
-        "columns": columns,
-        "primary_key": primary_key
-    }))?;
-    let mut hasher = Sha256::new();
-    hasher.update(canonical);
-    Ok(format!("sha256:{:x}", hasher.finalize()))
-}
-
 pub trait StandingProgramRuntimeFactory: Send + Sync + 'static {
     fn output_schemas_for_view_request(
         &self,
@@ -2804,25 +222,6 @@ pub trait StandingProgramRuntimeFactory: Send + Sync + 'static {
             return Ok(None);
         };
         self.output_schemas_for_view_request(view_id, sql, catalog, input_schema_fingerprint)
-    }
-
-    fn compile_artifact_for_spec(
-        &self,
-        _catalog: &VelorixRelationCatalogV1,
-        _spec: &StandingViewSpec,
-    ) -> Result<Option<FelderaCompileArtifactMetadata>, ApiError> {
-        Ok(None)
-    }
-
-    fn compile_artifact_for_spec_with_catalogs(
-        &self,
-        catalogs: &[VelorixRelationCatalogV1],
-        spec: &StandingViewSpec,
-    ) -> Result<Option<FelderaCompileArtifactMetadata>, ApiError> {
-        let Some(catalog) = catalogs.first() else {
-            return Ok(None);
-        };
-        self.compile_artifact_for_spec(catalog, spec)
     }
 
     fn create(
@@ -2874,6 +273,19 @@ pub trait StandingProgramRuntimeFactory: Send + Sync + 'static {
         self.create_with_catalog_and_spec(identity, catalog, spec, input_schemas, output_schemas)
     }
 
+    fn create_with_catalogs_plan_and_spec(
+        &self,
+        identity: &StandingProgramIdentity,
+        catalogs: &[VelorixRelationCatalogV1],
+        logical_plan: &VelorixLogicalViewPlanV1,
+        spec: &StandingViewSpec,
+        input_schemas: &[RelationSchema],
+        output_schemas: &[RelationSchema],
+    ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
+        let _ = logical_plan;
+        self.create_with_catalogs_and_spec(identity, catalogs, spec, input_schemas, output_schemas)
+    }
+
     fn restore(
         &self,
         checkpoint: RuntimeCheckpoint,
@@ -2905,29 +317,109 @@ struct StandingRuntimeCheckpointRecord {
     replay_checkpoints: Vec<ReplayCheckpoint>,
 }
 
-#[derive(Clone, Debug)]
-struct GeneratedScoresByUserRuntimeFactory;
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StandingRuntimeStatePayloadRecord {
+    schema_version: u16,
+    record_kind: String,
+    tenant_id: String,
+    program_id: String,
+    view_id: String,
+    logical_epoch: u64,
+    checkpoint_codec_identity: String,
+    state_content_hash: String,
+    source_kind: String,
+    payload: RuntimeCheckpointStatePayload,
+}
 
-impl StandingProgramRuntimeFactory for GeneratedScoresByUserRuntimeFactory {
-    fn create(
-        &self,
-        identity: &StandingProgramIdentity,
-    ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
-        velorix_generated_scores_by_user::create_standing_runtime(identity)
-    }
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StandingRuntimeOutputManifestRecord {
+    schema_version: u16,
+    record_kind: String,
+    tenant_id: String,
+    program_id: String,
+    view_id: String,
+    checkpoint_key: String,
+    logical_epoch: u64,
+    checkpoint_content_hash: String,
+    output_content_hash: String,
+    output_encoding: String,
+    output_row_count: usize,
+    source_kind: String,
+    #[serde(default)]
+    pages: Vec<StandingRuntimeOutputPageRef>,
+    published_output: Value,
+}
 
-    fn restore(
-        &self,
-        checkpoint: RuntimeCheckpoint,
-    ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
-        velorix_generated_scores_by_user::restore_standing_runtime(checkpoint)
-    }
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StandingRuntimeOutputPageRef {
+    page_index: u32,
+    page_key: String,
+    page_content_hash: String,
+    row_count: usize,
+    output_encoding: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StandingRuntimeOutputPageRecord {
+    schema_version: u16,
+    record_kind: String,
+    tenant_id: String,
+    program_id: String,
+    view_id: String,
+    logical_epoch: u64,
+    output_content_hash: String,
+    page_index: u32,
+    page_content_hash: String,
+    row_count: usize,
+    output_encoding: String,
+    source_kind: String,
+    published_output: Value,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StandingRuntimeOutputDeltaRecord {
+    schema_version: u16,
+    record_kind: String,
+    tenant_id: String,
+    program_id: String,
+    view_id: String,
+    logical_epoch: u64,
+    schema_fingerprint: String,
+    delta_content_hash: String,
+    delta_encoding: String,
+    delta_row_count: usize,
+    source_kind: String,
+    output_delta: Value,
 }
 
 #[derive(Clone, Debug)]
-struct GeneratedSingleKeySumCountRuntimeFactory;
+struct StandingRuntimeOutputPublication {
+    manifest_key: ObjectKey,
+    manifest_record: StandingRuntimeOutputManifestRecord,
+    page_records: Vec<(ObjectKey, StandingRuntimeOutputPageRecord)>,
+}
 
-impl StandingProgramRuntimeFactory for GeneratedSingleKeySumCountRuntimeFactory {
+#[derive(Clone, Debug)]
+struct StandingRuntimeDeltaPublication {
+    delta_key: ObjectKey,
+    delta_record: StandingRuntimeOutputDeltaRecord,
+}
+
+#[derive(Debug)]
+struct StandingRuntimeApplyResult {
+    checkpoint: RuntimeCheckpoint,
+    output_deltas: Vec<ViewOutputDelta>,
+}
+
+#[derive(Clone, Debug)]
+struct MaterializedViewRuntimeFactory;
+
+impl StandingProgramRuntimeFactory for MaterializedViewRuntimeFactory {
     fn output_schemas_for_view_request(
         &self,
         view_id: &str,
@@ -2935,21 +427,18 @@ impl StandingProgramRuntimeFactory for GeneratedSingleKeySumCountRuntimeFactory 
         catalog: &VelorixRelationCatalogV1,
         _input_schema_fingerprint: &str,
     ) -> Result<Option<Vec<RelationSchema>>, ApiError> {
-        if validate_catalog_backed_sum_count_view_sql(sql, catalog).is_err() {
-            return Ok(None);
-        }
-        if validate_generic_single_key_sum_count_runtime_scope(catalog).is_err() {
-            return Ok(None);
-        }
-        single_key_sum_count_output_schema(view_id, catalog).map(|schema| Some(vec![schema]))
-    }
-
-    fn compile_artifact_for_spec(
-        &self,
-        catalog: &VelorixRelationCatalogV1,
-        spec: &StandingViewSpec,
-    ) -> Result<Option<FelderaCompileArtifactMetadata>, ApiError> {
-        generic_single_key_sum_count_artifact_for_spec(catalog, spec)
+        let Ok(plan) = validate_catalog_backed_sum_count_view_sql(sql, catalog) else {
+            let Ok(plan) = validate_supported_latest_by_key_sql(sql, catalog) else {
+                let Ok(plan) = validate_supported_tumbling_window_sql(sql, catalog) else {
+                    return Ok(None);
+                };
+                return tumbling_window_output_schema(view_id, catalog, &plan)
+                    .map(|schema| Some(vec![schema]));
+            };
+            return latest_by_key_output_schema(view_id, catalog, &plan)
+                .map(|schema| Some(vec![schema]));
+        };
+        single_key_sum_count_output_schema(view_id, catalog, &plan).map(|schema| Some(vec![schema]))
     }
 
     fn output_schemas_for_view_request_with_catalogs(
@@ -2960,16 +449,11 @@ impl StandingProgramRuntimeFactory for GeneratedSingleKeySumCountRuntimeFactory 
         input_schema_fingerprint: &str,
     ) -> Result<Option<Vec<RelationSchema>>, ApiError> {
         if catalogs.len() == 2 {
-            let Ok(plan) = validate_supported_dbsp_join_view_sql(sql, catalogs) else {
+            let Ok(plan) = validate_supported_join_view_sql(sql, catalogs) else {
                 return Ok(None);
             };
             validate_join_plan_catalog_order(&plan, catalogs)?;
-            for catalog in catalogs {
-                if validate_generic_single_key_sum_count_runtime_scope(catalog).is_err() {
-                    return Ok(None);
-                }
-            }
-            return join_sum_count_output_schema(view_id, catalogs)
+            return join_sum_count_output_schema(view_id, catalogs, &plan)
                 .map(|schema| Some(vec![schema]));
         }
         let Some(catalog) = catalogs.first() else {
@@ -2978,19 +462,11 @@ impl StandingProgramRuntimeFactory for GeneratedSingleKeySumCountRuntimeFactory 
         self.output_schemas_for_view_request(view_id, sql, catalog, input_schema_fingerprint)
     }
 
-    fn compile_artifact_for_spec_with_catalogs(
-        &self,
-        catalogs: &[VelorixRelationCatalogV1],
-        spec: &StandingViewSpec,
-    ) -> Result<Option<FelderaCompileArtifactMetadata>, ApiError> {
-        generic_single_key_sum_count_artifact_for_spec_with_catalogs(catalogs, spec)
-    }
-
     fn create(
         &self,
         _identity: &StandingProgramIdentity,
     ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
-        Err("single-key sum/count runtime requires input/output schemas".to_string())
+        Err("materialized view runtime requires input/output schemas".to_string())
     }
 
     fn create_with_schemas(
@@ -3000,7 +476,7 @@ impl StandingProgramRuntimeFactory for GeneratedSingleKeySumCountRuntimeFactory 
         _output_schemas: &[RelationSchema],
     ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
         let _ = identity;
-        Err("single-key sum/count runtime requires relation catalog".to_string())
+        Err("materialized view runtime requires relation catalog".to_string())
     }
 
     fn create_with_catalog(
@@ -3010,7 +486,7 @@ impl StandingProgramRuntimeFactory for GeneratedSingleKeySumCountRuntimeFactory 
         input_schemas: &[RelationSchema],
         output_schemas: &[RelationSchema],
     ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
-        velorix_generated_single_key_sum_count::create_standing_runtime(
+        velorix_runtime::materialized_view_runtime::create_standing_runtime(
             identity,
             catalog,
             input_schemas,
@@ -3026,7 +502,7 @@ impl StandingProgramRuntimeFactory for GeneratedSingleKeySumCountRuntimeFactory 
         input_schemas: &[RelationSchema],
         output_schemas: &[RelationSchema],
     ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
-        velorix_generated_single_key_sum_count::create_standing_runtime_with_sql(
+        velorix_runtime::materialized_view_runtime::create_standing_runtime_with_sql(
             identity,
             catalog,
             spec.sql.as_str(),
@@ -3043,10 +519,28 @@ impl StandingProgramRuntimeFactory for GeneratedSingleKeySumCountRuntimeFactory 
         input_schemas: &[RelationSchema],
         output_schemas: &[RelationSchema],
     ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
-        velorix_generated_single_key_sum_count::create_standing_runtime_with_sql_and_catalogs(
+        velorix_runtime::materialized_view_runtime::create_standing_runtime_with_sql_and_catalogs(
             identity,
             catalogs,
             spec.sql.as_str(),
+            input_schemas,
+            output_schemas,
+        )
+    }
+
+    fn create_with_catalogs_plan_and_spec(
+        &self,
+        identity: &StandingProgramIdentity,
+        catalogs: &[VelorixRelationCatalogV1],
+        logical_plan: &VelorixLogicalViewPlanV1,
+        _spec: &StandingViewSpec,
+        input_schemas: &[RelationSchema],
+        output_schemas: &[RelationSchema],
+    ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
+        velorix_runtime::materialized_view_runtime::create_standing_runtime_with_logical_plan_and_catalogs(
+            identity,
+            catalogs,
+            logical_plan.clone(),
             input_schemas,
             output_schemas,
         )
@@ -3056,7 +550,7 @@ impl StandingProgramRuntimeFactory for GeneratedSingleKeySumCountRuntimeFactory 
         &self,
         checkpoint: RuntimeCheckpoint,
     ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
-        velorix_generated_single_key_sum_count::restore_standing_runtime(checkpoint)
+        velorix_runtime::materialized_view_runtime::restore_standing_runtime(checkpoint)
     }
 }
 
@@ -3108,17 +602,14 @@ impl ApiState {
             admin_bearer_token: None,
             max_request_body_bytes: 1024 * 1024,
             max_ingest_rows: 10_000,
-            feldera_compiler_backend: None,
-            generated_artifact_packages: Arc::new(default_generated_artifact_packages()),
-            builtin_fixture_compile_worker_enabled: false,
-            trusted_generated_view_descriptors: Arc::new(
-                default_trusted_generated_view_descriptors(),
-            ),
             standing_runtimes: Arc::new(StandingRuntimeRegistry::default()),
             standing_runtime_factories: Arc::new(StandingRuntimeFactoryRegistry::default()),
             query_runtimes: Arc::new(Mutex::new(HashMap::new())),
         };
-        state.register_builtin_standing_runtime_factories_for_generated_packages();
+        state.register_standing_program_runtime_factory(
+            velorix_runtime::materialized_view_runtime::CRATE_NAME,
+            MaterializedViewRuntimeFactory,
+        );
 
         Ok(state)
     }
@@ -3174,54 +665,6 @@ impl ApiState {
         self
     }
 
-    pub fn with_generated_artifact_packages(
-        mut self,
-        crate_names: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
-        self.generated_artifact_packages = Arc::new(
-            crate_names
-                .into_iter()
-                .map(|crate_name| GeneratedRustArtifactPackage {
-                    abi_version: SUPPORTED_GENERATED_RUST_ABI_VERSION.to_string(),
-                    crate_name: crate_name.into(),
-                })
-                .collect(),
-        );
-        self.register_builtin_standing_runtime_factories_for_generated_packages();
-        self
-    }
-
-    pub fn with_builtin_fixture_compile_worker_enabled(mut self, enabled: bool) -> Self {
-        self.builtin_fixture_compile_worker_enabled = enabled;
-        self
-    }
-
-    pub fn with_feldera_compiler_backend(
-        mut self,
-        backend: Arc<dyn FelderaCompilerBackend>,
-    ) -> Self {
-        self.feldera_compiler_backend = Some(backend);
-        self
-    }
-
-    pub fn with_feldera_pipeline_manager_backend(
-        mut self,
-        backend: Arc<FelderaPipelineManagerCompilerBackend>,
-    ) -> Self {
-        self.feldera_compiler_backend = Some(backend.clone());
-        self.register_standing_program_runtime_factory(
-            FELDERA_PIPELINE_MANAGER_RUNTIME_PACKAGE_NAME,
-            backend.as_ref().clone(),
-        );
-        self
-    }
-
-    fn register_builtin_standing_runtime_factories_for_generated_packages(&self) {
-        for package in self.generated_artifact_packages.iter() {
-            register_builtin_standing_runtime_factory(self, &package.crate_name);
-        }
-    }
-
     pub fn register_standing_program_runtime(
         &self,
         view_id: impl Into<String>,
@@ -3240,16 +683,16 @@ impl ApiState {
 
     pub fn with_standing_program_runtime_factory(
         self,
-        generated_rust_crate_name: impl Into<String>,
+        runtime_kind: impl Into<String>,
         factory: impl StandingProgramRuntimeFactory,
     ) -> Self {
-        self.register_standing_program_runtime_factory(generated_rust_crate_name, factory);
+        self.register_standing_program_runtime_factory(runtime_kind, factory);
         self
     }
 
     pub fn register_standing_program_runtime_factory(
         &self,
-        generated_rust_crate_name: impl Into<String>,
+        runtime_kind: impl Into<String>,
         factory: impl StandingProgramRuntimeFactory,
     ) {
         let mut factories = self
@@ -3257,7 +700,7 @@ impl ApiState {
             .factories
             .lock()
             .expect("standing runtime factory registry lock poisoned");
-        factories.insert(generated_rust_crate_name.into(), Arc::new(factory));
+        factories.insert(runtime_kind.into(), Arc::new(factory));
     }
 
     fn standing_runtime(
@@ -3349,7 +792,7 @@ impl ApiState {
             _ => {
                 self.remove_standing_runtime_with_state(identity, view_id)?;
                 Err(ApiError::service_unavailable(format!(
-                    "standing runtime local state is not the committed checkpoint for artifact-backed view `{view_id}`"
+                    "standing runtime local state is not the committed checkpoint for view `{view_id}`"
                 )))
             }
         }
@@ -3450,69 +893,38 @@ impl ApiState {
 
     fn standing_runtime_factory(
         &self,
-        generated_rust_crate_name: &str,
+        runtime_kind: &str,
     ) -> Result<Option<Arc<dyn StandingProgramRuntimeFactory>>, ApiError> {
         let factories = self
             .standing_runtime_factories
             .factories
             .lock()
             .map_err(|_| ApiError::internal("standing runtime factory registry lock poisoned"))?;
-        Ok(factories.get(generated_rust_crate_name).cloned())
+        Ok(factories.get(runtime_kind).cloned())
     }
 
-    fn generated_package_output_schemas_for_view_request(
+    fn materialized_runtime_output_schemas_for_view_request(
         &self,
         view_id: &str,
         sql: &str,
         catalogs: &[VelorixRelationCatalogV1],
         input_schema_fingerprint: &str,
     ) -> Result<Option<Vec<RelationSchema>>, ApiError> {
-        if !self.builtin_fixture_compile_worker_enabled {
-            return Ok(None);
-        }
         let factories = self
             .standing_runtime_factories
             .factories
             .lock()
             .map_err(|_| ApiError::internal("standing runtime factory registry lock poisoned"))?;
-        for package in self.generated_artifact_packages.iter() {
-            if let Some(factory) = factories.get(&package.crate_name) {
-                if let Some(output) = factory.output_schemas_for_view_request_with_catalogs(
-                    view_id,
-                    sql,
-                    catalogs,
-                    input_schema_fingerprint,
-                )? {
-                    return Ok(Some(output));
-                }
-            }
-        }
-        Ok(None)
-    }
-
-    fn generated_package_artifact_for_spec(
-        &self,
-        catalogs: &[VelorixRelationCatalogV1],
-        spec: &StandingViewSpec,
-    ) -> Result<Option<FelderaCompileArtifactMetadata>, ApiError> {
-        if !self.builtin_fixture_compile_worker_enabled {
+        let Some(factory) = factories.get(velorix_runtime::materialized_view_runtime::CRATE_NAME)
+        else {
             return Ok(None);
-        }
-        let factories = self
-            .standing_runtime_factories
-            .factories
-            .lock()
-            .map_err(|_| ApiError::internal("standing runtime factory registry lock poisoned"))?;
-        for package in self.generated_artifact_packages.iter() {
-            if let Some(factory) = factories.get(&package.crate_name) {
-                if let Some(artifact) =
-                    factory.compile_artifact_for_spec_with_catalogs(catalogs, spec)?
-                {
-                    return Ok(Some(artifact));
-                }
-            }
-        }
-        Ok(None)
+        };
+        factory.output_schemas_for_view_request_with_catalogs(
+            view_id,
+            sql,
+            catalogs,
+            input_schema_fingerprint,
+        )
     }
 
     pub async fn restore_standing_program_runtimes_from_active_views(
@@ -3527,11 +939,14 @@ impl ApiState {
         let mut restored = 0;
 
         for active in active_views {
-            let Some(artifact) = active.artifact.as_ref() else {
+            if !standing_runtime_can_accept_incremental_ingest(&active) {
                 continue;
-            };
+            }
+            if active_standing_runtime_identity(&active).is_none() {
+                continue;
+            }
             if let Some(replay_plan) =
-                ensure_standing_runtime_for_artifact(self, &active.spec, artifact).await?
+                ensure_standing_runtime_for_active_view(self, &active).await?
             {
                 replay_committed_ingest_into_standing_runtime(self, &active, &replay_plan).await?;
                 restored += 1;
@@ -3539,457 +954,6 @@ impl ApiState {
         }
 
         Ok(restored)
-    }
-
-    pub async fn run_view_compile_deploy_worker_once(
-        &self,
-    ) -> Result<ViewCompileDeployWorkerReport, ApiError> {
-        self.reconcile_missing_view_compile_deploy_jobs().await?;
-        let jobs = self
-            .view_compile_deploy_job_registry()?
-            .list_pending()
-            .await
-            .map_err(view_compile_deploy_job_registry_error_to_api)?;
-        let mut report = ViewCompileDeployWorkerReport {
-            pending_jobs: jobs.len(),
-            ..ViewCompileDeployWorkerReport::default()
-        };
-
-        for job in jobs {
-            let job_id = job.job_id.clone();
-            let view_id = job.view_id.clone();
-            match self.run_view_compile_deploy_job(job).await {
-                Ok(status) => match status {
-                    ViewCompileDeployJobStatus::Activated => {
-                        report.activated += 1;
-                        report.outcomes.push(ViewCompileDeployWorkerJobOutcome {
-                            job_id,
-                            view_id,
-                            status: "activated".to_string(),
-                            reason: None,
-                        });
-                    }
-                    ViewCompileDeployJobStatus::CompileValidated => {
-                        report.skipped += 1;
-                        report.outcomes.push(ViewCompileDeployWorkerJobOutcome {
-                            job_id,
-                            view_id,
-                            status: "compile_validated".to_string(),
-                            reason: None,
-                        });
-                    }
-                    ViewCompileDeployJobStatus::Duplicate => {
-                        report.skipped += 1;
-                        report.outcomes.push(ViewCompileDeployWorkerJobOutcome {
-                            job_id,
-                            view_id,
-                            status: "duplicate".to_string(),
-                            reason: None,
-                        });
-                    }
-                    ViewCompileDeployJobStatus::Skipped(reason) => {
-                        report.skipped += 1;
-                        report.outcomes.push(ViewCompileDeployWorkerJobOutcome {
-                            job_id,
-                            view_id,
-                            status: "skipped".to_string(),
-                            reason: Some(reason),
-                        });
-                    }
-                },
-                Err(error) => {
-                    report.failed += 1;
-                    report.outcomes.push(ViewCompileDeployWorkerJobOutcome {
-                        job_id,
-                        view_id,
-                        status: "failed".to_string(),
-                        reason: Some(error.to_string()),
-                    });
-                }
-            }
-        }
-
-        Ok(report)
-    }
-
-    async fn reconcile_missing_view_compile_deploy_jobs(&self) -> Result<(), ApiError> {
-        let registry = self.view_compile_deploy_job_registry()?;
-        let active_views = self
-            .view_registry()?
-            .list_active()
-            .await
-            .map_err(materialized_view_registry_error_to_api)?;
-        for active in active_views {
-            if active.execution_mode != MaterializedViewExecutionMode::FelderaCompilePending {
-                continue;
-            }
-            let compile_request_hash = compile_request_hash_for_spec(&active.spec)?;
-            match registry
-                .read_by_compile_request_hash(&active.spec.view_id, &compile_request_hash)
-                .await
-            {
-                Ok(_) => continue,
-                Err(ViewCompileDeployJobRegistryError::ObjectStore(
-                    object_store::Error::NotFound { .. },
-                )) => {}
-                Err(error) => return Err(view_compile_deploy_job_registry_error_to_api(error)),
-            }
-            match registry.read(&active.spec.view_id, &active.spec_hash).await {
-                Ok(_) => continue,
-                Err(ViewCompileDeployJobRegistryError::ObjectStore(
-                    object_store::Error::NotFound { .. },
-                )) => {}
-                Err(error) => return Err(view_compile_deploy_job_registry_error_to_api(error)),
-            }
-            registry
-                .register_pending_for_spec(&active.spec, &active.spec_hash, &active.lifecycle)
-                .await
-                .map_err(view_compile_deploy_job_registry_error_to_api)?;
-        }
-
-        Ok(())
-    }
-
-    async fn run_view_compile_deploy_job(
-        &self,
-        job: ViewCompileDeployJobRecord,
-    ) -> Result<ViewCompileDeployJobStatus, ApiError> {
-        let active = self
-            .view_registry()?
-            .read_active(&job.view_id)
-            .await
-            .map_err(materialized_view_registry_error_to_api)?;
-        if active.spec_hash != job.spec_hash {
-            if repair_compile_deploy_job_for_active_standing_runtime(
-                self,
-                &active,
-                &job,
-                "standing runtime was already active; repaired compile/deploy job",
-            )
-            .await?
-            {
-                return Ok(ViewCompileDeployJobStatus::Duplicate);
-            }
-            return Ok(ViewCompileDeployJobStatus::Skipped(
-                "active view spec hash no longer matches compile/deploy job".to_string(),
-            ));
-        }
-        if active.execution_mode == MaterializedViewExecutionMode::FelderaCompilePending
-            && !compile_job_request_matches_active_spec(&job, &active.spec)
-        {
-            return Ok(ViewCompileDeployJobStatus::Skipped(
-                "compile/deploy job compiler_request does not match active view spec".to_string(),
-            ));
-        }
-        let catalogs = read_relation_catalogs_for_spec(self, &active.spec).await?;
-        let catalog = catalogs
-            .first()
-            .ok_or_else(|| ApiError::bad_request("pending view has no input relation"))?;
-        self.validate_standing_runtime_fencing_or_evict().await?;
-        let active_compile_request_hash = compile_request_hash_for_spec(&active.spec)?;
-        let resolution = if let Some(backend) = self.feldera_compiler_backend.as_ref() {
-            let Some(compiler_request) = job.compiler_request.as_ref() else {
-                return Ok(ViewCompileDeployJobStatus::Skipped(
-                    "compile/deploy job is missing compiler_request".to_string(),
-                ));
-            };
-            let compile_request_hash = compiler_request.compile_request_hash.clone();
-            let compiler_request = compiler_request.feldera_compile_request();
-            let program_code = feldera_sql_program_for_compile_request(&compiler_request)
-                .map_err(|error| ApiError::bad_request(error.to_string()))?;
-            let response = backend
-                .compile(FelderaCompilerBackendRequest {
-                    job_id: job.job_id.clone(),
-                    view_id: job.view_id.clone(),
-                    spec_hash: job.spec_hash.clone(),
-                    compile_request_hash,
-                    program_code,
-                    compiler_request,
-                    catalogs: catalogs.clone(),
-                })
-                .await?;
-            let resolved_spec = resolved_compile_spec_with_pending_output_relation_ids(
-                &active.spec,
-                response.resolved_spec,
-            );
-            validate_resolved_compile_spec(
-                &active.spec,
-                &resolved_spec,
-                &active_compile_request_hash,
-            )?;
-            ViewCompileDeployResolution {
-                spec: resolved_spec,
-                artifact: response.artifact,
-                product_runtime: response.product_runtime,
-                runtime_deployment: response.runtime_deployment,
-                activation_message: "standing runtime activated from Feldera compiler backend",
-            }
-        } else if let Some(descriptor) =
-            trusted_generated_descriptor_for_spec(self, catalog, &active.spec)?
-        {
-            if !state_has_generated_descriptor_package(self, &descriptor) {
-                return Ok(ViewCompileDeployJobStatus::Skipped(format!(
-                    "generated Rust package `{}` is not registered with this Velorix binary",
-                    descriptor.generated_rust.crate_name
-                )));
-            }
-            ViewCompileDeployResolution {
-                spec: active.spec.clone(),
-                artifact: Some(generated_view_artifact_for_descriptor(
-                    &descriptor,
-                    catalog,
-                )?),
-                product_runtime: None,
-                runtime_deployment: None,
-                activation_message: "standing runtime activated from linked generated package",
-            }
-        } else {
-            match self.generated_package_artifact_for_spec(&catalogs, &active.spec) {
-                Ok(Some(artifact)) => ViewCompileDeployResolution {
-                    spec: active.spec.clone(),
-                    artifact: Some(artifact),
-                    product_runtime: None,
-                    runtime_deployment: None,
-                    activation_message: "standing runtime activated from linked generated package",
-                },
-                Ok(None) => {
-                    return Ok(ViewCompileDeployJobStatus::Skipped(
-                        "feldera compiler backend is not configured; builtin generated runtime fixtures are disabled for product compile/deploy jobs".to_string(),
-                    ));
-                }
-                Err(error) => {
-                    return Ok(ViewCompileDeployJobStatus::Skipped(error.to_string()));
-                }
-            }
-        };
-        let activation_spec_hash =
-            feldera_spec_hash(&resolution.spec).map_err(ApiError::bad_request)?;
-        let output_schemas = resolution.spec.output_relations.clone();
-        let (artifact, should_activate_deploying) = match active.execution_mode {
-            MaterializedViewExecutionMode::FelderaCompilePending => {
-                if let Some(artifact_metadata) = resolution.artifact.as_ref() {
-                    validate_feldera_compile_artifact_for_compile_request(
-                        &resolution.spec,
-                        artifact_metadata,
-                        &active_compile_request_hash,
-                    )
-                    .map_err(ApiError::bad_request)?;
-                    (
-                        register_view_artifact(
-                            self,
-                            &catalogs,
-                            &resolution.spec,
-                            artifact_metadata,
-                        )
-                        .await?,
-                        true,
-                    )
-                } else if let Some(product_runtime) = resolution.product_runtime.as_ref() {
-                    let compile_request =
-                        FelderaCompileRequestV1::infer_output_from_standing_view_spec(&active.spec);
-                    validate_feldera_package_runtime_descriptor(
-                        &resolution.spec,
-                        &compile_request,
-                        product_runtime,
-                    )
-                    .map_err(ApiError::bad_request)?;
-                    (
-                        feldera_package_runtime_artifact_binding(
-                            &resolution.spec,
-                            product_runtime,
-                        )?,
-                        true,
-                    )
-                } else if let Some(deployment) = resolution.runtime_deployment.as_ref() {
-                    if resolution.spec.input_relations.len() > 1
-                        && !deployment.supports_multi_input_activation()
-                    {
-                        let message =
-                            "Feldera pipeline-manager runtime deployment is not activated for multi-input views in this runtime mode"
-                                .to_string();
-                        let lifecycle = MaterializedViewLifecycleStatus::feldera_compile_validated(
-                            Some(message.clone()),
-                        );
-                        self.view_registry()?
-                            .mark_pending_compile_validated_with_resolved_spec(
-                                &active.spec.view_id,
-                                &active.spec_hash,
-                                &resolution.spec,
-                                lifecycle,
-                            )
-                            .await
-                            .map_err(materialized_view_registry_error_to_api)?;
-                        self.view_compile_deploy_job_registry()?
-                            .mark_compile_validated_for_compile_request_hash(
-                                &active.spec.view_id,
-                                &active_compile_request_hash,
-                                Some(message),
-                            )
-                            .await
-                            .map_err(view_compile_deploy_job_registry_error_to_api)?;
-                        return Ok(ViewCompileDeployJobStatus::CompileValidated);
-                    }
-                    (
-                        external_feldera_runtime_artifact_binding(
-                            &catalogs,
-                            &resolution.spec,
-                            deployment,
-                        )?,
-                        true,
-                    )
-                } else {
-                    let lifecycle =
-                        MaterializedViewLifecycleStatus::feldera_compile_validated(Some(
-                            "Feldera compiler resolved schemas; executable runtime is not deployed"
-                                .to_string(),
-                        ));
-                    self.view_registry()?
-                        .mark_pending_compile_validated_with_resolved_spec(
-                            &active.spec.view_id,
-                            &active.spec_hash,
-                            &resolution.spec,
-                            lifecycle,
-                        )
-                        .await
-                        .map_err(materialized_view_registry_error_to_api)?;
-                    self.view_compile_deploy_job_registry()?
-                        .mark_compile_validated_for_compile_request_hash(
-                            &active.spec.view_id,
-                            &active_compile_request_hash,
-                            Some(
-                                "Feldera compiler resolved schemas; executable runtime is not deployed"
-                                    .to_string(),
-                            ),
-                        )
-                        .await
-                        .map_err(view_compile_deploy_job_registry_error_to_api)?;
-                    return Ok(ViewCompileDeployJobStatus::CompileValidated);
-                }
-            }
-            MaterializedViewExecutionMode::StandingRuntime
-                if active.lifecycle.deployment_status
-                    == MaterializedViewDeploymentStatus::Deploying =>
-            {
-                let artifact = active
-                    .artifact
-                    .clone()
-                    .ok_or_else(|| ApiError::conflict("deploying view is missing artifact"))?;
-                (artifact, false)
-            }
-            MaterializedViewExecutionMode::StandingRuntime => {
-                self.view_compile_deploy_job_registry()?
-                    .mark_running(
-                        &active.spec.view_id,
-                        &active.spec_hash,
-                        Some(
-                            "standing runtime was already active; repaired compile/deploy job"
-                                .to_string(),
-                        ),
-                    )
-                    .await
-                    .map_err(view_compile_deploy_job_registry_error_to_api)?;
-                return Ok(ViewCompileDeployJobStatus::Duplicate);
-            }
-        };
-        let identity = artifact
-            .standing_program_identity
-            .as_ref()
-            .ok_or_else(|| ApiError::conflict("generated artifact is missing runtime identity"))?
-            .clone();
-        let replay_plan = if let Some((runtime, replay_plan)) =
-            restore_or_build_standing_runtime_for_artifact(
-                self,
-                &resolution.spec,
-                &artifact,
-                &resolution.spec.input_relations,
-                &output_schemas,
-            )
-            .await?
-        {
-            insert_standing_runtime(self, &resolution.spec.view_id, runtime)?;
-            replay_plan
-        } else {
-            read_latest_standing_runtime_checkpoint(self, &identity, &resolution.spec.view_id)
-                .await?
-                .map(standing_runtime_replay_plan_from_record)
-                .unwrap_or_default()
-        };
-        let deploying_lifecycle = MaterializedViewLifecycleStatus::standing_runtime_deploying(
-            Some("catching up committed ingest before query activation".to_string()),
-        );
-        let activation = if should_activate_deploying {
-            let api_metadata = active.api.clone().unwrap_or_default();
-            validate_standing_runtime_create_api_metadata(
-                &resolution.spec.view_id,
-                &api_metadata,
-                &output_schemas,
-                sql_template_validation_mode_for_artifact(&artifact),
-            )
-            .await?;
-            if activation_spec_hash == active.spec_hash {
-                self.view_registry()?
-                    .activate_pending_with_artifact(
-                        &active.spec.view_id,
-                        &active.spec_hash,
-                        artifact.clone(),
-                        deploying_lifecycle.clone(),
-                    )
-                    .await
-                    .map_err(materialized_view_registry_error_to_api)?
-            } else {
-                self.view_registry()?
-                    .activate_pending_with_resolved_spec_artifact(
-                        &active.spec.view_id,
-                        &active.spec_hash,
-                        &resolution.spec,
-                        artifact.clone(),
-                        deploying_lifecycle.clone(),
-                    )
-                    .await
-                    .map_err(materialized_view_registry_error_to_api)?
-            }
-        } else {
-            ActivateMaterializedViewOutcome::Duplicate
-        };
-        let replay_active = ActiveMaterializedView {
-            spec_hash: activation_spec_hash.clone(),
-            spec: resolution.spec.clone(),
-            execution_mode: MaterializedViewExecutionMode::StandingRuntime,
-            api: active.api.clone(),
-            artifact: Some(artifact),
-            lifecycle: deploying_lifecycle,
-        };
-        replay_committed_ingest_into_standing_runtime(self, &replay_active, &replay_plan).await?;
-        let lifecycle = MaterializedViewLifecycleStatus::standing_runtime();
-        let lifecycle_update = self
-            .view_registry()?
-            .update_standing_runtime_lifecycle(
-                &resolution.spec.view_id,
-                &activation_spec_hash,
-                lifecycle,
-            )
-            .await
-            .map_err(materialized_view_registry_error_to_api)?;
-        mark_compile_deploy_job_running(
-            self,
-            &active.spec.view_id,
-            &active.spec_hash,
-            &active_compile_request_hash,
-            resolution.activation_message.to_string(),
-        )
-        .await?;
-
-        Ok(match activation {
-            ActivateMaterializedViewOutcome::Activated => ViewCompileDeployJobStatus::Activated,
-            ActivateMaterializedViewOutcome::Duplicate => match lifecycle_update {
-                UpdateMaterializedViewLifecycleOutcome::Updated => {
-                    ViewCompileDeployJobStatus::Activated
-                }
-                UpdateMaterializedViewLifecycleOutcome::Duplicate => {
-                    ViewCompileDeployJobStatus::Duplicate
-                }
-            },
-        })
     }
 
     fn relation_registry(&self) -> Result<RelationCatalogRegistry, ApiError> {
@@ -4008,24 +972,6 @@ impl ApiState {
             .map_err(ApiError::internal)?;
         MaterializedViewRegistry::new_checked(Arc::clone(&self.store), profile)
             .map_err(ApiError::internal)
-    }
-
-    fn view_compile_deploy_job_registry(&self) -> Result<ViewCompileDeployJobRegistry, ApiError> {
-        self.capabilities
-            .validate_namespace(AuthoritativeNamespace::ArtifactCatalog)
-            .map_err(ApiError::internal)?;
-        Ok(ViewCompileDeployJobRegistry::new(Arc::clone(&self.store)))
-    }
-
-    fn runtime_feldera_artifact_registry(
-        &self,
-    ) -> Result<RuntimeFelderaArtifactRegistry, ApiError> {
-        RuntimeFelderaArtifactRegistry::new_with_startup_capabilities_and_generated_packages(
-            Arc::clone(&self.store),
-            &self.capabilities,
-            self.generated_artifact_packages.iter().cloned(),
-        )
-        .map_err(ApiError::internal)
     }
 
     fn query_policy_catalog(&self) -> Result<QueryPolicyCatalogStore, ApiError> {
@@ -4076,6 +1022,10 @@ pub fn app(state: ApiState) -> Router {
         )
         .route("/v1/views/{view_id}", get(get_view))
         .route(
+            "/v1/views/{view_id}/backfill",
+            get(get_view_backfill_status).post(run_view_backfill),
+        )
+        .route(
             "/v1/views/{view_id}/query",
             get(query_view_rows_get).post(query_view_rows_post),
         )
@@ -4090,22 +1040,6 @@ pub fn app(state: ApiState) -> Router {
             require_api_auth,
         ));
     let admin_routes = Router::new()
-        .route(
-            "/v1/view-compile-deploy/jobs",
-            get(list_view_compile_deploy_jobs),
-        )
-        .route(
-            "/v1/view-compile-deploy/jobs/{view_id}/claim",
-            post(claim_view_compile_deploy_job),
-        )
-        .route(
-            "/v1/view-compile-deploy/jobs/{view_id}/complete",
-            post(complete_view_compile_deploy_job),
-        )
-        .route(
-            "/v1/view-compile-deploy/run-once",
-            post(run_view_compile_deploy_once),
-        )
         .route(
             "/v1/standing-runtime/owners",
             get(get_standing_runtime_owners).post(acquire_standing_runtime_owners),
@@ -4175,90 +1109,10 @@ fn require_bearer_token(
     }
 }
 
-fn register_builtin_standing_runtime_factory(state: &ApiState, generated_rust_crate_name: &str) {
-    if generated_rust_crate_name == velorix_generated_scores_by_user::CRATE_NAME {
-        state.register_standing_program_runtime_factory(
-            generated_rust_crate_name,
-            GeneratedScoresByUserRuntimeFactory,
-        );
-    } else if generated_rust_crate_name == velorix_generated_single_key_sum_count::CRATE_NAME {
-        state.register_standing_program_runtime_factory(
-            generated_rust_crate_name,
-            GeneratedSingleKeySumCountRuntimeFactory,
-        );
-    }
-}
-
-fn default_generated_artifact_packages() -> Vec<GeneratedRustArtifactPackage> {
-    vec![
-        GeneratedRustArtifactPackage {
-            abi_version: SUPPORTED_GENERATED_RUST_ABI_VERSION.to_string(),
-            crate_name: velorix_generated_scores_by_user::CRATE_NAME.to_string(),
-        },
-        GeneratedRustArtifactPackage {
-            abi_version: SUPPORTED_GENERATED_RUST_ABI_VERSION.to_string(),
-            crate_name: velorix_generated_single_key_sum_count::CRATE_NAME.to_string(),
-        },
-    ]
-}
-
-fn default_trusted_generated_view_descriptors() -> Vec<TrustedGeneratedViewDescriptor> {
-    vec![
-        trusted_positive_scores_generated_descriptor(
-            DEFAULT_POSITIVE_SCORES_VIEW_ID,
-            "builtin-positive-scores-by-user",
-            b"velorix-builtin-scores-by-user-generated-package".to_vec(),
-        ),
-        trusted_positive_scores_generated_descriptor(
-            PENDING_SCORES_COMPILE_DEPLOY_VIEW_ID,
-            "builtin-pending-positive-scores-by-user",
-            b"velorix-builtin-scores-by-user-generated-package:pending_scores_by_user".to_vec(),
-        ),
-        trusted_positive_scores_generated_descriptor(
-            MULTI_REPLICA_POSITIVE_SCORES_VIEW_ID,
-            "builtin-multi-replica-positive-scores-by-user",
-            b"velorix-builtin-scores-by-user-generated-package:multi_replica_positive_scores_by_user"
-                .to_vec(),
-        ),
-    ]
-}
-
 const DEFAULT_SCORES_RELATION_ID: &str = "scores";
 const DEFAULT_SCORES_RELATION_VERSION: &str = "2026-05-24.v1";
 const DEFAULT_POSITIVE_SCORES_VIEW_ID: &str = "positive_scores_by_user";
-const PENDING_SCORES_COMPILE_DEPLOY_VIEW_ID: &str = "pending_scores_by_user";
-const MULTI_REPLICA_POSITIVE_SCORES_VIEW_ID: &str = "multi_replica_positive_scores_by_user";
 const DEFAULT_POSITIVE_SCORES_SQL: &str = "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id";
-const POSITIVE_SCORES_DYNAMIC_SHAPE_ID: &str = "scores.positive-scores-by-user.v1";
-
-fn trusted_positive_scores_generated_descriptor(
-    view_id: &str,
-    artifact_id: &str,
-    artifact_identity_bytes: Vec<u8>,
-) -> TrustedGeneratedViewDescriptor {
-    TrustedGeneratedViewDescriptor {
-        view_id: view_id.to_string(),
-        input_relation_id: DEFAULT_SCORES_RELATION_ID.to_string(),
-        input_relation_version: DEFAULT_SCORES_RELATION_VERSION.to_string(),
-        sql: DEFAULT_POSITIVE_SCORES_SQL.to_string(),
-        dynamic_view_binding: Some(DynamicGeneratedViewBinding {
-            shape_id: POSITIVE_SCORES_DYNAMIC_SHAPE_ID.to_string(),
-        }),
-        artifact_id: artifact_id.to_string(),
-        artifact_identity_bytes,
-        compiler: FelderaCompilerIdentity {
-            name: "feldera-sql-compiler".to_string(),
-            version: "builtin-default".to_string(),
-            source: "velorix-linked-generated-package".to_string(),
-        },
-        generated_rust: GeneratedRustIdentity {
-            abi_version: SUPPORTED_GENERATED_RUST_ABI_VERSION.to_string(),
-            crate_name: velorix_generated_scores_by_user::CRATE_NAME.to_string(),
-        },
-        output_schemas: vec![positive_scores_output_schema(view_id, "")],
-        state_schema_version: 1,
-    }
-}
 
 fn default_scores_relation_catalog() -> Result<VelorixRelationCatalogV1, ApiError> {
     let relation_schema = VelorixRelationSchemaV1 {
@@ -4309,7 +1163,7 @@ fn default_scores_relation_catalog() -> Result<VelorixRelationCatalogV1, ApiErro
             name: DEFAULT_SCORES_RELATION_ID.to_string(),
             mode: DataFusionRegistrationModeV1::Table,
         },
-        feldera_relation: FelderaRelationBindingV1 {
+        incremental_relation: IncrementalRelationBindingV1 {
             relation_id: DEFAULT_SCORES_RELATION_ID.to_string(),
             schema_fingerprint,
         },
@@ -4333,289 +1187,13 @@ fn default_positive_scores_view_request(
         sql: DEFAULT_POSITIVE_SCORES_SQL.to_string(),
         source_kind: SqlSourceKind::StandingView,
         output_relation_ids: Vec::new(),
-        udf_rust: None,
-        udf_toml: None,
         sql_template: None,
         description: Some("Positive score totals by user".to_string()),
         request: Vec::new(),
         response_schema: None,
         response_formats: vec!["json".to_string()],
         query_policy_id: None,
-        artifact: None,
     })
-}
-
-fn generated_view_artifact_for_descriptor(
-    descriptor: &TrustedGeneratedViewDescriptor,
-    catalog: &VelorixRelationCatalogV1,
-) -> Result<FelderaCompileArtifactMetadata, ApiError> {
-    descriptor
-        .artifact_metadata(catalog)
-        .map_err(ApiError::bad_request)
-}
-
-fn generic_single_key_sum_count_artifact_for_spec(
-    catalog: &VelorixRelationCatalogV1,
-    spec: &StandingViewSpec,
-) -> Result<Option<FelderaCompileArtifactMetadata>, ApiError> {
-    generic_single_key_sum_count_artifact_for_spec_with_catalogs(
-        std::slice::from_ref(catalog),
-        spec,
-    )
-}
-
-fn generic_single_key_sum_count_artifact_for_spec_with_catalogs(
-    catalogs: &[VelorixRelationCatalogV1],
-    spec: &StandingViewSpec,
-) -> Result<Option<FelderaCompileArtifactMetadata>, ApiError> {
-    let Some(catalog) = catalogs.first() else {
-        return Ok(None);
-    };
-    if catalogs.len() > 2 {
-        return Ok(None);
-    }
-    if catalog.relation_schema.relation_id == DEFAULT_SCORES_RELATION_ID
-        && catalog.relation_schema.relation_version == DEFAULT_SCORES_RELATION_VERSION
-        && catalogs.len() == 1
-    {
-        return Ok(None);
-    }
-    if catalogs.len() == 2 {
-        let plan = validate_supported_dbsp_join_view_sql(&spec.sql, catalogs)
-            .map_err(ApiError::bad_request)?;
-        validate_join_plan_catalog_order(&plan, catalogs)?;
-        for catalog in catalogs {
-            validate_generic_single_key_sum_count_runtime_scope(catalog)?;
-        }
-    } else {
-        if let Err(error) = validate_catalog_backed_sum_count_view_sql(&spec.sql, catalog) {
-            return Err(ApiError::bad_request(error));
-        }
-        validate_generic_single_key_sum_count_runtime_scope(catalog)?;
-    }
-    let spec_hash = feldera_spec_hash(spec).map_err(ApiError::bad_request)?;
-    let spec_hash_segment = spec_hash
-        .strip_prefix("velorix-feldera-spec-sha256-v1:")
-        .unwrap_or(spec_hash.as_str());
-    let artifact_id = format!(
-        "builtin-single-key-sum-count-{}-{}",
-        spec.view_id, spec_hash_segment
-    );
-    let artifact_identity_bytes = serde_json::to_vec(&json!({
-        "runtime": velorix_generated_single_key_sum_count::CRATE_NAME,
-        "view_id": spec.view_id,
-        "spec_hash": spec_hash,
-        "input_schemas": spec.input_relations,
-        "output_schemas": spec.output_relations,
-    }))
-    .map_err(|source| ApiError::internal(source.to_string()))?;
-
-    Ok(Some(FelderaCompileArtifactMetadata {
-        metadata_version: FELDERA_ARTIFACT_METADATA_VERSION,
-        view_id: spec.view_id.clone(),
-        spec_hash,
-        compile_request_hash: Some(compile_request_hash_for_spec(spec)?),
-        artifact_id,
-        artifact_hash: feldera_artifact_bytes_hash(&artifact_identity_bytes),
-        compiler: FelderaCompilerIdentity {
-            name: if catalogs.len() == 2 {
-                "velorix-linked-fixture-two-input-join-sum-count".to_string()
-            } else {
-                "velorix-linked-fixture-single-key-sum-count".to_string()
-            },
-            version: "builtin-v1".to_string(),
-            source: "velorix-relation-catalog".to_string(),
-        },
-        generated_rust: GeneratedRustIdentity {
-            abi_version: SUPPORTED_GENERATED_RUST_ABI_VERSION.to_string(),
-            crate_name: velorix_generated_single_key_sum_count::CRATE_NAME.to_string(),
-        },
-        input_schemas: spec.input_relations.clone(),
-        output_schemas: spec.output_relations.clone(),
-        state_codec: SUPPORTED_STATE_CODEC.to_string(),
-        state_schema_version: 1,
-        epoch_policy: SUPPORTED_EPOCH_POLICY.to_string(),
-    }))
-}
-
-fn validate_user_supplied_generic_single_key_sum_count_artifact(
-    state: &ApiState,
-    catalogs: &[VelorixRelationCatalogV1],
-    spec: &StandingViewSpec,
-    artifact: &FelderaCompileArtifactMetadata,
-) -> Result<(), ApiError> {
-    if artifact.generated_rust.crate_name != velorix_generated_single_key_sum_count::CRATE_NAME {
-        return Ok(());
-    }
-    let Some(expected) = state.generated_package_artifact_for_spec(catalogs, spec)? else {
-        return Err(ApiError::bad_request(
-            "generic single-key sum/count artifact is not supported for this view spec/catalog",
-        ));
-    };
-    if artifact == &expected {
-        Ok(())
-    } else {
-        Err(ApiError::bad_request(
-            "generic single-key sum/count artifact metadata must exactly match the validated catalog-backed view spec",
-        ))
-    }
-}
-
-fn trusted_generated_descriptor_for_request(
-    state: &ApiState,
-    catalog: &VelorixRelationCatalogV1,
-    request: &CreateViewRequest,
-) -> Result<Option<TrustedGeneratedViewDescriptor>, ApiError> {
-    if request.artifact.is_some()
-        || !request.input_relation_refs.is_empty()
-        || !request.input_relations.is_empty()
-        || request.source_kind != SqlSourceKind::StandingView
-        || !request.output_relation_ids.is_empty()
-    {
-        return Ok(None);
-    }
-    Ok(trusted_generated_descriptor_for_shape(
-        state,
-        catalog,
-        &request.view_id,
-        &request.input_relation_id,
-        &request.input_relation_version,
-        &request.sql,
-    ))
-}
-
-fn trusted_generated_descriptor_for_spec(
-    state: &ApiState,
-    catalog: &VelorixRelationCatalogV1,
-    spec: &StandingViewSpec,
-) -> Result<Option<TrustedGeneratedViewDescriptor>, ApiError> {
-    if spec.source_kind != SqlSourceKind::StandingView {
-        return Ok(None);
-    }
-    let input = spec
-        .input_relations
-        .first()
-        .ok_or_else(|| ApiError::bad_request("view has no input relation"))?;
-    Ok(trusted_generated_descriptor_for_shape(
-        state,
-        catalog,
-        &spec.view_id,
-        &input.relation_id,
-        &input.relation_version,
-        &spec.sql,
-    ))
-}
-
-fn trusted_generated_descriptor_for_shape(
-    state: &ApiState,
-    catalog: &VelorixRelationCatalogV1,
-    view_id: &str,
-    input_relation_id: &str,
-    input_relation_version: &str,
-    sql: &str,
-) -> Option<TrustedGeneratedViewDescriptor> {
-    state
-        .trusted_generated_view_descriptors
-        .iter()
-        .find(|descriptor| {
-            trusted_generated_descriptor_matches(
-                descriptor,
-                catalog,
-                view_id,
-                input_relation_id,
-                input_relation_version,
-                sql,
-            )
-        })
-        .map(|descriptor| {
-            trusted_generated_descriptor_for_request_view(descriptor, catalog, view_id)
-        })
-}
-
-fn trusted_generated_descriptor_for_request_view(
-    descriptor: &TrustedGeneratedViewDescriptor,
-    catalog: &VelorixRelationCatalogV1,
-    view_id: &str,
-) -> TrustedGeneratedViewDescriptor {
-    let mut descriptor = descriptor.clone();
-    if descriptor.view_id != view_id {
-        descriptor.view_id = view_id.to_string();
-        descriptor.artifact_id = format!("{}-view-binding-{view_id}", descriptor.artifact_id);
-    }
-    if descriptor.generated_rust.crate_name == velorix_generated_scores_by_user::CRATE_NAME
-        && descriptor.input_relation_id == DEFAULT_SCORES_RELATION_ID
-        && descriptor.input_relation_version == DEFAULT_SCORES_RELATION_VERSION
-        && descriptor.sql == DEFAULT_POSITIVE_SCORES_SQL
-    {
-        descriptor.output_schemas = vec![positive_scores_output_schema(
-            view_id,
-            catalog.schema_fingerprint.as_str(),
-        )];
-    }
-    descriptor
-}
-
-fn trusted_generated_descriptor_matches(
-    descriptor: &TrustedGeneratedViewDescriptor,
-    catalog: &VelorixRelationCatalogV1,
-    view_id: &str,
-    input_relation_id: &str,
-    input_relation_version: &str,
-    sql: &str,
-) -> bool {
-    input_relation_id == descriptor.input_relation_id
-        && input_relation_version == descriptor.input_relation_version
-        && catalog.relation_schema.relation_id == descriptor.input_relation_id
-        && catalog.relation_schema.relation_version == descriptor.input_relation_version
-        && (view_id == descriptor.view_id || descriptor.dynamic_view_binding.is_some())
-        && descriptor.matches_view_shape(input_relation_id, input_relation_version, sql)
-}
-
-fn state_has_generated_descriptor_package(
-    state: &ApiState,
-    descriptor: &TrustedGeneratedViewDescriptor,
-) -> bool {
-    state_has_generated_package(
-        state,
-        &GeneratedRustArtifactPackage {
-            abi_version: descriptor.generated_rust.abi_version.clone(),
-            crate_name: descriptor.generated_rust.crate_name.clone(),
-        },
-    )
-}
-
-fn state_has_generated_package(state: &ApiState, package: &GeneratedRustArtifactPackage) -> bool {
-    state
-        .generated_artifact_packages
-        .iter()
-        .any(|registered| registered == package)
-}
-
-fn positive_scores_output_schema(view_id: &str, schema_fingerprint: &str) -> RelationSchema {
-    RelationSchema {
-        relation_id: view_id.to_string(),
-        relation_name: view_id.to_string(),
-        relation_version: "v1".to_string(),
-        schema_fingerprint: schema_fingerprint.to_string(),
-        columns: vec![
-            ColumnSchema {
-                name: "user_id".to_string(),
-                data_type: SqlDataType::Utf8,
-                nullable: false,
-            },
-            ColumnSchema {
-                name: "sum".to_string(),
-                data_type: SqlDataType::Int64,
-                nullable: false,
-            },
-            ColumnSchema {
-                name: "count".to_string(),
-                data_type: SqlDataType::Int64,
-                nullable: false,
-            },
-        ],
-        primary_key: vec!["user_id".to_string()],
-    }
 }
 
 pub async fn run_from_env() -> anyhow::Result<()> {
@@ -4677,27 +1255,6 @@ pub async fn run_from_env() -> anyhow::Result<()> {
             state = state.with_meta_store_endpoint(endpoint);
         }
     }
-    let generated_packages = generated_artifact_packages_from_env();
-    if !generated_packages.is_empty() {
-        state = state.with_generated_artifact_packages(generated_packages);
-    }
-    if let Some(base_url) = config.feldera_pipeline_manager_url {
-        let mut backend = FelderaPipelineManagerCompilerBackend::new(
-            base_url,
-            config.feldera_bearer_token,
-            Duration::from_millis(config.feldera_compiler_poll_interval_ms),
-            Duration::from_millis(config.feldera_compiler_timeout_ms),
-            config.feldera_compiler_profile,
-            config.feldera_compiler_workers,
-        )
-        .map_err(|error| anyhow!(error.to_string()))?;
-        if let Some(mode) = config.feldera_pipeline_manager_runtime_deployment_mode {
-            backend = backend.with_runtime_deployment_mode(mode);
-            state = state.with_feldera_pipeline_manager_backend(Arc::new(backend));
-        } else {
-            state = state.with_feldera_compiler_backend(Arc::new(backend));
-        }
-    }
     state
         .restore_standing_program_runtimes_from_active_views()
         .await
@@ -4733,16 +1290,6 @@ pub async fn run_from_env() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn generated_artifact_packages_from_env() -> Vec<String> {
-    env::var("VELORIX_GENERATED_ARTIFACT_PACKAGES")
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-        .filter(|package| !package.is_empty())
-        .map(ToString::to_string)
-        .collect()
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CreateRelationRequest {
     #[serde(default)]
@@ -4758,7 +1305,16 @@ pub struct IngestRowsRequest {
     pub stream_id: String,
     pub partition_id: u32,
     pub start_offset_inclusive: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_time_watermark: Option<IngestEventTimeWatermarkRequest>,
     pub rows: Vec<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct IngestEventTimeWatermarkRequest {
+    pub event_time_column_id: String,
+    pub max_observed_event_time_ns: i64,
+    pub watermark_ns: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -4837,10 +1393,6 @@ pub struct CreateViewRequest {
     pub source_kind: SqlSourceKind,
     #[serde(default)]
     pub output_relation_ids: Vec<String>,
-    #[serde(default, rename = "udfRust", alias = "udf_rust")]
-    pub udf_rust: Option<String>,
-    #[serde(default, rename = "udfToml", alias = "udf_toml")]
-    pub udf_toml: Option<String>,
     #[serde(default)]
     pub sql_template: Option<String>,
     #[serde(default)]
@@ -4853,8 +1405,6 @@ pub struct CreateViewRequest {
     pub response_formats: Vec<String>,
     #[serde(default)]
     pub query_policy_id: Option<String>,
-    #[serde(default)]
-    pub artifact: Option<CreateViewArtifactRequest>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -4869,55 +1419,7 @@ fn default_sql_source_kind() -> SqlSourceKind {
 }
 
 fn resolved_sql_source_kind_for_create_view(request: &CreateViewRequest) -> SqlSourceKind {
-    if request.source_kind == SqlSourceKind::StandingView
-        && looks_like_feldera_program_sql(request.sql.as_str())
-    {
-        SqlSourceKind::FelderaProgram
-    } else {
-        request.source_kind.clone()
-    }
-}
-
-fn looks_like_feldera_program_sql(sql: &str) -> bool {
-    let sql = trim_sql_leading_space_and_comments(sql);
-    let Some(prefix) = sql.get(..6) else {
-        return false;
-    };
-    if !prefix.eq_ignore_ascii_case("create") {
-        return false;
-    }
-    sql.get(6..)
-        .and_then(|rest| rest.chars().next())
-        .map_or(true, is_sql_keyword_boundary)
-}
-
-fn trim_sql_leading_space_and_comments(mut sql: &str) -> &str {
-    loop {
-        let trimmed = sql.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("--") {
-            sql = rest
-                .find(['\n', '\r'])
-                .map_or("", |line_end| &rest[line_end + 1..]);
-            continue;
-        }
-        if let Some(rest) = trimmed.strip_prefix("/*") {
-            let Some(comment_end) = rest.find("*/") else {
-                return trimmed;
-            };
-            sql = &rest[comment_end + 2..];
-            continue;
-        }
-        return trimmed;
-    }
-}
-
-fn is_sql_keyword_boundary(ch: char) -> bool {
-    !ch.is_ascii_alphanumeric() && ch != '_'
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct CreateViewArtifactRequest {
-    pub metadata: FelderaCompileArtifactMetadata,
+    request.source_kind.clone()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -4932,6 +1434,17 @@ pub struct QueryViewRequest {
     pub page_token: Option<String>,
     #[serde(default)]
     pub max_rows: Option<usize>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackfillViewRequest {
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    batch_limit: Option<usize>,
+    #[serde(default)]
+    pause_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -4997,6 +1510,42 @@ struct QueryResponse {
 }
 
 #[derive(Clone, Debug, Serialize)]
+struct CoverageCapabilityResponse {
+    status: String,
+    reason: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct MaterializationCoverageResponse {
+    state: String,
+    full_view: CoverageCapabilityResponse,
+    request_scope: CoverageCapabilityResponse,
+    range: CoverageCapabilityResponse,
+    background_backfill: CoverageCapabilityResponse,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct BackfillProgressResponse {
+    processed_batches: usize,
+    remaining_batches: usize,
+    total_batches: usize,
+    percent: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct BackfillViewResponse {
+    view_id: String,
+    outcome: String,
+    mode: String,
+    lifecycle: MaterializedViewLifecycleStatus,
+    query_enabled: bool,
+    coverage: MaterializationCoverageResponse,
+    progress: BackfillProgressResponse,
+    applied_batches: usize,
+    remaining_batches: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
 struct ViewResponse {
     view_id: String,
     #[serde(skip_serializing_if = "Option::is_none", rename = "urlPath")]
@@ -5010,10 +1559,7 @@ struct ViewResponse {
     execution_mode: MaterializedViewExecutionMode,
     lifecycle: MaterializedViewLifecycleStatus,
     query_enabled: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    disabled_reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    compile_job_id: Option<String>,
+    coverage: MaterializationCoverageResponse,
     query_endpoint: String,
     output_query_endpoints: Vec<String>,
     output_relations: Vec<RelationSchema>,
@@ -5038,104 +1584,10 @@ struct ViewCatalogResponse {
     views: Vec<ViewResponse>,
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
-pub struct ViewCompileDeployWorkerReport {
-    pub pending_jobs: usize,
-    pub activated: usize,
-    pub skipped: usize,
-    pub failed: usize,
-    pub outcomes: Vec<ViewCompileDeployWorkerJobOutcome>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct ViewCompileDeployJobCatalogResponse {
-    pub pending_jobs: usize,
-    pub jobs: Vec<ViewCompileDeployJobResponse>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct ViewCompileDeployJobResponse {
-    #[serde(flatten)]
-    pub job: ViewCompileDeployJobRecord,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub input_relation_catalogs: Vec<VelorixRelationCatalogV1>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ClaimViewCompileDeployJobRequest {
-    worker_id: String,
-    #[serde(default = "default_view_compile_deploy_claim_lease_duration_ms")]
-    lease_duration_ms: u64,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct ClaimViewCompileDeployJobResponse {
-    claim_status: String,
-    #[serde(flatten)]
-    claim: ViewCompileDeployJobClaimRecord,
-}
-
-fn default_view_compile_deploy_claim_lease_duration_ms() -> u64 {
-    300_000
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct ViewCompileDeployWorkerJobOutcome {
-    pub job_id: String,
-    pub view_id: String,
-    pub status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum ViewCompileDeployJobStatus {
-    Activated,
-    CompileValidated,
-    Duplicate,
-    Skipped(String),
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SqlTemplateValidationMode {
     LocalDataFusion,
-    ExternalFelderaRuntime,
-}
-
-struct ViewCompileDeployResolution {
-    spec: StandingViewSpec,
-    artifact: Option<FelderaCompileArtifactMetadata>,
-    product_runtime: Option<FelderaPackageRuntimeDescriptorV1>,
-    runtime_deployment: Option<FelderaPipelineManagerRuntimeDeployment>,
-    activation_message: &'static str,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CompleteViewCompileDeployRequest {
-    #[serde(default)]
-    spec_hash: Option<String>,
-    #[serde(default)]
-    compile_request_hash: Option<String>,
-    #[serde(default)]
-    tenant_id: Option<String>,
-    #[serde(default)]
-    job_generation: Option<u64>,
-    #[serde(default)]
-    worker_id: Option<String>,
-    #[serde(default)]
-    lease_id: Option<String>,
-    #[serde(default)]
-    fencing_token: Option<u64>,
-    #[serde(default)]
-    resolved_spec: Option<StandingViewSpec>,
-    #[serde(default)]
-    artifact: Option<FelderaCompileArtifactMetadata>,
-    #[serde(default)]
-    product_runtime: Option<FelderaPackageRuntimeDescriptorV1>,
-    #[serde(default)]
-    runtime_deployment: Option<FelderaPipelineManagerRuntimeDeployment>,
+    ExternalSqlRuntime,
 }
 
 async fn healthz() -> Json<Value> {
@@ -5214,6 +1666,14 @@ fn object_store_profile_json(profile: &ObjectStoreCapabilityProfile) -> Value {
         "list_after_write": profile.list_after_write,
         "read_after_write": profile.read_after_write,
     })
+}
+
+fn sql_quoted_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn api_path_segment(segment: &str) -> String {
+    utf8_percent_encode(segment, API_PATH_SEGMENT_ENCODE_SET).to_string()
 }
 
 fn standing_runtime_fencing_capability_json(
@@ -5337,113 +1797,6 @@ async fn create_default_positive_scores_view(
     create_view(State(state), Json(request)).await
 }
 
-async fn run_view_compile_deploy_once(
-    State(state): State<ApiState>,
-) -> Result<Json<ViewCompileDeployWorkerReport>, ApiError> {
-    Ok(Json(state.run_view_compile_deploy_worker_once().await?))
-}
-
-async fn list_view_compile_deploy_jobs(
-    State(state): State<ApiState>,
-) -> Result<Json<ViewCompileDeployJobCatalogResponse>, ApiError> {
-    let jobs = state
-        .view_compile_deploy_job_registry()?
-        .list_pending()
-        .await
-        .map_err(view_compile_deploy_job_registry_error_to_api)?;
-    let mut responses = Vec::with_capacity(jobs.len());
-    for job in jobs {
-        let input_relation_catalogs = if let Some(compiler_request) = &job.compiler_request {
-            read_relation_catalogs_for_input_schemas(&state, &compiler_request.input_relations)
-                .await?
-        } else {
-            Vec::new()
-        };
-        responses.push(ViewCompileDeployJobResponse {
-            job,
-            input_relation_catalogs,
-        });
-    }
-    Ok(Json(ViewCompileDeployJobCatalogResponse {
-        pending_jobs: responses.len(),
-        jobs: responses,
-    }))
-}
-
-async fn claim_view_compile_deploy_job(
-    State(state): State<ApiState>,
-    AxumPath(view_id): AxumPath<String>,
-    Json(request): Json<ClaimViewCompileDeployJobRequest>,
-) -> Result<Json<ClaimViewCompileDeployJobResponse>, ApiError> {
-    if request.lease_duration_ms == 0 || request.lease_duration_ms > 3_600_000 {
-        return Err(ApiError::bad_request(
-            "claim lease_duration_ms must be between 1 and 3600000",
-        ));
-    }
-    let active = state
-        .view_registry()?
-        .read_active(&view_id)
-        .await
-        .map_err(materialized_view_registry_error_to_api)?;
-    if active.execution_mode != MaterializedViewExecutionMode::FelderaCompilePending {
-        return Err(ApiError::conflict(format!(
-            "view `{view_id}` is not waiting for Feldera compile/deploy claim"
-        )));
-    }
-    let compile_request_hash = compile_request_hash_for_spec(&active.spec)?;
-    let job =
-        read_pending_compile_deploy_job(&state, &view_id, &active.spec_hash, &compile_request_hash)
-            .await?;
-    if !compile_job_request_matches_active_spec(&job, &active.spec) {
-        return Err(ApiError::conflict(
-            "compile/deploy job compiler_request does not match active view spec",
-        ));
-    }
-    let outcome = state
-        .view_compile_deploy_job_registry()?
-        .claim_pending_for_compile_request_hash(
-            &view_id,
-            &compile_request_hash,
-            request.worker_id.as_str(),
-            unix_epoch_millis()?,
-            request.lease_duration_ms,
-        )
-        .await
-        .map_err(view_compile_deploy_job_registry_error_to_api)?;
-    let (claim_status, claim) = match outcome {
-        ViewCompileDeployJobClaimOutcome::Claimed(claim) => ("claimed", claim),
-        ViewCompileDeployJobClaimOutcome::Duplicate(claim) => ("duplicate", claim),
-    };
-    Ok(Json(ClaimViewCompileDeployJobResponse {
-        claim_status: claim_status.to_string(),
-        claim,
-    }))
-}
-
-async fn complete_view_compile_deploy_job(
-    State(state): State<ApiState>,
-    AxumPath(view_id): AxumPath<String>,
-    Json(request): Json<CompleteViewCompileDeployRequest>,
-) -> Result<Json<ViewResponse>, ApiError> {
-    let response = complete_pending_view_compile_deploy_job(
-        &state,
-        &view_id,
-        request.spec_hash.as_deref(),
-        request.compile_request_hash.as_deref(),
-        request.tenant_id.as_deref(),
-        request.job_generation,
-        request.worker_id.as_deref(),
-        request.lease_id.as_deref(),
-        request.fencing_token,
-        request.resolved_spec.as_ref(),
-        request.artifact.as_ref(),
-        request.product_runtime.as_ref(),
-        request.runtime_deployment.as_ref(),
-    )
-    .await?;
-    Ok(Json(response))
-}
-
 async fn get_standing_runtime_owners(
     State(state): State<ApiState>,
 ) -> Result<Json<StandingRuntimeOwnerReportResponse>, ApiError> {
@@ -5461,11 +1814,10 @@ async fn acquire_standing_runtime_owners(
     let mut outcomes = Vec::new();
 
     for active in active_views {
-        let Some(identity) = active
-            .artifact
-            .as_ref()
-            .and_then(|artifact| artifact.standing_program_identity.as_ref())
-        else {
+        if !standing_runtime_can_accept_incremental_ingest(&active) {
+            continue;
+        }
+        let Some(identity) = active_standing_runtime_identity(&active) else {
             continue;
         };
         let view_id = active.spec.view_id.clone();
@@ -5532,11 +1884,10 @@ async fn standing_runtime_owner_report(
     let mut owners = Vec::new();
 
     for active in active_views {
-        let Some(identity) = active
-            .artifact
-            .as_ref()
-            .and_then(|artifact| artifact.standing_program_identity.as_ref())
-        else {
+        if !standing_runtime_can_accept_incremental_ingest(&active) {
+            continue;
+        }
+        let Some(identity) = active_standing_runtime_identity(&active) else {
             continue;
         };
         let key = standing_runtime_key(identity, &active.spec.view_id);
@@ -5591,124 +1942,65 @@ async fn create_view(
     Json(request): Json<CreateViewRequest>,
 ) -> Result<(StatusCode, Json<ViewResponse>), ApiError> {
     let catalogs = read_relation_catalogs_for_view_request(&state, &request).await?;
-    let catalog = catalogs
-        .first()
-        .ok_or_else(|| ApiError::bad_request("view has no input relation"))?;
-    let trusted_generated_descriptor =
-        trusted_generated_descriptor_for_request(&state, catalog, &request)?;
-    let trusted_generated_artifact = trusted_generated_descriptor
-        .as_ref()
-        .map(|descriptor| generated_view_artifact_for_descriptor(descriptor, catalog))
-        .transpose()?;
-    let trusted_static_artifact = if trusted_generated_descriptor
-        .as_ref()
-        .is_some_and(|descriptor| state_has_generated_descriptor_package(&state, descriptor))
-    {
-        trusted_generated_artifact.clone()
-    } else {
-        None
-    };
-    let selected_artifact_metadata = request
-        .artifact
-        .as_ref()
-        .map(|artifact_request| &artifact_request.metadata)
-        .or(trusted_generated_artifact.as_ref());
-    let spec = view_spec_from_request(&state, &request, &catalogs, selected_artifact_metadata)?;
-    validate_feldera_runtime_spec_admission(&spec)?;
-    let artifact = if let Some(artifact_request) = &request.artifact {
-        state.validate_standing_runtime_fencing_or_evict().await?;
-        validate_user_supplied_generic_single_key_sum_count_artifact(
-            &state,
-            &catalogs,
-            &spec,
-            &artifact_request.metadata,
-        )?;
-        Some(register_view_artifact(&state, &catalogs, &spec, &artifact_request.metadata).await?)
-    } else if let Some(artifact_metadata) = &trusted_static_artifact {
-        state.validate_standing_runtime_fencing_or_evict().await?;
-        Some(register_view_artifact(&state, &catalogs, &spec, artifact_metadata).await?)
-    } else {
-        None
-    };
-    let spec_hash = feldera_spec_hash(&spec).map_err(ApiError::bad_request)?;
+    let spec = view_spec_from_request(&state, &request, &catalogs)?;
+    validate_materialized_runtime_spec_admission(&spec)?;
+    state.validate_standing_runtime_fencing_or_evict().await?;
+    let runtime_binding = materialized_view_runtime_binding_for_spec(&catalogs, &spec)?;
+    let spec_hash = view_spec_hash(&spec).map_err(ApiError::bad_request)?;
     let api_metadata = api_metadata_from_create_view_request(&request);
     validate_view_api_metadata(&api_metadata)?;
     validate_query_policy_reference(&state, &api_metadata).await?;
     validate_view_api_output_binding(&spec.view_id, &api_metadata, &spec.output_relations)?;
-    if let Some(artifact_binding) = artifact.as_ref() {
-        validate_standing_runtime_create_api_metadata(
-            &spec.view_id,
-            &api_metadata,
-            &spec.output_relations,
-            sql_template_validation_mode_for_artifact(artifact_binding),
-        )
-        .await?;
-    }
-    let pending_runtime = if let (Some(artifact), Some(artifact_metadata)) =
-        (&artifact, selected_artifact_metadata)
-    {
-        build_standing_runtime_for_artifact(
-            &state,
-            &spec,
-            artifact,
-            &catalogs,
-            &artifact_metadata.input_schemas,
-            &artifact_metadata.output_schemas,
-        )?
-    } else {
-        None
-    };
-    let execution_mode = if artifact.is_some() {
-        MaterializedViewExecutionMode::StandingRuntime
-    } else {
-        MaterializedViewExecutionMode::FelderaCompilePending
-    };
-    let lifecycle = lifecycle_for_create_view_execution(&execution_mode);
+    validate_standing_runtime_create_api_metadata(
+        &spec.view_id,
+        &api_metadata,
+        &spec.output_relations,
+        SqlTemplateValidationMode::LocalDataFusion,
+    )
+    .await?;
+    let pending_runtime = build_standing_runtime_for_runtime_binding(
+        &state,
+        &spec,
+        &runtime_binding,
+        &catalogs,
+        &spec.input_relations,
+        &spec.output_relations,
+    )?;
+    let execution_mode = MaterializedViewExecutionMode::StandingRuntime;
+    let requires_backfill = standing_runtime_create_requires_backfill(&state, &spec).await?;
+    let lifecycle = lifecycle_for_create_view_execution(&execution_mode, requires_backfill);
     let outcome = if let Some(runtime) = pending_runtime {
         let operation_lock =
             state.standing_runtime_operation_lock(runtime.program_identity(), &spec.view_id)?;
         let _operation_guard = operation_lock.lock().await;
-        let outcome = state
-            .view_registry()?
-            .register_with_api_metadata_artifact_execution(
-                &spec,
-                Some(api_metadata.clone()),
-                artifact.clone(),
-                Some(execution_mode.clone()),
-                Some(lifecycle.clone()),
-            )
-            .await
-            .map_err(materialized_view_registry_error_to_api)?;
-        insert_standing_runtime(&state, &spec.view_id, runtime)?;
+        let outcome = register_materialized_view_execution(
+            &state,
+            &spec,
+            Some(api_metadata.clone()),
+            None,
+            Some(runtime_binding.clone()),
+            Some(execution_mode.clone()),
+            Some(lifecycle.clone()),
+        )
+        .await?;
+        if view_query_availability(&lifecycle) {
+            insert_standing_runtime(&state, &spec.view_id, runtime)?;
+        }
         outcome
     } else {
-        state
-            .view_registry()?
-            .register_with_api_metadata_artifact_execution(
-                &spec,
-                Some(api_metadata.clone()),
-                artifact.clone(),
-                Some(execution_mode.clone()),
-                Some(lifecycle.clone()),
-            )
-            .await
-            .map_err(materialized_view_registry_error_to_api)?
+        register_materialized_view_execution(
+            &state,
+            &spec,
+            Some(api_metadata.clone()),
+            None,
+            Some(runtime_binding.clone()),
+            Some(execution_mode.clone()),
+            Some(lifecycle.clone()),
+        )
+        .await?
     };
-    if execution_mode == MaterializedViewExecutionMode::FelderaCompilePending {
-        state
-            .view_compile_deploy_job_registry()?
-            .register_pending_for_spec(&spec, &spec_hash, &lifecycle)
-            .await
-            .map_err(view_compile_deploy_job_registry_error_to_api)?;
-    }
     let (status, outcome_text) = match outcome {
-        RegisterMaterializedViewOutcome::Created => {
-            if execution_mode == MaterializedViewExecutionMode::FelderaCompilePending {
-                (StatusCode::ACCEPTED, "compile_pending")
-            } else {
-                (StatusCode::CREATED, "created")
-            }
-        }
+        RegisterMaterializedViewOutcome::Created => (StatusCode::CREATED, "created"),
         RegisterMaterializedViewOutcome::Duplicate => (StatusCode::OK, "duplicate"),
     };
 
@@ -5720,733 +2012,71 @@ async fn create_view(
             execution_mode,
             lifecycle,
             Some(api_metadata),
-            artifact,
+            None,
             Some(outcome_text),
         )?),
     ))
 }
 
-async fn register_view_artifact(
+async fn register_materialized_view_execution(
     state: &ApiState,
-    catalogs: &[VelorixRelationCatalogV1],
     spec: &StandingViewSpec,
-    artifact: &FelderaCompileArtifactMetadata,
-) -> Result<MaterializedViewArtifactBinding, ApiError> {
-    let catalog = catalogs
-        .first()
-        .ok_or_else(|| ApiError::bad_request("view artifact requires at least one catalog"))?;
-    if artifact.compile_request_hash.is_some()
-        || artifact.metadata_version == FELDERA_ARTIFACT_METADATA_VERSION
-    {
-        validate_feldera_compile_artifact_for_compile_request(
-            spec,
-            artifact,
-            &compile_request_hash_for_spec(spec)?,
-        )
-        .map_err(ApiError::bad_request)?;
-    }
-    let registered = state
-        .runtime_feldera_artifact_registry()?
-        .register_trusted_artifact_for_catalogs(catalogs, spec, artifact)
-        .await
-        .map_err(ApiError::bad_request)?;
-    let execution_status = runtime_artifact_status_text(&registered.status);
-    if !matches!(
-        registered.status,
-        RuntimeFelderaArtifactSelectionStatus::DirectExecutionEnabled { .. }
-    ) {
-        return Err(ApiError::bad_request(format!(
-            "generated Rust package `{}` is not registered with this Velorix binary",
-            artifact.generated_rust.crate_name
-        )));
-    }
-
-    Ok(MaterializedViewArtifactBinding {
-        artifact_id: artifact.artifact_id.clone(),
-        artifact_hash: artifact.artifact_hash.clone(),
-        generated_rust_crate_name: artifact.generated_rust.crate_name.clone(),
-        state_codec: artifact.state_codec.clone(),
-        state_schema_version: artifact.state_schema_version,
-        execution_status: execution_status.to_string(),
-        execution_path: "static_release_artifact".to_string(),
-        standing_program_identity: Some(standing_program_identity_from_artifact(
-            catalog, spec, artifact,
-        )?),
-    })
-}
-
-fn external_feldera_runtime_artifact_binding(
-    catalogs: &[VelorixRelationCatalogV1],
-    spec: &StandingViewSpec,
-    deployment: &FelderaPipelineManagerRuntimeDeployment,
-) -> Result<MaterializedViewArtifactBinding, ApiError> {
-    let identity = standing_program_identity_from_external_feldera_runtime(catalogs, spec)?;
-    let artifact_hash = feldera_artifact_bytes_hash(
-        serde_json::to_vec(&json!({
-            "execution_path": "feldera_pipeline_manager",
-            "pipeline_name": deployment.pipeline_name,
-            "deployment_mode": format!("{:?}", deployment.mode),
-            "spec": spec
-        }))
-        .map_err(ApiError::internal)?
-        .as_slice(),
-    );
-    Ok(MaterializedViewArtifactBinding {
-        artifact_id: format!("feldera-pipeline-manager:{}", deployment.pipeline_name),
-        artifact_hash,
-        generated_rust_crate_name: FELDERA_PIPELINE_MANAGER_RUNTIME_PACKAGE_NAME.to_string(),
-        state_codec: FELDERA_PIPELINE_MANAGER_STATE_CODEC.to_string(),
-        state_schema_version: 2,
-        execution_status: "direct_execution_enabled".to_string(),
-        execution_path: "feldera_pipeline_manager".to_string(),
-        standing_program_identity: Some(identity),
-    })
-}
-
-fn feldera_package_runtime_artifact_binding(
-    _spec: &StandingViewSpec,
-    descriptor: &FelderaPackageRuntimeDescriptorV1,
-) -> Result<MaterializedViewArtifactBinding, ApiError> {
-    let artifact_hash = feldera_artifact_bytes_hash(
-        serde_json::to_vec(&descriptor)
-            .map_err(ApiError::internal)?
-            .as_slice(),
-    );
-    Ok(MaterializedViewArtifactBinding {
-        artifact_id: format!(
-            "{}:{}",
-            FELDERA_PACKAGE_RUNTIME_EXECUTION_PATH, descriptor.view_id
-        ),
-        artifact_hash,
-        generated_rust_crate_name: descriptor.runtime_factory.crate_name.clone(),
-        state_codec: descriptor.state_codec.clone(),
-        state_schema_version: descriptor.state_schema_version,
-        execution_status: "direct_execution_enabled".to_string(),
-        execution_path: FELDERA_PACKAGE_RUNTIME_EXECUTION_PATH.to_string(),
-        standing_program_identity: Some(descriptor.standing_program_identity.clone()),
-    })
-}
-
-fn validate_external_feldera_runtime_deployment_completion(
-    spec: &StandingViewSpec,
-    deployment: &FelderaPipelineManagerRuntimeDeployment,
-) -> Result<(), ApiError> {
-    if deployment.pipeline_name.trim().is_empty() {
-        return Err(ApiError::bad_request(
-            "runtime_deployment.pipeline_name must not be empty",
-        ));
-    }
-    if deployment.pipeline_name.contains('/') || deployment.pipeline_name.contains('\\') {
-        return Err(ApiError::bad_request(
-            "runtime_deployment.pipeline_name must be a Feldera pipeline name, not a path",
-        ));
-    }
-    let expected_pipeline_name = feldera_pipeline_name_for_view_spec(spec)?;
-    if deployment.pipeline_name != expected_pipeline_name {
-        return Err(ApiError::conflict(format!(
-            "runtime_deployment.pipeline_name does not match pending view compile request: expected={}, request={}",
-            expected_pipeline_name, deployment.pipeline_name
-        )));
-    }
-    Ok(())
-}
-
-async fn validate_compile_deploy_claim_for_completion(
-    state: &ApiState,
-    view_id: &str,
-    compile_request_hash: &str,
-    request_tenant_id: Option<&str>,
-    request_job_generation: Option<u64>,
-    request_worker_id: Option<&str>,
-    request_lease_id: Option<&str>,
-    request_fencing_token: Option<u64>,
-) -> Result<(), ApiError> {
-    let registry = state.view_compile_deploy_job_registry()?;
-    let claim = match registry
-        .read_claim_by_compile_request_hash(view_id, compile_request_hash)
-        .await
-    {
-        Ok(claim) => Some(claim),
-        Err(ViewCompileDeployJobRegistryError::ObjectStore(object_store::Error::NotFound {
-            ..
-        })) => None,
-        Err(error) => return Err(view_compile_deploy_job_registry_error_to_api(error)),
-    };
-    let Some(claim) = claim else {
-        if request_tenant_id.is_some()
-            || request_job_generation.is_some()
-            || request_worker_id.is_some()
-            || request_lease_id.is_some()
-            || request_fencing_token.is_some()
-        {
-            return Err(ApiError::conflict(
-                "completion request supplied claim proof but no active compile/deploy job claim exists",
-            ));
-        }
-        return Ok(());
-    };
-    let Some(tenant_id) = request_tenant_id else {
-        return Err(ApiError::conflict(
-            "claimed compile/deploy job completion requires `tenant_id`",
-        ));
-    };
-    let Some(job_generation) = request_job_generation else {
-        return Err(ApiError::conflict(
-            "claimed compile/deploy job completion requires `job_generation`",
-        ));
-    };
-    let Some(worker_id) = request_worker_id else {
-        return Err(ApiError::conflict(
-            "claimed compile/deploy job completion requires `worker_id`",
-        ));
-    };
-    let Some(lease_id) = request_lease_id else {
-        return Err(ApiError::conflict(
-            "claimed compile/deploy job completion requires `lease_id`",
-        ));
-    };
-    let Some(fencing_token) = request_fencing_token else {
-        return Err(ApiError::conflict(
-            "claimed compile/deploy job completion requires `fencing_token`",
-        ));
-    };
-    if claim.tenant_id != tenant_id
-        || claim.job_generation != job_generation
-        || claim.worker_id != worker_id
-        || claim.lease_id != lease_id
-        || claim.fencing_token != fencing_token
-    {
-        return Err(ApiError::conflict(
-            "claimed compile/deploy job completion proof does not match the active claim",
-        ));
-    }
-    if claim.lease_expires_at_ms <= unix_epoch_millis()? {
-        return Err(ApiError::conflict(
-            "claimed compile/deploy job lease has expired",
-        ));
-    }
-    Ok(())
-}
-
-fn sql_template_validation_mode_for_artifact(
-    artifact: &MaterializedViewArtifactBinding,
-) -> SqlTemplateValidationMode {
-    if artifact.execution_path == "feldera_pipeline_manager" {
-        SqlTemplateValidationMode::ExternalFelderaRuntime
-    } else {
-        SqlTemplateValidationMode::LocalDataFusion
-    }
-}
-
-async fn complete_pending_view_compile_deploy_job(
-    state: &ApiState,
-    view_id: &str,
-    request_spec_hash: Option<&str>,
-    request_compile_request_hash: Option<&str>,
-    request_tenant_id: Option<&str>,
-    request_job_generation: Option<u64>,
-    request_worker_id: Option<&str>,
-    request_lease_id: Option<&str>,
-    request_fencing_token: Option<u64>,
-    request_resolved_spec: Option<&StandingViewSpec>,
-    artifact_metadata: Option<&FelderaCompileArtifactMetadata>,
-    product_runtime: Option<&FelderaPackageRuntimeDescriptorV1>,
-    runtime_deployment: Option<&FelderaPipelineManagerRuntimeDeployment>,
-) -> Result<ViewResponse, ApiError> {
-    if request_spec_hash.is_none() && request_compile_request_hash.is_none() {
-        return Err(ApiError::bad_request(
-            "completion request must include `compile_request_hash` or legacy `spec_hash`",
-        ));
-    }
-    let completion_payloads = [
-        artifact_metadata.is_some(),
-        product_runtime.is_some(),
-        runtime_deployment.is_some(),
-    ]
-    .into_iter()
-    .filter(|present| *present)
-    .count();
-    if completion_payloads != 1 {
-        return Err(ApiError::bad_request(
-            "completion request must include exactly one of `artifact`, `product_runtime`, or `runtime_deployment`",
-        ));
-    }
-    let active = state
-        .view_registry()?
-        .read_active(view_id)
-        .await
-        .map_err(materialized_view_registry_error_to_api)?;
-    let active_compile_request_hash = compile_request_hash_for_spec(&active.spec)?;
-    if let Some(spec_hash) = request_spec_hash {
-        if active.spec_hash != spec_hash {
-            let modern_resolved_retry_matches = active.execution_mode
-                == MaterializedViewExecutionMode::StandingRuntime
-                && request_compile_request_hash == Some(active_compile_request_hash.as_str());
-            if modern_resolved_retry_matches {
-                // A resolved-spec activation intentionally moves the active view
-                // away from the pending admission spec hash. The compile request
-                // hash remains the durable identity for retry/repair.
-            } else {
-                return Err(ApiError::conflict(format!(
-                "active view spec hash does not match completion request: active={}, request={}",
-                active.spec_hash, spec_hash
-            )));
-            }
-        }
-    }
-    if let Some(compile_request_hash) = request_compile_request_hash {
-        if active_compile_request_hash != compile_request_hash {
-            return Err(ApiError::conflict(format!(
-                "active view compile request hash does not match completion request: active={}, request={}",
-                active_compile_request_hash, compile_request_hash
-            )));
-        }
-    }
-    let activation_spec = if let Some(resolved_spec) = request_resolved_spec {
-        validate_resolved_compile_spec(&active.spec, resolved_spec, &active_compile_request_hash)?;
-        resolved_spec.clone()
-    } else {
-        active.spec.clone()
-    };
-    if let Some(deployment) = runtime_deployment {
-        validate_external_feldera_runtime_deployment_completion(&activation_spec, deployment)?;
-    }
-    validate_compile_deploy_claim_for_completion(
-        state,
-        view_id,
-        &active_compile_request_hash,
-        request_tenant_id,
-        request_job_generation,
-        request_worker_id,
-        request_lease_id,
-        request_fencing_token,
-    )
-    .await?;
-    let activation_spec_hash =
-        feldera_spec_hash(&activation_spec).map_err(ApiError::bad_request)?;
-    if let Some(artifact_metadata) = artifact_metadata {
-        if activation_spec_hash != artifact_metadata.spec_hash {
-            return Err(ApiError::conflict(format!(
-                "resolved view spec hash does not match artifact metadata: resolved={}, artifact={}",
-                activation_spec_hash, artifact_metadata.spec_hash
-            )));
-        }
-        validate_feldera_compile_artifact_for_compile_request(
-            &activation_spec,
-            artifact_metadata,
-            &active_compile_request_hash,
-        )
-        .map_err(ApiError::bad_request)?;
-    }
-    let active_compile_request =
-        FelderaCompileRequestV1::infer_output_from_standing_view_spec(&active.spec);
-    if let Some(product_runtime) = product_runtime {
-        validate_feldera_package_runtime_descriptor(
-            &activation_spec,
-            &active_compile_request,
-            product_runtime,
-        )
-        .map_err(ApiError::bad_request)?;
-    }
-    let catalogs = read_relation_catalogs_for_spec(state, &activation_spec).await?;
-    let catalog = catalogs
-        .first()
-        .ok_or_else(|| ApiError::bad_request("pending view has no input relation"))?;
-    if active.execution_mode == MaterializedViewExecutionMode::StandingRuntime
-        && request_compile_request_hash.is_some()
-        && request_resolved_spec.is_some()
-    {
-        if let Some(artifact_metadata) = artifact_metadata {
-            validate_active_standing_runtime_artifact_matches_metadata(
-                &active,
-                catalog,
-                &activation_spec,
-                artifact_metadata,
-            )?;
-        } else if let Some(product_runtime) = product_runtime {
-            validate_active_standing_runtime_artifact_matches_product_runtime(
-                &active,
-                &activation_spec,
-                product_runtime,
-            )?;
-        } else {
-            return Err(ApiError::bad_request(
-                "duplicate standing-runtime completion repair requires `artifact` or `product_runtime`",
-            ));
-        }
-        repair_matching_compile_deploy_job_for_active_standing_runtime(
-            state,
-            &active,
-            request_spec_hash,
-            request_compile_request_hash,
-            "standing runtime was already active; repaired compile/deploy job",
-        )
-        .await?;
-        let active = state
-            .view_registry()?
-            .read_active(view_id)
-            .await
-            .map_err(materialized_view_registry_error_to_api)?;
-        return active_view_response(&active, Some("duplicate"));
-    }
-    if active.execution_mode != MaterializedViewExecutionMode::FelderaCompilePending {
-        return Err(ApiError::conflict(format!(
-            "view `{view_id}` is not waiting for Feldera compile/deploy completion"
-        )));
-    }
-    let job = read_pending_compile_deploy_job(
-        state,
-        view_id,
-        &active.spec_hash,
-        &active_compile_request_hash,
-    )
-    .await?;
-    if !compile_job_request_matches_active_spec(&job, &active.spec) {
-        return Err(ApiError::conflict(
-            "compile/deploy job compiler_request does not match active view spec",
-        ));
-    }
-
-    state.validate_standing_runtime_fencing_or_evict().await?;
-    let output_schemas = activation_spec.output_relations.clone();
-    let (artifact, activation_message, template_validation_mode) = if let Some(artifact_metadata) =
-        artifact_metadata
-    {
-        (
-            register_view_artifact(state, &catalogs, &activation_spec, artifact_metadata).await?,
-            "standing runtime activated from completed Feldera artifact",
-            SqlTemplateValidationMode::LocalDataFusion,
-        )
-    } else if let Some(product_runtime) = product_runtime {
-        (
-            feldera_package_runtime_artifact_binding(&activation_spec, product_runtime)?,
-            "standing runtime activated from completed jarless Feldera package runtime",
-            SqlTemplateValidationMode::LocalDataFusion,
-        )
-    } else {
-        let deployment = runtime_deployment.expect("runtime_deployment was validated above");
-        (
-            external_feldera_runtime_artifact_binding(&catalogs, &activation_spec, deployment)?,
-            "standing runtime activated from completed Feldera runtime deployment",
-            SqlTemplateValidationMode::ExternalFelderaRuntime,
-        )
-    };
-    let identity = artifact
-        .standing_program_identity
-        .as_ref()
-        .ok_or_else(|| ApiError::conflict("generated artifact is missing runtime identity"))?
-        .clone();
-    let api_metadata = active.api.clone().unwrap_or_default();
-    validate_standing_runtime_create_api_metadata(
-        &activation_spec.view_id,
-        &api_metadata,
-        &output_schemas,
-        template_validation_mode,
-    )
-    .await?;
-    let replay_plan = if let Some((runtime, replay_plan)) =
-        restore_or_build_standing_runtime_for_artifact(
-            state,
-            &activation_spec,
-            &artifact,
-            &activation_spec.input_relations,
-            &output_schemas,
-        )
-        .await?
-    {
-        insert_standing_runtime(state, &activation_spec.view_id, runtime)?;
-        replay_plan
-    } else {
-        read_latest_standing_runtime_checkpoint(state, &identity, &activation_spec.view_id)
-            .await?
-            .map(standing_runtime_replay_plan_from_record)
-            .unwrap_or_default()
-    };
-    let deploying_lifecycle = MaterializedViewLifecycleStatus::standing_runtime_deploying(Some(
-        "catching up committed ingest before query activation".to_string(),
-    ));
-    let activation = if request_resolved_spec.is_some() {
+    api: Option<MaterializedViewApiMetadata>,
+    artifact: Option<MaterializedViewArtifactBinding>,
+    runtime: Option<MaterializedViewRuntimeBinding>,
+    execution_mode: Option<MaterializedViewExecutionMode>,
+    lifecycle: Option<MaterializedViewLifecycleStatus>,
+) -> Result<RegisterMaterializedViewOutcome, ApiError> {
+    if let Some(runtime) = runtime {
         state
             .view_registry()?
-            .activate_pending_with_resolved_spec_artifact(
-                &active.spec.view_id,
-                &active.spec_hash,
-                &activation_spec,
-                artifact.clone(),
-                deploying_lifecycle.clone(),
-            )
+            .register_with_api_metadata_runtime_execution(spec, api, runtime, lifecycle)
             .await
-            .map_err(materialized_view_registry_error_to_api)?
+            .map_err(materialized_view_registry_error_to_api)
     } else {
         state
             .view_registry()?
-            .activate_pending_with_artifact(
-                &active.spec.view_id,
-                &active.spec_hash,
-                artifact.clone(),
-                deploying_lifecycle.clone(),
+            .register_with_api_metadata_artifact_execution(
+                spec,
+                api,
+                artifact,
+                execution_mode,
+                lifecycle,
             )
             .await
-            .map_err(materialized_view_registry_error_to_api)?
-    };
-    let replay_active = ActiveMaterializedView {
-        spec_hash: activation_spec_hash.clone(),
-        spec: activation_spec.clone(),
-        execution_mode: MaterializedViewExecutionMode::StandingRuntime,
-        api: active.api.clone(),
-        artifact: Some(artifact),
-        lifecycle: deploying_lifecycle,
-    };
-    replay_committed_ingest_into_standing_runtime(state, &replay_active, &replay_plan).await?;
-    let lifecycle = MaterializedViewLifecycleStatus::standing_runtime();
-    let lifecycle_update = state
-        .view_registry()?
-        .update_standing_runtime_lifecycle(
-            &activation_spec.view_id,
-            &activation_spec_hash,
-            lifecycle,
-        )
-        .await
-        .map_err(materialized_view_registry_error_to_api)?;
-    mark_compile_deploy_job_running(
-        state,
-        &active.spec.view_id,
-        &active.spec_hash,
-        &active_compile_request_hash,
-        activation_message.to_string(),
-    )
-    .await?;
-    let outcome = match (activation, lifecycle_update) {
-        (ActivateMaterializedViewOutcome::Activated, _) => "activated",
-        (
-            ActivateMaterializedViewOutcome::Duplicate,
-            UpdateMaterializedViewLifecycleOutcome::Updated,
-        ) => "activated",
-        (
-            ActivateMaterializedViewOutcome::Duplicate,
-            UpdateMaterializedViewLifecycleOutcome::Duplicate,
-        ) => "duplicate",
-    };
-    let active = state
-        .view_registry()?
-        .read_active(&active.spec.view_id)
-        .await
-        .map_err(materialized_view_registry_error_to_api)?;
-    active_view_response(&active, Some(outcome))
-}
-
-async fn read_pending_compile_deploy_job(
-    state: &ApiState,
-    view_id: &str,
-    spec_hash: &str,
-    compile_request_hash: &str,
-) -> Result<ViewCompileDeployJobRecord, ApiError> {
-    let registry = state.view_compile_deploy_job_registry()?;
-    match registry
-        .read_by_compile_request_hash(view_id, compile_request_hash)
-        .await
-    {
-        Ok(job) => Ok(job),
-        Err(ViewCompileDeployJobRegistryError::ObjectStore(object_store::Error::NotFound {
-            ..
-        })) => match registry.read(view_id, spec_hash).await {
-            Ok(job) => Ok(job),
-            Err(ViewCompileDeployJobRegistryError::ObjectStore(object_store::Error::NotFound {
-                ..
-            })) => Err(ApiError::conflict(format!(
-                "compile/deploy job does not exist for view `{view_id}`, compile request hash `{compile_request_hash}`, and legacy spec hash `{spec_hash}`"
-            ))),
-            Err(error) => Err(view_compile_deploy_job_registry_error_to_api(error)),
-        },
-        Err(error) => Err(view_compile_deploy_job_registry_error_to_api(error)),
+            .map_err(materialized_view_registry_error_to_api)
     }
 }
 
-async fn mark_compile_deploy_job_running(
-    state: &ApiState,
-    view_id: &str,
-    spec_hash: &str,
-    compile_request_hash: &str,
-    message: String,
-) -> Result<(), ApiError> {
-    let registry = state.view_compile_deploy_job_registry()?;
-    match registry
-        .mark_running_for_compile_request_hash(view_id, compile_request_hash, Some(message.clone()))
-        .await
-    {
-        Ok(_) => Ok(()),
-        Err(ViewCompileDeployJobRegistryError::ObjectStore(object_store::Error::NotFound {
-            ..
-        })) => registry
-            .mark_running(view_id, spec_hash, Some(message))
-            .await
-            .map(|_| ())
-            .map_err(view_compile_deploy_job_registry_error_to_api),
-        Err(error) => Err(view_compile_deploy_job_registry_error_to_api(error)),
-    }
-}
-
-async fn repair_compile_deploy_job_for_active_standing_runtime(
-    state: &ApiState,
-    active: &ActiveMaterializedView,
-    job: &ViewCompileDeployJobRecord,
-    message: &str,
-) -> Result<bool, ApiError> {
-    if active.execution_mode != MaterializedViewExecutionMode::StandingRuntime {
-        return Ok(false);
-    }
-    if !compile_job_request_matches_active_spec(job, &active.spec) {
-        return Ok(false);
-    }
-    let compile_request_hash = job
-        .compiler_request
-        .as_ref()
-        .map(|request| request.compile_request_hash.as_str())
-        .ok_or_else(|| ApiError::conflict("compile/deploy job is missing compiler_request"))?;
-    mark_compile_deploy_job_running(
-        state,
-        &active.spec.view_id,
-        &job.spec_hash,
-        compile_request_hash,
-        message.to_string(),
-    )
-    .await?;
-    Ok(true)
-}
-
-async fn repair_matching_compile_deploy_job_for_active_standing_runtime(
-    state: &ApiState,
-    active: &ActiveMaterializedView,
-    request_spec_hash: Option<&str>,
-    request_compile_request_hash: Option<&str>,
-    message: &str,
-) -> Result<(), ApiError> {
-    if active.execution_mode != MaterializedViewExecutionMode::StandingRuntime {
-        return Ok(());
-    }
-    let registry = state.view_compile_deploy_job_registry()?;
-    let job = if let Some(compile_request_hash) = request_compile_request_hash {
-        match registry
-            .read_by_compile_request_hash(&active.spec.view_id, compile_request_hash)
-            .await
-        {
-            Ok(job) => Some(job),
-            Err(ViewCompileDeployJobRegistryError::ObjectStore(
-                object_store::Error::NotFound { .. },
-            )) => None,
-            Err(error) => return Err(view_compile_deploy_job_registry_error_to_api(error)),
-        }
-    } else if let Some(spec_hash) = request_spec_hash {
-        match registry.read(&active.spec.view_id, spec_hash).await {
-            Ok(job) => Some(job),
-            Err(ViewCompileDeployJobRegistryError::ObjectStore(
-                object_store::Error::NotFound { .. },
-            )) => None,
-            Err(error) => return Err(view_compile_deploy_job_registry_error_to_api(error)),
-        }
-    } else {
-        None
-    };
-
-    if let Some(job) = job {
-        if !repair_compile_deploy_job_for_active_standing_runtime(state, active, &job, message)
-            .await?
-        {
-            return Err(ApiError::conflict(
-                "compile/deploy job compiler_request does not match active view spec",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn validate_active_standing_runtime_artifact_matches_metadata(
-    active: &ActiveMaterializedView,
-    catalog: &VelorixRelationCatalogV1,
+fn materialized_view_runtime_binding_for_spec(
+    catalogs: &[VelorixRelationCatalogV1],
     spec: &StandingViewSpec,
-    artifact_metadata: &FelderaCompileArtifactMetadata,
-) -> Result<(), ApiError> {
-    let active_artifact = active
-        .artifact
-        .as_ref()
-        .ok_or_else(|| ApiError::conflict("active standing runtime is missing artifact"))?;
-    let expected_identity =
-        standing_program_identity_from_artifact(catalog, spec, artifact_metadata)?;
-    let matches = active_artifact.artifact_id == artifact_metadata.artifact_id
-        && active_artifact.artifact_hash == artifact_metadata.artifact_hash
-        && active_artifact.generated_rust_crate_name == artifact_metadata.generated_rust.crate_name
-        && active_artifact.state_codec == artifact_metadata.state_codec
-        && active_artifact.state_schema_version == artifact_metadata.state_schema_version
-        && active_artifact.standing_program_identity.as_ref() == Some(&expected_identity);
-    if !matches {
-        return Err(ApiError::conflict(
-            "active standing runtime artifact does not match completion artifact metadata",
+) -> Result<MaterializedViewRuntimeBinding, ApiError> {
+    let identity = standing_program_identity_from_materialized_view_runtime(catalogs, spec)?;
+    let output_schema = only_output_relation_for_runtime_binding(spec)?;
+    let logical_plan =
+        lower_supported_sql_to_logical_plan(spec.sql.as_str(), catalogs, output_schema)
+            .map_err(ApiError::bad_request)?;
+    Ok(MaterializedViewRuntimeBinding {
+        runtime_kind: velorix_runtime::materialized_view_runtime::CRATE_NAME.to_string(),
+        runtime_version: "builtin-v1".to_string(),
+        standing_program_identity: identity,
+        logical_plan: Some(logical_plan),
+    })
+}
+
+fn only_output_relation_for_runtime_binding(
+    spec: &StandingViewSpec,
+) -> Result<&RelationSchema, ApiError> {
+    let [output_schema] = spec.output_relations.as_slice() else {
+        return Err(ApiError::bad_request(
+            "materialized view runtime requires exactly one output relation",
         ));
-    }
-    Ok(())
-}
-
-fn validate_active_standing_runtime_artifact_matches_product_runtime(
-    active: &ActiveMaterializedView,
-    spec: &StandingViewSpec,
-    descriptor: &FelderaPackageRuntimeDescriptorV1,
-) -> Result<(), ApiError> {
-    let active_artifact = active
-        .artifact
-        .as_ref()
-        .ok_or_else(|| ApiError::conflict("active standing runtime is missing artifact"))?;
-    let expected = feldera_package_runtime_artifact_binding(spec, descriptor)?;
-    let matches = active_artifact.artifact_id == expected.artifact_id
-        && active_artifact.artifact_hash == expected.artifact_hash
-        && active_artifact.generated_rust_crate_name == expected.generated_rust_crate_name
-        && active_artifact.state_codec == expected.state_codec
-        && active_artifact.state_schema_version == expected.state_schema_version
-        && active_artifact.execution_path == expected.execution_path
-        && active_artifact.standing_program_identity == expected.standing_program_identity;
-    if !matches {
-        return Err(ApiError::conflict(
-            "active standing runtime artifact does not match product runtime descriptor",
-        ));
-    }
-    Ok(())
-}
-
-fn standing_program_identity_from_artifact(
-    catalog: &VelorixRelationCatalogV1,
-    spec: &StandingViewSpec,
-    artifact: &FelderaCompileArtifactMetadata,
-) -> Result<StandingProgramIdentity, ApiError> {
-    let input_schema_bytes = serde_json::to_vec(&artifact.input_schemas)
-        .map_err(|source| ApiError::internal(source.to_string()))?;
-    let output_schema_bytes = serde_json::to_vec(&artifact.output_schemas)
-        .map_err(|source| ApiError::internal(source.to_string()))?;
-    let input_catalog_hash = if artifact.input_schemas.len() == 1 {
-        catalog.schema_fingerprint.as_str().to_string()
-    } else {
-        feldera_artifact_bytes_hash(&input_schema_bytes)
     };
-    let identity = StandingProgramIdentity {
-        tenant_id: "default".to_string(),
-        program_id: spec.view_id.clone(),
-        view_ids: standing_program_view_ids_for_spec(spec),
-        sql_hash: feldera_artifact_bytes_hash(spec.sql.as_bytes()),
-        input_catalog_hash,
-        output_schema_hash: feldera_artifact_bytes_hash(&output_schema_bytes),
-        compiler_identity: format!("{}:{}", artifact.compiler.name, artifact.compiler.version),
-        runtime_packages: vec![FelderaRuntimePackageIdentity {
-            name: artifact.generated_rust.crate_name.clone(),
-            version: artifact.generated_rust.abi_version.clone(),
-        }],
-        package_feature_set: vec!["static_release_artifact".to_string()],
-        dbsp_runtime_compatibility: artifact.generated_rust.abi_version.clone(),
-        checkpoint_codec_identity: artifact.state_codec.clone(),
-        native_code_policy: NativeCodePolicy::DisabledNoExternalDependencies,
-    };
-    identity.validate().map_err(ApiError::bad_request)?;
-    Ok(identity)
+    Ok(output_schema)
 }
 
-fn standing_program_identity_from_external_feldera_runtime(
+fn standing_program_identity_from_materialized_view_runtime(
     catalogs: &[VelorixRelationCatalogV1],
     spec: &StandingViewSpec,
 ) -> Result<StandingProgramIdentity, ApiError> {
@@ -6457,27 +2087,42 @@ fn standing_program_identity_from_external_feldera_runtime(
     let input_catalog_hash = if catalogs.len() == 1 {
         catalogs[0].schema_fingerprint.as_str().to_string()
     } else {
-        feldera_artifact_bytes_hash(&input_schema_bytes)
+        stable_bytes_hash(&input_schema_bytes)
     };
     let identity = StandingProgramIdentity {
         tenant_id: "default".to_string(),
         program_id: spec.view_id.clone(),
         view_ids: standing_program_view_ids_for_spec(spec),
-        sql_hash: feldera_artifact_bytes_hash(spec.sql.as_bytes()),
+        sql_hash: stable_bytes_hash(spec.sql.as_bytes()),
         input_catalog_hash,
-        output_schema_hash: feldera_artifact_bytes_hash(&output_schema_bytes),
-        compiler_identity: "feldera-pipeline-manager".to_string(),
-        runtime_packages: vec![FelderaRuntimePackageIdentity {
-            name: FELDERA_PIPELINE_MANAGER_RUNTIME_PACKAGE_NAME.to_string(),
-            version: FELDERA_PIPELINE_MANAGER_RUNTIME_PACKAGE_VERSION.to_string(),
+        output_schema_hash: stable_bytes_hash(&output_schema_bytes),
+        compiler_identity: "velorix-materialized-view-runtime".to_string(),
+        runtime_packages: vec![RuntimePackageIdentity {
+            name: velorix_runtime::materialized_view_runtime::CRATE_NAME.to_string(),
+            version: "builtin-v1".to_string(),
         }],
-        package_feature_set: vec!["feldera_pipeline_manager_runtime".to_string()],
-        dbsp_runtime_compatibility: FELDERA_PIPELINE_MANAGER_RUNTIME_PACKAGE_VERSION.to_string(),
-        checkpoint_codec_identity: FELDERA_PIPELINE_MANAGER_STATE_CODEC.to_string(),
+        package_feature_set: vec!["materialized_view_runtime".to_string()],
+        runtime_compatibility: "velorix-materialized-view-runtime-v1".to_string(),
+        checkpoint_codec_identity: "velorix-materialized-view-state-v1".to_string(),
         native_code_policy: NativeCodePolicy::DisabledNoExternalDependencies,
     };
     identity.validate().map_err(ApiError::bad_request)?;
     Ok(identity)
+}
+
+fn active_standing_runtime_identity(
+    active: &ActiveMaterializedView,
+) -> Option<&StandingProgramIdentity> {
+    active
+        .runtime
+        .as_ref()
+        .map(|runtime| &runtime.standing_program_identity)
+        .or_else(|| {
+            active
+                .artifact
+                .as_ref()
+                .and_then(|artifact| artifact.standing_program_identity.as_ref())
+        })
 }
 
 fn standing_program_view_ids_for_spec(spec: &StandingViewSpec) -> Vec<String> {
@@ -6495,79 +2140,68 @@ fn standing_program_view_ids_for_spec(spec: &StandingViewSpec) -> Vec<String> {
     view_ids
 }
 
-async fn ensure_standing_runtime_for_artifact(
+async fn ensure_standing_runtime_for_active_view(
     state: &ApiState,
-    spec: &StandingViewSpec,
-    artifact: &MaterializedViewArtifactBinding,
+    active: &ActiveMaterializedView,
 ) -> Result<Option<StandingRuntimeReplayPlan>, ApiError> {
-    let Some((runtime, replay_plan)) = restore_or_build_standing_runtime_for_artifact(
+    let Some(runtime_binding) = active.runtime.as_ref() else {
+        return Ok(None);
+    };
+    let Some((runtime, replay_plan)) = restore_or_build_standing_runtime_for_runtime_binding(
         state,
-        spec,
-        artifact,
-        &spec.input_relations,
-        &spec.output_relations,
+        &active.spec,
+        runtime_binding,
+        &active.spec.input_relations,
+        &active.spec.output_relations,
     )
-    .await
-    .map_err(|error| active_artifact_runtime_unavailable_error(&spec.view_id, artifact, error))?
+    .await?
     else {
         return Ok(None);
     };
-    let committed_checkpoint =
-        read_latest_standing_runtime_checkpoint(state, runtime.program_identity(), &spec.view_id)
-            .await?
-            .as_ref()
-            .map(standing_runtime_checkpoint_pointer_from_record);
+    let committed_checkpoint = read_latest_standing_runtime_checkpoint(
+        state,
+        runtime.program_identity(),
+        &active.spec.view_id,
+    )
+    .await?
+    .as_ref()
+    .map(standing_runtime_checkpoint_pointer_from_record);
     state.set_standing_runtime_committed_checkpoint(
         runtime.program_identity(),
-        &spec.view_id,
+        &active.spec.view_id,
         committed_checkpoint,
     )?;
-    insert_standing_runtime(state, &spec.view_id, runtime)?;
+    insert_standing_runtime(state, &active.spec.view_id, runtime)?;
     Ok(Some(replay_plan))
 }
 
-fn active_artifact_runtime_unavailable_error(
-    view_id: &str,
-    artifact: &MaterializedViewArtifactBinding,
-    error: ApiError,
-) -> ApiError {
-    if error.status == StatusCode::BAD_REQUEST
-        && error
-            .message
-            .contains("standing runtime factory is not registered")
-    {
-        return ApiError::service_unavailable(format!(
-            "standing runtime is unavailable for active artifact-backed view `{}`: generated Rust crate `{}` is not linked in this Velorix binary",
-            view_id, artifact.generated_rust_crate_name
-        ));
-    }
-    error
-}
-
-fn build_standing_runtime_for_artifact(
+fn build_standing_runtime_for_runtime_binding(
     state: &ApiState,
     spec: &StandingViewSpec,
-    artifact: &MaterializedViewArtifactBinding,
+    runtime_binding: &MaterializedViewRuntimeBinding,
     catalogs: &[VelorixRelationCatalogV1],
     expected_input_schemas: &[RelationSchema],
     expected_output_schemas: &[RelationSchema],
 ) -> Result<Option<Box<dyn StandingProgramRuntime + Send>>, ApiError> {
-    let Some(identity) = artifact.standing_program_identity.as_ref() else {
-        return Ok(None);
-    };
+    let identity = &runtime_binding.standing_program_identity;
     if state.standing_runtime(identity, &spec.view_id)?.is_some() {
         return Ok(None);
     }
-    let Some(factory) = state.standing_runtime_factory(&artifact.generated_rust_crate_name)? else {
+    let Some(factory) = state.standing_runtime_factory(&runtime_binding.runtime_kind)? else {
         return Err(ApiError::bad_request(format!(
-            "standing runtime factory is not registered for generated Rust crate `{}`",
-            artifact.generated_rust_crate_name
+            "standing runtime factory is not registered for runtime `{}`",
+            runtime_binding.runtime_kind
         )));
     };
+    let logical_plan = runtime_binding
+        .logical_plan
+        .as_ref()
+        .ok_or_else(|| ApiError::bad_request("standing runtime binding is missing logical plan"))?;
     let runtime = factory
-        .create_with_catalogs_and_spec(
+        .create_with_catalogs_plan_and_spec(
             identity,
             catalogs,
+            logical_plan,
             spec,
             expected_input_schemas,
             expected_output_schemas,
@@ -6589,10 +2223,10 @@ fn build_standing_runtime_for_artifact(
     Ok(Some(runtime))
 }
 
-async fn restore_or_build_standing_runtime_for_artifact(
+async fn restore_or_build_standing_runtime_for_runtime_binding(
     state: &ApiState,
     spec: &StandingViewSpec,
-    artifact: &MaterializedViewArtifactBinding,
+    runtime_binding: &MaterializedViewRuntimeBinding,
     expected_input_schemas: &[RelationSchema],
     expected_output_schemas: &[RelationSchema],
 ) -> Result<
@@ -6602,18 +2236,20 @@ async fn restore_or_build_standing_runtime_for_artifact(
     )>,
     ApiError,
 > {
-    let Some(identity) = artifact.standing_program_identity.as_ref() else {
-        return Ok(None);
-    };
+    let identity = &runtime_binding.standing_program_identity;
     if state.standing_runtime(identity, &spec.view_id)?.is_some() {
         return Ok(None);
     }
-    let Some(factory) = state.standing_runtime_factory(&artifact.generated_rust_crate_name)? else {
+    let Some(factory) = state.standing_runtime_factory(&runtime_binding.runtime_kind)? else {
         return Err(ApiError::bad_request(format!(
-            "standing runtime factory is not registered for generated Rust crate `{}`",
-            artifact.generated_rust_crate_name
+            "standing runtime factory is not registered for runtime `{}`",
+            runtime_binding.runtime_kind
         )));
     };
+    let logical_plan = runtime_binding
+        .logical_plan
+        .as_ref()
+        .ok_or_else(|| ApiError::bad_request("standing runtime binding is missing logical plan"))?;
     let catalogs = read_relation_catalogs_for_input_schemas(state, expected_input_schemas).await?;
 
     let (runtime, replay_plan) = if let Some(record) =
@@ -6649,14 +2285,16 @@ async fn restore_or_build_standing_runtime_for_artifact(
             let factory = Arc::clone(&factory);
             let identity = identity.clone();
             let catalogs = catalogs.clone();
+            let logical_plan = logical_plan.clone();
             let spec = spec.clone();
             let expected_input_schemas = expected_input_schemas.to_vec();
             let expected_output_schemas = expected_output_schemas.to_vec();
             (
                 tokio::task::spawn_blocking(move || {
-                    factory.create_with_catalogs_and_spec(
+                    factory.create_with_catalogs_plan_and_spec(
                         &identity,
                         &catalogs,
+                        &logical_plan,
                         &spec,
                         &expected_input_schemas,
                         &expected_output_schemas,
@@ -6672,14 +2310,16 @@ async fn restore_or_build_standing_runtime_for_artifact(
         let factory = Arc::clone(&factory);
         let identity = identity.clone();
         let catalogs = catalogs.clone();
+        let logical_plan = logical_plan.clone();
         let spec = spec.clone();
         let expected_input_schemas = expected_input_schemas.to_vec();
         let expected_output_schemas = expected_output_schemas.to_vec();
         (
             tokio::task::spawn_blocking(move || {
-                factory.create_with_catalogs_and_spec(
+                factory.create_with_catalogs_plan_and_spec(
                     &identity,
                     &catalogs,
+                    &logical_plan,
                     &spec,
                     &expected_input_schemas,
                     &expected_output_schemas,
@@ -6772,199 +2412,26 @@ fn remove_standing_runtime_if_present(
     Ok(removed_runtime || removed_local_state)
 }
 
-fn compile_job_request_matches_active_spec(
-    job: &ViewCompileDeployJobRecord,
-    spec: &StandingViewSpec,
-) -> bool {
-    let Some(request) = &job.compiler_request else {
-        return false;
-    };
-    let expected = FelderaCompileRequestV1::infer_output_from_standing_view_spec(spec);
-
-    request.view_id == spec.view_id
-        && request.compile_request_hash
-            == feldera_compile_request_hash(&expected).unwrap_or_default()
-        && request.spec_hash == job.spec_hash
-        && request.sql == spec.sql
-        && request.dialect == spec.dialect
-        && request.source_kind == spec.source_kind
-        && request.rust_extension == spec.rust_extension
-        && request.input_relations == spec.input_relations
-        && request.output_contract == OutputSchemaContract::Infer
-        && request.output_relations.is_empty()
-        && request.shape == expected.shape
-}
-
-fn validate_resolved_compile_spec(
-    pending_spec: &StandingViewSpec,
-    resolved_spec: &StandingViewSpec,
-    expected_compile_request_hash: &str,
-) -> Result<(), ApiError> {
-    if resolved_spec.view_id != pending_spec.view_id
-        || resolved_spec.sql != pending_spec.sql
-        || resolved_spec.dialect != pending_spec.dialect
-        || resolved_spec.source_kind != pending_spec.source_kind
-        || resolved_spec.rust_extension != pending_spec.rust_extension
-        || resolved_spec.input_relations != pending_spec.input_relations
-        || resolved_spec.shape.is_materialized != pending_spec.shape.is_materialized
-        || resolved_spec.shape.multi_input != pending_spec.shape.multi_input
-        || resolved_spec.shape.multi_output != (resolved_spec.output_relations.len() > 1)
-    {
-        return Err(ApiError::conflict(
-            "resolved Feldera compile spec does not match pending compiler request identity",
-        ));
-    }
-    if resolved_spec.output_relations.is_empty() {
-        return Err(ApiError::bad_request(
-            "resolved Feldera compile spec must include compiler-inferred output relations",
-        ));
-    }
-    validate_feldera_program_output_hints(pending_spec, resolved_spec)?;
-    validate_feldera_runtime_spec_admission(resolved_spec)?;
-    let actual_compile_request_hash = compile_request_hash_for_spec(resolved_spec)?;
-    if actual_compile_request_hash != expected_compile_request_hash {
-        return Err(ApiError::conflict(format!(
-            "resolved Feldera compile request hash does not match pending request: expected={}, actual={}",
-            expected_compile_request_hash, actual_compile_request_hash
-        )));
-    }
-    Ok(())
-}
-
-fn validate_feldera_program_output_hints(
-    pending_spec: &StandingViewSpec,
-    resolved_spec: &StandingViewSpec,
-) -> Result<(), ApiError> {
-    if !feldera_program_output_hints_are_present(pending_spec) {
-        return Ok(());
-    }
-    let expected = pending_spec
-        .output_relations
-        .iter()
-        .map(|schema| schema.relation_id.as_str())
-        .collect::<BTreeSet<_>>();
-    let actual = resolved_spec
-        .output_relations
-        .iter()
-        .map(|schema| schema.relation_id.as_str())
-        .collect::<BTreeSet<_>>();
-    if !feldera_output_hint_relation_ids_match(&expected, &actual) {
-        return Err(ApiError::bad_request(format!(
-            "resolved Feldera program output relations do not match requested output_relation_ids: expected={expected:?}, actual={actual:?}"
-        )));
-    }
-    Ok(())
-}
-
-fn resolved_compile_spec_with_pending_output_relation_ids(
-    pending_spec: &StandingViewSpec,
-    mut resolved_spec: StandingViewSpec,
-) -> StandingViewSpec {
-    if !feldera_program_output_hints_are_present(pending_spec) {
-        return resolved_spec;
-    }
-    let expected = pending_spec
-        .output_relations
-        .iter()
-        .map(|schema| schema.relation_id.as_str())
-        .collect::<BTreeSet<_>>();
-    let actual = resolved_spec
-        .output_relations
-        .iter()
-        .map(|schema| schema.relation_id.as_str())
-        .collect::<BTreeSet<_>>();
-    if expected == actual || !feldera_output_hint_relation_ids_match(&expected, &actual) {
-        return resolved_spec;
-    }
-    let Some(pending_ids_by_folded_id) =
-        feldera_pending_output_relation_ids_by_folded_id(pending_spec)
-    else {
-        return resolved_spec;
-    };
-    for output_schema in &mut resolved_spec.output_relations {
-        if let Some(pending_id) =
-            pending_ids_by_folded_id.get(&output_schema.relation_id.to_ascii_lowercase())
-        {
-            output_schema.relation_id = pending_id.clone();
-        }
-    }
-    resolved_spec
-}
-
-fn feldera_program_output_hints_are_present(spec: &StandingViewSpec) -> bool {
-    spec.source_kind == SqlSourceKind::FelderaProgram
-        && !spec.output_relations.is_empty()
-        && !(spec.output_relations.len() == 1
-            && spec.output_relations[0].relation_id == spec.view_id)
-}
-
-fn feldera_output_hint_relation_ids_match(
-    expected: &BTreeSet<&str>,
-    actual: &BTreeSet<&str>,
-) -> bool {
-    expected == actual
-        || match (
-            feldera_non_ambiguous_case_folded_relation_ids(expected),
-            feldera_non_ambiguous_case_folded_relation_ids(actual),
-        ) {
-            (Some(expected), Some(actual)) => expected == actual,
-            _ => false,
-        }
-}
-
-fn feldera_non_ambiguous_case_folded_relation_ids(
-    ids: &BTreeSet<&str>,
-) -> Option<BTreeSet<String>> {
-    let mut folded = BTreeSet::new();
-    for id in ids {
-        if !folded.insert(id.to_ascii_lowercase()) {
-            return None;
-        }
-    }
-    Some(folded)
-}
-
-fn feldera_pending_output_relation_ids_by_folded_id(
-    spec: &StandingViewSpec,
-) -> Option<BTreeMap<String, String>> {
-    let mut ids = BTreeMap::new();
-    for schema in &spec.output_relations {
-        if ids
-            .insert(
-                schema.relation_id.to_ascii_lowercase(),
-                schema.relation_id.clone(),
-            )
-            .is_some()
-        {
-            return None;
-        }
-    }
-    Some(ids)
-}
-
-fn validate_feldera_runtime_spec_admission(spec: &StandingViewSpec) -> Result<(), ApiError> {
-    validate_feldera_compile_request(
-        &FelderaCompileRequestV1::infer_output_from_standing_view_spec(spec),
-    )
-    .map_err(ApiError::bad_request)?;
-    validate_feldera_runtime_relation_schemas_admission(
+fn validate_materialized_runtime_spec_admission(spec: &StandingViewSpec) -> Result<(), ApiError> {
+    validate_materialized_standing_view_spec(spec).map_err(ApiError::bad_request)?;
+    validate_materialized_runtime_relation_schemas_admission(
         "spec.input_relations",
         &spec.input_relations,
     )?;
-    validate_feldera_runtime_relation_schemas_admission(
+    validate_materialized_runtime_relation_schemas_admission(
         "spec.output_relations",
         &spec.output_relations,
     )?;
     Ok(())
 }
 
-fn validate_feldera_runtime_relation_schemas_admission(
+fn validate_materialized_runtime_relation_schemas_admission(
     field: &str,
     schemas: &[RelationSchema],
 ) -> Result<(), ApiError> {
     for schema in schemas {
         for column in &schema.columns {
-            validate_feldera_runtime_sql_type_admission(
+            validate_materialized_runtime_sql_type_admission(
                 &format!("{field}.{}.{}", schema.relation_id, column.name),
                 &column.data_type,
             )?;
@@ -6973,7 +2440,7 @@ fn validate_feldera_runtime_relation_schemas_admission(
     Ok(())
 }
 
-fn validate_feldera_runtime_sql_type_admission(
+fn validate_materialized_runtime_sql_type_admission(
     field: &str,
     data_type: &SqlDataType,
 ) -> Result<(), ApiError> {
@@ -6981,14 +2448,14 @@ fn validate_feldera_runtime_sql_type_admission(
         SqlDataType::Timestamp {
             timezone: Some(timezone),
         } => Err(ApiError::bad_request(format!(
-            "Feldera runtime admission rejected `{field}`: timezone-bearing timestamps are not supported yet; timezone={timezone}"
+            "materialized runtime admission rejected `{field}`: timezone-bearing timestamps are not supported yet; timezone={timezone}"
         ))),
         SqlDataType::Array { element_type } => {
-            validate_feldera_runtime_sql_type_admission(field, element_type)
+            validate_materialized_runtime_sql_type_admission(field, element_type)
         }
         SqlDataType::Struct { fields } => {
             for struct_field in fields {
-                validate_feldera_runtime_sql_type_admission(
+                validate_materialized_runtime_sql_type_admission(
                     &format!("{field}.{}", struct_field.name),
                     &struct_field.data_type,
                 )?;
@@ -6999,8 +2466,8 @@ fn validate_feldera_runtime_sql_type_admission(
             key_type,
             value_type,
         } => {
-            validate_feldera_runtime_sql_type_admission(&format!("{field}.key"), key_type)?;
-            validate_feldera_runtime_sql_type_admission(&format!("{field}.value"), value_type)
+            validate_materialized_runtime_sql_type_admission(&format!("{field}.key"), key_type)?;
+            validate_materialized_runtime_sql_type_admission(&format!("{field}.value"), value_type)
         }
         other => {
             arrow_data_type_from_sql_data_type(other)?;
@@ -7027,14 +2494,6 @@ fn standing_runtime_owner_token_from_claim(
         owner_id: claim.owner_id.clone(),
         owner_epoch: claim.owner_epoch,
     }
-}
-
-fn unix_epoch_millis() -> Result<u64, ApiError> {
-    let millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| ApiError::internal("system clock is before unix epoch"))?
-        .as_millis();
-    u64::try_from(millis).map_err(|_| ApiError::internal("system clock millis overflowed u64"))
 }
 
 fn process_incarnation_owner_id(operator_id: String) -> Result<String, ApiError> {
@@ -7078,11 +2537,92 @@ async fn get_view(
     Ok(Json(active_view_response(&active, None)?))
 }
 
+async fn get_view_backfill_status(
+    State(state): State<ApiState>,
+    AxumPath(view_id): AxumPath<String>,
+) -> Result<Json<BackfillViewResponse>, ApiError> {
+    let active = state
+        .view_registry()?
+        .read_active(&view_id)
+        .await
+        .map_err(materialized_view_registry_error_to_api)?;
+    let progress = committed_backfill_progress(&state, &active).await?;
+    Ok(Json(backfill_view_response(
+        &active,
+        "status",
+        "status",
+        0,
+        progress.remaining_batches,
+        progress,
+    )))
+}
+
+async fn run_view_backfill(
+    State(state): State<ApiState>,
+    AxumPath(view_id): AxumPath<String>,
+    Json(request): Json<BackfillViewRequest>,
+) -> Result<(StatusCode, Json<BackfillViewResponse>), ApiError> {
+    let mode = request.mode.as_deref().unwrap_or("sync");
+    match mode {
+        "sync" => {
+            let outcome = run_view_backfill_step(&state, &view_id, request.batch_limit).await?;
+            Ok((StatusCode::OK, Json(outcome)))
+        }
+        "background" => {
+            let batch_limit = request.batch_limit.unwrap_or(1);
+            if batch_limit == 0 {
+                return Err(ApiError::bad_request(
+                    "backfill batch_limit must be a positive integer",
+                ));
+            }
+            let pause_ms = request.pause_ms.unwrap_or(100);
+            let active = state
+                .view_registry()?
+                .read_active(&view_id)
+                .await
+                .map_err(materialized_view_registry_error_to_api)?;
+            if view_query_availability(&active.lifecycle) {
+                return Ok((
+                    StatusCode::OK,
+                    Json(backfill_view_response(
+                        &active,
+                        "already_running",
+                        mode,
+                        0,
+                        0,
+                        committed_backfill_progress(&state, &active).await?,
+                    )),
+                ));
+            }
+            if !view_backfill_is_query_triggerable(&active) {
+                ensure_view_execution_allowed(&active)?;
+            }
+            spawn_background_view_backfill(state.clone(), view_id.clone(), batch_limit, pause_ms);
+            let progress = committed_backfill_progress(&state, &active).await?;
+            Ok((
+                StatusCode::ACCEPTED,
+                Json(backfill_view_response(
+                    &active,
+                    "scheduled",
+                    mode,
+                    0,
+                    progress.remaining_batches,
+                    progress,
+                )),
+            ))
+        }
+        other => Err(ApiError::bad_request(format!(
+            "unsupported backfill mode `{other}`; expected `sync` or `background`"
+        ))),
+    }
+}
+
 struct PreparedIngestBatch {
     request: IngestRowsRequest,
     catalog: VelorixRelationCatalogV1,
     record_batch: RecordBatch,
     end_offset_exclusive: u64,
+    event_time_watermark: Option<InputEventTimeWatermark>,
     payload_digest: String,
     envelope: bytes::Bytes,
 }
@@ -7110,6 +2650,8 @@ struct IngestEpochManifestBatchRecord {
     partition_id: u32,
     start_offset_inclusive: u64,
     end_offset_exclusive: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    event_time_watermark: Option<InputEventTimeWatermark>,
     payload_digest: String,
     batch_key: String,
 }
@@ -7298,16 +2840,12 @@ async fn repair_ingest_epoch_runtime_failure(
         .read_active(&request.view_id)
         .await
         .map_err(materialized_view_registry_error_to_api)?;
-    let identity = active
-        .artifact
-        .as_ref()
-        .and_then(|artifact| artifact.standing_program_identity.as_ref())
-        .ok_or_else(|| {
-            ApiError::bad_request(format!(
-                "view `{}` is not backed by a standing runtime identity",
-                request.view_id
-            ))
-        })?;
+    let identity = active_standing_runtime_identity(&active).ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "view `{}` is not backed by a standing runtime identity",
+            request.view_id
+        ))
+    })?;
     if identity.tenant_id != request.tenant_id || identity.program_id != request.program_id {
         return Err(ApiError::bad_request(format!(
             "repair request identity does not match active view `{}`",
@@ -7384,6 +2922,7 @@ async fn prepare_ingest_batch(
         .start_offset_inclusive
         .checked_add(request.rows.len() as u64)
         .ok_or_else(|| ApiError::bad_request("ingest offset range overflow"))?;
+    let event_time_watermark = ingest_event_time_watermark(&catalog, &request, &batch)?;
     let envelope = IngestEnvelope::encode_batches(
         IngestEnvelopeEncodeRequest {
             relation_id: request.relation_id.clone(),
@@ -7393,6 +2932,7 @@ async fn prepare_ingest_batch(
             partition_id: request.partition_id,
             start_offset_inclusive: request.start_offset_inclusive,
             end_offset_exclusive,
+            event_time_watermark: event_time_watermark.clone(),
         },
         std::slice::from_ref(&batch),
     )
@@ -7407,8 +2947,155 @@ async fn prepare_ingest_batch(
         catalog,
         record_batch: batch,
         end_offset_exclusive,
+        event_time_watermark,
         payload_digest,
         envelope,
+    })
+}
+
+fn ingest_event_time_watermark(
+    catalog: &VelorixRelationCatalogV1,
+    request: &IngestRowsRequest,
+    batch: &RecordBatch,
+) -> Result<Option<InputEventTimeWatermark>, ApiError> {
+    let Some(request_watermark) = &request.event_time_watermark else {
+        return Ok(None);
+    };
+    let Some(event_time_column_id) = &catalog.relation_schema.event_time_column_id else {
+        return Err(ApiError::bad_request(
+            "event_time_watermark requires relation_schema.event_time_column_id",
+        ));
+    };
+    if request_watermark.event_time_column_id != *event_time_column_id {
+        return Err(ApiError::bad_request(format!(
+            "event_time_watermark.event_time_column_id must match relation event_time_column_id `{event_time_column_id}`"
+        )));
+    }
+    let column = catalog
+        .relation_schema
+        .columns
+        .iter()
+        .find(|column| column.column_id == *event_time_column_id)
+        .ok_or_else(|| ApiError::bad_request("relation event_time_column_id column is missing"))?;
+    match &column.physical_arrow_type {
+        ArrowPhysicalTypeV1::Int64
+        | ArrowPhysicalTypeV1::Date32
+        | ArrowPhysicalTypeV1::TimestampNanosecond { .. } => {}
+        _ => {
+            return Err(ApiError::bad_request(
+                "event_time_watermark currently supports Int64, Date32, or TimestampNanosecond event-time columns",
+            ));
+        }
+    }
+    if request_watermark.event_time_column_id.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "event_time_watermark.event_time_column_id must be nonempty",
+        ));
+    }
+    if request_watermark.watermark_ns > request_watermark.max_observed_event_time_ns {
+        return Err(ApiError::bad_request(
+            "event_time_watermark.watermark_ns must be <= max_observed_event_time_ns",
+        ));
+    }
+    let actual_max_observed = event_time_column_max_value(column, batch)?;
+    if request_watermark.max_observed_event_time_ns < actual_max_observed {
+        return Err(ApiError::bad_request(format!(
+            "event_time_watermark.max_observed_event_time_ns must be >= actual max event-time value {actual_max_observed}"
+        )));
+    }
+    Ok(Some(InputEventTimeWatermark {
+        stream_id: request.stream_id.clone(),
+        partition_id: request.partition_id,
+        event_time_column_id: request_watermark.event_time_column_id.clone(),
+        max_observed_event_time_ns: request_watermark.max_observed_event_time_ns,
+        watermark_ns: request_watermark.watermark_ns,
+    }))
+}
+
+fn event_time_column_max_value(
+    column: &RelationColumnV1,
+    batch: &RecordBatch,
+) -> Result<i64, ApiError> {
+    match &column.physical_arrow_type {
+        ArrowPhysicalTypeV1::Int64 => {
+            let array = batch
+                .column_by_name(&column.name)
+                .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+                .ok_or_else(|| ApiError::bad_request("event-time column must be Int64"))?;
+            max_int64_array_value(&column.name, array)
+        }
+        ArrowPhysicalTypeV1::Date32 => {
+            let array = batch
+                .column_by_name(&column.name)
+                .and_then(|column| column.as_any().downcast_ref::<Date32Array>())
+                .ok_or_else(|| ApiError::bad_request("event-time column must be Date32"))?;
+            max_i32_array_value(&column.name, array).map(i64::from)
+        }
+        ArrowPhysicalTypeV1::TimestampNanosecond { .. } => {
+            let array = batch
+                .column_by_name(&column.name)
+                .and_then(|column| {
+                    column.as_any().downcast_ref::<TimestampNanosecondArray>()
+                })
+                .ok_or_else(|| {
+                    ApiError::bad_request("event-time column must be TimestampNanosecond")
+                })?;
+            max_timestamp_array_value(&column.name, array)
+        }
+        _ => Err(ApiError::bad_request(
+            "event_time_watermark currently supports Int64, Date32, or TimestampNanosecond event-time columns",
+        )),
+    }
+}
+
+fn max_int64_array_value(name: &str, array: &Int64Array) -> Result<i64, ApiError> {
+    let mut max_value = None;
+    for row in 0..array.len() {
+        if !array.is_null(row) {
+            max_value = Some(max_value.map_or(array.value(row), |current: i64| {
+                current.max(array.value(row))
+            }));
+        }
+    }
+    max_value.ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "event-time column `{name}` must contain at least one non-null value"
+        ))
+    })
+}
+
+fn max_timestamp_array_value(
+    name: &str,
+    array: &TimestampNanosecondArray,
+) -> Result<i64, ApiError> {
+    let mut max_value = None;
+    for row in 0..array.len() {
+        if !array.is_null(row) {
+            max_value = Some(max_value.map_or(array.value(row), |current: i64| {
+                current.max(array.value(row))
+            }));
+        }
+    }
+    max_value.ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "event-time column `{name}` must contain at least one non-null value"
+        ))
+    })
+}
+
+fn max_i32_array_value(name: &str, array: &Date32Array) -> Result<i32, ApiError> {
+    let mut max_value = None;
+    for row in 0..array.len() {
+        if !array.is_null(row) {
+            max_value = Some(max_value.map_or(array.value(row), |current: i32| {
+                current.max(array.value(row))
+            }));
+        }
+    }
+    max_value.ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "event-time column `{name}` must contain at least one non-null value"
+        ))
     })
 }
 
@@ -7598,6 +3285,7 @@ fn ingest_epoch_manifest_batch_record(
         partition_id: prepared.request.partition_id,
         start_offset_inclusive: prepared.request.start_offset_inclusive,
         end_offset_exclusive: prepared.end_offset_exclusive,
+        event_time_watermark: prepared.event_time_watermark.clone(),
         payload_digest: prepared.payload_digest.clone(),
         batch_key: batch_key.as_str().to_string(),
     })
@@ -7718,6 +3406,7 @@ async fn read_ingest_epoch_view_convergence(
         checkpoint_key: record.checkpoint_key.clone(),
         logical_epoch: record.logical_epoch,
         content_hash: record.checkpoint_content_hash.clone(),
+        output_manifest_refs: Vec::new(),
     };
     let checkpoint =
         read_standing_runtime_checkpoint_record_from_pointer(state, identity, view_id, &pointer)
@@ -7876,6 +3565,36 @@ fn ingest_epoch_view_runtime_failure_error(
     ))
 }
 
+async fn standing_runtime_create_requires_backfill(
+    state: &ApiState,
+    spec: &StandingViewSpec,
+) -> Result<bool, ApiError> {
+    if spec.input_relations.is_empty() {
+        return Ok(false);
+    }
+    let ingest_log =
+        IngestLog::new_catalog_checked(Arc::clone(&state.store), state.capabilities.as_ref())
+            .map_err(ApiError::internal)?;
+    let batches = ingest_log
+        .replay_admitted_validated_envelopes_from(&[])
+        .await
+        .map_err(ApiError::internal)?;
+    for batch in batches {
+        let envelope =
+            IngestEnvelope::decode(batch.payload().clone()).map_err(ApiError::bad_request)?;
+        let header = envelope.header();
+        if spec.input_relations.iter().any(|input| {
+            header.relation_id == input.relation_id
+                && header.relation_version == input.relation_version
+                && header.schema_fingerprint == input.schema_fingerprint
+        }) {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
 async fn ensure_standing_runtimes_for_ingest(
     state: &ApiState,
     request: &IngestRowsRequest,
@@ -7887,11 +3606,10 @@ async fn ensure_standing_runtimes_for_ingest(
         .map_err(materialized_view_registry_error_to_api)?;
     let mut needs_restore = false;
     for active in &active_views {
-        let Some(identity) = active
-            .artifact
-            .as_ref()
-            .and_then(|artifact| artifact.standing_program_identity.as_ref())
-        else {
+        if !standing_runtime_can_accept_incremental_ingest(active) {
+            continue;
+        }
+        let Some(identity) = active_standing_runtime_identity(&active) else {
             continue;
         };
         if !view_uses_ingest_relation(active, request) {
@@ -7913,11 +3631,10 @@ async fn ensure_standing_runtimes_for_ingest(
     }
 
     for active in active_views {
-        let Some(identity) = active
-            .artifact
-            .as_ref()
-            .and_then(|artifact| artifact.standing_program_identity.as_ref())
-        else {
+        if !standing_runtime_can_accept_incremental_ingest(&active) {
+            continue;
+        }
+        let Some(identity) = active_standing_runtime_identity(&active) else {
             continue;
         };
         if !view_uses_ingest_relation(&active, request) {
@@ -7928,7 +3645,7 @@ async fn ensure_standing_runtimes_for_ingest(
             .is_none()
         {
             return Err(ApiError::service_unavailable(format!(
-                "standing runtime is unavailable for active artifact-backed view `{}`",
+                "standing runtime is unavailable for active view `{}`",
                 active.spec.view_id
             )));
         }
@@ -7947,11 +3664,10 @@ async fn preacquire_standing_runtime_owners_for_ingest(
         .await
         .map_err(materialized_view_registry_error_to_api)?;
     for active in active_views {
-        let Some(identity) = active
-            .artifact
-            .as_ref()
-            .and_then(|artifact| artifact.standing_program_identity.as_ref())
-        else {
+        if !standing_runtime_can_accept_incremental_ingest(&active) {
+            continue;
+        }
+        let Some(identity) = active_standing_runtime_identity(&active) else {
             continue;
         };
         if !view_uses_ingest_relation(&active, request) {
@@ -7983,11 +3699,10 @@ async fn apply_standing_runtime_ingests(
         .await
         .map_err(materialized_view_registry_error_to_api)?;
     for active in active_views {
-        let Some(identity) = active
-            .artifact
-            .as_ref()
-            .and_then(|artifact| artifact.standing_program_identity.as_ref())
-        else {
+        if !standing_runtime_can_accept_incremental_ingest(&active) {
+            continue;
+        }
+        let Some(identity) = active_standing_runtime_identity(&active) else {
             continue;
         };
         if !requests
@@ -8021,11 +3736,10 @@ async fn apply_standing_runtime_ingests_for_epoch_repair(
         .await
         .map_err(materialized_view_registry_error_to_api)?;
     for active in active_views {
-        let Some(identity) = active
-            .artifact
-            .as_ref()
-            .and_then(|artifact| artifact.standing_program_identity.as_ref())
-        else {
+        if !standing_runtime_can_accept_incremental_ingest(&active) {
+            continue;
+        }
+        let Some(identity) = active_standing_runtime_identity(&active) else {
             continue;
         };
         if !requests
@@ -8086,11 +3800,10 @@ async fn ensure_no_ingest_epoch_view_runtime_failures(
         .await
         .map_err(materialized_view_registry_error_to_api)?;
     for active in active_views {
-        let Some(identity) = active
-            .artifact
-            .as_ref()
-            .and_then(|artifact| artifact.standing_program_identity.as_ref())
-        else {
+        if !standing_runtime_can_accept_incremental_ingest(&active) {
+            continue;
+        }
+        let Some(identity) = active_standing_runtime_identity(&active) else {
             continue;
         };
         if !prepared_batches
@@ -8135,11 +3848,10 @@ async fn apply_standing_runtime_ingest_epoch(
         .await
         .map_err(materialized_view_registry_error_to_api)?;
     for active in active_views {
-        let Some(identity) = active
-            .artifact
-            .as_ref()
-            .and_then(|artifact| artifact.standing_program_identity.as_ref())
-        else {
+        if !standing_runtime_can_accept_incremental_ingest(&active) {
+            continue;
+        }
+        let Some(identity) = active_standing_runtime_identity(&active) else {
             continue;
         };
         let matching_prepared_batches = prepared_batches
@@ -8212,7 +3924,7 @@ async fn apply_standing_runtime_ingest_epoch(
             .standing_runtime(identity, &active.spec.view_id)?
             .ok_or_else(|| {
                 ApiError::service_unavailable(format!(
-                    "standing runtime disappeared for active artifact-backed view `{}`",
+                    "standing runtime disappeared for active view `{}`",
                     active.spec.view_id
                 ))
             })?;
@@ -8224,15 +3936,15 @@ async fn apply_standing_runtime_ingest_epoch(
             matching_prepared_batches.iter().copied(),
         )
         .map_err(ApiError::bad_request)?;
-        let checkpoint = apply_standing_runtime_changes_and_checkpoint_many(
+        let apply_result = apply_standing_runtime_changes_and_checkpoint_many(
             Arc::clone(&runtime),
             0,
             idempotency_key,
             input_batches,
         )
         .await;
-        let checkpoint = match checkpoint {
-            Ok(checkpoint) => checkpoint,
+        let apply_result = match apply_result {
+            Ok(apply_result) => apply_result,
             Err(error) => {
                 persist_ingest_epoch_view_runtime_failure(
                     state,
@@ -8250,7 +3962,8 @@ async fn apply_standing_runtime_ingest_epoch(
         if let Err(error) = persist_standing_runtime_checkpoint(
             state,
             &active.spec.view_id,
-            &checkpoint,
+            &apply_result.checkpoint,
+            &apply_result.output_deltas,
             replay_checkpoints.clone(),
             owner,
         )
@@ -8263,7 +3976,7 @@ async fn apply_standing_runtime_ingest_epoch(
             state,
             epoch_manifest,
             &active.spec.view_id,
-            &checkpoint,
+            &apply_result.checkpoint,
             replay_checkpoints,
         )
         .await?;
@@ -8297,6 +4010,7 @@ fn relation_input_batch_from_prepared_ingest(prepared: &PreparedIngestBatch) -> 
         schema_fingerprint: prepared.catalog.schema_fingerprint.as_str().to_string(),
         start_offset_inclusive: prepared.request.start_offset_inclusive,
         end_offset_exclusive: prepared.end_offset_exclusive,
+        event_time_watermark: prepared.event_time_watermark.clone(),
         batches: vec![prepared.record_batch.clone()],
     }
 }
@@ -8348,7 +4062,7 @@ async fn apply_standing_runtime_changes_and_checkpoint(
     lower_bound_epoch: u64,
     idempotency_key: EpochIdempotencyKey,
     input_batch: RelationInputBatch,
-) -> Result<RuntimeCheckpoint, ApiError> {
+) -> Result<StandingRuntimeApplyResult, ApiError> {
     apply_standing_runtime_changes_and_checkpoint_many(
         runtime,
         lower_bound_epoch,
@@ -8363,17 +4077,21 @@ async fn apply_standing_runtime_changes_and_checkpoint_many(
     lower_bound_epoch: u64,
     idempotency_key: EpochIdempotencyKey,
     input_batches: Vec<RelationInputBatch>,
-) -> Result<RuntimeCheckpoint, ApiError> {
+) -> Result<StandingRuntimeApplyResult, ApiError> {
     tokio::task::spawn_blocking(move || {
         let mut runtime = runtime
             .lock()
             .map_err(|_| ApiError::internal("standing runtime lock poisoned"))?;
         let logical_epoch =
             next_standing_runtime_logical_epoch(runtime.as_ref(), lower_bound_epoch)?;
-        runtime
+        let commit = runtime
             .apply_changes(logical_epoch, idempotency_key, input_batches)
             .map_err(ApiError::bad_request)?;
-        runtime.checkpoint().map_err(ApiError::bad_request)
+        let checkpoint = runtime.checkpoint().map_err(ApiError::bad_request)?;
+        Ok(StandingRuntimeApplyResult {
+            checkpoint,
+            output_deltas: commit.output_deltas,
+        })
     })
     .await
     .map_err(ApiError::internal)?
@@ -8383,6 +4101,7 @@ async fn persist_standing_runtime_checkpoint(
     state: &ApiState,
     view_id: &str,
     checkpoint: &RuntimeCheckpoint,
+    output_deltas: &[ViewOutputDelta],
     replay_checkpoints_to_merge: Vec<ReplayCheckpoint>,
     owner: Option<StandingRuntimeOwnerToken>,
 ) -> Result<(), ApiError> {
@@ -8404,6 +4123,49 @@ async fn persist_standing_runtime_checkpoint(
     let expected_previous = previous_record
         .as_ref()
         .map(standing_runtime_checkpoint_pointer_from_record);
+    let output_manifest = standing_runtime_output_manifest_record_for_checkpoint(
+        checkpoint,
+        view_id,
+        &checkpoint_key,
+    )?;
+    if let Some(output_manifest) = &output_manifest {
+        for (output_page_key, output_page_record) in &output_manifest.page_records {
+            persist_standing_runtime_output_page(state, output_page_key, output_page_record)
+                .await?;
+        }
+        persist_standing_runtime_output_manifest(
+            state,
+            &output_manifest.manifest_key,
+            &output_manifest.manifest_record,
+        )
+        .await?;
+    }
+    let output_delta_publications =
+        standing_runtime_output_delta_records_for_checkpoint(checkpoint, view_id, output_deltas)?;
+    for publication in &output_delta_publications {
+        persist_standing_runtime_output_delta(
+            state,
+            &publication.delta_key,
+            &publication.delta_record,
+        )
+        .await?;
+    }
+    let (state_payload_key, state_payload_record) =
+        standing_runtime_state_payload_record_for_checkpoint(checkpoint, view_id)?;
+    persist_standing_runtime_state_payload(state, &state_payload_key, &state_payload_record)
+        .await?;
+    let checkpoint_for_record = standing_runtime_checkpoint_with_durable_publication_refs(
+        checkpoint,
+        output_manifest
+            .as_ref()
+            .map(|publication| &publication.manifest_key),
+        output_delta_publications
+            .iter()
+            .map(|publication| &publication.delta_key)
+            .collect::<Vec<_>>()
+            .as_slice(),
+        &state_payload_key,
+    );
     let candidate = standing_runtime_checkpoint_pointer_from_key(
         &checkpoint_key,
         &checkpoint.identity.tenant_id,
@@ -8411,6 +4173,7 @@ async fn persist_standing_runtime_checkpoint(
         view_id,
         checkpoint.logical_epoch,
         &checkpoint.state_root.content_hash,
+        checkpoint_for_record.output_manifest_refs.clone(),
     )?;
     let previous_checkpoint = if expected_previous.as_ref() == Some(&candidate) {
         previous_record
@@ -8435,7 +4198,7 @@ async fn persist_standing_runtime_checkpoint(
         view_id: view_id.to_string(),
         checkpoint_key: checkpoint_key.as_str().to_string(),
         previous_checkpoint,
-        checkpoint: checkpoint.clone(),
+        checkpoint: checkpoint_for_record,
         replay_checkpoints,
     };
     let bytes =
@@ -8492,6 +4255,408 @@ async fn persist_standing_runtime_checkpoint(
     Ok(())
 }
 
+fn standing_runtime_checkpoint_with_publication_output_refs(
+    checkpoint: &RuntimeCheckpoint,
+    output_manifest_key: Option<&ObjectKey>,
+    output_delta_keys: &[&ObjectKey],
+) -> RuntimeCheckpoint {
+    let mut checkpoint = checkpoint.clone();
+    checkpoint.output_manifest_refs.clear();
+    if let Some(output_manifest_key) = output_manifest_key {
+        checkpoint.output_manifest_refs.push(format!(
+            "{STANDING_RUNTIME_OUTPUT_MANIFEST_REF_PREFIX}{}",
+            output_manifest_key.as_str()
+        ));
+    }
+    checkpoint
+        .output_manifest_refs
+        .extend(output_delta_keys.iter().map(|output_delta_key| {
+            format!(
+                "{STANDING_RUNTIME_OUTPUT_DELTA_REF_PREFIX}{}",
+                output_delta_key.as_str()
+            )
+        }));
+    checkpoint
+}
+
+fn standing_runtime_checkpoint_with_durable_publication_refs(
+    checkpoint: &RuntimeCheckpoint,
+    output_manifest_key: Option<&ObjectKey>,
+    output_delta_keys: &[&ObjectKey],
+    state_payload_key: &ObjectKey,
+) -> RuntimeCheckpoint {
+    let mut checkpoint = standing_runtime_checkpoint_with_publication_output_refs(
+        checkpoint,
+        output_manifest_key,
+        output_delta_keys,
+    );
+    checkpoint.state_root.object_key = state_payload_key.as_str().to_string();
+    checkpoint.state_payload = None;
+    checkpoint
+}
+
+fn standing_runtime_state_payload_record_for_checkpoint(
+    checkpoint: &RuntimeCheckpoint,
+    view_id: &str,
+) -> Result<(ObjectKey, StandingRuntimeStatePayloadRecord), ApiError> {
+    let Some(payload) = checkpoint.state_payload.clone() else {
+        return Err(ApiError::bad_request(format!(
+            "standing runtime checkpoint for view `{view_id}` is missing state payload"
+        )));
+    };
+    if payload.codec_identity != checkpoint.checkpoint_codec_identity {
+        return Err(ApiError::bad_request(format!(
+            "standing runtime checkpoint state payload codec mismatch for view `{view_id}`"
+        )));
+    }
+    let actual_state_hash = stable_bytes_hash(payload.payload.as_bytes());
+    if actual_state_hash != checkpoint.state_root.content_hash {
+        return Err(ApiError::bad_request(format!(
+            "standing runtime checkpoint state payload hash mismatch for view `{view_id}`"
+        )));
+    }
+    let key = ObjectKey::standing_runtime_state_payload(
+        &checkpoint.identity.tenant_id,
+        &checkpoint.identity.program_id,
+        view_id,
+        checkpoint.logical_epoch,
+        &checkpoint.state_root.content_hash,
+    )
+    .map_err(ApiError::bad_request)?;
+    let record = StandingRuntimeStatePayloadRecord {
+        schema_version: 1,
+        record_kind: "standing_runtime_state_payload_v1".to_string(),
+        tenant_id: checkpoint.identity.tenant_id.clone(),
+        program_id: checkpoint.identity.program_id.clone(),
+        view_id: view_id.to_string(),
+        logical_epoch: checkpoint.logical_epoch,
+        checkpoint_codec_identity: checkpoint.checkpoint_codec_identity.clone(),
+        state_content_hash: checkpoint.state_root.content_hash.clone(),
+        source_kind: "standing_runtime_checkpoint_state_payload".to_string(),
+        payload,
+    };
+    validate_standing_runtime_state_payload_record(&key, &record)?;
+    Ok((key, record))
+}
+
+async fn persist_standing_runtime_state_payload(
+    state: &ApiState,
+    state_payload_key: &ObjectKey,
+    record: &StandingRuntimeStatePayloadRecord,
+) -> Result<(), ApiError> {
+    let bytes =
+        serde_json::to_vec(record).map_err(|source| ApiError::internal(source.to_string()))?;
+    let path = ObjectPath::from(state_payload_key.as_str());
+    let result = state
+        .store
+        .put_opts(
+            &path,
+            bytes::Bytes::from(bytes.clone()).into(),
+            PutMode::Create.into(),
+        )
+        .await;
+    match result {
+        Ok(_) => Ok(()),
+        Err(object_store::Error::AlreadyExists { .. }) => {
+            let existing = state
+                .store
+                .get(&path)
+                .await
+                .map_err(ApiError::internal)?
+                .bytes()
+                .await
+                .map_err(ApiError::internal)?;
+            if existing.as_ref() == bytes.as_slice() {
+                Ok(())
+            } else {
+                Err(ApiError::conflict(format!(
+                    "standing runtime state payload conflict at {}",
+                    state_payload_key.as_str()
+                )))
+            }
+        }
+        Err(error) => Err(ApiError::internal(error)),
+    }
+}
+
+fn standing_runtime_output_manifest_record_for_checkpoint(
+    checkpoint: &RuntimeCheckpoint,
+    view_id: &str,
+    checkpoint_key: &ObjectKey,
+) -> Result<Option<StandingRuntimeOutputPublication>, ApiError> {
+    let Some(published_output) = standing_runtime_checkpoint_published_output(checkpoint) else {
+        return Ok(None);
+    };
+    let output_row_count = standing_runtime_published_output_row_count(&published_output)?;
+    let output_bytes = serde_json::to_vec(&published_output)
+        .map_err(|source| ApiError::internal(source.to_string()))?;
+    let output_content_hash = stable_bytes_hash(&output_bytes);
+    let output_page_key = ObjectKey::standing_runtime_output_page(
+        &checkpoint.identity.tenant_id,
+        &checkpoint.identity.program_id,
+        view_id,
+        checkpoint.logical_epoch,
+        0,
+        &output_content_hash,
+    )
+    .map_err(ApiError::bad_request)?;
+    let page_ref = StandingRuntimeOutputPageRef {
+        page_index: 0,
+        page_key: output_page_key.as_str().to_string(),
+        page_content_hash: output_content_hash.clone(),
+        row_count: output_row_count,
+        output_encoding: "velorix-delta-batch-json-v1".to_string(),
+    };
+    let page_record = StandingRuntimeOutputPageRecord {
+        schema_version: 1,
+        record_kind: "standing_runtime_output_page_v1".to_string(),
+        tenant_id: checkpoint.identity.tenant_id.clone(),
+        program_id: checkpoint.identity.program_id.clone(),
+        view_id: view_id.to_string(),
+        logical_epoch: checkpoint.logical_epoch,
+        output_content_hash: output_content_hash.clone(),
+        page_index: 0,
+        page_content_hash: output_content_hash.clone(),
+        row_count: output_row_count,
+        output_encoding: "velorix-delta-batch-json-v1".to_string(),
+        source_kind: "standing_runtime_checkpoint_published_output".to_string(),
+        published_output: published_output.clone(),
+    };
+    let output_manifest_key = ObjectKey::standing_runtime_output_manifest(
+        &checkpoint.identity.tenant_id,
+        &checkpoint.identity.program_id,
+        view_id,
+        checkpoint.logical_epoch,
+        &output_content_hash,
+    )
+    .map_err(ApiError::bad_request)?;
+    let record = StandingRuntimeOutputManifestRecord {
+        schema_version: 1,
+        record_kind: "standing_runtime_output_manifest_v1".to_string(),
+        tenant_id: checkpoint.identity.tenant_id.clone(),
+        program_id: checkpoint.identity.program_id.clone(),
+        view_id: view_id.to_string(),
+        checkpoint_key: checkpoint_key.as_str().to_string(),
+        logical_epoch: checkpoint.logical_epoch,
+        checkpoint_content_hash: checkpoint.state_root.content_hash.clone(),
+        output_content_hash,
+        output_encoding: "velorix-delta-batch-json-v1".to_string(),
+        output_row_count,
+        source_kind: "standing_runtime_checkpoint_published_output".to_string(),
+        pages: vec![page_ref],
+        published_output,
+    };
+    validate_standing_runtime_output_page_record(&output_page_key, &page_record)?;
+    validate_standing_runtime_output_manifest_record(&output_manifest_key, &record)?;
+    Ok(Some(StandingRuntimeOutputPublication {
+        manifest_key: output_manifest_key,
+        manifest_record: record,
+        page_records: vec![(output_page_key, page_record)],
+    }))
+}
+
+async fn persist_standing_runtime_output_page(
+    state: &ApiState,
+    output_page_key: &ObjectKey,
+    record: &StandingRuntimeOutputPageRecord,
+) -> Result<(), ApiError> {
+    let bytes =
+        serde_json::to_vec(record).map_err(|source| ApiError::internal(source.to_string()))?;
+    let path = ObjectPath::from(output_page_key.as_str());
+    let result = state
+        .store
+        .put_opts(
+            &path,
+            bytes::Bytes::from(bytes.clone()).into(),
+            PutMode::Create.into(),
+        )
+        .await;
+    match result {
+        Ok(_) => Ok(()),
+        Err(object_store::Error::AlreadyExists { .. }) => {
+            let existing = state
+                .store
+                .get(&path)
+                .await
+                .map_err(ApiError::internal)?
+                .bytes()
+                .await
+                .map_err(ApiError::internal)?;
+            if existing.as_ref() == bytes.as_slice() {
+                Ok(())
+            } else {
+                Err(ApiError::conflict(format!(
+                    "standing runtime output page conflict at {}",
+                    output_page_key.as_str()
+                )))
+            }
+        }
+        Err(error) => Err(ApiError::internal(error)),
+    }
+}
+
+async fn persist_standing_runtime_output_manifest(
+    state: &ApiState,
+    output_manifest_key: &ObjectKey,
+    record: &StandingRuntimeOutputManifestRecord,
+) -> Result<(), ApiError> {
+    let bytes =
+        serde_json::to_vec(record).map_err(|source| ApiError::internal(source.to_string()))?;
+    let path = ObjectPath::from(output_manifest_key.as_str());
+    let result = state
+        .store
+        .put_opts(
+            &path,
+            bytes::Bytes::from(bytes.clone()).into(),
+            PutMode::Create.into(),
+        )
+        .await;
+    match result {
+        Ok(_) => Ok(()),
+        Err(object_store::Error::AlreadyExists { .. }) => {
+            let existing = state
+                .store
+                .get(&path)
+                .await
+                .map_err(ApiError::internal)?
+                .bytes()
+                .await
+                .map_err(ApiError::internal)?;
+            if existing.as_ref() == bytes.as_slice() {
+                Ok(())
+            } else {
+                Err(ApiError::conflict(format!(
+                    "standing runtime output manifest conflict at {}",
+                    output_manifest_key.as_str()
+                )))
+            }
+        }
+        Err(error) => Err(ApiError::internal(error)),
+    }
+}
+
+fn standing_runtime_output_delta_records_for_checkpoint(
+    checkpoint: &RuntimeCheckpoint,
+    view_id: &str,
+    output_deltas: &[ViewOutputDelta],
+) -> Result<Vec<StandingRuntimeDeltaPublication>, ApiError> {
+    let mut publications = Vec::new();
+    for output_delta in output_deltas {
+        if output_delta.view_id != view_id {
+            return Err(ApiError::bad_request(format!(
+                "standing runtime output delta identity does not match view `{view_id}`"
+            )));
+        }
+        let output_delta_value = serde_json::to_value(&output_delta.delta)
+            .map_err(|source| ApiError::internal(source.to_string()))?;
+        let delta_bytes = serde_json::to_vec(&output_delta_value)
+            .map_err(|source| ApiError::internal(source.to_string()))?;
+        let delta_content_hash = stable_bytes_hash(&delta_bytes);
+        let delta_key = ObjectKey::standing_runtime_output_delta(
+            &checkpoint.identity.tenant_id,
+            &checkpoint.identity.program_id,
+            view_id,
+            checkpoint.logical_epoch,
+            &delta_content_hash,
+        )
+        .map_err(ApiError::bad_request)?;
+        let delta_row_count = output_delta
+            .delta
+            .net_rows()
+            .map_err(|_| ApiError::bad_request("standing runtime output delta is malformed"))?
+            .len();
+        let delta_record = StandingRuntimeOutputDeltaRecord {
+            schema_version: 1,
+            record_kind: "standing_runtime_output_delta_v1".to_string(),
+            tenant_id: checkpoint.identity.tenant_id.clone(),
+            program_id: checkpoint.identity.program_id.clone(),
+            view_id: view_id.to_string(),
+            logical_epoch: checkpoint.logical_epoch,
+            schema_fingerprint: output_delta.schema_fingerprint.clone(),
+            delta_content_hash,
+            delta_encoding: "velorix-delta-batch-json-v1".to_string(),
+            delta_row_count,
+            source_kind: "standing_runtime_epoch_output_delta".to_string(),
+            output_delta: output_delta_value,
+        };
+        validate_standing_runtime_output_delta_record(&delta_key, &delta_record)?;
+        publications.push(StandingRuntimeDeltaPublication {
+            delta_key,
+            delta_record,
+        });
+    }
+    Ok(publications)
+}
+
+async fn persist_standing_runtime_output_delta(
+    state: &ApiState,
+    output_delta_key: &ObjectKey,
+    record: &StandingRuntimeOutputDeltaRecord,
+) -> Result<(), ApiError> {
+    let bytes =
+        serde_json::to_vec(record).map_err(|source| ApiError::internal(source.to_string()))?;
+    let path = ObjectPath::from(output_delta_key.as_str());
+    let result = state
+        .store
+        .put_opts(
+            &path,
+            bytes::Bytes::from(bytes.clone()).into(),
+            PutMode::Create.into(),
+        )
+        .await;
+    match result {
+        Ok(_) => Ok(()),
+        Err(object_store::Error::AlreadyExists { .. }) => {
+            let existing = state
+                .store
+                .get(&path)
+                .await
+                .map_err(ApiError::internal)?
+                .bytes()
+                .await
+                .map_err(ApiError::internal)?;
+            if existing.as_ref() == bytes.as_slice() {
+                Ok(())
+            } else {
+                Err(ApiError::conflict(format!(
+                    "standing runtime output delta conflict at {}",
+                    output_delta_key.as_str()
+                )))
+            }
+        }
+        Err(error) => Err(ApiError::internal(error)),
+    }
+}
+
+fn standing_runtime_checkpoint_published_output(checkpoint: &RuntimeCheckpoint) -> Option<Value> {
+    let Some(state_payload) = &checkpoint.state_payload else {
+        return None;
+    };
+    let Ok(payload) = serde_json::from_str::<Value>(&state_payload.payload) else {
+        return None;
+    };
+    payload
+        .get("published_output")
+        .filter(|published_output| !published_output.is_null())
+        .cloned()
+}
+
+fn standing_runtime_published_output_row_count(
+    published_output: &Value,
+) -> Result<usize, ApiError> {
+    let output: DeltaBatch = serde_json::from_value(published_output.clone())
+        .map_err(|source| ApiError::bad_request(source.to_string()))?;
+    let rows = output
+        .net_rows()
+        .map_err(|source| ApiError::bad_request(source.to_string()))?;
+    if rows.iter().any(|row| row.weight != 1) {
+        return Err(ApiError::bad_request(
+            "standing runtime published output contains non-materialized row weights",
+        ));
+    }
+    Ok(rows.len())
+}
+
 async fn publish_standing_runtime_checkpoint_pointer(
     state: &ApiState,
     expected_previous: Option<StandingRuntimeCheckpointPointer>,
@@ -8532,14 +4697,7 @@ fn standing_runtime_checkpoint_pointer_from_record(
         checkpoint_key: record.checkpoint_key.clone(),
         logical_epoch: record.checkpoint.logical_epoch,
         content_hash: record.checkpoint.state_root.content_hash.clone(),
-    }
-}
-
-fn standing_runtime_replay_plan_from_record(
-    record: StandingRuntimeCheckpointRecord,
-) -> StandingRuntimeReplayPlan {
-    StandingRuntimeReplayPlan {
-        replay_checkpoints: record.replay_checkpoints,
+        output_manifest_refs: record.checkpoint.output_manifest_refs.clone(),
     }
 }
 
@@ -8558,6 +4716,7 @@ fn standing_runtime_checkpoint_pointer_from_key(
     view_id: &str,
     logical_epoch: u64,
     content_hash: &str,
+    output_manifest_refs: Vec<String>,
 ) -> Result<StandingRuntimeCheckpointPointer, ApiError> {
     let pointer = StandingRuntimeCheckpointPointer {
         tenant_id: tenant_id.to_string(),
@@ -8566,6 +4725,7 @@ fn standing_runtime_checkpoint_pointer_from_key(
         checkpoint_key: checkpoint_key.as_str().to_string(),
         logical_epoch,
         content_hash: content_hash.to_string(),
+        output_manifest_refs,
     };
     let (_, parts) = ObjectKey::parse_standing_runtime_checkpoint(pointer.checkpoint_key.clone())
         .map_err(ApiError::bad_request)?;
@@ -8678,6 +4838,18 @@ async fn read_latest_standing_runtime_checkpoint(
             identity.tenant_id, identity.program_id
         )));
     }
+    let pointer = StandingRuntimeCheckpointPointer {
+        tenant_id: checkpoint_key_parts.tenant_id,
+        program_id: checkpoint_key_parts.program_id,
+        view_id: checkpoint_key_parts.view_id,
+        checkpoint_key: latest_checkpoint_path,
+        logical_epoch: checkpoint_key_parts.logical_epoch,
+        content_hash: checkpoint_key_parts.content_hash,
+        output_manifest_refs: record.checkpoint.output_manifest_refs.clone(),
+    };
+    validate_standing_runtime_checkpoint_output_refs(&record, &pointer)?;
+    hydrate_standing_runtime_checkpoint_state_payload(state, &mut record).await?;
+    validate_standing_runtime_checkpoint_output_manifest_records(state, &record).await?;
     validate_standing_runtime_checkpoint_replay_frontiers(&record)?;
 
     Ok(Some(record))
@@ -8703,6 +4875,8 @@ async fn read_standing_runtime_checkpoint_record_from_pointer(
         record.checkpoint_key = pointer.checkpoint_key.clone();
     }
     validate_standing_runtime_checkpoint_record(identity, view_id, pointer, &record)?;
+    hydrate_standing_runtime_checkpoint_state_payload(state, &mut record).await?;
+    validate_standing_runtime_checkpoint_output_manifest_records(state, &record).await?;
     validate_standing_runtime_checkpoint_replay_frontiers(&record)?;
     Ok(record)
 }
@@ -8729,6 +4903,8 @@ fn validate_standing_runtime_checkpoint_record(
         || pointer.checkpoint_key != record.checkpoint_key
         || pointer.logical_epoch != record.checkpoint.logical_epoch
         || pointer.content_hash != record.checkpoint.state_root.content_hash
+        || (!pointer.output_manifest_refs.is_empty()
+            && pointer.output_manifest_refs != record.checkpoint.output_manifest_refs)
     {
         return Err(ApiError::bad_request(format!(
             "standing runtime checkpoint pointer/body mismatch for `{}/{}/{view_id}`",
@@ -8748,6 +4924,488 @@ fn validate_standing_runtime_checkpoint_record(
         return Err(ApiError::bad_request(format!(
             "standing runtime checkpoint pointer key/body mismatch for `{}/{}/{view_id}`",
             identity.tenant_id, identity.program_id
+        )));
+    }
+    validate_standing_runtime_checkpoint_output_refs(record, pointer)?;
+    Ok(())
+}
+
+async fn hydrate_standing_runtime_checkpoint_state_payload(
+    state: &ApiState,
+    record: &mut StandingRuntimeCheckpointRecord,
+) -> Result<(), ApiError> {
+    let state_root_key = record.checkpoint.state_root.object_key.clone();
+    let parsed_state_key = ObjectKey::parse_standing_runtime_state_payload(state_root_key.clone());
+    let Ok((state_payload_key, parts)) = parsed_state_key else {
+        if record.checkpoint.state_payload.is_some() {
+            return Ok(());
+        }
+        return Err(ApiError::bad_request(format!(
+            "standing runtime checkpoint for view `{}` is missing durable state payload root",
+            record.view_id
+        )));
+    };
+    if parts.tenant_id != record.checkpoint.identity.tenant_id
+        || parts.program_id != record.checkpoint.identity.program_id
+        || parts.view_id != record.view_id
+        || parts.logical_epoch != record.checkpoint.logical_epoch
+        || parts.state_content_hash != record.checkpoint.state_root.content_hash
+    {
+        return Err(ApiError::bad_request(format!(
+            "standing runtime checkpoint state payload key/body mismatch for `{}/{}/{}`",
+            record.checkpoint.identity.tenant_id,
+            record.checkpoint.identity.program_id,
+            record.view_id
+        )));
+    }
+    let bytes = state
+        .store
+        .get(&ObjectPath::from(state_payload_key.as_str()))
+        .await
+        .map_err(ApiError::internal)?
+        .bytes()
+        .await
+        .map_err(ApiError::internal)?;
+    let state_payload_record: StandingRuntimeStatePayloadRecord = serde_json::from_slice(&bytes)
+        .map_err(|source| ApiError::bad_request(source.to_string()))?;
+    validate_standing_runtime_state_payload_record(&state_payload_key, &state_payload_record)?;
+    if state_payload_record.tenant_id != record.checkpoint.identity.tenant_id
+        || state_payload_record.program_id != record.checkpoint.identity.program_id
+        || state_payload_record.view_id != record.view_id
+        || state_payload_record.logical_epoch != record.checkpoint.logical_epoch
+        || state_payload_record.checkpoint_codec_identity
+            != record.checkpoint.checkpoint_codec_identity
+        || state_payload_record.state_content_hash != record.checkpoint.state_root.content_hash
+    {
+        return Err(ApiError::bad_request(format!(
+            "standing runtime checkpoint state payload record mismatch for `{}/{}/{}`",
+            record.checkpoint.identity.tenant_id,
+            record.checkpoint.identity.program_id,
+            record.view_id
+        )));
+    }
+    if let Some(existing_payload) = &record.checkpoint.state_payload {
+        if existing_payload != &state_payload_record.payload {
+            return Err(ApiError::bad_request(format!(
+                "standing runtime checkpoint embedded state payload mismatch for `{}/{}/{}`",
+                record.checkpoint.identity.tenant_id,
+                record.checkpoint.identity.program_id,
+                record.view_id
+            )));
+        }
+    }
+    record.checkpoint.state_payload = Some(state_payload_record.payload);
+    Ok(())
+}
+
+fn validate_standing_runtime_checkpoint_output_refs(
+    record: &StandingRuntimeCheckpointRecord,
+    pointer: &StandingRuntimeCheckpointPointer,
+) -> Result<(), ApiError> {
+    for output_ref in &record.checkpoint.output_manifest_refs {
+        if let Some(output_manifest_key) =
+            output_ref.strip_prefix(STANDING_RUNTIME_OUTPUT_MANIFEST_REF_PREFIX)
+        {
+            let (parsed_key, parts) =
+                ObjectKey::parse_standing_runtime_output_manifest(output_manifest_key.to_string())
+                    .map_err(ApiError::bad_request)?;
+            if parsed_key.as_str() != output_manifest_key
+                || parts.tenant_id != pointer.tenant_id
+                || parts.program_id != pointer.program_id
+                || parts.view_id != pointer.view_id
+                || parts.logical_epoch != pointer.logical_epoch
+            {
+                return Err(ApiError::bad_request(format!(
+                    "standing runtime checkpoint output manifest ref mismatch for `{}/{}/{}`",
+                    pointer.tenant_id, pointer.program_id, pointer.view_id
+                )));
+            }
+        } else if let Some(output_delta_key) =
+            output_ref.strip_prefix(STANDING_RUNTIME_OUTPUT_DELTA_REF_PREFIX)
+        {
+            let (parsed_key, parts) =
+                ObjectKey::parse_standing_runtime_output_delta(output_delta_key.to_string())
+                    .map_err(ApiError::bad_request)?;
+            if parsed_key.as_str() != output_delta_key
+                || parts.tenant_id != pointer.tenant_id
+                || parts.program_id != pointer.program_id
+                || parts.view_id != pointer.view_id
+                || parts.logical_epoch != pointer.logical_epoch
+            {
+                return Err(ApiError::bad_request(format!(
+                    "standing runtime checkpoint output delta ref mismatch for `{}/{}/{}`",
+                    pointer.tenant_id, pointer.program_id, pointer.view_id
+                )));
+            }
+        } else {
+            return Err(ApiError::bad_request(format!(
+                "unsupported standing runtime checkpoint output ref for view `{}`",
+                record.view_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn validate_standing_runtime_checkpoint_output_manifest_records(
+    state: &ApiState,
+    record: &StandingRuntimeCheckpointRecord,
+) -> Result<(), ApiError> {
+    for output_ref in &record.checkpoint.output_manifest_refs {
+        if output_ref
+            .strip_prefix(STANDING_RUNTIME_OUTPUT_DELTA_REF_PREFIX)
+            .is_some()
+        {
+            let (_key, delta) =
+                read_standing_runtime_output_delta_record(state, output_ref, &record.view_id)
+                    .await?;
+            if delta.tenant_id != record.checkpoint.identity.tenant_id
+                || delta.program_id != record.checkpoint.identity.program_id
+                || delta.view_id != record.view_id
+                || delta.logical_epoch != record.checkpoint.logical_epoch
+            {
+                return Err(ApiError::bad_request(format!(
+                    "standing runtime output delta body/checkpoint mismatch for `{}/{}/{}`",
+                    record.checkpoint.identity.tenant_id,
+                    record.checkpoint.identity.program_id,
+                    record.view_id
+                )));
+            }
+            continue;
+        }
+        let (_key, manifest) =
+            read_standing_runtime_output_manifest_record(state, output_ref, &record.view_id)
+                .await?;
+        if manifest.tenant_id != record.checkpoint.identity.tenant_id
+            || manifest.program_id != record.checkpoint.identity.program_id
+            || manifest.view_id != record.view_id
+            || manifest.checkpoint_key != record.checkpoint_key
+            || manifest.logical_epoch != record.checkpoint.logical_epoch
+            || manifest.checkpoint_content_hash != record.checkpoint.state_root.content_hash
+        {
+            return Err(ApiError::bad_request(format!(
+                "standing runtime output manifest body/checkpoint mismatch for `{}/{}/{}`",
+                record.checkpoint.identity.tenant_id,
+                record.checkpoint.identity.program_id,
+                record.view_id
+            )));
+        }
+        for page in &manifest.pages {
+            let (_page_key, page_record) =
+                read_standing_runtime_output_page_record(state, page, &record.view_id).await?;
+            if page_record.tenant_id != record.checkpoint.identity.tenant_id
+                || page_record.program_id != record.checkpoint.identity.program_id
+                || page_record.view_id != record.view_id
+                || page_record.logical_epoch != record.checkpoint.logical_epoch
+                || page_record.output_content_hash != manifest.output_content_hash
+            {
+                return Err(ApiError::bad_request(format!(
+                    "standing runtime output page body/checkpoint mismatch for `{}/{}/{}`",
+                    record.checkpoint.identity.tenant_id,
+                    record.checkpoint.identity.program_id,
+                    record.view_id
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn read_standing_runtime_output_manifest_record(
+    state: &ApiState,
+    output_ref: &str,
+    view_id: &str,
+) -> Result<(ObjectKey, StandingRuntimeOutputManifestRecord), ApiError> {
+    let output_manifest_key = output_ref
+        .strip_prefix(STANDING_RUNTIME_OUTPUT_MANIFEST_REF_PREFIX)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "unsupported standing runtime checkpoint output manifest ref for view `{view_id}`"
+            ))
+        })?;
+    let bytes = state
+        .store
+        .get(&ObjectPath::from(output_manifest_key.to_string()))
+        .await
+        .map_err(ApiError::internal)?
+        .bytes()
+        .await
+        .map_err(ApiError::internal)?;
+    let manifest: StandingRuntimeOutputManifestRecord = serde_json::from_slice(&bytes)
+        .map_err(|source| ApiError::bad_request(source.to_string()))?;
+    let (key, _) =
+        ObjectKey::parse_standing_runtime_output_manifest(output_manifest_key.to_string())
+            .map_err(ApiError::bad_request)?;
+    validate_standing_runtime_output_manifest_record(&key, &manifest)?;
+    Ok((key, manifest))
+}
+
+async fn read_standing_runtime_output_page_record(
+    state: &ApiState,
+    page: &StandingRuntimeOutputPageRef,
+    view_id: &str,
+) -> Result<(ObjectKey, StandingRuntimeOutputPageRecord), ApiError> {
+    let bytes = state
+        .store
+        .get(&ObjectPath::from(page.page_key.clone()))
+        .await
+        .map_err(ApiError::internal)?
+        .bytes()
+        .await
+        .map_err(ApiError::internal)?;
+    let record: StandingRuntimeOutputPageRecord = serde_json::from_slice(&bytes)
+        .map_err(|source| ApiError::bad_request(source.to_string()))?;
+    let (key, _) = ObjectKey::parse_standing_runtime_output_page(page.page_key.clone())
+        .map_err(ApiError::bad_request)?;
+    validate_standing_runtime_output_page_ref(page, view_id)?;
+    validate_standing_runtime_output_page_record(&key, &record)?;
+    if page.page_index != record.page_index
+        || page.page_content_hash != record.page_content_hash
+        || page.row_count != record.row_count
+        || page.output_encoding != record.output_encoding
+    {
+        return Err(ApiError::bad_request(format!(
+            "standing runtime output page ref/body mismatch for view `{view_id}`"
+        )));
+    }
+    Ok((key, record))
+}
+
+async fn read_standing_runtime_output_delta_record(
+    state: &ApiState,
+    output_ref: &str,
+    view_id: &str,
+) -> Result<(ObjectKey, StandingRuntimeOutputDeltaRecord), ApiError> {
+    let output_delta_key = output_ref
+        .strip_prefix(STANDING_RUNTIME_OUTPUT_DELTA_REF_PREFIX)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "unsupported standing runtime checkpoint output delta ref for view `{view_id}`"
+            ))
+        })?;
+    let bytes = state
+        .store
+        .get(&ObjectPath::from(output_delta_key.to_string()))
+        .await
+        .map_err(ApiError::internal)?
+        .bytes()
+        .await
+        .map_err(ApiError::internal)?;
+    let record: StandingRuntimeOutputDeltaRecord = serde_json::from_slice(&bytes)
+        .map_err(|source| ApiError::bad_request(source.to_string()))?;
+    let (key, _) = ObjectKey::parse_standing_runtime_output_delta(output_delta_key.to_string())
+        .map_err(ApiError::bad_request)?;
+    validate_standing_runtime_output_delta_record(&key, &record)?;
+    Ok((key, record))
+}
+
+fn validate_standing_runtime_output_manifest_record(
+    key: &ObjectKey,
+    record: &StandingRuntimeOutputManifestRecord,
+) -> Result<(), ApiError> {
+    if record.schema_version != 1 || record.record_kind != "standing_runtime_output_manifest_v1" {
+        return Err(ApiError::bad_request(format!(
+            "standing runtime output manifest record identity mismatch for `{}/{}/{}`",
+            record.tenant_id, record.program_id, record.view_id
+        )));
+    }
+    if record.output_encoding != "velorix-delta-batch-json-v1"
+        || record.source_kind != "standing_runtime_checkpoint_published_output"
+    {
+        return Err(ApiError::bad_request(format!(
+            "standing runtime output manifest codec/source mismatch for `{}/{}/{}`",
+            record.tenant_id, record.program_id, record.view_id
+        )));
+    }
+    let (_, parts) = ObjectKey::parse_standing_runtime_output_manifest(key.as_str().to_string())
+        .map_err(ApiError::bad_request)?;
+    let output_bytes = serde_json::to_vec(&record.published_output)
+        .map_err(|source| ApiError::internal(source.to_string()))?;
+    let actual_output_hash = stable_bytes_hash(&output_bytes);
+    let output_row_count = standing_runtime_published_output_row_count(&record.published_output)?;
+    if record.pages.is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "standing runtime output manifest has no page index for `{}/{}/{}`",
+            record.tenant_id, record.program_id, record.view_id
+        )));
+    }
+    let mut page_indexes = BTreeSet::new();
+    let mut indexed_row_count = 0usize;
+    for page in &record.pages {
+        validate_standing_runtime_output_page_ref(page, &record.view_id)?;
+        if !page_indexes.insert(page.page_index) {
+            return Err(ApiError::bad_request(format!(
+                "duplicate standing runtime output page index for `{}/{}/{}`",
+                record.tenant_id, record.program_id, record.view_id
+            )));
+        }
+        let (_, page_parts) = ObjectKey::parse_standing_runtime_output_page(page.page_key.clone())
+            .map_err(ApiError::bad_request)?;
+        if page_parts.tenant_id != record.tenant_id
+            || page_parts.program_id != record.program_id
+            || page_parts.view_id != record.view_id
+            || page_parts.logical_epoch != record.logical_epoch
+            || page_parts.page_index != page.page_index
+            || page_parts.page_content_hash != page.page_content_hash
+        {
+            return Err(ApiError::bad_request(format!(
+                "standing runtime output page ref mismatch for `{}/{}/{}`",
+                record.tenant_id, record.program_id, record.view_id
+            )));
+        }
+        indexed_row_count = indexed_row_count
+            .checked_add(page.row_count)
+            .ok_or_else(|| ApiError::bad_request("standing runtime output page row overflow"))?;
+    }
+    if parts.tenant_id != record.tenant_id
+        || parts.program_id != record.program_id
+        || parts.view_id != record.view_id
+        || parts.logical_epoch != record.logical_epoch
+        || parts.output_content_hash != record.output_content_hash
+        || record.output_content_hash != actual_output_hash
+        || record.output_row_count != output_row_count
+        || indexed_row_count != record.output_row_count
+    {
+        return Err(ApiError::bad_request(format!(
+            "standing runtime output manifest key/body mismatch for `{}/{}/{}`",
+            record.tenant_id, record.program_id, record.view_id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_standing_runtime_output_delta_record(
+    key: &ObjectKey,
+    record: &StandingRuntimeOutputDeltaRecord,
+) -> Result<(), ApiError> {
+    if record.schema_version != 1 || record.record_kind != "standing_runtime_output_delta_v1" {
+        return Err(ApiError::bad_request(format!(
+            "standing runtime output delta record identity mismatch for `{}/{}/{}`",
+            record.tenant_id, record.program_id, record.view_id
+        )));
+    }
+    if record.delta_encoding != "velorix-delta-batch-json-v1"
+        || record.source_kind != "standing_runtime_epoch_output_delta"
+        || record.schema_fingerprint.is_empty()
+    {
+        return Err(ApiError::bad_request(format!(
+            "standing runtime output delta codec/source mismatch for `{}/{}/{}`",
+            record.tenant_id, record.program_id, record.view_id
+        )));
+    }
+    let (_, parts) = ObjectKey::parse_standing_runtime_output_delta(key.as_str().to_string())
+        .map_err(ApiError::bad_request)?;
+    let delta_bytes = serde_json::to_vec(&record.output_delta)
+        .map_err(|source| ApiError::internal(source.to_string()))?;
+    let actual_delta_hash = stable_bytes_hash(&delta_bytes);
+    let output_delta: DeltaBatch = serde_json::from_value(record.output_delta.clone())
+        .map_err(|source| ApiError::bad_request(source.to_string()))?;
+    let delta_row_count = output_delta
+        .net_rows()
+        .map_err(|_| ApiError::bad_request("standing runtime output delta is malformed"))?
+        .len();
+    if parts.tenant_id != record.tenant_id
+        || parts.program_id != record.program_id
+        || parts.view_id != record.view_id
+        || parts.logical_epoch != record.logical_epoch
+        || parts.delta_content_hash != record.delta_content_hash
+        || actual_delta_hash != record.delta_content_hash
+        || delta_row_count != record.delta_row_count
+    {
+        return Err(ApiError::bad_request(format!(
+            "standing runtime output delta key/body mismatch for `{}/{}/{}`",
+            record.tenant_id, record.program_id, record.view_id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_standing_runtime_state_payload_record(
+    key: &ObjectKey,
+    record: &StandingRuntimeStatePayloadRecord,
+) -> Result<(), ApiError> {
+    if record.schema_version != 1 || record.record_kind != "standing_runtime_state_payload_v1" {
+        return Err(ApiError::bad_request(format!(
+            "standing runtime state payload record identity mismatch for `{}/{}/{}`",
+            record.tenant_id, record.program_id, record.view_id
+        )));
+    }
+    if record.source_kind != "standing_runtime_checkpoint_state_payload"
+        || record.payload.codec_identity != record.checkpoint_codec_identity
+    {
+        return Err(ApiError::bad_request(format!(
+            "standing runtime state payload codec/source mismatch for `{}/{}/{}`",
+            record.tenant_id, record.program_id, record.view_id
+        )));
+    }
+    let (_, parts) = ObjectKey::parse_standing_runtime_state_payload(key.as_str().to_string())
+        .map_err(ApiError::bad_request)?;
+    let actual_state_hash = stable_bytes_hash(record.payload.payload.as_bytes());
+    if parts.tenant_id != record.tenant_id
+        || parts.program_id != record.program_id
+        || parts.view_id != record.view_id
+        || parts.logical_epoch != record.logical_epoch
+        || parts.state_content_hash != record.state_content_hash
+        || record.state_content_hash != actual_state_hash
+    {
+        return Err(ApiError::bad_request(format!(
+            "standing runtime state payload key/body mismatch for `{}/{}/{}`",
+            record.tenant_id, record.program_id, record.view_id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_standing_runtime_output_page_ref(
+    page: &StandingRuntimeOutputPageRef,
+    view_id: &str,
+) -> Result<(), ApiError> {
+    if page.output_encoding != "velorix-delta-batch-json-v1" {
+        return Err(ApiError::bad_request(format!(
+            "standing runtime output page codec mismatch for view `{view_id}`"
+        )));
+    }
+    ObjectKey::parse_standing_runtime_output_page(page.page_key.clone())
+        .map_err(ApiError::bad_request)?;
+    Ok(())
+}
+
+fn validate_standing_runtime_output_page_record(
+    key: &ObjectKey,
+    record: &StandingRuntimeOutputPageRecord,
+) -> Result<(), ApiError> {
+    if record.schema_version != 1 || record.record_kind != "standing_runtime_output_page_v1" {
+        return Err(ApiError::bad_request(format!(
+            "standing runtime output page record identity mismatch for `{}/{}/{}`",
+            record.tenant_id, record.program_id, record.view_id
+        )));
+    }
+    if record.output_encoding != "velorix-delta-batch-json-v1"
+        || record.source_kind != "standing_runtime_checkpoint_published_output"
+    {
+        return Err(ApiError::bad_request(format!(
+            "standing runtime output page codec/source mismatch for `{}/{}/{}`",
+            record.tenant_id, record.program_id, record.view_id
+        )));
+    }
+    let (_, parts) = ObjectKey::parse_standing_runtime_output_page(key.as_str().to_string())
+        .map_err(ApiError::bad_request)?;
+    let page_bytes = serde_json::to_vec(&record.published_output)
+        .map_err(|source| ApiError::internal(source.to_string()))?;
+    let actual_page_hash = stable_bytes_hash(&page_bytes);
+    let row_count = standing_runtime_published_output_row_count(&record.published_output)?;
+    if parts.tenant_id != record.tenant_id
+        || parts.program_id != record.program_id
+        || parts.view_id != record.view_id
+        || parts.logical_epoch != record.logical_epoch
+        || parts.page_index != record.page_index
+        || parts.page_content_hash != record.page_content_hash
+        || record.page_content_hash != actual_page_hash
+        || record.row_count != row_count
+    {
+        return Err(ApiError::bad_request(format!(
+            "standing runtime output page key/body mismatch for `{}/{}/{}`",
+            record.tenant_id, record.program_id, record.view_id
         )));
     }
     Ok(())
@@ -8926,25 +5584,43 @@ fn prepared_batches_are_covered_by_replay_checkpoints(
     })
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct StandingRuntimeBackfillReplayOutcome {
+    applied_batches: usize,
+    remaining_batches: usize,
+}
+
 async fn replay_committed_ingest_into_standing_runtime(
     state: &ApiState,
     active: &ActiveMaterializedView,
     replay_plan: &StandingRuntimeReplayPlan,
 ) -> Result<(), ApiError> {
+    replay_committed_ingest_into_standing_runtime_limited(state, active, replay_plan, None)
+        .await
+        .map(|_| ())
+}
+
+async fn replay_committed_ingest_into_standing_runtime_limited(
+    state: &ApiState,
+    active: &ActiveMaterializedView,
+    replay_plan: &StandingRuntimeReplayPlan,
+    batch_limit: Option<usize>,
+) -> Result<StandingRuntimeBackfillReplayOutcome, ApiError> {
     if active.spec.input_relations.is_empty() {
-        return Ok(());
+        return Ok(StandingRuntimeBackfillReplayOutcome::default());
     }
-    let Some(identity) = active
-        .artifact
-        .as_ref()
-        .and_then(|artifact| artifact.standing_program_identity.as_ref())
-    else {
-        return Ok(());
+    let Some(identity) = active_standing_runtime_identity(active) else {
+        return Ok(StandingRuntimeBackfillReplayOutcome::default());
     };
+    if batch_limit.is_some_and(|limit| limit == 0) {
+        return Err(ApiError::bad_request(
+            "backfill batch_limit must be a positive integer",
+        ));
+    }
     let operation_lock = state.standing_runtime_operation_lock(identity, &active.spec.view_id)?;
     let _operation_guard = operation_lock.lock().await;
     let Some(runtime) = state.standing_runtime(identity, &active.spec.view_id)? else {
-        return Ok(());
+        return Ok(StandingRuntimeBackfillReplayOutcome::default());
     };
     let ingest_log =
         IngestLog::new_catalog_checked(Arc::clone(&state.store), state.capabilities.as_ref())
@@ -8954,6 +5630,7 @@ async fn replay_committed_ingest_into_standing_runtime(
         .await
         .map_err(ApiError::internal)?;
 
+    let mut outcome = StandingRuntimeBackfillReplayOutcome::default();
     for batch in batches {
         let descriptor = batch.descriptor();
         let envelope =
@@ -8976,6 +5653,10 @@ async fn replay_committed_ingest_into_standing_runtime(
         ) {
             continue;
         }
+        if batch_limit.is_some_and(|limit| outcome.applied_batches >= limit) {
+            outcome.remaining_batches += 1;
+            continue;
+        }
         let owner = state
             .acquire_standing_runtime_owner(identity, &active.spec.view_id)
             .await?;
@@ -8993,9 +5674,10 @@ async fn replay_committed_ingest_into_standing_runtime(
             schema_fingerprint: header.schema_fingerprint.clone(),
             start_offset_inclusive: descriptor.start_offset_inclusive,
             end_offset_exclusive: descriptor.end_offset_exclusive,
+            event_time_watermark: header.event_time_watermark.clone(),
             batches: envelope.record_batches().map_err(ApiError::bad_request)?,
         };
-        let checkpoint = apply_standing_runtime_changes_and_checkpoint(
+        let apply_result = apply_standing_runtime_changes_and_checkpoint(
             Arc::clone(&runtime),
             descriptor.end_offset_exclusive,
             idempotency_key,
@@ -9005,7 +5687,8 @@ async fn replay_committed_ingest_into_standing_runtime(
         if let Err(error) = persist_standing_runtime_checkpoint(
             state,
             &active.spec.view_id,
-            &checkpoint,
+            &apply_result.checkpoint,
+            &apply_result.output_deltas,
             vec![ReplayCheckpoint::for_relation(
                 header.relation_id.clone(),
                 header.relation_version.clone(),
@@ -9020,9 +5703,79 @@ async fn replay_committed_ingest_into_standing_runtime(
             remove_standing_runtime(state, identity, &active.spec.view_id)?;
             return Err(error);
         }
+        outcome.applied_batches += 1;
     }
 
-    Ok(())
+    Ok(outcome)
+}
+
+async fn committed_backfill_progress(
+    state: &ApiState,
+    active: &ActiveMaterializedView,
+) -> Result<BackfillProgressResponse, ApiError> {
+    if active.spec.input_relations.is_empty() {
+        return Ok(backfill_progress_response(0, 0));
+    }
+    let replay_plan = match active_standing_runtime_identity(active) {
+        Some(identity) => {
+            read_latest_standing_runtime_checkpoint(state, identity, &active.spec.view_id)
+                .await?
+                .as_ref()
+                .map(standing_runtime_replay_plan_from_record_ref)
+                .unwrap_or_default()
+        }
+        None => StandingRuntimeReplayPlan::default(),
+    };
+    let ingest_log =
+        IngestLog::new_catalog_checked(Arc::clone(&state.store), state.capabilities.as_ref())
+            .map_err(ApiError::internal)?;
+    let batches = ingest_log
+        .replay_admitted_validated_envelopes_from(&[])
+        .await
+        .map_err(ApiError::internal)?;
+    let mut total = 0usize;
+    let mut remaining = 0usize;
+    for batch in batches {
+        let descriptor = batch.descriptor();
+        let envelope =
+            IngestEnvelope::decode(batch.payload().clone()).map_err(ApiError::bad_request)?;
+        let header = envelope.header();
+        if !active.spec.input_relations.iter().any(|input| {
+            header.relation_id == input.relation_id
+                && header.relation_version == input.relation_version
+                && header.schema_fingerprint == input.schema_fingerprint
+        }) {
+            continue;
+        }
+        total += 1;
+        if replay_checkpoints_cover_replayed_batch(
+            &replay_plan.replay_checkpoints,
+            header.relation_id.as_str(),
+            header.relation_version.as_str(),
+            descriptor.stream_id.as_str(),
+            descriptor.partition_id,
+            descriptor.end_offset_exclusive,
+        ) {
+            continue;
+        }
+        remaining += 1;
+    }
+    Ok(backfill_progress_response(total, remaining))
+}
+
+fn backfill_progress_response(total: usize, remaining: usize) -> BackfillProgressResponse {
+    let processed = total.saturating_sub(remaining);
+    let percent = if total == 0 {
+        100.0
+    } else {
+        (processed as f64 / total as f64) * 100.0
+    };
+    BackfillProgressResponse {
+        processed_batches: processed,
+        remaining_batches: remaining,
+        total_batches: total,
+        percent,
+    }
 }
 
 async fn read_relation_catalog(
@@ -9098,13 +5851,6 @@ async fn read_relation_catalogs_for_view_request(
     )
     .await
     .map(|catalog| vec![catalog])
-}
-
-async fn read_relation_catalogs_for_spec(
-    state: &ApiState,
-    spec: &StandingViewSpec,
-) -> Result<Vec<VelorixRelationCatalogV1>, ApiError> {
-    read_relation_catalogs_for_input_schemas(state, &spec.input_relations).await
 }
 
 async fn read_relation_catalogs_for_input_schemas(
@@ -9310,7 +6056,6 @@ async fn query_view_api_get(
 ) -> Result<Json<QueryResponse>, ApiError> {
     let page_request = extract_snapshot_page_request(&mut query)?;
     let (active, mut parameters) = read_active_view_by_api_path(&state, &api_path).await?;
-    ensure_view_execution_allowed(&active)?;
     let api = active.api.clone().unwrap_or_default();
     for (name, raw_value) in query {
         let value = request_query_value_for_api_field(&api, &name, raw_value.as_str())?;
@@ -9381,7 +6126,6 @@ async fn query_view_rows_post(
         .read_active(&view_id)
         .await
         .map_err(materialized_view_registry_error_to_api)?;
-    ensure_view_execution_allowed(&active)?;
     if request.sql.is_none() {
         validate_direct_view_query_parameter_sources(&active, &request.parameters)?;
     }
@@ -9409,7 +6153,6 @@ async fn query_view_output_rows_post(
         .read_active(&view_id)
         .await
         .map_err(materialized_view_registry_error_to_api)?;
-    ensure_view_execution_allowed(&active)?;
     query_active_view_output_rows_impl(
         state,
         active,
@@ -9520,8 +6263,8 @@ async fn query_active_view_output_rows_impl(
     page_request: SnapshotPageRequest,
     use_view_api_metadata: bool,
 ) -> Result<Json<QueryResponse>, ApiError> {
+    let active = ensure_view_query_ready(&state, active).await?;
     ensure_view_execution_allowed(&active)?;
-    let view_id = active.spec.view_id.clone();
     let output_id = resolve_view_query_output_id(&active, requested_output_id.as_deref())?;
     let active_api = active.api.clone().unwrap_or_default();
     let raw_sql_query = request_sql.is_some();
@@ -9540,18 +6283,18 @@ async fn query_active_view_output_rows_impl(
 
     match active.execution_mode {
         MaterializedViewExecutionMode::StandingRuntime => {
-            let is_feldera_runtime = is_feldera_pipeline_manager_runtime(&active);
+            let is_materialized_runtime = is_external_sql_runtime(&active);
             validate_standing_runtime_query_contract(
                 &active.spec.view_id,
                 request_sql.as_ref(),
                 &api,
                 &parameters,
                 &page_request,
-                is_feldera_runtime,
+                is_materialized_runtime,
             )?;
             let (rows, logical_epoch, next_page_token) = if let Some(sql) = request_sql {
                 let requested_epoch = page_request.committed_epoch;
-                let sql = render_caller_sql_as_feldera_sql(&sql, &parameters)?;
+                let sql = render_caller_sql_as_bound_sql(&sql, &parameters)?;
                 let page_request =
                     page_request_with_query_policy_limit(page_request, query_policy.policy);
                 let page =
@@ -9584,9 +6327,6 @@ async fn query_active_view_output_rows_impl(
                 next_page_token,
             }))
         }
-        MaterializedViewExecutionMode::FelderaCompilePending => Err(ApiError::service_unavailable(
-            format!("feldera_compile_pending: view `{view_id}` is accepted but not deployed yet"),
-        )),
     }
 }
 
@@ -9626,12 +6366,6 @@ fn resolve_view_query_output_id(
 }
 
 fn ensure_view_execution_allowed(active: &ActiveMaterializedView) -> Result<(), ApiError> {
-    if active.execution_mode == MaterializedViewExecutionMode::FelderaCompilePending {
-        return Err(ApiError::service_unavailable(format!(
-            "feldera_compile_pending: view `{}` is accepted but not deployed yet",
-            active.spec.view_id
-        )));
-    }
     if active.lifecycle.compile_status != MaterializedViewCompileStatus::Success
         || active.lifecycle.deployment_status != MaterializedViewDeploymentStatus::Running
     {
@@ -9641,6 +6375,142 @@ fn ensure_view_execution_allowed(active: &ActiveMaterializedView) -> Result<(), 
         )));
     }
     Ok(())
+}
+
+async fn ensure_view_query_ready(
+    state: &ApiState,
+    active: ActiveMaterializedView,
+) -> Result<ActiveMaterializedView, ApiError> {
+    if view_query_availability(&active.lifecycle) {
+        return Ok(active);
+    }
+    if !view_backfill_is_query_triggerable(&active) {
+        ensure_view_execution_allowed(&active)?;
+        return Ok(active);
+    }
+
+    let outcome = run_active_view_backfill_step(state, active, None).await?;
+    let refreshed = outcome.active;
+    ensure_view_execution_allowed(&refreshed)?;
+    Ok(refreshed)
+}
+
+struct ActiveViewBackfillStepOutcome {
+    active: ActiveMaterializedView,
+    replay: StandingRuntimeBackfillReplayOutcome,
+}
+
+async fn run_view_backfill_step(
+    state: &ApiState,
+    view_id: &str,
+    batch_limit: Option<usize>,
+) -> Result<BackfillViewResponse, ApiError> {
+    let active = state
+        .view_registry()?
+        .read_active(view_id)
+        .await
+        .map_err(materialized_view_registry_error_to_api)?;
+    let outcome = run_active_view_backfill_step(state, active, batch_limit).await?;
+    let progress = committed_backfill_progress(state, &outcome.active).await?;
+    Ok(backfill_view_response(
+        &outcome.active,
+        if outcome.replay.remaining_batches == 0 {
+            "completed"
+        } else {
+            "advanced"
+        },
+        "sync",
+        outcome.replay.applied_batches,
+        outcome.replay.remaining_batches,
+        progress,
+    ))
+}
+
+async fn run_active_view_backfill_step(
+    state: &ApiState,
+    active: ActiveMaterializedView,
+    batch_limit: Option<usize>,
+) -> Result<ActiveViewBackfillStepOutcome, ApiError> {
+    if view_query_availability(&active.lifecycle) {
+        return Ok(ActiveViewBackfillStepOutcome {
+            active,
+            replay: StandingRuntimeBackfillReplayOutcome::default(),
+        });
+    }
+    if !view_backfill_is_query_triggerable(&active) {
+        ensure_view_execution_allowed(&active)?;
+        return Ok(ActiveViewBackfillStepOutcome {
+            active,
+            replay: StandingRuntimeBackfillReplayOutcome::default(),
+        });
+    }
+    let Some(identity) = active_standing_runtime_identity(&active) else {
+        return Err(ApiError::service_unavailable(format!(
+            "standing_runtime_not_deployed: view `{}` is backfill pending but has no runtime binding",
+            active.spec.view_id
+        )));
+    };
+    let replay_plan = if state
+        .standing_runtime(identity, &active.spec.view_id)?
+        .is_some()
+    {
+        read_latest_standing_runtime_checkpoint(state, identity, &active.spec.view_id)
+            .await?
+            .as_ref()
+            .map(standing_runtime_replay_plan_from_record_ref)
+            .unwrap_or_default()
+    } else {
+        ensure_standing_runtime_for_active_view(state, &active)
+            .await?
+            .unwrap_or_default()
+    };
+    let replay = replay_committed_ingest_into_standing_runtime_limited(
+        state,
+        &active,
+        &replay_plan,
+        batch_limit,
+    )
+    .await?;
+    if replay.remaining_batches == 0 {
+        state
+            .view_registry()?
+            .update_standing_runtime_lifecycle(
+                &active.spec.view_id,
+                &active.spec_hash,
+                MaterializedViewLifecycleStatus::standing_runtime(),
+            )
+            .await
+            .map_err(materialized_view_registry_error_to_api)?;
+    }
+
+    let refreshed = state
+        .view_registry()?
+        .read_active(&active.spec.view_id)
+        .await
+        .map_err(materialized_view_registry_error_to_api)?;
+    Ok(ActiveViewBackfillStepOutcome {
+        active: refreshed,
+        replay,
+    })
+}
+
+fn spawn_background_view_backfill(
+    state: ApiState,
+    view_id: String,
+    batch_limit: usize,
+    pause_ms: u64,
+) {
+    tokio::spawn(async move {
+        loop {
+            let outcome = run_view_backfill_step(&state, &view_id, Some(batch_limit)).await;
+            match outcome {
+                Ok(response) if response.remaining_batches == 0 => break,
+                Ok(response) if response.applied_batches == 0 => break,
+                Ok(_) => tokio::time::sleep(Duration::from_millis(pause_ms)).await,
+                Err(_) => break,
+            }
+        }
+    });
 }
 
 async fn query_standing_runtime_rows_with_template(
@@ -9659,12 +6529,10 @@ async fn query_standing_runtime_rows_with_template(
         ))
     })?;
     let requested_epoch = page_request.committed_epoch;
-    if is_feldera_pipeline_manager_runtime(active) {
-        let feldera_sql =
-            render_view_sql_template_as_feldera_sql(sql_template, &api.request, parameters)?;
+    if is_external_sql_runtime(active) {
+        let sql = render_view_sql_template_as_bound_sql(sql_template, &api.request, parameters)?;
         let page_request = page_request_with_query_policy_limit(page_request, query_policy.policy);
-        let page =
-            standing_runtime_sql_page(state, active, output_id, feldera_sql, page_request).await?;
+        let page = standing_runtime_sql_page(state, active, output_id, sql, page_request).await?;
         validate_standing_runtime_sql_page(active, output_id, &page, requested_epoch)?;
         return Ok((page.rows, page.logical_epoch, page.next_page_token));
     }
@@ -9693,11 +6561,11 @@ async fn query_standing_runtime_rows_with_template(
     ))
 }
 
-fn is_feldera_pipeline_manager_runtime(active: &ActiveMaterializedView) -> bool {
+fn is_external_sql_runtime(active: &ActiveMaterializedView) -> bool {
     active
         .artifact
         .as_ref()
-        .is_some_and(|artifact| artifact.execution_path == "feldera_pipeline_manager")
+        .is_some_and(|artifact| artifact.execution_path == "external_sql_runtime")
 }
 
 fn validate_standing_runtime_sql_page(
@@ -9706,15 +6574,9 @@ fn validate_standing_runtime_sql_page(
     page: &MaterializedViewSqlPage,
     requested_epoch: Option<u64>,
 ) -> Result<(), ApiError> {
-    let artifact = active.artifact.as_ref().ok_or_else(|| {
+    let identity = active_standing_runtime_identity(active).ok_or_else(|| {
         ApiError::conflict(format!(
-            "standing runtime view `{}` is missing artifact binding",
-            active.spec.view_id
-        ))
-    })?;
-    let identity = artifact.standing_program_identity.as_ref().ok_or_else(|| {
-        ApiError::conflict(format!(
-            "artifact-backed view `{}` is missing standing runtime identity",
+            "standing runtime view `{}` is missing runtime identity",
             active.spec.view_id
         ))
     })?;
@@ -9746,15 +6608,9 @@ fn validate_standing_runtime_template_page(
     page: &MaterializedViewPage,
     requested_epoch: Option<u64>,
 ) -> Result<(), ApiError> {
-    let artifact = active.artifact.as_ref().ok_or_else(|| {
+    let identity = active_standing_runtime_identity(active).ok_or_else(|| {
         ApiError::conflict(format!(
-            "standing runtime view `{}` is missing artifact binding",
-            active.spec.view_id
-        ))
-    })?;
-    let identity = artifact.standing_program_identity.as_ref().ok_or_else(|| {
-        ApiError::conflict(format!(
-            "artifact-backed view `{}` is missing standing runtime identity",
+            "standing runtime view `{}` is missing runtime identity",
             active.spec.view_id
         ))
     })?;
@@ -9800,7 +6656,7 @@ fn validate_standing_runtime_template_page(
             active.spec.view_id, page.schema_fingerprint, output_schema.schema_fingerprint
         )));
     }
-    let expected_arrow_schema = arrow_schema_from_feldera_relation_schema(output_schema)?;
+    let expected_arrow_schema = arrow_schema_from_incremental_relation_schema(output_schema)?;
     if page.batches.is_empty() {
         return Err(ApiError::conflict(format!(
             "standing runtime view `{}` returned no record batches",
@@ -9828,7 +6684,7 @@ async fn query_standing_runtime_rows(
 ) -> Result<(Vec<Value>, u64, Option<String>), ApiError> {
     let page_request = page_request_with_query_policy_limit(page_request, query_policy.policy);
     let page = standing_runtime_page(state, active, output_id, page_request).await?;
-    let sql = format!("SELECT * FROM {}", feldera_sql_quoted_identifier(output_id));
+    let sql = format!("SELECT * FROM {}", sql_quoted_identifier(output_id));
     let batches = query_record_batches_table_with_bindings_and_policy_and_limiter(
         output_id,
         page.batches,
@@ -9852,7 +6708,7 @@ async fn query_standing_runtime_rows(
         })?;
 
     Ok((
-        record_batches_to_json_rows_for_feldera_schema(output_schema, &batches)?,
+        record_batches_to_json_rows_for_view_schema(output_schema, &batches)?,
         page.logical_epoch,
         page.next_page_token,
     ))
@@ -9882,57 +6738,183 @@ async fn standing_runtime_page(
     page_request: SnapshotPageRequest,
 ) -> Result<MaterializedViewPage, ApiError> {
     state.validate_standing_runtime_fencing_or_evict().await?;
-    let artifact = active.artifact.as_ref().ok_or_else(|| {
+    let identity = active_standing_runtime_identity(active).ok_or_else(|| {
         ApiError::conflict(format!(
-            "standing runtime view `{}` is missing artifact binding",
+            "standing runtime view `{}` is missing runtime identity",
             active.spec.view_id
         ))
     })?;
-    let identity = artifact.standing_program_identity.as_ref().ok_or_else(|| {
-        ApiError::conflict(format!(
-            "artifact-backed view `{}` is missing standing runtime identity",
+    standing_runtime_page_from_output_manifest(
+        state,
+        active,
+        identity,
+        output_id,
+        page_request.clone(),
+    )
+    .await?
+    .ok_or_else(|| {
+        ApiError::service_unavailable(format!(
+            "standing runtime output manifest is unavailable for view `{}` output `{output_id}`",
             active.spec.view_id
         ))
-    })?;
-    if state
-        .standing_runtime(identity, &active.spec.view_id)?
-        .is_none()
-    {
-        let _ = ensure_standing_runtime_for_artifact(state, &active.spec, artifact).await?;
-    }
-    let operation_lock = state.standing_runtime_operation_lock(identity, &active.spec.view_id)?;
-    let _operation_guard = operation_lock.lock().await;
-    let runtime = state
-        .standing_runtime(identity, &active.spec.view_id)?
+    })
+}
+
+async fn standing_runtime_page_from_output_manifest(
+    state: &ApiState,
+    active: &ActiveMaterializedView,
+    identity: &StandingProgramIdentity,
+    output_id: &str,
+    page_request: SnapshotPageRequest,
+) -> Result<Option<MaterializedViewPage>, ApiError> {
+    let Some(record) =
+        read_latest_standing_runtime_checkpoint(state, identity, &active.spec.view_id).await?
+    else {
+        return Ok(None);
+    };
+    let Some(output_ref) = record
+        .checkpoint
+        .output_manifest_refs
+        .iter()
+        .find(|output_ref| {
+            output_ref
+                .strip_prefix(STANDING_RUNTIME_OUTPUT_MANIFEST_REF_PREFIX)
+                .and_then(|key| {
+                    ObjectKey::parse_standing_runtime_output_manifest(key.to_string())
+                        .ok()
+                        .map(|(_, parts)| parts)
+                })
+                .is_some_and(|parts| parts.view_id == output_id)
+        })
+    else {
+        return Ok(None);
+    };
+    let output_schema = active
+        .spec
+        .output_relations
+        .iter()
+        .find(|schema| schema.relation_id == output_id)
         .ok_or_else(|| {
-            ApiError::service_unavailable(format!(
-                "standing runtime is unavailable for artifact-backed view `{}`",
+            ApiError::conflict(format!(
+                "standing runtime view `{}` has no matching output schema for `{output_id}`",
                 active.spec.view_id
             ))
         })?;
+    let (_key, manifest) =
+        read_standing_runtime_output_manifest_record(state, output_ref, &active.spec.view_id)
+            .await?;
+    if manifest.checkpoint_key != record.checkpoint_key
+        || manifest.logical_epoch != record.checkpoint.logical_epoch
+        || manifest.checkpoint_content_hash != record.checkpoint.state_root.content_hash
+    {
+        return Err(ApiError::bad_request(format!(
+            "standing runtime output manifest is not bound to the latest checkpoint for `{}/{}/{}`",
+            identity.tenant_id, identity.program_id, active.spec.view_id
+        )));
+    }
+    let published_output =
+        standing_runtime_published_output_from_manifest_page(state, &manifest).await?;
+    let aggregate_outputs =
+        standing_runtime_output_aggregate_outputs_for_checkpoint(&record.checkpoint)?;
     let scoped_view = ScopedViewId {
         tenant_id: identity.tenant_id.clone(),
         program_id: identity.program_id.clone(),
         view_id: output_id.to_string(),
     };
-    let page = tokio::task::spawn_blocking(move || {
-        runtime
-            .lock()
-            .map_err(|_| ApiError::internal("standing runtime lock poisoned"))?
-            .materialized_view_page(scoped_view, page_request)
-            .map_err(ApiError::bad_request)
-    })
-    .await
-    .map_err(ApiError::internal)??;
-    state
-        .validate_standing_runtime_committed_for_query(
-            identity,
-            &active.spec.view_id,
-            page.logical_epoch,
-        )
-        .await?;
+    let page = velorix_runtime::materialized_view_runtime::materialized_delta_to_page(
+        output_schema,
+        &published_output,
+        scoped_view,
+        record.checkpoint.logical_epoch,
+        page_request,
+        aggregate_outputs.as_deref(),
+    )
+    .map_err(ApiError::bad_request)?;
+    Ok(Some(page))
+}
 
-    Ok(page)
+async fn standing_runtime_published_output_from_manifest_page(
+    state: &ApiState,
+    manifest: &StandingRuntimeOutputManifestRecord,
+) -> Result<DeltaBatch, ApiError> {
+    let Some(page) = manifest.pages.iter().find(|page| page.page_index == 0) else {
+        return Err(ApiError::bad_request(format!(
+            "standing runtime output manifest has no first page for `{}/{}/{}`",
+            manifest.tenant_id, manifest.program_id, manifest.view_id
+        )));
+    };
+    let (_key, page_record) =
+        read_standing_runtime_output_page_record(state, page, &manifest.view_id).await?;
+    if page_record.output_content_hash != manifest.output_content_hash
+        || page_record.logical_epoch != manifest.logical_epoch
+        || page_record.tenant_id != manifest.tenant_id
+        || page_record.program_id != manifest.program_id
+        || page_record.view_id != manifest.view_id
+    {
+        return Err(ApiError::bad_request(format!(
+            "standing runtime output page is not bound to manifest for `{}/{}/{}`",
+            manifest.tenant_id, manifest.program_id, manifest.view_id
+        )));
+    }
+    serde_json::from_value(page_record.published_output)
+        .map_err(|source| ApiError::bad_request(source.to_string()))
+}
+
+fn standing_runtime_output_aggregate_outputs_for_checkpoint(
+    checkpoint: &RuntimeCheckpoint,
+) -> Result<Option<Vec<SupportedAggregateOutput>>, ApiError> {
+    let Some(state_payload) = &checkpoint.state_payload else {
+        return Ok(None);
+    };
+    let payload: Value = serde_json::from_str(&state_payload.payload)
+        .map_err(|source| ApiError::bad_request(source.to_string()))?;
+    if payload
+        .get("runtime_kind")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind == "latest_by_key")
+    {
+        return Ok(None);
+    }
+    if payload
+        .get("runtime_kind")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind == "two_input_join_sum_count")
+    {
+        return Ok(Some(default_standing_runtime_sum_count_outputs()));
+    }
+    if payload
+        .get("runtime_kind")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind == "tumbling_event_time_aggregate")
+    {
+        let Some(plan) = payload.get("plan").filter(|plan| !plan.is_null()) else {
+            return Ok(None);
+        };
+        let plan: SupportedTumblingWindowPlan = serde_json::from_value(plan.clone())
+            .map_err(|source| ApiError::bad_request(source.to_string()))?;
+        return Ok(Some(plan.aggregate_outputs));
+    }
+    let Some(plan) = payload.get("plan").filter(|plan| !plan.is_null()) else {
+        return Ok(None);
+    };
+    let plan: SupportedViewPlan = serde_json::from_value(plan.clone())
+        .map_err(|source| ApiError::bad_request(source.to_string()))?;
+    Ok(Some(supported_view_plan_aggregate_outputs(&plan)))
+}
+
+fn default_standing_runtime_sum_count_outputs() -> Vec<SupportedAggregateOutput> {
+    vec![
+        SupportedAggregateOutput {
+            function: LogicalPlanAggregateFunctionV1::Sum,
+            input_column_id: None,
+            output_column_id: "sum".to_string(),
+        },
+        SupportedAggregateOutput {
+            function: LogicalPlanAggregateFunctionV1::Count,
+            input_column_id: None,
+            output_column_id: "count".to_string(),
+        },
+    ]
 }
 
 async fn standing_runtime_sql_page(
@@ -9943,15 +6925,9 @@ async fn standing_runtime_sql_page(
     page_request: SnapshotPageRequest,
 ) -> Result<MaterializedViewSqlPage, ApiError> {
     state.validate_standing_runtime_fencing_or_evict().await?;
-    let artifact = active.artifact.as_ref().ok_or_else(|| {
+    let identity = active_standing_runtime_identity(active).ok_or_else(|| {
         ApiError::conflict(format!(
-            "standing runtime view `{}` is missing artifact binding",
-            active.spec.view_id
-        ))
-    })?;
-    let identity = artifact.standing_program_identity.as_ref().ok_or_else(|| {
-        ApiError::conflict(format!(
-            "artifact-backed view `{}` is missing standing runtime identity",
+            "standing runtime view `{}` is missing runtime identity",
             active.spec.view_id
         ))
     })?;
@@ -9959,7 +6935,7 @@ async fn standing_runtime_sql_page(
         .standing_runtime(identity, &active.spec.view_id)?
         .is_none()
     {
-        let _ = ensure_standing_runtime_for_artifact(state, &active.spec, artifact).await?;
+        let _ = ensure_standing_runtime_for_active_view(state, active).await?;
     }
     let operation_lock = state.standing_runtime_operation_lock(identity, &active.spec.view_id)?;
     let _operation_guard = operation_lock.lock().await;
@@ -9967,7 +6943,7 @@ async fn standing_runtime_sql_page(
         .standing_runtime(identity, &active.spec.view_id)?
         .ok_or_else(|| {
             ApiError::service_unavailable(format!(
-                "standing runtime is unavailable for artifact-backed view `{}`",
+                "standing runtime is unavailable for view `{}`",
                 active.spec.view_id
             ))
         })?;
@@ -10261,7 +7237,7 @@ fn parse_sql_identifier(sql: &str) -> Option<(String, usize)> {
     (index > 0).then(|| (sql[..index].to_string(), trimmed_start + index))
 }
 
-fn arrow_schema_from_feldera_relation_schema(
+fn arrow_schema_from_incremental_relation_schema(
     schema: &RelationSchema,
 ) -> Result<Arc<Schema>, ApiError> {
     let fields = schema
@@ -10349,335 +7325,7 @@ fn arrow_data_type_from_sql_data_type(data_type: &SqlDataType) -> Result<DataTyp
     }
 }
 
-fn feldera_query_rows_from_text(
-    text: &str,
-    output_column_names: Option<&BTreeSet<String>>,
-) -> Result<Vec<Value>, String> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return Ok(Vec::new());
-    }
-    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
-        return feldera_query_rows_from_value(value, output_column_names);
-    }
-    trimmed
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            serde_json::from_str::<Value>(line)
-                .map_err(|error| format!("invalid Feldera JSON query row: {error}"))
-                .and_then(|value| feldera_query_row_from_value(value, output_column_names))
-        })
-        .collect()
-}
-
-fn feldera_query_rows_from_value(
-    value: Value,
-    output_column_names: Option<&BTreeSet<String>>,
-) -> Result<Vec<Value>, String> {
-    match value {
-        Value::Array(rows) => rows
-            .into_iter()
-            .map(|row| feldera_query_row_from_value(row, output_column_names))
-            .collect::<Result<Vec<_>, _>>(),
-        Value::Object(object) => Ok(vec![feldera_query_row_from_value(
-            Value::Object(object),
-            output_column_names,
-        )?]),
-        other => Err(format!(
-            "Feldera JSON query result must be an object or array, got {other}"
-        )),
-    }
-}
-
-fn feldera_query_row_from_value(
-    value: Value,
-    output_column_names: Option<&BTreeSet<String>>,
-) -> Result<Value, String> {
-    match value {
-        Value::Object(mut object) => {
-            if object.len() == 1
-                && object.contains_key("insert")
-                && !output_column_names.is_some_and(|columns| columns.contains("insert"))
-            {
-                let insert = object.remove("insert").expect("insert key checked above");
-                if insert.is_object() {
-                    return feldera_query_row_from_value(insert, output_column_names);
-                }
-                return Ok(json!({ "insert": insert }));
-            }
-            if object.len() == 1
-                && object.contains_key("delete")
-                && !output_column_names.is_some_and(|columns| columns.contains("delete"))
-            {
-                let delete = object.remove("delete").expect("delete key checked above");
-                if delete.is_object() {
-                    return Err("Feldera query snapshot returned delete event".to_string());
-                }
-                return Ok(json!({ "delete": delete }));
-            }
-            Ok(Value::Object(object))
-        }
-        other => Err(format!("Feldera query row must be an object, got {other}")),
-    }
-}
-
-fn feldera_rows_to_record_batch(
-    schema: &RelationSchema,
-    rows: &[Value],
-) -> Result<RecordBatch, String> {
-    let arrow_schema =
-        arrow_schema_from_feldera_relation_schema(schema).map_err(|error| error.to_string())?;
-    let arrays = schema
-        .columns
-        .iter()
-        .map(|column| feldera_json_column_to_arrow_array(column, rows))
-        .collect::<Result<Vec<_>, _>>()?;
-    RecordBatch::try_new(arrow_schema, arrays).map_err(|error| error.to_string())
-}
-
-fn feldera_json_column_to_arrow_array(
-    column: &ColumnSchema,
-    rows: &[Value],
-) -> Result<ArrayRef, String> {
-    match &column.data_type {
-        SqlDataType::Bool => Ok(Arc::new(BooleanArray::from(collect_feldera_column_values(
-            column,
-            rows,
-            |value| {
-                value
-                    .as_bool()
-                    .ok_or_else(|| format!("column `{}` must be boolean", column.name))
-            },
-        )?))),
-        SqlDataType::Int8 => Ok(Arc::new(Int8Array::from(collect_feldera_column_values(
-            column,
-            rows,
-            |value| {
-                let value = value
-                    .as_i64()
-                    .ok_or_else(|| format!("column `{}` must be int8", column.name))?;
-                i8::try_from(value).map_err(|_| format!("column `{}` must fit int8", column.name))
-            },
-        )?))),
-        SqlDataType::Int16 => Ok(Arc::new(Int16Array::from(collect_feldera_column_values(
-            column,
-            rows,
-            |value| {
-                let value = value
-                    .as_i64()
-                    .ok_or_else(|| format!("column `{}` must be int16", column.name))?;
-                i16::try_from(value).map_err(|_| format!("column `{}` must fit int16", column.name))
-            },
-        )?))),
-        SqlDataType::Int32 => Ok(Arc::new(Int32Array::from(collect_feldera_column_values(
-            column,
-            rows,
-            |value| {
-                let value = value
-                    .as_i64()
-                    .ok_or_else(|| format!("column `{}` must be int32", column.name))?;
-                i32::try_from(value).map_err(|_| format!("column `{}` must fit int32", column.name))
-            },
-        )?))),
-        SqlDataType::Int64 => Ok(Arc::new(Int64Array::from(collect_feldera_column_values(
-            column,
-            rows,
-            |value| {
-                value
-                    .as_i64()
-                    .ok_or_else(|| format!("column `{}` must be int64", column.name))
-            },
-        )?))),
-        SqlDataType::UInt8 => Ok(Arc::new(UInt8Array::from(collect_feldera_column_values(
-            column,
-            rows,
-            |value| {
-                let value = value
-                    .as_u64()
-                    .ok_or_else(|| format!("column `{}` must be uint8", column.name))?;
-                u8::try_from(value).map_err(|_| format!("column `{}` must fit uint8", column.name))
-            },
-        )?))),
-        SqlDataType::UInt16 => Ok(Arc::new(UInt16Array::from(collect_feldera_column_values(
-            column,
-            rows,
-            |value| {
-                let value = value
-                    .as_u64()
-                    .ok_or_else(|| format!("column `{}` must be uint16", column.name))?;
-                u16::try_from(value)
-                    .map_err(|_| format!("column `{}` must fit uint16", column.name))
-            },
-        )?))),
-        SqlDataType::UInt32 => Ok(Arc::new(UInt32Array::from(collect_feldera_column_values(
-            column,
-            rows,
-            |value| {
-                let value = value
-                    .as_u64()
-                    .ok_or_else(|| format!("column `{}` must be uint32", column.name))?;
-                u32::try_from(value)
-                    .map_err(|_| format!("column `{}` must fit uint32", column.name))
-            },
-        )?))),
-        SqlDataType::UInt64 => Ok(Arc::new(UInt64Array::from(collect_feldera_column_values(
-            column,
-            rows,
-            |value| {
-                value
-                    .as_u64()
-                    .ok_or_else(|| format!("column `{}` must be uint64", column.name))
-            },
-        )?))),
-        SqlDataType::Float32 => Ok(Arc::new(Float32Array::from(collect_feldera_column_values(
-            column,
-            rows,
-            |value| {
-                let value = value
-                    .as_f64()
-                    .filter(|value| value.is_finite())
-                    .ok_or_else(|| format!("column `{}` must be finite float32", column.name))?;
-                let value = value as f32;
-                if value.is_finite() {
-                    Ok(value)
-                } else {
-                    Err(format!("column `{}` must fit finite float32", column.name))
-                }
-            },
-        )?))),
-        SqlDataType::Float64 => Ok(Arc::new(Float64Array::from(collect_feldera_column_values(
-            column,
-            rows,
-            |value| {
-                value
-                    .as_f64()
-                    .filter(|value| value.is_finite())
-                    .ok_or_else(|| format!("column `{}` must be finite float64", column.name))
-            },
-        )?))),
-        SqlDataType::Char { .. }
-        | SqlDataType::Utf8
-        | SqlDataType::Uuid
-        | SqlDataType::Geometry => Ok(Arc::new(StringArray::from(collect_feldera_column_values(
-            column,
-            rows,
-            |value| match value {
-                Value::String(value) => Ok(value.clone()),
-                _ => Err(format!("column `{}` must be string", column.name)),
-            },
-        )?))),
-        SqlDataType::Json => Ok(Arc::new(StringArray::from(collect_feldera_column_values(
-            column,
-            rows,
-            |value| serde_json::to_string(value).map_err(|error| error.to_string()),
-        )?))),
-        SqlDataType::Binary { .. } | SqlDataType::Varbinary => {
-            let values = collect_feldera_column_values(column, rows, |value| {
-                let bytes = parse_feldera_output_binary_value(column, value)?;
-                validate_sql_fixed_binary_length(
-                    column.name.as_str(),
-                    &column.data_type,
-                    bytes.len(),
-                )?;
-                Ok(bytes)
-            })?;
-            Ok(Arc::new(BinaryArray::from_iter(
-                values.iter().map(|value| value.as_deref()),
-            )))
-        }
-        SqlDataType::Date => Ok(Arc::new(Date32Array::from(collect_feldera_column_values(
-            column,
-            rows,
-            |value| parse_date32_value(column, value),
-        )?))),
-        SqlDataType::Time => Ok(Arc::new(Time64NanosecondArray::from(
-            collect_feldera_column_values(column, rows, |value| {
-                parse_time64_nanos_value(column, value)
-            })?,
-        ))),
-        SqlDataType::Timestamp { .. } => Ok(Arc::new(TimestampNanosecondArray::from(
-            collect_feldera_column_values(column, rows, |value| {
-                parse_timestamp_nanos_value(column, value)
-            })?,
-        ))),
-        SqlDataType::Decimal { precision, scale } => {
-            let scale_i8 =
-                i8::try_from(*scale).map_err(|_| "decimal scale is out of range".to_string())?;
-            let values = collect_feldera_column_values(column, rows, |value| match value {
-                Value::Number(number) => parse_decimal128(&number.to_string(), *precision, *scale)
-                    .map_err(|reason| {
-                        format!("column `{}` invalid decimal: {reason}", column.name)
-                    }),
-                Value::String(raw) => parse_decimal128(raw, *precision, *scale).map_err(|reason| {
-                    format!("column `{}` invalid decimal: {reason}", column.name)
-                }),
-                _ => Err(format!(
-                    "column `{}` must be decimal string or number",
-                    column.name
-                )),
-            })?;
-            Ok(Arc::new(
-                Decimal128Array::from(values)
-                    .with_precision_and_scale(*precision, scale_i8)
-                    .map_err(|error| error.to_string())?,
-            ))
-        }
-        SqlDataType::Array { .. } | SqlDataType::Struct { .. } | SqlDataType::Map { .. } => {
-            feldera_json_reader_column_to_arrow_array(column, rows)
-        }
-        SqlDataType::Interval { .. } => Ok(Arc::new(StringArray::from(
-            collect_feldera_column_values(column, rows, |value| match value {
-                Value::String(value) => Ok(value.clone()),
-                other => serde_json::to_string(other).map_err(|error| error.to_string()),
-            })?,
-        ))),
-        SqlDataType::Null => Ok(Arc::new(NullArray::new(rows.len()))),
-    }
-}
-
-fn parse_feldera_output_binary_value(
-    column: &ColumnSchema,
-    value: &Value,
-) -> Result<Vec<u8>, String> {
-    match value {
-        Value::String(value) => parse_hex_binary(value)
-            .map_err(|reason| format!("column `{}` invalid binary: {reason}", column.name)),
-        Value::Array(values) => values
-            .iter()
-            .enumerate()
-            .map(|(index, value)| {
-                let byte = value.as_u64().ok_or_else(|| {
-                    format!("column `{}` byte {index} must be an integer", column.name)
-                })?;
-                u8::try_from(byte)
-                    .map_err(|_| format!("column `{}` byte {index} must fit uint8", column.name))
-            })
-            .collect(),
-        _ => Err(format!(
-            "column `{}` must be binary hex string or byte array",
-            column.name
-        )),
-    }
-}
-
-fn validate_sql_fixed_binary_length(
-    column_name: &str,
-    data_type: &SqlDataType,
-    actual_len: usize,
-) -> Result<(), String> {
-    let SqlDataType::Binary { length } = data_type else {
-        return Ok(());
-    };
-    if actual_len == usize::try_from(*length).unwrap_or(usize::MAX) {
-        return Ok(());
-    }
-    Err(format!(
-        "column `{column_name}` must contain exactly {length} bytes, got {actual_len}"
-    ))
-}
-
-fn feldera_json_reader_column_to_arrow_array(
+fn json_reader_column_to_arrow_array(
     column: &ColumnSchema,
     rows: &[Value],
 ) -> Result<ArrayRef, String> {
@@ -10693,7 +7341,7 @@ fn feldera_json_reader_column_to_arrow_array(
     ));
     let mut lines = String::new();
     for row in rows {
-        let value = feldera_row_column_value_for_json_reader(column, row)?;
+        let value = row_column_value_for_json_reader(column, row)?;
         lines.push_str(&serde_json::to_string(&value).map_err(|error| error.to_string())?);
         lines.push('\n');
     }
@@ -10708,7 +7356,7 @@ fn feldera_json_reader_column_to_arrow_array(
         .ok_or_else(|| format!("column `{}` produced no Arrow JSON batch", column.name))?;
     if batch.num_rows() != rows.len() {
         return Err(format!(
-            "column `{}` produced {} rows for {} Feldera rows",
+            "column `{}` produced {} rows for {} JSON rows",
             column.name,
             batch.num_rows(),
             rows.len()
@@ -10717,13 +7365,10 @@ fn feldera_json_reader_column_to_arrow_array(
     Ok(batch.column(0).clone())
 }
 
-fn feldera_row_column_value_for_json_reader(
-    column: &ColumnSchema,
-    row: &Value,
-) -> Result<Value, String> {
+fn row_column_value_for_json_reader(column: &ColumnSchema, row: &Value) -> Result<Value, String> {
     let object = row
         .as_object()
-        .ok_or_else(|| "Feldera query row must be an object".to_string())?;
+        .ok_or_else(|| "query row must be an object".to_string())?;
     let Some(value) = object.get(&column.name) else {
         if column.nullable {
             return Ok(Value::Null);
@@ -10734,35 +7379,6 @@ fn feldera_row_column_value_for_json_reader(
         return Err(format!("column `{}` must be non-null", column.name));
     }
     Ok(value.clone())
-}
-
-fn collect_feldera_column_values<T>(
-    column: &ColumnSchema,
-    rows: &[Value],
-    parse: impl Fn(&Value) -> Result<T, String>,
-) -> Result<Vec<Option<T>>, String> {
-    rows.iter()
-        .map(|row| {
-            let object = row
-                .as_object()
-                .ok_or_else(|| "Feldera query row must be an object".to_string())?;
-            let Some(value) = object.get(&column.name) else {
-                if column.nullable {
-                    return Ok(None);
-                }
-                return Err(format!("column `{}` is missing", column.name));
-            };
-            if value.is_null() {
-                if column.nullable {
-                    Ok(None)
-                } else {
-                    Err(format!("column `{}` must be non-null", column.name))
-                }
-            } else {
-                parse(value).map(Some)
-            }
-        })
-        .collect()
 }
 
 fn parse_hex_binary(raw: &str) -> Result<Vec<u8>, String> {
@@ -10789,53 +7405,6 @@ fn hex_digit_value(value: u8) -> Result<u8, String> {
         b'a'..=b'f' => Ok(value - b'a' + 10),
         b'A'..=b'F' => Ok(value - b'A' + 10),
         _ => Err("hex string contains a non-hex digit".to_string()),
-    }
-}
-
-fn parse_date32_value(column: &ColumnSchema, value: &Value) -> Result<i32, String> {
-    match value {
-        Value::Number(number) => number
-            .as_i64()
-            .and_then(|value| i32::try_from(value).ok())
-            .ok_or_else(|| format!("column `{}` must be date32 integer", column.name)),
-        Value::String(raw) => {
-            let days = parse_date_days(raw)
-                .map_err(|reason| format!("column `{}` invalid date: {reason}", column.name))?;
-            i32::try_from(days)
-                .map_err(|_| format!("column `{}` date is outside Date32 range", column.name))
-        }
-        _ => Err(format!(
-            "column `{}` must be date32 integer or date string",
-            column.name
-        )),
-    }
-}
-
-fn parse_time64_nanos_value(column: &ColumnSchema, value: &Value) -> Result<i64, String> {
-    match value {
-        Value::Number(number) => number
-            .as_i64()
-            .ok_or_else(|| format!("column `{}` must be time nanos", column.name)),
-        Value::String(raw) => parse_time_nanos(raw)
-            .map_err(|reason| format!("column `{}` invalid time: {reason}", column.name)),
-        _ => Err(format!(
-            "column `{}` must be time nanos or time string",
-            column.name
-        )),
-    }
-}
-
-fn parse_timestamp_nanos_value(column: &ColumnSchema, value: &Value) -> Result<i64, String> {
-    match value {
-        Value::Number(number) => number
-            .as_i64()
-            .ok_or_else(|| format!("column `{}` must be timestamp nanos", column.name)),
-        Value::String(raw) => parse_timestamp_nanos(raw)
-            .map_err(|reason| format!("column `{}` invalid timestamp: {reason}", column.name)),
-        _ => Err(format!(
-            "column `{}` must be timestamp nanos or timestamp string",
-            column.name
-        )),
     }
 }
 
@@ -11202,7 +7771,7 @@ async fn validate_standing_runtime_create_api_metadata(
         }
         return Ok(());
     };
-    if sql_template_validation_mode != SqlTemplateValidationMode::ExternalFelderaRuntime
+    if sql_template_validation_mode != SqlTemplateValidationMode::ExternalSqlRuntime
         && !sql_references_table(sql_template, &output_id)
     {
         return Err(ApiError::bad_request(format!(
@@ -11217,10 +7786,10 @@ async fn validate_standing_runtime_create_api_metadata(
                 "standing runtime view `{view_id}` artifact metadata has no matching output schema `{output_id}`"
             ))
         })?;
-    if sql_template_validation_mode == SqlTemplateValidationMode::ExternalFelderaRuntime {
+    if sql_template_validation_mode == SqlTemplateValidationMode::ExternalSqlRuntime {
         return Ok(());
     }
-    let table_schema = arrow_schema_from_feldera_relation_schema(output_schema)?;
+    let table_schema = arrow_schema_from_incremental_relation_schema(output_schema)?;
     let bound_sql = render_view_sql_template_for_validation(sql_template, &api.request)?;
     validate_record_batch_table_query_with_bindings_and_policy(
         &output_id,
@@ -11290,9 +7859,9 @@ fn validate_standing_runtime_query_contract(
     api: &MaterializedViewApiMetadata,
     parameters: &BTreeMap<String, Value>,
     page_request: &SnapshotPageRequest,
-    allow_feldera_runtime_sql: bool,
+    allow_materialized_runtime_sql: bool,
 ) -> Result<(), ApiError> {
-    if request_sql.is_some() && !allow_feldera_runtime_sql {
+    if request_sql.is_some() && !allow_materialized_runtime_sql {
         return Err(ApiError::bad_request(format!(
             "caller-supplied SQL is not supported for standing runtime view `{view_id}`"
         )));
@@ -11305,13 +7874,18 @@ fn validate_standing_runtime_query_contract(
             "standing runtime view `{view_id}` has request parameters but no sql_template"
         )));
     }
-    if api.sql_template.is_some() && page_request.page_token.is_some() && !allow_feldera_runtime_sql
+    if api.sql_template.is_some()
+        && page_request.page_token.is_some()
+        && !allow_materialized_runtime_sql
     {
         return Err(ApiError::bad_request(format!(
             "cursor pagination is not supported for templated standing runtime view `{view_id}`"
         )));
     }
-    if api.sql_template.is_some() && page_request.max_rows.is_some() && !allow_feldera_runtime_sql {
+    if api.sql_template.is_some()
+        && page_request.max_rows.is_some()
+        && !allow_materialized_runtime_sql
+    {
         return Err(ApiError::bad_request(format!(
             "row limits are not supported for templated standing runtime view `{view_id}`"
         )));
@@ -11426,7 +8000,7 @@ fn validate_request_field_contract(
 fn unsupported_request_field_type_error(name: &str, field_type: &str) -> ApiError {
     if field_type.eq_ignore_ascii_case("variant") {
         ApiError::bad_request(format!(
-            "request field `{name}` declares unsupported type `variant`: Feldera pipeline-manager /query does not support request-time VARIANT bind literals; use type `json` for canonical JSON text parameters or compute VARIANT inside a Feldera view"
+            "request field `{name}` declares unsupported type `variant`: external SQL runtime /query does not support request-time VARIANT bind literals; use type `json` for canonical JSON text parameters or compute VARIANT inside a materialized runtime view"
         ))
     } else {
         ApiError::bad_request(format!(
@@ -11777,7 +8351,7 @@ struct BoundViewSql {
     bind_values: Vec<QueryBindValue>,
 }
 
-const FELDERA_PREPARED_QUERY_NAME: &str = "velorix_query";
+const PREPARED_QUERY_NAME: &str = "velorix_query";
 
 fn render_view_sql_template(
     template: &str,
@@ -11820,26 +8394,26 @@ fn render_view_sql_template(
     })
 }
 
-fn render_view_sql_template_as_feldera_sql(
+fn render_view_sql_template_as_bound_sql(
     template: &str,
     fields: &[MaterializedViewRequestFieldSpec],
     values: &BTreeMap<String, Value>,
 ) -> Result<String, ApiError> {
     let bound_sql = render_view_sql_template(template, fields, values)?;
-    let bound_sql = rewrite_feldera_array_unnest_placeholders(bound_sql)?;
-    feldera_prepared_query_sql(bound_sql)
+    let bound_sql = rewrite_array_unnest_placeholders(bound_sql)?;
+    prepared_query_sql(bound_sql)
 }
 
-fn render_caller_sql_as_feldera_sql(
+fn render_caller_sql_as_bound_sql(
     sql: &str,
     values: &BTreeMap<String, Value>,
 ) -> Result<String, ApiError> {
-    let bound_sql = render_caller_sql_as_feldera_bound_sql(sql, values)?;
-    let bound_sql = rewrite_feldera_array_unnest_placeholders(bound_sql)?;
-    feldera_prepared_query_sql(bound_sql)
+    let bound_sql = render_caller_sql_as_parameterized_bound_sql(sql, values)?;
+    let bound_sql = rewrite_array_unnest_placeholders(bound_sql)?;
+    prepared_query_sql(bound_sql)
 }
 
-fn render_caller_sql_as_feldera_bound_sql(
+fn render_caller_sql_as_parameterized_bound_sql(
     sql: &str,
     values: &BTreeMap<String, Value>,
 ) -> Result<BoundViewSql, ApiError> {
@@ -11920,35 +8494,33 @@ fn render_caller_sql_as_feldera_bound_sql(
     })
 }
 
-fn feldera_prepared_query_sql(bound_sql: BoundViewSql) -> Result<String, ApiError> {
+fn prepared_query_sql(bound_sql: BoundViewSql) -> Result<String, ApiError> {
     if bound_sql.bind_values.is_empty() {
         return Ok(bound_sql.sql);
     }
-    let query_sql = trim_feldera_prepared_statement_sql(&bound_sql.sql);
+    let query_sql = trim_prepared_statement_sql(&bound_sql.sql);
     if query_sql.is_empty() {
         return Err(ApiError::bad_request(
-            "Feldera prepared query SQL cannot be empty",
+            "materialized runtime prepared query SQL cannot be empty",
         ));
     }
-    if feldera_sql_has_statement_separator(query_sql) {
+    if sql_has_statement_separator(query_sql) {
         return Err(ApiError::bad_request(
-            "Feldera prepared query parameters require a single SQL statement",
+            "materialized runtime prepared query parameters require a single SQL statement",
         ));
     }
     let args = bound_sql
         .bind_values
         .iter()
-        .map(query_bind_value_to_feldera_sql_literal)
+        .map(query_bind_value_to_sql_literal)
         .collect::<Result<Vec<_>, _>>()?
         .join(", ");
     Ok(format!(
-        "PREPARE {FELDERA_PREPARED_QUERY_NAME} AS {query_sql};\nEXECUTE {FELDERA_PREPARED_QUERY_NAME}({args});"
+        "PREPARE {PREPARED_QUERY_NAME} AS {query_sql};\nEXECUTE {PREPARED_QUERY_NAME}({args});"
     ))
 }
 
-fn rewrite_feldera_array_unnest_placeholders(
-    bound_sql: BoundViewSql,
-) -> Result<BoundViewSql, ApiError> {
+fn rewrite_array_unnest_placeholders(bound_sql: BoundViewSql) -> Result<BoundViewSql, ApiError> {
     if bound_sql.bind_values.is_empty() {
         return Ok(bound_sql);
     }
@@ -11975,11 +8547,11 @@ fn rewrite_feldera_array_unnest_placeholders(
             copy_sql_block_comment(&bound_sql.sql, &mut offset, &mut output);
             continue;
         }
-        if let Some((end, index)) = parse_feldera_in_unnest_placeholder(&bound_sql.sql, offset) {
+        if let Some((end, index)) = parse_in_unnest_placeholder(&bound_sql.sql, offset) {
             let value = bind_value_by_one_based_index(&bound_sql.bind_values, index)?;
             let Some(values) = array_bind_value_elements(value) else {
                 return Err(ApiError::bad_request(
-                    "Feldera IN UNNEST query parameter must be an array",
+                    "materialized runtime IN UNNEST query parameter must be an array",
                 ));
             };
             output.push_str("IN (");
@@ -11999,7 +8571,7 @@ fn rewrite_feldera_array_unnest_placeholders(
             continue;
         }
         if rest.starts_with('$') {
-            if let Some((end, index)) = parse_feldera_placeholder(&bound_sql.sql, offset) {
+            if let Some((end, index)) = parse_numbered_placeholder(&bound_sql.sql, offset) {
                 let value = bind_value_by_one_based_index(&bound_sql.bind_values, index)?;
                 bind_values.push(value.clone());
                 output.push_str(&format!("${}", bind_values.len()));
@@ -12011,7 +8583,7 @@ fn rewrite_feldera_array_unnest_placeholders(
         let ch = rest
             .chars()
             .next()
-            .expect("non-empty SQL slice while rewriting Feldera placeholders");
+            .expect("non-empty SQL slice while rewriting materialized runtime placeholders");
         output.push(ch);
         offset += ch.len_utf8();
     }
@@ -12029,7 +8601,7 @@ fn bind_value_by_one_based_index(
     index
         .checked_sub(1)
         .and_then(|index| bind_values.get(index))
-        .ok_or_else(|| ApiError::bad_request("Feldera query placeholder index is out of range"))
+        .ok_or_else(|| ApiError::bad_request("query placeholder index is out of range"))
 }
 
 fn array_bind_value_elements(value: &QueryBindValue) -> Option<Vec<QueryBindValue>> {
@@ -12097,7 +8669,7 @@ fn array_bind_value_elements(value: &QueryBindValue) -> Option<Vec<QueryBindValu
     }
 }
 
-fn parse_feldera_in_unnest_placeholder(sql: &str, offset: usize) -> Option<(usize, usize)> {
+fn parse_in_unnest_placeholder(sql: &str, offset: usize) -> Option<(usize, usize)> {
     let mut cursor = offset;
     cursor = parse_ascii_keyword(sql, cursor, "in")?;
     let after_in = skip_ascii_whitespace(sql, cursor);
@@ -12108,13 +8680,13 @@ fn parse_feldera_in_unnest_placeholder(sql: &str, offset: usize) -> Option<(usiz
     cursor = skip_ascii_whitespace(sql, cursor);
     cursor = consume_ascii_byte(sql, cursor, b'(')?;
     cursor = skip_ascii_whitespace(sql, cursor);
-    let (after_placeholder, index) = parse_feldera_placeholder(sql, cursor)?;
+    let (after_placeholder, index) = parse_numbered_placeholder(sql, cursor)?;
     cursor = skip_ascii_whitespace(sql, after_placeholder);
     cursor = consume_ascii_byte(sql, cursor, b')')?;
     Some((cursor, index))
 }
 
-fn parse_feldera_placeholder(sql: &str, offset: usize) -> Option<(usize, usize)> {
+fn parse_numbered_placeholder(sql: &str, offset: usize) -> Option<(usize, usize)> {
     let bytes = sql.as_bytes();
     if bytes.get(offset).copied()? != b'$' {
         return None;
@@ -12166,11 +8738,11 @@ fn consume_ascii_byte(sql: &str, offset: usize, expected: u8) -> Option<usize> {
     }
 }
 
-fn trim_feldera_prepared_statement_sql(sql: &str) -> &str {
+fn trim_prepared_statement_sql(sql: &str) -> &str {
     sql.trim().trim_end_matches(';').trim_end()
 }
 
-fn feldera_sql_has_statement_separator(sql: &str) -> bool {
+fn sql_has_statement_separator(sql: &str) -> bool {
     let mut offset = 0;
     let mut copied = String::new();
     while offset < sql.len() {
@@ -12194,7 +8766,7 @@ fn feldera_sql_has_statement_separator(sql: &str) -> bool {
         let ch = rest
             .chars()
             .next()
-            .expect("non-empty SQL slice while scanning Feldera SQL");
+            .expect("non-empty SQL slice while scanning SQL");
         if ch == ';' {
             return true;
         }
@@ -12299,7 +8871,7 @@ fn caller_sql_parameter_bind_value(
     {
         return query_array_bind_value_for_json_value(name, value, filter).map(Some);
     }
-    if let Some(value) = typed_feldera_literal_bind_value_for_json_value(name, value, filters)? {
+    if let Some(value) = typed_sql_literal_bind_value_for_json_value(name, value, filters)? {
         return Ok(Some(value));
     }
     if filters
@@ -12352,10 +8924,10 @@ fn caller_sql_parameter_bind_value(
         return Ok(Some(QueryBindValue::Boolean(value)));
     }
 
-    inferred_feldera_bind_value_for_json_value(name, value)
+    inferred_bind_value_for_json_value(name, value)
 }
 
-fn inferred_feldera_bind_value_for_json_value(
+fn inferred_bind_value_for_json_value(
     name: &str,
     value: &Value,
 ) -> Result<Option<QueryBindValue>, ApiError> {
@@ -12384,14 +8956,14 @@ fn inferred_feldera_bind_value_for_json_value(
     }
 }
 
-fn query_bind_value_to_feldera_sql_literal(value: &QueryBindValue) -> Result<String, ApiError> {
+fn query_bind_value_to_sql_literal(value: &QueryBindValue) -> Result<String, ApiError> {
     match value {
         QueryBindValue::Utf8(value) => Ok(format!("'{}'", value.replace('\'', "''"))),
         QueryBindValue::Json(value) => Ok(format!("'{}'", value.replace('\'', "''"))),
         QueryBindValue::Int64(value) => Ok(value.to_string()),
         QueryBindValue::Float64(value) if value.is_finite() => Ok(value.to_string()),
         QueryBindValue::Float64(_) => Err(ApiError::bad_request(
-            "non-finite float query parameter cannot be rendered as Feldera SQL",
+            "non-finite float query parameter cannot be rendered as SQL",
         )),
         QueryBindValue::Boolean(value) => Ok(if *value { "TRUE" } else { "FALSE" }.to_string()),
         QueryBindValue::Date(value)
@@ -12435,7 +9007,7 @@ fn query_bind_value_to_feldera_sql_literal(value: &QueryBindValue) -> Result<Str
                         Ok(value.to_string())
                     } else {
                         Err(ApiError::bad_request(
-                            "non-finite float query parameter cannot be rendered as Feldera SQL",
+                            "non-finite float query parameter cannot be rendered as SQL",
                         ))
                     }
                 })
@@ -12587,7 +9159,7 @@ fn bind_value_for_template_parameter(
     {
         return query_array_bind_value_for_json_value(name, value, filter).map(Some);
     }
-    if let Some(value) = typed_feldera_literal_bind_value_for_json_value(name, value, filters)? {
+    if let Some(value) = typed_sql_literal_bind_value_for_json_value(name, value, filters)? {
         return Ok(Some(value));
     }
     if filters
@@ -12833,7 +9405,7 @@ fn query_array_bind_value_for_json_value(
     }
 }
 
-fn typed_feldera_literal_bind_value_for_json_value(
+fn typed_sql_literal_bind_value_for_json_value(
     name: &str,
     value: &Value,
     filters: &[String],
@@ -13052,7 +9624,7 @@ fn bind_value_for_request_field(
 
 fn unsupported_variant_filter_error(name: &str) -> ApiError {
     ApiError::bad_request(format!(
-        "parameter `{name}` uses unsupported SQL template filter `is_variant`: Feldera pipeline-manager /query does not support request-time VARIANT bind literals; use `is_json` for canonical JSON text parameters or compute VARIANT inside a Feldera view"
+        "parameter `{name}` uses unsupported SQL template filter `is_variant`: external SQL runtime /query does not support request-time VARIANT bind literals; use `is_json` for canonical JSON text parameters or compute VARIANT inside a materialized runtime view"
     ))
 }
 
@@ -13368,17 +9940,6 @@ fn api_metadata_from_create_view_request(
     }
 }
 
-fn runtime_artifact_status_text(status: &RuntimeFelderaArtifactSelectionStatus) -> &'static str {
-    match status {
-        RuntimeFelderaArtifactSelectionStatus::DirectExecutionDisabled => {
-            "direct_execution_disabled"
-        }
-        RuntimeFelderaArtifactSelectionStatus::DirectExecutionEnabled { .. } => {
-            "direct_execution_enabled"
-        }
-    }
-}
-
 fn active_view_response(
     active: &ActiveMaterializedView,
     outcome: Option<&str>,
@@ -13412,12 +9973,8 @@ fn view_response(
         ..MaterializedViewApiMetadata::default()
     });
 
-    let (query_enabled, disabled_reason) = view_query_availability(&execution_mode, &lifecycle);
-    let compile_job_id = if execution_mode == MaterializedViewExecutionMode::FelderaCompilePending {
-        Some(compile_job_id_for_spec(spec)?)
-    } else {
-        None
-    };
+    let query_enabled = view_query_availability(&lifecycle);
+    let coverage = materialization_coverage_response(&lifecycle);
 
     Ok(ViewResponse {
         view_id: spec.view_id.clone(),
@@ -13430,8 +9987,7 @@ fn view_response(
         execution_mode,
         lifecycle,
         query_enabled,
-        disabled_reason,
-        compile_job_id,
+        coverage,
         query_endpoint: api
             .url_path
             .as_deref()
@@ -13460,61 +10016,102 @@ fn view_response(
     })
 }
 
-fn compile_request_hash_for_spec(spec: &StandingViewSpec) -> Result<String, ApiError> {
-    feldera_compile_request_hash(
-        &FelderaCompileRequestV1::infer_output_from_standing_view_spec(spec),
-    )
-    .map_err(ApiError::bad_request)
-}
-
-fn compile_job_id_for_spec(spec: &StandingViewSpec) -> Result<String, ApiError> {
-    Ok(view_compile_deploy_compile_request_job_id(
-        &spec.view_id,
-        &compile_request_hash_for_spec(spec)?,
-    ))
+fn backfill_view_response(
+    active: &ActiveMaterializedView,
+    outcome: &str,
+    mode: &str,
+    applied_batches: usize,
+    remaining_batches: usize,
+    progress: BackfillProgressResponse,
+) -> BackfillViewResponse {
+    BackfillViewResponse {
+        view_id: active.spec.view_id.clone(),
+        outcome: outcome.to_string(),
+        mode: mode.to_string(),
+        lifecycle: active.lifecycle.clone(),
+        query_enabled: view_query_availability(&active.lifecycle),
+        coverage: materialization_coverage_response(&active.lifecycle),
+        progress,
+        applied_batches,
+        remaining_batches,
+    }
 }
 
 fn lifecycle_for_create_view_execution(
     execution_mode: &MaterializedViewExecutionMode,
+    requires_backfill: bool,
 ) -> MaterializedViewLifecycleStatus {
     match execution_mode {
-        MaterializedViewExecutionMode::StandingRuntime => {
-            MaterializedViewLifecycleStatus::standing_runtime()
-        }
-        MaterializedViewExecutionMode::FelderaCompilePending => {
-            MaterializedViewLifecycleStatus::feldera_compile_pending(Some(
-                "view accepted; feldera compiler/deploy worker is not configured in this build"
-                    .to_string(),
+        MaterializedViewExecutionMode::StandingRuntime if requires_backfill => {
+            MaterializedViewLifecycleStatus::standing_runtime_deploying(Some(
+                "backfill_required: committed input data exists; first query will materialize the view before serving rows".to_string(),
             ))
         }
+        MaterializedViewExecutionMode::StandingRuntime => MaterializedViewLifecycleStatus::standing_runtime(),
     }
 }
 
-fn view_query_availability(
-    execution_mode: &MaterializedViewExecutionMode,
+fn view_query_availability(lifecycle: &MaterializedViewLifecycleStatus) -> bool {
+    lifecycle.compile_status == MaterializedViewCompileStatus::Success
+        && lifecycle.deployment_status == MaterializedViewDeploymentStatus::Running
+}
+
+fn materialization_coverage_response(
     lifecycle: &MaterializedViewLifecycleStatus,
-) -> (bool, Option<String>) {
-    match execution_mode {
-        MaterializedViewExecutionMode::FelderaCompilePending => {
-            (false, Some("feldera_compile_pending".to_string()))
-        }
-        MaterializedViewExecutionMode::StandingRuntime => {
-            if lifecycle.compile_status == MaterializedViewCompileStatus::Success
-                && lifecycle.deployment_status == MaterializedViewDeploymentStatus::Running
-            {
-                (true, None)
-            } else {
-                (false, Some("standing_runtime_not_deployed".to_string()))
-            }
-        }
+) -> MaterializationCoverageResponse {
+    let state = if view_query_availability(lifecycle) {
+        "materialized"
+    } else if lifecycle.deployment_status == MaterializedViewDeploymentStatus::Deploying
+        && lifecycle
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("backfill_required"))
+    {
+        "backfill_required"
+    } else if lifecycle.deployment_status == MaterializedViewDeploymentStatus::Failed {
+        "failed"
+    } else {
+        "unavailable"
+    };
+    MaterializationCoverageResponse {
+        state: state.to_string(),
+        full_view: CoverageCapabilityResponse {
+            status: "available".to_string(),
+            reason: "full-view materialization is backed by committed ingest replay and durable standing-runtime checkpoints".to_string(),
+        },
+        request_scope: CoverageCapabilityResponse {
+            status: "unsupported".to_string(),
+            reason: "request-scope backfill needs a durable input scope index; current ingest logs are checkpoint-contiguous by stream/partition".to_string(),
+        },
+        range: CoverageCapabilityResponse {
+            status: "unsupported".to_string(),
+            reason: "arbitrary range backfill would violate contiguous input frontier semantics without a new range/index contract".to_string(),
+        },
+        background_backfill: CoverageCapabilityResponse {
+            status: "available".to_string(),
+            reason: "backfill can run in bounded committed-ingest batches through the view backfill API".to_string(),
+        },
     }
+}
+
+fn view_backfill_is_query_triggerable(active: &ActiveMaterializedView) -> bool {
+    active.lifecycle.compile_status == MaterializedViewCompileStatus::Success
+        && active.lifecycle.deployment_status == MaterializedViewDeploymentStatus::Deploying
+        && active
+            .lifecycle
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("backfill_required"))
+}
+
+fn standing_runtime_can_accept_incremental_ingest(active: &ActiveMaterializedView) -> bool {
+    view_query_availability(&active.lifecycle)
 }
 
 fn view_spec_from_request(
     state: &ApiState,
     request: &CreateViewRequest,
     catalogs: &[VelorixRelationCatalogV1],
-    artifact: Option<&FelderaCompileArtifactMetadata>,
 ) -> Result<StandingViewSpec, ApiError> {
     let input_relations = catalogs
         .iter()
@@ -13525,47 +10122,31 @@ fn view_spec_from_request(
         .ok_or_else(|| ApiError::bad_request("view has no input relation"))?;
     validate_create_view_sql_source_contract(request)?;
     let source_kind = resolved_sql_source_kind_for_create_view(request);
-    let output_relations = if let Some(artifact_request) = &request.artifact {
-        artifact_request.metadata.output_schemas.clone()
-    } else if let Some(artifact) = artifact {
-        artifact.output_schemas.clone()
-    } else if source_kind == SqlSourceKind::FelderaProgram
-        && !request.output_relation_ids.is_empty()
-    {
-        generic_materialized_view_output_schemas_for_ids(
-            &request.output_relation_ids,
-            input.schema_fingerprint.as_str(),
-        )?
-    } else if source_kind == SqlSourceKind::StandingView {
+    let output_relations = if source_kind == SqlSourceKind::StandingView {
         state
-            .generated_package_output_schemas_for_view_request(
+            .materialized_runtime_output_schemas_for_view_request(
                 request.view_id.as_str(),
                 request.sql.as_str(),
                 catalogs,
                 input.schema_fingerprint.as_str(),
             )?
-            .unwrap_or_else(|| {
-                vec![generic_materialized_view_output_schema(
-                    request.view_id.as_str(),
-                    input.schema_fingerprint.as_str(),
-                )]
+            .ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "unsupported view SQL for materialized runtime `{}`",
+                    request.view_id
+                ))
             })
     } else {
-        vec![generic_materialized_view_output_schema(
-            request.view_id.as_str(),
-            input.schema_fingerprint.as_str(),
-        )]
-    };
+        return Err(ApiError::bad_request(
+            "CREATE VIEW SQL requires a supported materialized view runtime; runtime fallback is disabled",
+        ));
+    }?;
     let multi_output = output_relations.len() > 1;
     Ok(StandingViewSpec {
         view_id: request.view_id.clone(),
         sql: request.sql.clone(),
-        dialect: SqlDialect::FelderaSql,
+        dialect: SqlDialect::VelorixSql,
         source_kind,
-        rust_extension: FelderaRustExtensionV1 {
-            udf_rust: request.udf_rust.clone(),
-            udf_toml: request.udf_toml.clone(),
-        },
         input_relations,
         output_relations,
         shape: StandingViewShape {
@@ -13577,7 +10158,6 @@ fn view_spec_from_request(
 }
 
 fn validate_create_view_sql_source_contract(request: &CreateViewRequest) -> Result<(), ApiError> {
-    let source_kind = resolved_sql_source_kind_for_create_view(request);
     let mut output_ids = BTreeSet::new();
     for output_id in &request.output_relation_ids {
         let trimmed = output_id.trim();
@@ -13592,42 +10172,18 @@ fn validate_create_view_sql_source_contract(request: &CreateViewRequest) -> Resu
             )));
         }
     }
-    if source_kind == SqlSourceKind::StandingView && !request.output_relation_ids.is_empty() {
+    if !request.output_relation_ids.is_empty() {
         return Err(ApiError::bad_request(
-            "output_relation_ids are only supported when source_kind is `feldera_program`",
+            "output_relation_ids are not supported by the local materialized runtime",
         ));
     }
     Ok(())
 }
 
-fn generic_materialized_view_output_schemas_for_ids(
-    output_relation_ids: &[String],
-    input_schema_fingerprint: &str,
-) -> Result<Vec<RelationSchema>, ApiError> {
-    output_relation_ids
-        .iter()
-        .map(|output_id| {
-            let output_id = output_id.trim();
-            if output_id.is_empty() {
-                return Err(ApiError::bad_request(
-                    "output_relation_ids must not contain blank output ids",
-                ));
-            }
-            let schema_fingerprint = feldera_artifact_bytes_hash(
-                format!("velorix-compile-pending-output:{input_schema_fingerprint}:{output_id}")
-                    .as_bytes(),
-            );
-            Ok(generic_materialized_view_output_schema(
-                output_id,
-                &schema_fingerprint,
-            ))
-        })
-        .collect()
-}
-
 fn single_key_sum_count_output_schema(
     view_id: &str,
     catalog: &VelorixRelationCatalogV1,
+    plan: &SupportedViewPlan,
 ) -> Result<RelationSchema, ApiError> {
     let [primary_key_id] = catalog.relation_schema.primary_key_column_ids.as_slice() else {
         return Err(ApiError::bad_request(
@@ -13641,36 +10197,143 @@ fn single_key_sum_count_output_schema(
         .find(|column| &column.column_id == primary_key_id)
         .ok_or_else(|| ApiError::bad_request("primary key column is missing from catalog"))?;
     let key_type = sql_type_from_catalog_column(key_column)?;
-    let sum_type = generic_single_key_sum_count_sum_type(catalog)?;
+    let aggregate_outputs = supported_view_plan_aggregate_outputs(plan);
+    let mut columns = Vec::with_capacity(1 + aggregate_outputs.len());
+    columns.push(ColumnSchema {
+        name: key_column.name.clone(),
+        data_type: key_type,
+        nullable: false,
+    });
+    for aggregate in &aggregate_outputs {
+        columns.push(ColumnSchema {
+            name: aggregate.output_column_id.clone(),
+            data_type: single_key_aggregate_output_type(catalog, aggregate)?,
+            nullable: false,
+        });
+    }
+    let primary_key = vec![key_column.name.clone()];
+    let schema_fingerprint =
+        materialized_output_schema_fingerprint(view_id, "v1", &columns, &primary_key)?;
     Ok(RelationSchema {
         relation_id: view_id.to_string(),
         relation_name: view_id.to_string(),
         relation_version: "v1".to_string(),
-        schema_fingerprint: catalog.schema_fingerprint.to_string(),
-        columns: vec![
-            ColumnSchema {
-                name: key_column.name.clone(),
-                data_type: key_type,
-                nullable: false,
-            },
-            ColumnSchema {
-                name: "sum".to_string(),
-                data_type: sum_type,
-                nullable: false,
-            },
-            ColumnSchema {
-                name: "count".to_string(),
-                data_type: SqlDataType::Int64,
-                nullable: false,
-            },
-        ],
-        primary_key: vec![key_column.name.clone()],
+        schema_fingerprint,
+        columns,
+        primary_key,
+    })
+}
+
+fn latest_by_key_output_schema(
+    view_id: &str,
+    catalog: &VelorixRelationCatalogV1,
+    plan: &SupportedLatestByKeyPlan,
+) -> Result<RelationSchema, ApiError> {
+    let [primary_key_id] = catalog.relation_schema.primary_key_column_ids.as_slice() else {
+        return Err(ApiError::bad_request(
+            "latest-by-key view requires exactly one primary key column",
+        ));
+    };
+    let key_column = catalog
+        .relation_schema
+        .columns
+        .iter()
+        .find(|column| &column.column_id == primary_key_id)
+        .ok_or_else(|| ApiError::bad_request("primary key column is missing from catalog"))?;
+    let value_column = catalog
+        .relation_schema
+        .columns
+        .iter()
+        .find(|column| column.column_id == plan.value_column_id)
+        .ok_or_else(|| {
+            ApiError::bad_request("latest-by-key value column is missing from catalog")
+        })?;
+    let columns = vec![
+        ColumnSchema {
+            name: key_column.name.clone(),
+            data_type: sql_type_from_catalog_column(key_column)?,
+            nullable: false,
+        },
+        ColumnSchema {
+            name: plan.output_value_column_id.clone(),
+            data_type: sql_type_from_catalog_column(value_column)?,
+            nullable: false,
+        },
+    ];
+    let primary_key = vec![key_column.name.clone()];
+    let schema_fingerprint =
+        materialized_output_schema_fingerprint(view_id, "v1", &columns, &primary_key)?;
+    Ok(RelationSchema {
+        relation_id: view_id.to_string(),
+        relation_name: view_id.to_string(),
+        relation_version: "v1".to_string(),
+        schema_fingerprint,
+        columns,
+        primary_key,
+    })
+}
+
+fn tumbling_window_output_schema(
+    view_id: &str,
+    catalog: &VelorixRelationCatalogV1,
+    plan: &SupportedTumblingWindowPlan,
+) -> Result<RelationSchema, ApiError> {
+    let [primary_key_id] = catalog.relation_schema.primary_key_column_ids.as_slice() else {
+        return Err(ApiError::bad_request(
+            "tumbling window view requires exactly one primary key column",
+        ));
+    };
+    let key_column = catalog
+        .relation_schema
+        .columns
+        .iter()
+        .find(|column| &column.column_id == primary_key_id)
+        .ok_or_else(|| ApiError::bad_request("primary key column is missing from catalog"))?;
+    let mut columns = vec![
+        ColumnSchema {
+            name: key_column.name.clone(),
+            data_type: sql_type_from_catalog_column(key_column)?,
+            nullable: false,
+        },
+        ColumnSchema {
+            name: plan.window_start_output_column_id.clone(),
+            data_type: SqlDataType::Int64,
+            nullable: false,
+        },
+        ColumnSchema {
+            name: plan.window_end_output_column_id.clone(),
+            data_type: SqlDataType::Int64,
+            nullable: false,
+        },
+    ];
+    for aggregate in &plan.aggregate_outputs {
+        columns.push(ColumnSchema {
+            name: aggregate.output_column_id.clone(),
+            data_type: single_key_aggregate_output_type(catalog, aggregate)?,
+            nullable: false,
+        });
+    }
+    let primary_key = vec![
+        key_column.name.clone(),
+        plan.window_start_output_column_id.clone(),
+        plan.window_end_output_column_id.clone(),
+    ];
+    let schema_fingerprint =
+        materialized_output_schema_fingerprint(view_id, "v1", &columns, &primary_key)?;
+    Ok(RelationSchema {
+        relation_id: view_id.to_string(),
+        relation_name: view_id.to_string(),
+        relation_version: "v1".to_string(),
+        schema_fingerprint,
+        columns,
+        primary_key,
     })
 }
 
 fn join_sum_count_output_schema(
     view_id: &str,
     catalogs: &[VelorixRelationCatalogV1],
+    plan: &SupportedJoinViewPlan,
 ) -> Result<RelationSchema, ApiError> {
     let [left_catalog, right_catalog] = catalogs else {
         return Err(ApiError::bad_request(
@@ -13693,43 +10356,58 @@ fn join_sum_count_output_schema(
         .find(|column| &column.column_id == right_primary_key_id)
         .ok_or_else(|| ApiError::bad_request("right primary key column is missing from catalog"))?;
     let key_type = sql_type_from_catalog_column(key_column)?;
-    let sum_type = generic_single_key_sum_count_sum_type(left_catalog)?;
-    let input_fingerprint = feldera_artifact_bytes_hash(
-        serde_json::to_vec(&[
-            left_catalog.schema_fingerprint.as_str(),
-            right_catalog.schema_fingerprint.as_str(),
-        ])
-        .map_err(|source| ApiError::internal(source.to_string()))?
-        .as_slice(),
-    );
+    let sum_type =
+        generic_single_key_sum_count_sum_type_for_column(left_catalog, &plan.sum_value_column_id)?;
+    let columns = vec![
+        ColumnSchema {
+            name: key_column.name.clone(),
+            data_type: key_type,
+            nullable: false,
+        },
+        ColumnSchema {
+            name: "sum".to_string(),
+            data_type: sum_type,
+            nullable: false,
+        },
+        ColumnSchema {
+            name: "count".to_string(),
+            data_type: SqlDataType::Int64,
+            nullable: false,
+        },
+    ];
+    let primary_key = vec![key_column.name.clone()];
+    let schema_fingerprint =
+        materialized_output_schema_fingerprint(view_id, "v1", &columns, &primary_key)?;
     Ok(RelationSchema {
         relation_id: view_id.to_string(),
         relation_name: view_id.to_string(),
         relation_version: "v1".to_string(),
-        schema_fingerprint: input_fingerprint,
-        columns: vec![
-            ColumnSchema {
-                name: key_column.name.clone(),
-                data_type: key_type,
-                nullable: false,
-            },
-            ColumnSchema {
-                name: "sum".to_string(),
-                data_type: sum_type,
-                nullable: false,
-            },
-            ColumnSchema {
-                name: "count".to_string(),
-                data_type: SqlDataType::Int64,
-                nullable: false,
-            },
-        ],
-        primary_key: vec![key_column.name.clone()],
+        schema_fingerprint,
+        columns,
+        primary_key,
     })
 }
 
+fn materialized_output_schema_fingerprint(
+    relation_id: &str,
+    relation_version: &str,
+    columns: &[ColumnSchema],
+    primary_key: &[String],
+) -> Result<String, ApiError> {
+    let canonical = json!({
+        "relation_id": relation_id,
+        "relation_name": relation_id,
+        "relation_version": relation_version,
+        "columns": columns,
+        "primary_key": primary_key,
+    });
+    let bytes =
+        serde_json::to_vec(&canonical).map_err(|source| ApiError::internal(source.to_string()))?;
+    Ok(stable_bytes_hash(&bytes))
+}
+
 fn validate_join_plan_catalog_order(
-    plan: &SupportedDbspJoinViewPlan,
+    plan: &SupportedJoinViewPlan,
     catalogs: &[VelorixRelationCatalogV1],
 ) -> Result<(), ApiError> {
     let [left, right] = catalogs else {
@@ -13748,28 +10426,16 @@ fn validate_join_plan_catalog_order(
     }
 }
 
-fn validate_generic_single_key_sum_count_runtime_scope(
+fn generic_single_key_sum_count_sum_type_for_column(
     catalog: &VelorixRelationCatalogV1,
-) -> Result<(), ApiError> {
-    generic_single_key_sum_count_sum_type(catalog).map(|_| ())
-}
-
-fn generic_single_key_sum_count_sum_type(
-    catalog: &VelorixRelationCatalogV1,
+    column_id: &str,
 ) -> Result<SqlDataType, ApiError> {
-    let mut value_columns = catalog
+    let value = catalog
         .relation_schema
         .columns
         .iter()
-        .filter(|column| column.semantic_role == RelationSemanticRoleV1::Value);
-    let value = value_columns.next().ok_or_else(|| {
-        ApiError::bad_request("single-key sum/count view requires one value column")
-    })?;
-    if value_columns.next().is_some() {
-        return Err(ApiError::bad_request(
-            "single-key sum/count view supports exactly one value column",
-        ));
-    }
+        .find(|column| column.column_id == column_id)
+        .ok_or_else(|| ApiError::bad_request("sum value column is missing from catalog"))?;
     match &value.physical_arrow_type {
         ArrowPhysicalTypeV1::Int64 => Ok(SqlDataType::Int64),
         ArrowPhysicalTypeV1::Decimal128 { precision, scale } => Ok(SqlDataType::Decimal {
@@ -13777,9 +10443,50 @@ fn generic_single_key_sum_count_sum_type(
             scale: *scale,
         }),
         _ => Err(ApiError::bad_request(format!(
-            "single-key sum/count generated runtime value column `{}` must be Int64 or Decimal128",
+            "single-key sum/count materialized runtime value column `{}` must be Int64 or Decimal128",
             value.name
         ))),
+    }
+}
+
+fn single_key_aggregate_output_type(
+    catalog: &VelorixRelationCatalogV1,
+    aggregate: &SupportedAggregateOutput,
+) -> Result<SqlDataType, ApiError> {
+    match aggregate.function {
+        LogicalPlanAggregateFunctionV1::Sum => {
+            let column_id = aggregate
+                .input_column_id
+                .as_ref()
+                .ok_or_else(|| ApiError::bad_request("sum aggregate input column is missing"))?;
+            generic_single_key_sum_count_sum_type_for_column(catalog, column_id)
+        }
+        LogicalPlanAggregateFunctionV1::Count => Ok(SqlDataType::Int64),
+        LogicalPlanAggregateFunctionV1::Avg => {
+            let column_id = aggregate
+                .input_column_id
+                .as_ref()
+                .ok_or_else(|| ApiError::bad_request("avg aggregate input column is missing"))?;
+            let value = catalog
+                .relation_schema
+                .columns
+                .iter()
+                .find(|column| &column.column_id == column_id)
+                .ok_or_else(|| ApiError::bad_request("avg value column is missing from catalog"))?;
+            match &value.physical_arrow_type {
+                ArrowPhysicalTypeV1::Int64 => Ok(SqlDataType::Float64),
+                _ => Err(ApiError::bad_request(format!(
+                    "single-key materialized runtime avg column `{}` must be Int64",
+                    value.name
+                ))),
+            }
+        }
+        LogicalPlanAggregateFunctionV1::Min | LogicalPlanAggregateFunctionV1::Max => {
+            let column_id = aggregate.input_column_id.as_ref().ok_or_else(|| {
+                ApiError::bad_request("min/max aggregate input column is missing")
+            })?;
+            generic_single_key_sum_count_sum_type_for_column(catalog, column_id)
+        }
     }
 }
 
@@ -13840,36 +10547,6 @@ fn sql_type_from_logical_type(
             value_type: Box::new(sql_type_from_logical_type(value_type)?),
         },
     })
-}
-
-fn generic_materialized_view_output_schema(
-    view_id: &str,
-    schema_fingerprint: &str,
-) -> RelationSchema {
-    RelationSchema {
-        relation_id: view_id.to_string(),
-        relation_name: view_id.to_string(),
-        relation_version: "v1".to_string(),
-        schema_fingerprint: schema_fingerprint.to_string(),
-        columns: vec![
-            ColumnSchema {
-                name: "key_json".to_string(),
-                data_type: SqlDataType::Utf8,
-                nullable: false,
-            },
-            ColumnSchema {
-                name: "value_json".to_string(),
-                data_type: SqlDataType::Utf8,
-                nullable: false,
-            },
-            ColumnSchema {
-                name: "weight".to_string(),
-                data_type: SqlDataType::Int64,
-                nullable: false,
-            },
-        ],
-        primary_key: vec!["key_json".to_string()],
-    }
 }
 
 fn normalize_ingest_operation_envelopes(
@@ -14019,83 +10696,63 @@ fn rows_to_record_batch(
     }
 
     catalog
-        .validate_feldera_ingest_adapter_scope()
+        .validate_ingest_adapter_scope()
         .map_err(ApiError::bad_request)?;
     let schema = datafusion_schema_from_catalog(catalog).map_err(ApiError::bad_request)?;
     let arrays = catalog
         .relation_schema
         .columns
         .iter()
-        .map(|column| json_column_to_arrow_array(column, rows))
+        .map(|column| relation_json_column_to_arrow_array(column, rows))
         .collect::<Result<Vec<_>, _>>()?;
 
     RecordBatch::try_new(schema, arrays).map_err(ApiError::bad_request)
 }
 
-fn json_column_to_arrow_array(
+fn relation_json_column_to_arrow_array(
     column: &RelationColumnV1,
     rows: &[Value],
 ) -> Result<ArrayRef, ApiError> {
     match &column.physical_arrow_type {
-        ArrowPhysicalTypeV1::Boolean => Ok(Arc::new(BooleanArray::from(collect_column_values(
-            column,
-            rows,
-            json_bool_value,
-        )?))),
-        ArrowPhysicalTypeV1::Int8 => Ok(Arc::new(Int8Array::from(collect_column_values(
+        ArrowPhysicalTypeV1::Boolean => Ok(Arc::new(BooleanArray::from(
+            collect_relation_column_values(column, rows, json_bool_value)?,
+        ))),
+        ArrowPhysicalTypeV1::Int8 => Ok(Arc::new(Int8Array::from(collect_relation_column_values(
             column,
             rows,
             json_i8_value,
         )?))),
-        ArrowPhysicalTypeV1::Int16 => Ok(Arc::new(Int16Array::from(collect_column_values(
-            column,
-            rows,
-            json_i16_value,
-        )?))),
-        ArrowPhysicalTypeV1::Int32 => Ok(Arc::new(Int32Array::from(collect_column_values(
-            column,
-            rows,
-            json_i32_value,
-        )?))),
-        ArrowPhysicalTypeV1::Int64 => Ok(Arc::new(Int64Array::from(collect_column_values(
-            column,
-            rows,
-            json_i64_value,
-        )?))),
-        ArrowPhysicalTypeV1::UInt8 => Ok(Arc::new(UInt8Array::from(collect_column_values(
-            column,
-            rows,
-            json_u8_value,
-        )?))),
-        ArrowPhysicalTypeV1::UInt16 => Ok(Arc::new(UInt16Array::from(collect_column_values(
-            column,
-            rows,
-            json_u16_value,
-        )?))),
-        ArrowPhysicalTypeV1::UInt32 => Ok(Arc::new(UInt32Array::from(collect_column_values(
-            column,
-            rows,
-            json_u32_value,
-        )?))),
-        ArrowPhysicalTypeV1::UInt64 => Ok(Arc::new(UInt64Array::from(collect_column_values(
-            column,
-            rows,
-            json_u64_value,
-        )?))),
-        ArrowPhysicalTypeV1::Float32 => Ok(Arc::new(Float32Array::from(collect_column_values(
-            column,
-            rows,
-            json_f32_value,
-        )?))),
-        ArrowPhysicalTypeV1::Float64 => Ok(Arc::new(Float64Array::from(collect_column_values(
-            column,
-            rows,
-            json_f64_value,
-        )?))),
+        ArrowPhysicalTypeV1::Int16 => Ok(Arc::new(Int16Array::from(
+            collect_relation_column_values(column, rows, json_i16_value)?,
+        ))),
+        ArrowPhysicalTypeV1::Int32 => Ok(Arc::new(Int32Array::from(
+            collect_relation_column_values(column, rows, json_i32_value)?,
+        ))),
+        ArrowPhysicalTypeV1::Int64 => Ok(Arc::new(Int64Array::from(
+            collect_relation_column_values(column, rows, json_i64_value)?,
+        ))),
+        ArrowPhysicalTypeV1::UInt8 => Ok(Arc::new(UInt8Array::from(
+            collect_relation_column_values(column, rows, json_u8_value)?,
+        ))),
+        ArrowPhysicalTypeV1::UInt16 => Ok(Arc::new(UInt16Array::from(
+            collect_relation_column_values(column, rows, json_u16_value)?,
+        ))),
+        ArrowPhysicalTypeV1::UInt32 => Ok(Arc::new(UInt32Array::from(
+            collect_relation_column_values(column, rows, json_u32_value)?,
+        ))),
+        ArrowPhysicalTypeV1::UInt64 => Ok(Arc::new(UInt64Array::from(
+            collect_relation_column_values(column, rows, json_u64_value)?,
+        ))),
+        ArrowPhysicalTypeV1::Float32 => Ok(Arc::new(Float32Array::from(
+            collect_relation_column_values(column, rows, json_f32_value)?,
+        ))),
+        ArrowPhysicalTypeV1::Float64 => Ok(Arc::new(Float64Array::from(
+            collect_relation_column_values(column, rows, json_f64_value)?,
+        ))),
         ArrowPhysicalTypeV1::Decimal128 { precision, scale } => {
             let scale_i8 = i8::try_from(*scale)
                 .map_err(|_| ApiError::bad_request("decimal scale is out of range"))?;
-            let values = collect_column_values(column, rows, |column, value| {
+            let values = collect_relation_column_values(column, rows, |column, value| {
                 json_decimal128_value(column, value, *precision, *scale)
             })?;
             Ok(Arc::new(
@@ -14104,27 +10761,23 @@ fn json_column_to_arrow_array(
                     .map_err(ApiError::bad_request)?,
             ))
         }
-        ArrowPhysicalTypeV1::Utf8 => Ok(Arc::new(StringArray::from(collect_column_values(
-            column,
-            rows,
-            json_string_value,
-        )?))),
+        ArrowPhysicalTypeV1::Utf8 => Ok(Arc::new(StringArray::from(
+            collect_relation_column_values(column, rows, json_string_value)?,
+        ))),
         ArrowPhysicalTypeV1::Binary => {
-            let values = collect_column_values(column, rows, json_binary_value)?;
+            let values = collect_relation_column_values(column, rows, json_binary_value)?;
             Ok(Arc::new(BinaryArray::from_iter(
                 values.iter().map(|value| value.as_deref()),
             )))
         }
-        ArrowPhysicalTypeV1::Date32 => Ok(Arc::new(Date32Array::from(collect_column_values(
-            column,
-            rows,
-            json_date32_value,
-        )?))),
+        ArrowPhysicalTypeV1::Date32 => Ok(Arc::new(Date32Array::from(
+            collect_relation_column_values(column, rows, json_date32_value)?,
+        ))),
         ArrowPhysicalTypeV1::Time64Nanosecond => Ok(Arc::new(Time64NanosecondArray::from(
-            collect_column_values(column, rows, json_time64_nanos_value)?,
+            collect_relation_column_values(column, rows, json_time64_nanos_value)?,
         ))),
         ArrowPhysicalTypeV1::TimestampNanosecond { timezone } => {
-            let array = TimestampNanosecondArray::from(collect_column_values(
+            let array = TimestampNanosecondArray::from(collect_relation_column_values(
                 column,
                 rows,
                 json_timestamp_nanos_value,
@@ -14133,14 +10786,12 @@ fn json_column_to_arrow_array(
             Ok(Arc::new(array))
         }
         ArrowPhysicalTypeV1::DictionaryUtf8 { key_type, .. } => {
-            let values = collect_column_values(column, rows, json_string_value)?;
+            let values = collect_relation_column_values(column, rows, json_string_value)?;
             dictionary_utf8_array(key_type, values)
         }
-        ArrowPhysicalTypeV1::JsonUtf8 => Ok(Arc::new(StringArray::from(collect_column_values(
-            column,
-            rows,
-            json_canonical_string_value,
-        )?))),
+        ArrowPhysicalTypeV1::JsonUtf8 => Ok(Arc::new(StringArray::from(
+            collect_relation_column_values(column, rows, json_canonical_string_value)?,
+        ))),
         ArrowPhysicalTypeV1::List { .. }
         | ArrowPhysicalTypeV1::Struct { .. }
         | ArrowPhysicalTypeV1::Map { .. } => {
@@ -14159,10 +10810,10 @@ fn relation_json_reader_column_to_arrow_array(
         data_type,
         nullable: column.nullable,
     };
-    feldera_json_reader_column_to_arrow_array(&schema, rows).map_err(ApiError::bad_request)
+    json_reader_column_to_arrow_array(&schema, rows).map_err(ApiError::bad_request)
 }
 
-fn collect_column_values<T>(
+fn collect_relation_column_values<T>(
     column: &RelationColumnV1,
     rows: &[Value],
     parse: impl Fn(&RelationColumnV1, &Value) -> Result<T, ApiError>,
@@ -14510,7 +11161,7 @@ fn record_batches_to_json_rows(batches: &[RecordBatch]) -> Result<Vec<Value>, Ap
     Ok(rows)
 }
 
-fn record_batches_to_json_rows_for_feldera_schema(
+fn record_batches_to_json_rows_for_view_schema(
     output_schema: &RelationSchema,
     batches: &[RecordBatch],
 ) -> Result<Vec<Value>, ApiError> {
@@ -14537,115 +11188,17 @@ fn record_batches_to_json_rows_for_feldera_schema(
             }
             let raw = value.as_str().ok_or_else(|| {
                 ApiError::internal(format!(
-                    "Feldera JSON output column `{column}` must be stored as canonical JSON text"
+                    "query JSON output column `{column}` must be stored as canonical JSON text"
                 ))
             })?;
             *value = serde_json::from_str(raw).map_err(|error| {
                 ApiError::internal(format!(
-                    "Feldera JSON output column `{column}` contains invalid canonical JSON: {error}"
+                    "query JSON output column `{column}` contains invalid canonical JSON: {error}"
                 ))
             })?;
         }
     }
     Ok(rows)
-}
-
-#[cfg(test)]
-fn record_batches_to_feldera_ingress_json_rows(
-    batches: &[RecordBatch],
-) -> Result<Vec<Value>, ApiError> {
-    let mut rows = Vec::new();
-    for batch in batches {
-        let schema = batch.schema();
-        for row_index in 0..batch.num_rows() {
-            let mut row = serde_json::Map::new();
-            for (column_index, field) in schema.fields().iter().enumerate() {
-                row.insert(
-                    field.name().clone(),
-                    arrow_value_to_feldera_ingress_json(batch.column(column_index), row_index)?,
-                );
-            }
-            rows.push(Value::Object(row));
-        }
-    }
-    Ok(rows)
-}
-
-fn record_batches_to_feldera_ingress_json_rows_for_catalog(
-    catalog: &VelorixRelationCatalogV1,
-    batches: &[RecordBatch],
-) -> Result<Vec<Value>, ApiError> {
-    let mut rows = Vec::new();
-    for batch in batches {
-        let schema = batch.schema();
-        for row_index in 0..batch.num_rows() {
-            let mut row = serde_json::Map::new();
-            for column in &catalog.relation_schema.columns {
-                let column_index = schema.index_of(column.name.as_str()).map_err(|error| {
-                    ApiError::bad_request(format!(
-                        "Feldera ingress batch for relation `{}` is missing column `{}`: {error}",
-                        catalog.relation_schema.relation_id, column.name
-                    ))
-                })?;
-                row.insert(
-                    column.name.clone(),
-                    arrow_value_to_feldera_ingress_json_for_catalog_column(
-                        column,
-                        batch.column(column_index),
-                        row_index,
-                    )?,
-                );
-            }
-            rows.push(Value::Object(row));
-        }
-    }
-    Ok(rows)
-}
-
-fn arrow_value_to_feldera_ingress_json_for_catalog_column(
-    column: &RelationColumnV1,
-    arrow_column: &ArrayRef,
-    row_index: usize,
-) -> Result<Value, ApiError> {
-    if arrow_column.is_null(row_index) {
-        return Ok(Value::Null);
-    }
-    if matches!(column.logical_type, VelorixLogicalTypeV1::Json)
-        && matches!(column.physical_arrow_type, ArrowPhysicalTypeV1::JsonUtf8)
-    {
-        let json_text = arrow_column
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| {
-                ApiError::bad_request(format!(
-                    "Feldera JSON ingress column `{}` must be Arrow Utf8",
-                    column.name
-                ))
-            })?
-            .value(row_index);
-        return serde_json::from_str(json_text).map_err(|error| {
-            ApiError::bad_request(format!(
-                "Feldera JSON ingress column `{}` contains invalid JSON: {error}",
-                column.name
-            ))
-        });
-    }
-    if matches!(column.logical_type, VelorixLogicalTypeV1::Binary { .. })
-        && matches!(arrow_column.data_type(), DataType::Binary)
-    {
-        let values = arrow_column
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .ok_or_else(|| ApiError::internal("invalid Binary Arrow column"))?
-            .value(row_index);
-        validate_fixed_binary_length(
-            "Feldera ingress column",
-            column.name.as_str(),
-            &column.logical_type,
-            values.len(),
-        )?;
-    }
-    arrow_value_to_feldera_ingress_json(arrow_column, row_index)
 }
 
 fn validate_fixed_binary_length(
@@ -14668,107 +11221,6 @@ fn validate_fixed_binary_length(
     Err(ApiError::bad_request(format!(
         "{field} must contain exactly {length} bytes, got {actual_len}"
     )))
-}
-
-fn arrow_value_to_feldera_ingress_json(
-    column: &ArrayRef,
-    row_index: usize,
-) -> Result<Value, ApiError> {
-    if column.is_null(row_index) {
-        return Ok(Value::Null);
-    }
-    match column.data_type() {
-        DataType::Binary => {
-            let values = column
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| ApiError::internal("invalid Binary Arrow column"))?
-                .value(row_index)
-                .iter()
-                .copied()
-                .map(Value::from)
-                .collect();
-            Ok(Value::Array(values))
-        }
-        DataType::Date32 => Ok(Value::String(format_date32_for_feldera_ingress(
-            column
-                .as_any()
-                .downcast_ref::<Date32Array>()
-                .ok_or_else(|| ApiError::internal("invalid Date32 Arrow column"))?
-                .value(row_index),
-        ))),
-        DataType::Time64(TimeUnit::Nanosecond) => {
-            Ok(Value::String(format_time_nanos_for_feldera_ingress(
-                column
-                    .as_any()
-                    .downcast_ref::<Time64NanosecondArray>()
-                    .ok_or_else(|| ApiError::internal("invalid Time64Nanosecond Arrow column"))?
-                    .value(row_index),
-            )?))
-        }
-        DataType::Timestamp(TimeUnit::Nanosecond, timezone) => {
-            if timezone.is_some() {
-                return Err(ApiError::bad_request(
-                    "Feldera ingress for timezone-bearing TimestampNanosecond columns is not supported",
-                ));
-            }
-            Ok(Value::String(format_timestamp_nanos_for_feldera_ingress(
-                column
-                    .as_any()
-                    .downcast_ref::<TimestampNanosecondArray>()
-                    .ok_or_else(|| ApiError::internal("invalid TimestampNanosecond Arrow column"))?
-                    .value(row_index),
-            )?))
-        }
-        DataType::List(_) => {
-            let list = column
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .ok_or_else(|| ApiError::internal("invalid List Arrow column"))?;
-            let values = list.value(row_index);
-            let mut json_values = Vec::with_capacity(values.len());
-            for index in 0..values.len() {
-                json_values.push(arrow_value_to_feldera_ingress_json(&values, index)?);
-            }
-            Ok(Value::Array(json_values))
-        }
-        DataType::Struct(fields) => {
-            let struct_array = column
-                .as_any()
-                .downcast_ref::<StructArray>()
-                .ok_or_else(|| ApiError::internal("invalid Struct Arrow column"))?;
-            let mut object = serde_json::Map::with_capacity(fields.len());
-            for (field_index, field) in fields.iter().enumerate() {
-                object.insert(
-                    field.name().clone(),
-                    arrow_value_to_feldera_ingress_json(
-                        struct_array.column(field_index),
-                        row_index,
-                    )?,
-                );
-            }
-            Ok(Value::Object(object))
-        }
-        DataType::Map(_, _) => {
-            let map = column
-                .as_any()
-                .downcast_ref::<MapArray>()
-                .ok_or_else(|| ApiError::internal("invalid Map Arrow column"))?;
-            let entries = map.value(row_index);
-            let keys = entries.column(0);
-            let values = entries.column(1);
-            let mut object = serde_json::Map::with_capacity(entries.len());
-            for index in 0..entries.len() {
-                let key = arrow_value_to_feldera_ingress_json(keys, index)?;
-                object.insert(
-                    json_value_as_object_key(key),
-                    arrow_value_to_feldera_ingress_json(values, index)?,
-                );
-            }
-            Ok(Value::Object(object))
-        }
-        _ => arrow_value_to_json(column, row_index),
-    }
 }
 
 fn arrow_value_to_json(column: &ArrayRef, row_index: usize) -> Result<Value, ApiError> {
@@ -14947,65 +11399,6 @@ fn format_hex_binary(bytes: &[u8]) -> String {
     output
 }
 
-fn format_date32_for_feldera_ingress(days: i32) -> String {
-    let (year, month, day) = civil_from_days(i64::from(days));
-    format!("{year:04}-{month:02}-{day:02}")
-}
-
-fn format_time_nanos_for_feldera_ingress(nanos: i64) -> Result<String, ApiError> {
-    const DAY_NANOS: i64 = 86_400_000_000_000;
-    if !(0..DAY_NANOS).contains(&nanos) {
-        return Err(ApiError::internal(format!(
-            "time nanos value {nanos} is outside a single day"
-        )));
-    }
-    Ok(format_time_of_day_nanos(nanos))
-}
-
-fn format_timestamp_nanos_for_feldera_ingress(nanos: i64) -> Result<String, ApiError> {
-    const DAY_NANOS: i64 = 86_400_000_000_000;
-    let days = nanos.div_euclid(DAY_NANOS);
-    let time_nanos = nanos.rem_euclid(DAY_NANOS);
-    let (year, month, day) = civil_from_days(days);
-    Ok(format!(
-        "{year:04}-{month:02}-{day:02} {}",
-        format_time_of_day_nanos(time_nanos)
-    ))
-}
-
-fn format_time_of_day_nanos(nanos: i64) -> String {
-    let seconds = nanos / 1_000_000_000;
-    let fraction = nanos % 1_000_000_000;
-    let hour = seconds / 3_600;
-    let minute = (seconds % 3_600) / 60;
-    let second = seconds % 60;
-    let mut output = format!("{hour:02}:{minute:02}:{second:02}");
-    if fraction != 0 {
-        let mut fraction = format!("{fraction:09}");
-        while fraction.ends_with('0') {
-            fraction.pop();
-        }
-        output.push('.');
-        output.push_str(&fraction);
-    }
-    output
-}
-
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let day_of_era = z - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
-    let year = year + i64::from(month <= 2);
-    (year, month, day)
-}
-
 fn format_decimal128_for_json(value: i128, scale: i8) -> String {
     let magnitude = value.unsigned_abs();
     let mut digits = magnitude.to_string();
@@ -15103,13 +11496,13 @@ fn materialized_view_registry_error_to_api(error: MaterializedViewRegistryError)
             view_id,
             reason: InvalidExecutionModeReason::StandingRuntimeMissingIdentity,
         } => ApiError::conflict(format!(
-            "artifact-backed view `{view_id}` is missing standing runtime identity"
+            "standing runtime view `{view_id}` is missing runtime identity"
         )),
         MaterializedViewRegistryError::InvalidExecutionMode {
             view_id,
             reason: InvalidExecutionModeReason::StandingRuntimeMissingArtifact,
         } => ApiError::conflict(format!(
-            "standing runtime view `{view_id}` is missing artifact binding"
+            "standing runtime view `{view_id}` is missing artifact or runtime binding"
         )),
         error @ (MaterializedViewRegistryError::RecordConflict { .. }
         | MaterializedViewRegistryError::ActiveRecordConflict { .. }
@@ -15141,20 +11534,6 @@ fn query_policy_catalog_error_to_api(error: QueryPolicyCatalogError) -> ApiError
             ApiError::service_unavailable(error)
         }
         QueryPolicyCatalogError::ObjectStore(_) => ApiError::internal(error),
-    }
-}
-
-fn view_compile_deploy_job_registry_error_to_api(
-    error: ViewCompileDeployJobRegistryError,
-) -> ApiError {
-    match error {
-        ViewCompileDeployJobRegistryError::RecordConflict { .. }
-        | ViewCompileDeployJobRegistryError::ActiveClaim { .. }
-        | ViewCompileDeployJobRegistryError::RecordIdentityMismatch { .. }
-        | ViewCompileDeployJobRegistryError::CompileRequest(_) => ApiError::conflict(error),
-        ViewCompileDeployJobRegistryError::ObjectKey(_)
-        | ViewCompileDeployJobRegistryError::Serde(_)
-        | ViewCompileDeployJobRegistryError::ObjectStore(_) => ApiError::internal(error),
     }
 }
 
@@ -15203,14 +11582,6 @@ struct ApiConfig {
     max_ingest_rows: usize,
     standing_runtime_fencing: StandingRuntimeFencingMode,
     standing_runtime_owner_ttl_ms: u64,
-    feldera_pipeline_manager_url: Option<String>,
-    feldera_bearer_token: Option<String>,
-    feldera_compiler_poll_interval_ms: u64,
-    feldera_compiler_timeout_ms: u64,
-    feldera_compiler_profile: String,
-    feldera_compiler_workers: u32,
-    feldera_pipeline_manager_runtime_deployment_mode:
-        Option<FelderaPipelineManagerRuntimeDeploymentMode>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -15291,53 +11662,6 @@ impl ApiConfig {
         )?;
         let standing_runtime_owner_ttl_ms =
             parse_positive_u64_env("VELORIX_STANDING_RUNTIME_OWNER_TTL_MS", 30_000)?;
-        let feldera_pipeline_manager_url = std::env::var("VELORIX_FELDERA_PIPELINE_MANAGER_URL")
-            .ok()
-            .filter(|value| !value.trim().is_empty());
-        let feldera_bearer_token = match std::env::var("VELORIX_FELDERA_BEARER_TOKEN") {
-            Ok(value) if !value.trim().is_empty() => Some(value),
-            Ok(_) => return Err(anyhow!("VELORIX_FELDERA_BEARER_TOKEN must not be empty")),
-            Err(env::VarError::NotPresent) => None,
-            Err(error) => return Err(anyhow!("invalid VELORIX_FELDERA_BEARER_TOKEN: {error}")),
-        };
-        let feldera_compiler_poll_interval_ms =
-            parse_positive_u64_env("VELORIX_FELDERA_COMPILER_POLL_INTERVAL_MS", 1_000)?;
-        let feldera_pipeline_manager_runtime_mode_raw =
-            std::env::var("VELORIX_FELDERA_PIPELINE_MANAGER_RUNTIME_MODE").ok();
-        let feldera_pipeline_manager_runtime_mode = parse_feldera_pipeline_manager_runtime_mode(
-            feldera_pipeline_manager_runtime_mode_raw.as_deref(),
-        )?;
-        let feldera_pipeline_manager_runtime_production_enable = parse_bool_env(
-            "VELORIX_FELDERA_PIPELINE_MANAGER_RUNTIME_PRODUCTION_ENABLE",
-            false,
-        )?;
-        let feldera_pipeline_manager_runtime_deployment_mode =
-            resolve_feldera_pipeline_manager_runtime_deployment_mode(
-                feldera_pipeline_manager_runtime_mode,
-                standing_runtime_fencing,
-                feldera_pipeline_manager_runtime_production_enable,
-                feldera_pipeline_manager_runtime_mode_raw.as_deref(),
-            )?;
-        let feldera_compiler_timeout_ms = parse_positive_u64_env(
-            "VELORIX_FELDERA_COMPILER_TIMEOUT_MS",
-            default_feldera_compiler_timeout_ms(
-                feldera_pipeline_manager_runtime_deployment_mode.is_some(),
-            ),
-        )?;
-        if feldera_compiler_timeout_ms < feldera_compiler_poll_interval_ms {
-            return Err(anyhow!(
-                "VELORIX_FELDERA_COMPILER_TIMEOUT_MS must be greater than or equal to VELORIX_FELDERA_COMPILER_POLL_INTERVAL_MS"
-            ));
-        }
-        let feldera_compiler_profile =
-            std::env::var("VELORIX_FELDERA_COMPILER_PROFILE").unwrap_or_else(|_| "dev".to_string());
-        if feldera_compiler_profile.trim().is_empty() {
-            return Err(anyhow!(
-                "VELORIX_FELDERA_COMPILER_PROFILE must not be empty"
-            ));
-        }
-        let feldera_compiler_workers =
-            parse_positive_u32_env("VELORIX_FELDERA_COMPILER_WORKERS", 1)?;
         Ok(Self {
             bind,
             tls,
@@ -15362,13 +11686,6 @@ impl ApiConfig {
             max_ingest_rows,
             standing_runtime_fencing,
             standing_runtime_owner_ttl_ms,
-            feldera_pipeline_manager_url,
-            feldera_bearer_token,
-            feldera_compiler_poll_interval_ms,
-            feldera_compiler_timeout_ms,
-            feldera_compiler_profile,
-            feldera_compiler_workers,
-            feldera_pipeline_manager_runtime_deployment_mode,
         })
     }
 
@@ -15395,78 +11712,6 @@ impl ApiConfig {
                 store,
                 ObjectPath::from(self.prefix.trim_matches('/')),
             )))
-        }
-    }
-}
-
-fn default_feldera_compiler_timeout_ms(runtime_enabled: bool) -> u64 {
-    if runtime_enabled {
-        FELDERA_COMPILER_RUNTIME_TIMEOUT_DEFAULT_MS
-    } else {
-        FELDERA_COMPILER_SCHEMA_TIMEOUT_DEFAULT_MS
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FelderaPipelineManagerRuntimeMode {
-    Default,
-    CompilerOnly,
-    LocalVolatile,
-    ExternalManaged,
-}
-
-fn parse_feldera_pipeline_manager_runtime_mode(
-    value: Option<&str>,
-) -> anyhow::Result<FelderaPipelineManagerRuntimeMode> {
-    match value.map(str::trim).filter(|value| !value.is_empty()) {
-        None => Ok(FelderaPipelineManagerRuntimeMode::Default),
-        Some("pipeline_manager_local_volatile") | Some("runtime") | Some("volatile_demo") => {
-            Ok(FelderaPipelineManagerRuntimeMode::LocalVolatile)
-        }
-        Some("pipeline_manager_external_managed") | Some("external_managed") => {
-            Ok(FelderaPipelineManagerRuntimeMode::ExternalManaged)
-        }
-        Some("compiler_only") => Ok(FelderaPipelineManagerRuntimeMode::CompilerOnly),
-        Some(other) => Err(anyhow!(
-            "VELORIX_FELDERA_PIPELINE_MANAGER_RUNTIME_MODE must be `pipeline_manager_local_volatile`, `runtime`, `volatile_demo`, `pipeline_manager_external_managed`, `external_managed`, or `compiler_only`, got `{other}`"
-        )),
-    }
-}
-
-fn resolve_feldera_pipeline_manager_runtime_deployment_mode(
-    mode: FelderaPipelineManagerRuntimeMode,
-    standing_runtime_fencing: StandingRuntimeFencingMode,
-    production_enable: bool,
-    raw_mode: Option<&str>,
-) -> anyhow::Result<Option<FelderaPipelineManagerRuntimeDeploymentMode>> {
-    match mode {
-        FelderaPipelineManagerRuntimeMode::CompilerOnly => Ok(None),
-        FelderaPipelineManagerRuntimeMode::Default => Ok((standing_runtime_fencing
-            != StandingRuntimeFencingMode::Required)
-            .then_some(FelderaPipelineManagerRuntimeDeploymentMode::LocalVolatile)),
-        FelderaPipelineManagerRuntimeMode::LocalVolatile => {
-            if standing_runtime_fencing == StandingRuntimeFencingMode::Required {
-                return Err(anyhow!(
-                    "VELORIX_FELDERA_PIPELINE_MANAGER_RUNTIME_MODE={} is local volatile and cannot be used when VELORIX_STANDING_RUNTIME_FENCING=required; use `pipeline_manager_external_managed` or `compiler_only`",
-                    raw_mode.unwrap_or("pipeline_manager_local_volatile")
-                ));
-            }
-            Ok(Some(
-                FelderaPipelineManagerRuntimeDeploymentMode::LocalVolatile,
-            ))
-        }
-        FelderaPipelineManagerRuntimeMode::ExternalManaged => {
-            if standing_runtime_fencing == StandingRuntimeFencingMode::Required
-                && !production_enable
-            {
-                return Err(anyhow!(
-                    "VELORIX_FELDERA_PIPELINE_MANAGER_RUNTIME_MODE={} requires VELORIX_FELDERA_PIPELINE_MANAGER_RUNTIME_PRODUCTION_ENABLE=1 when VELORIX_STANDING_RUNTIME_FENCING=required",
-                    raw_mode.unwrap_or("pipeline_manager_external_managed")
-                ));
-            }
-            Ok(Some(
-                FelderaPipelineManagerRuntimeDeploymentMode::ExternalManaged,
-            ))
         }
     }
 }
@@ -15664,24 +11909,6 @@ fn parse_positive_u64_env(name: &str, default: u64) -> anyhow::Result<u64> {
     }
 }
 
-fn parse_positive_u32_env(name: &str, default: u32) -> anyhow::Result<u32> {
-    match env::var(name) {
-        Ok(value) => {
-            let value = value.trim();
-            let parsed = value
-                .parse::<u32>()
-                .with_context(|| format!("invalid {name} `{value}`"))?;
-            if parsed == 0 {
-                Err(anyhow!("{name} must be greater than zero"))
-            } else {
-                Ok(parsed)
-            }
-        }
-        Err(env::VarError::NotPresent) => Ok(default),
-        Err(error) => Err(anyhow!("invalid {name}: {error}")),
-    }
-}
-
 async fn enforce_standing_runtime_fencing_startup(
     config: &ApiConfig,
     meta_store: Option<&Arc<dyn MetaStore>>,
@@ -15866,3869 +12093,2272 @@ fn validate_production_standing_runtime_fencing(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use velorix_core::relation::{ArrowStructFieldV1, VelorixStructFieldV1};
+    use axum::http::Method;
+    use object_store::{memory::InMemory, path::Path, ObjectStore};
+    use tower::ServiceExt as _;
+    use velorix_core::{
+        delta::{DeltaKey, DeltaRecord, DeltaValue},
+        standing_program::{
+            DurableStateRoot, RelationFrontier, RuntimeCheckpointStatePayload, ViewFrontier,
+        },
+    };
+    use velorix_meta::InMemoryMetaStore;
 
     #[test]
-    fn feldera_runtime_compile_stall_detection_matches_sql_compiled_stopped_without_rust_artifact()
-    {
-        let stalled = FelderaPipelineStatusResponse {
-            program_status: "SqlCompiled".to_string(),
-            deployment_status: Some("Stopped".to_string()),
-            deployment_resources_status: Some("Stopped".to_string()),
-            program_version: 7,
-            program_info: Some(json!({"schema": {"outputs": []}})),
-            program_error: Some(json!({
-                "sql_compilation": {
-                    "exit_code": 0,
-                    "messages": []
-                },
-                "rust_compilation": null
-            })),
-        };
-        assert!(feldera_pipeline_sql_compiled_without_runtime_artifact(
-            &stalled
-        ));
-
-        let compiling = FelderaPipelineStatusResponse {
-            program_status: "CompilingRust".to_string(),
-            deployment_status: Some("Stopped".to_string()),
-            deployment_resources_status: Some("Stopped".to_string()),
-            program_version: 7,
-            program_info: None,
-            program_error: None,
-        };
-        assert!(!feldera_pipeline_sql_compiled_without_runtime_artifact(
-            &compiling
-        ));
-    }
-
-    #[test]
-    fn feldera_pipeline_name_stays_within_feldera_limit_when_view_id_is_long() {
-        let name = feldera_pipeline_name_for_parts(
-            "velorix_live_scores_by_user_15dc2_19ec1eae8bc_0",
-            "velorix-feldera-compile-request-sha256-v1:df87b84c85c6ee61ffffffffffffffffffffffffffffffffffffffffffffffff",
-        );
-
-        assert!(
-            name.len() <= FELDERA_PIPELINE_NAME_MAX_CHARS,
-            "pipeline name `{name}` is too long"
-        );
-        assert!(name.starts_with("velorix-velorix_live_scores_by_user"));
-        assert!(name.ends_with("-df87b84c85c6ee61"));
-    }
-
-    #[test]
-    fn epoch_ingest_idempotency_key_is_order_independent_and_payload_bound() {
-        let catalog = default_scores_relation_catalog().unwrap();
-        let first = test_prepared_ingest_batch(
-            &catalog,
-            0,
-            1,
-            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        );
-        let second = test_prepared_ingest_batch(
-            &catalog,
-            1,
-            2,
-            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        );
-        let forward = epoch_ingest_idempotency_key("scores_by_user", [&first, &second]).unwrap();
-        let reverse = epoch_ingest_idempotency_key("scores_by_user", [&second, &first]).unwrap();
-        assert_eq!(forward.as_str(), reverse.as_str());
-
-        let changed_payload = test_prepared_ingest_batch(
-            &catalog,
-            1,
-            2,
-            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-        );
-        let changed =
-            epoch_ingest_idempotency_key("scores_by_user", [&first, &changed_payload]).unwrap();
-        assert_ne!(forward.as_str(), changed.as_str());
-    }
-
-    fn test_prepared_ingest_batch(
-        catalog: &VelorixRelationCatalogV1,
-        start_offset_inclusive: u64,
-        end_offset_exclusive: u64,
-        payload_digest: &str,
-    ) -> PreparedIngestBatch {
-        PreparedIngestBatch {
-            request: IngestRowsRequest {
-                relation_id: "scores".to_string(),
-                relation_version: "2026-05-24.v1".to_string(),
-                stream_id: "scores".to_string(),
-                partition_id: 0,
-                start_offset_inclusive,
-                rows: vec![json!({ "user_id": "u1", "score": 1, "delta": 1 })],
-            },
-            catalog: catalog.clone(),
-            record_batch: RecordBatch::new_empty(Arc::new(Schema::empty())),
-            end_offset_exclusive,
-            payload_digest: payload_digest.to_string(),
-            envelope: bytes::Bytes::new(),
-        }
-    }
-
-    #[test]
-    fn standing_runtime_fencing_defaults_to_required() {
-        assert_eq!(
-            StandingRuntimeFencingMode::from_env(None, 2).unwrap(),
-            StandingRuntimeFencingMode::Required
-        );
-        assert_eq!(
-            StandingRuntimeFencingMode::from_env(None, 1).unwrap(),
-            StandingRuntimeFencingMode::Required
-        );
-    }
-
-    #[test]
-    fn standing_runtime_fencing_allows_explicit_unsafe_dev_only_for_single_replica() {
-        assert_eq!(
-            StandingRuntimeFencingMode::from_env(Some("required"), 1).unwrap(),
-            StandingRuntimeFencingMode::Required
-        );
-        assert_eq!(
-            StandingRuntimeFencingMode::from_env(Some("logical-fencing"), 2).unwrap(),
-            StandingRuntimeFencingMode::LogicalFencing
-        );
-        assert_eq!(
-            StandingRuntimeFencingMode::from_env(Some("unsafe-dev-only"), 1).unwrap(),
-            StandingRuntimeFencingMode::SingleWriter
-        );
-        assert!(StandingRuntimeFencingMode::from_env(Some("unsafe-dev-only"), 2).is_err());
-        assert!(StandingRuntimeFencingMode::from_env(Some("maybe"), 1).is_err());
-    }
-
-    #[test]
-    fn api_replica_count_rejects_zero_and_malformed_values() {
-        assert_eq!(parse_api_replica_count(None).unwrap(), 1);
-        assert_eq!(parse_api_replica_count(Some("3")).unwrap(), 3);
-        assert!(parse_api_replica_count(Some("0")).is_err());
-        assert!(parse_api_replica_count(Some("three")).is_err());
-    }
-
-    #[test]
-    fn feldera_pipeline_manager_runtime_mode_defaults_to_local_runtime() {
-        assert_eq!(
-            parse_feldera_pipeline_manager_runtime_mode(None).unwrap(),
-            FelderaPipelineManagerRuntimeMode::Default
-        );
-        assert_eq!(
-            parse_feldera_pipeline_manager_runtime_mode(Some("pipeline_manager_local_volatile"))
-                .unwrap(),
-            FelderaPipelineManagerRuntimeMode::LocalVolatile
-        );
-        assert_eq!(
-            parse_feldera_pipeline_manager_runtime_mode(Some("runtime")).unwrap(),
-            FelderaPipelineManagerRuntimeMode::LocalVolatile
-        );
-        assert_eq!(
-            parse_feldera_pipeline_manager_runtime_mode(Some("volatile_demo")).unwrap(),
-            FelderaPipelineManagerRuntimeMode::LocalVolatile
-        );
-        assert_eq!(
-            parse_feldera_pipeline_manager_runtime_mode(Some("pipeline_manager_external_managed"))
-                .unwrap(),
-            FelderaPipelineManagerRuntimeMode::ExternalManaged
-        );
-        assert_eq!(
-            parse_feldera_pipeline_manager_runtime_mode(Some("external_managed")).unwrap(),
-            FelderaPipelineManagerRuntimeMode::ExternalManaged
-        );
-        assert_eq!(
-            parse_feldera_pipeline_manager_runtime_mode(Some("compiler_only")).unwrap(),
-            FelderaPipelineManagerRuntimeMode::CompilerOnly
-        );
-        assert!(parse_feldera_pipeline_manager_runtime_mode(Some("running")).is_err());
-    }
-
-    #[test]
-    fn feldera_compiler_timeout_default_is_runtime_sensitive() {
-        assert_eq!(
-            default_feldera_compiler_timeout_ms(false),
-            FELDERA_COMPILER_SCHEMA_TIMEOUT_DEFAULT_MS
-        );
-        assert_eq!(
-            default_feldera_compiler_timeout_ms(true),
-            FELDERA_COMPILER_RUNTIME_TIMEOUT_DEFAULT_MS
-        );
-        assert!(
-            FELDERA_COMPILER_RUNTIME_TIMEOUT_DEFAULT_MS
-                > FELDERA_COMPILER_SCHEMA_TIMEOUT_DEFAULT_MS
-        );
-    }
-
-    #[test]
-    fn feldera_pipeline_manager_runtime_gate_resolves_deployment_modes() {
-        assert_eq!(
-            resolve_feldera_pipeline_manager_runtime_deployment_mode(
-                FelderaPipelineManagerRuntimeMode::Default,
-                StandingRuntimeFencingMode::SingleWriter,
-                false,
-                None,
-            )
-            .unwrap(),
-            Some(FelderaPipelineManagerRuntimeDeploymentMode::LocalVolatile)
-        );
-        assert_eq!(
-            resolve_feldera_pipeline_manager_runtime_deployment_mode(
-                FelderaPipelineManagerRuntimeMode::Default,
-                StandingRuntimeFencingMode::LogicalFencing,
-                false,
-                None,
-            )
-            .unwrap(),
-            Some(FelderaPipelineManagerRuntimeDeploymentMode::LocalVolatile)
-        );
-        assert_eq!(
-            resolve_feldera_pipeline_manager_runtime_deployment_mode(
-                FelderaPipelineManagerRuntimeMode::Default,
-                StandingRuntimeFencingMode::Required,
-                false,
-                None,
-            )
-            .unwrap(),
-            None
-        );
-        assert_eq!(
-            resolve_feldera_pipeline_manager_runtime_deployment_mode(
-                FelderaPipelineManagerRuntimeMode::CompilerOnly,
-                StandingRuntimeFencingMode::Required,
-                true,
-                Some("compiler_only"),
-            )
-            .unwrap(),
-            None
-        );
-        assert!(resolve_feldera_pipeline_manager_runtime_deployment_mode(
-            FelderaPipelineManagerRuntimeMode::LocalVolatile,
-            StandingRuntimeFencingMode::Required,
-            true,
-            Some("runtime"),
-        )
-        .is_err());
-        assert!(resolve_feldera_pipeline_manager_runtime_deployment_mode(
-            FelderaPipelineManagerRuntimeMode::ExternalManaged,
-            StandingRuntimeFencingMode::Required,
-            false,
-            Some("external_managed"),
-        )
-        .is_err());
-        assert_eq!(
-            resolve_feldera_pipeline_manager_runtime_deployment_mode(
-                FelderaPipelineManagerRuntimeMode::ExternalManaged,
-                StandingRuntimeFencingMode::Required,
-                true,
-                Some("external_managed"),
-            )
-            .unwrap(),
-            Some(FelderaPipelineManagerRuntimeDeploymentMode::ExternalManaged)
-        );
-    }
-
-    #[test]
-    fn sql_references_table_accepts_quoted_feldera_output_identifiers() {
-        assert!(sql_references_table(
-            "select user_id, sum from \"scores-by-user\" where sum > 0",
-            "scores-by-user"
-        ));
-        assert!(sql_references_table(
-            "select region from \"sales.summary\" order by region",
-            "sales.summary"
-        ));
-        assert!(sql_references_table(
-            "select x from \"quoted\"\"output\"",
-            "quoted\"output"
-        ));
-    }
-
-    #[test]
-    fn sql_references_table_ignores_literals_and_rejects_other_tables() {
-        assert!(!sql_references_table(
-            "select 'from scores-by-user' as message",
-            "scores-by-user"
-        ));
-        assert!(!sql_references_table(
-            "select 'from scores_by_user' as message",
-            "scores_by_user"
-        ));
-        assert!(!sql_references_table(
-            "select user_id from scores join raw_scores on scores.user_id = raw_scores.user_id",
-            "scores-by-user"
-        ));
-        assert!(sql_references_table(
-            "select user_id from scores_by_user where note = 'join raw_scores'",
-            "scores_by_user"
-        ));
-    }
-
-    #[test]
-    fn feldera_pipeline_manager_insert_delete_events_strip_weight_metadata() {
-        let events = feldera_pipeline_manager_insert_delete_events(
-            "delta",
-            true,
-            vec![
-                json!({ "user_id": "u1", "score": 5, "delta": 1 }),
-                json!({ "user_id": "u1", "score": 5, "delta": -1 }),
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(
-            events,
-            vec![
-                json!({ "insert": { "user_id": "u1", "score": 5 } }),
-                json!({ "delete": { "user_id": "u1", "score": 5 } }),
-            ]
-        );
-    }
-
-    #[test]
-    fn feldera_pipeline_manager_insert_delete_events_rejects_non_unit_weight() {
-        let error = feldera_pipeline_manager_insert_delete_events(
-            "delta",
-            true,
-            vec![json!({ "user_id": "u1", "score": 5, "delta": 2 })],
-        )
-        .unwrap_err();
-
-        assert!(error.contains("supports only signed unit weights"));
-    }
-
-    #[test]
-    fn feldera_pipeline_manager_insert_delete_events_rejects_delete_without_capability() {
-        let error = feldera_pipeline_manager_insert_delete_events(
-            "delta",
-            false,
-            vec![json!({ "user_id": "u1", "score": 5, "delta": -1 })],
-        )
-        .unwrap_err();
-
-        assert!(error.contains("insert-only relation"));
-    }
-
-    #[test]
-    fn feldera_pipeline_manager_relation_operations_accept_insert_delete_as_set() {
-        let mut catalog = default_scores_relation_catalog().unwrap();
-        catalog.relation_schema.allowed_operations =
-            vec![RelationOperationV1::Delete, RelationOperationV1::Insert];
-
-        let delete_capable =
-            validate_feldera_pipeline_manager_relation_operations(&catalog).unwrap();
-
-        assert!(delete_capable);
-    }
-
-    #[test]
-    fn feldera_pipeline_manager_relation_operations_reject_delete_only() {
-        let mut catalog = default_scores_relation_catalog().unwrap();
-        catalog.relation_schema.allowed_operations = vec![RelationOperationV1::Delete];
-
-        let error = validate_feldera_pipeline_manager_relation_operations(&catalog).unwrap_err();
-
-        assert!(error.contains("requires Insert relation operation"));
-    }
-
-    #[test]
-    fn feldera_pipeline_manager_relation_operations_reject_duplicates() {
-        let mut catalog = default_scores_relation_catalog().unwrap();
-        catalog.relation_schema.allowed_operations =
-            vec![RelationOperationV1::Insert, RelationOperationV1::Insert];
-
-        let error = validate_feldera_pipeline_manager_relation_operations(&catalog).unwrap_err();
-
-        assert!(error.contains("duplicate Insert"));
-    }
-
-    #[test]
-    fn feldera_pipeline_manager_relation_operations_reject_duplicate_update_and_upsert() {
-        for (operation, expected) in [
-            (RelationOperationV1::Update, "duplicate Update"),
-            (RelationOperationV1::Upsert, "duplicate Upsert"),
-        ] {
-            let mut catalog = default_scores_relation_catalog().unwrap();
-            catalog.relation_schema.allowed_operations = vec![
-                RelationOperationV1::Insert,
-                operation.clone(),
-                operation.clone(),
-            ];
-
-            let error = validate_feldera_pipeline_manager_relation_operations(&catalog)
-                .expect_err("duplicate operation should fail admission");
-
-            assert!(
-                error.contains(expected),
-                "expected `{expected}`, got `{error}`"
-            );
-        }
-    }
-
-    #[test]
-    fn feldera_pipeline_manager_relation_operations_treat_update_and_upsert_as_delete_event_capable(
+    fn standing_runtime_checkpoint_publication_refs_output_manifest_when_payload_contains_published_output(
     ) {
-        for operation in [RelationOperationV1::Update, RelationOperationV1::Upsert] {
-            let mut catalog = default_scores_relation_catalog().unwrap();
-            catalog.relation_schema.allowed_operations =
-                vec![RelationOperationV1::Insert, operation.clone()];
-
-            let delete_capable =
-                validate_feldera_pipeline_manager_relation_operations(&catalog).unwrap();
-
-            assert!(
-                delete_capable,
-                "operation {operation:?} should allow internal delete events"
-            );
-        }
-    }
-
-    #[test]
-    fn ingest_operation_envelope_normalizes_update_and_upsert_to_signed_rows() {
-        let mut catalog = default_scores_relation_catalog().unwrap();
-        catalog
-            .relation_schema
-            .allowed_operations
-            .push(RelationOperationV1::Update);
-        catalog
-            .relation_schema
-            .allowed_operations
-            .push(RelationOperationV1::Upsert);
-
-        let rows = normalize_ingest_operation_envelopes(
-            &catalog,
-            &[
-                json!({
-                    "operation": "update",
-                    "before": { "user_id": "u1", "score": 5 },
-                    "after": { "user_id": "u1", "score": 7 }
-                }),
-                json!({
-                    "operation": "upsert",
-                    "before": { "user_id": "u2", "score": 3 },
-                    "row": { "user_id": "u2", "score": 9 }
-                }),
-            ],
+        let checkpoint = test_runtime_checkpoint(Vec::new());
+        let checkpoint_key = test_checkpoint_key(&checkpoint);
+        let publication = standing_runtime_output_manifest_record_for_checkpoint(
+            &checkpoint,
+            "purchases_by_user",
+            &checkpoint_key,
         )
+        .unwrap()
         .unwrap();
 
+        let published = standing_runtime_checkpoint_with_publication_output_refs(
+            &checkpoint,
+            Some(&publication.manifest_key),
+            &[],
+        );
+
         assert_eq!(
-            rows,
-            vec![
-                json!({ "user_id": "u1", "score": 5, "delta": -1 }),
-                json!({ "user_id": "u1", "score": 7, "delta": 1 }),
-                json!({ "user_id": "u2", "score": 3, "delta": -1 }),
-                json!({ "user_id": "u2", "score": 9, "delta": 1 }),
-            ]
+            published.output_manifest_refs,
+            vec![format!(
+                "{STANDING_RUNTIME_OUTPUT_MANIFEST_REF_PREFIX}{}",
+                publication.manifest_key.as_str()
+            )]
         );
     }
 
     #[test]
-    fn ingest_operation_envelope_rejects_update_without_capability() {
-        let catalog = default_scores_relation_catalog().unwrap();
+    fn standing_runtime_output_manifest_record_hashes_published_output_payload() {
+        let checkpoint = test_runtime_checkpoint(Vec::new());
+        let checkpoint_key = test_checkpoint_key(&checkpoint);
 
-        let error = normalize_ingest_operation_envelopes(
-            &catalog,
-            &[json!({
-                "operation": "update",
-                "before": { "user_id": "u1", "score": 5 },
-                "after": { "user_id": "u1", "score": 7 }
-            })],
+        let publication = standing_runtime_output_manifest_record_for_checkpoint(
+            &checkpoint,
+            "purchases_by_user",
+            &checkpoint_key,
         )
-        .unwrap_err();
-
-        assert!(
-            error.to_string().contains("does not allow Update"),
-            "error: {error}"
-        );
-    }
-
-    #[test]
-    fn feldera_pipeline_manager_runtime_catalogs_reject_weight_column_primary_key() {
-        let mut catalog = default_scores_relation_catalog().unwrap();
-        catalog
-            .relation_schema
-            .primary_key_column_ids
-            .push("delta".to_string());
-
-        let error = validate_feldera_pipeline_manager_runtime_catalogs(&[catalog]).unwrap_err();
-
-        assert!(error.contains("does not allow the weight column in the primary key"));
-    }
-
-    #[test]
-    fn feldera_pipeline_manager_external_managed_mode_changes_artifact_identity() {
-        let catalog = default_scores_relation_catalog().unwrap();
-        let input = catalog_input_relation_schema(&catalog).unwrap();
-        let output = single_key_sum_count_output_schema("scores_by_user", &catalog).unwrap();
-        let spec = StandingViewSpec {
-            view_id: "scores_by_user".to_string(),
-            sql:
-                "select user_id, sum(score) as sum, count(*) as count from scores group by user_id"
-                    .to_string(),
-            dialect: SqlDialect::FelderaSql,
-            source_kind: SqlSourceKind::StandingView,
-            rust_extension: Default::default(),
-            input_relations: vec![input],
-            output_relations: vec![output],
-            shape: StandingViewShape {
-                is_materialized: true,
-                multi_input: false,
-                multi_output: false,
-            },
-        };
-        let local = external_feldera_runtime_artifact_binding(
-            std::slice::from_ref(&catalog),
-            &spec,
-            &FelderaPipelineManagerRuntimeDeployment {
-                pipeline_name: "velorix-scores".to_string(),
-                mode: FelderaPipelineManagerRuntimeDeploymentMode::LocalVolatile,
-            },
-        )
+        .unwrap()
         .unwrap();
-        let external = external_feldera_runtime_artifact_binding(
-            std::slice::from_ref(&catalog),
-            &spec,
-            &FelderaPipelineManagerRuntimeDeployment {
-                pipeline_name: "velorix-scores".to_string(),
-                mode: FelderaPipelineManagerRuntimeDeploymentMode::ExternalManaged,
-            },
-        )
-        .unwrap();
+        let record = &publication.manifest_record;
 
-        assert_eq!(local.execution_path, "feldera_pipeline_manager");
-        assert_eq!(external.execution_path, "feldera_pipeline_manager");
-        assert_ne!(local.artifact_hash, external.artifact_hash);
-        assert_ne!(local.artifact_id, "");
-        assert_eq!(local.artifact_id, external.artifact_id);
-        assert_eq!(external.state_schema_version, 2);
-        assert_eq!(external.state_codec, "feldera-pipeline-manager-state-v2");
-    }
-
-    #[test]
-    fn feldera_pipeline_manager_checkpoint_records_external_managed_mode() {
-        let catalog = default_scores_relation_catalog().unwrap();
-        let input_schema = catalog_input_relation_schema(&catalog).unwrap();
-        let output_schema = single_key_sum_count_output_schema("scores_by_user", &catalog).unwrap();
-        let spec = StandingViewSpec {
-            view_id: "scores_by_user".to_string(),
-            sql:
-                "select user_id, sum(score) as sum, count(*) as count from scores group by user_id"
-                    .to_string(),
-            dialect: SqlDialect::FelderaSql,
-            source_kind: SqlSourceKind::StandingView,
-            rust_extension: Default::default(),
-            input_relations: vec![input_schema.clone()],
-            output_relations: vec![output_schema.clone()],
-            shape: StandingViewShape {
-                is_materialized: true,
-                multi_input: false,
-                multi_output: false,
-            },
-        };
-        let identity =
-            standing_program_identity_from_external_feldera_runtime(&[catalog.clone()], &spec)
-                .unwrap();
-        let (input_relation_names, input_weight_column_names, input_delete_capable_relation_ids) =
-            validate_feldera_pipeline_manager_runtime_catalogs(std::slice::from_ref(&catalog))
-                .unwrap();
-        let runtime = FelderaPipelineManagerStandingRuntime {
-            identity,
-            input_schemas: vec![input_schema],
-            output_schemas: vec![output_schema],
-            input_relation_names,
-            input_weight_column_names,
-            input_delete_capable_relation_ids,
-            input_catalogs: input_catalog_map(vec![catalog]),
-            base_url: "http://127.0.0.1:1".to_string(),
-            bearer_token: None,
-            pipeline_name: "velorix-scores".to_string(),
-            runtime_deployment_mode: FelderaPipelineManagerRuntimeDeploymentMode::ExternalManaged,
-            logical_epoch: 3,
-            applied_idempotency: HashMap::from([("epoch-3".to_string(), 3)]),
-            input_frontiers: BTreeMap::new(),
-            poisoned_reason: None,
-            timeout: Duration::from_millis(1),
-            cleanup_on_drop: false,
-        };
-
-        let checkpoint = runtime.checkpoint().unwrap();
-        let payload = checkpoint.state_payload.as_ref().unwrap();
-        let payload: Value = serde_json::from_str(&payload.payload).unwrap();
-
-        assert_eq!(
-            checkpoint.checkpoint_codec_identity,
-            FELDERA_PIPELINE_MANAGER_STATE_CODEC
-        );
-        assert_eq!(payload["pipeline_name"], "velorix-scores");
-        assert_eq!(payload["logical_epoch"], 3);
-        assert_eq!(payload["deployment_mode"], "external_managed");
-        assert_eq!(payload["applied_idempotency"]["epoch-3"], 3);
-    }
-
-    #[test]
-    fn feldera_pipeline_manager_restore_rejects_checkpoint_deployment_mode_mismatch() {
-        let catalog = default_scores_relation_catalog().unwrap();
-        let input_schema = catalog_input_relation_schema(&catalog).unwrap();
-        let output_schema = single_key_sum_count_output_schema("scores_by_user", &catalog).unwrap();
-        let spec = StandingViewSpec {
-            view_id: "scores_by_user".to_string(),
-            sql:
-                "select user_id, sum(score) as sum, count(*) as count from scores group by user_id"
-                    .to_string(),
-            dialect: SqlDialect::FelderaSql,
-            source_kind: SqlSourceKind::StandingView,
-            rust_extension: Default::default(),
-            input_relations: vec![input_schema.clone()],
-            output_relations: vec![output_schema.clone()],
-            shape: StandingViewShape {
-                is_materialized: true,
-                multi_input: false,
-                multi_output: false,
-            },
-        };
-        let identity =
-            standing_program_identity_from_external_feldera_runtime(&[catalog.clone()], &spec)
-                .unwrap();
-        let payload = json!({
-            "pipeline_name": "velorix-scores",
-            "logical_epoch": 7,
-            "deployment_mode": "local_volatile",
-            "applied_idempotency": { "epoch-7": 7 }
-        })
-        .to_string();
-        let checkpoint = RuntimeCheckpoint {
-            identity,
-            logical_epoch: 7,
-            input_frontiers: Vec::new(),
-            output_frontiers: Vec::new(),
-            checkpoint_codec_identity: FELDERA_PIPELINE_MANAGER_STATE_CODEC.to_string(),
-            state_root: DurableStateRoot {
-                object_key: "feldera-pipeline-manager://velorix-scores".to_string(),
-                content_hash: feldera_artifact_bytes_hash(payload.as_bytes()),
-            },
-            state_payload: Some(
-                velorix_core::standing_program::RuntimeCheckpointStatePayload {
-                    codec_identity: FELDERA_PIPELINE_MANAGER_STATE_CODEC.to_string(),
-                    payload,
-                },
-            ),
-            output_manifest_refs: Vec::new(),
-            owner_epoch: None,
-        };
-
-        let error = match FelderaPipelineManagerStandingRuntime::restore_with_metadata(
-            checkpoint,
-            vec![input_schema],
-            vec![output_schema],
-            vec![catalog],
-            "http://127.0.0.1:1".to_string(),
-            None,
-            "velorix-scores".to_string(),
-            FelderaPipelineManagerRuntimeDeploymentMode::ExternalManaged,
-            Duration::from_millis(1),
-        ) {
-            Ok(_) => panic!("restore unexpectedly accepted mismatched deployment mode"),
-            Err(error) => error,
-        };
-
-        assert!(
-            error.contains("checkpoint deployment mode mismatch"),
-            "error: {error}"
-        );
-    }
-
-    #[test]
-    fn create_view_request_accepts_feldera_program_output_hints() {
-        let request: CreateViewRequest = serde_json::from_value(json!({
-            "view_id": "score_program",
-            "input_relation_id": "scores",
-            "input_relation_version": "v1",
-            "source_kind": "feldera_program",
-            "output_relation_ids": ["by_user", "by_region"],
-            "sql": "CREATE MATERIALIZED VIEW by_user AS SELECT user_id, SUM(score) AS total_score FROM scores GROUP BY user_id; CREATE MATERIALIZED VIEW by_region AS SELECT region, COUNT(*) AS count FROM scores GROUP BY region;"
-        }))
-        .unwrap();
-
-        validate_create_view_sql_source_contract(&request).unwrap();
-        let outputs = generic_materialized_view_output_schemas_for_ids(
-            &request.output_relation_ids,
-            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        )
-        .unwrap();
-
-        assert_eq!(request.source_kind, SqlSourceKind::FelderaProgram);
-        assert_eq!(
-            outputs
-                .iter()
-                .map(|schema| schema.relation_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["by_user", "by_region"]
-        );
-        assert!(outputs
-            .iter()
-            .all(|schema| schema.schema_fingerprint.starts_with("sha256:")));
-    }
-
-    #[test]
-    fn create_view_request_treats_create_sql_as_feldera_program_when_source_kind_omitted() {
-        let request: CreateViewRequest = serde_json::from_value(json!({
-            "view_id": "score_program",
-            "input_relation_id": "scores",
-            "input_relation_version": "v1",
-            "output_relation_ids": ["by_user", "by_region"],
-            "sql": "  CREATE MATERIALIZED VIEW by_user AS SELECT user_id, SUM(score) AS total_score FROM scores GROUP BY user_id; CREATE MATERIALIZED VIEW by_region AS SELECT region, COUNT(*) AS count FROM scores GROUP BY region;"
-        }))
-        .unwrap();
-
-        validate_create_view_sql_source_contract(&request).unwrap();
-
-        assert_eq!(request.source_kind, SqlSourceKind::StandingView);
-        assert_eq!(
-            resolved_sql_source_kind_for_create_view(&request),
-            SqlSourceKind::FelderaProgram
-        );
-    }
-
-    #[test]
-    fn create_view_request_treats_commented_create_sql_as_feldera_program() {
-        let request: CreateViewRequest = serde_json::from_value(json!({
-            "view_id": "score_program",
-            "input_relation_id": "scores",
-            "input_relation_version": "v1",
-            "output_relation_ids": ["by_user"],
-            "sql": "-- generated by app\n/* program outputs */\nCREATE MATERIALIZED VIEW by_user AS SELECT user_id, SUM(score) AS total_score FROM scores GROUP BY user_id"
-        }))
-        .unwrap();
-
-        validate_create_view_sql_source_contract(&request).unwrap();
-
-        assert_eq!(
-            resolved_sql_source_kind_for_create_view(&request),
-            SqlSourceKind::FelderaProgram
-        );
-    }
-
-    #[test]
-    fn create_view_request_does_not_treat_create_prefix_identifier_as_program() {
-        let request: CreateViewRequest = serde_json::from_value(json!({
-            "view_id": "score_program",
-            "input_relation_id": "scores",
-            "input_relation_version": "v1",
-            "output_relation_ids": ["by_user"],
-            "sql": "create_view_alias AS SELECT user_id FROM scores"
-        }))
-        .unwrap();
-
-        assert!(validate_create_view_sql_source_contract(&request).is_err());
-        assert_eq!(
-            resolved_sql_source_kind_for_create_view(&request),
-            SqlSourceKind::StandingView
-        );
-    }
-
-    #[test]
-    fn create_view_request_rejects_output_hints_for_standing_view_source() {
-        let request: CreateViewRequest = serde_json::from_value(json!({
-            "view_id": "score_program",
-            "input_relation_id": "scores",
-            "input_relation_version": "v1",
-            "output_relation_ids": ["by_user"],
-            "sql": "SELECT user_id, SUM(score) AS total_score FROM scores GROUP BY user_id"
-        }))
-        .unwrap();
-
-        assert!(validate_create_view_sql_source_contract(&request).is_err());
-    }
-
-    #[test]
-    fn caller_sql_renderer_compiles_typed_placeholders_to_feldera_prepare_execute() {
-        let sql = "select * from scores where user_id = {{ context.params.user_id | is_required | is_string }} and score >= {{ context.params.min_score | is_integer(min=0) }} and active = {{ context.params.active | is_boolean }}";
-        let rendered = render_caller_sql_as_feldera_sql(
-            sql,
-            &BTreeMap::from([
-                ("user_id".to_string(), json!("u'1")),
-                ("min_score".to_string(), json!("5")),
-                ("active".to_string(), json!("true")),
-            ]),
-        )
-        .unwrap();
-
-        assert_eq!(
-            rendered,
-            "PREPARE velorix_query AS select * from scores where user_id = $1 and score >= $2 and active = $3;\nEXECUTE velorix_query('u''1', 5, TRUE);"
-        );
-    }
-
-    #[test]
-    fn caller_sql_renderer_compiles_array_placeholder_to_feldera_array_literal() {
-        let sql =
-            "select * from scores where user_id in unnest({{ context.params.user_ids | is_array(element=string) }})";
-        let rendered = render_caller_sql_as_feldera_sql(
-            sql,
-            &BTreeMap::from([("user_ids".to_string(), json!(["u1", "u'2"]))]),
-        )
-        .unwrap();
-
-        assert_eq!(
-            rendered,
-            "PREPARE velorix_query AS select * from scores where user_id IN ($1, $2);\nEXECUTE velorix_query('u1', 'u''2');"
-        );
-    }
-
-    #[test]
-    fn caller_sql_renderer_compiles_typed_array_placeholders_to_feldera_literals() {
-        let sql = "select * from events where event_date in unnest({{ context.params.days | is_array(element=date) }}) and event_ts in unnest({{ context.params.timestamps | is_array(element=timestamp) }}) and event_uuid in unnest({{ context.params.ids | is_array(element=uuid) }}) and amount in unnest({{ context.params.amounts | is_array(element=decimal) }}) and raw in unnest({{ context.params.raw_values | is_array(element=binary_hex) }})";
-        let rendered = render_caller_sql_as_feldera_sql(
-            sql,
-            &BTreeMap::from([
-                ("days".to_string(), json!(["2026-06-10", "2026-06-11"])),
-                (
-                    "timestamps".to_string(),
-                    json!(["2026-06-10T01:02:03", "2026-06-11 04:05:06"]),
-                ),
-                (
-                    "ids".to_string(),
-                    json!([
-                        "018f4b6e-9cb5-7f5a-8027-2ce24be4d3aa",
-                        "018f4b6e-9cb5-7f5a-8027-2ce24be4d3ab"
-                    ]),
-                ),
-                ("amounts".to_string(), json!(["123.45", "-7"])),
-                ("raw_values".to_string(), json!(["0x0A0bff", "deadbeef"])),
-            ]),
-        )
-        .unwrap();
-
-        assert_eq!(
-            rendered,
-            "PREPARE velorix_query AS select * from events where event_date IN ($1, $2) and event_ts IN ($3, $4) and event_uuid IN ($5, $6) and amount IN ($7, $8) and raw IN ($9, $10);\nEXECUTE velorix_query('2026-06-10', '2026-06-11', '2026-06-10 01:02:03', '2026-06-11 04:05:06', '018f4b6e-9cb5-7f5a-8027-2ce24be4d3aa', '018f4b6e-9cb5-7f5a-8027-2ce24be4d3ab', 123.45, -7, x'0a0bff', x'deadbeef');"
-        );
-    }
-
-    #[test]
-    fn caller_sql_renderer_rejects_invalid_typed_array_placeholder() {
-        let error = render_caller_sql_as_feldera_sql(
-            "select * from events where event_date in unnest({{ context.params.days | is_array(element=date) }})",
-            &BTreeMap::from([("days".to_string(), json!(["2026-06-10", "2026-02-30"]))]),
-        )
-        .unwrap_err();
-
-        assert!(error.to_string().contains("is_date"), "error: {error}");
-    }
-
-    #[test]
-    fn caller_sql_renderer_compiles_typed_feldera_literal_placeholders() {
-        let sql = "select * from events where event_date = {{ context.params.event_date | is_date }} and event_time = {{ context.params.event_time | is_time }} and event_ts = {{ context.params.event_ts | is_timestamp }} and event_uuid = {{ context.params.event_uuid | is_uuid }} and amount = {{ context.params.amount | is_decimal }} and raw = {{ context.params.raw | is_binary_hex }}";
-        let rendered = render_caller_sql_as_feldera_sql(
-            sql,
-            &BTreeMap::from([
-                ("event_date".to_string(), json!("2026-06-10")),
-                ("event_time".to_string(), json!("01:02:03.004")),
-                ("event_ts".to_string(), json!("2026-06-10T01:02:03.004")),
-                (
-                    "event_uuid".to_string(),
-                    json!("018f4b6e-9cb5-7f5a-8027-2ce24be4d3aa"),
-                ),
-                ("amount".to_string(), json!("123.4500")),
-                ("raw".to_string(), json!("0x0A0bff")),
-            ]),
-        )
-        .unwrap();
-
-        assert_eq!(
-            rendered,
-            "PREPARE velorix_query AS select * from events where event_date = $1 and event_time = $2 and event_ts = $3 and event_uuid = $4 and amount = $5 and raw = $6;\nEXECUTE velorix_query('2026-06-10', '01:02:03.004', '2026-06-10 01:02:03.004', '018f4b6e-9cb5-7f5a-8027-2ce24be4d3aa', 123.4500, x'0a0bff');"
-        );
-    }
-
-    #[test]
-    fn caller_sql_renderer_compiles_json_placeholder_to_canonical_feldera_string_literal() {
-        let sql = "select * from events where raw_json = {{ context.params.payload | is_json }}";
-        let rendered = render_caller_sql_as_feldera_sql(
-            sql,
-            &BTreeMap::from([(
-                "payload".to_string(),
-                json!({"name": "Ada", "quote": "it isn't magic"}),
-            )]),
-        )
-        .unwrap();
-
-        assert_eq!(
-            rendered,
-            "PREPARE velorix_query AS select * from events where raw_json = $1;\nEXECUTE velorix_query('{\"name\":\"Ada\",\"quote\":\"it isn''t magic\"}');"
-        );
-    }
-
-    #[test]
-    fn caller_sql_renderer_compiles_json_array_to_canonical_feldera_string_literals() {
-        let sql =
-            "select * from events where raw_json in unnest({{ context.params.payloads | is_array(element=json) }})";
-        let rendered = render_caller_sql_as_feldera_sql(
-            sql,
-            &BTreeMap::from([(
-                "payloads".to_string(),
-                json!([{"kind": "a"}, {"kind": "b"}]),
-            )]),
-        )
-        .unwrap();
-
-        assert_eq!(
-            rendered,
-            "PREPARE velorix_query AS select * from events where raw_json IN ($1, $2);\nEXECUTE velorix_query('{\"kind\":\"a\"}', '{\"kind\":\"b\"}');"
-        );
-    }
-
-    #[test]
-    fn request_field_contract_rejects_variant_type_with_feldera_query_reason() {
-        let field = MaterializedViewRequestFieldSpec {
-            field_name: "payload".to_string(),
-            field_in: "query".to_string(),
-            r#type: "variant".to_string(),
-            validators: vec!["required".to_string()],
-            default_value: None,
-            description: None,
-        };
-
-        let error = validate_request_field_contract(&field).unwrap_err();
-
-        assert!(
-            error.to_string().contains(
-                "Feldera pipeline-manager /query does not support request-time VARIANT bind literals"
-            ),
-            "error: {error}"
-        );
-    }
-
-    #[test]
-    fn caller_sql_renderer_rejects_is_variant_filter_with_feldera_query_reason() {
-        let error = render_caller_sql_as_feldera_sql(
-            "select * from events where payload = {{ context.params.payload | is_variant }}",
-            &BTreeMap::from([("payload".to_string(), json!({"name": "Ada"}))]),
-        )
-        .unwrap_err();
-
-        assert!(
-            error.to_string().contains(
-                "Feldera pipeline-manager /query does not support request-time VARIANT bind literals"
-            ),
-            "error: {error}"
-        );
-    }
-
-    #[test]
-    fn caller_sql_renderer_rejects_invalid_typed_feldera_literal_placeholder() {
-        let error = render_caller_sql_as_feldera_sql(
-            "select * from events where event_date = {{ context.params.event_date | is_date }}",
-            &BTreeMap::from([("event_date".to_string(), json!("2026-02-30"))]),
-        )
-        .unwrap_err();
-
-        assert!(error.to_string().contains("is_date"), "error: {error}");
-    }
-
-    #[test]
-    fn caller_sql_renderer_rejects_array_placeholder_with_wrong_element_type() {
-        let error = render_caller_sql_as_feldera_sql(
-            "select * from scores where user_id in unnest({{ context.params.user_ids | is_array(element=string) }})",
-            &BTreeMap::from([("user_ids".to_string(), json!(["u1", 2]))]),
-        )
-        .unwrap_err();
-
-        assert!(
-            error.to_string().contains("is_array(element=string)"),
-            "error: {error}"
-        );
-    }
-
-    #[test]
-    fn caller_sql_renderer_rejects_unreferenced_parameters() {
-        let error = render_caller_sql_as_feldera_sql(
-            "select * from scores",
-            &BTreeMap::from([("unused".to_string(), json!("u1"))]),
-        )
-        .unwrap_err();
-
-        assert!(
-            error.to_string().contains("not referenced"),
-            "error: {error}"
-        );
-    }
-
-    #[test]
-    fn caller_sql_renderer_rejects_multi_statement_sql_when_parameters_require_prepare() {
-        let error = render_caller_sql_as_feldera_sql(
-            "select * from scores where user_id = {{ context.params.user_id | is_string }}; select * from scores",
-            &BTreeMap::from([("user_id".to_string(), json!("u1"))]),
-        )
-        .unwrap_err();
-
-        assert!(
-            error.to_string().contains("single SQL statement"),
-            "error: {error}"
-        );
-    }
-
-    #[test]
-    fn caller_sql_renderer_passes_through_braces_when_parameters_are_empty() {
-        let sql = "select '{{ not_a_parameter }}' as literal from scores";
-
-        let rendered = render_caller_sql_as_feldera_sql(sql, &BTreeMap::new()).unwrap();
-
-        assert_eq!(rendered, sql);
-    }
-
-    #[test]
-    fn caller_sql_renderer_only_replaces_context_params_placeholders() {
-        let sql = "select '{{ feldera_owned }}' as literal, {{ context.params.user_id | is_string }} as user_id";
-        let rendered = render_caller_sql_as_feldera_sql(
-            sql,
-            &BTreeMap::from([("user_id".to_string(), json!("u1"))]),
-        )
-        .unwrap();
-
-        assert_eq!(
-            rendered,
-            "PREPARE velorix_query AS select '{{ feldera_owned }}' as literal, $1 as user_id;\nEXECUTE velorix_query('u1');"
-        );
-    }
-
-    #[test]
-    fn caller_sql_renderer_does_not_replace_placeholders_inside_sql_strings_or_comments() {
-        let sql = "select 'it''s {{ context.params.literal }}' as literal, \"{{ context.params.ident }}\" as quoted_ident, {{ context.params.user_id | is_string }} as user_id -- {{ context.params.comment }}\n/* {{ context.params.block }} */";
-        let rendered = render_caller_sql_as_feldera_sql(
-            sql,
-            &BTreeMap::from([("user_id".to_string(), json!("u1"))]),
-        )
-        .unwrap();
-
-        assert_eq!(
-            rendered,
-            "PREPARE velorix_query AS select 'it''s {{ context.params.literal }}' as literal, \"{{ context.params.ident }}\" as quoted_ident, $1 as user_id -- {{ context.params.comment }}\n/* {{ context.params.block }} */;\nEXECUTE velorix_query('u1');"
-        );
-    }
-
-    #[test]
-    fn sql_template_renderer_does_not_replace_placeholders_inside_sql_strings_or_comments() {
-        let field = MaterializedViewRequestFieldSpec {
-            field_name: "user_id".to_string(),
-            field_in: "query".to_string(),
-            r#type: "string".to_string(),
-            validators: vec!["required".to_string(), "string".to_string()],
-            default_value: None,
-            description: None,
-        };
-        let template = "select '{{ context.params.literal }}' as literal, \"{{ context.params.ident }}\" as ident, {{ context.params.user_id | is_required | is_string }} as user_id -- {{ context.params.comment }}\n/* {{ context.params.block }} */";
-        let rendered = render_view_sql_template_as_feldera_sql(
-            template,
-            &[field],
-            &BTreeMap::from([("user_id".to_string(), json!("u1"))]),
-        )
-        .unwrap();
-
-        assert_eq!(
-            rendered,
-            "PREPARE velorix_query AS select '{{ context.params.literal }}' as literal, \"{{ context.params.ident }}\" as ident, $1 as user_id -- {{ context.params.comment }}\n/* {{ context.params.block }} */;\nEXECUTE velorix_query('u1');"
-        );
-    }
-
-    #[test]
-    fn response_schema_json_column_parses_canonical_json_text() {
-        let rows = vec![json!({
-            "payload_alias": "{\"name\":\"Ada\",\"scores\":[8,13],\"nested\":{\"active\":true}}",
-            "label": "object"
-        })];
-        let response_schema = MaterializedViewResponseSchema {
-            columns: vec![
-                MaterializedViewResponseColumnSpec {
-                    name: "payload".to_string(),
-                    r#type: "json".to_string(),
-                    source: "payload_alias".to_string(),
-                    description: None,
-                },
-                MaterializedViewResponseColumnSpec {
-                    name: "label".to_string(),
-                    r#type: "string".to_string(),
-                    source: "label".to_string(),
-                    description: None,
-                },
-            ],
-        };
-
-        let rows = materialized_rows_to_api_rows(&rows, &response_schema).unwrap();
-
-        assert_eq!(rows[0]["payload"]["name"], json!("Ada"));
-        assert_eq!(rows[0]["payload"]["scores"], json!([8, 13]));
-        assert_eq!(rows[0]["payload"]["nested"]["active"], json!(true));
-        assert_eq!(rows[0]["label"], json!("object"));
-    }
-
-    #[test]
-    fn response_schema_json_column_preserves_plain_string_values() {
-        let rows = vec![json!({ "payload_alias": "plain-string" })];
-        let response_schema = MaterializedViewResponseSchema {
-            columns: vec![MaterializedViewResponseColumnSpec {
-                name: "payload".to_string(),
-                r#type: "json".to_string(),
-                source: "payload_alias".to_string(),
-                description: None,
-            }],
-        };
-
-        let rows = materialized_rows_to_api_rows(&rows, &response_schema).unwrap();
-
-        assert_eq!(rows[0]["payload"], json!("plain-string"));
-    }
-
-    #[test]
-    fn response_schema_json_column_parses_canonical_json_string_scalar() {
-        let rows = vec![json!({ "payload_alias": "\"plain-string\"" })];
-        let response_schema = MaterializedViewResponseSchema {
-            columns: vec![MaterializedViewResponseColumnSpec {
-                name: "payload".to_string(),
-                r#type: "json".to_string(),
-                source: "payload_alias".to_string(),
-                description: None,
-            }],
-        };
-
-        let rows = materialized_rows_to_api_rows(&rows, &response_schema).unwrap();
-
-        assert_eq!(rows[0]["payload"], json!("plain-string"));
-    }
-
-    #[test]
-    fn response_schema_accepts_feldera_scalar_output_types() {
-        let rows = vec![json!({
-            "event_date": "2026-06-10",
-            "event_time": "01:02:03.004005006",
-            "event_ts": "2026-06-10T01:02:03.004005006",
-            "event_uuid": "018F4B6E-9CB5-7F5A-8027-2CE24BE4D3AA",
-            "amount": 12.34,
-            "raw": "0A0BFF"
-        })];
-        let response_schema = MaterializedViewResponseSchema {
-            columns: vec![
-                MaterializedViewResponseColumnSpec {
-                    name: "event_date".to_string(),
-                    r#type: "date".to_string(),
-                    source: "event_date".to_string(),
-                    description: None,
-                },
-                MaterializedViewResponseColumnSpec {
-                    name: "event_time".to_string(),
-                    r#type: "time".to_string(),
-                    source: "event_time".to_string(),
-                    description: None,
-                },
-                MaterializedViewResponseColumnSpec {
-                    name: "event_ts".to_string(),
-                    r#type: "timestamp".to_string(),
-                    source: "event_ts".to_string(),
-                    description: None,
-                },
-                MaterializedViewResponseColumnSpec {
-                    name: "event_uuid".to_string(),
-                    r#type: "uuid".to_string(),
-                    source: "event_uuid".to_string(),
-                    description: None,
-                },
-                MaterializedViewResponseColumnSpec {
-                    name: "amount".to_string(),
-                    r#type: "decimal".to_string(),
-                    source: "amount".to_string(),
-                    description: None,
-                },
-                MaterializedViewResponseColumnSpec {
-                    name: "raw".to_string(),
-                    r#type: "binary_hex".to_string(),
-                    source: "raw".to_string(),
-                    description: None,
-                },
-            ],
-        };
-
-        let rows = materialized_rows_to_api_rows(&rows, &response_schema).unwrap();
-
-        assert_eq!(rows[0]["event_date"], json!("2026-06-10"));
-        assert_eq!(rows[0]["event_time"], json!("01:02:03.004005006"));
-        assert_eq!(rows[0]["event_ts"], json!("2026-06-10 01:02:03.004005006"));
-        assert_eq!(
-            rows[0]["event_uuid"],
-            json!("018f4b6e-9cb5-7f5a-8027-2ce24be4d3aa")
-        );
-        assert_eq!(rows[0]["amount"], json!("12.34"));
-        assert_eq!(rows[0]["raw"], json!("0x0a0bff"));
-    }
-
-    #[test]
-    fn response_schema_accepts_feldera_complex_output_types() {
-        let rows = vec![json!({
-            "scores": [8, null, 13],
-            "profile": { "name": "Ada", "tier": 2 },
-            "attributes_json": "{\"critical\":9,\"batch\":null}",
-            "tags_json": "[\"streaming\",\"sql\"]"
-        })];
-        let response_schema = MaterializedViewResponseSchema {
-            columns: vec![
-                MaterializedViewResponseColumnSpec {
-                    name: "scores".to_string(),
-                    r#type: "array".to_string(),
-                    source: "scores".to_string(),
-                    description: None,
-                },
-                MaterializedViewResponseColumnSpec {
-                    name: "profile".to_string(),
-                    r#type: "object".to_string(),
-                    source: "profile".to_string(),
-                    description: None,
-                },
-                MaterializedViewResponseColumnSpec {
-                    name: "attributes".to_string(),
-                    r#type: "object".to_string(),
-                    source: "attributes_json".to_string(),
-                    description: None,
-                },
-                MaterializedViewResponseColumnSpec {
-                    name: "tags".to_string(),
-                    r#type: "array".to_string(),
-                    source: "tags_json".to_string(),
-                    description: None,
-                },
-            ],
-        };
-
-        let rows = materialized_rows_to_api_rows(&rows, &response_schema).unwrap();
-
-        assert_eq!(rows[0]["scores"], json!([8, null, 13]));
-        assert_eq!(rows[0]["profile"], json!({ "name": "Ada", "tier": 2 }));
-        assert_eq!(
-            rows[0]["attributes"],
-            json!({ "critical": 9, "batch": null })
-        );
-        assert_eq!(rows[0]["tags"], json!(["streaming", "sql"]));
-    }
-
-    #[test]
-    fn response_schema_preserves_null_for_feldera_nullable_output_types() {
-        let rows = vec![json!({
-            "string_value": null,
-            "int_value": null,
-            "float_value": null,
-            "bool_value": null,
-            "date_value": null,
-            "time_value": null,
-            "timestamp_value": null,
-            "uuid_value": null,
-            "decimal_value": null,
-            "binary_value": null,
-            "array_value": null,
-            "object_value": null,
-            "json_value": null
-        })];
-        let response_schema = MaterializedViewResponseSchema {
-            columns: vec![
-                ("string_value", "string"),
-                ("int_value", "int64"),
-                ("float_value", "float64"),
-                ("bool_value", "boolean"),
-                ("date_value", "date"),
-                ("time_value", "time"),
-                ("timestamp_value", "timestamp"),
-                ("uuid_value", "uuid"),
-                ("decimal_value", "decimal"),
-                ("binary_value", "binary_hex"),
-                ("array_value", "array"),
-                ("object_value", "object"),
-                ("json_value", "json"),
-            ]
-            .into_iter()
-            .map(|(name, type_name)| MaterializedViewResponseColumnSpec {
-                name: name.to_string(),
-                r#type: type_name.to_string(),
-                source: name.to_string(),
-                description: None,
-            })
-            .collect(),
-        };
-
-        let rows = materialized_rows_to_api_rows(&rows, &response_schema).unwrap();
-
-        for column in response_schema.columns {
-            assert_eq!(rows[0].get(&column.name), Some(&Value::Null));
-        }
-    }
-
-    #[test]
-    fn response_schema_rejects_unknown_type_during_admission() {
-        let api = MaterializedViewApiMetadata {
-            response_schema: Some(MaterializedViewResponseSchema {
-                columns: vec![MaterializedViewResponseColumnSpec {
-                    name: "payload".to_string(),
-                    r#type: "xml".to_string(),
-                    source: "payload".to_string(),
-                    description: None,
-                }],
-            }),
-            ..MaterializedViewApiMetadata::default()
-        };
-
-        let error = validate_view_api_metadata(&api).unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("response schema column `payload` declares unsupported type `xml`"),
-            "error: {error}"
-        );
-    }
-
-    #[test]
-    fn sql_template_renderer_compiles_array_parameter_to_feldera_array_literal() {
-        let field = MaterializedViewRequestFieldSpec {
-            field_name: "scores".to_string(),
-            field_in: "query".to_string(),
-            r#type: "array".to_string(),
-            validators: vec!["array(element=integer)".to_string()],
-            default_value: None,
-            description: None,
-        };
-        validate_request_field_contract(&field).unwrap();
-        let template =
-            "select user_id from scores where score in unnest({{ context.params.scores | is_required | is_array(element=integer) }})";
-        let rendered = render_view_sql_template_as_feldera_sql(
-            template,
-            &[field],
-            &BTreeMap::from([("scores".to_string(), json!([5, "7"]))]),
-        )
-        .unwrap();
-
-        assert_eq!(
-            rendered,
-            "PREPARE velorix_query AS select user_id from scores where score IN ($1, $2);\nEXECUTE velorix_query(5, 7);"
-        );
-    }
-
-    #[test]
-    fn sql_template_renderer_compiles_json_request_field_to_canonical_feldera_string_literal() {
-        let field = MaterializedViewRequestFieldSpec {
-            field_name: "payload".to_string(),
-            field_in: "query".to_string(),
-            r#type: "json".to_string(),
-            validators: vec!["required".to_string(), "json".to_string()],
-            default_value: None,
-            description: None,
-        };
-        validate_request_field_contract(&field).unwrap();
-        let template =
-            "select id from events where raw_json = {{ context.params.payload | is_required | is_json }}";
-        let rendered = render_view_sql_template_as_feldera_sql(
-            template,
-            &[field],
-            &BTreeMap::from([("payload".to_string(), json!({"flag": true, "count": 3}))]),
-        )
-        .unwrap();
-
-        assert_eq!(
-            rendered,
-            "PREPARE velorix_query AS select id from events where raw_json = $1;\nEXECUTE velorix_query('{\"count\":3,\"flag\":true}');"
-        );
-    }
-
-    #[test]
-    fn sql_template_coverage_ignores_placeholders_inside_sql_strings_or_comments() {
-        let api = MaterializedViewApiMetadata {
-            request: vec![MaterializedViewRequestFieldSpec {
-                field_name: "user_id".to_string(),
-                field_in: "query".to_string(),
-                r#type: "string".to_string(),
-                validators: vec!["required".to_string()],
-                default_value: None,
-                description: None,
-            }],
-            sql_template: Some(
-                "select '{{ context.params.user_id }}' as literal -- {{ context.params.user_id }}"
-                    .to_string(),
-            ),
-            ..MaterializedViewApiMetadata::default()
-        };
-
-        let error =
-            validate_sql_template_parameter_coverage(api.sql_template.as_deref().unwrap(), &api)
-                .unwrap_err();
-
-        assert!(
-            error.to_string().contains("required parameter `user_id`"),
-            "error: {error}"
-        );
-    }
-
-    #[test]
-    fn promoted_api_output_binding_is_required_for_multi_output_views() {
-        let outputs = vec![
-            test_relation_schema(
-                "by_user",
-                vec![test_feldera_column("user_id", SqlDataType::Int64)],
-            ),
-            test_relation_schema(
-                "by_region",
-                vec![test_feldera_column("region", SqlDataType::Utf8)],
-            ),
-        ];
-        let api_without_output = MaterializedViewApiMetadata {
-            url_path: Some("/scores/by-user".to_string()),
-            ..MaterializedViewApiMetadata::default()
-        };
-        let api_with_output = MaterializedViewApiMetadata {
-            url_path: Some("/scores/by-user".to_string()),
-            output_relation_id: Some("by_user".to_string()),
-            ..MaterializedViewApiMetadata::default()
-        };
-
-        assert!(
-            validate_view_api_output_binding("score_program", &api_without_output, &outputs)
-                .is_err()
-        );
-        validate_view_api_output_binding("score_program", &api_with_output, &outputs).unwrap();
-    }
-
-    #[test]
-    fn create_view_request_accepts_output_relation_binding_aliases() {
-        let camel: CreateViewRequest = serde_json::from_value(json!({
-            "view_id": "score_program",
-            "input_relation_id": "scores",
-            "input_relation_version": "v1",
-            "outputRelationId": "by_user",
-            "sql": "select * from scores"
-        }))
-        .unwrap();
-        let snake: CreateViewRequest = serde_json::from_value(json!({
-            "view_id": "score_program",
-            "input_relation_id": "scores",
-            "input_relation_version": "v1",
-            "output_relation_id": "by_user",
-            "sql": "select * from scores"
-        }))
-        .unwrap();
-
-        assert_eq!(camel.output_relation_id.as_deref(), Some("by_user"));
-        assert_eq!(snake.output_relation_id.as_deref(), Some("by_user"));
-    }
-
-    #[test]
-    fn standing_runtime_page_request_uses_query_policy_output_row_bound() {
-        let unbounded = SnapshotPageRequest {
-            committed_epoch: Some(7),
-            page_token: None,
-            max_rows: None,
-        };
-        let policy = QueryPolicy {
-            max_output_rows: Some(10),
-            ..QueryPolicy::default()
-        };
-        let bounded = page_request_with_query_policy_limit(unbounded, policy);
-
-        assert_eq!(bounded.committed_epoch, Some(7));
-        assert_eq!(bounded.max_rows, Some(11));
-
-        let caller_bounded = page_request_with_query_policy_limit(
-            SnapshotPageRequest {
-                committed_epoch: None,
-                page_token: Some("next".to_string()),
-                max_rows: Some(5),
-            },
-            policy,
-        );
-        assert_eq!(caller_bounded.page_token.as_deref(), Some("next"));
-        assert_eq!(caller_bounded.max_rows, Some(5));
-    }
-
-    #[test]
-    fn feldera_pipeline_manager_output_schemas_reads_all_outputs_when_multi_output() {
-        let program_info = json!({
-            "schema": {
-                "outputs": [
-                    {
-                        "name": "by_user",
-                        "fields": [
-                            { "name": "user_id", "columntype": "BIGINT" },
-                            { "name": "total_score", "columntype": "BIGINT" }
-                        ],
-                        "primary_key": ["user_id"]
-                    },
-                    {
-                        "name": "by_region",
-                        "fields": [
-                            { "name": "region", "columntype": "VARCHAR" },
-                            { "name": "event_count", "columntype": "BIGINT" }
-                        ],
-                        "primary_key": ["region"]
-                    }
-                ]
-            }
-        });
-
-        let outputs =
-            feldera_output_schemas_from_program_info("score_program", 7, Some(&program_info), true)
-                .unwrap();
-
-        assert_eq!(
-            outputs
-                .iter()
-                .map(|schema| schema.relation_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["by_user", "by_region"]
-        );
-        assert_eq!(outputs[0].columns[0].data_type, SqlDataType::Int64);
-        assert_eq!(outputs[1].columns[0].data_type, SqlDataType::Utf8);
-    }
-
-    #[test]
-    fn feldera_pipeline_manager_output_schemas_keeps_single_output_contract() {
-        let program_info = json!({
-            "schema": {
-                "outputs": [
-                    {
-                        "name": "by_user",
-                        "fields": [{ "name": "user_id", "columntype": "BIGINT" }],
-                        "primary_key": ["user_id"]
-                    },
-                    {
-                        "name": "by_region",
-                        "fields": [{ "name": "region", "columntype": "VARCHAR" }],
-                        "primary_key": ["region"]
-                    }
-                ]
-            }
-        });
-
-        let outputs =
-            feldera_output_schemas_from_program_info("by_region", 7, Some(&program_info), false)
-                .unwrap();
-
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].relation_id, "by_region");
-    }
-
-    #[test]
-    fn feldera_pipeline_manager_output_schemas_skip_non_materialized_multi_outputs() {
-        let program_info = json!({
-            "schema": {
-                "outputs": [
-                    {
-                        "name": "error_view",
-                        "materialized": false,
-                        "fields": [{ "name": "message", "columntype": "VARCHAR" }],
-                        "primary_key": []
-                    },
-                    {
-                        "name": "by_user",
-                        "materialized": true,
-                        "fields": [{ "name": "user_id", "columntype": "BIGINT" }],
-                        "primary_key": ["user_id"]
-                    }
-                ]
-            }
-        });
-
-        let outputs =
-            feldera_output_schemas_from_program_info("score_program", 7, Some(&program_info), true)
-                .unwrap();
-
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].relation_id, "by_user");
-    }
-
-    #[test]
-    fn feldera_pipeline_manager_output_schemas_rejects_non_materialized_single_output() {
-        let program_info = json!({
-            "schema": {
-                "outputs": [{
-                    "name": "by_user",
-                    "materialized": false,
-                    "fields": [{ "name": "user_id", "columntype": "BIGINT" }],
-                    "primary_key": ["user_id"]
-                }]
-            }
-        });
-
-        let error =
-            feldera_output_schemas_from_program_info("by_user", 7, Some(&program_info), false)
-                .unwrap_err();
-
-        assert!(error
-            .to_string()
-            .contains("Feldera output view `by_user` is not materialized"));
-    }
-
-    #[test]
-    fn feldera_pipeline_manager_output_schemas_rejects_connector_bearing_outputs() {
-        let program_info = json!({
-            "schema": {
-                "outputs": [{
-                    "name": "by_user",
-                    "materialized": true,
-                    "fields": [{ "name": "user_id", "columntype": "BIGINT" }],
-                    "primary_key": ["user_id"],
-                    "properties": {
-                        "connectors": [{ "name": "sink" }]
-                    }
-                }]
-            }
-        });
-
-        let error =
-            feldera_output_schemas_from_program_info("score_program", 7, Some(&program_info), true)
-                .unwrap_err();
-
-        assert!(error.to_string().contains(
-            "Feldera output view `by_user` contains unmanaged connector/external IO properties"
-        ));
-    }
-
-    #[test]
-    fn feldera_pipeline_manager_output_schemas_rejects_duplicate_output_names() {
-        let program_info = json!({
-            "schema": {
-                "outputs": [
-                    {
-                        "name": "by_user",
-                        "fields": [{ "name": "user_id", "columntype": "BIGINT" }],
-                        "primary_key": ["user_id"]
-                    },
-                    {
-                        "name": "by_user",
-                        "fields": [{ "name": "region", "columntype": "VARCHAR" }],
-                        "primary_key": ["region"]
-                    }
-                ]
-            }
-        });
-
-        let error =
-            feldera_output_schemas_from_program_info("score_program", 7, Some(&program_info), true)
-                .unwrap_err();
-
-        assert!(error
-            .to_string()
-            .contains("Feldera compiled program contains duplicate output view `by_user`"));
-    }
-
-    #[test]
-    fn feldera_pipeline_manager_output_schemas_rejects_case_insensitive_duplicate_output_names() {
-        let program_info = json!({
-            "schema": {
-                "outputs": [
-                    {
-                        "name": "by_user",
-                        "case_sensitive": false,
-                        "fields": [{ "name": "user_id", "columntype": "BIGINT" }],
-                        "primary_key": ["user_id"]
-                    },
-                    {
-                        "name": "BY_USER",
-                        "case_sensitive": false,
-                        "fields": [{ "name": "region", "columntype": "VARCHAR" }],
-                        "primary_key": ["region"]
-                    }
-                ]
-            }
-        });
-
-        let error =
-            feldera_output_schemas_from_program_info("score_program", 7, Some(&program_info), true)
-                .unwrap_err();
-
-        assert!(error
-            .to_string()
-            .contains("Feldera compiled program contains duplicate output view `BY_USER`"));
-    }
-
-    #[test]
-    fn feldera_pipeline_manager_output_schemas_matches_case_insensitive_single_output() {
-        let program_info = json!({
-            "schema": {
-                "outputs": [{
-                    "name": "BY_USER",
-                    "case_sensitive": false,
-                    "fields": [{ "name": "user_id", "columntype": "BIGINT" }],
-                    "primary_key": ["user_id"]
-                }]
-            }
-        });
-
-        let outputs =
-            feldera_output_schemas_from_program_info("by_user", 7, Some(&program_info), false)
-                .unwrap();
-
-        assert_eq!(outputs[0].relation_id, "BY_USER");
-    }
-
-    #[test]
-    fn feldera_pipeline_manager_output_schemas_rejects_blank_output_field_name() {
-        let program_info = json!({
-            "schema": {
-                "outputs": [{
-                    "name": "by_user",
-                    "fields": [{ "name": " ", "columntype": "BIGINT" }],
-                    "primary_key": []
-                }]
-            }
-        });
-
-        let error =
-            feldera_output_schemas_from_program_info("score_program", 7, Some(&program_info), true)
-                .unwrap_err();
-
-        assert!(error
-            .to_string()
-            .contains("Feldera output view `by_user` contains a blank field name"));
-    }
-
-    #[test]
-    fn feldera_pipeline_manager_output_schemas_rejects_duplicate_output_field_names() {
-        let program_info = json!({
-            "schema": {
-                "outputs": [{
-                    "name": "by_user",
-                    "fields": [
-                        { "name": "user_id", "columntype": "BIGINT" },
-                        { "name": "user_id", "columntype": "VARCHAR" }
-                    ],
-                    "primary_key": []
-                }]
-            }
-        });
-
-        let error =
-            feldera_output_schemas_from_program_info("score_program", 7, Some(&program_info), true)
-                .unwrap_err();
-
-        assert!(error
-            .to_string()
-            .contains("Feldera output view `by_user` contains duplicate field `user_id`"));
-    }
-
-    #[test]
-    fn feldera_pipeline_manager_output_schemas_rejects_case_insensitive_duplicate_output_field_names(
-    ) {
-        let program_info = json!({
-            "schema": {
-                "outputs": [{
-                    "name": "by_user",
-                    "case_sensitive": false,
-                    "fields": [
-                        { "name": "user_id", "columntype": "BIGINT" },
-                        { "name": "USER_ID", "columntype": "VARCHAR" }
-                    ],
-                    "primary_key": []
-                }]
-            }
-        });
-
-        let error =
-            feldera_output_schemas_from_program_info("score_program", 7, Some(&program_info), true)
-                .unwrap_err();
-
-        assert!(error
-            .to_string()
-            .contains("Feldera output view `by_user` contains duplicate field `USER_ID`"));
-    }
-
-    #[test]
-    fn feldera_pipeline_manager_output_schemas_rejects_non_array_primary_key() {
-        let program_info = json!({
-            "schema": {
-                "outputs": [{
-                    "name": "by_user",
-                    "fields": [{ "name": "user_id", "columntype": "BIGINT" }],
-                    "primary_key": "user_id"
-                }]
-            }
-        });
-
-        let error =
-            feldera_output_schemas_from_program_info("score_program", 7, Some(&program_info), true)
-                .unwrap_err();
-
-        assert!(error
-            .to_string()
-            .contains("Feldera output view `by_user` primary_key must be an array"));
-    }
-
-    #[test]
-    fn feldera_pipeline_manager_output_schemas_rejects_non_string_primary_key_entry() {
-        let program_info = json!({
-            "schema": {
-                "outputs": [{
-                    "name": "by_user",
-                    "fields": [{ "name": "user_id", "columntype": "BIGINT" }],
-                    "primary_key": [7]
-                }]
-            }
-        });
-
-        let error =
-            feldera_output_schemas_from_program_info("score_program", 7, Some(&program_info), true)
-                .unwrap_err();
-
-        assert!(error
-            .to_string()
-            .contains("Feldera output view `by_user` primary_key entry 0 must be a string"));
-    }
-
-    #[test]
-    fn feldera_pipeline_manager_output_schemas_rejects_blank_primary_key_entry() {
-        let program_info = json!({
-            "schema": {
-                "outputs": [{
-                    "name": "by_user",
-                    "fields": [{ "name": "user_id", "columntype": "BIGINT" }],
-                    "primary_key": [" "]
-                }]
-            }
-        });
-
-        let error =
-            feldera_output_schemas_from_program_info("score_program", 7, Some(&program_info), true)
-                .unwrap_err();
-
-        assert!(error
-            .to_string()
-            .contains("Feldera output view `by_user` contains a blank primary_key entry"));
-    }
-
-    #[test]
-    fn feldera_pipeline_manager_output_schemas_rejects_unknown_primary_key_field() {
-        let program_info = json!({
-            "schema": {
-                "outputs": [{
-                    "name": "by_user",
-                    "fields": [{ "name": "user_id", "columntype": "BIGINT" }],
-                    "primary_key": ["missing_id"]
-                }]
-            }
-        });
-
-        let error =
-            feldera_output_schemas_from_program_info("score_program", 7, Some(&program_info), true)
-                .unwrap_err();
-
-        assert!(error.to_string().contains(
-            "Feldera output view `by_user` primary_key entry `missing_id` does not reference a field"
-        ));
-    }
-
-    #[test]
-    fn feldera_pipeline_manager_output_schemas_rejects_duplicate_primary_key_entry() {
-        let program_info = json!({
-            "schema": {
-                "outputs": [{
-                    "name": "by_user",
-                    "case_sensitive": false,
-                    "fields": [{ "name": "user_id", "columntype": "BIGINT" }],
-                    "primary_key": ["user_id", "USER_ID"]
-                }]
-            }
-        });
-
-        let error =
-            feldera_output_schemas_from_program_info("score_program", 7, Some(&program_info), true)
-                .unwrap_err();
-
-        assert!(error.to_string().contains(
-            "Feldera output view `by_user` contains duplicate primary_key entry `USER_ID`"
-        ));
-    }
-
-    #[test]
-    fn feldera_pipeline_manager_output_schemas_canonicalizes_case_insensitive_primary_key() {
-        let program_info = json!({
-            "schema": {
-                "outputs": [{
-                    "name": "by_user",
-                    "case_sensitive": false,
-                    "fields": [{ "name": "user_id", "columntype": "BIGINT" }],
-                    "primary_key": ["USER_ID"]
-                }]
-            }
-        });
-
-        let outputs =
-            feldera_output_schemas_from_program_info("score_program", 7, Some(&program_info), true)
-                .unwrap();
-
-        assert_eq!(outputs[0].primary_key, vec!["user_id"]);
-    }
-
-    #[test]
-    fn feldera_pipeline_manager_output_schemas_accept_feldera_type_aliases() {
-        let program_info = json!({
-            "schema": {
-                "outputs": [{
-                    "name": "wide_output",
-                    "fields": [
-                        { "name": "small_alias", "columntype": "INT2" },
-                        { "name": "signed_alias", "columntype": "SIGNED" },
-                        { "name": "big_alias", "columntype": "INT64" },
-                        { "name": "real_alias", "columntype": "FLOAT32" },
-                        { "name": "double_alias", "columntype": "FLOAT8" },
-                        { "name": "bytes_alias", "columntype": "BINARY VARYING" },
-                        { "name": "timestamp_alias", "columntype": "DATETIME" },
-                        { "name": "shape", "columntype": { "type": "GEOMETRY", "nullable": true } }
-                    ],
-                    "primary_key": ["small_alias"]
-                }]
-            }
-        });
-
-        let outputs =
-            feldera_output_schemas_from_program_info("wide_output", 11, Some(&program_info), false)
-                .unwrap();
-        let columns = &outputs[0].columns;
-
-        assert_eq!(columns[0].data_type, SqlDataType::Int16);
-        assert_eq!(columns[1].data_type, SqlDataType::Int32);
-        assert_eq!(columns[2].data_type, SqlDataType::Int64);
-        assert_eq!(columns[3].data_type, SqlDataType::Float32);
-        assert_eq!(columns[4].data_type, SqlDataType::Float64);
-        assert_eq!(columns[5].data_type, SqlDataType::Varbinary);
-        assert_eq!(
-            columns[6].data_type,
-            SqlDataType::Timestamp { timezone: None }
-        );
-        assert_eq!(columns[7].data_type, SqlDataType::Geometry);
-        assert!(columns[7].nullable);
-    }
-
-    #[test]
-    fn feldera_program_info_admission_accepts_registered_inputs() {
-        let request = test_feldera_program_compile_request(vec![test_relation_schema(
-            "scores",
-            vec![test_feldera_column("score", SqlDataType::Int64)],
-        )]);
-        let program_info = json!({
-            "schema": {
-                "inputs": [{
-                    "name": "scores",
-                    "fields": [{ "name": "score", "columntype": "BIGINT" }],
-                    "primary_key": []
-                }],
-                "outputs": [{
-                    "name": "scores_by_user",
-                    "fields": [{ "name": "score", "columntype": "BIGINT" }],
-                    "primary_key": []
-                }]
-            }
-        });
-
-        validate_feldera_program_info_admission(&request, Some(&program_info)).unwrap();
-    }
-
-    #[test]
-    fn feldera_program_info_admission_accepts_case_insensitive_registered_input() {
-        let request = test_feldera_program_compile_request(vec![test_relation_schema(
-            "scores",
-            vec![test_feldera_column("score", SqlDataType::Int64)],
-        )]);
-        let program_info = json!({
-            "schema": {
-                "inputs": [{
-                    "name": "SCORES",
-                    "case_sensitive": false,
-                    "fields": [{ "name": "score", "columntype": "BIGINT" }],
-                    "primary_key": []
-                }],
-                "outputs": [{
-                    "name": "scores_by_user",
-                    "fields": [{ "name": "score", "columntype": "BIGINT" }],
-                    "primary_key": []
-                }]
-            }
-        });
-
-        validate_feldera_program_info_admission(&request, Some(&program_info)).unwrap();
-    }
-
-    #[test]
-    fn feldera_program_info_admission_accepts_case_insensitive_registered_input_schema() {
-        let request =
-            test_feldera_program_compile_request(vec![test_relation_schema_with_primary_key(
-                "scores",
-                vec![
-                    test_feldera_column("user_id", SqlDataType::Utf8),
-                    test_feldera_column("score", SqlDataType::Int64),
-                ],
-                vec!["user_id"],
-            )]);
-        let program_info = json!({
-            "schema": {
-                "inputs": [{
-                    "name": "SCORES",
-                    "case_sensitive": false,
-                    "fields": [
-                        { "name": "USER_ID", "case_sensitive": false, "columntype": "VARCHAR" },
-                        { "name": "SCORE", "case_sensitive": false, "columntype": "BIGINT" }
-                    ],
-                    "primary_key": ["USER_ID"]
-                }],
-                "outputs": [{
-                    "name": "scores_by_user",
-                    "fields": [{ "name": "score", "columntype": "BIGINT" }],
-                    "primary_key": []
-                }]
-            }
-        });
-
-        validate_feldera_program_info_admission(&request, Some(&program_info)).unwrap();
-    }
-
-    #[test]
-    fn feldera_program_info_admission_accepts_registered_input_column_projection() {
-        let request = test_feldera_program_compile_request(vec![test_relation_schema(
-            "scores",
-            vec![
-                test_feldera_column("user_id", SqlDataType::Utf8),
-                test_feldera_column("score", SqlDataType::Int64),
-            ],
-        )]);
-        let program_info = json!({
-            "schema": {
-                "inputs": [{
-                    "name": "scores",
-                    "fields": [{ "name": "score", "columntype": "BIGINT" }],
-                    "primary_key": []
-                }],
-                "outputs": [{
-                    "name": "scores_by_user",
-                    "fields": [{ "name": "score", "columntype": "BIGINT" }],
-                    "primary_key": []
-                }]
-            }
-        });
-
-        validate_feldera_program_info_admission(&request, Some(&program_info)).unwrap();
-    }
-
-    #[test]
-    fn feldera_program_info_admission_rejects_input_column_type_mismatch() {
-        let request = test_feldera_program_compile_request(vec![test_relation_schema(
-            "scores",
-            vec![test_feldera_column("score", SqlDataType::Int64)],
-        )]);
-        let program_info = json!({
-            "schema": {
-                "inputs": [{
-                    "name": "scores",
-                    "fields": [{ "name": "score", "columntype": "VARCHAR" }],
-                    "primary_key": []
-                }],
-                "outputs": [{
-                    "name": "scores_by_user",
-                    "fields": [{ "name": "score", "columntype": "BIGINT" }],
-                    "primary_key": []
-                }]
-            }
-        });
-
-        let error =
-            validate_feldera_program_info_admission(&request, Some(&program_info)).unwrap_err();
-
-        assert_eq!(error.status, StatusCode::BAD_REQUEST);
-        assert!(
-            error.message.contains("column `score` type does not match"),
-            "unexpected error message: {}",
-            error.message
-        );
-    }
-
-    #[test]
-    fn feldera_program_info_admission_rejects_input_primary_key_mismatch() {
-        let request =
-            test_feldera_program_compile_request(vec![test_relation_schema_with_primary_key(
-                "scores",
-                vec![
-                    test_feldera_column("user_id", SqlDataType::Utf8),
-                    test_feldera_column("score", SqlDataType::Int64),
-                ],
-                vec!["user_id"],
-            )]);
-        let program_info = json!({
-            "schema": {
-                "inputs": [{
-                    "name": "scores",
-                    "fields": [
-                        { "name": "user_id", "columntype": "VARCHAR" },
-                        { "name": "score", "columntype": "BIGINT" }
-                    ],
-                    "primary_key": ["score"]
-                }],
-                "outputs": [{
-                    "name": "scores_by_user",
-                    "fields": [{ "name": "score", "columntype": "BIGINT" }],
-                    "primary_key": []
-                }]
-            }
-        });
-
-        let error =
-            validate_feldera_program_info_admission(&request, Some(&program_info)).unwrap_err();
-
-        assert_eq!(error.status, StatusCode::BAD_REQUEST);
-        assert!(
-            error.message.contains("primary_key does not match"),
-            "unexpected error message: {}",
-            error.message
-        );
-    }
-
-    #[test]
-    fn feldera_program_info_admission_rejects_case_insensitive_duplicate_input_relation() {
-        let request = test_feldera_program_compile_request(vec![test_relation_schema(
-            "scores",
-            vec![test_feldera_column("score", SqlDataType::Int64)],
-        )]);
-        let program_info = json!({
-            "schema": {
-                "inputs": [
-                    {
-                        "name": "scores",
-                        "case_sensitive": false,
-                        "fields": [{ "name": "score", "columntype": "BIGINT" }],
-                        "primary_key": []
-                    },
-                    {
-                        "name": "SCORES",
-                        "case_sensitive": false,
-                        "fields": [{ "name": "score", "columntype": "BIGINT" }],
-                        "primary_key": []
-                    }
-                ],
-                "outputs": [{
-                    "name": "scores_by_user",
-                    "fields": [{ "name": "score", "columntype": "BIGINT" }],
-                    "primary_key": []
-                }]
-            }
-        });
-
-        let error =
-            validate_feldera_program_info_admission(&request, Some(&program_info)).unwrap_err();
-
-        assert_eq!(error.status, StatusCode::BAD_REQUEST);
-        assert!(
-            error.message.contains("duplicate input relation `SCORES`"),
-            "unexpected error message: {}",
-            error.message
-        );
-    }
-
-    #[test]
-    fn feldera_program_info_admission_rejects_unregistered_input_relation() {
-        let request = test_feldera_program_compile_request(vec![test_relation_schema(
-            "scores",
-            vec![test_feldera_column("score", SqlDataType::Int64)],
-        )]);
-        let program_info = json!({
-            "schema": {
-                "inputs": [
-                    {
-                        "name": "scores",
-                        "fields": [{ "name": "score", "columntype": "BIGINT" }],
-                        "primary_key": []
-                    },
-                    {
-                        "name": "external_scores",
-                        "fields": [{ "name": "payload", "columntype": "VARCHAR" }],
-                        "primary_key": []
-                    }
-                ],
-                "outputs": [{
-                    "name": "scores_by_user",
-                    "fields": [{ "name": "score", "columntype": "BIGINT" }],
-                    "primary_key": []
-                }]
-            }
-        });
-
-        let error =
-            validate_feldera_program_info_admission(&request, Some(&program_info)).unwrap_err();
-
-        assert_eq!(error.status, StatusCode::BAD_REQUEST);
-        assert!(
-            error
-                .message
-                .contains("unregistered input relation `external_scores`"),
-            "unexpected error message: {}",
-            error.message
-        );
-    }
-
-    #[test]
-    fn feldera_program_info_admission_rejects_connector_bearing_input_relation() {
-        let request = test_feldera_program_compile_request(vec![test_relation_schema(
-            "scores",
-            vec![test_feldera_column("score", SqlDataType::Int64)],
-        )]);
-        let program_info = json!({
-            "schema": {
-                "inputs": [{
-                    "name": "scores",
-                    "fields": [{ "name": "score", "columntype": "BIGINT" }],
-                    "primary_key": [],
-                    "properties": {
-                        "connectors": "kafka://scores"
-                    }
-                }],
-                "outputs": [{
-                    "name": "scores_by_user",
-                    "fields": [{ "name": "score", "columntype": "BIGINT" }],
-                    "primary_key": []
-                }]
-            }
-        });
-
-        let error =
-            validate_feldera_program_info_admission(&request, Some(&program_info)).unwrap_err();
-
-        assert_eq!(error.status, StatusCode::BAD_REQUEST);
-        assert!(
-            error
-                .message
-                .contains("unmanaged connector/external IO properties"),
-            "unexpected error message: {}",
-            error.message
-        );
-        assert!(
-            error.message.contains("properties.connectors"),
-            "unexpected error message: {}",
-            error.message
-        );
-    }
-
-    #[test]
-    fn feldera_query_rows_preserves_row_fields_named_like_envelopes() {
-        let rows = feldera_query_rows_from_text(
-            r#"{"rows":[1,2],"data":{"nested":true},"records":"literal"}"#,
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(
-            rows,
-            vec![json!({
-                "rows": [1, 2],
-                "data": { "nested": true },
-                "records": "literal"
-            })]
-        );
-    }
-
-    #[test]
-    fn feldera_query_rows_accepts_ndjson_insert_rows() {
-        let rows = feldera_query_rows_from_text(
-            "{\"insert\":{\"user_id\":\"u1\",\"score\":10}}\n{\"insert\":{\"user_id\":\"u2\",\"score\":20}}\n",
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(
-            rows,
-            vec![
-                json!({ "user_id": "u1", "score": 10 }),
-                json!({ "user_id": "u2", "score": 20 })
-            ]
-        );
-    }
-
-    #[test]
-    fn feldera_query_rows_preserves_insert_field_when_output_schema_declares_it() {
-        let output_column_names = BTreeSet::from(["insert".to_string()]);
-        let rows =
-            feldera_query_rows_from_text(r#"[{"insert":"literal"}]"#, Some(&output_column_names))
-                .unwrap();
-
-        assert_eq!(rows, vec![json!({ "insert": "literal" })]);
-    }
-
-    #[test]
-    fn feldera_query_rows_preserves_delete_field_when_output_schema_declares_it() {
-        let output_column_names = BTreeSet::from(["delete".to_string()]);
-        let rows =
-            feldera_query_rows_from_text(r#"[{"delete":"literal"}]"#, Some(&output_column_names))
-                .unwrap();
-
-        assert_eq!(rows, vec![json!({ "delete": "literal" })]);
-    }
-
-    #[test]
-    fn feldera_query_rows_preserves_insert_named_field_when_row_has_other_fields() {
-        let rows =
-            feldera_query_rows_from_text(r#"[{"insert":"literal","value":7}]"#, None).unwrap();
-
-        assert_eq!(rows, vec![json!({ "insert": "literal", "value": 7 })]);
-    }
-
-    #[test]
-    fn feldera_query_rows_preserves_schema_less_scalar_insert_and_delete_fields() {
-        let rows =
-            feldera_query_rows_from_text(r#"[{"insert":"literal"},{"delete":"literal"}]"#, None)
-                .unwrap();
-
-        assert_eq!(
-            rows,
-            vec![
-                json!({ "insert": "literal" }),
-                json!({ "delete": "literal" })
-            ]
-        );
-    }
-
-    #[test]
-    fn view_query_output_resolution_requires_explicit_output_for_multi_output_without_default() {
-        let active = test_active_view_with_outputs(
-            "score_program",
-            vec![
-                test_relation_schema(
-                    "by_user",
-                    vec![test_feldera_column("user_id", SqlDataType::Int64)],
-                ),
-                test_relation_schema(
-                    "by_region",
-                    vec![test_feldera_column("region", SqlDataType::Utf8)],
-                ),
-            ],
-        );
-
-        assert!(resolve_view_query_output_id(&active, None).is_err());
-        assert_eq!(
-            resolve_view_query_output_id(&active, Some("by_region")).unwrap(),
-            "by_region"
-        );
-        assert!(resolve_view_query_output_id(&active, Some("missing")).is_err());
-    }
-
-    #[test]
-    fn standing_program_identity_includes_multi_output_relation_ids() {
-        let spec = test_standing_view_spec_with_outputs(
-            "score_program",
-            vec![
-                test_relation_schema(
-                    "by_user",
-                    vec![test_feldera_column("user_id", SqlDataType::Int64)],
-                ),
-                test_relation_schema(
-                    "by_region",
-                    vec![test_feldera_column("region", SqlDataType::Utf8)],
-                ),
-            ],
-        );
-
-        assert_eq!(
-            standing_program_view_ids_for_spec(&spec),
-            vec!["score_program", "by_user", "by_region"]
-        );
-    }
-
-    #[test]
-    fn resolved_compile_spec_rejects_timezone_bearing_output_timestamp() {
-        let pending_spec = test_standing_view_spec_with_outputs(
-            "tz_view",
-            vec![test_relation_schema(
-                "tz_view",
-                vec![test_feldera_column("event_ts", SqlDataType::Utf8)],
-            )],
-        );
-        let mut resolved_spec = pending_spec.clone();
-        resolved_spec.output_relations = vec![test_relation_schema(
-            "tz_view",
-            vec![test_feldera_column(
-                "event_ts",
-                SqlDataType::Timestamp {
-                    timezone: Some("UTC".to_string()),
-                },
-            )],
-        )];
-        resolved_spec.shape.multi_output = false;
-        let compile_request_hash = compile_request_hash_for_spec(&pending_spec).unwrap();
-
-        let error =
-            validate_resolved_compile_spec(&pending_spec, &resolved_spec, &compile_request_hash)
-                .unwrap_err();
-
-        assert_eq!(error.status, StatusCode::BAD_REQUEST);
-        assert!(
-            error
-                .message
-                .contains("timezone-bearing timestamps are not supported"),
-            "unexpected error message: {}",
-            error.message
-        );
-    }
-
-    #[test]
-    fn resolved_compile_spec_rejects_feldera_program_output_hint_mismatch() {
-        let mut pending_spec = test_standing_view_spec_with_outputs(
-            "score_program",
-            vec![
-                test_relation_schema(
-                    "by_user",
-                    vec![test_feldera_column("user_id", SqlDataType::Utf8)],
-                ),
-                test_relation_schema(
-                    "by_region",
-                    vec![test_feldera_column("region", SqlDataType::Utf8)],
-                ),
-            ],
-        );
-        pending_spec.source_kind = SqlSourceKind::FelderaProgram;
-        pending_spec.shape.multi_output = true;
-        let mut resolved_spec = pending_spec.clone();
-        resolved_spec.output_relations = vec![
-            test_relation_schema(
-                "by_user",
-                vec![test_feldera_column("user_id", SqlDataType::Utf8)],
-            ),
-            test_relation_schema(
-                "unexpected",
-                vec![test_feldera_column("region", SqlDataType::Utf8)],
-            ),
-        ];
-        let compile_request_hash = compile_request_hash_for_spec(&pending_spec).unwrap();
-
-        let error =
-            validate_resolved_compile_spec(&pending_spec, &resolved_spec, &compile_request_hash)
-                .unwrap_err();
-
-        assert_eq!(error.status, StatusCode::BAD_REQUEST);
-        assert!(
-            error
-                .message
-                .contains("resolved Feldera program output relations do not match requested output_relation_ids"),
-            "unexpected error message: {}",
-            error.message
-        );
-    }
-
-    #[test]
-    fn resolved_compile_spec_allows_case_insensitive_feldera_program_output_hints() {
-        let mut pending_spec = test_standing_view_spec_with_outputs(
-            "score_program",
-            vec![
-                test_relation_schema(
-                    "by_user",
-                    vec![test_feldera_column("user_id", SqlDataType::Utf8)],
-                ),
-                test_relation_schema(
-                    "by_region",
-                    vec![test_feldera_column("region", SqlDataType::Utf8)],
-                ),
-            ],
-        );
-        pending_spec.source_kind = SqlSourceKind::FelderaProgram;
-        pending_spec.shape.multi_output = true;
-        let mut resolved_spec = pending_spec.clone();
-        resolved_spec.output_relations = vec![
-            test_relation_schema(
-                "BY_USER",
-                vec![test_feldera_column("user_id", SqlDataType::Utf8)],
-            ),
-            test_relation_schema(
-                "BY_REGION",
-                vec![test_feldera_column("region", SqlDataType::Utf8)],
-            ),
-        ];
-        let compile_request_hash = compile_request_hash_for_spec(&pending_spec).unwrap();
-
-        validate_resolved_compile_spec(&pending_spec, &resolved_spec, &compile_request_hash)
+        validate_standing_runtime_output_manifest_record(&publication.manifest_key, record)
             .unwrap();
-    }
-
-    #[test]
-    fn resolved_compile_spec_preserves_pending_output_id_for_case_insensitive_hints() {
-        let mut pending_spec = test_standing_view_spec_with_outputs(
-            "score_program",
-            vec![test_relation_schema(
-                "by_user",
-                vec![test_feldera_column("user_id", SqlDataType::Utf8)],
-            )],
-        );
-        pending_spec.source_kind = SqlSourceKind::FelderaProgram;
-        let mut resolved_spec = pending_spec.clone();
-        resolved_spec.output_relations = vec![test_relation_schema(
-            "BY_USER",
-            vec![test_feldera_column("user_id", SqlDataType::Utf8)],
-        )];
-        resolved_spec.shape.multi_output = false;
-        let resolved_spec =
-            resolved_compile_spec_with_pending_output_relation_ids(&pending_spec, resolved_spec);
-        let compile_request_hash = compile_request_hash_for_spec(&pending_spec).unwrap();
-
-        validate_resolved_compile_spec(&pending_spec, &resolved_spec, &compile_request_hash)
-            .unwrap();
-        assert_eq!(resolved_spec.output_relations[0].relation_id, "by_user");
-        assert_eq!(resolved_spec.output_relations[0].relation_name, "BY_USER");
-    }
-
-    #[test]
-    fn feldera_program_output_hint_matching_rejects_case_folded_ambiguity() {
-        let expected = BTreeSet::from(["by_user", "by_region"]);
-        let actual = BTreeSet::from(["BY_USER", "by_user"]);
-
-        assert!(!feldera_output_hint_relation_ids_match(&expected, &actual));
-    }
-
-    #[test]
-    fn resolved_compile_spec_allows_feldera_program_output_discovery_without_hints() {
-        let mut pending_spec = test_standing_view_spec_with_outputs(
-            "score_program",
-            vec![test_relation_schema(
-                "score_program",
-                vec![test_feldera_column("placeholder", SqlDataType::Utf8)],
-            )],
-        );
-        pending_spec.source_kind = SqlSourceKind::FelderaProgram;
-        pending_spec.shape.multi_output = false;
-        let mut resolved_spec = pending_spec.clone();
-        resolved_spec.output_relations = vec![
-            test_relation_schema(
-                "by_user",
-                vec![test_feldera_column("user_id", SqlDataType::Utf8)],
-            ),
-            test_relation_schema(
-                "by_region",
-                vec![test_feldera_column("region", SqlDataType::Utf8)],
-            ),
-        ];
-        resolved_spec.shape.multi_output = true;
-        let compile_request_hash = compile_request_hash_for_spec(&pending_spec).unwrap();
-
-        validate_resolved_compile_spec(&pending_spec, &resolved_spec, &compile_request_hash)
-            .unwrap();
-    }
-
-    #[test]
-    fn feldera_runtime_admission_rejects_nested_timezone_bearing_timestamps() {
-        let spec = test_standing_view_spec_with_outputs(
-            "nested_tz_view",
-            vec![test_relation_schema(
-                "nested_tz_view",
-                vec![test_feldera_column(
-                    "profile",
-                    SqlDataType::Struct {
-                        fields: vec![SqlStructField {
-                            name: "created_at".to_string(),
-                            data_type: SqlDataType::Timestamp {
-                                timezone: Some("UTC".to_string()),
-                            },
-                            nullable: false,
-                        }],
-                    },
-                )],
-            )],
-        );
-
-        let error = validate_feldera_runtime_spec_admission(&spec).unwrap_err();
-
-        assert_eq!(error.status, StatusCode::BAD_REQUEST);
-        assert!(
-            error
-                .message
-                .contains("spec.output_relations.nested_tz_view.profile.created_at"),
-            "unexpected error message: {}",
-            error.message
-        );
-    }
-
-    #[test]
-    fn feldera_query_conversion_accepts_supported_scalar_result_types() {
-        let schema = RelationSchema {
-            relation_id: "scalar_view".to_string(),
-            relation_name: "scalar_view".to_string(),
-            relation_version: "v1".to_string(),
-            schema_fingerprint: "scalar-fingerprint".to_string(),
-            columns: vec![
-                test_feldera_column("tiny", SqlDataType::Int8),
-                test_feldera_column("small", SqlDataType::Int16),
-                test_feldera_column("int_value", SqlDataType::Int32),
-                test_feldera_column("big", SqlDataType::Int64),
-                test_feldera_column("utiny", SqlDataType::UInt8),
-                test_feldera_column("usmall", SqlDataType::UInt16),
-                test_feldera_column("uint_value", SqlDataType::UInt32),
-                test_feldera_column("ubig", SqlDataType::UInt64),
-                test_feldera_column("real_value", SqlDataType::Float32),
-                test_feldera_column("double_value", SqlDataType::Float64),
-                test_feldera_column("char_value", SqlDataType::Char { length: Some(8) }),
-                test_feldera_column("uuid_value", SqlDataType::Uuid),
-                test_feldera_column("geometry_value", SqlDataType::Geometry),
-                test_feldera_column("binary_value", SqlDataType::Binary { length: 3 }),
-                test_feldera_column("varbinary_value", SqlDataType::Varbinary),
-                test_feldera_column("date_value", SqlDataType::Date),
-                test_feldera_column("time_value", SqlDataType::Time),
-                test_feldera_column("timestamp_value", SqlDataType::Timestamp { timezone: None }),
-            ],
-            primary_key: vec!["tiny".to_string()],
-        };
-        let rows = vec![json!({
-            "tiny": -8,
-            "small": -32000,
-            "int_value": -123456,
-            "big": -1234567890123_i64,
-            "utiny": 8,
-            "usmall": 65000,
-            "uint_value": 4_000_000_000_u64,
-            "ubig": 9_000_000_000_u64,
-            "real_value": 1.25,
-            "double_value": 9.5,
-            "char_value": "ABCDEFGH",
-            "uuid_value": "018f4b6e-9cb5-7f5a-8027-2ce24be4d3aa",
-            "geometry_value": "POINT(1 2)",
-            "binary_value": "0x0A0bff",
-            "varbinary_value": "0x",
-            "date_value": "1970-01-02",
-            "time_value": "01:02:03.004005006",
-            "timestamp_value": "1970-01-02T03:04:05.006+02:00"
-        })];
-
-        let batch = feldera_rows_to_record_batch(&schema, &rows).unwrap();
-        let arrow_schema = batch.schema();
         assert_eq!(
-            arrow_schema.field_with_name("tiny").unwrap().data_type(),
-            &DataType::Int8
+            publication.manifest_key.as_str(),
+            ObjectKey::standing_runtime_output_manifest(
+                "tenant-a",
+                "program-purchases",
+                "purchases_by_user",
+                7,
+                &record.output_content_hash,
+            )
+            .unwrap()
+            .as_str()
+        );
+        assert_eq!(record.checkpoint_key, checkpoint_key.as_str());
+        assert_eq!(record.output_encoding, "velorix-delta-batch-json-v1");
+        assert_eq!(
+            record.source_kind,
+            "standing_runtime_checkpoint_published_output"
+        );
+        assert_eq!(record.output_row_count, 0);
+        assert_eq!(record.pages.len(), 1);
+        assert_eq!(record.pages[0].page_index, 0);
+        assert_eq!(record.pages[0].row_count, 0);
+        assert_eq!(
+            record.pages[0].page_content_hash,
+            record.output_content_hash
         );
         assert_eq!(
-            arrow_schema.field_with_name("ubig").unwrap().data_type(),
-            &DataType::UInt64
+            record.pages[0].page_key,
+            ObjectKey::standing_runtime_output_page(
+                "tenant-a",
+                "program-purchases",
+                "purchases_by_user",
+                7,
+                0,
+                &record.output_content_hash,
+            )
+            .unwrap()
+            .as_str()
         );
+        assert_eq!(publication.page_records.len(), 1);
+        validate_standing_runtime_output_page_record(
+            &publication.page_records[0].0,
+            &publication.page_records[0].1,
+        )
+        .unwrap();
         assert_eq!(
-            arrow_schema
-                .field_with_name("real_value")
-                .unwrap()
-                .data_type(),
-            &DataType::Float32
-        );
-        assert_eq!(
-            arrow_schema
-                .field_with_name("binary_value")
-                .unwrap()
-                .data_type(),
-            &DataType::Binary
-        );
-        assert_eq!(
-            arrow_schema
-                .field_with_name("time_value")
-                .unwrap()
-                .data_type(),
-            &DataType::Time64(TimeUnit::Nanosecond)
-        );
-
-        let rows = record_batches_to_json_rows(&[batch.clone()]).unwrap();
-        assert_eq!(rows[0]["tiny"], json!(-8));
-        assert_eq!(rows[0]["uint_value"], json!(4_000_000_000_u64));
-        assert_eq!(rows[0]["ubig"], json!(9_000_000_000_u64));
-        assert_eq!(rows[0]["char_value"], json!("ABCDEFGH"));
-        assert_eq!(
-            rows[0]["uuid_value"],
-            json!("018f4b6e-9cb5-7f5a-8027-2ce24be4d3aa")
-        );
-        assert_eq!(rows[0]["geometry_value"], json!("POINT(1 2)"));
-        assert_eq!(rows[0]["binary_value"], json!("0x0a0bff"));
-        assert_eq!(rows[0]["varbinary_value"], json!("0x"));
-        assert_eq!(rows[0]["date_value"], json!(1));
-        assert_eq!(rows[0]["time_value"], json!(3_723_004_005_006_i64));
-        assert_eq!(rows[0]["timestamp_value"], json!(90_245_006_000_000_i64));
-
-        let feldera_ingress_rows = record_batches_to_feldera_ingress_json_rows(&[batch]).unwrap();
-        assert_eq!(
-            feldera_ingress_rows[0]["binary_value"],
-            json!([10, 11, 255])
-        );
-        assert_eq!(feldera_ingress_rows[0]["varbinary_value"], json!([]));
-        assert_eq!(feldera_ingress_rows[0]["date_value"], json!("1970-01-02"));
-        assert_eq!(
-            feldera_ingress_rows[0]["time_value"],
-            json!("01:02:03.004005006")
-        );
-        assert_eq!(
-            feldera_ingress_rows[0]["timestamp_value"],
-            json!("1970-01-02 01:04:05.006")
+            publication.page_records[0].1.published_output,
+            record.published_output
         );
     }
 
-    #[test]
-    fn relation_ingest_conversion_rejects_fixed_binary_length_mismatch() {
-        let catalog = test_expanded_scalar_catalog();
-        let rows = vec![json!({
-            "id": "row-1",
-            "i8_value": -8,
-            "i16_value": -32000,
-            "i32_value": -123456,
-            "u8_value": 8,
-            "u16_value": 65000,
-            "u32_value": 4_000_000_000_u64,
-            "u64_value": 9_000_000_000_u64,
-            "f32_value": 1.25,
-            "raw": "0x0a0b",
-            "bytes": "0xdeadbeef",
-            "event_time": "01:02:03.004005006",
-            "event_date": "1970-01-02",
-            "event_ts": "1970-01-02 01:04:05.006",
-            "uuid_value": "018f4b6e-9cb5-7f5a-8027-2ce24be4d3aa",
-            "amount": 10,
-            "weight": 1
-        })];
-
-        let error = rows_to_record_batch(&catalog, &rows).unwrap_err();
-
-        assert_eq!(error.status, StatusCode::BAD_REQUEST);
-        assert!(
-            error
-                .message
-                .contains("row.raw must contain exactly 3 bytes"),
-            "unexpected error message: {}",
-            error.message
-        );
-    }
-
-    #[test]
-    fn feldera_query_conversion_rejects_fixed_binary_length_mismatch() {
-        let schema = RelationSchema {
-            relation_id: "binary_view".to_string(),
-            relation_name: "binary_view".to_string(),
-            relation_version: "v1".to_string(),
-            schema_fingerprint: "binary-fingerprint".to_string(),
-            columns: vec![
-                test_feldera_column("raw", SqlDataType::Binary { length: 3 }),
-                test_feldera_column("bytes", SqlDataType::Varbinary),
-            ],
-            primary_key: vec!["raw".to_string()],
-        };
-        let rows = vec![json!({
-            "raw": "0x0a0b",
-            "bytes": "0x0a0b"
-        })];
-
-        let error = feldera_rows_to_record_batch(&schema, &rows).unwrap_err();
-
-        assert!(
-            error.contains("column `raw` must contain exactly 3 bytes"),
-            "unexpected error message: {error}"
-        );
-    }
-
-    #[test]
-    fn feldera_query_conversion_accepts_binary_byte_array_values() {
-        let schema = RelationSchema {
-            relation_id: "binary_view".to_string(),
-            relation_name: "binary_view".to_string(),
-            relation_version: "v1".to_string(),
-            schema_fingerprint: "binary-fingerprint".to_string(),
-            columns: vec![
-                test_feldera_column("raw", SqlDataType::Binary { length: 3 }),
-                test_feldera_column("bytes", SqlDataType::Varbinary),
-            ],
-            primary_key: vec!["raw".to_string()],
-        };
-        let rows = vec![json!({
-            "raw": [10, 11, 255],
-            "bytes": []
-        })];
-
-        let batch = feldera_rows_to_record_batch(&schema, &rows).unwrap();
-        let rows = record_batches_to_json_rows(&[batch]).unwrap();
-
-        assert_eq!(rows[0]["raw"], json!("0x0a0bff"));
-        assert_eq!(rows[0]["bytes"], json!("0x"));
-    }
-
-    #[test]
-    fn feldera_query_conversion_accepts_decimal_number_values() {
-        let schema = RelationSchema {
-            relation_id: "decimal_view".to_string(),
-            relation_name: "decimal_view".to_string(),
-            relation_version: "v1".to_string(),
-            schema_fingerprint: "decimal-fingerprint".to_string(),
-            columns: vec![test_feldera_column(
-                "amount",
-                SqlDataType::Decimal {
-                    precision: 6,
-                    scale: 2,
-                },
-            )],
-            primary_key: vec!["amount".to_string()],
-        };
-        let rows = vec![json!({ "amount": 12.34 })];
-
-        let batch = feldera_rows_to_record_batch(&schema, &rows).unwrap();
-        let rows = record_batches_to_json_rows(&[batch]).unwrap();
-
-        assert_eq!(rows[0]["amount"], json!("12.34"));
-    }
-
-    #[test]
-    fn relation_ingest_conversion_accepts_decimal_number_values() {
-        let relation_schema = VelorixRelationSchemaV1 {
-            relation_id: "decimal_events".to_string(),
-            relation_name: "decimal_events".to_string(),
-            relation_version: "2026-06-12.v1".to_string(),
-            columns: vec![
-                test_relation_column(
-                    "id",
-                    VelorixLogicalTypeV1::Utf8,
-                    ArrowPhysicalTypeV1::Utf8,
-                    RelationSemanticRoleV1::PrimaryKey,
-                    0,
+    #[tokio::test]
+    async fn standing_runtime_checkpoint_persistence_writes_output_delta_manifest_ref() {
+        let state = test_api_state().await;
+        let checkpoint = test_runtime_checkpoint(Vec::new());
+        let output_delta = ViewOutputDelta {
+            view_id: "purchases_by_user".to_string(),
+            schema_fingerprint:
+                "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+                    .to_string(),
+            delta: DeltaBatch::from_records([
+                DeltaRecord::new(
+                    DeltaKey::from_json(json!("alice")),
+                    DeltaValue::from_json(json!({ "count": 2, "sum": 17 })),
+                    -1,
                 ),
-                test_relation_column(
-                    "amount",
-                    VelorixLogicalTypeV1::Decimal {
-                        precision: 6,
-                        scale: 2,
-                    },
-                    ArrowPhysicalTypeV1::Decimal128 {
-                        precision: 6,
-                        scale: 2,
-                    },
-                    RelationSemanticRoleV1::Value,
+                DeltaRecord::new(
+                    DeltaKey::from_json(json!("alice")),
+                    DeltaValue::from_json(json!({ "count": 3, "sum": 20 })),
                     1,
                 ),
-                test_relation_column(
-                    "weight",
-                    VelorixLogicalTypeV1::Int64,
-                    ArrowPhysicalTypeV1::Int64,
-                    RelationSemanticRoleV1::Weight,
-                    2,
-                ),
-            ],
-            primary_key_column_ids: vec!["id".to_string()],
-            weight_column_id: "weight".to_string(),
-            allowed_operations: vec![RelationOperationV1::Insert],
-            event_time_column_id: None,
+            ]),
         };
-        let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema)
-            .expect("decimal relation schema must fingerprint");
-        let catalog = VelorixRelationCatalogV1 {
-            schema_version: RELATION_SCHEMA_VERSION_V1,
-            relation_schema,
-            schema_fingerprint: schema_fingerprint.clone(),
-            datafusion_registration: DataFusionRegistrationV1 {
-                name: "decimal_events".to_string(),
-                mode: DataFusionRegistrationModeV1::Table,
-            },
-            feldera_relation: FelderaRelationBindingV1 {
-                relation_id: "decimal_events".to_string(),
-                schema_fingerprint,
-            },
-            incremental_adapter: IncrementalAdapterBindingV1 {
-                adapter_id: CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID.to_string(),
-            },
-        };
-        let rows = vec![json!({
-            "id": "d1",
-            "amount": 12.34,
-            "weight": 1
-        })];
 
-        let batch = rows_to_record_batch(&catalog, &rows).unwrap();
-        let rows = record_batches_to_json_rows(&[batch]).unwrap();
-
-        assert_eq!(rows[0]["amount"], json!("12.34"));
-    }
-
-    #[test]
-    fn feldera_query_conversion_preserves_json_variant_result_values() {
-        let schema = RelationSchema {
-            relation_id: "json_view".to_string(),
-            relation_name: "json_view".to_string(),
-            relation_version: "v1".to_string(),
-            schema_fingerprint: "json-fingerprint".to_string(),
-            columns: vec![
-                test_feldera_column("payload", SqlDataType::Json),
-                test_feldera_column("label", SqlDataType::Utf8),
-            ],
-            primary_key: vec!["label".to_string()],
-        };
-        let rows = vec![json!({
-            "payload": {
-                "name": "Ada",
-                "scores": [8, 13],
-                "nested": { "active": true }
-            },
-            "label": "object"
-        })];
-
-        let batch = feldera_rows_to_record_batch(&schema, &rows).unwrap();
-        let rows = record_batches_to_json_rows_for_feldera_schema(&schema, &[batch]).unwrap();
-
-        assert_eq!(rows[0]["payload"]["name"], json!("Ada"));
-        assert_eq!(rows[0]["payload"]["scores"], json!([8, 13]));
-        assert_eq!(rows[0]["payload"]["nested"]["active"], json!(true));
-        assert_eq!(rows[0]["label"], json!("object"));
-    }
-
-    #[test]
-    fn feldera_query_conversion_preserves_json_variant_string_values() {
-        let schema = RelationSchema {
-            relation_id: "json_view".to_string(),
-            relation_name: "json_view".to_string(),
-            relation_version: "v1".to_string(),
-            schema_fingerprint: "json-fingerprint".to_string(),
-            columns: vec![test_feldera_column("payload", SqlDataType::Json)],
-            primary_key: vec!["payload".to_string()],
-        };
-        let rows = vec![json!({ "payload": "plain-string" })];
-
-        let batch = feldera_rows_to_record_batch(&schema, &rows).unwrap();
-        let rows = record_batches_to_json_rows_for_feldera_schema(&schema, &[batch]).unwrap();
-
-        assert_eq!(rows[0]["payload"], json!("plain-string"));
-    }
-
-    #[test]
-    fn feldera_ingress_conversion_rejects_fixed_binary_length_mismatch() {
-        let catalog = test_expanded_scalar_catalog();
-        let schema = datafusion_schema_from_catalog(&catalog).unwrap();
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(vec!["row-1"])) as ArrayRef,
-                Arc::new(Int8Array::from(vec![-8])) as ArrayRef,
-                Arc::new(Int16Array::from(vec![-32000])) as ArrayRef,
-                Arc::new(Int32Array::from(vec![-123456])) as ArrayRef,
-                Arc::new(UInt8Array::from(vec![8])) as ArrayRef,
-                Arc::new(UInt16Array::from(vec![65000])) as ArrayRef,
-                Arc::new(UInt32Array::from(vec![4_000_000_000_u32])) as ArrayRef,
-                Arc::new(UInt64Array::from(vec![9_000_000_000_u64])) as ArrayRef,
-                Arc::new(Float32Array::from(vec![1.25])) as ArrayRef,
-                Arc::new(BinaryArray::from_vec(vec![b"\x0a\x0b"])) as ArrayRef,
-                Arc::new(BinaryArray::from_vec(vec![b"\xde\xad\xbe\xef"])) as ArrayRef,
-                Arc::new(Time64NanosecondArray::from(vec![3_723_004_005_006_i64])) as ArrayRef,
-                Arc::new(Date32Array::from(vec![1])) as ArrayRef,
-                Arc::new(TimestampNanosecondArray::from(vec![90_245_006_000_000_i64])) as ArrayRef,
-                Arc::new(StringArray::from(vec![
-                    "018f4b6e-9cb5-7f5a-8027-2ce24be4d3aa",
-                ])) as ArrayRef,
-                Arc::new(Int64Array::from(vec![10])) as ArrayRef,
-                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
-            ],
-        )
-        .unwrap();
-
-        let error = record_batches_to_feldera_ingress_json_rows_for_catalog(&catalog, &[batch])
-            .unwrap_err();
-
-        assert_eq!(error.status, StatusCode::BAD_REQUEST);
-        assert!(
-            error
-                .message
-                .contains("Feldera ingress column `raw` must contain exactly 3 bytes"),
-            "unexpected error message: {}",
-            error.message
-        );
-    }
-
-    #[test]
-    fn feldera_ingress_conversion_rejects_timezone_bearing_timestamps() {
-        let timezone = Some(Arc::<str>::from("UTC"));
-        let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new(
-                "event_ts",
-                DataType::Timestamp(TimeUnit::Nanosecond, timezone.clone()),
-                false,
-            )])),
-            vec![Arc::new(
-                TimestampNanosecondArray::from(vec![0]).with_timezone_opt(timezone),
-            )],
-        )
-        .unwrap();
-
-        let error = record_batches_to_feldera_ingress_json_rows(&[batch]).unwrap_err();
-        assert_eq!(
-            error.status,
-            StatusCode::BAD_REQUEST,
-            "timezone-bearing timestamps must fail closed at Feldera ingress"
-        );
-        assert!(
-            error
-                .message
-                .contains("timezone-bearing TimestampNanosecond"),
-            "unexpected error message: {}",
-            error.message
-        );
-    }
-
-    #[test]
-    fn feldera_ingress_conversion_emits_json_utf8_as_raw_variant_values() {
-        let catalog = test_json_events_catalog();
-        let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("id", DataType::Utf8, false),
-                Field::new("payload", DataType::Utf8, false),
-                Field::new("raw_json", DataType::Utf8, false),
-                Field::new("weight", DataType::Int64, false),
-            ])),
-            vec![
-                Arc::new(StringArray::from(vec!["j1"])),
-                Arc::new(StringArray::from(vec![
-                    r#"{"name":"Ada","scores":[8,13],"nested":{"active":true}}"#,
-                ])),
-                Arc::new(StringArray::from(vec![r#"{"flag":true,"count":3}"#])),
-                Arc::new(Int64Array::from(vec![1])),
-            ],
-        )
-        .unwrap();
-
-        let rows =
-            record_batches_to_feldera_ingress_json_rows_for_catalog(&catalog, &[batch]).unwrap();
-
-        assert_eq!(rows[0]["payload"]["name"], json!("Ada"));
-        assert_eq!(rows[0]["payload"]["scores"], json!([8, 13]));
-        assert_eq!(rows[0]["raw_json"], json!(r#"{"flag":true,"count":3}"#));
-        assert_eq!(rows[0]["weight"], json!(1));
-    }
-
-    #[test]
-    fn feldera_query_conversion_preserves_supported_complex_result_types() {
-        let schema = RelationSchema {
-            relation_id: "complex_view".to_string(),
-            relation_name: "complex_view".to_string(),
-            relation_version: "v1".to_string(),
-            schema_fingerprint: "complex-fingerprint".to_string(),
-            columns: vec![
-                test_feldera_column(
-                    "scores",
-                    SqlDataType::Array {
-                        element_type: Box::new(SqlDataType::Int32),
-                    },
-                ),
-                test_feldera_column(
-                    "profile",
-                    SqlDataType::Struct {
-                        fields: vec![
-                            velorix_core::feldera_artifact::SqlStructField {
-                                name: "name".to_string(),
-                                data_type: SqlDataType::Utf8,
-                                nullable: false,
-                            },
-                            velorix_core::feldera_artifact::SqlStructField {
-                                name: "active".to_string(),
-                                data_type: SqlDataType::Bool,
-                                nullable: true,
-                            },
-                        ],
-                    },
-                ),
-                test_feldera_column(
-                    "labels",
-                    SqlDataType::Map {
-                        key_type: Box::new(SqlDataType::Utf8),
-                        value_type: Box::new(SqlDataType::Int64),
-                    },
-                ),
-                test_feldera_column(
-                    "int_labels",
-                    SqlDataType::Map {
-                        key_type: Box::new(SqlDataType::Int32),
-                        value_type: Box::new(SqlDataType::Utf8),
-                    },
-                ),
-                test_feldera_column(
-                    "interval_value",
-                    SqlDataType::Interval {
-                        unit: velorix_core::feldera_artifact::SqlIntervalUnit::DayToSecond,
-                    },
-                ),
-                test_feldera_column("null_value", SqlDataType::Null),
-            ],
-            primary_key: vec!["profile".to_string()],
-        };
-        let rows = vec![json!({
-            "scores": [1, null, 3],
-            "profile": { "name": "ada", "active": true },
-            "labels": { "critical": 9, "batch": null },
-            "int_labels": { "1": "one", "2": null },
-            "interval_value": "1 02:03:04",
-            "null_value": null
-        })];
-
-        let batch = feldera_rows_to_record_batch(&schema, &rows).unwrap();
-        assert!(matches!(
-            batch.schema().field(0).data_type(),
-            DataType::List(_)
-        ));
-        assert!(matches!(
-            batch.schema().field(1).data_type(),
-            DataType::Struct(_)
-        ));
-        assert!(matches!(
-            batch.schema().field(2).data_type(),
-            DataType::Map(_, _)
-        ));
-        assert!(matches!(
-            batch.schema().field(3).data_type(),
-            DataType::Map(_, _)
-        ));
-        assert_eq!(batch.schema().field(4).data_type(), &DataType::Utf8);
-        assert_eq!(batch.schema().field(5).data_type(), &DataType::Null);
-
-        let rows = record_batches_to_json_rows(&[batch]).unwrap();
-        assert_eq!(rows[0]["scores"], json!([1, null, 3]));
-        assert_eq!(rows[0]["profile"], json!({ "name": "ada", "active": true }));
-        assert_eq!(rows[0]["labels"], json!({ "critical": 9, "batch": null }));
-        assert_eq!(rows[0]["int_labels"], json!({ "1": "one", "2": null }));
-        assert_eq!(rows[0]["interval_value"], json!("1 02:03:04"));
-        assert_eq!(rows[0]["null_value"], Value::Null);
-    }
-
-    #[test]
-    fn relation_ingest_conversion_accepts_expanded_scalar_input_types() {
-        let catalog = test_expanded_scalar_catalog();
-        let rows = vec![json!({
-            "id": "row-1",
-            "i8_value": -8,
-            "i16_value": -32000,
-            "i32_value": -123456,
-            "u8_value": 8,
-            "u16_value": 65000,
-            "u32_value": 4_000_000_000_u64,
-            "u64_value": 9_000_000_000_u64,
-            "f32_value": 1.25,
-            "raw": "0x0A0BFF",
-            "bytes": "0x",
-            "event_time": "01:02:03.004005006",
-            "event_date": "2026-06-10",
-            "event_ts": "2026-06-10T01:02:03.004005006",
-            "uuid_value": "018f4b6e-9cb5-7f5a-8027-2ce24be4d3aa",
-            "amount": 42,
-            "weight": 1
-        })];
-
-        let batch = rows_to_record_batch(&catalog, &rows).unwrap();
-        assert_eq!(
-            batch
-                .schema()
-                .field_with_name("i8_value")
-                .unwrap()
-                .data_type(),
-            &DataType::Int8
-        );
-        assert_eq!(
-            batch
-                .schema()
-                .field_with_name("u64_value")
-                .unwrap()
-                .data_type(),
-            &DataType::UInt64
-        );
-        assert_eq!(
-            batch
-                .schema()
-                .field_with_name("f32_value")
-                .unwrap()
-                .data_type(),
-            &DataType::Float32
-        );
-        assert_eq!(
-            batch.schema().field_with_name("raw").unwrap().data_type(),
-            &DataType::Binary
-        );
-        assert_eq!(
-            batch
-                .schema()
-                .field_with_name("event_time")
-                .unwrap()
-                .data_type(),
-            &DataType::Time64(TimeUnit::Nanosecond)
-        );
-        assert_eq!(
-            batch
-                .schema()
-                .field_with_name("event_date")
-                .unwrap()
-                .data_type(),
-            &DataType::Date32
-        );
-        assert_eq!(
-            batch
-                .schema()
-                .field_with_name("event_ts")
-                .unwrap()
-                .data_type(),
-            &DataType::Timestamp(TimeUnit::Nanosecond, None)
-        );
-
-        let rows = record_batches_to_json_rows(&[batch.clone()]).unwrap();
-        assert_eq!(rows[0]["i8_value"], json!(-8));
-        assert_eq!(rows[0]["u32_value"], json!(4_000_000_000_u64));
-        assert_eq!(rows[0]["u64_value"], json!(9_000_000_000_u64));
-        assert_eq!(rows[0]["f32_value"], json!(1.25));
-        assert_eq!(rows[0]["raw"], json!("0x0a0bff"));
-        assert_eq!(rows[0]["bytes"], json!("0x"));
-        assert_eq!(rows[0]["event_time"], json!(3_723_004_005_006_i64));
-        assert_eq!(rows[0]["event_date"], json!(20_614));
-        assert_eq!(rows[0]["event_ts"], json!(1_781_053_323_004_005_006_i64));
-        assert_eq!(
-            rows[0]["uuid_value"],
-            json!("018f4b6e-9cb5-7f5a-8027-2ce24be4d3aa")
-        );
-
-        let feldera_rows = record_batches_to_feldera_ingress_json_rows(&[batch]).unwrap();
-        assert_eq!(feldera_rows[0]["raw"], json!([10, 11, 255]));
-        assert_eq!(feldera_rows[0]["bytes"], json!([]));
-        assert_eq!(feldera_rows[0]["event_time"], json!("01:02:03.004005006"));
-        assert_eq!(feldera_rows[0]["event_date"], json!("2026-06-10"));
-        assert_eq!(
-            feldera_rows[0]["event_ts"],
-            json!("2026-06-10 01:02:03.004005006")
-        );
-    }
-
-    #[test]
-    fn relation_ingest_conversion_accepts_nested_input_types() {
-        let catalog = test_nested_input_catalog();
-        let rows = vec![json!({
-            "id": "row-1",
-            "scores": [10, null, 30],
-            "attributes": { "critical": 9, "batch": null },
-            "profile": { "name": "ada", "tier": 2 },
-            "amount": 42,
-            "weight": 1
-        })];
-
-        let batch = rows_to_record_batch(&catalog, &rows).unwrap();
-        assert!(matches!(
-            batch
-                .schema()
-                .field_with_name("scores")
-                .unwrap()
-                .data_type(),
-            DataType::List(_)
-        ));
-        assert!(matches!(
-            batch
-                .schema()
-                .field_with_name("attributes")
-                .unwrap()
-                .data_type(),
-            DataType::Map(_, _)
-        ));
-        assert!(matches!(
-            batch
-                .schema()
-                .field_with_name("profile")
-                .unwrap()
-                .data_type(),
-            DataType::Struct(_)
-        ));
-
-        let rows = record_batches_to_json_rows(&[batch]).unwrap();
-        assert_eq!(rows[0]["scores"], json!([10, null, 30]));
-        assert_eq!(
-            rows[0]["attributes"],
-            json!({ "critical": 9, "batch": null })
-        );
-        assert_eq!(rows[0]["profile"], json!({ "name": "ada", "tier": 2 }));
-    }
-
-    fn test_feldera_column(name: &str, data_type: SqlDataType) -> ColumnSchema {
-        ColumnSchema {
-            name: name.to_string(),
-            data_type,
-            nullable: false,
-        }
-    }
-
-    fn test_relation_schema(relation_id: &str, columns: Vec<ColumnSchema>) -> RelationSchema {
-        test_relation_schema_with_primary_key(relation_id, columns, Vec::<&str>::new())
-    }
-
-    fn test_relation_schema_with_primary_key(
-        relation_id: &str,
-        columns: Vec<ColumnSchema>,
-        primary_key: Vec<&str>,
-    ) -> RelationSchema {
-        RelationSchema {
-            relation_id: relation_id.to_string(),
-            relation_name: relation_id.to_string(),
-            relation_version: "v1".to_string(),
-            schema_fingerprint: feldera_artifact_bytes_hash(relation_id.as_bytes()),
-            columns,
-            primary_key: primary_key
-                .into_iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>(),
-        }
-    }
-
-    fn test_feldera_program_compile_request(
-        input_relations: Vec<RelationSchema>,
-    ) -> FelderaCompileRequestV1 {
-        FelderaCompileRequestV1 {
-            view_id: "scores_program".to_string(),
-            sql: "CREATE MATERIALIZED VIEW scores_by_user AS SELECT score FROM scores".to_string(),
-            dialect: SqlDialect::FelderaSql,
-            source_kind: SqlSourceKind::FelderaProgram,
-            rust_extension: Default::default(),
-            input_relations,
-            output_contract: OutputSchemaContract::Infer,
-            shape: StandingViewShape {
-                is_materialized: true,
-                multi_input: false,
-                multi_output: true,
-            },
-        }
-    }
-
-    fn test_expanded_scalar_catalog() -> VelorixRelationCatalogV1 {
-        let columns = vec![
-            test_relation_column(
-                "id",
-                VelorixLogicalTypeV1::Utf8,
-                ArrowPhysicalTypeV1::Utf8,
-                RelationSemanticRoleV1::PrimaryKey,
-                0,
-            ),
-            test_relation_column(
-                "i8_value",
-                VelorixLogicalTypeV1::Int8,
-                ArrowPhysicalTypeV1::Int8,
-                RelationSemanticRoleV1::Metadata,
-                1,
-            ),
-            test_relation_column(
-                "i16_value",
-                VelorixLogicalTypeV1::Int16,
-                ArrowPhysicalTypeV1::Int16,
-                RelationSemanticRoleV1::Metadata,
-                2,
-            ),
-            test_relation_column(
-                "i32_value",
-                VelorixLogicalTypeV1::Int32,
-                ArrowPhysicalTypeV1::Int32,
-                RelationSemanticRoleV1::Metadata,
-                3,
-            ),
-            test_relation_column(
-                "u8_value",
-                VelorixLogicalTypeV1::UInt8,
-                ArrowPhysicalTypeV1::UInt8,
-                RelationSemanticRoleV1::Metadata,
-                4,
-            ),
-            test_relation_column(
-                "u16_value",
-                VelorixLogicalTypeV1::UInt16,
-                ArrowPhysicalTypeV1::UInt16,
-                RelationSemanticRoleV1::Metadata,
-                5,
-            ),
-            test_relation_column(
-                "u32_value",
-                VelorixLogicalTypeV1::UInt32,
-                ArrowPhysicalTypeV1::UInt32,
-                RelationSemanticRoleV1::Metadata,
-                6,
-            ),
-            test_relation_column(
-                "u64_value",
-                VelorixLogicalTypeV1::UInt64,
-                ArrowPhysicalTypeV1::UInt64,
-                RelationSemanticRoleV1::Metadata,
-                7,
-            ),
-            test_relation_column(
-                "f32_value",
-                VelorixLogicalTypeV1::Float32,
-                ArrowPhysicalTypeV1::Float32,
-                RelationSemanticRoleV1::Metadata,
-                8,
-            ),
-            test_relation_column(
-                "raw",
-                VelorixLogicalTypeV1::Binary { length: 3 },
-                ArrowPhysicalTypeV1::Binary,
-                RelationSemanticRoleV1::Metadata,
-                9,
-            ),
-            test_relation_column(
-                "bytes",
-                VelorixLogicalTypeV1::Varbinary,
-                ArrowPhysicalTypeV1::Binary,
-                RelationSemanticRoleV1::Metadata,
-                10,
-            ),
-            test_relation_column(
-                "event_time",
-                VelorixLogicalTypeV1::Time,
-                ArrowPhysicalTypeV1::Time64Nanosecond,
-                RelationSemanticRoleV1::Metadata,
-                11,
-            ),
-            test_relation_column(
-                "event_date",
-                VelorixLogicalTypeV1::Date,
-                ArrowPhysicalTypeV1::Date32,
-                RelationSemanticRoleV1::Metadata,
-                12,
-            ),
-            test_relation_column(
-                "event_ts",
-                VelorixLogicalTypeV1::Timestamp { timezone: None },
-                ArrowPhysicalTypeV1::TimestampNanosecond { timezone: None },
-                RelationSemanticRoleV1::Metadata,
-                13,
-            ),
-            test_relation_column(
-                "uuid_value",
-                VelorixLogicalTypeV1::Uuid,
-                ArrowPhysicalTypeV1::Utf8,
-                RelationSemanticRoleV1::Metadata,
-                14,
-            ),
-            test_relation_column(
-                "amount",
-                VelorixLogicalTypeV1::Int64,
-                ArrowPhysicalTypeV1::Int64,
-                RelationSemanticRoleV1::Value,
-                15,
-            ),
-            test_relation_column(
-                "weight",
-                VelorixLogicalTypeV1::Int64,
-                ArrowPhysicalTypeV1::Int64,
-                RelationSemanticRoleV1::Weight,
-                16,
-            ),
-        ];
-        let relation_schema = VelorixRelationSchemaV1 {
-            relation_id: "expanded_scalars".to_string(),
-            relation_name: "expanded_scalars".to_string(),
-            relation_version: "2026-06-09.v1".to_string(),
-            columns,
-            primary_key_column_ids: vec!["id".to_string()],
-            weight_column_id: "weight".to_string(),
-            allowed_operations: vec![RelationOperationV1::Insert],
-            event_time_column_id: None,
-        };
-        let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema)
-            .expect("expanded scalar relation schema must fingerprint");
-        VelorixRelationCatalogV1 {
-            schema_version: RELATION_SCHEMA_VERSION_V1,
-            relation_schema,
-            schema_fingerprint: schema_fingerprint.clone(),
-            datafusion_registration: DataFusionRegistrationV1 {
-                name: "expanded_scalars".to_string(),
-                mode: DataFusionRegistrationModeV1::Table,
-            },
-            feldera_relation: FelderaRelationBindingV1 {
-                relation_id: "expanded_scalars".to_string(),
-                schema_fingerprint,
-            },
-            incremental_adapter: IncrementalAdapterBindingV1 {
-                adapter_id: CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID.to_string(),
-            },
-        }
-    }
-
-    fn test_nested_input_catalog() -> VelorixRelationCatalogV1 {
-        let columns = vec![
-            test_relation_column(
-                "id",
-                VelorixLogicalTypeV1::Utf8,
-                ArrowPhysicalTypeV1::Utf8,
-                RelationSemanticRoleV1::PrimaryKey,
-                0,
-            ),
-            test_relation_column(
-                "scores",
-                VelorixLogicalTypeV1::Array {
-                    element_type: Box::new(VelorixLogicalTypeV1::Int64),
-                },
-                ArrowPhysicalTypeV1::List {
-                    element_type: Box::new(ArrowPhysicalTypeV1::Int64),
-                },
-                RelationSemanticRoleV1::Metadata,
-                1,
-            ),
-            test_relation_column(
-                "attributes",
-                VelorixLogicalTypeV1::Map {
-                    key_type: Box::new(VelorixLogicalTypeV1::Utf8),
-                    value_type: Box::new(VelorixLogicalTypeV1::Int64),
-                },
-                ArrowPhysicalTypeV1::Map {
-                    key_type: Box::new(ArrowPhysicalTypeV1::Utf8),
-                    value_type: Box::new(ArrowPhysicalTypeV1::Int64),
-                },
-                RelationSemanticRoleV1::Metadata,
-                2,
-            ),
-            test_relation_column(
-                "profile",
-                VelorixLogicalTypeV1::Struct {
-                    fields: vec![
-                        VelorixStructFieldV1 {
-                            name: "name".to_string(),
-                            logical_type: VelorixLogicalTypeV1::Utf8,
-                            nullable: false,
-                        },
-                        VelorixStructFieldV1 {
-                            name: "tier".to_string(),
-                            logical_type: VelorixLogicalTypeV1::Int32,
-                            nullable: true,
-                        },
-                    ],
-                },
-                ArrowPhysicalTypeV1::Struct {
-                    fields: vec![
-                        ArrowStructFieldV1 {
-                            name: "name".to_string(),
-                            physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
-                            nullable: false,
-                        },
-                        ArrowStructFieldV1 {
-                            name: "tier".to_string(),
-                            physical_arrow_type: ArrowPhysicalTypeV1::Int32,
-                            nullable: true,
-                        },
-                    ],
-                },
-                RelationSemanticRoleV1::Metadata,
-                3,
-            ),
-            test_relation_column(
-                "amount",
-                VelorixLogicalTypeV1::Int64,
-                ArrowPhysicalTypeV1::Int64,
-                RelationSemanticRoleV1::Value,
-                4,
-            ),
-            test_relation_column(
-                "weight",
-                VelorixLogicalTypeV1::Int64,
-                ArrowPhysicalTypeV1::Int64,
-                RelationSemanticRoleV1::Weight,
-                5,
-            ),
-        ];
-        let relation_schema = VelorixRelationSchemaV1 {
-            relation_id: "nested_inputs".to_string(),
-            relation_name: "nested_inputs".to_string(),
-            relation_version: "2026-06-10.v1".to_string(),
-            columns,
-            primary_key_column_ids: vec!["id".to_string()],
-            weight_column_id: "weight".to_string(),
-            allowed_operations: vec![RelationOperationV1::Insert],
-            event_time_column_id: None,
-        };
-        let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema)
-            .expect("nested input relation schema must fingerprint");
-        VelorixRelationCatalogV1 {
-            schema_version: RELATION_SCHEMA_VERSION_V1,
-            relation_schema,
-            schema_fingerprint: schema_fingerprint.clone(),
-            datafusion_registration: DataFusionRegistrationV1 {
-                name: "nested_inputs".to_string(),
-                mode: DataFusionRegistrationModeV1::Table,
-            },
-            feldera_relation: FelderaRelationBindingV1 {
-                relation_id: "nested_inputs".to_string(),
-                schema_fingerprint,
-            },
-            incremental_adapter: IncrementalAdapterBindingV1 {
-                adapter_id: CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID.to_string(),
-            },
-        }
-    }
-
-    fn test_json_events_catalog() -> VelorixRelationCatalogV1 {
-        let columns = vec![
-            test_relation_column(
-                "id",
-                VelorixLogicalTypeV1::Utf8,
-                ArrowPhysicalTypeV1::Utf8,
-                RelationSemanticRoleV1::PrimaryKey,
-                0,
-            ),
-            test_relation_column(
-                "payload",
-                VelorixLogicalTypeV1::Json,
-                ArrowPhysicalTypeV1::JsonUtf8,
-                RelationSemanticRoleV1::Metadata,
-                1,
-            ),
-            test_relation_column(
-                "raw_json",
-                VelorixLogicalTypeV1::Utf8,
-                ArrowPhysicalTypeV1::Utf8,
-                RelationSemanticRoleV1::Metadata,
-                2,
-            ),
-            test_relation_column(
-                "weight",
-                VelorixLogicalTypeV1::Int64,
-                ArrowPhysicalTypeV1::Int64,
-                RelationSemanticRoleV1::Weight,
-                3,
-            ),
-        ];
-        let relation_schema = VelorixRelationSchemaV1 {
-            relation_id: "json_events".to_string(),
-            relation_name: "json_events".to_string(),
-            relation_version: "2026-06-11.v1".to_string(),
-            columns,
-            primary_key_column_ids: vec!["id".to_string()],
-            weight_column_id: "weight".to_string(),
-            allowed_operations: vec![RelationOperationV1::Insert],
-            event_time_column_id: None,
-        };
-        let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema)
-            .expect("JSON event relation schema must fingerprint");
-        VelorixRelationCatalogV1 {
-            schema_version: RELATION_SCHEMA_VERSION_V1,
-            relation_schema,
-            schema_fingerprint: schema_fingerprint.clone(),
-            datafusion_registration: DataFusionRegistrationV1 {
-                name: "json_events".to_string(),
-                mode: DataFusionRegistrationModeV1::Table,
-            },
-            feldera_relation: FelderaRelationBindingV1 {
-                relation_id: "json_events".to_string(),
-                schema_fingerprint,
-            },
-            incremental_adapter: IncrementalAdapterBindingV1 {
-                adapter_id: CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID.to_string(),
-            },
-        }
-    }
-
-    fn test_relation_column(
-        name: &str,
-        logical_type: VelorixLogicalTypeV1,
-        physical_arrow_type: ArrowPhysicalTypeV1,
-        semantic_role: RelationSemanticRoleV1,
-        ordinal: u32,
-    ) -> RelationColumnV1 {
-        RelationColumnV1 {
-            column_id: name.to_string(),
-            name: name.to_string(),
-            logical_type,
-            physical_arrow_type,
-            nullable: false,
-            ordinal,
-            semantic_role,
-        }
-    }
-
-    fn test_standing_view_spec_with_outputs(
-        view_id: &str,
-        output_relations: Vec<RelationSchema>,
-    ) -> StandingViewSpec {
-        StandingViewSpec {
-            view_id: view_id.to_string(),
-            sql: "select 1".to_string(),
-            dialect: SqlDialect::FelderaSql,
-            source_kind: SqlSourceKind::StandingView,
-            rust_extension: Default::default(),
-            input_relations: vec![test_relation_schema(
-                "scores",
-                vec![test_feldera_column("score", SqlDataType::Int64)],
-            )],
-            shape: StandingViewShape {
-                is_materialized: true,
-                multi_input: false,
-                multi_output: output_relations.len() > 1,
-            },
-            output_relations,
-        }
-    }
-
-    fn test_active_view_with_outputs(
-        view_id: &str,
-        output_relations: Vec<RelationSchema>,
-    ) -> ActiveMaterializedView {
-        ActiveMaterializedView {
-            spec_hash: "test-spec-hash".to_string(),
-            spec: test_standing_view_spec_with_outputs(view_id, output_relations),
-            execution_mode: MaterializedViewExecutionMode::StandingRuntime,
-            api: None,
-            artifact: None,
-            lifecycle: MaterializedViewLifecycleStatus::standing_runtime(),
-        }
-    }
-
-    #[test]
-    fn api_tls_config_requires_cert_and_key_together() {
-        assert!(api_tls_config_from_values(None, None, None)
-            .unwrap()
-            .is_none());
-        assert!(api_tls_config_from_values(Some("/cert.pem".to_string()), None, None).is_err());
-        assert!(api_tls_config_from_values(None, Some("/key.pem".to_string()), None).is_err());
-    }
-
-    #[test]
-    fn api_tls_config_defaults_and_parses_bind_address() {
-        let config = api_tls_config_from_values(
-            Some("/cert.pem".to_string()),
-            Some("/key.pem".to_string()),
+        persist_standing_runtime_checkpoint(
+            &state,
+            "purchases_by_user",
+            &checkpoint,
+            std::slice::from_ref(&output_delta),
+            Vec::new(),
             None,
         )
-        .unwrap()
+        .await
         .unwrap();
 
-        assert_eq!(config.bind.to_string(), "0.0.0.0:8443");
-        assert_eq!(config.cert_path, "/cert.pem");
-        assert_eq!(config.key_path, "/key.pem");
+        let checkpoint_key = test_checkpoint_key(&checkpoint);
+        let checkpoint_bytes = state
+            .store
+            .get(&Path::from(checkpoint_key.as_str()))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let record: StandingRuntimeCheckpointRecord =
+            serde_json::from_slice(&checkpoint_bytes).unwrap();
+        let delta_ref = record
+            .checkpoint
+            .output_manifest_refs
+            .iter()
+            .find(|output_ref| output_ref.starts_with(STANDING_RUNTIME_OUTPUT_DELTA_REF_PREFIX))
+            .unwrap();
+        let delta_key = delta_ref
+            .strip_prefix(STANDING_RUNTIME_OUTPUT_DELTA_REF_PREFIX)
+            .unwrap();
+        let delta_bytes = state
+            .store
+            .get(&Path::from(delta_key))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let delta_record: StandingRuntimeOutputDeltaRecord =
+            serde_json::from_slice(&delta_bytes).unwrap();
+        let (parsed_delta_key, _) =
+            ObjectKey::parse_standing_runtime_output_delta(delta_key).unwrap();
 
-        let config = api_tls_config_from_values(
-            Some("/cert.pem".to_string()),
-            Some("/key.pem".to_string()),
-            Some("127.0.0.1:9443".to_string()),
+        validate_standing_runtime_output_delta_record(&parsed_delta_key, &delta_record).unwrap();
+        assert_eq!(
+            delta_record.output_delta,
+            serde_json::to_value(output_delta.delta).unwrap()
+        );
+        assert_eq!(delta_record.delta_row_count, 2);
+        assert_eq!(
+            delta_record.source_kind,
+            "standing_runtime_epoch_output_delta"
+        );
+
+        read_latest_standing_runtime_checkpoint(&state, &checkpoint.identity, "purchases_by_user")
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn standing_runtime_output_serving_reads_page_object_not_manifest_payload() {
+        let state = test_api_state().await;
+        let checkpoint = test_runtime_checkpoint(Vec::new());
+        let checkpoint_key = test_checkpoint_key(&checkpoint);
+        let mut publication = standing_runtime_output_manifest_record_for_checkpoint(
+            &checkpoint,
+            "purchases_by_user",
+            &checkpoint_key,
         )
         .unwrap()
         .unwrap();
-        assert_eq!(config.bind.to_string(), "127.0.0.1:9443");
-    }
+        publication.manifest_record.published_output = serde_json::json!({"records": [{"key": "poison", "value": {"sum": 999, "count": 999}, "weight": 1}]});
+        let (page_key, page_record) = &publication.page_records[0];
+        persist_standing_runtime_output_page(&state, page_key, page_record)
+            .await
+            .unwrap();
 
-    #[test]
-    fn default_authority_store_id_is_s3_compatible_not_local_rustfs() {
-        assert_eq!(
-            default_authority_store_id("velorix-product", "product/run-1"),
-            "s3://s3-compatible/velorix-product/product/run-1"
-        );
-    }
-
-    #[test]
-    fn api_meta_bearer_token_parser_rejects_invalid_configured_tokens() {
-        assert_eq!(
-            parse_optional_bearer_token(None, "VELORIX_META_BEARER_TOKEN").unwrap(),
-            None
-        );
-        assert_eq!(
-            parse_optional_bearer_token(Some("secret".to_string()), "VELORIX_META_BEARER_TOKEN")
-                .unwrap(),
-            Some("secret".to_string())
-        );
-        assert!(
-            parse_optional_bearer_token(Some(String::new()), "VELORIX_META_BEARER_TOKEN").is_err()
-        );
-        assert!(
-            parse_optional_bearer_token(Some("   ".to_string()), "VELORIX_META_BEARER_TOKEN")
-                .is_err()
-        );
-        assert!(parse_optional_bearer_token(
-            Some("secret\n".to_string()),
-            "VELORIX_META_BEARER_TOKEN"
+        let output = standing_runtime_published_output_from_manifest_page(
+            &state,
+            &publication.manifest_record,
         )
-        .is_err());
+        .await
+        .unwrap();
+
+        let expected: DeltaBatch =
+            serde_json::from_value(page_record.published_output.clone()).unwrap();
+        assert_eq!(output, expected);
+    }
+
+    #[tokio::test]
+    async fn standing_runtime_output_serving_fails_closed_when_page_object_is_missing() {
+        let state = test_api_state().await;
+        let checkpoint = test_runtime_checkpoint(Vec::new());
+        let checkpoint_key = test_checkpoint_key(&checkpoint);
+        let publication = standing_runtime_output_manifest_record_for_checkpoint(
+            &checkpoint,
+            "purchases_by_user",
+            &checkpoint_key,
+        )
+        .unwrap()
+        .unwrap();
+
+        standing_runtime_published_output_from_manifest_page(&state, &publication.manifest_record)
+            .await
+            .unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn standing_runtime_output_serving_fails_closed_when_page_object_is_corrupt() {
+        let state = test_api_state().await;
+        let checkpoint = test_runtime_checkpoint(Vec::new());
+        let checkpoint_key = test_checkpoint_key(&checkpoint);
+        let publication = standing_runtime_output_manifest_record_for_checkpoint(
+            &checkpoint,
+            "purchases_by_user",
+            &checkpoint_key,
+        )
+        .unwrap()
+        .unwrap();
+        let (page_key, page_record) = &publication.page_records[0];
+        let mut corrupt = page_record.clone();
+        corrupt.published_output = serde_json::json!({"records": [{"key": "other", "value": {"sum": 1, "count": 1}, "weight": 1}]});
+        let corrupt_bytes = serde_json::to_vec(&corrupt).unwrap();
+        state
+            .store
+            .put(
+                &Path::from(page_key.as_str()),
+                bytes::Bytes::from(corrupt_bytes).into(),
+            )
+            .await
+            .unwrap();
+
+        let error = standing_runtime_published_output_from_manifest_page(
+            &state,
+            &publication.manifest_record,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(format!("{error:?}").contains("standing runtime output page key/body mismatch"));
+    }
+
+    #[tokio::test]
+    async fn standing_runtime_output_serving_fails_closed_when_manifest_object_is_missing() {
+        let state = test_api_state().await;
+        let checkpoint = test_runtime_checkpoint(Vec::new());
+        let checkpoint_key = test_checkpoint_key(&checkpoint);
+        let publication = standing_runtime_output_manifest_record_for_checkpoint(
+            &checkpoint,
+            "purchases_by_user",
+            &checkpoint_key,
+        )
+        .unwrap()
+        .unwrap();
+        let output_ref = format!(
+            "{STANDING_RUNTIME_OUTPUT_MANIFEST_REF_PREFIX}{}",
+            publication.manifest_key.as_str()
+        );
+
+        let error = read_standing_runtime_output_manifest_record(
+            &state,
+            output_ref.as_str(),
+            "purchases_by_user",
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn standing_runtime_output_serving_fails_closed_when_manifest_object_is_corrupt() {
+        let state = test_api_state().await;
+        let checkpoint = test_runtime_checkpoint(Vec::new());
+        let checkpoint_key = test_checkpoint_key(&checkpoint);
+        let publication = standing_runtime_output_manifest_record_for_checkpoint(
+            &checkpoint,
+            "purchases_by_user",
+            &checkpoint_key,
+        )
+        .unwrap()
+        .unwrap();
+        state
+            .store
+            .put(
+                &Path::from(publication.manifest_key.as_str()),
+                bytes::Bytes::from_static(b"{not-json").into(),
+            )
+            .await
+            .unwrap();
+        let output_ref = format!(
+            "{STANDING_RUNTIME_OUTPUT_MANIFEST_REF_PREFIX}{}",
+            publication.manifest_key.as_str()
+        );
+
+        let error = read_standing_runtime_output_manifest_record(
+            &state,
+            output_ref.as_str(),
+            "purchases_by_user",
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn standing_runtime_checkpoint_persistence_writes_state_object_and_strips_embedded_payload(
+    ) {
+        let state = test_api_state().await;
+        let checkpoint = test_runtime_checkpoint(Vec::new());
+        let expected_payload = checkpoint.state_payload.clone();
+        let checkpoint_key = test_checkpoint_key(&checkpoint);
+
+        persist_standing_runtime_checkpoint(
+            &state,
+            "purchases_by_user",
+            &checkpoint,
+            &[],
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let checkpoint_bytes = state
+            .store
+            .get(&Path::from(checkpoint_key.as_str()))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let raw_record: StandingRuntimeCheckpointRecord =
+            serde_json::from_slice(&checkpoint_bytes).unwrap();
+        assert!(raw_record.checkpoint.state_payload.is_none());
+        let (state_key, state_key_parts) = ObjectKey::parse_standing_runtime_state_payload(
+            raw_record.checkpoint.state_root.object_key.clone(),
+        )
+        .unwrap();
+        assert_eq!(state_key_parts.tenant_id, "tenant-a");
+        assert_eq!(state_key_parts.program_id, "program-purchases");
+        assert_eq!(state_key_parts.view_id, "purchases_by_user");
+        assert_eq!(state_key_parts.logical_epoch, checkpoint.logical_epoch);
+        assert_eq!(
+            state_key_parts.state_content_hash,
+            checkpoint.state_root.content_hash
+        );
+
+        let state_bytes = state
+            .store
+            .get(&Path::from(state_key.as_str()))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let state_record: StandingRuntimeStatePayloadRecord =
+            serde_json::from_slice(&state_bytes).unwrap();
+        validate_standing_runtime_state_payload_record(&state_key, &state_record).unwrap();
+        assert_eq!(Some(state_record.payload), expected_payload);
+    }
+
+    #[tokio::test]
+    async fn standing_runtime_checkpoint_read_hydrates_state_payload_from_state_object() {
+        let state = test_api_state().await;
+        let checkpoint = test_runtime_checkpoint(Vec::new());
+        let expected_payload = checkpoint.state_payload.clone();
+
+        persist_standing_runtime_checkpoint(
+            &state,
+            "purchases_by_user",
+            &checkpoint,
+            &[],
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let record = read_latest_standing_runtime_checkpoint(
+            &state,
+            &checkpoint.identity,
+            "purchases_by_user",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(record.checkpoint.state_payload, expected_payload);
+    }
+
+    #[tokio::test]
+    async fn standing_runtime_checkpoint_read_fails_closed_when_state_object_is_missing() {
+        let state = test_api_state().await;
+        let checkpoint = test_runtime_checkpoint(Vec::new());
+
+        persist_standing_runtime_checkpoint(
+            &state,
+            "purchases_by_user",
+            &checkpoint,
+            &[],
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        let checkpoint_key = test_checkpoint_key(&checkpoint);
+        let checkpoint_bytes = state
+            .store
+            .get(&Path::from(checkpoint_key.as_str()))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let raw_record: StandingRuntimeCheckpointRecord =
+            serde_json::from_slice(&checkpoint_bytes).unwrap();
+        state
+            .store
+            .delete(&Path::from(raw_record.checkpoint.state_root.object_key))
+            .await
+            .unwrap();
+
+        let error = read_latest_standing_runtime_checkpoint(
+            &state,
+            &checkpoint.identity,
+            "purchases_by_user",
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn standing_runtime_checkpoint_read_fails_closed_when_checkpoint_object_is_corrupt() {
+        let state = test_api_state().await;
+        let checkpoint = test_runtime_checkpoint(Vec::new());
+        let checkpoint_key = test_checkpoint_key(&checkpoint);
+        state
+            .store
+            .put(
+                &Path::from(checkpoint_key.as_str()),
+                bytes::Bytes::from_static(b"{not-json").into(),
+            )
+            .await
+            .unwrap();
+
+        let error = read_latest_standing_runtime_checkpoint(
+            &state,
+            &checkpoint.identity,
+            "purchases_by_user",
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn standing_runtime_checkpoint_read_fails_closed_when_meta_pointer_checkpoint_object_is_missing(
+    ) {
+        let meta_store = Arc::new(InMemoryMetaStore::default());
+        let state = test_api_state().await.with_meta_store(meta_store.clone());
+        let checkpoint = test_runtime_checkpoint(Vec::new());
+        let checkpoint_key = test_checkpoint_key(&checkpoint);
+        let owner = match meta_store
+            .acquire_standing_runtime_owner(AcquireStandingRuntimeOwnerRequest {
+                tenant_id: checkpoint.identity.tenant_id.clone(),
+                program_id: checkpoint.identity.program_id.clone(),
+                view_id: "purchases_by_user".to_string(),
+                owner_id: "api-test-missing-checkpoint-owner".to_string(),
+                ttl_ms: 30_000,
+            })
+            .await
+            .unwrap()
+        {
+            AcquireStandingRuntimeOwnerOutcome::Acquired(claim)
+            | AcquireStandingRuntimeOwnerOutcome::Renewed(claim) => {
+                standing_runtime_owner_token_from_claim(&claim)
+            }
+            AcquireStandingRuntimeOwnerOutcome::Conflict(claim) => {
+                panic!("unexpected owner conflict: {claim:?}")
+            }
+        };
+
+        persist_standing_runtime_checkpoint(
+            &state,
+            "purchases_by_user",
+            &checkpoint,
+            &[],
+            Vec::new(),
+            Some(owner),
+        )
+        .await
+        .unwrap();
+        state
+            .store
+            .delete(&Path::from(checkpoint_key.as_str()))
+            .await
+            .unwrap();
+
+        let error = read_latest_standing_runtime_checkpoint(
+            &state,
+            &checkpoint.identity,
+            "purchases_by_user",
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn standing_runtime_checkpoint_read_fails_closed_when_state_object_is_corrupt() {
+        let state = test_api_state().await;
+        let checkpoint = test_runtime_checkpoint(Vec::new());
+
+        persist_standing_runtime_checkpoint(
+            &state,
+            "purchases_by_user",
+            &checkpoint,
+            &[],
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        let checkpoint_key = test_checkpoint_key(&checkpoint);
+        let checkpoint_bytes = state
+            .store
+            .get(&Path::from(checkpoint_key.as_str()))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let raw_record: StandingRuntimeCheckpointRecord =
+            serde_json::from_slice(&checkpoint_bytes).unwrap();
+        let state_key = ObjectKey::parse_standing_runtime_state_payload(
+            raw_record.checkpoint.state_root.object_key.clone(),
+        )
+        .unwrap()
+        .0;
+        let mut corrupt_record =
+            standing_runtime_state_payload_record_for_checkpoint(&checkpoint, "purchases_by_user")
+                .unwrap()
+                .1;
+        corrupt_record.payload.payload = serde_json::json!({
+            "schema_version": 1,
+            "published_output": {
+                "records": [{"key": "poison", "value": {"sum": 1, "count": 1}, "weight": 1}]
+            }
+        })
+        .to_string();
+        state
+            .store
+            .put(
+                &Path::from(state_key.as_str()),
+                bytes::Bytes::from(serde_json::to_vec(&corrupt_record).unwrap()).into(),
+            )
+            .await
+            .unwrap();
+
+        let error = read_latest_standing_runtime_checkpoint(
+            &state,
+            &checkpoint.identity,
+            "purchases_by_user",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(format!("{error:?}").contains("standing runtime state payload key/body mismatch"));
     }
 
     #[test]
-    fn production_standing_runtime_fencing_requires_every_capability_bit() {
-        let unsafe_capability = StandingRuntimeFencingCapability {
-            capability_schema_version: STANDING_RUNTIME_FENCING_CAPABILITY_SCHEMA_VERSION,
-            backend_name: "in-memory".to_string(),
-            owner_scope_kind: STANDING_RUNTIME_OWNER_SCOPE_KIND_TENANT_PROGRAM_VIEW.to_string(),
-            linearizable_owner_lease: true,
-            durable_monotonic_owner_epoch: false,
-            authoritative_backend_time: false,
-            owner_validated_checkpoint_publish: true,
-            publish_checks_owner_and_latest_atomically: true,
-            publish_rejects_expired_owner: true,
-            latest_read_linearizable: true,
-            publish_rejects_scope_mismatch: true,
-            max_owner_ttl_ms: 300_000,
-            control_plane_auth_enforced: false,
-            production_multi_writer_safe: false,
-            backend_time_source_kind: "process_clock".to_string(),
-            backend_time_blocked_reason: "test_process_clock".to_string(),
-            lease_authority_kind: "process_local".to_string(),
-            lease_expiry_semantics: "process_clock_ttl".to_string(),
-            bounded_wall_clock_failover: false,
-            failover_time_bound_ms: 0,
-            multi_writer_fencing_safe: false,
-            production_bounded_failover_safe: false,
-        };
-        let error = validate_production_standing_runtime_fencing(&unsafe_capability).unwrap_err();
-        assert!(error.to_string().contains("durable_monotonic_owner_epoch"));
-        assert!(error.to_string().contains("authoritative_backend_time"));
-        assert!(error
-            .to_string()
-            .contains("raft_replicated_authority_time_source"));
-        assert!(error
-            .to_string()
-            .contains("raft_replicated_time_lease_authority"));
-        assert!(error
-            .to_string()
-            .contains("backend_wall_clock_ttl_lease_expiry"));
-        assert!(error.to_string().contains("control_plane_auth_enforced"));
-        assert!(error.to_string().contains("multi_writer_fencing_safe"));
-        assert!(error.to_string().contains("bounded_wall_clock_failover"));
-        assert!(error.to_string().contains("failover_time_bound_ms"));
-        assert!(error
-            .to_string()
-            .contains("production_bounded_failover_safe"));
-        assert!(error.to_string().contains("production_multi_writer_safe"));
+    fn standing_runtime_checkpoint_output_ref_validation_rejects_untagged_ref() {
+        let mut checkpoint = test_runtime_checkpoint(Vec::new());
+        let checkpoint_key = test_checkpoint_key(&checkpoint);
+        checkpoint
+            .output_manifest_refs
+            .push(checkpoint_key.as_str().to_string());
+        let pointer = test_checkpoint_pointer(&checkpoint_key, &checkpoint);
+        let record = test_checkpoint_record(&checkpoint_key, checkpoint);
 
-        let safe_capability = StandingRuntimeFencingCapability {
-            capability_schema_version: STANDING_RUNTIME_FENCING_CAPABILITY_SCHEMA_VERSION,
-            backend_name: "hiqlite".to_string(),
-            owner_scope_kind: STANDING_RUNTIME_OWNER_SCOPE_KIND_TENANT_PROGRAM_VIEW.to_string(),
-            linearizable_owner_lease: true,
-            durable_monotonic_owner_epoch: true,
-            authoritative_backend_time: true,
-            owner_validated_checkpoint_publish: true,
-            publish_checks_owner_and_latest_atomically: true,
-            publish_rejects_expired_owner: true,
-            latest_read_linearizable: true,
-            publish_rejects_scope_mismatch: true,
-            max_owner_ttl_ms: 300_000,
-            control_plane_auth_enforced: true,
-            production_multi_writer_safe: true,
-            backend_time_source_kind: STANDING_RUNTIME_BACKEND_TIME_SOURCE_RAFT_REPLICATED
-                .to_string(),
-            backend_time_blocked_reason: String::new(),
-            lease_authority_kind: "raft_replicated_time".to_string(),
-            lease_expiry_semantics: "backend_wall_clock_ttl".to_string(),
-            bounded_wall_clock_failover: true,
-            failover_time_bound_ms: 300_000,
-            multi_writer_fencing_safe: true,
-            production_bounded_failover_safe: true,
-        };
-        validate_production_standing_runtime_fencing(&safe_capability).unwrap();
+        let error =
+            validate_standing_runtime_checkpoint_output_refs(&record, &pointer).unwrap_err();
+
+        assert!(format!("{error:?}").contains("unsupported standing runtime checkpoint output ref"));
     }
 
     #[test]
-    fn logical_standing_runtime_fencing_accepts_hiqlite_logical_clock_without_bounded_failover() {
-        let capability = StandingRuntimeFencingCapability {
-            capability_schema_version: STANDING_RUNTIME_FENCING_CAPABILITY_SCHEMA_VERSION,
-            backend_name: "hiqlite".to_string(),
-            owner_scope_kind: STANDING_RUNTIME_OWNER_SCOPE_KIND_TENANT_PROGRAM_VIEW.to_string(),
-            linearizable_owner_lease: true,
-            durable_monotonic_owner_epoch: true,
-            authoritative_backend_time: false,
-            owner_validated_checkpoint_publish: true,
-            publish_checks_owner_and_latest_atomically: true,
-            publish_rejects_expired_owner: true,
-            latest_read_linearizable: true,
-            publish_rejects_scope_mismatch: true,
-            max_owner_ttl_ms: 300_000,
-            control_plane_auth_enforced: true,
-            production_multi_writer_safe: false,
-            backend_time_source_kind: "unavailable".to_string(),
-            backend_time_blocked_reason: "hiqlite_raft_replicated_authority_time_primitive_missing"
-                .to_string(),
-            lease_authority_kind: STANDING_RUNTIME_LEASE_AUTHORITY_KIND_HIQLITE_RAFT_SERIALIZED
-                .to_string(),
-            lease_expiry_semantics:
-                STANDING_RUNTIME_LEASE_EXPIRY_SEMANTICS_OPERATION_DRIVEN_LOGICAL.to_string(),
-            bounded_wall_clock_failover: false,
-            failover_time_bound_ms: 0,
-            multi_writer_fencing_safe: true,
-            production_bounded_failover_safe: false,
+    fn standing_runtime_checkpoint_output_ref_validation_rejects_mismatched_output_manifest_key() {
+        let mut checkpoint = test_runtime_checkpoint(Vec::new());
+        let checkpoint_key = test_checkpoint_key(&checkpoint);
+        let output_content_hash = format!("sha256:{}", "f".repeat(64));
+        let mismatched_key = ObjectKey::standing_runtime_output_manifest(
+            &checkpoint.identity.tenant_id,
+            &checkpoint.identity.program_id,
+            "purchases_by_user",
+            checkpoint.logical_epoch + 1,
+            &output_content_hash,
+        )
+        .unwrap();
+        checkpoint.output_manifest_refs.push(format!(
+            "{STANDING_RUNTIME_OUTPUT_MANIFEST_REF_PREFIX}{}",
+            mismatched_key.as_str()
+        ));
+        let pointer = test_checkpoint_pointer(&checkpoint_key, &checkpoint);
+        let record = test_checkpoint_record(&checkpoint_key, checkpoint);
+
+        let error =
+            validate_standing_runtime_checkpoint_output_refs(&record, &pointer).unwrap_err();
+
+        assert!(format!("{error:?}")
+            .contains("standing runtime checkpoint output manifest ref mismatch"));
+    }
+
+    #[test]
+    fn single_key_output_schema_fingerprint_changes_with_aggregate_projection() {
+        let catalog = test_purchases_catalog();
+        let sum_count_plan = validate_catalog_backed_sum_count_view_sql(
+            "select user_id, sum(amount) as sum, count(*) as count from purchases group by user_id",
+            &catalog,
+        )
+        .unwrap();
+        let avg_plan = validate_catalog_backed_sum_count_view_sql(
+            "select user_id, sum(amount) as total, count(*) as events, avg(amount) as average from purchases group by user_id",
+            &catalog,
+        )
+        .unwrap();
+
+        let sum_count_schema =
+            single_key_sum_count_output_schema("purchase_metrics", &catalog, &sum_count_plan)
+                .unwrap();
+        let avg_schema =
+            single_key_sum_count_output_schema("purchase_metrics", &catalog, &avg_plan).unwrap();
+
+        assert_ne!(
+            sum_count_schema.schema_fingerprint,
+            avg_schema.schema_fingerprint
+        );
+        assert_ne!(
+            avg_schema.schema_fingerprint,
+            catalog.schema_fingerprint.to_string()
+        );
+        assert_eq!(
+            avg_schema
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["user_id", "total", "events", "average"]
+        );
+    }
+
+    #[test]
+    fn materialized_runtime_binding_persists_admitted_logical_plan() {
+        let catalog = test_purchases_catalog();
+        let sql =
+            "select user_id, sum(amount) as sum, count(*) as count from purchases group by user_id";
+        let plan = validate_catalog_backed_sum_count_view_sql(sql, &catalog).unwrap();
+        let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+        let output_schema =
+            single_key_sum_count_output_schema("purchases_by_user", &catalog, &plan).unwrap();
+        let spec = StandingViewSpec {
+            view_id: "purchases_by_user".to_string(),
+            sql: sql.to_string(),
+            dialect: SqlDialect::VelorixSql,
+            source_kind: SqlSourceKind::StandingView,
+            input_relations: vec![input_schema],
+            output_relations: vec![output_schema],
+            shape: StandingViewShape {
+                is_materialized: true,
+                multi_input: false,
+                multi_output: false,
+            },
         };
 
-        validate_logical_standing_runtime_fencing(&capability).unwrap();
-        assert!(validate_production_standing_runtime_fencing(&capability).is_err());
+        let binding =
+            materialized_view_runtime_binding_for_spec(std::slice::from_ref(&catalog), &spec)
+                .unwrap();
+        let logical_plan = binding.logical_plan.unwrap();
+
+        assert_eq!(logical_plan.view_sql, spec.sql);
+        assert_eq!(
+            logical_plan.output_relation.relation_id,
+            "purchases_by_user"
+        );
+        assert_eq!(
+            logical_plan.input_relations[0].schema_fingerprint,
+            catalog.schema_fingerprint.to_string()
+        );
+    }
+
+    #[test]
+    fn latest_by_key_output_schema_uses_arg_max_value_type() {
+        let catalog = test_device_status_catalog();
+        let plan = validate_supported_latest_by_key_sql(
+            "select device_id, arg_max(enabled, event_time) as enabled from device_status group by device_id",
+            &catalog,
+        )
+        .unwrap();
+
+        let schema = latest_by_key_output_schema("latest_device_status", &catalog, &plan).unwrap();
+
+        assert_eq!(schema.relation_id, "latest_device_status");
+        assert_eq!(
+            schema
+                .columns
+                .iter()
+                .map(|column| (column.name.as_str(), &column.data_type))
+                .collect::<Vec<_>>(),
+            vec![
+                ("device_id", &SqlDataType::Utf8),
+                ("enabled", &SqlDataType::Bool)
+            ]
+        );
+        assert_eq!(schema.primary_key, vec!["device_id"]);
+    }
+
+    #[test]
+    fn materialized_runtime_output_schema_supports_tumbling_event_time_window() {
+        let factory = MaterializedViewRuntimeFactory;
+        let catalog = test_purchases_event_time_catalog();
+
+        let schemas = factory
+            .output_schemas_for_view_request(
+                "purchases_by_user_minute",
+                "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count, min(amount) as minimum_amount, max(amount) as maximum_amount, avg(amount) as average_amount from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end",
+                &catalog,
+                catalog.schema_fingerprint.as_str(),
+            )
+            .unwrap()
+            .unwrap();
+
+        let schema = &schemas[0];
+        assert_eq!(schema.relation_id, "purchases_by_user_minute");
+        assert_eq!(
+            schema
+                .columns
+                .iter()
+                .map(|column| (column.name.as_str(), &column.data_type))
+                .collect::<Vec<_>>(),
+            vec![
+                ("user_id", &SqlDataType::Utf8),
+                ("window_start", &SqlDataType::Int64),
+                ("window_end", &SqlDataType::Int64),
+                ("total_amount", &SqlDataType::Int64),
+                ("event_count", &SqlDataType::Int64),
+                ("minimum_amount", &SqlDataType::Int64),
+                ("maximum_amount", &SqlDataType::Int64),
+                ("average_amount", &SqlDataType::Float64),
+            ]
+        );
+        assert_eq!(
+            schema.primary_key,
+            vec!["user_id", "window_start", "window_end"]
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_latest_bool_view_materialized_output_replays_later_ingest_after_restart() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state = test_api_state_with_store(store.clone(), "api-test-owner-a", false).await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_device_status_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+        assert_eq!(relation_response.1["relation_id"], "device_status");
+
+        let view_request = CreateViewRequest {
+            view_id: "latest_device_status".to_string(),
+            url_path: Some("/devices/latest-status".to_string()),
+            output_relation_id: None,
+            input_relation_id: "device_status".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select device_id, arg_max(enabled, event_time) as enabled from device_status group by device_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("latest bool status by device".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(
+            view_response.0,
+            StatusCode::CREATED,
+            "view creation response: {}",
+            view_response.1
+        );
+        assert_eq!(view_response.1["view_id"], "latest_device_status");
+        assert_eq!(view_response.1["query_enabled"], true);
+
+        let ingest_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/ingest",
+            json!({
+                "relation_id": "device_status",
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "device-status-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "event_time_watermark": {
+                    "event_time_column_id": "event_time",
+                    "max_observed_event_time_ns": 110,
+                    "watermark_ns": 100
+                },
+                "rows": [
+                    {"device_id": "device-a", "enabled": true, "event_time": 100, "delta": 1},
+                    {"device_id": "device-a", "enabled": false, "event_time": 110, "delta": 1},
+                    {"device_id": "device-b", "enabled": true, "event_time": 90, "delta": 1}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(ingest_response.0, StatusCode::CREATED);
+        assert_eq!(ingest_response.1["outcome"], "appended");
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/latest_device_status/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(
+            query_response.0,
+            StatusCode::OK,
+            "join query response: {}",
+            query_response.1
+        );
+        assert_latest_device_rows(&query_response.1, 3, true);
+
+        append_committed_ingest_without_runtime_apply(
+            store.clone(),
+            IngestRowsRequest {
+                relation_id: "device_status".to_string(),
+                relation_version: "2026-05-24.v1".to_string(),
+                stream_id: "device-status-stream".to_string(),
+                partition_id: 0,
+                start_offset_inclusive: 3,
+                event_time_watermark: Some(IngestEventTimeWatermarkRequest {
+                    event_time_column_id: "event_time".to_string(),
+                    max_observed_event_time_ns: 120,
+                    watermark_ns: 115,
+                }),
+                rows: vec![json!({
+                    "device_id": "device-b",
+                    "enabled": false,
+                    "event_time": 120,
+                    "delta": 1
+                })],
+            },
+        )
+        .await;
+
+        let restarted_state =
+            test_api_state_with_store(store.clone(), "api-test-owner-b", true).await;
+        let restored = restarted_state
+            .restore_standing_program_runtimes_from_active_views()
+            .await
+            .unwrap();
+        assert_eq!(restored, 1);
+        let restarted_app = app(restarted_state);
+        let restarted_query_response = call_json(
+            &restarted_app,
+            Method::POST,
+            "/v1/views/latest_device_status/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(restarted_query_response.0, StatusCode::OK);
+        assert_latest_device_rows(&restarted_query_response.1, 4, false);
+    }
+
+    #[tokio::test]
+    async fn rest_ingest_event_time_watermark_requires_declared_event_time_column() {
+        let state = test_api_state().await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let ingest_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/ingest",
+            json!({
+                "relation_id": "scores",
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "scores-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "event_time_watermark": {
+                    "event_time_column_id": "event_time",
+                    "max_observed_event_time_ns": 100,
+                    "watermark_ns": 90
+                },
+                "rows": [
+                    {"user_id": "alice", "score": 10, "delta": 1}
+                ]
+            }),
+        )
+        .await;
+
+        assert_eq!(ingest_response.0, StatusCode::BAD_REQUEST);
+        assert!(
+            ingest_response.1["error"]
+                .as_str()
+                .unwrap()
+                .contains("event_time_watermark requires relation_schema.event_time_column_id"),
+            "unexpected response: {}",
+            ingest_response.1
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_ingest_event_time_watermark_rejects_max_below_batch_event_time() {
+        let state = test_api_state().await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_device_status_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let ingest_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/ingest",
+            json!({
+                "relation_id": "device_status",
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "device-status-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "event_time_watermark": {
+                    "event_time_column_id": "event_time",
+                    "max_observed_event_time_ns": 109,
+                    "watermark_ns": 100
+                },
+                "rows": [
+                    {"device_id": "device-a", "enabled": true, "event_time": 100, "delta": 1},
+                    {"device_id": "device-b", "enabled": false, "event_time": 110, "delta": 1}
+                ]
+            }),
+        )
+        .await;
+
+        assert_eq!(ingest_response.0, StatusCode::BAD_REQUEST);
+        assert!(
+            ingest_response.1["error"]
+                .as_str()
+                .unwrap()
+                .contains("max_observed_event_time_ns must be >= actual max event-time value 110"),
+            "unexpected response: {}",
+            ingest_response.1
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_tumbling_window_view_materialized_output_replays_later_ingest_after_restart() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state =
+            test_api_state_with_store(store.clone(), "api-test-window-owner-a", false).await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_purchases_event_time_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(
+            relation_response.0,
+            StatusCode::CREATED,
+            "relation creation response: {}",
+            relation_response.1
+        );
+        assert_eq!(relation_response.1["relation_id"], "purchases");
+
+        let sql = "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end";
+        let view_request = CreateViewRequest {
+            view_id: "purchases_by_user_minute".to_string(),
+            url_path: Some("/purchases/by-user-minute".to_string()),
+            output_relation_id: None,
+            input_relation_id: "purchases".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: sql.to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("purchase totals by user and event-time minute".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(
+            view_response.0,
+            StatusCode::CREATED,
+            "window view creation response: {}",
+            view_response.1
+        );
+        assert_eq!(view_response.1["view_id"], "purchases_by_user_minute");
+        assert_eq!(view_response.1["query_enabled"], true);
+
+        let ingest_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/ingest",
+            json!({
+                "relation_id": "purchases",
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "purchases-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "event_time_watermark": {
+                    "event_time_column_id": "event_time",
+                    "max_observed_event_time_ns": 70_000_000_000i64,
+                    "watermark_ns": 60_000_000_000i64
+                },
+                "rows": [
+                    {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64, "delta": 1},
+                    {"user_id": "bob", "amount": 5, "event_time": 30_000_000_000i64, "delta": 1},
+                    {"user_id": "alice", "amount": 7, "event_time": 70_000_000_000i64, "delta": 1}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(ingest_response.0, StatusCode::CREATED);
+        assert_eq!(ingest_response.1["outcome"], "appended");
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/purchases_by_user_minute/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(
+            query_response.0,
+            StatusCode::OK,
+            "window query response: {}",
+            query_response.1
+        );
+        assert_window_rows(
+            &query_response.1,
+            3,
+            json!([
+                {"user_id": "alice", "window_start": 0, "window_end": 60_000_000_000i64, "total_amount": 10, "event_count": 1},
+                {"user_id": "bob", "window_start": 0, "window_end": 60_000_000_000i64, "total_amount": 5, "event_count": 1}
+            ]),
+        );
+
+        append_committed_ingest_without_runtime_apply(
+            store.clone(),
+            IngestRowsRequest {
+                relation_id: "purchases".to_string(),
+                relation_version: "2026-05-24.v1".to_string(),
+                stream_id: "purchases-stream".to_string(),
+                partition_id: 0,
+                start_offset_inclusive: 3,
+                event_time_watermark: Some(IngestEventTimeWatermarkRequest {
+                    event_time_column_id: "event_time".to_string(),
+                    max_observed_event_time_ns: 120_000_000_000,
+                    watermark_ns: 120_000_000_000,
+                }),
+                rows: vec![json!({
+                    "user_id": "bob",
+                    "amount": 11,
+                    "event_time": 80_000_000_000i64,
+                    "delta": 1
+                })],
+            },
+        )
+        .await;
+
+        let restarted_state =
+            test_api_state_with_store(store.clone(), "api-test-window-owner-b", true).await;
+        let restored = restarted_state
+            .restore_standing_program_runtimes_from_active_views()
+            .await
+            .unwrap();
+        assert_eq!(restored, 1);
+        let restarted_app = app(restarted_state);
+        let restarted_query_response = call_json(
+            &restarted_app,
+            Method::POST,
+            "/v1/views/purchases_by_user_minute/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(
+            restarted_query_response.0,
+            StatusCode::OK,
+            "restarted window query response: {}",
+            restarted_query_response.1
+        );
+        assert_window_rows(
+            &restarted_query_response.1,
+            4,
+            json!([
+                {"user_id": "alice", "window_start": 0, "window_end": 60_000_000_000i64, "total_amount": 10, "event_count": 1},
+                {"user_id": "alice", "window_start": 60_000_000_000i64, "window_end": 120_000_000_000i64, "total_amount": 7, "event_count": 1},
+                {"user_id": "bob", "window_start": 0, "window_end": 60_000_000_000i64, "total_amount": 5, "event_count": 1},
+                {"user_id": "bob", "window_start": 60_000_000_000i64, "window_end": 120_000_000_000i64, "total_amount": 11, "event_count": 1}
+            ]),
+        );
+    }
+
+    async fn call_json(
+        app: &Router,
+        method: Method,
+        uri: &str,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        (status, value)
+    }
+
+    async fn append_committed_ingest_without_runtime_apply(
+        store: Arc<dyn ObjectStore>,
+        request: IngestRowsRequest,
+    ) {
+        let state = test_api_state_with_store(store, "api-test-crash-window-writer", false).await;
+        let prepared = prepare_ingest_batch(&state, request).await.unwrap();
+        let outcome = append_ingest_envelope(&state, prepared.envelope)
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            AppendValidatedEnvelopeOutcome::Appended { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn rest_late_view_backfills_on_first_query_without_blocking_later_ingest() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state = test_api_state_with_store(store, "api-test-late-view-owner", false).await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let first_ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/ingest",
+            json!({
+                "relation_id": "scores",
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "scores-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "rows": [
+                    {"user_id": "alice", "score": 10, "delta": 1},
+                    {"user_id": "alice", "score": 3, "delta": 1},
+                    {"user_id": "bob", "score": 4, "delta": 1}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(first_ingest.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "late_scores_by_user".to_string(),
+            url_path: Some("/scores/late-by-user".to_string()),
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("late-created score totals".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(
+            view_response.0,
+            StatusCode::CREATED,
+            "late view creation response: {}",
+            view_response.1
+        );
+        assert_eq!(view_response.1["query_enabled"], false);
+        assert_eq!(
+            view_response.1["lifecycle"]["deployment_status"],
+            "deploying"
+        );
+        assert!(
+            view_response.1["lifecycle"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("backfill_required"),
+            "late view lifecycle: {}",
+            view_response.1
+        );
+
+        let second_ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/ingest",
+            json!({
+                "relation_id": "scores",
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "scores-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 3,
+                "rows": [
+                    {"user_id": "alice", "score": 2, "delta": 1}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(
+            second_ingest.0,
+            StatusCode::CREATED,
+            "late view must not block later ingest: {}",
+            second_ingest.1
+        );
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/late_scores_by_user/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(
+            query_response.0,
+            StatusCode::OK,
+            "query-triggered backfill response: {}",
+            query_response.1
+        );
+        assert_eq!(query_response.1["logical_epoch"], 4);
+        assert_eq!(
+            query_response.1["rows"],
+            json!([
+                {"user_id": "alice", "sum": 15, "count": 3},
+                {"user_id": "bob", "sum": 4, "count": 1}
+            ])
+        );
+
+        let refreshed_view = call_json(
+            &router,
+            Method::GET,
+            "/v1/views/late_scores_by_user",
+            json!({}),
+        )
+        .await;
+        assert_eq!(refreshed_view.0, StatusCode::OK);
+        assert_eq!(refreshed_view.1["query_enabled"], true);
+        assert_eq!(
+            refreshed_view.1["lifecycle"]["deployment_status"],
+            "running"
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_late_view_backfill_api_reports_coverage_and_runs_limited_steps() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state = test_api_state_with_store(store, "api-test-backfill-api-owner", false).await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        for (start, rows) in [
+            (
+                0,
+                json!([
+                    {"user_id": "alice", "score": 10, "delta": 1},
+                    {"user_id": "bob", "score": 4, "delta": 1}
+                ]),
+            ),
+            (
+                2,
+                json!([
+                    {"user_id": "alice", "score": 5, "delta": 1}
+                ]),
+            ),
+        ] {
+            let ingest = call_json(
+                &router,
+                Method::POST,
+                "/v1/ingest",
+                json!({
+                    "relation_id": "scores",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "scores-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": start,
+                    "rows": rows
+                }),
+            )
+            .await;
+            assert_eq!(
+                ingest.0,
+                StatusCode::CREATED,
+                "ingest response: {}",
+                ingest.1
+            );
+        }
+
+        let view_request = CreateViewRequest {
+            view_id: "late_scores_backfill_api".to_string(),
+            url_path: Some("/scores/backfill-api".to_string()),
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("late-created score totals with explicit backfill".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED);
+        assert_eq!(view_response.1["coverage"]["state"], "backfill_required");
+        assert_eq!(
+            view_response.1["coverage"]["request_scope"]["status"],
+            "unsupported"
+        );
+        assert_eq!(
+            view_response.1["coverage"]["background_backfill"]["status"],
+            "available"
+        );
+
+        let status = call_json(
+            &router,
+            Method::GET,
+            "/v1/views/late_scores_backfill_api/backfill",
+            json!({}),
+        )
+        .await;
+        assert_eq!(status.0, StatusCode::OK);
+        assert_eq!(status.1["coverage"]["state"], "backfill_required");
+        assert_eq!(status.1["progress"]["processed_batches"], 0);
+        assert_eq!(status.1["progress"]["remaining_batches"], 2);
+        assert_eq!(status.1["progress"]["total_batches"], 2);
+        assert_eq!(status.1["progress"]["percent"], 0.0);
+
+        let first_step = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/late_scores_backfill_api/backfill",
+            json!({"mode": "sync", "batch_limit": 1}),
+        )
+        .await;
+        assert_eq!(
+            first_step.0,
+            StatusCode::OK,
+            "first backfill response: {}",
+            first_step.1
+        );
+        assert_eq!(first_step.1["applied_batches"], 1);
+        assert_eq!(first_step.1["remaining_batches"], 1);
+        assert_eq!(first_step.1["query_enabled"], false);
+        assert_eq!(first_step.1["progress"]["processed_batches"], 1);
+        assert_eq!(first_step.1["progress"]["remaining_batches"], 1);
+        assert_eq!(first_step.1["progress"]["total_batches"], 2);
+        assert_eq!(first_step.1["progress"]["percent"], 50.0);
+
+        let finish = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/late_scores_backfill_api/backfill",
+            json!({"mode": "sync"}),
+        )
+        .await;
+        assert_eq!(finish.0, StatusCode::OK, "finish response: {}", finish.1);
+        assert_eq!(finish.1["remaining_batches"], 0);
+        assert_eq!(finish.1["query_enabled"], true);
+        assert_eq!(finish.1["progress"]["processed_batches"], 2);
+        assert_eq!(finish.1["progress"]["remaining_batches"], 0);
+        assert_eq!(finish.1["progress"]["total_batches"], 2);
+        assert_eq!(finish.1["progress"]["percent"], 100.0);
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/late_scores_backfill_api/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query_response.0, StatusCode::OK);
+        assert_eq!(
+            query_response.1["rows"],
+            json!([
+                {"user_id": "alice", "sum": 15, "count": 2},
+                {"user_id": "bob", "sum": 4, "count": 1}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_late_view_background_backfill_scheduler_eventually_marks_running() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state =
+            test_api_state_with_store(store, "api-test-background-backfill-owner", false).await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        for (start, rows) in [
+            (
+                0,
+                json!([
+                    {"user_id": "alice", "score": 10, "delta": 1}
+                ]),
+            ),
+            (
+                1,
+                json!([
+                    {"user_id": "bob", "score": 4, "delta": 1}
+                ]),
+            ),
+        ] {
+            let ingest = call_json(
+                &router,
+                Method::POST,
+                "/v1/ingest",
+                json!({
+                    "relation_id": "scores",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "scores-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": start,
+                    "rows": rows
+                }),
+            )
+            .await;
+            assert_eq!(ingest.0, StatusCode::CREATED);
+        }
+
+        let view_request = CreateViewRequest {
+            view_id: "late_scores_background".to_string(),
+            url_path: None,
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: None,
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED);
+        assert_eq!(view_response.1["query_enabled"], false);
+
+        let scheduled = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/late_scores_background/backfill",
+            json!({"mode": "background", "batch_limit": 1, "pause_ms": 1}),
+        )
+        .await;
+        assert_eq!(
+            scheduled.0,
+            StatusCode::ACCEPTED,
+            "scheduled response: {}",
+            scheduled.1
+        );
+        assert_eq!(scheduled.1["outcome"], "scheduled");
+
+        let mut latest = Value::Null;
+        for _ in 0..50 {
+            latest = call_json(
+                &router,
+                Method::GET,
+                "/v1/views/late_scores_background",
+                json!({}),
+            )
+            .await
+            .1;
+            if latest["query_enabled"] == true {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            latest["query_enabled"], true,
+            "view did not become queryable: {latest}"
+        );
+        assert_eq!(latest["coverage"]["state"], "materialized");
+    }
+
+    #[tokio::test]
+    async fn rest_view_query_fails_closed_without_published_output_manifest() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-no-manifest-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(
+            relation_response.0,
+            StatusCode::CREATED,
+            "relation creation response: {}",
+            relation_response.1
+        );
+
+        let view_request = CreateViewRequest {
+            view_id: "scores_empty_until_ingest".to_string(),
+            url_path: None,
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: None,
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(
+            view_response.0,
+            StatusCode::CREATED,
+            "view creation response: {}",
+            view_response.1
+        );
+        assert_eq!(view_response.1["query_enabled"], true);
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/scores_empty_until_ingest/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query_response.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            query_response.1["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("standing runtime output manifest is unavailable"),
+            "query response: {}",
+            query_response.1
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_two_relation_join_view_materialized_output_survives_api_restart() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state = test_api_state_with_store(store.clone(), "api-test-join-owner-a", false).await;
+        let router = app(state);
+
+        for catalog in [test_scores_catalog(), test_accounts_catalog()] {
+            let relation_response = call_json(
+                &router,
+                Method::POST,
+                "/v1/relations",
+                json!({
+                    "catalog": catalog,
+                    "default_orders_sum_count": false
+                }),
+            )
+            .await;
+            assert_eq!(
+                relation_response.0,
+                StatusCode::CREATED,
+                "relation creation response: {}",
+                relation_response.1
+            );
+        }
+
+        let view_request = CreateViewRequest {
+            view_id: "scores_by_account".to_string(),
+            url_path: Some("/scores/by-account".to_string()),
+            output_relation_id: None,
+            input_relation_id: String::new(),
+            input_relation_version: String::new(),
+            input_relation_refs: vec![
+                InputRelationRef {
+                    relation_id: "scores".to_string(),
+                    relation_version: "2026-05-24.v1".to_string(),
+                },
+                InputRelationRef {
+                    relation_id: "accounts".to_string(),
+                    relation_version: "2026-05-24.v1".to_string(),
+                },
+            ],
+            input_relations: Vec::new(),
+            sql: "select a.account_id, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.user_id = a.account_id group by a.account_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("score metrics grouped by account join".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(
+            view_response.0,
+            StatusCode::CREATED,
+            "join view creation response: {}",
+            view_response.1
+        );
+        assert_eq!(view_response.1["view_id"], "scores_by_account");
+        assert_eq!(view_response.1["query_enabled"], true);
+
+        let scores_ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/ingest",
+            json!({
+                "relation_id": "scores",
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "scores-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "rows": [
+                    {"user_id": "alice", "score": 10, "delta": 1},
+                    {"user_id": "alice", "score": 7, "delta": 1},
+                    {"user_id": "bob", "score": 5, "delta": 1}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(scores_ingest.0, StatusCode::CREATED);
+        assert_eq!(scores_ingest.1["outcome"], "appended");
+
+        let accounts_ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/ingest",
+            json!({
+                "relation_id": "accounts",
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "accounts-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "rows": [
+                    {"account_id": "alice", "limit": 100, "delta": 1},
+                    {"account_id": "bob", "limit": 50, "delta": 1}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(accounts_ingest.0, StatusCode::CREATED);
+        assert_eq!(accounts_ingest.1["outcome"], "appended");
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/scores_by_account/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(
+            query_response.0,
+            StatusCode::OK,
+            "join query response: {}",
+            query_response.1
+        );
+        assert_join_rows(&query_response.1, 4, 17);
+
+        let restarted_state =
+            test_api_state_with_store(store.clone(), "api-test-join-owner-b", true).await;
+        let restored = restarted_state
+            .restore_standing_program_runtimes_from_active_views()
+            .await
+            .unwrap();
+        assert_eq!(restored, 1);
+        let restarted_router = app(restarted_state);
+        let restarted_query = call_json(
+            &restarted_router,
+            Method::POST,
+            "/v1/views/scores_by_account/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(
+            restarted_query.0,
+            StatusCode::OK,
+            "restarted join query response: {}",
+            restarted_query.1
+        );
+        assert_join_rows(&restarted_query.1, 4, 17);
+    }
+
+    fn assert_join_rows(response: &Value, expected_epoch: u64, expected_alice_sum: i64) {
+        assert_eq!(response["logical_epoch"], expected_epoch);
+        assert_eq!(
+            response["rows"],
+            json!([
+                {"account_id": "alice", "sum": expected_alice_sum, "count": 2},
+                {"account_id": "bob", "sum": 5, "count": 1}
+            ])
+        );
+    }
+
+    fn assert_latest_device_rows(response: &Value, expected_epoch: u64, expected_device_b: bool) {
+        assert_eq!(response["logical_epoch"], expected_epoch);
+        assert_eq!(
+            response["rows"],
+            json!([
+                {"device_id": "device-a", "enabled": false},
+                {"device_id": "device-b", "enabled": expected_device_b}
+            ])
+        );
+    }
+
+    fn assert_window_rows(response: &Value, expected_epoch: u64, expected_rows: Value) {
+        assert_eq!(response["logical_epoch"], expected_epoch);
+        assert_eq!(response["rows"], expected_rows);
+    }
+
+    fn test_runtime_checkpoint(output_manifest_refs: Vec<String>) -> RuntimeCheckpoint {
+        let state_payload = serde_json::json!({
+            "schema_version": 1,
+            "published_output": {
+                "records": []
+            }
+        })
+        .to_string();
+        let content_hash = stable_bytes_hash(state_payload.as_bytes());
+        RuntimeCheckpoint {
+            identity: StandingProgramIdentity {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_ids: vec!["purchases_by_user".to_string()],
+                sql_hash: format!("sha256:{}", "a".repeat(64)),
+                input_catalog_hash: format!("sha256:{}", "b".repeat(64)),
+                output_schema_hash: format!("sha256:{}", "c".repeat(64)),
+                compiler_identity: "velorix-logical-view-plan-v1".to_string(),
+                runtime_packages: vec![RuntimePackageIdentity {
+                    name: "velorix-runtime".to_string(),
+                    version: "test".to_string(),
+                }],
+                package_feature_set: vec!["materialized-view-runtime".to_string()],
+                runtime_compatibility: "velorix-materialized-view-runtime-v1".to_string(),
+                checkpoint_codec_identity: "velorix-standing-program-checkpoint-v1".to_string(),
+                native_code_policy: NativeCodePolicy::DisabledNoExternalDependencies,
+            },
+            logical_epoch: 7,
+            input_frontiers: vec![RelationFrontier {
+                relation_id: "purchases".to_string(),
+                relation_version: "2026-05-24.v1".to_string(),
+                committed_offset_exclusive: 11,
+            }],
+            input_event_time_frontiers: Vec::new(),
+            output_frontiers: vec![ViewFrontier {
+                view_id: "purchases_by_user".to_string(),
+                committed_epoch: 7,
+            }],
+            checkpoint_codec_identity: "velorix-standing-program-checkpoint-v1".to_string(),
+            state_root: DurableStateRoot {
+                object_key: "v1/state/materialized-view-runtime/program-purchases/checkpoint"
+                    .to_string(),
+                content_hash,
+            },
+            state_payload: Some(RuntimeCheckpointStatePayload {
+                codec_identity: "velorix-standing-program-checkpoint-v1".to_string(),
+                payload: state_payload,
+            }),
+            output_manifest_refs,
+            owner_epoch: None,
+        }
+    }
+
+    async fn test_api_state() -> ApiState {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        test_api_state_with_store(store, "api-test-owner", false).await
+    }
+
+    async fn test_api_state_with_store(
+        store: Arc<dyn ObjectStore>,
+        owner_id: &str,
+        reconstruct_ingest_admission: bool,
+    ) -> ApiState {
+        let validated = validate_operator_authority(
+            ObjectStoreAuthorityRef {
+                store_id: "test".to_string(),
+                namespace: "unit".to_string(),
+            },
+            store,
+            "memory",
+            "api-test",
+        )
+        .await
+        .unwrap();
+        ApiState::from_validated_authority_with_ingest_admission_startup(
+            validated,
+            "ignored",
+            owner_id,
+            reconstruct_ingest_admission,
+        )
+        .await
+        .unwrap()
+    }
+
+    fn test_checkpoint_key(checkpoint: &RuntimeCheckpoint) -> ObjectKey {
+        ObjectKey::standing_runtime_checkpoint(
+            &checkpoint.identity.tenant_id,
+            &checkpoint.identity.program_id,
+            "purchases_by_user",
+            checkpoint.logical_epoch,
+            &checkpoint.state_root.content_hash,
+        )
+        .unwrap()
+    }
+
+    fn test_checkpoint_pointer(
+        checkpoint_key: &ObjectKey,
+        checkpoint: &RuntimeCheckpoint,
+    ) -> StandingRuntimeCheckpointPointer {
+        StandingRuntimeCheckpointPointer {
+            tenant_id: checkpoint.identity.tenant_id.clone(),
+            program_id: checkpoint.identity.program_id.clone(),
+            view_id: "purchases_by_user".to_string(),
+            checkpoint_key: checkpoint_key.as_str().to_string(),
+            logical_epoch: checkpoint.logical_epoch,
+            content_hash: checkpoint.state_root.content_hash.clone(),
+            output_manifest_refs: checkpoint.output_manifest_refs.clone(),
+        }
+    }
+
+    fn test_checkpoint_record(
+        checkpoint_key: &ObjectKey,
+        checkpoint: RuntimeCheckpoint,
+    ) -> StandingRuntimeCheckpointRecord {
+        StandingRuntimeCheckpointRecord {
+            schema_version: 1,
+            record_kind: "standing_runtime_checkpoint_v1".to_string(),
+            view_id: "purchases_by_user".to_string(),
+            checkpoint_key: checkpoint_key.as_str().to_string(),
+            previous_checkpoint: None,
+            checkpoint,
+            replay_checkpoints: Vec::new(),
+        }
+    }
+
+    fn test_purchases_catalog() -> VelorixRelationCatalogV1 {
+        let relation_schema = VelorixRelationSchemaV1 {
+            relation_id: "purchases".to_string(),
+            relation_name: "purchases".to_string(),
+            relation_version: "2026-05-24.v1".to_string(),
+            columns: vec![
+                RelationColumnV1 {
+                    column_id: "user_id".to_string(),
+                    name: "user_id".to_string(),
+                    logical_type: VelorixLogicalTypeV1::Utf8,
+                    physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+                    nullable: false,
+                    ordinal: 0,
+                    semantic_role: RelationSemanticRoleV1::Metadata,
+                },
+                RelationColumnV1 {
+                    column_id: "amount".to_string(),
+                    name: "amount".to_string(),
+                    logical_type: VelorixLogicalTypeV1::Int64,
+                    physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                    nullable: false,
+                    ordinal: 1,
+                    semantic_role: RelationSemanticRoleV1::Metadata,
+                },
+                RelationColumnV1 {
+                    column_id: "delta".to_string(),
+                    name: "delta".to_string(),
+                    logical_type: VelorixLogicalTypeV1::Int64,
+                    physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                    nullable: false,
+                    ordinal: 2,
+                    semantic_role: RelationSemanticRoleV1::Weight,
+                },
+            ],
+            primary_key_column_ids: vec!["user_id".to_string()],
+            weight_column_id: "delta".to_string(),
+            allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+            event_time_column_id: None,
+        };
+        let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema)
+            .expect("test relation schema should fingerprint");
+
+        VelorixRelationCatalogV1 {
+            schema_version: RELATION_SCHEMA_VERSION_V1,
+            relation_schema,
+            schema_fingerprint: schema_fingerprint.clone(),
+            datafusion_registration: DataFusionRegistrationV1 {
+                name: "purchases".to_string(),
+                mode: DataFusionRegistrationModeV1::Table,
+            },
+            incremental_relation: IncrementalRelationBindingV1 {
+                relation_id: "purchases".to_string(),
+                schema_fingerprint,
+            },
+            incremental_adapter: IncrementalAdapterBindingV1 {
+                adapter_id: CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID.to_string(),
+            },
+        }
+    }
+
+    fn test_purchases_event_time_catalog() -> VelorixRelationCatalogV1 {
+        let mut catalog = test_purchases_catalog();
+        catalog.relation_schema.columns.insert(
+            2,
+            RelationColumnV1 {
+                column_id: "event_time".to_string(),
+                name: "event_time".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 2,
+                semantic_role: RelationSemanticRoleV1::EventTime,
+            },
+        );
+        for (ordinal, column) in catalog.relation_schema.columns.iter_mut().enumerate() {
+            column.ordinal = ordinal as u32;
+        }
+        catalog.relation_schema.event_time_column_id = Some("event_time".to_string());
+        let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema)
+            .expect("event-time purchases schema should fingerprint");
+        catalog.schema_fingerprint = schema_fingerprint.clone();
+        catalog.incremental_relation.schema_fingerprint = schema_fingerprint;
+        catalog
+    }
+
+    fn test_scores_catalog() -> VelorixRelationCatalogV1 {
+        let relation_schema = VelorixRelationSchemaV1 {
+            relation_id: "scores".to_string(),
+            relation_name: "scores".to_string(),
+            relation_version: "2026-05-24.v1".to_string(),
+            columns: vec![
+                RelationColumnV1 {
+                    column_id: "user_id".to_string(),
+                    name: "user_id".to_string(),
+                    logical_type: VelorixLogicalTypeV1::Utf8,
+                    physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+                    nullable: false,
+                    ordinal: 0,
+                    semantic_role: RelationSemanticRoleV1::PrimaryKey,
+                },
+                RelationColumnV1 {
+                    column_id: "score".to_string(),
+                    name: "score".to_string(),
+                    logical_type: VelorixLogicalTypeV1::Int64,
+                    physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                    nullable: false,
+                    ordinal: 1,
+                    semantic_role: RelationSemanticRoleV1::Metadata,
+                },
+                RelationColumnV1 {
+                    column_id: "delta".to_string(),
+                    name: "delta".to_string(),
+                    logical_type: VelorixLogicalTypeV1::Int64,
+                    physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                    nullable: false,
+                    ordinal: 2,
+                    semantic_role: RelationSemanticRoleV1::Weight,
+                },
+            ],
+            primary_key_column_ids: vec!["user_id".to_string()],
+            weight_column_id: "delta".to_string(),
+            allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+            event_time_column_id: None,
+        };
+        let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema)
+            .expect("scores catalog should fingerprint");
+        VelorixRelationCatalogV1 {
+            schema_version: RELATION_SCHEMA_VERSION_V1,
+            relation_schema,
+            schema_fingerprint: schema_fingerprint.clone(),
+            datafusion_registration: DataFusionRegistrationV1 {
+                name: "scores".to_string(),
+                mode: DataFusionRegistrationModeV1::Table,
+            },
+            incremental_relation: IncrementalRelationBindingV1 {
+                relation_id: "scores".to_string(),
+                schema_fingerprint,
+            },
+            incremental_adapter: IncrementalAdapterBindingV1 {
+                adapter_id: CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID.to_string(),
+            },
+        }
+    }
+
+    fn test_accounts_catalog() -> VelorixRelationCatalogV1 {
+        let relation_schema = VelorixRelationSchemaV1 {
+            relation_id: "accounts".to_string(),
+            relation_name: "accounts".to_string(),
+            relation_version: "2026-05-24.v1".to_string(),
+            columns: vec![
+                RelationColumnV1 {
+                    column_id: "account_id".to_string(),
+                    name: "account_id".to_string(),
+                    logical_type: VelorixLogicalTypeV1::Utf8,
+                    physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+                    nullable: false,
+                    ordinal: 0,
+                    semantic_role: RelationSemanticRoleV1::PrimaryKey,
+                },
+                RelationColumnV1 {
+                    column_id: "limit".to_string(),
+                    name: "limit".to_string(),
+                    logical_type: VelorixLogicalTypeV1::Int64,
+                    physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                    nullable: false,
+                    ordinal: 1,
+                    semantic_role: RelationSemanticRoleV1::Value,
+                },
+                RelationColumnV1 {
+                    column_id: "delta".to_string(),
+                    name: "delta".to_string(),
+                    logical_type: VelorixLogicalTypeV1::Int64,
+                    physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                    nullable: false,
+                    ordinal: 2,
+                    semantic_role: RelationSemanticRoleV1::Weight,
+                },
+            ],
+            primary_key_column_ids: vec!["account_id".to_string()],
+            weight_column_id: "delta".to_string(),
+            allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+            event_time_column_id: None,
+        };
+        let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema)
+            .expect("accounts catalog should fingerprint");
+        VelorixRelationCatalogV1 {
+            schema_version: RELATION_SCHEMA_VERSION_V1,
+            relation_schema,
+            schema_fingerprint: schema_fingerprint.clone(),
+            datafusion_registration: DataFusionRegistrationV1 {
+                name: "accounts".to_string(),
+                mode: DataFusionRegistrationModeV1::Table,
+            },
+            incremental_relation: IncrementalRelationBindingV1 {
+                relation_id: "accounts".to_string(),
+                schema_fingerprint,
+            },
+            incremental_adapter: IncrementalAdapterBindingV1 {
+                adapter_id: CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID.to_string(),
+            },
+        }
+    }
+
+    fn test_device_status_catalog() -> VelorixRelationCatalogV1 {
+        let relation_schema = VelorixRelationSchemaV1 {
+            relation_id: "device_status".to_string(),
+            relation_name: "device_status".to_string(),
+            relation_version: "2026-05-24.v1".to_string(),
+            columns: vec![
+                RelationColumnV1 {
+                    column_id: "device_id".to_string(),
+                    name: "device_id".to_string(),
+                    logical_type: VelorixLogicalTypeV1::Utf8,
+                    physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+                    nullable: false,
+                    ordinal: 0,
+                    semantic_role: RelationSemanticRoleV1::PrimaryKey,
+                },
+                RelationColumnV1 {
+                    column_id: "enabled".to_string(),
+                    name: "enabled".to_string(),
+                    logical_type: VelorixLogicalTypeV1::Bool,
+                    physical_arrow_type: ArrowPhysicalTypeV1::Boolean,
+                    nullable: false,
+                    ordinal: 1,
+                    semantic_role: RelationSemanticRoleV1::Value,
+                },
+                RelationColumnV1 {
+                    column_id: "event_time".to_string(),
+                    name: "event_time".to_string(),
+                    logical_type: VelorixLogicalTypeV1::Int64,
+                    physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                    nullable: false,
+                    ordinal: 2,
+                    semantic_role: RelationSemanticRoleV1::EventTime,
+                },
+                RelationColumnV1 {
+                    column_id: "delta".to_string(),
+                    name: "delta".to_string(),
+                    logical_type: VelorixLogicalTypeV1::Int64,
+                    physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                    nullable: false,
+                    ordinal: 3,
+                    semantic_role: RelationSemanticRoleV1::Weight,
+                },
+            ],
+            primary_key_column_ids: vec!["device_id".to_string()],
+            weight_column_id: "delta".to_string(),
+            allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+            event_time_column_id: Some("event_time".to_string()),
+        };
+        let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema)
+            .expect("device status catalog should fingerprint");
+        VelorixRelationCatalogV1 {
+            schema_version: RELATION_SCHEMA_VERSION_V1,
+            relation_schema,
+            schema_fingerprint: schema_fingerprint.clone(),
+            datafusion_registration: DataFusionRegistrationV1 {
+                name: "device_status".to_string(),
+                mode: DataFusionRegistrationModeV1::Table,
+            },
+            incremental_relation: IncrementalRelationBindingV1 {
+                relation_id: "device_status".to_string(),
+                schema_fingerprint,
+            },
+            incremental_adapter: IncrementalAdapterBindingV1 {
+                adapter_id: CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID.to_string(),
+            },
+        }
     }
 }

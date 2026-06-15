@@ -17,12 +17,12 @@ use serde_json::json;
 use tempfile::TempDir;
 use velorix_core::{
     delta::{DeltaBatch, DeltaKey, DeltaRecord, DeltaValue},
-    feldera_artifact::catalog_input_relation_schema,
     query::{QueryError, QueryPolicy, QueryPolicyError},
     relation::{
         datafusion_schema_from_catalog, DATAFUSION_RELATION_ID_METADATA_KEY,
         DATAFUSION_RELATION_VERSION_METADATA_KEY, DATAFUSION_SCHEMA_FINGERPRINT_METADATA_KEY,
     },
+    view_contract::catalog_input_relation_schema,
 };
 use velorix_runtime::{
     query::{
@@ -114,6 +114,7 @@ fn ingest_envelope_bytes(
             partition_id,
             start_offset_inclusive,
             end_offset_exclusive,
+            event_time_watermark: None,
         },
         input,
     )
@@ -158,6 +159,7 @@ async fn append_ingest_envelope(
                 partition_id,
                 start_offset_inclusive,
                 end_offset_exclusive,
+                event_time_watermark: None,
             },
             input,
         ))
@@ -339,6 +341,7 @@ async fn recovery_rejects_ingest_envelope_with_wrong_relation_version() {
             partition_id: 0,
             start_offset_inclusive: 0,
             end_offset_exclusive: 1,
+            event_time_watermark: None,
         },
         &input,
     );
@@ -375,6 +378,7 @@ async fn recovery_rejects_ingest_envelope_with_wrong_schema_fingerprint() {
             partition_id: 0,
             start_offset_inclusive: 0,
             end_offset_exclusive: 1,
+            event_time_watermark: None,
         },
         &input,
     );
@@ -396,7 +400,7 @@ async fn recovery_rejects_ingest_envelope_with_wrong_schema_fingerprint() {
 }
 
 #[tokio::test]
-async fn arrow_ingest_datafusion_and_feldera_use_the_same_catalog_identity() {
+async fn arrow_ingest_datafusion_and_view_contract_use_the_same_catalog_identity() {
     let (_temp_dir, store) = temp_store();
     let ingest_coordinator = IngestAdmissionCoordinator::new(IngestLog::new(Arc::clone(&store)));
     let input = batch([input_delta("account-a", 4, 1)]);
@@ -418,7 +422,7 @@ async fn arrow_ingest_datafusion_and_feldera_use_the_same_catalog_identity() {
         .await
         .unwrap();
     let datafusion_schema = datafusion_schema_from_catalog(&catalog).unwrap();
-    let feldera_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let view_contract_schema = catalog_input_relation_schema(&catalog).unwrap();
 
     assert_eq!(recovered.replayed_batch_count(), 1);
     assert_eq!(
@@ -446,15 +450,15 @@ async fn arrow_ingest_datafusion_and_feldera_use_the_same_catalog_identity() {
         catalog.schema_fingerprint.as_str()
     );
     assert_eq!(
-        feldera_schema.relation_id,
+        view_contract_schema.relation_id,
         catalog.relation_schema.relation_id
     );
     assert_eq!(
-        feldera_schema.relation_version,
+        view_contract_schema.relation_version,
         catalog.relation_schema.relation_version
     );
     assert_eq!(
-        feldera_schema.schema_fingerprint,
+        view_contract_schema.schema_fingerprint,
         catalog.schema_fingerprint.as_str()
     );
 }

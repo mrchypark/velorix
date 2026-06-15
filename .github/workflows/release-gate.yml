@@ -11,18 +11,6 @@ on:
         description: Path to the production readiness evidence JSON.
         required: false
         default: ""
-      feldera-spec-path:
-        description: Path to the Feldera standing-view spec JSON.
-        required: false
-        default: ""
-      feldera-metadata-path:
-        description: Path to the Feldera compile artifact metadata JSON.
-        required: false
-        default: ""
-      feldera-artifact-package-path:
-        description: Path to the compiled Feldera artifact package.
-        required: false
-        default: ""
       production-gc-evidence-path:
         description: Path to production GC run evidence JSON.
         required: false
@@ -61,9 +49,6 @@ env:
   RELEASE_COMMIT: ${{ github.sha }}
   S3_BENCHMARK_RESULT_PATH: ${{ inputs.s3-result-path }}
   READINESS_EVIDENCE_PATH: ${{ inputs.readiness-evidence-path }}
-  FELDERA_SPEC_PATH: ${{ inputs.feldera-spec-path }}
-  FELDERA_METADATA_PATH: ${{ inputs.feldera-metadata-path }}
-  FELDERA_ARTIFACT_PACKAGE_PATH: ${{ inputs.feldera-artifact-package-path }}
   PRODUCTION_GC_EVIDENCE_PATH: ${{ inputs.production-gc-evidence-path }}
   RUSTFS_PRODUCTION_GC_VALIDATION_EVIDENCE_PATH: ${{ inputs.rustfs-production-gc-validation-evidence-path }}
   INGEST_WRITER_LIFECYCLE_EVIDENCE_PATH: ${{ inputs.ingest-writer-lifecycle-evidence-path }}
@@ -154,35 +139,6 @@ jobs:
           cargo run -p velorix-cli -- release-status-validate \
             --status-matrix docs/architecture/production-readiness-status.md
 
-      - name: Validate Feldera artifact hash evidence
-        if: ${{ inputs.feldera-spec-path != '' || inputs.feldera-metadata-path != '' || inputs.feldera-artifact-package-path != '' }}
-        run: |
-          # Feldera generated artifact hash verification is optional release
-          # diagnostics. Supplying any Feldera artifact input intentionally
-          # requires the complete spec/metadata/package triple so partial
-          # diagnostics cannot be mistaken for verified evidence.
-          if [ -z "$FELDERA_SPEC_PATH" ] || [ -z "$FELDERA_METADATA_PATH" ] || [ -z "$FELDERA_ARTIFACT_PACKAGE_PATH" ]; then
-            echo "Feldera artifact hash verification is optional, but requires all three inputs when enabled: feldera-spec-path, feldera-metadata-path, and feldera-artifact-package-path"
-            exit 1
-          fi
-          test -f "$FELDERA_SPEC_PATH"
-          test -f "$FELDERA_METADATA_PATH"
-          test -f "$FELDERA_ARTIFACT_PACKAGE_PATH"
-          mkdir -p target/release-evidence/feldera-inputs
-          cp "$FELDERA_SPEC_PATH" target/release-evidence/feldera-inputs/standing-view-spec.json
-          cp "$FELDERA_METADATA_PATH" target/release-evidence/feldera-inputs/compile-artifact-metadata.json
-          cp "$FELDERA_ARTIFACT_PACKAGE_PATH" target/release-evidence/feldera-inputs/artifact-package
-          (
-            cd target/release-evidence/feldera-inputs
-            sha256sum standing-view-spec.json compile-artifact-metadata.json artifact-package > SHA256SUMS
-          )
-          cargo run -p velorix-cli -- feldera-artifact-verify \
-            --spec "$FELDERA_SPEC_PATH" \
-            --metadata "$FELDERA_METADATA_PATH" \
-            --artifact-package "$FELDERA_ARTIFACT_PACKAGE_PATH" \
-            --json \
-            > target/release-evidence/feldera-artifact-hash.json
-
       - name: Run release benchmark gate
         run: |
           test -f "$S3_BENCHMARK_RESULT_PATH"
@@ -268,19 +224,12 @@ jobs:
               --attester velorix-ci \
               --update-product-evidence
           test "$HIQLITE_BACKEND_TIME_CANONICAL_BUNDLE_SHA256" = "$(sha256sum "$HIQLITE_BACKEND_TIME_CANONICAL_BUNDLE_PATH" | awk '{print $1}')"
-          FELDERA_READINESS_ARGS=()
-          # Omitted Feldera hash evidence is accepted for product completion;
-          # readiness-report only receives it when the optional diagnostic step ran.
-          if [ -f target/release-evidence/feldera-artifact-hash.json ]; then
-            FELDERA_READINESS_ARGS+=(--feldera-artifact-hash-evidence target/release-evidence/feldera-artifact-hash.json)
-          fi
           cargo run -p velorix-cli -- readiness-report \
             --evidence "$READINESS_EVIDENCE_PATH" \
             --require-release-artifacts \
-            --dependency-governance-evidence target/dependency-governance/local-dependency-governance-evidence.json \
+            --dependency-governance-evidence target/dependency-governance/dependency-governance-evidence.json \
             --dependency-governance-manifest dependency-governance.json \
             --release-commit "$RELEASE_COMMIT" \
-            "${FELDERA_READINESS_ARGS[@]}" \
             --s3-release-benchmark-gate-evidence target/release-evidence/s3-release-benchmark-gate.json \
             --production-gc-run-evidence "$PRODUCTION_GC_RELEASE_PATH" \
             --rustfs-production-gc-validation-evidence "$RUSTFS_PRODUCTION_GC_RECHECKED_PATH" \
@@ -310,6 +259,5 @@ jobs:
           path: |
             target/release-evidence/*.json
             target/release-evidence/rustfs-production-gc/**
-            target/release-evidence/feldera-inputs/**
             target/release-evidence/ingest-writer-lifecycle/**
             target/release-evidence/standing-runtime-product/**

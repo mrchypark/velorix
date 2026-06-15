@@ -103,9 +103,19 @@ impl PrototypeIncrementalEngine {
     }
 
     pub fn with_aggregate_value_mode(value_mode: AggregateValueMode) -> Self {
+        Self::with_aggregate_value_mode_and_extrema(value_mode, false)
+    }
+
+    pub fn with_aggregate_value_mode_and_extrema(
+        value_mode: AggregateValueMode,
+        track_extrema: bool,
+    ) -> Self {
         Self {
             logical_epoch: 0,
-            aggregate: KeyedSumCountAggregate::with_value_mode(value_mode),
+            aggregate: KeyedSumCountAggregate::with_value_mode_and_extrema(
+                value_mode,
+                track_extrema,
+            ),
         }
     }
 
@@ -113,11 +123,20 @@ impl PrototypeIncrementalEngine {
         checkpoint: EngineCheckpoint,
         value_mode: AggregateValueMode,
     ) -> Result<Self, EngineError> {
+        Self::from_checkpoint_with_aggregate_value_mode_and_extrema(checkpoint, value_mode, false)
+    }
+
+    pub fn from_checkpoint_with_aggregate_value_mode_and_extrema(
+        checkpoint: EngineCheckpoint,
+        value_mode: AggregateValueMode,
+        track_extrema: bool,
+    ) -> Result<Self, EngineError> {
         Ok(Self {
             logical_epoch: checkpoint.logical_epoch,
-            aggregate: KeyedSumCountAggregate::from_state_with_value_mode(
+            aggregate: KeyedSumCountAggregate::from_state_with_value_mode_and_extrema(
                 &checkpoint.state,
                 value_mode,
+                track_extrema,
             )?,
         })
     }

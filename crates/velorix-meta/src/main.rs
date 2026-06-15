@@ -9,10 +9,10 @@ use object_store::{aws::AmazonS3Builder, path::Path, prefix::PrefixStore, Object
 use tonic::{transport::Server, Code, Request};
 use velorix_core::relation::{
     ArrowPhysicalTypeV1, DataFusionRegistrationModeV1, DataFusionRegistrationV1,
-    FelderaRelationBindingV1, IncrementalAdapterBindingV1, RelationColumnV1, RelationOperationV1,
-    RelationSemanticRoleV1, SchemaFingerprintV1, VelorixLogicalTypeV1, VelorixRelationCatalogV1,
-    VelorixRelationSchemaV1, CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID,
-    RELATION_SCHEMA_VERSION_V1,
+    IncrementalAdapterBindingV1, IncrementalRelationBindingV1, RelationColumnV1,
+    RelationOperationV1, RelationSemanticRoleV1, SchemaFingerprintV1, VelorixLogicalTypeV1,
+    VelorixRelationCatalogV1, VelorixRelationSchemaV1,
+    CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID, RELATION_SCHEMA_VERSION_V1,
 };
 use velorix_meta::{
     proto::{
@@ -415,6 +415,7 @@ fn smoke_checkpoint_pointer(
         checkpoint_key,
         logical_epoch,
         content_hash,
+        output_manifest_refs: Vec::new(),
     })
 }
 
@@ -489,7 +490,7 @@ fn smoke_relation_catalog(probe_id: &str) -> anyhow::Result<VelorixRelationCatal
             mode: DataFusionRegistrationModeV1::View,
             name: "velorix_meta_smoke".to_string(),
         },
-        feldera_relation: FelderaRelationBindingV1 {
+        incremental_relation: IncrementalRelationBindingV1 {
             relation_id: "velorix_meta_smoke".to_string(),
             schema_fingerprint,
         },

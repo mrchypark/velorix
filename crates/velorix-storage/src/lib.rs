@@ -4,7 +4,6 @@
 
 pub mod capability;
 pub mod checkpoint_index;
-pub mod feldera_artifact_registry;
 pub mod gc;
 pub mod ingest_envelope;
 pub mod log;
@@ -15,4 +14,3 @@ pub mod ownership;
 pub mod relation_catalog_registry;
 pub mod state;
 pub mod state_store;
-pub mod view_compile_deploy_job_registry;

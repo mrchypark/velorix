@@ -4,8 +4,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::delta::DeltaBatch;
 use crate::engine::LogicalEpoch;
-use crate::feldera_artifact::RelationSchema;
+use crate::view_contract::RelationSchema;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -17,9 +18,9 @@ pub struct StandingProgramIdentity {
     pub input_catalog_hash: String,
     pub output_schema_hash: String,
     pub compiler_identity: String,
-    pub runtime_packages: Vec<FelderaRuntimePackageIdentity>,
+    pub runtime_packages: Vec<RuntimePackageIdentity>,
     pub package_feature_set: Vec<String>,
-    pub dbsp_runtime_compatibility: String,
+    pub runtime_compatibility: String,
     pub checkpoint_codec_identity: String,
     pub native_code_policy: NativeCodePolicy,
 }
@@ -32,10 +33,7 @@ impl StandingProgramIdentity {
         require_sha256("input_catalog_hash", &self.input_catalog_hash)?;
         require_sha256("output_schema_hash", &self.output_schema_hash)?;
         require_non_empty("compiler_identity", &self.compiler_identity)?;
-        require_non_empty(
-            "dbsp_runtime_compatibility",
-            &self.dbsp_runtime_compatibility,
-        )?;
+        require_non_empty("runtime_compatibility", &self.runtime_compatibility)?;
         require_non_empty("checkpoint_codec_identity", &self.checkpoint_codec_identity)?;
         if self.view_ids.is_empty() {
             return Err(StandingProgramRuntimeError::InvalidProgramIdentity { field: "view_ids" });
@@ -62,12 +60,12 @@ impl StandingProgramIdentity {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct FelderaRuntimePackageIdentity {
+pub struct RuntimePackageIdentity {
     pub name: String,
     pub version: String,
 }
 
-impl FelderaRuntimePackageIdentity {
+impl RuntimePackageIdentity {
     fn validate(&self) -> Result<(), StandingProgramRuntimeError> {
         require_non_empty("runtime_packages.name", &self.name)?;
         require_non_empty("runtime_packages.version", &self.version)?;
@@ -106,6 +104,7 @@ pub struct RelationInputBatch {
     pub schema_fingerprint: String,
     pub start_offset_inclusive: u64,
     pub end_offset_exclusive: u64,
+    pub event_time_watermark: Option<InputEventTimeWatermark>,
     pub batches: Vec<RecordBatch>,
 }
 
@@ -117,10 +116,19 @@ pub struct ViewOutputBatch {
 }
 
 #[derive(Clone, Debug)]
+pub struct ViewOutputDelta {
+    pub view_id: String,
+    pub schema_fingerprint: String,
+    pub delta: DeltaBatch,
+}
+
+#[derive(Clone, Debug)]
 pub struct EpochCommit {
     pub logical_epoch: LogicalEpoch,
     pub idempotency_key: EpochIdempotencyKey,
     pub input_frontiers: Vec<RelationFrontier>,
+    pub input_event_time_frontiers: Vec<InputEventTimeFrontier>,
+    pub output_deltas: Vec<ViewOutputDelta>,
     pub output_batches: Vec<ViewOutputBatch>,
 }
 
@@ -130,6 +138,29 @@ pub struct RelationFrontier {
     pub relation_id: String,
     pub relation_version: String,
     pub committed_offset_exclusive: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InputEventTimeWatermark {
+    pub stream_id: String,
+    pub partition_id: u32,
+    pub event_time_column_id: String,
+    pub max_observed_event_time_ns: i64,
+    pub watermark_ns: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InputEventTimeFrontier {
+    pub relation_id: String,
+    pub relation_version: String,
+    pub schema_fingerprint: String,
+    pub stream_id: String,
+    pub partition_id: u32,
+    pub event_time_column_id: String,
+    pub max_observed_event_time_ns: i64,
+    pub watermark_ns: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -152,6 +183,8 @@ pub struct RuntimeCheckpoint {
     pub identity: StandingProgramIdentity,
     pub logical_epoch: LogicalEpoch,
     pub input_frontiers: Vec<RelationFrontier>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_event_time_frontiers: Vec<InputEventTimeFrontier>,
     pub output_frontiers: Vec<ViewFrontier>,
     pub checkpoint_codec_identity: String,
     pub state_root: DurableStateRoot,

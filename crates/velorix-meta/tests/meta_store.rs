@@ -94,7 +94,7 @@ async fn relation_catalog_create_rejects_same_identity_with_different_body() {
     changed.relation_schema.relation_name = "orders_changed".to_string();
     changed.schema_fingerprint =
         SchemaFingerprintV1::for_relation_schema(&changed.relation_schema).unwrap();
-    changed.feldera_relation.schema_fingerprint = changed.schema_fingerprint.clone();
+    changed.incremental_relation.schema_fingerprint = changed.schema_fingerprint.clone();
 
     store.store_relation_catalog(first).await.unwrap();
     let error = store.store_relation_catalog(changed).await.unwrap_err();
@@ -233,6 +233,90 @@ async fn standing_runtime_checkpoint_publish_is_linearizable_and_idempotent() {
     assert_eq!(conflict, PublishStandingRuntimeCheckpointOutcome::Conflict);
     assert_eq!(advanced, PublishStandingRuntimeCheckpointOutcome::Published);
     assert_eq!(latest, Some(second));
+}
+
+#[tokio::test]
+async fn standing_runtime_checkpoint_pointer_preserves_output_manifest_refs() {
+    let store = InMemoryMetaStore::default();
+    let owner = acquire_owner(&store, "owner-a").await;
+    let mut pointer = checkpoint_pointer(1, "a");
+    let output_hash = "b".repeat(64);
+    let delta_hash = "c".repeat(64);
+    pointer.output_manifest_refs = vec![format!(
+        "{}v1/standing-runtime-output-manifests/default/program/view/epochs/00000000000000000001/sha256/{output_hash}.output-manifest.json",
+        velorix_meta::STANDING_RUNTIME_OUTPUT_MANIFEST_REF_PREFIX,
+    ), format!(
+        "{}v1/standing-runtime-output-deltas/default/program/view/epochs/00000000000000000001/sha256/{delta_hash}.output-delta.json",
+        velorix_meta::STANDING_RUNTIME_OUTPUT_DELTA_REF_PREFIX,
+    )];
+
+    let outcome = store
+        .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
+            expected_previous: None,
+            candidate: pointer.clone(),
+            owner,
+        })
+        .await
+        .unwrap();
+    let latest = store
+        .read_standing_runtime_checkpoint("default", "program", "view")
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, PublishStandingRuntimeCheckpointOutcome::Published);
+    assert_eq!(latest, Some(pointer));
+}
+
+#[tokio::test]
+async fn standing_runtime_checkpoint_pointer_rejects_invalid_output_manifest_refs() {
+    let store = InMemoryMetaStore::default();
+    let owner = acquire_owner(&store, "owner-a").await;
+    let mut wrong_prefix = checkpoint_pointer(1, "a");
+    wrong_prefix.output_manifest_refs = vec![format!(
+        "standing-runtime-checkpoint:{}",
+        wrong_prefix.checkpoint_key
+    )];
+
+    assert!(store
+        .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
+            expected_previous: None,
+            candidate: wrong_prefix,
+            owner: owner.clone(),
+        })
+        .await
+        .is_err());
+
+    let mut wrong_epoch = checkpoint_pointer(1, "a");
+    let output_hash = "b".repeat(64);
+    wrong_epoch.output_manifest_refs = vec![format!(
+        "{}v1/standing-runtime-output-manifests/default/program/view/epochs/00000000000000000002/sha256/{output_hash}.output-manifest.json",
+        velorix_meta::STANDING_RUNTIME_OUTPUT_MANIFEST_REF_PREFIX,
+    )];
+
+    assert!(store
+        .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
+            expected_previous: None,
+            candidate: wrong_epoch,
+            owner: owner.clone(),
+        })
+        .await
+        .is_err());
+
+    let mut wrong_delta_epoch = checkpoint_pointer(1, "a");
+    let delta_hash = "c".repeat(64);
+    wrong_delta_epoch.output_manifest_refs = vec![format!(
+        "{}v1/standing-runtime-output-deltas/default/program/view/epochs/00000000000000000002/sha256/{delta_hash}.output-delta.json",
+        velorix_meta::STANDING_RUNTIME_OUTPUT_DELTA_REF_PREFIX,
+    )];
+
+    assert!(store
+        .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
+            expected_previous: None,
+            candidate: wrong_delta_epoch,
+            owner,
+        })
+        .await
+        .is_err());
 }
 
 #[tokio::test]
@@ -377,6 +461,7 @@ fn checkpoint_pointer(epoch: u64, hash_seed: &str) -> StandingRuntimeCheckpointP
         ),
         logical_epoch: epoch,
         content_hash: format!("sha256:{hash}"),
+        output_manifest_refs: Vec::new(),
     }
 }
 

@@ -1116,7 +1116,7 @@ fn relation_catalog_json() -> Value {
             "name": "deposits",
             "mode": "table",
         },
-        "feldera_relation": {
+        "incremental_relation": {
             "relation_id": "deposits",
             "schema_fingerprint": relation().schema_fingerprint,
         },
@@ -1136,6 +1136,7 @@ fn catalog_envelope_bytes_for(start_offset_inclusive: u64, end_offset_exclusive:
             partition_id: 0,
             start_offset_inclusive,
             end_offset_exclusive,
+            event_time_watermark: None,
         },
         &[valid_batch()],
     )

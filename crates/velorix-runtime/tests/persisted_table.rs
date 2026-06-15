@@ -22,7 +22,7 @@ use velorix_core::{
     query::{QueryError, QueryExecutionPolicyV1, QueryPolicy, QueryPolicyError},
     relation::{
         ArrowPhysicalTypeV1, DataFusionRegistrationModeV1, DataFusionRegistrationV1,
-        FelderaRelationBindingV1, IncrementalAdapterBindingV1, RelationColumnV1,
+        IncrementalAdapterBindingV1, IncrementalRelationBindingV1, RelationColumnV1,
         RelationOperationV1, RelationSemanticRoleV1, SchemaFingerprintV1, VelorixLogicalTypeV1,
         VelorixRelationCatalogV1, VelorixRelationSchemaV1, ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID,
         RELATION_SCHEMA_VERSION_V1,
@@ -2408,7 +2408,7 @@ fn orders_relation_catalog() -> VelorixRelationCatalogV1 {
             name: "orders".to_string(),
             mode: DataFusionRegistrationModeV1::Table,
         },
-        feldera_relation: FelderaRelationBindingV1 {
+        incremental_relation: IncrementalRelationBindingV1 {
             relation_id: "orders".to_string(),
             schema_fingerprint,
         },
@@ -2424,7 +2424,7 @@ fn mutated_orders_relation_catalog() -> VelorixRelationCatalogV1 {
     let schema_fingerprint =
         SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema).unwrap();
     catalog.schema_fingerprint = schema_fingerprint.clone();
-    catalog.feldera_relation.schema_fingerprint = schema_fingerprint;
+    catalog.incremental_relation.schema_fingerprint = schema_fingerprint;
 
     catalog
 }

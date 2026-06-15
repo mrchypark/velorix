@@ -8,11 +8,12 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use velorix_core::{
-    feldera_artifact::{
-        feldera_spec_hash, validate_materialized_standing_view_spec, FelderaArtifactError,
-        StandingViewSpec,
-    },
     standing_program::StandingProgramIdentity,
+    view_contract::{
+        validate_materialized_standing_view_spec, view_spec_hash, StandingViewSpec,
+        ViewContractError,
+    },
+    view_plan::VelorixLogicalViewPlanV1,
 };
 
 use crate::{
@@ -53,7 +54,6 @@ pub enum UpdateMaterializedViewLifecycleOutcome {
 #[serde(rename_all = "snake_case")]
 pub enum MaterializedViewExecutionMode {
     StandingRuntime,
-    FelderaCompilePending,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -95,7 +95,7 @@ pub struct MaterializedViewLifecycleStatus {
 impl MaterializedViewLifecycleStatus {
     pub fn standing_runtime() -> Self {
         Self {
-            compiler_backend: "linked_generated_package".to_string(),
+            compiler_backend: "materialized_view_runtime".to_string(),
             compile_status: MaterializedViewCompileStatus::Success,
             deployment_status: MaterializedViewDeploymentStatus::Running,
             message: None,
@@ -104,27 +104,9 @@ impl MaterializedViewLifecycleStatus {
 
     pub fn standing_runtime_deploying(message: Option<String>) -> Self {
         Self {
-            compiler_backend: "linked_generated_package".to_string(),
+            compiler_backend: "materialized_view_runtime".to_string(),
             compile_status: MaterializedViewCompileStatus::Success,
             deployment_status: MaterializedViewDeploymentStatus::Deploying,
-            message,
-        }
-    }
-
-    pub fn feldera_compile_pending(message: Option<String>) -> Self {
-        Self {
-            compiler_backend: "feldera_compiler".to_string(),
-            compile_status: MaterializedViewCompileStatus::Pending,
-            deployment_status: MaterializedViewDeploymentStatus::NotDeployed,
-            message,
-        }
-    }
-
-    pub fn feldera_compile_validated(message: Option<String>) -> Self {
-        Self {
-            compiler_backend: "feldera_compiler".to_string(),
-            compile_status: MaterializedViewCompileStatus::Success,
-            deployment_status: MaterializedViewDeploymentStatus::NotDeployed,
             message,
         }
     }
@@ -143,6 +125,8 @@ pub struct ActiveMaterializedViewRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact: Option<MaterializedViewArtifactBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<MaterializedViewRuntimeBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifecycle: Option<MaterializedViewLifecycleStatus>,
 }
 
@@ -153,6 +137,7 @@ pub struct ActiveMaterializedView {
     pub execution_mode: MaterializedViewExecutionMode,
     pub api: Option<MaterializedViewApiMetadata>,
     pub artifact: Option<MaterializedViewArtifactBinding>,
+    pub runtime: Option<MaterializedViewRuntimeBinding>,
     pub lifecycle: MaterializedViewLifecycleStatus,
 }
 
@@ -161,13 +146,23 @@ pub struct ActiveMaterializedView {
 pub struct MaterializedViewArtifactBinding {
     pub artifact_id: String,
     pub artifact_hash: String,
-    pub generated_rust_crate_name: String,
+    pub runtime_crate_name: String,
     pub state_codec: String,
     pub state_schema_version: u32,
     pub execution_status: String,
     pub execution_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub standing_program_identity: Option<StandingProgramIdentity>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaterializedViewRuntimeBinding {
+    pub runtime_kind: String,
+    pub runtime_version: String,
+    pub standing_program_identity: StandingProgramIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_plan: Option<VelorixLogicalViewPlanV1>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -252,7 +247,6 @@ pub struct MaterializedViewResponseColumnSpec {
 pub enum InvalidExecutionModeReason {
     StandingRuntimeMissingArtifact,
     StandingRuntimeMissingIdentity,
-    FelderaCompilePendingWithArtifact,
     MissingExecutionModeForCurrentSchema { schema_version: u16 },
 }
 
@@ -264,9 +258,6 @@ impl std::fmt::Display for InvalidExecutionModeReason {
             }
             Self::StandingRuntimeMissingIdentity => {
                 write!(f, "standing_runtime requires standing_program_identity")
-            }
-            Self::FelderaCompilePendingWithArtifact => {
-                write!(f, "feldera_compile_pending cannot have an artifact binding")
             }
             Self::MissingExecutionModeForCurrentSchema { schema_version } => write!(
                 f,
@@ -281,7 +272,7 @@ pub enum MaterializedViewRegistryError {
     #[error(transparent)]
     ObjectKey(#[from] ObjectKeyError),
     #[error(transparent)]
-    Validation(#[from] FelderaArtifactError),
+    Validation(#[from] ViewContractError),
     #[error("materialized view registry record conflict at `{object_key}`")]
     RecordConflict { object_key: ObjectKey },
     #[error("materialized view registry record `{object_key}` body identity does not match key")]
@@ -363,6 +354,24 @@ impl MaterializedViewRegistry {
             .await
     }
 
+    pub async fn register_with_api_metadata_runtime_execution(
+        &self,
+        spec: &StandingViewSpec,
+        api: Option<MaterializedViewApiMetadata>,
+        runtime: MaterializedViewRuntimeBinding,
+        lifecycle: Option<MaterializedViewLifecycleStatus>,
+    ) -> Result<RegisterMaterializedViewOutcome, MaterializedViewRegistryError> {
+        self.register_with_api_metadata_artifact_runtime_execution(
+            spec,
+            api,
+            None,
+            Some(runtime),
+            Some(MaterializedViewExecutionMode::StandingRuntime),
+            lifecycle,
+        )
+        .await
+    }
+
     pub async fn register_with_api_metadata_artifact_execution(
         &self,
         spec: &StandingViewSpec,
@@ -371,9 +380,29 @@ impl MaterializedViewRegistry {
         execution_mode: Option<MaterializedViewExecutionMode>,
         lifecycle: Option<MaterializedViewLifecycleStatus>,
     ) -> Result<RegisterMaterializedViewOutcome, MaterializedViewRegistryError> {
+        self.register_with_api_metadata_artifact_runtime_execution(
+            spec,
+            api,
+            artifact,
+            None,
+            execution_mode,
+            lifecycle,
+        )
+        .await
+    }
+
+    async fn register_with_api_metadata_artifact_runtime_execution(
+        &self,
+        spec: &StandingViewSpec,
+        api: Option<MaterializedViewApiMetadata>,
+        artifact: Option<MaterializedViewArtifactBinding>,
+        runtime: Option<MaterializedViewRuntimeBinding>,
+        execution_mode: Option<MaterializedViewExecutionMode>,
+        lifecycle: Option<MaterializedViewLifecycleStatus>,
+    ) -> Result<RegisterMaterializedViewOutcome, MaterializedViewRegistryError> {
         validate_materialized_standing_view_spec(spec)?;
 
-        let spec_hash = feldera_spec_hash(spec)?;
+        let spec_hash = view_spec_hash(spec)?;
         let object_key = self.object_key(&spec.view_id, &spec_hash)?;
         let bytes = serde_json::to_vec(spec)?;
         let result = self
@@ -409,6 +438,7 @@ impl MaterializedViewRegistry {
             spec_hash.as_str(),
             api,
             artifact,
+            runtime,
             execution_mode,
             lifecycle,
         )
@@ -454,6 +484,7 @@ impl MaterializedViewRegistry {
             execution_mode,
             api: record.api,
             artifact: record.artifact,
+            runtime: record.runtime,
             lifecycle,
         })
     }
@@ -487,230 +518,13 @@ impl MaterializedViewRegistry {
                 execution_mode,
                 api: record.api,
                 artifact: record.artifact,
+                runtime: record.runtime,
                 lifecycle,
             });
         }
 
         active.sort_by(|left, right| left.spec.view_id.cmp(&right.spec.view_id));
         Ok(active)
-    }
-
-    pub async fn activate_pending_with_artifact(
-        &self,
-        view_id: &str,
-        spec_hash: &str,
-        artifact: MaterializedViewArtifactBinding,
-        lifecycle: MaterializedViewLifecycleStatus,
-    ) -> Result<ActivateMaterializedViewOutcome, MaterializedViewRegistryError> {
-        let object_key = self.active_object_key(view_id)?;
-        let get_result = self.store.get(&Path::from(object_key.as_str())).await?;
-        let update_version = UpdateVersion {
-            e_tag: get_result.meta.e_tag.clone(),
-            version: get_result.meta.version.clone(),
-        };
-        let bytes = get_result.bytes().await?;
-        let existing: ActiveMaterializedViewRecord = serde_json::from_slice(&bytes)?;
-        self.validate_active_record_identity(view_id, &existing, &object_key)?;
-        let existing_mode = self.normalized_execution_mode(&existing)?;
-
-        let record = ActiveMaterializedViewRecord {
-            schema_version: ACTIVE_MATERIALIZED_VIEW_SCHEMA_VERSION,
-            view_id: view_id.to_string(),
-            spec_hash: spec_hash.to_string(),
-            execution_mode: Some(MaterializedViewExecutionMode::StandingRuntime),
-            api: existing.api.clone(),
-            artifact: Some(artifact),
-            lifecycle: Some(lifecycle),
-        };
-        self.validate_execution_mode(
-            view_id,
-            &MaterializedViewExecutionMode::StandingRuntime,
-            &record.artifact,
-        )?;
-
-        if existing == record {
-            return Ok(ActivateMaterializedViewOutcome::Duplicate);
-        }
-        if existing.spec_hash != spec_hash
-            || existing_mode != MaterializedViewExecutionMode::FelderaCompilePending
-            || existing.artifact.is_some()
-        {
-            return Err(MaterializedViewRegistryError::ActiveRecordConflict { object_key });
-        }
-
-        self.put_active_record_update(&object_key, update_version, &record)
-            .await?;
-
-        Ok(ActivateMaterializedViewOutcome::Activated)
-    }
-
-    pub async fn activate_pending_with_resolved_spec_artifact(
-        &self,
-        pending_view_id: &str,
-        pending_spec_hash: &str,
-        resolved_spec: &StandingViewSpec,
-        artifact: MaterializedViewArtifactBinding,
-        lifecycle: MaterializedViewLifecycleStatus,
-    ) -> Result<ActivateMaterializedViewOutcome, MaterializedViewRegistryError> {
-        validate_materialized_standing_view_spec(resolved_spec)?;
-        if resolved_spec.view_id != pending_view_id {
-            return Err(MaterializedViewRegistryError::ActiveRecordConflict {
-                object_key: self.active_object_key(pending_view_id)?,
-            });
-        }
-        let resolved_spec_hash = feldera_spec_hash(resolved_spec)?;
-        let spec_object_key = self.object_key(&resolved_spec.view_id, &resolved_spec_hash)?;
-        let spec_bytes = Bytes::from(serde_json::to_vec(resolved_spec)?);
-        match self
-            .store
-            .put_opts(
-                &Path::from(spec_object_key.as_str()),
-                spec_bytes.into(),
-                PutMode::Create.into(),
-            )
-            .await
-        {
-            Ok(_) => {}
-            Err(object_store::Error::AlreadyExists { .. }) => {
-                let existing = self.read_object(&spec_object_key).await?;
-                if existing != *resolved_spec {
-                    return Err(MaterializedViewRegistryError::RecordConflict {
-                        object_key: spec_object_key,
-                    });
-                }
-            }
-            Err(error) => return Err(error.into()),
-        }
-
-        let active_object_key = self.active_object_key(pending_view_id)?;
-        let get_result = self
-            .store
-            .get(&Path::from(active_object_key.as_str()))
-            .await?;
-        let update_version = UpdateVersion {
-            e_tag: get_result.meta.e_tag.clone(),
-            version: get_result.meta.version.clone(),
-        };
-        let bytes = get_result.bytes().await?;
-        let existing: ActiveMaterializedViewRecord = serde_json::from_slice(&bytes)?;
-        self.validate_active_record_identity(pending_view_id, &existing, &active_object_key)?;
-        let existing_mode = self.normalized_execution_mode(&existing)?;
-
-        let record = ActiveMaterializedViewRecord {
-            schema_version: ACTIVE_MATERIALIZED_VIEW_SCHEMA_VERSION,
-            view_id: pending_view_id.to_string(),
-            spec_hash: resolved_spec_hash,
-            execution_mode: Some(MaterializedViewExecutionMode::StandingRuntime),
-            api: existing.api.clone(),
-            artifact: Some(artifact),
-            lifecycle: Some(lifecycle),
-        };
-        self.validate_execution_mode(
-            pending_view_id,
-            &MaterializedViewExecutionMode::StandingRuntime,
-            &record.artifact,
-        )?;
-
-        if existing == record {
-            return Ok(ActivateMaterializedViewOutcome::Duplicate);
-        }
-        if existing.spec_hash != pending_spec_hash
-            || existing_mode != MaterializedViewExecutionMode::FelderaCompilePending
-            || existing.artifact.is_some()
-        {
-            return Err(MaterializedViewRegistryError::ActiveRecordConflict {
-                object_key: active_object_key,
-            });
-        }
-
-        self.put_active_record_update(&active_object_key, update_version, &record)
-            .await?;
-
-        Ok(ActivateMaterializedViewOutcome::Activated)
-    }
-
-    pub async fn mark_pending_compile_validated_with_resolved_spec(
-        &self,
-        pending_view_id: &str,
-        pending_spec_hash: &str,
-        resolved_spec: &StandingViewSpec,
-        lifecycle: MaterializedViewLifecycleStatus,
-    ) -> Result<UpdateMaterializedViewLifecycleOutcome, MaterializedViewRegistryError> {
-        validate_materialized_standing_view_spec(resolved_spec)?;
-        if resolved_spec.view_id != pending_view_id {
-            return Err(MaterializedViewRegistryError::ActiveRecordConflict {
-                object_key: self.active_object_key(pending_view_id)?,
-            });
-        }
-        let resolved_spec_hash = feldera_spec_hash(resolved_spec)?;
-        let spec_object_key = self.object_key(&resolved_spec.view_id, &resolved_spec_hash)?;
-        let spec_bytes = Bytes::from(serde_json::to_vec(resolved_spec)?);
-        match self
-            .store
-            .put_opts(
-                &Path::from(spec_object_key.as_str()),
-                spec_bytes.into(),
-                PutMode::Create.into(),
-            )
-            .await
-        {
-            Ok(_) => {}
-            Err(object_store::Error::AlreadyExists { .. }) => {
-                let existing = self.read_object(&spec_object_key).await?;
-                if existing != *resolved_spec {
-                    return Err(MaterializedViewRegistryError::RecordConflict {
-                        object_key: spec_object_key,
-                    });
-                }
-            }
-            Err(error) => return Err(error.into()),
-        }
-
-        let active_object_key = self.active_object_key(pending_view_id)?;
-        let get_result = self
-            .store
-            .get(&Path::from(active_object_key.as_str()))
-            .await?;
-        let update_version = UpdateVersion {
-            e_tag: get_result.meta.e_tag.clone(),
-            version: get_result.meta.version.clone(),
-        };
-        let bytes = get_result.bytes().await?;
-        let existing: ActiveMaterializedViewRecord = serde_json::from_slice(&bytes)?;
-        self.validate_active_record_identity(pending_view_id, &existing, &active_object_key)?;
-        let existing_mode = self.normalized_execution_mode(&existing)?;
-
-        let record = ActiveMaterializedViewRecord {
-            schema_version: ACTIVE_MATERIALIZED_VIEW_SCHEMA_VERSION,
-            view_id: pending_view_id.to_string(),
-            spec_hash: resolved_spec_hash,
-            execution_mode: Some(MaterializedViewExecutionMode::FelderaCompilePending),
-            api: existing.api.clone(),
-            artifact: None,
-            lifecycle: Some(lifecycle),
-        };
-        self.validate_execution_mode(
-            pending_view_id,
-            &MaterializedViewExecutionMode::FelderaCompilePending,
-            &record.artifact,
-        )?;
-
-        if existing == record {
-            return Ok(UpdateMaterializedViewLifecycleOutcome::Duplicate);
-        }
-        if existing.spec_hash != pending_spec_hash
-            || existing_mode != MaterializedViewExecutionMode::FelderaCompilePending
-            || existing.artifact.is_some()
-        {
-            return Err(MaterializedViewRegistryError::ActiveRecordConflict {
-                object_key: active_object_key,
-            });
-        }
-
-        self.put_active_record_update(&active_object_key, update_version, &record)
-            .await?;
-
-        Ok(UpdateMaterializedViewLifecycleOutcome::Updated)
     }
 
     pub async fn update_standing_runtime_lifecycle(
@@ -731,7 +545,7 @@ impl MaterializedViewRegistry {
         let existing_mode = self.normalized_execution_mode(&existing)?;
         if existing.spec_hash != spec_hash
             || existing_mode != MaterializedViewExecutionMode::StandingRuntime
-            || existing.artifact.is_none()
+            || (existing.artifact.is_none() && existing.runtime.is_none())
         {
             return Err(MaterializedViewRegistryError::ActiveRecordConflict { object_key });
         }
@@ -743,12 +557,14 @@ impl MaterializedViewRegistry {
             execution_mode: Some(MaterializedViewExecutionMode::StandingRuntime),
             api: existing.api.clone(),
             artifact: existing.artifact.clone(),
+            runtime: existing.runtime.clone(),
             lifecycle: Some(lifecycle),
         };
         self.validate_execution_mode(
             view_id,
             &MaterializedViewExecutionMode::StandingRuntime,
             &record.artifact,
+            &record.runtime,
         )?;
 
         if existing == record {
@@ -839,7 +655,7 @@ impl MaterializedViewRegistry {
         object_key: &ObjectKey,
         record: &StandingViewSpec,
     ) -> Result<(), MaterializedViewRegistryError> {
-        let spec_hash = feldera_spec_hash(record)?;
+        let spec_hash = view_spec_hash(record)?;
         if *object_key == self.object_key(&record.view_id, &spec_hash)? {
             Ok(())
         } else {
@@ -859,16 +675,17 @@ impl MaterializedViewRegistry {
         spec_hash: &str,
         api: Option<MaterializedViewApiMetadata>,
         artifact: Option<MaterializedViewArtifactBinding>,
+        runtime: Option<MaterializedViewRuntimeBinding>,
         execution_mode: Option<MaterializedViewExecutionMode>,
         lifecycle: Option<MaterializedViewLifecycleStatus>,
     ) -> Result<(), MaterializedViewRegistryError> {
         let object_key = self.active_object_key(view_id)?;
         let execution_mode = match execution_mode {
             Some(mode) => {
-                self.validate_execution_mode(view_id, &mode, &artifact)?;
+                self.validate_execution_mode(view_id, &mode, &artifact, &runtime)?;
                 mode
             }
-            None => self.execution_mode_for_new_record(view_id, &artifact)?,
+            None => self.execution_mode_for_new_record(view_id, &artifact, &runtime)?,
         };
         let lifecycle = lifecycle.unwrap_or_else(|| self.lifecycle_for_mode(&execution_mode));
         let record = ActiveMaterializedViewRecord {
@@ -878,6 +695,7 @@ impl MaterializedViewRegistry {
             execution_mode: Some(execution_mode),
             api,
             artifact,
+            runtime,
             lifecycle: Some(lifecycle),
         };
         let bytes = serde_json::to_vec(&record)?;
@@ -973,13 +791,10 @@ impl MaterializedViewRegistry {
         &self,
         view_id: &str,
         artifact: &Option<MaterializedViewArtifactBinding>,
+        runtime: &Option<MaterializedViewRuntimeBinding>,
     ) -> Result<MaterializedViewExecutionMode, MaterializedViewRegistryError> {
-        let mode = if artifact.is_some() {
-            MaterializedViewExecutionMode::StandingRuntime
-        } else {
-            MaterializedViewExecutionMode::FelderaCompilePending
-        };
-        self.validate_execution_mode(view_id, &mode, artifact)?;
+        let mode = MaterializedViewExecutionMode::StandingRuntime;
+        self.validate_execution_mode(view_id, &mode, artifact, runtime)?;
         Ok(mode)
     }
 
@@ -990,11 +805,7 @@ impl MaterializedViewRegistry {
         let mode = match &record.execution_mode {
             Some(mode) => mode.clone(),
             None if record.schema_version == LEGACY_ACTIVE_MATERIALIZED_VIEW_SCHEMA_VERSION => {
-                if record.artifact.is_some() {
-                    MaterializedViewExecutionMode::StandingRuntime
-                } else {
-                    MaterializedViewExecutionMode::FelderaCompilePending
-                }
+                MaterializedViewExecutionMode::StandingRuntime
             }
             None => {
                 return Err(MaterializedViewRegistryError::InvalidExecutionMode {
@@ -1005,7 +816,7 @@ impl MaterializedViewRegistry {
                 });
             }
         };
-        self.validate_execution_mode(&record.view_id, &mode, &record.artifact)?;
+        self.validate_execution_mode(&record.view_id, &mode, &record.artifact, &record.runtime)?;
         Ok(mode)
     }
 
@@ -1028,9 +839,6 @@ impl MaterializedViewRegistry {
             MaterializedViewExecutionMode::StandingRuntime => {
                 MaterializedViewLifecycleStatus::standing_runtime()
             }
-            MaterializedViewExecutionMode::FelderaCompilePending => {
-                MaterializedViewLifecycleStatus::feldera_compile_pending(None)
-            }
         }
     }
 
@@ -1039,30 +847,19 @@ impl MaterializedViewRegistry {
         view_id: &str,
         mode: &MaterializedViewExecutionMode,
         artifact: &Option<MaterializedViewArtifactBinding>,
+        runtime: &Option<MaterializedViewRuntimeBinding>,
     ) -> Result<(), MaterializedViewRegistryError> {
-        match mode {
-            MaterializedViewExecutionMode::StandingRuntime => {
-                let Some(artifact) = artifact else {
-                    return Err(MaterializedViewRegistryError::InvalidExecutionMode {
-                        view_id: view_id.to_string(),
-                        reason: InvalidExecutionModeReason::StandingRuntimeMissingArtifact,
-                    });
-                };
-                if artifact.standing_program_identity.is_none() {
-                    return Err(MaterializedViewRegistryError::InvalidExecutionMode {
-                        view_id: view_id.to_string(),
-                        reason: InvalidExecutionModeReason::StandingRuntimeMissingIdentity,
-                    });
-                }
-            }
-            MaterializedViewExecutionMode::FelderaCompilePending => {
-                if artifact.is_some() {
-                    return Err(MaterializedViewRegistryError::InvalidExecutionMode {
-                        view_id: view_id.to_string(),
-                        reason: InvalidExecutionModeReason::FelderaCompilePendingWithArtifact,
-                    });
-                }
-            }
+        let MaterializedViewExecutionMode::StandingRuntime = mode;
+        let has_artifact_identity = artifact
+            .as_ref()
+            .and_then(|artifact| artifact.standing_program_identity.as_ref())
+            .is_some();
+        let has_runtime_identity = runtime.is_some();
+        if !has_artifact_identity && !has_runtime_identity {
+            return Err(MaterializedViewRegistryError::InvalidExecutionMode {
+                view_id: view_id.to_string(),
+                reason: InvalidExecutionModeReason::StandingRuntimeMissingArtifact,
+            });
         }
 
         Ok(())

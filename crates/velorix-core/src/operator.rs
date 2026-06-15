@@ -57,6 +57,7 @@ where
     Ok(DeltaBatch::from_records(records))
 }
 
+#[derive(Clone, Debug)]
 pub struct KeyedEquiJoin<F>
 where
     F: FnMut(&DeltaValue, &DeltaValue) -> Result<DeltaValue, OperatorError>,
@@ -149,6 +150,7 @@ impl AggregateValueMode {
 pub struct KeyedSumCountAggregate {
     state: BTreeMap<String, AggregateEntry>,
     value_mode: AggregateValueMode,
+    track_extrema: bool,
 }
 
 impl KeyedSumCountAggregate {
@@ -157,9 +159,17 @@ impl KeyedSumCountAggregate {
     }
 
     pub fn with_value_mode(value_mode: AggregateValueMode) -> Self {
+        Self::with_value_mode_and_extrema(value_mode, false)
+    }
+
+    pub fn with_value_mode_and_extrema(
+        value_mode: AggregateValueMode,
+        track_extrema: bool,
+    ) -> Self {
         Self {
             state: BTreeMap::new(),
             value_mode,
+            track_extrema,
         }
     }
 
@@ -171,10 +181,19 @@ impl KeyedSumCountAggregate {
         state: &DeltaBatch,
         value_mode: AggregateValueMode,
     ) -> Result<Self, OperatorError> {
-        let mut aggregate = Self::with_value_mode(value_mode);
+        Self::from_state_with_value_mode_and_extrema(state, value_mode, false)
+    }
+
+    pub fn from_state_with_value_mode_and_extrema(
+        state: &DeltaBatch,
+        value_mode: AggregateValueMode,
+        track_extrema: bool,
+    ) -> Result<Self, OperatorError> {
+        let mut aggregate = Self::with_value_mode_and_extrema(value_mode, track_extrema);
 
         for record in state.records() {
-            let (sum, count) = aggregate_state_sum_count(&record.value, value_mode)?;
+            let (sum, count, values) =
+                aggregate_state_sum_count_values(&record.value, value_mode, track_extrema)?;
             let key = canonical_json(record.key.as_json());
             let entry = aggregate
                 .state
@@ -183,14 +202,25 @@ impl KeyedSumCountAggregate {
                     key: record.key.clone(),
                     sum: 0,
                     count: 0,
+                    values: BTreeMap::new(),
                 });
 
             entry.add_weighted(sum, count, record.weight)?;
+            if track_extrema {
+                for (order_value, value) in &values {
+                    entry.add_value_weight(
+                        *order_value,
+                        &value.value,
+                        value.weight,
+                        record.weight,
+                    )?;
+                }
+            }
             if entry.is_zero() {
                 aggregate.state.remove(&key);
             }
         }
-        validate_aggregate_entries(&aggregate.state, value_mode)?;
+        validate_aggregate_entries(&aggregate.state, value_mode, track_extrema)?;
 
         Ok(aggregate)
     }
@@ -200,11 +230,12 @@ impl KeyedSumCountAggregate {
 
         for record in input.records() {
             let amount = self.value_mode.parse_input(&record.value)?;
+            let value = aggregate_sum_json_value(amount, self.value_mode)?;
             let key = canonical_json(record.key.as_json());
             let change = changes
                 .entry(key)
                 .or_insert_with(|| AggregateChange::new(record.key.clone()));
-            change.add(amount, record.weight)?;
+            change.add(amount, value, record.weight)?;
         }
 
         let mut output = Vec::new();
@@ -212,19 +243,19 @@ impl KeyedSumCountAggregate {
 
         for (key, change) in changes {
             let before = self.state.get(&key).cloned();
-            let after = change.apply_to(before.clone())?;
+            let after = change.apply_to(before.clone(), self.track_extrema)?;
 
             if before == after {
                 continue;
             }
 
             if let Some(before) = before {
-                output.push(before.to_record(-1, self.value_mode)?);
+                output.push(before.to_record(-1, self.value_mode, self.track_extrema)?);
             }
 
             match after {
                 Some(after) => {
-                    output.push(after.to_record(1, self.value_mode)?);
+                    output.push(after.to_record(1, self.value_mode, self.track_extrema)?);
                     next_state.insert(key, after);
                 }
                 None => {
@@ -241,7 +272,7 @@ impl KeyedSumCountAggregate {
         DeltaBatch::from_records(
             self.state
                 .values()
-                .map(|entry| entry.to_record(1, self.value_mode))
+                .map(|entry| entry.to_record(1, self.value_mode, self.track_extrema))
                 .collect::<Result<Vec<_>, _>>()
                 .expect("stored aggregate state must fit delta records"),
         )
@@ -355,6 +386,7 @@ struct AggregateEntry {
     key: DeltaKey,
     sum: i128,
     count: i128,
+    values: BTreeMap<i128, AggregateValueEntry>,
 }
 
 impl AggregateEntry {
@@ -382,35 +414,109 @@ impl AggregateEntry {
     }
 
     fn is_zero(&self) -> bool {
-        self.sum == 0 && self.count == 0
+        self.sum == 0 && self.count == 0 && self.values.is_empty()
     }
 
     fn to_record(
         &self,
         weight: DeltaWeight,
         value_mode: AggregateValueMode,
+        track_extrema: bool,
     ) -> Result<DeltaRecord, OperatorError> {
         let count: i64 = self
             .count
             .try_into()
             .map_err(|_| OperatorError::WeightOverflow)?;
         let sum = aggregate_sum_json_value(self.sum, value_mode)?;
+        let mut value = serde_json::Map::new();
+        value.insert("sum".to_string(), sum);
+        value.insert("count".to_string(), json!(count));
+        if track_extrema {
+            let Some(min) = self.values.values().next().map(|entry| entry.value.clone()) else {
+                return Err(OperatorError::InvalidAggregateStateValue);
+            };
+            let Some(max) = self
+                .values
+                .values()
+                .next_back()
+                .map(|entry| entry.value.clone())
+            else {
+                return Err(OperatorError::InvalidAggregateStateValue);
+            };
+            value.insert("min".to_string(), min);
+            value.insert("max".to_string(), max);
+            value.insert(
+                "values".to_string(),
+                Value::Array(
+                    self.values
+                        .values()
+                        .map(|entry| {
+                            let weight: i64 = entry
+                                .weight
+                                .try_into()
+                                .map_err(|_| OperatorError::WeightOverflow)?;
+                            Ok(json!({
+                                "value": entry.value,
+                                "weight": weight,
+                            }))
+                        })
+                        .collect::<Result<Vec<_>, OperatorError>>()?,
+                ),
+            );
+        }
 
         Ok(DeltaRecord::new(
             self.key.clone(),
-            DeltaValue::from_json(json!({
-                "sum": sum,
-                "count": count,
-            })),
+            DeltaValue::from_json(Value::Object(value)),
             weight,
         ))
     }
+
+    fn add_value_weight(
+        &mut self,
+        order_value: i128,
+        value: &Value,
+        value_weight: i128,
+        record_weight: DeltaWeight,
+    ) -> Result<(), OperatorError> {
+        let delta = value_weight
+            .checked_mul(i128::from(record_weight))
+            .ok_or(OperatorError::WeightOverflow)?;
+        let next_weight = self
+            .values
+            .get(&order_value)
+            .map_or(0, |entry| entry.weight)
+            .checked_add(delta)
+            .ok_or(OperatorError::WeightOverflow)?;
+        if next_weight < 0 {
+            return Err(OperatorError::InvalidAggregateStateValue);
+        }
+        if next_weight == 0 {
+            self.values.remove(&order_value);
+        } else {
+            self.values.insert(
+                order_value,
+                AggregateValueEntry {
+                    value: value.clone(),
+                    weight: next_weight,
+                },
+            );
+        }
+        Ok(())
+    }
 }
 
-fn aggregate_state_sum_count(
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AggregateValueEntry {
+    value: Value,
+    weight: i128,
+}
+
+fn aggregate_state_sum_count_values(
     value: &DeltaValue,
     value_mode: AggregateValueMode,
-) -> Result<(i128, i64), OperatorError> {
+    track_extrema: bool,
+) -> Result<(i128, i64, BTreeMap<i128, AggregateValueEntry>), OperatorError> {
     let value = value.as_json();
     let sum = value
         .get("sum")
@@ -421,7 +527,45 @@ fn aggregate_state_sum_count(
         .and_then(Value::as_i64)
         .ok_or(OperatorError::InvalidAggregateStateValue)?;
 
-    Ok((sum, count))
+    let values = if track_extrema {
+        let values = value
+            .get("values")
+            .and_then(Value::as_array)
+            .ok_or(OperatorError::InvalidAggregateStateValue)?;
+        let mut state_values = BTreeMap::new();
+        for value in values {
+            let value = value
+                .as_object()
+                .ok_or(OperatorError::InvalidAggregateStateValue)?;
+            let aggregate_value = value
+                .get("value")
+                .cloned()
+                .ok_or(OperatorError::InvalidAggregateStateValue)?;
+            let order_value = value_mode.parse_state_sum(&aggregate_value)?;
+            let weight = value
+                .get("weight")
+                .and_then(Value::as_i64)
+                .ok_or(OperatorError::InvalidAggregateStateValue)?;
+            if weight == 0 {
+                return Err(OperatorError::InvalidAggregateStateValue);
+            }
+            state_values.insert(
+                order_value,
+                AggregateValueEntry {
+                    value: aggregate_value,
+                    weight: i128::from(weight),
+                },
+            );
+        }
+        if state_values.is_empty() {
+            return Err(OperatorError::InvalidAggregateStateValue);
+        }
+        state_values
+    } else {
+        BTreeMap::new()
+    };
+
+    Ok((sum, count, values))
 }
 
 fn aggregate_sum_json_value(
@@ -443,9 +587,10 @@ fn aggregate_sum_json_value(
 fn validate_aggregate_entries(
     state: &BTreeMap<String, AggregateEntry>,
     value_mode: AggregateValueMode,
+    track_extrema: bool,
 ) -> Result<(), OperatorError> {
     for entry in state.values() {
-        entry.to_record(1, value_mode)?;
+        entry.to_record(1, value_mode, track_extrema)?;
     }
 
     Ok(())
@@ -456,6 +601,7 @@ struct AggregateChange {
     key: DeltaKey,
     sum_delta: i128,
     count_delta: i128,
+    value_deltas: BTreeMap<i128, AggregateValueEntry>,
 }
 
 impl AggregateChange {
@@ -464,10 +610,16 @@ impl AggregateChange {
             key,
             sum_delta: 0,
             count_delta: 0,
+            value_deltas: BTreeMap::new(),
         }
     }
 
-    fn add(&mut self, amount: i128, weight: DeltaWeight) -> Result<(), OperatorError> {
+    fn add(
+        &mut self,
+        amount: i128,
+        value: Value,
+        weight: DeltaWeight,
+    ) -> Result<(), OperatorError> {
         let weighted_amount = amount
             .checked_mul(i128::from(weight))
             .ok_or(OperatorError::WeightOverflow)?;
@@ -479,15 +631,36 @@ impl AggregateChange {
             .count_delta
             .checked_add(i128::from(weight))
             .ok_or(OperatorError::WeightOverflow)?;
+        let next_weight = self
+            .value_deltas
+            .get(&amount)
+            .map_or(0, |entry| entry.weight)
+            .checked_add(i128::from(weight))
+            .ok_or(OperatorError::WeightOverflow)?;
+        if next_weight == 0 {
+            self.value_deltas.remove(&amount);
+        } else {
+            self.value_deltas.insert(
+                amount,
+                AggregateValueEntry {
+                    value,
+                    weight: next_weight,
+                },
+            );
+        }
         Ok(())
     }
 
     fn apply_to(
         self,
         before: Option<AggregateEntry>,
+        track_extrema: bool,
     ) -> Result<Option<AggregateEntry>, OperatorError> {
         let sum = before.as_ref().map_or(0, |entry| entry.sum);
         let count = before.as_ref().map_or(0, |entry| entry.count);
+        let mut values = before
+            .as_ref()
+            .map_or_else(BTreeMap::new, |entry| entry.values.clone());
         let sum = sum
             .checked_add(self.sum_delta)
             .ok_or(OperatorError::WeightOverflow)?;
@@ -495,16 +668,58 @@ impl AggregateChange {
             .checked_add(self.count_delta)
             .ok_or(OperatorError::WeightOverflow)?;
 
-        if sum == 0 && count == 0 {
+        if track_extrema {
+            for (order_value, value) in &self.value_deltas {
+                add_value_weight_to_map(
+                    &mut values,
+                    *order_value,
+                    &value.value,
+                    value.weight,
+                    true,
+                )?;
+            }
+        }
+
+        if sum == 0 && count == 0 && (!track_extrema || values.is_empty()) {
             Ok(None)
         } else {
             Ok(Some(AggregateEntry {
                 key: before.map_or(self.key, |entry| entry.key),
                 sum,
                 count,
+                values,
             }))
         }
     }
+}
+
+fn add_value_weight_to_map(
+    values: &mut BTreeMap<i128, AggregateValueEntry>,
+    order_value: i128,
+    value: &Value,
+    weight_delta: i128,
+    reject_negative: bool,
+) -> Result<(), OperatorError> {
+    let next_weight = values
+        .get(&order_value)
+        .map_or(0, |entry| entry.weight)
+        .checked_add(weight_delta)
+        .ok_or(OperatorError::WeightOverflow)?;
+    if reject_negative && next_weight < 0 {
+        return Err(OperatorError::InvalidAggregateStateValue);
+    }
+    if next_weight == 0 {
+        values.remove(&order_value);
+    } else {
+        values.insert(
+            order_value,
+            AggregateValueEntry {
+                value: value.clone(),
+                weight: next_weight,
+            },
+        );
+    }
+    Ok(())
 }
 
 fn parse_decimal128_value(value: &Value, precision: u8, scale: u8) -> Result<i128, OperatorError> {

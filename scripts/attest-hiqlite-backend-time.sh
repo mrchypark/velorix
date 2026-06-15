@@ -59,7 +59,7 @@ By default this reads sibling evidence beside product-evidence.json:
   standing-runtime-failover-smoke.json
   velorix-meta-smoke.log
 
-The generated artifact is intentionally diagnostic. It proves that a deployed
+The evidence file is intentionally diagnostic. It proves that a deployed
 vind product run produced the currently required smoke evidence and records the
 core backend-time claim shape. It becomes release-validator trusted only when
 VELORIX_HIQLITE_BACKEND_TIME_TRUSTED_PROVENANCE=1 supplies CI provenance over

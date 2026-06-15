@@ -25,9 +25,9 @@ use serde_json::Value;
 use tempfile::TempDir;
 use velorix_core::relation::{
     ArrowPhysicalTypeV1, DataFusionRegistrationModeV1, DataFusionRegistrationV1,
-    FelderaRelationBindingV1, IncrementalAdapterBindingV1, RelationColumnV1, RelationOperationV1,
-    RelationSemanticRoleV1, SchemaFingerprintV1, VelorixLogicalTypeV1, VelorixRelationCatalogV1,
-    VelorixRelationSchemaV1, RELATION_SCHEMA_VERSION_V1,
+    IncrementalAdapterBindingV1, IncrementalRelationBindingV1, RelationColumnV1,
+    RelationOperationV1, RelationSemanticRoleV1, SchemaFingerprintV1, VelorixLogicalTypeV1,
+    VelorixRelationCatalogV1, VelorixRelationSchemaV1, RELATION_SCHEMA_VERSION_V1,
 };
 use velorix_storage::{
     capability::{
@@ -903,6 +903,7 @@ async fn put_legacy_materialized_admission(
         partition_id: descriptor.partition_id,
         start_offset_inclusive: descriptor.start_offset_inclusive,
         end_offset_exclusive: descriptor.end_offset_exclusive,
+        event_time_watermark: None,
         batch_key: descriptor.object_key,
         admission_record_key: ObjectKey::ingest_admission_record(
             &descriptor.stream_id,
@@ -1186,6 +1187,7 @@ fn catalog_envelope_bytes_for(
             partition_id: 7,
             start_offset_inclusive,
             end_offset_exclusive,
+            event_time_watermark: None,
         },
         &[valid_batch()],
     )
@@ -1259,7 +1261,7 @@ fn orders_relation_catalog() -> VelorixRelationCatalogV1 {
             name: "orders".to_string(),
             mode: DataFusionRegistrationModeV1::Table,
         },
-        feldera_relation: FelderaRelationBindingV1 {
+        incremental_relation: IncrementalRelationBindingV1 {
             relation_id: "orders_relation".to_string(),
             schema_fingerprint,
         },

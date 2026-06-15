@@ -200,7 +200,7 @@ The manual `RustFS S3-Compatible Gate` workflow runs this same RustFS-backed
 gate on a GitHub-hosted runner and uploads the JSON as
 `rustfs-s3-compatible-evidence`.
 Its benchmark input defaults off so the fast storage/runtime API behavior gate
-can be reviewed separately from slower benchmark output. The generated artifact
+can be reviewed separately from slower benchmark output. The evidence file
 records the `s3_compatible` and `s3_compatible_integration_harness` readiness
 evidence kinds plus gate-local detail
 `s3_compatible_ingest_admission_crash_restart` for the indexed admission

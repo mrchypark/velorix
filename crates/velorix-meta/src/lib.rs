@@ -2,7 +2,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -44,6 +44,8 @@ pub const STANDING_RUNTIME_LEASE_EXPIRY_SEMANTICS_OPERATION_DRIVEN_LOGICAL: &str
     "operation_driven_logical";
 pub const STANDING_RUNTIME_LEASE_EXPIRY_SEMANTICS_BACKEND_WALL_CLOCK_TTL: &str =
     "backend_wall_clock_ttl";
+pub const STANDING_RUNTIME_OUTPUT_MANIFEST_REF_PREFIX: &str = "standing-runtime-output-manifest:";
+pub const STANDING_RUNTIME_OUTPUT_DELTA_REF_PREFIX: &str = "standing-runtime-output-delta:";
 pub const MAX_STANDING_RUNTIME_OWNER_TTL_MS: u64 = 300_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -114,6 +116,8 @@ pub struct StandingRuntimeCheckpointPointer {
     pub checkpoint_key: String,
     pub logical_epoch: u64,
     pub content_hash: String,
+    #[serde(default)]
+    pub output_manifest_refs: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -826,6 +830,53 @@ impl StandingRuntimeCheckpointPointer {
                 self.tenant_id, self.program_id, self.view_id
             )));
         }
+        let mut seen_output_manifest_refs = BTreeSet::new();
+        for output_manifest_ref in &self.output_manifest_refs {
+            require_non_empty("output_manifest_refs", output_manifest_ref)?;
+            if !seen_output_manifest_refs.insert(output_manifest_ref) {
+                return Err(MetaStoreError::Serialization(format!(
+                    "duplicate standing runtime output manifest ref `{output_manifest_ref}`"
+                )));
+            }
+            if let Some(output_manifest_key) =
+                output_manifest_ref.strip_prefix(STANDING_RUNTIME_OUTPUT_MANIFEST_REF_PREFIX)
+            {
+                let (_, output_parts) = ObjectKey::parse_standing_runtime_output_manifest(
+                    output_manifest_key.to_string(),
+                )
+                .map_err(|error| MetaStoreError::Serialization(error.to_string()))?;
+                if output_parts.tenant_id != self.tenant_id
+                    || output_parts.program_id != self.program_id
+                    || output_parts.view_id != self.view_id
+                    || output_parts.logical_epoch != self.logical_epoch
+                {
+                    return Err(MetaStoreError::Serialization(format!(
+                        "standing runtime output manifest ref scope mismatch for `{}/{}/{}`",
+                        self.tenant_id, self.program_id, self.view_id
+                    )));
+                }
+            } else if let Some(output_delta_key) =
+                output_manifest_ref.strip_prefix(STANDING_RUNTIME_OUTPUT_DELTA_REF_PREFIX)
+            {
+                let (_, output_parts) =
+                    ObjectKey::parse_standing_runtime_output_delta(output_delta_key.to_string())
+                        .map_err(|error| MetaStoreError::Serialization(error.to_string()))?;
+                if output_parts.tenant_id != self.tenant_id
+                    || output_parts.program_id != self.program_id
+                    || output_parts.view_id != self.view_id
+                    || output_parts.logical_epoch != self.logical_epoch
+                {
+                    return Err(MetaStoreError::Serialization(format!(
+                        "standing runtime output delta ref scope mismatch for `{}/{}/{}`",
+                        self.tenant_id, self.program_id, self.view_id
+                    )));
+                }
+            } else {
+                return Err(MetaStoreError::Serialization(format!(
+                    "standing runtime output ref uses unsupported prefix: `{output_manifest_ref}`"
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -1470,6 +1521,7 @@ fn standing_runtime_checkpoint_pointer_from_proto(
         checkpoint_key: pointer.checkpoint_key,
         logical_epoch: pointer.logical_epoch,
         content_hash: pointer.content_hash,
+        output_manifest_refs: pointer.output_manifest_refs,
     }
 }
 
@@ -1483,6 +1535,7 @@ fn standing_runtime_checkpoint_pointer_to_proto(
         checkpoint_key: pointer.checkpoint_key,
         logical_epoch: pointer.logical_epoch,
         content_hash: pointer.content_hash,
+        output_manifest_refs: pointer.output_manifest_refs,
     }
 }
 
@@ -1598,12 +1651,29 @@ impl HiqliteMetaStore {
                     checkpoint_key TEXT NOT NULL,
                     logical_epoch INTEGER NOT NULL,
                     content_hash TEXT NOT NULL,
+                    output_manifest_refs_json TEXT NOT NULL DEFAULT '[]',
                     PRIMARY KEY (tenant_id, program_id, view_id)
                 )",
                 vec![],
             )
             .await
             .map_err(hiqlite_error)?;
+        if !self
+            .hiqlite_table_has_column(
+                "PRAGMA table_info(velorix_standing_runtime_checkpoints)",
+                "output_manifest_refs_json",
+            )
+            .await?
+        {
+            self.client
+                .execute(
+                    "ALTER TABLE velorix_standing_runtime_checkpoints
+                        ADD COLUMN output_manifest_refs_json TEXT NOT NULL DEFAULT '[]'",
+                    vec![],
+                )
+                .await
+                .map_err(hiqlite_error)?;
+        }
         self.client
             .execute(
                 "CREATE TABLE IF NOT EXISTS velorix_standing_runtime_owners (
@@ -1992,6 +2062,8 @@ impl MetaStore for HiqliteMetaStore {
     ) -> Result<PublishStandingRuntimeCheckpointOutcome, MetaStoreError> {
         request.validate()?;
         let candidate_epoch = i64_from_u64("logical_epoch", request.candidate.logical_epoch)?;
+        let candidate_output_manifest_refs_json =
+            standing_runtime_output_manifest_refs_json(&request.candidate.output_manifest_refs)?;
         let owner_epoch = i64_from_u64("owner_epoch", request.owner.owner_epoch)?;
         let (changed, raft_timestamp) = if let Some(expected) = &request.expected_previous {
             let expected_epoch =
@@ -2002,7 +2074,8 @@ impl MetaStore for HiqliteMetaStore {
                     "UPDATE velorix_standing_runtime_checkpoints
                             SET checkpoint_key = $1,
                                 logical_epoch = $2,
-                                content_hash = $3
+                                content_hash = $3,
+                                output_manifest_refs_json = $16
                             WHERE tenant_id = $4
                               AND program_id = $5
                               AND view_id = $6
@@ -2038,6 +2111,7 @@ impl MetaStore for HiqliteMetaStore {
                         hiqlite::Param::from(request.owner.tenant_id.clone()),
                         hiqlite::Param::from(request.owner.program_id.clone()),
                         hiqlite::Param::from(request.owner.view_id.clone()),
+                        hiqlite::Param::from(candidate_output_manifest_refs_json.clone()),
                     ],
                 )])
                 .await
@@ -2054,9 +2128,10 @@ impl MetaStore for HiqliteMetaStore {
                             view_id,
                             checkpoint_key,
                             logical_epoch,
-                            content_hash
+                            content_hash,
+                            output_manifest_refs_json
                         )
-                        SELECT $1, $2, $3, $4, $5, $6
+                        SELECT $1, $2, $3, $4, $5, $6, $13
                         WHERE NOT EXISTS (
                             SELECT 1 FROM velorix_standing_runtime_checkpoints
                             WHERE tenant_id = $1
@@ -2089,6 +2164,7 @@ impl MetaStore for HiqliteMetaStore {
                         hiqlite::Param::from(request.owner.tenant_id.clone()),
                         hiqlite::Param::from(request.owner.program_id.clone()),
                         hiqlite::Param::from(request.owner.view_id.clone()),
+                        hiqlite::Param::from(candidate_output_manifest_refs_json),
                     ],
                 )])
                 .await
@@ -2143,7 +2219,8 @@ impl MetaStore for HiqliteMetaStore {
                     view_id,
                     checkpoint_key,
                     logical_epoch,
-                    content_hash
+                    content_hash,
+                    output_manifest_refs_json
                 FROM velorix_standing_runtime_checkpoints
                 WHERE tenant_id = $1
                   AND program_id = $2
@@ -2213,6 +2290,7 @@ struct StandingRuntimeCheckpointPointerRow {
     checkpoint_key: String,
     logical_epoch: i64,
     content_hash: String,
+    output_manifest_refs_json: String,
 }
 
 #[cfg(feature = "hiqlite-backend")]
@@ -2281,6 +2359,9 @@ impl StandingRuntimeCheckpointPointerRow {
             checkpoint_key: self.checkpoint_key,
             logical_epoch,
             content_hash: self.content_hash,
+            output_manifest_refs: standing_runtime_output_manifest_refs_from_json(
+                &self.output_manifest_refs_json,
+            )?,
         };
         pointer.validate()?;
         Ok(pointer)
@@ -2297,8 +2378,21 @@ impl From<&mut hiqlite::Row<'_>> for StandingRuntimeCheckpointPointerRow {
             checkpoint_key: row.get("checkpoint_key"),
             logical_epoch: row.get("logical_epoch"),
             content_hash: row.get("content_hash"),
+            output_manifest_refs_json: row.get("output_manifest_refs_json"),
         }
     }
+}
+
+#[cfg(feature = "hiqlite-backend")]
+fn standing_runtime_output_manifest_refs_json(refs: &[String]) -> Result<String, MetaStoreError> {
+    serde_json::to_string(refs).map_err(|source| MetaStoreError::Serialization(source.to_string()))
+}
+
+#[cfg(feature = "hiqlite-backend")]
+fn standing_runtime_output_manifest_refs_from_json(
+    value: &str,
+) -> Result<Vec<String>, MetaStoreError> {
+    serde_json::from_str(value).map_err(|source| MetaStoreError::Serialization(source.to_string()))
 }
 
 #[cfg(feature = "hiqlite-backend")]
@@ -2809,6 +2903,7 @@ mod hiqlite_capability_tests {
                 content_hash:
                     "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                         .to_string(),
+                output_manifest_refs: Vec::new(),
             },
             owner: StandingRuntimeOwnerToken {
                 tenant_id: "other".to_string(),

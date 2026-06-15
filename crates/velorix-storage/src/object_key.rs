@@ -45,6 +45,43 @@ pub struct StandingRuntimeCheckpointKeyParts {
     pub content_hash: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StandingRuntimeStatePayloadKeyParts {
+    pub tenant_id: String,
+    pub program_id: String,
+    pub view_id: String,
+    pub logical_epoch: u64,
+    pub state_content_hash: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StandingRuntimeOutputManifestKeyParts {
+    pub tenant_id: String,
+    pub program_id: String,
+    pub view_id: String,
+    pub logical_epoch: u64,
+    pub output_content_hash: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StandingRuntimeOutputPageKeyParts {
+    pub tenant_id: String,
+    pub program_id: String,
+    pub view_id: String,
+    pub logical_epoch: u64,
+    pub page_index: u32,
+    pub page_content_hash: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StandingRuntimeOutputDeltaKeyParts {
+    pub tenant_id: String,
+    pub program_id: String,
+    pub view_id: String,
+    pub logical_epoch: u64,
+    pub delta_content_hash: String,
+}
+
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum ObjectKeyError {
     #[error("object key segment `{0}` is empty")]
@@ -272,21 +309,9 @@ impl ObjectKey {
         )))
     }
 
-    pub fn feldera_artifact(
-        artifact_id: &str,
-        artifact_hash: &str,
-    ) -> Result<Self, ObjectKeyError> {
-        validate_segment("artifact_id", artifact_id)?;
-        let hash = parse_sha256_hash_segment(artifact_hash)?;
-
-        Ok(Self(format!(
-            "v1/feldera-artifacts/{artifact_id}/sha256/{hash}.artifact.json"
-        )))
-    }
-
     pub fn materialized_view(view_id: &str, spec_hash: &str) -> Result<Self, ObjectKeyError> {
         validate_segment("view_id", view_id)?;
-        let hash = parse_feldera_spec_hash_segment(spec_hash)?;
+        let hash = parse_view_spec_hash_segment(spec_hash)?;
 
         Ok(Self(format!(
             "v1/views/{view_id}/spec-sha256/{hash}.view.json"
@@ -297,39 +322,6 @@ impl ObjectKey {
         validate_segment("view_id", view_id)?;
 
         Ok(Self(format!("v1/views/{view_id}/active.json")))
-    }
-
-    pub fn view_compile_deploy_job(view_id: &str, spec_hash: &str) -> Result<Self, ObjectKeyError> {
-        validate_segment("view_id", view_id)?;
-        let hash = parse_feldera_spec_hash_segment(spec_hash)?;
-
-        Ok(Self(format!(
-            "v1/view-compile-deploy-jobs/{view_id}/spec-sha256/{hash}.job.json"
-        )))
-    }
-
-    pub fn view_compile_deploy_job_for_compile_request(
-        view_id: &str,
-        compile_request_hash: &str,
-    ) -> Result<Self, ObjectKeyError> {
-        validate_segment("view_id", view_id)?;
-        let hash = parse_feldera_compile_request_hash_segment(compile_request_hash)?;
-
-        Ok(Self(format!(
-            "v1/view-compile-deploy-jobs/{view_id}/compile-request-sha256/{hash}.job.json"
-        )))
-    }
-
-    pub fn view_compile_deploy_job_claim_for_compile_request(
-        view_id: &str,
-        compile_request_hash: &str,
-    ) -> Result<Self, ObjectKeyError> {
-        validate_segment("view_id", view_id)?;
-        let hash = parse_feldera_compile_request_hash_segment(compile_request_hash)?;
-
-        Ok(Self(format!(
-            "v1/view-compile-deploy-job-claims/{view_id}/compile-request-sha256/{hash}.claim.json"
-        )))
     }
 
     pub fn standing_runtime_checkpoint(
@@ -360,6 +352,75 @@ impl ObjectKey {
 
         Ok(Self(format!(
             "v1/standing-runtime-checkpoints/{tenant_id}/{program_id}/{view_id}/latest.json"
+        )))
+    }
+
+    pub fn standing_runtime_state_payload(
+        tenant_id: &str,
+        program_id: &str,
+        view_id: &str,
+        logical_epoch: u64,
+        state_content_hash: &str,
+    ) -> Result<Self, ObjectKeyError> {
+        validate_segment("tenant_id", tenant_id)?;
+        validate_segment("program_id", program_id)?;
+        validate_segment("view_id", view_id)?;
+        let hash = parse_sha256_hash_segment(state_content_hash)?;
+
+        Ok(Self(format!(
+            "v1/standing-runtime-state-payloads/{tenant_id}/{program_id}/{view_id}/epochs/{logical_epoch:0CHECKPOINT_WIDTH$}/sha256/{hash}.state-payload.json"
+        )))
+    }
+
+    pub fn standing_runtime_output_manifest(
+        tenant_id: &str,
+        program_id: &str,
+        view_id: &str,
+        logical_epoch: u64,
+        output_content_hash: &str,
+    ) -> Result<Self, ObjectKeyError> {
+        validate_segment("tenant_id", tenant_id)?;
+        validate_segment("program_id", program_id)?;
+        validate_segment("view_id", view_id)?;
+        let hash = parse_sha256_hash_segment(output_content_hash)?;
+
+        Ok(Self(format!(
+            "v1/standing-runtime-output-manifests/{tenant_id}/{program_id}/{view_id}/epochs/{logical_epoch:0CHECKPOINT_WIDTH$}/sha256/{hash}.output-manifest.json"
+        )))
+    }
+
+    pub fn standing_runtime_output_page(
+        tenant_id: &str,
+        program_id: &str,
+        view_id: &str,
+        logical_epoch: u64,
+        page_index: u32,
+        page_content_hash: &str,
+    ) -> Result<Self, ObjectKeyError> {
+        validate_segment("tenant_id", tenant_id)?;
+        validate_segment("program_id", program_id)?;
+        validate_segment("view_id", view_id)?;
+        let hash = parse_sha256_hash_segment(page_content_hash)?;
+
+        Ok(Self(format!(
+            "v1/standing-runtime-output-pages/{tenant_id}/{program_id}/{view_id}/epochs/{logical_epoch:0CHECKPOINT_WIDTH$}/pages/{page_index:0PARTITION_WIDTH$}/sha256/{hash}.output-page.json"
+        )))
+    }
+
+    pub fn standing_runtime_output_delta(
+        tenant_id: &str,
+        program_id: &str,
+        view_id: &str,
+        logical_epoch: u64,
+        delta_content_hash: &str,
+    ) -> Result<Self, ObjectKeyError> {
+        validate_segment("tenant_id", tenant_id)?;
+        validate_segment("program_id", program_id)?;
+        validate_segment("view_id", view_id)?;
+        let hash = parse_sha256_hash_segment(delta_content_hash)?;
+
+        Ok(Self(format!(
+            "v1/standing-runtime-output-deltas/{tenant_id}/{program_id}/{view_id}/epochs/{logical_epoch:0CHECKPOINT_WIDTH$}/sha256/{hash}.output-delta.json"
         )))
     }
 
@@ -425,6 +486,46 @@ impl ObjectKey {
         let value = value.into();
         let key = Self::parse(value.clone())?;
         let parts = parse_standing_runtime_checkpoint_layout(&value)?;
+
+        Ok((key, parts))
+    }
+
+    pub fn parse_standing_runtime_state_payload(
+        value: impl Into<String>,
+    ) -> Result<(Self, StandingRuntimeStatePayloadKeyParts), ObjectKeyError> {
+        let value = value.into();
+        let key = Self::parse(value.clone())?;
+        let parts = parse_standing_runtime_state_payload_layout(&value)?;
+
+        Ok((key, parts))
+    }
+
+    pub fn parse_standing_runtime_output_manifest(
+        value: impl Into<String>,
+    ) -> Result<(Self, StandingRuntimeOutputManifestKeyParts), ObjectKeyError> {
+        let value = value.into();
+        let key = Self::parse(value.clone())?;
+        let parts = parse_standing_runtime_output_manifest_layout(&value)?;
+
+        Ok((key, parts))
+    }
+
+    pub fn parse_standing_runtime_output_page(
+        value: impl Into<String>,
+    ) -> Result<(Self, StandingRuntimeOutputPageKeyParts), ObjectKeyError> {
+        let value = value.into();
+        let key = Self::parse(value.clone())?;
+        let parts = parse_standing_runtime_output_page_layout(&value)?;
+
+        Ok((key, parts))
+    }
+
+    pub fn parse_standing_runtime_output_delta(
+        value: impl Into<String>,
+    ) -> Result<(Self, StandingRuntimeOutputDeltaKeyParts), ObjectKeyError> {
+        let value = value.into();
+        let key = Self::parse(value.clone())?;
+        let parts = parse_standing_runtime_output_delta_layout(&value)?;
 
         Ok((key, parts))
     }
@@ -583,14 +684,6 @@ fn validate_known_layout(value: &str) -> Result<(), ObjectKeyError> {
                 .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
             validate_segment("query_policy_id", query_policy_id)?;
         }
-        ["v1", "feldera-artifacts", artifact_id, "sha256", artifact_file] => {
-            validate_segment("artifact_id", artifact_id)?;
-            let hash = artifact_file
-                .strip_suffix(".artifact.json")
-                .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
-            validate_sha256_hex(hash)
-                .map_err(|_| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
-        }
         ["v1", "views", view_id, "active.json"] => {
             validate_segment("view_id", view_id)?;
         }
@@ -598,22 +691,6 @@ fn validate_known_layout(value: &str) -> Result<(), ObjectKeyError> {
             validate_segment("view_id", view_id)?;
             let hash = view_file
                 .strip_suffix(".view.json")
-                .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
-            validate_sha256_hex(hash)
-                .map_err(|_| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
-        }
-        ["v1", "view-compile-deploy-jobs", view_id, "spec-sha256", job_file] => {
-            validate_segment("view_id", view_id)?;
-            let hash = job_file
-                .strip_suffix(".job.json")
-                .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
-            validate_sha256_hex(hash)
-                .map_err(|_| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
-        }
-        ["v1", "view-compile-deploy-jobs", view_id, "compile-request-sha256", job_file] => {
-            validate_segment("view_id", view_id)?;
-            let hash = job_file
-                .strip_suffix(".job.json")
                 .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
             validate_sha256_hex(hash)
                 .map_err(|_| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
@@ -633,6 +710,51 @@ fn validate_known_layout(value: &str) -> Result<(), ObjectKeyError> {
             validate_segment("tenant_id", tenant_id)?;
             validate_segment("program_id", program_id)?;
             validate_segment("view_id", view_id)?;
+        }
+        ["v1", "standing-runtime-state-payloads", tenant_id, program_id, view_id, "epochs", logical_epoch, "sha256", state_payload_file] =>
+        {
+            parse_standing_runtime_state_payload_parts(
+                value,
+                tenant_id,
+                program_id,
+                view_id,
+                logical_epoch,
+                state_payload_file,
+            )?;
+        }
+        ["v1", "standing-runtime-output-manifests", tenant_id, program_id, view_id, "epochs", logical_epoch, "sha256", output_manifest_file] =>
+        {
+            parse_standing_runtime_output_manifest_parts(
+                value,
+                tenant_id,
+                program_id,
+                view_id,
+                logical_epoch,
+                output_manifest_file,
+            )?;
+        }
+        ["v1", "standing-runtime-output-pages", tenant_id, program_id, view_id, "epochs", logical_epoch, "pages", page_index, "sha256", output_page_file] =>
+        {
+            parse_standing_runtime_output_page_parts(
+                value,
+                tenant_id,
+                program_id,
+                view_id,
+                logical_epoch,
+                page_index,
+                output_page_file,
+            )?;
+        }
+        ["v1", "standing-runtime-output-deltas", tenant_id, program_id, view_id, "epochs", logical_epoch, "sha256", output_delta_file] =>
+        {
+            parse_standing_runtime_output_delta_parts(
+                value,
+                tenant_id,
+                program_id,
+                view_id,
+                logical_epoch,
+                output_delta_file,
+            )?;
         }
         ["v1", "relations", relation_id, "versions", relation_file] => {
             validate_segment("relation_id", relation_id)?;
@@ -702,6 +824,91 @@ fn parse_standing_runtime_checkpoint_layout(
     )
 }
 
+fn parse_standing_runtime_state_payload_layout(
+    value: &str,
+) -> Result<StandingRuntimeStatePayloadKeyParts, ObjectKeyError> {
+    let segments: Vec<_> = value.split('/').collect();
+
+    let ["v1", "standing-runtime-state-payloads", tenant_id, program_id, view_id, "epochs", logical_epoch, "sha256", state_payload_file] =
+        segments.as_slice()
+    else {
+        return Err(ObjectKeyError::InvalidExternalKey(value.to_string()));
+    };
+
+    parse_standing_runtime_state_payload_parts(
+        value,
+        tenant_id,
+        program_id,
+        view_id,
+        logical_epoch,
+        state_payload_file,
+    )
+}
+
+fn parse_standing_runtime_output_manifest_layout(
+    value: &str,
+) -> Result<StandingRuntimeOutputManifestKeyParts, ObjectKeyError> {
+    let segments: Vec<_> = value.split('/').collect();
+
+    let ["v1", "standing-runtime-output-manifests", tenant_id, program_id, view_id, "epochs", logical_epoch, "sha256", output_manifest_file] =
+        segments.as_slice()
+    else {
+        return Err(ObjectKeyError::InvalidExternalKey(value.to_string()));
+    };
+
+    parse_standing_runtime_output_manifest_parts(
+        value,
+        tenant_id,
+        program_id,
+        view_id,
+        logical_epoch,
+        output_manifest_file,
+    )
+}
+
+fn parse_standing_runtime_output_page_layout(
+    value: &str,
+) -> Result<StandingRuntimeOutputPageKeyParts, ObjectKeyError> {
+    let segments: Vec<_> = value.split('/').collect();
+
+    let ["v1", "standing-runtime-output-pages", tenant_id, program_id, view_id, "epochs", logical_epoch, "pages", page_index, "sha256", output_page_file] =
+        segments.as_slice()
+    else {
+        return Err(ObjectKeyError::InvalidExternalKey(value.to_string()));
+    };
+
+    parse_standing_runtime_output_page_parts(
+        value,
+        tenant_id,
+        program_id,
+        view_id,
+        logical_epoch,
+        page_index,
+        output_page_file,
+    )
+}
+
+fn parse_standing_runtime_output_delta_layout(
+    value: &str,
+) -> Result<StandingRuntimeOutputDeltaKeyParts, ObjectKeyError> {
+    let segments: Vec<_> = value.split('/').collect();
+
+    let ["v1", "standing-runtime-output-deltas", tenant_id, program_id, view_id, "epochs", logical_epoch, "sha256", output_delta_file] =
+        segments.as_slice()
+    else {
+        return Err(ObjectKeyError::InvalidExternalKey(value.to_string()));
+    };
+
+    parse_standing_runtime_output_delta_parts(
+        value,
+        tenant_id,
+        program_id,
+        view_id,
+        logical_epoch,
+        output_delta_file,
+    )
+}
+
 fn parse_ingest_batch_parts(
     value: &str,
     stream_id: &str,
@@ -747,6 +954,113 @@ fn parse_standing_runtime_checkpoint_parts(
         view_id: view_id.to_string(),
         logical_epoch,
         content_hash: format!("sha256:{hash}"),
+    })
+}
+
+fn parse_standing_runtime_state_payload_parts(
+    value: &str,
+    tenant_id: &str,
+    program_id: &str,
+    view_id: &str,
+    logical_epoch: &str,
+    state_payload_file: &str,
+) -> Result<StandingRuntimeStatePayloadKeyParts, ObjectKeyError> {
+    validate_segment("tenant_id", tenant_id)?;
+    validate_segment("program_id", program_id)?;
+    validate_segment("view_id", view_id)?;
+    let logical_epoch = parse_fixed_u64("logical_epoch", logical_epoch, CHECKPOINT_WIDTH)?;
+    let hash = state_payload_file
+        .strip_suffix(".state-payload.json")
+        .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+    validate_sha256_hex(hash).map_err(|_| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+
+    Ok(StandingRuntimeStatePayloadKeyParts {
+        tenant_id: tenant_id.to_string(),
+        program_id: program_id.to_string(),
+        view_id: view_id.to_string(),
+        logical_epoch,
+        state_content_hash: format!("sha256:{hash}"),
+    })
+}
+
+fn parse_standing_runtime_output_manifest_parts(
+    value: &str,
+    tenant_id: &str,
+    program_id: &str,
+    view_id: &str,
+    logical_epoch: &str,
+    output_manifest_file: &str,
+) -> Result<StandingRuntimeOutputManifestKeyParts, ObjectKeyError> {
+    validate_segment("tenant_id", tenant_id)?;
+    validate_segment("program_id", program_id)?;
+    validate_segment("view_id", view_id)?;
+    let logical_epoch = parse_fixed_u64("logical_epoch", logical_epoch, CHECKPOINT_WIDTH)?;
+    let hash = output_manifest_file
+        .strip_suffix(".output-manifest.json")
+        .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+    validate_sha256_hex(hash).map_err(|_| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+
+    Ok(StandingRuntimeOutputManifestKeyParts {
+        tenant_id: tenant_id.to_string(),
+        program_id: program_id.to_string(),
+        view_id: view_id.to_string(),
+        logical_epoch,
+        output_content_hash: format!("sha256:{hash}"),
+    })
+}
+
+fn parse_standing_runtime_output_page_parts(
+    value: &str,
+    tenant_id: &str,
+    program_id: &str,
+    view_id: &str,
+    logical_epoch: &str,
+    page_index: &str,
+    output_page_file: &str,
+) -> Result<StandingRuntimeOutputPageKeyParts, ObjectKeyError> {
+    validate_segment("tenant_id", tenant_id)?;
+    validate_segment("program_id", program_id)?;
+    validate_segment("view_id", view_id)?;
+    let logical_epoch = parse_fixed_u64("logical_epoch", logical_epoch, CHECKPOINT_WIDTH)?;
+    let page_index = parse_fixed_u32("page_index", page_index, PARTITION_WIDTH)?;
+    let hash = output_page_file
+        .strip_suffix(".output-page.json")
+        .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+    validate_sha256_hex(hash).map_err(|_| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+
+    Ok(StandingRuntimeOutputPageKeyParts {
+        tenant_id: tenant_id.to_string(),
+        program_id: program_id.to_string(),
+        view_id: view_id.to_string(),
+        logical_epoch,
+        page_index,
+        page_content_hash: format!("sha256:{hash}"),
+    })
+}
+
+fn parse_standing_runtime_output_delta_parts(
+    value: &str,
+    tenant_id: &str,
+    program_id: &str,
+    view_id: &str,
+    logical_epoch: &str,
+    output_delta_file: &str,
+) -> Result<StandingRuntimeOutputDeltaKeyParts, ObjectKeyError> {
+    validate_segment("tenant_id", tenant_id)?;
+    validate_segment("program_id", program_id)?;
+    validate_segment("view_id", view_id)?;
+    let logical_epoch = parse_fixed_u64("logical_epoch", logical_epoch, CHECKPOINT_WIDTH)?;
+    let hash = output_delta_file
+        .strip_suffix(".output-delta.json")
+        .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+    validate_sha256_hex(hash).map_err(|_| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+
+    Ok(StandingRuntimeOutputDeltaKeyParts {
+        tenant_id: tenant_id.to_string(),
+        program_id: program_id.to_string(),
+        view_id: view_id.to_string(),
+        logical_epoch,
+        delta_content_hash: format!("sha256:{hash}"),
     })
 }
 
@@ -909,8 +1223,8 @@ fn parse_sha256_hash_segment(artifact_hash: &str) -> Result<&str, ObjectKeyError
     Ok(hash)
 }
 
-fn parse_feldera_spec_hash_segment(spec_hash: &str) -> Result<&str, ObjectKeyError> {
-    let Some(hash) = spec_hash.strip_prefix("velorix-feldera-spec-sha256-v1:") else {
+fn parse_view_spec_hash_segment(spec_hash: &str) -> Result<&str, ObjectKeyError> {
+    let Some(hash) = spec_hash.strip_prefix("velorix-view-spec-sha256-v1:") else {
         return Err(ObjectKeyError::UnsafeSegment {
             name: "spec_hash",
             value: spec_hash.to_string(),
@@ -918,25 +1232,6 @@ fn parse_feldera_spec_hash_segment(spec_hash: &str) -> Result<&str, ObjectKeyErr
     };
     validate_sha256_hex(hash).map_err(|_| ObjectKeyError::UnsafeSegment {
         name: "spec_hash",
-        value: hash.to_string(),
-    })?;
-
-    Ok(hash)
-}
-
-fn parse_feldera_compile_request_hash_segment(
-    compile_request_hash: &str,
-) -> Result<&str, ObjectKeyError> {
-    let Some(hash) =
-        compile_request_hash.strip_prefix("velorix-feldera-compile-request-sha256-v1:")
-    else {
-        return Err(ObjectKeyError::UnsafeSegment {
-            name: "compile_request_hash",
-            value: compile_request_hash.to_string(),
-        });
-    };
-    validate_sha256_hex(hash).map_err(|_| ObjectKeyError::UnsafeSegment {
-        name: "compile_request_hash",
         value: hash.to_string(),
     })?;
 
@@ -1241,46 +1536,8 @@ mod tests {
     }
 
     #[test]
-    fn feldera_artifact_key_is_deterministic_and_parseable() {
-        let hash = format!("sha256:{}", "a".repeat(64));
-        let key = ObjectKey::feldera_artifact("orders-by-region", &hash).unwrap();
-        let restarted = ObjectKey::feldera_artifact("orders-by-region", &hash).unwrap();
-
-        assert_eq!(
-            key.as_str(),
-            "v1/feldera-artifacts/orders-by-region/sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.artifact.json"
-        );
-        assert_eq!(key, restarted);
-        assert_eq!(ObjectKey::parse(key.as_str()).unwrap(), key);
-    }
-
-    #[test]
-    fn feldera_artifact_key_rejects_unsafe_identity() {
-        for (artifact_id, artifact_hash) in [
-            (
-                "",
-                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            ),
-            (
-                "orders/current",
-                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            ),
-            (
-                "orders",
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            ),
-            ("orders", "sha256:not-hex"),
-        ] {
-            assert!(
-                ObjectKey::feldera_artifact(artifact_id, artifact_hash).is_err(),
-                "accepted invalid artifact identity: {artifact_id}/{artifact_hash}"
-            );
-        }
-    }
-
-    #[test]
     fn materialized_view_key_is_deterministic_and_parseable() {
-        let spec_hash = format!("velorix-feldera-spec-sha256-v1:{}", "a".repeat(64));
+        let spec_hash = format!("velorix-view-spec-sha256-v1:{}", "a".repeat(64));
         let key = ObjectKey::materialized_view("orders-by-region", &spec_hash).unwrap();
         let restarted = ObjectKey::materialized_view("orders-by-region", &spec_hash).unwrap();
 
@@ -1297,77 +1554,21 @@ mod tests {
         for (view_id, spec_hash) in [
             (
                 "",
-                "velorix-feldera-spec-sha256-v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "velorix-view-spec-sha256-v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             ),
             (
                 "orders/current",
-                "velorix-feldera-spec-sha256-v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "velorix-view-spec-sha256-v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             ),
             (
                 "orders",
                 "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             ),
-            ("orders", "velorix-feldera-spec-sha256-v1:not-hex"),
+            ("orders", "velorix-view-spec-sha256-v1:not-hex"),
         ] {
             assert!(
                 ObjectKey::materialized_view(view_id, spec_hash).is_err(),
                 "accepted invalid materialized view identity: {view_id}/{spec_hash}"
-            );
-        }
-    }
-
-    #[test]
-    fn view_compile_deploy_job_compile_request_key_is_deterministic_and_parseable() {
-        let compile_request_hash = format!(
-            "velorix-feldera-compile-request-sha256-v1:{}",
-            "b".repeat(64)
-        );
-        let key = ObjectKey::view_compile_deploy_job_for_compile_request(
-            "orders-by-region",
-            &compile_request_hash,
-        )
-        .unwrap();
-        let restarted = ObjectKey::view_compile_deploy_job_for_compile_request(
-            "orders-by-region",
-            &compile_request_hash,
-        )
-        .unwrap();
-
-        assert_eq!(
-            key.as_str(),
-            "v1/view-compile-deploy-jobs/orders-by-region/compile-request-sha256/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.job.json"
-        );
-        assert_eq!(key, restarted);
-        assert_eq!(ObjectKey::parse(key.as_str()).unwrap(), key);
-    }
-
-    #[test]
-    fn view_compile_deploy_job_compile_request_key_rejects_unsafe_identity() {
-        for (view_id, compile_request_hash) in [
-            (
-                "",
-                "velorix-feldera-compile-request-sha256-v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            ),
-            (
-                "orders/current",
-                "velorix-feldera-compile-request-sha256-v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            ),
-            (
-                "orders",
-                "velorix-feldera-spec-sha256-v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            ),
-            (
-                "orders",
-                "velorix-feldera-compile-request-sha256-v1:not-hex",
-            ),
-        ] {
-            assert!(
-                ObjectKey::view_compile_deploy_job_for_compile_request(
-                    view_id,
-                    compile_request_hash
-                )
-                .is_err(),
-                "accepted invalid compile/deploy job identity: {view_id}/{compile_request_hash}"
             );
         }
     }
@@ -1415,6 +1616,150 @@ mod tests {
             "v1/standing-runtime-checkpoints/tenant-a/program-a/scores-by-user/latest.json"
         );
         assert_eq!(ObjectKey::parse(latest.as_str()).unwrap(), latest);
+    }
+
+    #[test]
+    fn standing_runtime_state_payload_keys_are_deterministic_and_parseable() {
+        let state_content_hash = format!("sha256:{}", "a".repeat(64));
+        let state_payload = ObjectKey::standing_runtime_state_payload(
+            "tenant-a",
+            "program-a",
+            "scores-by-user",
+            42,
+            &state_content_hash,
+        )
+        .unwrap();
+        let restarted = ObjectKey::standing_runtime_state_payload(
+            "tenant-a",
+            "program-a",
+            "scores-by-user",
+            42,
+            &state_content_hash,
+        )
+        .unwrap();
+
+        assert_eq!(
+            state_payload.as_str(),
+            "v1/standing-runtime-state-payloads/tenant-a/program-a/scores-by-user/epochs/00000000000000000042/sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.state-payload.json"
+        );
+        assert_eq!(state_payload, restarted);
+        assert_eq!(
+            ObjectKey::parse(state_payload.as_str()).unwrap(),
+            state_payload
+        );
+        let (_, parts) =
+            ObjectKey::parse_standing_runtime_state_payload(state_payload.as_str()).unwrap();
+        assert_eq!(parts.tenant_id, "tenant-a");
+        assert_eq!(parts.program_id, "program-a");
+        assert_eq!(parts.view_id, "scores-by-user");
+        assert_eq!(parts.logical_epoch, 42);
+        assert_eq!(parts.state_content_hash, state_content_hash);
+    }
+
+    #[test]
+    fn standing_runtime_output_manifest_keys_are_deterministic_and_parseable() {
+        let output_content_hash = format!("sha256:{}", "e".repeat(64));
+        let manifest = ObjectKey::standing_runtime_output_manifest(
+            "tenant-a",
+            "program-a",
+            "scores-by-user",
+            42,
+            &output_content_hash,
+        )
+        .unwrap();
+        let restarted = ObjectKey::standing_runtime_output_manifest(
+            "tenant-a",
+            "program-a",
+            "scores-by-user",
+            42,
+            &output_content_hash,
+        )
+        .unwrap();
+
+        assert_eq!(
+            manifest.as_str(),
+            "v1/standing-runtime-output-manifests/tenant-a/program-a/scores-by-user/epochs/00000000000000000042/sha256/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.output-manifest.json"
+        );
+        assert_eq!(manifest, restarted);
+        assert_eq!(ObjectKey::parse(manifest.as_str()).unwrap(), manifest);
+        let (_, parts) =
+            ObjectKey::parse_standing_runtime_output_manifest(manifest.as_str()).unwrap();
+        assert_eq!(parts.tenant_id, "tenant-a");
+        assert_eq!(parts.program_id, "program-a");
+        assert_eq!(parts.view_id, "scores-by-user");
+        assert_eq!(parts.logical_epoch, 42);
+        assert_eq!(parts.output_content_hash, output_content_hash);
+    }
+
+    #[test]
+    fn standing_runtime_output_page_keys_are_deterministic_and_parseable() {
+        let page_content_hash = format!("sha256:{}", "f".repeat(64));
+        let page = ObjectKey::standing_runtime_output_page(
+            "tenant-a",
+            "program-a",
+            "scores-by-user",
+            42,
+            7,
+            &page_content_hash,
+        )
+        .unwrap();
+        let restarted = ObjectKey::standing_runtime_output_page(
+            "tenant-a",
+            "program-a",
+            "scores-by-user",
+            42,
+            7,
+            &page_content_hash,
+        )
+        .unwrap();
+
+        assert_eq!(
+            page.as_str(),
+            "v1/standing-runtime-output-pages/tenant-a/program-a/scores-by-user/epochs/00000000000000000042/pages/0000000007/sha256/ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff.output-page.json"
+        );
+        assert_eq!(page, restarted);
+        assert_eq!(ObjectKey::parse(page.as_str()).unwrap(), page);
+        let (_, parts) = ObjectKey::parse_standing_runtime_output_page(page.as_str()).unwrap();
+        assert_eq!(parts.tenant_id, "tenant-a");
+        assert_eq!(parts.program_id, "program-a");
+        assert_eq!(parts.view_id, "scores-by-user");
+        assert_eq!(parts.logical_epoch, 42);
+        assert_eq!(parts.page_index, 7);
+        assert_eq!(parts.page_content_hash, page_content_hash);
+    }
+
+    #[test]
+    fn standing_runtime_output_delta_keys_are_deterministic_and_parseable() {
+        let delta_content_hash = format!("sha256:{}", "a".repeat(64));
+        let delta = ObjectKey::standing_runtime_output_delta(
+            "tenant-a",
+            "program-a",
+            "scores-by-user",
+            42,
+            &delta_content_hash,
+        )
+        .unwrap();
+        let restarted = ObjectKey::standing_runtime_output_delta(
+            "tenant-a",
+            "program-a",
+            "scores-by-user",
+            42,
+            &delta_content_hash,
+        )
+        .unwrap();
+
+        assert_eq!(
+            delta.as_str(),
+            "v1/standing-runtime-output-deltas/tenant-a/program-a/scores-by-user/epochs/00000000000000000042/sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.output-delta.json"
+        );
+        assert_eq!(delta, restarted);
+        assert_eq!(ObjectKey::parse(delta.as_str()).unwrap(), delta);
+        let (_, parts) = ObjectKey::parse_standing_runtime_output_delta(delta.as_str()).unwrap();
+        assert_eq!(parts.tenant_id, "tenant-a");
+        assert_eq!(parts.program_id, "program-a");
+        assert_eq!(parts.view_id, "scores-by-user");
+        assert_eq!(parts.logical_epoch, 42);
+        assert_eq!(parts.delta_content_hash, delta_content_hash);
     }
 
     #[test]
@@ -1488,8 +1833,8 @@ mod tests {
             "v1/tables/orders.txt",
             "v1/query-policy/tenant-a/.json",
             "v1/query-policy/tenant-a/standard/base.json",
-            "v1/feldera-artifacts/orders/sha256/not-hex.artifact.json",
-            "v1/feldera-artifacts/orders/sha512/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.artifact.json",
+            "v1/artifacts/orders/sha256/not-hex.artifact.json",
+            "v1/artifacts/orders/sha512/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.artifact.json",
             "v1/views/orders/spec-sha256/not-hex.view.json",
             "v1/views/orders/sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.view.json",
             "v1/views/orders/spec-sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json",

@@ -4,9 +4,9 @@ use object_store::{local::LocalFileSystem, ObjectStore};
 use tempfile::TempDir;
 use velorix_core::relation::{
     ArrowPhysicalTypeV1, DataFusionRegistrationModeV1, DataFusionRegistrationV1,
-    FelderaRelationBindingV1, IncrementalAdapterBindingV1, RelationColumnV1, RelationOperationV1,
-    RelationSemanticRoleV1, SchemaFingerprintV1, VelorixLogicalTypeV1, VelorixRelationCatalogV1,
-    VelorixRelationSchemaV1, CATALOG_FELDERA_GENERIC_INCREMENTAL_ADAPTER_ID,
+    IncrementalAdapterBindingV1, IncrementalRelationBindingV1, RelationColumnV1,
+    RelationOperationV1, RelationSemanticRoleV1, SchemaFingerprintV1, VelorixLogicalTypeV1,
+    VelorixRelationCatalogV1, VelorixRelationSchemaV1, CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID,
     ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID, RELATION_SCHEMA_VERSION_V1,
 };
 use velorix_storage::{
@@ -89,7 +89,7 @@ fn orders_relation_catalog() -> VelorixRelationCatalogV1 {
             name: "orders".to_string(),
             mode: DataFusionRegistrationModeV1::Table,
         },
-        feldera_relation: FelderaRelationBindingV1 {
+        incremental_relation: IncrementalRelationBindingV1 {
             relation_id: "orders".to_string(),
             schema_fingerprint,
         },
@@ -139,7 +139,7 @@ fn generic_activity_relation_catalog() -> VelorixRelationCatalogV1 {
                 physical_arrow_type: ArrowPhysicalTypeV1::Int64,
                 nullable: false,
                 ordinal: 3,
-                semantic_role: RelationSemanticRoleV1::Weight,
+                semantic_role: RelationSemanticRoleV1::Metadata,
             },
         ],
         primary_key_column_ids: vec!["event_id".to_string()],
@@ -157,12 +157,12 @@ fn generic_activity_relation_catalog() -> VelorixRelationCatalogV1 {
             name: "activity_events".to_string(),
             mode: DataFusionRegistrationModeV1::Table,
         },
-        feldera_relation: FelderaRelationBindingV1 {
+        incremental_relation: IncrementalRelationBindingV1 {
             relation_id: "activity_events".to_string(),
             schema_fingerprint,
         },
         incremental_adapter: IncrementalAdapterBindingV1 {
-            adapter_id: CATALOG_FELDERA_GENERIC_INCREMENTAL_ADAPTER_ID.to_string(),
+            adapter_id: CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.to_string(),
         },
     }
 }
@@ -209,7 +209,7 @@ async fn relation_catalog_registry_treats_duplicate_same_record_as_idempotent() 
 }
 
 #[tokio::test]
-async fn relation_catalog_registry_accepts_generic_feldera_relation_without_value_shape() {
+async fn relation_catalog_registry_accepts_generic_incremental_relation_without_value_shape() {
     let (_temp_dir, store) = temp_store();
     let registry = RelationCatalogRegistry::new(store);
     let catalog = generic_activity_relation_catalog();
@@ -264,7 +264,30 @@ async fn relation_catalog_registry_rejects_unsupported_adapter_on_create() {
 }
 
 #[tokio::test]
-async fn relation_catalog_registry_rejects_multi_value_adapter_shape_on_create() {
+async fn relation_catalog_registry_accepts_scalar_adapter_without_value_role() {
+    let (_temp_dir, store) = temp_store();
+    let registry = RelationCatalogRegistry::new(store);
+    let mut catalog = orders_relation_catalog();
+    catalog.relation_schema.columns[1].semantic_role =
+        velorix_core::relation::RelationSemanticRoleV1::Metadata;
+    catalog.schema_fingerprint =
+        SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema).unwrap();
+    catalog.incremental_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
+
+    let outcome = registry.create(&catalog).await.unwrap();
+    assert_eq!(outcome, CreateRelationCatalogOutcome::Created);
+    let restored = registry
+        .read(
+            &catalog.relation_schema.relation_id,
+            &catalog.relation_schema.relation_version,
+        )
+        .await
+        .unwrap();
+    assert_eq!(restored, catalog);
+}
+
+#[tokio::test]
+async fn relation_catalog_registry_accepts_multi_value_roles_on_create() {
     let (_temp_dir, store) = temp_store();
     let registry = RelationCatalogRegistry::new(store);
     let mut catalog = orders_relation_catalog();
@@ -275,18 +298,11 @@ async fn relation_catalog_registry_rejects_multi_value_adapter_shape_on_create()
     catalog.relation_schema.columns.push(fee_column);
     catalog.schema_fingerprint =
         SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema).unwrap();
-    catalog.feldera_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
+    catalog.incremental_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
 
-    let error = registry.create(&catalog).await.unwrap_err();
+    let outcome = registry.create(&catalog).await.unwrap();
 
-    assert!(matches!(
-        error,
-        RelationCatalogRegistryError::Validation(
-            velorix_core::relation::RelationSchemaError::InvalidRelationSchema {
-                field: "incremental_adapter.value_columns"
-            }
-        )
-    ));
+    assert_eq!(outcome, CreateRelationCatalogOutcome::Created);
 }
 
 #[tokio::test]
@@ -328,7 +344,7 @@ async fn relation_catalog_registry_rejects_unsupported_adapter_on_read() {
 }
 
 #[tokio::test]
-async fn relation_catalog_registry_rejects_multi_value_adapter_shape_on_read() {
+async fn relation_catalog_registry_accepts_multi_value_roles_on_read() {
     let (_temp_dir, store) = temp_store();
     let registry = RelationCatalogRegistry::new(Arc::clone(&store));
     let mut catalog = orders_relation_catalog();
@@ -339,7 +355,7 @@ async fn relation_catalog_registry_rejects_multi_value_adapter_shape_on_read() {
     catalog.relation_schema.columns.push(fee_column);
     catalog.schema_fingerprint =
         SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema).unwrap();
-    catalog.feldera_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
+    catalog.incremental_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
     let path = registry
         .object_key(
             &catalog.relation_schema.relation_id,
@@ -354,22 +370,15 @@ async fn relation_catalog_registry_rejects_multi_value_adapter_shape_on_read() {
     )
     .await
     .unwrap();
-    let error = registry
+    let restored = registry
         .read(
             &catalog.relation_schema.relation_id,
             &catalog.relation_schema.relation_version,
         )
         .await
-        .unwrap_err();
+        .unwrap();
 
-    assert!(matches!(
-        error,
-        RelationCatalogRegistryError::Validation(
-            velorix_core::relation::RelationSchemaError::InvalidRelationSchema {
-                field: "incremental_adapter.value_columns"
-            }
-        )
-    ));
+    assert_eq!(restored, catalog);
 }
 
 #[tokio::test]
@@ -437,10 +446,10 @@ async fn relation_catalog_registry_rejects_stored_body_identity_mismatch_on_read
     let catalog = orders_relation_catalog();
     let mut wrong_body = catalog.clone();
     wrong_body.relation_schema.relation_id = "customers".to_string();
-    wrong_body.feldera_relation.relation_id = "customers".to_string();
+    wrong_body.incremental_relation.relation_id = "customers".to_string();
     wrong_body.schema_fingerprint =
         SchemaFingerprintV1::for_relation_schema(&wrong_body.relation_schema).unwrap();
-    wrong_body.feldera_relation.schema_fingerprint = wrong_body.schema_fingerprint.clone();
+    wrong_body.incremental_relation.schema_fingerprint = wrong_body.schema_fingerprint.clone();
     let path = registry
         .object_key(
             &catalog.relation_schema.relation_id,

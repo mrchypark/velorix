@@ -1759,6 +1759,7 @@ fn encode_default_scores_payload(
             partition_id,
             start_offset_inclusive,
             end_offset_exclusive,
+            event_time_watermark: None,
         },
         &[batch],
     )

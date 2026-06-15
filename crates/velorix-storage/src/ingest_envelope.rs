@@ -10,7 +10,9 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use velorix_core::relation::validate_schema_fingerprint;
+use velorix_core::{
+    relation::validate_schema_fingerprint, standing_program::InputEventTimeWatermark,
+};
 
 use crate::log::IngestBatchDescriptor;
 
@@ -30,6 +32,8 @@ pub struct IngestEnvelopeHeader {
     pub partition_id: u32,
     pub start_offset_inclusive: u64,
     pub end_offset_exclusive: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_time_watermark: Option<InputEventTimeWatermark>,
     pub relation_id: String,
     pub relation_version: String,
     pub schema_fingerprint: String,
@@ -52,6 +56,7 @@ pub struct IngestEnvelopeEncodeRequest {
     pub partition_id: u32,
     pub start_offset_inclusive: u64,
     pub end_offset_exclusive: u64,
+    pub event_time_watermark: Option<InputEventTimeWatermark>,
 }
 
 #[derive(Debug, Error)]
@@ -125,6 +130,7 @@ impl IngestEnvelope {
             partition_id: request.partition_id,
             start_offset_inclusive: request.start_offset_inclusive,
             end_offset_exclusive: request.end_offset_exclusive,
+            event_time_watermark: request.event_time_watermark,
             relation_id: request.relation_id,
             relation_version: request.relation_version,
             schema_fingerprint: request.schema_fingerprint,
@@ -225,6 +231,8 @@ struct IngestEnvelopeHeaderWithoutDigest {
     partition_id: u32,
     start_offset_inclusive: u64,
     end_offset_exclusive: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    event_time_watermark: Option<InputEventTimeWatermark>,
     relation_id: String,
     relation_version: String,
     schema_fingerprint: String,
@@ -240,6 +248,7 @@ impl IngestEnvelopeHeaderWithoutDigest {
             partition_id: self.partition_id,
             start_offset_inclusive: self.start_offset_inclusive,
             end_offset_exclusive: self.end_offset_exclusive,
+            event_time_watermark: self.event_time_watermark,
             relation_id: self.relation_id,
             relation_version: self.relation_version,
             schema_fingerprint: self.schema_fingerprint,
@@ -258,6 +267,7 @@ impl From<&IngestEnvelopeHeader> for IngestEnvelopeHeaderWithoutDigest {
             partition_id: header.partition_id,
             start_offset_inclusive: header.start_offset_inclusive,
             end_offset_exclusive: header.end_offset_exclusive,
+            event_time_watermark: header.event_time_watermark.clone(),
             relation_id: header.relation_id.clone(),
             relation_version: header.relation_version.clone(),
             schema_fingerprint: header.schema_fingerprint.clone(),
@@ -376,6 +386,31 @@ fn validate_header_without_digest(
         });
     }
 
+    if let Some(watermark) = &header.event_time_watermark {
+        if watermark.stream_id != header.stream_id {
+            return Err(IngestEnvelopeError::MalformedEnvelope {
+                reason: "event_time_watermark.stream_id must match header stream_id".to_string(),
+            });
+        }
+        if watermark.partition_id != header.partition_id {
+            return Err(IngestEnvelopeError::MalformedEnvelope {
+                reason: "event_time_watermark.partition_id must match header partition_id"
+                    .to_string(),
+            });
+        }
+        if watermark.event_time_column_id.trim().is_empty() {
+            return Err(IngestEnvelopeError::MalformedEnvelope {
+                reason: "event_time_watermark.event_time_column_id must be nonempty".to_string(),
+            });
+        }
+        if watermark.watermark_ns > watermark.max_observed_event_time_ns {
+            return Err(IngestEnvelopeError::MalformedEnvelope {
+                reason: "event_time_watermark.watermark_ns must be <= max_observed_event_time_ns"
+                    .to_string(),
+            });
+        }
+    }
+
     Ok(())
 }
 
@@ -383,7 +418,7 @@ fn payload_digest(
     header: &IngestEnvelopeHeaderWithoutDigest,
     payload: &[u8],
 ) -> Result<String, IngestEnvelopeError> {
-    let canonical_header = serde_json::json!({
+    let mut canonical_header = serde_json::json!({
         "schema_version": header.schema_version,
         "format": header.format,
         "stream_id": header.stream_id,
@@ -395,6 +430,14 @@ fn payload_digest(
         "schema_fingerprint": header.schema_fingerprint,
         "compression": header.compression,
     });
+    if let Some(watermark) = &header.event_time_watermark {
+        canonical_header["event_time_watermark"] =
+            serde_json::to_value(watermark).map_err(|source| {
+                IngestEnvelopeError::MalformedEnvelope {
+                    reason: format!("could not encode canonical event-time watermark: {source}"),
+                }
+            })?;
+    }
     let canonical_header = serde_json::to_vec(&canonical_header).map_err(|source| {
         IngestEnvelopeError::MalformedEnvelope {
             reason: format!("could not encode canonical digest header: {source}"),

@@ -353,7 +353,7 @@ fn relation_catalog_json(relation: &RelationVersionRef) -> Value {
             "name": relation.relation_id,
             "mode": "table",
         },
-        "feldera_relation": {
+        "incremental_relation": {
             "relation_id": relation.relation_id,
             "schema_fingerprint": relation.schema_fingerprint,
         },
