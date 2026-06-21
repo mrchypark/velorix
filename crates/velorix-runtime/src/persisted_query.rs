@@ -1,13 +1,12 @@
 use std::sync::Arc;
 
+use crate::query::{validate_input_query_with_policy, validate_table_query_with_policy};
 use bytes::Bytes;
 use object_store::{path::Path, ObjectStore, PutMode};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use velorix_core::{
-    query::{
-        validate_input_query_with_policy, validate_table_query_with_policy, QueryError, QueryPolicy,
-    },
+    query::{QueryError, QueryPolicy},
     relation::{
         datafusion_schema_from_catalog, DataFusionRegistrationModeV1, RelationSchemaError,
         VelorixRelationCatalogV1,

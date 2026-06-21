@@ -26,6 +26,19 @@ use sigstore_types::{Bundle as SigstoreBundle, Sha256Hash as SigstoreSha256Hash}
 use sigstore_verify::{
     verify as verify_sigstore_bundle, VerificationPolicy as SigstoreVerificationPolicy,
 };
+use velorix_control::benchmark_gate::{
+    BenchmarkBackend, BenchmarkBudgetV1, BenchmarkEvidenceScope, BenchmarkGateLevel,
+    BenchmarkGateResultV1,
+};
+use velorix_control::readiness::{ProductionReadinessEvidenceV1, ProductionReadinessReportV1};
+use velorix_control::storage_admin::{
+    probe_authoritative_object_store_capabilities, AppendValidatedEnvelopeOutcome,
+    AuthoritativeObjectStoreCapabilitiesV1, CheckpointAdminInspection, CheckpointAdminRepairReport,
+    CheckpointLifecycleStatus, CheckpointManifest, CheckpointManifestInspectionStatus,
+    CheckpointPublisher, CheckpointRetentionRecordV1, GarbageCollectionCandidate,
+    GarbageCollectionPlan, GarbageCollectionPolicy, GarbageCollectionRunV1, IngestBatchDescriptor,
+    InputRange, LatestCandidateMarker, StateObjectWrite,
+};
 use velorix_k8s::{
     crd::ObjectStoreAuthorityRef,
     ingest_writer::DeployedIngestWriterRuntime,
@@ -38,11 +51,6 @@ use velorix_meta::{
     STANDING_RUNTIME_LEASE_EXPIRY_SEMANTICS_BACKEND_WALL_CLOCK_TTL,
     STANDING_RUNTIME_OWNER_SCOPE_KIND_TENANT_PROGRAM_VIEW,
 };
-use velorix_runtime::benchmark_gate::{
-    BenchmarkBackend, BenchmarkBudgetV1, BenchmarkEvidenceScope, BenchmarkGateLevel,
-    BenchmarkGateResultV1,
-};
-use velorix_runtime::readiness::{ProductionReadinessEvidenceV1, ProductionReadinessReportV1};
 
 const OBJECT_STORE_CAPABILITY_PROBE_WORKLOAD: &str = "object_store_capability_probe";
 const LOCAL_BENCHMARK_GATE_WORKLOADS: &[&str] = &[
@@ -51,6 +59,13 @@ const LOCAL_BENCHMARK_GATE_WORKLOADS: &[&str] = &[
     "checkpoint_publish",
     "checkpoint_recovery",
     "datafusion_table_scan",
+    "materialized_output_segment_pruning",
+    "materialized_output_recent_k",
+    "materialized_output_compaction_equivalence",
+    "materialized_output_compaction_debt",
+    "materialized_output_delete_vector",
+    "materialized_output_ttl_vector",
+    "materialized_output_late_materialization",
     "slatedb_state_reopen",
     "gc_dry_run_planning",
     "gc_execution_evidence",
@@ -61,6 +76,13 @@ const S3_COMPATIBLE_BENCHMARK_GATE_WORKLOADS: &[&str] = &[
     "checkpoint_publish",
     "checkpoint_recovery",
     "datafusion_table_scan",
+    "materialized_output_segment_pruning",
+    "materialized_output_recent_k",
+    "materialized_output_compaction_equivalence",
+    "materialized_output_compaction_debt",
+    "materialized_output_delete_vector",
+    "materialized_output_ttl_vector",
+    "materialized_output_late_materialization",
     "slatedb_state_reopen",
     "gc_dry_run_planning",
 ];
@@ -128,21 +150,8 @@ const REQUIRED_RELEASE_CONTRACTS: &[&str] = &[
     "GC",
     "dependency governance",
 ];
-use velorix_runtime::recovery::{RecoveredRuntime, ORDERS_SUM_COUNT_OWNER};
-use velorix_storage::{
-    capability::{
-        probe_authoritative_object_store_capabilities, AuthoritativeObjectStoreCapabilitiesV1,
-    },
-    checkpoint_index::{
-        CheckpointAdminInspection, CheckpointAdminRepairReport, CheckpointLifecycleStatus,
-        CheckpointManifestInspectionStatus, CheckpointRetentionRecordV1, LatestCandidateMarker,
-    },
-    gc::{GarbageCollectionPlan, GarbageCollectionPolicy, GarbageCollectionRunV1},
-    log::{AppendValidatedEnvelopeOutcome, IngestBatchDescriptor},
-    manifest::{CheckpointManifest, InputRange},
-    relation_catalog_registry::RelationCatalogRegistry,
-    state::{CheckpointPublisher, StateObjectWrite},
-};
+
+const ORDERS_SUM_COUNT_OWNER: &str = "orders_sum_count";
 
 #[derive(Debug, Parser)]
 #[command(name = "velorix-cli")]
@@ -154,30 +163,6 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    RecoverLocal {
-        #[arg(long)]
-        object_store_dir: PathBuf,
-        #[arg(long)]
-        relation_id: String,
-        #[arg(long)]
-        relation_version: String,
-        #[arg(
-            long,
-            help = "Open checkpoint state through this SlateDB database path"
-        )]
-        slatedb_state_path: Option<String>,
-        #[arg(
-            long,
-            conflicts_with = "slatedb_state_path",
-            help = "Permit bootstrap/migration recovery from legacy raw object state refs"
-        )]
-        allow_bootstrap_raw_state: bool,
-        #[arg(
-            long,
-            help = "Start recovery from this published checkpoint, then replay later ingest"
-        )]
-        checkpoint_version: Option<u64>,
-    },
     CheckpointInspectLocal {
         #[arg(long)]
         object_store_dir: PathBuf,
@@ -310,6 +295,18 @@ enum Command {
         #[arg(long)]
         standing_runtime_product_evidence: Option<PathBuf>,
         #[arg(long)]
+        s3_checkpoint_fault_matrix_evidence: Option<PathBuf>,
+        #[arg(long)]
+        hiqlite_restore_drill_evidence: Option<PathBuf>,
+        #[arg(long)]
+        upgrade_rollback_repair_gc_fault_matrix_evidence: Option<PathBuf>,
+        #[arg(long)]
+        query_output_isolation_evidence: Option<PathBuf>,
+        #[arg(long)]
+        security_release_provenance_evidence: Option<PathBuf>,
+        #[arg(long)]
+        remaining_release_readiness_evidence: Option<PathBuf>,
+        #[arg(long)]
         json: bool,
     },
     DependencyGovernanceValidate {
@@ -331,34 +328,6 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Command::RecoverLocal {
-            object_store_dir,
-            relation_id,
-            relation_version,
-            slatedb_state_path,
-            allow_bootstrap_raw_state,
-            checkpoint_version,
-        }) => {
-            let store = local_object_store(&object_store_dir)?;
-            let recovered = recover_local_runtime(
-                store,
-                relation_id,
-                relation_version,
-                slatedb_state_path,
-                checkpoint_version,
-                allow_bootstrap_raw_state,
-            )
-            .await
-            .context("failed to recover local runtime")?;
-            let materialized_records = recovered.materialized_state().records().len();
-
-            println!(
-                "recovered checkpoint={:?} replayed_batches={} materialized_records={}",
-                recovered.latest_checkpoint_version(),
-                recovered.replayed_batch_count(),
-                materialized_records
-            );
-        }
         Some(Command::CheckpointInspectLocal {
             object_store_dir,
             json,
@@ -603,6 +572,12 @@ async fn main() -> anyhow::Result<()> {
             rustfs_production_gc_validation_evidence,
             ingest_writer_lifecycle_evidence,
             standing_runtime_product_evidence,
+            s3_checkpoint_fault_matrix_evidence,
+            hiqlite_restore_drill_evidence,
+            upgrade_rollback_repair_gc_fault_matrix_evidence,
+            query_output_isolation_evidence,
+            security_release_provenance_evidence,
+            remaining_release_readiness_evidence,
             json,
         }) => {
             let artifacts = ReadinessReleaseArtifactPaths {
@@ -616,6 +591,12 @@ async fn main() -> anyhow::Result<()> {
                 rustfs_production_gc_validation_evidence,
                 ingest_writer_lifecycle_evidence,
                 standing_runtime_product_evidence,
+                s3_checkpoint_fault_matrix_evidence,
+                hiqlite_restore_drill_evidence,
+                upgrade_rollback_repair_gc_fault_matrix_evidence,
+                query_output_isolation_evidence,
+                security_release_provenance_evidence,
+                remaining_release_readiness_evidence,
             };
             let report = read_readiness_report(&evidence, &artifacts)?;
             if json {
@@ -666,19 +647,12 @@ struct ReadinessReleaseArtifactPaths {
     rustfs_production_gc_validation_evidence: Option<PathBuf>,
     ingest_writer_lifecycle_evidence: Option<PathBuf>,
     standing_runtime_product_evidence: Option<PathBuf>,
-}
-
-impl ReadinessReleaseArtifactPaths {
-    fn any_path_supplied(&self) -> bool {
-        self.dependency_governance_evidence.is_some()
-            || self.dependency_governance_manifest.is_some()
-            || self.release_commit.is_some()
-            || self.s3_release_benchmark_gate_evidence.is_some()
-            || self.production_gc_run_evidence.is_some()
-            || self.rustfs_production_gc_validation_evidence.is_some()
-            || self.ingest_writer_lifecycle_evidence.is_some()
-            || self.standing_runtime_product_evidence.is_some()
-    }
+    s3_checkpoint_fault_matrix_evidence: Option<PathBuf>,
+    hiqlite_restore_drill_evidence: Option<PathBuf>,
+    upgrade_rollback_repair_gc_fault_matrix_evidence: Option<PathBuf>,
+    query_output_isolation_evidence: Option<PathBuf>,
+    security_release_provenance_evidence: Option<PathBuf>,
+    remaining_release_readiness_evidence: Option<PathBuf>,
 }
 
 fn read_readiness_report(
@@ -710,10 +684,13 @@ fn validate_readiness_release_artifacts(
     authority_store_id: &str,
 ) -> anyhow::Result<()> {
     if artifacts.require_release_artifacts && artifacts.first_e2e_artifacts {
-        bail!("readiness-report cannot combine --require-release-artifacts with --first-e2e-artifacts");
+        bail!(
+            "readiness-report cannot combine --require-release-artifacts with --first-e2e-artifacts"
+        );
     }
+    let release_artifacts_required = !artifacts.first_e2e_artifacts;
 
-    if artifacts.require_release_artifacts {
+    if release_artifacts_required {
         require_artifact_path(
             "dependency-governance-evidence",
             &artifacts.dependency_governance_evidence,
@@ -733,6 +710,30 @@ fn validate_readiness_release_artifacts(
         require_artifact_path(
             "standing-runtime-product-evidence",
             &artifacts.standing_runtime_product_evidence,
+        )?;
+        require_artifact_path(
+            "s3-checkpoint-fault-matrix-evidence",
+            &artifacts.s3_checkpoint_fault_matrix_evidence,
+        )?;
+        require_artifact_path(
+            "hiqlite-restore-drill-evidence",
+            &artifacts.hiqlite_restore_drill_evidence,
+        )?;
+        require_artifact_path(
+            "upgrade-rollback-repair-gc-fault-matrix-evidence",
+            &artifacts.upgrade_rollback_repair_gc_fault_matrix_evidence,
+        )?;
+        require_artifact_path(
+            "query-output-isolation-evidence",
+            &artifacts.query_output_isolation_evidence,
+        )?;
+        require_artifact_path(
+            "security-release-provenance-evidence",
+            &artifacts.security_release_provenance_evidence,
+        )?;
+        require_artifact_path(
+            "remaining-release-readiness-evidence",
+            &artifacts.remaining_release_readiness_evidence,
         )?;
     } else if artifacts.first_e2e_artifacts {
         require_first_e2e_artifact_path(
@@ -755,8 +756,6 @@ fn validate_readiness_release_artifacts(
             "standing-runtime-product-evidence",
             &artifacts.standing_runtime_product_evidence,
         )?;
-    } else if !artifacts.any_path_supplied() {
-        return Ok(());
     }
 
     if let Some(path) = &artifacts.dependency_governance_evidence {
@@ -780,7 +779,7 @@ fn validate_readiness_release_artifacts(
         )?;
     }
     if let Some(path) = &artifacts.standing_runtime_product_evidence {
-        let mode = if artifacts.require_release_artifacts {
+        let mode = if release_artifacts_required {
             StandingRuntimeProductEvidenceMode::Release
         } else {
             StandingRuntimeProductEvidenceMode::FirstE2e
@@ -793,7 +792,7 @@ fn validate_readiness_release_artifacts(
             artifacts.release_commit.as_deref(),
         )?;
     }
-    if artifacts.require_release_artifacts {
+    if release_artifacts_required {
         require_artifact_path(
             "rustfs-production-gc-validation-evidence",
             &artifacts.rustfs_production_gc_validation_evidence,
@@ -812,15 +811,1436 @@ fn validate_readiness_release_artifacts(
             authority_store_id,
         )?;
     }
+    if let Some(path) = &artifacts.s3_checkpoint_fault_matrix_evidence {
+        validate_critique_release_evidence_artifact(
+            path,
+            &["s3_compatible_checkpoint_fault_matrix"],
+            deployment_id,
+            authority_store_id,
+            artifacts.release_commit.as_deref(),
+            release_artifacts_required,
+            &[
+                "live_s3_compatible",
+                "delayed_visibility_cases_passed",
+                "retry_fault_cases_passed",
+                "mixed_checkpoint_publish_prevented",
+                "object_refs_verified",
+            ],
+            &[],
+            &[],
+            &[
+                "object_write_failure",
+                "verification_read_failure",
+                "manifest_write_failure",
+                "metadata_cas_failure",
+                "delayed_visibility",
+                "retry_after_failure",
+            ],
+        )?;
+    }
+    if let Some(path) = &artifacts.hiqlite_restore_drill_evidence {
+        validate_critique_release_evidence_artifact(
+            path,
+            &[
+                "hiqlite_total_voter_loss_restore_drill",
+                "hiqlite_no_pvc_three_voter_backup_restore",
+            ],
+            deployment_id,
+            authority_store_id,
+            artifacts.release_commit.as_deref(),
+            release_artifacts_required,
+            &[
+                "no_pvc",
+                "total_voter_loss_exercised",
+                "restored_from_object_store_backup",
+                "acknowledged_metadata_writes_survived",
+                "catalog_verified",
+                "owner_epoch_verified",
+                "checkpoint_pointer_verified",
+                "post_restore_ingest_query_verified",
+                "restore_drill_verified",
+            ],
+            &[],
+            &[
+                "object_store_backup",
+                "total_voter_loss_log",
+                "restore_log",
+                "metadata_write_survival",
+                "post_restore_ingest_query",
+            ],
+            &[],
+        )?;
+    }
+    if let Some(path) = &artifacts.upgrade_rollback_repair_gc_fault_matrix_evidence {
+        validate_critique_release_evidence_artifact(
+            path,
+            &["upgrade_rollback_repair_gc_fault_matrix"],
+            deployment_id,
+            authority_store_id,
+            artifacts.release_commit.as_deref(),
+            release_artifacts_required,
+            &[
+                "live_upgrade_rollback_repair_gc_matrix",
+                "upgrade_verified",
+                "rollback_verified",
+                "repair_verified",
+                "gc_reachability_verified",
+                "acknowledged_data_preserved",
+                "no_source_query_recomputation",
+            ],
+            &[],
+            &[],
+            &[
+                "rolling_upgrade",
+                "rollback_after_upgrade",
+                "corrupt_latest_checkpoint_repair",
+                "gc_concurrent_with_query",
+                "gc_concurrent_with_compaction",
+                "gc_concurrent_with_recovery",
+                "gc_concurrent_with_checkpoint_publication",
+                "gc_retains_repair_roots",
+            ],
+        )?;
+    }
+    if let Some(path) = &artifacts.query_output_isolation_evidence {
+        validate_critique_release_evidence_artifact(
+            path,
+            &["query_output_isolation"],
+            deployment_id,
+            authority_store_id,
+            artifacts.release_commit.as_deref(),
+            release_artifacts_required,
+            &[
+                "live_release_query_isolation",
+                "cold_query_succeeded",
+                "object_store_audit_no_source_reads",
+                "object_store_audit_no_source_writes",
+                "object_store_audit_no_durable_writes",
+                "materialized_output_read_verified",
+                "no_source_query_recomputation",
+            ],
+            &[
+                "query_pod_source_ingest_prefix_read_access",
+                "query_pod_metadata_write_access",
+            ],
+            &[
+                "query_pod_iam_policy",
+                "cold_query_log",
+                "object_store_audit_log",
+                "materialized_output_read",
+            ],
+            &[],
+        )?;
+    }
+    if let Some(path) = &artifacts.security_release_provenance_evidence {
+        validate_critique_release_evidence_artifact(
+            path,
+            &["security_release_provenance"],
+            deployment_id,
+            authority_store_id,
+            artifacts.release_commit.as_deref(),
+            release_artifacts_required,
+            &[
+                "mandatory_api_auth",
+                "mandatory_metadata_auth",
+                "tenant_authorization_verified",
+                "tls_verified",
+                "secret_rotation_verified",
+                "body_limits_verified",
+                "rate_limits_verified",
+                "object_prefix_isolation_verified",
+                "negative_cross_tenant_tests_passed",
+                "clean_source_revision_verified",
+                "exact_deployed_image_digests_verified",
+                "sbom_attached",
+                "dependency_policy_passed",
+                "immutable_test_evidence_attached",
+            ],
+            &[],
+            &[
+                "api_auth_test",
+                "metadata_auth_test",
+                "tenant_authorization_test",
+                "tls_attestation",
+                "secret_rotation_test",
+                "limit_tests",
+                "object_prefix_isolation_test",
+                "cross_tenant_negative_tests",
+                "sbom",
+                "dependency_policy",
+                "immutable_test_evidence",
+            ],
+            &[],
+        )?;
+        validate_security_release_provenance_identity(
+            path,
+            artifacts.release_commit.as_deref(),
+            release_artifacts_required,
+        )?;
+    }
+    if let Some(path) = &artifacts.remaining_release_readiness_evidence {
+        validate_critique_release_evidence_artifact(
+            path,
+            &["remaining_release_readiness"],
+            deployment_id,
+            authority_store_id,
+            artifacts.release_commit.as_deref(),
+            release_artifacts_required,
+            &[
+                "release_image_contract_tests_passed",
+                "versioned_openapi_contract_verified",
+                "no_conflicting_accepted_contracts",
+                "sql_admission_corpus_generated",
+                "sql_admission_corpus_covers_unsupported_datafusion_plan_nodes",
+                "sql_admission_corpus_covers_unsupported_datafusion_expression_nodes",
+                "unsupported_sql_leaves_no_persisted_view_metadata",
+                "unsupported_sql_leaves_no_runtime_binding",
+                "sql_admission_mutation_ci_failure_verified",
+                "persistent_write_boundary_crash_matrix_passed",
+                "crash_matrix_covers_one_view",
+                "crash_matrix_covers_multiple_affected_views",
+                "crash_matrix_covers_joins",
+                "crash_matrix_covers_compaction",
+                "replay_duplicate_reordered_gapped_retried_batches_verified",
+                "replay_live_crash_clean_outputs_identical",
+                "replay_checkpoint_hashes_identical",
+                "non_contiguous_input_never_advances_frontier",
+                "join_frontier_spec_verified",
+                "concurrent_two_input_ingest_crash_leader_handoff_verified",
+                "output_manifests_record_exact_input_frontiers",
+                "published_limits_verified",
+                "multi_day_supported_object_store_soak_passed",
+            ],
+            &[],
+            &[
+                "release_image_contract_tests",
+                "openapi_contract",
+                "sql_admission_corpus",
+                "crash_matrix",
+                "replay_determinism",
+                "join_frontier",
+                "scale_soak",
+            ],
+            &[],
+        )?;
+    }
 
     Ok(())
+}
+
+fn validate_critique_release_evidence_artifact(
+    path: &Path,
+    expected_evidence_kinds: &[&str],
+    deployment_id: &str,
+    authority_store_id: &str,
+    release_commit: Option<&str>,
+    release_artifacts_required: bool,
+    required_true_fields: &[&str],
+    required_false_fields: &[&str],
+    required_evidence_refs: &[&str],
+    required_scenarios: &[&str],
+) -> anyhow::Result<()> {
+    let value: serde_json::Value = read_json_artifact(path)?;
+    let artifact = value
+        .get("s3_compatible_test_status")
+        .or_else(|| value.get("gc_status"))
+        .unwrap_or(&value);
+
+    let evidence_kind = require_json_str(path, artifact, "/evidence_kind")?;
+    if !expected_evidence_kinds.contains(&evidence_kind) {
+        bail!(
+            "{} has evidence_kind {}, expected one of {}",
+            path.display(),
+            evidence_kind,
+            expected_evidence_kinds.join(", ")
+        );
+    }
+    if require_json_str(path, artifact, "/status")? != "pass" {
+        bail!("{} critique release evidence is not pass", path.display());
+    }
+    validate_critique_release_evidence_kind_specific_fields(path, artifact, evidence_kind)?;
+    if require_json_str(path, artifact, "/deployment_id")? != deployment_id {
+        bail!(
+            "{} deployment_id does not match readiness evidence",
+            path.display()
+        );
+    }
+    let observed_authority_store_id = require_json_str(path, artifact, "/authority_store_id")?;
+    if observed_authority_store_id != authority_store_id
+        || !observed_authority_store_id.starts_with("s3://")
+    {
+        bail!(
+            "{} authority_store_id does not match readiness evidence s3:// authority",
+            path.display()
+        );
+    }
+    validate_critique_release_identity(path, artifact, release_commit, release_artifacts_required)?;
+    for field in required_true_fields {
+        require_json_true(path, artifact, &format!("/{field}"))?;
+    }
+    for field in required_false_fields {
+        require_json_false(path, artifact, &format!("/{field}"))?;
+    }
+    if !required_evidence_refs.is_empty() {
+        let refs = artifact
+            .get("evidence_refs")
+            .and_then(serde_json::Value::as_object)
+            .with_context(|| format!("{} missing object /evidence_refs", path.display()))?;
+        for field in required_evidence_refs {
+            match refs.get(*field).and_then(serde_json::Value::as_str) {
+                Some(value) if !value.trim().is_empty() => {
+                    validate_release_evidence_ref(path, value, &format!("evidence_refs.{field}"))?;
+                }
+                _ => bail!(
+                    "{} critique release evidence missing nonempty evidence_refs.{field}",
+                    path.display()
+                ),
+            }
+        }
+    }
+    if !required_scenarios.is_empty() {
+        let scenarios = artifact
+            .get("scenarios")
+            .and_then(serde_json::Value::as_array)
+            .with_context(|| format!("{} missing array /scenarios", path.display()))?;
+        let mut observed = BTreeSet::new();
+        for (index, scenario) in scenarios.iter().enumerate() {
+            let name = scenario
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .filter(|name| !name.trim().is_empty())
+                .with_context(|| {
+                    format!(
+                        "{} critique release evidence missing scenarios[{index}].name",
+                        path.display()
+                    )
+                })?;
+            if scenario.get("status").and_then(serde_json::Value::as_str) != Some("pass") {
+                bail!(
+                    "{} critique release evidence requires scenarios[{index}].status=pass",
+                    path.display()
+                );
+            }
+            let evidence_ref = scenario
+                .get("evidence")
+                .and_then(serde_json::Value::as_str)
+                .filter(|evidence| !evidence.trim().is_empty())
+                .with_context(|| {
+                    format!(
+                        "{} critique release evidence missing nonempty scenarios[{index}].evidence",
+                        path.display()
+                    )
+                })?;
+            validate_release_evidence_ref(
+                path,
+                evidence_ref,
+                &format!("scenarios[{index}].evidence"),
+            )?;
+            observed.insert(name);
+        }
+        for scenario in required_scenarios {
+            if !observed.contains(scenario) {
+                bail!(
+                    "{} critique release evidence missing scenario {scenario}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    let text = serde_json::to_string(&value)?.to_ascii_lowercase();
+    reject_critique_release_forbidden_tokens(path, evidence_kind, &text)?;
+
+    Ok(())
+}
+
+fn validate_critique_release_identity(
+    path: &Path,
+    artifact: &serde_json::Value,
+    release_commit: Option<&str>,
+    release_artifacts_required: bool,
+) -> anyhow::Result<()> {
+    if !release_artifacts_required {
+        return Ok(());
+    }
+    let Some(release_commit) = release_commit else {
+        bail!(
+            "{} critique release evidence requires --release-commit",
+            path.display()
+        );
+    };
+    validate_full_git_commit_sha(path, release_commit, "release_commit")?;
+    let source_revision = require_json_str(path, artifact, "/source_revision")?;
+    validate_full_git_commit_sha(path, source_revision, "source_revision")?;
+    if source_revision != release_commit {
+        bail!(
+            "{} critique release evidence source_revision does not match release_commit",
+            path.display()
+        );
+    }
+    let digests = artifact
+        .get("deployed_image_digests")
+        .and_then(serde_json::Value::as_object)
+        .with_context(|| format!("{} missing object /deployed_image_digests", path.display()))?;
+    for role in ["velorix-api", "velorix-meta"] {
+        let digest = digests
+            .get(role)
+            .and_then(serde_json::Value::as_str)
+            .with_context(|| format!("{} missing deployed_image_digests.{role}", path.display()))?;
+        validate_sha256_digest(path, digest, &format!("deployed_image_digests.{role}"))?;
+    }
+    Ok(())
+}
+
+fn validate_critique_release_evidence_kind_specific_fields(
+    path: &Path,
+    artifact: &serde_json::Value,
+    evidence_kind: &str,
+) -> anyhow::Result<()> {
+    match evidence_kind {
+        "s3_compatible_checkpoint_fault_matrix" => {
+            let backend = artifact
+                .get("backend")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let provider = artifact
+                .get("provider")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if !format!("{backend} {provider}").contains("s3-compatible") {
+                bail!(
+                    "{} S3 checkpoint fault matrix backend or provider must identify s3-compatible",
+                    path.display()
+                );
+            }
+        }
+        "hiqlite_total_voter_loss_restore_drill" | "hiqlite_no_pvc_three_voter_backup_restore" => {
+            if require_json_u64(path, artifact, "/voter_count")? != 3 {
+                bail!(
+                    "{} Hiqlite restore drill requires voter_count=3",
+                    path.display()
+                );
+            }
+        }
+        "query_output_isolation" => {
+            if require_json_str(path, artifact, "/query_authority")?
+                != "published_materialized_output"
+            {
+                bail!(
+                    "{} query output isolation requires query_authority=published_materialized_output",
+                    path.display()
+                );
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn reject_critique_release_forbidden_tokens(
+    path: &Path,
+    evidence_kind: &str,
+    text: &str,
+) -> anyhow::Result<()> {
+    for token in [
+        "local-only",
+        "local_only",
+        "local only",
+        "local smoke",
+        "local_smoke",
+        "emulator",
+        "fake",
+        "synthetic",
+        "placeholder",
+        "todo",
+        "tbd",
+    ] {
+        if text.contains(token) {
+            bail!(
+                "{} critique release evidence must not contain {token}",
+                path.display()
+            );
+        }
+    }
+
+    for token in match evidence_kind {
+        "s3_compatible_checkpoint_fault_matrix" => &[
+            "rustfs-only",
+            "localstack",
+            "minio",
+            "moto",
+            "localhost",
+            "127.0.0.1",
+        ][..],
+        "hiqlite_total_voter_loss_restore_drill" | "hiqlite_no_pvc_three_voter_backup_restore" => {
+            &[
+                "persistentvolumeclaim",
+                "volumeclaimtemplates",
+                "volumeclaim",
+            ]
+        }
+        "security_release_provenance" => &[
+            "127.0.0.1",
+            "::1",
+            "changeme",
+            "dummy",
+            "example.com",
+            "example.net",
+            "example.org",
+            "localhost",
+            "localstack",
+            "lorem ipsum",
+            "minio",
+            "mock",
+            "moto",
+            "replace-me",
+            "replace_me",
+            "replace_with",
+        ],
+        "remaining_release_readiness" => &["mock"],
+        _ => &[],
+    } {
+        if text.contains(token) {
+            bail!(
+                "{} critique release evidence must not contain {token}",
+                path.display()
+            );
+        }
+    }
+
+    if matches!(
+        evidence_kind,
+        "hiqlite_total_voter_loss_restore_drill" | "hiqlite_no_pvc_three_voter_backup_restore"
+    ) && contains_json_word_token(text, "pvc")
+    {
+        bail!(
+            "{} critique release evidence must not contain pvc",
+            path.display()
+        );
+    }
+
+    Ok(())
+}
+
+fn contains_json_word_token(text: &str, token: &str) -> bool {
+    text.match_indices(token).any(|(index, _)| {
+        let before = text[..index].chars().next_back();
+        let after = text[index + token.len()..].chars().next();
+        !matches!(before, Some(ch) if ch.is_ascii_alphanumeric() || ch == '_')
+            && !matches!(after, Some(ch) if ch.is_ascii_alphanumeric() || ch == '_')
+    })
+}
+
+fn validate_release_evidence_ref(path: &Path, reference: &str, label: &str) -> anyhow::Result<()> {
+    let reference = reference.trim();
+    if has_uri_scheme(reference) {
+        if extract_sha256_identity(reference).is_some() {
+            return Ok(());
+        }
+        bail!(
+            "{} {label} immutable URI must include sha256/digest identity",
+            path.display()
+        );
+    }
+
+    let local_ref = reference
+        .split(['#', '?'])
+        .next()
+        .unwrap_or(reference)
+        .trim();
+    let local_path = if Path::new(local_ref).is_absolute() {
+        PathBuf::from(local_ref)
+    } else {
+        path.parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(local_ref)
+    };
+    if !local_path.is_file() {
+        bail!(
+            "{} {label} local evidence file does not exist: {}",
+            path.display(),
+            local_path.display()
+        );
+    }
+
+    let Some(expected_sha256) =
+        extract_sha256_identity(reference).or_else(|| sidecar_sha256(&local_path).ok().flatten())
+    else {
+        bail!(
+            "{} {label} local evidence file must include inline or sidecar sha256 identity",
+            path.display()
+        );
+    };
+    let actual_sha256 = file_sha256(&local_path)?;
+    if actual_sha256 != expected_sha256 {
+        bail!(
+            "{} {label} sha256 mismatch: expected {expected_sha256}, got {actual_sha256}",
+            path.display()
+        );
+    }
+
+    Ok(())
+}
+
+fn has_uri_scheme(reference: &str) -> bool {
+    let Some(index) = reference.find("://") else {
+        return false;
+    };
+    let scheme = &reference[..index];
+    !scheme.is_empty()
+        && scheme
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '.' | '-'))
+}
+
+fn extract_sha256_identity(reference: &str) -> Option<String> {
+    let lower = reference.to_ascii_lowercase();
+    if !lower.contains("sha256") && !lower.contains("digest") {
+        return None;
+    }
+    let chars: Vec<char> = lower.chars().collect();
+    chars
+        .windows(64)
+        .find(|window| window.iter().all(|ch| ch.is_ascii_hexdigit()))
+        .map(|window| window.iter().collect())
+}
+
+fn sidecar_sha256(path: &Path) -> anyhow::Result<Option<String>> {
+    for suffix in [".sha256", ".sha256sum", ".sha256.txt"] {
+        let sidecar = PathBuf::from(format!("{}{}", path.display(), suffix));
+        if sidecar.is_file() {
+            let contents = fs::read_to_string(&sidecar)
+                .with_context(|| format!("failed to read {}", sidecar.display()))?;
+            if let Some(value) = first_sha256_hex(&contents) {
+                return Ok(Some(value));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn first_sha256_hex(contents: &str) -> Option<String> {
+    let lower = contents.to_ascii_lowercase();
+    let chars: Vec<char> = lower.chars().collect();
+    chars
+        .windows(64)
+        .find(|window| window.iter().all(|ch| ch.is_ascii_hexdigit()))
+        .map(|window| window.iter().collect())
+}
+
+fn file_sha256(path: &Path) -> anyhow::Result<String> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    Ok(format!("{:x}", Sha256::digest(&bytes)))
+}
+
+fn validate_security_release_provenance_identity(
+    path: &Path,
+    release_commit: Option<&str>,
+    release_artifacts_required: bool,
+) -> anyhow::Result<()> {
+    let value: serde_json::Value = read_json_artifact(path)?;
+    let source_revision = require_json_str(path, &value, "/source_revision")?;
+    if source_revision.len() != 40
+        || !source_revision
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase())
+    {
+        bail!(
+            "{} security release provenance source_revision must be a 40-character git SHA",
+            path.display()
+        );
+    }
+    if release_artifacts_required {
+        let Some(release_commit) = release_commit else {
+            bail!(
+                "{} security release provenance requires --release-commit",
+                path.display()
+            );
+        };
+        if release_commit.len() != 40
+            || !release_commit
+                .chars()
+                .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase())
+        {
+            bail!(
+                "{} security release provenance release_commit must be a 40-character git SHA",
+                path.display()
+            );
+        }
+        if source_revision != release_commit {
+            bail!(
+                "{} security release provenance source_revision does not match release_commit",
+                path.display()
+            );
+        }
+    }
+    let digests = value
+        .get("deployed_image_digests")
+        .and_then(serde_json::Value::as_object)
+        .with_context(|| format!("{} missing object /deployed_image_digests", path.display()))?;
+    for role in ["velorix-api", "velorix-meta"] {
+        let digest = digests
+            .get(role)
+            .and_then(serde_json::Value::as_str)
+            .with_context(|| format!("{} missing deployed_image_digests.{role}", path.display()))?;
+        let hash = digest.strip_prefix("sha256:").unwrap_or_default();
+        if hash.len() != 64
+            || !hash
+                .chars()
+                .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase())
+        {
+            bail!(
+                "{} deployed_image_digests.{role} must be a sha256 digest",
+                path.display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn write_artifact(name: &str, value: serde_json::Value) -> PathBuf {
+        let mut path = env::temp_dir();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        path.push(format!("velorix-cli-{name}-{nonce}.json"));
+        fs::write(
+            &path,
+            serde_json::to_vec(&value).expect("serialize artifact"),
+        )
+        .expect("write artifact");
+        path
+    }
+
+    fn evidence_uri(name: &str) -> String {
+        format!("s3://release-evidence/{name}?sha256={}", "c".repeat(64))
+    }
+
+    fn add_release_identity(
+        mut artifact: serde_json::Value,
+        source_revision: &str,
+    ) -> serde_json::Value {
+        artifact["source_revision"] = json!(source_revision);
+        artifact["deployed_image_digests"] = json!({
+            "velorix-api": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "velorix-meta": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        });
+        artifact
+    }
+
+    fn valid_s3_checkpoint_fault_matrix() -> serde_json::Value {
+        json!({
+            "evidence_kind": "s3_compatible_checkpoint_fault_matrix",
+            "status": "pass",
+            "deployment_id": "release-prod",
+            "authority_store_id": "s3://velorix-release/checkpoints",
+            "backend": "external-s3-compatible",
+            "provider": "s3-compatible",
+            "live_s3_compatible": true,
+            "delayed_visibility_cases_passed": true,
+            "retry_fault_cases_passed": true,
+            "mixed_checkpoint_publish_prevented": true,
+            "object_refs_verified": true,
+            "scenarios": [
+                {"name": "object_write_failure", "status": "pass", "evidence": evidence_uri("object-write.json")},
+                {"name": "verification_read_failure", "status": "pass", "evidence": evidence_uri("verification-read.json")},
+                {"name": "manifest_write_failure", "status": "pass", "evidence": evidence_uri("manifest-write.json")},
+                {"name": "metadata_cas_failure", "status": "pass", "evidence": evidence_uri("metadata-cas.json")},
+                {"name": "delayed_visibility", "status": "pass", "evidence": evidence_uri("delayed-visibility.json")},
+                {"name": "retry_after_failure", "status": "pass", "evidence": evidence_uri("retry-after-failure.json")}
+            ]
+        })
+    }
+
+    fn valid_hiqlite_restore_drill() -> serde_json::Value {
+        json!({
+            "evidence_kind": "hiqlite_total_voter_loss_restore_drill",
+            "status": "pass",
+            "deployment_id": "release-prod",
+            "authority_store_id": "s3://velorix-release/checkpoints",
+            "no_pvc": true,
+            "voter_count": 3,
+            "total_voter_loss_exercised": true,
+            "restored_from_object_store_backup": true,
+            "acknowledged_metadata_writes_survived": true,
+            "catalog_verified": true,
+            "owner_epoch_verified": true,
+            "checkpoint_pointer_verified": true,
+            "post_restore_ingest_query_verified": true,
+            "restore_drill_verified": true,
+            "evidence_refs": {
+                "object_store_backup": evidence_uri("object-store-backup.json"),
+                "total_voter_loss_log": evidence_uri("total-voter-loss.log"),
+                "restore_log": evidence_uri("restore.log"),
+                "metadata_write_survival": evidence_uri("metadata-write-survival.json"),
+                "post_restore_ingest_query": evidence_uri("post-restore-ingest-query.json")
+            }
+        })
+    }
+
+    fn valid_upgrade_rollback_repair_gc_matrix() -> serde_json::Value {
+        json!({
+            "evidence_kind": "upgrade_rollback_repair_gc_fault_matrix",
+            "status": "pass",
+            "deployment_id": "release-prod",
+            "authority_store_id": "s3://velorix-release/checkpoints",
+            "live_upgrade_rollback_repair_gc_matrix": true,
+            "upgrade_verified": true,
+            "rollback_verified": true,
+            "repair_verified": true,
+            "gc_reachability_verified": true,
+            "acknowledged_data_preserved": true,
+            "no_source_query_recomputation": true,
+            "scenarios": [
+                {"name": "rolling_upgrade", "status": "pass", "evidence": evidence_uri("rolling-upgrade.json")},
+                {"name": "rollback_after_upgrade", "status": "pass", "evidence": evidence_uri("rollback.json")},
+                {"name": "corrupt_latest_checkpoint_repair", "status": "pass", "evidence": evidence_uri("repair.json")},
+                {"name": "gc_concurrent_with_query", "status": "pass", "evidence": evidence_uri("gc-query.json")},
+                {"name": "gc_concurrent_with_compaction", "status": "pass", "evidence": evidence_uri("gc-compaction.json")},
+                {"name": "gc_concurrent_with_recovery", "status": "pass", "evidence": evidence_uri("gc-recovery.json")},
+                {"name": "gc_concurrent_with_checkpoint_publication", "status": "pass", "evidence": evidence_uri("gc-checkpoint.json")},
+                {"name": "gc_retains_repair_roots", "status": "pass", "evidence": evidence_uri("gc-retains-repair-roots.json")}
+            ]
+        })
+    }
+
+    fn valid_query_output_isolation() -> serde_json::Value {
+        json!({
+            "evidence_kind": "query_output_isolation",
+            "status": "pass",
+            "deployment_id": "release-prod",
+            "authority_store_id": "s3://velorix-release/checkpoints",
+            "live_release_query_isolation": true,
+            "query_authority": "published_materialized_output",
+            "cold_query_succeeded": true,
+            "query_pod_source_ingest_prefix_read_access": false,
+            "query_pod_metadata_write_access": false,
+            "object_store_audit_no_source_reads": true,
+            "object_store_audit_no_source_writes": true,
+            "object_store_audit_no_durable_writes": true,
+            "materialized_output_read_verified": true,
+            "no_source_query_recomputation": true,
+            "evidence_refs": {
+                "query_pod_iam_policy": evidence_uri("query-pod-iam-policy.json"),
+                "cold_query_log": evidence_uri("cold-query.log"),
+                "object_store_audit_log": evidence_uri("object-store-audit.log"),
+                "materialized_output_read": evidence_uri("materialized-output-read.json")
+            }
+        })
+    }
+
+    fn valid_security_release_provenance() -> serde_json::Value {
+        json!({
+            "evidence_kind": "security_release_provenance",
+            "status": "pass",
+            "deployment_id": "release-prod",
+            "authority_store_id": "s3://velorix-release/checkpoints",
+            "mandatory_api_auth": true,
+            "mandatory_metadata_auth": true,
+            "tenant_authorization_verified": true,
+            "tls_verified": true,
+            "secret_rotation_verified": true,
+            "body_limits_verified": true,
+            "rate_limits_verified": true,
+            "object_prefix_isolation_verified": true,
+            "negative_cross_tenant_tests_passed": true,
+            "clean_source_revision_verified": true,
+            "exact_deployed_image_digests_verified": true,
+            "sbom_attached": true,
+            "dependency_policy_passed": true,
+            "immutable_test_evidence_attached": true,
+            "source_revision": "0123456789abcdef0123456789abcdef01234567",
+            "deployed_image_digests": {
+                "velorix-api": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "velorix-meta": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            },
+            "evidence_refs": {
+                "api_auth_test": evidence_uri("api-auth.json"),
+                "metadata_auth_test": evidence_uri("metadata-auth.json"),
+                "tenant_authorization_test": evidence_uri("tenant-auth.json"),
+                "tls_attestation": evidence_uri("tls.json"),
+                "secret_rotation_test": evidence_uri("secret-rotation.json"),
+                "limit_tests": evidence_uri("limits.json"),
+                "object_prefix_isolation_test": evidence_uri("object-prefix-isolation.json"),
+                "cross_tenant_negative_tests": evidence_uri("cross-tenant-negative.json"),
+                "sbom": evidence_uri("sbom.spdx.json"),
+                "dependency_policy": evidence_uri("dependency-policy.json"),
+                "immutable_test_evidence": evidence_uri("immutable-test-evidence.json")
+            }
+        })
+    }
+
+    fn valid_remaining_release_readiness() -> serde_json::Value {
+        json!({
+            "evidence_kind": "remaining_release_readiness",
+            "status": "pass",
+            "deployment_id": "release-prod",
+            "authority_store_id": "s3://velorix-release/checkpoints",
+            "release_image_contract_tests_passed": true,
+            "versioned_openapi_contract_verified": true,
+            "no_conflicting_accepted_contracts": true,
+            "sql_admission_corpus_generated": true,
+            "sql_admission_corpus_covers_unsupported_datafusion_plan_nodes": true,
+            "sql_admission_corpus_covers_unsupported_datafusion_expression_nodes": true,
+            "unsupported_sql_leaves_no_persisted_view_metadata": true,
+            "unsupported_sql_leaves_no_runtime_binding": true,
+            "sql_admission_mutation_ci_failure_verified": true,
+            "persistent_write_boundary_crash_matrix_passed": true,
+            "crash_matrix_covers_one_view": true,
+            "crash_matrix_covers_multiple_affected_views": true,
+            "crash_matrix_covers_joins": true,
+            "crash_matrix_covers_compaction": true,
+            "replay_duplicate_reordered_gapped_retried_batches_verified": true,
+            "replay_live_crash_clean_outputs_identical": true,
+            "replay_checkpoint_hashes_identical": true,
+            "non_contiguous_input_never_advances_frontier": true,
+            "join_frontier_spec_verified": true,
+            "concurrent_two_input_ingest_crash_leader_handoff_verified": true,
+            "output_manifests_record_exact_input_frontiers": true,
+            "published_limits_verified": true,
+            "multi_day_supported_object_store_soak_passed": true,
+            "evidence_refs": {
+                "release_image_contract_tests": evidence_uri("release-image-contract-tests.json"),
+                "openapi_contract": evidence_uri("openapi-contract.json"),
+                "sql_admission_corpus": evidence_uri("sql-admission-corpus.json"),
+                "crash_matrix": evidence_uri("crash-matrix.json"),
+                "replay_determinism": evidence_uri("replay-determinism.json"),
+                "join_frontier": evidence_uri("join-frontier.json"),
+                "scale_soak": evidence_uri("scale-soak.json")
+            }
+        })
+    }
+
+    #[test]
+    fn s3_checkpoint_fault_matrix_rejects_non_s3_compatible_backend() {
+        let mut artifact = valid_s3_checkpoint_fault_matrix();
+        artifact["backend"] = json!("rustfs-only");
+        artifact["provider"] = json!("release-object-store");
+        let path = write_artifact("s3-checkpoint-fault-matrix", artifact);
+
+        let result = validate_critique_release_evidence_artifact(
+            &path,
+            &["s3_compatible_checkpoint_fault_matrix"],
+            "release-prod",
+            "s3://velorix-release/checkpoints",
+            None,
+            false,
+            &[
+                "live_s3_compatible",
+                "delayed_visibility_cases_passed",
+                "retry_fault_cases_passed",
+                "mixed_checkpoint_publish_prevented",
+                "object_refs_verified",
+            ],
+            &[],
+            &[],
+            &[
+                "object_write_failure",
+                "verification_read_failure",
+                "manifest_write_failure",
+                "metadata_cas_failure",
+                "delayed_visibility",
+                "retry_after_failure",
+            ],
+        );
+
+        fs::remove_file(path).ok();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn critique_release_evidence_requires_release_identity_when_release_artifacts_are_required() {
+        let path = write_artifact(
+            "s3-checkpoint-fault-matrix-missing-release-identity",
+            valid_s3_checkpoint_fault_matrix(),
+        );
+
+        let result = validate_critique_release_evidence_artifact(
+            &path,
+            &["s3_compatible_checkpoint_fault_matrix"],
+            "release-prod",
+            "s3://velorix-release/checkpoints",
+            Some("0123456789abcdef0123456789abcdef01234567"),
+            true,
+            &[
+                "live_s3_compatible",
+                "delayed_visibility_cases_passed",
+                "retry_fault_cases_passed",
+                "mixed_checkpoint_publish_prevented",
+                "object_refs_verified",
+            ],
+            &[],
+            &[],
+            &[
+                "object_write_failure",
+                "verification_read_failure",
+                "manifest_write_failure",
+                "metadata_cas_failure",
+                "delayed_visibility",
+                "retry_after_failure",
+            ],
+        );
+
+        fs::remove_file(path).ok();
+        assert!(result
+            .expect_err("missing release identity should fail")
+            .to_string()
+            .contains("/source_revision"));
+    }
+
+    #[test]
+    fn critique_release_evidence_source_revision_must_match_release_commit() {
+        let path = write_artifact(
+            "s3-checkpoint-fault-matrix-release-identity-mismatch",
+            add_release_identity(
+                valid_s3_checkpoint_fault_matrix(),
+                "0123456789abcdef0123456789abcdef01234567",
+            ),
+        );
+
+        let result = validate_critique_release_evidence_artifact(
+            &path,
+            &["s3_compatible_checkpoint_fault_matrix"],
+            "release-prod",
+            "s3://velorix-release/checkpoints",
+            Some("fedcba9876543210fedcba9876543210fedcba98"),
+            true,
+            &[
+                "live_s3_compatible",
+                "delayed_visibility_cases_passed",
+                "retry_fault_cases_passed",
+                "mixed_checkpoint_publish_prevented",
+                "object_refs_verified",
+            ],
+            &[],
+            &[],
+            &[
+                "object_write_failure",
+                "verification_read_failure",
+                "manifest_write_failure",
+                "metadata_cas_failure",
+                "delayed_visibility",
+                "retry_after_failure",
+            ],
+        );
+
+        fs::remove_file(path).ok();
+        assert!(result
+            .expect_err("release identity mismatch should fail")
+            .to_string()
+            .contains("source_revision does not match release_commit"));
+    }
+
+    #[test]
+    fn critique_release_evidence_rejects_uppercase_image_digest_identity() {
+        let mut artifact = add_release_identity(
+            valid_s3_checkpoint_fault_matrix(),
+            "0123456789abcdef0123456789abcdef01234567",
+        );
+        artifact["deployed_image_digests"]["velorix-api"] =
+            json!("sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        let path = write_artifact(
+            "s3-checkpoint-fault-matrix-uppercase-release-identity",
+            artifact,
+        );
+
+        let result = validate_critique_release_evidence_artifact(
+            &path,
+            &["s3_compatible_checkpoint_fault_matrix"],
+            "release-prod",
+            "s3://velorix-release/checkpoints",
+            Some("0123456789abcdef0123456789abcdef01234567"),
+            true,
+            &[
+                "live_s3_compatible",
+                "delayed_visibility_cases_passed",
+                "retry_fault_cases_passed",
+                "mixed_checkpoint_publish_prevented",
+                "object_refs_verified",
+            ],
+            &[],
+            &[],
+            &[
+                "object_write_failure",
+                "verification_read_failure",
+                "manifest_write_failure",
+                "metadata_cas_failure",
+                "delayed_visibility",
+                "retry_after_failure",
+            ],
+        );
+
+        fs::remove_file(path).ok();
+        assert!(result
+            .expect_err("uppercase release digest should fail")
+            .to_string()
+            .contains("lowercase hex"));
+    }
+
+    #[test]
+    fn hiqlite_restore_drill_requires_three_voters() {
+        let mut artifact = valid_hiqlite_restore_drill();
+        artifact["voter_count"] = json!(1);
+        let path = write_artifact("hiqlite-restore-drill", artifact);
+
+        let result = validate_critique_release_evidence_artifact(
+            &path,
+            &[
+                "hiqlite_total_voter_loss_restore_drill",
+                "hiqlite_no_pvc_three_voter_backup_restore",
+            ],
+            "release-prod",
+            "s3://velorix-release/checkpoints",
+            None,
+            false,
+            &[
+                "no_pvc",
+                "total_voter_loss_exercised",
+                "restored_from_object_store_backup",
+                "acknowledged_metadata_writes_survived",
+                "catalog_verified",
+                "owner_epoch_verified",
+                "checkpoint_pointer_verified",
+                "post_restore_ingest_query_verified",
+                "restore_drill_verified",
+            ],
+            &[],
+            &[
+                "object_store_backup",
+                "total_voter_loss_log",
+                "restore_log",
+                "metadata_write_survival",
+                "post_restore_ingest_query",
+            ],
+            &[],
+        );
+
+        fs::remove_file(path).ok();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn upgrade_rollback_repair_gc_rejects_local_smoke() {
+        let mut artifact = valid_upgrade_rollback_repair_gc_matrix();
+        artifact["evidence_note"] = json!("local_smoke");
+        let path = write_artifact("upgrade-rollback-repair-gc", artifact);
+
+        let result = validate_critique_release_evidence_artifact(
+            &path,
+            &["upgrade_rollback_repair_gc_fault_matrix"],
+            "release-prod",
+            "s3://velorix-release/checkpoints",
+            None,
+            false,
+            &[
+                "live_upgrade_rollback_repair_gc_matrix",
+                "upgrade_verified",
+                "rollback_verified",
+                "repair_verified",
+                "gc_reachability_verified",
+                "acknowledged_data_preserved",
+                "no_source_query_recomputation",
+            ],
+            &[],
+            &[],
+            &[
+                "rolling_upgrade",
+                "rollback_after_upgrade",
+                "corrupt_latest_checkpoint_repair",
+                "gc_concurrent_with_query",
+                "gc_concurrent_with_compaction",
+                "gc_concurrent_with_recovery",
+                "gc_concurrent_with_checkpoint_publication",
+                "gc_retains_repair_roots",
+            ],
+        );
+
+        fs::remove_file(path).ok();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn query_output_isolation_requires_published_materialized_output_authority() {
+        let mut artifact = valid_query_output_isolation();
+        artifact["query_authority"] = json!("source_recompute");
+        let path = write_artifact("query-output-isolation", artifact);
+
+        let result = validate_critique_release_evidence_artifact(
+            &path,
+            &["query_output_isolation"],
+            "release-prod",
+            "s3://velorix-release/checkpoints",
+            None,
+            false,
+            &[
+                "live_release_query_isolation",
+                "cold_query_succeeded",
+                "object_store_audit_no_source_reads",
+                "object_store_audit_no_source_writes",
+                "object_store_audit_no_durable_writes",
+                "materialized_output_read_verified",
+                "no_source_query_recomputation",
+            ],
+            &[
+                "query_pod_source_ingest_prefix_read_access",
+                "query_pod_metadata_write_access",
+            ],
+            &[
+                "query_pod_iam_policy",
+                "cold_query_log",
+                "object_store_audit_log",
+                "materialized_output_read",
+            ],
+            &[],
+        );
+
+        fs::remove_file(path).ok();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn release_evidence_refs_must_resolve_to_local_file_or_digest_uri() {
+        let mut artifact = valid_query_output_isolation();
+        artifact["evidence_refs"]["cold_query_log"] = json!("missing-cold-query.log");
+        let path = write_artifact("query-output-isolation-missing-ref", artifact);
+
+        let result = validate_critique_release_evidence_artifact(
+            &path,
+            &["query_output_isolation"],
+            "release-prod",
+            "s3://velorix-release/checkpoints",
+            None,
+            false,
+            &[
+                "live_release_query_isolation",
+                "cold_query_succeeded",
+                "object_store_audit_no_source_reads",
+                "object_store_audit_no_source_writes",
+                "object_store_audit_no_durable_writes",
+                "materialized_output_read_verified",
+                "no_source_query_recomputation",
+            ],
+            &[
+                "query_pod_source_ingest_prefix_read_access",
+                "query_pod_metadata_write_access",
+            ],
+            &[
+                "query_pod_iam_policy",
+                "cold_query_log",
+                "object_store_audit_log",
+                "materialized_output_read",
+            ],
+            &[],
+        );
+
+        fs::remove_file(path).ok();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn release_evidence_refs_reject_bare_local_file_without_sha256() {
+        let path = write_artifact("query-output-isolation-bare-local-ref", json!({}));
+        let local = path.with_file_name("velorix-cli-bare-local-proof.log");
+        fs::write(&local, b"release proof").expect("write local proof");
+
+        let result = validate_release_evidence_ref(
+            &path,
+            local.file_name().unwrap().to_str().unwrap(),
+            "evidence_refs.proof",
+        );
+
+        fs::remove_file(path).ok();
+        fs::remove_file(local).ok();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn security_release_provenance_rejects_uppercase_hex_identity() {
+        let mut artifact = valid_security_release_provenance();
+        artifact["source_revision"] = json!("0123456789ABCDEF0123456789ABCDEF01234567");
+        artifact["deployed_image_digests"]["velorix-api"] =
+            json!("sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        let path = write_artifact("security-release-provenance", artifact);
+
+        let result = validate_security_release_provenance_identity(&path, None, false);
+
+        fs::remove_file(path).ok();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn security_release_provenance_requires_source_revision_to_match_release_commit() {
+        let path = write_artifact(
+            "security-release-provenance-mismatch",
+            valid_security_release_provenance(),
+        );
+
+        let result = validate_security_release_provenance_identity(
+            &path,
+            Some("fedcba9876543210fedcba9876543210fedcba98"),
+            true,
+        );
+
+        fs::remove_file(path).ok();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn normal_readiness_report_requires_release_artifacts_by_default() {
+        let artifacts = ReadinessReleaseArtifactPaths::default();
+
+        let result = validate_readiness_release_artifacts(
+            &artifacts,
+            "release-prod",
+            "s3://velorix-release/checkpoints",
+        );
+
+        assert!(result
+            .expect_err("normal readiness should require release artifacts")
+            .to_string()
+            .contains("release readiness requires --dependency-governance-evidence"));
+    }
+
+    #[test]
+    fn first_e2e_readiness_report_uses_first_e2e_artifact_requirements() {
+        let artifacts = ReadinessReleaseArtifactPaths {
+            first_e2e_artifacts: true,
+            ..Default::default()
+        };
+
+        let result = validate_readiness_release_artifacts(
+            &artifacts,
+            "release-prod",
+            "s3://velorix-release/checkpoints",
+        );
+
+        assert!(result
+            .expect_err("first-E2E readiness should use first-E2E artifact requirements")
+            .to_string()
+            .contains("--first-e2e-artifacts requires --dependency-governance-evidence"));
+    }
+
+    #[test]
+    fn security_release_provenance_rejects_placeholder_string_tokens() {
+        let mut artifact = valid_security_release_provenance();
+        artifact["external_endpoint"] = json!("replace_with");
+        let path = write_artifact("security-release-provenance-token", artifact);
+
+        let result = validate_critique_release_evidence_artifact(
+            &path,
+            &["security_release_provenance"],
+            "release-prod",
+            "s3://velorix-release/checkpoints",
+            None,
+            false,
+            &[
+                "mandatory_api_auth",
+                "mandatory_metadata_auth",
+                "tenant_authorization_verified",
+                "tls_verified",
+                "secret_rotation_verified",
+                "body_limits_verified",
+                "rate_limits_verified",
+                "object_prefix_isolation_verified",
+                "negative_cross_tenant_tests_passed",
+                "clean_source_revision_verified",
+                "exact_deployed_image_digests_verified",
+                "sbom_attached",
+                "dependency_policy_passed",
+                "immutable_test_evidence_attached",
+            ],
+            &[],
+            &[
+                "api_auth_test",
+                "metadata_auth_test",
+                "tenant_authorization_test",
+                "tls_attestation",
+                "secret_rotation_test",
+                "limit_tests",
+                "object_prefix_isolation_test",
+                "cross_tenant_negative_tests",
+                "sbom",
+                "dependency_policy",
+                "immutable_test_evidence",
+            ],
+            &[],
+        );
+
+        fs::remove_file(path).ok();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn remaining_release_readiness_rejects_mock_tokens() {
+        let mut artifact = valid_remaining_release_readiness();
+        artifact["scale_soak_note"] = json!("mock");
+        let path = write_artifact("remaining-release-readiness", artifact);
+
+        let result = validate_critique_release_evidence_artifact(
+            &path,
+            &["remaining_release_readiness"],
+            "release-prod",
+            "s3://velorix-release/checkpoints",
+            None,
+            false,
+            &[
+                "release_image_contract_tests_passed",
+                "versioned_openapi_contract_verified",
+                "no_conflicting_accepted_contracts",
+                "sql_admission_corpus_generated",
+                "sql_admission_corpus_covers_unsupported_datafusion_plan_nodes",
+                "sql_admission_corpus_covers_unsupported_datafusion_expression_nodes",
+                "unsupported_sql_leaves_no_persisted_view_metadata",
+                "unsupported_sql_leaves_no_runtime_binding",
+                "sql_admission_mutation_ci_failure_verified",
+                "persistent_write_boundary_crash_matrix_passed",
+                "crash_matrix_covers_one_view",
+                "crash_matrix_covers_multiple_affected_views",
+                "crash_matrix_covers_joins",
+                "crash_matrix_covers_compaction",
+                "replay_duplicate_reordered_gapped_retried_batches_verified",
+                "replay_live_crash_clean_outputs_identical",
+                "replay_checkpoint_hashes_identical",
+                "non_contiguous_input_never_advances_frontier",
+                "join_frontier_spec_verified",
+                "concurrent_two_input_ingest_crash_leader_handoff_verified",
+                "output_manifests_record_exact_input_frontiers",
+                "published_limits_verified",
+                "multi_day_supported_object_store_soak_passed",
+            ],
+            &[],
+            &[
+                "release_image_contract_tests",
+                "openapi_contract",
+                "sql_admission_corpus",
+                "crash_matrix",
+                "replay_determinism",
+                "join_frontier",
+                "scale_soak",
+            ],
+            &[],
+        );
+
+        fs::remove_file(path).ok();
+        assert!(result.is_err());
+    }
 }
 
 fn require_artifact_path(name: &str, path: &Option<PathBuf>) -> anyhow::Result<()> {
     if path.is_some() {
         Ok(())
     } else {
-        bail!("readiness-report --require-release-artifacts requires --{name}")
+        bail!("readiness-report release readiness requires --{name}")
     }
 }
 
@@ -2241,23 +3661,23 @@ fn validate_product_hiqlite_backend_time_evidence_files(
         {
             if kind != "product_evidence" {
                 bail!(
-                        "{} product Hiqlite backend-time evidence /evidence_files {kind} cannot use product_evidence canonicalization",
-                        path.display()
-                    );
+                    "{} product Hiqlite backend-time evidence /evidence_files {kind} cannot use product_evidence canonicalization",
+                    path.display()
+                );
             }
             Some(canonical_product_evidence_without_backend_time_attestation_bytes(&sibling_path)?)
         } else {
             if kind == "product_evidence" {
                 bail!(
-                        "{} product Hiqlite backend-time evidence /evidence_files product_evidence must use canonicalization=without_metadata_store_hiqlite_backend_time_attestation",
-                        path.display()
-                    );
+                    "{} product Hiqlite backend-time evidence /evidence_files product_evidence must use canonicalization=without_metadata_store_hiqlite_backend_time_attestation",
+                    path.display()
+                );
             }
             if canonicalization.is_some() {
                 bail!(
-                        "{} product Hiqlite backend-time evidence /evidence_files {kind} has unsupported canonicalization",
-                        path.display()
-                    );
+                    "{} product Hiqlite backend-time evidence /evidence_files {kind} has unsupported canonicalization",
+                    path.display()
+                );
             }
             None
         };
@@ -5867,9 +7287,13 @@ fn validate_sha256_digest(path: &Path, value: &str, label: &str) -> anyhow::Resu
     let Some(hex) = value.strip_prefix("sha256:") else {
         bail!("{} {label} must start with sha256:", path.display());
     };
-    if hex.len() != 64 || !hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+    if hex.len() != 64
+        || !hex
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase())
+    {
         bail!(
-            "{} {label} must be a sha256 digest with 64 hex characters",
+            "{} {label} must be a sha256 digest with 64 lowercase hex characters",
             path.display()
         );
     }
@@ -5878,9 +7302,13 @@ fn validate_sha256_digest(path: &Path, value: &str, label: &str) -> anyhow::Resu
 
 fn validate_full_git_commit_sha(path: &Path, value: &str, label: &str) -> anyhow::Result<()> {
     let value = value.trim();
-    if value.len() != 40 || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
+    if value.len() != 40
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase())
+    {
         bail!(
-            "{} {label} must be a full 40-character git commit SHA",
+            "{} {label} must be a full 40-character lowercase git commit SHA",
             path.display()
         );
     }
@@ -6126,7 +7554,7 @@ fn sorted_u64s(values: &[u64]) -> Vec<u64> {
 }
 
 fn canonical_gc_candidates(
-    candidates: &[velorix_storage::gc::GarbageCollectionCandidate],
+    candidates: &[GarbageCollectionCandidate],
 ) -> anyhow::Result<Vec<serde_json::Value>> {
     let mut values = Vec::with_capacity(candidates.len());
     for candidate in candidates {
@@ -7820,96 +9248,13 @@ fn local_object_store(object_store_dir: &Path) -> anyhow::Result<Arc<dyn ObjectS
     Ok(Arc::new(store) as Arc<dyn ObjectStore>)
 }
 
-async fn recover_local_runtime(
-    store: Arc<dyn ObjectStore>,
-    relation_id: String,
-    relation_version: String,
-    slatedb_state_path: Option<String>,
-    checkpoint_version: Option<u64>,
-    allow_bootstrap_raw_state: bool,
-) -> anyhow::Result<RecoveredRuntime> {
-    if slatedb_state_path.is_some() && allow_bootstrap_raw_state {
-        bail!(
-            "recover-local --allow-bootstrap-raw-state cannot be combined with \
-             --slatedb-state-path"
-        );
-    }
-    if slatedb_state_path.is_none() && !allow_bootstrap_raw_state {
-        bail!(
-            "recover-local raw object state recovery requires --allow-bootstrap-raw-state when \
-             --slatedb-state-path is omitted"
-        );
-    }
-
-    match (slatedb_state_path, checkpoint_version) {
-        (None, None) => Ok(
-            RecoveredRuntime::recover_bootstrap_with_owner_and_relation_catalog_record(
-                store,
-                ORDERS_SUM_COUNT_OWNER,
-                &relation_id,
-                &relation_version,
-            )
-            .await?,
-        ),
-        (Some(db_path), Some(checkpoint_version)) => {
-            let capabilities = recover_local_capabilities(store.as_ref()).await?;
-            Ok(RecoveredRuntime::recover_from_published_checkpoint_version_with_slatedb_state_store_and_relation_catalog_record_checked(
-                store,
-                db_path,
-                checkpoint_version,
-                ORDERS_SUM_COUNT_OWNER,
-                &relation_id,
-                &relation_version,
-                &capabilities,
-            )
-            .await?)
-        }
-        (Some(db_path), None) => {
-            let capabilities = recover_local_capabilities(store.as_ref()).await?;
-            Ok(
-                RecoveredRuntime::recover_with_slatedb_state_store_and_catalog_record_checked(
-                    store,
-                    db_path,
-                    ORDERS_SUM_COUNT_OWNER,
-                    &relation_id,
-                    &relation_version,
-                    &capabilities,
-                )
-                .await?,
-            )
-        }
-        (None, Some(checkpoint_version)) => {
-            let capabilities = recover_local_capabilities(store.as_ref()).await?;
-            let relation_catalog = RelationCatalogRegistry::new_checked(
-                Arc::clone(&store),
-                capabilities
-                    .validate_namespace(
-                        velorix_storage::capability::AuthoritativeNamespace::RelationCatalog,
-                    )
-                    .map_err(anyhow::Error::from)?,
-            )
-            .map_err(anyhow::Error::from)?
-            .read(&relation_id, &relation_version)
-            .await?;
-            Ok(RecoveredRuntime::recover_from_published_checkpoint_version_with_owner_and_relation_catalog_checked(
-                store,
-                checkpoint_version,
-                ORDERS_SUM_COUNT_OWNER,
-                relation_catalog,
-                &capabilities,
-            )
-            .await?)
-        }
-    }
-}
-
-async fn recover_local_capabilities(
+async fn local_admin_capabilities(
     store: &dyn ObjectStore,
-) -> anyhow::Result<velorix_storage::capability::AuthoritativeObjectStoreCapabilitiesV1> {
+) -> anyhow::Result<AuthoritativeObjectStoreCapabilitiesV1> {
     Ok(probe_authoritative_object_store_capabilities(
         store,
-        "recover-local",
-        "recover-local-capability-probes",
+        "checkpoint-admin-local",
+        "checkpoint-admin-local-capability-probes",
     )
     .await?)
 }
@@ -7917,7 +9262,7 @@ async fn recover_local_capabilities(
 async fn checked_local_admin_checkpoint_publisher(
     store: Arc<dyn ObjectStore>,
 ) -> anyhow::Result<CheckpointPublisher> {
-    let capabilities = recover_local_capabilities(store.as_ref()).await?;
+    let capabilities = local_admin_capabilities(store.as_ref()).await?;
     capabilities
         .validate_for_startup()
         .map_err(anyhow::Error::from)?;

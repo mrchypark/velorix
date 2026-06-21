@@ -47,6 +47,12 @@ pub struct IngestEnvelope {
     payload: Bytes,
 }
 
+#[derive(Clone, Debug)]
+pub struct EncodedIngestEnvelope {
+    pub bytes: Bytes,
+    pub header: IngestEnvelopeHeader,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IngestEnvelopeEncodeRequest {
     pub relation_id: String,
@@ -99,6 +105,13 @@ impl IngestEnvelope {
         request: IngestEnvelopeEncodeRequest,
         batches: &[RecordBatch],
     ) -> Result<Bytes, IngestEnvelopeError> {
+        Ok(Self::encode_batches_with_header(request, batches)?.bytes)
+    }
+
+    pub fn encode_batches_with_header(
+        request: IngestEnvelopeEncodeRequest,
+        batches: &[RecordBatch],
+    ) -> Result<EncodedIngestEnvelope, IngestEnvelopeError> {
         let schema = batches.first().map(RecordBatch::schema).ok_or_else(|| {
             IngestEnvelopeError::MalformedEnvelope {
                 reason: "at least one Arrow record batch is required".to_string(),
@@ -141,8 +154,9 @@ impl IngestEnvelope {
         let payload = encode_arrow_ipc_stream(schema.as_ref(), batches)?;
         let payload_digest = payload_digest(&header_without_digest, &payload)?;
         let header = header_without_digest.with_payload_digest(payload_digest);
+        let bytes = encode_envelope(header.clone(), &payload)?;
 
-        encode_envelope(header, &payload)
+        Ok(EncodedIngestEnvelope { bytes, header })
     }
 
     pub fn decode(bytes: Bytes) -> Result<Self, IngestEnvelopeError> {

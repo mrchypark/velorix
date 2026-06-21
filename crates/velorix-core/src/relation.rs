@@ -12,9 +12,6 @@ use arrow::datatypes::{
     DataType, Field, Int16Type, Int32Type, Int64Type, Int8Type, Schema, TimeUnit,
 };
 use arrow::record_batch::RecordBatch;
-use datafusion::datasource::MemTable;
-use datafusion::error::DataFusionError;
-use datafusion::prelude::SessionContext;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -32,6 +29,9 @@ pub const CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID: &str =
 pub const CATALOG_ROW_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID: &str =
     "incremental-adapter-row-key-sum-count-v1";
 pub const ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID: &str = "incremental-adapter-orders-sum-count-v1";
+pub const ORDERS_SUM_COUNT_RELATION_ID: &str = "orders";
+pub const ORDERS_SUM_COUNT_RELATION_VERSION: &str = "2026-05-05.v1";
+pub const ORDERS_SUM_COUNT_ADAPTER_ID: &str = ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID;
 pub const CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID: &str = "incremental-adapter-generic-v1";
 const MAX_RELATION_TYPE_NESTING_DEPTH: usize = 16;
 const MAX_RELATION_STRUCT_FIELDS: usize = 256;
@@ -165,6 +165,66 @@ impl VelorixRelationCatalogV1 {
             }
         }
     }
+}
+
+pub fn orders_sum_count_relation_catalog() -> Result<VelorixRelationCatalogV1, RelationSchemaError>
+{
+    let relation_schema = VelorixRelationSchemaV1 {
+        relation_id: ORDERS_SUM_COUNT_RELATION_ID.to_string(),
+        relation_name: "orders".to_string(),
+        relation_version: ORDERS_SUM_COUNT_RELATION_VERSION.to_string(),
+        columns: vec![
+            RelationColumnV1 {
+                column_id: "account_id".to_string(),
+                name: "account_id".to_string(),
+                logical_type: VelorixLogicalTypeV1::Utf8,
+                physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+                nullable: false,
+                ordinal: 0,
+                semantic_role: RelationSemanticRoleV1::PrimaryKey,
+            },
+            RelationColumnV1 {
+                column_id: "amount".to_string(),
+                name: "amount".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 1,
+                semantic_role: RelationSemanticRoleV1::Value,
+            },
+            RelationColumnV1 {
+                column_id: "weight".to_string(),
+                name: "weight".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 2,
+                semantic_role: RelationSemanticRoleV1::Weight,
+            },
+        ],
+        primary_key_column_ids: vec!["account_id".to_string()],
+        weight_column_id: "weight".to_string(),
+        allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+        event_time_column_id: None,
+    };
+    let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema)?;
+
+    Ok(VelorixRelationCatalogV1 {
+        schema_version: RELATION_SCHEMA_VERSION_V1,
+        relation_schema,
+        schema_fingerprint: schema_fingerprint.clone(),
+        datafusion_registration: DataFusionRegistrationV1 {
+            name: "orders".to_string(),
+            mode: DataFusionRegistrationModeV1::Table,
+        },
+        incremental_relation: IncrementalRelationBindingV1 {
+            relation_id: ORDERS_SUM_COUNT_RELATION_ID.to_string(),
+            schema_fingerprint,
+        },
+        incremental_adapter: IncrementalAdapterBindingV1 {
+            adapter_id: ORDERS_SUM_COUNT_ADAPTER_ID.to_string(),
+        },
+    })
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -855,16 +915,293 @@ pub fn arrow_record_batches_to_key_value_delta_batch(
     Ok(DeltaBatch::from_records(records))
 }
 
-pub fn arrow_record_batches_to_key_latest_by_delta_batch(
+pub fn arrow_record_batches_to_key_nullable_value_delta_batch(
     catalog: &VelorixRelationCatalogV1,
     relation_id: &str,
     relation_version: &str,
     schema_fingerprint: &str,
-    key_column_id: &str,
+    key_column_ids: &[String],
     value_column_id: &str,
-    ordering_column_id: &str,
     batches: &[RecordBatch],
 ) -> Result<DeltaBatch, IncrementalInputAdapterError> {
+    catalog.validate()?;
+    supported_incremental_adapter_spec(&catalog.incremental_adapter.adapter_id).ok_or_else(
+        || IncrementalInputAdapterError::UnsupportedIncrementalAdapter {
+            adapter_id: catalog.incremental_adapter.adapter_id.clone(),
+        },
+    )?;
+    validate_incremental_input_identity(
+        catalog,
+        relation_id,
+        relation_version,
+        schema_fingerprint,
+    )?;
+    if key_column_ids.is_empty() {
+        return Err(IncrementalInputAdapterError::MalformedArrowInput {
+            reason: "materialized view input must define at least one key column".to_string(),
+        });
+    }
+    if batches.is_empty() {
+        return Err(IncrementalInputAdapterError::MalformedArrowInput {
+            reason: "at least one Arrow record batch is required".to_string(),
+        });
+    }
+
+    let key_columns = key_column_ids
+        .iter()
+        .map(|column_id| relation_column(&catalog.relation_schema, column_id))
+        .collect::<Result<Vec<_>, _>>()?;
+    let value_column = relation_column(&catalog.relation_schema, value_column_id)?;
+    if value_column.column_id == catalog.relation_schema.weight_column_id {
+        return Err(IncrementalInputAdapterError::MalformedArrowInput {
+            reason: "materialized view value column must not be the weight column".to_string(),
+        });
+    }
+    let weight_column = relation_column(
+        &catalog.relation_schema,
+        catalog.relation_schema.weight_column_id.as_str(),
+    )?;
+    let mut records = Vec::new();
+
+    for batch in batches {
+        validate_record_batch_matches_catalog(catalog, batch)
+            .map_err(incremental_input_batch_schema_error)?;
+        let keys = key_columns
+            .iter()
+            .map(|column| incremental_key_column(batch, column).map(|key| (*column, key)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let value = incremental_value_column(batch, value_column)?;
+        let weight = int64_column(batch, weight_column.name.as_str())?;
+
+        for row in 0..batch.num_rows() {
+            if keys.iter().any(|(_, key)| key.is_null(row)) || weight.is_null(row) {
+                return Err(IncrementalInputAdapterError::MalformedArrowInput {
+                    reason: "materialized view key and weight columns must be non-null".to_string(),
+                });
+            }
+
+            let value = if value.is_null(row) {
+                DeltaValue::from_json(Value::Null)
+            } else {
+                value.delta_value(row)?
+            };
+            records.push(DeltaRecord::new(
+                delta_key_from_columns(&keys, row)?,
+                value,
+                weight.value(row),
+            ));
+        }
+    }
+
+    Ok(DeltaBatch::from_records(records))
+}
+
+pub fn arrow_record_batches_to_key_value_delta_batch_skipping_null_values(
+    catalog: &VelorixRelationCatalogV1,
+    relation_id: &str,
+    relation_version: &str,
+    schema_fingerprint: &str,
+    key_column_ids: &[String],
+    value_column_id: &str,
+    batches: &[RecordBatch],
+) -> Result<DeltaBatch, IncrementalInputAdapterError> {
+    catalog.validate()?;
+    supported_incremental_adapter_spec(&catalog.incremental_adapter.adapter_id).ok_or_else(
+        || IncrementalInputAdapterError::UnsupportedIncrementalAdapter {
+            adapter_id: catalog.incremental_adapter.adapter_id.clone(),
+        },
+    )?;
+    validate_incremental_input_identity(
+        catalog,
+        relation_id,
+        relation_version,
+        schema_fingerprint,
+    )?;
+    if key_column_ids.is_empty() {
+        return Err(IncrementalInputAdapterError::MalformedArrowInput {
+            reason: "materialized view input must define at least one key column".to_string(),
+        });
+    }
+    if batches.is_empty() {
+        return Err(IncrementalInputAdapterError::MalformedArrowInput {
+            reason: "at least one Arrow record batch is required".to_string(),
+        });
+    }
+
+    let key_columns = key_column_ids
+        .iter()
+        .map(|column_id| relation_column(&catalog.relation_schema, column_id))
+        .collect::<Result<Vec<_>, _>>()?;
+    let value_column = relation_column(&catalog.relation_schema, value_column_id)?;
+    if value_column.column_id == catalog.relation_schema.weight_column_id {
+        return Err(IncrementalInputAdapterError::MalformedArrowInput {
+            reason: "materialized view value column must not be the weight column".to_string(),
+        });
+    }
+    let weight_column = relation_column(
+        &catalog.relation_schema,
+        catalog.relation_schema.weight_column_id.as_str(),
+    )?;
+    let mut records = Vec::new();
+
+    for batch in batches {
+        validate_record_batch_matches_catalog(catalog, batch)
+            .map_err(incremental_input_batch_schema_error)?;
+        let keys = key_columns
+            .iter()
+            .map(|column| incremental_key_column(batch, column).map(|key| (*column, key)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let value = incremental_value_column(batch, value_column)?;
+        let weight = int64_column(batch, weight_column.name.as_str())?;
+
+        for row in 0..batch.num_rows() {
+            if value.is_null(row) {
+                continue;
+            }
+            if keys.iter().any(|(_, key)| key.is_null(row)) || weight.is_null(row) {
+                return Err(IncrementalInputAdapterError::MalformedArrowInput {
+                    reason: "materialized view input columns must be non-null".to_string(),
+                });
+            }
+
+            records.push(DeltaRecord::new(
+                delta_key_from_columns(&keys, row)?,
+                value.delta_value(row)?,
+                weight.value(row),
+            ));
+        }
+    }
+
+    Ok(DeltaBatch::from_records(records))
+}
+
+pub fn arrow_record_batches_to_key_multi_value_delta_batch(
+    catalog: &VelorixRelationCatalogV1,
+    relation_id: &str,
+    relation_version: &str,
+    schema_fingerprint: &str,
+    key_column_ids: &[String],
+    value_column_ids: &[String],
+    batches: &[RecordBatch],
+) -> Result<DeltaBatch, IncrementalInputAdapterError> {
+    catalog.validate()?;
+    supported_incremental_adapter_spec(&catalog.incremental_adapter.adapter_id).ok_or_else(
+        || IncrementalInputAdapterError::UnsupportedIncrementalAdapter {
+            adapter_id: catalog.incremental_adapter.adapter_id.clone(),
+        },
+    )?;
+    validate_incremental_input_identity(
+        catalog,
+        relation_id,
+        relation_version,
+        schema_fingerprint,
+    )?;
+    if key_column_ids.is_empty() || value_column_ids.is_empty() {
+        return Err(IncrementalInputAdapterError::MalformedArrowInput {
+            reason: "materialized view input must define key and value columns".to_string(),
+        });
+    }
+    if batches.is_empty() {
+        return Err(IncrementalInputAdapterError::MalformedArrowInput {
+            reason: "at least one Arrow record batch is required".to_string(),
+        });
+    }
+
+    let key_columns = key_column_ids
+        .iter()
+        .map(|column_id| relation_column(&catalog.relation_schema, column_id))
+        .collect::<Result<Vec<_>, _>>()?;
+    let value_columns = value_column_ids
+        .iter()
+        .map(|column_id| relation_column(&catalog.relation_schema, column_id))
+        .collect::<Result<Vec<_>, _>>()?;
+    if value_columns
+        .iter()
+        .any(|column| column.column_id == catalog.relation_schema.weight_column_id)
+    {
+        return Err(IncrementalInputAdapterError::MalformedArrowInput {
+            reason: "materialized view value column must not be the weight column".to_string(),
+        });
+    }
+    let weight_column = relation_column(
+        &catalog.relation_schema,
+        catalog.relation_schema.weight_column_id.as_str(),
+    )?;
+    let mut records = Vec::new();
+
+    for batch in batches {
+        validate_record_batch_matches_catalog(catalog, batch)
+            .map_err(incremental_input_batch_schema_error)?;
+        let keys = key_columns
+            .iter()
+            .map(|column| incremental_key_column(batch, column).map(|key| (*column, key)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let values = value_columns
+            .iter()
+            .map(|column| incremental_value_column(batch, column).map(|value| (*column, value)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let weight = int64_column(batch, weight_column.name.as_str())?;
+
+        for row in 0..batch.num_rows() {
+            if keys.iter().any(|(_, key)| key.is_null(row)) || weight.is_null(row) {
+                return Err(IncrementalInputAdapterError::MalformedArrowInput {
+                    reason: "materialized view input columns must be non-null".to_string(),
+                });
+            }
+            let value = values
+                .iter()
+                .map(|(column, value)| {
+                    let json_value = if value.is_null(row) {
+                        if !column.nullable {
+                            return Err(IncrementalInputAdapterError::MalformedArrowInput {
+                                reason: "materialized view input columns must be non-null"
+                                    .to_string(),
+                            });
+                        }
+                        Value::Null
+                    } else {
+                        value.json_value(row)?
+                    };
+                    Ok((column.column_id.clone(), json_value))
+                })
+                .collect::<Result<serde_json::Map<_, _>, IncrementalInputAdapterError>>()?;
+
+            records.push(DeltaRecord::new(
+                delta_key_from_columns(&keys, row)?,
+                DeltaValue::from_json(Value::Object(value)),
+                weight.value(row),
+            ));
+        }
+    }
+
+    Ok(DeltaBatch::from_records(records))
+}
+
+pub struct KeyLatestByDeltaBatchInput<'a> {
+    pub catalog: &'a VelorixRelationCatalogV1,
+    pub relation_id: &'a str,
+    pub relation_version: &'a str,
+    pub schema_fingerprint: &'a str,
+    pub key_column_id: &'a str,
+    pub value_column_id: &'a str,
+    pub ordering_column_id: &'a str,
+    pub batches: &'a [RecordBatch],
+}
+
+pub fn arrow_record_batches_to_key_latest_by_delta_batch(
+    input: KeyLatestByDeltaBatchInput<'_>,
+) -> Result<DeltaBatch, IncrementalInputAdapterError> {
+    let KeyLatestByDeltaBatchInput {
+        catalog,
+        relation_id,
+        relation_version,
+        schema_fingerprint,
+        key_column_id,
+        value_column_id,
+        ordering_column_id,
+        batches,
+    } = input;
+
     catalog.validate()?;
     supported_incremental_adapter_spec(&catalog.incremental_adapter.adapter_id).ok_or_else(
         || IncrementalInputAdapterError::UnsupportedIncrementalAdapter {
@@ -960,33 +1297,6 @@ fn incremental_input_batch_schema_error(
         },
         error => IncrementalInputAdapterError::RelationCatalog(error),
     }
-}
-
-pub fn register_datafusion_catalog_batches(
-    context: &SessionContext,
-    catalog: &VelorixRelationCatalogV1,
-    batches: Vec<RecordBatch>,
-) -> Result<(), DataFusionError> {
-    if catalog.datafusion_registration.mode != DataFusionRegistrationModeV1::Table {
-        return Err(relation_datafusion_error(
-            RelationSchemaError::InvalidRelationSchema {
-                field: "datafusion_registration.mode",
-            },
-        ));
-    }
-
-    for batch in &batches {
-        validate_record_batch_matches_catalog(catalog, batch).map_err(relation_datafusion_error)?;
-    }
-
-    let schema = datafusion_schema_from_catalog(catalog).map_err(relation_datafusion_error)?;
-    let table = MemTable::try_new(schema, vec![batches])?;
-    context.register_table(
-        catalog.datafusion_registration.name.as_str(),
-        Arc::new(table),
-    )?;
-
-    Ok(())
 }
 
 fn data_type_for_arrow_physical_type(
@@ -1785,10 +2095,6 @@ fn timestamp_nanosecond_column<'a>(
         .ok_or_else(|| IncrementalInputAdapterError::MalformedArrowInput {
             reason: format!("`{name}` column must be TimestampNanosecond"),
         })
-}
-
-fn relation_datafusion_error(error: RelationSchemaError) -> DataFusionError {
-    DataFusionError::External(Box::new(error))
 }
 
 fn validate_logical_physical_type_pair(

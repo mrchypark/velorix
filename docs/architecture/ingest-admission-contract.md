@@ -4,9 +4,14 @@ Status: Accepted
 Applies to: ingest API acknowledgement, idempotency, and range conflict
 semantics.
 
-Ingest acknowledgements cover durable input admission only. They do not claim
-that SQL processing, standing views, output publication, or checkpoint
-publication has completed.
+Internal admission-layer acknowledgements cover durable input admission only.
+They do not claim that SQL processing, standing views, output publication, or
+checkpoint publication has completed. This durable-admission-only guarantee is
+an internal storage/runtime contract, not the public 1.0 relation ingest API
+contract. The public `/v1/relations/.../ingest` API exposes only the
+`materialized` acknowledgement: a successful response means the relation update
+and admitted materialized-view effects have both reached the durable
+materialized output contract, not merely append admission.
 
 ## Admission Modes
 
@@ -35,6 +40,27 @@ rechecks committed and reserved ranges while guarded, rejects visible overlaps,
 permits adjacent ranges, and preserves same-digest retry idempotency. The
 unchecked constructor remains bootstrap/dev compatibility and must not be used
 as production evidence.
+
+## Relation Ingest and Join Frontiers
+
+The public relation ingest contract is sequential. A relation ingest advances
+the frontier for the relation stream/partition named by that request, and active
+dependent views publish materialized output for the resulting frontier vector
+before returning the `materialized` acknowledgement. For joins, that vector may
+contain one advanced relation and one relation still at its previous frontier.
+Those intermediate vectors are valid published states.
+
+Velorix does not expose a public atomic multi-relation transaction API for 1.0.
+`/v1/relations/ingest`, when used with multiple relation batches, is a
+deterministic convenience wrapper over relation ingest sequencing. It must not
+claim all-or-nothing rollback, one client-visible global epoch, or hidden
+multi-relation join atomicity.
+
+Each runtime checkpoint must record the complete input frontier vector for the
+published materialized output. Output manifests must either record that vector
+directly or remain selected only through the checkpoint/pointer that records it.
+Product completion is not proven by an output manifest that can be served
+without the frontier vector that produced it.
 
 `RangeAdmissionIndexV1` is a create-only, single-successor partition index under
 `v1/ingest-admission-index/{stream_id}/p={partition_id}/advances/{previous_state_digest}.transition.json`.

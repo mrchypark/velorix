@@ -350,7 +350,9 @@ if isinstance(blockers, list):
         }
     ]
     product["product_complete_blockers"] = blockers
-    product["product_complete"] = len(blockers) == 0
+    product["product_complete"] = (
+        product.get("product_complete") is True and len(blockers) == 0
+    )
 
 with open(output_path, "w", encoding="utf-8") as f:
     json.dump(product, f, indent=2, sort_keys=True)

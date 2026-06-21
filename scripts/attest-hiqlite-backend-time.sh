@@ -399,6 +399,7 @@ for assertion in [
     "logical_owner_expiry_checked",
     "new_owner_epoch_fences_old_owner",
     "stale_owner_checkpoint_publish_rejected",
+    "stale_checkpoint_pointer_publish_conflicted",
     "latest_checkpoint_remains_metadata_authoritative",
 ]:
     require(adversarial_assertions.get(assertion) is True, f"metadata adversarial assertion {assertion} must be true")

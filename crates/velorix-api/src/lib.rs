@@ -4,7 +4,7 @@ use std::{
     io::Cursor,
     net::SocketAddr,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::Instant,
 };
 
 use anyhow::{anyhow, Context};
@@ -31,7 +31,7 @@ use axum::{
     Json, Router,
 };
 use axum_server::tls_rustls::RustlsConfig;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use object_store::{
     aws::{AmazonS3Builder, S3ConditionalPut},
     path::Path as ObjectPath,
@@ -43,23 +43,66 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as AsyncMutex;
+use velorix_control::{
+    ingest_writer_runtime::DeployedIngestWriterRuntime,
+    meta_admin::{
+        validate_bearer_token, AcquireStandingRuntimeOwnerOutcome,
+        AcquireStandingRuntimeOwnerRequest, GrpcMetaStore, IngestRangeReservation, MetaStore,
+        MetaStoreError, PublishStandingRuntimeCheckpointOutcome,
+        PublishStandingRuntimeCheckpointRequest, ReserveIngestRangeOutcome,
+        StandingRuntimeCheckpointPointer, StandingRuntimeFencingCapability,
+        StandingRuntimeOwnerClaim, StandingRuntimeOwnerToken, StoreRelationCatalogOutcome,
+        STANDING_RUNTIME_BACKEND_TIME_SOURCE_RAFT_REPLICATED,
+        STANDING_RUNTIME_FENCING_CAPABILITY_SCHEMA_VERSION,
+        STANDING_RUNTIME_LEASE_AUTHORITY_KIND_HIQLITE_RAFT_SERIALIZED,
+        STANDING_RUNTIME_LEASE_AUTHORITY_KIND_RAFT_REPLICATED_TIME,
+        STANDING_RUNTIME_LEASE_EXPIRY_SEMANTICS_BACKEND_WALL_CLOCK_TTL,
+        STANDING_RUNTIME_LEASE_EXPIRY_SEMANTICS_OPERATION_DRIVEN_LOGICAL,
+        STANDING_RUNTIME_OUTPUT_DELTA_REF_PREFIX, STANDING_RUNTIME_OUTPUT_MANIFEST_REF_PREFIX,
+        STANDING_RUNTIME_OWNER_SCOPE_KIND_TENANT_PROGRAM_VIEW,
+    },
+    operator_authority::{
+        validate_operator_authority, ObjectStoreAuthorityRef, OperatorAuthorityStartupComponents,
+        ValidatedOperatorAuthority,
+    },
+    query_policy_catalog::{
+        QueryPolicyCatalogError, QueryPolicyCatalogRecord, QueryPolicyCatalogStore,
+    },
+    runtime_contract::{
+        query_record_batches_table_with_bindings_and_policy_and_limiter,
+        validate_record_batch_table_query_with_bindings_and_policy, ProductionQueryRuntime,
+        QueryExecutionLimiter, MATERIALIZED_VIEW_RUNTIME_NAME,
+    },
+    storage_admin::{
+        ActiveMaterializedView, AppendValidatedEnvelopeOutcome, AuthoritativeNamespace,
+        AuthoritativeObjectStoreCapabilitiesV1, CreateRelationCatalogOutcome,
+        IngestBatchDescriptor, IngestEnvelope, IngestEnvelopeEncodeRequest, IngestEnvelopeHeader,
+        IngestLog, InvalidExecutionModeReason, MaterializedViewAdmissionStatus,
+        MaterializedViewApiMetadata, MaterializedViewDeploymentStatus,
+        MaterializedViewExecutionMode, MaterializedViewLifecycleStatus, MaterializedViewRegistry,
+        MaterializedViewRegistryError, MaterializedViewRequestFieldSpec,
+        MaterializedViewResponseColumnSpec, MaterializedViewResponseSchema,
+        MaterializedViewRuntimeBinding, ObjectKey, ObjectStoreCapabilityProfile,
+        RegisterMaterializedViewOutcome, RelationCatalogRegistry, ReplayCheckpoint,
+        StandingRuntimeCheckpointKeyParts,
+    },
+};
 use velorix_core::{
     delta::DeltaBatch,
-    query::QueryPolicy,
+    query::{QueryBindValue, QueryPolicy},
     relation::{
-        datafusion_schema_from_catalog, ArrowPhysicalTypeV1, DataFusionRegistrationModeV1,
-        DataFusionRegistrationV1, DictionaryKeyTypeV1, IncrementalAdapterBindingV1,
-        IncrementalRelationBindingV1, RelationColumnV1, RelationOperationV1,
-        RelationSemanticRoleV1, SchemaFingerprintV1, VelorixLogicalTypeV1,
+        datafusion_schema_from_catalog, orders_sum_count_relation_catalog, ArrowPhysicalTypeV1,
+        DataFusionRegistrationModeV1, DataFusionRegistrationV1, DictionaryKeyTypeV1,
+        IncrementalAdapterBindingV1, IncrementalRelationBindingV1, RelationColumnV1,
+        RelationOperationV1, RelationSemanticRoleV1, SchemaFingerprintV1, VelorixLogicalTypeV1,
         VelorixRelationCatalogV1, VelorixRelationSchemaV1,
         CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID, RELATION_SCHEMA_VERSION_V1,
     },
     standing_program::{
-        EpochIdempotencyKey, InputEventTimeWatermark, MaterializedViewPage,
-        MaterializedViewSqlPage, NativeCodePolicy, RelationFrontier, RelationInputBatch,
-        RuntimeCheckpoint, RuntimeCheckpointStatePayload, RuntimePackageIdentity, ScopedViewId,
-        SnapshotPageRequest, StandingProgramIdentity, StandingProgramRuntime,
-        StandingProgramRuntimeError, ViewOutputDelta,
+        BuiltinRuntimeIdentity, EpochIdempotencyKey, InputEventTimeWatermark, MaterializedViewPage,
+        NativeCodePolicy, RelationFrontier, RelationInputBatch, RuntimeCheckpoint,
+        RuntimeCheckpointStatePayload, ScopedViewId, SnapshotPageRequest, StandingProgramIdentity,
+        StandingProgramRuntime, StandingProgramRuntimeError, ViewOutputDelta,
     },
     view_contract::{
         catalog_input_relation_schema, stable_bytes_hash, validate_materialized_standing_view_spec,
@@ -67,66 +110,29 @@ use velorix_core::{
         SqlStructField, StandingViewShape, StandingViewSpec,
     },
     view_plan::{
-        lower_supported_sql_to_logical_plan, supported_view_plan_aggregate_outputs,
-        validate_catalog_backed_sum_count_view_sql, validate_supported_join_view_sql,
-        validate_supported_latest_by_key_sql, validate_supported_tumbling_window_sql,
-        LogicalPlanAggregateFunctionV1, SupportedAggregateOutput, SupportedJoinViewPlan,
+        lower_supported_analytic_row_number_sql_to_logical_plan,
+        lower_supported_sql_to_logical_plan, supported_join_view_plan_aggregate_outputs,
+        supported_view_plan_aggregate_outputs, validate_catalog_backed_sum_count_view_sql,
+        validate_supported_analytic_row_number_sql, validate_supported_filter_project_sql,
+        validate_supported_join_view_sql, validate_supported_latest_by_key_sql,
+        validate_supported_tumbling_window_sql, LogicalPlanAggregateFunctionV1,
+        SupportedAggregateInputRelationSide, SupportedAggregateOutput,
+        SupportedAnalyticRowNumberPlan, SupportedFilterProjectPlan, SupportedJoinViewPlan,
         SupportedLatestByKeyPlan, SupportedTumblingWindowPlan, SupportedViewPlan,
-        VelorixLogicalViewPlanV1,
+        VelorixLogicalViewExecutionV1, VelorixLogicalViewPlanV1, ViewPlanError,
     },
 };
-use velorix_k8s::{
-    crd::ObjectStoreAuthorityRef,
-    ingest_writer::DeployedIngestWriterRuntime,
-    startup::{
-        validate_operator_authority, OperatorAuthorityStartupComponents, ValidatedOperatorAuthority,
-    },
-};
-use velorix_meta::{
-    validate_bearer_token, AcquireStandingRuntimeOwnerOutcome, AcquireStandingRuntimeOwnerRequest,
-    GrpcMetaStore, IngestRangeReservation, MetaStore, MetaStoreError,
-    PublishStandingRuntimeCheckpointOutcome, PublishStandingRuntimeCheckpointRequest,
-    ReserveIngestRangeOutcome, StandingRuntimeCheckpointPointer, StandingRuntimeFencingCapability,
-    StandingRuntimeOwnerClaim, StandingRuntimeOwnerToken, StoreRelationCatalogOutcome,
-    STANDING_RUNTIME_BACKEND_TIME_SOURCE_RAFT_REPLICATED,
-    STANDING_RUNTIME_FENCING_CAPABILITY_SCHEMA_VERSION,
-    STANDING_RUNTIME_LEASE_AUTHORITY_KIND_HIQLITE_RAFT_SERIALIZED,
-    STANDING_RUNTIME_LEASE_AUTHORITY_KIND_RAFT_REPLICATED_TIME,
-    STANDING_RUNTIME_LEASE_EXPIRY_SEMANTICS_BACKEND_WALL_CLOCK_TTL,
-    STANDING_RUNTIME_LEASE_EXPIRY_SEMANTICS_OPERATION_DRIVEN_LOGICAL,
-    STANDING_RUNTIME_OUTPUT_DELTA_REF_PREFIX, STANDING_RUNTIME_OUTPUT_MANIFEST_REF_PREFIX,
-    STANDING_RUNTIME_OWNER_SCOPE_KIND_TENANT_PROGRAM_VIEW,
-};
-use velorix_runtime::query::{
-    query_record_batches_table_with_bindings_and_policy_and_limiter,
-    validate_record_batch_table_query_with_bindings_and_policy, ProductionQueryRuntime,
-    QueryBindValue, QueryExecutionLimiter,
-};
-use velorix_runtime::query_policy_catalog::{
-    QueryPolicyCatalogError, QueryPolicyCatalogRecord, QueryPolicyCatalogStore,
-};
-use velorix_storage::{
-    capability::{AuthoritativeNamespace, ObjectStoreCapabilityProfile},
-    ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
-    log::{AppendValidatedEnvelopeOutcome, IngestBatchDescriptor, IngestLog, ReplayCheckpoint},
-    materialized_view_registry::{
-        ActiveMaterializedView, InvalidExecutionModeReason, MaterializedViewApiMetadata,
-        MaterializedViewArtifactBinding, MaterializedViewCompileStatus,
-        MaterializedViewDeploymentStatus, MaterializedViewExecutionMode,
-        MaterializedViewLifecycleStatus, MaterializedViewRegistry, MaterializedViewRegistryError,
-        MaterializedViewRequestFieldSpec, MaterializedViewResponseColumnSpec,
-        MaterializedViewResponseSchema, MaterializedViewRuntimeBinding,
-        RegisterMaterializedViewOutcome,
-    },
-    object_key::ObjectKey,
-    relation_catalog_registry::{CreateRelationCatalogOutcome, RelationCatalogRegistry},
-};
+
+const PUBLIC_1_0_MAX_JOIN_INPUT_RELATIONS: usize = 2;
+const PUBLIC_1_0_MAX_TOP_K_LIMIT: usize = 1_000;
+const DEFAULT_MAX_STANDING_RUNTIME_OUTPUT_DELTA_RECORDS: usize = 100_000;
+const DEFAULT_MAX_STANDING_RUNTIME_STATE_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct ApiState {
     store: Arc<dyn ObjectStore>,
-    capabilities: Arc<velorix_storage::capability::AuthoritativeObjectStoreCapabilitiesV1>,
-    ingest_writer: Arc<DeployedIngestWriterRuntime>,
+    capabilities: Arc<AuthoritativeObjectStoreCapabilitiesV1>,
+    ingest_writer: Arc<DeployedIngestWriterRuntime<ObjectStoreAuthorityRef>>,
     meta_store: Option<Arc<dyn MetaStore>>,
     meta_store_endpoint: Option<String>,
     owner_id: String,
@@ -137,12 +143,20 @@ pub struct ApiState {
     admin_bearer_token: Option<Arc<str>>,
     max_request_body_bytes: usize,
     max_ingest_rows: usize,
+    max_standing_runtime_output_delta_records: usize,
+    max_standing_runtime_state_payload_bytes: usize,
+    output_compaction_interval_epochs: u64,
+    experimental_advanced_view_features: bool,
+    background_tasks: Arc<Mutex<BackgroundTaskStatus>>,
+    background_compactions: Arc<Mutex<BTreeSet<String>>>,
     standing_runtimes: Arc<StandingRuntimeRegistry>,
     standing_runtime_factories: Arc<StandingRuntimeFactoryRegistry>,
     query_runtimes: Arc<Mutex<HashMap<String, ProductionQueryRuntime>>>,
 }
 
 type SharedStandingRuntime = Arc<Mutex<Box<dyn StandingProgramRuntime + Send>>>;
+
+const MAX_CONCURRENT_EPOCH_APPENDS: usize = 16;
 
 const API_PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
@@ -174,6 +188,23 @@ const API_PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
 struct StandingRuntimeReplayPlan {
     replay_checkpoints: Vec<ReplayCheckpoint>,
     input_frontiers: Vec<RelationFrontier>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct BackgroundTaskStatus {
+    materialization_scheduled: u64,
+    materialization_started: u64,
+    materialization_succeeded: u64,
+    materialization_failed: u64,
+    last_materialization_elapsed_us: Option<u128>,
+    last_materialization_error: Option<String>,
+    compaction_scheduled: u64,
+    compaction_already_running: u64,
+    compaction_started: u64,
+    compaction_succeeded: u64,
+    compaction_failed: u64,
+    last_compaction_elapsed_us: Option<u128>,
+    last_compaction_error: Option<String>,
 }
 
 #[derive(Default)]
@@ -316,6 +347,49 @@ struct StandingRuntimeCheckpointRecord {
     previous_checkpoint: Option<StandingRuntimeCheckpointPointer>,
     checkpoint: RuntimeCheckpoint,
     replay_checkpoints: Vec<ReplayCheckpoint>,
+    #[serde(skip)]
+    manifest_hash: String,
+}
+
+fn standing_runtime_checkpoint_record_from_slice(
+    bytes: &[u8],
+) -> Result<StandingRuntimeCheckpointRecord, serde_json::Error> {
+    let mut value: Value = serde_json::from_slice(bytes)?;
+    if let Some(identity) = value.pointer_mut("/checkpoint/identity") {
+        normalize_legacy_standing_program_identity_value(identity);
+    }
+    let mut record: StandingRuntimeCheckpointRecord = serde_json::from_value(value)?;
+    record.manifest_hash = stable_bytes_hash(bytes);
+    Ok(record)
+}
+
+fn normalize_legacy_standing_program_identity_value(value: &mut Value) {
+    let Some(identity) = value.as_object_mut() else {
+        return;
+    };
+    move_legacy_key(identity, "compiler", "_identity", "planner_identity");
+    move_legacy_key(
+        identity,
+        "runtime",
+        "_packages",
+        "builtin_runtime_identities",
+    );
+    move_legacy_key(identity, "package", "_feature_set", "runtime_capabilities");
+}
+
+fn move_legacy_key(
+    object: &mut serde_json::Map<String, Value>,
+    old_prefix: &str,
+    old_suffix: &str,
+    new_key: &str,
+) {
+    if object.contains_key(new_key) {
+        return;
+    }
+    let old_key = format!("{old_prefix}{old_suffix}");
+    if let Some(value) = object.remove(old_key.as_str()) {
+        object.insert(new_key.to_string(), value);
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -431,7 +505,15 @@ impl StandingProgramRuntimeFactory for MaterializedViewRuntimeFactory {
         let Ok(plan) = validate_catalog_backed_sum_count_view_sql(sql, catalog) else {
             let Ok(plan) = validate_supported_latest_by_key_sql(sql, catalog) else {
                 let Ok(plan) = validate_supported_tumbling_window_sql(sql, catalog) else {
-                    return Ok(None);
+                    let Ok(plan) = validate_supported_analytic_row_number_sql(sql, catalog) else {
+                        let Ok(plan) = validate_supported_filter_project_sql(sql, catalog) else {
+                            return Ok(None);
+                        };
+                        return filter_project_output_schema(view_id, catalog, &plan)
+                            .map(|schema| Some(vec![schema]));
+                    };
+                    return analytic_row_number_output_schema(view_id, catalog, &plan)
+                        .map(|schema| Some(vec![schema]));
                 };
                 return tumbling_window_output_schema(view_id, catalog, &plan)
                     .map(|schema| Some(vec![schema]));
@@ -487,7 +569,7 @@ impl StandingProgramRuntimeFactory for MaterializedViewRuntimeFactory {
         input_schemas: &[RelationSchema],
         output_schemas: &[RelationSchema],
     ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
-        velorix_runtime::materialized_view_runtime::create_standing_runtime(
+        velorix_control::materialized_view_runtime::create_standing_runtime(
             identity,
             catalog,
             input_schemas,
@@ -503,7 +585,7 @@ impl StandingProgramRuntimeFactory for MaterializedViewRuntimeFactory {
         input_schemas: &[RelationSchema],
         output_schemas: &[RelationSchema],
     ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
-        velorix_runtime::materialized_view_runtime::create_standing_runtime_with_sql(
+        velorix_control::materialized_view_runtime::create_standing_runtime_with_sql(
             identity,
             catalog,
             spec.sql.as_str(),
@@ -520,7 +602,7 @@ impl StandingProgramRuntimeFactory for MaterializedViewRuntimeFactory {
         input_schemas: &[RelationSchema],
         output_schemas: &[RelationSchema],
     ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
-        velorix_runtime::materialized_view_runtime::create_standing_runtime_with_sql_and_catalogs(
+        velorix_control::materialized_view_runtime::create_standing_runtime_with_sql_and_catalogs(
             identity,
             catalogs,
             spec.sql.as_str(),
@@ -538,7 +620,7 @@ impl StandingProgramRuntimeFactory for MaterializedViewRuntimeFactory {
         input_schemas: &[RelationSchema],
         output_schemas: &[RelationSchema],
     ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
-        velorix_runtime::materialized_view_runtime::create_standing_runtime_with_logical_plan_and_catalogs(
+        velorix_control::materialized_view_runtime::create_standing_runtime_with_logical_plan_and_catalogs(
             identity,
             catalogs,
             logical_plan.clone(),
@@ -551,7 +633,7 @@ impl StandingProgramRuntimeFactory for MaterializedViewRuntimeFactory {
         &self,
         checkpoint: RuntimeCheckpoint,
     ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
-        velorix_runtime::materialized_view_runtime::restore_standing_runtime(checkpoint)
+        velorix_control::materialized_view_runtime::restore_standing_runtime(checkpoint)
     }
 }
 
@@ -603,12 +685,20 @@ impl ApiState {
             admin_bearer_token: None,
             max_request_body_bytes: 1024 * 1024,
             max_ingest_rows: 10_000,
+            max_standing_runtime_output_delta_records:
+                DEFAULT_MAX_STANDING_RUNTIME_OUTPUT_DELTA_RECORDS,
+            max_standing_runtime_state_payload_bytes:
+                DEFAULT_MAX_STANDING_RUNTIME_STATE_PAYLOAD_BYTES,
+            output_compaction_interval_epochs: 0,
+            experimental_advanced_view_features: false,
+            background_tasks: Arc::new(Mutex::new(BackgroundTaskStatus::default())),
+            background_compactions: Arc::new(Mutex::new(BTreeSet::new())),
             standing_runtimes: Arc::new(StandingRuntimeRegistry::default()),
             standing_runtime_factories: Arc::new(StandingRuntimeFactoryRegistry::default()),
             query_runtimes: Arc::new(Mutex::new(HashMap::new())),
         };
         state.register_standing_program_runtime_factory(
-            velorix_runtime::materialized_view_runtime::CRATE_NAME,
+            MATERIALIZED_VIEW_RUNTIME_NAME,
             MaterializedViewRuntimeFactory,
         );
 
@@ -664,6 +754,97 @@ impl ApiState {
         self.max_request_body_bytes = max_body_bytes;
         self.max_ingest_rows = max_ingest_rows;
         self
+    }
+
+    pub fn with_standing_runtime_budget_limits(
+        mut self,
+        max_output_delta_records: usize,
+        max_state_payload_bytes: usize,
+    ) -> Self {
+        self.max_standing_runtime_output_delta_records = max_output_delta_records;
+        self.max_standing_runtime_state_payload_bytes = max_state_payload_bytes;
+        self
+    }
+
+    pub fn with_output_compaction_interval_epochs(mut self, interval_epochs: u64) -> Self {
+        self.output_compaction_interval_epochs = interval_epochs;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_experimental_advanced_view_features(mut self, enabled: bool) -> Self {
+        self.experimental_advanced_view_features = enabled;
+        self
+    }
+
+    #[cfg(test)]
+    fn background_task_status(&self) -> BackgroundTaskStatus {
+        self.background_tasks
+            .lock()
+            .map(|status| status.clone())
+            .unwrap_or_else(|_| BackgroundTaskStatus {
+                last_materialization_error: Some(
+                    "background task status lock poisoned".to_string(),
+                ),
+                last_compaction_error: Some("background task status lock poisoned".to_string()),
+                ..BackgroundTaskStatus::default()
+            })
+    }
+
+    fn record_background_compaction_scheduled(&self) {
+        if let Ok(mut status) = self.background_tasks.lock() {
+            status.compaction_scheduled += 1;
+        }
+    }
+
+    fn record_background_compaction_already_running(&self) {
+        if let Ok(mut status) = self.background_tasks.lock() {
+            status.compaction_already_running += 1;
+        }
+    }
+
+    fn try_start_background_compaction(&self, view_id: &str) -> bool {
+        match self.background_compactions.lock() {
+            Ok(mut active) => active.insert(view_id.to_string()),
+            Err(_) => {
+                self.record_background_compaction_error(
+                    "background compaction registry lock poisoned",
+                    0,
+                );
+                false
+            }
+        }
+    }
+
+    fn finish_background_compaction(&self, view_id: &str) {
+        if let Ok(mut active) = self.background_compactions.lock() {
+            active.remove(view_id);
+        }
+    }
+
+    fn record_background_compaction_started(&self) {
+        if let Ok(mut status) = self.background_tasks.lock() {
+            status.compaction_started += 1;
+        }
+    }
+
+    fn record_background_compaction_succeeded(&self, elapsed_us: u128) {
+        if let Ok(mut status) = self.background_tasks.lock() {
+            status.compaction_succeeded += 1;
+            status.last_compaction_elapsed_us = Some(elapsed_us);
+            status.last_compaction_error = None;
+        }
+    }
+
+    fn record_background_compaction_error(&self, error: impl Into<String>, elapsed_us: u128) {
+        match self.background_tasks.lock() {
+            Ok(mut status) => {
+                status.compaction_failed += 1;
+                status.last_compaction_elapsed_us = Some(elapsed_us);
+                status.last_compaction_error = Some(error.into());
+            }
+            Err(_) => eprintln!("background task status lock poisoned"),
+        }
     }
 
     pub fn register_standing_program_runtime(
@@ -767,33 +948,6 @@ impl ApiState {
                     view_id,
                     claim.owner_id,
                     claim.owner_epoch
-                )))
-            }
-        }
-    }
-
-    async fn validate_standing_runtime_committed_for_query(
-        &self,
-        identity: &StandingProgramIdentity,
-        view_id: &str,
-        runtime_epoch: u64,
-    ) -> Result<(), ApiError> {
-        let Some(meta_store) = &self.meta_store else {
-            return Ok(());
-        };
-        let key = standing_runtime_key(identity, view_id);
-        let local = self.standing_runtime_local_state(&key)?;
-        let latest = meta_store
-            .read_standing_runtime_checkpoint(&identity.tenant_id, &identity.program_id, view_id)
-            .await
-            .map_err(meta_error_to_api)?;
-        match (latest, local.committed_checkpoint) {
-            (Some(latest), Some(local)) if latest == local => Ok(()),
-            (None, None) if runtime_epoch == 0 => Ok(()),
-            _ => {
-                self.remove_standing_runtime_with_state(identity, view_id)?;
-                Err(ApiError::service_unavailable(format!(
-                    "standing runtime local state is not the committed checkpoint for view `{view_id}`"
                 )))
             }
         }
@@ -916,8 +1070,7 @@ impl ApiState {
             .factories
             .lock()
             .map_err(|_| ApiError::internal("standing runtime factory registry lock poisoned"))?;
-        let Some(factory) = factories.get(velorix_runtime::materialized_view_runtime::CRATE_NAME)
-        else {
+        let Some(factory) = factories.get(MATERIALIZED_VIEW_RUNTIME_NAME) else {
             return Ok(None);
         };
         factory.output_schemas_for_view_request_with_catalogs(
@@ -1009,8 +1162,11 @@ pub fn app(state: ApiState) -> Router {
             "/v1/relations/scores-default",
             post(create_default_scores_relation),
         )
-        .route("/v1/ingest", post(ingest_rows))
-        .route("/v1/ingest/epoch", post(ingest_epoch))
+        .route(
+            "/v1/relations/{relation_id}/ingest",
+            post(ingest_relation_rows),
+        )
+        .route("/v1/relations/ingest", post(ingest_epoch))
         .route("/v1/query-policies", post(create_query_policy))
         .route(
             "/v1/query-policies/{query_policy_id}",
@@ -1040,6 +1196,8 @@ pub fn app(state: ApiState) -> Router {
             state.clone(),
             require_api_auth,
         ));
+    #[cfg(test)]
+    let protected_routes = protected_routes.route("/v1/ingest", post(ingest_rows_test_compat));
     let admin_routes = Router::new()
         .route(
             "/v1/standing-runtime/owners",
@@ -1212,7 +1370,7 @@ pub async fn run_from_env() -> anyhow::Result<()> {
     .await?;
     validated
         .capabilities()
-        .validate_namespace(velorix_storage::capability::AuthoritativeNamespace::ArtifactCatalog)?
+        .validate_namespace(AuthoritativeNamespace::ArtifactCatalog)?
         .validate_for_conditional_update()
         .context(
             "velorix-api requires object-store conditional update support for active view CAS",
@@ -1238,8 +1396,13 @@ pub async fn run_from_env() -> anyhow::Result<()> {
     .await?;
     state = state
         .with_request_limits(config.max_request_body_bytes, config.max_ingest_rows)
+        .with_standing_runtime_budget_limits(
+            config.max_standing_runtime_output_delta_records,
+            config.max_standing_runtime_state_payload_bytes,
+        )
         .with_standing_runtime_fencing_mode(config.standing_runtime_fencing)
-        .with_standing_runtime_owner_ttl_ms(config.standing_runtime_owner_ttl_ms);
+        .with_standing_runtime_owner_ttl_ms(config.standing_runtime_owner_ttl_ms)
+        .with_output_compaction_interval_epochs(config.output_compaction_interval_epochs);
     if let Some(token) = config.api_bearer_token {
         state = state
             .with_api_bearer_token(token)
@@ -1300,8 +1463,21 @@ pub struct CreateRelationRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct IngestRowsRequest {
     pub relation_id: String,
+    pub relation_version: String,
+    pub stream_id: String,
+    pub partition_id: u32,
+    pub start_offset_inclusive: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_time_watermark: Option<IngestEventTimeWatermarkRequest>,
+    pub rows: Vec<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IngestRelationRowsRequest {
     pub relation_version: String,
     pub stream_id: String,
     pub partition_id: u32,
@@ -1319,8 +1495,16 @@ pub struct IngestEventTimeWatermarkRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct IngestEpochRequest {
     pub batches: Vec<IngestRowsRequest>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IngestAckMode {
+    #[default]
+    Materialized,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1330,7 +1514,7 @@ struct RepairIngestEpochRuntimeFailureRequest {
     tenant_id: String,
     program_id: String,
     view_id: String,
-    confirm_external_runtime_rebuilt: bool,
+    confirm_standing_runtime_repaired: bool,
     repair_reason: String,
 }
 
@@ -1441,11 +1625,27 @@ pub struct QueryViewRequest {
 #[serde(deny_unknown_fields)]
 struct BackfillViewRequest {
     #[serde(default)]
-    mode: Option<String>,
-    #[serde(default)]
     batch_limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackfillRangeRequest {
+    relation_id: String,
+    relation_version: String,
     #[serde(default)]
-    pause_ms: Option<u64>,
+    stream_id: Option<String>,
+    #[serde(default)]
+    partition_id: Option<u32>,
+    start_offset_inclusive: u64,
+    end_offset_exclusive: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackfillScopeRequest {
+    #[serde(rename = "where")]
+    where_clause: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1460,6 +1660,12 @@ struct RelationResponse {
 struct IngestResponse {
     outcome: String,
     descriptor: IngestDescriptorResponse,
+    epoch_manifest_id: String,
+    ingest_epoch: String,
+    materialized_through: Option<u64>,
+    ack_mode: IngestAckMode,
+    materialization: IngestMaterializationResponse,
+    timings: IngestTimingResponse,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1467,7 +1673,104 @@ struct IngestEpochResponse {
     outcome: String,
     epoch_manifest_id: String,
     epoch_manifest_key: String,
+    ingest_epoch: String,
+    materialized_through: Option<u64>,
+    ack_mode: IngestAckMode,
+    materialization: IngestMaterializationResponse,
+    timings: IngestTimingResponse,
     batches: Vec<IngestResponse>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct IngestMaterializationResponse {
+    status: String,
+    active_views: usize,
+    applied_batches: usize,
+    materialized_through: Option<u64>,
+    checkpoint_writes: usize,
+    applied_batches_per_checkpoint_write: Option<usize>,
+    output_delta_writes: usize,
+    state_payload_writes: usize,
+    checkpoint_record_writes: usize,
+    checkpoint_pointer_writes: usize,
+    latest_cache_writes: usize,
+    checkpoint_publication_writes: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct IngestTimingResponse {
+    total_ms: u128,
+    total_us: u128,
+    avg_batch_us: Option<u128>,
+    avg_row_us: Option<u128>,
+    rows_per_second: Option<u64>,
+    batch_count: usize,
+    row_count: usize,
+}
+
+#[derive(Debug)]
+struct IngestTimer {
+    started_at: Instant,
+    last_stage_at: Instant,
+    batch_count: usize,
+    row_count: usize,
+}
+
+impl IngestTimer {
+    fn start() -> Self {
+        let now = Instant::now();
+        Self {
+            started_at: now,
+            last_stage_at: now,
+            batch_count: 0,
+            row_count: 0,
+        }
+    }
+
+    fn set_workload(&mut self, batch_count: usize, row_count: usize) {
+        self.batch_count = batch_count;
+        self.row_count = row_count;
+    }
+
+    fn mark(&mut self, stage: &str) {
+        let now = Instant::now();
+        let _ = stage;
+        self.last_stage_at = now;
+    }
+
+    fn finish(self) -> IngestTimingResponse {
+        let total = self.started_at.elapsed();
+        let total_us = total.as_micros();
+        IngestTimingResponse {
+            total_ms: total.as_millis(),
+            total_us,
+            avg_batch_us: nonzero_div(total_us, self.batch_count),
+            avg_row_us: nonzero_div(total_us, self.row_count),
+            rows_per_second: rows_per_second(self.row_count, total_us),
+            batch_count: self.batch_count,
+            row_count: self.row_count,
+        }
+    }
+}
+
+fn nonzero_div(total: u128, count: usize) -> Option<u128> {
+    total.checked_div(count as u128)
+}
+
+fn nonzero_div_usize(total: usize, count: usize) -> Option<usize> {
+    total.checked_div(count)
+}
+
+fn rows_per_second(row_count: usize, total_us: u128) -> Option<u64> {
+    if row_count == 0 || total_us == 0 {
+        None
+    } else {
+        Some(((row_count as u128 * 1_000_000) / total_us) as u64)
+    }
+}
+
+fn record_materialized_through(boundary: &mut Option<u64>, logical_epoch: u64) {
+    *boundary = Some(boundary.map_or(logical_epoch, |current| current.min(logical_epoch)));
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1520,9 +1823,6 @@ struct CoverageCapabilityResponse {
 struct MaterializationCoverageResponse {
     state: String,
     full_view: CoverageCapabilityResponse,
-    request_scope: CoverageCapabilityResponse,
-    range: CoverageCapabilityResponse,
-    background_backfill: CoverageCapabilityResponse,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1544,6 +1844,17 @@ struct BackfillViewResponse {
     progress: BackfillProgressResponse,
     applied_batches: usize,
     remaining_batches: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CompactViewResponse {
+    view_id: String,
+    outcome: String,
+    mode: String,
+    logical_epoch: Option<u64>,
+    before_pages: usize,
+    after_pages: usize,
+    compacted_manifests: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1575,20 +1886,12 @@ struct ViewResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     query_policy_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    artifact: Option<MaterializedViewArtifactBinding>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     outcome: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 struct ViewCatalogResponse {
     views: Vec<ViewResponse>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SqlTemplateValidationMode {
-    LocalDataFusion,
-    ExternalSqlRuntime,
 }
 
 async fn healthz() -> Json<Value> {
@@ -1623,6 +1926,23 @@ async fn readyz(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> 
             "max_request_body_bytes": state.max_request_body_bytes,
             "max_ingest_rows": state.max_ingest_rows,
         },
+        "materialization_policy": {
+            "preferred_ingest_path": "/v1/relations/{relation_id}/ingest",
+            "multi_relation_ingest_path": "/v1/relations/ingest",
+            "default_ack_mode": "materialized",
+            "ack_modes": ["materialized"],
+            "enforced_public_1_0_limits": {
+                "max_request_body_bytes": state.max_request_body_bytes,
+                "max_ingest_rows_per_request": state.max_ingest_rows,
+                "max_join_input_relations": PUBLIC_1_0_MAX_JOIN_INPUT_RELATIONS,
+                "max_top_k_limit": PUBLIC_1_0_MAX_TOP_K_LIMIT,
+                "max_output_delta_records_per_commit": state.max_standing_runtime_output_delta_records,
+                "max_state_payload_bytes_per_checkpoint": state.max_standing_runtime_state_payload_bytes
+            },
+            "checkpoint_coalescing": "one checkpoint publish per affected active view per committed epoch",
+            "latency_diagnostics": "ingest responses include total_us, avg_batch_us, avg_row_us, rows_per_second, workload shape, and write coalescing counters; detailed stage timings belong in traces/metrics",
+            "materialization_write_counters": ["output_delta_writes", "state_payload_writes", "checkpoint_record_writes", "checkpoint_pointer_writes", "latest_cache_writes", "checkpoint_publication_writes"]
+        },
         "admin_auth": {
             "configured": state.admin_bearer_token.is_some(),
             "mode": if state.admin_bearer_token.is_some() { "bearer-token" } else { "unauthenticated-dev" },
@@ -1631,9 +1951,7 @@ async fn readyz(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> 
     })))
 }
 
-fn object_store_capabilities_json(
-    capabilities: &velorix_storage::capability::AuthoritativeObjectStoreCapabilitiesV1,
-) -> Value {
+fn object_store_capabilities_json(capabilities: &AuthoritativeObjectStoreCapabilitiesV1) -> Value {
     let profiles = AuthoritativeNamespace::all()
         .into_iter()
         .filter_map(|namespace| {
@@ -1667,10 +1985,6 @@ fn object_store_profile_json(profile: &ObjectStoreCapabilityProfile) -> Value {
         "list_after_write": profile.list_after_write,
         "read_after_write": profile.read_after_write,
     })
-}
-
-fn sql_quoted_identifier(identifier: &str) -> String {
-    format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
 fn api_path_segment(segment: &str) -> String {
@@ -1709,8 +2023,7 @@ fn standing_runtime_fencing_capability_json(
 async fn create_default_orders_relation(
     State(state): State<ApiState>,
 ) -> Result<(StatusCode, Json<RelationResponse>), ApiError> {
-    let catalog = velorix_runtime::recovery::orders_sum_count_relation_catalog()
-        .map_err(ApiError::bad_request)?;
+    let catalog = orders_sum_count_relation_catalog().map_err(ApiError::bad_request)?;
     create_relation_catalog(state, catalog).await
 }
 
@@ -1726,8 +2039,7 @@ async fn create_relation(
 ) -> Result<(StatusCode, Json<RelationResponse>), ApiError> {
     let catalog = match (request.catalog, request.default_orders_sum_count) {
         (Some(catalog), false) | (Some(catalog), true) => catalog,
-        (None, true) => velorix_runtime::recovery::orders_sum_count_relation_catalog()
-            .map_err(ApiError::bad_request)?,
+        (None, true) => orders_sum_count_relation_catalog().map_err(ApiError::bad_request)?,
         (None, false) => {
             return Err(ApiError::bad_request(
                 "request must include `catalog` or set `default_orders_sum_count`",
@@ -1942,11 +2254,18 @@ async fn create_view(
     State(state): State<ApiState>,
     Json(request): Json<CreateViewRequest>,
 ) -> Result<(StatusCode, Json<ViewResponse>), ApiError> {
+    validate_public_view_feature_admission(&state, &request)?;
     let catalogs = read_relation_catalogs_for_view_request(&state, &request).await?;
     let spec = view_spec_from_request(&state, &request, &catalogs)?;
     validate_materialized_runtime_spec_admission(&spec)?;
     state.validate_standing_runtime_fencing_or_evict().await?;
     let runtime_binding = materialized_view_runtime_binding_for_spec(&catalogs, &spec)?;
+    validate_public_runtime_plan_admission(
+        &state,
+        runtime_binding.logical_plan.as_ref().ok_or_else(|| {
+            ApiError::bad_request("materialized view runtime binding is missing a logical plan")
+        })?,
+    )?;
     let spec_hash = view_spec_hash(&spec).map_err(ApiError::bad_request)?;
     let api_metadata = api_metadata_from_create_view_request(&request);
     validate_view_api_metadata(&api_metadata)?;
@@ -1956,7 +2275,6 @@ async fn create_view(
         &spec.view_id,
         &api_metadata,
         &spec.output_relations,
-        SqlTemplateValidationMode::LocalDataFusion,
     )
     .await?;
     let pending_runtime = build_standing_runtime_for_runtime_binding(
@@ -1978,9 +2296,7 @@ async fn create_view(
             &state,
             &spec,
             Some(api_metadata.clone()),
-            None,
-            Some(runtime_binding.clone()),
-            Some(execution_mode.clone()),
+            runtime_binding.clone(),
             Some(lifecycle.clone()),
         )
         .await?;
@@ -1993,9 +2309,7 @@ async fn create_view(
             &state,
             &spec,
             Some(api_metadata.clone()),
-            None,
-            Some(runtime_binding.clone()),
-            Some(execution_mode.clone()),
+            runtime_binding.clone(),
             Some(lifecycle.clone()),
         )
         .await?
@@ -2013,40 +2327,128 @@ async fn create_view(
             execution_mode,
             lifecycle,
             Some(api_metadata),
-            None,
             Some(outcome_text),
+            state.experimental_advanced_view_features,
         )?),
     ))
+}
+
+fn validate_public_view_feature_admission(
+    state: &ApiState,
+    request: &CreateViewRequest,
+) -> Result<(), ApiError> {
+    if state.experimental_advanced_view_features {
+        return Ok(());
+    }
+    let sql = request.sql.to_ascii_lowercase();
+    if contains_sql_function_call(&sql, "tumble")
+        || contains_sql_function_call(&sql, "hop")
+        || contains_sql_function_call(&sql, "session")
+        || contains_sql_function_call(&sql, "row_number")
+        || contains_sql_function_call(&sql, "rank")
+        || contains_sql_function_call(&sql, "dense_rank")
+        || contains_sql_keyword(&sql, "over")
+    {
+        return Err(ApiError::bad_request(
+            "advanced view SQL is experimental and disabled for the public 1.0 API",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_public_runtime_plan_admission(
+    state: &ApiState,
+    plan: &VelorixLogicalViewPlanV1,
+) -> Result<(), ApiError> {
+    if state.experimental_advanced_view_features {
+        return Ok(());
+    }
+    if plan.input_relations.len() > PUBLIC_1_0_MAX_JOIN_INPUT_RELATIONS {
+        return Err(ApiError::bad_request(format!(
+            "materialized view uses {} input relations; public 1.0 supports at most {}",
+            plan.input_relations.len(),
+            PUBLIC_1_0_MAX_JOIN_INPUT_RELATIONS
+        )));
+    }
+    match &plan.execution {
+        VelorixLogicalViewExecutionV1::AnalyticRowNumber { .. }
+        | VelorixLogicalViewExecutionV1::TumblingEventTimeAggregate { .. } => {
+            Err(ApiError::bad_request(
+                "advanced view execution is experimental and disabled for the public 1.0 API",
+            ))
+        }
+        VelorixLogicalViewExecutionV1::SingleKeySumCount { plan } => {
+            validate_public_top_k_limit(plan.top_k.as_ref())
+        }
+        VelorixLogicalViewExecutionV1::FilterProject { plan } => {
+            validate_public_top_k_limit(plan.top_k.as_ref())
+        }
+        VelorixLogicalViewExecutionV1::LatestByKey { plan } => {
+            validate_public_top_k_limit(plan.top_k.as_ref())
+        }
+        VelorixLogicalViewExecutionV1::TwoInputJoinSumCount { plan } => {
+            validate_public_top_k_limit(plan.top_k.as_ref())
+        }
+    }
+}
+
+fn validate_public_top_k_limit(
+    top_k: Option<&velorix_core::view_plan::SupportedTopKPlan>,
+) -> Result<(), ApiError> {
+    if let Some(top_k) = top_k {
+        if top_k.limit > PUBLIC_1_0_MAX_TOP_K_LIMIT {
+            return Err(ApiError::bad_request(format!(
+                "top-k limit {} exceeds public 1.0 limit {}",
+                top_k.limit, PUBLIC_1_0_MAX_TOP_K_LIMIT
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn contains_sql_function_call(sql: &str, function_name: &str) -> bool {
+    sql.match_indices(function_name).any(|(index, _)| {
+        let bytes = sql.as_bytes();
+        if index > 0 && is_sql_identifier_byte(bytes[index - 1]) {
+            return false;
+        }
+        let mut next = index + function_name.len();
+        if next < bytes.len() && is_sql_identifier_byte(bytes[next]) {
+            return false;
+        }
+        while next < bytes.len() && bytes[next].is_ascii_whitespace() {
+            next += 1;
+        }
+        next < bytes.len() && bytes[next] == b'('
+    })
+}
+
+fn contains_sql_keyword(sql: &str, keyword: &str) -> bool {
+    sql.match_indices(keyword).any(|(index, _)| {
+        let bytes = sql.as_bytes();
+        let before_is_identifier = index > 0 && is_sql_identifier_byte(bytes[index - 1]);
+        let after = index + keyword.len();
+        let after_is_identifier = after < bytes.len() && is_sql_identifier_byte(bytes[after]);
+        !before_is_identifier && !after_is_identifier
+    })
+}
+
+fn is_sql_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 async fn register_materialized_view_execution(
     state: &ApiState,
     spec: &StandingViewSpec,
     api: Option<MaterializedViewApiMetadata>,
-    artifact: Option<MaterializedViewArtifactBinding>,
-    runtime: Option<MaterializedViewRuntimeBinding>,
-    execution_mode: Option<MaterializedViewExecutionMode>,
+    runtime: MaterializedViewRuntimeBinding,
     lifecycle: Option<MaterializedViewLifecycleStatus>,
 ) -> Result<RegisterMaterializedViewOutcome, ApiError> {
-    if let Some(runtime) = runtime {
-        state
-            .view_registry()?
-            .register_with_api_metadata_runtime_execution(spec, api, runtime, lifecycle)
-            .await
-            .map_err(materialized_view_registry_error_to_api)
-    } else {
-        state
-            .view_registry()?
-            .register_with_api_metadata_artifact_execution(
-                spec,
-                api,
-                artifact,
-                execution_mode,
-                lifecycle,
-            )
-            .await
-            .map_err(materialized_view_registry_error_to_api)
-    }
+    state
+        .view_registry()?
+        .register_with_api_metadata_runtime_execution(spec, api, runtime, lifecycle)
+        .await
+        .map_err(materialized_view_registry_error_to_api)
 }
 
 fn materialized_view_runtime_binding_for_spec(
@@ -2055,11 +2457,13 @@ fn materialized_view_runtime_binding_for_spec(
 ) -> Result<MaterializedViewRuntimeBinding, ApiError> {
     let identity = standing_program_identity_from_materialized_view_runtime(catalogs, spec)?;
     let output_schema = only_output_relation_for_runtime_binding(spec)?;
-    let logical_plan =
-        lower_supported_sql_to_logical_plan(spec.sql.as_str(), catalogs, output_schema)
-            .map_err(ApiError::bad_request)?;
+    let logical_plan = lower_materialized_view_runtime_sql_to_logical_plan(
+        spec.sql.as_str(),
+        catalogs,
+        output_schema,
+    )?;
     Ok(MaterializedViewRuntimeBinding {
-        runtime_kind: velorix_runtime::materialized_view_runtime::CRATE_NAME.to_string(),
+        runtime_kind: MATERIALIZED_VIEW_RUNTIME_NAME.to_string(),
         runtime_version: "builtin-v1".to_string(),
         standing_program_identity: identity,
         logical_plan: Some(logical_plan),
@@ -2075,6 +2479,21 @@ fn only_output_relation_for_runtime_binding(
         ));
     };
     Ok(output_schema)
+}
+
+fn lower_materialized_view_runtime_sql_to_logical_plan(
+    sql: &str,
+    catalogs: &[VelorixRelationCatalogV1],
+    output_schema: &RelationSchema,
+) -> Result<VelorixLogicalViewPlanV1, ApiError> {
+    if let [catalog] = catalogs {
+        match lower_supported_analytic_row_number_sql_to_logical_plan(sql, catalog, output_schema) {
+            Ok(plan) => return Ok(plan),
+            Err(ViewPlanError::UnsupportedShape { .. }) => {}
+            Err(error) => return Err(ApiError::bad_request(error)),
+        }
+    }
+    lower_supported_sql_to_logical_plan(sql, catalogs, output_schema).map_err(ApiError::bad_request)
 }
 
 fn standing_program_identity_from_materialized_view_runtime(
@@ -2097,12 +2516,12 @@ fn standing_program_identity_from_materialized_view_runtime(
         sql_hash: stable_bytes_hash(spec.sql.as_bytes()),
         input_catalog_hash,
         output_schema_hash: stable_bytes_hash(&output_schema_bytes),
-        compiler_identity: "velorix-materialized-view-runtime".to_string(),
-        runtime_packages: vec![RuntimePackageIdentity {
-            name: velorix_runtime::materialized_view_runtime::CRATE_NAME.to_string(),
+        planner_identity: "velorix-logical-view-planner".to_string(),
+        builtin_runtime_identities: vec![BuiltinRuntimeIdentity {
+            name: MATERIALIZED_VIEW_RUNTIME_NAME.to_string(),
             version: "builtin-v1".to_string(),
         }],
-        package_feature_set: vec!["materialized_view_runtime".to_string()],
+        runtime_capabilities: vec!["materialized_view_runtime".to_string()],
         runtime_compatibility: "velorix-materialized-view-runtime-v1".to_string(),
         checkpoint_codec_identity: "velorix-materialized-view-state-v1".to_string(),
         native_code_policy: NativeCodePolicy::DisabledNoExternalDependencies,
@@ -2118,12 +2537,6 @@ fn active_standing_runtime_identity(
         .runtime
         .as_ref()
         .map(|runtime| &runtime.standing_program_identity)
-        .or_else(|| {
-            active
-                .artifact
-                .as_ref()
-                .and_then(|artifact| artifact.standing_program_identity.as_ref())
-        })
 }
 
 fn standing_program_view_ids_for_spec(spec: &StandingViewSpec) -> Vec<String> {
@@ -2356,13 +2769,13 @@ fn validate_runtime_schemas(
     let actual_input_schemas = runtime.input_schemas();
     if actual_input_schemas != expected_input_schemas {
         return Err(ApiError::bad_request(
-            "standing runtime input schemas do not match artifact metadata",
+            "standing runtime input schemas do not match runtime metadata",
         ));
     }
     let actual_output_schemas = runtime.output_schemas();
     if actual_output_schemas != expected_output_schemas {
         return Err(ApiError::bad_request(
-            "standing runtime output schemas do not match artifact metadata",
+            "standing runtime output schemas do not match runtime metadata",
         ));
     }
 
@@ -2555,6 +2968,7 @@ async fn get_view_backfill_status(
         0,
         progress.remaining_batches,
         progress,
+        state.experimental_advanced_view_features,
     )))
 }
 
@@ -2563,61 +2977,200 @@ async fn run_view_backfill(
     AxumPath(view_id): AxumPath<String>,
     Json(request): Json<BackfillViewRequest>,
 ) -> Result<(StatusCode, Json<BackfillViewResponse>), ApiError> {
-    let mode = request.mode.as_deref().unwrap_or("sync");
-    match mode {
-        "sync" => {
-            let outcome = run_view_backfill_step(&state, &view_id, request.batch_limit).await?;
-            Ok((StatusCode::OK, Json(outcome)))
-        }
-        "background" => {
-            let batch_limit = request.batch_limit.unwrap_or(1);
-            if batch_limit == 0 {
-                return Err(ApiError::bad_request(
-                    "backfill batch_limit must be a positive integer",
-                ));
-            }
-            let pause_ms = request.pause_ms.unwrap_or(100);
-            let active = state
-                .view_registry()?
-                .read_active(&view_id)
-                .await
-                .map_err(materialized_view_registry_error_to_api)?;
-            if view_query_availability(&active.lifecycle) {
-                return Ok((
-                    StatusCode::OK,
-                    Json(backfill_view_response(
-                        &active,
-                        "already_running",
-                        mode,
-                        0,
-                        0,
-                        committed_backfill_progress(&state, &active).await?,
-                    )),
-                ));
-            }
-            if !view_backfill_is_query_triggerable(&active) {
-                ensure_view_execution_allowed(&active)?;
-            }
-            spawn_background_view_backfill(state.clone(), view_id.clone(), batch_limit, pause_ms);
-            let progress = committed_backfill_progress(&state, &active).await?;
-            Ok((
-                StatusCode::ACCEPTED,
-                Json(backfill_view_response(
-                    &active,
-                    "scheduled",
-                    mode,
-                    0,
-                    progress.remaining_batches,
-                    progress,
-                )),
-            ))
-        }
-        other => Err(ApiError::bad_request(format!(
-            "unsupported backfill mode `{other}`; expected `sync` or `background`"
-        ))),
-    }
+    let outcome = run_view_backfill_step(&state, &view_id, request.batch_limit, None, None).await?;
+    Ok((StatusCode::OK, Json(outcome)))
 }
 
+fn spawn_background_view_output_compaction(state: ApiState, view_id: String) -> bool {
+    if !state.try_start_background_compaction(&view_id) {
+        state.record_background_compaction_already_running();
+        return false;
+    }
+    state.record_background_compaction_scheduled();
+    tokio::spawn(async move {
+        let started_at = Instant::now();
+        state.record_background_compaction_started();
+        if let Err(error) = compact_view_output_once(&state, &view_id, "background").await {
+            state.record_background_compaction_error(
+                error.message.clone(),
+                started_at.elapsed().as_micros(),
+            );
+            eprintln!(
+                "background view output compaction failed for `{view_id}`: {}",
+                error.message
+            );
+        } else {
+            state.record_background_compaction_succeeded(started_at.elapsed().as_micros());
+        }
+        state.finish_background_compaction(&view_id);
+    });
+    true
+}
+
+fn maybe_spawn_background_view_output_compaction_after_checkpoint(
+    state: &ApiState,
+    view_id: &str,
+    logical_epoch: u64,
+) -> bool {
+    if !state.experimental_advanced_view_features {
+        return false;
+    }
+    let interval = state.output_compaction_interval_epochs;
+    if !should_schedule_background_output_compaction(interval, logical_epoch) {
+        return false;
+    }
+    spawn_background_view_output_compaction(state.clone(), view_id.to_string())
+}
+
+fn should_schedule_background_output_compaction(interval_epochs: u64, logical_epoch: u64) -> bool {
+    interval_epochs != 0 && logical_epoch != 0 && logical_epoch.is_multiple_of(interval_epochs)
+}
+
+async fn compact_view_output_once(
+    state: &ApiState,
+    view_id: &str,
+    mode: &str,
+) -> Result<CompactViewResponse, ApiError> {
+    let active = state
+        .view_registry()?
+        .read_active(view_id)
+        .await
+        .map_err(materialized_view_registry_error_to_api)?;
+    ensure_view_execution_allowed(&active)?;
+    let identity = active_standing_runtime_identity(&active).ok_or_else(|| {
+        ApiError::conflict(format!(
+            "standing runtime view `{view_id}` is missing runtime identity"
+        ))
+    })?;
+    let operation_lock = state.standing_runtime_operation_lock(identity, &active.spec.view_id)?;
+    let _guard = operation_lock.lock().await;
+    let owner = state
+        .acquire_standing_runtime_owner(identity, &active.spec.view_id)
+        .await?;
+    let Some(record) =
+        read_latest_standing_runtime_checkpoint(state, identity, &active.spec.view_id).await?
+    else {
+        return Err(ApiError::service_unavailable(format!(
+            "standing runtime checkpoint is unavailable for view `{view_id}`"
+        )));
+    };
+    let before_pages = record.checkpoint.output_manifest_refs.len();
+    let checkpoint_key =
+        ObjectKey::parse_standing_runtime_checkpoint(record.checkpoint_key.clone())
+            .map_err(ApiError::bad_request)?
+            .0;
+    let publication = standing_runtime_output_manifest_record_for_checkpoint(
+        &record.checkpoint,
+        &record.view_id,
+        &checkpoint_key,
+    )?
+    .ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "standing runtime checkpoint for view `{}` cannot publish output without hydrated state payload",
+            record.view_id
+        ))
+    })?;
+    let output_manifest_refs = vec![format!(
+        "{STANDING_RUNTIME_OUTPUT_MANIFEST_REF_PREFIX}{}",
+        publication.manifest_key.as_str()
+    )];
+    let after_pages = publication.manifest_record.pages.len();
+    let compacted_manifests =
+        usize::from(record.checkpoint.output_manifest_refs != output_manifest_refs);
+
+    publish_standing_runtime_output_snapshot_from_checkpoint(state, &record).await?;
+    drop(owner);
+
+    Ok(CompactViewResponse {
+        view_id: active.spec.view_id,
+        outcome: if compacted_manifests == 0 {
+            "already_compacted".to_string()
+        } else {
+            "compacted".to_string()
+        },
+        mode: mode.to_string(),
+        logical_epoch: Some(record.checkpoint.logical_epoch),
+        before_pages,
+        after_pages,
+        compacted_manifests,
+    })
+}
+
+#[cfg(test)]
+async fn compact_standing_runtime_output_manifest(
+    state: &ApiState,
+    record: &StandingRuntimeCheckpointRecord,
+    manifest: &StandingRuntimeOutputManifestRecord,
+) -> Result<StandingRuntimeOutputPublication, ApiError> {
+    let mut output = DeltaBatch::default();
+    for page in &manifest.pages {
+        let (_key, page_record) =
+            read_standing_runtime_output_page_record(state, page, &manifest.view_id).await?;
+        let page_output: DeltaBatch = serde_json::from_value(page_record.published_output)
+            .map_err(|source| ApiError::bad_request(source.to_string()))?;
+        output = output.combine(&page_output);
+    }
+    let compacted = DeltaBatch::from_records(
+        output
+            .net_rows()
+            .map_err(|source| ApiError::bad_request(source.to_string()))?,
+    );
+    let published_output =
+        serde_json::to_value(compacted).map_err(|source| ApiError::internal(source.to_string()))?;
+    let checkpoint_key =
+        ObjectKey::parse_standing_runtime_checkpoint(record.checkpoint_key.clone())
+            .map_err(ApiError::bad_request)?
+            .0;
+    let publication = standing_runtime_output_publication(
+        &record.checkpoint,
+        &manifest.view_id,
+        &checkpoint_key,
+        published_output,
+    )?;
+    for (page_key, page_record) in &publication.page_records {
+        put_standing_runtime_output_page(state, page_key, page_record).await?;
+    }
+    put_standing_runtime_output_manifest(
+        state,
+        &publication.manifest_key,
+        &publication.manifest_record,
+    )
+    .await?;
+    Ok(publication)
+}
+
+async fn publish_standing_runtime_output_snapshot_from_checkpoint(
+    state: &ApiState,
+    record: &StandingRuntimeCheckpointRecord,
+) -> Result<StandingRuntimeOutputPublication, ApiError> {
+    let checkpoint_key =
+        ObjectKey::parse_standing_runtime_checkpoint(record.checkpoint_key.clone())
+            .map_err(ApiError::bad_request)?
+            .0;
+    let publication = standing_runtime_output_manifest_record_for_checkpoint(
+        &record.checkpoint,
+        &record.view_id,
+        &checkpoint_key,
+    )?
+    .ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "standing runtime checkpoint for view `{}` cannot publish output without hydrated state payload",
+            record.view_id
+        ))
+    })?;
+    for (page_key, page_record) in &publication.page_records {
+        persist_standing_runtime_output_page(state, page_key, page_record).await?;
+    }
+    persist_standing_runtime_output_manifest(
+        state,
+        &publication.manifest_key,
+        &publication.manifest_record,
+    )
+    .await?;
+    Ok(publication)
+}
+
+#[derive(Clone)]
 struct PreparedIngestBatch {
     request: IngestRowsRequest,
     catalog: VelorixRelationCatalogV1,
@@ -2626,6 +3179,57 @@ struct PreparedIngestBatch {
     event_time_watermark: Option<InputEventTimeWatermark>,
     payload_digest: String,
     envelope: bytes::Bytes,
+}
+
+struct PreparedIngestAppendOutcome {
+    index: usize,
+    response: IngestResponse,
+    appended: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PreparedStandingRuntimeApplySummary {
+    active_views: usize,
+    applied_batches: usize,
+    materialized_through: Option<u64>,
+    checkpoint_writes: usize,
+    output_delta_writes: usize,
+    state_payload_writes: usize,
+    checkpoint_record_writes: usize,
+    checkpoint_pointer_writes: usize,
+    latest_cache_writes: usize,
+    convergence_writes: usize,
+    compaction_scheduled: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct StandingRuntimeCheckpointWriteSummary {
+    output_delta_writes: usize,
+    state_payload_writes: usize,
+    checkpoint_record_writes: usize,
+    checkpoint_pointer_writes: usize,
+    latest_cache_writes: usize,
+    compaction_scheduled: usize,
+}
+
+struct StandingRuntimeCheckpointPersistContext {
+    previous_record: Option<StandingRuntimeCheckpointRecord>,
+    replay_checkpoints_to_merge: Vec<ReplayCheckpoint>,
+    owner: Option<StandingRuntimeOwnerToken>,
+}
+
+impl StandingRuntimeCheckpointPersistContext {
+    fn new(
+        previous_record: Option<StandingRuntimeCheckpointRecord>,
+        replay_checkpoints_to_merge: Vec<ReplayCheckpoint>,
+        owner: Option<StandingRuntimeOwnerToken>,
+    ) -> Self {
+        Self {
+            previous_record,
+            replay_checkpoints_to_merge,
+            owner,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2683,42 +3287,72 @@ struct IngestEpochViewRuntimeFailureRecord {
     replay_checkpoints: Vec<ReplayCheckpoint>,
 }
 
-async fn ingest_rows(
+#[cfg(test)]
+async fn ingest_rows_test_compat(
     State(state): State<ApiState>,
     Json(request): Json<IngestRowsRequest>,
 ) -> Result<(StatusCode, Json<IngestResponse>), ApiError> {
-    let prepared = prepare_ingest_batch(&state, request).await?;
-    ensure_standing_runtimes_for_ingest(&state, &prepared.request).await?;
-    preacquire_standing_runtime_owners_for_ingest(&state, &prepared.request).await?;
-    if state.meta_store.is_some() {
-        reserve_ingest_range(
-            &state,
-            &prepared.request,
-            &prepared.catalog,
-            prepared.end_offset_exclusive,
-            &prepared.envelope,
-        )
-        .await?;
-    }
-    let outcome = append_ingest_envelope(&state, prepared.envelope).await?;
-    let (status, outcome, descriptor) = ingest_outcome_parts(outcome)?;
-    if matches!(outcome, "appended" | "duplicate") {
-        apply_standing_runtime_ingest(&state, &prepared.request).await?;
-    }
-
+    let (status, Json(epoch_response)) = ingest_epoch(
+        State(state),
+        Json(IngestEpochRequest {
+            batches: vec![IngestRowsRequest { ..request }],
+        }),
+    )
+    .await?;
+    let Some(batch) = epoch_response.batches.into_iter().next() else {
+        return Err(ApiError::internal(
+            "single ingest produced no batch response",
+        ));
+    };
     Ok((
         status,
         Json(IngestResponse {
-            outcome: outcome.to_string(),
-            descriptor: ingest_descriptor_response(&descriptor),
+            outcome: batch.outcome,
+            descriptor: batch.descriptor,
+            epoch_manifest_id: epoch_response.epoch_manifest_id,
+            ingest_epoch: epoch_response.ingest_epoch,
+            materialized_through: epoch_response.materialized_through,
+            ack_mode: epoch_response.ack_mode,
+            materialization: epoch_response.materialization,
+            timings: epoch_response.timings,
         }),
     ))
+}
+
+async fn ingest_relation_rows(
+    State(state): State<ApiState>,
+    AxumPath(relation_id): AxumPath<String>,
+    Json(request): Json<IngestRelationRowsRequest>,
+) -> Result<(StatusCode, Json<IngestEpochResponse>), ApiError> {
+    if relation_id.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "relation_id path segment is required",
+        ));
+    }
+    ingest_epoch(
+        State(state),
+        Json(IngestEpochRequest {
+            batches: vec![IngestRowsRequest {
+                relation_id,
+                relation_version: request.relation_version,
+                stream_id: request.stream_id,
+                partition_id: request.partition_id,
+                start_offset_inclusive: request.start_offset_inclusive,
+                event_time_watermark: request.event_time_watermark,
+                rows: request.rows,
+            }],
+        }),
+    )
+    .await
 }
 
 async fn ingest_epoch(
     State(state): State<ApiState>,
     Json(request): Json<IngestEpochRequest>,
 ) -> Result<(StatusCode, Json<IngestEpochResponse>), ApiError> {
+    let ack_mode = IngestAckMode::Materialized;
+    let mut timer = IngestTimer::start();
+    let batch_count = request.batches.len();
     if request.batches.is_empty() {
         return Err(ApiError::bad_request(
             "ingest epoch must contain at least one batch",
@@ -2740,11 +3374,30 @@ async fn ingest_epoch(
             state.max_ingest_rows
         )));
     }
+    timer.set_workload(batch_count, total_rows);
 
     let mut prepared_batches = Vec::with_capacity(request.batches.len());
+    let mut catalog_cache: HashMap<(String, String), VelorixRelationCatalogV1> = HashMap::new();
     for batch in request.batches {
-        prepared_batches.push(prepare_ingest_batch(&state, batch).await?);
+        let catalog_key = (batch.relation_id.clone(), batch.relation_version.clone());
+        let catalog = match catalog_cache.get(&catalog_key) {
+            Some(catalog) => catalog.clone(),
+            None => {
+                let catalog =
+                    read_relation_catalog(&state, &batch.relation_id, &batch.relation_version)
+                        .await?;
+                catalog_cache.insert(catalog_key, catalog.clone());
+                catalog
+            }
+        };
+        prepared_batches.push(prepare_ingest_batch_with_catalog(
+            &state,
+            batch,
+            catalog,
+            Some(&mut timer),
+        )?);
     }
+    timer.mark("prepare");
     let canonical_total_rows = prepared_batches
         .iter()
         .try_fold(0usize, |total, batch| {
@@ -2759,14 +3412,31 @@ async fn ingest_epoch(
     }
     validate_ingest_epoch_batch_ranges(&prepared_batches)?;
     let epoch_manifest = persist_ingest_epoch_manifest(&state, &prepared_batches).await?;
+    timer.mark("epoch_manifest");
     ensure_no_ingest_epoch_view_runtime_failures(&state, &epoch_manifest, &prepared_batches)
         .await?;
+    let mut ensured_ingest_relations = BTreeSet::new();
     for prepared in &prepared_batches {
-        ensure_standing_runtimes_for_ingest(&state, &prepared.request).await?;
+        let key = (
+            prepared.request.relation_id.as_str(),
+            prepared.request.relation_version.as_str(),
+        );
+        if ensured_ingest_relations.insert(key) {
+            ensure_standing_runtimes_for_ingest(&state, &prepared.request).await?;
+        }
     }
+    timer.mark("ensure_runtime");
+    let mut preacquired_ingest_relations = BTreeSet::new();
     for prepared in &prepared_batches {
-        preacquire_standing_runtime_owners_for_ingest(&state, &prepared.request).await?;
+        let key = (
+            prepared.request.relation_id.as_str(),
+            prepared.request.relation_version.as_str(),
+        );
+        if preacquired_ingest_relations.insert(key) {
+            preacquire_standing_runtime_owners_for_ingest(&state, &prepared.request).await?;
+        }
     }
+    timer.mark("preacquire_owner");
     if state.meta_store.is_some() {
         for prepared in &prepared_batches {
             reserve_ingest_range(
@@ -2779,33 +3449,25 @@ async fn ingest_epoch(
             .await?;
         }
     }
-    let epoch_requests = prepared_batches
-        .iter()
-        .map(|prepared| prepared.request.clone())
-        .collect::<Vec<_>>();
-    apply_standing_runtime_ingests_for_epoch_repair(
+    timer.mark("reserve_range");
+    let (appended, responses) = append_prepared_ingest_epoch_batches(
         &state,
-        &epoch_manifest,
         &prepared_batches,
-        &epoch_requests,
+        ack_mode,
+        &epoch_manifest.epoch_manifest_id,
     )
     .await?;
+    timer.mark("append_parallel");
+    timer.mark("append");
 
-    let mut responses = Vec::with_capacity(prepared_batches.len());
-    let mut appended = 0usize;
-    for prepared in &prepared_batches {
-        let outcome = append_ingest_envelope(&state, prepared.envelope.clone()).await?;
-        let (_status, outcome, descriptor) = ingest_outcome_parts(outcome)?;
-        if outcome == "appended" {
-            appended += 1;
-        }
-        responses.push(IngestResponse {
-            outcome: outcome.to_string(),
-            descriptor: ingest_descriptor_response(&descriptor),
-        });
-    }
-
-    apply_standing_runtime_ingest_epoch(&state, &epoch_manifest, &prepared_batches).await?;
+    let materialization = materialize_prepared_ingest_epoch_for_ack_mode(
+        &state,
+        &epoch_manifest,
+        prepared_batches.clone(),
+        ack_mode,
+        &mut timer,
+    )
+    .await?;
 
     let (status, outcome) = if appended > 0 {
         (StatusCode::CREATED, "appended")
@@ -2816,20 +3478,137 @@ async fn ingest_epoch(
         status,
         Json(IngestEpochResponse {
             outcome: outcome.to_string(),
-            epoch_manifest_id: epoch_manifest.epoch_manifest_id,
+            epoch_manifest_id: epoch_manifest.epoch_manifest_id.clone(),
             epoch_manifest_key: epoch_manifest.epoch_manifest_key,
+            ingest_epoch: epoch_manifest.epoch_manifest_id,
+            materialized_through: materialization.materialized_through,
+            ack_mode,
+            materialization,
+            timings: timer.finish(),
             batches: responses,
         }),
     ))
+}
+
+async fn append_prepared_ingest_epoch_batches(
+    state: &ApiState,
+    prepared_batches: &[PreparedIngestBatch],
+    ack_mode: IngestAckMode,
+    ingest_epoch: &str,
+) -> Result<(usize, Vec<IngestResponse>), ApiError> {
+    let concurrency = prepared_batches
+        .len()
+        .clamp(1, MAX_CONCURRENT_EPOCH_APPENDS);
+    let mut outcomes = futures::stream::iter(prepared_batches.iter().cloned().enumerate())
+        .map(|(index, prepared)| {
+            let state = state.clone();
+            let ingest_epoch = ingest_epoch.to_string();
+            async move {
+                let outcome = append_ingest_envelope(&state, prepared.envelope.clone()).await?;
+                let (_status, outcome, descriptor) = ingest_outcome_parts(outcome)?;
+                Ok::<_, ApiError>(PreparedIngestAppendOutcome {
+                    index,
+                    appended: outcome == "appended",
+                    response: IngestResponse {
+                        outcome: outcome.to_string(),
+                        descriptor: ingest_descriptor_response(&descriptor),
+                        epoch_manifest_id: ingest_epoch.clone(),
+                        ingest_epoch,
+                        materialized_through: None,
+                        ack_mode,
+                        materialization: IngestMaterializationResponse {
+                            status: "epoch_scoped".to_string(),
+                            active_views: 0,
+                            applied_batches: 0,
+                            materialized_through: None,
+                            checkpoint_writes: 0,
+                            applied_batches_per_checkpoint_write: None,
+                            output_delta_writes: 0,
+                            state_payload_writes: 0,
+                            checkpoint_record_writes: 0,
+                            checkpoint_pointer_writes: 0,
+                            latest_cache_writes: 0,
+                            checkpoint_publication_writes: 0,
+                        },
+                        timings: IngestTimingResponse {
+                            total_ms: 0,
+                            total_us: 0,
+                            avg_batch_us: None,
+                            avg_row_us: None,
+                            rows_per_second: None,
+                            batch_count: 1,
+                            row_count: prepared.request.rows.len(),
+                        },
+                    },
+                })
+            }
+        })
+        .buffer_unordered(concurrency)
+        .try_collect::<Vec<_>>()
+        .await?;
+    outcomes.sort_by_key(|outcome| outcome.index);
+    let appended = outcomes.iter().filter(|outcome| outcome.appended).count();
+    Ok((
+        appended,
+        outcomes
+            .into_iter()
+            .map(|outcome| outcome.response)
+            .collect(),
+    ))
+}
+
+async fn materialize_prepared_ingest_epoch_for_ack_mode(
+    state: &ApiState,
+    epoch_manifest: &PersistedIngestEpochManifest,
+    prepared_batches: Vec<PreparedIngestBatch>,
+    ack_mode: IngestAckMode,
+    timer: &mut IngestTimer,
+) -> Result<IngestMaterializationResponse, ApiError> {
+    match ack_mode {
+        IngestAckMode::Materialized => {
+            let summary = apply_standing_runtime_ingest_epoch(
+                state,
+                epoch_manifest,
+                &prepared_batches,
+                Some(timer),
+            )
+            .await?;
+            timer.mark("materialize");
+            Ok(materialization_response("completed", summary))
+        }
+    }
+}
+
+fn materialization_response(
+    status: &str,
+    summary: PreparedStandingRuntimeApplySummary,
+) -> IngestMaterializationResponse {
+    IngestMaterializationResponse {
+        status: status.to_string(),
+        active_views: summary.active_views,
+        applied_batches: summary.applied_batches,
+        materialized_through: summary.materialized_through,
+        checkpoint_writes: summary.checkpoint_writes,
+        applied_batches_per_checkpoint_write: nonzero_div_usize(
+            summary.applied_batches,
+            summary.checkpoint_writes,
+        ),
+        output_delta_writes: summary.output_delta_writes,
+        state_payload_writes: summary.state_payload_writes,
+        checkpoint_record_writes: summary.checkpoint_record_writes,
+        checkpoint_pointer_writes: summary.checkpoint_pointer_writes,
+        latest_cache_writes: summary.latest_cache_writes,
+        checkpoint_publication_writes: summary.convergence_writes,
+    }
 }
 
 async fn repair_ingest_epoch_runtime_failure(
     State(state): State<ApiState>,
     Json(request): Json<RepairIngestEpochRuntimeFailureRequest>,
 ) -> Result<Json<RepairIngestEpochRuntimeFailureResponse>, ApiError> {
-    if !request.confirm_external_runtime_rebuilt {
+    if !request.confirm_standing_runtime_repaired {
         return Err(ApiError::bad_request(
-            "confirm_external_runtime_rebuilt must be true after the external runtime has been rebuilt or cleared",
+            "confirm_standing_runtime_repaired must be true after the native standing runtime has been repaired or cleared",
         ));
     }
     let repair_reason = request.repair_reason.trim();
@@ -2897,9 +3676,22 @@ async fn repair_ingest_epoch_runtime_failure(
     }))
 }
 
+#[cfg(test)]
 async fn prepare_ingest_batch(
     state: &ApiState,
+    request: IngestRowsRequest,
+    timer: Option<&mut IngestTimer>,
+) -> Result<PreparedIngestBatch, ApiError> {
+    let catalog =
+        read_relation_catalog(state, &request.relation_id, &request.relation_version).await?;
+    prepare_ingest_batch_with_catalog(state, request, catalog, timer)
+}
+
+fn prepare_ingest_batch_with_catalog(
+    state: &ApiState,
     mut request: IngestRowsRequest,
+    catalog: VelorixRelationCatalogV1,
+    mut timer: Option<&mut IngestTimer>,
 ) -> Result<PreparedIngestBatch, ApiError> {
     if request.rows.len() > state.max_ingest_rows {
         return Err(ApiError::payload_too_large(format!(
@@ -2908,9 +3700,24 @@ async fn prepare_ingest_batch(
             state.max_ingest_rows
         )));
     }
-    let catalog =
-        read_relation_catalog(state, &request.relation_id, &request.relation_version).await?;
+    if catalog.relation_schema.relation_id != request.relation_id
+        || catalog.relation_schema.relation_version != request.relation_version
+    {
+        return Err(ApiError::bad_request(format!(
+            "relation catalog identity mismatch: request relation={}/{} catalog relation={}/{}",
+            request.relation_id,
+            request.relation_version,
+            catalog.relation_schema.relation_id,
+            catalog.relation_schema.relation_version
+        )));
+    }
+    if let Some(timer) = timer.as_mut() {
+        timer.mark("prepare_catalog");
+    }
     request.rows = normalize_ingest_operation_envelopes(&catalog, &request.rows)?;
+    if let Some(timer) = timer.as_mut() {
+        timer.mark("prepare_normalize");
+    }
     if request.rows.len() > state.max_ingest_rows {
         return Err(ApiError::payload_too_large(format!(
             "canonical ingest row count {} exceeds configured limit {}",
@@ -2919,12 +3726,15 @@ async fn prepare_ingest_batch(
         )));
     }
     let batch = rows_to_record_batch(&catalog, &request.rows)?;
+    if let Some(timer) = timer.as_mut() {
+        timer.mark("prepare_arrow");
+    }
     let end_offset_exclusive = request
         .start_offset_inclusive
         .checked_add(request.rows.len() as u64)
         .ok_or_else(|| ApiError::bad_request("ingest offset range overflow"))?;
     let event_time_watermark = ingest_event_time_watermark(&catalog, &request, &batch)?;
-    let envelope = IngestEnvelope::encode_batches(
+    let encoded = IngestEnvelope::encode_batches_with_header(
         IngestEnvelopeEncodeRequest {
             relation_id: request.relation_id.clone(),
             relation_version: request.relation_version.clone(),
@@ -2938,11 +3748,13 @@ async fn prepare_ingest_batch(
         std::slice::from_ref(&batch),
     )
     .map_err(ApiError::bad_request)?;
-    let payload_digest = IngestEnvelope::decode(envelope.clone())
-        .map_err(ApiError::bad_request)?
-        .header()
-        .payload_digest
-        .clone();
+    if let Some(timer) = timer.as_mut() {
+        timer.mark("prepare_envelope");
+    }
+    let payload_digest = encoded.header.payload_digest.clone();
+    if let Some(timer) = timer.as_mut() {
+        timer.mark("prepare_digest");
+    }
     Ok(PreparedIngestBatch {
         request,
         catalog,
@@ -2950,7 +3762,7 @@ async fn prepare_ingest_batch(
         end_offset_exclusive,
         event_time_watermark,
         payload_digest,
-        envelope,
+        envelope: encoded.bytes,
     })
 }
 
@@ -3400,15 +4212,29 @@ async fn read_ingest_epoch_view_convergence(
         view_id,
         key.as_str(),
     )?;
-    let pointer = StandingRuntimeCheckpointPointer {
-        tenant_id: record.tenant_id.clone(),
-        program_id: record.program_id.clone(),
-        view_id: record.view_id.clone(),
-        checkpoint_key: record.checkpoint_key.clone(),
-        logical_epoch: record.logical_epoch,
-        content_hash: record.checkpoint_content_hash.clone(),
-        output_manifest_refs: Vec::new(),
-    };
+    let pointer = state
+        .meta_store
+        .as_ref()
+        .ok_or_else(|| {
+            ApiError::service_unavailable(
+                "ingest epoch convergence requires authoritative checkpoint metadata",
+            )
+        })?
+        .read_standing_runtime_checkpoint(&record.tenant_id, &record.program_id, &record.view_id)
+        .await
+        .map_err(meta_error_to_api)?
+        .ok_or_else(|| {
+            ApiError::service_unavailable(format!(
+                "standing runtime checkpoint metadata is unavailable for `{}/{}/{}`",
+                record.tenant_id, record.program_id, record.view_id
+            ))
+        })?;
+    if pointer.checkpoint_key != record.checkpoint_key {
+        return Err(ApiError::bad_request(format!(
+            "ingest epoch view convergence checkpoint pointer mismatch at {}",
+            key.as_str()
+        )));
+    }
     let checkpoint =
         read_standing_runtime_checkpoint_record_from_pointer(state, identity, view_id, &pointer)
             .await?;
@@ -3561,7 +4387,7 @@ fn ingest_epoch_view_runtime_failure_error(
     failure: &IngestEpochViewRuntimeFailureRecord,
 ) -> ApiError {
     ApiError::service_unavailable(format!(
-        "standing runtime ingest epoch `{}` for view `{}` has a durable runtime failure marker and will not be retried automatically; rebuild or repair the external runtime before replaying this epoch: {}",
+        "standing runtime ingest epoch `{}` for view `{}` has a durable runtime failure marker and will not be retried automatically; repair the native standing runtime before replaying this epoch: {}",
         epoch_manifest.epoch_manifest_id, failure.view_id, failure.failure_reason
     ))
 }
@@ -3610,7 +4436,7 @@ async fn ensure_standing_runtimes_for_ingest(
         if !standing_runtime_can_accept_incremental_ingest(active) {
             continue;
         }
-        let Some(identity) = active_standing_runtime_identity(&active) else {
+        let Some(identity) = active_standing_runtime_identity(active) else {
             continue;
         };
         if !view_uses_ingest_relation(active, request) {
@@ -3682,114 +4508,6 @@ async fn preacquire_standing_runtime_owners_for_ingest(
     Ok(())
 }
 
-async fn apply_standing_runtime_ingest(
-    state: &ApiState,
-    request: &IngestRowsRequest,
-) -> Result<(), ApiError> {
-    apply_standing_runtime_ingests(state, std::slice::from_ref(request)).await
-}
-
-async fn apply_standing_runtime_ingests(
-    state: &ApiState,
-    requests: &[IngestRowsRequest],
-) -> Result<(), ApiError> {
-    state.validate_standing_runtime_fencing_or_evict().await?;
-    let active_views = state
-        .view_registry()?
-        .list_active()
-        .await
-        .map_err(materialized_view_registry_error_to_api)?;
-    for active in active_views {
-        if !standing_runtime_can_accept_incremental_ingest(&active) {
-            continue;
-        }
-        let Some(identity) = active_standing_runtime_identity(&active) else {
-            continue;
-        };
-        if !requests
-            .iter()
-            .any(|request| view_uses_ingest_relation(&active, request))
-        {
-            continue;
-        }
-        let latest_checkpoint =
-            read_latest_standing_runtime_checkpoint(state, identity, &active.spec.view_id).await?;
-        let replay_plan = latest_checkpoint
-            .as_ref()
-            .map(standing_runtime_replay_plan_from_record_ref)
-            .unwrap_or_default();
-        replay_committed_ingest_into_standing_runtime(state, &active, &replay_plan).await?;
-    }
-
-    Ok(())
-}
-
-async fn apply_standing_runtime_ingests_for_epoch_repair(
-    state: &ApiState,
-    epoch_manifest: &PersistedIngestEpochManifest,
-    prepared_batches: &[PreparedIngestBatch],
-    requests: &[IngestRowsRequest],
-) -> Result<(), ApiError> {
-    state.validate_standing_runtime_fencing_or_evict().await?;
-    let active_views = state
-        .view_registry()?
-        .list_active()
-        .await
-        .map_err(materialized_view_registry_error_to_api)?;
-    for active in active_views {
-        if !standing_runtime_can_accept_incremental_ingest(&active) {
-            continue;
-        }
-        let Some(identity) = active_standing_runtime_identity(&active) else {
-            continue;
-        };
-        if !requests
-            .iter()
-            .any(|request| view_uses_ingest_relation(&active, request))
-        {
-            continue;
-        }
-        if prepared_batches
-            .iter()
-            .any(|prepared| view_uses_prepared_ingest_batch(&active, prepared))
-        {
-            if read_ingest_epoch_view_convergence(
-                state,
-                epoch_manifest,
-                identity,
-                &active.spec.view_id,
-            )
-            .await?
-            .is_some()
-            {
-                continue;
-            }
-            if let Some(failure) = read_ingest_epoch_view_runtime_failure(
-                state,
-                epoch_manifest,
-                identity,
-                &active.spec.view_id,
-            )
-            .await?
-            {
-                return Err(ingest_epoch_view_runtime_failure_error(
-                    epoch_manifest,
-                    &failure,
-                ));
-            }
-        }
-        let latest_checkpoint =
-            read_latest_standing_runtime_checkpoint(state, identity, &active.spec.view_id).await?;
-        let replay_plan = latest_checkpoint
-            .as_ref()
-            .map(standing_runtime_replay_plan_from_record_ref)
-            .unwrap_or_default();
-        replay_committed_ingest_into_standing_runtime(state, &active, &replay_plan).await?;
-    }
-
-    Ok(())
-}
-
 async fn ensure_no_ingest_epoch_view_runtime_failures(
     state: &ApiState,
     epoch_manifest: &PersistedIngestEpochManifest,
@@ -3841,13 +4559,25 @@ async fn apply_standing_runtime_ingest_epoch(
     state: &ApiState,
     epoch_manifest: &PersistedIngestEpochManifest,
     prepared_batches: &[PreparedIngestBatch],
-) -> Result<(), ApiError> {
+    timer: Option<&mut IngestTimer>,
+) -> Result<PreparedStandingRuntimeApplySummary, ApiError> {
+    apply_standing_runtime_prepared_ingests(state, Some(epoch_manifest), prepared_batches, timer)
+        .await
+}
+
+async fn apply_standing_runtime_prepared_ingests(
+    state: &ApiState,
+    epoch_manifest: Option<&PersistedIngestEpochManifest>,
+    prepared_batches: &[PreparedIngestBatch],
+    mut timer: Option<&mut IngestTimer>,
+) -> Result<PreparedStandingRuntimeApplySummary, ApiError> {
     state.validate_standing_runtime_fencing_or_evict().await?;
     let active_views = state
         .view_registry()?
         .list_active()
         .await
         .map_err(materialized_view_registry_error_to_api)?;
+    let mut summary = PreparedStandingRuntimeApplySummary::default();
     for active in active_views {
         if !standing_runtime_can_accept_incremental_ingest(&active) {
             continue;
@@ -3862,24 +4592,35 @@ async fn apply_standing_runtime_ingest_epoch(
         if matching_prepared_batches.is_empty() {
             continue;
         }
-        if read_ingest_epoch_view_convergence(state, epoch_manifest, identity, &active.spec.view_id)
-            .await?
-            .is_some()
-        {
-            continue;
-        }
-        if let Some(failure) = read_ingest_epoch_view_runtime_failure(
-            state,
-            epoch_manifest,
-            identity,
-            &active.spec.view_id,
-        )
-        .await?
-        {
-            return Err(ingest_epoch_view_runtime_failure_error(
+        summary.active_views += 1;
+        if let Some(epoch_manifest) = epoch_manifest {
+            if let Some(convergence) = read_ingest_epoch_view_convergence(
+                state,
                 epoch_manifest,
-                &failure,
-            ));
+                identity,
+                &active.spec.view_id,
+            )
+            .await?
+            {
+                record_materialized_through(
+                    &mut summary.materialized_through,
+                    convergence.logical_epoch,
+                );
+                continue;
+            }
+            if let Some(failure) = read_ingest_epoch_view_runtime_failure(
+                state,
+                epoch_manifest,
+                identity,
+                &active.spec.view_id,
+            )
+            .await?
+            {
+                return Err(ingest_epoch_view_runtime_failure_error(
+                    epoch_manifest,
+                    &failure,
+                ));
+            }
         }
         let epoch_replay_checkpoints = matching_prepared_batches
             .iter()
@@ -3890,20 +4631,29 @@ async fn apply_standing_runtime_ingest_epoch(
             state.standing_runtime_operation_lock(identity, &active.spec.view_id)?;
         let _operation_guard = operation_lock.lock().await;
         let mut uncovered_prepared_batches = matching_prepared_batches.clone();
-        if let Some(latest_checkpoint) =
-            read_latest_standing_runtime_checkpoint(state, identity, &active.spec.view_id).await?
-        {
-            let replay_plan = standing_runtime_replay_plan_from_record_ref(&latest_checkpoint);
+        let previous_checkpoint =
+            read_latest_standing_runtime_checkpoint(state, identity, &active.spec.view_id).await?;
+        if let Some(timer) = timer.as_mut() {
+            timer.mark("materialize_checkpoint_lookup");
+        }
+        if let Some(latest_checkpoint) = &previous_checkpoint {
+            let replay_plan = standing_runtime_replay_plan_from_record_ref(latest_checkpoint);
             if prepared_batches_are_covered_by_replay_plan(&replay_plan, &matching_prepared_batches)
             {
-                persist_ingest_epoch_view_convergence(
-                    state,
-                    epoch_manifest,
-                    &active.spec.view_id,
-                    &latest_checkpoint.checkpoint,
-                    epoch_replay_checkpoints,
-                )
-                .await?;
+                if let Some(epoch_manifest) = epoch_manifest {
+                    persist_ingest_epoch_view_convergence(
+                        state,
+                        epoch_manifest,
+                        &active.spec.view_id,
+                        &latest_checkpoint.checkpoint,
+                        epoch_replay_checkpoints,
+                    )
+                    .await?;
+                }
+                record_materialized_through(
+                    &mut summary.materialized_through,
+                    latest_checkpoint.checkpoint.logical_epoch,
+                );
                 continue;
             }
             uncovered_prepared_batches.retain(|prepared| {
@@ -3934,53 +4684,96 @@ async fn apply_standing_runtime_ingest_epoch(
             uncovered_prepared_batches.iter().copied(),
         )
         .map_err(ApiError::bad_request)?;
+        let lower_bound_epoch = uncovered_prepared_batches
+            .iter()
+            .map(|prepared| prepared.end_offset_exclusive)
+            .max()
+            .unwrap_or(0);
         let apply_result = apply_standing_runtime_changes_and_checkpoint_many(
             Arc::clone(&runtime),
-            0,
+            lower_bound_epoch,
             idempotency_key,
             input_batches,
+            StandingRuntimeBudgetLimits::from_state(state),
         )
         .await;
+        if let Some(timer) = timer.as_mut() {
+            if epoch_manifest.is_some() {
+                timer.mark("materialize_apply");
+            } else {
+                timer.mark("materialize_direct_apply");
+            }
+        }
         let apply_result = match apply_result {
             Ok(apply_result) => apply_result,
             Err(error) => {
-                persist_ingest_epoch_view_runtime_failure(
-                    state,
-                    epoch_manifest,
-                    identity,
-                    &active.spec.view_id,
-                    error.message.clone(),
-                    epoch_replay_checkpoints.clone(),
-                )
-                .await?;
+                if let Some(epoch_manifest) = epoch_manifest {
+                    persist_ingest_epoch_view_runtime_failure(
+                        state,
+                        epoch_manifest,
+                        identity,
+                        &active.spec.view_id,
+                        error.message.clone(),
+                        epoch_replay_checkpoints.clone(),
+                    )
+                    .await?;
+                }
                 remove_standing_runtime(state, identity, &active.spec.view_id)?;
                 return Err(error);
             }
         };
-        if let Err(error) = persist_standing_runtime_checkpoint(
+        let checkpoint_write_summary = match persist_standing_runtime_checkpoint(
             state,
             &active.spec.view_id,
             &apply_result.checkpoint,
             &apply_result.output_deltas,
-            epoch_replay_checkpoints.clone(),
-            owner,
+            StandingRuntimeCheckpointPersistContext::new(
+                previous_checkpoint,
+                epoch_replay_checkpoints.clone(),
+                owner,
+            ),
+            timer.as_deref_mut(),
         )
         .await
         {
-            remove_standing_runtime(state, identity, &active.spec.view_id)?;
-            return Err(error);
+            Ok(summary) => summary,
+            Err(error) => {
+                remove_standing_runtime(state, identity, &active.spec.view_id)?;
+                return Err(error);
+            }
+        };
+        if let Some(timer) = timer.as_mut() {
+            timer.mark("materialize_checkpoint");
         }
-        persist_ingest_epoch_view_convergence(
-            state,
-            epoch_manifest,
-            &active.spec.view_id,
-            &apply_result.checkpoint,
-            epoch_replay_checkpoints,
-        )
-        .await?;
+        summary.applied_batches += uncovered_prepared_batches.len();
+        summary.checkpoint_writes += 1;
+        summary.output_delta_writes += checkpoint_write_summary.output_delta_writes;
+        summary.state_payload_writes += checkpoint_write_summary.state_payload_writes;
+        summary.checkpoint_record_writes += checkpoint_write_summary.checkpoint_record_writes;
+        summary.checkpoint_pointer_writes += checkpoint_write_summary.checkpoint_pointer_writes;
+        summary.latest_cache_writes += checkpoint_write_summary.latest_cache_writes;
+        summary.compaction_scheduled += checkpoint_write_summary.compaction_scheduled;
+        record_materialized_through(
+            &mut summary.materialized_through,
+            apply_result.checkpoint.logical_epoch,
+        );
+        if let Some(epoch_manifest) = epoch_manifest {
+            persist_ingest_epoch_view_convergence(
+                state,
+                epoch_manifest,
+                &active.spec.view_id,
+                &apply_result.checkpoint,
+                epoch_replay_checkpoints,
+            )
+            .await?;
+            summary.convergence_writes += 1;
+            if let Some(timer) = timer.as_mut() {
+                timer.mark("materialize_checkpoint_publication");
+            }
+        }
     }
 
-    Ok(())
+    Ok(summary)
 }
 
 fn view_uses_ingest_relation(active: &ActiveMaterializedView, request: &IngestRowsRequest) -> bool {
@@ -4005,6 +4798,8 @@ fn relation_input_batch_from_prepared_ingest(prepared: &PreparedIngestBatch) -> 
     RelationInputBatch {
         relation_id: prepared.request.relation_id.clone(),
         relation_version: prepared.request.relation_version.clone(),
+        stream_id: prepared.request.stream_id.clone(),
+        partition_id: prepared.request.partition_id,
         schema_fingerprint: prepared.catalog.schema_fingerprint.as_str().to_string(),
         start_offset_inclusive: prepared.request.start_offset_inclusive,
         end_offset_exclusive: prepared.end_offset_exclusive,
@@ -4070,14 +4865,31 @@ async fn apply_standing_runtime_changes_and_checkpoint(
     lower_bound_epoch: u64,
     idempotency_key: EpochIdempotencyKey,
     input_batch: RelationInputBatch,
+    budget_limits: StandingRuntimeBudgetLimits,
 ) -> Result<StandingRuntimeApplyResult, ApiError> {
     apply_standing_runtime_changes_and_checkpoint_many(
         runtime,
         lower_bound_epoch,
         idempotency_key,
         vec![input_batch],
+        budget_limits,
     )
     .await
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StandingRuntimeBudgetLimits {
+    max_output_delta_records: usize,
+    max_state_payload_bytes: usize,
+}
+
+impl StandingRuntimeBudgetLimits {
+    fn from_state(state: &ApiState) -> Self {
+        Self {
+            max_output_delta_records: state.max_standing_runtime_output_delta_records,
+            max_state_payload_bytes: state.max_standing_runtime_state_payload_bytes,
+        }
+    }
 }
 
 async fn apply_standing_runtime_changes_and_checkpoint_many(
@@ -4085,6 +4897,7 @@ async fn apply_standing_runtime_changes_and_checkpoint_many(
     lower_bound_epoch: u64,
     idempotency_key: EpochIdempotencyKey,
     input_batches: Vec<RelationInputBatch>,
+    budget_limits: StandingRuntimeBudgetLimits,
 ) -> Result<StandingRuntimeApplyResult, ApiError> {
     tokio::task::spawn_blocking(move || {
         let mut runtime = runtime
@@ -4096,6 +4909,7 @@ async fn apply_standing_runtime_changes_and_checkpoint_many(
             .apply_changes(logical_epoch, idempotency_key, input_batches)
             .map_err(ApiError::bad_request)?;
         let checkpoint = runtime.checkpoint().map_err(ApiError::bad_request)?;
+        validate_standing_runtime_budget(&commit.output_deltas, &checkpoint, budget_limits)?;
         Ok(StandingRuntimeApplyResult {
             checkpoint,
             output_deltas: commit.output_deltas,
@@ -4105,14 +4919,43 @@ async fn apply_standing_runtime_changes_and_checkpoint_many(
     .map_err(ApiError::internal)?
 }
 
+fn validate_standing_runtime_budget(
+    output_deltas: &[ViewOutputDelta],
+    checkpoint: &RuntimeCheckpoint,
+    limits: StandingRuntimeBudgetLimits,
+) -> Result<(), ApiError> {
+    let output_delta_records = output_deltas
+        .iter()
+        .map(|delta| delta.delta.records().len())
+        .sum::<usize>();
+    if output_delta_records > limits.max_output_delta_records {
+        return Err(ApiError::payload_too_large(format!(
+            "standing runtime output delta record count {output_delta_records} exceeds configured limit {}",
+            limits.max_output_delta_records
+        )));
+    }
+    let state_payload_bytes = checkpoint
+        .state_payload
+        .as_ref()
+        .map(|payload| payload.payload.len())
+        .unwrap_or(0);
+    if state_payload_bytes > limits.max_state_payload_bytes {
+        return Err(ApiError::payload_too_large(format!(
+            "standing runtime checkpoint state payload size {state_payload_bytes} exceeds configured limit {}",
+            limits.max_state_payload_bytes
+        )));
+    }
+    Ok(())
+}
+
 async fn persist_standing_runtime_checkpoint(
     state: &ApiState,
     view_id: &str,
     checkpoint: &RuntimeCheckpoint,
     output_deltas: &[ViewOutputDelta],
-    replay_checkpoints_to_merge: Vec<ReplayCheckpoint>,
-    owner: Option<StandingRuntimeOwnerToken>,
-) -> Result<(), ApiError> {
+    context: StandingRuntimeCheckpointPersistContext,
+    mut timer: Option<&mut IngestTimer>,
+) -> Result<StandingRuntimeCheckpointWriteSummary, ApiError> {
     if !checkpoint.identity.view_ids.iter().any(|id| id == view_id) {
         return Err(ApiError::bad_request(format!(
             "standing runtime checkpoint identity does not include view `{view_id}`"
@@ -4126,30 +4969,25 @@ async fn persist_standing_runtime_checkpoint(
         &checkpoint.state_root.content_hash,
     )
     .map_err(ApiError::bad_request)?;
-    let previous_record =
-        read_latest_standing_runtime_checkpoint(state, &checkpoint.identity, view_id).await?;
+    let previous_record = match context.previous_record {
+        Some(record) => Some(record),
+        None => {
+            read_latest_standing_runtime_checkpoint(state, &checkpoint.identity, view_id).await?
+        }
+    };
     let expected_previous = previous_record
         .as_ref()
         .map(standing_runtime_checkpoint_pointer_from_record);
-    let output_manifest = standing_runtime_output_manifest_record_for_checkpoint(
-        checkpoint,
-        view_id,
-        &checkpoint_key,
-    )?;
-    if let Some(output_manifest) = &output_manifest {
-        for (output_page_key, output_page_record) in &output_manifest.page_records {
-            persist_standing_runtime_output_page(state, output_page_key, output_page_record)
-                .await?;
-        }
-        persist_standing_runtime_output_manifest(
-            state,
-            &output_manifest.manifest_key,
-            &output_manifest.manifest_record,
-        )
-        .await?;
-    }
     let output_delta_publications =
         standing_runtime_output_delta_records_for_checkpoint(checkpoint, view_id, output_deltas)?;
+    let mut write_summary = StandingRuntimeCheckpointWriteSummary {
+        output_delta_writes: output_delta_publications.len(),
+        state_payload_writes: 1,
+        checkpoint_record_writes: 1,
+        checkpoint_pointer_writes: usize::from(state.meta_store.is_some()),
+        latest_cache_writes: 1,
+        compaction_scheduled: 0,
+    };
     for publication in &output_delta_publications {
         persist_standing_runtime_output_delta(
             state,
@@ -4158,15 +4996,19 @@ async fn persist_standing_runtime_checkpoint(
         )
         .await?;
     }
+    if let Some(timer) = timer.as_mut() {
+        timer.mark("checkpoint_output_delta");
+    }
     let (state_payload_key, state_payload_record) =
         standing_runtime_state_payload_record_for_checkpoint(checkpoint, view_id)?;
     persist_standing_runtime_state_payload(state, &state_payload_key, &state_payload_record)
         .await?;
+    if let Some(timer) = timer.as_mut() {
+        timer.mark("checkpoint_state_payload");
+    }
     let checkpoint_for_record = standing_runtime_checkpoint_with_durable_publication_refs(
         checkpoint,
-        output_manifest
-            .as_ref()
-            .map(|publication| &publication.manifest_key),
+        None,
         output_delta_publications
             .iter()
             .map(|publication| &publication.delta_key)
@@ -4174,16 +5016,13 @@ async fn persist_standing_runtime_checkpoint(
             .as_slice(),
         &state_payload_key,
     );
-    let candidate = standing_runtime_checkpoint_pointer_from_key(
-        &checkpoint_key,
-        &checkpoint.identity.tenant_id,
-        &checkpoint.identity.program_id,
-        view_id,
-        checkpoint.logical_epoch,
-        &checkpoint.state_root.content_hash,
-        checkpoint_for_record.output_manifest_refs.clone(),
-    )?;
-    let previous_checkpoint = if expected_previous.as_ref() == Some(&candidate) {
+    let duplicate_checkpoint = expected_previous.as_ref().is_some_and(|pointer| {
+        pointer.checkpoint_key == checkpoint_key.as_str()
+            && pointer.logical_epoch == checkpoint.logical_epoch
+            && pointer.content_hash == checkpoint.state_root.content_hash
+            && pointer.output_manifest_refs == checkpoint_for_record.output_manifest_refs
+    });
+    let previous_checkpoint = if duplicate_checkpoint {
         previous_record
             .as_ref()
             .and_then(|record| record.previous_checkpoint.clone())
@@ -4198,7 +5037,7 @@ async fn persist_standing_runtime_checkpoint(
     .map_err(ApiError::bad_request)?;
     let replay_checkpoints = merged_standing_runtime_replay_checkpoints(
         previous_record.as_ref(),
-        replay_checkpoints_to_merge,
+        context.replay_checkpoints_to_merge,
     );
     let record = StandingRuntimeCheckpointRecord {
         schema_version: 1,
@@ -4208,9 +5047,20 @@ async fn persist_standing_runtime_checkpoint(
         previous_checkpoint,
         checkpoint: checkpoint_for_record,
         replay_checkpoints,
+        manifest_hash: String::new(),
     };
     let bytes =
         serde_json::to_vec(&record).map_err(|source| ApiError::internal(source.to_string()))?;
+    let candidate = standing_runtime_checkpoint_pointer_from_key(
+        &checkpoint_key,
+        &checkpoint.identity.tenant_id,
+        &checkpoint.identity.program_id,
+        view_id,
+        checkpoint.logical_epoch,
+        &checkpoint.state_root.content_hash,
+        stable_bytes_hash(&bytes),
+        record.checkpoint.output_manifest_refs.clone(),
+    )?;
     let checkpoint_path = ObjectPath::from(checkpoint_key.as_str());
     let result = state
         .store
@@ -4240,8 +5090,22 @@ async fn persist_standing_runtime_checkpoint(
         }
         Err(error) => return Err(ApiError::internal(error)),
     }
-    publish_standing_runtime_checkpoint_pointer(state, expected_previous, candidate.clone(), owner)
-        .await?;
+    if let Some(timer) = timer.as_mut() {
+        timer.mark("checkpoint_record");
+    }
+    if state.meta_store.is_some() {
+        validate_checkpoint_pointer_object_exists_for_meta_rehydration(state, &candidate).await?;
+    }
+    publish_standing_runtime_checkpoint_pointer(
+        state,
+        expected_previous,
+        candidate.clone(),
+        context.owner,
+    )
+    .await?;
+    if let Some(timer) = timer.as_mut() {
+        timer.mark("checkpoint_pointer");
+    }
     state.set_standing_runtime_committed_checkpoint(
         &checkpoint.identity,
         view_id,
@@ -4259,8 +5123,18 @@ async fn persist_standing_runtime_checkpoint(
             return Err(ApiError::internal(error));
         }
     }
+    if let Some(timer) = timer.as_mut() {
+        timer.mark("checkpoint_latest_cache");
+    }
+    if maybe_spawn_background_view_output_compaction_after_checkpoint(
+        state,
+        view_id,
+        checkpoint.logical_epoch,
+    ) {
+        write_summary.compaction_scheduled = 1;
+    }
 
-    Ok(())
+    Ok(write_summary)
 }
 
 fn standing_runtime_checkpoint_with_publication_output_refs(
@@ -4395,6 +5269,16 @@ fn standing_runtime_output_manifest_record_for_checkpoint(
     let Some(published_output) = standing_runtime_checkpoint_published_output(checkpoint) else {
         return Ok(None);
     };
+    standing_runtime_output_publication(checkpoint, view_id, checkpoint_key, published_output)
+        .map(Some)
+}
+
+fn standing_runtime_output_publication(
+    checkpoint: &RuntimeCheckpoint,
+    view_id: &str,
+    checkpoint_key: &ObjectKey,
+    published_output: Value,
+) -> Result<StandingRuntimeOutputPublication, ApiError> {
     let output_row_count = standing_runtime_published_output_row_count(&published_output)?;
     let output_bytes = serde_json::to_vec(&published_output)
         .map_err(|source| ApiError::internal(source.to_string()))?;
@@ -4456,11 +5340,11 @@ fn standing_runtime_output_manifest_record_for_checkpoint(
     };
     validate_standing_runtime_output_page_record(&output_page_key, &page_record)?;
     validate_standing_runtime_output_manifest_record(&output_manifest_key, &record)?;
-    Ok(Some(StandingRuntimeOutputPublication {
+    Ok(StandingRuntimeOutputPublication {
         manifest_key: output_manifest_key,
         manifest_record: record,
         page_records: vec![(output_page_key, page_record)],
-    }))
+    })
 }
 
 async fn persist_standing_runtime_output_page(
@@ -4503,6 +5387,26 @@ async fn persist_standing_runtime_output_page(
     }
 }
 
+#[cfg(test)]
+async fn put_standing_runtime_output_page(
+    state: &ApiState,
+    output_page_key: &ObjectKey,
+    record: &StandingRuntimeOutputPageRecord,
+) -> Result<(), ApiError> {
+    validate_standing_runtime_output_page_record(output_page_key, record)?;
+    let bytes =
+        serde_json::to_vec(record).map_err(|source| ApiError::internal(source.to_string()))?;
+    state
+        .store
+        .put(
+            &ObjectPath::from(output_page_key.as_str()),
+            bytes::Bytes::from(bytes).into(),
+        )
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(())
+}
+
 async fn persist_standing_runtime_output_manifest(
     state: &ApiState,
     output_manifest_key: &ObjectKey,
@@ -4541,6 +5445,26 @@ async fn persist_standing_runtime_output_manifest(
         }
         Err(error) => Err(ApiError::internal(error)),
     }
+}
+
+#[cfg(test)]
+async fn put_standing_runtime_output_manifest(
+    state: &ApiState,
+    output_manifest_key: &ObjectKey,
+    record: &StandingRuntimeOutputManifestRecord,
+) -> Result<(), ApiError> {
+    validate_standing_runtime_output_manifest_record(output_manifest_key, record)?;
+    let bytes =
+        serde_json::to_vec(record).map_err(|source| ApiError::internal(source.to_string()))?;
+    state
+        .store
+        .put(
+            &ObjectPath::from(output_manifest_key.as_str()),
+            bytes::Bytes::from(bytes).into(),
+        )
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(())
 }
 
 fn standing_runtime_output_delta_records_for_checkpoint(
@@ -4677,9 +5601,71 @@ async fn publish_standing_runtime_checkpoint_pointer(
     let owner = owner.ok_or_else(|| {
         ApiError::service_unavailable("standing runtime owner is required for checkpoint publish")
     })?;
+    let retry_expected_previous = expected_previous.clone();
     match meta_store
         .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
             expected_previous,
+            candidate: candidate.clone(),
+            owner: owner.clone(),
+        })
+        .await
+        .map_err(meta_error_to_api)?
+    {
+        PublishStandingRuntimeCheckpointOutcome::Published
+        | PublishStandingRuntimeCheckpointOutcome::Duplicate => Ok(()),
+        PublishStandingRuntimeCheckpointOutcome::Conflict => {
+            let Some(previous) = retry_expected_previous else {
+                return Err(standing_runtime_checkpoint_publish_conflict(&candidate));
+            };
+            rehydrate_empty_meta_checkpoint_pointer_and_retry_publish(
+                state, &previous, candidate, owner,
+            )
+            .await
+        }
+    }
+}
+
+async fn rehydrate_empty_meta_checkpoint_pointer_and_retry_publish(
+    state: &ApiState,
+    previous: &StandingRuntimeCheckpointPointer,
+    candidate: StandingRuntimeCheckpointPointer,
+    owner: StandingRuntimeOwnerToken,
+) -> Result<(), ApiError> {
+    let Some(meta_store) = &state.meta_store else {
+        return Ok(());
+    };
+    let current = meta_store
+        .read_standing_runtime_checkpoint(
+            &candidate.tenant_id,
+            &candidate.program_id,
+            &candidate.view_id,
+        )
+        .await
+        .map_err(meta_error_to_api)?;
+    if current.is_some() {
+        return Err(standing_runtime_checkpoint_publish_conflict(&candidate));
+    }
+    validate_checkpoint_pointer_object_exists_for_meta_rehydration(state, previous).await?;
+
+    match meta_store
+        .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
+            expected_previous: None,
+            candidate: previous.clone(),
+            owner: owner.clone(),
+        })
+        .await
+        .map_err(meta_error_to_api)?
+    {
+        PublishStandingRuntimeCheckpointOutcome::Published
+        | PublishStandingRuntimeCheckpointOutcome::Duplicate => {}
+        PublishStandingRuntimeCheckpointOutcome::Conflict => {
+            return Err(standing_runtime_checkpoint_publish_conflict(&candidate));
+        }
+    }
+
+    match meta_store
+        .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
+            expected_previous: Some(previous.clone()),
             candidate: candidate.clone(),
             owner,
         })
@@ -4688,16 +5674,67 @@ async fn publish_standing_runtime_checkpoint_pointer(
     {
         PublishStandingRuntimeCheckpointOutcome::Published
         | PublishStandingRuntimeCheckpointOutcome::Duplicate => Ok(()),
-        PublishStandingRuntimeCheckpointOutcome::Conflict => Err(ApiError::conflict(format!(
-            "standing runtime checkpoint publish conflict for `{}/{}/{}` at epoch {}",
-            candidate.tenant_id, candidate.program_id, candidate.view_id, candidate.logical_epoch
-        ))),
+        PublishStandingRuntimeCheckpointOutcome::Conflict => {
+            Err(standing_runtime_checkpoint_publish_conflict(&candidate))
+        }
     }
+}
+
+async fn validate_checkpoint_pointer_object_exists_for_meta_rehydration(
+    state: &ApiState,
+    pointer: &StandingRuntimeCheckpointPointer,
+) -> Result<(), ApiError> {
+    let bytes = state
+        .store
+        .get(&ObjectPath::from(pointer.checkpoint_key.clone()))
+        .await
+        .map_err(ApiError::internal)?
+        .bytes()
+        .await
+        .map_err(ApiError::internal)?;
+    let actual_manifest_hash = stable_bytes_hash(&bytes);
+    if actual_manifest_hash != pointer.manifest_hash {
+        return Err(ApiError::bad_request(format!(
+            "standing runtime checkpoint manifest hash mismatch for `{}/{}/{}`",
+            pointer.tenant_id, pointer.program_id, pointer.view_id
+        )));
+    }
+    let record = standing_runtime_checkpoint_record_from_slice(&bytes)
+        .map_err(|source| ApiError::bad_request(source.to_string()))?;
+    if record.view_id != pointer.view_id
+        || record.checkpoint.identity.tenant_id != pointer.tenant_id
+        || record.checkpoint.identity.program_id != pointer.program_id
+        || record.checkpoint.logical_epoch != pointer.logical_epoch
+        || record.checkpoint.state_root.content_hash != pointer.content_hash
+        || record.checkpoint_key != pointer.checkpoint_key
+    {
+        return Err(ApiError::bad_request(format!(
+            "standing runtime checkpoint pointer/body mismatch for `{}/{}/{}`",
+            pointer.tenant_id, pointer.program_id, pointer.view_id
+        )));
+    }
+    Ok(())
+}
+
+fn standing_runtime_checkpoint_publish_conflict(
+    candidate: &StandingRuntimeCheckpointPointer,
+) -> ApiError {
+    ApiError::conflict(format!(
+        "standing runtime checkpoint publish conflict for `{}/{}/{}` at epoch {}",
+        candidate.tenant_id, candidate.program_id, candidate.view_id, candidate.logical_epoch
+    ))
 }
 
 fn standing_runtime_checkpoint_pointer_from_record(
     record: &StandingRuntimeCheckpointRecord,
 ) -> StandingRuntimeCheckpointPointer {
+    let manifest_hash = if record.manifest_hash.is_empty() {
+        serde_json::to_vec(record)
+            .map(|bytes| stable_bytes_hash(&bytes))
+            .unwrap_or_default()
+    } else {
+        record.manifest_hash.clone()
+    };
     StandingRuntimeCheckpointPointer {
         tenant_id: record.checkpoint.identity.tenant_id.clone(),
         program_id: record.checkpoint.identity.program_id.clone(),
@@ -4705,6 +5742,7 @@ fn standing_runtime_checkpoint_pointer_from_record(
         checkpoint_key: record.checkpoint_key.clone(),
         logical_epoch: record.checkpoint.logical_epoch,
         content_hash: record.checkpoint.state_root.content_hash.clone(),
+        manifest_hash,
         output_manifest_refs: record.checkpoint.output_manifest_refs.clone(),
     }
 }
@@ -4725,6 +5763,7 @@ fn standing_runtime_checkpoint_pointer_from_key(
     view_id: &str,
     logical_epoch: u64,
     content_hash: &str,
+    manifest_hash: String,
     output_manifest_refs: Vec<String>,
 ) -> Result<StandingRuntimeCheckpointPointer, ApiError> {
     let pointer = StandingRuntimeCheckpointPointer {
@@ -4734,6 +5773,7 @@ fn standing_runtime_checkpoint_pointer_from_key(
         checkpoint_key: checkpoint_key.as_str().to_string(),
         logical_epoch,
         content_hash: content_hash.to_string(),
+        manifest_hash,
         output_manifest_refs,
     };
     let (_, parts) = ObjectKey::parse_standing_runtime_checkpoint(pointer.checkpoint_key.clone())
@@ -4756,35 +5796,44 @@ async fn read_latest_standing_runtime_checkpoint(
     identity: &StandingProgramIdentity,
     view_id: &str,
 ) -> Result<Option<StandingRuntimeCheckpointRecord>, ApiError> {
-    ObjectKey::standing_runtime_latest_checkpoint(
+    let latest_key = ObjectKey::standing_runtime_latest_checkpoint(
         &identity.tenant_id,
         &identity.program_id,
         view_id,
     )
     .map_err(ApiError::bad_request)?;
     if let Some(meta_store) = &state.meta_store {
-        let Some(pointer) = meta_store
+        if let Some(pointer) = meta_store
             .read_standing_runtime_checkpoint(&identity.tenant_id, &identity.program_id, view_id)
             .await
             .map_err(meta_error_to_api)?
-        else {
-            return Ok(None);
-        };
-        return read_standing_runtime_checkpoint_record_from_pointer(
-            state, identity, view_id, &pointer,
-        )
-        .await
-        .map(Some);
+        {
+            return read_standing_runtime_checkpoint_record_from_pointer(
+                state, identity, view_id, &pointer,
+            )
+            .await
+            .map(Some);
+        }
+        return Ok(None);
+    }
+    match read_standing_runtime_checkpoint_record_from_latest_cache(
+        state,
+        identity,
+        view_id,
+        &latest_key,
+    )
+    .await
+    {
+        Ok(Some(record)) => return Ok(Some(record)),
+        Ok(None) => {}
+        Err(error) => return Err(error),
     }
     let prefix = ObjectPath::from(format!(
         "v1/standing-runtime-checkpoints/{}/{}/{view_id}/epochs",
         identity.tenant_id, identity.program_id
     ));
     let mut stream = state.store.list(Some(&prefix));
-    let mut latest_checkpoint: Option<(
-        String,
-        velorix_storage::object_key::StandingRuntimeCheckpointKeyParts,
-    )> = None;
+    let mut latest_checkpoint: Option<(String, StandingRuntimeCheckpointKeyParts)> = None;
     while let Some(meta) = stream.try_next().await.map_err(ApiError::internal)? {
         let location = meta.location.to_string();
         if location.ends_with(".checkpoint.json") {
@@ -4820,7 +5869,7 @@ async fn read_latest_standing_runtime_checkpoint(
         .bytes()
         .await
         .map_err(ApiError::internal)?;
-    let mut record: StandingRuntimeCheckpointRecord = serde_json::from_slice(&bytes)
+    let mut record = standing_runtime_checkpoint_record_from_slice(&bytes)
         .map_err(|source| ApiError::bad_request(source.to_string()))?;
     if record.checkpoint_key.is_empty() {
         record.checkpoint_key = latest_checkpoint_path.clone();
@@ -4854,6 +5903,7 @@ async fn read_latest_standing_runtime_checkpoint(
         checkpoint_key: latest_checkpoint_path,
         logical_epoch: checkpoint_key_parts.logical_epoch,
         content_hash: checkpoint_key_parts.content_hash,
+        manifest_hash: stable_bytes_hash(&bytes),
         output_manifest_refs: record.checkpoint.output_manifest_refs.clone(),
     };
     validate_standing_runtime_checkpoint_output_refs(&record, &pointer)?;
@@ -4861,6 +5911,31 @@ async fn read_latest_standing_runtime_checkpoint(
     validate_standing_runtime_checkpoint_output_manifest_records(state, &record).await?;
     validate_standing_runtime_checkpoint_replay_frontiers(&record)?;
 
+    Ok(Some(record))
+}
+
+async fn read_standing_runtime_checkpoint_record_from_latest_cache(
+    state: &ApiState,
+    identity: &StandingProgramIdentity,
+    view_id: &str,
+    latest_key: &ObjectKey,
+) -> Result<Option<StandingRuntimeCheckpointRecord>, ApiError> {
+    let bytes = match state
+        .store
+        .get(&ObjectPath::from(latest_key.as_str()))
+        .await
+    {
+        Ok(object) => object.bytes().await.map_err(ApiError::internal)?,
+        Err(object_store::Error::NotFound { .. }) => return Ok(None),
+        Err(error) => return Err(ApiError::internal(error)),
+    };
+    let mut record = standing_runtime_checkpoint_record_from_slice(&bytes)
+        .map_err(|source| ApiError::bad_request(source.to_string()))?;
+    let pointer = standing_runtime_checkpoint_pointer_from_record(&record);
+    validate_standing_runtime_checkpoint_record(identity, view_id, &pointer, &record)?;
+    hydrate_standing_runtime_checkpoint_state_payload(state, &mut record).await?;
+    validate_standing_runtime_checkpoint_output_manifest_records(state, &record).await?;
+    validate_standing_runtime_checkpoint_replay_frontiers(&record)?;
     Ok(Some(record))
 }
 
@@ -4878,7 +5953,14 @@ async fn read_standing_runtime_checkpoint_record_from_pointer(
         .bytes()
         .await
         .map_err(ApiError::internal)?;
-    let mut record: StandingRuntimeCheckpointRecord = serde_json::from_slice(&bytes)
+    let actual_manifest_hash = stable_bytes_hash(&bytes);
+    if actual_manifest_hash != pointer.manifest_hash {
+        return Err(ApiError::bad_request(format!(
+            "standing runtime checkpoint manifest hash mismatch for `{}/{}/{}`",
+            pointer.tenant_id, pointer.program_id, pointer.view_id
+        )));
+    }
+    let mut record = standing_runtime_checkpoint_record_from_slice(&bytes)
         .map_err(|source| ApiError::bad_request(source.to_string()))?;
     if record.checkpoint_key.is_empty() {
         record.checkpoint_key = pointer.checkpoint_key.clone();
@@ -4912,6 +5994,7 @@ fn validate_standing_runtime_checkpoint_record(
         || pointer.checkpoint_key != record.checkpoint_key
         || pointer.logical_epoch != record.checkpoint.logical_epoch
         || pointer.content_hash != record.checkpoint.state_root.content_hash
+        || pointer.manifest_hash != record.manifest_hash
         || (!pointer.output_manifest_refs.is_empty()
             && pointer.output_manifest_refs != record.checkpoint.output_manifest_refs)
     {
@@ -5125,6 +6208,20 @@ async fn read_standing_runtime_output_manifest_record(
     output_ref: &str,
     view_id: &str,
 ) -> Result<(ObjectKey, StandingRuntimeOutputManifestRecord), ApiError> {
+    maybe_read_standing_runtime_output_manifest_record(state, output_ref, view_id)
+        .await?
+        .ok_or_else(|| {
+            ApiError::internal(format!(
+                "standing runtime output manifest is missing for view `{view_id}`"
+            ))
+        })
+}
+
+async fn maybe_read_standing_runtime_output_manifest_record(
+    state: &ApiState,
+    output_ref: &str,
+    view_id: &str,
+) -> Result<Option<(ObjectKey, StandingRuntimeOutputManifestRecord)>, ApiError> {
     let output_manifest_key = output_ref
         .strip_prefix(STANDING_RUNTIME_OUTPUT_MANIFEST_REF_PREFIX)
         .ok_or_else(|| {
@@ -5132,21 +6229,23 @@ async fn read_standing_runtime_output_manifest_record(
                 "unsupported standing runtime checkpoint output manifest ref for view `{view_id}`"
             ))
         })?;
-    let bytes = state
+    let object = match state
         .store
         .get(&ObjectPath::from(output_manifest_key.to_string()))
         .await
-        .map_err(ApiError::internal)?
-        .bytes()
-        .await
-        .map_err(ApiError::internal)?;
+    {
+        Ok(object) => object,
+        Err(object_store::Error::NotFound { .. }) => return Ok(None),
+        Err(error) => return Err(ApiError::internal(error)),
+    };
+    let bytes = object.bytes().await.map_err(ApiError::internal)?;
     let manifest: StandingRuntimeOutputManifestRecord = serde_json::from_slice(&bytes)
         .map_err(|source| ApiError::bad_request(source.to_string()))?;
     let (key, _) =
         ObjectKey::parse_standing_runtime_output_manifest(output_manifest_key.to_string())
             .map_err(ApiError::bad_request)?;
     validate_standing_runtime_output_manifest_record(&key, &manifest)?;
-    Ok((key, manifest))
+    Ok(Some((key, manifest)))
 }
 
 async fn read_standing_runtime_output_page_record(
@@ -5444,14 +6543,20 @@ fn validate_standing_runtime_checkpoint_replay_frontiers(
         let key = (
             frontier.relation_id.as_str(),
             frontier.relation_version.as_str(),
+            frontier.stream_id.as_str(),
+            frontier.partition_id,
         );
         if input_frontiers_by_relation
             .insert(key, frontier.committed_offset_exclusive)
             .is_some()
         {
             return Err(ApiError::bad_request(format!(
-                "duplicate standing runtime checkpoint input frontier for view `{}` relation={} version={}",
-                record.view_id, frontier.relation_id, frontier.relation_version
+                "duplicate standing runtime checkpoint input frontier for view `{}` relation={} version={} stream={} partition={}",
+                record.view_id,
+                frontier.relation_id,
+                frontier.relation_version,
+                frontier.stream_id,
+                frontier.partition_id
             )));
         }
     }
@@ -5473,17 +6578,18 @@ fn validate_standing_runtime_checkpoint_replay_frontiers(
             replay.relation_version.as_deref(),
         ) {
             (Some(relation_id), Some(relation_version)) => {
-                let Some(checkpoint_input_frontier) =
-                    input_frontiers_by_relation.get(&(relation_id, relation_version))
-                else {
-                    return Err(ApiError::bad_request(format!(
-                        "standing runtime checkpoint replay frontier has no matching input frontier for view `{}` relation={} version={} stream={} partition={}",
-                        record.view_id,
+                let Some(checkpoint_input_frontier) = input_frontiers_by_relation
+                    .get(&(
                         relation_id,
                         relation_version,
-                        replay.stream_id,
-                        replay.partition_id
-                    )));
+                        replay.stream_id.as_str(),
+                        replay.partition_id,
+                    ))
+                    .or_else(|| {
+                        input_frontiers_by_relation.get(&(relation_id, relation_version, "", 0))
+                    })
+                else {
+                    continue;
                 };
                 if replay.end_offset_exclusive > *checkpoint_input_frontier {
                     return Err(ApiError::bad_request(format!(
@@ -5577,6 +6683,8 @@ fn replay_plan_covers_replayed_batch(
     }) || replay_plan.input_frontiers.iter().any(|frontier| {
         frontier.relation_id == relation_id
             && frontier.relation_version == relation_version
+            && ((frontier.stream_id == stream_id && frontier.partition_id == partition_id)
+                || frontier.stream_id.is_empty())
             && frontier.committed_offset_exclusive >= batch_end_offset_exclusive
     })
 }
@@ -5615,9 +6723,16 @@ async fn replay_committed_ingest_into_standing_runtime(
     active: &ActiveMaterializedView,
     replay_plan: &StandingRuntimeReplayPlan,
 ) -> Result<(), ApiError> {
-    replay_committed_ingest_into_standing_runtime_limited(state, active, replay_plan, None)
-        .await
-        .map(|_| ())
+    replay_committed_ingest_into_standing_runtime_limited(
+        state,
+        active,
+        replay_plan,
+        None,
+        None,
+        None,
+    )
+    .await
+    .map(|_| ())
 }
 
 async fn replay_committed_ingest_into_standing_runtime_limited(
@@ -5625,6 +6740,8 @@ async fn replay_committed_ingest_into_standing_runtime_limited(
     active: &ActiveMaterializedView,
     replay_plan: &StandingRuntimeReplayPlan,
     batch_limit: Option<usize>,
+    range: Option<&BackfillRangeRequest>,
+    scope: Option<&BackfillScopeRequest>,
 ) -> Result<StandingRuntimeBackfillReplayOutcome, ApiError> {
     if active.spec.input_relations.is_empty() {
         return Ok(StandingRuntimeBackfillReplayOutcome::default());
@@ -5637,11 +6754,25 @@ async fn replay_committed_ingest_into_standing_runtime_limited(
             "backfill batch_limit must be a positive integer",
         ));
     }
+    if let Some(range) = range {
+        validate_backfill_range(range)?;
+    }
+    if let Some(scope) = scope {
+        validate_backfill_scope(scope)?;
+    }
     let operation_lock = state.standing_runtime_operation_lock(identity, &active.spec.view_id)?;
     let _operation_guard = operation_lock.lock().await;
     let Some(runtime) = state.standing_runtime(identity, &active.spec.view_id)? else {
         return Ok(StandingRuntimeBackfillReplayOutcome::default());
     };
+    let replay_plan =
+        match read_latest_standing_runtime_checkpoint(state, identity, &active.spec.view_id).await?
+        {
+            Some(latest_checkpoint) => {
+                standing_runtime_replay_plan_from_record_ref(&latest_checkpoint)
+            }
+            None => replay_plan.clone(),
+        };
     let ingest_log =
         IngestLog::new_catalog_checked(Arc::clone(&state.store), state.capabilities.as_ref())
             .map_err(ApiError::internal)?;
@@ -5651,6 +6782,11 @@ async fn replay_committed_ingest_into_standing_runtime_limited(
         .map_err(ApiError::internal)?;
 
     let mut outcome = StandingRuntimeBackfillReplayOutcome::default();
+    let coalesce_replay = range.is_none() && scope.is_none();
+    let mut coalesced_input_batches = Vec::new();
+    let mut coalesced_replay_checkpoints = Vec::new();
+    let mut coalesced_idempotency_parts = Vec::new();
+    let mut coalesced_lower_bound_epoch = 0_u64;
     for batch in batches {
         let descriptor = batch.descriptor();
         let envelope =
@@ -5663,8 +6799,30 @@ async fn replay_committed_ingest_into_standing_runtime_limited(
         }) {
             continue;
         }
+        if range.is_some_and(|range| {
+            !backfill_range_matches_batch(
+                range,
+                header,
+                descriptor.stream_id.as_str(),
+                descriptor.partition_id,
+                descriptor.start_offset_inclusive,
+                descriptor.end_offset_exclusive,
+            )
+        }) {
+            continue;
+        }
+        if let Some(scope) = scope {
+            if !backfill_scope_matches_batches(
+                scope,
+                &envelope.record_batches().map_err(ApiError::bad_request)?,
+            )
+            .await?
+            {
+                continue;
+            }
+        }
         if replay_plan_covers_replayed_batch(
-            replay_plan,
+            &replay_plan,
             header.relation_id.as_str(),
             header.relation_version.as_str(),
             descriptor.stream_id.as_str(),
@@ -5677,56 +6835,198 @@ async fn replay_committed_ingest_into_standing_runtime_limited(
             outcome.remaining_batches += 1;
             continue;
         }
-        let owner = state
-            .acquire_standing_runtime_owner(identity, &active.spec.view_id)
-            .await?;
-        let idempotency_key = EpochIdempotencyKey::new(format!(
-            "{}:{}:{}-{}",
-            descriptor.stream_id,
-            descriptor.partition_id,
-            descriptor.start_offset_inclusive,
-            descriptor.end_offset_exclusive
-        ))
-        .map_err(ApiError::bad_request)?;
         let input_batch = RelationInputBatch {
             relation_id: header.relation_id.clone(),
             relation_version: header.relation_version.clone(),
+            stream_id: descriptor.stream_id.clone(),
+            partition_id: descriptor.partition_id,
             schema_fingerprint: header.schema_fingerprint.clone(),
             start_offset_inclusive: descriptor.start_offset_inclusive,
             end_offset_exclusive: descriptor.end_offset_exclusive,
             event_time_watermark: header.event_time_watermark.clone(),
             batches: envelope.record_batches().map_err(ApiError::bad_request)?,
         };
-        let apply_result = apply_standing_runtime_changes_and_checkpoint(
-            Arc::clone(&runtime),
-            descriptor.end_offset_exclusive,
-            idempotency_key,
-            input_batch,
-        )
-        .await?;
-        if let Err(error) = persist_standing_runtime_checkpoint(
-            state,
-            &active.spec.view_id,
-            &apply_result.checkpoint,
-            &apply_result.output_deltas,
-            vec![ReplayCheckpoint::for_relation(
+
+        if coalesce_replay {
+            coalesced_idempotency_parts.push(format!(
+                "{}:{}:{}-{}",
+                descriptor.stream_id,
+                descriptor.partition_id,
+                descriptor.start_offset_inclusive,
+                descriptor.end_offset_exclusive
+            ));
+            coalesced_lower_bound_epoch =
+                coalesced_lower_bound_epoch.max(descriptor.end_offset_exclusive);
+            coalesced_replay_checkpoints.push(ReplayCheckpoint::for_relation(
                 header.relation_id.clone(),
                 header.relation_version.clone(),
                 descriptor.stream_id.clone(),
                 descriptor.partition_id,
                 descriptor.end_offset_exclusive,
-            )],
-            owner,
+            ));
+            coalesced_input_batches.push(input_batch);
+        } else {
+            let owner = state
+                .acquire_standing_runtime_owner(identity, &active.spec.view_id)
+                .await?;
+            let idempotency_key = EpochIdempotencyKey::new(format!(
+                "{}:{}:{}-{}",
+                descriptor.stream_id,
+                descriptor.partition_id,
+                descriptor.start_offset_inclusive,
+                descriptor.end_offset_exclusive
+            ))
+            .map_err(ApiError::bad_request)?;
+            let apply_result = match apply_standing_runtime_changes_and_checkpoint(
+                Arc::clone(&runtime),
+                descriptor.end_offset_exclusive,
+                idempotency_key,
+                input_batch,
+                StandingRuntimeBudgetLimits::from_state(state),
+            )
+            .await
+            {
+                Ok(apply_result) => apply_result,
+                Err(error) => {
+                    remove_standing_runtime(state, identity, &active.spec.view_id)?;
+                    return Err(error);
+                }
+            };
+            if let Err(error) = persist_standing_runtime_checkpoint(
+                state,
+                &active.spec.view_id,
+                &apply_result.checkpoint,
+                &apply_result.output_deltas,
+                StandingRuntimeCheckpointPersistContext::new(
+                    None,
+                    vec![ReplayCheckpoint::for_relation(
+                        header.relation_id.clone(),
+                        header.relation_version.clone(),
+                        descriptor.stream_id.clone(),
+                        descriptor.partition_id,
+                        descriptor.end_offset_exclusive,
+                    )],
+                    owner,
+                ),
+                None,
+            )
+            .await
+            {
+                remove_standing_runtime(state, identity, &active.spec.view_id)?;
+                return Err(error);
+            }
+        }
+        outcome.applied_batches += 1;
+    }
+
+    if !coalesced_input_batches.is_empty() {
+        let owner = state
+            .acquire_standing_runtime_owner(identity, &active.spec.view_id)
+            .await?;
+        let idempotency_hash = stable_bytes_hash(coalesced_idempotency_parts.join("|").as_bytes());
+        let idempotency_key = EpochIdempotencyKey::new(format!(
+            "{}:coalesced-replay:{idempotency_hash}",
+            active.spec.view_id
+        ))
+        .map_err(ApiError::bad_request)?;
+        let apply_result = match apply_standing_runtime_changes_and_checkpoint_many(
+            Arc::clone(&runtime),
+            coalesced_lower_bound_epoch,
+            idempotency_key,
+            coalesced_input_batches,
+            StandingRuntimeBudgetLimits::from_state(state),
+        )
+        .await
+        {
+            Ok(apply_result) => apply_result,
+            Err(error) => {
+                remove_standing_runtime(state, identity, &active.spec.view_id)?;
+                return Err(error);
+            }
+        };
+        if let Err(error) = persist_standing_runtime_checkpoint(
+            state,
+            &active.spec.view_id,
+            &apply_result.checkpoint,
+            &apply_result.output_deltas,
+            StandingRuntimeCheckpointPersistContext::new(None, coalesced_replay_checkpoints, owner),
+            None,
         )
         .await
         {
             remove_standing_runtime(state, identity, &active.spec.view_id)?;
             return Err(error);
         }
-        outcome.applied_batches += 1;
     }
 
     Ok(outcome)
+}
+
+fn validate_backfill_range(range: &BackfillRangeRequest) -> Result<(), ApiError> {
+    if range.relation_id.trim().is_empty()
+        || range.relation_version.trim().is_empty()
+        || range.start_offset_inclusive >= range.end_offset_exclusive
+    {
+        return Err(ApiError::bad_request(
+            "backfill range requires relation_id, relation_version, and start_offset_inclusive < end_offset_exclusive",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_backfill_scope(scope: &BackfillScopeRequest) -> Result<(), ApiError> {
+    if scope.where_clause.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "backfill scope.where must be a non-empty SQL predicate",
+        ));
+    }
+    Ok(())
+}
+
+async fn backfill_scope_matches_batches(
+    scope: &BackfillScopeRequest,
+    batches: &[RecordBatch],
+) -> Result<bool, ApiError> {
+    validate_backfill_scope(scope)?;
+    if batches.is_empty() || batches.iter().all(|batch| batch.num_rows() == 0) {
+        return Ok(false);
+    }
+    let sql = format!(
+        "select * from __velorix_backfill_scope where {}",
+        scope.where_clause
+    );
+    let filtered = query_record_batches_table_with_bindings_and_policy_and_limiter(
+        "__velorix_backfill_scope",
+        batches.to_vec(),
+        &sql,
+        &[],
+        QueryPolicy::default(),
+        None,
+    )
+    .await
+    .map_err(|error| ApiError::bad_request(format!("invalid backfill scope.where: {error}")))?;
+    Ok(filtered.iter().any(|batch| batch.num_rows() > 0))
+}
+
+fn backfill_range_matches_batch(
+    range: &BackfillRangeRequest,
+    header: &IngestEnvelopeHeader,
+    stream_id: &str,
+    partition_id: u32,
+    batch_start_offset_inclusive: u64,
+    batch_end_offset_exclusive: u64,
+) -> bool {
+    header.relation_id == range.relation_id
+        && header.relation_version == range.relation_version
+        && range
+            .stream_id
+            .as_deref()
+            .is_none_or(|requested| requested == stream_id)
+        && range
+            .partition_id
+            .is_none_or(|requested| requested == partition_id)
+        && batch_start_offset_inclusive < range.end_offset_exclusive
+        && batch_end_offset_exclusive > range.start_offset_inclusive
 }
 
 async fn committed_backfill_progress(
@@ -5804,17 +7104,20 @@ async fn read_relation_catalog(
     relation_version: &str,
 ) -> Result<VelorixRelationCatalogV1, ApiError> {
     if let Some(meta_store) = &state.meta_store {
-        meta_store
+        match meta_store
             .read_relation_catalog(relation_id, relation_version)
             .await
-            .map_err(meta_error_to_api)
-    } else {
-        state
-            .relation_registry()?
-            .read(relation_id, relation_version)
-            .await
-            .map_err(ApiError::bad_request)
+        {
+            Ok(catalog) => return Ok(catalog),
+            Err(MetaStoreError::RelationCatalogNotFound { .. }) => {}
+            Err(error) => return Err(meta_error_to_api(error)),
+        }
     }
+    state
+        .relation_registry()?
+        .read(relation_id, relation_version)
+        .await
+        .map_err(ApiError::bad_request)
 }
 
 async fn read_relation_catalogs_for_view_request(
@@ -6016,11 +7319,12 @@ async fn query_view_rows_get(
     Query(mut query): Query<BTreeMap<String, String>>,
 ) -> Result<Json<QueryResponse>, ApiError> {
     let page_request = extract_snapshot_page_request(&mut query)?;
+    let request_sql = query.remove("sql").filter(|value| !value.trim().is_empty());
     let parameters = query
         .into_iter()
         .map(|(name, value)| (name, Value::String(value)))
         .collect();
-    query_view_rows_impl(state, view_id, None, parameters, page_request).await
+    query_view_rows_impl(state, view_id, request_sql, parameters, page_request).await
 }
 
 async fn query_view_output_rows_get(
@@ -6029,11 +7333,20 @@ async fn query_view_output_rows_get(
     Query(mut query): Query<BTreeMap<String, String>>,
 ) -> Result<Json<QueryResponse>, ApiError> {
     let page_request = extract_snapshot_page_request(&mut query)?;
+    let request_sql = query.remove("sql").filter(|value| !value.trim().is_empty());
     let parameters = query
         .into_iter()
         .map(|(name, value)| (name, Value::String(value)))
         .collect();
-    query_view_output_rows_impl(state, view_id, output_id, None, parameters, page_request).await
+    query_view_output_rows_impl(
+        state,
+        view_id,
+        output_id,
+        request_sql,
+        parameters,
+        page_request,
+    )
+    .await
 }
 
 fn extract_snapshot_page_request(
@@ -6303,25 +7616,40 @@ async fn query_active_view_output_rows_impl(
 
     match active.execution_mode {
         MaterializedViewExecutionMode::StandingRuntime => {
-            let is_materialized_runtime = is_external_sql_runtime(&active);
             validate_standing_runtime_query_contract(
                 &active.spec.view_id,
                 request_sql.as_ref(),
                 &api,
                 &parameters,
                 &page_request,
-                is_materialized_runtime,
             )?;
             let (rows, logical_epoch, next_page_token) = if let Some(sql) = request_sql {
                 let requested_epoch = page_request.committed_epoch;
                 let sql = render_caller_sql_as_bound_sql(&sql, &parameters)?;
                 let page_request =
                     page_request_with_query_policy_limit(page_request, query_policy.policy);
-                let page =
-                    standing_runtime_sql_page(&state, &active, &output_id, sql, page_request)
-                        .await?;
-                validate_standing_runtime_sql_page(&active, &output_id, &page, requested_epoch)?;
-                (page.rows, page.logical_epoch, page.next_page_token)
+                let page = standing_runtime_page(&state, &active, &output_id, page_request).await?;
+                validate_standing_runtime_template_page(
+                    &active,
+                    &output_id,
+                    &page,
+                    requested_epoch,
+                )?;
+                let batches = query_record_batches_table_with_bindings_and_policy_and_limiter(
+                    &output_id,
+                    page.batches,
+                    &normalize_view_query_sql(&sql, &output_id),
+                    &[],
+                    query_policy.policy,
+                    query_policy.limiter,
+                )
+                .await
+                .map_err(ApiError::bad_request)?;
+                (
+                    record_batches_to_json_rows(&batches)?,
+                    page.logical_epoch,
+                    None,
+                )
             } else if api.sql_template.is_some() {
                 query_standing_runtime_rows_with_template(
                     &state,
@@ -6386,7 +7714,7 @@ fn resolve_view_query_output_id(
 }
 
 fn ensure_view_execution_allowed(active: &ActiveMaterializedView) -> Result<(), ApiError> {
-    if active.lifecycle.compile_status != MaterializedViewCompileStatus::Success
+    if active.lifecycle.admission_status != MaterializedViewAdmissionStatus::Admitted
         || active.lifecycle.deployment_status != MaterializedViewDeploymentStatus::Running
     {
         return Err(ApiError::service_unavailable(format!(
@@ -6401,18 +7729,39 @@ async fn ensure_view_query_ready(
     state: &ApiState,
     active: ActiveMaterializedView,
 ) -> Result<ActiveMaterializedView, ApiError> {
+    let _ = state;
     if view_query_availability(&active.lifecycle) {
         return Ok(active);
     }
-    if !view_backfill_is_query_triggerable(&active) {
-        ensure_view_execution_allowed(&active)?;
-        return Ok(active);
+    if view_has_backfill_required_lag(&active) {
+        return Err(materialization_lag_error(&active));
     }
 
-    let outcome = run_active_view_backfill_step(state, active, None).await?;
-    let refreshed = outcome.active;
-    ensure_view_execution_allowed(&refreshed)?;
-    Ok(refreshed)
+    ensure_view_execution_allowed(&active)?;
+    Ok(active)
+}
+
+fn materialization_lag_error(active: &ActiveMaterializedView) -> ApiError {
+    ApiError::service_unavailable_with_details(
+        format!(
+            "MATERIALIZATION_LAG: view `{}` is not fully materialized; query reads published materialized output only, run `/v1/views/{}/backfill` before querying",
+            active.spec.view_id, active.spec.view_id
+        ),
+        json!({
+            "code": "MATERIALIZATION_LAG",
+            "view_id": active.spec.view_id,
+            "query_authority": "published_materialized_output",
+            "coverage_state": materialization_coverage_response(&active.lifecycle, false).state,
+            "committed_frontier": {
+                "status": "ahead_of_materialized_output",
+                "source_read_on_query_path": false
+            },
+            "materialized_frontier": {
+                "status": "not_queryable_until_backfill_checkpoint_published"
+            },
+            "recovery_action": format!("/v1/views/{}/backfill", active.spec.view_id)
+        }),
+    )
 }
 
 struct ActiveViewBackfillStepOutcome {
@@ -6424,13 +7773,15 @@ async fn run_view_backfill_step(
     state: &ApiState,
     view_id: &str,
     batch_limit: Option<usize>,
+    range: Option<&BackfillRangeRequest>,
+    scope: Option<&BackfillScopeRequest>,
 ) -> Result<BackfillViewResponse, ApiError> {
     let active = state
         .view_registry()?
         .read_active(view_id)
         .await
         .map_err(materialized_view_registry_error_to_api)?;
-    let outcome = run_active_view_backfill_step(state, active, batch_limit).await?;
+    let outcome = run_active_view_backfill_step(state, active, batch_limit, range, scope).await?;
     let progress = committed_backfill_progress(state, &outcome.active).await?;
     Ok(backfill_view_response(
         &outcome.active,
@@ -6443,6 +7794,7 @@ async fn run_view_backfill_step(
         outcome.replay.applied_batches,
         outcome.replay.remaining_batches,
         progress,
+        state.experimental_advanced_view_features,
     ))
 }
 
@@ -6450,14 +7802,18 @@ async fn run_active_view_backfill_step(
     state: &ApiState,
     active: ActiveMaterializedView,
     batch_limit: Option<usize>,
+    range: Option<&BackfillRangeRequest>,
+    scope: Option<&BackfillScopeRequest>,
 ) -> Result<ActiveViewBackfillStepOutcome, ApiError> {
     if view_query_availability(&active.lifecycle) {
-        return Ok(ActiveViewBackfillStepOutcome {
-            active,
-            replay: StandingRuntimeBackfillReplayOutcome::default(),
-        });
-    }
-    if !view_backfill_is_query_triggerable(&active) {
+        let progress = committed_backfill_progress(state, &active).await?;
+        if progress.remaining_batches == 0 {
+            return Ok(ActiveViewBackfillStepOutcome {
+                active,
+                replay: StandingRuntimeBackfillReplayOutcome::default(),
+            });
+        }
+    } else if !view_has_backfill_required_lag(&active) {
         ensure_view_execution_allowed(&active)?;
         return Ok(ActiveViewBackfillStepOutcome {
             active,
@@ -6489,9 +7845,11 @@ async fn run_active_view_backfill_step(
         &active,
         &replay_plan,
         batch_limit,
+        range,
+        scope,
     )
     .await?;
-    if replay.remaining_batches == 0 {
+    if range.is_none() && scope.is_none() && replay.remaining_batches == 0 {
         state
             .view_registry()?
             .update_standing_runtime_lifecycle(
@@ -6514,25 +7872,6 @@ async fn run_active_view_backfill_step(
     })
 }
 
-fn spawn_background_view_backfill(
-    state: ApiState,
-    view_id: String,
-    batch_limit: usize,
-    pause_ms: u64,
-) {
-    tokio::spawn(async move {
-        loop {
-            let outcome = run_view_backfill_step(&state, &view_id, Some(batch_limit)).await;
-            match outcome {
-                Ok(response) if response.remaining_batches == 0 => break,
-                Ok(response) if response.applied_batches == 0 => break,
-                Ok(_) => tokio::time::sleep(Duration::from_millis(pause_ms)).await,
-                Err(_) => break,
-            }
-        }
-    });
-}
-
 async fn query_standing_runtime_rows_with_template(
     state: &ApiState,
     active: &ActiveMaterializedView,
@@ -6549,13 +7888,6 @@ async fn query_standing_runtime_rows_with_template(
         ))
     })?;
     let requested_epoch = page_request.committed_epoch;
-    if is_external_sql_runtime(active) {
-        let sql = render_view_sql_template_as_bound_sql(sql_template, &api.request, parameters)?;
-        let page_request = page_request_with_query_policy_limit(page_request, query_policy.policy);
-        let page = standing_runtime_sql_page(state, active, output_id, sql, page_request).await?;
-        validate_standing_runtime_sql_page(active, output_id, &page, requested_epoch)?;
-        return Ok((page.rows, page.logical_epoch, page.next_page_token));
-    }
     let bound_sql = render_view_sql_template(
         &normalize_view_query_sql(sql_template, output_id),
         &api.request,
@@ -6579,47 +7911,6 @@ async fn query_standing_runtime_rows_with_template(
         page.logical_epoch,
         None,
     ))
-}
-
-fn is_external_sql_runtime(active: &ActiveMaterializedView) -> bool {
-    active
-        .artifact
-        .as_ref()
-        .is_some_and(|artifact| artifact.execution_path == "external_sql_runtime")
-}
-
-fn validate_standing_runtime_sql_page(
-    active: &ActiveMaterializedView,
-    output_id: &str,
-    page: &MaterializedViewSqlPage,
-    requested_epoch: Option<u64>,
-) -> Result<(), ApiError> {
-    let identity = active_standing_runtime_identity(active).ok_or_else(|| {
-        ApiError::conflict(format!(
-            "standing runtime view `{}` is missing runtime identity",
-            active.spec.view_id
-        ))
-    })?;
-    let expected_view = ScopedViewId {
-        tenant_id: identity.tenant_id.clone(),
-        program_id: identity.program_id.clone(),
-        view_id: output_id.to_string(),
-    };
-    if page.view != expected_view {
-        return Err(ApiError::conflict(format!(
-            "standing runtime view `{}` output `{output_id}` returned SQL rows for a different scoped view",
-            active.spec.view_id
-        )));
-    }
-    if let Some(epoch) = requested_epoch {
-        if page.logical_epoch != epoch {
-            return Err(ApiError::conflict(format!(
-                "standing runtime view `{}` returned epoch {} for requested epoch {epoch}",
-                active.spec.view_id, page.logical_epoch
-            )));
-        }
-    }
-    Ok(())
 }
 
 fn validate_standing_runtime_template_page(
@@ -6704,17 +7995,6 @@ async fn query_standing_runtime_rows(
 ) -> Result<(Vec<Value>, u64, Option<String>), ApiError> {
     let page_request = page_request_with_query_policy_limit(page_request, query_policy.policy);
     let page = standing_runtime_page(state, active, output_id, page_request).await?;
-    let sql = format!("SELECT * FROM {}", sql_quoted_identifier(output_id));
-    let batches = query_record_batches_table_with_bindings_and_policy_and_limiter(
-        output_id,
-        page.batches,
-        &sql,
-        &[],
-        query_policy.policy,
-        query_policy.limiter,
-    )
-    .await
-    .map_err(ApiError::bad_request)?;
     let output_schema = active
         .spec
         .output_relations
@@ -6728,7 +8008,7 @@ async fn query_standing_runtime_rows(
         })?;
 
     Ok((
-        record_batches_to_json_rows_for_view_schema(output_schema, &batches)?,
+        record_batches_to_json_rows_for_view_schema(output_schema, &page.batches)?,
         page.logical_epoch,
         page.next_page_token,
     ))
@@ -6764,7 +8044,7 @@ async fn standing_runtime_page(
             active.spec.view_id
         ))
     })?;
-    standing_runtime_page_from_output_manifest(
+    if let Some(page) = standing_runtime_page_from_output_manifest(
         state,
         active,
         identity,
@@ -6772,12 +8052,19 @@ async fn standing_runtime_page(
         page_request.clone(),
     )
     .await?
-    .ok_or_else(|| {
-        ApiError::service_unavailable(format!(
-            "standing runtime output manifest is unavailable for view `{}` output `{output_id}`",
-            active.spec.view_id
-        ))
-    })
+    {
+        return Ok(page);
+    }
+
+    standing_runtime_page_from_checkpoint_published_output(
+        state,
+        active,
+        identity,
+        output_id,
+        page_request,
+    )
+    .await?
+    .ok_or_else(|| materialization_lag_error(active))
 }
 
 async fn standing_runtime_page_from_output_manifest(
@@ -6792,23 +8079,6 @@ async fn standing_runtime_page_from_output_manifest(
     else {
         return Ok(None);
     };
-    let Some(output_ref) = record
-        .checkpoint
-        .output_manifest_refs
-        .iter()
-        .find(|output_ref| {
-            output_ref
-                .strip_prefix(STANDING_RUNTIME_OUTPUT_MANIFEST_REF_PREFIX)
-                .and_then(|key| {
-                    ObjectKey::parse_standing_runtime_output_manifest(key.to_string())
-                        .ok()
-                        .map(|(_, parts)| parts)
-                })
-                .is_some_and(|parts| parts.view_id == output_id)
-        })
-    else {
-        return Ok(None);
-    };
     let output_schema = active
         .spec
         .output_relations
@@ -6820,9 +8090,11 @@ async fn standing_runtime_page_from_output_manifest(
                 active.spec.view_id
             ))
         })?;
-    let (_key, manifest) =
-        read_standing_runtime_output_manifest_record(state, output_ref, &active.spec.view_id)
-            .await?;
+    let Some(manifest) =
+        standing_runtime_checkpoint_output_manifest(state, &record, output_id).await?
+    else {
+        return Ok(None);
+    };
     if manifest.checkpoint_key != record.checkpoint_key
         || manifest.logical_epoch != record.checkpoint.logical_epoch
         || manifest.checkpoint_content_hash != record.checkpoint.state_root.content_hash
@@ -6841,7 +8113,101 @@ async fn standing_runtime_page_from_output_manifest(
         program_id: identity.program_id.clone(),
         view_id: output_id.to_string(),
     };
-    let page = velorix_runtime::materialized_view_runtime::materialized_delta_to_page(
+    let page = velorix_control::materialized_view_runtime::materialized_delta_to_page(
+        output_schema,
+        &published_output,
+        scoped_view,
+        record.checkpoint.logical_epoch,
+        page_request,
+        aggregate_outputs.as_deref(),
+    )
+    .map_err(ApiError::bad_request)?;
+    Ok(Some(page))
+}
+
+async fn standing_runtime_checkpoint_output_manifest(
+    state: &ApiState,
+    record: &StandingRuntimeCheckpointRecord,
+    output_id: &str,
+) -> Result<Option<StandingRuntimeOutputManifestRecord>, ApiError> {
+    if let Some(output_ref) = record
+        .checkpoint
+        .output_manifest_refs
+        .iter()
+        .find(|output_ref| {
+            output_ref
+                .strip_prefix(STANDING_RUNTIME_OUTPUT_MANIFEST_REF_PREFIX)
+                .and_then(|key| {
+                    ObjectKey::parse_standing_runtime_output_manifest(key.to_string())
+                        .ok()
+                        .map(|(_, parts)| parts)
+                })
+                .is_some_and(|parts| parts.view_id == output_id)
+        })
+    {
+        return read_standing_runtime_output_manifest_record(state, output_ref, &record.view_id)
+            .await
+            .map(|(_key, manifest)| Some(manifest));
+    }
+
+    let checkpoint_key =
+        ObjectKey::parse_standing_runtime_checkpoint(record.checkpoint_key.clone())
+            .map_err(ApiError::bad_request)?
+            .0;
+    let Some(publication) = standing_runtime_output_manifest_record_for_checkpoint(
+        &record.checkpoint,
+        output_id,
+        &checkpoint_key,
+    )?
+    else {
+        return Ok(None);
+    };
+    let output_ref = format!(
+        "{STANDING_RUNTIME_OUTPUT_MANIFEST_REF_PREFIX}{}",
+        publication.manifest_key.as_str()
+    );
+    maybe_read_standing_runtime_output_manifest_record(state, &output_ref, &record.view_id)
+        .await
+        .map(|record| record.map(|(_key, manifest)| manifest))
+}
+
+async fn standing_runtime_page_from_checkpoint_published_output(
+    state: &ApiState,
+    active: &ActiveMaterializedView,
+    identity: &StandingProgramIdentity,
+    output_id: &str,
+    page_request: SnapshotPageRequest,
+) -> Result<Option<MaterializedViewPage>, ApiError> {
+    let Some(record) =
+        read_latest_standing_runtime_checkpoint(state, identity, &active.spec.view_id).await?
+    else {
+        return Ok(None);
+    };
+    let Some(published_output) = standing_runtime_checkpoint_published_output(&record.checkpoint)
+    else {
+        return Ok(None);
+    };
+    let output_schema = active
+        .spec
+        .output_relations
+        .iter()
+        .find(|schema| schema.relation_id == output_id)
+        .ok_or_else(|| {
+            ApiError::conflict(format!(
+                "standing runtime view `{}` has no matching output schema for `{output_id}`",
+                active.spec.view_id
+            ))
+        })?;
+    let published_output: DeltaBatch = serde_json::from_value(published_output)
+        .map_err(|source| ApiError::bad_request(source.to_string()))?;
+    let aggregate_outputs =
+        standing_runtime_output_aggregate_outputs_for_checkpoint(&record.checkpoint)?;
+    let scoped_view = ScopedViewId {
+        tenant_id: identity.tenant_id.clone(),
+        program_id: identity.program_id.clone(),
+        view_id: output_id.to_string(),
+    };
+    let page = velorix_control::materialized_view_runtime::materialized_delta_to_page(
         output_schema,
         &published_output,
         scoped_view,
@@ -6888,31 +8254,25 @@ fn standing_runtime_output_aggregate_outputs_for_checkpoint(
     };
     let payload: Value = serde_json::from_str(&state_payload.payload)
         .map_err(|source| ApiError::bad_request(source.to_string()))?;
-    if payload
-        .get("runtime_kind")
-        .and_then(Value::as_str)
-        .is_some_and(|kind| kind == "latest_by_key")
-    {
-        return Ok(None);
-    }
-    if payload
-        .get("runtime_kind")
-        .and_then(Value::as_str)
-        .is_some_and(|kind| kind == "two_input_join_sum_count")
-    {
-        return Ok(Some(default_standing_runtime_sum_count_outputs()));
-    }
-    if payload
-        .get("runtime_kind")
-        .and_then(Value::as_str)
-        .is_some_and(|kind| kind == "tumbling_event_time_aggregate")
-    {
-        let Some(plan) = payload.get("plan").filter(|plan| !plan.is_null()) else {
-            return Ok(None);
-        };
-        let plan: SupportedTumblingWindowPlan = serde_json::from_value(plan.clone())
-            .map_err(|source| ApiError::bad_request(source.to_string()))?;
-        return Ok(Some(plan.aggregate_outputs));
+    match payload.get("runtime_kind").and_then(Value::as_str) {
+        Some("filter_project" | "analytic_row_number" | "latest_by_key") => return Ok(None),
+        Some("two_input_join_sum_count") => {
+            let Some(plan) = payload.get("plan").filter(|plan| !plan.is_null()) else {
+                return Ok(None);
+            };
+            let plan: SupportedJoinViewPlan = serde_json::from_value(plan.clone())
+                .map_err(|source| ApiError::bad_request(source.to_string()))?;
+            return Ok(Some(supported_join_view_plan_aggregate_outputs(&plan)));
+        }
+        Some("tumbling_event_time_aggregate") => {
+            let Some(plan) = payload.get("plan").filter(|plan| !plan.is_null()) else {
+                return Ok(None);
+            };
+            let plan: SupportedTumblingWindowPlan = serde_json::from_value(plan.clone())
+                .map_err(|source| ApiError::bad_request(source.to_string()))?;
+            return Ok(Some(plan.aggregate_outputs));
+        }
+        Some(_) | None => {}
     }
     let Some(plan) = payload.get("plan").filter(|plan| !plan.is_null()) else {
         return Ok(None);
@@ -6920,75 +8280,6 @@ fn standing_runtime_output_aggregate_outputs_for_checkpoint(
     let plan: SupportedViewPlan = serde_json::from_value(plan.clone())
         .map_err(|source| ApiError::bad_request(source.to_string()))?;
     Ok(Some(supported_view_plan_aggregate_outputs(&plan)))
-}
-
-fn default_standing_runtime_sum_count_outputs() -> Vec<SupportedAggregateOutput> {
-    vec![
-        SupportedAggregateOutput {
-            function: LogicalPlanAggregateFunctionV1::Sum,
-            input_column_id: None,
-            output_column_id: "sum".to_string(),
-        },
-        SupportedAggregateOutput {
-            function: LogicalPlanAggregateFunctionV1::Count,
-            input_column_id: None,
-            output_column_id: "count".to_string(),
-        },
-    ]
-}
-
-async fn standing_runtime_sql_page(
-    state: &ApiState,
-    active: &ActiveMaterializedView,
-    output_id: &str,
-    sql: String,
-    page_request: SnapshotPageRequest,
-) -> Result<MaterializedViewSqlPage, ApiError> {
-    state.validate_standing_runtime_fencing_or_evict().await?;
-    let identity = active_standing_runtime_identity(active).ok_or_else(|| {
-        ApiError::conflict(format!(
-            "standing runtime view `{}` is missing runtime identity",
-            active.spec.view_id
-        ))
-    })?;
-    if state
-        .standing_runtime(identity, &active.spec.view_id)?
-        .is_none()
-    {
-        let _ = ensure_standing_runtime_for_active_view(state, active).await?;
-    }
-    let operation_lock = state.standing_runtime_operation_lock(identity, &active.spec.view_id)?;
-    let _operation_guard = operation_lock.lock().await;
-    let runtime = state
-        .standing_runtime(identity, &active.spec.view_id)?
-        .ok_or_else(|| {
-            ApiError::service_unavailable(format!(
-                "standing runtime is unavailable for view `{}`",
-                active.spec.view_id
-            ))
-        })?;
-    let scoped_view = ScopedViewId {
-        tenant_id: identity.tenant_id.clone(),
-        program_id: identity.program_id.clone(),
-        view_id: output_id.to_string(),
-    };
-    let page = tokio::task::spawn_blocking(move || {
-        runtime
-            .lock()
-            .map_err(|_| ApiError::internal("standing runtime lock poisoned"))?
-            .materialized_view_sql_page(scoped_view, sql, page_request)
-            .map_err(ApiError::bad_request)
-    })
-    .await
-    .map_err(ApiError::internal)??;
-    state
-        .validate_standing_runtime_committed_for_query(
-            identity,
-            &active.spec.view_id,
-            page.logical_epoch,
-        )
-        .await?;
-    Ok(page)
 }
 
 async fn openapi_json(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
@@ -7009,20 +8300,62 @@ async fn openapi_json(State(state): State<ApiState>) -> Result<Json<Value>, ApiE
         }),
     );
     paths.insert(
-        "/v1/ingest".to_string(),
+        "/v1/relations/{relation_id}/ingest".to_string(),
         json!({
             "post": {
-                "summary": "Ingest rows into a relation",
-                "responses": { "201": { "description": "Rows ingested" } }
+                "summary": "Ingest rows into one relation and update active views",
+                "description": "Preferred product ingest path. The relation is selected by the URL path; successful materialized ack updates all active materialized views that depend on the relation before returning.",
+                "parameters": [{
+                    "name": "relation_id",
+                    "in": "path",
+                    "required": true,
+                    "schema": { "type": "string" }
+                }],
+                "requestBody": {
+                    "required": true,
+                    "content": {
+                        "application/json": {
+                            "schema": openapi_ingest_relation_rows_request_schema()
+                        }
+                    }
+                },
+                "responses": {
+                    "201": {
+                        "description": "Rows ingested and matching active views materialized",
+                        "content": {
+                            "application/json": {
+                                "schema": openapi_ingest_epoch_response_schema()
+                            }
+                        }
+                    }
+                }
             }
         }),
     );
     paths.insert(
-        "/v1/ingest/epoch".to_string(),
+        "/v1/relations/ingest".to_string(),
         json!({
             "post": {
-                "summary": "Ingest one logical epoch across one or more relations",
-                "responses": { "201": { "description": "Epoch batches ingested" } }
+                "summary": "Ingest ordered batches for one or more relations",
+                "description": "Public multi-relation ingest convenience path. It applies the submitted relation batches in request order and publishes materialized views at the resulting per-relation frontier vector; it is not an atomic multi-relation transaction API. A successful materialized ack durably appends every batch and updates every active dependent materialized view before returning.",
+                "requestBody": {
+                    "required": true,
+                    "content": {
+                        "application/json": {
+                            "schema": openapi_ingest_relations_request_schema()
+                        }
+                    }
+                },
+                "responses": {
+                    "201": {
+                        "description": "Batches ingested and matching active views materialized",
+                        "content": {
+                            "application/json": {
+                                "schema": openapi_ingest_epoch_response_schema()
+                            }
+                        }
+                    }
+                }
             }
         }),
     );
@@ -7039,7 +8372,6 @@ async fn openapi_json(State(state): State<ApiState>) -> Result<Json<Value>, ApiE
             }
         }),
     );
-
     for view in views {
         let response = active_view_response(&view, None)?;
         if !response.query_enabled {
@@ -7065,7 +8397,8 @@ async fn openapi_json(State(state): State<ApiState>) -> Result<Json<Value>, ApiE
                     "parameters": openapi_view_query_parameters(
                         &response.request,
                         !(response.execution_mode == MaterializedViewExecutionMode::StandingRuntime
-                            && response.sql_template.is_some())
+                            && response.sql_template.is_some()),
+                        response.url_path.is_none()
                     ),
                     "responses": {
                         "200": {
@@ -7097,6 +8430,7 @@ async fn openapi_json(State(state): State<ApiState>) -> Result<Json<Value>, ApiE
                         "parameters": openapi_view_query_parameters(
                             &response.request,
                             response.sql_template.is_some(),
+                            true,
                         ),
                         "responses": { "200": { "description": "Rows" } }
                     },
@@ -7161,9 +8495,7 @@ fn next_from_or_join(sql: &str) -> Option<(&str, &str)> {
     let mut index = 0;
     while index < sql.len() {
         let remaining = &sql[index..];
-        let Some((token, start, end)) = next_unquoted_sql_word(remaining) else {
-            return None;
-        };
+        let (token, start, end) = next_unquoted_sql_word(remaining)?;
         let absolute_start = index + start;
         let absolute_end = index + end;
         if matches!(token.to_ascii_lowercase().as_str(), "from" | "join") {
@@ -7407,7 +8739,7 @@ fn parse_hex_binary(raw: &str) -> Result<Vec<u8>, String> {
         .strip_prefix("0x")
         .or_else(|| trimmed.strip_prefix("0X"))
         .unwrap_or(trimmed);
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return Err("hex string must contain an even number of digits".to_string());
     }
     let mut bytes = Vec::with_capacity(hex.len() / 2);
@@ -7779,7 +9111,6 @@ async fn validate_standing_runtime_create_api_metadata(
     view_id: &str,
     api: &MaterializedViewApiMetadata,
     output_schemas: &[RelationSchema],
-    sql_template_validation_mode: SqlTemplateValidationMode,
 ) -> Result<(), ApiError> {
     validate_view_api_output_binding(view_id, api, output_schemas)?;
     let output_id = api_output_binding_id(view_id, api, output_schemas)?;
@@ -7791,9 +9122,7 @@ async fn validate_standing_runtime_create_api_metadata(
         }
         return Ok(());
     };
-    if sql_template_validation_mode != SqlTemplateValidationMode::ExternalSqlRuntime
-        && !sql_references_table(sql_template, &output_id)
-    {
+    if !sql_references_table(sql_template, &output_id) {
         return Err(ApiError::bad_request(format!(
             "standing runtime view `{view_id}` sql_template must reference table `{output_id}`"
         )));
@@ -7803,12 +9132,9 @@ async fn validate_standing_runtime_create_api_metadata(
         .find(|schema| schema.relation_id == output_id)
         .ok_or_else(|| {
             ApiError::bad_request(format!(
-                "standing runtime view `{view_id}` artifact metadata has no matching output schema `{output_id}`"
+                "standing runtime view `{view_id}` runtime metadata has no matching output schema `{output_id}`"
             ))
         })?;
-    if sql_template_validation_mode == SqlTemplateValidationMode::ExternalSqlRuntime {
-        return Ok(());
-    }
     let table_schema = arrow_schema_from_incremental_relation_schema(output_schema)?;
     let bound_sql = render_view_sql_template_for_validation(sql_template, &api.request)?;
     validate_record_batch_table_query_with_bindings_and_policy(
@@ -7879,13 +9205,7 @@ fn validate_standing_runtime_query_contract(
     api: &MaterializedViewApiMetadata,
     parameters: &BTreeMap<String, Value>,
     page_request: &SnapshotPageRequest,
-    allow_materialized_runtime_sql: bool,
 ) -> Result<(), ApiError> {
-    if request_sql.is_some() && !allow_materialized_runtime_sql {
-        return Err(ApiError::bad_request(format!(
-            "caller-supplied SQL is not supported for standing runtime view `{view_id}`"
-        )));
-    }
     if request_sql.is_some() {
         return Ok(());
     }
@@ -7894,18 +9214,12 @@ fn validate_standing_runtime_query_contract(
             "standing runtime view `{view_id}` has request parameters but no sql_template"
         )));
     }
-    if api.sql_template.is_some()
-        && page_request.page_token.is_some()
-        && !allow_materialized_runtime_sql
-    {
+    if api.sql_template.is_some() && page_request.page_token.is_some() {
         return Err(ApiError::bad_request(format!(
             "cursor pagination is not supported for templated standing runtime view `{view_id}`"
         )));
     }
-    if api.sql_template.is_some()
-        && page_request.max_rows.is_some()
-        && !allow_materialized_runtime_sql
-    {
+    if api.sql_template.is_some() && page_request.max_rows.is_some() {
         return Err(ApiError::bad_request(format!(
             "row limits are not supported for templated standing runtime view `{view_id}`"
         )));
@@ -8020,7 +9334,7 @@ fn validate_request_field_contract(
 fn unsupported_request_field_type_error(name: &str, field_type: &str) -> ApiError {
     if field_type.eq_ignore_ascii_case("variant") {
         ApiError::bad_request(format!(
-            "request field `{name}` declares unsupported type `variant`: external SQL runtime /query does not support request-time VARIANT bind literals; use type `json` for canonical JSON text parameters or compute VARIANT inside a materialized runtime view"
+            "request field `{name}` declares unsupported type `variant`: use type `json` for canonical JSON text parameters or compute VARIANT-equivalent values inside a materialized runtime view"
         ))
     } else {
         ApiError::bad_request(format!(
@@ -8412,16 +9726,6 @@ fn render_view_sql_template(
         sql: output,
         bind_values,
     })
-}
-
-fn render_view_sql_template_as_bound_sql(
-    template: &str,
-    fields: &[MaterializedViewRequestFieldSpec],
-    values: &BTreeMap<String, Value>,
-) -> Result<String, ApiError> {
-    let bound_sql = render_view_sql_template(template, fields, values)?;
-    let bound_sql = rewrite_array_unnest_placeholders(bound_sql)?;
-    prepared_query_sql(bound_sql)
 }
 
 fn render_caller_sql_as_bound_sql(
@@ -8899,7 +10203,7 @@ fn caller_sql_parameter_bind_value(
         .any(|filter| filter_name(filter) == "to_json")
     {
         return serde_json::to_string(value)
-            .map(|value| QueryBindValue::Utf8(value))
+            .map(QueryBindValue::Utf8)
             .map(Some)
             .map_err(ApiError::bad_request);
     }
@@ -9644,7 +10948,7 @@ fn bind_value_for_request_field(
 
 fn unsupported_variant_filter_error(name: &str) -> ApiError {
     ApiError::bad_request(format!(
-        "parameter `{name}` uses unsupported SQL template filter `is_variant`: external SQL runtime /query does not support request-time VARIANT bind literals; use `is_json` for canonical JSON text parameters or compute VARIANT inside a materialized runtime view"
+        "parameter `{name}` uses unsupported SQL template filter `is_variant`: use `is_json` for canonical JSON text parameters or compute VARIANT-equivalent values inside a materialized runtime view"
     ))
 }
 
@@ -9827,6 +11131,7 @@ fn coerce_response_column_value(
 fn openapi_view_query_parameters(
     request: &[MaterializedViewRequestFieldSpec],
     include_cursor_parameters: bool,
+    include_sql_parameter: bool,
 ) -> Value {
     let mut parameters = request
         .iter()
@@ -9847,6 +11152,15 @@ fn openapi_view_query_parameters(
         "description": "Committed logical epoch to read",
         "schema": { "type": "integer", "minimum": 0 }
     }));
+    if include_sql_parameter {
+        parameters.push(json!({
+            "name": "sql",
+            "in": "query",
+            "required": false,
+            "description": "DataFusion SQL to run against the materialized view output table",
+            "schema": { "type": "string" }
+        }));
+    }
     if include_cursor_parameters {
         parameters.push(json!({
             "name": "page_token",
@@ -9864,6 +11178,189 @@ fn openapi_view_query_parameters(
         }));
     }
     Value::Array(parameters)
+}
+
+fn openapi_ingest_relation_rows_request_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": [
+            "relation_version",
+            "stream_id",
+            "partition_id",
+            "start_offset_inclusive",
+            "rows"
+        ],
+        "properties": {
+            "relation_version": { "type": "string" },
+            "stream_id": { "type": "string" },
+            "partition_id": { "type": "integer", "minimum": 0 },
+            "start_offset_inclusive": { "type": "integer", "minimum": 0 },
+            "event_time_watermark": {
+                "type": "object",
+                "properties": {
+                    "event_time_column_id": { "type": "string" },
+                    "max_observed_event_time_ns": { "type": "integer", "format": "int64" },
+                    "watermark_ns": { "type": "integer", "format": "int64" }
+                }
+            },
+            "rows": {
+                "type": "array",
+                "items": { "type": "object" }
+            }
+        }
+    })
+}
+
+fn openapi_ingest_relations_request_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["batches"],
+        "properties": {
+            "batches": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "required": [
+                        "relation_id",
+                        "relation_version",
+                        "stream_id",
+                        "partition_id",
+                        "start_offset_inclusive",
+                        "rows"
+                    ],
+                    "properties": {
+                        "relation_id": { "type": "string" },
+                        "relation_version": { "type": "string" },
+                        "stream_id": { "type": "string" },
+                        "partition_id": { "type": "integer", "minimum": 0 },
+                        "start_offset_inclusive": { "type": "integer", "minimum": 0 },
+                        "event_time_watermark": {
+                            "type": "object",
+                            "properties": {
+                                "event_time_column_id": { "type": "string" },
+                                "max_observed_event_time_ns": { "type": "integer", "format": "int64" },
+                                "watermark_ns": { "type": "integer", "format": "int64" }
+                            }
+                        },
+                        "rows": {
+                            "type": "array",
+                            "items": { "type": "object" }
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn openapi_ingest_materialization_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "status": { "type": "string", "enum": ["completed", "skipped", "duplicate", "epoch_scoped"] },
+            "active_views": { "type": "integer", "minimum": 0 },
+            "applied_batches": { "type": "integer", "minimum": 0 },
+            "materialized_through": {
+                "type": ["integer", "null"],
+                "format": "int64",
+                "description": "Conservative logical epoch boundary published by every active dependent view affected by this ingest epoch; null when no dependent active view had to advance."
+            },
+            "checkpoint_writes": { "type": "integer", "minimum": 0 },
+            "applied_batches_per_checkpoint_write": {
+                "type": ["integer", "null"],
+                "minimum": 0,
+                "description": "Integer ratio showing checkpoint coalescing. For example, 2 means two applied batches were published with one checkpoint write."
+            },
+            "output_delta_writes": { "type": "integer", "minimum": 0 },
+            "state_payload_writes": { "type": "integer", "minimum": 0 },
+            "checkpoint_record_writes": { "type": "integer", "minimum": 0 },
+            "checkpoint_pointer_writes": { "type": "integer", "minimum": 0 },
+            "latest_cache_writes": { "type": "integer", "minimum": 0 },
+            "checkpoint_publication_writes": { "type": "integer", "minimum": 0 }
+        }
+    })
+}
+
+fn openapi_ingest_timing_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Stable wall-clock ingest timing counters. Detailed per-stage timings are intentionally not part of the public 1.0 response contract; publish them through traces or metrics.",
+        "properties": {
+            "total_ms": { "type": "integer", "minimum": 0 },
+            "total_us": { "type": "integer", "minimum": 0 },
+            "avg_batch_us": { "type": ["integer", "null"], "minimum": 0 },
+            "avg_row_us": { "type": ["integer", "null"], "minimum": 0 },
+            "rows_per_second": { "type": ["integer", "null"], "minimum": 0 },
+            "batch_count": { "type": "integer", "minimum": 0 },
+            "row_count": { "type": "integer", "minimum": 0 }
+        }
+    })
+}
+
+fn openapi_ingest_ack_mode_schema() -> Value {
+    json!({
+        "type": "string",
+        "enum": ["materialized"],
+        "default": "materialized",
+        "readOnly": true,
+        "description": "A successful public 1.0 ingest response means the input is durable and every active dependent view has published a checkpoint at or beyond materialized_through"
+    })
+}
+
+fn openapi_ingest_descriptor_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "stream_id": { "type": "string" },
+            "partition_id": { "type": "integer", "minimum": 0 },
+            "start_offset_inclusive": { "type": "integer", "minimum": 0 },
+            "end_offset_exclusive": { "type": "integer", "minimum": 0 },
+            "object_key": { "type": "string" }
+        }
+    })
+}
+
+fn openapi_ingest_response_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "outcome": { "type": "string" },
+            "descriptor": openapi_ingest_descriptor_schema(),
+            "epoch_manifest_id": { "type": "string" },
+            "ingest_epoch": { "type": "string" },
+            "materialized_through": {
+                "type": ["integer", "null"],
+                "format": "int64"
+            },
+            "ack_mode": openapi_ingest_ack_mode_schema(),
+            "materialization": openapi_ingest_materialization_schema(),
+            "timings": openapi_ingest_timing_schema()
+        }
+    })
+}
+
+fn openapi_ingest_epoch_response_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "outcome": { "type": "string" },
+            "epoch_manifest_id": { "type": "string" },
+            "epoch_manifest_key": { "type": "string" },
+            "ingest_epoch": { "type": "string" },
+            "materialized_through": {
+                "type": ["integer", "null"],
+                "format": "int64"
+            },
+            "ack_mode": openapi_ingest_ack_mode_schema(),
+            "materialization": openapi_ingest_materialization_schema(),
+            "timings": openapi_ingest_timing_schema(),
+            "batches": {
+                "type": "array",
+                "items": openapi_ingest_response_schema()
+            }
+        }
+    })
 }
 
 fn openapi_request_field_schema(field: &MaterializedViewRequestFieldSpec) -> Value {
@@ -9970,8 +11467,8 @@ fn active_view_response(
         active.execution_mode.clone(),
         active.lifecycle.clone(),
         active.api.clone(),
-        active.artifact.clone(),
         outcome,
+        false,
     )
 }
 
@@ -9981,8 +11478,8 @@ fn view_response(
     execution_mode: MaterializedViewExecutionMode,
     lifecycle: MaterializedViewLifecycleStatus,
     api: Option<MaterializedViewApiMetadata>,
-    artifact: Option<MaterializedViewArtifactBinding>,
     outcome: Option<&str>,
+    experimental_advanced_view_features: bool,
 ) -> Result<ViewResponse, ApiError> {
     let input = spec
         .input_relations
@@ -9994,7 +11491,8 @@ fn view_response(
     });
 
     let query_enabled = view_query_availability(&lifecycle);
-    let coverage = materialization_coverage_response(&lifecycle);
+    let coverage =
+        materialization_coverage_response(&lifecycle, experimental_advanced_view_features);
 
     Ok(ViewResponse {
         view_id: spec.view_id.clone(),
@@ -10031,7 +11529,6 @@ fn view_response(
         sql_template: api.sql_template,
         response_formats: api.response_formats,
         query_policy_id: api.query_policy_id,
-        artifact,
         outcome: outcome.map(ToString::to_string),
     })
 }
@@ -10043,6 +11540,7 @@ fn backfill_view_response(
     applied_batches: usize,
     remaining_batches: usize,
     progress: BackfillProgressResponse,
+    experimental_advanced_view_features: bool,
 ) -> BackfillViewResponse {
     BackfillViewResponse {
         view_id: active.spec.view_id.clone(),
@@ -10050,7 +11548,10 @@ fn backfill_view_response(
         mode: mode.to_string(),
         lifecycle: active.lifecycle.clone(),
         query_enabled: view_query_availability(&active.lifecycle),
-        coverage: materialization_coverage_response(&active.lifecycle),
+        coverage: materialization_coverage_response(
+            &active.lifecycle,
+            experimental_advanced_view_features,
+        ),
         progress,
         applied_batches,
         remaining_batches,
@@ -10064,7 +11565,7 @@ fn lifecycle_for_create_view_execution(
     match execution_mode {
         MaterializedViewExecutionMode::StandingRuntime if requires_backfill => {
             MaterializedViewLifecycleStatus::standing_runtime_deploying(Some(
-                "backfill_required: committed input data exists; first query will materialize the view before serving rows".to_string(),
+                "backfill_required: committed input data exists; run the view backfill API before querying materialized output".to_string(),
             ))
         }
         MaterializedViewExecutionMode::StandingRuntime => MaterializedViewLifecycleStatus::standing_runtime(),
@@ -10072,12 +11573,13 @@ fn lifecycle_for_create_view_execution(
 }
 
 fn view_query_availability(lifecycle: &MaterializedViewLifecycleStatus) -> bool {
-    lifecycle.compile_status == MaterializedViewCompileStatus::Success
+    lifecycle.admission_status == MaterializedViewAdmissionStatus::Admitted
         && lifecycle.deployment_status == MaterializedViewDeploymentStatus::Running
 }
 
 fn materialization_coverage_response(
     lifecycle: &MaterializedViewLifecycleStatus,
+    _experimental_advanced_view_features: bool,
 ) -> MaterializationCoverageResponse {
     let state = if view_query_availability(lifecycle) {
         "materialized"
@@ -10099,23 +11601,11 @@ fn materialization_coverage_response(
             status: "available".to_string(),
             reason: "full-view materialization is backed by committed ingest replay and durable standing-runtime checkpoints".to_string(),
         },
-        request_scope: CoverageCapabilityResponse {
-            status: "unsupported".to_string(),
-            reason: "request-scope backfill needs a durable input scope index; current ingest logs are ordered for replay, not indexed by query predicate scope".to_string(),
-        },
-        range: CoverageCapabilityResponse {
-            status: "unsupported".to_string(),
-            reason: "arbitrary range backfill needs a range-aware input index and materialized coverage contract".to_string(),
-        },
-        background_backfill: CoverageCapabilityResponse {
-            status: "available".to_string(),
-            reason: "backfill can run in bounded committed-ingest batches through the view backfill API".to_string(),
-        },
     }
 }
 
-fn view_backfill_is_query_triggerable(active: &ActiveMaterializedView) -> bool {
-    active.lifecycle.compile_status == MaterializedViewCompileStatus::Success
+fn view_has_backfill_required_lag(active: &ActiveMaterializedView) -> bool {
+    active.lifecycle.admission_status == MaterializedViewAdmissionStatus::Admitted
         && active.lifecycle.deployment_status == MaterializedViewDeploymentStatus::Deploying
         && active
             .lifecycle
@@ -10217,10 +11707,15 @@ fn single_key_sum_count_output_schema(
         .find(|column| &column.column_id == primary_key_id)
         .ok_or_else(|| ApiError::bad_request("primary key column is missing from catalog"))?;
     let key_type = sql_type_from_catalog_column(key_column)?;
+    let output_key_name = if plan.output_key_column_id.is_empty() {
+        key_column.name.clone()
+    } else {
+        plan.output_key_column_id.clone()
+    };
     let aggregate_outputs = supported_view_plan_aggregate_outputs(plan);
     let mut columns = Vec::with_capacity(1 + aggregate_outputs.len());
     columns.push(ColumnSchema {
-        name: key_column.name.clone(),
+        name: output_key_name.clone(),
         data_type: key_type,
         nullable: false,
     });
@@ -10231,7 +11726,7 @@ fn single_key_sum_count_output_schema(
             nullable: false,
         });
     }
-    let primary_key = vec![key_column.name.clone()];
+    let primary_key = vec![output_key_name];
     let schema_fingerprint =
         materialized_output_schema_fingerprint(view_id, "v1", &columns, &primary_key)?;
     Ok(RelationSchema {
@@ -10268,9 +11763,14 @@ fn latest_by_key_output_schema(
         .ok_or_else(|| {
             ApiError::bad_request("latest-by-key value column is missing from catalog")
         })?;
+    let output_key_name = if plan.output_key_column_id.is_empty() {
+        key_column.name.clone()
+    } else {
+        plan.output_key_column_id.clone()
+    };
     let columns = vec![
         ColumnSchema {
-            name: key_column.name.clone(),
+            name: output_key_name.clone(),
             data_type: sql_type_from_catalog_column(key_column)?,
             nullable: false,
         },
@@ -10280,7 +11780,112 @@ fn latest_by_key_output_schema(
             nullable: false,
         },
     ];
-    let primary_key = vec![key_column.name.clone()];
+    let primary_key = vec![output_key_name];
+    let schema_fingerprint =
+        materialized_output_schema_fingerprint(view_id, "v1", &columns, &primary_key)?;
+    Ok(RelationSchema {
+        relation_id: view_id.to_string(),
+        relation_name: view_id.to_string(),
+        relation_version: "v1".to_string(),
+        schema_fingerprint,
+        columns,
+        primary_key,
+    })
+}
+
+fn filter_project_output_schema(
+    view_id: &str,
+    catalog: &VelorixRelationCatalogV1,
+    plan: &SupportedFilterProjectPlan,
+) -> Result<RelationSchema, ApiError> {
+    let [primary_key_id] = catalog.relation_schema.primary_key_column_ids.as_slice() else {
+        return Err(ApiError::bad_request(
+            "filter/project view requires exactly one primary key column",
+        ));
+    };
+    let key_column = catalog
+        .relation_schema
+        .columns
+        .iter()
+        .find(|column| &column.column_id == primary_key_id)
+        .ok_or_else(|| ApiError::bad_request("primary key column is missing from catalog"))?;
+    let output_key_name = if plan.output_key_column_id.is_empty() {
+        key_column.name.clone()
+    } else {
+        plan.output_key_column_id.clone()
+    };
+    let mut columns = vec![ColumnSchema {
+        name: output_key_name.clone(),
+        data_type: sql_type_from_catalog_column(key_column)?,
+        nullable: false,
+    }];
+    for projection in &plan.value_columns {
+        let input_column = catalog
+            .relation_schema
+            .columns
+            .iter()
+            .find(|column| column.column_id == projection.input_column_id)
+            .ok_or_else(|| {
+                ApiError::bad_request("filter/project input column is missing from catalog")
+            })?;
+        let data_type = if projection.expression.is_some() {
+            SqlDataType::Int64
+        } else {
+            sql_type_from_catalog_column(input_column)?
+        };
+        columns.push(ColumnSchema {
+            name: projection.output_column_id.clone(),
+            data_type,
+            nullable: projection.expression.is_none() && input_column.nullable,
+        });
+    }
+    let primary_key = vec![output_key_name];
+    let schema_fingerprint =
+        materialized_output_schema_fingerprint(view_id, "v1", &columns, &primary_key)?;
+    Ok(RelationSchema {
+        relation_id: view_id.to_string(),
+        relation_name: view_id.to_string(),
+        relation_version: "v1".to_string(),
+        schema_fingerprint,
+        columns,
+        primary_key,
+    })
+}
+
+fn analytic_row_number_output_schema(
+    view_id: &str,
+    catalog: &VelorixRelationCatalogV1,
+    plan: &SupportedAnalyticRowNumberPlan,
+) -> Result<RelationSchema, ApiError> {
+    let [primary_key_id] = catalog.relation_schema.primary_key_column_ids.as_slice() else {
+        return Err(ApiError::bad_request(
+            "analytic row_number view requires exactly one primary key column",
+        ));
+    };
+    let key_column = catalog
+        .relation_schema
+        .columns
+        .iter()
+        .find(|column| &column.column_id == primary_key_id)
+        .ok_or_else(|| ApiError::bad_request("primary key column is missing from catalog"))?;
+    let output_key_name = if plan.output_key_column_id.is_empty() {
+        key_column.name.clone()
+    } else {
+        plan.output_key_column_id.clone()
+    };
+    let columns = vec![
+        ColumnSchema {
+            name: output_key_name.clone(),
+            data_type: sql_type_from_catalog_column(key_column)?,
+            nullable: false,
+        },
+        ColumnSchema {
+            name: plan.output_row_number_column_id.clone(),
+            data_type: SqlDataType::Int64,
+            nullable: false,
+        },
+    ];
+    let primary_key = vec![output_key_name];
     let schema_fingerprint =
         materialized_output_schema_fingerprint(view_id, "v1", &columns, &primary_key)?;
     Ok(RelationSchema {
@@ -10309,9 +11914,14 @@ fn tumbling_window_output_schema(
         .iter()
         .find(|column| &column.column_id == primary_key_id)
         .ok_or_else(|| ApiError::bad_request("primary key column is missing from catalog"))?;
+    let output_key_name = if plan.output_key_column_id.is_empty() {
+        key_column.name.clone()
+    } else {
+        plan.output_key_column_id.clone()
+    };
     let mut columns = vec![
         ColumnSchema {
-            name: key_column.name.clone(),
+            name: output_key_name.clone(),
             data_type: sql_type_from_catalog_column(key_column)?,
             nullable: false,
         },
@@ -10334,7 +11944,7 @@ fn tumbling_window_output_schema(
         });
     }
     let primary_key = vec![
-        key_column.name.clone(),
+        output_key_name,
         plan.window_start_output_column_id.clone(),
         plan.window_end_output_column_id.clone(),
     ];
@@ -10360,42 +11970,37 @@ fn join_sum_count_output_schema(
             "join sum/count view requires exactly two input relations",
         ));
     };
-    let [right_primary_key_id] = right_catalog
-        .relation_schema
-        .primary_key_column_ids
-        .as_slice()
-    else {
-        return Err(ApiError::bad_request(
-            "join sum/count view requires right input to have exactly one primary key column",
-        ));
-    };
-    let key_column = right_catalog
+    let key_catalog = catalogs
+        .iter()
+        .find(|catalog| catalog.relation_schema.relation_id == plan.group_key_relation_id)
+        .ok_or_else(|| ApiError::bad_request("join group key relation is missing from catalog"))?;
+    let key_column = key_catalog
         .relation_schema
         .columns
         .iter()
-        .find(|column| &column.column_id == right_primary_key_id)
-        .ok_or_else(|| ApiError::bad_request("right primary key column is missing from catalog"))?;
+        .find(|column| column.column_id == plan.group_key_column_id)
+        .ok_or_else(|| ApiError::bad_request("join group key column is missing from catalog"))?;
     let key_type = sql_type_from_catalog_column(key_column)?;
-    let sum_type =
-        generic_single_key_sum_count_sum_type_for_column(left_catalog, &plan.sum_value_column_id)?;
-    let columns = vec![
-        ColumnSchema {
-            name: key_column.name.clone(),
-            data_type: key_type,
+    let output_key_name = if plan.output_key_column_id.is_empty() {
+        key_column.name.clone()
+    } else {
+        plan.output_key_column_id.clone()
+    };
+    let aggregate_outputs = supported_join_view_plan_aggregate_outputs(plan);
+    let mut columns = vec![ColumnSchema {
+        name: output_key_name.clone(),
+        data_type: key_type,
+        nullable: false,
+    }];
+    for aggregate in aggregate_outputs {
+        let data_type = join_aggregate_output_type(left_catalog, right_catalog, plan, &aggregate)?;
+        columns.push(ColumnSchema {
+            name: aggregate.output_column_id,
+            data_type,
             nullable: false,
-        },
-        ColumnSchema {
-            name: "sum".to_string(),
-            data_type: sum_type,
-            nullable: false,
-        },
-        ColumnSchema {
-            name: "count".to_string(),
-            data_type: SqlDataType::Int64,
-            nullable: false,
-        },
-    ];
-    let primary_key = vec![key_column.name.clone()];
+        });
+    }
+    let primary_key = vec![output_key_name];
     let schema_fingerprint =
         materialized_output_schema_fingerprint(view_id, "v1", &columns, &primary_key)?;
     Ok(RelationSchema {
@@ -10406,6 +12011,105 @@ fn join_sum_count_output_schema(
         columns,
         primary_key,
     })
+}
+
+fn join_aggregate_output_type(
+    left_catalog: &VelorixRelationCatalogV1,
+    right_catalog: &VelorixRelationCatalogV1,
+    plan: &SupportedJoinViewPlan,
+    aggregate: &SupportedAggregateOutput,
+) -> Result<SqlDataType, ApiError> {
+    match aggregate.function {
+        LogicalPlanAggregateFunctionV1::Count | LogicalPlanAggregateFunctionV1::CountDistinct => {
+            if aggregate.input_column_id.is_some() {
+                let _ = join_value_aggregate_column(
+                    left_catalog,
+                    right_catalog,
+                    plan,
+                    aggregate,
+                    "count",
+                )?;
+            }
+            Ok(SqlDataType::Int64)
+        }
+        LogicalPlanAggregateFunctionV1::Sum => {
+            let column =
+                join_value_aggregate_column(left_catalog, right_catalog, plan, aggregate, "sum")?;
+            join_sum_min_max_output_type(column)
+        }
+        LogicalPlanAggregateFunctionV1::Min | LogicalPlanAggregateFunctionV1::Max => {
+            let column = join_value_aggregate_column(
+                left_catalog,
+                right_catalog,
+                plan,
+                aggregate,
+                "min/max",
+            )?;
+            join_sum_min_max_output_type(column)
+        }
+        LogicalPlanAggregateFunctionV1::Avg => {
+            let column =
+                join_value_aggregate_column(left_catalog, right_catalog, plan, aggregate, "avg")?;
+            match &column.physical_arrow_type {
+                ArrowPhysicalTypeV1::Int64 => Ok(SqlDataType::Float64),
+                _ => Err(ApiError::bad_request(format!(
+                    "join aggregate avg column `{}` must be Int64",
+                    column.name
+                ))),
+            }
+        }
+    }
+}
+
+fn join_value_aggregate_column<'a>(
+    left_catalog: &'a VelorixRelationCatalogV1,
+    right_catalog: &'a VelorixRelationCatalogV1,
+    plan: &SupportedJoinViewPlan,
+    aggregate: &SupportedAggregateOutput,
+    function_name: &str,
+) -> Result<&'a RelationColumnV1, ApiError> {
+    let column_id = aggregate.input_column_id.as_deref().ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "join aggregate {function_name} input column is missing"
+        ))
+    })?;
+    let side = aggregate
+        .input_relation_side
+        .unwrap_or(SupportedAggregateInputRelationSide::Left);
+    if side == SupportedAggregateInputRelationSide::Left && column_id != plan.sum_value_column_id {
+        return Err(ApiError::bad_request(format!(
+            "join aggregate {function_name} currently supports the left input value column `{}`",
+            plan.sum_value_column_id
+        )));
+    }
+    let catalog = match side {
+        SupportedAggregateInputRelationSide::Left => left_catalog,
+        SupportedAggregateInputRelationSide::Right => right_catalog,
+    };
+    catalog
+        .relation_schema
+        .columns
+        .iter()
+        .find(|column| column.column_id == column_id)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "join aggregate {function_name} value column is missing from input catalog"
+            ))
+        })
+}
+
+fn join_sum_min_max_output_type(column: &RelationColumnV1) -> Result<SqlDataType, ApiError> {
+    match &column.physical_arrow_type {
+        ArrowPhysicalTypeV1::Int64 => Ok(SqlDataType::Int64),
+        ArrowPhysicalTypeV1::Decimal128 { precision, scale } => Ok(SqlDataType::Decimal {
+            precision: *precision,
+            scale: *scale,
+        }),
+        _ => Err(ApiError::bad_request(format!(
+            "join aggregate value column `{}` must be Int64 or Decimal128",
+            column.name
+        ))),
+    }
 }
 
 fn materialized_output_schema_fingerprint(
@@ -10481,7 +12185,9 @@ fn single_key_aggregate_output_type(
                 .ok_or_else(|| ApiError::bad_request("sum aggregate input column is missing"))?;
             generic_single_key_sum_count_sum_type_for_column(catalog, column_id)
         }
-        LogicalPlanAggregateFunctionV1::Count => Ok(SqlDataType::Int64),
+        LogicalPlanAggregateFunctionV1::Count | LogicalPlanAggregateFunctionV1::CountDistinct => {
+            Ok(SqlDataType::Int64)
+        }
         LogicalPlanAggregateFunctionV1::Avg => {
             let column_id = aggregate
                 .input_column_id
@@ -11442,6 +13148,7 @@ fn format_decimal128_for_json(value: i128, scale: i8) -> String {
 pub struct ApiError {
     status: StatusCode,
     message: String,
+    details: Option<Value>,
 }
 
 impl ApiError {
@@ -11449,6 +13156,7 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: error.to_string(),
+            details: None,
         }
     }
 
@@ -11456,6 +13164,7 @@ impl ApiError {
         Self {
             status: StatusCode::UNAUTHORIZED,
             message: error.to_string(),
+            details: None,
         }
     }
 
@@ -11463,6 +13172,7 @@ impl ApiError {
         Self {
             status: StatusCode::CONFLICT,
             message: error.to_string(),
+            details: None,
         }
     }
 
@@ -11470,6 +13180,7 @@ impl ApiError {
         Self {
             status: StatusCode::PAYLOAD_TOO_LARGE,
             message: error.to_string(),
+            details: None,
         }
     }
 
@@ -11477,6 +13188,15 @@ impl ApiError {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: error.to_string(),
+            details: None,
+        }
+    }
+
+    fn service_unavailable_with_details(error: impl std::fmt::Display, details: Value) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: error.to_string(),
+            details: Some(details),
         }
     }
 
@@ -11484,6 +13204,7 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: error.to_string(),
+            details: None,
         }
     }
 }
@@ -11517,12 +13238,6 @@ fn materialized_view_registry_error_to_api(error: MaterializedViewRegistryError)
             reason: InvalidExecutionModeReason::StandingRuntimeMissingIdentity,
         } => ApiError::conflict(format!(
             "standing runtime view `{view_id}` is missing runtime identity"
-        )),
-        MaterializedViewRegistryError::InvalidExecutionMode {
-            view_id,
-            reason: InvalidExecutionModeReason::StandingRuntimeMissingArtifact,
-        } => ApiError::conflict(format!(
-            "standing runtime view `{view_id}` is missing artifact or runtime binding"
         )),
         error @ (MaterializedViewRegistryError::RecordConflict { .. }
         | MaterializedViewRegistryError::ActiveRecordConflict { .. }
@@ -11567,13 +13282,13 @@ impl std::error::Error for ApiError {}
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (
-            self.status,
-            Json(json!({
-                "error": self.message,
-            })),
-        )
-            .into_response()
+        let mut body = json!({
+            "error": self.message,
+        });
+        if let Some(details) = self.details {
+            body["details"] = details;
+        }
+        (self.status, Json(body)).into_response()
     }
 }
 
@@ -11600,6 +13315,9 @@ struct ApiConfig {
     admin_bearer_token: Option<String>,
     max_request_body_bytes: usize,
     max_ingest_rows: usize,
+    max_standing_runtime_output_delta_records: usize,
+    max_standing_runtime_state_payload_bytes: usize,
+    output_compaction_interval_epochs: u64,
     standing_runtime_fencing: StandingRuntimeFencingMode,
     standing_runtime_owner_ttl_ms: u64,
 }
@@ -11672,6 +13390,21 @@ impl ApiConfig {
         let max_request_body_bytes =
             parse_positive_usize_env("VELORIX_API_MAX_REQUEST_BODY_BYTES", 1024 * 1024)?;
         let max_ingest_rows = parse_positive_usize_env("VELORIX_API_MAX_INGEST_ROWS", 10_000)?;
+        let max_standing_runtime_output_delta_records = parse_positive_usize_env(
+            "VELORIX_STANDING_RUNTIME_MAX_OUTPUT_DELTA_RECORDS",
+            DEFAULT_MAX_STANDING_RUNTIME_OUTPUT_DELTA_RECORDS,
+        )?;
+        let max_standing_runtime_state_payload_bytes = parse_positive_usize_env(
+            "VELORIX_STANDING_RUNTIME_MAX_STATE_PAYLOAD_BYTES",
+            DEFAULT_MAX_STANDING_RUNTIME_STATE_PAYLOAD_BYTES,
+        )?;
+        let output_compaction_interval_epochs =
+            parse_u64_env("VELORIX_OUTPUT_COMPACTION_INTERVAL_EPOCHS", 0)?;
+        if output_compaction_interval_epochs != 0 {
+            return Err(anyhow!(
+                "VELORIX_OUTPUT_COMPACTION_INTERVAL_EPOCHS is experimental and disabled for the public 1.0 API"
+            ));
+        }
         let api_replica_count =
             parse_api_replica_count(std::env::var("VELORIX_API_REPLICA_COUNT").ok().as_deref())?;
         let standing_runtime_fencing = StandingRuntimeFencingMode::from_env(
@@ -11704,6 +13437,9 @@ impl ApiConfig {
             admin_bearer_token,
             max_request_body_bytes,
             max_ingest_rows,
+            max_standing_runtime_output_delta_records,
+            max_standing_runtime_state_payload_bytes,
+            output_compaction_interval_epochs,
             standing_runtime_fencing,
             standing_runtime_owner_ttl_ms,
         })
@@ -11929,6 +13665,17 @@ fn parse_positive_u64_env(name: &str, default: u64) -> anyhow::Result<u64> {
     }
 }
 
+fn parse_u64_env(name: &str, default: u64) -> anyhow::Result<u64> {
+    match env::var(name) {
+        Ok(value) => value
+            .trim()
+            .parse::<u64>()
+            .with_context(|| format!("invalid {name} `{}`", value.trim())),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(anyhow!("invalid {name}: {error}")),
+    }
+}
+
 async fn enforce_standing_runtime_fencing_startup(
     config: &ApiConfig,
     meta_store: Option<&Arc<dyn MetaStore>>,
@@ -12114,15 +13861,190 @@ fn validate_production_standing_runtime_fencing(
 mod tests {
     use super::*;
     use axum::http::Method;
-    use object_store::{memory::InMemory, path::Path, ObjectStore};
+    use futures::stream::BoxStream;
+    use object_store::{
+        memory::InMemory, path::Path, GetOptions, GetResult, ListResult, MultipartUpload,
+        ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+        Result as ObjectStoreResult,
+    };
+    use std::{fmt, time::Duration};
     use tower::ServiceExt as _;
+    use velorix_control::meta_admin::InMemoryMetaStore;
     use velorix_core::{
         delta::{DeltaKey, DeltaRecord, DeltaValue},
         standing_program::{
             DurableStateRoot, RelationFrontier, RuntimeCheckpointStatePayload, ViewFrontier,
         },
     };
-    use velorix_meta::InMemoryMetaStore;
+
+    fn legacy_key(prefix: &str, suffix: &str) -> String {
+        format!("{prefix}{suffix}")
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct ObjectStoreAccessCounts {
+        get_paths: Arc<Mutex<Vec<String>>>,
+        list_prefixes: Arc<Mutex<Vec<String>>>,
+        active_ingest_puts: Arc<std::sync::atomic::AtomicUsize>,
+        max_concurrent_ingest_puts: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ObjectStoreAccessCounts {
+        fn clear(&self) {
+            self.get_paths.lock().unwrap().clear();
+            self.list_prefixes.lock().unwrap().clear();
+            self.active_ingest_puts
+                .store(0, std::sync::atomic::Ordering::SeqCst);
+            self.max_concurrent_ingest_puts
+                .store(0, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn get_paths(&self) -> Vec<String> {
+            self.get_paths.lock().unwrap().clone()
+        }
+
+        fn list_prefixes(&self) -> Vec<String> {
+            self.list_prefixes.lock().unwrap().clone()
+        }
+
+        fn max_concurrent_ingest_puts(&self) -> usize {
+            self.max_concurrent_ingest_puts
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn start_ingest_put(&self) {
+            let current = self
+                .active_ingest_puts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            let mut observed = self
+                .max_concurrent_ingest_puts
+                .load(std::sync::atomic::Ordering::SeqCst);
+            while current > observed {
+                match self.max_concurrent_ingest_puts.compare_exchange(
+                    observed,
+                    current,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                ) {
+                    Ok(_) => break,
+                    Err(next) => observed = next,
+                }
+            }
+        }
+
+        fn finish_ingest_put(&self) {
+            self.active_ingest_puts
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Debug)]
+    struct CountingObjectStore {
+        inner: Arc<dyn ObjectStore>,
+        counts: ObjectStoreAccessCounts,
+        ingest_put_delay: Duration,
+    }
+
+    impl CountingObjectStore {
+        fn new(inner: Arc<dyn ObjectStore>, counts: ObjectStoreAccessCounts) -> Self {
+            Self {
+                inner,
+                counts,
+                ingest_put_delay: Duration::ZERO,
+            }
+        }
+
+        fn with_ingest_put_delay(
+            inner: Arc<dyn ObjectStore>,
+            counts: ObjectStoreAccessCounts,
+            ingest_put_delay: Duration,
+        ) -> Self {
+            Self {
+                inner,
+                counts,
+                ingest_put_delay,
+            }
+        }
+    }
+
+    impl fmt::Display for CountingObjectStore {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "CountingObjectStore({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for CountingObjectStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> ObjectStoreResult<PutResult> {
+            let track_ingest_put = location.to_string().starts_with("v1/ingest/");
+            if track_ingest_put {
+                self.counts.start_ingest_put();
+                if self.ingest_put_delay > Duration::ZERO {
+                    tokio::time::sleep(self.ingest_put_delay).await;
+                }
+            }
+            let result = self.inner.put_opts(location, payload, opts).await;
+            if track_ingest_put {
+                self.counts.finish_ingest_put();
+            }
+            result
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> ObjectStoreResult<GetResult> {
+            self.counts
+                .get_paths
+                .lock()
+                .unwrap()
+                .push(location.to_string());
+            self.inner.get_opts(location, options).await
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.counts
+                .list_prefixes
+                .lock()
+                .unwrap()
+                .push(prefix.map(Path::to_string).unwrap_or_default());
+            self.inner.list(prefix)
+        }
+
+        async fn delete(&self, location: &Path) -> ObjectStoreResult<()> {
+            self.inner.delete(location).await
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> ObjectStoreResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
 
     #[test]
     fn standing_runtime_checkpoint_publication_refs_output_manifest_when_payload_contains_published_output(
@@ -12247,7 +14169,7 @@ mod tests {
             "purchases_by_user",
             &checkpoint,
             std::slice::from_ref(&output_delta),
-            Vec::new(),
+            StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), None),
             None,
         )
         .await
@@ -12264,6 +14186,15 @@ mod tests {
             .unwrap();
         let record: StandingRuntimeCheckpointRecord =
             serde_json::from_slice(&checkpoint_bytes).unwrap();
+        assert!(
+            record
+                .checkpoint
+                .output_manifest_refs
+                .iter()
+                .all(|output_ref| output_ref.starts_with(STANDING_RUNTIME_OUTPUT_DELTA_REF_PREFIX)),
+            "ingest checkpoint should publish delta refs only; full output snapshots are compacted separately: {:?}",
+            record.checkpoint.output_manifest_refs
+        );
         let delta_ref = record
             .checkpoint
             .output_manifest_refs
@@ -12304,6 +14235,145 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn standing_runtime_checkpoint_read_fails_closed_when_output_delta_object_is_missing() {
+        let state = test_api_state().await;
+        let checkpoint = test_runtime_checkpoint(Vec::new());
+        let output_delta = ViewOutputDelta {
+            view_id: "purchases_by_user".to_string(),
+            schema_fingerprint:
+                "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+                    .to_string(),
+            delta: DeltaBatch::from_records([DeltaRecord::new(
+                DeltaKey::from_json(json!("alice")),
+                DeltaValue::from_json(json!({ "count": 3, "sum": 20 })),
+                1,
+            )]),
+        };
+
+        persist_standing_runtime_checkpoint(
+            &state,
+            "purchases_by_user",
+            &checkpoint,
+            std::slice::from_ref(&output_delta),
+            StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), None),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let checkpoint_key = test_checkpoint_key(&checkpoint);
+        let checkpoint_bytes = state
+            .store
+            .get(&Path::from(checkpoint_key.as_str()))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let record: StandingRuntimeCheckpointRecord =
+            serde_json::from_slice(&checkpoint_bytes).unwrap();
+        let delta_ref = record
+            .checkpoint
+            .output_manifest_refs
+            .iter()
+            .find(|output_ref| output_ref.starts_with(STANDING_RUNTIME_OUTPUT_DELTA_REF_PREFIX))
+            .unwrap();
+        let delta_key = delta_ref
+            .strip_prefix(STANDING_RUNTIME_OUTPUT_DELTA_REF_PREFIX)
+            .unwrap();
+        state.store.delete(&Path::from(delta_key)).await.unwrap();
+
+        let error = read_latest_standing_runtime_checkpoint(
+            &state,
+            &checkpoint.identity,
+            "purchases_by_user",
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn standing_runtime_checkpoint_read_fails_closed_when_output_delta_object_is_corrupt() {
+        let state = test_api_state().await;
+        let checkpoint = test_runtime_checkpoint(Vec::new());
+        let output_delta = ViewOutputDelta {
+            view_id: "purchases_by_user".to_string(),
+            schema_fingerprint:
+                "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+                    .to_string(),
+            delta: DeltaBatch::from_records([DeltaRecord::new(
+                DeltaKey::from_json(json!("alice")),
+                DeltaValue::from_json(json!({ "count": 3, "sum": 20 })),
+                1,
+            )]),
+        };
+
+        persist_standing_runtime_checkpoint(
+            &state,
+            "purchases_by_user",
+            &checkpoint,
+            std::slice::from_ref(&output_delta),
+            StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), None),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let checkpoint_key = test_checkpoint_key(&checkpoint);
+        let checkpoint_bytes = state
+            .store
+            .get(&Path::from(checkpoint_key.as_str()))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let record: StandingRuntimeCheckpointRecord =
+            serde_json::from_slice(&checkpoint_bytes).unwrap();
+        let delta_ref = record
+            .checkpoint
+            .output_manifest_refs
+            .iter()
+            .find(|output_ref| output_ref.starts_with(STANDING_RUNTIME_OUTPUT_DELTA_REF_PREFIX))
+            .unwrap();
+        let delta_key = delta_ref
+            .strip_prefix(STANDING_RUNTIME_OUTPUT_DELTA_REF_PREFIX)
+            .unwrap();
+        let delta_bytes = state
+            .store
+            .get(&Path::from(delta_key))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let mut delta_record: StandingRuntimeOutputDeltaRecord =
+            serde_json::from_slice(&delta_bytes).unwrap();
+        delta_record.output_delta = json!({"records": []});
+        state
+            .store
+            .put(
+                &Path::from(delta_key),
+                bytes::Bytes::from(serde_json::to_vec(&delta_record).unwrap()).into(),
+            )
+            .await
+            .unwrap();
+
+        let error = read_latest_standing_runtime_checkpoint(
+            &state,
+            &checkpoint.identity,
+            "purchases_by_user",
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("output delta key/body mismatch"));
+    }
+
+    #[tokio::test]
     async fn standing_runtime_output_serving_reads_page_object_not_manifest_payload() {
         let state = test_api_state().await;
         let checkpoint = test_runtime_checkpoint(Vec::new());
@@ -12331,6 +14401,229 @@ mod tests {
         let expected: DeltaBatch =
             serde_json::from_value(page_record.published_output.clone()).unwrap();
         assert_eq!(output, expected);
+    }
+
+    #[tokio::test]
+    async fn standing_runtime_output_compaction_rewrites_fragmented_pages_as_single_page() {
+        let state = test_api_state().await;
+        let checkpoint = test_runtime_checkpoint(Vec::new());
+        let checkpoint_key = test_checkpoint_key(&checkpoint);
+        let record = test_checkpoint_record(&checkpoint_key, checkpoint.clone());
+        let page_outputs = [
+            DeltaBatch::from_records([DeltaRecord::new(
+                DeltaKey::from_json(json!("alice")),
+                DeltaValue::from_json(json!({"sum": 10, "count": 1})),
+                1,
+            )]),
+            DeltaBatch::from_records([DeltaRecord::new(
+                DeltaKey::from_json(json!("bob")),
+                DeltaValue::from_json(json!({"sum": 5, "count": 1})),
+                1,
+            )]),
+        ];
+        let full_output = page_outputs[0].combine(&page_outputs[1]);
+        let full_value = serde_json::to_value(&full_output).unwrap();
+        let full_hash = stable_bytes_hash(&serde_json::to_vec(&full_value).unwrap());
+        let mut pages = Vec::new();
+        for (index, output) in page_outputs.into_iter().enumerate() {
+            let output_value = serde_json::to_value(output).unwrap();
+            let page_hash = stable_bytes_hash(&serde_json::to_vec(&output_value).unwrap());
+            let page_key = ObjectKey::standing_runtime_output_page(
+                "tenant-a",
+                "program-purchases",
+                "purchases_by_user",
+                checkpoint.logical_epoch,
+                index as u32,
+                &page_hash,
+            )
+            .unwrap();
+            let page_ref = StandingRuntimeOutputPageRef {
+                page_index: index as u32,
+                page_key: page_key.as_str().to_string(),
+                page_content_hash: page_hash.clone(),
+                row_count: 1,
+                output_encoding: "velorix-delta-batch-json-v1".to_string(),
+            };
+            let page_record = StandingRuntimeOutputPageRecord {
+                schema_version: 1,
+                record_kind: "standing_runtime_output_page_v1".to_string(),
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "purchases_by_user".to_string(),
+                logical_epoch: checkpoint.logical_epoch,
+                output_content_hash: full_hash.clone(),
+                page_index: index as u32,
+                page_content_hash: page_hash,
+                row_count: 1,
+                output_encoding: "velorix-delta-batch-json-v1".to_string(),
+                source_kind: "standing_runtime_checkpoint_published_output".to_string(),
+                published_output: output_value,
+            };
+            put_standing_runtime_output_page(&state, &page_key, &page_record)
+                .await
+                .unwrap();
+            pages.push(page_ref);
+        }
+        let manifest = StandingRuntimeOutputManifestRecord {
+            schema_version: 1,
+            record_kind: "standing_runtime_output_manifest_v1".to_string(),
+            tenant_id: "tenant-a".to_string(),
+            program_id: "program-purchases".to_string(),
+            view_id: "purchases_by_user".to_string(),
+            checkpoint_key: checkpoint_key.as_str().to_string(),
+            logical_epoch: checkpoint.logical_epoch,
+            checkpoint_content_hash: checkpoint.state_root.content_hash.clone(),
+            output_content_hash: full_hash,
+            output_encoding: "velorix-delta-batch-json-v1".to_string(),
+            output_row_count: 2,
+            source_kind: "standing_runtime_checkpoint_published_output".to_string(),
+            pages,
+            published_output: full_value,
+        };
+
+        let compacted = compact_standing_runtime_output_manifest(&state, &record, &manifest)
+            .await
+            .unwrap();
+
+        assert_eq!(compacted.manifest_record.pages.len(), 1);
+        assert_eq!(compacted.manifest_record.output_row_count, 2);
+        let (_page_key, page_record) = read_standing_runtime_output_page_record(
+            &state,
+            &compacted.manifest_record.pages[0],
+            "purchases_by_user",
+        )
+        .await
+        .unwrap();
+        let compacted_output: DeltaBatch =
+            serde_json::from_value(page_record.published_output).unwrap();
+        assert_eq!(compacted_output.net_rows().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn standing_runtime_output_compaction_publishes_checkpoint_bound_snapshot_without_republishing_checkpoint(
+    ) {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-compact-no-side-effect-owner",
+            false,
+        )
+        .await;
+        let router = app(state.clone());
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "scores_compact_no_side_effect".to_string(),
+            url_path: None,
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("score totals for compaction conflict side-effect check".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED);
+
+        let ingest_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/ingest",
+            json!({
+                "relation_id": "scores",
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "scores-compact-no-side-effect-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "rows": [
+                    {"user_id": "alice", "score": 10, "delta": 1}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(ingest_response.0, StatusCode::CREATED);
+
+        let active = state
+            .view_registry()
+            .unwrap()
+            .read_active("scores_compact_no_side_effect")
+            .await
+            .unwrap();
+        let identity = active_standing_runtime_identity(&active).unwrap();
+        let record = read_latest_standing_runtime_checkpoint(
+            &state,
+            identity,
+            "scores_compact_no_side_effect",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(record
+            .checkpoint
+            .output_manifest_refs
+            .iter()
+            .all(|output_ref| {
+                output_ref.starts_with(STANDING_RUNTIME_OUTPUT_DELTA_REF_PREFIX)
+            }));
+        let checkpoint_key =
+            ObjectKey::parse_standing_runtime_checkpoint(record.checkpoint_key.clone())
+                .unwrap()
+                .0;
+        let publication = standing_runtime_output_manifest_record_for_checkpoint(
+            &record.checkpoint,
+            "scores_compact_no_side_effect",
+            &checkpoint_key,
+        )
+        .unwrap()
+        .unwrap();
+
+        let response = compact_view_output_once(&state, "scores_compact_no_side_effect", "sync")
+            .await
+            .unwrap();
+
+        assert_eq!(response.outcome, "compacted");
+        assert_eq!(response.compacted_manifests, 1);
+        assert!(state
+            .store
+            .get(&Path::from(publication.manifest_key.as_str()))
+            .await
+            .is_ok());
+        assert!(state
+            .store
+            .get(&Path::from(publication.page_records[0].0.as_str()))
+            .await
+            .is_ok());
+        let latest = read_latest_standing_runtime_checkpoint(
+            &state,
+            identity,
+            "scores_compact_no_side_effect",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            latest.checkpoint.output_manifest_refs,
+            record.checkpoint.output_manifest_refs
+        );
     }
 
     #[tokio::test]
@@ -12463,7 +14756,7 @@ mod tests {
             "purchases_by_user",
             &checkpoint,
             &[],
-            Vec::new(),
+            StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), None),
             None,
         )
         .await
@@ -12518,7 +14811,7 @@ mod tests {
             "purchases_by_user",
             &checkpoint,
             &[],
-            Vec::new(),
+            StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), None),
             None,
         )
         .await
@@ -12536,6 +14829,60 @@ mod tests {
         assert_eq!(record.checkpoint.state_payload, expected_payload);
     }
 
+    #[tokio::test]
+    async fn standing_runtime_checkpoint_read_migrates_legacy_identity_keys() {
+        let state = test_api_state().await;
+        let checkpoint = test_runtime_checkpoint(Vec::new());
+        persist_standing_runtime_checkpoint(
+            &state,
+            "purchases_by_user",
+            &checkpoint,
+            &[],
+            StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), None),
+            None,
+        )
+        .await
+        .unwrap();
+        let checkpoint_key = test_checkpoint_key(&checkpoint);
+        let checkpoint_bytes = state
+            .store
+            .get(&Path::from(checkpoint_key.as_str()))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let mut record: Value = serde_json::from_slice(&checkpoint_bytes).unwrap();
+        let identity = record
+            .pointer_mut("/checkpoint/identity")
+            .and_then(Value::as_object_mut)
+            .unwrap();
+        let planner = identity.remove("planner_identity").unwrap();
+        identity.insert(legacy_key("compiler", "_identity"), planner);
+        let runtimes = identity.remove("builtin_runtime_identities").unwrap();
+        identity.insert(legacy_key("runtime", "_packages"), runtimes);
+        let capabilities = identity.remove("runtime_capabilities").unwrap();
+        identity.insert(legacy_key("package", "_feature_set"), capabilities);
+        object_store::ObjectStore::put(
+            &*state.store,
+            &Path::from(checkpoint_key.as_str()),
+            serde_json::to_vec(&record).unwrap().into(),
+        )
+        .await
+        .unwrap();
+
+        let restored = read_latest_standing_runtime_checkpoint(
+            &state,
+            &checkpoint.identity,
+            "purchases_by_user",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(restored.checkpoint.identity, checkpoint.identity);
+    }
+
     #[test]
     fn standing_runtime_replay_plan_uses_input_frontier_when_replay_checkpoints_are_absent() {
         let checkpoint = test_runtime_checkpoint(Vec::new());
@@ -12547,6 +14894,7 @@ mod tests {
             previous_checkpoint: None,
             checkpoint,
             replay_checkpoints: Vec::new(),
+            manifest_hash: String::new(),
         };
 
         let replay_plan = standing_runtime_replay_plan_from_record_ref(&record);
@@ -12555,17 +14903,57 @@ mod tests {
             &replay_plan,
             "purchases",
             "2026-05-24.v1",
-            "any-stream",
-            99,
+            "test-stream",
+            0,
             11,
         ));
         assert!(!replay_plan_covers_replayed_batch(
             &replay_plan,
             "purchases",
             "2026-05-24.v1",
-            "any-stream",
-            99,
+            "other-stream",
+            0,
+            11,
+        ));
+        assert!(!replay_plan_covers_replayed_batch(
+            &replay_plan,
+            "purchases",
+            "2026-05-24.v1",
+            "test-stream",
+            0,
             12,
+        ));
+    }
+
+    #[test]
+    fn standing_runtime_checkpoint_validation_allows_historical_replay_without_active_frontier() {
+        let checkpoint = test_runtime_checkpoint(Vec::new());
+        let record = StandingRuntimeCheckpointRecord {
+            schema_version: 1,
+            record_kind: "standing_runtime_checkpoint_v1".to_string(),
+            view_id: "purchases_by_user".to_string(),
+            checkpoint_key: test_checkpoint_key(&checkpoint).as_str().to_string(),
+            previous_checkpoint: None,
+            checkpoint,
+            replay_checkpoints: vec![ReplayCheckpoint::for_relation(
+                "purchases".to_string(),
+                "2026-05-24.v1".to_string(),
+                "historical-stream".to_string(),
+                0,
+                1,
+            )],
+            manifest_hash: String::new(),
+        };
+
+        validate_standing_runtime_checkpoint_replay_frontiers(&record).unwrap();
+        let replay_plan = standing_runtime_replay_plan_from_record_ref(&record);
+        assert!(replay_plan_covers_replayed_batch(
+            &replay_plan,
+            "purchases",
+            "2026-05-24.v1",
+            "historical-stream",
+            0,
+            1,
         ));
     }
 
@@ -12579,7 +14967,7 @@ mod tests {
             "purchases_by_user",
             &checkpoint,
             &[],
-            Vec::new(),
+            StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), None),
             None,
         )
         .await
@@ -12638,6 +15026,376 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relation_catalog_read_falls_back_to_object_store_when_meta_is_empty_after_recovery() {
+        let state = test_api_state().await;
+        let catalog = test_scores_catalog();
+        materialize_relation_catalog_to_object_store(&state, &catalog)
+            .await
+            .unwrap();
+        let state = state.with_meta_store(Arc::new(InMemoryMetaStore::default()));
+
+        let restored = read_relation_catalog(&state, "scores", "2026-05-24.v1")
+            .await
+            .unwrap();
+
+        assert_eq!(restored, catalog);
+    }
+
+    #[tokio::test]
+    async fn standing_runtime_checkpoint_read_ignores_object_store_when_meta_pointer_is_empty_after_recovery(
+    ) {
+        let state = test_api_state().await;
+        let checkpoint = test_runtime_checkpoint(Vec::new());
+        persist_standing_runtime_checkpoint(
+            &state,
+            "purchases_by_user",
+            &checkpoint,
+            &[],
+            StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), None),
+            None,
+        )
+        .await
+        .unwrap();
+        let state = state.with_meta_store(Arc::new(InMemoryMetaStore::default()));
+
+        let restored = read_latest_standing_runtime_checkpoint(
+            &state,
+            &checkpoint.identity,
+            "purchases_by_user",
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            restored.is_none(),
+            "meta-backed recovery must not treat object listing or latest cache as checkpoint authority"
+        );
+    }
+
+    #[tokio::test]
+    async fn standing_runtime_checkpoint_read_uses_meta_pointer_when_latest_cache_is_stale() {
+        let meta_store = Arc::new(InMemoryMetaStore::default());
+        let state = test_api_state().await.with_meta_store(meta_store);
+        let checkpoint = test_runtime_checkpoint(Vec::new());
+        let owner = state
+            .acquire_standing_runtime_owner(&checkpoint.identity, "purchases_by_user")
+            .await
+            .unwrap()
+            .expect("test meta store should grant owner token");
+
+        persist_standing_runtime_checkpoint(
+            &state,
+            "purchases_by_user",
+            &checkpoint,
+            &[],
+            StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), Some(owner.clone())),
+            None,
+        )
+        .await
+        .unwrap();
+        let latest_key = ObjectKey::standing_runtime_latest_checkpoint(
+            &checkpoint.identity.tenant_id,
+            &checkpoint.identity.program_id,
+            "purchases_by_user",
+        )
+        .unwrap();
+        let stale_latest_bytes = state
+            .store
+            .get(&Path::from(latest_key.as_str()))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+
+        let mut next = test_runtime_checkpoint(Vec::new());
+        next.logical_epoch = checkpoint.logical_epoch + 1;
+        next.input_frontiers[0].committed_offset_exclusive += 1;
+        next.output_frontiers[0].committed_epoch = next.logical_epoch;
+        let next_payload = serde_json::json!({
+            "schema_version": 1,
+            "published_output": {
+                "records": []
+            },
+            "meta_pointer_winner": true
+        })
+        .to_string();
+        next.state_root.content_hash = stable_bytes_hash(next_payload.as_bytes());
+        next.state_payload = Some(RuntimeCheckpointStatePayload {
+            codec_identity: "velorix-standing-program-checkpoint-v1".to_string(),
+            payload: next_payload,
+        });
+
+        persist_standing_runtime_checkpoint(
+            &state,
+            "purchases_by_user",
+            &next,
+            &[],
+            StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), Some(owner)),
+            None,
+        )
+        .await
+        .unwrap();
+        state
+            .store
+            .put(
+                &Path::from(latest_key.as_str()),
+                stale_latest_bytes.clone().into(),
+            )
+            .await
+            .unwrap();
+
+        let restored =
+            read_latest_standing_runtime_checkpoint(&state, &next.identity, "purchases_by_user")
+                .await
+                .unwrap()
+                .expect("meta pointer should select the published checkpoint");
+
+        assert_eq!(restored.checkpoint.logical_epoch, next.logical_epoch);
+        assert_eq!(
+            restored.checkpoint.state_root.content_hash,
+            next.state_root.content_hash
+        );
+    }
+
+    #[tokio::test]
+    async fn standing_runtime_checkpoint_read_keeps_old_meta_pointer_when_new_checkpoint_is_orphaned(
+    ) {
+        let meta_store = Arc::new(InMemoryMetaStore::default());
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state = test_api_state_with_store(store.clone(), "api-test-orphan-meta", false)
+            .await
+            .with_meta_store(meta_store);
+        let checkpoint = test_runtime_checkpoint(Vec::new());
+        let owner = state
+            .acquire_standing_runtime_owner(&checkpoint.identity, "purchases_by_user")
+            .await
+            .unwrap()
+            .expect("test meta store should grant owner token");
+
+        persist_standing_runtime_checkpoint(
+            &state,
+            "purchases_by_user",
+            &checkpoint,
+            &[],
+            StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), Some(owner)),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mut orphaned = test_runtime_checkpoint(Vec::new());
+        orphaned.logical_epoch = checkpoint.logical_epoch + 1;
+        orphaned.input_frontiers[0].committed_offset_exclusive += 1;
+        orphaned.output_frontiers[0].committed_epoch = orphaned.logical_epoch;
+        let orphaned_payload = serde_json::json!({
+            "schema_version": 1,
+            "published_output": {
+                "records": []
+            },
+            "orphaned_checkpoint": true
+        })
+        .to_string();
+        orphaned.state_root.content_hash = stable_bytes_hash(orphaned_payload.as_bytes());
+        orphaned.state_payload = Some(RuntimeCheckpointStatePayload {
+            codec_identity: "velorix-standing-program-checkpoint-v1".to_string(),
+            payload: orphaned_payload,
+        });
+
+        let orphan_writer =
+            test_api_state_with_store(store, "api-test-orphan-object-writer", false).await;
+        persist_standing_runtime_checkpoint(
+            &orphan_writer,
+            "purchases_by_user",
+            &orphaned,
+            &[],
+            StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), None),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let restored = read_latest_standing_runtime_checkpoint(
+            &state,
+            &checkpoint.identity,
+            "purchases_by_user",
+        )
+        .await
+        .unwrap()
+        .expect("metadata pointer should remain authoritative");
+
+        assert_eq!(restored.checkpoint.logical_epoch, checkpoint.logical_epoch);
+        assert_eq!(
+            restored.checkpoint.state_root.content_hash,
+            checkpoint.state_root.content_hash
+        );
+    }
+
+    #[tokio::test]
+    async fn standing_runtime_checkpoint_read_fails_closed_when_manifest_hash_mismatches_pointer() {
+        let state = test_api_state().await;
+        let checkpoint = test_runtime_checkpoint(Vec::new());
+        persist_standing_runtime_checkpoint(
+            &state,
+            "purchases_by_user",
+            &checkpoint,
+            &[],
+            StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), None),
+            None,
+        )
+        .await
+        .unwrap();
+        let record = read_latest_standing_runtime_checkpoint(
+            &state,
+            &checkpoint.identity,
+            "purchases_by_user",
+        )
+        .await
+        .unwrap()
+        .expect("checkpoint should be readable without meta authority");
+        let mut pointer = standing_runtime_checkpoint_pointer_from_record(&record);
+        pointer.manifest_hash =
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_string();
+
+        let error = read_standing_runtime_checkpoint_record_from_pointer(
+            &state,
+            &checkpoint.identity,
+            "purchases_by_user",
+            &pointer,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("manifest hash mismatch"));
+    }
+
+    #[tokio::test]
+    async fn standing_runtime_checkpoint_read_fails_closed_when_pointer_body_mismatches_checkpoint_object(
+    ) {
+        let state = test_api_state().await;
+        let checkpoint = test_runtime_checkpoint(Vec::new());
+        persist_standing_runtime_checkpoint(
+            &state,
+            "purchases_by_user",
+            &checkpoint,
+            &[],
+            StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), None),
+            None,
+        )
+        .await
+        .unwrap();
+        let record = read_latest_standing_runtime_checkpoint(
+            &state,
+            &checkpoint.identity,
+            "purchases_by_user",
+        )
+        .await
+        .unwrap()
+        .expect("checkpoint should be readable without meta authority");
+        let mut pointer = standing_runtime_checkpoint_pointer_from_record(&record);
+        pointer.logical_epoch += 1;
+
+        let error = read_standing_runtime_checkpoint_record_from_pointer(
+            &state,
+            &checkpoint.identity,
+            "purchases_by_user",
+            &pointer,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("pointer/body mismatch"));
+    }
+
+    #[tokio::test]
+    async fn standing_runtime_checkpoint_publish_rehydrates_empty_meta_pointer_after_recovery() {
+        let state = test_api_state().await;
+        let previous = test_runtime_checkpoint(Vec::new());
+        persist_standing_runtime_checkpoint(
+            &state,
+            "purchases_by_user",
+            &previous,
+            &[],
+            StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), None),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let meta_store = Arc::new(InMemoryMetaStore::default());
+        let state = state.with_meta_store(meta_store.clone());
+        let owner = match meta_store
+            .acquire_standing_runtime_owner(AcquireStandingRuntimeOwnerRequest {
+                tenant_id: previous.identity.tenant_id.clone(),
+                program_id: previous.identity.program_id.clone(),
+                view_id: "purchases_by_user".to_string(),
+                owner_id: "api-test-recovery-owner".to_string(),
+                ttl_ms: 30_000,
+            })
+            .await
+            .unwrap()
+        {
+            AcquireStandingRuntimeOwnerOutcome::Acquired(claim)
+            | AcquireStandingRuntimeOwnerOutcome::Renewed(claim) => {
+                standing_runtime_owner_token_from_claim(&claim)
+            }
+            AcquireStandingRuntimeOwnerOutcome::Conflict(claim) => {
+                panic!("unexpected owner conflict: {claim:?}")
+            }
+        };
+
+        let mut next = test_runtime_checkpoint(Vec::new());
+        next.logical_epoch = previous.logical_epoch + 1;
+        next.input_frontiers[0].committed_offset_exclusive += 1;
+        next.output_frontiers[0].committed_epoch = next.logical_epoch;
+        let next_payload = serde_json::json!({
+            "schema_version": 1,
+            "published_output": {
+                "records": []
+            },
+            "recovered_after_empty_meta": true
+        })
+        .to_string();
+        next.state_root.content_hash = stable_bytes_hash(next_payload.as_bytes());
+        next.state_payload = Some(RuntimeCheckpointStatePayload {
+            codec_identity: "velorix-standing-program-checkpoint-v1".to_string(),
+            payload: next_payload,
+        });
+
+        persist_standing_runtime_checkpoint(
+            &state,
+            "purchases_by_user",
+            &next,
+            &[],
+            StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), Some(owner)),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let published = meta_store
+            .read_standing_runtime_checkpoint(
+                &next.identity.tenant_id,
+                &next.identity.program_id,
+                "purchases_by_user",
+            )
+            .await
+            .unwrap()
+            .expect("meta pointer should be rehydrated and advanced");
+        assert_eq!(published.logical_epoch, next.logical_epoch);
+        assert_eq!(published.content_hash, next.state_root.content_hash);
+
+        let restored =
+            read_latest_standing_runtime_checkpoint(&state, &next.identity, "purchases_by_user")
+                .await
+                .unwrap()
+                .expect("published checkpoint should be readable");
+        assert_eq!(restored.checkpoint.logical_epoch, next.logical_epoch);
+    }
+
+    #[tokio::test]
     async fn standing_runtime_checkpoint_read_fails_closed_when_meta_pointer_checkpoint_object_is_missing(
     ) {
         let meta_store = Arc::new(InMemoryMetaStore::default());
@@ -12669,8 +15427,8 @@ mod tests {
             "purchases_by_user",
             &checkpoint,
             &[],
-            Vec::new(),
-            Some(owner),
+            StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), Some(owner)),
+            None,
         )
         .await
         .unwrap();
@@ -12701,7 +15459,7 @@ mod tests {
             "purchases_by_user",
             &checkpoint,
             &[],
-            Vec::new(),
+            StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), None),
             None,
         )
         .await
@@ -12805,7 +15563,7 @@ mod tests {
         )
         .unwrap();
         let avg_plan = validate_catalog_backed_sum_count_view_sql(
-            "select user_id, sum(amount) as total, count(*) as events, avg(amount) as average from purchases group by user_id",
+            "select user_id as user, sum(amount) as total, count(*) as events, avg(amount) as average from purchases group by user_id",
             &catalog,
         )
         .unwrap();
@@ -12830,7 +15588,7 @@ mod tests {
                 .iter()
                 .map(|column| column.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["user_id", "total", "events", "average"]
+            vec!["user", "total", "events", "average"]
         );
     }
 
@@ -12877,7 +15635,7 @@ mod tests {
     fn latest_by_key_output_schema_uses_arg_max_value_type() {
         let catalog = test_device_status_catalog();
         let plan = validate_supported_latest_by_key_sql(
-            "select device_id, arg_max(enabled, event_time) as enabled from device_status group by device_id",
+            "select device_id as device, arg_max(enabled, event_time) as enabled from device_status group by device_id",
             &catalog,
         )
         .unwrap();
@@ -12892,11 +15650,42 @@ mod tests {
                 .map(|column| (column.name.as_str(), &column.data_type))
                 .collect::<Vec<_>>(),
             vec![
-                ("device_id", &SqlDataType::Utf8),
+                ("device", &SqlDataType::Utf8),
                 ("enabled", &SqlDataType::Bool)
             ]
         );
-        assert_eq!(schema.primary_key, vec!["device_id"]);
+        assert_eq!(schema.primary_key, vec!["device"]);
+    }
+
+    #[test]
+    fn materialized_runtime_output_schema_supports_analytic_row_number() {
+        let factory = MaterializedViewRuntimeFactory;
+        let catalog = test_scores_catalog();
+
+        let schemas = factory
+            .output_schemas_for_view_request(
+                "ranked_scores",
+                "select user_id, row_number() over (partition by user_id order by score desc, user_id asc) as score_rank from scores",
+                &catalog,
+                catalog.schema_fingerprint.as_str(),
+            )
+            .unwrap()
+            .expect("ROW_NUMBER analytic view should be admitted");
+
+        let schema = &schemas[0];
+        assert_eq!(schema.relation_id, "ranked_scores");
+        assert_eq!(
+            schema
+                .columns
+                .iter()
+                .map(|column| (column.name.as_str(), &column.data_type))
+                .collect::<Vec<_>>(),
+            vec![
+                ("user_id", &SqlDataType::Utf8),
+                ("score_rank", &SqlDataType::Int64)
+            ]
+        );
+        assert_eq!(schema.primary_key, vec!["user_id"]);
     }
 
     #[test]
@@ -12907,7 +15696,7 @@ mod tests {
         let schemas = factory
             .output_schemas_for_view_request(
                 "purchases_by_user_minute",
-                "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count, min(amount) as minimum_amount, max(amount) as maximum_amount, avg(amount) as average_amount from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end",
+                "select user_id as user, window_start as start_time, window_end as end_time, sum(amount) as total_amount, count(*) as event_count, min(amount) as minimum_amount, max(amount) as maximum_amount, avg(amount) as average_amount from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end",
                 &catalog,
                 catalog.schema_fingerprint.as_str(),
             )
@@ -12923,9 +15712,9 @@ mod tests {
                 .map(|column| (column.name.as_str(), &column.data_type))
                 .collect::<Vec<_>>(),
             vec![
-                ("user_id", &SqlDataType::Utf8),
-                ("window_start", &SqlDataType::Int64),
-                ("window_end", &SqlDataType::Int64),
+                ("user", &SqlDataType::Utf8),
+                ("start_time", &SqlDataType::Int64),
+                ("end_time", &SqlDataType::Int64),
                 ("total_amount", &SqlDataType::Int64),
                 ("event_count", &SqlDataType::Int64),
                 ("minimum_amount", &SqlDataType::Int64),
@@ -12933,9 +15722,276 @@ mod tests {
                 ("average_amount", &SqlDataType::Float64),
             ]
         );
+        assert_eq!(schema.primary_key, vec!["user", "start_time", "end_time"]);
+    }
+
+    #[test]
+    fn materialized_runtime_output_schema_supports_join_min_max_avg() {
+        let catalogs = vec![test_scores_catalog(), test_accounts_catalog()];
+        let plan = validate_supported_join_view_sql(
+            "select a.account_id, sum(s.score) as total_score, count(*) as event_count, min(s.score) as min_score, max(s.score) as max_score, avg(s.score) as avg_score from scores s join accounts a on s.user_id = a.account_id group by a.account_id",
+            &catalogs,
+        )
+        .unwrap();
+
+        let schema =
+            join_sum_count_output_schema("score_extremes_by_account", &catalogs, &plan).unwrap();
+
+        assert_eq!(schema.relation_id, "score_extremes_by_account");
         assert_eq!(
-            schema.primary_key,
-            vec!["user_id", "window_start", "window_end"]
+            schema
+                .columns
+                .iter()
+                .map(|column| (column.name.as_str(), &column.data_type))
+                .collect::<Vec<_>>(),
+            vec![
+                ("account_id", &SqlDataType::Utf8),
+                ("total_score", &SqlDataType::Int64),
+                ("event_count", &SqlDataType::Int64),
+                ("min_score", &SqlDataType::Int64),
+                ("max_score", &SqlDataType::Int64),
+                ("avg_score", &SqlDataType::Float64),
+            ]
+        );
+        assert_eq!(schema.primary_key, vec!["account_id"]);
+    }
+
+    #[test]
+    fn materialized_runtime_output_schema_supports_join_right_min_max_avg() {
+        let catalogs = vec![test_scores_catalog(), test_accounts_catalog()];
+        let plan = validate_supported_join_view_sql(
+            "select a.account_id, sum(s.score) as total_score, count(*) as event_count, count(a.limit) as limit_count, count(distinct a.limit) as distinct_limits, min(a.limit) as min_limit, max(a.limit) as max_limit, avg(a.limit) as avg_limit from scores s join accounts a on s.user_id = a.account_id group by a.account_id",
+            &catalogs,
+        )
+        .unwrap();
+
+        let schema =
+            join_sum_count_output_schema("score_limits_by_account", &catalogs, &plan).unwrap();
+
+        assert_eq!(
+            schema
+                .columns
+                .iter()
+                .map(|column| (column.name.as_str(), &column.data_type))
+                .collect::<Vec<_>>(),
+            vec![
+                ("account_id", &SqlDataType::Utf8),
+                ("total_score", &SqlDataType::Int64),
+                ("event_count", &SqlDataType::Int64),
+                ("limit_count", &SqlDataType::Int64),
+                ("distinct_limits", &SqlDataType::Int64),
+                ("min_limit", &SqlDataType::Int64),
+                ("max_limit", &SqlDataType::Int64),
+                ("avg_limit", &SqlDataType::Float64),
+            ]
+        );
+    }
+
+    #[test]
+    fn materialized_runtime_output_schema_admits_supported_rest_join_smoke_shape() {
+        let mut readings = test_scores_catalog();
+        readings.relation_schema.relation_id = "rest_join_readings_test".to_string();
+        readings.relation_schema.relation_name = "rest_join_readings_test".to_string();
+        readings.relation_schema.columns[0].column_id = "device_id".to_string();
+        readings.relation_schema.columns[0].name = "device_id".to_string();
+        readings.relation_schema.columns[1].column_id = "temperature_c".to_string();
+        readings.relation_schema.columns[1].name = "temperature_c".to_string();
+        readings.relation_schema.primary_key_column_ids = vec!["device_id".to_string()];
+        let schema_fingerprint =
+            SchemaFingerprintV1::for_relation_schema(&readings.relation_schema)
+                .expect("readings schema should fingerprint");
+        readings.schema_fingerprint = schema_fingerprint.clone();
+        readings.incremental_relation.relation_id = "rest_join_readings_test".to_string();
+        readings.incremental_relation.schema_fingerprint = schema_fingerprint;
+        readings.datafusion_registration.name = "rest_join_readings_test".to_string();
+
+        let mut devices = test_accounts_catalog();
+        devices.relation_schema.relation_id = "rest_join_devices_test".to_string();
+        devices.relation_schema.relation_name = "rest_join_devices_test".to_string();
+        devices.relation_schema.columns[0].column_id = "device_id".to_string();
+        devices.relation_schema.columns[0].name = "device_id".to_string();
+        devices.relation_schema.columns[1].column_id = "calibration_offset".to_string();
+        devices.relation_schema.columns[1].name = "calibration_offset".to_string();
+        devices.relation_schema.columns[2].column_id = "site".to_string();
+        devices.relation_schema.columns[2].name = "site".to_string();
+        devices.relation_schema.primary_key_column_ids = vec!["device_id".to_string()];
+        let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&devices.relation_schema)
+            .expect("devices schema should fingerprint");
+        devices.schema_fingerprint = schema_fingerprint.clone();
+        devices.incremental_relation.relation_id = "rest_join_devices_test".to_string();
+        devices.incremental_relation.schema_fingerprint = schema_fingerprint;
+        devices.datafusion_registration.name = "rest_join_devices_test".to_string();
+
+        let catalogs = vec![readings, devices];
+        let schemas = MaterializedViewRuntimeFactory
+            .output_schemas_for_view_request_with_catalogs(
+                "rest_join_readings_by_device_test",
+                "select d.device_id, sum(r.temperature_c) as total_temperature_c, count(*) as reading_count, min(r.temperature_c) as min_temperature_c, max(r.temperature_c) as max_temperature_c from rest_join_readings_test r join rest_join_devices_test d on r.device_id = d.device_id group by d.device_id",
+                &catalogs,
+                catalogs[0].schema_fingerprint.as_str(),
+            )
+            .unwrap()
+            .expect("REST join smoke SQL should be admitted");
+        let schema = &schemas[0];
+
+        assert_eq!(
+            schema
+                .columns
+                .iter()
+                .map(|column| (column.name.as_str(), &column.data_type))
+                .collect::<Vec<_>>(),
+            vec![
+                ("device_id", &SqlDataType::Utf8),
+                ("total_temperature_c", &SqlDataType::Int64),
+                ("reading_count", &SqlDataType::Int64),
+                ("min_temperature_c", &SqlDataType::Int64),
+                ("max_temperature_c", &SqlDataType::Int64),
+            ]
+        );
+    }
+
+    #[test]
+    fn materialized_runtime_output_schema_supports_filter_project_union_distinct() {
+        let factory = MaterializedViewRuntimeFactory;
+        let catalog = test_scores_catalog();
+
+        let schemas = factory
+            .output_schemas_for_view_request(
+                "positive_scores",
+                "select user_id, score from scores where score > 0 union distinct select user_id, score from scores where score >= 10",
+                &catalog,
+                catalog.schema_fingerprint.as_str(),
+            )
+            .unwrap()
+            .unwrap();
+
+        let schema = &schemas[0];
+        assert_eq!(schema.relation_id, "positive_scores");
+        assert_eq!(
+            schema
+                .columns
+                .iter()
+                .map(|column| (column.name.as_str(), &column.data_type))
+                .collect::<Vec<_>>(),
+            vec![
+                ("user_id", &SqlDataType::Utf8),
+                ("score", &SqlDataType::Int64)
+            ]
+        );
+        assert_eq!(schema.primary_key, vec!["user_id"]);
+    }
+
+    #[test]
+    fn materialized_runtime_output_schema_supports_join_left_group_key_projection() {
+        let catalogs = vec![test_scores_catalog(), test_accounts_catalog()];
+        let plan = validate_supported_join_view_sql(
+            "select s.user_id as user, sum(s.score) as total_score, count(*) as event_count from scores s join accounts a on s.user_id = a.account_id group by s.user_id",
+            &catalogs,
+        )
+        .unwrap();
+
+        let schema = join_sum_count_output_schema("scores_by_user", &catalogs, &plan).unwrap();
+
+        assert_eq!(
+            schema
+                .columns
+                .iter()
+                .map(|column| (column.name.as_str(), &column.data_type))
+                .collect::<Vec<_>>(),
+            vec![
+                ("user", &SqlDataType::Utf8),
+                ("total_score", &SqlDataType::Int64),
+                ("event_count", &SqlDataType::Int64),
+            ]
+        );
+        assert_eq!(schema.primary_key, vec!["user"]);
+    }
+
+    #[tokio::test]
+    async fn rest_latest_by_key_cte_view_materializes_outputs() {
+        let state =
+            test_api_state_with_store(Arc::new(InMemory::new()), "api-test-latest-cte", false)
+                .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_device_status_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "latest_device_status_cte".to_string(),
+            url_path: None,
+            output_relation_id: None,
+            input_relation_id: "device_status".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "with status_source as (select * from device_status where event_time > 95) select device_id as device, arg_max(enabled, event_time) as enabled from status_source where enabled = true group by device_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("latest device status through CTE source".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+        assert_eq!(view_response.1["query_enabled"], true);
+
+        let ingest_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "device_status",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "device-status-cte-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 0,
+                    "event_time_watermark": {
+                        "event_time_column_id": "event_time",
+                        "max_observed_event_time_ns": 110,
+                        "watermark_ns": 100
+                    },
+                    "rows": [
+                        {"device_id": "device-a", "enabled": true, "event_time": 100, "delta": 1},
+                        {"device_id": "device-a", "enabled": false, "event_time": 110, "delta": 1},
+                        {"device_id": "device-b", "enabled": true, "event_time": 90, "delta": 1}
+                    ]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(
+            ingest_response.0,
+            StatusCode::CREATED,
+            "{ingest_response:?}"
+        );
+        assert_eq!(ingest_response.1["materialization"]["status"], "completed");
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/latest_device_status_cte/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query_response.0, StatusCode::OK, "{query_response:?}");
+        assert_eq!(
+            query_response.1["rows"],
+            json!([{"device": "device-a", "enabled": true}])
         );
     }
 
@@ -12966,7 +16022,7 @@ mod tests {
             input_relation_version: "2026-05-24.v1".to_string(),
             input_relation_refs: Vec::new(),
             input_relations: Vec::new(),
-            sql: "select device_id, arg_max(enabled, event_time) as enabled from device_status group by device_id".to_string(),
+            sql: "select d.device_id as device, arg_max(d.enabled, d.event_time) as enabled from device_status as d where d.enabled = true group by d.device_id".to_string(),
             source_kind: SqlSourceKind::StandingView,
             output_relation_ids: Vec::new(),
             sql_template: None,
@@ -13026,9 +16082,30 @@ mod tests {
             "join query response: {}",
             query_response.1
         );
-        assert_latest_device_rows(&query_response.1, 3, true);
+        assert_latest_device_rows(&query_response.1, 3, true, true);
 
-        append_committed_ingest_without_runtime_apply(
+        let get_sql_response = call_json(
+            &router,
+            Method::GET,
+            "/v1/views/latest_device_status/query?sql=select%20device%2C%20enabled%20from%20latest_device_status%20where%20enabled%20%3D%20true%20order%20by%20device",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(
+            get_sql_response.0,
+            StatusCode::OK,
+            "GET SQL query response: {}",
+            get_sql_response.1
+        );
+        assert_eq!(
+            get_sql_response.1["rows"],
+            json!([
+                {"device": "device-a", "enabled": true},
+                {"device": "device-b", "enabled": true}
+            ])
+        );
+
+        append_admitted_ingest_without_runtime_apply(
             store.clone(),
             IngestRowsRequest {
                 relation_id: "device_status".to_string(),
@@ -13067,7 +16144,182 @@ mod tests {
         )
         .await;
         assert_eq!(restarted_query_response.0, StatusCode::OK);
-        assert_latest_device_rows(&restarted_query_response.1, 4, false);
+        assert_latest_device_rows(&restarted_query_response.1, 4, true, true);
+    }
+
+    #[tokio::test]
+    async fn rest_latest_by_key_order_by_limit_top_k_view_materializes_outputs() {
+        let state =
+            test_api_state_with_store(Arc::new(InMemory::new()), "api-test-latest-top-k", false)
+                .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_device_status_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "latest_device_status_top".to_string(),
+            url_path: None,
+            output_relation_id: None,
+            input_relation_id: "device_status".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select device_id as device, arg_max(enabled, event_time) as enabled from device_status group by device_id order by device desc limit 1".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("top latest device status".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let openapi_response =
+            call_json(&router, Method::GET, "/v1/openapi.json", Value::Null).await;
+        assert_eq!(openapi_response.0, StatusCode::OK, "{openapi_response:?}");
+        assert!(
+            openapi_response.1["paths"]["/v1/relations/{relation_id}/ingest"].is_object(),
+            "relation ingest path missing from OpenAPI: {}",
+            openapi_response.1
+        );
+        assert_eq!(openapi_response.1["paths"]["/v1/ingest"], Value::Null);
+        assert_eq!(openapi_response.1["paths"]["/v1/ingest/epoch"], Value::Null);
+
+        let ingest_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "device_status",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "device-status-top-k-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 0,
+                    "rows": [
+                        {"device_id": "device-a", "enabled": true, "event_time": 100, "delta": 1},
+                        {"device_id": "device-b", "enabled": false, "event_time": 110, "delta": 1}
+                    ]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(
+            ingest_response.0,
+            StatusCode::CREATED,
+            "{ingest_response:?}"
+        );
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/latest_device_status_top/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query_response.0, StatusCode::OK, "{query_response:?}");
+        assert_eq!(
+            query_response.1["rows"],
+            json!([{"device": "device-b", "enabled": false}])
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_latest_by_key_order_by_limit_offset_view_materializes_outputs() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-latest-limit-offset",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_device_status_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "latest_device_status_offset".to_string(),
+            url_path: None,
+            output_relation_id: None,
+            input_relation_id: "device_status".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select device_id as device, arg_max(enabled, event_time) as enabled from device_status group by device_id order by device desc limit 1 offset 1".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("second latest device status by device order".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let ingest_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "device_status",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "device-status-offset-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 0,
+                    "rows": [
+                        {"device_id": "device-a", "enabled": true, "event_time": 100, "delta": 1},
+                        {"device_id": "device-b", "enabled": false, "event_time": 110, "delta": 1},
+                        {"device_id": "device-c", "enabled": true, "event_time": 120, "delta": 1}
+                    ]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(
+            ingest_response.0,
+            StatusCode::CREATED,
+            "{ingest_response:?}"
+        );
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/latest_device_status_offset/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query_response.0, StatusCode::OK, "{query_response:?}");
+        assert_eq!(
+            query_response.1["rows"],
+            json!([{"device": "device-b", "enabled": false}])
+        );
     }
 
     #[tokio::test]
@@ -13196,7 +16448,7 @@ mod tests {
         );
         assert_eq!(relation_response.1["relation_id"], "purchases");
 
-        let sql = "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end";
+        let sql = "select p.user_id as user, window_start as start_time, window_end as end_time, sum(p.amount) as total_amount, count(1) as event_count from tumble(purchases, event_time, interval '60 seconds') as p where p.amount > 0 group by p.user_id, window_start, window_end having sum(p.amount) > 6 and count(1) > 0";
         let view_request = CreateViewRequest {
             view_id: "purchases_by_user_minute".to_string(),
             url_path: Some("/purchases/by-user-minute".to_string()),
@@ -13244,6 +16496,7 @@ mod tests {
                 "rows": [
                     {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64, "delta": 1},
                     {"user_id": "bob", "amount": 5, "event_time": 30_000_000_000i64, "delta": 1},
+                    {"user_id": "bob", "amount": -50, "event_time": 35_000_000_000i64, "delta": 1},
                     {"user_id": "alice", "amount": 7, "event_time": 70_000_000_000i64, "delta": 1}
                 ]
             }),
@@ -13267,21 +16520,20 @@ mod tests {
         );
         assert_window_rows(
             &query_response.1,
-            3,
+            4,
             json!([
-                {"user_id": "alice", "window_start": 0, "window_end": 60_000_000_000i64, "total_amount": 10, "event_count": 1},
-                {"user_id": "bob", "window_start": 0, "window_end": 60_000_000_000i64, "total_amount": 5, "event_count": 1}
+                {"user": "alice", "start_time": 0, "end_time": 60_000_000_000i64, "total_amount": 10, "event_count": 1}
             ]),
         );
 
-        append_committed_ingest_without_runtime_apply(
+        append_admitted_ingest_without_runtime_apply(
             store.clone(),
             IngestRowsRequest {
                 relation_id: "purchases".to_string(),
                 relation_version: "2026-05-24.v1".to_string(),
                 stream_id: "purchases-stream".to_string(),
                 partition_id: 0,
-                start_offset_inclusive: 3,
+                start_offset_inclusive: 4,
                 event_time_watermark: Some(IngestEventTimeWatermarkRequest {
                     event_time_column_id: "event_time".to_string(),
                     max_observed_event_time_ns: 120_000_000_000,
@@ -13320,14 +16572,1859 @@ mod tests {
         );
         assert_window_rows(
             &restarted_query_response.1,
-            4,
+            5,
             json!([
-                {"user_id": "alice", "window_start": 0, "window_end": 60_000_000_000i64, "total_amount": 10, "event_count": 1},
-                {"user_id": "alice", "window_start": 60_000_000_000i64, "window_end": 120_000_000_000i64, "total_amount": 7, "event_count": 1},
-                {"user_id": "bob", "window_start": 0, "window_end": 60_000_000_000i64, "total_amount": 5, "event_count": 1},
-                {"user_id": "bob", "window_start": 60_000_000_000i64, "window_end": 120_000_000_000i64, "total_amount": 11, "event_count": 1}
+                {"user": "alice", "start_time": 0, "end_time": 60_000_000_000i64, "total_amount": 10, "event_count": 1},
+                {"user": "alice", "start_time": 60_000_000_000i64, "end_time": 120_000_000_000i64, "total_amount": 7, "event_count": 1},
+                {"user": "bob", "start_time": 60_000_000_000i64, "end_time": 120_000_000_000i64, "total_amount": 11, "event_count": 1}
             ]),
         );
+    }
+
+    #[tokio::test]
+    async fn rest_tumbling_window_cte_view_materializes_outputs() {
+        let state =
+            test_api_state_with_store(Arc::new(InMemory::new()), "api-test-window-cte", false)
+                .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_purchases_event_time_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "purchases_by_user_minute_cte".to_string(),
+            url_path: Some("/purchases/by-user-minute-cte".to_string()),
+            output_relation_id: None,
+            input_relation_id: "purchases".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "with purchase_source as (select * from purchases where amount > 5) select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from tumble(purchase_source, event_time, interval '60 seconds') where user_id <> 'bob' group by user_id, window_start, window_end".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("purchase window totals through CTE source".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+        assert_eq!(view_response.1["query_enabled"], true);
+
+        let ingest_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "purchases",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "purchases-window-cte-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 0,
+                    "event_time_watermark": {
+                        "event_time_column_id": "event_time",
+                        "max_observed_event_time_ns": 60_000_000_000i64,
+                        "watermark_ns": 60_000_000_000i64
+                    },
+                    "rows": [
+                        {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64, "delta": 1},
+                        {"user_id": "bob", "amount": 8, "event_time": 20_000_000_000i64, "delta": 1},
+                        {"user_id": "alice", "amount": 4, "event_time": 30_000_000_000i64, "delta": 1}
+                    ]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(
+            ingest_response.0,
+            StatusCode::CREATED,
+            "{ingest_response:?}"
+        );
+        assert_eq!(ingest_response.1["materialization"]["status"], "completed");
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/purchases_by_user_minute_cte/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query_response.0, StatusCode::OK, "{query_response:?}");
+        assert_window_rows(
+            &query_response.1,
+            3,
+            json!([
+                {"user_id": "alice", "window_start": 0, "window_end": 60_000_000_000i64, "total_amount": 10, "event_count": 1}
+            ]),
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_tumbling_window_order_by_limit_top_k_view_materializes_outputs() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-window-top-k-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_purchases_event_time_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "top_purchase_window".to_string(),
+            url_path: Some("/purchases/top-window".to_string()),
+            output_relation_id: None,
+            input_relation_id: "purchases".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id as user, window_start as start_time, window_end as end_time, sum(amount) as total_amount, count(*) as event_count from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end order by total_amount desc limit 1".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("top purchase window by materialized amount".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let ingest_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "purchases",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "top-window-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 0,
+                    "event_time_watermark": {
+                        "event_time_column_id": "event_time",
+                        "max_observed_event_time_ns": 70_000_000_000i64,
+                        "watermark_ns": 60_000_000_000i64
+                    },
+                    "rows": [
+                        {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64, "delta": 1},
+                        {"user_id": "bob", "amount": 12, "event_time": 30_000_000_000i64, "delta": 1},
+                        {"user_id": "alice", "amount": 50, "event_time": 70_000_000_000i64, "delta": 1}
+                    ]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(
+            ingest_response.0,
+            StatusCode::CREATED,
+            "{ingest_response:?}"
+        );
+
+        let query_response = call_json(
+            &router,
+            Method::GET,
+            "/v1/api/purchases/top-window",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(query_response.0, StatusCode::OK, "{query_response:?}");
+        assert_window_rows(
+            &query_response.1,
+            3,
+            json!([
+                {"user": "bob", "start_time": 0, "end_time": 60_000_000_000i64, "total_amount": 12, "event_count": 1}
+            ]),
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_tumbling_window_order_by_sum_function_top_k_view_materializes_outputs() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-window-function-top-k-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_purchases_event_time_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "top_purchase_window_by_sum_function".to_string(),
+            url_path: Some("/purchases/top-window-by-sum".to_string()),
+            output_relation_id: None,
+            input_relation_id: "purchases".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id as user, window_start as start_time, window_end as end_time, sum(amount) as total_amount, count(*) as event_count from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end order by sum(amount) desc limit 1".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("top purchase window by materialized amount".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let ingest_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "purchases",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "top-window-function-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 0,
+                    "event_time_watermark": {
+                        "event_time_column_id": "event_time",
+                        "max_observed_event_time_ns": 70_000_000_000i64,
+                        "watermark_ns": 60_000_000_000i64
+                    },
+                    "rows": [
+                        {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64, "delta": 1},
+                        {"user_id": "bob", "amount": 12, "event_time": 30_000_000_000i64, "delta": 1},
+                        {"user_id": "alice", "amount": 50, "event_time": 70_000_000_000i64, "delta": 1}
+                    ]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(
+            ingest_response.0,
+            StatusCode::CREATED,
+            "{ingest_response:?}"
+        );
+
+        let query_response = call_json(
+            &router,
+            Method::GET,
+            "/v1/api/purchases/top-window-by-sum",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(query_response.0, StatusCode::OK, "{query_response:?}");
+        assert_window_rows(
+            &query_response.1,
+            3,
+            json!([
+                {"user": "bob", "start_time": 0, "end_time": 60_000_000_000i64, "total_amount": 12, "event_count": 1}
+            ]),
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_tumbling_window_count_distinct_view_materializes_outputs() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state = test_api_state_with_store(
+            store.clone(),
+            "api-test-window-count-distinct-owner-a",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_purchases_event_time_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "purchases_distinct_amounts_by_user_minute".to_string(),
+            url_path: Some("/purchases/distinct-amounts-by-user-minute".to_string()),
+            output_relation_id: None,
+            input_relation_id: "purchases".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, window_start, window_end, sum(amount) as total_amount, count(distinct amount) as event_count from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("distinct purchase amounts by user and event-time minute".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let ingest_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "purchases",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "purchases-distinct-window-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 0,
+                    "event_time_watermark": {
+                        "event_time_column_id": "event_time",
+                        "max_observed_event_time_ns": 70_000_000_000i64,
+                        "watermark_ns": 60_000_000_000i64
+                    },
+                    "rows": [
+                        {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64, "delta": 1},
+                        {"user_id": "alice", "amount": 10, "event_time": 20_000_000_000i64, "delta": 1},
+                        {"user_id": "alice", "amount": 7, "event_time": 30_000_000_000i64, "delta": 1},
+                        {"user_id": "bob", "amount": 5, "event_time": 30_000_000_000i64, "delta": 1}
+                    ]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(
+            ingest_response.0,
+            StatusCode::CREATED,
+            "{ingest_response:?}"
+        );
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/purchases_distinct_amounts_by_user_minute/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query_response.0, StatusCode::OK, "{query_response:?}");
+        assert_window_rows(
+            &query_response.1,
+            4,
+            json!([
+                {"user_id": "alice", "window_start": 0, "window_end": 60_000_000_000i64, "total_amount": 27, "event_count": 2},
+                {"user_id": "bob", "window_start": 0, "window_end": 60_000_000_000i64, "total_amount": 5, "event_count": 1}
+            ]),
+        );
+
+        let restarted_state =
+            test_api_state_with_store(store, "api-test-window-count-distinct-owner-b", true).await;
+        assert_eq!(
+            restarted_state
+                .restore_standing_program_runtimes_from_active_views()
+                .await
+                .unwrap(),
+            1
+        );
+        let restarted_app = app(restarted_state);
+        let restarted_query = call_json(
+            &restarted_app,
+            Method::POST,
+            "/v1/views/purchases_distinct_amounts_by_user_minute/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(restarted_query.0, StatusCode::OK, "{restarted_query:?}");
+        assert_eq!(restarted_query.1["rows"], query_response.1["rows"]);
+    }
+
+    #[tokio::test]
+    async fn rest_tumbling_window_filtered_count_distinct_view_materializes_outputs() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state = test_api_state_with_store(
+            store.clone(),
+            "api-test-window-filtered-count-distinct-owner-a",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_purchases_event_time_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "purchases_filtered_distinct_amounts_by_user_minute".to_string(),
+            url_path: Some("/purchases/filtered-distinct-amounts-by-user-minute".to_string()),
+            output_relation_id: None,
+            input_relation_id: "purchases".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, window_start, window_end, sum(amount) filter (where amount > 5) as total_amount, count(distinct amount) filter (where amount > 0) as event_count from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("filtered distinct purchase amounts by user and event-time minute".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let ingest_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "purchases",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "purchases-filtered-distinct-window-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 0,
+                    "event_time_watermark": {
+                        "event_time_column_id": "event_time",
+                        "max_observed_event_time_ns": 70_000_000_000i64,
+                        "watermark_ns": 60_000_000_000i64
+                    },
+                    "rows": [
+                        {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64, "delta": 1},
+                        {"user_id": "alice", "amount": 10, "event_time": 20_000_000_000i64, "delta": 1},
+                        {"user_id": "alice", "amount": 7, "event_time": 30_000_000_000i64, "delta": 1},
+                        {"user_id": "bob", "amount": 5, "event_time": 30_000_000_000i64, "delta": 1}
+                    ]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(
+            ingest_response.0,
+            StatusCode::CREATED,
+            "{ingest_response:?}"
+        );
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/purchases_filtered_distinct_amounts_by_user_minute/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query_response.0, StatusCode::OK, "{query_response:?}");
+        assert_window_rows(
+            &query_response.1,
+            4,
+            json!([
+                {"user_id": "alice", "window_start": 0, "window_end": 60_000_000_000i64, "total_amount": 27, "event_count": 2},
+                {"user_id": "bob", "window_start": 0, "window_end": 60_000_000_000i64, "total_amount": 0, "event_count": 1}
+            ]),
+        );
+
+        let restarted_state = test_api_state_with_store(
+            store,
+            "api-test-window-filtered-count-distinct-owner-b",
+            true,
+        )
+        .await;
+        assert_eq!(
+            restarted_state
+                .restore_standing_program_runtimes_from_active_views()
+                .await
+                .unwrap(),
+            1
+        );
+        let restarted_app = app(restarted_state);
+        let restarted_query = call_json(
+            &restarted_app,
+            Method::POST,
+            "/v1/views/purchases_filtered_distinct_amounts_by_user_minute/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(restarted_query.0, StatusCode::OK, "{restarted_query:?}");
+        assert_eq!(restarted_query.1["rows"], query_response.1["rows"]);
+    }
+
+    #[tokio::test]
+    async fn rest_tumbling_window_nullable_column_count_view_materializes_outputs() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state = test_api_state_with_store(
+            store.clone(),
+            "api-test-window-nullable-count-owner-a",
+            false,
+        )
+        .await;
+        let router = app(state);
+        let mut catalog = test_purchases_event_time_catalog();
+        let amount = catalog
+            .relation_schema
+            .columns
+            .iter_mut()
+            .find(|column| column.column_id == "amount")
+            .unwrap();
+        amount.nullable = true;
+        let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema)
+            .expect("nullable event-time purchases catalog should fingerprint");
+        catalog.schema_fingerprint = schema_fingerprint.clone();
+        catalog.incremental_relation.schema_fingerprint = schema_fingerprint;
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": catalog,
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "purchases_nullable_amounts_by_user_minute".to_string(),
+            url_path: Some("/purchases/nullable-amounts-by-user-minute".to_string()),
+            output_relation_id: None,
+            input_relation_id: "purchases".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, window_start, window_end, sum(amount) as total_amount, count(amount) as event_count from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("nullable purchase amount counts by event-time minute".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let ingest_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "purchases",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "purchases-nullable-window-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 0,
+                    "event_time_watermark": {
+                        "event_time_column_id": "event_time",
+                        "max_observed_event_time_ns": 70_000_000_000i64,
+                        "watermark_ns": 60_000_000_000i64
+                    },
+                    "rows": [
+                        {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64, "delta": 1},
+                        {"user_id": "alice", "amount": null, "event_time": 20_000_000_000i64, "delta": 1},
+                        {"user_id": "alice", "amount": 7, "event_time": 30_000_000_000i64, "delta": 1},
+                        {"user_id": "bob", "amount": null, "event_time": 30_000_000_000i64, "delta": 1}
+                    ]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(
+            ingest_response.0,
+            StatusCode::CREATED,
+            "{ingest_response:?}"
+        );
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/purchases_nullable_amounts_by_user_minute/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query_response.0, StatusCode::OK, "{query_response:?}");
+        assert_window_rows(
+            &query_response.1,
+            4,
+            json!([
+                {"user_id": "alice", "window_start": 0, "window_end": 60_000_000_000i64, "total_amount": 17, "event_count": 2}
+            ]),
+        );
+
+        let restarted_state =
+            test_api_state_with_store(store, "api-test-window-nullable-count-owner-b", true).await;
+        assert_eq!(
+            restarted_state
+                .restore_standing_program_runtimes_from_active_views()
+                .await
+                .unwrap(),
+            1
+        );
+        let restarted_app = app(restarted_state);
+        let restarted_query = call_json(
+            &restarted_app,
+            Method::POST,
+            "/v1/views/purchases_nullable_amounts_by_user_minute/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(restarted_query.0, StatusCode::OK, "{restarted_query:?}");
+        assert_eq!(restarted_query.1["rows"], query_response.1["rows"]);
+    }
+
+    #[tokio::test]
+    async fn rest_tumbling_window_filtered_nullable_column_count_view_materializes_outputs() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state = test_api_state_with_store(
+            store.clone(),
+            "api-test-window-filtered-nullable-count-owner-a",
+            false,
+        )
+        .await;
+        let router = app(state);
+        let mut catalog = test_purchases_event_time_catalog();
+        let amount = catalog
+            .relation_schema
+            .columns
+            .iter_mut()
+            .find(|column| column.column_id == "amount")
+            .unwrap();
+        amount.nullable = true;
+        let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema)
+            .expect("nullable event-time purchases catalog should fingerprint");
+        catalog.schema_fingerprint = schema_fingerprint.clone();
+        catalog.incremental_relation.schema_fingerprint = schema_fingerprint;
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": catalog,
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "purchases_filtered_nullable_amounts_by_user_minute".to_string(),
+            url_path: Some("/purchases/filtered-nullable-amounts-by-user-minute".to_string()),
+            output_relation_id: None,
+            input_relation_id: "purchases".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, window_start, window_end, sum(amount) filter (where amount > 5) as total_amount, count(amount) filter (where event_time >= 0) as event_count from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("filtered nullable purchase amount counts by event-time minute".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let ingest_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "purchases",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "purchases-filtered-nullable-window-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 0,
+                    "event_time_watermark": {
+                        "event_time_column_id": "event_time",
+                        "max_observed_event_time_ns": 70_000_000_000i64,
+                        "watermark_ns": 60_000_000_000i64
+                    },
+                    "rows": [
+                        {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64, "delta": 1},
+                        {"user_id": "alice", "amount": null, "event_time": 20_000_000_000i64, "delta": 1},
+                        {"user_id": "alice", "amount": 7, "event_time": 30_000_000_000i64, "delta": 1},
+                        {"user_id": "bob", "amount": null, "event_time": 30_000_000_000i64, "delta": 1}
+                    ]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(
+            ingest_response.0,
+            StatusCode::CREATED,
+            "{ingest_response:?}"
+        );
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/purchases_filtered_nullable_amounts_by_user_minute/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query_response.0, StatusCode::OK, "{query_response:?}");
+        assert_window_rows(
+            &query_response.1,
+            4,
+            json!([
+                {"user_id": "alice", "window_start": 0, "window_end": 60_000_000_000i64, "total_amount": 17, "event_count": 2}
+            ]),
+        );
+
+        let restarted_state = test_api_state_with_store(
+            store,
+            "api-test-window-filtered-nullable-count-owner-b",
+            true,
+        )
+        .await;
+        assert_eq!(
+            restarted_state
+                .restore_standing_program_runtimes_from_active_views()
+                .await
+                .unwrap(),
+            1
+        );
+        let restarted_app = app(restarted_state);
+        let restarted_query = call_json(
+            &restarted_app,
+            Method::POST,
+            "/v1/views/purchases_filtered_nullable_amounts_by_user_minute/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(restarted_query.0, StatusCode::OK, "{restarted_query:?}");
+        assert_eq!(restarted_query.1["rows"], query_response.1["rows"]);
+    }
+
+    #[tokio::test]
+    async fn rest_hopping_window_advanced_aggregate_view_survives_api_restart() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state =
+            test_api_state_with_store(store.clone(), "api-test-hop-advanced-owner-a", false).await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_purchases_event_time_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let sql = "select user_id, window_start, window_end, sum(amount) as total_amount, count(distinct amount) as event_count, min(amount) as minimum_amount, max(amount) as maximum_amount, avg(amount) as average_amount from purchases group by user_id, hop(interval '30 seconds', interval '60 seconds') having avg(amount) > 11 order by sum(amount) desc limit 1";
+        let view_request = CreateViewRequest {
+            view_id: "purchases_by_user_hop_stats".to_string(),
+            url_path: Some("/purchases/by-user-hop-stats".to_string()),
+            output_relation_id: None,
+            input_relation_id: "purchases".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: sql.to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("advanced hopping purchase stats by user".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+        assert_eq!(view_response.1["query_enabled"], true);
+
+        let ingest_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "purchases",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "purchases-hop-advanced-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 0,
+                    "event_time_watermark": {
+                        "event_time_column_id": "event_time",
+                        "max_observed_event_time_ns": 90_000_000_000i64,
+                        "watermark_ns": 90_000_000_000i64
+                    },
+                    "rows": [
+                        {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64, "delta": 1},
+                        {"user_id": "alice", "amount": 14, "event_time": 20_000_000_000i64, "delta": 1},
+                        {"user_id": "alice", "amount": 10, "event_time": 40_000_000_000i64, "delta": 1}
+                    ]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(
+            ingest_response.0,
+            StatusCode::CREATED,
+            "{ingest_response:?}"
+        );
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/purchases_by_user_hop_stats/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query_response.0, StatusCode::OK, "{query_response:?}");
+        let expected_average = 34.0 / 3.0;
+        assert_window_rows(
+            &query_response.1,
+            3,
+            json!([{
+                "user_id": "alice",
+                "window_start": 0,
+                "window_end": 60_000_000_000i64,
+                "total_amount": 34,
+                "event_count": 2,
+                "minimum_amount": 10,
+                "maximum_amount": 14,
+                "average_amount": expected_average
+            }]),
+        );
+
+        let restarted_state =
+            test_api_state_with_store(store, "api-test-hop-advanced-owner-b", true).await;
+        assert_eq!(
+            restarted_state
+                .restore_standing_program_runtimes_from_active_views()
+                .await
+                .unwrap(),
+            1
+        );
+        let restarted_app = app(restarted_state);
+        let restarted_query = call_json(
+            &restarted_app,
+            Method::POST,
+            "/v1/views/purchases_by_user_hop_stats/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(restarted_query.0, StatusCode::OK, "{restarted_query:?}");
+        assert_eq!(restarted_query.1["rows"], query_response.1["rows"]);
+    }
+
+    #[tokio::test]
+    async fn rest_hopping_and_session_window_views_materialize_outputs() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state =
+            test_api_state_with_store(store, "api-test-hop-session-window-owner", false).await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_purchases_event_time_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        for (view_id, url_path, sql) in [
+            (
+                "purchases_by_user_hop",
+                "/purchases/by-user-hop",
+                "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from purchases group by user_id, hop(interval '30 seconds', interval '60 seconds')",
+            ),
+            (
+                "purchases_by_user_session",
+                "/purchases/by-user-session",
+                "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from purchases group by user_id, session(interval '30 seconds')",
+            ),
+        ] {
+            let view_request = CreateViewRequest {
+                view_id: view_id.to_string(),
+                url_path: Some(url_path.to_string()),
+                output_relation_id: None,
+                input_relation_id: "purchases".to_string(),
+                input_relation_version: "2026-05-24.v1".to_string(),
+                input_relation_refs: Vec::new(),
+                input_relations: Vec::new(),
+                sql: sql.to_string(),
+                source_kind: SqlSourceKind::StandingView,
+                output_relation_ids: Vec::new(),
+                sql_template: None,
+                description: Some(format!("event-time window view {view_id}")),
+                request: Vec::new(),
+                response_schema: None,
+                response_formats: vec!["json".to_string()],
+                query_policy_id: None,
+            };
+            let view_response =
+                call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+            assert_eq!(
+                view_response.0,
+                StatusCode::CREATED,
+                "view creation response: {}",
+                view_response.1
+            );
+            assert_eq!(view_response.1["query_enabled"], true);
+        }
+
+        let ingest_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/ingest",
+            json!({
+                "relation_id": "purchases",
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "hop-session-purchases-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "event_time_watermark": {
+                    "event_time_column_id": "event_time",
+                    "max_observed_event_time_ns": 120_000_000_000i64,
+                    "watermark_ns": 120_000_000_000i64
+                },
+                "rows": [
+                    {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64, "delta": 1},
+                    {"user_id": "alice", "amount": 7, "event_time": 25_000_000_000i64, "delta": 1},
+                    {"user_id": "alice", "amount": 11, "event_time": 80_000_000_000i64, "delta": 1}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(ingest_response.0, StatusCode::CREATED);
+        assert_eq!(ingest_response.1["outcome"], "appended");
+
+        let hop_query = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/purchases_by_user_hop/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(hop_query.0, StatusCode::OK, "hop query: {}", hop_query.1);
+        assert_window_rows(
+            &hop_query.1,
+            3,
+            json!([
+                {"user_id": "alice", "window_start": -30_000_000_000i64, "window_end": 30_000_000_000i64, "total_amount": 17, "event_count": 2},
+                {"user_id": "alice", "window_start": 0, "window_end": 60_000_000_000i64, "total_amount": 17, "event_count": 2},
+                {"user_id": "alice", "window_start": 30_000_000_000i64, "window_end": 90_000_000_000i64, "total_amount": 11, "event_count": 1},
+                {"user_id": "alice", "window_start": 60_000_000_000i64, "window_end": 120_000_000_000i64, "total_amount": 11, "event_count": 1}
+            ]),
+        );
+
+        let session_query = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/purchases_by_user_session/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(
+            session_query.0,
+            StatusCode::OK,
+            "session query: {}",
+            session_query.1
+        );
+        assert_window_rows(
+            &session_query.1,
+            3,
+            json!([
+                {"user_id": "alice", "window_start": 10_000_000_000i64, "window_end": 25_000_000_000i64, "total_amount": 17, "event_count": 2},
+                {"user_id": "alice", "window_start": 80_000_000_000i64, "window_end": 80_000_000_000i64, "total_amount": 11, "event_count": 1}
+            ]),
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_session_window_view_materialized_output_survives_api_restart() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state =
+            test_api_state_with_store(store.clone(), "api-test-session-window-owner-a", false)
+                .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_purchases_event_time_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "purchases_by_user_session_restart".to_string(),
+            url_path: Some("/purchases/by-user-session-restart".to_string()),
+            output_relation_id: None,
+            input_relation_id: "purchases".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from purchases group by user_id, session(interval '30 seconds')".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("restart-restored session window view".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let ingest_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/purchases/ingest",
+            json!({
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "session-restart-purchases-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "event_time_watermark": {
+                    "event_time_column_id": "event_time",
+                    "max_observed_event_time_ns": 120_000_000_000i64,
+                    "watermark_ns": 120_000_000_000i64
+                },
+                "rows": [
+                    {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64, "delta": 1},
+                    {"user_id": "alice", "amount": 7, "event_time": 25_000_000_000i64, "delta": 1},
+                    {"user_id": "alice", "amount": 11, "event_time": 80_000_000_000i64, "delta": 1}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(
+            ingest_response.0,
+            StatusCode::CREATED,
+            "{ingest_response:?}"
+        );
+        assert_eq!(ingest_response.1["materialization"]["status"], "completed");
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/purchases_by_user_session_restart/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query_response.0, StatusCode::OK, "{query_response:?}");
+        assert_window_rows(
+            &query_response.1,
+            3,
+            json!([
+                {"user_id": "alice", "window_start": 10_000_000_000i64, "window_end": 25_000_000_000i64, "total_amount": 17, "event_count": 2},
+                {"user_id": "alice", "window_start": 80_000_000_000i64, "window_end": 80_000_000_000i64, "total_amount": 11, "event_count": 1}
+            ]),
+        );
+
+        let restarted_state =
+            test_api_state_with_store(store, "api-test-session-window-owner-b", true).await;
+        let restored = restarted_state
+            .restore_standing_program_runtimes_from_active_views()
+            .await
+            .unwrap();
+        assert_eq!(restored, 1);
+        let restarted_router = app(restarted_state);
+        let restarted_query = call_json(
+            &restarted_router,
+            Method::POST,
+            "/v1/views/purchases_by_user_session_restart/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(restarted_query.0, StatusCode::OK, "{restarted_query:?}");
+        assert_eq!(restarted_query.1["rows"], query_response.1["rows"]);
+    }
+
+    #[tokio::test]
+    async fn rest_late_tumbling_window_view_reports_materialization_lag_on_first_query() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state = test_api_state_with_store(store, "api-test-late-window-owner", false).await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_purchases_event_time_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(
+            relation_response.0,
+            StatusCode::CREATED,
+            "relation creation response: {}",
+            relation_response.1
+        );
+
+        let first_ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/ingest",
+            json!({
+                "relation_id": "purchases",
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "late-purchases-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "event_time_watermark": {
+                    "event_time_column_id": "event_time",
+                    "max_observed_event_time_ns": 80_000_000_000i64,
+                    "watermark_ns": 60_000_000_000i64
+                },
+                "rows": [
+                    {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64, "delta": 1},
+                    {"user_id": "bob", "amount": 5, "event_time": 30_000_000_000i64, "delta": 1},
+                    {"user_id": "alice", "amount": 7, "event_time": 80_000_000_000i64, "delta": 1}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(
+            first_ingest.0,
+            StatusCode::CREATED,
+            "initial ingest response: {}",
+            first_ingest.1
+        );
+
+        let sql = "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from purchases group by user_id, tumble(interval '60 seconds')";
+        let view_request = CreateViewRequest {
+            view_id: "late_purchases_by_user_minute".to_string(),
+            url_path: Some("/purchases/late-by-user-minute".to_string()),
+            output_relation_id: None,
+            input_relation_id: "purchases".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: sql.to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("late-created purchase totals by event-time minute".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(
+            view_response.0,
+            StatusCode::CREATED,
+            "late window view creation response: {}",
+            view_response.1
+        );
+        assert_eq!(view_response.1["query_enabled"], false);
+        assert_eq!(view_response.1["coverage"]["state"], "backfill_required");
+
+        let second_ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/ingest",
+            json!({
+                "relation_id": "purchases",
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "late-purchases-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 3,
+                "event_time_watermark": {
+                    "event_time_column_id": "event_time",
+                    "max_observed_event_time_ns": 120_000_000_000i64,
+                    "watermark_ns": 120_000_000_000i64
+                },
+                "rows": [
+                    {"user_id": "bob", "amount": 11, "event_time": 80_000_000_000i64, "delta": 1}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(
+            second_ingest.0,
+            StatusCode::CREATED,
+            "late window view must not block later ingest: {}",
+            second_ingest.1
+        );
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/late_purchases_by_user_minute/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(
+            query_response.0,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "late window query response: {}",
+            query_response.1
+        );
+        assert!(query_response.1["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("MATERIALIZATION_LAG"));
+        assert_eq!(query_response.1["details"]["code"], "MATERIALIZATION_LAG");
+        assert_eq!(
+            query_response.1["details"]["view_id"],
+            "late_purchases_by_user_minute"
+        );
+        assert_eq!(
+            query_response.1["details"]["query_authority"],
+            "published_materialized_output"
+        );
+        assert_eq!(
+            query_response.1["details"]["coverage_state"],
+            "backfill_required"
+        );
+        assert_eq!(
+            query_response.1["details"]["committed_frontier"]["status"],
+            "ahead_of_materialized_output"
+        );
+        assert_eq!(
+            query_response.1["details"]["committed_frontier"]["source_read_on_query_path"],
+            false
+        );
+        assert_eq!(
+            query_response.1["details"]["materialized_frontier"]["status"],
+            "not_queryable_until_backfill_checkpoint_published"
+        );
+
+        let refreshed_view = call_json(
+            &router,
+            Method::GET,
+            "/v1/views/late_purchases_by_user_minute",
+            json!({}),
+        )
+        .await;
+        assert_eq!(refreshed_view.0, StatusCode::OK);
+        assert_eq!(refreshed_view.1["query_enabled"], false);
+        assert_eq!(
+            refreshed_view.1["lifecycle"]["deployment_status"],
+            "deploying"
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_late_hopping_and_session_window_views_report_materialization_lag_on_first_query()
+    {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state =
+            test_api_state_with_store(store, "api-test-late-hop-session-window-owner", false).await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_purchases_event_time_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let ingest_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/ingest",
+            json!({
+                "relation_id": "purchases",
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "late-hop-session-purchases-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "event_time_watermark": {
+                    "event_time_column_id": "event_time",
+                    "max_observed_event_time_ns": 120_000_000_000i64,
+                    "watermark_ns": 120_000_000_000i64
+                },
+                "rows": [
+                    {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64, "delta": 1},
+                    {"user_id": "alice", "amount": 7, "event_time": 25_000_000_000i64, "delta": 1},
+                    {"user_id": "alice", "amount": 11, "event_time": 80_000_000_000i64, "delta": 1}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(ingest_response.0, StatusCode::CREATED);
+        assert_eq!(ingest_response.1["outcome"], "appended");
+
+        for (view_id, url_path, sql) in [
+            (
+                "late_purchases_by_user_hop",
+                "/purchases/late-by-user-hop",
+                "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from purchases group by user_id, hop(interval '30 seconds', interval '60 seconds')",
+            ),
+            (
+                "late_purchases_by_user_session",
+                "/purchases/late-by-user-session",
+                "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from purchases group by user_id, session(interval '30 seconds')",
+            ),
+        ] {
+            let view_request = CreateViewRequest {
+                view_id: view_id.to_string(),
+                url_path: Some(url_path.to_string()),
+                output_relation_id: None,
+                input_relation_id: "purchases".to_string(),
+                input_relation_version: "2026-05-24.v1".to_string(),
+                input_relation_refs: Vec::new(),
+                input_relations: Vec::new(),
+                sql: sql.to_string(),
+                source_kind: SqlSourceKind::StandingView,
+                output_relation_ids: Vec::new(),
+                sql_template: None,
+                description: Some(format!("late-created event-time window view {view_id}")),
+                request: Vec::new(),
+                response_schema: None,
+                response_formats: vec!["json".to_string()],
+                query_policy_id: None,
+            };
+            let view_response =
+                call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+            assert_eq!(
+                view_response.0,
+                StatusCode::CREATED,
+                "view creation response: {}",
+                view_response.1
+            );
+            assert_eq!(view_response.1["query_enabled"], false);
+            assert_eq!(view_response.1["coverage"]["state"], "backfill_required");
+        }
+
+        let hop_query = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/late_purchases_by_user_hop/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(
+            hop_query.0,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "hop query: {}",
+            hop_query.1
+        );
+        assert!(hop_query.1["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("MATERIALIZATION_LAG"));
+
+        let session_query = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/late_purchases_by_user_session/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(
+            session_query.0,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "session query: {}",
+            session_query.1
+        );
+        assert!(session_query.1["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("MATERIALIZATION_LAG"));
+
+        for view_id in [
+            "late_purchases_by_user_hop",
+            "late_purchases_by_user_session",
+        ] {
+            let refreshed_view = call_json(
+                &router,
+                Method::GET,
+                &format!("/v1/views/{view_id}"),
+                json!({}),
+            )
+            .await;
+            assert_eq!(refreshed_view.0, StatusCode::OK);
+            assert_eq!(refreshed_view.1["query_enabled"], false);
+            assert_eq!(
+                refreshed_view.1["lifecycle"]["deployment_status"],
+                "deploying"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rest_unsupported_single_input_sql_admission_fails_closed_without_creating_view() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-unsupported-single-input-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        for (view_id, sql) in [
+            (
+                "unsupported_scores_window_function",
+                "select user_id, row_number() over (partition by user_id order by score) as sum, count(*) as count from scores group by user_id",
+            ),
+            (
+                "unsupported_scores_bad_offset",
+                "select user_id, sum(score) as sum, count(*) as count from scores group by user_id order by sum desc limit 1 offset delta",
+            ),
+            (
+                "unsupported_scores_rollup",
+                "select user_id, sum(score) as sum, count(*) as count from scores group by rollup(user_id)",
+            ),
+            (
+                "unsupported_scores_union_all",
+                "select user_id, score from scores where score > 0 union all select user_id, score from scores where score >= 10",
+            ),
+        ] {
+            let view_request = CreateViewRequest {
+                view_id: view_id.to_string(),
+                url_path: None,
+                output_relation_id: None,
+                input_relation_id: "scores".to_string(),
+                input_relation_version: "2026-05-24.v1".to_string(),
+                input_relation_refs: Vec::new(),
+                input_relations: Vec::new(),
+                sql: sql.to_string(),
+                source_kind: SqlSourceKind::StandingView,
+                output_relation_ids: Vec::new(),
+                sql_template: None,
+                description: Some("unsupported single-input SQL".to_string()),
+                request: Vec::new(),
+                response_schema: None,
+                response_formats: vec!["json".to_string()],
+                query_policy_id: None,
+            };
+            let response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+            assert!(
+                response.0.is_client_error(),
+                "unsupported SQL should fail with 4xx, got {response:?}"
+            );
+        }
+
+        let views = call_json(&router, Method::GET, "/v1/views", Value::Null).await;
+        assert_eq!(views.0, StatusCode::OK);
+        assert_eq!(views.1["views"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn rest_unsupported_join_sql_admission_fails_closed_without_creating_view() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-unsupported-join-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        for catalog in [test_scores_catalog(), test_accounts_catalog()] {
+            let relation_response = call_json(
+                &router,
+                Method::POST,
+                "/v1/relations",
+                json!({
+                    "catalog": catalog,
+                    "default_orders_sum_count": false
+                }),
+            )
+            .await;
+            assert_eq!(relation_response.0, StatusCode::CREATED);
+        }
+
+        for (view_id, sql) in [
+            (
+                "unsupported_scores_left_join",
+                "select a.account_id, sum(s.score) as sum, count(*) as count from scores s left join accounts a on s.user_id = a.account_id group by a.account_id",
+            ),
+            (
+                "unsupported_scores_cross_join",
+                "select a.account_id, sum(s.score) as sum, count(*) as count from scores s cross join accounts a group by a.account_id",
+            ),
+            (
+                "unsupported_scores_non_equi_join",
+                "select a.account_id, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.user_id <> a.account_id group by a.account_id",
+            ),
+        ] {
+            let view_request = CreateViewRequest {
+                view_id: view_id.to_string(),
+                url_path: None,
+                output_relation_id: None,
+                input_relation_id: String::new(),
+                input_relation_version: String::new(),
+                input_relation_refs: vec![
+                    InputRelationRef {
+                        relation_id: "scores".to_string(),
+                        relation_version: "2026-05-24.v1".to_string(),
+                    },
+                    InputRelationRef {
+                        relation_id: "accounts".to_string(),
+                        relation_version: "2026-05-24.v1".to_string(),
+                    },
+                ],
+                input_relations: Vec::new(),
+                sql: sql.to_string(),
+                source_kind: SqlSourceKind::StandingView,
+                output_relation_ids: Vec::new(),
+                sql_template: None,
+                description: Some("unsupported join SQL".to_string()),
+                request: Vec::new(),
+                response_schema: None,
+                response_formats: vec!["json".to_string()],
+                query_policy_id: None,
+            };
+            let response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+            assert!(
+                response.0.is_client_error(),
+                "unsupported join SQL should fail with 4xx, got {response:?}"
+            );
+        }
+
+        let views = call_json(&router, Method::GET, "/v1/views", Value::Null).await;
+        assert_eq!(views.0, StatusCode::OK);
+        assert_eq!(views.1["views"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn rest_unsupported_three_table_join_admission_fails_closed_without_active_view() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-unsupported-three-table-join-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        for catalog in [
+            test_scores_catalog(),
+            test_accounts_catalog(),
+            test_device_status_catalog(),
+        ] {
+            let relation_response = call_json(
+                &router,
+                Method::POST,
+                "/v1/relations",
+                json!({
+                    "catalog": catalog,
+                    "default_orders_sum_count": false
+                }),
+            )
+            .await;
+            assert_eq!(relation_response.0, StatusCode::CREATED);
+        }
+
+        let view_id = "unsupported_scores_three_table_join";
+        let view_request = CreateViewRequest {
+            view_id: view_id.to_string(),
+            url_path: None,
+            output_relation_id: None,
+            input_relation_id: String::new(),
+            input_relation_version: String::new(),
+            input_relation_refs: vec![
+                InputRelationRef {
+                    relation_id: "scores".to_string(),
+                    relation_version: "2026-05-24.v1".to_string(),
+                },
+                InputRelationRef {
+                    relation_id: "accounts".to_string(),
+                    relation_version: "2026-05-24.v1".to_string(),
+                },
+                InputRelationRef {
+                    relation_id: "device_status".to_string(),
+                    relation_version: "2026-05-24.v1".to_string(),
+                },
+            ],
+            input_relations: Vec::new(),
+            sql: "select a.account_id, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.user_id = a.account_id join device_status d on d.device_id = s.user_id group by a.account_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("unsupported three-table join SQL".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+
+        let create_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert!(
+            create_response.0.is_client_error(),
+            "unsupported three-table join should fail with 4xx, got {create_response:?}"
+        );
+
+        let views = call_json(&router, Method::GET, "/v1/views", Value::Null).await;
+        assert_eq!(views.0, StatusCode::OK);
+        assert_eq!(views.1["views"], json!([]));
+
+        let get_response = call_json(
+            &router,
+            Method::GET,
+            &format!("/v1/views/{view_id}"),
+            Value::Null,
+        )
+        .await;
+        assert!(
+            get_response.0.is_client_error(),
+            "rejected view should not be readable as active, got {get_response:?}"
+        );
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            &format!("/v1/views/{view_id}/query"),
+            json!({}),
+        )
+        .await;
+        assert!(
+            query_response.0.is_client_error(),
+            "rejected view should not be queryable, got {query_response:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_sql_admission_corpus_fails_closed_without_metadata_or_runtime_binding() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-sql-admission-corpus-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        for catalog in [
+            test_scores_catalog(),
+            test_accounts_catalog(),
+            test_device_status_catalog(),
+        ] {
+            let relation_response = call_json(
+                &router,
+                Method::POST,
+                "/v1/relations",
+                json!({
+                    "catalog": catalog,
+                    "default_orders_sum_count": false
+                }),
+            )
+            .await;
+            assert_eq!(relation_response.0, StatusCode::CREATED);
+        }
+
+        let scores = vec![InputRelationRef {
+            relation_id: "scores".to_string(),
+            relation_version: "2026-05-24.v1".to_string(),
+        }];
+        let scores_accounts = vec![
+            InputRelationRef {
+                relation_id: "scores".to_string(),
+                relation_version: "2026-05-24.v1".to_string(),
+            },
+            InputRelationRef {
+                relation_id: "accounts".to_string(),
+                relation_version: "2026-05-24.v1".to_string(),
+            },
+        ];
+        let scores_accounts_devices = vec![
+            InputRelationRef {
+                relation_id: "scores".to_string(),
+                relation_version: "2026-05-24.v1".to_string(),
+            },
+            InputRelationRef {
+                relation_id: "accounts".to_string(),
+                relation_version: "2026-05-24.v1".to_string(),
+            },
+            InputRelationRef {
+                relation_id: "device_status".to_string(),
+                relation_version: "2026-05-24.v1".to_string(),
+            },
+        ];
+
+        for (view_id, sql, refs) in [
+            (
+                "corpus_window_row_number",
+                "select user_id, row_number() over (partition by user_id order by score) as row_number from scores",
+                scores.clone(),
+            ),
+            (
+                "corpus_window_aggregate_over",
+                "select user_id, sum(score) over (partition by user_id) as sum from scores",
+                scores.clone(),
+            ),
+            (
+                "corpus_tumble_window",
+                "select window_start, user_id, sum(amount) as sum from tumble(purchases, ts, interval '1 minute') group by window_start, user_id",
+                scores.clone(),
+            ),
+            (
+                "corpus_hop_window",
+                "select window_start, user_id, sum(amount) as sum from hop(purchases, ts, interval '1 minute', interval '5 minutes') group by window_start, user_id",
+                scores.clone(),
+            ),
+            (
+                "corpus_session_window",
+                "select window_start, user_id, sum(amount) as sum from session(purchases, ts, interval '5 minutes') group by window_start, user_id",
+                scores.clone(),
+            ),
+            (
+                "corpus_rollup",
+                "select user_id, sum(score) as sum from scores group by rollup(user_id)",
+                scores.clone(),
+            ),
+            (
+                "corpus_union_all",
+                "select user_id, score from scores where score > 0 union all select user_id, score from scores where score >= 10",
+                scores.clone(),
+            ),
+            (
+                "corpus_offset_expression",
+                "select user_id, sum(score) as sum from scores group by user_id order by sum desc limit 1 offset delta",
+                scores.clone(),
+            ),
+            (
+                "corpus_cross_join",
+                "select a.account_id, sum(s.score) as sum from scores s cross join accounts a group by a.account_id",
+                scores_accounts.clone(),
+            ),
+            (
+                "corpus_non_equi_join",
+                "select a.account_id, sum(s.score) as sum from scores s join accounts a on s.user_id <> a.account_id group by a.account_id",
+                scores_accounts.clone(),
+            ),
+            (
+                "corpus_three_table_join",
+                "select a.account_id, sum(s.score) as sum from scores s join accounts a on s.user_id = a.account_id join device_status d on d.device_id = s.user_id group by a.account_id",
+                scores_accounts_devices.clone(),
+            ),
+        ] {
+            let view_request = CreateViewRequest {
+                view_id: view_id.to_string(),
+                url_path: None,
+                output_relation_id: None,
+                input_relation_id: String::new(),
+                input_relation_version: String::new(),
+                input_relation_refs: refs,
+                input_relations: Vec::new(),
+                sql: sql.to_string(),
+                source_kind: SqlSourceKind::StandingView,
+                output_relation_ids: Vec::new(),
+                sql_template: None,
+                description: Some("unsupported SQL admission corpus".to_string()),
+                request: Vec::new(),
+                response_schema: None,
+                response_formats: vec!["json".to_string()],
+                query_policy_id: None,
+            };
+
+            let create_response =
+                call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+            assert!(
+                create_response.0.is_client_error(),
+                "unsupported SQL corpus case `{view_id}` should fail with 4xx, got {create_response:?}"
+            );
+
+            let get_response = call_json(
+                &router,
+                Method::GET,
+                &format!("/v1/views/{view_id}"),
+                Value::Null,
+            )
+            .await;
+            assert!(
+                get_response.0.is_client_error(),
+                "rejected corpus case `{view_id}` should not leave view metadata, got {get_response:?}"
+            );
+
+            let query_response = call_json(
+                &router,
+                Method::POST,
+                &format!("/v1/views/{view_id}/query"),
+                json!({}),
+            )
+            .await;
+            assert!(
+                query_response.0.is_client_error(),
+                "rejected corpus case `{view_id}` should not leave runtime binding, got {query_response:?}"
+            );
+        }
+
+        let views = call_json(&router, Method::GET, "/v1/views", Value::Null).await;
+        assert_eq!(views.0, StatusCode::OK);
+        assert_eq!(views.1["views"], json!([]));
     }
 
     async fn call_json(
@@ -13355,17 +18452,4435 @@ mod tests {
         let value = if bytes.is_empty() {
             Value::Null
         } else {
-            serde_json::from_slice(&bytes).unwrap()
+            serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| json!({ "error": String::from_utf8_lossy(&bytes).to_string() }))
         };
         (status, value)
     }
 
-    async fn append_committed_ingest_without_runtime_apply(
+    #[test]
+    fn ingest_epoch_request_rejects_ack_mode_negotiation_field() {
+        let error = serde_json::from_value::<IngestEpochRequest>(json!({
+            "ack_mode": "append_committed",
+            "batches": [{
+                "relation_id": "scores",
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "scores",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "rows": [{"user_id": "alice", "score": 1, "delta": 1}]
+            }]
+        }))
+        .unwrap_err();
+
+        assert!(error.to_string().contains("ack_mode"));
+    }
+
+    #[test]
+    fn output_compaction_policy_schedules_only_on_configured_epoch_interval() {
+        assert!(!should_schedule_background_output_compaction(0, 10));
+        assert!(!should_schedule_background_output_compaction(3, 0));
+        assert!(!should_schedule_background_output_compaction(3, 5));
+        assert!(should_schedule_background_output_compaction(3, 6));
+    }
+
+    #[tokio::test]
+    async fn background_compaction_registry_deduplicates_same_view_work() {
+        let state = test_api_state().await;
+
+        assert!(state.try_start_background_compaction("scores_by_user"));
+        assert!(!state.try_start_background_compaction("scores_by_user"));
+        state.record_background_compaction_already_running();
+        assert!(state.try_start_background_compaction("orders_by_region"));
+
+        let status = state.background_task_status();
+        assert_eq!(status.compaction_already_running, 1);
+
+        state.finish_background_compaction("scores_by_user");
+        assert!(state.try_start_background_compaction("scores_by_user"));
+    }
+
+    #[tokio::test]
+    async fn direct_apply_uses_prepared_current_batch_without_replaying_ingest_object() {
+        let object_access_counts = ObjectStoreAccessCounts::default();
+        let store: Arc<dyn ObjectStore> = Arc::new(CountingObjectStore::new(
+            Arc::new(InMemory::new()),
+            object_access_counts.clone(),
+        ));
+        let state = test_api_state_with_store(store, "api-test-direct-apply-owner", false).await;
+        let router = app(state.clone());
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "direct_apply_scores_by_user".to_string(),
+            url_path: None,
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("direct apply current batch proof".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED);
+
+        let prepared = prepare_ingest_batch(
+            &state,
+            IngestRowsRequest {
+                relation_id: "scores".to_string(),
+                relation_version: "2026-05-24.v1".to_string(),
+                stream_id: "direct-apply-scores-stream".to_string(),
+                partition_id: 0,
+                start_offset_inclusive: 0,
+                event_time_watermark: None,
+                rows: vec![json!({"user_id": "alice", "score": 10, "delta": 1})],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        object_access_counts.clear();
+        let summary = apply_standing_runtime_prepared_ingests(&state, None, &[prepared], None)
+            .await
+            .unwrap();
+
+        assert_eq!(summary.active_views, 1);
+        assert_eq!(summary.applied_batches, 1);
+        let ingest_get_paths = object_access_counts
+            .get_paths()
+            .into_iter()
+            .filter(|path| path.starts_with("v1/ingest/"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ingest_get_paths,
+            Vec::<String>::new(),
+            "direct apply must use the prepared current batch instead of reading source ingest objects"
+        );
+
+        let next_prepared = prepare_ingest_batch(
+            &state,
+            IngestRowsRequest {
+                relation_id: "scores".to_string(),
+                relation_version: "2026-05-24.v1".to_string(),
+                stream_id: "direct-apply-scores-stream".to_string(),
+                partition_id: 0,
+                start_offset_inclusive: 1,
+                event_time_watermark: None,
+                rows: vec![json!({"user_id": "alice", "score": 5, "delta": 1})],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        object_access_counts.clear();
+        let second_summary =
+            apply_standing_runtime_prepared_ingests(&state, None, &[next_prepared], None)
+                .await
+                .unwrap();
+        assert_eq!(second_summary.applied_batches, 1);
+        let checkpoint_get_paths = object_access_counts
+            .get_paths()
+            .into_iter()
+            .filter(|path| path.starts_with("v1/standing-runtime-checkpoints/"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            checkpoint_get_paths.len(),
+            1,
+            "direct apply should reuse the pre-apply checkpoint record during checkpoint publish"
+        );
+        let checkpoint_list_prefixes = object_access_counts
+            .list_prefixes()
+            .into_iter()
+            .filter(|path| path.starts_with("v1/standing-runtime-checkpoints/"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            checkpoint_list_prefixes,
+            Vec::<String>::new(),
+            "direct apply should read latest checkpoint cache instead of listing checkpoint epochs"
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_relation_scoped_materialized_ingest_uses_prepared_current_batch_without_object_replay(
+    ) {
+        let baseline_counts = ObjectStoreAccessCounts::default();
+        let baseline_store: Arc<dyn ObjectStore> = Arc::new(CountingObjectStore::new(
+            Arc::new(InMemory::new()),
+            baseline_counts.clone(),
+        ));
+        let baseline_state =
+            test_api_state_with_store(baseline_store, "api-test-rest-direct-apply-baseline", false)
+                .await;
+        let baseline_router = app(baseline_state);
+        let baseline_relation = call_json(
+            &baseline_router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(baseline_relation.0, StatusCode::CREATED);
+        baseline_counts.clear();
+        let baseline_ingest = call_json(
+            &baseline_router,
+            Method::POST,
+            "/v1/relations/scores/ingest",
+            json!({
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "rest-direct-apply-baseline-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "rows": [{"user_id": "alice", "score": 10, "delta": 1}]
+            }),
+        )
+        .await;
+        assert_eq!(
+            baseline_ingest.0,
+            StatusCode::CREATED,
+            "{baseline_ingest:?}"
+        );
+        let baseline_ingest_list_count = baseline_counts
+            .list_prefixes()
+            .into_iter()
+            .filter(|path| path == "v1/ingest")
+            .count();
+        let baseline_ingest_get_count = baseline_counts
+            .get_paths()
+            .into_iter()
+            .filter(|path| path.starts_with("v1/ingest/"))
+            .count();
+
+        let object_access_counts = ObjectStoreAccessCounts::default();
+        let store: Arc<dyn ObjectStore> = Arc::new(CountingObjectStore::new(
+            Arc::new(InMemory::new()),
+            object_access_counts.clone(),
+        ));
+        let state =
+            test_api_state_with_store(store, "api-test-rest-direct-apply-owner", false).await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "rest_direct_apply_scores_by_user".to_string(),
+            url_path: None,
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("REST direct apply current batch proof".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        object_access_counts.clear();
+        let ingest_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/scores/ingest",
+            json!({
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "rest-direct-apply-scores-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "rows": [{"user_id": "alice", "score": 10, "delta": 1}]
+            }),
+        )
+        .await;
+        assert_eq!(
+            ingest_response.0,
+            StatusCode::CREATED,
+            "{ingest_response:?}"
+        );
+        assert_eq!(ingest_response.1["ack_mode"], "materialized");
+        assert_eq!(ingest_response.1["materialization"]["status"], "completed");
+        assert_eq!(ingest_response.1["materialization"]["applied_batches"], 1);
+        let ingest_list_count = object_access_counts
+            .list_prefixes()
+            .into_iter()
+            .filter(|path| path == "v1/ingest")
+            .count();
+        let ingest_get_count = object_access_counts
+            .get_paths()
+            .into_iter()
+            .filter(|path| path.starts_with("v1/ingest/"))
+            .count();
+        assert_eq!(
+            ingest_list_count,
+            baseline_ingest_list_count,
+            "relation-scoped materialized ingest should not add committed-ingest replay listing beyond the append/admission baseline"
+        );
+        assert_eq!(
+            ingest_get_count,
+            baseline_ingest_get_count,
+            "relation-scoped materialized ingest should not add ingest object replay reads beyond the append/admission baseline"
+        );
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/rest_direct_apply_scores_by_user/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query_response.0, StatusCode::OK, "{query_response:?}");
+        assert_eq!(
+            query_response.1["rows"],
+            json!([{"user_id": "alice", "sum": 10, "count": 1}])
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_relation_scoped_ingest_materializes_views_automatically() {
+        let state =
+            test_api_state_with_store(Arc::new(InMemory::new()), "api-test-relation-ingest", false)
+                .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "relation_scoped_scores_by_user".to_string(),
+            url_path: None,
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("relation scoped ingest proof".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let ingest_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/scores/ingest",
+            json!({
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "relation-scoped-scores-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "rows": [
+                    {"user_id": "alice", "score": 10, "delta": 1},
+                    {"user_id": "alice", "score": -4, "delta": 1},
+                    {"user_id": "bob", "score": 7, "delta": 1}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(
+            ingest_response.0,
+            StatusCode::CREATED,
+            "{ingest_response:?}"
+        );
+        assert_eq!(ingest_response.1["outcome"], "appended");
+        assert_eq!(ingest_response.1["ack_mode"], "materialized");
+        assert_eq!(ingest_response.1["materialization"]["status"], "completed");
+        assert_eq!(ingest_response.1["materialization"]["active_views"], 1);
+        assert_eq!(ingest_response.1["materialization"]["applied_batches"], 1);
+        assert_eq!(ingest_response.1["batches"][0]["outcome"], "appended");
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/relation_scoped_scores_by_user/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query_response.0, StatusCode::OK, "{query_response:?}");
+        assert_eq!(
+            query_response.1["rows"],
+            json!([
+                {"user_id": "alice", "sum": 10, "count": 1},
+                {"user_id": "bob", "sum": 7, "count": 1}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_relation_batch_ingest_materializes_multiple_batches_without_ingest_replay() {
+        let baseline_counts = ObjectStoreAccessCounts::default();
+        let baseline_store: Arc<dyn ObjectStore> = Arc::new(CountingObjectStore::new(
+            Arc::new(InMemory::new()),
+            baseline_counts.clone(),
+        ));
+        let baseline_state = test_api_state_with_store(
+            baseline_store,
+            "api-test-relation-batch-baseline-owner",
+            false,
+        )
+        .await;
+        let baseline_router = app(baseline_state);
+        let baseline_relation = call_json(
+            &baseline_router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(baseline_relation.0, StatusCode::CREATED);
+        baseline_counts.clear();
+        let baseline_ingest = call_json(
+            &baseline_router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [
+                    {
+                        "relation_id": "scores",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "relation-batch-baseline-stream",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [{"user_id": "alice", "score": 10, "delta": 1}]
+                    },
+                    {
+                        "relation_id": "scores",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "relation-batch-baseline-stream",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 1,
+                        "rows": [{"user_id": "bob", "score": 7, "delta": 1}]
+                    }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(
+            baseline_ingest.0,
+            StatusCode::CREATED,
+            "{baseline_ingest:?}"
+        );
+        let baseline_ingest_list_count = baseline_counts
+            .list_prefixes()
+            .into_iter()
+            .filter(|path| path == "v1/ingest")
+            .count();
+        let baseline_ingest_get_count = baseline_counts
+            .get_paths()
+            .into_iter()
+            .filter(|path| path.starts_with("v1/ingest/"))
+            .count();
+
+        let object_access_counts = ObjectStoreAccessCounts::default();
+        let store: Arc<dyn ObjectStore> = Arc::new(CountingObjectStore::new(
+            Arc::new(InMemory::new()),
+            object_access_counts.clone(),
+        ));
+        let state =
+            test_api_state_with_store(store, "api-test-relation-batch-direct-apply-owner", false)
+                .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "relation_batch_scores_by_user".to_string(),
+            url_path: None,
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("relation batch ingest direct apply proof".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        object_access_counts.clear();
+        let ingest_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [
+                    {
+                        "relation_id": "scores",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "relation-batch-direct-apply-stream",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [{"user_id": "alice", "score": 10, "delta": 1}]
+                    },
+                    {
+                        "relation_id": "scores",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "relation-batch-direct-apply-stream",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 1,
+                        "rows": [{"user_id": "bob", "score": 7, "delta": 1}]
+                    }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(
+            ingest_response.0,
+            StatusCode::CREATED,
+            "{ingest_response:?}"
+        );
+        assert_eq!(ingest_response.1["ack_mode"], "materialized");
+        assert_eq!(ingest_response.1["materialization"]["status"], "completed");
+        assert_eq!(ingest_response.1["materialization"]["active_views"], 1);
+        assert_eq!(ingest_response.1["materialization"]["applied_batches"], 2);
+        assert_eq!(
+            ingest_response.1["materialization"]["applied_batches_per_checkpoint_write"],
+            2
+        );
+        assert_eq!(ingest_response.1["timings"]["batch_count"], 2);
+        assert_eq!(ingest_response.1["timings"]["row_count"], 2);
+        assert!(ingest_response.1["timings"]["avg_batch_us"]
+            .as_u64()
+            .is_some());
+        assert!(ingest_response.1["timings"]["avg_row_us"]
+            .as_u64()
+            .is_some());
+        assert!(ingest_response.1["timings"]["rows_per_second"]
+            .as_u64()
+            .is_some());
+        let ingest_list_count = object_access_counts
+            .list_prefixes()
+            .into_iter()
+            .filter(|path| path == "v1/ingest")
+            .count();
+        let ingest_get_count = object_access_counts
+            .get_paths()
+            .into_iter()
+            .filter(|path| path.starts_with("v1/ingest/"))
+            .count();
+        assert_eq!(
+            ingest_list_count,
+            baseline_ingest_list_count,
+            "relation batch materialized ingest should not add committed-ingest replay listing beyond the append/admission baseline"
+        );
+        assert_eq!(
+            ingest_get_count,
+            baseline_ingest_get_count,
+            "relation batch materialized ingest should not add ingest object replay reads beyond the append/admission baseline"
+        );
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/relation_batch_scores_by_user/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query_response.0, StatusCode::OK, "{query_response:?}");
+        assert_eq!(
+            query_response.1["rows"],
+            json!([
+                {"user_id": "alice", "sum": 10, "count": 1},
+                {"user_id": "bob", "sum": 7, "count": 1}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_row_number_view_materializes_relation_scoped_ingest_and_survives_restart() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state =
+            test_api_state_with_store(store.clone(), "api-test-row-number-owner-a", false).await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_accounts_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "accounts_ranked_by_tier".to_string(),
+            url_path: None,
+            output_relation_id: None,
+            input_relation_id: "accounts".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select account_id, row_number() over (partition by tier order by limit desc, account_id asc) as tier_rank from accounts where limit > 0".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("account tier row_number ranking".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+        assert_eq!(view_response.1["query_enabled"], true);
+
+        let ingest_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/accounts/ingest",
+            json!({
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "accounts-row-number-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "rows": [
+                    {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
+                    {"account_id": "aaron", "limit": 100, "tier": "gold", "delta": 1},
+                    {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1},
+                    {"account_id": "carol", "limit": 80, "tier": "silver", "delta": 1}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(
+            ingest_response.0,
+            StatusCode::CREATED,
+            "{ingest_response:?}"
+        );
+        assert_eq!(ingest_response.1["materialization"]["status"], "completed");
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/accounts_ranked_by_tier/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query_response.0, StatusCode::OK, "{query_response:?}");
+        assert_eq!(
+            query_response.1["rows"],
+            json!([
+                {"account_id": "aaron", "tier_rank": 1},
+                {"account_id": "alice", "tier_rank": 2},
+                {"account_id": "bob", "tier_rank": 3},
+                {"account_id": "carol", "tier_rank": 1}
+            ])
+        );
+
+        let restarted_state =
+            test_api_state_with_store(store, "api-test-row-number-owner-b", true).await;
+        assert_eq!(
+            restarted_state
+                .restore_standing_program_runtimes_from_active_views()
+                .await
+                .unwrap(),
+            1
+        );
+        let restarted_router = app(restarted_state);
+        let restarted_query = call_json(
+            &restarted_router,
+            Method::POST,
+            "/v1/views/accounts_ranked_by_tier/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(restarted_query.0, StatusCode::OK, "{restarted_query:?}");
+        assert_eq!(restarted_query.1["rows"], query_response.1["rows"]);
+    }
+
+    #[tokio::test]
+    async fn rest_late_filter_project_view_reports_materialization_lag_on_first_query() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state =
+            test_api_state_with_store(store, "api-test-late-filter-project-owner", false).await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let ingest_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/scores/ingest",
+            json!({
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "late-filter-project-scores-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "rows": [
+                    {"user_id": "alice", "score": 10, "delta": 1},
+                    {"user_id": "bob", "score": -2, "delta": 1},
+                    {"user_id": "carol", "score": 7, "delta": 1}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(
+            ingest_response.0,
+            StatusCode::CREATED,
+            "{ingest_response:?}"
+        );
+
+        let view_request = CreateViewRequest {
+            view_id: "late_positive_scores_project".to_string(),
+            url_path: Some("/scores/late-positive-project".to_string()),
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, score from scores where score > 0".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("late-created positive score projection".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+        assert_eq!(view_response.1["query_enabled"], false);
+        assert_eq!(view_response.1["coverage"]["state"], "backfill_required");
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/late_positive_scores_project/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(
+            query_response.0,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{query_response:?}"
+        );
+        assert!(query_response.1["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("MATERIALIZATION_LAG"));
+    }
+
+    #[tokio::test]
+    async fn rest_between_predicate_aggregate_view_materializes_outputs() {
+        let state =
+            test_api_state_with_store(Arc::new(InMemory::new()), "api-test-between-owner", false)
+                .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_purchases_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "between_purchases_by_user".to_string(),
+            url_path: None,
+            output_relation_id: None,
+            input_relation_id: "purchases".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, sum(amount) as sum, count(*) as count from purchases where amount between 6 and 20 group by user_id having sum(amount) between 10 and 20".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("between predicate materialization proof".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let ingest_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/purchases/ingest",
+            json!({
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "between-purchases-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "rows": [
+                    {"user_id": "alice", "amount": 10, "delta": 1},
+                    {"user_id": "bob", "amount": 5, "delta": 1},
+                    {"user_id": "alice", "amount": 7, "delta": 1},
+                    {"user_id": "carol", "amount": 21, "delta": 1}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(
+            ingest_response.0,
+            StatusCode::CREATED,
+            "{ingest_response:?}"
+        );
+        assert_eq!(ingest_response.1["materialization"]["status"], "completed");
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/between_purchases_by_user/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query_response.0, StatusCode::OK, "{query_response:?}");
+        assert_eq!(
+            query_response.1["rows"],
+            json!([{"user_id": "alice", "sum": 17, "count": 2}])
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_ingest_retry_converges_after_runtime_failure_after_durable_append() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state =
+            test_api_state_with_store(store, "api-test-runtime-failure-retry-owner", false).await;
+        state.register_standing_program_runtime_factory(
+            MATERIALIZED_VIEW_RUNTIME_NAME,
+            FailingApplyRuntimeFactory::new(
+                "injected materialization failure after durable append",
+            ),
+        );
+        let router = app(state.clone());
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "retry_scores_by_user".to_string(),
+            url_path: Some("/scores/retry".to_string()),
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("runtime failure retry proof".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let ingest_request = IngestRowsRequest {
+            relation_id: "scores".to_string(),
+            relation_version: "2026-05-24.v1".to_string(),
+            stream_id: "retry-scores-stream".to_string(),
+            partition_id: 0,
+            start_offset_inclusive: 0,
+            event_time_watermark: None,
+            rows: vec![json!({"user_id": "alice", "score": 10, "delta": 1})],
+        };
+        let prepared = prepare_ingest_batch(&state, ingest_request.clone(), None)
+            .await
+            .unwrap();
+        let epoch_manifest_id =
+            ingest_epoch_manifest_id(&[ingest_epoch_manifest_batch_record(&prepared).unwrap()])
+                .unwrap();
+
+        let failed = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/scores/ingest",
+            json!({
+                "relation_version": ingest_request.relation_version,
+                "stream_id": ingest_request.stream_id,
+                "partition_id": ingest_request.partition_id,
+                "start_offset_inclusive": ingest_request.start_offset_inclusive,
+                "rows": ingest_request.rows
+            }),
+        )
+        .await;
+        assert!(!failed.0.is_success(), "{failed:?}");
+        assert!(failed.1["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("injected materialization failure after durable append"));
+
+        let active = state
+            .view_registry()
+            .unwrap()
+            .read_active("retry_scores_by_user")
+            .await
+            .unwrap();
+        let identity = active_standing_runtime_identity(&active).unwrap().clone();
+        let epoch_manifest = PersistedIngestEpochManifest {
+            epoch_manifest_key: ObjectKey::ingest_epoch_manifest(&epoch_manifest_id)
+                .unwrap()
+                .as_str()
+                .to_string(),
+            epoch_manifest_id: epoch_manifest_id.clone(),
+        };
+        let marker = read_ingest_epoch_view_runtime_failure(
+            &state,
+            &epoch_manifest,
+            &identity,
+            "retry_scores_by_user",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(marker
+            .failure_reason
+            .contains("injected materialization failure after durable append"));
+
+        let blocked_retry = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/scores/ingest",
+            json!({
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "retry-scores-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "rows": [{"user_id": "alice", "score": 10, "delta": 1}]
+            }),
+        )
+        .await;
+        assert_eq!(
+            blocked_retry.0,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{blocked_retry:?}"
+        );
+        assert!(blocked_retry.1["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("durable runtime failure marker"));
+
+        state.register_standing_program_runtime_factory(
+            MATERIALIZED_VIEW_RUNTIME_NAME,
+            MaterializedViewRuntimeFactory,
+        );
+        let repair = call_json(
+            &router,
+            Method::POST,
+            "/v1/standing-runtime/ingest-epoch-failures/repair",
+            json!({
+                "epoch_manifest_id": epoch_manifest_id,
+                "tenant_id": identity.tenant_id,
+                "program_id": identity.program_id,
+                "view_id": "retry_scores_by_user",
+                "confirm_standing_runtime_repaired": true,
+                "repair_reason": "test restored the materialized view runtime factory"
+            }),
+        )
+        .await;
+        assert_eq!(repair.0, StatusCode::OK, "{repair:?}");
+
+        let repaired_retry = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/scores/ingest",
+            json!({
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "retry-scores-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "rows": [{"user_id": "alice", "score": 10, "delta": 1}]
+            }),
+        )
+        .await;
+        assert_eq!(repaired_retry.0, StatusCode::OK, "{repaired_retry:?}");
+        assert_eq!(repaired_retry.1["materialization"]["status"], "completed");
+
+        let query = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/retry_scores_by_user/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query.0, StatusCode::OK, "{query:?}");
+        assert_eq!(
+            query.1["rows"],
+            json!([{"user_id": "alice", "sum": 10, "count": 1}])
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_ingest_optimization_modes_report_timings_and_materialize_correctly() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state =
+            test_api_state_with_store(store, "api-test-ingest-optimization-owner", false).await;
+        let router = app(state);
+
+        let ready = call_json(&router, Method::GET, "/readyz", Value::Null).await;
+        assert_eq!(ready.0, StatusCode::OK, "{ready:?}");
+        assert_eq!(
+            ready.1["materialization_policy"]["preferred_ingest_path"],
+            "/v1/relations/{relation_id}/ingest"
+        );
+        assert_eq!(
+            ready.1["materialization_policy"]["multi_relation_ingest_path"],
+            "/v1/relations/ingest"
+        );
+        assert_eq!(
+            ready.1["materialization_policy"]["ack_modes"],
+            json!(["materialized"])
+        );
+        assert_eq!(
+            ready.1["materialization_policy"]["enforced_public_1_0_limits"]
+                ["max_output_delta_records_per_commit"],
+            DEFAULT_MAX_STANDING_RUNTIME_OUTPUT_DELTA_RECORDS
+        );
+        assert_eq!(
+            ready.1["materialization_policy"]["enforced_public_1_0_limits"]
+                ["max_state_payload_bytes_per_checkpoint"],
+            DEFAULT_MAX_STANDING_RUNTIME_STATE_PAYLOAD_BYTES
+        );
+        assert!(!ready.1["materialization_policy"]
+            .as_object()
+            .unwrap()
+            .contains_key("append_committed_background_materialization"));
+        assert_eq!(
+            ready.1["materialization_policy"]["checkpoint_coalescing"],
+            "one checkpoint publish per affected active view per committed epoch"
+        );
+        assert_eq!(
+            ready.1["materialization_policy"]["latency_diagnostics"],
+            "ingest responses include total_us, avg_batch_us, avg_row_us, rows_per_second, workload shape, and write coalescing counters; detailed stage timings belong in traces/metrics"
+        );
+        assert!(
+            ready.1["materialization_policy"]["materialization_write_counters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|counter| counter == "state_payload_writes")
+        );
+        assert!(ready.1.get("background_tasks").is_none());
+        assert!(ready.1["materialization_policy"]
+            .get("output_compaction")
+            .is_none());
+
+        let openapi_response =
+            call_json(&router, Method::GET, "/v1/openapi.json", Value::Null).await;
+        assert_eq!(openapi_response.0, StatusCode::OK, "{openapi_response:?}");
+        let ingest_properties = &openapi_response.1["paths"]["/v1/relations/{relation_id}/ingest"]
+            ["post"]["requestBody"]["content"]["application/json"]["schema"]["properties"];
+        assert!(ingest_properties["ack_mode"].is_null());
+        let relation_batch_path = &openapi_response.1["paths"]["/v1/relations/ingest"];
+        assert!(relation_batch_path.is_object());
+        assert_eq!(
+            relation_batch_path["post"]["requestBody"]["content"]["application/json"]["schema"]
+                ["properties"]["batches"]["minItems"],
+            1
+        );
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "optimized_scores_by_user".to_string(),
+            url_path: Some("/scores/optimized".to_string()),
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("optimized score totals".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED);
+
+        let first_ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/ingest",
+            json!({
+                "relation_id": "scores",
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "optimized-scores-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "rows": [{"user_id": "alice", "score": 10, "delta": 1}]
+            }),
+        )
+        .await;
+        assert_eq!(first_ingest.0, StatusCode::CREATED, "{first_ingest:?}");
+        assert_eq!(first_ingest.1["ack_mode"], "materialized");
+        assert_eq!(
+            first_ingest.1["ingest_epoch"],
+            first_ingest.1["epoch_manifest_id"]
+        );
+        assert_eq!(first_ingest.1["materialized_through"], 1);
+        assert_eq!(first_ingest.1["materialization"]["status"], "completed");
+        assert_eq!(first_ingest.1["materialization"]["active_views"], 1);
+        assert_eq!(first_ingest.1["materialization"]["applied_batches"], 1);
+        assert_eq!(first_ingest.1["materialization"]["checkpoint_writes"], 1);
+        assert_eq!(
+            first_ingest.1["materialization"]["applied_batches_per_checkpoint_write"],
+            1
+        );
+        assert_eq!(first_ingest.1["materialization"]["output_delta_writes"], 1);
+        assert_eq!(first_ingest.1["materialization"]["state_payload_writes"], 1);
+        assert_eq!(
+            first_ingest.1["materialization"]["checkpoint_record_writes"],
+            1
+        );
+        assert_eq!(
+            first_ingest.1["materialization"]["checkpoint_pointer_writes"],
+            0
+        );
+        assert_eq!(first_ingest.1["materialization"]["latest_cache_writes"], 1);
+        assert_eq!(
+            first_ingest.1["materialization"]["checkpoint_publication_writes"],
+            1
+        );
+        assert!(first_ingest.1["materialization"]
+            .get("compaction_scheduled")
+            .is_none());
+        assert_eq!(first_ingest.1["timings"]["batch_count"], 1);
+        assert_eq!(first_ingest.1["timings"]["row_count"], 1);
+        assert!(first_ingest.1["timings"]["avg_batch_us"].as_u64().is_some());
+        assert!(first_ingest.1["timings"]["avg_row_us"].as_u64().is_some());
+        assert!(first_ingest.1["timings"]["rows_per_second"]
+            .as_u64()
+            .is_some());
+        assert!(first_ingest.1["timings"]["total_us"].as_u64().unwrap() > 0);
+        assert!(first_ingest.1["timings"].get("stages").is_none());
+
+        let epoch_ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [
+                    {
+                        "relation_id": "scores",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "optimized-scores-stream",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 1,
+                        "rows": [{"user_id": "alice", "score": 1, "delta": 1}]
+                    },
+                    {
+                        "relation_id": "scores",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "optimized-scores-stream",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 2,
+                        "rows": [{"user_id": "bob", "score": 2, "delta": 1}]
+                    }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(epoch_ingest.0, StatusCode::CREATED, "{epoch_ingest:?}");
+        assert_eq!(epoch_ingest.1["ack_mode"], "materialized");
+        assert_eq!(
+            epoch_ingest.1["ingest_epoch"],
+            epoch_ingest.1["epoch_manifest_id"]
+        );
+        assert_eq!(epoch_ingest.1["materialized_through"], 3);
+        assert_eq!(epoch_ingest.1["materialization"]["status"], "completed");
+        assert_eq!(epoch_ingest.1["materialization"]["applied_batches"], 2);
+        assert_eq!(epoch_ingest.1["materialization"]["checkpoint_writes"], 1);
+        assert_eq!(
+            epoch_ingest.1["materialization"]["applied_batches_per_checkpoint_write"],
+            2
+        );
+        assert_eq!(epoch_ingest.1["materialization"]["output_delta_writes"], 1);
+        assert_eq!(epoch_ingest.1["materialization"]["state_payload_writes"], 1);
+        assert_eq!(
+            epoch_ingest.1["materialization"]["checkpoint_record_writes"],
+            1
+        );
+        assert_eq!(
+            epoch_ingest.1["materialization"]["checkpoint_pointer_writes"],
+            0
+        );
+        assert_eq!(epoch_ingest.1["materialization"]["latest_cache_writes"], 1);
+        assert_eq!(
+            epoch_ingest.1["materialization"]["checkpoint_publication_writes"],
+            1
+        );
+        assert!(epoch_ingest.1["materialization"]
+            .get("compaction_scheduled")
+            .is_none());
+        assert_eq!(epoch_ingest.1["timings"]["batch_count"], 2);
+        assert_eq!(epoch_ingest.1["timings"]["row_count"], 2);
+        assert!(epoch_ingest.1["timings"]["avg_batch_us"].as_u64().is_some());
+        assert!(epoch_ingest.1["timings"]["avg_row_us"].as_u64().is_some());
+        assert!(epoch_ingest.1["timings"]["rows_per_second"]
+            .as_u64()
+            .is_some());
+        assert!(epoch_ingest.1["timings"].get("stages").is_none());
+
+        let rejected_ack_mode = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "ack_mode": "append_committed",
+                "batches": [
+                    {
+                        "relation_id": "scores",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "optimized-scores-stream",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 3,
+                        "rows": [{"user_id": "alice", "score": 3, "delta": 1}]
+                    },
+                    {
+                        "relation_id": "scores",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "optimized-scores-stream",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 4,
+                        "rows": [{"user_id": "bob", "score": 4, "delta": 1}]
+                    }
+                ]
+            }),
+        )
+        .await;
+        assert!(
+            rejected_ack_mode.0.is_client_error(),
+            "{rejected_ack_mode:?}"
+        );
+        assert!(rejected_ack_mode.1["error"]
+            .as_str()
+            .unwrap()
+            .contains("ack_mode"));
+        assert!(rejected_ack_mode.1["error"]
+            .as_str()
+            .unwrap()
+            .contains("unknown field"));
+
+        let rejected_batch_ack_mode = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "scores",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "optimized-scores-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 3,
+                    "ack_mode": "append_committed",
+                    "rows": [{"user_id": "alice", "score": 3, "delta": 1}]
+                }]
+            }),
+        )
+        .await;
+        assert!(
+            rejected_batch_ack_mode.0.is_client_error(),
+            "{rejected_batch_ack_mode:?}"
+        );
+        assert!(rejected_batch_ack_mode.1["error"]
+            .as_str()
+            .unwrap()
+            .contains("ack_mode"));
+    }
+
+    #[tokio::test]
+    async fn rest_materialization_rejects_output_delta_over_runtime_budget() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state = test_api_state_with_store(store, "api-test-runtime-budget-owner", false)
+            .await
+            .with_standing_runtime_budget_limits(
+                1,
+                DEFAULT_MAX_STANDING_RUNTIME_STATE_PAYLOAD_BYTES,
+            );
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "budgeted_scores_by_user".to_string(),
+            url_path: Some("/scores/budgeted".to_string()),
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("runtime output delta budget proof".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED);
+
+        let ingest_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/scores/ingest",
+            json!({
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "budgeted-scores-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "rows": [
+                    {"user_id": "alice", "score": 10, "delta": 1},
+                    {"user_id": "bob", "score": 20, "delta": 1}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(
+            ingest_response.0,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "{ingest_response:?}"
+        );
+        assert!(ingest_response.1["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("output delta record count 2 exceeds configured limit 1"));
+
+        let query_response = call_json(
+            &router,
+            Method::GET,
+            "/v1/views/budgeted_scores_by_user/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(
+            query_response.0,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{query_response:?}"
+        );
+        assert!(query_response.1["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not fully materialized"));
+    }
+
+    #[tokio::test]
+    async fn rest_epoch_ingest_appends_batches_concurrently() {
+        let counts = ObjectStoreAccessCounts::default();
+        let store: Arc<dyn ObjectStore> = Arc::new(CountingObjectStore::with_ingest_put_delay(
+            Arc::new(InMemory::new()),
+            counts.clone(),
+            Duration::from_millis(25),
+        ));
+        let state =
+            test_api_state_with_store(store, "api-test-epoch-append-parallel-owner", false).await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        counts.clear();
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [
+                    {
+                        "relation_id": "scores",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "parallel-append-a",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [{"user_id": "alice", "score": 1, "delta": 1}]
+                    },
+                    {
+                        "relation_id": "scores",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "parallel-append-b",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [{"user_id": "bob", "score": 2, "delta": 1}]
+                    },
+                    {
+                        "relation_id": "scores",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "parallel-append-c",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [{"user_id": "carol", "score": 3, "delta": 1}]
+                    },
+                    {
+                        "relation_id": "scores",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "parallel-append-d",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [{"user_id": "dave", "score": 4, "delta": 1}]
+                    }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+        assert_eq!(ingest.1["outcome"], "appended");
+        assert_eq!(ingest.1["timings"]["batch_count"], 4);
+        assert!(ingest.1["timings"].get("stages").is_none());
+        assert!(
+            counts.max_concurrent_ingest_puts() > 1,
+            "epoch append should overlap ingest object puts; max concurrency was {}",
+            counts.max_concurrent_ingest_puts()
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_sum_arithmetic_expression_view_materializes_outputs() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-sum-expression-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "adjusted_scores_by_user".to_string(),
+            url_path: Some("/scores/adjusted".to_string()),
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, sum(score + 1) as adjusted_sum, count(*) as count from scores group by user_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("adjusted score totals".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "scores",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "sum-expression-scores-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 0,
+                    "rows": [
+                        {"user_id": "alice", "score": 10, "delta": 1},
+                        {"user_id": "alice", "score": 7, "delta": 1},
+                        {"user_id": "bob", "score": 5, "delta": 1}
+                    ]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+        assert_eq!(ingest.1["materialization"]["status"], "completed");
+
+        let query = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/adjusted_scores_by_user/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query.0, StatusCode::OK, "{query:?}");
+        let rows = query.1["rows"].as_array().unwrap();
+        let rows = rows
+            .iter()
+            .map(|row| {
+                (
+                    row["user_id"].as_str().unwrap().to_string(),
+                    (
+                        row["adjusted_sum"].as_i64().unwrap(),
+                        row["count"].as_i64().unwrap(),
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(rows.get("alice"), Some(&(19, 2)));
+        assert_eq!(rows.get("bob"), Some(&(6, 1)));
+    }
+
+    #[tokio::test]
+    async fn rest_cast_int64_aggregate_expression_view_materializes_outputs() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-cast-expression-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "cast_scores_by_user".to_string(),
+            url_path: Some("/scores/cast".to_string()),
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, sum(cast(score as bigint)) as sum, count(*) as count from scores group by user_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("cast score totals".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/scores/ingest",
+            json!({
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "cast-expression-scores-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "rows": [
+                    {"user_id": "alice", "score": 10, "delta": 1},
+                    {"user_id": "alice", "score": 7, "delta": 1},
+                    {"user_id": "bob", "score": 5, "delta": 1}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+        assert_eq!(ingest.1["materialization"]["status"], "completed");
+
+        let query = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/cast_scores_by_user/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query.0, StatusCode::OK, "{query:?}");
+        let rows = query.1["rows"].as_array().unwrap();
+        let rows = rows
+            .iter()
+            .map(|row| {
+                (
+                    row["user_id"].as_str().unwrap().to_string(),
+                    (row["sum"].as_i64().unwrap(), row["count"].as_i64().unwrap()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(rows.get("alice"), Some(&(17, 2)));
+        assert_eq!(rows.get("bob"), Some(&(5, 1)));
+    }
+
+    #[tokio::test]
+    async fn rest_nested_double_colon_cast_int64_aggregate_expression_view_materializes_outputs() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-double-colon-cast-expression-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "double_colon_cast_scores_by_user".to_string(),
+            url_path: Some("/scores/double-colon-cast".to_string()),
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, sum((score + 1)::bigint) as adjusted_sum, count(*) as count from scores group by user_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("double-colon cast adjusted score totals".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/scores/ingest",
+            json!({
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "double-colon-cast-expression-scores-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "rows": [
+                    {"user_id": "alice", "score": 10, "delta": 1},
+                    {"user_id": "alice", "score": 7, "delta": 1},
+                    {"user_id": "bob", "score": 5, "delta": 1}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+        assert_eq!(ingest.1["materialization"]["status"], "completed");
+
+        let query = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/double_colon_cast_scores_by_user/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query.0, StatusCode::OK, "{query:?}");
+        let rows = query.1["rows"].as_array().unwrap();
+        let rows = rows
+            .iter()
+            .map(|row| {
+                (
+                    row["user_id"].as_str().unwrap().to_string(),
+                    (
+                        row["adjusted_sum"].as_i64().unwrap(),
+                        row["count"].as_i64().unwrap(),
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(rows.get("alice"), Some(&(19, 2)));
+        assert_eq!(rows.get("bob"), Some(&(6, 1)));
+    }
+
+    #[tokio::test]
+    async fn rest_try_and_safe_cast_int64_aggregate_expression_view_materializes_outputs() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-try-safe-cast-expression-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "try_safe_cast_scores_by_user".to_string(),
+            url_path: Some("/scores/try-safe-cast".to_string()),
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, sum(try_cast(score as bigint)) as try_sum, sum(safe_cast(score as int64)) as safe_sum from scores group by user_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("try and safe cast score totals".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/scores/ingest",
+            json!({
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "try-safe-cast-expression-scores-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "rows": [
+                    {"user_id": "alice", "score": 10, "delta": 1},
+                    {"user_id": "alice", "score": 7, "delta": 1},
+                    {"user_id": "bob", "score": 5, "delta": 1}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+        assert_eq!(ingest.1["materialization"]["status"], "completed");
+
+        let query = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/try_safe_cast_scores_by_user/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query.0, StatusCode::OK, "{query:?}");
+        let rows = query.1["rows"].as_array().unwrap();
+        let rows = rows
+            .iter()
+            .map(|row| {
+                (
+                    row["user_id"].as_str().unwrap().to_string(),
+                    (
+                        row["try_sum"].as_i64().unwrap(),
+                        row["safe_sum"].as_i64().unwrap(),
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(rows.get("alice"), Some(&(17, 17)));
+        assert_eq!(rows.get("bob"), Some(&(5, 5)));
+    }
+
+    #[tokio::test]
+    async fn rest_abs_int64_aggregate_expression_view_materializes_outputs() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-abs-expression-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "absolute_scores_by_user".to_string(),
+            url_path: Some("/scores/absolute".to_string()),
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, sum(abs(score)) as absolute_sum, count(*) as count from scores group by user_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("absolute score totals".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "scores",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "abs-expression-scores-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 0,
+                    "rows": [
+                        {"user_id": "alice", "score": -10, "delta": 1},
+                        {"user_id": "alice", "score": 7, "delta": 1},
+                        {"user_id": "bob", "score": -5, "delta": 1}
+                    ]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+
+        let query = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/absolute_scores_by_user/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query.0, StatusCode::OK, "{query:?}");
+        let rows = query.1["rows"].as_array().unwrap();
+        let rows = rows
+            .iter()
+            .map(|row| {
+                (
+                    row["user_id"].as_str().unwrap().to_string(),
+                    (
+                        row["absolute_sum"].as_i64().unwrap(),
+                        row["count"].as_i64().unwrap(),
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(rows.get("alice"), Some(&(17, 2)));
+        assert_eq!(rows.get("bob"), Some(&(5, 1)));
+    }
+
+    #[tokio::test]
+    async fn rest_greatest_least_int64_aggregate_expression_view_materializes_outputs() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-greatest-least-expression-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "bounded_scores_by_user".to_string(),
+            url_path: Some("/scores/bounded".to_string()),
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, sum(greatest(score, 0)) as positive_floor_sum, sum(least(score, 10)) as capped_sum, count(*) as count from scores group by user_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("bounded score totals".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "scores",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "greatest-least-expression-scores-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 0,
+                    "rows": [
+                        {"user_id": "alice", "score": -10, "delta": 1},
+                        {"user_id": "alice", "score": 17, "delta": 1},
+                        {"user_id": "bob", "score": 5, "delta": 1}
+                    ]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+
+        let query = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/bounded_scores_by_user/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query.0, StatusCode::OK, "{query:?}");
+        let rows = query.1["rows"].as_array().unwrap();
+        let rows = rows
+            .iter()
+            .map(|row| {
+                (
+                    row["user_id"].as_str().unwrap().to_string(),
+                    (
+                        row["positive_floor_sum"].as_i64().unwrap(),
+                        row["capped_sum"].as_i64().unwrap(),
+                        row["count"].as_i64().unwrap(),
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(rows.get("alice"), Some(&(17, 0, 2)));
+        assert_eq!(rows.get("bob"), Some(&(5, 5, 1)));
+    }
+
+    #[tokio::test]
+    async fn rest_coalesce_nullable_int64_aggregate_expression_view_materializes_outputs() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-coalesce-expression-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog_with_nullable_score(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "coalesced_scores_by_user".to_string(),
+            url_path: Some("/scores/coalesced".to_string()),
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, sum(coalesce(score, 0)) as coalesced_sum, count(*) as count from scores group by user_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("coalesced nullable score totals".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "scores",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "coalesce-expression-scores-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 0,
+                    "rows": [
+                        {"user_id": "alice", "score": 10, "delta": 1},
+                        {"user_id": "alice", "score": null, "delta": 1},
+                        {"user_id": "alice", "score": 7, "delta": 1},
+                        {"user_id": "bob", "score": null, "delta": 1}
+                    ]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+
+        let query = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/coalesced_scores_by_user/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query.0, StatusCode::OK, "{query:?}");
+        let rows = query.1["rows"].as_array().unwrap();
+        let rows = rows
+            .iter()
+            .map(|row| {
+                (
+                    row["user_id"].as_str().unwrap().to_string(),
+                    (
+                        row["coalesced_sum"].as_i64().unwrap(),
+                        row["count"].as_i64().unwrap(),
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(rows.get("alice"), Some(&(17, 3)));
+        assert_eq!(rows.get("bob"), Some(&(0, 1)));
+    }
+
+    #[tokio::test]
+    async fn rest_is_not_distinct_from_null_predicate_view_materializes_outputs() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-is-not-distinct-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog_with_nullable_score(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "null_scores_by_user".to_string(),
+            url_path: None,
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, sum(coalesce(score, 0)) as sum, count(*) as count from scores where score is not distinct from null group by user_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("null-safe score aggregate".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/scores/ingest",
+            json!({
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "is-not-distinct-scores-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "rows": [
+                    {"user_id": "alice", "score": 10, "delta": 1},
+                    {"user_id": "alice", "score": null, "delta": 1},
+                    {"user_id": "bob", "score": null, "delta": 1},
+                    {"user_id": "carol", "score": 3, "delta": 1}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+        assert_eq!(ingest.1["materialization"]["status"], "completed");
+
+        let query = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/null_scores_by_user/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query.0, StatusCode::OK, "{query:?}");
+        let rows = query.1["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["user_id"].as_str().unwrap().to_string(),
+                    (row["sum"].as_i64().unwrap(), row["count"].as_i64().unwrap()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(rows.get("alice"), Some(&(0, 1)));
+        assert_eq!(rows.get("bob"), Some(&(0, 1)));
+        assert_eq!(rows.get("carol"), None);
+    }
+
+    #[tokio::test]
+    async fn rest_case_when_distinct_from_null_predicate_view_materializes_outputs() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-case-null-safe-expression-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog_with_nullable_score(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "case_null_safe_scores_by_user".to_string(),
+            url_path: Some("/scores/case-null-safe".to_string()),
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, sum(case when score is distinct from null then coalesce(score, 0) else 0 end) as present_sum, sum(case when score is not distinct from null then 1 else 0 end) as null_count from scores group by user_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("CASE null-safe score totals".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/scores/ingest",
+            json!({
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "case-null-safe-expression-scores-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "rows": [
+                    {"user_id": "alice", "score": 10, "delta": 1},
+                    {"user_id": "alice", "score": null, "delta": 1},
+                    {"user_id": "alice", "score": 7, "delta": 1},
+                    {"user_id": "bob", "score": null, "delta": 1}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+        assert_eq!(ingest.1["materialization"]["status"], "completed");
+
+        let query = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/case_null_safe_scores_by_user/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query.0, StatusCode::OK, "{query:?}");
+        let rows = query.1["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["user_id"].as_str().unwrap().to_string(),
+                    (
+                        row["present_sum"].as_i64().unwrap(),
+                        row["null_count"].as_i64().unwrap(),
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(rows.get("alice"), Some(&(17, 1)));
+        assert_eq!(rows.get("bob"), Some(&(0, 1)));
+    }
+
+    #[tokio::test]
+    async fn rest_case_when_is_null_predicate_view_materializes_outputs() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-case-null-predicate-expression-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog_with_nullable_score(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "case_null_predicate_scores_by_user".to_string(),
+            url_path: Some("/scores/case-null-predicate".to_string()),
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, sum(case when score is null then 1 else 0 end) as null_count, sum(case when score is not null then coalesce(score, 0) else 0 end) as present_sum from scores group by user_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("CASE nullable score predicate totals".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/scores/ingest",
+            json!({
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "case-null-predicate-expression-scores-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "rows": [
+                    {"user_id": "alice", "score": 10, "delta": 1},
+                    {"user_id": "alice", "score": null, "delta": 1},
+                    {"user_id": "alice", "score": 7, "delta": 1},
+                    {"user_id": "bob", "score": null, "delta": 1}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+        assert_eq!(ingest.1["materialization"]["status"], "completed");
+
+        let query = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/case_null_predicate_scores_by_user/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query.0, StatusCode::OK, "{query:?}");
+        let rows = query.1["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["user_id"].as_str().unwrap().to_string(),
+                    (
+                        row["null_count"].as_i64().unwrap(),
+                        row["present_sum"].as_i64().unwrap(),
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(rows.get("alice"), Some(&(1, 17)));
+        assert_eq!(rows.get("bob"), Some(&(1, 0)));
+    }
+
+    #[tokio::test]
+    async fn rest_case_when_int64_aggregate_expression_view_materializes_outputs() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-case-expression-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "positive_score_sum_by_user".to_string(),
+            url_path: Some("/scores/positive-sum".to_string()),
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, sum(case when score > 0 then score else 0 end) as positive_sum, count(*) as count from scores group by user_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("positive score totals through CASE".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "scores",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "case-expression-scores-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 0,
+                    "rows": [
+                        {"user_id": "alice", "score": 10, "delta": 1},
+                        {"user_id": "alice", "score": -7, "delta": 1},
+                        {"user_id": "bob", "score": -5, "delta": 1}
+                    ]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+        assert_eq!(ingest.1["materialization"]["status"], "completed");
+
+        let query = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/positive_score_sum_by_user/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query.0, StatusCode::OK, "{query:?}");
+        let rows = query.1["rows"].as_array().unwrap();
+        let rows = rows
+            .iter()
+            .map(|row| {
+                (
+                    row["user_id"].as_str().unwrap().to_string(),
+                    (
+                        row["positive_sum"].as_i64().unwrap(),
+                        row["count"].as_i64().unwrap(),
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(rows.get("alice"), Some(&(10, 2)));
+        assert_eq!(rows.get("bob"), Some(&(0, 1)));
+    }
+
+    #[tokio::test]
+    async fn rest_case_when_between_and_in_predicate_view_materializes_outputs() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-case-predicate-expression-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "case_predicate_scores_by_user".to_string(),
+            url_path: Some("/scores/case-predicate-sum".to_string()),
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, sum(case when score between 1 and 10 then score else 0 end) as bounded_sum, sum(case when score in (5, 7) then score else 0 end) as selected_sum, count(*) as count from scores group by user_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("score totals through CASE BETWEEN and IN predicates".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/scores/ingest",
+            json!({
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "case-predicate-expression-scores-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "rows": [
+                    {"user_id": "alice", "score": 10, "delta": 1},
+                    {"user_id": "alice", "score": 7, "delta": 1},
+                    {"user_id": "bob", "score": 5, "delta": 1},
+                    {"user_id": "carol", "score": 12, "delta": 1}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+        assert_eq!(ingest.1["materialization"]["status"], "completed");
+
+        let query = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/case_predicate_scores_by_user/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query.0, StatusCode::OK, "{query:?}");
+        let rows = query.1["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["user_id"].as_str().unwrap().to_string(),
+                    (
+                        row["bounded_sum"].as_i64().unwrap(),
+                        row["selected_sum"].as_i64().unwrap(),
+                        row["count"].as_i64().unwrap(),
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(rows.get("alice"), Some(&(17, 7, 2)));
+        assert_eq!(rows.get("bob"), Some(&(5, 5, 1)));
+        assert_eq!(rows.get("carol"), Some(&(0, 0, 1)));
+    }
+
+    #[tokio::test]
+    async fn rest_if_int64_aggregate_expression_view_materializes_outputs() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-if-expression-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "positive_if_score_sum_by_user".to_string(),
+            url_path: Some("/scores/positive-if-sum".to_string()),
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, sum(if(score > 0, score, 0)) as positive_sum, count(*) as count from scores group by user_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("positive score totals through IF".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "scores",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "if-expression-scores-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 0,
+                    "rows": [
+                        {"user_id": "alice", "score": 10, "delta": 1},
+                        {"user_id": "alice", "score": -7, "delta": 1},
+                        {"user_id": "bob", "score": -5, "delta": 1}
+                    ]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+        assert_eq!(ingest.1["materialization"]["status"], "completed");
+
+        let query = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/positive_if_score_sum_by_user/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query.0, StatusCode::OK, "{query:?}");
+        let rows = query.1["rows"].as_array().unwrap();
+        let rows = rows
+            .iter()
+            .map(|row| {
+                (
+                    row["user_id"].as_str().unwrap().to_string(),
+                    (
+                        row["positive_sum"].as_i64().unwrap(),
+                        row["count"].as_i64().unwrap(),
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(rows.get("alice"), Some(&(10, 2)));
+        assert_eq!(rows.get("bob"), Some(&(0, 1)));
+    }
+
+    #[tokio::test]
+    async fn rest_multi_branch_case_when_int64_aggregate_expression_view_materializes_outputs() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-multi-case-expression-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "capped_positive_score_sum_by_user".to_string(),
+            url_path: Some("/scores/capped-positive-sum".to_string()),
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, sum(case when score > 10 then 10 when score > 0 then score else 0 end) as capped_sum, count(*) as count from scores group by user_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("capped positive score totals through CASE".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "scores",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "multi-case-expression-scores-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 0,
+                    "rows": [
+                        {"user_id": "alice", "score": 20, "delta": 1},
+                        {"user_id": "alice", "score": 7, "delta": 1},
+                        {"user_id": "bob", "score": -5, "delta": 1}
+                    ]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+
+        let query = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/capped_positive_score_sum_by_user/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query.0, StatusCode::OK, "{query:?}");
+        let rows = query.1["rows"].as_array().unwrap();
+        let rows = rows
+            .iter()
+            .map(|row| {
+                (
+                    row["user_id"].as_str().unwrap().to_string(),
+                    (
+                        row["capped_sum"].as_i64().unwrap(),
+                        row["count"].as_i64().unwrap(),
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(rows.get("alice"), Some(&(17, 2)));
+        assert_eq!(rows.get("bob"), Some(&(0, 1)));
+    }
+
+    #[tokio::test]
+    async fn rest_simple_case_when_int64_aggregate_expression_view_materializes_outputs() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-simple-case-expression-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "bucketed_score_sum_by_user".to_string(),
+            url_path: Some("/scores/bucketed-sum".to_string()),
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, sum(case score when 1 then 10 when 2 then 20 else 0 end) as bucket_sum, count(*) as count from scores group by user_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("bucketed score totals through simple CASE".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "scores",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "simple-case-expression-scores-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 0,
+                    "rows": [
+                        {"user_id": "alice", "score": 1, "delta": 1},
+                        {"user_id": "alice", "score": 2, "delta": 1},
+                        {"user_id": "bob", "score": 9, "delta": 1}
+                    ]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+
+        let query = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/bucketed_score_sum_by_user/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query.0, StatusCode::OK, "{query:?}");
+        let rows = query.1["rows"].as_array().unwrap();
+        let rows = rows
+            .iter()
+            .map(|row| {
+                (
+                    row["user_id"].as_str().unwrap().to_string(),
+                    (
+                        row["bucket_sum"].as_i64().unwrap(),
+                        row["count"].as_i64().unwrap(),
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(rows.get("alice"), Some(&(30, 2)));
+        assert_eq!(rows.get("bob"), Some(&(0, 1)));
+    }
+
+    #[tokio::test]
+    async fn rest_min_max_arithmetic_expression_view_materializes_outputs() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-min-max-expression-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "score_extrema_by_user".to_string(),
+            url_path: Some("/scores/extrema".to_string()),
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, min(score + 1) as smallest, max(score + 1) as largest from scores group by user_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("adjusted score extrema".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "scores",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "min-max-expression-scores-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 0,
+                    "rows": [
+                        {"user_id": "alice", "score": 10, "delta": 1},
+                        {"user_id": "alice", "score": 7, "delta": 1},
+                        {"user_id": "bob", "score": 5, "delta": 1}
+                    ]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+        assert_eq!(ingest.1["materialization"]["status"], "completed");
+
+        let query = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/score_extrema_by_user/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query.0, StatusCode::OK, "{query:?}");
+        let rows = query.1["rows"].as_array().unwrap();
+        let rows = rows
+            .iter()
+            .map(|row| {
+                (
+                    row["user_id"].as_str().unwrap().to_string(),
+                    (
+                        row["smallest"].as_i64().unwrap(),
+                        row["largest"].as_i64().unwrap(),
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(rows.get("alice"), Some(&(8, 11)));
+        assert_eq!(rows.get("bob"), Some(&(6, 6)));
+    }
+
+    #[tokio::test]
+    async fn rest_avg_arithmetic_expression_view_materializes_outputs() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-avg-expression-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "average_adjusted_scores_by_user".to_string(),
+            url_path: Some("/scores/average-adjusted".to_string()),
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, avg(score + 1) as average from scores group by user_id"
+                .to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("adjusted score average".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "scores",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "avg-expression-scores-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 0,
+                    "rows": [
+                        {"user_id": "alice", "score": 10, "delta": 1},
+                        {"user_id": "alice", "score": 7, "delta": 1},
+                        {"user_id": "bob", "score": 5, "delta": 1}
+                    ]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+        assert_eq!(ingest.1["materialization"]["status"], "completed");
+
+        let query = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/average_adjusted_scores_by_user/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query.0, StatusCode::OK, "{query:?}");
+        let rows = query.1["rows"].as_array().unwrap();
+        let rows = rows
+            .iter()
+            .map(|row| {
+                (
+                    row["user_id"].as_str().unwrap().to_string(),
+                    row["average"].as_f64().unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(rows.get("alice"), Some(&9.5));
+        assert_eq!(rows.get("bob"), Some(&6.0));
+    }
+
+    #[tokio::test]
+    async fn rest_filter_project_view_materializes_outputs() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-filter-project-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "positive_scores".to_string(),
+            url_path: Some("/scores/positive-project".to_string()),
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, score from scores where score > 0".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("positive score projection".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+        assert_eq!(view_response.1["query_enabled"], true);
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "scores",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "filter-project-scores-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 0,
+                    "rows": [
+                        {"user_id": "alice", "score": 10, "delta": 1},
+                        {"user_id": "bob", "score": -3, "delta": 1}
+                    ]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+        assert_eq!(ingest.1["materialization"]["status"], "completed");
+
+        let query = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/positive_scores/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query.0, StatusCode::OK, "{query:?}");
+        assert_eq!(query.1["rows"], json!([{"user_id": "alice", "score": 10}]));
+    }
+
+    #[tokio::test]
+    async fn rest_filter_project_union_distinct_view_materializes_outputs() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-filter-project-union-distinct-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "positive_scores_union_distinct".to_string(),
+            url_path: Some("/scores/positive-union-distinct".to_string()),
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, score from scores where score > 0 union distinct select user_id, score from scores where score >= 10".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("positive score projection through union distinct".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+        assert_eq!(view_response.1["query_enabled"], true);
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/scores/ingest",
+            json!({
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "filter-project-union-distinct-scores-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "rows": [
+                    {"user_id": "alice", "score": 10, "delta": 1},
+                    {"user_id": "bob", "score": -3, "delta": 1},
+                    {"user_id": "carol", "score": 7, "delta": 1}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+        assert_eq!(ingest.1["materialization"]["status"], "completed");
+
+        let query = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/positive_scores_union_distinct/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query.0, StatusCode::OK, "{query:?}");
+        assert_eq!(
+            query.1["rows"],
+            json!([
+                {"user_id": "alice", "score": 10},
+                {"user_id": "carol", "score": 7}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_filter_project_order_by_limit_view_materializes_top_k_outputs() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-filter-project-top-k-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "positive_scores_top_k".to_string(),
+            url_path: Some("/scores/positive-top-k".to_string()),
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, score from scores where score > 0 order by score desc limit 2"
+                .to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("positive score top-k projection".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+        assert_eq!(view_response.1["query_enabled"], true);
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/scores/ingest",
+            json!({
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "filter-project-top-k-scores-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "rows": [
+                    {"user_id": "alice", "score": 10, "delta": 1},
+                    {"user_id": "bob", "score": 8, "delta": 1},
+                    {"user_id": "carol", "score": 6, "delta": 1}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+        assert_eq!(ingest.1["materialization"]["status"], "completed");
+
+        let query = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/positive_scores_top_k/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query.0, StatusCode::OK, "{query:?}");
+        assert_eq!(
+            query.1["rows"],
+            json!([
+                {"user_id": "alice", "score": 10},
+                {"user_id": "bob", "score": 8}
+            ])
+        );
+
+        let delete_top_row = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/scores/ingest",
+            json!({
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "filter-project-top-k-scores-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 3,
+                "rows": [
+                    {"user_id": "alice", "score": 10, "delta": -1}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(delete_top_row.0, StatusCode::CREATED, "{delete_top_row:?}");
+        assert_eq!(delete_top_row.1["materialization"]["status"], "completed");
+
+        let query = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/positive_scores_top_k/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query.0, StatusCode::OK, "{query:?}");
+        assert_eq!(
+            query.1["rows"],
+            json!([
+                {"user_id": "bob", "score": 8},
+                {"user_id": "carol", "score": 6}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_filter_project_case_over_bool_predicate_materializes_relation_scoped_ingest() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-filter-project-bool-case-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_device_status_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "device_enabled_flags".to_string(),
+            url_path: Some("/devices/enabled-flags".to_string()),
+            output_relation_id: None,
+            input_relation_id: "device_status".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select device_id, case when enabled = true then 1 else 0 end as enabled_flag from device_status".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("device enabled flags".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+        assert_eq!(view_response.1["query_enabled"], true);
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/device_status/ingest",
+            json!({
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "device-status-bool-case-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "rows": [
+                    {"device_id": "device-a", "enabled": true, "event_time": 100, "delta": 1},
+                    {"device_id": "device-b", "enabled": false, "event_time": 101, "delta": 1}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+        assert_eq!(ingest.1["materialization"]["status"], "completed");
+
+        let query = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/device_enabled_flags/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query.0, StatusCode::OK, "{query:?}");
+        assert_eq!(
+            query.1["rows"],
+            json!([
+                {"device_id": "device-a", "enabled_flag": 1},
+                {"device_id": "device-b", "enabled_flag": 0}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_filter_project_cte_view_materializes_outputs() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-filter-project-cte-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "positive_scores_cte".to_string(),
+            url_path: Some("/scores/positive-project-cte".to_string()),
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "with score_source as (select * from scores where score > 0) select user_id, score from score_source where user_id <> 'bob'".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("positive score projection through CTE source".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+        assert_eq!(view_response.1["query_enabled"], true);
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "scores",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "filter-project-cte-scores-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 0,
+                    "rows": [
+                        {"user_id": "alice", "score": 10, "delta": 1},
+                        {"user_id": "bob", "score": 8, "delta": 1},
+                        {"user_id": "carol", "score": -2, "delta": 1}
+                    ]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+        assert_eq!(ingest.1["materialization"]["status"], "completed");
+
+        let query = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/positive_scores_cte/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query.0, StatusCode::OK, "{query:?}");
+        assert_eq!(query.1["rows"], json!([{"user_id": "alice", "score": 10}]));
+    }
+
+    #[tokio::test]
+    async fn rest_filter_project_derived_table_view_materializes_outputs() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-filter-project-derived-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "positive_scores_derived".to_string(),
+            url_path: Some("/scores/positive-project-derived".to_string()),
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select s.user_id, s.score from (select * from scores where score > 0) s where s.user_id <> 'bob'".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("positive score projection through derived table source".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+        assert_eq!(view_response.1["query_enabled"], true);
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "scores",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "filter-project-derived-scores-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 0,
+                    "rows": [
+                        {"user_id": "alice", "score": 10, "delta": 1},
+                        {"user_id": "bob", "score": 8, "delta": 1},
+                        {"user_id": "carol", "score": -2, "delta": 1}
+                    ]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+        assert_eq!(ingest.1["materialization"]["status"], "completed");
+
+        let query = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/positive_scores_derived/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query.0, StatusCode::OK, "{query:?}");
+        assert_eq!(query.1["rows"], json!([{"user_id": "alice", "score": 10}]));
+    }
+
+    #[tokio::test]
+    async fn rest_filter_project_view_materializes_nullable_value_outputs() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-filter-project-nullable-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog_with_nullable_score(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "nullable_scores_project".to_string(),
+            url_path: Some("/scores/nullable-project".to_string()),
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, score from scores where user_id is not null".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("nullable score projection".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+        assert_eq!(view_response.1["query_enabled"], true);
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "scores",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "filter-project-nullable-scores-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 0,
+                    "rows": [
+                        {"user_id": "alice", "score": 10, "delta": 1},
+                        {"user_id": "bob", "score": null, "delta": 1}
+                    ]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+        assert_eq!(ingest.1["materialization"]["status"], "completed");
+
+        let query = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/nullable_scores_project/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query.0, StatusCode::OK, "{query:?}");
+        assert_eq!(
+            query.1["rows"],
+            json!([
+                {"user_id": "alice", "score": 10},
+                {"user_id": "bob", "score": null}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_computed_filter_project_view_materializes_outputs() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-computed-filter-project-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "positive_score_normalized".to_string(),
+            url_path: Some("/scores/positive-normalized".to_string()),
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, -score + score / 2 + score % 3 as normalized_score from scores where score > 0"
+                .to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("positive score normalized value".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+        assert_eq!(view_response.1["query_enabled"], true);
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "scores",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "computed-filter-project-scores-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 0,
+                    "rows": [
+                        {"user_id": "alice", "score": 10, "delta": 1},
+                        {"user_id": "bob", "score": -3, "delta": 1}
+                    ]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+        assert_eq!(ingest.1["materialization"]["status"], "completed");
+
+        let query = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/positive_score_normalized/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query.0, StatusCode::OK, "{query:?}");
+        assert_eq!(
+            query.1["rows"],
+            json!([{"user_id": "alice", "normalized_score": -4}])
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_aggregate_having_view_materializes_outputs() {
+        let state =
+            test_api_state_with_store(Arc::new(InMemory::new()), "api-test-having-owner", false)
+                .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "scores_having_by_user".to_string(),
+            url_path: Some("/scores/having".to_string()),
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select s.user_id as user, sum(s.score) as sum, count(1) as count from scores as s where s.user_id like 'a%' and s.user_id not like 'admin_%' and s.score in (5, 7, 100) and s.score not in (100) group by s.user_id having sum(s.score) in (12) and count(1) not in (0, 1)".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("score totals above threshold".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/scores/ingest",
+            json!({
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "scores-having-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "rows": [
+                    {"user_id": "alice", "score": 7, "delta": 1},
+                    {"user_id": "alice", "score": 5, "delta": 1},
+                    {"user_id": "bob", "score": 3, "delta": 1}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+        assert_eq!(ingest.1["materialization"]["status"], "completed");
+
+        let query = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/scores_having_by_user/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query.0, StatusCode::OK, "{query:?}");
+        assert_eq!(
+            query.1["rows"],
+            json!([{"user": "alice", "sum": 12, "count": 2}])
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_count_distinct_view_materializes_outputs() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-count-distinct-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "distinct_scores_by_user".to_string(),
+            url_path: Some("/scores/distinct".to_string()),
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, count(distinct score) as count from scores group by user_id"
+                .to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("distinct score count by user".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "scores",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "scores-count-distinct-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 0,
+                    "rows": [
+                        {"user_id": "alice", "score": 7, "delta": 1},
+                        {"user_id": "alice", "score": 7, "delta": 1},
+                        {"user_id": "alice", "score": 5, "delta": 1},
+                        {"user_id": "bob", "score": 3, "delta": 1}
+                    ]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+
+        let query = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/distinct_scores_by_user/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query.0, StatusCode::OK, "{query:?}");
+        assert_eq!(
+            query.1["rows"],
+            json!([
+                {"user_id": "alice", "count": 2},
+                {"user_id": "bob", "count": 1}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_having_count_distinct_function_view_materializes_outputs() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-having-count-distinct-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "scores_distinct_having_by_user".to_string(),
+            url_path: Some("/scores/distinct-having".to_string()),
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, sum(score) as sum, count(distinct score) as distinct_scores from scores group by user_id having count(distinct score) > 1".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("distinct score count HAVING by user".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/scores/ingest",
+            json!({
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "scores-having-count-distinct-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "rows": [
+                    {"user_id": "alice", "score": 10, "delta": 1},
+                    {"user_id": "alice", "score": 10, "delta": 1},
+                    {"user_id": "alice", "score": 7, "delta": 1},
+                    {"user_id": "bob", "score": 5, "delta": 1},
+                    {"user_id": "bob", "score": 5, "delta": 1}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+        assert_eq!(ingest.1["materialization"]["status"], "completed");
+
+        let query = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/scores_distinct_having_by_user/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query.0, StatusCode::OK, "{query:?}");
+        assert_eq!(
+            query.1["rows"],
+            json!([{"user_id": "alice", "sum": 27, "distinct_scores": 2}])
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_filtered_count_distinct_mixed_filter_view_materializes_outputs() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-filtered-count-distinct-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "filtered_distinct_scores_by_user".to_string(),
+            url_path: Some("/scores/filtered-distinct".to_string()),
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, sum(score) filter (where score > 5) as sum, count(distinct score) filter (where score > 0) as count from scores group by user_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("filtered distinct score count by user".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "scores",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "scores-filtered-count-distinct-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 0,
+                    "rows": [
+                        {"user_id": "alice", "score": 10, "delta": 1},
+                        {"user_id": "alice", "score": 10, "delta": 1},
+                        {"user_id": "alice", "score": 7, "delta": 1},
+                        {"user_id": "bob", "score": 5, "delta": 1}
+                    ]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+
+        let query = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/filtered_distinct_scores_by_user/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query.0, StatusCode::OK, "{query:?}");
+        assert_eq!(
+            query.1["rows"],
+            json!([
+                {"user_id": "alice", "sum": 27, "count": 2},
+                {"user_id": "bob", "sum": 0, "count": 1}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_order_by_limit_top_k_view_materializes_outputs() {
+        let state =
+            test_api_state_with_store(Arc::new(InMemory::new()), "api-test-top-k-owner", false)
+                .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_purchases_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "top_purchaser".to_string(),
+            url_path: Some("/purchases/top".to_string()),
+            output_relation_id: None,
+            input_relation_id: "purchases".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, sum(amount) as sum, count(*) as count from purchases group by user_id order by sum desc limit 1".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("top purchaser by materialized sum".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let first_ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "purchases",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "top-purchaser-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 0,
+                    "rows": [
+                        {"user_id": "alice", "amount": 10, "delta": 1},
+                        {"user_id": "alice", "amount": 7, "delta": 1},
+                        {"user_id": "bob", "amount": 5, "delta": 1}
+                    ]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(first_ingest.0, StatusCode::CREATED, "{first_ingest:?}");
+        let first_query = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/top_purchaser/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(first_query.0, StatusCode::OK, "{first_query:?}");
+        assert_eq!(
+            first_query.1["rows"],
+            json!([{"user_id": "alice", "sum": 17, "count": 2}])
+        );
+
+        let second_ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "purchases",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "top-purchaser-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 3,
+                    "rows": [{"user_id": "bob", "amount": 20, "delta": 1}]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(second_ingest.0, StatusCode::CREATED, "{second_ingest:?}");
+        let second_query =
+            call_json(&router, Method::GET, "/v1/api/purchases/top", Value::Null).await;
+        assert_eq!(second_query.0, StatusCode::OK, "{second_query:?}");
+        assert_eq!(
+            second_query.1["rows"],
+            json!([{"user_id": "bob", "sum": 25, "count": 2}])
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_order_by_limit_offset_view_materializes_outputs() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-aggregate-limit-offset",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_purchases_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "second_purchaser".to_string(),
+            url_path: None,
+            output_relation_id: None,
+            input_relation_id: "purchases".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, sum(amount) as sum, count(*) as count from purchases group by user_id order by sum desc limit 1 offset 1".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("second purchaser by materialized sum".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "purchases",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "second-purchaser-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 0,
+                    "rows": [
+                        {"user_id": "alice", "amount": 10, "delta": 1},
+                        {"user_id": "alice", "amount": 7, "delta": 1},
+                        {"user_id": "bob", "amount": 5, "delta": 1}
+                    ]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+
+        let query = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/second_purchaser/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query.0, StatusCode::OK, "{query:?}");
+        assert_eq!(
+            query.1["rows"],
+            json!([{"user_id": "bob", "sum": 5, "count": 1}])
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_order_by_function_top_k_view_materializes_relation_scoped_ingest() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-order-by-function-top-k",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "top_scores_by_user".to_string(),
+            url_path: Some("/scores/top-user".to_string()),
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, sum(score) as total_score, count(*) as event_count from scores group by user_id order by sum(score) desc limit 1".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("top score user by materialized sum".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/scores/ingest",
+            json!({
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "top-score-users-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "rows": [
+                    {"user_id": "alice", "score": 10, "delta": 1},
+                    {"user_id": "alice", "score": 7, "delta": 1},
+                    {"user_id": "bob", "score": 5, "delta": 1},
+                    {"user_id": "carol", "score": 20, "delta": 1}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+        assert_eq!(ingest.1["materialization"]["status"], "completed");
+
+        let query = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/top_scores_by_user/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query.0, StatusCode::OK, "{query:?}");
+        assert_eq!(
+            query.1["rows"],
+            json!([{"user_id": "carol", "total_score": 20, "event_count": 1}])
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_concurrent_ingest_replays_from_fresh_checkpoint_per_view() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state =
+            test_api_state_with_store(store, "api-test-concurrent-ingest-owner", false).await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = default_positive_scores_view_request(&test_scores_catalog()).unwrap();
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(
+            view_response.0,
+            StatusCode::CREATED,
+            "view creation response: {}",
+            view_response.1
+        );
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for stream_index in 0..8 {
+            let app = router.clone();
+            tasks.spawn(async move {
+                call_json(
+                    &app,
+                    Method::POST,
+                    "/v1/ingest",
+                    json!({
+                        "relation_id": "scores",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": format!("concurrent-scores-{stream_index}"),
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [
+                            {
+                                "user_id": format!("concurrent-user-{stream_index}"),
+                                "score": stream_index + 1,
+                                "delta": 1
+                            }
+                        ]
+                    }),
+                )
+                .await
+            });
+        }
+
+        while let Some(result) = tasks.join_next().await {
+            let (status, body) = result.unwrap();
+            assert_eq!(status, StatusCode::CREATED, "ingest response: {body}");
+            assert_eq!(body["outcome"], "appended");
+        }
+
+        let query_response = call_json(
+            &router,
+            Method::GET,
+            "/v1/views/positive_scores_by_user/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(
+            query_response.0,
+            StatusCode::OK,
+            "query response: {}",
+            query_response.1
+        );
+        let rows = query_response.1["rows"].as_array().unwrap();
+        for stream_index in 0..8 {
+            let user_id = format!("concurrent-user-{stream_index}");
+            assert!(
+                rows.iter().any(|row| {
+                    row["user_id"] == user_id
+                        && row["sum"].as_i64() == Some(i64::from(stream_index + 1))
+                        && row["count"].as_i64() == Some(1)
+                }),
+                "missing materialized row for {user_id}: {}",
+                query_response.1
+            );
+        }
+    }
+
+    async fn append_admitted_ingest_without_runtime_apply(
         store: Arc<dyn ObjectStore>,
         request: IngestRowsRequest,
     ) {
         let state = test_api_state_with_store(store, "api-test-crash-window-writer", false).await;
-        let prepared = prepare_ingest_batch(&state, request).await.unwrap();
+        let prepared = prepare_ingest_batch(&state, request, None).await.unwrap();
         let outcome = append_ingest_envelope(&state, prepared.envelope)
             .await
             .unwrap();
@@ -13376,7 +22891,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rest_late_view_backfills_on_first_query_without_blocking_later_ingest() {
+    async fn rest_late_view_query_reports_materialization_lag_without_blocking_later_ingest() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let state = test_api_state_with_store(store, "api-test-late-view-owner", false).await;
         let router = app(state);
@@ -13485,18 +23000,14 @@ mod tests {
         .await;
         assert_eq!(
             query_response.0,
-            StatusCode::OK,
-            "query-triggered backfill response: {}",
+            StatusCode::SERVICE_UNAVAILABLE,
+            "late view query response: {}",
             query_response.1
         );
-        assert_eq!(query_response.1["logical_epoch"], 4);
-        assert_eq!(
-            query_response.1["rows"],
-            json!([
-                {"user_id": "alice", "sum": 15, "count": 3},
-                {"user_id": "bob", "sum": 4, "count": 1}
-            ])
-        );
+        assert!(query_response.1["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("MATERIALIZATION_LAG"));
 
         let refreshed_view = call_json(
             &router,
@@ -13506,17 +23017,19 @@ mod tests {
         )
         .await;
         assert_eq!(refreshed_view.0, StatusCode::OK);
-        assert_eq!(refreshed_view.1["query_enabled"], true);
+        assert_eq!(refreshed_view.1["query_enabled"], false);
         assert_eq!(
             refreshed_view.1["lifecycle"]["deployment_status"],
-            "running"
+            "deploying"
         );
     }
 
     #[tokio::test]
     async fn rest_late_view_backfill_api_reports_coverage_and_runs_limited_steps() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let state = test_api_state_with_store(store, "api-test-backfill-api-owner", false).await;
+        let state = test_api_state_with_store(store, "api-test-backfill-api-owner", false)
+            .await
+            .with_experimental_advanced_view_features(true);
         let router = app(state);
 
         let relation_response = call_json(
@@ -13591,13 +23104,14 @@ mod tests {
         assert_eq!(view_response.0, StatusCode::CREATED);
         assert_eq!(view_response.1["coverage"]["state"], "backfill_required");
         assert_eq!(
-            view_response.1["coverage"]["request_scope"]["status"],
-            "unsupported"
-        );
-        assert_eq!(
-            view_response.1["coverage"]["background_backfill"]["status"],
+            view_response.1["coverage"]["full_view"]["status"],
             "available"
         );
+        assert!(view_response.1["coverage"].get("request_scope").is_none());
+        assert!(view_response.1["coverage"].get("range").is_none());
+        assert!(view_response.1["coverage"]
+            .get("background_backfill")
+            .is_none());
 
         let status = call_json(
             &router,
@@ -13617,7 +23131,7 @@ mod tests {
             &router,
             Method::POST,
             "/v1/views/late_scores_backfill_api/backfill",
-            json!({"mode": "sync", "batch_limit": 1}),
+            json!({"batch_limit": 1}),
         )
         .await;
         assert_eq!(
@@ -13638,7 +23152,7 @@ mod tests {
             &router,
             Method::POST,
             "/v1/views/late_scores_backfill_api/backfill",
-            json!({"mode": "sync"}),
+            json!({}),
         )
         .await;
         assert_eq!(finish.0, StatusCode::OK, "finish response: {}", finish.1);
@@ -13667,10 +23181,402 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rest_late_view_background_backfill_scheduler_eventually_marks_running() {
+    async fn rest_late_single_relation_stats_having_top_k_backfill_api_runs_limited_steps() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let state =
-            test_api_state_with_store(store, "api-test-background-backfill-owner", false).await;
+        let state = test_api_state_with_store(
+            store,
+            "api-test-late-stats-having-top-k-backfill-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        for (start, rows) in [
+            (
+                0,
+                json!([
+                    {"user_id": "alice", "score": 10, "delta": 1},
+                    {"user_id": "bob", "score": 12, "delta": 1}
+                ]),
+            ),
+            (
+                2,
+                json!([
+                    {"user_id": "alice", "score": 8, "delta": 1}
+                ]),
+            ),
+        ] {
+            let ingest = call_json(
+                &router,
+                Method::POST,
+                "/v1/ingest",
+                json!({
+                    "relation_id": "scores",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "scores-stats-having-top-k-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": start,
+                    "rows": rows
+                }),
+            )
+            .await;
+            assert_eq!(
+                ingest.0,
+                StatusCode::CREATED,
+                "ingest response: {}",
+                ingest.1
+            );
+        }
+
+        let view_request = CreateViewRequest {
+            view_id: "late_score_stats_having_top_k".to_string(),
+            url_path: Some("/scores/stats-having-top-k".to_string()),
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, min(score) as min_score, max(score) as max_score, avg(score) as avg_score, count(*) as count from scores group by user_id having count(*) > 1 order by avg_score desc limit 1".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("late-created score stats with HAVING and top-k".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(
+            view_response.0,
+            StatusCode::CREATED,
+            "view creation response: {}",
+            view_response.1
+        );
+        assert_eq!(view_response.1["coverage"]["state"], "backfill_required");
+        assert_eq!(view_response.1["query_enabled"], false);
+
+        let first_step = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/late_score_stats_having_top_k/backfill",
+            json!({"batch_limit": 1}),
+        )
+        .await;
+        assert_eq!(
+            first_step.0,
+            StatusCode::OK,
+            "first backfill response: {}",
+            first_step.1
+        );
+        assert_eq!(first_step.1["applied_batches"], 1);
+        assert_eq!(first_step.1["remaining_batches"], 1);
+        assert_eq!(first_step.1["query_enabled"], false);
+
+        let finish = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/late_score_stats_having_top_k/backfill",
+            json!({"batch_limit": 1}),
+        )
+        .await;
+        assert_eq!(
+            finish.0,
+            StatusCode::OK,
+            "finish backfill response: {}",
+            finish.1
+        );
+        assert_eq!(finish.1["applied_batches"], 1);
+        assert_eq!(finish.1["remaining_batches"], 0);
+        assert_eq!(finish.1["query_enabled"], true);
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/late_score_stats_having_top_k/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(
+            query_response.0,
+            StatusCode::OK,
+            "query response: {}",
+            query_response.1
+        );
+        assert_eq!(
+            query_response.1["rows"],
+            json!([
+                {"user_id": "alice", "min_score": 8, "max_score": 10, "avg_score": 9.0, "count": 2}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_late_view_backfill_rejects_offset_range_scope() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state = test_api_state_with_store(store, "api-test-range-backfill-owner", false)
+            .await
+            .with_experimental_advanced_view_features(true);
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        for (start, rows) in [
+            (
+                0,
+                json!([
+                    {"user_id": "alice", "score": 10, "delta": 1},
+                    {"user_id": "bob", "score": 4, "delta": 1}
+                ]),
+            ),
+            (
+                2,
+                json!([
+                    {"user_id": "alice", "score": 2, "delta": 1}
+                ]),
+            ),
+        ] {
+            let ingest_response = call_json(
+                &router,
+                Method::POST,
+                "/v1/ingest",
+                json!({
+                    "relation_id": "scores",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "scores-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": start,
+                    "rows": rows
+                }),
+            )
+            .await;
+            assert_eq!(ingest_response.0, StatusCode::CREATED);
+        }
+
+        let view_request = CreateViewRequest {
+            view_id: "late_scores_range_backfill".to_string(),
+            url_path: Some("/scores/range-backfill".to_string()),
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("late-created score totals with range backfill".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED);
+        assert_eq!(view_response.1["query_enabled"], false);
+
+        let range_backfill = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/late_scores_range_backfill/backfill",
+            json!({
+                "mode": "sync",
+                "range": {
+                    "relation_id": "scores",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "scores-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 0,
+                    "end_offset_exclusive": 2
+                }
+            }),
+        )
+        .await;
+        assert_eq!(
+            range_backfill.0,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "range backfill response: {}",
+            range_backfill.1
+        );
+
+        let full_backfill = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/late_scores_range_backfill/backfill",
+            json!({}),
+        )
+        .await;
+        assert_eq!(full_backfill.0, StatusCode::OK);
+        assert_eq!(full_backfill.1["query_enabled"], true);
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/late_scores_range_backfill/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query_response.0, StatusCode::OK);
+        assert_eq!(
+            query_response.1["rows"],
+            json!([
+                {"user_id": "alice", "sum": 12, "count": 2},
+                {"user_id": "bob", "sum": 4, "count": 1}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_late_view_backfill_rejects_predicate_request_scope() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state = test_api_state_with_store(store, "api-test-predicate-backfill-owner", false)
+            .await
+            .with_experimental_advanced_view_features(true);
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        for (start, rows) in [
+            (
+                0,
+                json!([
+                    {"user_id": "alice", "score": 10, "delta": 1},
+                    {"user_id": "bob", "score": 4, "delta": 1}
+                ]),
+            ),
+            (
+                2,
+                json!([
+                    {"user_id": "alice", "score": 2, "delta": 1}
+                ]),
+            ),
+        ] {
+            let ingest_response = call_json(
+                &router,
+                Method::POST,
+                "/v1/ingest",
+                json!({
+                    "relation_id": "scores",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "scores-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": start,
+                    "rows": rows
+                }),
+            )
+            .await;
+            assert_eq!(ingest_response.0, StatusCode::CREATED);
+        }
+
+        let view_request = CreateViewRequest {
+            view_id: "late_scores_predicate_backfill".to_string(),
+            url_path: Some("/scores/predicate-backfill".to_string()),
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("late-created score totals with predicate backfill".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED);
+        assert_eq!(view_response.1["query_enabled"], false);
+
+        let scoped_backfill = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/late_scores_predicate_backfill/backfill",
+            json!({
+                "mode": "sync",
+                "scope": {
+                    "where": "score > 9"
+                }
+            }),
+        )
+        .await;
+        assert_eq!(
+            scoped_backfill.0,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "predicate backfill response: {}",
+            scoped_backfill.1
+        );
+
+        let full_backfill = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/late_scores_predicate_backfill/backfill",
+            json!({}),
+        )
+        .await;
+        assert_eq!(full_backfill.0, StatusCode::OK);
+        assert_eq!(full_backfill.1["query_enabled"], true);
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/late_scores_predicate_backfill/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query_response.0, StatusCode::OK);
+        assert_eq!(
+            query_response.1["rows"],
+            json!([
+                {"user_id": "alice", "sum": 12, "count": 2},
+                {"user_id": "bob", "sum": 4, "count": 1}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_late_view_background_backfill_request_fails_closed() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state = test_api_state_with_store(store, "api-test-background-backfill-owner", false)
+            .await
+            .with_experimental_advanced_view_features(true);
         let router = app(state);
 
         let relation_response = call_json(
@@ -13748,27 +23654,27 @@ mod tests {
         .await;
         assert_eq!(
             scheduled.0,
-            StatusCode::ACCEPTED,
+            StatusCode::UNPROCESSABLE_ENTITY,
             "scheduled response: {}",
             scheduled.1
         );
-        assert_eq!(scheduled.1["outcome"], "scheduled");
 
-        let mut latest = Value::Null;
-        for _ in 0..50 {
-            latest = call_json(
-                &router,
-                Method::GET,
-                "/v1/views/late_scores_background",
-                json!({}),
-            )
-            .await
-            .1;
-            if latest["query_enabled"] == true {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        let full_backfill = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/late_scores_background/backfill",
+            json!({}),
+        )
+        .await;
+        assert_eq!(full_backfill.0, StatusCode::OK);
+        let latest = call_json(
+            &router,
+            Method::GET,
+            "/v1/views/late_scores_background",
+            json!({}),
+        )
+        .await
+        .1;
         assert_eq!(
             latest["query_enabled"], true,
             "view did not become queryable: {latest}"
@@ -13777,7 +23683,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rest_view_query_fails_closed_without_published_output_manifest() {
+    async fn rest_view_query_fails_closed_without_published_checkpoint_output() {
         let state = test_api_state_with_store(
             Arc::new(InMemory::new()),
             "api-test-no-manifest-owner",
@@ -13838,15 +23744,247 @@ mod tests {
             json!({}),
         )
         .await;
-        assert_eq!(query_response.0, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(
-            query_response.1["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("standing runtime output manifest is unavailable"),
-            "query response: {}",
+        assert_eq!(
+            query_response.0,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{query_response:?}"
+        );
+        assert!(query_response.1["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("MATERIALIZATION_LAG"));
+    }
+
+    #[tokio::test]
+    async fn rest_standing_runtime_output_query_without_sql_reads_materialized_rows_directly() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-output-direct-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let policy_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/query-policies",
+            json!({
+                "query_policy_id": "no-sql-output-read",
+                "policy": {
+                    "max_sql_bytes": 0,
+                    "planning_timeout_ms": 1000,
+                    "execution_timeout_ms": 1000,
+                    "max_output_rows": 100,
+                    "max_output_bytes": 1048576,
+                    "max_scan_files": 1,
+                    "max_scan_bytes": 1048576,
+                    "max_object_requests": 1,
+                    "max_concurrent_queries": 1,
+                    "memory_limit_bytes": 1048576,
+                    "spill_limit_bytes": 1048576
+                }
+            }),
+        )
+        .await;
+        assert_eq!(policy_response.0, StatusCode::CREATED);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "scores_output_direct".to_string(),
+            url_path: None,
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("direct output query should not plan generated SQL".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: Some("no-sql-output-read".to_string()),
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED);
+        assert_eq!(view_response.1["query_enabled"], true);
+        assert_eq!(view_response.1["execution_mode"], "standing_runtime");
+        assert_eq!(
+            view_response.1["output_relations"][0]["relation_id"],
+            "scores_output_direct"
+        );
+
+        let ingest_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/ingest",
+            json!({
+                "relation_id": "scores",
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "scores-output-direct-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "rows": [
+                    {"user_id": "alice", "score": 10, "delta": 1},
+                    {"user_id": "bob", "score": 5, "delta": 1}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(ingest_response.0, StatusCode::CREATED);
+
+        let query_response = call_json(
+            &router,
+            Method::GET,
+            "/v1/views/scores_output_direct/outputs/scores_output_direct/query",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(
+            query_response.0,
+            StatusCode::OK,
+            "output query response: {}",
             query_response.1
         );
+        assert_eq!(
+            query_response.1["rows"],
+            json!([
+                {"user_id": "alice", "sum": 10, "count": 1},
+                {"user_id": "bob", "sum": 5, "count": 1}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_view_compaction_and_openapi_paths_are_available_after_materialization() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-compact-openapi-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let view_request = CreateViewRequest {
+            view_id: "scores_compact_openapi".to_string(),
+            url_path: Some("/scores/compact-openapi".to_string()),
+            output_relation_id: None,
+            input_relation_id: "scores".to_string(),
+            input_relation_version: "2026-05-24.v1".to_string(),
+            input_relation_refs: Vec::new(),
+            input_relations: Vec::new(),
+            sql: "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("score totals for compaction and OpenAPI route smoke".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED);
+        assert_eq!(view_response.1["query_enabled"], true);
+
+        let ingest_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/ingest",
+            json!({
+                "relation_id": "scores",
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "scores-compact-openapi-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "rows": [
+                    {"user_id": "alice", "score": 10, "delta": 1},
+                    {"user_id": "alice", "score": 15, "delta": 1},
+                    {"user_id": "bob", "score": 5, "delta": 1}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(ingest_response.0, StatusCode::CREATED);
+        assert_eq!(ingest_response.1["outcome"], "appended");
+
+        let query_response = call_json(
+            &router,
+            Method::GET,
+            "/v1/api/scores/compact-openapi?max_rows=1000",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(query_response.0, StatusCode::OK);
+        assert_eq!(
+            query_response.1["rows"],
+            json!([
+                {"user_id": "alice", "sum": 25, "count": 2},
+                {"user_id": "bob", "sum": 5, "count": 1}
+            ])
+        );
+
+        let direct_sql_response = call_json(
+            &router,
+            Method::GET,
+            "/v1/views/scores_compact_openapi/query?sql=select%20user_id%2C%20sum%20from%20scores_compact_openapi%20where%20sum%20%3E%2010%20order%20by%20user_id",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(direct_sql_response.0, StatusCode::OK);
+        assert_eq!(
+            direct_sql_response.1["rows"],
+            json!([{"user_id": "alice", "sum": 25}])
+        );
+
+        let compact_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/scores_compact_openapi/compact",
+            json!({"mode": "sync"}),
+        )
+        .await;
+        assert_eq!(
+            compact_response.0,
+            StatusCode::NOT_FOUND,
+            "compaction response: {}",
+            compact_response.1
+        );
+
+        let openapi_response =
+            call_json(&router, Method::GET, "/v1/openapi.json", Value::Null).await;
+        assert_eq!(openapi_response.0, StatusCode::OK);
+        let paths = openapi_response.1["paths"].as_object().unwrap();
+        assert!(!paths.contains_key("/v1/views/{view_id}/compact"));
+        assert!(paths.contains_key("/v1/api/scores/compact-openapi"));
     }
 
     #[tokio::test]
@@ -13912,46 +24050,43 @@ mod tests {
         assert_eq!(view_response.1["view_id"], "scores_by_account");
         assert_eq!(view_response.1["query_enabled"], true);
 
-        let scores_ingest = call_json(
+        let relations_ingest = call_json(
             &router,
             Method::POST,
-            "/v1/ingest",
+            "/v1/relations/ingest",
             json!({
-                "relation_id": "scores",
-                "relation_version": "2026-05-24.v1",
-                "stream_id": "scores-stream",
-                "partition_id": 0,
-                "start_offset_inclusive": 0,
-                "rows": [
-                    {"user_id": "alice", "score": 10, "delta": 1},
-                    {"user_id": "alice", "score": 7, "delta": 1},
-                    {"user_id": "bob", "score": 5, "delta": 1}
+                "batches": [
+                    {
+                        "relation_id": "scores",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "scores-stream",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [
+                            {"user_id": "alice", "score": 10, "delta": 1},
+                            {"user_id": "alice", "score": 7, "delta": 1},
+                            {"user_id": "bob", "score": 5, "delta": 1}
+                        ]
+                    },
+                    {
+                        "relation_id": "accounts",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "accounts-stream",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [
+                            {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
+                            {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1}
+                        ]
+                    }
                 ]
             }),
         )
         .await;
-        assert_eq!(scores_ingest.0, StatusCode::CREATED);
-        assert_eq!(scores_ingest.1["outcome"], "appended");
-
-        let accounts_ingest = call_json(
-            &router,
-            Method::POST,
-            "/v1/ingest",
-            json!({
-                "relation_id": "accounts",
-                "relation_version": "2026-05-24.v1",
-                "stream_id": "accounts-stream",
-                "partition_id": 0,
-                "start_offset_inclusive": 0,
-                "rows": [
-                    {"account_id": "alice", "limit": 100, "delta": 1},
-                    {"account_id": "bob", "limit": 50, "delta": 1}
-                ]
-            }),
-        )
-        .await;
-        assert_eq!(accounts_ingest.0, StatusCode::CREATED);
-        assert_eq!(accounts_ingest.1["outcome"], "appended");
+        assert_eq!(relations_ingest.0, StatusCode::CREATED);
+        assert_eq!(relations_ingest.1["outcome"], "appended");
+        assert_eq!(relations_ingest.1["materialization"]["status"], "completed");
+        assert_eq!(relations_ingest.1["materialization"]["applied_batches"], 2);
 
         let query_response = call_json(
             &router,
@@ -13966,7 +24101,8 @@ mod tests {
             "join query response: {}",
             query_response.1
         );
-        assert_join_rows(&query_response.1, 4, 17);
+        assert_eq!(relations_ingest.1["materialized_through"], 3);
+        assert_join_rows(&query_response.1, 3, 17);
 
         let restarted_state =
             test_api_state_with_store(store.clone(), "api-test-join-owner-b", true).await;
@@ -13989,7 +24125,1921 @@ mod tests {
             "restarted join query response: {}",
             restarted_query.1
         );
-        assert_join_rows(&restarted_query.1, 4, 17);
+        assert_join_rows(&restarted_query.1, 3, 17);
+    }
+
+    #[tokio::test]
+    async fn rest_two_relation_join_count_only_view_materialized_output_survives_api_restart() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state =
+            test_api_state_with_store(store.clone(), "api-test-join-count-only-a", false).await;
+        let router = app(state);
+
+        for catalog in [test_scores_catalog(), test_accounts_catalog()] {
+            let relation_response = call_json(
+                &router,
+                Method::POST,
+                "/v1/relations",
+                json!({
+                    "catalog": catalog,
+                    "default_orders_sum_count": false
+                }),
+            )
+            .await;
+            assert_eq!(relation_response.0, StatusCode::CREATED);
+        }
+
+        let view_request = CreateViewRequest {
+            view_id: "score_counts_by_account".to_string(),
+            url_path: Some("/scores/counts-by-account".to_string()),
+            output_relation_id: None,
+            input_relation_id: String::new(),
+            input_relation_version: String::new(),
+            input_relation_refs: vec![
+                InputRelationRef {
+                    relation_id: "scores".to_string(),
+                    relation_version: "2026-05-24.v1".to_string(),
+                },
+                InputRelationRef {
+                    relation_id: "accounts".to_string(),
+                    relation_version: "2026-05-24.v1".to_string(),
+                },
+            ],
+            input_relations: Vec::new(),
+            sql: "select a.account_id, count(*) as count from scores s join accounts a on s.user_id = a.account_id group by a.account_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("score event counts grouped by joined account".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+        assert_eq!(view_response.1["query_enabled"], true);
+        let output_columns = view_response.1["output_relations"][0]["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|column| column["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(output_columns, vec!["account_id", "count"]);
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [
+                    {
+                        "relation_id": "scores",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "scores-join-count-only-stream",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [
+                            {"user_id": "alice", "score": 10, "delta": 1},
+                            {"user_id": "alice", "score": 7, "delta": 1},
+                            {"user_id": "bob", "score": 5, "delta": 1}
+                        ]
+                    },
+                    {
+                        "relation_id": "accounts",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "accounts-join-count-only-stream",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [
+                            {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
+                            {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1}
+                        ]
+                    }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/score_counts_by_account/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query_response.0, StatusCode::OK, "{query_response:?}");
+        assert_eq!(
+            query_response.1["rows"],
+            json!([
+                {"account_id": "alice", "count": 2},
+                {"account_id": "bob", "count": 1}
+            ])
+        );
+
+        let restarted_state =
+            test_api_state_with_store(store, "api-test-join-count-only-b", true).await;
+        assert_eq!(
+            restarted_state
+                .restore_standing_program_runtimes_from_active_views()
+                .await
+                .unwrap(),
+            1
+        );
+        let restarted_router = app(restarted_state);
+        let restarted_query = call_json(
+            &restarted_router,
+            Method::POST,
+            "/v1/views/score_counts_by_account/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(restarted_query.0, StatusCode::OK, "{restarted_query:?}");
+        assert_eq!(restarted_query.1["rows"], query_response.1["rows"]);
+    }
+
+    #[tokio::test]
+    async fn rest_left_join_left_group_key_view_materializes_unmatched_left_rows() {
+        let state =
+            test_api_state_with_store(Arc::new(InMemory::new()), "api-test-join-left-key", false)
+                .await;
+        let router = app(state);
+
+        for catalog in [test_scores_catalog(), test_accounts_catalog()] {
+            let relation_response = call_json(
+                &router,
+                Method::POST,
+                "/v1/relations",
+                json!({
+                    "catalog": catalog,
+                    "default_orders_sum_count": false
+                }),
+            )
+            .await;
+            assert_eq!(relation_response.0, StatusCode::CREATED);
+        }
+
+        let view_request = CreateViewRequest {
+            view_id: "scores_by_user".to_string(),
+            url_path: Some("/scores/by-user".to_string()),
+            output_relation_id: None,
+            input_relation_id: String::new(),
+            input_relation_version: String::new(),
+            input_relation_refs: vec![
+                InputRelationRef {
+                    relation_id: "scores".to_string(),
+                    relation_version: "2026-05-24.v1".to_string(),
+                },
+                InputRelationRef {
+                    relation_id: "accounts".to_string(),
+                    relation_version: "2026-05-24.v1".to_string(),
+                },
+            ],
+            input_relations: Vec::new(),
+            sql: "select s.user_id as user, sum(s.score) as sum, count(*) as count from scores s left join accounts a on s.user_id = a.account_id group by s.user_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("score metrics grouped by left join key".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [
+                    {
+                        "relation_id": "scores",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "left-key-scores",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [
+                            {"user_id": "alice", "score": 10, "delta": 1},
+                            {"user_id": "alice", "score": 7, "delta": 1},
+                            {"user_id": "bob", "score": 5, "delta": 1},
+                            {"user_id": "charlie", "score": 30, "delta": 1}
+                        ]
+                    },
+                    {
+                        "relation_id": "accounts",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "left-key-accounts",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [
+                            {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
+                            {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1}
+                        ]
+                    }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/scores_by_user/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query_response.0, StatusCode::OK, "{query_response:?}");
+        assert_eq!(
+            query_response.1["rows"],
+            json!([
+                {"user": "alice", "sum": 17, "count": 2},
+                {"user": "bob", "sum": 5, "count": 1},
+                {"user": "charlie", "sum": 30, "count": 1}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_two_relation_join_min_max_avg_view_materializes_outputs() {
+        let state =
+            test_api_state_with_store(Arc::new(InMemory::new()), "api-test-join-stats", false)
+                .await;
+        let router = app(state);
+
+        for catalog in [test_scores_catalog(), test_accounts_catalog()] {
+            let relation_response = call_json(
+                &router,
+                Method::POST,
+                "/v1/relations",
+                json!({
+                    "catalog": catalog,
+                    "default_orders_sum_count": false
+                }),
+            )
+            .await;
+            assert_eq!(relation_response.0, StatusCode::CREATED);
+        }
+
+        let view_request = CreateViewRequest {
+            view_id: "score_stats_by_account".to_string(),
+            url_path: Some("/scores/account-stats".to_string()),
+            output_relation_id: None,
+            input_relation_id: String::new(),
+            input_relation_version: String::new(),
+            input_relation_refs: vec![
+                InputRelationRef {
+                    relation_id: "scores".to_string(),
+                    relation_version: "2026-05-24.v1".to_string(),
+                },
+                InputRelationRef {
+                    relation_id: "accounts".to_string(),
+                    relation_version: "2026-05-24.v1".to_string(),
+                },
+            ],
+            input_relations: Vec::new(),
+            sql: "select a.account_id, sum(s.score) as sum, count(*) as count, min(s.score) as min_score, max(s.score) as max_score, avg(s.score) as avg_score from scores s join accounts a on s.user_id = a.account_id group by a.account_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("score stats by account materialized join".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+        assert_eq!(view_response.1["query_enabled"], true);
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [
+                    {
+                        "relation_id": "scores",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "join-stats-scores",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [
+                            {"user_id": "alice", "score": 10, "delta": 1},
+                            {"user_id": "alice", "score": 7, "delta": 1},
+                            {"user_id": "bob", "score": 5, "delta": 1}
+                        ]
+                    },
+                    {
+                        "relation_id": "accounts",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "join-stats-accounts",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [
+                            {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
+                            {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1}
+                        ]
+                    }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/score_stats_by_account/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query_response.0, StatusCode::OK, "{query_response:?}");
+        assert_eq!(
+            query_response.1["rows"],
+            json!([
+                {"account_id": "alice", "sum": 17, "count": 2, "min_score": 7, "max_score": 10, "avg_score": 8.5},
+                {"account_id": "bob", "sum": 5, "count": 1, "min_score": 5, "max_score": 5, "avg_score": 5.0}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_two_relation_join_right_min_max_avg_view_materializes_outputs() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-join-right-stats",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        for catalog in [test_scores_catalog(), test_accounts_catalog()] {
+            let relation_response = call_json(
+                &router,
+                Method::POST,
+                "/v1/relations",
+                json!({
+                    "catalog": catalog,
+                    "default_orders_sum_count": false
+                }),
+            )
+            .await;
+            assert_eq!(relation_response.0, StatusCode::CREATED);
+        }
+
+        let view_request = CreateViewRequest {
+            view_id: "score_limits_by_account".to_string(),
+            url_path: Some("/scores/account-limits".to_string()),
+            output_relation_id: None,
+            input_relation_id: String::new(),
+            input_relation_version: String::new(),
+            input_relation_refs: vec![
+                InputRelationRef {
+                    relation_id: "scores".to_string(),
+                    relation_version: "2026-05-24.v1".to_string(),
+                },
+                InputRelationRef {
+                    relation_id: "accounts".to_string(),
+                    relation_version: "2026-05-24.v1".to_string(),
+                },
+            ],
+            input_relations: Vec::new(),
+            sql: "select a.account_id, sum(s.score) as sum, count(*) as count, count(a.limit) as count_limit, count(distinct a.limit) as distinct_limits, min(a.limit) as min_limit, max(a.limit) as max_limit, avg(a.limit) as avg_limit from scores s join accounts a on s.user_id = a.account_id group by a.account_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("account limits through materialized join".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [
+                    {
+                        "relation_id": "scores",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "join-right-stats-scores",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [
+                            {"user_id": "alice", "score": 10, "delta": 1},
+                            {"user_id": "alice", "score": 7, "delta": 1},
+                            {"user_id": "bob", "score": 5, "delta": 1}
+                        ]
+                    },
+                    {
+                        "relation_id": "accounts",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "join-right-stats-accounts",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [
+                            {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
+                            {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1}
+                        ]
+                    }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/score_limits_by_account/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query_response.0, StatusCode::OK, "{query_response:?}");
+        assert_eq!(
+            query_response.1["rows"],
+            json!([
+                {"account_id": "alice", "sum": 17, "count": 2, "count_limit": 2, "distinct_limits": 1, "min_limit": 100, "max_limit": 100, "avg_limit": 100.0},
+                {"account_id": "bob", "sum": 5, "count": 1, "count_limit": 1, "distinct_limits": 1, "min_limit": 50, "max_limit": 50, "avg_limit": 50.0}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_late_two_relation_join_having_top_k_reports_materialization_lag_on_first_query() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-late-join-having-top-k",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        for catalog in [test_scores_catalog(), test_accounts_catalog()] {
+            let relation_response = call_json(
+                &router,
+                Method::POST,
+                "/v1/relations",
+                json!({
+                    "catalog": catalog,
+                    "default_orders_sum_count": false
+                }),
+            )
+            .await;
+            assert_eq!(relation_response.0, StatusCode::CREATED);
+        }
+
+        let first_ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [
+                    {
+                        "relation_id": "scores",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "late-join-having-top-k-scores",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [
+                            {"user_id": "alice", "score": 10, "delta": 1},
+                            {"user_id": "alice", "score": 7, "delta": 1},
+                            {"user_id": "bob", "score": 5, "delta": 1}
+                        ]
+                    },
+                    {
+                        "relation_id": "accounts",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "late-join-having-top-k-accounts",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [
+                            {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
+                            {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1}
+                        ]
+                    }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(first_ingest.0, StatusCode::CREATED, "{first_ingest:?}");
+
+        let view_request = CreateViewRequest {
+            view_id: "late_top_scores_by_account_having".to_string(),
+            url_path: Some("/scores/late-top-account-having".to_string()),
+            output_relation_id: None,
+            input_relation_id: String::new(),
+            input_relation_version: String::new(),
+            input_relation_refs: vec![
+                InputRelationRef {
+                    relation_id: "scores".to_string(),
+                    relation_version: "2026-05-24.v1".to_string(),
+                },
+                InputRelationRef {
+                    relation_id: "accounts".to_string(),
+                    relation_version: "2026-05-24.v1".to_string(),
+                },
+            ],
+            input_relations: Vec::new(),
+            sql: "select a.account_id, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.user_id = a.account_id group by a.account_id having sum(s.score) >= 5 order by sum desc limit 1".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("late-created top account score join above threshold".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+        assert_eq!(view_response.1["query_enabled"], false);
+        assert_eq!(view_response.1["coverage"]["state"], "backfill_required");
+
+        let second_ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "scores",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "late-join-having-top-k-scores",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 3,
+                    "rows": [{"user_id": "bob", "score": 20, "delta": 1}]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(
+            second_ingest.0,
+            StatusCode::CREATED,
+            "late join view must not block later ingest: {}",
+            second_ingest.1
+        );
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/late_top_scores_by_account_having/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(
+            query_response.0,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "late join query response: {}",
+            query_response.1
+        );
+        assert!(query_response.1["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("MATERIALIZATION_LAG"));
+
+        let refreshed_view = call_json(
+            &router,
+            Method::GET,
+            "/v1/views/late_top_scores_by_account_having",
+            json!({}),
+        )
+        .await;
+        assert_eq!(refreshed_view.0, StatusCode::OK);
+        assert_eq!(refreshed_view.1["query_enabled"], false);
+        assert_eq!(
+            refreshed_view.1["lifecycle"]["deployment_status"],
+            "deploying"
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_two_relation_join_order_by_limit_top_k_view_materializes_outputs() {
+        let state =
+            test_api_state_with_store(Arc::new(InMemory::new()), "api-test-join-top-k", false)
+                .await;
+        let router = app(state);
+
+        for catalog in [test_scores_catalog(), test_accounts_catalog()] {
+            let relation_response = call_json(
+                &router,
+                Method::POST,
+                "/v1/relations",
+                json!({
+                    "catalog": catalog,
+                    "default_orders_sum_count": false
+                }),
+            )
+            .await;
+            assert_eq!(relation_response.0, StatusCode::CREATED);
+        }
+
+        let view_request = CreateViewRequest {
+            view_id: "top_scores_by_account".to_string(),
+            url_path: Some("/scores/top-account".to_string()),
+            output_relation_id: None,
+            input_relation_id: String::new(),
+            input_relation_version: String::new(),
+            input_relation_refs: vec![
+                InputRelationRef {
+                    relation_id: "scores".to_string(),
+                    relation_version: "2026-05-24.v1".to_string(),
+                },
+                InputRelationRef {
+                    relation_id: "accounts".to_string(),
+                    relation_version: "2026-05-24.v1".to_string(),
+                },
+            ],
+            input_relations: Vec::new(),
+            sql: "select a.account_id, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.user_id = a.account_id group by a.account_id order by sum desc limit 1".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("top score account by materialized join sum".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let first_ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [
+                    {
+                        "relation_id": "scores",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "join-top-k-scores",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [
+                            {"user_id": "alice", "score": 10, "delta": 1},
+                            {"user_id": "alice", "score": 7, "delta": 1},
+                            {"user_id": "bob", "score": 5, "delta": 1}
+                        ]
+                    },
+                    {
+                        "relation_id": "accounts",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "join-top-k-accounts",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [
+                            {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
+                            {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1}
+                        ]
+                    }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(first_ingest.0, StatusCode::CREATED, "{first_ingest:?}");
+        let first_query = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/top_scores_by_account/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(first_query.0, StatusCode::OK, "{first_query:?}");
+        assert_eq!(
+            first_query.1["rows"],
+            json!([{"account_id": "alice", "sum": 17, "count": 2}])
+        );
+
+        let second_ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "scores",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "join-top-k-scores",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 3,
+                    "rows": [{"user_id": "bob", "score": 20, "delta": 1}]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(second_ingest.0, StatusCode::CREATED, "{second_ingest:?}");
+        let second_query = call_json(
+            &router,
+            Method::GET,
+            "/v1/api/scores/top-account",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(second_query.0, StatusCode::OK, "{second_query:?}");
+        assert_eq!(
+            second_query.1["rows"],
+            json!([{"account_id": "bob", "sum": 25, "count": 2}])
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_two_relation_join_having_view_materializes_outputs() {
+        let state =
+            test_api_state_with_store(Arc::new(InMemory::new()), "api-test-join-having", false)
+                .await;
+        let router = app(state);
+
+        for catalog in [test_scores_catalog(), test_accounts_catalog()] {
+            let relation_response = call_json(
+                &router,
+                Method::POST,
+                "/v1/relations",
+                json!({
+                    "catalog": catalog,
+                    "default_orders_sum_count": false
+                }),
+            )
+            .await;
+            assert_eq!(relation_response.0, StatusCode::CREATED);
+        }
+
+        let view_request = CreateViewRequest {
+            view_id: "scores_by_account_having".to_string(),
+            url_path: Some("/scores/by-account-having".to_string()),
+            output_relation_id: None,
+            input_relation_id: String::new(),
+            input_relation_version: String::new(),
+            input_relation_refs: vec![
+                InputRelationRef {
+                    relation_id: "scores".to_string(),
+                    relation_version: "2026-05-24.v1".to_string(),
+                },
+                InputRelationRef {
+                    relation_id: "accounts".to_string(),
+                    relation_version: "2026-05-24.v1".to_string(),
+                },
+            ],
+            input_relations: Vec::new(),
+            sql: "select a.account_id, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.user_id = a.account_id group by a.account_id having sum(s.score) > 10 or count(*) = 1".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("score metrics above threshold grouped by account join".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+        assert_eq!(view_response.1["query_enabled"], true);
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [
+                    {
+                        "relation_id": "scores",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "scores-join-having-stream",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [
+                            {"user_id": "alice", "score": 10, "delta": 1},
+                            {"user_id": "alice", "score": 7, "delta": 1},
+                            {"user_id": "bob", "score": 5, "delta": 1}
+                        ]
+                    },
+                    {
+                        "relation_id": "accounts",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "accounts-join-having-stream",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [
+                            {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
+                            {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1}
+                        ]
+                    }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/scores_by_account_having/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query_response.0, StatusCode::OK, "{query_response:?}");
+        assert_eq!(
+            query_response.1["rows"],
+            json!([
+                {"account_id": "alice", "sum": 17, "count": 2},
+                {"account_id": "bob", "sum": 5, "count": 1}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_two_relation_join_mixed_aggregate_filter_view_materializes_outputs() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-join-mixed-filter",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        for catalog in [test_scores_catalog(), test_accounts_catalog()] {
+            let relation_response = call_json(
+                &router,
+                Method::POST,
+                "/v1/relations",
+                json!({
+                    "catalog": catalog,
+                    "default_orders_sum_count": false
+                }),
+            )
+            .await;
+            assert_eq!(relation_response.0, StatusCode::CREATED);
+        }
+
+        let view_request = CreateViewRequest {
+            view_id: "scores_by_account_mixed_filter".to_string(),
+            url_path: Some("/scores/by-account-mixed-filter".to_string()),
+            output_relation_id: None,
+            input_relation_id: String::new(),
+            input_relation_version: String::new(),
+            input_relation_refs: vec![
+                InputRelationRef {
+                    relation_id: "scores".to_string(),
+                    relation_version: "2026-05-24.v1".to_string(),
+                },
+                InputRelationRef {
+                    relation_id: "accounts".to_string(),
+                    relation_version: "2026-05-24.v1".to_string(),
+                },
+            ],
+            input_relations: Vec::new(),
+            sql: "select a.account_id, sum(s.score) filter (where s.score > 5) as sum, count(*) filter (where s.score > 0) as count from scores s join accounts a on s.user_id = a.account_id group by a.account_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("mixed filtered score metrics grouped by account join".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+        assert_eq!(view_response.1["query_enabled"], true);
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [
+                    {
+                        "relation_id": "scores",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "scores-join-mixed-filter-stream",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [
+                            {"user_id": "alice", "score": 10, "delta": 1},
+                            {"user_id": "alice", "score": 7, "delta": 1},
+                            {"user_id": "bob", "score": 5, "delta": 1}
+                        ]
+                    },
+                    {
+                        "relation_id": "accounts",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "accounts-join-mixed-filter-stream",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [
+                            {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
+                            {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1}
+                        ]
+                    }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/scores_by_account_mixed_filter/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query_response.0, StatusCode::OK, "{query_response:?}");
+        assert_eq!(
+            query_response.1["rows"],
+            json!([
+                {"account_id": "alice", "sum": 17, "count": 2},
+                {"account_id": "bob", "sum": 0, "count": 1}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_two_relation_join_filtered_count_distinct_view_materializes_outputs() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-join-filtered-distinct",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        for catalog in [test_scores_catalog(), test_accounts_catalog()] {
+            let relation_response = call_json(
+                &router,
+                Method::POST,
+                "/v1/relations",
+                json!({
+                    "catalog": catalog,
+                    "default_orders_sum_count": false
+                }),
+            )
+            .await;
+            assert_eq!(relation_response.0, StatusCode::CREATED);
+        }
+
+        let view_request = CreateViewRequest {
+            view_id: "filtered_distinct_scores_by_account".to_string(),
+            url_path: Some("/scores/filtered-distinct-by-account".to_string()),
+            output_relation_id: None,
+            input_relation_id: String::new(),
+            input_relation_version: String::new(),
+            input_relation_refs: vec![
+                InputRelationRef {
+                    relation_id: "scores".to_string(),
+                    relation_version: "2026-05-24.v1".to_string(),
+                },
+                InputRelationRef {
+                    relation_id: "accounts".to_string(),
+                    relation_version: "2026-05-24.v1".to_string(),
+                },
+            ],
+            input_relations: Vec::new(),
+            sql: "select a.account_id, sum(s.score) filter (where s.score > 5) as sum, count(distinct s.score) filter (where s.score > 0) as distinct_scores from scores s join accounts a on s.user_id = a.account_id group by a.account_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("filtered distinct score counts grouped by account join".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+        assert_eq!(view_response.1["query_enabled"], true);
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [
+                    {
+                        "relation_id": "scores",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "scores-join-filtered-distinct-stream",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [
+                            {"user_id": "alice", "score": 10, "delta": 1},
+                            {"user_id": "alice", "score": 10, "delta": 1},
+                            {"user_id": "alice", "score": 7, "delta": 1},
+                            {"user_id": "bob", "score": 5, "delta": 1}
+                        ]
+                    },
+                    {
+                        "relation_id": "accounts",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "accounts-join-filtered-distinct-stream",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [
+                            {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
+                            {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1}
+                        ]
+                    }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/filtered_distinct_scores_by_account/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query_response.0, StatusCode::OK, "{query_response:?}");
+        assert_eq!(
+            query_response.1["rows"],
+            json!([
+                {"account_id": "alice", "sum": 27, "distinct_scores": 2},
+                {"account_id": "bob", "sum": 0, "distinct_scores": 1}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_two_relation_join_nullable_left_value_count_view_materializes_outputs() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-join-nullable-count",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        for catalog in [
+            test_scores_catalog_with_nullable_score(),
+            test_accounts_catalog(),
+        ] {
+            let relation_response = call_json(
+                &router,
+                Method::POST,
+                "/v1/relations",
+                json!({
+                    "catalog": catalog,
+                    "default_orders_sum_count": false
+                }),
+            )
+            .await;
+            assert_eq!(relation_response.0, StatusCode::CREATED);
+        }
+
+        let view_request = CreateViewRequest {
+            view_id: "nullable_score_counts_by_account".to_string(),
+            url_path: Some("/scores/nullable-count-by-account".to_string()),
+            output_relation_id: None,
+            input_relation_id: String::new(),
+            input_relation_version: String::new(),
+            input_relation_refs: vec![
+                InputRelationRef {
+                    relation_id: "scores".to_string(),
+                    relation_version: "2026-05-24.v1".to_string(),
+                },
+                InputRelationRef {
+                    relation_id: "accounts".to_string(),
+                    relation_version: "2026-05-24.v1".to_string(),
+                },
+            ],
+            input_relations: Vec::new(),
+            sql: "select a.account_id, sum(s.score) as sum, count(s.score) as count from scores s join accounts a on s.user_id = a.account_id group by a.account_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("nullable score counts grouped by account join".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+        assert_eq!(view_response.1["query_enabled"], true);
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [
+                    {
+                        "relation_id": "scores",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "scores-join-nullable-count-stream",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [
+                            {"user_id": "alice", "score": 10, "delta": 1},
+                            {"user_id": "alice", "score": null, "delta": 1},
+                            {"user_id": "alice", "score": 7, "delta": 1},
+                            {"user_id": "bob", "score": 5, "delta": 1}
+                        ]
+                    },
+                    {
+                        "relation_id": "accounts",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "accounts-join-nullable-count-stream",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [
+                            {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
+                            {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1}
+                        ]
+                    }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/nullable_score_counts_by_account/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query_response.0, StatusCode::OK, "{query_response:?}");
+        assert_eq!(
+            query_response.1["rows"],
+            json!([
+                {"account_id": "alice", "sum": 17, "count": 2},
+                {"account_id": "bob", "sum": 5, "count": 1}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_two_relation_join_count_distinct_view_materializes_outputs() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state =
+            test_api_state_with_store(store.clone(), "api-test-join-count-distinct-a", false).await;
+        let router = app(state);
+
+        for catalog in [test_scores_catalog(), test_accounts_catalog()] {
+            let relation_response = call_json(
+                &router,
+                Method::POST,
+                "/v1/relations",
+                json!({
+                    "catalog": catalog,
+                    "default_orders_sum_count": false
+                }),
+            )
+            .await;
+            assert_eq!(relation_response.0, StatusCode::CREATED);
+        }
+
+        let view_request = CreateViewRequest {
+            view_id: "distinct_scores_by_account".to_string(),
+            url_path: Some("/scores/distinct-by-account".to_string()),
+            output_relation_id: None,
+            input_relation_id: String::new(),
+            input_relation_version: String::new(),
+            input_relation_refs: vec![
+                InputRelationRef {
+                    relation_id: "scores".to_string(),
+                    relation_version: "2026-05-24.v1".to_string(),
+                },
+                InputRelationRef {
+                    relation_id: "accounts".to_string(),
+                    relation_version: "2026-05-24.v1".to_string(),
+                },
+            ],
+            input_relations: Vec::new(),
+            sql: "select a.account_id, sum(s.score) as sum, count(distinct s.score) as distinct_scores from scores s join accounts a on s.user_id = a.account_id group by a.account_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("distinct score counts grouped by joined account".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+        assert_eq!(view_response.1["query_enabled"], true);
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [
+                    {
+                        "relation_id": "scores",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "scores-join-distinct-stream",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [
+                            {"user_id": "alice", "score": 10, "delta": 1},
+                            {"user_id": "alice", "score": 10, "delta": 1},
+                            {"user_id": "alice", "score": 7, "delta": 1},
+                            {"user_id": "bob", "score": 5, "delta": 1}
+                        ]
+                    },
+                    {
+                        "relation_id": "accounts",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "accounts-join-distinct-stream",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [
+                            {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
+                            {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1}
+                        ]
+                    }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/distinct_scores_by_account/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query_response.0, StatusCode::OK, "{query_response:?}");
+        assert_eq!(
+            query_response.1["rows"],
+            json!([
+                {"account_id": "alice", "sum": 27, "distinct_scores": 2},
+                {"account_id": "bob", "sum": 5, "distinct_scores": 1}
+            ])
+        );
+
+        let restarted_state =
+            test_api_state_with_store(store, "api-test-join-count-distinct-b", true).await;
+        assert_eq!(
+            restarted_state
+                .restore_standing_program_runtimes_from_active_views()
+                .await
+                .unwrap(),
+            1
+        );
+        let restarted_router = app(restarted_state);
+        let restarted_query = call_json(
+            &restarted_router,
+            Method::POST,
+            "/v1/views/distinct_scores_by_account/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(restarted_query.0, StatusCode::OK, "{restarted_query:?}");
+        assert_eq!(restarted_query.1["rows"], query_response.1["rows"]);
+    }
+
+    #[tokio::test]
+    async fn rest_two_relation_join_alias_view_materializes_outputs() {
+        let state =
+            test_api_state_with_store(Arc::new(InMemory::new()), "api-test-join-alias", false)
+                .await;
+        let router = app(state);
+
+        for catalog in [test_scores_catalog(), test_accounts_catalog()] {
+            let relation_response = call_json(
+                &router,
+                Method::POST,
+                "/v1/relations",
+                json!({
+                    "catalog": catalog,
+                    "default_orders_sum_count": false
+                }),
+            )
+            .await;
+            assert_eq!(relation_response.0, StatusCode::CREATED);
+        }
+
+        let view_request = CreateViewRequest {
+            view_id: "scores_by_account_alias".to_string(),
+            url_path: Some("/scores/by-account-alias".to_string()),
+            output_relation_id: None,
+            input_relation_id: String::new(),
+            input_relation_version: String::new(),
+            input_relation_refs: vec![
+                InputRelationRef {
+                    relation_id: "scores".to_string(),
+                    relation_version: "2026-05-24.v1".to_string(),
+                },
+                InputRelationRef {
+                    relation_id: "accounts".to_string(),
+                    relation_version: "2026-05-24.v1".to_string(),
+                },
+            ],
+            input_relations: Vec::new(),
+            sql: "select a.account_id as account, sum(s.score) as total_score, count(1) as score_events from scores s join accounts a on s.user_id = a.account_id group by a.account_id having total_score > 10 and count(1) > 1".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("aliased score metrics grouped by account join".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+        assert_eq!(view_response.1["query_enabled"], true);
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [
+                    {
+                        "relation_id": "scores",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "scores-join-alias-stream",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [
+                            {"user_id": "alice", "score": 10, "delta": 1},
+                            {"user_id": "alice", "score": 7, "delta": 1},
+                            {"user_id": "bob", "score": 5, "delta": 1}
+                        ]
+                    },
+                    {
+                        "relation_id": "accounts",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "accounts-join-alias-stream",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [
+                            {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
+                            {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1}
+                        ]
+                    }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/scores_by_account_alias/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query_response.0, StatusCode::OK, "{query_response:?}");
+        assert_eq!(
+            query_response.1["rows"],
+            json!([{"account": "alice", "total_score": 17, "score_events": 2}])
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_two_relation_join_where_view_materializes_outputs() {
+        let state =
+            test_api_state_with_store(Arc::new(InMemory::new()), "api-test-join-where", false)
+                .await;
+        let router = app(state);
+
+        for catalog in [test_scores_catalog(), test_accounts_catalog()] {
+            let relation_response = call_json(
+                &router,
+                Method::POST,
+                "/v1/relations",
+                json!({
+                    "catalog": catalog,
+                    "default_orders_sum_count": false
+                }),
+            )
+            .await;
+            assert_eq!(relation_response.0, StatusCode::CREATED);
+        }
+
+        let view_request = CreateViewRequest {
+            view_id: "scores_by_account_where".to_string(),
+            url_path: Some("/scores/by-account-where".to_string()),
+            output_relation_id: None,
+            input_relation_id: String::new(),
+            input_relation_version: String::new(),
+            input_relation_refs: vec![
+                InputRelationRef {
+                    relation_id: "scores".to_string(),
+                    relation_version: "2026-05-24.v1".to_string(),
+                },
+                InputRelationRef {
+                    relation_id: "accounts".to_string(),
+                    relation_version: "2026-05-24.v1".to_string(),
+                },
+            ],
+            input_relations: Vec::new(),
+            sql: "select a.account_id, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.user_id = a.account_id where (s.score > 0 or s.score = -3) and s.score < 100 and a.limit > 60 and a.tier = 'gold' group by a.account_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("positive score metrics grouped by account join".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+        assert_eq!(view_response.1["query_enabled"], true);
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [
+                    {
+                        "relation_id": "scores",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "scores-join-where-stream",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [
+                            {"user_id": "alice", "score": 10, "delta": 1},
+                            {"user_id": "alice", "score": 7, "delta": 1},
+                            {"user_id": "bob", "score": 5, "delta": 1},
+                            {"user_id": "alice", "score": 150, "delta": 1},
+                            {"user_id": "charlie", "score": 8, "delta": 1},
+                            {"user_id": "alice", "score": -3, "delta": 1}
+                        ]
+                    },
+                    {
+                        "relation_id": "accounts",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "accounts-join-where-stream",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [
+                            {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
+                            {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1},
+                            {"account_id": "charlie", "limit": 100, "tier": "silver", "delta": 1}
+                        ]
+                    }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/scores_by_account_where/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query_response.0, StatusCode::OK, "{query_response:?}");
+        assert_eq!(
+            query_response.1["rows"],
+            json!([{"account_id": "alice", "sum": 14, "count": 3}])
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_two_relation_join_cte_source_filter_view_materializes_outputs() {
+        let state =
+            test_api_state_with_store(Arc::new(InMemory::new()), "api-test-join-cte", false).await;
+        let router = app(state);
+
+        for catalog in [test_scores_catalog(), test_accounts_catalog()] {
+            let relation_response = call_json(
+                &router,
+                Method::POST,
+                "/v1/relations",
+                json!({
+                    "catalog": catalog,
+                    "default_orders_sum_count": false
+                }),
+            )
+            .await;
+            assert_eq!(relation_response.0, StatusCode::CREATED);
+        }
+
+        let view_request = CreateViewRequest {
+            view_id: "scores_by_account_cte".to_string(),
+            url_path: Some("/scores/by-account-cte".to_string()),
+            output_relation_id: None,
+            input_relation_id: String::new(),
+            input_relation_version: String::new(),
+            input_relation_refs: vec![
+                InputRelationRef {
+                    relation_id: "scores".to_string(),
+                    relation_version: "2026-05-24.v1".to_string(),
+                },
+                InputRelationRef {
+                    relation_id: "accounts".to_string(),
+                    relation_version: "2026-05-24.v1".to_string(),
+                },
+            ],
+            input_relations: Vec::new(),
+            sql: "with positive_scores as (select * from scores where score > 0) select a.account_id, sum(s.score) as sum, count(*) as count from positive_scores s join accounts a on s.user_id = a.account_id where a.limit > 60 group by a.account_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("positive score metrics from CTE source grouped by account join".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+        assert_eq!(view_response.1["query_enabled"], true);
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [
+                    {
+                        "relation_id": "scores",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "scores-join-cte-stream",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [
+                            {"user_id": "alice", "score": 10, "delta": 1},
+                            {"user_id": "alice", "score": -3, "delta": 1},
+                            {"user_id": "bob", "score": 5, "delta": 1},
+                            {"user_id": "alice", "score": 7, "delta": 1}
+                        ]
+                    },
+                    {
+                        "relation_id": "accounts",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "accounts-join-cte-stream",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [
+                            {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
+                            {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1},
+                            {"account_id": "charlie", "limit": 100, "tier": "silver", "delta": 1}
+                        ]
+                    }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/scores_by_account_cte/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query_response.0, StatusCode::OK, "{query_response:?}");
+        assert_eq!(
+            query_response.1["rows"],
+            json!([{"account_id": "alice", "sum": 17, "count": 2}])
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_two_relation_join_right_cte_source_filter_view_materializes_outputs() {
+        let state =
+            test_api_state_with_store(Arc::new(InMemory::new()), "api-test-join-right-cte", false)
+                .await;
+        let router = app(state);
+
+        for catalog in [test_scores_catalog(), test_accounts_catalog()] {
+            let relation_response = call_json(
+                &router,
+                Method::POST,
+                "/v1/relations",
+                json!({
+                    "catalog": catalog,
+                    "default_orders_sum_count": false
+                }),
+            )
+            .await;
+            assert_eq!(relation_response.0, StatusCode::CREATED);
+        }
+
+        let view_request = CreateViewRequest {
+            view_id: "scores_by_account_right_cte".to_string(),
+            url_path: Some("/scores/by-account-right-cte".to_string()),
+            output_relation_id: None,
+            input_relation_id: String::new(),
+            input_relation_version: String::new(),
+            input_relation_refs: vec![
+                InputRelationRef {
+                    relation_id: "scores".to_string(),
+                    relation_version: "2026-05-24.v1".to_string(),
+                },
+                InputRelationRef {
+                    relation_id: "accounts".to_string(),
+                    relation_version: "2026-05-24.v1".to_string(),
+                },
+            ],
+            input_relations: Vec::new(),
+            sql: "with eligible_accounts as (select * from accounts where limit > 60) select a.account_id, sum(s.score) as sum, count(*) as count from scores s join eligible_accounts a on s.user_id = a.account_id where s.score > 0 group by a.account_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("positive score metrics joined to right CTE account source".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+        assert_eq!(view_response.1["query_enabled"], true);
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [
+                    {
+                        "relation_id": "scores",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "scores-join-right-cte-stream",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [
+                            {"user_id": "alice", "score": 10, "delta": 1},
+                            {"user_id": "alice", "score": -3, "delta": 1},
+                            {"user_id": "bob", "score": 5, "delta": 1},
+                            {"user_id": "alice", "score": 7, "delta": 1}
+                        ]
+                    },
+                    {
+                        "relation_id": "accounts",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "accounts-join-right-cte-stream",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [
+                            {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
+                            {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1},
+                            {"account_id": "charlie", "limit": 100, "tier": "silver", "delta": 1}
+                        ]
+                    }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/scores_by_account_right_cte/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query_response.0, StatusCode::OK, "{query_response:?}");
+        assert_eq!(
+            query_response.1["rows"],
+            json!([{"account_id": "alice", "sum": 17, "count": 2}])
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_two_relation_join_two_cte_source_filter_view_materializes_outputs() {
+        let state =
+            test_api_state_with_store(Arc::new(InMemory::new()), "api-test-join-two-cte", false)
+                .await;
+        let router = app(state);
+
+        for catalog in [test_scores_catalog(), test_accounts_catalog()] {
+            let relation_response = call_json(
+                &router,
+                Method::POST,
+                "/v1/relations",
+                json!({
+                    "catalog": catalog,
+                    "default_orders_sum_count": false
+                }),
+            )
+            .await;
+            assert_eq!(relation_response.0, StatusCode::CREATED);
+        }
+
+        let view_request = CreateViewRequest {
+            view_id: "scores_by_account_two_cte".to_string(),
+            url_path: Some("/scores/by-account-two-cte".to_string()),
+            output_relation_id: None,
+            input_relation_id: String::new(),
+            input_relation_version: String::new(),
+            input_relation_refs: vec![
+                InputRelationRef {
+                    relation_id: "scores".to_string(),
+                    relation_version: "2026-05-24.v1".to_string(),
+                },
+                InputRelationRef {
+                    relation_id: "accounts".to_string(),
+                    relation_version: "2026-05-24.v1".to_string(),
+                },
+            ],
+            input_relations: Vec::new(),
+            sql: "with positive_scores as (select * from scores where score > 0), eligible_accounts as (select * from accounts where limit > 60) select a.account_id, sum(s.score) as sum, count(*) as count from positive_scores s join eligible_accounts a on s.user_id = a.account_id group by a.account_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("positive score metrics joined through two CTE sources".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+        assert_eq!(view_response.1["query_enabled"], true);
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [
+                    {
+                        "relation_id": "scores",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "scores-join-two-cte-stream",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [
+                            {"user_id": "alice", "score": 10, "delta": 1},
+                            {"user_id": "alice", "score": -3, "delta": 1},
+                            {"user_id": "bob", "score": 5, "delta": 1},
+                            {"user_id": "alice", "score": 7, "delta": 1}
+                        ]
+                    },
+                    {
+                        "relation_id": "accounts",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "accounts-join-two-cte-stream",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [
+                            {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
+                            {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1},
+                            {"account_id": "charlie", "limit": 100, "tier": "silver", "delta": 1}
+                        ]
+                    }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/scores_by_account_two_cte/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query_response.0, StatusCode::OK, "{query_response:?}");
+        assert_eq!(
+            query_response.1["rows"],
+            json!([{"account_id": "alice", "sum": 17, "count": 2}])
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_two_relation_join_derived_table_source_filter_view_materializes_outputs() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-join-derived-source",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        for catalog in [test_scores_catalog(), test_accounts_catalog()] {
+            let relation_response = call_json(
+                &router,
+                Method::POST,
+                "/v1/relations",
+                json!({
+                    "catalog": catalog,
+                    "default_orders_sum_count": false
+                }),
+            )
+            .await;
+            assert_eq!(relation_response.0, StatusCode::CREATED);
+        }
+
+        let view_request = CreateViewRequest {
+            view_id: "scores_by_account_derived_source".to_string(),
+            url_path: Some("/scores/by-account-derived-source".to_string()),
+            output_relation_id: None,
+            input_relation_id: String::new(),
+            input_relation_version: String::new(),
+            input_relation_refs: vec![
+                InputRelationRef {
+                    relation_id: "scores".to_string(),
+                    relation_version: "2026-05-24.v1".to_string(),
+                },
+                InputRelationRef {
+                    relation_id: "accounts".to_string(),
+                    relation_version: "2026-05-24.v1".to_string(),
+                },
+            ],
+            input_relations: Vec::new(),
+            sql: "select a.account_id, sum(s.score) as sum, count(*) as count from (select * from scores where score > 0) s join (select * from accounts where limit > 60) a on s.user_id = a.account_id group by a.account_id".to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("positive score metrics joined through derived table sources".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+        assert_eq!(view_response.1["query_enabled"], true);
+
+        let ingest = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [
+                    {
+                        "relation_id": "scores",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "scores-join-derived-source-stream",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [
+                            {"user_id": "alice", "score": 10, "delta": 1},
+                            {"user_id": "alice", "score": -3, "delta": 1},
+                            {"user_id": "bob", "score": 5, "delta": 1},
+                            {"user_id": "alice", "score": 7, "delta": 1}
+                        ]
+                    },
+                    {
+                        "relation_id": "accounts",
+                        "relation_version": "2026-05-24.v1",
+                        "stream_id": "accounts-join-derived-source-stream",
+                        "partition_id": 0,
+                        "start_offset_inclusive": 0,
+                        "rows": [
+                            {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
+                            {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1},
+                            {"account_id": "charlie", "limit": 100, "tier": "silver", "delta": 1}
+                        ]
+                    }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/scores_by_account_derived_source/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query_response.0, StatusCode::OK, "{query_response:?}");
+        assert_eq!(
+            query_response.1["rows"],
+            json!([{"account_id": "alice", "sum": 17, "count": 2}])
+        );
     }
 
     fn assert_join_rows(response: &Value, expected_epoch: u64, expected_alice_sum: i64) {
@@ -14003,13 +26053,18 @@ mod tests {
         );
     }
 
-    fn assert_latest_device_rows(response: &Value, expected_epoch: u64, expected_device_b: bool) {
+    fn assert_latest_device_rows(
+        response: &Value,
+        expected_epoch: u64,
+        expected_device_a: bool,
+        expected_device_b: bool,
+    ) {
         assert_eq!(response["logical_epoch"], expected_epoch);
         assert_eq!(
             response["rows"],
             json!([
-                {"device_id": "device-a", "enabled": false},
-                {"device_id": "device-b", "enabled": expected_device_b}
+                {"device": "device-a", "enabled": expected_device_a},
+                {"device": "device-b", "enabled": expected_device_b}
             ])
         );
     }
@@ -14036,12 +26091,12 @@ mod tests {
                 sql_hash: format!("sha256:{}", "a".repeat(64)),
                 input_catalog_hash: format!("sha256:{}", "b".repeat(64)),
                 output_schema_hash: format!("sha256:{}", "c".repeat(64)),
-                compiler_identity: "velorix-logical-view-plan-v1".to_string(),
-                runtime_packages: vec![RuntimePackageIdentity {
+                planner_identity: "velorix-logical-view-planner-v1".to_string(),
+                builtin_runtime_identities: vec![BuiltinRuntimeIdentity {
                     name: "velorix-runtime".to_string(),
                     version: "test".to_string(),
                 }],
-                package_feature_set: vec!["materialized-view-runtime".to_string()],
+                runtime_capabilities: vec!["materialized-view-runtime".to_string()],
                 runtime_compatibility: "velorix-materialized-view-runtime-v1".to_string(),
                 checkpoint_codec_identity: "velorix-standing-program-checkpoint-v1".to_string(),
                 native_code_policy: NativeCodePolicy::DisabledNoExternalDependencies,
@@ -14050,6 +26105,8 @@ mod tests {
             input_frontiers: vec![RelationFrontier {
                 relation_id: "purchases".to_string(),
                 relation_version: "2026-05-24.v1".to_string(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
                 committed_offset_exclusive: 11,
             }],
             input_event_time_frontiers: Vec::new(),
@@ -14072,12 +26129,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn standing_runtime_budget_rejects_oversized_state_payload() {
+        let checkpoint = test_runtime_checkpoint(Vec::new());
+        let error = validate_standing_runtime_budget(
+            &[],
+            &checkpoint,
+            StandingRuntimeBudgetLimits {
+                max_output_delta_records: 1,
+                max_state_payload_bytes: 1,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(error.to_string().contains("checkpoint state payload size"));
+    }
+
     async fn test_api_state() -> ApiState {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         test_api_state_with_store(store, "api-test-owner", false).await
     }
 
     async fn test_api_state_with_store(
+        store: Arc<dyn ObjectStore>,
+        owner_id: &str,
+        reconstruct_ingest_admission: bool,
+    ) -> ApiState {
+        test_public_api_state_with_store(store, owner_id, reconstruct_ingest_admission)
+            .await
+            .with_experimental_advanced_view_features(true)
+    }
+
+    async fn test_public_api_state_with_store(
         store: Arc<dyn ObjectStore>,
         owner_id: &str,
         reconstruct_ingest_admission: bool,
@@ -14103,6 +26187,302 @@ mod tests {
         .unwrap()
     }
 
+    struct FailingApplyRuntimeFactory {
+        delegate: MaterializedViewRuntimeFactory,
+        reason: String,
+    }
+
+    impl FailingApplyRuntimeFactory {
+        fn new(reason: impl Into<String>) -> Self {
+            Self {
+                delegate: MaterializedViewRuntimeFactory,
+                reason: reason.into(),
+            }
+        }
+    }
+
+    impl StandingProgramRuntimeFactory for FailingApplyRuntimeFactory {
+        fn output_schemas_for_view_request(
+            &self,
+            view_id: &str,
+            sql: &str,
+            catalog: &VelorixRelationCatalogV1,
+            input_schema_fingerprint: &str,
+        ) -> Result<Option<Vec<RelationSchema>>, ApiError> {
+            self.delegate.output_schemas_for_view_request(
+                view_id,
+                sql,
+                catalog,
+                input_schema_fingerprint,
+            )
+        }
+
+        fn output_schemas_for_view_request_with_catalogs(
+            &self,
+            view_id: &str,
+            sql: &str,
+            catalogs: &[VelorixRelationCatalogV1],
+            input_schema_fingerprint: &str,
+        ) -> Result<Option<Vec<RelationSchema>>, ApiError> {
+            self.delegate.output_schemas_for_view_request_with_catalogs(
+                view_id,
+                sql,
+                catalogs,
+                input_schema_fingerprint,
+            )
+        }
+
+        fn create(
+            &self,
+            identity: &StandingProgramIdentity,
+        ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
+            Ok(Box::new(FailingApplyRuntime {
+                identity: identity.clone(),
+                input_schemas: Vec::new(),
+                output_schemas: Vec::new(),
+                reason: self.reason.clone(),
+            }))
+        }
+
+        fn create_with_catalogs_plan_and_spec(
+            &self,
+            identity: &StandingProgramIdentity,
+            _catalogs: &[VelorixRelationCatalogV1],
+            _logical_plan: &VelorixLogicalViewPlanV1,
+            _spec: &StandingViewSpec,
+            input_schemas: &[RelationSchema],
+            output_schemas: &[RelationSchema],
+        ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
+            Ok(Box::new(FailingApplyRuntime {
+                identity: identity.clone(),
+                input_schemas: input_schemas.to_vec(),
+                output_schemas: output_schemas.to_vec(),
+                reason: self.reason.clone(),
+            }))
+        }
+
+        fn restore(
+            &self,
+            checkpoint: RuntimeCheckpoint,
+        ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
+            Ok(Box::new(FailingApplyRuntime {
+                identity: checkpoint.identity,
+                input_schemas: Vec::new(),
+                output_schemas: Vec::new(),
+                reason: self.reason.clone(),
+            }))
+        }
+    }
+
+    struct FailingApplyRuntime {
+        identity: StandingProgramIdentity,
+        input_schemas: Vec<RelationSchema>,
+        output_schemas: Vec<RelationSchema>,
+        reason: String,
+    }
+
+    impl FailingApplyRuntime {
+        fn error(&self) -> StandingProgramRuntimeError {
+            StandingProgramRuntimeError::ExternalRuntime {
+                reason: self.reason.clone(),
+            }
+        }
+    }
+
+    impl StandingProgramRuntime for FailingApplyRuntime {
+        fn program_identity(&self) -> &StandingProgramIdentity {
+            &self.identity
+        }
+
+        fn input_schemas(&self) -> Vec<RelationSchema> {
+            self.input_schemas.clone()
+        }
+
+        fn output_schemas(&self) -> Vec<RelationSchema> {
+            self.output_schemas.clone()
+        }
+
+        fn logical_epoch(&self) -> u64 {
+            0
+        }
+
+        fn apply_changes(
+            &mut self,
+            _logical_epoch: u64,
+            _idempotency_key: EpochIdempotencyKey,
+            _input_changes: Vec<RelationInputBatch>,
+        ) -> Result<velorix_core::standing_program::EpochCommit, StandingProgramRuntimeError>
+        {
+            Err(self.error())
+        }
+
+        fn materialized_view_page(
+            &self,
+            _view: ScopedViewId,
+            _page: SnapshotPageRequest,
+        ) -> Result<MaterializedViewPage, StandingProgramRuntimeError> {
+            Err(self.error())
+        }
+
+        fn checkpoint(&self) -> Result<RuntimeCheckpoint, StandingProgramRuntimeError> {
+            Err(self.error())
+        }
+
+        fn restore(checkpoint: RuntimeCheckpoint) -> Result<Self, StandingProgramRuntimeError> {
+            Ok(Self {
+                identity: checkpoint.identity,
+                input_schemas: Vec::new(),
+                output_schemas: Vec::new(),
+                reason: "restored failing apply runtime".to_string(),
+            })
+        }
+    }
+
+    #[test]
+    fn public_view_response_json_omits_legacy_artifact_key() {
+        let input = RelationSchema {
+            relation_id: "scores".to_string(),
+            relation_name: "scores".to_string(),
+            relation_version: "2026-05-24.v1".to_string(),
+            schema_fingerprint: "sha256:input".to_string(),
+            columns: vec![ColumnSchema {
+                name: "user_id".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            }],
+            primary_key: vec!["user_id".to_string()],
+        };
+        let output = RelationSchema {
+            relation_id: "scores_by_user".to_string(),
+            relation_name: "scores_by_user".to_string(),
+            relation_version: "view".to_string(),
+            schema_fingerprint: "sha256:output".to_string(),
+            columns: input.columns.clone(),
+            primary_key: input.primary_key.clone(),
+        };
+        let spec = StandingViewSpec {
+            view_id: "scores_by_user".to_string(),
+            sql: "select user_id from scores".to_string(),
+            dialect: SqlDialect::VelorixSql,
+            source_kind: SqlSourceKind::StandingView,
+            input_relations: vec![input],
+            output_relations: vec![output],
+            shape: StandingViewShape {
+                is_materialized: true,
+                multi_input: false,
+                multi_output: false,
+            },
+        };
+        let active = ActiveMaterializedView {
+            spec_hash: "sha256:spec".to_string(),
+            spec,
+            execution_mode: MaterializedViewExecutionMode::StandingRuntime,
+            api: Some(MaterializedViewApiMetadata::default()),
+            artifact: Some(
+                velorix_control::storage_admin::MaterializedViewArtifactBinding {
+                    artifact_id: "legacy-artifact".to_string(),
+                    artifact_hash: "sha256:artifact".to_string(),
+                    runtime_crate_name: "legacy-runtime".to_string(),
+                    state_codec: "legacy-codec".to_string(),
+                    state_schema_version: 1,
+                    execution_status: "ready".to_string(),
+                    execution_path: "legacy/external/path".to_string(),
+                    standing_program_identity: None,
+                },
+            ),
+            runtime: None,
+            lifecycle: MaterializedViewLifecycleStatus::standing_runtime(),
+        };
+
+        let response = active_view_response(&active, None).unwrap();
+        let response_json = serde_json::to_value(response).unwrap();
+        assert!(response_json.get("artifact").is_none(), "{response_json}");
+    }
+
+    #[tokio::test]
+    async fn public_1_0_rejects_experimental_view_surfaces_by_default() {
+        let state = test_public_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-public-1-0-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        for sql in [
+            "select user_id, window_start, window_end, sum(score) as sum, count(*) as count from scores group by user_id, tumble(interval '60 seconds')",
+            "select user_id, window_start, window_end, sum(score) as sum, count(*) as count from scores group by user_id, hop (interval '60 seconds', interval '5 seconds')",
+            "select user_id, window_start, window_end, sum(score) as sum, count(*) as count from scores group by user_id, session(interval '60 seconds')",
+            "select user_id, row_number() over (partition by user_id order by score desc, user_id asc) as rank from scores",
+            "select user_id, sum(score)\nover (partition by user_id) as total from scores",
+        ] {
+            let view_response = call_json(
+                &router,
+                Method::POST,
+                "/v1/views",
+                json!({
+                    "view_id": "experimental_view",
+                    "input_relation_id": "scores",
+                    "input_relation_version": "2026-05-24.v1",
+                    "sql": sql
+                }),
+            )
+            .await;
+            assert_eq!(view_response.0, StatusCode::BAD_REQUEST, "{view_response:?}");
+            assert!(view_response.1["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("experimental"));
+        }
+
+        for body in [
+            json!({"mode": "background"}),
+            json!({"mode": "sync", "range": {
+                "relation_id": "scores",
+                "relation_version": "2026-05-24.v1",
+                "start_offset_inclusive": 0,
+                "end_offset_exclusive": 1
+            }}),
+            json!({"mode": "sync", "scope": {"where": "score > 0"}}),
+        ] {
+            let backfill_response =
+                call_json(&router, Method::POST, "/v1/views/missing/backfill", body).await;
+            assert_eq!(
+                backfill_response.0,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{backfill_response:?}"
+            );
+        }
+
+        let compact_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/missing/compact",
+            json!({"mode": "background"}),
+        )
+        .await;
+        assert_eq!(compact_response.0, StatusCode::NOT_FOUND);
+
+        let ready = call_json(&router, Method::GET, "/readyz", Value::Null).await;
+        assert_eq!(ready.0, StatusCode::OK);
+        assert!(ready.1["materialization_policy"]
+            .get("output_compaction")
+            .is_none());
+        assert!(ready.1.get("background_tasks").is_none());
+    }
+
     fn test_checkpoint_key(checkpoint: &RuntimeCheckpoint) -> ObjectKey {
         ObjectKey::standing_runtime_checkpoint(
             &checkpoint.identity.tenant_id,
@@ -14125,6 +26505,7 @@ mod tests {
             checkpoint_key: checkpoint_key.as_str().to_string(),
             logical_epoch: checkpoint.logical_epoch,
             content_hash: checkpoint.state_root.content_hash.clone(),
+            manifest_hash: "sha256:test-manifest".to_string(),
             output_manifest_refs: checkpoint.output_manifest_refs.clone(),
         }
     }
@@ -14141,6 +26522,7 @@ mod tests {
             previous_checkpoint: None,
             checkpoint,
             replay_checkpoints: Vec::new(),
+            manifest_hash: String::new(),
         }
     }
 
@@ -14288,6 +26670,22 @@ mod tests {
         }
     }
 
+    fn test_scores_catalog_with_nullable_score() -> VelorixRelationCatalogV1 {
+        let mut catalog = test_scores_catalog();
+        let score = catalog
+            .relation_schema
+            .columns
+            .iter_mut()
+            .find(|column| column.column_id == "score")
+            .unwrap();
+        score.nullable = true;
+        let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema)
+            .expect("nullable scores catalog should fingerprint");
+        catalog.schema_fingerprint = schema_fingerprint.clone();
+        catalog.incremental_relation.schema_fingerprint = schema_fingerprint;
+        catalog
+    }
+
     fn test_accounts_catalog() -> VelorixRelationCatalogV1 {
         let relation_schema = VelorixRelationSchemaV1 {
             relation_id: "accounts".to_string(),
@@ -14313,12 +26711,21 @@ mod tests {
                     semantic_role: RelationSemanticRoleV1::Value,
                 },
                 RelationColumnV1 {
+                    column_id: "tier".to_string(),
+                    name: "tier".to_string(),
+                    logical_type: VelorixLogicalTypeV1::Utf8,
+                    physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+                    nullable: false,
+                    ordinal: 2,
+                    semantic_role: RelationSemanticRoleV1::Metadata,
+                },
+                RelationColumnV1 {
                     column_id: "delta".to_string(),
                     name: "delta".to_string(),
                     logical_type: VelorixLogicalTypeV1::Int64,
                     physical_arrow_type: ArrowPhysicalTypeV1::Int64,
                     nullable: false,
-                    ordinal: 2,
+                    ordinal: 3,
                     semantic_role: RelationSemanticRoleV1::Weight,
                 },
             ],

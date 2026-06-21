@@ -10,6 +10,7 @@ use datafusion::{
         memory::InMemory as DataFusionInMemory, path::Path as DataFusionPath,
         ObjectStore as DataFusionObjectStore, ObjectStoreExt as DataFusionObjectStoreExt,
     },
+    prelude::SessionContext,
 };
 use object_store::{local::LocalFileSystem, ObjectStore};
 use parquet::arrow::ArrowWriter;
@@ -26,8 +27,10 @@ use velorix_core::{
 };
 use velorix_runtime::{
     query::{
-        query_object_backed_input_with_policy, query_object_backed_input_with_policy_and_metrics,
+        query_delta_batch, query_delta_batch_with_policy, query_object_backed_input_with_policy,
+        query_object_backed_input_with_policy_and_metrics,
         query_record_batches_table_with_bindings_and_policy_and_limiter,
+        register_datafusion_catalog_batches,
         validate_record_batch_table_query_with_bindings_and_policy, QueryBindValue,
         RuntimeQueryError,
     },
@@ -59,6 +62,91 @@ fn input_delta(account: &str, amount: i64, weight: i64) -> DeltaRecord {
 
 fn batch(records: impl IntoIterator<Item = DeltaRecord>) -> DeltaBatch {
     DeltaBatch::from_records(records)
+}
+
+#[tokio::test]
+async fn query_delta_batch_returns_arrow_record_batches_when_sql_projects_input_columns() {
+    let input =
+        DeltaBatch::from_records([input_delta("order:1", 12, 2), input_delta("order:2", 7, -1)]);
+
+    let output = query_delta_batch(
+        &input,
+        "select key_json, value_json, weight from input where weight > 0",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].num_rows(), 1);
+    assert_eq!(
+        output[0]
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name())
+            .collect::<Vec<_>>(),
+        vec!["key_json", "value_json", "weight"]
+    );
+    assert_eq!(string_value(&output[0], 0, 0), "\"order:1\"");
+    assert_eq!(string_value(&output[0], 1, 0), "12");
+    assert_eq!(int64_value(&output[0], 2, 0), 2);
+}
+
+#[tokio::test]
+async fn query_delta_batch_with_policy_rejects_results_above_row_limit() {
+    let input = DeltaBatch::from_records([
+        input_delta("acct:1", 10, 1),
+        input_delta("acct:2", 4, 1),
+        input_delta("acct:3", 8, 1),
+    ]);
+
+    let error = query_delta_batch_with_policy(
+        &input,
+        "select key_json, value_json, weight from input order by key_json",
+        QueryPolicy {
+            max_output_rows: Some(2),
+            ..QueryPolicy::default()
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        QueryError::Policy(QueryPolicyError::OutputRowsExceeded {
+            observed_rows,
+            max_rows: 2
+        }) if observed_rows == 3
+    ));
+}
+
+#[tokio::test]
+async fn datafusion_registration_from_catalog_exposes_typed_columns() {
+    let catalog = orders_sum_count_relation_catalog().unwrap();
+    let schema = datafusion_schema_from_catalog(&catalog).unwrap();
+    let batch = RecordBatch::new_empty(schema);
+    let context = SessionContext::new();
+
+    register_datafusion_catalog_batches(&context, &catalog, vec![batch]).unwrap();
+
+    let output = context
+        .sql("select account_id, amount, weight from orders")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        output[0]
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name())
+            .collect::<Vec<_>>(),
+        vec!["account_id", "amount", "weight"]
+    );
+    assert_eq!(output[0].schema().field(1).data_type(), &DataType::Int64);
 }
 
 fn batch_bytes(batch: &DeltaBatch) -> Bytes {
@@ -650,8 +738,10 @@ async fn query_object_backed_input_returns_datafusion_memory_exhausted_when_grou
     assert!(
         matches!(
             error,
-            RuntimeQueryError::Query(QueryError::DataFusion(ref error))
-                if datafusion_error_has_resources_exhausted_root(error)
+            RuntimeQueryError::Query(QueryError::Engine(ref error))
+                if error
+                    .downcast_ref::<DataFusionError>()
+                    .is_some_and(datafusion_error_has_resources_exhausted_root)
         ),
         "expected DataFusion ResourcesExhausted, got {error:?}"
     );
@@ -809,7 +899,7 @@ async fn query_object_backed_input_propagates_datafusion_scan_errors() {
 
     assert!(matches!(
         error,
-        RuntimeQueryError::Query(QueryError::DataFusion(_))
+        RuntimeQueryError::Query(QueryError::Engine(_))
     ));
 }
 

@@ -3,6 +3,8 @@
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeSet, HashMap};
+#[cfg(feature = "hiqlite-backend")]
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -116,6 +118,8 @@ pub struct StandingRuntimeCheckpointPointer {
     pub checkpoint_key: String,
     pub logical_epoch: u64,
     pub content_hash: String,
+    #[serde(default)]
+    pub manifest_hash: String,
     #[serde(default)]
     pub output_manifest_refs: Vec<String>,
 }
@@ -817,6 +821,7 @@ impl StandingRuntimeCheckpointPointer {
         validate_standing_runtime_scope(&self.tenant_id, &self.program_id, &self.view_id)?;
         require_non_empty("checkpoint_key", &self.checkpoint_key)?;
         require_non_empty("content_hash", &self.content_hash)?;
+        require_non_empty("manifest_hash", &self.manifest_hash)?;
         let (_, parts) = ObjectKey::parse_standing_runtime_checkpoint(self.checkpoint_key.clone())
             .map_err(|error| MetaStoreError::Serialization(error.to_string()))?;
         if parts.tenant_id != self.tenant_id
@@ -1521,6 +1526,7 @@ fn standing_runtime_checkpoint_pointer_from_proto(
         checkpoint_key: pointer.checkpoint_key,
         logical_epoch: pointer.logical_epoch,
         content_hash: pointer.content_hash,
+        manifest_hash: pointer.manifest_hash,
         output_manifest_refs: pointer.output_manifest_refs,
     }
 }
@@ -1535,6 +1541,7 @@ fn standing_runtime_checkpoint_pointer_to_proto(
         checkpoint_key: pointer.checkpoint_key,
         logical_epoch: pointer.logical_epoch,
         content_hash: pointer.content_hash,
+        manifest_hash: pointer.manifest_hash,
         output_manifest_refs: pointer.output_manifest_refs,
     }
 }
@@ -1651,6 +1658,7 @@ impl HiqliteMetaStore {
                     checkpoint_key TEXT NOT NULL,
                     logical_epoch INTEGER NOT NULL,
                     content_hash TEXT NOT NULL,
+                    manifest_hash TEXT NOT NULL DEFAULT '',
                     output_manifest_refs_json TEXT NOT NULL DEFAULT '[]',
                     PRIMARY KEY (tenant_id, program_id, view_id)
                 )",
@@ -1658,6 +1666,22 @@ impl HiqliteMetaStore {
             )
             .await
             .map_err(hiqlite_error)?;
+        if !self
+            .hiqlite_table_has_column(
+                "PRAGMA table_info(velorix_standing_runtime_checkpoints)",
+                "manifest_hash",
+            )
+            .await?
+        {
+            self.client
+                .execute(
+                    "ALTER TABLE velorix_standing_runtime_checkpoints
+                        ADD COLUMN manifest_hash TEXT NOT NULL DEFAULT ''",
+                    vec![],
+                )
+                .await
+                .map_err(hiqlite_error)?;
+        }
         if !self
             .hiqlite_table_has_column(
                 "PRAGMA table_info(velorix_standing_runtime_checkpoints)",
@@ -1722,6 +1746,20 @@ impl HiqliteMetaStore {
         Ok(())
     }
 
+    async fn with_schema_repair<T, F, Fut>(&self, mut operation: F) -> Result<T, MetaStoreError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, MetaStoreError>>,
+    {
+        match operation().await {
+            Err(error) if hiqlite_meta_error_is_missing_table(&error) => {
+                self.initialize_schema().await?;
+                operation().await
+            }
+            result => result,
+        }
+    }
+
     #[cfg(feature = "hiqlite-backend")]
     async fn hiqlite_table_has_column(
         &self,
@@ -1745,27 +1783,30 @@ impl HiqliteMetaStore {
     ) -> Result<Option<StandingRuntimeOwnerClaim>, MetaStoreError> {
         validate_standing_runtime_scope(tenant_id, program_id, view_id)?;
         let rows = self
-            .client
-            .query_consistent_map::<StandingRuntimeOwnerClaimRow, _>(
-                "SELECT
-                    owner.tenant_id,
-                    owner.program_id,
-                    owner.view_id,
-                    owner_id,
-                    owner_epoch,
-                    expires_at_unix_ms
-                FROM velorix_standing_runtime_owners owner
-                WHERE owner.tenant_id = $1
-                  AND owner.program_id = $2
-                  AND owner.view_id = $3",
-                vec![
-                    hiqlite::Param::from(tenant_id.to_string()),
-                    hiqlite::Param::from(program_id.to_string()),
-                    hiqlite::Param::from(view_id.to_string()),
-                ],
-            )
-            .await
-            .map_err(hiqlite_error)?;
+            .with_schema_repair(|| async {
+                self.client
+                    .query_consistent_map::<StandingRuntimeOwnerClaimRow, _>(
+                        "SELECT
+                            owner.tenant_id,
+                            owner.program_id,
+                            owner.view_id,
+                            owner_id,
+                            owner_epoch,
+                            expires_at_unix_ms
+                        FROM velorix_standing_runtime_owners owner
+                        WHERE owner.tenant_id = $1
+                          AND owner.program_id = $2
+                          AND owner.view_id = $3",
+                        vec![
+                            hiqlite::Param::from(tenant_id.to_string()),
+                            hiqlite::Param::from(program_id.to_string()),
+                            hiqlite::Param::from(view_id.to_string()),
+                        ],
+                    )
+                    .await
+                    .map_err(hiqlite_error)
+            })
+            .await?;
         rows.into_iter()
             .next()
             .map(StandingRuntimeOwnerClaimRow::into_claim)
@@ -1792,19 +1833,22 @@ impl MetaStore for HiqliteMetaStore {
         let catalog_json = serde_json::to_vec(&catalog)
             .map_err(|error| MetaStoreError::Serialization(error.to_string()))?;
         let inserted = self
-            .client
-            .execute(
-                "INSERT OR IGNORE INTO velorix_relation_catalogs
-                    (relation_id, relation_version, catalog_json)
-                    VALUES ($1, $2, $3)",
-                vec![
-                    hiqlite::Param::from(relation_id.clone()),
-                    hiqlite::Param::from(relation_version.clone()),
-                    hiqlite::Param::from(catalog_json.clone()),
-                ],
-            )
-            .await
-            .map_err(hiqlite_error)?;
+            .with_schema_repair(|| async {
+                self.client
+                    .execute(
+                        "INSERT OR IGNORE INTO velorix_relation_catalogs
+                            (relation_id, relation_version, catalog_json)
+                            VALUES ($1, $2, $3)",
+                        vec![
+                            hiqlite::Param::from(relation_id.clone()),
+                            hiqlite::Param::from(relation_version.clone()),
+                            hiqlite::Param::from(catalog_json.clone()),
+                        ],
+                    )
+                    .await
+                    .map_err(hiqlite_error)
+            })
+            .await?;
         if inserted == 1 {
             return Ok(StoreRelationCatalogOutcome::Created);
         }
@@ -1830,17 +1874,20 @@ impl MetaStore for HiqliteMetaStore {
         require_non_empty("relation_id", relation_id)?;
         require_non_empty("relation_version", relation_version)?;
         let rows = self
-            .client
-            .query_map::<CatalogJsonRow, _>(
-                "SELECT catalog_json FROM velorix_relation_catalogs
-                    WHERE relation_id = $1 AND relation_version = $2",
-                vec![
-                    hiqlite::Param::from(relation_id.to_string()),
-                    hiqlite::Param::from(relation_version.to_string()),
-                ],
-            )
-            .await
-            .map_err(hiqlite_error)?;
+            .with_schema_repair(|| async {
+                self.client
+                    .query_map::<CatalogJsonRow, _>(
+                        "SELECT catalog_json FROM velorix_relation_catalogs
+                            WHERE relation_id = $1 AND relation_version = $2",
+                        vec![
+                            hiqlite::Param::from(relation_id.to_string()),
+                            hiqlite::Param::from(relation_version.to_string()),
+                        ],
+                    )
+                    .await
+                    .map_err(hiqlite_error)
+            })
+            .await?;
         let Some(row) = rows.into_iter().next() else {
             return Err(MetaStoreError::RelationCatalogNotFound {
                 relation_id: relation_id.to_string(),
@@ -1861,75 +1908,81 @@ impl MetaStore for HiqliteMetaStore {
         let end = i64_from_u64("end_offset_exclusive", reservation.end_offset_exclusive)?;
         let writer_epoch = i64_from_u64("writer_epoch", reservation.writer_epoch)?;
         let inserted = self
-            .client
-            .execute(
-                "INSERT INTO velorix_ingest_reservations (
-                    stream_id,
-                    partition_id,
-                    start_offset_inclusive,
-                    end_offset_exclusive,
-                    batch_key,
-                    payload_digest,
-                    relation_id,
-                    relation_version,
-                    schema_fingerprint,
-                    writer_epoch
-                )
-                SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM velorix_ingest_reservations
-                    WHERE stream_id = $1
-                      AND partition_id = $2
-                      AND start_offset_inclusive < $4
-                      AND $3 < end_offset_exclusive
-                )",
-                vec![
-                    hiqlite::Param::from(reservation.stream_id.clone()),
-                    hiqlite::Param::from(reservation.partition_id),
-                    hiqlite::Param::from(start),
-                    hiqlite::Param::from(end),
-                    hiqlite::Param::from(reservation.batch_key.clone()),
-                    hiqlite::Param::from(reservation.payload_digest.clone()),
-                    hiqlite::Param::from(reservation.relation_id.clone()),
-                    hiqlite::Param::from(reservation.relation_version.clone()),
-                    hiqlite::Param::from(reservation.schema_fingerprint.clone()),
-                    hiqlite::Param::from(writer_epoch),
-                ],
-            )
-            .await
-            .map_err(hiqlite_error)?;
+            .with_schema_repair(|| async {
+                self.client
+                    .execute(
+                        "INSERT INTO velorix_ingest_reservations (
+                            stream_id,
+                            partition_id,
+                            start_offset_inclusive,
+                            end_offset_exclusive,
+                            batch_key,
+                            payload_digest,
+                            relation_id,
+                            relation_version,
+                            schema_fingerprint,
+                            writer_epoch
+                        )
+                        SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM velorix_ingest_reservations
+                            WHERE stream_id = $1
+                              AND partition_id = $2
+                              AND start_offset_inclusive < $4
+                              AND $3 < end_offset_exclusive
+                        )",
+                        vec![
+                            hiqlite::Param::from(reservation.stream_id.clone()),
+                            hiqlite::Param::from(reservation.partition_id),
+                            hiqlite::Param::from(start),
+                            hiqlite::Param::from(end),
+                            hiqlite::Param::from(reservation.batch_key.clone()),
+                            hiqlite::Param::from(reservation.payload_digest.clone()),
+                            hiqlite::Param::from(reservation.relation_id.clone()),
+                            hiqlite::Param::from(reservation.relation_version.clone()),
+                            hiqlite::Param::from(reservation.schema_fingerprint.clone()),
+                            hiqlite::Param::from(writer_epoch),
+                        ],
+                    )
+                    .await
+                    .map_err(hiqlite_error)
+            })
+            .await?;
         if inserted == 1 {
             return Ok(ReserveIngestRangeOutcome::Reserved);
         }
 
         let exact_rows = self
-            .client
-            .query_map::<IngestReservationRow, _>(
-                "SELECT
-                    stream_id,
-                    partition_id,
-                    start_offset_inclusive,
-                    end_offset_exclusive,
-                    batch_key,
-                    payload_digest,
-                    relation_id,
-                    relation_version,
-                    schema_fingerprint,
-                    writer_epoch
-                FROM velorix_ingest_reservations
-                WHERE stream_id = $1
-                  AND partition_id = $2
-                  AND start_offset_inclusive = $3
-                  AND end_offset_exclusive = $4",
-                vec![
-                    hiqlite::Param::from(reservation.stream_id.clone()),
-                    hiqlite::Param::from(reservation.partition_id),
-                    hiqlite::Param::from(start),
-                    hiqlite::Param::from(end),
-                ],
-            )
-            .await
-            .map_err(hiqlite_error)?;
+            .with_schema_repair(|| async {
+                self.client
+                    .query_map::<IngestReservationRow, _>(
+                        "SELECT
+                            stream_id,
+                            partition_id,
+                            start_offset_inclusive,
+                            end_offset_exclusive,
+                            batch_key,
+                            payload_digest,
+                            relation_id,
+                            relation_version,
+                            schema_fingerprint,
+                            writer_epoch
+                        FROM velorix_ingest_reservations
+                        WHERE stream_id = $1
+                          AND partition_id = $2
+                          AND start_offset_inclusive = $3
+                          AND end_offset_exclusive = $4",
+                        vec![
+                            hiqlite::Param::from(reservation.stream_id.clone()),
+                            hiqlite::Param::from(reservation.partition_id),
+                            hiqlite::Param::from(start),
+                            hiqlite::Param::from(end),
+                        ],
+                    )
+                    .await
+                    .map_err(hiqlite_error)
+            })
+            .await?;
         if exact_rows
             .into_iter()
             .any(|existing| existing.into_reservation() == reservation)
@@ -1954,9 +2007,10 @@ impl MetaStore for HiqliteMetaStore {
             .await?;
         let ttl_ms = i64_from_u64("ttl_ms", request.ttl_ms)?;
         let txn = self
-            .client
-            .txn_with_raft_serialized_timestamp([(
-                "INSERT INTO velorix_standing_runtime_owners (
+            .with_schema_repair(|| async {
+                self.client
+                    .txn_with_raft_serialized_timestamp([(
+                        "INSERT INTO velorix_standing_runtime_owners (
                         tenant_id,
                         program_id,
                         view_id,
@@ -1986,17 +2040,19 @@ impl MetaStore for HiqliteMetaStore {
                         expires_at_authority_tick = excluded.expires_at_authority_tick
                     WHERE velorix_standing_runtime_owners.owner_id = excluded.owner_id
                        OR velorix_standing_runtime_owners.expires_at_unix_ms <= $5",
-                vec![
-                    hiqlite::Param::from(request.tenant_id.clone()),
-                    hiqlite::Param::from(request.program_id.clone()),
-                    hiqlite::Param::from(request.view_id.clone()),
-                    hiqlite::Param::from(request.owner_id.clone()),
-                    hiqlite::Param::raft_serialized_unix_ms(),
-                    hiqlite::Param::from(ttl_ms),
-                ],
-            )])
-            .await
-            .map_err(hiqlite_error)?;
+                        vec![
+                            hiqlite::Param::from(request.tenant_id.clone()),
+                            hiqlite::Param::from(request.program_id.clone()),
+                            hiqlite::Param::from(request.view_id.clone()),
+                            hiqlite::Param::from(request.owner_id.clone()),
+                            hiqlite::Param::raft_serialized_unix_ms(),
+                            hiqlite::Param::from(ttl_ms),
+                        ],
+                    )])
+                    .await
+                    .map_err(hiqlite_error)
+            })
+            .await?;
         let results = txn.result.map_err(hiqlite_error)?;
         let raft_timestamp = txn.timestamp;
         let changed = hiqlite_txn_changed_rows(results, 0)?;
@@ -2038,15 +2094,18 @@ impl MetaStore for HiqliteMetaStore {
     ) -> Result<Option<StandingRuntimeOwnerClaim>, MetaStoreError> {
         validate_standing_runtime_scope(tenant_id, program_id, view_id)?;
         let txn = self
-            .client
-            .txn_with_raft_serialized_timestamp([(
-                "UPDATE velorix_standing_runtime_owners
+            .with_schema_repair(|| async {
+                self.client
+                    .txn_with_raft_serialized_timestamp([(
+                        "UPDATE velorix_standing_runtime_owners
                     SET expires_at_unix_ms = expires_at_unix_ms
                     WHERE 0",
-                vec![],
-            )])
-            .await
-            .map_err(hiqlite_error)?;
+                        vec![],
+                    )])
+                    .await
+                    .map_err(hiqlite_error)
+            })
+            .await?;
         txn.result.map_err(hiqlite_error)?;
         let now =
             u64::try_from(txn.timestamp.unix_ms).map_err(|_| MetaStoreError::TimestampOverflow)?;
@@ -2069,108 +2128,140 @@ impl MetaStore for HiqliteMetaStore {
             let expected_epoch =
                 i64_from_u64("expected_previous.logical_epoch", expected.logical_epoch)?;
             let txn = self
-                .client
-                .txn_with_raft_serialized_timestamp([(
-                    "UPDATE velorix_standing_runtime_checkpoints
+                .with_schema_repair(|| async {
+                    self.client
+                        .txn_with_raft_serialized_timestamp([
+                            (
+                                "SELECT 1 AS authorized
+                            FROM velorix_standing_runtime_owners owner
+                            WHERE owner.tenant_id = $1
+                              AND owner.program_id = $2
+                              AND owner.view_id = $3
+                              AND owner.owner_id = $4
+                              AND owner.owner_epoch = $5
+                              AND owner.expires_at_unix_ms > $6
+                              AND $7 = $1
+                              AND $8 = $2
+                              AND $9 = $3",
+                                vec![
+                                    hiqlite::Param::from(request.owner.tenant_id.clone()),
+                                    hiqlite::Param::from(request.owner.program_id.clone()),
+                                    hiqlite::Param::from(request.owner.view_id.clone()),
+                                    hiqlite::Param::from(request.owner.owner_id.clone()),
+                                    hiqlite::Param::from(owner_epoch),
+                                    hiqlite::Param::raft_serialized_unix_ms(),
+                                    hiqlite::Param::from(request.candidate.tenant_id.clone()),
+                                    hiqlite::Param::from(request.candidate.program_id.clone()),
+                                    hiqlite::Param::from(request.candidate.view_id.clone()),
+                                ],
+                            ),
+                            (
+                                "UPDATE velorix_standing_runtime_checkpoints
                             SET checkpoint_key = $1,
                                 logical_epoch = $2,
                                 content_hash = $3,
-                                output_manifest_refs_json = $16
-                            WHERE tenant_id = $4
-                              AND program_id = $5
-                              AND view_id = $6
-                              AND checkpoint_key = $7
-                              AND logical_epoch = $8
-                              AND content_hash = $9
-                              AND EXISTS (
-                                  SELECT 1
-                                  FROM velorix_standing_runtime_owners owner
-                                  WHERE owner.tenant_id = $4
-                                    AND owner.program_id = $5
-                                    AND owner.view_id = $6
-                                    AND owner.owner_id = $10
-                                    AND owner.owner_epoch = $11
-                                    AND owner.expires_at_unix_ms > $12
-                                    AND $13 = $4
-                                    AND $14 = $5
-                                    AND $15 = $6
-                              )",
-                    vec![
-                        hiqlite::Param::from(request.candidate.checkpoint_key.clone()),
-                        hiqlite::Param::from(candidate_epoch),
-                        hiqlite::Param::from(request.candidate.content_hash.clone()),
-                        hiqlite::Param::from(request.candidate.tenant_id.clone()),
-                        hiqlite::Param::from(request.candidate.program_id.clone()),
-                        hiqlite::Param::from(request.candidate.view_id.clone()),
-                        hiqlite::Param::from(expected.checkpoint_key.clone()),
-                        hiqlite::Param::from(expected_epoch),
-                        hiqlite::Param::from(expected.content_hash.clone()),
-                        hiqlite::Param::from(request.owner.owner_id.clone()),
-                        hiqlite::Param::from(owner_epoch),
-                        hiqlite::Param::raft_serialized_unix_ms(),
-                        hiqlite::Param::from(request.owner.tenant_id.clone()),
-                        hiqlite::Param::from(request.owner.program_id.clone()),
-                        hiqlite::Param::from(request.owner.view_id.clone()),
-                        hiqlite::Param::from(candidate_output_manifest_refs_json.clone()),
-                    ],
-                )])
-                .await
-                .map_err(hiqlite_error)?;
-            let results = txn.result.map_err(hiqlite_error)?;
-            (hiqlite_txn_changed_rows(results, 0)?, txn.timestamp)
+                                manifest_hash = $4,
+                                output_manifest_refs_json = $5
+                            WHERE tenant_id = $6
+                              AND program_id = $7
+                              AND view_id = $8
+                              AND checkpoint_key = $9
+                              AND logical_epoch = $10
+                              AND content_hash = $11
+                              AND manifest_hash = $12
+                              AND $13 = 1",
+                                vec![
+                                    hiqlite::Param::from(request.candidate.checkpoint_key.clone()),
+                                    hiqlite::Param::from(candidate_epoch),
+                                    hiqlite::Param::from(request.candidate.content_hash.clone()),
+                                    hiqlite::Param::from(request.candidate.manifest_hash.clone()),
+                                    hiqlite::Param::from(
+                                        candidate_output_manifest_refs_json.clone(),
+                                    ),
+                                    hiqlite::Param::from(request.candidate.tenant_id.clone()),
+                                    hiqlite::Param::from(request.candidate.program_id.clone()),
+                                    hiqlite::Param::from(request.candidate.view_id.clone()),
+                                    hiqlite::Param::from(expected.checkpoint_key.clone()),
+                                    hiqlite::Param::from(expected_epoch),
+                                    hiqlite::Param::from(expected.content_hash.clone()),
+                                    hiqlite::Param::from(expected.manifest_hash.clone()),
+                                    hiqlite::Param::StmtOutputIndexed(0, 0),
+                                ],
+                            ),
+                        ])
+                        .await
+                        .map_err(hiqlite_error)
+                })
+                .await?;
+            (
+                hiqlite_txn_changed_rows_or_zero_for_missing_stmt_output(txn.result, 1)?,
+                txn.timestamp,
+            )
         } else {
             let txn = self
-                .client
-                .txn_with_raft_serialized_timestamp([(
-                    "INSERT INTO velorix_standing_runtime_checkpoints (
+                .with_schema_repair(|| async {
+                    self.client
+                        .txn_with_raft_serialized_timestamp([
+                            (
+                                "SELECT 1 AS authorized
+                            FROM velorix_standing_runtime_owners owner
+                            WHERE owner.tenant_id = $1
+                              AND owner.program_id = $2
+                              AND owner.view_id = $3
+                              AND owner.owner_id = $4
+                              AND owner.owner_epoch = $5
+                              AND owner.expires_at_unix_ms > $6
+                              AND $7 = $1
+                              AND $8 = $2
+                              AND $9 = $3",
+                                vec![
+                                    hiqlite::Param::from(request.owner.tenant_id.clone()),
+                                    hiqlite::Param::from(request.owner.program_id.clone()),
+                                    hiqlite::Param::from(request.owner.view_id.clone()),
+                                    hiqlite::Param::from(request.owner.owner_id.clone()),
+                                    hiqlite::Param::from(owner_epoch),
+                                    hiqlite::Param::raft_serialized_unix_ms(),
+                                    hiqlite::Param::from(request.candidate.tenant_id.clone()),
+                                    hiqlite::Param::from(request.candidate.program_id.clone()),
+                                    hiqlite::Param::from(request.candidate.view_id.clone()),
+                                ],
+                            ),
+                            (
+                                "INSERT OR IGNORE INTO velorix_standing_runtime_checkpoints (
                             tenant_id,
                             program_id,
                             view_id,
                             checkpoint_key,
                             logical_epoch,
                             content_hash,
+                            manifest_hash,
                             output_manifest_refs_json
                         )
-                        SELECT $1, $2, $3, $4, $5, $6, $13
-                        WHERE NOT EXISTS (
-                            SELECT 1 FROM velorix_standing_runtime_checkpoints
-                            WHERE tenant_id = $1
-                              AND program_id = $2
-                              AND view_id = $3
-                        )
-                        AND EXISTS (
-                            SELECT 1
-                            FROM velorix_standing_runtime_owners owner
-                            WHERE owner.tenant_id = $1
-                              AND owner.program_id = $2
-                              AND owner.view_id = $3
-                              AND owner.owner_id = $7
-                              AND owner.owner_epoch = $8
-                              AND owner.expires_at_unix_ms > $9
-                              AND $10 = $1
-                              AND $11 = $2
-                              AND $12 = $3
-                        )",
-                    vec![
-                        hiqlite::Param::from(request.candidate.tenant_id.clone()),
-                        hiqlite::Param::from(request.candidate.program_id.clone()),
-                        hiqlite::Param::from(request.candidate.view_id.clone()),
-                        hiqlite::Param::from(request.candidate.checkpoint_key.clone()),
-                        hiqlite::Param::from(candidate_epoch),
-                        hiqlite::Param::from(request.candidate.content_hash.clone()),
-                        hiqlite::Param::from(request.owner.owner_id.clone()),
-                        hiqlite::Param::from(owner_epoch),
-                        hiqlite::Param::raft_serialized_unix_ms(),
-                        hiqlite::Param::from(request.owner.tenant_id.clone()),
-                        hiqlite::Param::from(request.owner.program_id.clone()),
-                        hiqlite::Param::from(request.owner.view_id.clone()),
-                        hiqlite::Param::from(candidate_output_manifest_refs_json),
-                    ],
-                )])
-                .await
-                .map_err(hiqlite_error)?;
-            let results = txn.result.map_err(hiqlite_error)?;
-            (hiqlite_txn_changed_rows(results, 0)?, txn.timestamp)
+                        SELECT $1, $2, $3, $4, $5, $6, $7, $8
+                        WHERE $9 = 1",
+                                vec![
+                                    hiqlite::Param::from(request.candidate.tenant_id.clone()),
+                                    hiqlite::Param::from(request.candidate.program_id.clone()),
+                                    hiqlite::Param::from(request.candidate.view_id.clone()),
+                                    hiqlite::Param::from(request.candidate.checkpoint_key.clone()),
+                                    hiqlite::Param::from(candidate_epoch),
+                                    hiqlite::Param::from(request.candidate.content_hash.clone()),
+                                    hiqlite::Param::from(request.candidate.manifest_hash.clone()),
+                                    hiqlite::Param::from(
+                                        candidate_output_manifest_refs_json.clone(),
+                                    ),
+                                    hiqlite::Param::StmtOutputIndexed(0, 0),
+                                ],
+                            ),
+                        ])
+                        .await
+                        .map_err(hiqlite_error)
+                })
+                .await?;
+            (
+                hiqlite_txn_changed_rows_or_zero_for_missing_stmt_output(txn.result, 1)?,
+                txn.timestamp,
+            )
         };
         if changed == 1 {
             return Ok(PublishStandingRuntimeCheckpointOutcome::Published);
@@ -2211,28 +2302,32 @@ impl MetaStore for HiqliteMetaStore {
     ) -> Result<Option<StandingRuntimeCheckpointPointer>, MetaStoreError> {
         validate_standing_runtime_scope(tenant_id, program_id, view_id)?;
         let rows = self
-            .client
-            .query_consistent_map::<StandingRuntimeCheckpointPointerRow, _>(
-                "SELECT
-                    tenant_id,
-                    program_id,
-                    view_id,
-                    checkpoint_key,
-                    logical_epoch,
-                    content_hash,
-                    output_manifest_refs_json
-                FROM velorix_standing_runtime_checkpoints
-                WHERE tenant_id = $1
-                  AND program_id = $2
-                  AND view_id = $3",
-                vec![
-                    hiqlite::Param::from(tenant_id.to_string()),
-                    hiqlite::Param::from(program_id.to_string()),
-                    hiqlite::Param::from(view_id.to_string()),
-                ],
-            )
-            .await
-            .map_err(hiqlite_error)?;
+            .with_schema_repair(|| async {
+                self.client
+                    .query_consistent_map::<StandingRuntimeCheckpointPointerRow, _>(
+                        "SELECT
+                            tenant_id,
+                            program_id,
+                            view_id,
+                            checkpoint_key,
+                            logical_epoch,
+                            content_hash,
+                            manifest_hash,
+                            output_manifest_refs_json
+                        FROM velorix_standing_runtime_checkpoints
+                        WHERE tenant_id = $1
+                          AND program_id = $2
+                          AND view_id = $3",
+                        vec![
+                            hiqlite::Param::from(tenant_id.to_string()),
+                            hiqlite::Param::from(program_id.to_string()),
+                            hiqlite::Param::from(view_id.to_string()),
+                        ],
+                    )
+                    .await
+                    .map_err(hiqlite_error)
+            })
+            .await?;
         rows.into_iter()
             .next()
             .map(StandingRuntimeCheckpointPointerRow::into_pointer)
@@ -2290,6 +2385,7 @@ struct StandingRuntimeCheckpointPointerRow {
     checkpoint_key: String,
     logical_epoch: i64,
     content_hash: String,
+    manifest_hash: String,
     output_manifest_refs_json: String,
 }
 
@@ -2359,6 +2455,7 @@ impl StandingRuntimeCheckpointPointerRow {
             checkpoint_key: self.checkpoint_key,
             logical_epoch,
             content_hash: self.content_hash,
+            manifest_hash: self.manifest_hash,
             output_manifest_refs: standing_runtime_output_manifest_refs_from_json(
                 &self.output_manifest_refs_json,
             )?,
@@ -2378,6 +2475,7 @@ impl From<&mut hiqlite::Row<'_>> for StandingRuntimeCheckpointPointerRow {
             checkpoint_key: row.get("checkpoint_key"),
             logical_epoch: row.get("logical_epoch"),
             content_hash: row.get("content_hash"),
+            manifest_hash: row.get("manifest_hash"),
             output_manifest_refs_json: row.get("output_manifest_refs_json"),
         }
     }
@@ -2437,6 +2535,16 @@ fn hiqlite_error(error: hiqlite::Error) -> MetaStoreError {
 }
 
 #[cfg(feature = "hiqlite-backend")]
+fn hiqlite_meta_error_is_missing_table(error: &MetaStoreError) -> bool {
+    matches!(
+        error,
+        MetaStoreError::Hiqlite(message)
+            if message.contains("no such table: velorix_")
+                || message.contains("no such table: main.velorix_")
+    )
+}
+
+#[cfg(feature = "hiqlite-backend")]
 fn i64_from_u64(field: &'static str, value: u64) -> Result<i64, MetaStoreError> {
     i64::try_from(value).map_err(|_| MetaStoreError::IntegerOutOfRange { field, value })
 }
@@ -2458,6 +2566,27 @@ fn hiqlite_txn_changed_rows(
             "hiqlite transaction did not return result index {changed_result_index}"
         ))
     })
+}
+
+#[cfg(feature = "hiqlite-backend")]
+fn hiqlite_txn_changed_rows_or_zero_for_missing_stmt_output(
+    result: Result<Vec<Result<usize, hiqlite::Error>>, hiqlite::Error>,
+    changed_result_index: usize,
+) -> Result<usize, MetaStoreError> {
+    match result {
+        Ok(results) => hiqlite_txn_changed_rows(results, changed_result_index),
+        Err(error) if hiqlite_error_is_missing_stmt_output(&error) => Ok(0),
+        Err(error) => Err(hiqlite_error(error)),
+    }
+}
+
+#[cfg(feature = "hiqlite-backend")]
+fn hiqlite_error_is_missing_stmt_output(error: &hiqlite::Error) -> bool {
+    matches!(
+        error,
+        hiqlite::Error::QueryParams(message)
+            if message.contains("does not have observable row output")
+    )
 }
 
 impl GrpcMetaStore {
@@ -2861,6 +2990,41 @@ mod hiqlite_capability_tests {
     }
 
     #[test]
+    fn hiqlite_schema_loss_paths_retry_after_idempotent_schema_repair() {
+        let source = include_str!("lib.rs");
+        let hiqlite_impl = source
+            .split("impl MetaStore for HiqliteMetaStore")
+            .nth(1)
+            .expect("Hiqlite MetaStore impl should be present");
+
+        assert!(
+            source.contains("async fn with_schema_repair")
+                && source.contains("hiqlite_meta_error_is_missing_table")
+                && source.contains("self.initialize_schema().await?"),
+            "HiqliteMetaStore must repair schema after an empty no-PVC DB is re-created"
+        );
+        for required_call in [
+            "store_relation_catalog",
+            "read_relation_catalog",
+            "reserve_ingest_range",
+            "acquire_standing_runtime_owner",
+            "read_standing_runtime_owner",
+            "publish_standing_runtime_checkpoint",
+            "read_standing_runtime_checkpoint",
+        ] {
+            let method = hiqlite_impl
+                .split(&format!("async fn {required_call}"))
+                .nth(1)
+                .and_then(|tail| tail.split("async fn ").next())
+                .expect("required Hiqlite method should exist");
+            assert!(
+                method.contains(".with_schema_repair("),
+                "Hiqlite method {required_call} must retry once after missing-table schema repair"
+            );
+        }
+    }
+
+    #[test]
     fn hiqlite_owner_read_filters_expiry_with_authority_time_not_process_time() {
         let source = include_str!("lib.rs");
         let hiqlite_impl = source
@@ -2902,6 +3066,9 @@ mod hiqlite_capability_tests {
                 logical_epoch: 1,
                 content_hash:
                     "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_string(),
+                manifest_hash:
+                    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                         .to_string(),
                 output_manifest_refs: Vec::new(),
             },
@@ -2962,8 +3129,8 @@ mod hiqlite_capability_tests {
                     .matches("hiqlite::Param::raft_serialized_unix_ms()")
                     .count()
                     >= 2
-                && publish_impl.contains("owner.expires_at_unix_ms > $12")
-                && publish_impl.contains("owner.expires_at_unix_ms > $9"),
+                && publish_impl.contains("owner.expires_at_unix_ms > $6")
+                && publish_impl.matches("hiqlite::Param::StmtOutputIndexed(0, 0)").count() >= 2,
             "Hiqlite checkpoint publish update and insert paths must both compare owner expiry to the Raft-serialized authority Unix timestamp"
         );
         assert!(
@@ -3027,16 +3194,17 @@ mod hiqlite_capability_tests {
             .split("async fn publish_standing_runtime_checkpoint")
             .nth(1)
             .expect("Hiqlite checkpoint publish impl should be present in source");
+        let owner_validation = publish_impl
+            .find("SELECT 1 AS authorized")
+            .expect("publish must validate current owner token in SQL");
         let checkpoint_mutation = publish_impl
             .find("velorix_standing_runtime_checkpoints")
             .expect("publish should mutate checkpoint rows");
-        let owner_validation = publish_impl
-            .find("AND owner.owner_id =")
-            .expect("publish mutation must validate current owner token in SQL");
 
         assert!(
-            checkpoint_mutation < owner_validation,
-            "Hiqlite publish must validate owner token and authority-time expiry inside the checkpoint mutation"
+            owner_validation < checkpoint_mutation
+                && publish_impl.contains("hiqlite::Param::StmtOutputIndexed(0, 0)"),
+            "Hiqlite publish must validate owner token and authority-time expiry inside the same transaction and gate the checkpoint mutation on that validation"
         );
     }
 
@@ -3109,23 +3277,28 @@ mod hiqlite_capability_tests {
             .split("async fn publish_standing_runtime_checkpoint")
             .nth(1)
             .expect("Hiqlite checkpoint publish impl should be present in source");
+        let update_impl = publish_impl
+            .split("UPDATE velorix_standing_runtime_checkpoints")
+            .nth(1)
+            .and_then(|tail| tail.split("INSERT OR IGNORE INTO").next())
+            .expect("Hiqlite checkpoint publish update statement should be present");
 
         assert!(
-            publish_impl.contains(
+            update_impl.contains(
                 "SET checkpoint_key = $1,\n                                logical_epoch = $2,\n                                content_hash = $3"
             ),
             "Hiqlite binds SQL parameters by first appearance; publish update SET params must be $1..$3"
         );
-        let candidate_key = publish_impl
+        let candidate_key = update_impl
             .find("hiqlite::Param::from(request.candidate.checkpoint_key.clone())")
             .expect("publish update should bind candidate checkpoint_key");
-        let candidate_epoch_param = publish_impl
+        let candidate_epoch_param = update_impl
             .find("hiqlite::Param::from(candidate_epoch)")
             .expect("publish update should bind candidate logical_epoch");
-        let candidate_hash = publish_impl
+        let candidate_hash = update_impl
             .find("hiqlite::Param::from(request.candidate.content_hash.clone())")
             .expect("publish update should bind candidate content_hash");
-        let candidate_tenant = publish_impl
+        let candidate_tenant = update_impl
             .find("hiqlite::Param::from(request.candidate.tenant_id.clone())")
             .expect("publish update should bind candidate tenant_id");
         assert!(
@@ -3153,12 +3326,11 @@ mod hiqlite_capability_tests {
             .expect("Hiqlite checkpoint publish impl should be present in source");
 
         assert!(
-            publish_impl.contains("AND $13 = $4\n                                    AND $14 = $5\n                                    AND $15 = $6"),
-            "Hiqlite checkpoint update path must enforce owner scope equals candidate scope inside the SQL mutation"
-        );
-        assert!(
-            publish_impl.contains("AND $10 = $1\n                              AND $11 = $2\n                              AND $12 = $3"),
-            "Hiqlite checkpoint insert path must enforce owner scope equals candidate scope inside the SQL mutation"
+            publish_impl.matches("AND $7 = $1").count() >= 2
+                && publish_impl.matches("AND $8 = $2").count() >= 2
+                && publish_impl.matches("AND $9 = $3").count() >= 2
+                && publish_impl.matches("hiqlite::Param::StmtOutputIndexed(0, 0)").count() >= 2,
+            "Hiqlite checkpoint publish must enforce owner scope equals candidate scope in the authorization statement and gate both checkpoint mutations on that statement"
         );
         for owner_scope_param in [
             "hiqlite::Param::from(request.owner.tenant_id.clone())",

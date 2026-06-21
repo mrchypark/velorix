@@ -494,17 +494,6 @@ fn allowed_bootstrap_recovery_use(
         return true;
     }
 
-    if source == workspace.join("crates/velorix-cli/src/main.rs")
-        && [
-            "RecoveredRuntime::recover_bootstrap_with_owner_and_relation_catalog_record(",
-            "RecoveredRuntime::recover_bootstrap_from_published_checkpoint_version_with_owner_and_relation_catalog(",
-        ]
-        .contains(&pattern)
-        && line_is_inside_function(lines, line_number, "async fn recover_local_runtime(")
-    {
-        return true;
-    }
-
     if source == workspace.join("tests/e2e/local_recovery.rs") {
         return allowed_local_recovery_bootstrap_fixture(lines, line_number, pattern);
     }

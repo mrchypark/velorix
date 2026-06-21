@@ -96,6 +96,104 @@
       "scan_bytes": 1084
     },
     {
+      "name": "materialized_output_segment_pruning",
+      "p50_ms": 50.0,
+      "p95_ms": 50.0,
+      "object_requests": {
+        "put_count": 0,
+        "get_count": 4,
+        "list_count": 0,
+        "range_read_count": 0,
+        "bytes_written": 0,
+        "bytes_read": 90
+      },
+      "scan_bytes": 45
+    },
+    {
+      "name": "materialized_output_recent_k",
+      "p50_ms": 1000.0,
+      "p95_ms": 1000.0,
+      "object_requests": {
+        "put_count": 0,
+        "get_count": 10,
+        "list_count": 0,
+        "range_read_count": 0,
+        "bytes_written": 0,
+        "bytes_read": 4096
+      },
+      "scan_bytes": 4096
+    },
+    {
+      "name": "materialized_output_compaction_equivalence",
+      "p50_ms": 1000.0,
+      "p95_ms": 1000.0,
+      "object_requests": {
+        "put_count": 1,
+        "get_count": 10,
+        "list_count": 0,
+        "range_read_count": 0,
+        "bytes_written": 4096,
+        "bytes_read": 4096
+      },
+      "scan_bytes": 4096
+    },
+    {
+      "name": "materialized_output_compaction_debt",
+      "p50_ms": 1000.0,
+      "p95_ms": 1000.0,
+      "object_requests": {
+        "put_count": 1,
+        "get_count": 20,
+        "list_count": 0,
+        "range_read_count": 0,
+        "bytes_written": 4096,
+        "bytes_read": 8192
+      },
+      "scan_bytes": 8192
+    },
+    {
+      "name": "materialized_output_delete_vector",
+      "p50_ms": 1000.0,
+      "p95_ms": 1000.0,
+      "object_requests": {
+        "put_count": 0,
+        "get_count": 10,
+        "list_count": 0,
+        "range_read_count": 0,
+        "bytes_written": 0,
+        "bytes_read": 4096
+      },
+      "scan_bytes": 4096
+    },
+    {
+      "name": "materialized_output_ttl_vector",
+      "p50_ms": 1000.0,
+      "p95_ms": 1000.0,
+      "object_requests": {
+        "put_count": 0,
+        "get_count": 10,
+        "list_count": 0,
+        "range_read_count": 0,
+        "bytes_written": 0,
+        "bytes_read": 4096
+      },
+      "scan_bytes": 4096
+    },
+    {
+      "name": "materialized_output_late_materialization",
+      "p50_ms": 1000.0,
+      "p95_ms": 1000.0,
+      "object_requests": {
+        "put_count": 0,
+        "get_count": 10,
+        "list_count": 0,
+        "range_read_count": 0,
+        "bytes_written": 0,
+        "bytes_read": 4096
+      },
+      "scan_bytes": 4096
+    },
+    {
       "name": "slatedb_state_reopen",
       "p50_ms": 176.348375,
       "p95_ms": 176.348375,

@@ -1,20 +1,25 @@
 # API Serving Scope V1
 
-Velorix 1.0 includes a minimal governed data API surface on top of relations,
-queries, persisted tables, and internal materialized views.
+Velorix public 1.0 includes a minimal governed data API surface on top of
+relations and admitted materialized views. Public query responses read published
+materialized output only.
 
 Included scope:
 
-- stable endpoint definitions for persisted queries, table scans, and admitted
-  materialized views
+- stable endpoint definitions for relation ingest, admitted materialized views,
+  promoted view APIs, and materialized-output queries
 - request parameter validation before execution
 - response-shape metadata for stable JSON output
 - OpenAPI-compatible catalog metadata
-- query policy, row/byte caps, object-request limits, and concurrency admission
-- immediate-response paths from materialized or checkpoint-recovered state
+- query policy, row/byte caps, and concurrency admission over materialized output
+- immediate-response paths from published materialized output selected by
+  checkpoint/frontier metadata
 
 Excluded scope:
 
+- public generic `/v1/query` source scans
+- public persisted table scan APIs
+- public ad hoc persisted query execution
 - arbitrary user-defined HTTP middleware
 - unbounded SQL templating that bypasses query policy
 - raw object URL serving outside the production storage registry
@@ -23,8 +28,10 @@ Excluded scope:
 
 Contract mapping:
 
-- `DataFusion policy` covers bounded ad hoc queries.
-- `table registry` covers endpoint-backed table scans.
+- `DataFusion policy` covers internal/dev object-backed scans and bounded
+  post-filtering over materialized output; it is not a public source-query
+  authority.
+- `table registry` covers internal/dev endpoint-backed table scans.
 - `materialized view runtime` covers standing-view serving from admitted
   internal runtime specs.
 - `benchmark gate` covers served data paths under local and S3-compatible

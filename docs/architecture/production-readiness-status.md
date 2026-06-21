@@ -1,21 +1,32 @@
 # Production Readiness Status
 
-This matrix is the release-status validator input. Each required contract must
-be complete with no blocking tasks before the release gate can pass.
+This document does not certify release readiness. It exists to point readers at
+the evidence-bound release gate.
 
-| Contract | Evidence | Scope | Status | Blocking tasks |
-| --- | --- | --- | --- | --- |
-| ingest | REST ingest and object log checks | schema-bound relation appends | complete | none |
-| relation catalog | catalog registry checks | durable relation schemas | complete | none |
-| object-store capability | startup capability checks | create/read/list authority | complete | none |
-| ownership | runtime fencing checks | single active writer/runtime ownership | complete | none |
-| checkpoint lifecycle | checkpoint publish/recover checks | restart recovery | complete | none |
-| state substrate | state checkpoint checks | materialized view state | complete | none |
-| DataFusion policy | query policy checks | bounded SQL/query execution | complete | none |
-| table registry | table registry checks | persisted table specs | complete | none |
-| materialized view runtime | standing runtime checks | internal jarless materialized views | complete | none |
-| benchmark gate | benchmark evidence | release performance guard | complete | none |
-| S3-compatible tests | S3-compatible harness | object-store compatibility | complete | none |
-| Kubernetes operator | operator startup checks | deployed control-plane lifecycle | complete | none |
-| GC | GC evidence | retention and cleanup | complete | none |
-| dependency governance | cargo-deny/governance evidence | package policy | complete | none |
+Release readiness is generated from the readiness report produced by:
+
+```bash
+cargo run -p velorix-cli -- readiness-report \
+  --evidence "$READINESS_EVIDENCE_PATH" \
+  --require-release-artifacts \
+  --dependency-governance-evidence target/dependency-governance/local-dependency-governance-evidence.json \
+  --dependency-governance-manifest dependency-governance.json \
+  --release-commit "$RELEASE_COMMIT" \
+  --s3-release-benchmark-gate-evidence target/release-evidence/s3-release-benchmark-gate.json \
+  --production-gc-run-evidence "$PRODUCTION_GC_RELEASE_PATH" \
+  --rustfs-production-gc-validation-evidence "$RUSTFS_PRODUCTION_GC_RECHECKED_PATH" \
+  --ingest-writer-lifecycle-evidence "$INGEST_WRITER_LIFECYCLE_RELEASE_PATH" \
+  --standing-runtime-product-evidence "$STANDING_RUNTIME_PRODUCT_RELEASE_PATH" \
+  --s3-checkpoint-fault-matrix-evidence "$VELORIX_S3_CHECKPOINT_FAULT_MATRIX_EVIDENCE_PATH" \
+  --hiqlite-restore-drill-evidence "$VELORIX_HIQLITE_RESTORE_DRILL_EVIDENCE_PATH" \
+  --upgrade-rollback-repair-gc-fault-matrix-evidence "$VELORIX_UPGRADE_ROLLBACK_REPAIR_GC_FAULT_MATRIX_EVIDENCE_PATH" \
+  --query-output-isolation-evidence "$VELORIX_QUERY_OUTPUT_ISOLATION_EVIDENCE_PATH" \
+  --security-release-provenance-evidence "$VELORIX_SECURITY_RELEASE_PROVENANCE_EVIDENCE_PATH" \
+  --remaining-release-readiness-evidence "$VELORIX_REMAINING_RELEASE_READINESS_EVIDENCE_PATH" \
+  --json
+```
+
+The static Markdown matrix was removed because it could say `complete` while
+required artifacts were missing, local-only, stale, or failed their artifact
+requirements. The release decision must come from the generated readiness report
+and its concrete evidence artifacts, not from this file.

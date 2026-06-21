@@ -26,12 +26,13 @@ The local evidence has `schema_version=1`,
 cargo-deny diagnostics path, required and reviewed package subjects, exception
 counts, and warning counts. `--json` requires `--cargo-deny-json` so release
 evidence cannot claim a dependency-governance pass from manifest-only
-validation. This cargo-deny-backed artifact is sufficient for the
-artifact-gated `readiness-report` dependency-governance check when it has
+validation. This cargo-deny-backed artifact is sufficient only for the
+artifact-gated `readiness-report` dependency-governance subcheck when it has
 `status=pass`, `evidence_kind=dependency_governance_validated`, checked
 cargo-deny diagnostics, and no missing required package-review subjects.
 `external_audit_attestation=false` is expected for this local governance
-artifact and is not a release blocker.
+artifact; it does not satisfy the separate live release-readiness evidence
+gates.
 
 The manifest records the declared MSRV policy and requires package review
 records for the high-risk production dependency subjects that shape Velorix's
@@ -63,8 +64,8 @@ Unmaintained advisories are also warnings today. Each allowed exception is
 tracked in the governance manifest with an owner, expiry, reason, replacement
 plan, and promotion rule.
 
-There is no separate `cargo-vet` release-attestation blocker in the 1.0
-readiness contract. Decisions about whether duplicate-version, unmaintained, or
-advisory warnings later graduate from local-review exception governance into
-hard `deny.toml` gates are ongoing maintenance policy, not a 1.0 release
-blocker.
+The current generated 1.0 readiness report does not require a separate
+`cargo-vet` attestation. Decisions about whether duplicate-version,
+unmaintained, or advisory warnings later graduate from local-review exception
+governance into hard `deny.toml` gates are ongoing maintenance policy, not a
+substitute for the release evidence gates.

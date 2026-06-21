@@ -20,8 +20,7 @@ sigstore-verify = { workspace = true }
 tokio = { workspace = true }
 velorix-k8s = { path = "../velorix-k8s" }
 velorix-meta = { path = "../velorix-meta" }
-velorix-runtime = { path = "../velorix-runtime" }
-velorix-storage = { path = "../velorix-storage" }
+velorix-control = { path = "../velorix-control" }
 
 [dev-dependencies]
 arrow = { workspace = true, features = ["ipc"] }

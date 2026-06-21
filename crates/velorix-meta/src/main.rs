@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeSet, HashMap},
     env,
     net::SocketAddr,
     sync::Arc,
@@ -43,21 +44,213 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn serve() -> anyhow::Result<()> {
-    let bind = env::var("VELORIX_META_BIND")
-        .unwrap_or_else(|_| "0.0.0.0:9090".to_string())
-        .parse::<SocketAddr>()?;
-    let store = meta_store_from_env().await?;
-    let service = match optional_bearer_token_env("VELORIX_META_BEARER_TOKEN")? {
+    let config = parse_meta_serve_config_from_env()?;
+    let store = meta_store_from_config(&config).await?;
+    let service = match config.bearer_token.clone() {
         Some(token) => MetaGrpcService::with_bearer_token(store, token)?,
         None => MetaGrpcService::new(store),
     };
 
     Server::builder()
         .add_service(VelorixMetaServer::new(service))
-        .serve(bind)
+        .serve(config.bind)
         .await?;
 
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MetaServeMode {
+    Production,
+    Development,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MetaBackendKind {
+    Memory,
+    Hiqlite,
+    Oss,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MetaServeConfig {
+    mode: MetaServeMode,
+    bind: SocketAddr,
+    backend: MetaBackendKind,
+    bearer_token: Option<String>,
+    transport_security: Option<String>,
+    transport_security_attestation: Option<String>,
+    hiqlite_nodes: Vec<String>,
+    hiqlite_api_secret: Option<String>,
+}
+
+fn parse_meta_serve_config_from_env() -> anyhow::Result<MetaServeConfig> {
+    parse_meta_serve_config(&env::vars().collect())
+}
+
+#[cfg(test)]
+fn parse_meta_serve_config_from_pairs<const N: usize>(
+    pairs: [(&str, &str); N],
+) -> anyhow::Result<MetaServeConfig> {
+    parse_meta_serve_config(
+        &pairs
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect(),
+    )
+}
+
+fn parse_meta_serve_config(vars: &HashMap<String, String>) -> anyhow::Result<MetaServeConfig> {
+    let mode = match required_nonempty_config(vars, "VELORIX_META_MODE")?.as_str() {
+        "production" | "prod" => MetaServeMode::Production,
+        "development" | "dev" => MetaServeMode::Development,
+        other => anyhow::bail!(
+            "unsupported VELORIX_META_MODE `{other}`; expected `production` or `development`"
+        ),
+    };
+    let backend = parse_meta_backend(&required_nonempty_config(vars, "VELORIX_META_BACKEND")?)?;
+    let bind = parse_meta_bind(vars, &mode)?;
+    let bearer_token = optional_raw_config(vars, "VELORIX_META_BEARER_TOKEN");
+    if let Some(token) = &bearer_token {
+        validate_bearer_token(token)
+            .map_err(|error| anyhow::anyhow!("invalid VELORIX_META_BEARER_TOKEN: {error}"))?;
+    }
+    let transport_security = optional_config(vars, "VELORIX_META_TRANSPORT_SECURITY");
+    let transport_security_attestation =
+        optional_config(vars, "VELORIX_META_TRANSPORT_SECURITY_ATTESTATION");
+    let hiqlite_nodes = if backend == MetaBackendKind::Hiqlite {
+        parse_hiqlite_nodes(&required_nonempty_config(vars, "VELORIX_HIQLITE_NODES")?)?
+    } else {
+        Vec::new()
+    };
+    let hiqlite_api_secret = if backend == MetaBackendKind::Hiqlite {
+        Some(required_nonempty_config(
+            vars,
+            "VELORIX_HIQLITE_API_SECRET",
+        )?)
+    } else {
+        None
+    };
+
+    match mode {
+        MetaServeMode::Production => validate_production_meta_serve_config(
+            &backend,
+            &bearer_token,
+            &transport_security,
+            &transport_security_attestation,
+            &hiqlite_nodes,
+        )?,
+        MetaServeMode::Development => {
+            if !bind.ip().is_loopback() {
+                anyhow::bail!("development VELORIX_META_BIND must use a loopback address");
+            }
+        }
+    }
+
+    Ok(MetaServeConfig {
+        mode,
+        bind,
+        backend,
+        bearer_token,
+        transport_security,
+        transport_security_attestation,
+        hiqlite_nodes,
+        hiqlite_api_secret,
+    })
+}
+
+fn parse_meta_backend(value: &str) -> anyhow::Result<MetaBackendKind> {
+    match value {
+        "memory" | "in-memory" => Ok(MetaBackendKind::Memory),
+        "hiqlite" => Ok(MetaBackendKind::Hiqlite),
+        "oss" | "object-store" => Ok(MetaBackendKind::Oss),
+        other => anyhow::bail!(
+            "unsupported VELORIX_META_BACKEND `{other}`; expected `memory`, `hiqlite`, or `oss`"
+        ),
+    }
+}
+
+fn parse_meta_bind(
+    vars: &HashMap<String, String>,
+    mode: &MetaServeMode,
+) -> anyhow::Result<SocketAddr> {
+    let value = match optional_config(vars, "VELORIX_META_BIND") {
+        Some(value) => value,
+        None if *mode == MetaServeMode::Development => "127.0.0.1:9090".to_string(),
+        None => anyhow::bail!("VELORIX_META_BIND is required in production mode"),
+    };
+    value
+        .parse()
+        .map_err(|error| anyhow::anyhow!("invalid VELORIX_META_BIND `{value}`: {error}"))
+}
+
+fn validate_production_meta_serve_config(
+    backend: &MetaBackendKind,
+    bearer_token: &Option<String>,
+    transport_security: &Option<String>,
+    transport_security_attestation: &Option<String>,
+    hiqlite_nodes: &[String],
+) -> anyhow::Result<()> {
+    if *backend == MetaBackendKind::Memory {
+        anyhow::bail!(
+            "production VELORIX_META_BACKEND must be durable; memory is development-only"
+        );
+    }
+    if bearer_token.is_none() {
+        anyhow::bail!("VELORIX_META_BEARER_TOKEN is required in production mode");
+    }
+    match transport_security.as_deref() {
+        Some("service-mesh-mtls") => {}
+        Some(other) => anyhow::bail!(
+            "unsupported VELORIX_META_TRANSPORT_SECURITY `{other}`; velorix-meta has no native TLS listener, use `service-mesh-mtls` attestation"
+        ),
+        None => anyhow::bail!("VELORIX_META_TRANSPORT_SECURITY is required in production mode"),
+    }
+    if transport_security_attestation.is_none() {
+        anyhow::bail!("VELORIX_META_TRANSPORT_SECURITY_ATTESTATION is required in production mode");
+    }
+    if *backend == MetaBackendKind::Hiqlite && hiqlite_nodes.len() != 3 {
+        anyhow::bail!(
+            "production VELORIX_HIQLITE_NODES must contain exactly three unique voter nodes"
+        );
+    }
+    Ok(())
+}
+
+fn parse_hiqlite_nodes(value: &str) -> anyhow::Result<Vec<String>> {
+    let nodes = value
+        .split(',')
+        .map(str::trim)
+        .filter(|node| !node.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let unique_nodes = nodes.iter().collect::<BTreeSet<_>>();
+    if nodes.is_empty() {
+        anyhow::bail!("VELORIX_HIQLITE_NODES must contain at least one node");
+    }
+    if unique_nodes.len() != nodes.len() {
+        anyhow::bail!("VELORIX_HIQLITE_NODES must contain exactly three unique voter nodes");
+    }
+    Ok(nodes)
+}
+
+fn required_nonempty_config(
+    vars: &HashMap<String, String>,
+    name: &'static str,
+) -> anyhow::Result<String> {
+    optional_config(vars, name).ok_or_else(|| anyhow::anyhow!("{name} is required"))
+}
+
+fn optional_config(vars: &HashMap<String, String>, name: &str) -> Option<String> {
+    vars.get(name)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn optional_raw_config(vars: &HashMap<String, String>, name: &str) -> Option<String> {
+    vars.get(name)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -273,8 +466,8 @@ async fn run_standing_runtime_fencing_adversarial_smoke<S>(
 where
     S: MetaStore + ?Sized,
 {
-    const OWNER_A_TTL_MS: u64 = 250;
-    const OWNER_A_EXPIRY_WAIT_MS: u64 = 500;
+    const OWNER_A_TTL_MS: u64 = 5_000;
+    const OWNER_A_EXPIRY_WAIT_MS: u64 = 5_500;
 
     let tenant_id = format!("smoke-tenant-{probe_id}");
     let program_id = "smoke-program".to_string();
@@ -305,7 +498,15 @@ where
         })
         .await?;
     if publish_1 != PublishStandingRuntimeCheckpointOutcome::Published {
-        anyhow::bail!("owner-a initial checkpoint publish returned {publish_1:?}");
+        let current_owner = store
+            .read_standing_runtime_owner(&tenant_id, &program_id, &view_id)
+            .await?;
+        let current_checkpoint = store
+            .read_standing_runtime_checkpoint(&tenant_id, &program_id, &view_id)
+            .await?;
+        anyhow::bail!(
+            "owner-a initial checkpoint publish returned {publish_1:?}; owner_a={owner_a:?}; current_owner={current_owner:?}; current_checkpoint={current_checkpoint:?}"
+        );
     }
 
     tokio::time::sleep(Duration::from_millis(OWNER_A_EXPIRY_WAIT_MS)).await;
@@ -361,6 +562,19 @@ where
     }
 
     let checkpoint_3 = smoke_checkpoint_pointer(&tenant_id, &program_id, &view_id, 3, 'c')?;
+    let stale_expected_previous_publish = store
+        .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
+            expected_previous: Some(checkpoint_1),
+            candidate: checkpoint_3.clone(),
+            owner: smoke_owner_token(&owner_b),
+        })
+        .await?;
+    if stale_expected_previous_publish != PublishStandingRuntimeCheckpointOutcome::Conflict {
+        anyhow::bail!(
+            "stale expected_previous checkpoint publish returned {stale_expected_previous_publish:?}"
+        );
+    }
+
     let stale_owner_publish = store
         .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
             expected_previous: Some(checkpoint_2.clone()),
@@ -381,7 +595,7 @@ where
     }
 
     println!(
-        "velorix-meta standing runtime adversarial smoke ok: tenant={} program={} view={} owner_a_epoch={} owner_b_epoch={} latest_epoch={}",
+        "velorix-meta standing runtime adversarial smoke ok: tenant={} program={} view={} owner_a_epoch={} owner_b_epoch={} latest_epoch={} stale_checkpoint_pointer_publish_conflicted=true",
         tenant_id,
         program_id,
         view_id,
@@ -415,6 +629,7 @@ fn smoke_checkpoint_pointer(
         checkpoint_key,
         logical_epoch,
         content_hash,
+        manifest_hash: format!("sha256:{}", hash_char.to_string().repeat(64)),
         output_manifest_refs: Vec::new(),
     })
 }
@@ -515,17 +730,20 @@ async fn assert_unauthenticated_capability_read_rejected(endpoint: &str) -> anyh
     }
 }
 
-async fn meta_store_from_env() -> anyhow::Result<Arc<dyn MetaStore>> {
-    match env::var("VELORIX_META_BACKEND")
-        .unwrap_or_else(|_| "memory".to_string())
-        .as_str()
-    {
-        "memory" | "in-memory" => Ok(Arc::new(InMemoryMetaStore::default())),
-        "hiqlite" => hiqlite_meta_store_from_env().await,
-        "oss" | "object-store" => Ok(Arc::new(OssMetaStore::new(oss_object_store_from_env()?))),
-        other => Err(anyhow::anyhow!(
-            "unsupported VELORIX_META_BACKEND `{other}`; expected `memory`, `hiqlite`, or `oss`"
-        )),
+async fn meta_store_from_config(config: &MetaServeConfig) -> anyhow::Result<Arc<dyn MetaStore>> {
+    match config.backend {
+        MetaBackendKind::Memory => Ok(Arc::new(InMemoryMetaStore::default())),
+        MetaBackendKind::Hiqlite => {
+            hiqlite_meta_store_from_config(
+                &config.hiqlite_nodes,
+                config
+                    .hiqlite_api_secret
+                    .as_ref()
+                    .expect("hiqlite api secret is validated before store construction"),
+            )
+            .await
+        }
+        MetaBackendKind::Oss => Ok(Arc::new(OssMetaStore::new(oss_object_store_from_env()?))),
     }
 }
 
@@ -578,39 +796,24 @@ fn optional_nonempty_env(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn optional_bearer_token_env(name: &str) -> anyhow::Result<Option<String>> {
-    match env::var(name) {
-        Ok(value) => {
-            validate_bearer_token(&value)
-                .map_err(|error| anyhow::anyhow!("invalid {name}: {error}"))?;
-            Ok(Some(value))
-        }
-        Err(env::VarError::NotPresent) => Ok(None),
-        Err(error) => Err(anyhow::anyhow!("invalid {name}: {error}")),
-    }
-}
-
 #[cfg(feature = "hiqlite-backend")]
-async fn hiqlite_meta_store_from_env() -> anyhow::Result<Arc<dyn MetaStore>> {
-    let nodes = env::var("VELORIX_HIQLITE_NODES")?
-        .split(',')
-        .map(str::trim)
-        .filter(|node| !node.is_empty())
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    if nodes.is_empty() {
-        anyhow::bail!("VELORIX_HIQLITE_NODES must contain at least one node");
-    }
-    let api_secret = env::var("VELORIX_HIQLITE_API_SECRET")?;
+async fn hiqlite_meta_store_from_config(
+    nodes: &[String],
+    api_secret: &str,
+) -> anyhow::Result<Arc<dyn MetaStore>> {
     let with_proxy = env::var("VELORIX_HIQLITE_WITH_PROXY").ok().as_deref() == Some("1");
 
     Ok(Arc::new(
-        HiqliteMetaStore::connect_remote(nodes, api_secret, with_proxy).await?,
+        HiqliteMetaStore::connect_remote(nodes.to_vec(), api_secret.to_string(), with_proxy)
+            .await?,
     ))
 }
 
 #[cfg(not(feature = "hiqlite-backend"))]
-async fn hiqlite_meta_store_from_env() -> anyhow::Result<Arc<dyn MetaStore>> {
+async fn hiqlite_meta_store_from_config(
+    _nodes: &[String],
+    _api_secret: &str,
+) -> anyhow::Result<Arc<dyn MetaStore>> {
     anyhow::bail!(
         "VELORIX_META_BACKEND=hiqlite requires building velorix-meta with `--features hiqlite-backend`"
     )
@@ -736,6 +939,196 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("--expect-backend"));
+    }
+
+    #[test]
+    fn serve_config_requires_explicit_mode_and_backend() {
+        let mode_error = parse_meta_serve_config_from_pairs([]).unwrap_err();
+        assert!(mode_error.to_string().contains("VELORIX_META_MODE"));
+
+        let backend_error =
+            parse_meta_serve_config_from_pairs([("VELORIX_META_MODE", "development")]).unwrap_err();
+        assert!(backend_error.to_string().contains("VELORIX_META_BACKEND"));
+    }
+
+    #[test]
+    fn development_memory_config_defaults_to_loopback_only() {
+        let config = parse_meta_serve_config_from_pairs([
+            ("VELORIX_META_MODE", "development"),
+            ("VELORIX_META_BACKEND", "memory"),
+        ])
+        .unwrap();
+
+        assert_eq!(config.mode, MetaServeMode::Development);
+        assert_eq!(config.bind, "127.0.0.1:9090".parse::<SocketAddr>().unwrap());
+        assert_eq!(config.backend, MetaBackendKind::Memory);
+        assert_eq!(config.bearer_token, None);
+
+        let public_bind_error = parse_meta_serve_config_from_pairs([
+            ("VELORIX_META_MODE", "development"),
+            ("VELORIX_META_BACKEND", "memory"),
+            ("VELORIX_META_BIND", "0.0.0.0:9090"),
+        ])
+        .unwrap_err();
+        assert!(public_bind_error.to_string().contains("loopback"));
+    }
+
+    #[test]
+    fn production_config_rejects_missing_durable_backend_and_memory_backend() {
+        let missing_backend_error = parse_meta_serve_config_from_pairs([
+            ("VELORIX_META_MODE", "production"),
+            ("VELORIX_META_BIND", "0.0.0.0:9090"),
+            ("VELORIX_META_BEARER_TOKEN", "secret"),
+            ("VELORIX_META_TRANSPORT_SECURITY", "service-mesh-mtls"),
+            (
+                "VELORIX_META_TRANSPORT_SECURITY_ATTESTATION",
+                "mesh-policy/velorix-meta",
+            ),
+        ])
+        .unwrap_err();
+        assert!(missing_backend_error
+            .to_string()
+            .contains("VELORIX_META_BACKEND"));
+
+        let memory_backend_error = parse_meta_serve_config_from_pairs([
+            ("VELORIX_META_MODE", "production"),
+            ("VELORIX_META_BACKEND", "memory"),
+            ("VELORIX_META_BIND", "0.0.0.0:9090"),
+            ("VELORIX_META_BEARER_TOKEN", "secret"),
+            ("VELORIX_META_TRANSPORT_SECURITY", "service-mesh-mtls"),
+            (
+                "VELORIX_META_TRANSPORT_SECURITY_ATTESTATION",
+                "mesh-policy/velorix-meta",
+            ),
+        ])
+        .unwrap_err();
+        assert!(memory_backend_error.to_string().contains("memory"));
+    }
+
+    #[test]
+    fn production_config_requires_auth_and_transport_security_attestation() {
+        let missing_auth_error = parse_meta_serve_config_from_pairs([
+            ("VELORIX_META_MODE", "production"),
+            ("VELORIX_META_BACKEND", "oss"),
+            ("VELORIX_META_BIND", "0.0.0.0:9090"),
+            ("VELORIX_META_TRANSPORT_SECURITY", "service-mesh-mtls"),
+            (
+                "VELORIX_META_TRANSPORT_SECURITY_ATTESTATION",
+                "mesh-policy/velorix-meta",
+            ),
+        ])
+        .unwrap_err();
+        assert!(missing_auth_error
+            .to_string()
+            .contains("VELORIX_META_BEARER_TOKEN"));
+
+        let missing_transport_error = parse_meta_serve_config_from_pairs([
+            ("VELORIX_META_MODE", "production"),
+            ("VELORIX_META_BACKEND", "oss"),
+            ("VELORIX_META_BIND", "0.0.0.0:9090"),
+            ("VELORIX_META_BEARER_TOKEN", "secret"),
+        ])
+        .unwrap_err();
+        assert!(missing_transport_error
+            .to_string()
+            .contains("VELORIX_META_TRANSPORT_SECURITY"));
+
+        let unsupported_transport_error = parse_meta_serve_config_from_pairs([
+            ("VELORIX_META_MODE", "production"),
+            ("VELORIX_META_BACKEND", "oss"),
+            ("VELORIX_META_BIND", "0.0.0.0:9090"),
+            ("VELORIX_META_BEARER_TOKEN", "secret"),
+            ("VELORIX_META_TRANSPORT_SECURITY", "native-tls"),
+            (
+                "VELORIX_META_TRANSPORT_SECURITY_ATTESTATION",
+                "mesh-policy/velorix-meta",
+            ),
+        ])
+        .unwrap_err();
+        assert!(unsupported_transport_error
+            .to_string()
+            .contains("service-mesh-mtls"));
+
+        let missing_attestation_error = parse_meta_serve_config_from_pairs([
+            ("VELORIX_META_MODE", "production"),
+            ("VELORIX_META_BACKEND", "oss"),
+            ("VELORIX_META_BIND", "0.0.0.0:9090"),
+            ("VELORIX_META_BEARER_TOKEN", "secret"),
+            ("VELORIX_META_TRANSPORT_SECURITY", "service-mesh-mtls"),
+        ])
+        .unwrap_err();
+        assert!(missing_attestation_error
+            .to_string()
+            .contains("VELORIX_META_TRANSPORT_SECURITY_ATTESTATION"));
+    }
+
+    #[test]
+    fn production_hiqlite_requires_exactly_three_unique_voter_nodes() {
+        let missing_api_secret_error = parse_meta_serve_config_from_pairs([
+            ("VELORIX_META_MODE", "production"),
+            ("VELORIX_META_BACKEND", "hiqlite"),
+            ("VELORIX_META_BIND", "0.0.0.0:9090"),
+            ("VELORIX_META_BEARER_TOKEN", "secret"),
+            ("VELORIX_META_TRANSPORT_SECURITY", "service-mesh-mtls"),
+            (
+                "VELORIX_META_TRANSPORT_SECURITY_ATTESTATION",
+                "mesh-policy/velorix-meta",
+            ),
+            (
+                "VELORIX_HIQLITE_NODES",
+                "node-a:8200,node-b:8200,node-c:8200",
+            ),
+        ])
+        .unwrap_err();
+        assert!(missing_api_secret_error
+            .to_string()
+            .contains("VELORIX_HIQLITE_API_SECRET"));
+
+        let duplicate_error = parse_meta_serve_config_from_pairs([
+            ("VELORIX_META_MODE", "production"),
+            ("VELORIX_META_BACKEND", "hiqlite"),
+            ("VELORIX_META_BIND", "0.0.0.0:9090"),
+            ("VELORIX_META_BEARER_TOKEN", "secret"),
+            ("VELORIX_META_TRANSPORT_SECURITY", "service-mesh-mtls"),
+            (
+                "VELORIX_META_TRANSPORT_SECURITY_ATTESTATION",
+                "mesh-policy/velorix-meta",
+            ),
+            ("VELORIX_HIQLITE_API_SECRET", "api-secret"),
+            (
+                "VELORIX_HIQLITE_NODES",
+                "node-a:8200,node-a:8200,node-b:8200",
+            ),
+        ])
+        .unwrap_err();
+        assert!(duplicate_error.to_string().contains("three unique"));
+
+        let valid = parse_meta_serve_config_from_pairs([
+            ("VELORIX_META_MODE", "production"),
+            ("VELORIX_META_BACKEND", "hiqlite"),
+            ("VELORIX_META_BIND", "0.0.0.0:9090"),
+            ("VELORIX_META_BEARER_TOKEN", "secret"),
+            ("VELORIX_META_TRANSPORT_SECURITY", "service-mesh-mtls"),
+            (
+                "VELORIX_META_TRANSPORT_SECURITY_ATTESTATION",
+                "mesh-policy/velorix-meta",
+            ),
+            ("VELORIX_HIQLITE_API_SECRET", "api-secret"),
+            (
+                "VELORIX_HIQLITE_NODES",
+                "node-a:8200,node-b:8200,node-c:8200",
+            ),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            valid.hiqlite_nodes,
+            vec![
+                "node-a:8200".to_string(),
+                "node-b:8200".to_string(),
+                "node-c:8200".to_string()
+            ]
+        );
     }
 
     #[test]

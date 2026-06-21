@@ -1,18 +1,10 @@
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+pub use velorix_control::operator_authority::ObjectStoreAuthorityRef;
 
 const API_GROUP: &str = "control.velorix.io";
 const API_VERSION: &str = "v1alpha1";
-
-#[derive(
-    Clone, Debug, Default, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
-#[serde(deny_unknown_fields)]
-pub struct ObjectStoreAuthorityRef {
-    pub store_id: String,
-    pub namespace: String,
-}
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields)]

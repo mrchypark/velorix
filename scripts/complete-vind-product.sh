@@ -382,6 +382,13 @@ print("missing")
 PY
 }
 
+run_completion_report() {
+  VELORIX_VIND_PRODUCT_DIR="$product_dir" \
+    VELORIX_VIND_PRODUCT_EVIDENCE="$product_evidence" \
+    VELORIX_PRODUCT_COMPLETION_REPORT="$report_file" \
+    scripts/report-vind-product-completion.sh "$@"
+}
+
 write_plan() {
   python3 - "$product_evidence" "$report_file" "$input_preflight_file" "${env_file:-}" "$external_s3_step" "$ingress_step" "$durability_step" "$hiqlite_backend_time_step" "$local_evidence_step" "$dry_run" "$hiqlite_release_required" "$@" <<'PY'
 import json
@@ -492,7 +499,7 @@ def planned_step(name, *, mode, helper, preflight, waiting_on=None):
     return summary
 
 
-product = load_json(product_evidence)
+product = load_json(product_evidence) if Path(product_evidence).is_file() else {}
 preflight = load_json(input_preflight_file)
 local_execution_allowed = dry_run != "1"
 external_execution_allowed = dry_run != "1" and preflight.get("status") != "blocked"
@@ -584,7 +591,7 @@ payload = {
             "mode": env.get("VELORIX_COMPLETE_PRODUCT_REPORT", "1"),
             "helper": "scripts/report-vind-product-completion.sh",
             "state": "ready_to_run" if env.get("VELORIX_COMPLETE_PRODUCT_REPORT", "1") == "1" else "disabled",
-            "will_run": local_execution_allowed and env.get("VELORIX_COMPLETE_PRODUCT_REPORT", "1") == "1" and Path(product_evidence).is_file(),
+            "will_run": local_execution_allowed and env.get("VELORIX_COMPLETE_PRODUCT_REPORT", "1") == "1",
         },
     },
 }
@@ -610,11 +617,8 @@ if [ "$dry_run" = "1" ]; then
         --report "${product_dir}/hiqlite-backend-time-release-env.json" >/dev/null
     fi
   fi
-  if [ "$final_report" = "1" ] && [ -f "$product_evidence" ]; then
-    VELORIX_VIND_PRODUCT_DIR="$product_dir" \
-      VELORIX_VIND_PRODUCT_EVIDENCE="$product_evidence" \
-      VELORIX_PRODUCT_COMPLETION_REPORT="$report_file" \
-      scripts/report-vind-product-completion.sh >/dev/null || true
+  if [ "$final_report" = "1" ]; then
+    run_completion_report >/dev/null || true
     echo "product_completion_report=${report_file}"
   fi
   exit 0
@@ -630,11 +634,8 @@ write_plan "$@"
 
 run_local_evidence_refresh
 
-if [ "$final_report" = "1" ] && [ -f "$product_evidence" ]; then
-  VELORIX_VIND_PRODUCT_DIR="$product_dir" \
-    VELORIX_VIND_PRODUCT_EVIDENCE="$product_evidence" \
-    VELORIX_PRODUCT_COMPLETION_REPORT="$report_file" \
-    scripts/report-vind-product-completion.sh >/dev/null || true
+if [ "$final_report" = "1" ]; then
+  run_completion_report >/dev/null || true
 fi
 
 if [ "$preflight_failed" = "1" ]; then
@@ -655,11 +656,8 @@ if [ "$external_s3_step" != "0" ]; then
   fi
 fi
 
-if [ "$final_report" = "1" ] && [ -f "$product_evidence" ]; then
-  VELORIX_VIND_PRODUCT_DIR="$product_dir" \
-    VELORIX_VIND_PRODUCT_EVIDENCE="$product_evidence" \
-    VELORIX_PRODUCT_COMPLETION_REPORT="$report_file" \
-    scripts/report-vind-product-completion.sh >/dev/null || true
+if [ "$final_report" = "1" ]; then
+    run_completion_report >/dev/null || true
 fi
 
 if [ "$ingress_step" != "0" ]; then
@@ -677,11 +675,8 @@ if [ "$ingress_step" != "0" ]; then
   fi
 fi
 
-if [ "$final_report" = "1" ] && [ -f "$product_evidence" ]; then
-  VELORIX_VIND_PRODUCT_DIR="$product_dir" \
-    VELORIX_VIND_PRODUCT_EVIDENCE="$product_evidence" \
-    VELORIX_PRODUCT_COMPLETION_REPORT="$report_file" \
-    scripts/report-vind-product-completion.sh >/dev/null || true
+if [ "$final_report" = "1" ]; then
+  run_completion_report >/dev/null || true
 fi
 
 if [ "$durability_step" != "0" ]; then
@@ -733,11 +728,8 @@ if [ "$hiqlite_backend_time_step" != "0" ] && [ -f "$product_evidence" ]; then
   fi
 fi
 
-if [ "$final_report" = "1" ] && [ -f "$product_evidence" ]; then
-  VELORIX_VIND_PRODUCT_DIR="$product_dir" \
-    VELORIX_VIND_PRODUCT_EVIDENCE="$product_evidence" \
-    VELORIX_PRODUCT_COMPLETION_REPORT="$report_file" \
-    scripts/report-vind-product-completion.sh
+if [ "$final_report" = "1" ]; then
+  run_completion_report
 fi
 
 python3 - "$report_file" <<'PY'

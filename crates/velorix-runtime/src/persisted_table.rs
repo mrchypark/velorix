@@ -9,6 +9,7 @@ use object_store::{path::Path, ObjectStore, PutMode};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
+use velorix_control::query_policy_catalog::{QueryPolicyCatalogError, QueryPolicyCatalogStore};
 use velorix_core::{
     query::QueryPolicy,
     relation::{
@@ -30,7 +31,6 @@ use crate::query::{
     query_object_backed_relation_with_policy_and_limiter_and_metrics, ObjectBackedQueryResult,
     ProductionQueryRuntime, QueryExecutionLimiter, RuntimeQueryError,
 };
-use crate::query_policy_catalog::{QueryPolicyCatalogError, QueryPolicyCatalogStore};
 use crate::storage_registry::{validate_tenant_prefix, StorageRegistry, StorageRegistryError};
 
 pub const PERSISTED_TABLE_SCHEMA_VERSION: u32 = 1;

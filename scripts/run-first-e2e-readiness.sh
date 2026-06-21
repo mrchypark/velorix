@@ -1002,7 +1002,7 @@ standing_runtime_evidence = (
 )
 
 readiness = {
-    "schema_version": 5,
+    "schema_version": 8,
     "deployment_id": production_gc["deployment_id"],
     "authority_store_id": production_gc["authority_store_id"],
     "capability_status": {

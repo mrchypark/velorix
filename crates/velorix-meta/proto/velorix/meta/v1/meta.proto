@@ -86,6 +86,7 @@ message StandingRuntimeCheckpointPointer {
   uint64 logical_epoch = 5;
   string content_hash = 6;
   repeated string output_manifest_refs = 7;
+  string manifest_hash = 8;
 }
 
 message StandingRuntimeOwnerClaim {

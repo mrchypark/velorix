@@ -236,6 +236,51 @@ async fn standing_runtime_checkpoint_publish_is_linearizable_and_idempotent() {
 }
 
 #[tokio::test]
+async fn standing_runtime_checkpoint_publish_conflicts_on_stale_expected_previous() {
+    let store = InMemoryMetaStore::default();
+    let owner = acquire_owner(&store, "owner-a").await;
+    let first = checkpoint_pointer(1, "a");
+    let second = checkpoint_pointer(2, "b");
+    let third = checkpoint_pointer(3, "c");
+
+    store
+        .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
+            expected_previous: None,
+            candidate: first.clone(),
+            owner: owner.clone(),
+        })
+        .await
+        .unwrap();
+    store
+        .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
+            expected_previous: Some(first.clone()),
+            candidate: second.clone(),
+            owner: owner.clone(),
+        })
+        .await
+        .unwrap();
+
+    let stale_expected_previous = store
+        .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
+            expected_previous: Some(first),
+            candidate: third,
+            owner,
+        })
+        .await
+        .unwrap();
+    let latest = store
+        .read_standing_runtime_checkpoint("default", "program", "view")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        stale_expected_previous,
+        PublishStandingRuntimeCheckpointOutcome::Conflict
+    );
+    assert_eq!(latest, Some(second));
+}
+
+#[tokio::test]
 async fn standing_runtime_checkpoint_pointer_preserves_output_manifest_refs() {
     let store = InMemoryMetaStore::default();
     let owner = acquire_owner(&store, "owner-a").await;
@@ -461,6 +506,7 @@ fn checkpoint_pointer(epoch: u64, hash_seed: &str) -> StandingRuntimeCheckpointP
         ),
         logical_epoch: epoch,
         content_hash: format!("sha256:{hash}"),
+        manifest_hash: format!("sha256:{hash}"),
         output_manifest_refs: Vec::new(),
     }
 }

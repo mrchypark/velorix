@@ -17,9 +17,9 @@ pub struct StandingProgramIdentity {
     pub sql_hash: String,
     pub input_catalog_hash: String,
     pub output_schema_hash: String,
-    pub compiler_identity: String,
-    pub runtime_packages: Vec<RuntimePackageIdentity>,
-    pub package_feature_set: Vec<String>,
+    pub planner_identity: String,
+    pub builtin_runtime_identities: Vec<BuiltinRuntimeIdentity>,
+    pub runtime_capabilities: Vec<String>,
     pub runtime_compatibility: String,
     pub checkpoint_codec_identity: String,
     pub native_code_policy: NativeCodePolicy,
@@ -32,19 +32,19 @@ impl StandingProgramIdentity {
         require_sha256("sql_hash", &self.sql_hash)?;
         require_sha256("input_catalog_hash", &self.input_catalog_hash)?;
         require_sha256("output_schema_hash", &self.output_schema_hash)?;
-        require_non_empty("compiler_identity", &self.compiler_identity)?;
+        require_non_empty("planner_identity", &self.planner_identity)?;
         require_non_empty("runtime_compatibility", &self.runtime_compatibility)?;
         require_non_empty("checkpoint_codec_identity", &self.checkpoint_codec_identity)?;
         if self.view_ids.is_empty() {
             return Err(StandingProgramRuntimeError::InvalidProgramIdentity { field: "view_ids" });
         }
-        if self.runtime_packages.is_empty() {
+        if self.builtin_runtime_identities.is_empty() {
             return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
-                field: "runtime_packages",
+                field: "builtin_runtime_identities",
             });
         }
-        for package in &self.runtime_packages {
-            package.validate()?;
+        for runtime in &self.builtin_runtime_identities {
+            runtime.validate()?;
         }
         if let NativeCodePolicy::NativeCodeOrExternalDependenciesPresent { reason } =
             &self.native_code_policy
@@ -60,15 +60,15 @@ impl StandingProgramIdentity {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct RuntimePackageIdentity {
+pub struct BuiltinRuntimeIdentity {
     pub name: String,
     pub version: String,
 }
 
-impl RuntimePackageIdentity {
+impl BuiltinRuntimeIdentity {
     fn validate(&self) -> Result<(), StandingProgramRuntimeError> {
-        require_non_empty("runtime_packages.name", &self.name)?;
-        require_non_empty("runtime_packages.version", &self.version)?;
+        require_non_empty("builtin_runtime_identities.name", &self.name)?;
+        require_non_empty("builtin_runtime_identities.version", &self.version)?;
         Ok(())
     }
 }
@@ -101,6 +101,8 @@ impl EpochIdempotencyKey {
 pub struct RelationInputBatch {
     pub relation_id: String,
     pub relation_version: String,
+    pub stream_id: String,
+    pub partition_id: u32,
     pub schema_fingerprint: String,
     pub start_offset_inclusive: u64,
     pub end_offset_exclusive: u64,
@@ -137,6 +139,10 @@ pub struct EpochCommit {
 pub struct RelationFrontier {
     pub relation_id: String,
     pub relation_version: String,
+    #[serde(default)]
+    pub stream_id: String,
+    #[serde(default)]
+    pub partition_id: u32,
     pub committed_offset_exclusive: u64,
 }
 

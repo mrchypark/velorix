@@ -94,15 +94,17 @@ impl DataFusionSessionFactory {
 
         Ok(SessionContext::new_with_config_rt(
             config,
-            runtime.build_arc()?,
+            runtime.build_arc().map_err(QueryError::engine)?,
         ))
     }
 }
 
 fn memory_limit_usize(memory_limit_bytes: u64) -> Result<usize, QueryError> {
-    usize::try_from(memory_limit_bytes)
-        .map_err(|_| DataFusionError::Configuration("memory_limit_bytes exceeds usize".into()))
-        .map_err(QueryError::from)
+    usize::try_from(memory_limit_bytes).map_err(|_| {
+        QueryError::engine(DataFusionError::Configuration(
+            "memory_limit_bytes exceeds usize".into(),
+        ))
+    })
 }
 
 #[derive(Clone, Debug)]

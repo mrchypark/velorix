@@ -63,6 +63,7 @@ product_evidence_level="${VELORIX_PRODUCT_EVIDENCE_LEVEL:-local-vind-only}"
 api_replica_count="${VELORIX_API_REPLICA_COUNT:-1}"
 standing_runtime_fencing="${VELORIX_STANDING_RUNTIME_FENCING:-unsafe-dev-only}"
 standing_runtime_owner_ttl_ms="${VELORIX_STANDING_RUNTIME_OWNER_TTL_MS:-5000}"
+output_compaction_interval_epochs="${VELORIX_OUTPUT_COMPACTION_INTERVAL_EPOCHS:-0}"
 output_dir="${VELORIX_VIND_PRODUCT_DIR:-target/velorix-product}"
 local_disk_preflight="${VELORIX_LOCAL_DISK_PREFLIGHT:-1}"
 local_min_free_disk_gib="${VELORIX_LOCAL_MIN_FREE_DISK_GIB:-20}"
@@ -209,14 +210,14 @@ After it finishes, call the REST API through the local port-forward:
   curl "$VELORIX_API_URL/healthz"
   curl -X POST "$VELORIX_API_URL/v1/relations/scores-default" -H "$VELORIX_API_AUTH_HEADER"
   curl -X POST "$VELORIX_API_URL/v1/views" -H "$VELORIX_API_AUTH_HEADER" -H 'content-type: application/json' -d '{"view_id":"positive_scores_by_user","urlPath":"/scores/positive","input_relation_id":"scores","input_relation_version":"2026-05-24.v1","sql":"select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id","response_formats":["json"]}'
-  curl -X POST "$VELORIX_API_URL/v1/ingest" -H "$VELORIX_API_AUTH_HEADER" -H 'content-type: application/json' -d '{"relation_id":"scores","relation_version":"2026-05-24.v1","stream_id":"scores","partition_id":0,"start_offset_inclusive":0,"rows":[{"user_id":"u1","score":5,"delta":1},{"user_id":"u1","score":7,"delta":1},{"user_id":"u2","score":-1,"delta":1}]}'
+  curl -X POST "$VELORIX_API_URL/v1/relations/scores/ingest" -H "$VELORIX_API_AUTH_HEADER" -H 'content-type: application/json' -d '{"relation_version":"2026-05-24.v1","stream_id":"scores","partition_id":0,"start_offset_inclusive":0,"rows":[{"user_id":"u1","score":5,"delta":1},{"user_id":"u1","score":7,"delta":1},{"user_id":"u2","score":-1,"delta":1}]}'
   curl "$VELORIX_API_URL/v1/views/positive_scores_by_user/query" -H "$VELORIX_API_AUTH_HEADER"
 
 Main overrides:
   VELORIX_VIND_CLUSTER=velorix-product
   VELORIX_VIND_CLUSTER_DRIVER=docker-vcluster
   VELORIX_K8S_CONTEXT=<required when VELORIX_VIND_CLUSTER_DRIVER=existing-context>
-  VELORIX_IMAGE_LOAD_MODE=auto  # auto, vcluster-docker, k3d, none
+  VELORIX_IMAGE_LOAD_MODE=auto  # auto, vcluster-docker, k3d, kind, none
   VELORIX_PRODUCT_DEPLOYMENT_ID=<defaults to VELORIX_VIND_CLUSTER/current-run-id>
   VELORIX_VIND_REUSE_EXISTING=1
   VELORIX_VIND_PRESERVE_STATE=0
@@ -1410,6 +1411,13 @@ case "$standing_runtime_owner_ttl_ms" in
     ;;
 esac
 
+case "$output_compaction_interval_epochs" in
+  '' | *[!0-9]*)
+    echo "VELORIX_OUTPUT_COMPACTION_INTERVAL_EPOCHS must be a non-negative integer" >&2
+    exit 64
+    ;;
+esac
+
 if [ "$meta_enabled" = "1" ] && [ -z "$meta_bearer_token" ]; then
   meta_bearer_token="$(
     python3 - <<'PY'
@@ -1834,6 +1842,27 @@ k3d_node_containers() {
     | awk '$2 == "server" || $2 == "agent" { print $1 }'
 }
 
+infer_kind_cluster_name() {
+  case "$context" in
+    kind-*)
+      printf '%s\n' "${context#kind-}"
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+load_image_into_kind() {
+  local image="$1"
+  local detected_cluster
+  detected_cluster="$(infer_kind_cluster_name)" || {
+    echo "could not infer kind cluster from Kubernetes context ${context}; set VELORIX_IMAGE_LOAD_MODE=none if images are already pullable" >&2
+    exit 66
+  }
+  echo "loading ${image} into kind cluster ${detected_cluster}"
+  kind load docker-image "$image" --name "$detected_cluster"
+}
+
 load_image_into_k3d() {
   local image="$1"
   local nodes
@@ -1868,6 +1897,8 @@ load_image_into_product_cluster() {
     existing-context:auto)
       if infer_k3d_cluster_name >/dev/null 2>&1; then
         load_image_into_k3d "$image"
+      elif infer_kind_cluster_name >/dev/null 2>&1; then
+        load_image_into_kind "$image"
       else
         echo "VELORIX_IMAGE_LOAD_MODE=auto cannot infer an image loader for context ${context}; set VELORIX_IMAGE_LOAD_MODE=none if images are already pullable" >&2
         exit 66
@@ -1875,6 +1906,9 @@ load_image_into_product_cluster() {
       ;;
     existing-context:k3d)
       load_image_into_k3d "$image"
+      ;;
+    existing-context:kind)
+      load_image_into_kind "$image"
       ;;
     *:none)
       echo "skipping image load for ${image}; assuming it is already pullable by ${context}"
@@ -2856,7 +2890,7 @@ EOF
   kubectl --context "$context" -n "$namespace" logs job/velorix-meta-smoke \
     >"$meta_fencing_adversarial_smoke_log"
   if [ "$standing_runtime_fencing" != "unsafe-dev-only" ]; then
-    if grep -q "velorix-meta standing runtime adversarial smoke ok" "$meta_fencing_adversarial_smoke_log"; then
+    if grep -q "velorix-meta standing runtime adversarial smoke ok: .*stale_checkpoint_pointer_publish_conflicted=true" "$meta_fencing_adversarial_smoke_log"; then
       meta_fencing_adversarial_smoke_passed=1
     else
       echo "metadata standing runtime adversarial smoke did not produce pass evidence" >&2
@@ -4474,9 +4508,9 @@ PY
 
   for _ in $(seq 1 10); do
     owner_ingest_status="$(curl_api_status "${output_dir}/multi-replica-owner-ingest.json" \
-      -X POST "http://127.0.0.1:${port_a}/v1/ingest" \
+      -X POST "http://127.0.0.1:${port_a}/v1/relations/scores/ingest" \
       -H 'content-type: application/json' \
-      -d "{\"relation_id\":\"scores\",\"relation_version\":\"2026-05-24.v1\",\"stream_id\":\"${data_stream_id}\",\"partition_id\":0,\"start_offset_inclusive\":0,\"rows\":[{\"user_id\":\"${user_id}\",\"score\":5,\"delta\":1}]}")"
+      -d "{\"relation_version\":\"2026-05-24.v1\",\"stream_id\":\"${data_stream_id}\",\"partition_id\":0,\"start_offset_inclusive\":0,\"rows\":[{\"user_id\":\"${user_id}\",\"score\":5,\"delta\":1}]}")"
     case "$owner_ingest_status" in
       200 | 201) break ;;
       409) sleep 1 ;;
@@ -4493,15 +4527,21 @@ PY
   esac
 
   wait_for_api_status \
+    "${output_dir}/multi-replica-owner-materialize-query.json" \
+    200 \
+    "multi-replica owner materialize query" \
+    "http://127.0.0.1:${port_a}/v1/views/${view_id}/query"
+
+  wait_for_api_status \
     "${output_dir}/multi-replica-read-replica-query.json" \
     200 \
     "multi-replica read-replica query" \
     "http://127.0.0.1:${port_b}/v1/views/${view_id}/query"
 
   fenced_ingest_status="$(curl_api_status "${output_dir}/multi-replica-fenced-ingest.json" \
-    -X POST "http://127.0.0.1:${port_b}/v1/ingest" \
+    -X POST "http://127.0.0.1:${port_b}/v1/relations/scores/ingest" \
     -H 'content-type: application/json' \
-    -d "{\"relation_id\":\"scores\",\"relation_version\":\"2026-05-24.v1\",\"stream_id\":\"${data_stream_id}\",\"partition_id\":0,\"start_offset_inclusive\":1,\"rows\":[{\"user_id\":\"${user_id}\",\"score\":9,\"delta\":1}]}")"
+    -d "{\"relation_version\":\"2026-05-24.v1\",\"stream_id\":\"${data_stream_id}\",\"partition_id\":0,\"start_offset_inclusive\":1,\"rows\":[{\"user_id\":\"${user_id}\",\"score\":9,\"delta\":1}]}")"
   if [ "$fenced_ingest_status" != "409" ]; then
     echo "expected non-owner replica ingest to be fenced with 409, got ${fenced_ingest_status}" >&2
     cat "${output_dir}/multi-replica-fenced-ingest.json" >&2 || true
@@ -4509,9 +4549,9 @@ PY
   fi
 
   owner_retry_status="$(curl_api_status "${output_dir}/multi-replica-owner-retry-ingest.json" \
-    -X POST "http://127.0.0.1:${port_a}/v1/ingest" \
+    -X POST "http://127.0.0.1:${port_a}/v1/relations/scores/ingest" \
     -H 'content-type: application/json' \
-    -d "{\"relation_id\":\"scores\",\"relation_version\":\"2026-05-24.v1\",\"stream_id\":\"${data_stream_id}\",\"partition_id\":0,\"start_offset_inclusive\":1,\"rows\":[{\"user_id\":\"${user_id}\",\"score\":9,\"delta\":1}]}")"
+    -d "{\"relation_version\":\"2026-05-24.v1\",\"stream_id\":\"${data_stream_id}\",\"partition_id\":0,\"start_offset_inclusive\":1,\"rows\":[{\"user_id\":\"${user_id}\",\"score\":9,\"delta\":1}]}")"
   case "$owner_retry_status" in
     200 | 201) ;;
     *)
@@ -4578,6 +4618,7 @@ evidence = {
         "pods": "multi-replica-api-pods.json",
         "view": "multi-replica-view.json",
         "owner_ingest": "multi-replica-owner-ingest.json",
+        "owner_materialize_query": "multi-replica-owner-materialize-query.json",
         "read_replica_query": "multi-replica-read-replica-query.json",
         "fenced_ingest": "multi-replica-fenced-ingest.json",
         "owner_retry_ingest": "multi-replica-owner-retry-ingest.json",
@@ -5174,6 +5215,7 @@ write_product_evidence() {
     "${output_dir}/readyz.json" \
     "$hiqlite_authority_attestation_file" \
     "$hiqlite_authority_attestation_validated" \
+    "$hiqlite_backend_time_assessment_file" \
     "$hiqlite_backend_time_attestation_file" \
     "$hiqlite_backend_time_attestation_validated" \
     "$api_tls_enabled" \
@@ -5262,6 +5304,7 @@ from datetime import datetime, timezone
     readyz_path,
     hiqlite_authority_attestation_file,
     hiqlite_authority_attestation_validated,
+    hiqlite_backend_time_assessment_file,
     hiqlite_backend_time_attestation_file,
     hiqlite_backend_time_attestation_validated,
     api_tls_enabled,
@@ -5362,6 +5405,31 @@ if hiqlite_authority_attestation_file:
         "attested_at": raw_attestation.get("attested_at"),
         "attester": raw_attestation.get("attester"),
     }
+
+hiqlite_backend_time_assessment = None
+if hiqlite_backend_time_assessment_file:
+    try:
+        with open(hiqlite_backend_time_assessment_file, "r", encoding="utf-8") as f:
+            raw_assessment = json.load(f)
+    except FileNotFoundError:
+        raw_assessment = None
+    if raw_assessment:
+        hiqlite_backend_time_assessment = {
+            "validated": True,
+            "evidence": "hiqlite-backend-time-assessment.json",
+            "schema_version": raw_assessment.get("schema_version"),
+            "evidence_kind": raw_assessment.get("evidence_kind"),
+            "required_mode_supported": raw_assessment.get("required_mode_supported"),
+            "can_generate_product_complete_backend_time_attestation": raw_assessment.get(
+                "can_generate_product_complete_backend_time_attestation"
+            ),
+            "backend_time_source_kind": raw_assessment.get("backend_time_source_kind"),
+            "backend_time_blocked_reason": raw_assessment.get("backend_time_blocked_reason"),
+            "lease_authority_kind": raw_assessment.get("lease_authority_kind"),
+            "lease_expiry_semantics": raw_assessment.get("lease_expiry_semantics"),
+            "bounded_wall_clock_failover": raw_assessment.get("bounded_wall_clock_failover"),
+            "trusted_for_product_complete": False,
+        }
 
 hiqlite_backend_time_attestation = None
 if hiqlite_backend_time_attestation_file and hiqlite_backend_time_attestation_validated == "1":
@@ -5721,6 +5789,7 @@ evidence = {
         "backend": meta_backend,
         "meta_s3_prefix": meta_s3_prefix if meta_enabled == "1" else None,
         "hiqlite_authority_attestation": hiqlite_authority_attestation,
+        "hiqlite_backend_time_assessment": hiqlite_backend_time_assessment,
         "hiqlite_backend_time_attestation": hiqlite_backend_time_attestation,
         "standing_runtime_adversarial_smoke": {
             "status": "pass" if meta_fencing_adversarial_smoke_passed == "1" else (
@@ -5733,6 +5802,7 @@ evidence = {
                 "logical_owner_expiry_checked": meta_fencing_adversarial_smoke_passed == "1",
                 "new_owner_epoch_fences_old_owner": meta_fencing_adversarial_smoke_passed == "1",
                 "stale_owner_checkpoint_publish_rejected": meta_fencing_adversarial_smoke_passed == "1",
+                "stale_checkpoint_pointer_publish_conflicted": meta_fencing_adversarial_smoke_passed == "1",
                 "latest_checkpoint_remains_metadata_authoritative": meta_fencing_adversarial_smoke_passed == "1",
             },
         },
@@ -6887,6 +6957,8 @@ ${api_auth_env}
               value: "${standing_runtime_fencing}"
             - name: VELORIX_STANDING_RUNTIME_OWNER_TTL_MS
               value: "${standing_runtime_owner_ttl_ms}"
+            - name: VELORIX_OUTPUT_COMPACTION_INTERVAL_EPOCHS
+              value: "${output_compaction_interval_epochs}"
 ${api_meta_env}
           ports:
             - containerPort: 8080
@@ -7180,9 +7252,9 @@ PY
       ;;
   esac
   start_api_writer_owner_port_forward_for_smoke
-  curl_api -X POST "http://127.0.0.1:${api_local_port}/v1/ingest" \
+  curl_api -X POST "http://127.0.0.1:${api_local_port}/v1/relations/scores/ingest" \
     -H 'content-type: application/json' \
-    -d '{"relation_id":"scores","relation_version":"2026-05-24.v1","stream_id":"product-smoke-'"${run_id}"'","partition_id":0,"start_offset_inclusive":0,"rows":[{"user_id":"u1","score":5,"delta":1},{"user_id":"u1","score":7,"delta":1},{"user_id":"u2","score":-1,"delta":1},{"user_id":"u3","score":0,"delta":1}]}' \
+    -d '{"relation_version":"2026-05-24.v1","stream_id":"product-smoke-'"${run_id}"'","partition_id":0,"start_offset_inclusive":0,"rows":[{"user_id":"u1","score":5,"delta":1},{"user_id":"u1","score":7,"delta":1},{"user_id":"u2","score":-1,"delta":1},{"user_id":"u3","score":0,"delta":1}]}' \
     | tee "${output_dir}/scores-ingest.json" >/dev/null
   curl_api "http://127.0.0.1:${api_local_port}/v1/views/positive_scores_by_user/query" \
     | tee "${output_dir}/positive-scores-query.json" >/dev/null
@@ -7396,7 +7468,7 @@ if [ "$api_auth_mode" = "bearer-token" ]; then
   # shellcheck disable=SC2016
   echo '  curl "$VELORIX_API_URL/healthz"'
   # shellcheck disable=SC2016
-  echo '  curl -X POST "$VELORIX_API_URL/v1/ingest" -H "$VELORIX_API_AUTH_HEADER" -H '\''content-type: application/json'\'' -d '\''{"relation_id":"scores","relation_version":"2026-05-24.v1","stream_id":"scores","partition_id":0,"start_offset_inclusive":0,"rows":[{"user_id":"u1","score":5,"delta":1},{"user_id":"u1","score":7,"delta":1},{"user_id":"u2","score":-1,"delta":1}]}'\'''
+  echo '  curl -X POST "$VELORIX_API_URL/v1/relations/scores/ingest" -H "$VELORIX_API_AUTH_HEADER" -H '\''content-type: application/json'\'' -d '\''{"relation_version":"2026-05-24.v1","stream_id":"scores","partition_id":0,"start_offset_inclusive":0,"rows":[{"user_id":"u1","score":5,"delta":1},{"user_id":"u1","score":7,"delta":1},{"user_id":"u2","score":-1,"delta":1}]}'\'''
   # shellcheck disable=SC2016
   echo '  curl "$VELORIX_API_URL/v1/views/positive_scores_by_user/query" -H "$VELORIX_API_AUTH_HEADER"'
   # shellcheck disable=SC2016
@@ -7407,7 +7479,7 @@ if [ "$api_auth_mode" = "bearer-token" ]; then
   echo "  VELORIX_VIND_PRODUCT_DIR=${output_dir} scripts/report-vind-product-completion.sh"
 else
   echo "  curl http://127.0.0.1:${api_local_port}/healthz"
-  echo "  curl -X POST http://127.0.0.1:${api_local_port}/v1/ingest -H 'content-type: application/json' -d '{\"relation_id\":\"scores\",\"relation_version\":\"2026-05-24.v1\",\"stream_id\":\"scores\",\"partition_id\":0,\"start_offset_inclusive\":0,\"rows\":[{\"user_id\":\"u1\",\"score\":5,\"delta\":1},{\"user_id\":\"u1\",\"score\":7,\"delta\":1},{\"user_id\":\"u2\",\"score\":-1,\"delta\":1}]}'"
+  echo "  curl -X POST http://127.0.0.1:${api_local_port}/v1/relations/scores/ingest -H 'content-type: application/json' -d '{\"relation_version\":\"2026-05-24.v1\",\"stream_id\":\"scores\",\"partition_id\":0,\"start_offset_inclusive\":0,\"rows\":[{\"user_id\":\"u1\",\"score\":5,\"delta\":1},{\"user_id\":\"u1\",\"score\":7,\"delta\":1},{\"user_id\":\"u2\",\"score\":-1,\"delta\":1}]}'"
   echo "  curl http://127.0.0.1:${api_local_port}/v1/views/positive_scores_by_user/query"
   echo "  curl http://127.0.0.1:${api_local_port}/v1/api/scores/positive"
 fi

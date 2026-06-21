@@ -166,6 +166,7 @@ curl_api_status() {
 run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 user_id="rest-smoke-${run_id}"
 stream_id="rest-smoke-${run_id}"
+batch_stream_id="rest-smoke-batch-${run_id}"
 
 healthz_file="${output_dir}/healthz.json"
 readyz_file="${output_dir}/readyz.json"
@@ -179,6 +180,7 @@ openapi_file="${output_dir}/openapi.json"
 owner_acquire_file="${output_dir}/standing-runtime-owner-acquire.json"
 owner_report_file="${output_dir}/standing-runtime-owner-report.json"
 ingest_file="${output_dir}/scores-ingest.json"
+batch_ingest_file="${output_dir}/scores-batch-ingest.json"
 view_query_file="${output_dir}/positive-scores-view-query.json"
 api_query_file="${output_dir}/positive-scores-api-query.json"
 
@@ -252,10 +254,15 @@ for path in sys.argv[1:]:
 PY
 fi
 
-curl_api -X POST "$VELORIX_API_URL/v1/ingest" \
+curl_api -X POST "$VELORIX_API_URL/v1/relations/scores/ingest" \
   -H 'content-type: application/json' \
-  -d "{\"relation_id\":\"scores\",\"relation_version\":\"2026-05-24.v1\",\"stream_id\":\"${stream_id}\",\"partition_id\":0,\"start_offset_inclusive\":0,\"rows\":[{\"user_id\":\"${user_id}\",\"score\":10,\"delta\":1},{\"user_id\":\"${user_id}\",\"score\":15,\"delta\":1},{\"user_id\":\"${user_id}\",\"score\":-7,\"delta\":1}]}" \
+  -d "{\"relation_version\":\"2026-05-24.v1\",\"stream_id\":\"${stream_id}\",\"partition_id\":0,\"start_offset_inclusive\":0,\"rows\":[{\"user_id\":\"${user_id}\",\"score\":10,\"delta\":1},{\"user_id\":\"${user_id}\",\"score\":15,\"delta\":1},{\"user_id\":\"${user_id}\",\"score\":-7,\"delta\":1}]}" \
   >"$ingest_file"
+
+curl_api -X POST "$VELORIX_API_URL/v1/relations/ingest" \
+  -H 'content-type: application/json' \
+  -d "{\"batches\":[{\"relation_id\":\"scores\",\"relation_version\":\"2026-05-24.v1\",\"stream_id\":\"${batch_stream_id}\",\"partition_id\":0,\"start_offset_inclusive\":0,\"rows\":[{\"user_id\":\"${user_id}\",\"score\":3,\"delta\":1}]}]}" \
+  >"$batch_ingest_file"
 
 deadline=$((SECONDS + query_wait_seconds))
 while true; do
@@ -270,7 +277,7 @@ for path in sys.argv[1:3]:
         body = json.load(f)
     rows = {row.get("user_id"): row for row in body.get("rows") or []}
     row = rows.get(sys.argv[3]) or {}
-    if row.get("sum") != 25 or row.get("count") != 2:
+    if row.get("sum") != 28 or row.get("count") != 3:
         raise SystemExit(1)
 PY
   then
@@ -292,6 +299,7 @@ python3 - \
   "$run_id" \
   "$user_id" \
   "$stream_id" \
+  "$batch_stream_id" \
   "$VELORIX_API_URL" \
   "$healthz_file" \
   "$readyz_file" \
@@ -303,6 +311,7 @@ python3 - \
   "$owner_acquire_file" \
   "$owner_report_file" \
   "$ingest_file" \
+  "$batch_ingest_file" \
   "$view_query_file" \
   "$api_query_file" <<'PY'
 import json
@@ -314,6 +323,7 @@ from datetime import datetime, timezone
     run_id,
     user_id,
     stream_id,
+    batch_stream_id,
     api_url,
     healthz_path,
     readyz_path,
@@ -325,6 +335,7 @@ from datetime import datetime, timezone
     owner_acquire_path,
     owner_report_path,
     ingest_path,
+    batch_ingest_path,
     view_query_path,
     api_query_path,
 ) = sys.argv[1:]
@@ -332,6 +343,26 @@ from datetime import datetime, timezone
 def read_json(path):
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+def reject_public_internal_keys(value, context):
+    forbidden = {
+        "stages",
+        "convergence_writes",
+        "materialize_convergence",
+        "compaction_scheduled",
+        "background_tasks",
+    }
+    if isinstance(value, dict):
+        leaked = forbidden.intersection(value)
+        if leaked:
+            raise SystemExit(
+                f"{context} leaked internal public response keys {sorted(leaked)}: {value}"
+            )
+        for child in value.values():
+            reject_public_internal_keys(child, context)
+    elif isinstance(value, list):
+        for child in value:
+            reject_public_internal_keys(child, context)
 
 readyz = read_json(readyz_path)
 if readyz.get("status") != "ready":
@@ -380,8 +411,14 @@ if not str(openapi.get("openapi", "")).startswith("3."):
 paths = openapi.get("paths") or {}
 if "/v1/query" in paths:
     raise SystemExit("generic /v1/query unexpectedly appears in OpenAPI")
+if "/v1/views/{view_id}/compact" in paths:
+    raise SystemExit("background compaction endpoint unexpectedly appears in OpenAPI")
 if "/v1/api/scores/positive" not in paths:
     raise SystemExit("promoted /v1/api/scores/positive path missing from OpenAPI")
+if "/v1/relations/{relation_id}/ingest" not in paths:
+    raise SystemExit("relation-scoped ingest path missing from OpenAPI")
+if "/v1/relations/ingest" not in paths:
+    raise SystemExit("public relation batch ingest path missing from OpenAPI")
 positive_get = paths["/v1/api/scores/positive"].get("get") or {}
 if positive_get.get("x-velorix-query-policy-id") != "interactive":
     raise SystemExit(f"promoted API is not linked to interactive policy: {positive_get}")
@@ -398,11 +435,57 @@ if owner.get("status") != "skipped":
     if not owners or not owner_matches:
         raise SystemExit(f"standing runtime owner report does not prove local writer ownership: {owner}")
 
+ingest = read_json(ingest_path)
+reject_public_internal_keys(ingest, "relation ingest")
+if ingest.get("ack_mode") != "materialized":
+    raise SystemExit(f"relation ingest did not use materialized ack mode: {ingest}")
+materialization = ingest.get("materialization") or {}
+if materialization.get("status") != "completed":
+    raise SystemExit(f"relation ingest materialization did not complete: {ingest}")
+if materialization.get("applied_batches", 0) < 1:
+    raise SystemExit(f"relation ingest did not report applied batches: {ingest}")
+if materialization.get("checkpoint_writes") != 1:
+    raise SystemExit(f"relation ingest did not coalesce checkpoint writes: {ingest}")
+if materialization.get("applied_batches_per_checkpoint_write", 0) < 1:
+    raise SystemExit(f"relation ingest did not report applied_batches_per_checkpoint_write: {ingest}")
+for field in (
+    "output_delta_writes",
+    "state_payload_writes",
+    "checkpoint_record_writes",
+    "checkpoint_pointer_writes",
+    "latest_cache_writes",
+    "checkpoint_publication_writes",
+):
+    if materialization.get(field) != 1:
+        raise SystemExit(f"relation ingest did not report coalesced {field}=1: {ingest}")
+timings = ingest.get("timings") or {}
+if timings.get("batch_count") != 1 or timings.get("row_count") != 3:
+    raise SystemExit(f"relation ingest timings did not report expected workload shape: {ingest}")
+for field in ("avg_batch_us", "avg_row_us", "rows_per_second"):
+    if timings.get(field) is None:
+        raise SystemExit(f"relation ingest timings did not include {field}: {ingest}")
+
+batch_ingest = read_json(batch_ingest_path)
+reject_public_internal_keys(batch_ingest, "relation batch ingest")
+if batch_ingest.get("ack_mode") != "materialized":
+    raise SystemExit(f"relation batch ingest did not use materialized ack mode: {batch_ingest}")
+batch_materialization = batch_ingest.get("materialization") or {}
+if batch_materialization.get("status") != "completed":
+    raise SystemExit(f"relation batch ingest materialization did not complete: {batch_ingest}")
+if batch_materialization.get("applied_batches", 0) < 1:
+    raise SystemExit(f"relation batch ingest did not report applied batches: {batch_ingest}")
+batch_timings = batch_ingest.get("timings") or {}
+if batch_timings.get("batch_count") != 1 or batch_timings.get("row_count") != 1:
+    raise SystemExit(f"relation batch ingest timings did not report expected workload shape: {batch_ingest}")
+batch_responses = batch_ingest.get("batches") or []
+if len(batch_responses) != 1 or batch_responses[0].get("descriptor", {}).get("relation_id") != "scores":
+    raise SystemExit(f"relation batch ingest did not include the scores batch response: {batch_ingest}")
+
 for path in (view_query_path, api_query_path):
     body = read_json(path)
     rows = {row.get("user_id"): row for row in body.get("rows") or []}
     row = rows.get(user_id) or {}
-    if row.get("sum") != 25 or row.get("count") != 2:
+    if row.get("sum") != 28 or row.get("count") != 3:
         raise SystemExit(f"query response does not include expected smoke row in {path}: {body}")
 
 payload = {
@@ -415,14 +498,23 @@ payload = {
     "relation_id": "scores",
     "relation_version": "2026-05-24.v1",
     "stream_id": stream_id,
+    "batch_stream_id": batch_stream_id,
     "user_id": user_id,
     "view_id": "positive_scores_by_user",
     "promoted_api_path": "/v1/api/scores/positive",
     "interactive_query_policy_verified": True,
     "standing_runtime_owner_status": owner_status,
     "standing_runtime_owner_matches_local_process": owner_matches,
-    "ingested_positive_sum": 25,
-    "ingested_positive_count": 2,
+    "ingest_ack_mode": ingest.get("ack_mode"),
+    "ingest_materialization": materialization,
+    "ingest_timings": timings,
+    "public_relation_ingest_path": "/v1/relations/{relation_id}/ingest",
+    "public_relation_batch_ingest_path": "/v1/relations/ingest",
+    "relation_batch_ingest_ack_mode": batch_ingest.get("ack_mode"),
+    "relation_batch_ingest_materialization": batch_materialization,
+    "relation_batch_ingest_timings": batch_timings,
+    "ingested_positive_sum": 28,
+    "ingested_positive_count": 3,
     "trusted_for_product_complete": False,
     "evidence_files": {
         "healthz": healthz_path,
@@ -435,6 +527,7 @@ payload = {
         "standing_runtime_owner_acquire": owner_acquire_path,
         "standing_runtime_owner_report": owner_report_path,
         "ingest": ingest_path,
+        "relation_batch_ingest": batch_ingest_path,
         "view_query": view_query_path,
         "promoted_api_query": api_query_path,
     },

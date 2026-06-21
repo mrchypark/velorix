@@ -60,12 +60,20 @@ No new durable ingest, recovery, query, or standing-view code may depend on JSON
 [Ingest Envelope V1](ingest-envelope-v1.md), and
 [Legacy JSON DeltaBatch Removal](legacy-json-deltabatch-removal.md).
 
-## Ingest API Acknowledgement Semantics
+## Storage-Layer Ingest Acknowledgement Semantics
 
-Ingest acknowledgement is scoped to durable input admission only. It must not
-claim that SQL processing, materialized view updates, output publication, or
-checkpoint publication has completed. View freshness and checkpoint progress
-belong to separate status surfaces over checkpoint manifests.
+This section describes the storage-layer append/admission contract, not the
+public relation ingest API. A storage-layer admission acknowledgement is scoped
+to durable input admission only. It must not claim that SQL processing,
+materialized view updates, output publication, or checkpoint publication has
+completed.
+
+The public 1.0 relation ingest API uses the higher-level synchronous
+`materialized` acknowledgement described in
+[Materialized View Runtime Roadmap](materialized-view-runtime-roadmap.md) and
+[Ingest Admission Contract](ingest-admission-contract.md). That public
+acknowledgement is still sequential per relation and does not add an atomic
+multi-relation transaction boundary for joins.
 
 A synchronous ingest API should use these meanings:
 
@@ -141,6 +149,13 @@ current schema includes:
 - referenced `output_objects`
 - `parent_checkpoint`
 - caller-provided `created_at`
+
+Standing-runtime checkpoints also carry `RuntimeCheckpoint.input_frontiers`: the
+complete per-relation stream/partition frontier vector for the materialized
+output selected by that checkpoint. Output manifests for materialized views must
+either include the same frontier vector directly or be selected only through a
+checkpoint pointer that includes it; a standalone output manifest without a
+recoverable input frontier vector is not product-complete join evidence.
 
 Manifest validation currently requires schema version 1, at least one input
 range, at least one state object reference, monotonic parent linkage, nonempty
@@ -368,6 +383,14 @@ the run's deleted checkpoint payloads. This verifier is a storage consistency
 boundary only; it is not a production GC command or live backend attestation by
 itself.
 
+The GC root set is deliberately larger than the latest-N manifest policy:
+authoritative latest checkpoint pointers, the predecessor chain required by the
+supported upgrade/rollback window, durable admitted replay lower bounds,
+explicit repair holds, active reader generations, and materialized output
+compaction source/output manifests are all reachability roots. A release GC run
+must not collect an object reachable from any of those roots, even when it is
+outside the simple latest-N set.
+
 Manifest objects outside the latest-N retention set can remain listed and
 readable after GC, but their Velorix-owned raw state and output payloads are not
 part of the retained recovery set. Operators and recovery code must treat those
@@ -376,9 +399,12 @@ still available for some other reason. Admin inspection may still use those
 older manifest bodies as structural parent-lineage evidence for newer retained
 checkpoints. Retention evidence records the GC run that removed payloads for
 non-retained checkpoints; broad manifest lifecycle retirement, manifest
-deletion, and compaction remain future work.
+deletion, and checkpoint-GC compaction remain future work. This is separate
+from the internal materialized-output compaction maintenance path described in
+`materialized-view-runtime-roadmap.md`.
 
 This is not a broad production GC service. It does not collect staging
 `v1/tmp/...` objects, does not add object-store listing-consistency controls,
 and does not delete SlateDB internal objects by prefix walking. Broader SlateDB
-retention handles, manifest deletion, and compaction policy remain future work.
+retention handles, manifest deletion, and checkpoint-GC compaction policy
+remain future work.

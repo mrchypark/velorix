@@ -32,6 +32,26 @@ fn production_sources_do_not_call_bootstrap_table_scan_apis() {
 }
 
 #[test]
+fn default_runtime_lib_does_not_export_legacy_source_scan_surfaces() {
+    let workspace = workspace_root();
+    let source = workspace.join("crates/velorix-runtime/src/lib.rs");
+    let contents = fs::read_to_string(&source).expect("read runtime lib");
+
+    for module in ["persisted_query", "persisted_table", "persisted_view"] {
+        let export = format!("pub mod {module};");
+        let feature_gate = "#[cfg(feature = \"legacy-source-scan-surfaces\")]";
+        let index = contents
+            .find(&export)
+            .unwrap_or_else(|| panic!("runtime lib should still name legacy module `{module}`"));
+        let prefix = &contents[..index];
+        assert!(
+            prefix.trim_end().ends_with(feature_gate),
+            "legacy source-scan module `{module}` must stay behind legacy-source-scan-surfaces"
+        );
+    }
+}
+
+#[test]
 fn production_source_contract_forbids_direct_persisted_view_bootstrap_helper_callers() {
     let workspace = Path::new("/workspace");
     let source = workspace.join("crates/velorix-runtime/src/production_surface.rs");

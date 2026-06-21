@@ -212,10 +212,10 @@ user_id="standing-failover-${run_id}"
 expected_sum=23
 expected_count=2
 curl -fsS --max-time 10 \
-  -X POST "$VELORIX_API_URL/v1/ingest" \
+  -X POST "$VELORIX_API_URL/v1/relations/scores/ingest" \
   -H "$VELORIX_API_AUTH_HEADER" \
   -H 'content-type: application/json' \
-  -d "{\"relation_id\":\"scores\",\"relation_version\":\"2026-05-24.v1\",\"stream_id\":\"${stream_id}\",\"partition_id\":0,\"start_offset_inclusive\":0,\"rows\":[{\"user_id\":\"${user_id}\",\"score\":19,\"delta\":1},{\"user_id\":\"${user_id}\",\"score\":4,\"delta\":1}]}" \
+  -d "{\"relation_version\":\"2026-05-24.v1\",\"stream_id\":\"${stream_id}\",\"partition_id\":0,\"start_offset_inclusive\":0,\"rows\":[{\"user_id\":\"${user_id}\",\"score\":19,\"delta\":1},{\"user_id\":\"${user_id}\",\"score\":4,\"delta\":1}]}" \
   >"$post_ingest_response"
 curl -fsS --max-time 10 \
   "$VELORIX_API_URL/v1/api/scores/positive" \

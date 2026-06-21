@@ -1,8 +1,12 @@
 # DataFusion Resource Policy V1
 
 Status: Accepted
-Applies to: ad hoc SQL, persisted query execution, persisted table scans, and
-persisted view access.
+Applies to: internal/dev ad hoc SQL, persisted query execution, persisted table
+scans, and bounded post-filtering over published materialized output.
+
+This is not a public 1.0 source-query authority. Public 1.0 query serving reads
+published materialized output only; it must not scan source ingest batches or
+perform catch-up materialization on the read path.
 
 Velorix treats DataFusion SQL as untrusted code. SQL text size and output row
 caps are bootstrap controls only; they are not a production resource boundary.
@@ -27,16 +31,16 @@ Policy is an execution admission contract, not just metadata stored with a
 query spec. Runtime query paths build `SessionContext` instances through the
 Velorix DataFusion session factory so `batch_size`, `target_partitions`,
 `memory_limit_bytes`, and `spill_limit_bytes` have one mapping point.
-Generic query policy catalog `create`/`get` remains bootstrap-compatible and
-admits `QueryExecutionPolicyV1::default()`. Production table-scan admission uses
-the explicit catalog production methods, which fail closed unless
-`QueryExecutionPolicyV1::validate_production_table_scan` sees all required
-single-query production boundary fields. The product REST surface for
-`/v1/query-policies` uses the production catalog methods, so a policy that can
-be linked to a served `/v1/api/*` view must carry those bounds when created and
-when read back. Tenant/global concurrency admission now has a narrow production
-runtime-owned limiter boundary for the persisted table, persisted view, and
-recovered-query scan paths. Setting
+Generic query policy catalog `create`/`get` remains bootstrap-compatible for
+internal/dev surfaces and admits `QueryExecutionPolicyV1::default()`.
+Production table-scan admission uses the explicit catalog production methods,
+which fail closed unless `QueryExecutionPolicyV1::validate_production_table_scan`
+sees all required single-query production boundary fields. Public promoted
+`/v1/api/*` views may use query policies only to bound materialized-output
+post-filtering and response size. Tenant/global concurrency admission now has a
+narrow production runtime-owned limiter boundary for the persisted table,
+persisted view, materialized-output post-filter, and recovered-query scan paths.
+Setting
 `max_concurrent_queries` without a compatible runtime limiter still fails query
 execution.
 

@@ -1797,6 +1797,51 @@ async fn gc_read_run_evidence_rejects_report_entries_not_in_plan() {
 }
 
 #[tokio::test]
+async fn gc_read_run_evidence_rejects_candidate_kind_key_mismatch() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+
+    for (run_id, location) in [
+        ("run-plan", "plan"),
+        ("run-deleted", "deleted"),
+        ("run-skipped", "skipped"),
+    ] {
+        let evidence_key = ObjectKey::garbage_collection_run(run_id).unwrap();
+        let mut run = garbage_collection_run(run_id, 1);
+        let candidate = GarbageCollectionCandidate {
+            object_key: ObjectKey::state_object("orders", 0, 7, location).unwrap(),
+            kind: GarbageCollectionCandidateKind::OutputObject,
+        };
+        match location {
+            "plan" => run.plan.candidates.push(candidate),
+            "deleted" => run.report.deleted.push(candidate),
+            "skipped" => run.report.skipped.push(candidate),
+            _ => unreachable!(),
+        }
+        store
+            .put(
+                &Path::from(evidence_key.as_str()),
+                Bytes::from(serde_json::to_vec(&run).unwrap()).into(),
+            )
+            .await
+            .unwrap();
+
+        let err = publisher
+            .read_garbage_collection_run_evidence(run_id)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            CheckpointPublishError::InvalidGarbageCollectionRunEvidence {
+                object_key,
+                reason,
+            } if object_key == evidence_key && reason.contains("candidate kind")
+        ));
+    }
+}
+
+#[tokio::test]
 async fn gc_ignores_publish_temp_attempt_objects() {
     let (_temp_dir, store) = temp_store();
     let publisher = CheckpointPublisher::new(Arc::clone(&store));

@@ -1,16 +1,21 @@
 use std::{
+    fs,
+    path::PathBuf,
+    sync::atomic::{AtomicUsize, Ordering},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use bytes::Bytes;
-use futures::TryStreamExt;
+use futures::{stream, StreamExt, TryStreamExt};
 use object_store::{
     aws::{AmazonS3Builder, S3ConditionalPut},
     path::Path,
     prefix::PrefixStore,
-    Error as ObjectStoreError, ObjectStore, PutMode,
+    Error as ObjectStoreError, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
+use serde_json::{json, Value};
 use velorix_storage::capability::{
     probe_authoritative_object_store_capabilities, AuthoritativeNamespace,
 };
@@ -144,6 +149,33 @@ async fn s3_compatible_gc_execution_persists_listed_run_and_retention_evidence()
     Ok(())
 }
 
+#[tokio::test]
+async fn s3_compatible_checkpoint_fault_matrix_writes_live_scenario_evidence() -> TestResult {
+    let Some(config) = live_config() else {
+        println!(
+            "skipping S3-compatible checkpoint fault matrix; set VELORIX_S3_COMPAT=1 to enable"
+        );
+        return Ok(());
+    };
+
+    let scenario_dir = scenario_dir();
+    fs::create_dir_all(&scenario_dir)?;
+
+    let scenarios = [
+        object_write_failure_scenario(&config).await?,
+        verification_read_failure_scenario(&config).await?,
+        manifest_write_failure_scenario(&config).await?,
+        delayed_visibility_scenario(&config).await?,
+        retry_after_failure_scenario(&config).await?,
+    ];
+
+    for scenario in scenarios {
+        write_scenario_evidence(&scenario_dir, scenario)?;
+    }
+
+    Ok(())
+}
+
 async fn validate_written_object(
     store: &dyn ObjectStore,
     key: &Path,
@@ -183,6 +215,410 @@ async fn validate_written_object(
     }
 
     Ok(())
+}
+
+async fn object_write_failure_scenario(config: &LiveConfig) -> Result<Value, TestError> {
+    let base = live_scenario_store(config, "object-write-failure")?;
+    let publisher = CheckpointPublisher::new(Arc::new(
+        FaultInjectingStore::new(Arc::clone(&base)).fail_put_prefix("v1/state/"),
+    ));
+    let state = fault_state(0, "object-write-failure");
+
+    let error = publisher
+        .write_state_object(&state)
+        .await
+        .expect_err("state write should fail under injected object-write failure");
+    assert_no_visible_checkpoint(&base, "object_write_failure").await?;
+
+    Ok(scenario_pass(
+        "object_write_failure",
+        "state object write failed before manifest publication",
+        "put v1/state/ returned a deterministic ObjectStore error",
+        error.to_string(),
+    ))
+}
+
+async fn verification_read_failure_scenario(config: &LiveConfig) -> Result<Value, TestError> {
+    let base = live_scenario_store(config, "verification-read-failure")?;
+    let writer = CheckpointPublisher::new(Arc::clone(&base));
+    let state = fault_state(0, "verification-read-failure");
+    let state_ref = writer.write_state_object(&state).await?;
+    let manifest = gc_manifest(0, 0, 1, None, vec![state_ref.clone()]);
+    let publisher = CheckpointPublisher::new(Arc::new(
+        FaultInjectingStore::new(Arc::clone(&base))
+            .fail_get_prefix(state_ref.object_key.as_str().to_string()),
+    ));
+
+    let error = publisher.publish_manifest(&manifest).await.expect_err(
+        "manifest publication should fail when state verification cannot read object metadata",
+    );
+    assert_no_visible_checkpoint(&base, "verification_read_failure").await?;
+
+    Ok(scenario_pass(
+        "verification_read_failure",
+        "manifest publication failed closed during referenced state verification",
+        "head/get for the referenced state object returned a deterministic ObjectStore error",
+        error.to_string(),
+    ))
+}
+
+async fn manifest_write_failure_scenario(config: &LiveConfig) -> Result<Value, TestError> {
+    let base = live_scenario_store(config, "manifest-write-failure")?;
+    let writer = CheckpointPublisher::new(Arc::clone(&base));
+    let state_ref = writer
+        .write_state_object(&fault_state(0, "manifest-write-failure"))
+        .await?;
+    let manifest = gc_manifest(0, 0, 1, None, vec![state_ref]);
+    let publisher = CheckpointPublisher::new(Arc::new(
+        FaultInjectingStore::new(Arc::clone(&base)).fail_put_prefix("v1/checkpoints/"),
+    ));
+
+    let error = publisher
+        .publish_manifest(&manifest)
+        .await
+        .expect_err("manifest write should fail under injected manifest-write failure");
+    assert_no_visible_checkpoint(&base, "manifest_write_failure").await?;
+
+    Ok(scenario_pass(
+        "manifest_write_failure",
+        "manifest put failure left no visible checkpoint",
+        "put v1/checkpoints/ returned a deterministic ObjectStore error",
+        error.to_string(),
+    ))
+}
+
+async fn delayed_visibility_scenario(config: &LiveConfig) -> Result<Value, TestError> {
+    let base = live_scenario_store(config, "delayed-visibility")?;
+    let publisher = CheckpointPublisher::new(Arc::clone(&base));
+    let state_ref = publisher
+        .write_state_object(&fault_state(0, "delayed-visibility"))
+        .await?;
+    publisher
+        .publish_manifest(&gc_manifest(0, 0, 1, None, vec![state_ref]))
+        .await?;
+
+    let delayed_reader = CheckpointPublisher::new(Arc::new(
+        FaultInjectingStore::new(Arc::clone(&base))
+            .hide_get_prefix("v1/checkpoint-index/latest-candidate.json")
+            .hide_list_prefix("v1/checkpoints"),
+    ));
+    if delayed_reader.latest_manifest().await?.is_some() {
+        return Err(test_error(
+            "delayed visibility injection did not hide the checkpoint on the first read",
+        ));
+    }
+    assert_visible_checkpoint_with(&delayed_reader, 0, "delayed_visibility retry").await?;
+
+    Ok(scenario_pass(
+        "delayed_visibility",
+        "temporary marker and listing invisibility produced no false checkpoint and later recovered",
+        "first marker get returned NotFound and first checkpoint listing returned empty",
+        "first read returned None; second read returned checkpoint 0",
+    ))
+}
+
+async fn retry_after_failure_scenario(config: &LiveConfig) -> Result<Value, TestError> {
+    let base = live_scenario_store(config, "retry-after-failure")?;
+    let failing_publisher = CheckpointPublisher::new(Arc::new(
+        FaultInjectingStore::new(Arc::clone(&base)).fail_put_prefix("v1/state/"),
+    ));
+    let state = fault_state(0, "retry-after-failure");
+    let first_error = failing_publisher
+        .write_state_object(&state)
+        .await
+        .expect_err("first state write should fail under transient object-write failure");
+    assert_no_visible_checkpoint(&base, "retry_after_failure first attempt").await?;
+
+    let retry_publisher = CheckpointPublisher::new(Arc::clone(&base));
+    let state_ref = retry_publisher.write_state_object(&state).await?;
+    retry_publisher
+        .publish_manifest(&gc_manifest(0, 0, 1, None, vec![state_ref]))
+        .await?;
+    assert_visible_checkpoint(&base, 0, "retry_after_failure").await?;
+
+    Ok(scenario_pass(
+        "retry_after_failure",
+        "explicit retry after transient write failure published one valid checkpoint",
+        "first put v1/state/ returned a deterministic ObjectStore error",
+        first_error.to_string(),
+    ))
+}
+
+async fn assert_no_visible_checkpoint(store: &Arc<dyn ObjectStore>, scenario: &str) -> TestResult {
+    let publisher = CheckpointPublisher::new(Arc::clone(store));
+    match publisher.latest_manifest().await? {
+        None => Ok(()),
+        Some(manifest) => Err(test_error(format!(
+            "{scenario}: unexpected visible checkpoint {}",
+            manifest.checkpoint_version
+        ))),
+    }
+}
+
+async fn assert_visible_checkpoint(
+    store: &Arc<dyn ObjectStore>,
+    checkpoint_version: u64,
+    scenario: &str,
+) -> TestResult {
+    let publisher = CheckpointPublisher::new(Arc::clone(store));
+    assert_visible_checkpoint_with(&publisher, checkpoint_version, scenario).await
+}
+
+async fn assert_visible_checkpoint_with(
+    publisher: &CheckpointPublisher,
+    checkpoint_version: u64,
+    scenario: &str,
+) -> TestResult {
+    let manifest = publisher.latest_manifest().await?.ok_or_else(|| {
+        test_error(format!(
+            "{scenario}: expected a visible checkpoint after live S3 write"
+        ))
+    })?;
+    if manifest.checkpoint_version != checkpoint_version {
+        return Err(test_error(format!(
+            "{scenario}: expected checkpoint {checkpoint_version}, got {}",
+            manifest.checkpoint_version
+        )));
+    }
+
+    Ok(())
+}
+
+fn fault_state(checkpoint_version: u64, object_id: &str) -> StateObjectWrite {
+    StateObjectWrite::new(
+        "s3_checkpoint_fault_matrix",
+        0,
+        checkpoint_version,
+        object_id,
+        Bytes::from(format!("{object_id}-state")),
+    )
+    .expect("fault matrix state key should be valid")
+}
+
+fn scenario_pass(
+    name: &'static str,
+    verified: &'static str,
+    fault_injection: &'static str,
+    observed: impl Into<String>,
+) -> Value {
+    json!({
+        "name": name,
+        "status": "pass",
+        "live_s3_compatible": true,
+        "backend": "external-s3-compatible",
+        "verified": verified,
+        "fault_injection": fault_injection,
+        "observed": observed.into(),
+    })
+}
+
+fn write_scenario_evidence(scenario_dir: &PathBuf, scenario: Value) -> TestResult {
+    let name = scenario
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| test_error("scenario evidence missing name"))?;
+    let path = scenario_dir.join(format!("{name}.json"));
+    fs::write(path, serde_json::to_vec_pretty(&scenario)?)?;
+
+    Ok(())
+}
+
+fn live_scenario_store(
+    config: &LiveConfig,
+    scenario_name: &str,
+) -> Result<Arc<dyn ObjectStore>, TestError> {
+    let store = live_store(config)?;
+    let prefix = Path::from(format!(
+        "{}/checkpoint-fault-matrix/{scenario_name}",
+        config.run_prefix
+    ));
+
+    Ok(Arc::new(PrefixStore::new(store, prefix)))
+}
+
+#[derive(Debug)]
+struct FaultInjectingStore {
+    inner: Arc<dyn ObjectStore>,
+    fail_put_prefix: Option<OneShotPrefix>,
+    fail_get_prefix: Option<OneShotPrefix>,
+    hide_get_prefix: Option<OneShotPrefix>,
+    hide_list_prefix: Option<OneShotPrefix>,
+}
+
+#[derive(Debug)]
+struct OneShotPrefix {
+    prefix: String,
+    remaining: AtomicUsize,
+}
+
+impl FaultInjectingStore {
+    fn new(inner: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            inner,
+            fail_put_prefix: None,
+            fail_get_prefix: None,
+            hide_get_prefix: None,
+            hide_list_prefix: None,
+        }
+    }
+
+    fn fail_put_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.fail_put_prefix = Some(OneShotPrefix::new(prefix));
+        self
+    }
+
+    fn fail_get_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.fail_get_prefix = Some(OneShotPrefix::new(prefix));
+        self
+    }
+
+    fn hide_get_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.hide_get_prefix = Some(OneShotPrefix::new(prefix));
+        self
+    }
+
+    fn hide_list_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.hide_list_prefix = Some(OneShotPrefix::new(prefix));
+        self
+    }
+}
+
+impl OneShotPrefix {
+    fn new(prefix: impl Into<String>) -> Self {
+        Self {
+            prefix: prefix.into(),
+            remaining: AtomicUsize::new(1),
+        }
+    }
+
+    fn consume_if_matches(&self, path: &str) -> bool {
+        path.starts_with(&self.prefix)
+            && self
+                .remaining
+                .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+    }
+}
+
+impl std::fmt::Display for FaultInjectingStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "fault-injecting-live-s3({})", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for FaultInjectingStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        if self
+            .fail_put_prefix
+            .as_ref()
+            .is_some_and(|fault| fault.consume_if_matches(location.as_ref()))
+        {
+            return Err(generic_store_error(
+                "fault-injecting-live-s3",
+                format!("injected put failure for {location}"),
+            ));
+        }
+
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        if self
+            .fail_get_prefix
+            .as_ref()
+            .is_some_and(|fault| fault.consume_if_matches(location.as_ref()))
+        {
+            return Err(generic_store_error(
+                "fault-injecting-live-s3",
+                format!("injected get failure for {location}"),
+            ));
+        }
+        if self
+            .hide_get_prefix
+            .as_ref()
+            .is_some_and(|fault| fault.consume_if_matches(location.as_ref()))
+        {
+            return Err(not_found_error(location, "injected delayed get visibility"));
+        }
+
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn delete(&self, location: &Path) -> object_store::Result<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+        if let Some(prefix) = prefix {
+            if self
+                .hide_list_prefix
+                .as_ref()
+                .is_some_and(|fault| fault.consume_if_matches(prefix.as_ref()))
+            {
+                return stream::empty().boxed();
+            }
+        }
+
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
+fn generic_store_error(store: &'static str, message: impl Into<String>) -> object_store::Error {
+    object_store::Error::Generic {
+        store,
+        source: Box::new(std::io::Error::other(message.into())),
+    }
+}
+
+fn not_found_error(location: &Path, message: impl Into<String>) -> object_store::Error {
+    object_store::Error::NotFound {
+        path: location.to_string(),
+        source: Box::new(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            message.into(),
+        )),
+    }
 }
 
 fn test_error(message: impl Into<String>) -> TestError {
@@ -237,6 +673,14 @@ struct LiveConfig {
 struct LiveGcConfig {
     run_prefix: String,
     run_id: String,
+}
+
+fn scenario_dir() -> PathBuf {
+    std::env::var("VELORIX_S3_CHECKPOINT_FAULT_MATRIX_SCENARIO_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from("target/velorix-product/s3-checkpoint-fault-matrix-scenarios")
+        })
 }
 
 fn live_gc_config(config: &LiveConfig) -> LiveGcConfig {

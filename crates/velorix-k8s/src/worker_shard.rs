@@ -28,11 +28,10 @@ use velorix_control::{
         plan_reconcile, EpochRecordFact, LeaseFact, ObservedControlPlaneFacts, ReconcileAction,
         ReconcilePlan, WorkerFact,
     },
-};
-use velorix_storage::{
-    capability::{AuthoritativeNamespace, AuthoritativeObjectStoreCapabilitiesV1},
-    ownership::OwnershipEpochRecord,
-    state::CheckpointPublisher,
+    storage_admin::{
+        AuthoritativeNamespace, AuthoritativeObjectStoreCapabilitiesV1, CheckpointPublishError,
+        CheckpointPublisher, OwnershipEpochRecord,
+    },
 };
 
 use crate::{
@@ -818,9 +817,9 @@ impl WorkerShardEpochStore for CheckpointPublisherEpochStore {
             .await
         {
             Ok(record) => Ok(Some(record)),
-            Err(velorix_storage::state::CheckpointPublishError::ObjectStore(
-                object_store::Error::NotFound { .. },
-            )) => Ok(None),
+            Err(CheckpointPublishError::ObjectStore(object_store::Error::NotFound { .. })) => {
+                Ok(None)
+            }
             Err(err) => Err(WorkerShardError::EpochStore(err.to_string())),
         }
     }

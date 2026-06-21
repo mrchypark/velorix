@@ -32,8 +32,11 @@ loop is:
 cargo run -p velorix-api
 ```
 
-Then call relation create, ingest, view create, query, and promoted API routes
-against the local server.
+Then call relation create, relation-scoped ingest through
+`/v1/relations/{relation_id}/ingest`, view create, query, and promoted API
+routes against the local server. Use `/v1/relations/ingest` as the public
+ordered batch ingest path when one request carries relation batches; do not use
+`/v1/ingest/epoch` as a user-facing product route.
 
 For an existing deployed product slice, run the authenticated REST E2E check:
 
@@ -45,6 +48,9 @@ The smoke uses `scripts/attach-vind-product-rest.sh` when it needs to attach to
 an existing port-forward. The attach helper can prefer the standing-runtime
 writer owner with `VELORIX_API_ATTACH_WRITER_OWNER=auto`; the evidence includes
 `GET /v1/standing-runtime/owners` and the protected OpenAPI readback.
+The smoke records both `scores-ingest.json` for
+`/v1/relations/{relation_id}/ingest` and `scores-batch-ingest.json` for the
+public `/v1/relations/ingest` batch path.
 
 `VELORIX_REST_API_SMOKE_ATTACH=auto` is the default. Set
 `VELORIX_REST_API_SMOKE_ATTACH=0` when the authenticated API is already
@@ -70,7 +76,8 @@ The local product path is no-PVC and jarless. Evidence is written under
 - `ingress-tls-auth-attestation.json`: public ingress/TLS/auth product
   attestation.
 - `ingest-writer-job-log.json`: product ingest-writer append evidence.
-- `rest-api-smoke.json`: authenticated REST relation/ingest/view/query smoke.
+- `rest-api-smoke.json`: authenticated REST relation-scoped ingest, public
+  relation batch ingest, view, and query smoke.
 
 Bearer-token auth evidence must include
 `data_plane_token_rejected_on_admin_route=true`. The product ingress wrappers
@@ -131,12 +138,16 @@ redacted release preflight details such as
 
 `VELORIX_PRODUCT_COMPLETE_REQUIRE_EXTERNAL_S3=0` is the current default.
 Therefore `object_store_external_authority` and
-`object_store_durability_policy` can be `out_of_scope`. The scope warning
+`object_store_durability_policy` can be `out_of_scope` for local diagnostics.
+The scope warning
 `object_store_external_authority_out_of_scope_does_not_prove_object_store_durability`
-is intentional: the local product slice can complete its current scope without
-claiming external S3/OSS durability. The report accepts only `pass` and
-`out_of_scope` gates for `product_complete=true` and derives
-`product_complete_blockers` from non-passing in-scope gates.
+is intentional: the local product slice can complete its diagnostic scope
+without claiming external S3/OSS durability. The report accepts `pass` or
+`out_of_scope` only for `local_diagnostic_complete=true`; release
+`product_complete=true` requires every product gate to be `pass`.
+Out-of-scope gates remain in `product_complete_blockers` and
+`completion_plan.deferred_steps` so the next-step helper can surface the
+operator action still needed for product completion.
 
 If external S3/OSS is later required, use `scripts/run-vind-product-external-s3.sh`
 and provide an S3_OR_OSS_ENDPOINT value as `AWS_ENDPOINT_URL`. That endpoint

@@ -750,21 +750,35 @@ fn deployed_ingest_writer_kubernetes_runtime_source_gates_pod_executor_after_pre
 
 #[test]
 fn deployed_ingest_writer_runtime_source_requires_startup_components() {
-    let source_code = include_str!("../src/ingest_writer.rs");
-    let runtime_body = function_body(source_code, "pub async fn from_startup_components(")
-        .expect("deployed ingest writer runtime assembly function should exist");
+    let runtime_source = include_str!("../../velorix-control/src/ingest_writer_runtime.rs");
+    let runtime_body = function_body(
+        runtime_source,
+        "pub async fn from_startup_components<Startup>(",
+    )
+    .expect("deployed ingest writer runtime assembly function should exist");
 
     assert!(
-        runtime_body.contains("startup_components: &OperatorAuthorityStartupComponents"),
-        "deployed ingest writer runtime assembly must require checked startup components"
+        runtime_body.contains("startup_components: &Startup"),
+        "deployed ingest writer runtime assembly must require checked startup components through the startup trait"
     );
     assert!(
-        runtime_body.contains("startup_components.ingest_admission_coordinator_provider()"),
+        runtime_body.contains(".coordinator_after_startup_reconstruction()"),
         "deployed ingest writer runtime must construct admission from startup components"
     );
     assert!(
-        runtime_body.contains("provider.coordinator_after_startup_reconstruction().await?"),
+        runtime_body.contains(".await?"),
         "deployed ingest writer runtime must reconstruct admission before append is exposed"
+    );
+    let k8s_source = include_str!("../src/ingest_writer.rs");
+    assert!(
+        k8s_source.contains(
+            "impl IngestWriterRuntimeStartup<ObjectStoreAuthorityRef> for OperatorAuthorityStartupComponents"
+        ),
+        "k8s startup components must adapt the generic deployed runtime"
+    );
+    assert!(
+        k8s_source.contains("self.ingest_admission_coordinator_provider()"),
+        "k8s startup adapter must construct admission from OperatorAuthorityStartupComponents"
     );
     for forbidden_call in [
         "IngestAdmissionCoordinator::new_checked(",
@@ -773,7 +787,7 @@ fn deployed_ingest_writer_runtime_source_requires_startup_components() {
     ] {
         assert!(
             !runtime_body.contains(forbidden_call),
-            "deployed ingest writer runtime must not bypass OperatorAuthorityStartupComponents with {forbidden_call}",
+            "deployed ingest writer runtime must not bypass checked startup components with {forbidden_call}",
         );
     }
 }

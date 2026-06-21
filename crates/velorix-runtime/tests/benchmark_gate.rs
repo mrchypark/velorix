@@ -209,6 +209,13 @@ fn benchmark_gate_can_require_specific_workload_names() {
             "checkpoint_publish",
             "checkpoint_recovery",
             "datafusion_table_scan",
+            "materialized_output_segment_pruning",
+            "materialized_output_recent_k",
+            "materialized_output_compaction_equivalence",
+            "materialized_output_compaction_debt",
+            "materialized_output_delete_vector",
+            "materialized_output_ttl_vector",
+            "materialized_output_late_materialization",
             "slatedb_state_reopen",
             "gc_dry_run_planning",
             "gc_execution_evidence",
@@ -486,6 +493,26 @@ fn local_workload_metrics() -> Vec<BenchmarkWorkloadMetricsV1> {
             scan_bytes: 1024,
         },
         BenchmarkWorkloadMetricsV1 {
+            name: "materialized_output_segment_pruning".to_string(),
+            p50_ms: 2.0,
+            p95_ms: 3.0,
+            object_requests: Some(ObjectRequestMetricsV1 {
+                put_count: 0,
+                get_count: 4,
+                list_count: 0,
+                range_read_count: 0,
+                bytes_written: 0,
+                bytes_read: 512,
+            }),
+            scan_bytes: 128,
+        },
+        materialized_output_metric("materialized_output_recent_k"),
+        materialized_output_metric("materialized_output_compaction_equivalence"),
+        materialized_output_metric("materialized_output_compaction_debt"),
+        materialized_output_metric("materialized_output_delete_vector"),
+        materialized_output_metric("materialized_output_ttl_vector"),
+        materialized_output_metric("materialized_output_late_materialization"),
+        BenchmarkWorkloadMetricsV1 {
             name: "slatedb_state_reopen".to_string(),
             p50_ms: 8.0,
             p95_ms: 9.0,
@@ -528,6 +555,23 @@ fn local_workload_metrics() -> Vec<BenchmarkWorkloadMetricsV1> {
             scan_bytes: 0,
         },
     ]
+}
+
+fn materialized_output_metric(name: &str) -> BenchmarkWorkloadMetricsV1 {
+    BenchmarkWorkloadMetricsV1 {
+        name: name.to_string(),
+        p50_ms: 2.0,
+        p95_ms: 3.0,
+        object_requests: Some(ObjectRequestMetricsV1 {
+            put_count: 0,
+            get_count: 4,
+            list_count: 0,
+            range_read_count: 0,
+            bytes_written: 0,
+            bytes_read: 512,
+        }),
+        scan_bytes: 128,
+    }
 }
 
 const VALID_LOCAL_SMOKE_JSON: &str = r#"{
@@ -625,6 +669,104 @@ const VALID_LOCAL_SMOKE_JSON: &str = r#"{
                 "bytes_read": 2048
             },
             "scan_bytes": 1024
+        },
+        {
+            "name": "materialized_output_segment_pruning",
+            "p50_ms": 2.0,
+            "p95_ms": 3.0,
+            "object_requests": {
+                "put_count": 0,
+                "get_count": 4,
+                "list_count": 0,
+                "range_read_count": 0,
+                "bytes_written": 0,
+                "bytes_read": 512
+            },
+            "scan_bytes": 128
+        },
+        {
+            "name": "materialized_output_recent_k",
+            "p50_ms": 2.0,
+            "p95_ms": 3.0,
+            "object_requests": {
+                "put_count": 0,
+                "get_count": 4,
+                "list_count": 0,
+                "range_read_count": 0,
+                "bytes_written": 0,
+                "bytes_read": 512
+            },
+            "scan_bytes": 128
+        },
+        {
+            "name": "materialized_output_compaction_equivalence",
+            "p50_ms": 2.0,
+            "p95_ms": 3.0,
+            "object_requests": {
+                "put_count": 0,
+                "get_count": 4,
+                "list_count": 0,
+                "range_read_count": 0,
+                "bytes_written": 0,
+                "bytes_read": 512
+            },
+            "scan_bytes": 128
+        },
+        {
+            "name": "materialized_output_compaction_debt",
+            "p50_ms": 2.0,
+            "p95_ms": 3.0,
+            "object_requests": {
+                "put_count": 0,
+                "get_count": 4,
+                "list_count": 0,
+                "range_read_count": 0,
+                "bytes_written": 0,
+                "bytes_read": 512
+            },
+            "scan_bytes": 128
+        },
+        {
+            "name": "materialized_output_delete_vector",
+            "p50_ms": 2.0,
+            "p95_ms": 3.0,
+            "object_requests": {
+                "put_count": 0,
+                "get_count": 4,
+                "list_count": 0,
+                "range_read_count": 0,
+                "bytes_written": 0,
+                "bytes_read": 512
+            },
+            "scan_bytes": 128
+        },
+        {
+            "name": "materialized_output_ttl_vector",
+            "p50_ms": 2.0,
+            "p95_ms": 3.0,
+            "object_requests": {
+                "put_count": 0,
+                "get_count": 4,
+                "list_count": 0,
+                "range_read_count": 0,
+                "bytes_written": 0,
+                "bytes_read": 512
+            },
+            "scan_bytes": 128
+        },
+        {
+            "name": "materialized_output_late_materialization",
+            "p50_ms": 2.0,
+            "p95_ms": 3.0,
+            "object_requests": {
+                "put_count": 0,
+                "get_count": 4,
+                "list_count": 0,
+                "range_read_count": 0,
+                "bytes_written": 0,
+                "bytes_read": 512
+            },
+            "scan_bytes": 128
         },
         {
             "name": "slatedb_state_reopen",

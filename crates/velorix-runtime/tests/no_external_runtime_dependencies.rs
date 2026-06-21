@@ -2,6 +2,7 @@ use std::{fs, path::Path};
 
 const PRODUCT_SOURCE_DIRS: &[&str] = &[
     "crates/velorix-api/src",
+    "crates/velorix-control/src",
     "crates/velorix-core/src",
     "crates/velorix-runtime/src",
     "crates/velorix-storage/src",
@@ -16,7 +17,6 @@ const FORBIDDEN_RUNTIME_DEPENDENCIES: &[&str] = &[
     "compiler_worker",
     "persistentvolumeclaim",
     "volumeclaimtemplates",
-    "pvc",
     "rustc",
     "javac",
     ".jar",

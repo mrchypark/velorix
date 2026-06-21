@@ -27,6 +27,30 @@ on:
         description: Path to deployed product evidence JSON with required-mode standing-runtime fencing.
         required: false
         default: ""
+      s3-checkpoint-fault-matrix-evidence-path:
+        description: Path to live S3-compatible checkpoint fault-matrix evidence JSON.
+        required: false
+        default: ""
+      hiqlite-restore-drill-evidence-path:
+        description: Path to live Hiqlite total-voter-loss restore drill evidence JSON.
+        required: false
+        default: ""
+      upgrade-rollback-repair-gc-fault-matrix-evidence-path:
+        description: Path to live upgrade/rollback/repair/GC fault-matrix evidence JSON.
+        required: false
+        default: ""
+      query-output-isolation-evidence-path:
+        description: Path to live query output isolation evidence JSON.
+        required: false
+        default: ""
+      security-release-provenance-evidence-path:
+        description: Path to live security/release provenance evidence JSON.
+        required: false
+        default: ""
+      remaining-release-readiness-evidence-path:
+        description: Path to remaining live release-readiness evidence JSON.
+        required: false
+        default: ""
       velorix-api-image-digest:
         description: sha256 digest of the velorix-api release image used by the product evidence.
         required: false
@@ -53,6 +77,12 @@ env:
   RUSTFS_PRODUCTION_GC_VALIDATION_EVIDENCE_PATH: ${{ inputs.rustfs-production-gc-validation-evidence-path }}
   INGEST_WRITER_LIFECYCLE_EVIDENCE_PATH: ${{ inputs.ingest-writer-lifecycle-evidence-path }}
   STANDING_RUNTIME_PRODUCT_EVIDENCE_PATH: ${{ inputs.standing-runtime-product-evidence-path }}
+  VELORIX_S3_CHECKPOINT_FAULT_MATRIX_EVIDENCE_PATH: ${{ inputs.s3-checkpoint-fault-matrix-evidence-path }}
+  VELORIX_HIQLITE_RESTORE_DRILL_EVIDENCE_PATH: ${{ inputs.hiqlite-restore-drill-evidence-path }}
+  VELORIX_UPGRADE_ROLLBACK_REPAIR_GC_FAULT_MATRIX_EVIDENCE_PATH: ${{ inputs.upgrade-rollback-repair-gc-fault-matrix-evidence-path }}
+  VELORIX_QUERY_OUTPUT_ISOLATION_EVIDENCE_PATH: ${{ inputs.query-output-isolation-evidence-path }}
+  VELORIX_SECURITY_RELEASE_PROVENANCE_EVIDENCE_PATH: ${{ inputs.security-release-provenance-evidence-path }}
+  VELORIX_REMAINING_RELEASE_READINESS_EVIDENCE_PATH: ${{ inputs.remaining-release-readiness-evidence-path }}
   VELORIX_API_IMAGE_DIGEST: ${{ inputs.velorix-api-image-digest }}
   VELORIX_META_IMAGE_DIGEST: ${{ inputs.velorix-meta-image-digest }}
   VELORIX_HIQLITE_IMAGE_DIGEST: ${{ inputs.hiqlite-image-digest }}
@@ -95,6 +125,30 @@ jobs:
             echo "release gate requires inputs.standing-runtime-product-evidence-path"
             exit 1
           fi
+          if [ -z "$VELORIX_S3_CHECKPOINT_FAULT_MATRIX_EVIDENCE_PATH" ]; then
+            echo "release gate requires inputs.s3-checkpoint-fault-matrix-evidence-path"
+            exit 1
+          fi
+          if [ -z "$VELORIX_HIQLITE_RESTORE_DRILL_EVIDENCE_PATH" ]; then
+            echo "release gate requires inputs.hiqlite-restore-drill-evidence-path"
+            exit 1
+          fi
+          if [ -z "$VELORIX_UPGRADE_ROLLBACK_REPAIR_GC_FAULT_MATRIX_EVIDENCE_PATH" ]; then
+            echo "release gate requires inputs.upgrade-rollback-repair-gc-fault-matrix-evidence-path"
+            exit 1
+          fi
+          if [ -z "$VELORIX_QUERY_OUTPUT_ISOLATION_EVIDENCE_PATH" ]; then
+            echo "release gate requires inputs.query-output-isolation-evidence-path"
+            exit 1
+          fi
+          if [ -z "$VELORIX_SECURITY_RELEASE_PROVENANCE_EVIDENCE_PATH" ]; then
+            echo "release gate requires inputs.security-release-provenance-evidence-path"
+            exit 1
+          fi
+          if [ -z "$VELORIX_REMAINING_RELEASE_READINESS_EVIDENCE_PATH" ]; then
+            echo "release gate requires inputs.remaining-release-readiness-evidence-path"
+            exit 1
+          fi
           if [ -z "$VELORIX_API_IMAGE_DIGEST" ]; then
             echo "release gate requires inputs.velorix-api-image-digest"
             exit 1
@@ -111,11 +165,64 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Fail if architecture critique still blocks 1.0
+        run: |
+          if grep -Eq '^\*\*Block 1\.0\.\*\*|still blocks release readiness' docs/architecture-critique.md; then
+            echo "docs/architecture-critique.md still declares a release-readiness blocker"
+            exit 1
+          fi
+
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo build artifacts
         uses: Swatinem/rust-cache@v2
+
+      - name: Check no external runtime artifacts
+        run: scripts/check-no-external-runtime-artifacts.sh
+
+      - name: Check crate boundary policy
+        run: scripts/check-crate-boundary-policy.sh
+
+      - name: Validate critique release evidence
+        run: |
+          test -f "$VELORIX_S3_CHECKPOINT_FAULT_MATRIX_EVIDENCE_PATH"
+          test -f "$VELORIX_HIQLITE_RESTORE_DRILL_EVIDENCE_PATH"
+          test -f "$VELORIX_UPGRADE_ROLLBACK_REPAIR_GC_FAULT_MATRIX_EVIDENCE_PATH"
+          test -f "$VELORIX_QUERY_OUTPUT_ISOLATION_EVIDENCE_PATH"
+          test -f "$VELORIX_SECURITY_RELEASE_PROVENANCE_EVIDENCE_PATH"
+          test -f "$VELORIX_REMAINING_RELEASE_READINESS_EVIDENCE_PATH"
+          mkdir -p target/release-evidence/critique
+          scripts/check-s3-checkpoint-fault-matrix-evidence.sh "$VELORIX_S3_CHECKPOINT_FAULT_MATRIX_EVIDENCE_PATH" \
+            > target/release-evidence/critique/s3-checkpoint-fault-matrix-validation.json
+          scripts/check-hiqlite-restore-drill-evidence.sh "$VELORIX_HIQLITE_RESTORE_DRILL_EVIDENCE_PATH" \
+            > target/release-evidence/critique/hiqlite-restore-drill-validation.json
+          scripts/check-upgrade-rollback-repair-gc-fault-matrix-evidence.sh "$VELORIX_UPGRADE_ROLLBACK_REPAIR_GC_FAULT_MATRIX_EVIDENCE_PATH" \
+            > target/release-evidence/critique/upgrade-rollback-repair-gc-fault-matrix-validation.json
+          scripts/check-query-output-isolation-evidence.sh "$VELORIX_QUERY_OUTPUT_ISOLATION_EVIDENCE_PATH" \
+            > target/release-evidence/critique/query-output-isolation-validation.json
+          scripts/check-security-release-provenance-evidence.sh "$VELORIX_SECURITY_RELEASE_PROVENANCE_EVIDENCE_PATH" \
+            > target/release-evidence/critique/security-release-provenance-validation.json
+          scripts/check-remaining-release-readiness-evidence.sh "$VELORIX_REMAINING_RELEASE_READINESS_EVIDENCE_PATH" \
+            > target/release-evidence/critique/remaining-release-readiness-validation.json
+          S3_CHECKPOINT_FAULT_MATRIX_RELEASE_PATH="$(scripts/copy-readiness-sibling-evidence.py --kind critique --artifact "$VELORIX_S3_CHECKPOINT_FAULT_MATRIX_EVIDENCE_PATH" --out-dir target/release-evidence/critique --artifact-name s3-checkpoint-fault-matrix.json)"
+          test -f "$S3_CHECKPOINT_FAULT_MATRIX_RELEASE_PATH"
+          printf 'S3_CHECKPOINT_FAULT_MATRIX_RELEASE_PATH=%s\n' "$S3_CHECKPOINT_FAULT_MATRIX_RELEASE_PATH" >> "$GITHUB_ENV"
+          HIQLITE_RESTORE_DRILL_RELEASE_PATH="$(scripts/copy-readiness-sibling-evidence.py --kind critique --artifact "$VELORIX_HIQLITE_RESTORE_DRILL_EVIDENCE_PATH" --out-dir target/release-evidence/critique --artifact-name hiqlite-restore-drill.json)"
+          test -f "$HIQLITE_RESTORE_DRILL_RELEASE_PATH"
+          printf 'HIQLITE_RESTORE_DRILL_RELEASE_PATH=%s\n' "$HIQLITE_RESTORE_DRILL_RELEASE_PATH" >> "$GITHUB_ENV"
+          UPGRADE_ROLLBACK_REPAIR_GC_FAULT_MATRIX_RELEASE_PATH="$(scripts/copy-readiness-sibling-evidence.py --kind critique --artifact "$VELORIX_UPGRADE_ROLLBACK_REPAIR_GC_FAULT_MATRIX_EVIDENCE_PATH" --out-dir target/release-evidence/critique --artifact-name upgrade-rollback-repair-gc-fault-matrix.json)"
+          test -f "$UPGRADE_ROLLBACK_REPAIR_GC_FAULT_MATRIX_RELEASE_PATH"
+          printf 'UPGRADE_ROLLBACK_REPAIR_GC_FAULT_MATRIX_RELEASE_PATH=%s\n' "$UPGRADE_ROLLBACK_REPAIR_GC_FAULT_MATRIX_RELEASE_PATH" >> "$GITHUB_ENV"
+          QUERY_OUTPUT_ISOLATION_RELEASE_PATH="$(scripts/copy-readiness-sibling-evidence.py --kind critique --artifact "$VELORIX_QUERY_OUTPUT_ISOLATION_EVIDENCE_PATH" --out-dir target/release-evidence/critique --artifact-name query-output-isolation.json)"
+          test -f "$QUERY_OUTPUT_ISOLATION_RELEASE_PATH"
+          printf 'QUERY_OUTPUT_ISOLATION_RELEASE_PATH=%s\n' "$QUERY_OUTPUT_ISOLATION_RELEASE_PATH" >> "$GITHUB_ENV"
+          SECURITY_RELEASE_PROVENANCE_RELEASE_PATH="$(scripts/copy-readiness-sibling-evidence.py --kind critique --artifact "$VELORIX_SECURITY_RELEASE_PROVENANCE_EVIDENCE_PATH" --out-dir target/release-evidence/critique --artifact-name security-release-provenance.json)"
+          test -f "$SECURITY_RELEASE_PROVENANCE_RELEASE_PATH"
+          printf 'SECURITY_RELEASE_PROVENANCE_RELEASE_PATH=%s\n' "$SECURITY_RELEASE_PROVENANCE_RELEASE_PATH" >> "$GITHUB_ENV"
+          REMAINING_RELEASE_READINESS_RELEASE_PATH="$(scripts/copy-readiness-sibling-evidence.py --kind critique --artifact "$VELORIX_REMAINING_RELEASE_READINESS_EVIDENCE_PATH" --out-dir target/release-evidence/critique --artifact-name remaining-release-readiness.json)"
+          test -f "$REMAINING_RELEASE_READINESS_RELEASE_PATH"
+          printf 'REMAINING_RELEASE_READINESS_RELEASE_PATH=%s\n' "$REMAINING_RELEASE_READINESS_RELEASE_PATH" >> "$GITHUB_ENV"
 
       - name: Install cargo-deny
         uses: taiki-e/install-action@v2
@@ -133,11 +240,6 @@ jobs:
             --manifest dependency-governance.json \
             --cargo-deny-json target/dependency-governance/cargo-deny.jsonl \
             --json > target/dependency-governance/local-dependency-governance-evidence.json
-
-      - name: Validate production readiness status matrix
-        run: |
-          cargo run -p velorix-cli -- release-status-validate \
-            --status-matrix docs/architecture/production-readiness-status.md
 
       - name: Run release benchmark gate
         run: |
@@ -157,6 +259,12 @@ jobs:
           test -f "$RUSTFS_PRODUCTION_GC_VALIDATION_EVIDENCE_PATH"
           test -f "$INGEST_WRITER_LIFECYCLE_EVIDENCE_PATH"
           test -f "$STANDING_RUNTIME_PRODUCT_EVIDENCE_PATH"
+          test -f "$S3_CHECKPOINT_FAULT_MATRIX_RELEASE_PATH"
+          test -f "$HIQLITE_RESTORE_DRILL_RELEASE_PATH"
+          test -f "$UPGRADE_ROLLBACK_REPAIR_GC_FAULT_MATRIX_RELEASE_PATH"
+          test -f "$QUERY_OUTPUT_ISOLATION_RELEASE_PATH"
+          test -f "$SECURITY_RELEASE_PROVENANCE_RELEASE_PATH"
+          test -f "$REMAINING_RELEASE_READINESS_RELEASE_PATH"
           mkdir -p target/release-evidence/rustfs-production-gc
           mkdir -p target/release-evidence/ingest-writer-lifecycle
           mkdir -p target/release-evidence/standing-runtime-product
@@ -227,7 +335,7 @@ jobs:
           cargo run -p velorix-cli -- readiness-report \
             --evidence "$READINESS_EVIDENCE_PATH" \
             --require-release-artifacts \
-            --dependency-governance-evidence target/dependency-governance/dependency-governance-evidence.json \
+            --dependency-governance-evidence target/dependency-governance/local-dependency-governance-evidence.json \
             --dependency-governance-manifest dependency-governance.json \
             --release-commit "$RELEASE_COMMIT" \
             --s3-release-benchmark-gate-evidence target/release-evidence/s3-release-benchmark-gate.json \
@@ -235,6 +343,12 @@ jobs:
             --rustfs-production-gc-validation-evidence "$RUSTFS_PRODUCTION_GC_RECHECKED_PATH" \
             --ingest-writer-lifecycle-evidence "$INGEST_WRITER_LIFECYCLE_RELEASE_PATH" \
             --standing-runtime-product-evidence "$STANDING_RUNTIME_PRODUCT_RELEASE_PATH" \
+            --s3-checkpoint-fault-matrix-evidence "$S3_CHECKPOINT_FAULT_MATRIX_RELEASE_PATH" \
+            --hiqlite-restore-drill-evidence "$HIQLITE_RESTORE_DRILL_RELEASE_PATH" \
+            --upgrade-rollback-repair-gc-fault-matrix-evidence "$UPGRADE_ROLLBACK_REPAIR_GC_FAULT_MATRIX_RELEASE_PATH" \
+            --query-output-isolation-evidence "$QUERY_OUTPUT_ISOLATION_RELEASE_PATH" \
+            --security-release-provenance-evidence "$SECURITY_RELEASE_PROVENANCE_RELEASE_PATH" \
+            --remaining-release-readiness-evidence "$REMAINING_RELEASE_READINESS_RELEASE_PATH" \
             --json \
             > target/release-evidence/production-readiness-report.json
 
@@ -261,3 +375,4 @@ jobs:
             target/release-evidence/rustfs-production-gc/**
             target/release-evidence/ingest-writer-lifecycle/**
             target/release-evidence/standing-runtime-product/**
+            target/release-evidence/critique/**

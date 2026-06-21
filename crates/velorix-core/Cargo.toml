@@ -6,12 +6,12 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 arrow = { workspace = true }
-datafusion = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+sqlparser = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+tokio = { workspace = true }

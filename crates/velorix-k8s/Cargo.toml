@@ -17,7 +17,6 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["process"] }
 velorix-control = { path = "../velorix-control" }
-velorix-storage = { path = "../velorix-storage" }
 
 [dev-dependencies]
 arrow = { workspace = true, features = ["ipc"] }
@@ -25,3 +24,4 @@ http = "1"
 http-body-util = "0.1"
 tempfile = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
+velorix-storage = { path = "../velorix-storage" }

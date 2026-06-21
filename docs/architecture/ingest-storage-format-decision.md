@@ -82,9 +82,10 @@ For the first implementation, a narrow relation shape is acceptable if it is
 explicitly versioned and tested. It must not preserve the old JSON
 `DeltaKey`/`DeltaValue` model as the durable ingest contract.
 
-## API Semantics
+## Storage-Layer Append Semantics
 
-The ingest acknowledgement contract in `storage-contract.md` remains in force:
+The storage-layer append acknowledgement contract in `storage-contract.md`
+remains in force for durable input admission:
 
 - `201 Created` means the canonical ingest object was created successfully.
 - `200 OK` means an exact idempotent retry found the same durable object and
@@ -92,6 +93,12 @@ The ingest acknowledgement contract in `storage-contract.md` remains in force:
 - `409 Conflict` means the key, range, digest, or idempotency mapping conflicts.
 - `202 Accepted` is future async admission only and cannot claim persistence
   without a separate durable admission record.
+
+This is not the public 1.0 relation ingest contract. Public
+`/v1/relations/{relation_id}/ingest` and `/v1/relations/ingest` expose only the
+synchronous `materialized` acknowledgement: the relation update and active
+dependent materialized-view effects must be durably published before success is
+returned.
 
 `schema_fingerprint` is not a hash of raw Arrow IPC schema bytes. It is a hash
 of `VelorixRelationSchemaV1` as defined in

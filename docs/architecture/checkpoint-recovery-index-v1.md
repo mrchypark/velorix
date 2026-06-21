@@ -12,6 +12,16 @@ v1/checkpoints/{checkpoint_version:020}.manifest
 
 Latest indexes are advisory acceleration only.
 
+## CheckpointManifestV1 Invariants
+
+Each `CheckpointManifestV1` binds the admitted plan hash, owner fencing
+token/epoch, input frontier vector, operator state objects, materialized output
+objects/pages/deltas, output schema/fingerprint, previous checkpoint
+pointer/hash, and query-visible version. Query serving and recovery both start
+from the same authoritative checkpoint pointer and then validate the immutable
+manifest it names. Index and latest-cache objects may accelerate lookup, but
+they are advisory only and never replace the pointer or manifest as authority.
+
 ## Latest Candidate
 
 An optional marker may point at a candidate latest checkpoint:
@@ -38,19 +48,12 @@ permanently hide the last known good checkpoint.
 - `last_known_good_read_only`: allow read-only recovery from an admin-selected
   valid checkpoint.
 
-`velorix-cli recover-local --object-store-dir <path> --relation-id <id> --relation-version <version> --slatedb-state-path <object-store-db-path> --checkpoint-version <n>`
-starts SlateDB-backed recovery from an admin-selected published checkpoint after
-reading the persisted relation catalog record and validating the manifest
-body/key/version, parent lineage, referenced payloads, and the digest-bound
-`published` lifecycle record. Recovery then replays durable ingest after that
-checkpoint boundary.
-SlateDB-backed checkpoint state is explicit: `--slatedb-state-path
-<object-store-db-path>` opens the SlateDB state substrate for
-selected-checkpoint or latest-checkpoint recovery; the path is the object-store
-database path stored in the checkpoint ref, not another local object-store root.
-If `--slatedb-state-path` is omitted, `recover-local` treats the operation as
-legacy raw-object bootstrap/migration recovery and requires
-`--allow-bootstrap-raw-state` before it will open that path.
+The public CLI no longer starts engine recovery directly. It exposes local
+inspection and admin metadata repair commands only; runtime recovery must happen
+inside the runtime/API process that owns the materializer and checkpoint
+authority. SlateDB-backed checkpoint state remains explicit in checkpoint refs:
+the stored object-store database path is opened by the runtime recovery path,
+not by a separate CLI engine instance.
 
 ## Lifecycle Status
 
@@ -123,6 +126,32 @@ timestamp. It is readiness/admin evidence that recovery crossed a validated
 checkpoint boundary; it is not checkpoint authority, does not mutate lifecycle
 status, and does not claim broader compaction, repair, or manifest deletion
 policy.
+
+## Upgrade, Repair, And GC Reachability Contract
+
+Supported release N must read release N-1 checkpoint manifests, output
+manifests/pages/deltas, and state payload refs before an upgrade or rollback can
+be called release-ready. Repair may restore only from the last valid published
+checkpoint plus durable admitted replay up to the authoritative frontier; it
+must not rewrite immutable manifests or reconstruct query output through source
+queries.
+
+GC reachability roots are the authoritative latest checkpoint pointers, the
+predecessor chain required by the supported upgrade/rollback window, durable
+admitted replay lower bounds, explicit repair holds, active reader generations,
+and materialized output compaction source/output manifests. A candidate outside
+those roots may be deleted only after the GC plan, persisted run evidence,
+retention evidence, and transition evidence agree on the same manifest digests
+and policy.
+
+Current local evidence is contract/admin evidence only. It does not satisfy the
+live upgrade, rollback, repair, and GC fault-injection matrix required to remove
+the `docs/architecture-critique.md` recovery blocker.
+
+Release readiness also requires S3-compatible delayed-visibility, retry, and
+fault-injection checkpoint matrix evidence proving metadata CAS and the
+object-store object set cannot publish a mixed checkpoint. Local object-store or
+RustFS-only checkpoint evidence does not satisfy this release gate.
 
 ## Verification
 

@@ -14,8 +14,8 @@ use thiserror::Error;
 use velorix_control::lease::{
     LeaseAcquireRequest, LeaseError, PartitionLeaseClient, PartitionLeaseGrant, PartitionLeaseKey,
 };
-use velorix_storage::{
-    object_key::ObjectKey, ownership::OwnershipEpochRecord, state::CheckpointPublisher,
+use velorix_control::storage_admin::{
+    CheckpointPublishError, CheckpointPublisher, ObjectKey, OwnershipEpochRecord,
 };
 
 const VIEW_ID_ANNOTATION: &str = "control.velorix.io/view-id";
@@ -280,7 +280,7 @@ pub async fn persist_ownership_epoch_record_from_grant(
     lease_identity: impl Into<String>,
     created_at: impl Into<String>,
     previous_checkpoint_version: Option<u64>,
-) -> Result<ObjectKey, velorix_storage::state::CheckpointPublishError> {
+) -> Result<ObjectKey, CheckpointPublishError> {
     let record = ownership_epoch_record_from_grant(
         grant,
         lease_identity,

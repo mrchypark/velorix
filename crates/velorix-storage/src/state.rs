@@ -1438,6 +1438,25 @@ impl CheckpointPublisher {
                 },
             );
         }
+        for candidate in run
+            .plan
+            .candidates
+            .iter()
+            .chain(&run.report.deleted)
+            .chain(&run.report.skipped)
+        {
+            if !candidate.kind.matches_key(&candidate.object_key) {
+                return Err(
+                    CheckpointPublishError::InvalidGarbageCollectionRunEvidence {
+                        object_key: object_key.clone(),
+                        reason: format!(
+                            "candidate kind {:?} does not match object key `{}`",
+                            candidate.kind, candidate.object_key
+                        ),
+                    },
+                );
+            }
+        }
         for candidate in run.report.deleted.iter().chain(&run.report.skipped) {
             if !run.plan.candidates.contains(candidate) {
                 return Err(

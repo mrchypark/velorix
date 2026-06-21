@@ -411,6 +411,7 @@ fn checkpoint_pointer(epoch: u64, hash_seed: &str) -> StandingRuntimeCheckpointP
         checkpoint_key: proto.checkpoint_key,
         logical_epoch: proto.logical_epoch,
         content_hash: proto.content_hash,
+        manifest_hash: proto.manifest_hash,
         output_manifest_refs: proto.output_manifest_refs,
     }
 }
@@ -426,6 +427,7 @@ fn proto_checkpoint_pointer(epoch: u64, hash_seed: &str) -> ProtoCheckpointPoint
         ),
         logical_epoch: epoch,
         content_hash: format!("sha256:{hash}"),
+        manifest_hash: format!("sha256:{hash}"),
         output_manifest_refs: Vec::new(),
     }
 }

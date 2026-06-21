@@ -62,9 +62,9 @@ When an ingest epoch is committed, affected views are advanced to that epoch and
 publish changed materialized output. Query serving reads the materialized output
 state for the view rather than scanning all source relation data.
 
-Two-relation joins must advance on an epoch-consistent snapshot. If an epoch
-contains changes for multiple participating relations, the join view observes
-the committed relation changes as one consistent view update boundary.
+Two-relation joins publish checkpoint-bound per-relation frontier vectors.
+Sequential relation ingests may expose sequential intermediate results; each
+published join output must state the exact input frontiers it has applied.
 
 ## Metadata, Cache, and Checkpoints
 
@@ -125,6 +125,7 @@ closed or use an explicitly accepted repair path.
 - Query reads materialized output rather than recomputing from source relations.
 - Restart recovers from hiqlite metadata and durable checkpoints.
 - Replay after restart applies only epochs after the restored checkpoint.
-- Two-relation join views update consistently at epoch boundaries.
+- Two-relation join views publish checkpoint-bound per-relation frontier
+  vectors.
 - Product execution does not require internal compiler services, generated
   artifact deployment, or PVC.

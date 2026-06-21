@@ -18,6 +18,8 @@ external_s3_path="${repo_root}/scripts/run-vind-product-external-s3.sh"
 durability_assess_path="${repo_root}/scripts/assess-object-store-durability-policy.sh"
 attach_rest_path="${repo_root}/scripts/attach-vind-product-rest.sh"
 rest_api_smoke_path="${repo_root}/scripts/smoke-vind-rest-api.sh"
+rest_join_smoke_path="${repo_root}/scripts/smoke-vind-rest-join.sh"
+stress_chaos_soak_path="${repo_root}/scripts/run-vind-product-stress-chaos-soak.sh"
 product_completion_report_path="${repo_root}/scripts/report-vind-product-completion.sh"
 refresh_deployed_images_path="${repo_root}/scripts/refresh-vind-product-deployed-images.sh"
 product_ingress_attest_path="${repo_root}/scripts/attest-vind-product-ingress.sh"
@@ -30,18 +32,81 @@ product_complete_path="${repo_root}/scripts/complete-vind-product.sh"
 failover_evidence_writer_path="${repo_root}/scripts/write-standing-runtime-failover-evidence.py"
 complete_input_preflight_path="${repo_root}/scripts/write-complete-vind-product-input-preflight.py"
 next_product_step_path="${repo_root}/scripts/next-vind-product-step.sh"
+crate_boundary_policy_path="${repo_root}/scripts/check-crate-boundary-policy.sh"
+no_external_runtime_artifacts_path="${repo_root}/scripts/check-no-external-runtime-artifacts.sh"
+hiqlite_backup_restore_evidence_path="${repo_root}/scripts/check-hiqlite-backup-restore-evidence.sh"
+s3_checkpoint_fault_matrix_runner_path="${repo_root}/scripts/run-s3-checkpoint-fault-matrix.sh"
 
-python3 - "$script_path" "$first_e2e_path" "$cli_path" "$meta_cargo_path" "$doc_path" "$release_copy_path" "$attest_path" "$durability_attest_path" "$backend_time_attest_path" "$backend_time_release_preflight_path" "$backend_time_release_env_path" "$external_rustfs_path" "$external_s3_path" "$durability_assess_path" "$attach_rest_path" "$rest_api_smoke_path" "$product_completion_report_path" "$refresh_deployed_images_path" "$product_ingress_attest_path" "$product_ingress_apply_path" "$product_ingress_attach_path" "$product_ingress_complete_path" "$object_store_durability_attach_path" "$object_store_durability_complete_path" "$product_complete_path" "$failover_evidence_writer_path" "$complete_input_preflight_path" "$next_product_step_path" <<'PY'
+python3 - "$script_path" "$first_e2e_path" "$cli_path" "$meta_cargo_path" "$doc_path" "$release_copy_path" "$attest_path" "$durability_attest_path" "$backend_time_attest_path" "$backend_time_release_preflight_path" "$backend_time_release_env_path" "$external_rustfs_path" "$external_s3_path" "$durability_assess_path" "$attach_rest_path" "$rest_api_smoke_path" "$rest_join_smoke_path" "$stress_chaos_soak_path" "$product_completion_report_path" "$refresh_deployed_images_path" "$product_ingress_attest_path" "$product_ingress_apply_path" "$product_ingress_attach_path" "$product_ingress_complete_path" "$object_store_durability_attach_path" "$object_store_durability_complete_path" "$product_complete_path" "$failover_evidence_writer_path" "$complete_input_preflight_path" "$next_product_step_path" "$crate_boundary_policy_path" "$no_external_runtime_artifacts_path" "$hiqlite_backup_restore_evidence_path" "$s3_checkpoint_fault_matrix_runner_path" <<'PY'
 import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import tomllib
 from pathlib import Path
 
-script_path, first_e2e_path, cli_path, meta_cargo_path, doc_path, release_copy_path, attest_path, durability_attest_path, backend_time_attest_path, backend_time_release_preflight_path, backend_time_release_env_path, external_rustfs_path, external_s3_path, durability_assess_path, attach_rest_path, rest_api_smoke_path, product_completion_report_path, refresh_deployed_images_path, product_ingress_attest_path, product_ingress_apply_path, product_ingress_attach_path, product_ingress_complete_path, object_store_durability_attach_path, object_store_durability_complete_path, product_complete_path, failover_evidence_writer_path, complete_input_preflight_path, next_product_step_path = sys.argv[1:]
+script_path, first_e2e_path, cli_path, meta_cargo_path, doc_path, release_copy_path, attest_path, durability_attest_path, backend_time_attest_path, backend_time_release_preflight_path, backend_time_release_env_path, external_rustfs_path, external_s3_path, durability_assess_path, attach_rest_path, rest_api_smoke_path, rest_join_smoke_path, stress_chaos_soak_path, product_completion_report_path, refresh_deployed_images_path, product_ingress_attest_path, product_ingress_apply_path, product_ingress_attach_path, product_ingress_complete_path, object_store_durability_attach_path, object_store_durability_complete_path, product_complete_path, failover_evidence_writer_path, complete_input_preflight_path, next_product_step_path, crate_boundary_policy_path, no_external_runtime_artifacts_path, hiqlite_backup_restore_evidence_path, s3_checkpoint_fault_matrix_runner_path = sys.argv[1:]
 repo_root = Path(script_path).parents[1]
+fixture_ref_digest = "a" * 64
+fixture_source_revision = "9f1c0e2d4b6a8c0f13579bdf2468ace013579bdf"
+fixture_deployed_image_digests = {
+    "velorix-api": "sha256:3b2c1d0e4f5061728394a5b6c7d8e9f00123456789abcdef0fedcba987654321",
+    "velorix-meta": "sha256:4c3d2e1f5061728394a5b6c7d8e9f001123456789abcdef00fedcba987654322",
+}
+
+
+def add_fixture_release_identity(value):
+    payload = dict(value)
+    payload["source_revision"] = fixture_source_revision
+    payload["deployed_image_digests"] = dict(fixture_deployed_image_digests)
+    return payload
+
+
+def add_fixture_ref_digests(value):
+    if isinstance(value, str):
+        if value.startswith("s3://release-evidence/") and "sha256=" not in value:
+            separator = "&" if "?" in value else "?"
+            return f"{value}{separator}sha256={fixture_ref_digest}"
+        return value
+    if isinstance(value, list):
+        return [add_fixture_ref_digests(item) for item in value]
+    if isinstance(value, dict):
+        return {key: add_fixture_ref_digests(item) for key, item in value.items()}
+    return value
+
+
+s3_checkpoint_fault_matrix_evidence_path = (
+    repo_root / "scripts" / "check-s3-checkpoint-fault-matrix-evidence.sh"
+)
+hiqlite_restore_drill_evidence_path = (
+    repo_root / "scripts" / "check-hiqlite-restore-drill-evidence.sh"
+)
+upgrade_repair_gc_fault_matrix_evidence_path = (
+    repo_root / "scripts" / "check-upgrade-rollback-repair-gc-fault-matrix-evidence.sh"
+)
+upgrade_repair_gc_fault_matrix_runner_path = (
+    repo_root / "scripts" / "run-upgrade-rollback-repair-gc-fault-matrix.sh"
+)
+query_output_isolation_evidence_path = (
+    repo_root / "scripts" / "check-query-output-isolation-evidence.sh"
+)
+query_output_isolation_runner_path = (
+    repo_root / "scripts" / "run-query-output-isolation-check.sh"
+)
+security_release_provenance_evidence_path = (
+    repo_root / "scripts" / "check-security-release-provenance-evidence.sh"
+)
+security_release_provenance_runner_path = (
+    repo_root / "scripts" / "run-security-release-provenance-check.sh"
+)
+remaining_release_readiness_evidence_path = (
+    repo_root / "scripts" / "check-remaining-release-readiness-evidence.sh"
+)
+remaining_release_readiness_runner_path = (
+    repo_root / "scripts" / "run-remaining-release-readiness-check.sh"
+)
 with open(script_path, "r", encoding="utf-8") as f:
     script = f.read()
 with open(first_e2e_path, "r", encoding="utf-8") as f:
@@ -56,6 +121,14 @@ with open(repo_root / ".github" / "workflows" / "release-gate.yml", "r", encodin
     release_gate = f.read()
 with open(repo_root / "docs" / "release" / "1.0-readiness-checklist.md", "r", encoding="utf-8") as f:
     release_doc = f.read()
+with open(repo_root / "docs" / "architecture" / "production-readiness-status.md", "r", encoding="utf-8") as f:
+    production_readiness_status = f.read()
+with open(repo_root / "docs" / "architecture" / "dependency-governance.md", "r", encoding="utf-8") as f:
+    dependency_governance_doc = f.read()
+with open(repo_root / "dependency-governance.json", "r", encoding="utf-8") as f:
+    dependency_governance_manifest = json.load(f)
+with open(repo_root / "docs" / "architecture" / "s3-compatible-test-harness.md", "r", encoding="utf-8") as f:
+    s3_compatible_test_harness = f.read()
 with open(release_copy_path, "r", encoding="utf-8") as f:
     release_copy = f.read()
 with open(attest_path, "r", encoding="utf-8") as f:
@@ -78,6 +151,19 @@ with open(attach_rest_path, "r", encoding="utf-8") as f:
     attach_rest = f.read()
 with open(rest_api_smoke_path, "r", encoding="utf-8") as f:
     rest_api_smoke = f.read()
+with open(rest_join_smoke_path, "r", encoding="utf-8") as f:
+    rest_join_smoke = f.read()
+rest_sql_family_smoke_paths = [
+    repo_root / "scripts" / "smoke-vind-rest-select-star.sh",
+    repo_root / "scripts" / "smoke-vind-rest-avg.sh",
+    repo_root / "scripts" / "smoke-vind-rest-row-number.sh",
+]
+rest_sql_family_smokes = {
+    path.name: path.read_text(encoding="utf-8") if path.is_file() else ""
+    for path in rest_sql_family_smoke_paths
+}
+with open(stress_chaos_soak_path, "r", encoding="utf-8") as f:
+    stress_chaos_soak = f.read()
 with open(product_completion_report_path, "r", encoding="utf-8") as f:
     product_completion_report = f.read()
 with open(refresh_deployed_images_path, "r", encoding="utf-8") as f:
@@ -104,8 +190,42 @@ with open(next_product_step_path, "r", encoding="utf-8") as f:
     next_product_step = f.read()
 with open(repo_root / "scripts" / "write-complete-vind-product-env.sh", "r", encoding="utf-8") as f:
     complete_product_env = f.read()
+with open(repo_root / "docs" / "architecture-critique.md", "r", encoding="utf-8") as f:
+    architecture_critique = f.read()
+with open(repo_root / "docs" / "architecture" / "materialized-view-runtime-roadmap.md", "r", encoding="utf-8") as f:
+    materialized_view_roadmap = f.read()
+with open(repo_root / "docs" / "architecture" / "materialized-output-segment-index-v1.md", "r", encoding="utf-8") as f:
+    materialized_output_segment_index = f.read()
+with open(repo_root / "docs" / "architecture" / "ingest-admission-contract.md", "r", encoding="utf-8") as f:
+    ingest_admission_contract = f.read()
+with open(repo_root / "docs" / "architecture" / "ingest-storage-format-decision.md", "r", encoding="utf-8") as f:
+    ingest_storage_format_decision = f.read()
+with open(repo_root / "docs" / "architecture" / "api-serving-scope-v1.md", "r", encoding="utf-8") as f:
+    api_serving_scope = f.read()
+with open(repo_root / "docs" / "architecture" / "datafusion-resource-policy-v1.md", "r", encoding="utf-8") as f:
+    datafusion_resource_policy = f.read()
+with open(repo_root / "docs" / "architecture" / "object-store-capabilities-v1.md", "r", encoding="utf-8") as f:
+    object_store_capabilities_doc = f.read()
+with open(repo_root / "docs" / "architecture" / "checkpoint-recovery-index-v1.md", "r", encoding="utf-8") as f:
+    checkpoint_recovery_index = f.read()
+with open(repo_root / "docs" / "architecture" / "storage-contract.md", "r", encoding="utf-8") as f:
+    storage_contract = f.read()
 with open(repo_root / "crates" / "velorix-api" / "src" / "lib.rs", "r", encoding="utf-8") as f:
     api = f.read()
+with open(repo_root / "crates" / "velorix-control" / "src" / "readiness.rs", "r", encoding="utf-8") as f:
+    control_readiness = f.read()
+runtime_cargo = tomllib.loads((repo_root / "crates" / "velorix-runtime" / "Cargo.toml").read_text(encoding="utf-8"))
+object_store_duplicate_exception = next(
+    (
+        item
+        for item in dependency_governance_manifest.get("exceptions", [])
+        if item.get("kind") == "duplicate" and item.get("crate") == "object_store"
+    ),
+    {},
+)
+with open(repo_root / "crates" / "velorix-runtime" / "src" / "lib.rs", "r", encoding="utf-8") as f:
+    runtime_lib = f.read()
+readyz_source = api.split("async fn readyz", 1)[1].split("async fn", 1)[0]
 with open(repo_root / "crates" / "velorix-ingest-writer" / "src" / "main.rs", "r", encoding="utf-8") as f:
     ingest_writer = f.read()
 with open(repo_root / "crates" / "velorix-meta" / "src" / "main.rs", "r", encoding="utf-8") as f:
@@ -113,6 +233,901 @@ with open(repo_root / "crates" / "velorix-meta" / "src" / "main.rs", "r", encodi
 ingress_validator = cli.split(
     "fn validate_product_ingress_tls_auth_attestation", 1
 )[1].split("\nfn ", 1)[0]
+
+
+def direct_dependencies(package, dependencies):
+    manifest = repo_root / "crates" / package / "Cargo.toml"
+    data = tomllib.loads(manifest.read_text(encoding="utf-8"))
+    declared = set((data.get("dependencies") or {}).keys())
+    return sorted(dep for dep in dependencies if dep in declared)
+
+
+def known_crate_boundary_direct_dependencies():
+    blocked = {
+        "velorix-api": direct_dependencies(
+            "velorix-api",
+            ["velorix-k8s", "velorix-meta", "velorix-runtime", "velorix-storage"],
+        ),
+        "velorix-cli": direct_dependencies(
+            "velorix-cli",
+            ["velorix-runtime", "velorix-storage"],
+        ),
+        "velorix-k8s": direct_dependencies("velorix-k8s", ["velorix-storage"]),
+    }
+    return {crate: deps for crate, deps in blocked.items() if deps}
+
+
+def cargo_metadata_crate_boundary_policy_passes_strict():
+    result = subprocess.run(
+        [crate_boundary_policy_path],
+        cwd=repo_root,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        return False
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return False
+    return (
+        payload.get("status") == "pass"
+        and payload.get("violations") == []
+        and known_crate_boundary_direct_dependencies() == {}
+    )
+
+
+def no_external_runtime_artifact_policy_passes():
+    result = subprocess.run(
+        [no_external_runtime_artifacts_path],
+        cwd=repo_root,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    return result.returncode == 0 and "no forbidden external runtime artifacts" in result.stdout
+
+
+def excludes_old_external_runtime_terms(text):
+    lowered = text.lower()
+    return all(
+        term not in lowered
+        for term in [
+            "feldera",
+            "dbsp",
+            "pipeline-manager",
+            "persistentvolumeclaim",
+            "package builds",
+            "generated runtimes",
+        ]
+    )
+
+
+def hiqlite_backup_restore_evidence_policy_has_pass_fail_coverage():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        valid = tmpdir / "valid.json"
+        invalid = tmpdir / "invalid.json"
+        valid.write_text(
+            json.dumps(
+                {
+                    "authority_kind": "velorix_managed_hiqlite",
+                    "metadata_authority_storage_mode": "object-store-backup-restore-with-ephemeral-node-disk",
+                    "backup_restore_configured": True,
+                    "nodes": [
+                        "velorix-meta-0:8200",
+                        "velorix-meta-1:8200",
+                        "velorix-meta-2:8200",
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        invalid.write_text(
+            json.dumps(
+                {
+                    "authority_kind": "velorix_managed_hiqlite",
+                    "metadata_authority_storage_mode": "emptyDir-only",
+                    "backup_restore_configured": False,
+                    "nodes": ["velorix-meta-0:8200"],
+                    "volumeClaimTemplates": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        pass_result = subprocess.run(
+            [hiqlite_backup_restore_evidence_path, str(valid)],
+            cwd=repo_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        fail_result = subprocess.run(
+            [hiqlite_backup_restore_evidence_path, str(invalid)],
+            cwd=repo_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    if pass_result.returncode != 0 or fail_result.returncode == 0:
+        return False
+    try:
+        pass_payload = json.loads(pass_result.stdout)
+    except json.JSONDecodeError:
+        return False
+    return (
+        pass_payload.get("status") == "pass"
+        and pass_payload.get("restore_drill_verified") is False
+        and "backup_restore_configured" in fail_result.stderr
+        and "volumeclaimtemplates" in fail_result.stderr.lower()
+    )
+
+
+def s3_checkpoint_fault_matrix_evidence_policy_has_pass_fail_coverage():
+    target_dir = repo_root / "target" / "vind-contract-fixtures"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="s3-fault-matrix-", dir=target_dir) as raw_dir:
+        fixture_dir = Path(raw_dir)
+        valid = fixture_dir / "valid.json"
+        invalid = fixture_dir / "invalid.json"
+        missing_deployment = fixture_dir / "missing-deployment.json"
+        missing_release_identity = fixture_dir / "missing-release-identity.json"
+        malformed_authority = fixture_dir / "malformed-authority.json"
+        bad_ref = fixture_dir / "bad-ref.json"
+        valid.write_text(
+            json.dumps(
+                add_fixture_ref_digests(
+                    add_fixture_release_identity(
+                        {
+                            "evidence_kind": "s3_compatible_checkpoint_fault_matrix",
+                            "status": "pass",
+                            "deployment_id": "release-deployment",
+                            "authority_store_id": "s3://release-authority/velorix-product/current",
+                            "backend": "external-s3-compatible",
+                            "live_s3_compatible": True,
+                            "delayed_visibility_cases_passed": True,
+                            "retry_fault_cases_passed": True,
+                            "mixed_checkpoint_publish_prevented": True,
+                            "object_refs_verified": True,
+                            "scenarios": [
+                                {
+                                    "name": "object_write_failure",
+                                    "status": "pass",
+                                    "evidence": "s3://release-evidence/s3/object-write-failure.json",
+                                },
+                                {
+                                    "name": "verification_read_failure",
+                                    "status": "pass",
+                                    "evidence": "s3://release-evidence/s3/verification-read-failure.json",
+                                },
+                                {
+                                    "name": "manifest_write_failure",
+                                    "status": "pass",
+                                    "evidence": "s3://release-evidence/s3/manifest-write-failure.json",
+                                },
+                                {
+                                    "name": "metadata_cas_failure",
+                                    "status": "pass",
+                                    "evidence": "s3://release-evidence/s3/metadata-cas-failure.json",
+                                },
+                                {
+                                    "name": "delayed_visibility",
+                                    "status": "pass",
+                                    "evidence": "s3://release-evidence/s3/delayed-visibility.json",
+                                },
+                                {
+                                    "name": "retry_after_failure",
+                                    "status": "pass",
+                                    "evidence": "s3://release-evidence/s3/retry-after-failure.json",
+                                },
+                            ],
+                        }
+                    )
+                )
+            ),
+            encoding="utf-8",
+        )
+        missing_deployment_payload = json.loads(valid.read_text(encoding="utf-8"))
+        missing_deployment_payload.pop("deployment_id")
+        missing_deployment.write_text(
+            json.dumps(missing_deployment_payload),
+            encoding="utf-8",
+        )
+        missing_release_identity_payload = json.loads(valid.read_text(encoding="utf-8"))
+        missing_release_identity_payload.pop("source_revision")
+        missing_release_identity.write_text(
+            json.dumps(missing_release_identity_payload),
+            encoding="utf-8",
+        )
+        malformed_authority_payload = json.loads(valid.read_text(encoding="utf-8"))
+        malformed_authority_payload["authority_store_id"] = "release-authority/velorix-product/current"
+        malformed_authority.write_text(
+            json.dumps(malformed_authority_payload),
+            encoding="utf-8",
+        )
+        bad_ref_payload = json.loads(valid.read_text(encoding="utf-8"))
+        bad_ref_payload["scenarios"][0]["evidence"] = (
+            "https://example.com/release-evidence/object-write-failure.json?sha256="
+            + fixture_ref_digest
+        )
+        bad_ref.write_text(
+            json.dumps(bad_ref_payload),
+            encoding="utf-8",
+        )
+        invalid.write_text(
+            json.dumps(
+                {
+                    "evidence_kind": "s3_compatible_checkpoint_fault_matrix",
+                    "status": "pass",
+                    "backend": "rustfs-only emulator",
+                    "live_s3_compatible": False,
+                    "scenarios": ["object_write_failure"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        pass_result = subprocess.run(
+            [s3_checkpoint_fault_matrix_evidence_path, valid],
+            cwd=repo_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        fail_result = subprocess.run(
+            [s3_checkpoint_fault_matrix_evidence_path, invalid],
+            cwd=repo_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        missing_deployment_result = subprocess.run(
+            [s3_checkpoint_fault_matrix_evidence_path, missing_deployment],
+            cwd=repo_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        missing_release_identity_result = subprocess.run(
+            [s3_checkpoint_fault_matrix_evidence_path, missing_release_identity],
+            cwd=repo_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        malformed_authority_result = subprocess.run(
+            [s3_checkpoint_fault_matrix_evidence_path, malformed_authority],
+            cwd=repo_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        bad_ref_result = subprocess.run(
+            [s3_checkpoint_fault_matrix_evidence_path, bad_ref],
+            cwd=repo_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    if pass_result.returncode != 0 or fail_result.returncode == 0:
+        return False
+    try:
+        pass_payload = json.loads(pass_result.stdout)
+    except json.JSONDecodeError:
+        return False
+    return (
+        pass_payload.get("status") == "pass"
+        and pass_payload.get("evidence_kind") == "s3_compatible_checkpoint_fault_matrix"
+        and "live_s3_compatible" in fail_result.stdout
+        and "rustfs-only" in fail_result.stdout.lower()
+        and missing_deployment_result.returncode != 0
+        and "deployment_id" in missing_deployment_result.stdout
+        and missing_release_identity_result.returncode != 0
+        and "source_revision" in missing_release_identity_result.stdout
+        and malformed_authority_result.returncode != 0
+        and "authority_store_id" in malformed_authority_result.stdout
+        and bad_ref_result.returncode != 0
+        and "s3://" in bad_ref_result.stdout
+    )
+
+
+def hiqlite_restore_drill_evidence_policy_has_pass_fail_coverage():
+    target_dir = repo_root / "target" / "vind-contract-fixtures"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="hiqlite-restore-drill-", dir=target_dir) as raw_dir:
+        fixture_dir = Path(raw_dir)
+        valid = fixture_dir / "valid.json"
+        compat = fixture_dir / "compat.json"
+        invalid = fixture_dir / "invalid.json"
+        valid_payload = add_fixture_ref_digests(
+            add_fixture_release_identity(
+                {
+                    "evidence_kind": "hiqlite_total_voter_loss_restore_drill",
+                    "status": "pass",
+                    "deployment_id": "release-deployment",
+                    "authority_store_id": "s3://release-authority/velorix-product/current",
+                    "no_pvc": True,
+                    "voter_count": 3,
+                    "total_voter_loss_exercised": True,
+                    "restored_from_object_store_backup": True,
+                    "acknowledged_metadata_writes_survived": True,
+                    "catalog_verified": True,
+                    "owner_epoch_verified": True,
+                    "checkpoint_pointer_verified": True,
+                    "post_restore_ingest_query_verified": True,
+                    "restore_drill_verified": True,
+                    "evidence_refs": {
+                        "object_store_backup": "s3://release-evidence/hiqlite/object-store-backup.json",
+                        "total_voter_loss_log": "s3://release-evidence/hiqlite/total-voter-loss-log.json",
+                        "restore_log": "s3://release-evidence/hiqlite/restore-log.json",
+                        "metadata_write_survival": "s3://release-evidence/hiqlite/metadata-write-survival.json",
+                        "post_restore_ingest_query": "s3://release-evidence/hiqlite/post-restore-ingest-query.json",
+                    },
+                }
+            )
+        )
+        valid.write_text(json.dumps(valid_payload), encoding="utf-8")
+        compat_payload = dict(valid_payload)
+        compat_payload["evidence_kind"] = "hiqlite_no_pvc_three_voter_backup_restore"
+        compat.write_text(json.dumps(compat_payload), encoding="utf-8")
+        invalid.write_text(
+            json.dumps(
+                {
+                    "evidence_kind": "hiqlite_total_voter_loss_restore_drill",
+                    "status": "pass",
+                    "no_pvc": False,
+                    "voter_count": 1,
+                    "restore_drill_verified": False,
+                    "volumeClaimTemplates": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        pass_result = subprocess.run(
+            [hiqlite_restore_drill_evidence_path, valid],
+            cwd=repo_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        compat_result = subprocess.run(
+            [hiqlite_restore_drill_evidence_path, compat],
+            cwd=repo_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        fail_result = subprocess.run(
+            [hiqlite_restore_drill_evidence_path, invalid],
+            cwd=repo_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    if pass_result.returncode != 0 or compat_result.returncode != 0 or fail_result.returncode == 0:
+        return False
+    try:
+        pass_payload = json.loads(pass_result.stdout)
+    except json.JSONDecodeError:
+        return False
+    return (
+        pass_payload.get("status") == "pass"
+        and pass_payload.get("evidence_kind") == "hiqlite_total_voter_loss_restore_drill"
+        and pass_payload.get("restore_drill_verified") is True
+        and "restore_drill_verified" in fail_result.stderr
+        and "volumeclaimtemplates" in fail_result.stderr.lower()
+    )
+
+
+def upgrade_repair_gc_fault_matrix_evidence_policy_has_pass_fail_coverage():
+    target_dir = repo_root / "target" / "vind-contract-fixtures"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="upgrade-repair-gc-", dir=target_dir) as raw_dir:
+        fixture_dir = Path(raw_dir)
+        valid = fixture_dir / "valid.json"
+        invalid = fixture_dir / "invalid.json"
+        missing_deployment = fixture_dir / "missing-deployment.json"
+        malformed_authority = fixture_dir / "malformed-authority.json"
+        valid.write_text(
+            json.dumps(
+                add_fixture_ref_digests(
+                    add_fixture_release_identity(
+                        {
+                            "evidence_kind": "upgrade_rollback_repair_gc_fault_matrix",
+                            "status": "pass",
+                            "deployment_id": "release-deployment",
+                            "authority_store_id": "s3://release-authority/velorix-product/current",
+                            "live_upgrade_rollback_repair_gc_matrix": True,
+                            "upgrade_verified": True,
+                            "rollback_verified": True,
+                            "repair_verified": True,
+                            "gc_reachability_verified": True,
+                            "acknowledged_data_preserved": True,
+                            "no_source_query_recomputation": True,
+                            "scenarios": [
+                                {
+                                    "name": "rolling_upgrade",
+                                    "status": "pass",
+                                    "evidence": "s3://release-evidence/gc/rolling-upgrade.json",
+                                },
+                                {
+                                    "name": "rollback_after_upgrade",
+                                    "status": "pass",
+                                    "evidence": "s3://release-evidence/gc/rollback-after-upgrade.json",
+                                },
+                                {
+                                    "name": "corrupt_latest_checkpoint_repair",
+                                    "status": "pass",
+                                    "evidence": "s3://release-evidence/gc/corrupt-latest-checkpoint-repair.json",
+                                },
+                                {
+                                    "name": "gc_concurrent_with_query",
+                                    "status": "pass",
+                                    "evidence": "s3://release-evidence/gc/gc-concurrent-with-query.json",
+                                },
+                                {
+                                    "name": "gc_concurrent_with_compaction",
+                                    "status": "pass",
+                                    "evidence": "s3://release-evidence/gc/gc-concurrent-with-compaction.json",
+                                },
+                                {
+                                    "name": "gc_concurrent_with_recovery",
+                                    "status": "pass",
+                                    "evidence": "s3://release-evidence/gc/gc-concurrent-with-recovery.json",
+                                },
+                                {
+                                    "name": "gc_concurrent_with_checkpoint_publication",
+                                    "status": "pass",
+                                    "evidence": "s3://release-evidence/gc/gc-concurrent-with-checkpoint-publication.json",
+                                },
+                                {
+                                    "name": "gc_retains_repair_roots",
+                                    "status": "pass",
+                                    "evidence": "s3://release-evidence/gc/gc-retains-repair-roots.json",
+                                },
+                            ],
+                        }
+                    )
+                )
+            ),
+            encoding="utf-8",
+        )
+        missing_deployment_payload = json.loads(valid.read_text(encoding="utf-8"))
+        missing_deployment_payload.pop("deployment_id")
+        missing_deployment.write_text(
+            json.dumps(missing_deployment_payload),
+            encoding="utf-8",
+        )
+        malformed_authority_payload = json.loads(valid.read_text(encoding="utf-8"))
+        malformed_authority_payload["authority_store_id"] = "release-authority/velorix-product/current"
+        malformed_authority.write_text(
+            json.dumps(malformed_authority_payload),
+            encoding="utf-8",
+        )
+        invalid.write_text(
+            json.dumps(
+                {
+                    "evidence_kind": "upgrade_rollback_repair_gc_fault_matrix",
+                    "status": "pass",
+                    "live_upgrade_rollback_repair_gc_matrix": False,
+                    "scenarios": ["rolling_upgrade"],
+                    "source": "local-only fake",
+                }
+            ),
+            encoding="utf-8",
+        )
+        pass_result = subprocess.run(
+            [upgrade_repair_gc_fault_matrix_evidence_path, valid],
+            cwd=repo_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        fail_result = subprocess.run(
+            [upgrade_repair_gc_fault_matrix_evidence_path, invalid],
+            cwd=repo_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        missing_deployment_result = subprocess.run(
+            [upgrade_repair_gc_fault_matrix_evidence_path, missing_deployment],
+            cwd=repo_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        malformed_authority_result = subprocess.run(
+            [upgrade_repair_gc_fault_matrix_evidence_path, malformed_authority],
+            cwd=repo_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    if (
+        pass_result.returncode != 0
+        or fail_result.returncode == 0
+        or missing_deployment_result.returncode == 0
+        or malformed_authority_result.returncode == 0
+    ):
+        return False
+    try:
+        pass_payload = json.loads(pass_result.stdout)
+    except json.JSONDecodeError:
+        return False
+    return (
+        pass_payload.get("status") == "pass"
+        and pass_payload.get("evidence_kind")
+        == "upgrade_rollback_repair_gc_fault_matrix"
+        and "live_upgrade_rollback_repair_gc_matrix" in fail_result.stdout
+        and "local-only" in fail_result.stdout.lower()
+        and "deployment_id" in missing_deployment_result.stdout
+        and "authority_store_id" in malformed_authority_result.stdout
+    )
+
+
+def query_output_isolation_evidence_policy_has_pass_fail_coverage():
+    target_dir = repo_root / "target" / "vind-contract-fixtures"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="query-output-isolation-", dir=target_dir) as raw_dir:
+        fixture_dir = Path(raw_dir)
+        valid = fixture_dir / "valid.json"
+        invalid = fixture_dir / "invalid.json"
+        valid.write_text(
+            json.dumps(
+                add_fixture_ref_digests(
+                    add_fixture_release_identity(
+                        {
+                            "evidence_kind": "query_output_isolation",
+                            "status": "pass",
+                            "deployment_id": "release-deployment",
+                            "authority_store_id": "s3://release-authority/velorix-product/current",
+                            "live_release_query_isolation": True,
+                            "query_authority": "published_materialized_output",
+                            "cold_query_succeeded": True,
+                            "query_pod_source_ingest_prefix_read_access": False,
+                            "query_pod_metadata_write_access": False,
+                            "object_store_audit_no_source_reads": True,
+                            "object_store_audit_no_source_writes": True,
+                            "object_store_audit_no_durable_writes": True,
+                            "materialized_output_read_verified": True,
+                            "no_source_query_recomputation": True,
+                            "evidence_refs": {
+                                "query_pod_iam_policy": "s3://release-evidence/query/query-pod-iam-policy.json",
+                                "cold_query_log": "s3://release-evidence/query/cold-query-log.json",
+                                "object_store_audit_log": "s3://release-evidence/query/object-store-audit-log.json",
+                                "materialized_output_read": "s3://release-evidence/query/materialized-output-read.json",
+                            },
+                        }
+                    )
+                )
+            ),
+            encoding="utf-8",
+        )
+        invalid.write_text(
+            json.dumps(
+                {
+                    "evidence_kind": "query_output_isolation",
+                    "status": "pass",
+                    "live_release_query_isolation": True,
+                    "query_authority": "published_materialized_output",
+                    "cold_query_succeeded": True,
+                    "query_pod_source_ingest_prefix_read_access": True,
+                    "source": "local-only fake",
+                }
+            ),
+            encoding="utf-8",
+        )
+        pass_result = subprocess.run(
+            [query_output_isolation_evidence_path, valid],
+            cwd=repo_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        fail_result = subprocess.run(
+            [query_output_isolation_evidence_path, invalid],
+            cwd=repo_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    if pass_result.returncode != 0 or fail_result.returncode == 0:
+        return False
+    try:
+        pass_payload = json.loads(pass_result.stdout)
+    except json.JSONDecodeError:
+        return False
+    return (
+        pass_payload.get("status") == "pass"
+        and pass_payload.get("evidence_kind") == "query_output_isolation"
+        and "query_pod_source_ingest_prefix_read_access" in fail_result.stdout
+        and "local-only" in fail_result.stdout.lower()
+    )
+
+
+def security_release_provenance_evidence_policy_has_pass_fail_coverage():
+    target_dir = repo_root / "target" / "vind-contract-fixtures"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="security-release-provenance-", dir=target_dir) as raw_dir:
+        fixture_dir = Path(raw_dir)
+        valid = fixture_dir / "valid.json"
+        invalid = fixture_dir / "invalid.json"
+        missing_authority = fixture_dir / "missing-authority.json"
+        missing_deployment = fixture_dir / "missing-deployment.json"
+        malformed_authority = fixture_dir / "malformed-authority.json"
+        valid.write_text(
+            json.dumps(
+                add_fixture_ref_digests(
+                {
+                    "evidence_kind": "security_release_provenance",
+                    "status": "pass",
+                    "deployment_id": "release-deployment",
+                    "authority_store_id": "s3://release-authority/velorix-product/current",
+                    "mandatory_api_auth": True,
+                    "mandatory_metadata_auth": True,
+                    "tenant_authorization_verified": True,
+                    "tls_verified": True,
+                    "secret_rotation_verified": True,
+                    "body_limits_verified": True,
+                    "rate_limits_verified": True,
+                    "object_prefix_isolation_verified": True,
+                    "negative_cross_tenant_tests_passed": True,
+                    "clean_source_revision_verified": True,
+                    "source_revision": fixture_source_revision,
+                    "exact_deployed_image_digests_verified": True,
+                    "deployed_image_digests": fixture_deployed_image_digests,
+                    "sbom_attached": True,
+                    "dependency_policy_passed": True,
+                    "immutable_test_evidence_attached": True,
+                    "evidence_refs": {
+                        "api_auth_test": "s3://release-evidence/security/api-auth-test.json",
+                        "metadata_auth_test": "s3://release-evidence/security/metadata-auth-test.json",
+                        "tenant_authorization_test": "s3://release-evidence/security/tenant-authorization-test.json",
+                        "tls_attestation": "s3://release-evidence/security/tls-attestation.json",
+                        "secret_rotation_test": "s3://release-evidence/security/secret-rotation-test.json",
+                        "limit_tests": "s3://release-evidence/security/limit-tests.json",
+                        "object_prefix_isolation_test": "s3://release-evidence/security/object-prefix-isolation-test.json",
+                        "cross_tenant_negative_tests": "s3://release-evidence/security/cross-tenant-negative-tests.json",
+                        "sbom": "s3://release-evidence/security/sbom.spdx.json",
+                        "dependency_policy": "s3://release-evidence/security/dependency-policy.json",
+                        "immutable_test_evidence": "s3://release-evidence/security/immutable-test-evidence.json",
+                    },
+                }
+                )
+            ),
+            encoding="utf-8",
+        )
+        missing_authority_payload = json.loads(valid.read_text(encoding="utf-8"))
+        missing_authority_payload.pop("authority_store_id")
+        missing_authority.write_text(
+            json.dumps(missing_authority_payload),
+            encoding="utf-8",
+        )
+        missing_deployment_payload = json.loads(valid.read_text(encoding="utf-8"))
+        missing_deployment_payload.pop("deployment_id")
+        missing_deployment.write_text(
+            json.dumps(missing_deployment_payload),
+            encoding="utf-8",
+        )
+        malformed_authority_payload = json.loads(valid.read_text(encoding="utf-8"))
+        malformed_authority_payload["authority_store_id"] = "release-authority/velorix-product/current"
+        malformed_authority.write_text(
+            json.dumps(malformed_authority_payload),
+            encoding="utf-8",
+        )
+        invalid.write_text(
+            json.dumps(
+                {
+                    "evidence_kind": "security_release_provenance",
+                    "status": "pass",
+                    "mandatory_api_auth": True,
+                    "mandatory_metadata_auth": True,
+                    "tenant_authorization_verified": False,
+                    "source": "synthetic",
+                }
+            ),
+            encoding="utf-8",
+        )
+        pass_result = subprocess.run(
+            [security_release_provenance_evidence_path, valid],
+            cwd=repo_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        fail_result = subprocess.run(
+            [security_release_provenance_evidence_path, invalid],
+            cwd=repo_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        missing_authority_result = subprocess.run(
+            [security_release_provenance_evidence_path, missing_authority],
+            cwd=repo_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        missing_deployment_result = subprocess.run(
+            [security_release_provenance_evidence_path, missing_deployment],
+            cwd=repo_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        malformed_authority_result = subprocess.run(
+            [security_release_provenance_evidence_path, malformed_authority],
+            cwd=repo_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    if (
+        pass_result.returncode != 0
+        or fail_result.returncode == 0
+        or missing_authority_result.returncode == 0
+        or missing_deployment_result.returncode == 0
+        or malformed_authority_result.returncode == 0
+    ):
+        return False
+    try:
+        pass_payload = json.loads(pass_result.stdout)
+    except json.JSONDecodeError:
+        return False
+    return (
+        pass_payload.get("status") == "pass"
+        and pass_payload.get("evidence_kind") == "security_release_provenance"
+        and "tenant_authorization_verified" in fail_result.stdout
+        and "synthetic" in fail_result.stdout.lower()
+        and "authority_store_id" in missing_authority_result.stdout
+        and "deployment_id" in missing_deployment_result.stdout
+        and "authority_store_id" in malformed_authority_result.stdout
+    )
+
+
+def remaining_release_readiness_evidence_policy_has_pass_fail_coverage():
+    target_dir = repo_root / "target" / "vind-contract-fixtures"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    fields = [
+        "release_image_contract_tests_passed",
+        "versioned_openapi_contract_verified",
+        "no_conflicting_accepted_contracts",
+        "sql_admission_corpus_generated",
+        "sql_admission_corpus_covers_unsupported_datafusion_plan_nodes",
+        "sql_admission_corpus_covers_unsupported_datafusion_expression_nodes",
+        "unsupported_sql_leaves_no_persisted_view_metadata",
+        "unsupported_sql_leaves_no_runtime_binding",
+        "sql_admission_mutation_ci_failure_verified",
+        "persistent_write_boundary_crash_matrix_passed",
+        "crash_matrix_covers_one_view",
+        "crash_matrix_covers_multiple_affected_views",
+        "crash_matrix_covers_joins",
+        "crash_matrix_covers_compaction",
+        "replay_duplicate_reordered_gapped_retried_batches_verified",
+        "replay_live_crash_clean_outputs_identical",
+        "replay_checkpoint_hashes_identical",
+        "non_contiguous_input_never_advances_frontier",
+        "join_frontier_spec_verified",
+        "concurrent_two_input_ingest_crash_leader_handoff_verified",
+        "output_manifests_record_exact_input_frontiers",
+        "published_limits_verified",
+        "multi_day_supported_object_store_soak_passed",
+    ]
+    with tempfile.TemporaryDirectory(prefix="remaining-release-readiness-", dir=target_dir) as raw_dir:
+        fixture_dir = Path(raw_dir)
+        valid = fixture_dir / "valid.json"
+        invalid = fixture_dir / "invalid.json"
+        missing_deployment = fixture_dir / "missing-deployment.json"
+        malformed_authority = fixture_dir / "malformed-authority.json"
+        valid_payload = {
+            "evidence_kind": "remaining_release_readiness",
+            "status": "pass",
+            "deployment_id": "release-deployment",
+            "authority_store_id": "s3://release-authority/velorix-product/current",
+        }
+        valid_payload = add_fixture_release_identity(valid_payload)
+        valid_payload.update({field: True for field in fields})
+        valid_payload["evidence_refs"] = {
+            "release_image_contract_tests": "s3://release-evidence/remaining/release-image-contract-tests.json",
+            "openapi_contract": "s3://release-evidence/remaining/openapi-contract.json",
+            "sql_admission_corpus": "s3://release-evidence/remaining/sql-admission-corpus.json",
+            "crash_matrix": "s3://release-evidence/remaining/crash-matrix.json",
+            "replay_determinism": "s3://release-evidence/remaining/replay-determinism.json",
+            "join_frontier": "s3://release-evidence/remaining/join-frontier.json",
+            "scale_soak": "s3://release-evidence/remaining/scale-soak.json",
+        }
+        valid_payload = add_fixture_ref_digests(valid_payload)
+        invalid_payload = dict(valid_payload)
+        invalid_payload.pop("evidence_refs")
+        invalid_payload["sql_admission_mutation_ci_failure_verified"] = False
+        invalid_payload["source"] = "placeholder todo"
+        missing_authority_payload = dict(valid_payload)
+        missing_authority_payload.pop("authority_store_id")
+        missing_deployment_payload = dict(valid_payload)
+        missing_deployment_payload.pop("deployment_id")
+        malformed_authority_payload = dict(valid_payload)
+        malformed_authority_payload["authority_store_id"] = "release-authority/velorix-product/current"
+        valid.write_text(json.dumps(valid_payload), encoding="utf-8")
+        invalid.write_text(json.dumps(invalid_payload), encoding="utf-8")
+        missing_authority = fixture_dir / "missing-authority.json"
+        missing_authority.write_text(json.dumps(missing_authority_payload), encoding="utf-8")
+        missing_deployment.write_text(json.dumps(missing_deployment_payload), encoding="utf-8")
+        malformed_authority.write_text(json.dumps(malformed_authority_payload), encoding="utf-8")
+        pass_result = subprocess.run(
+            [remaining_release_readiness_evidence_path, valid],
+            cwd=repo_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        fail_result = subprocess.run(
+            [remaining_release_readiness_evidence_path, invalid],
+            cwd=repo_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        missing_authority_result = subprocess.run(
+            [remaining_release_readiness_evidence_path, missing_authority],
+            cwd=repo_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        missing_deployment_result = subprocess.run(
+            [remaining_release_readiness_evidence_path, missing_deployment],
+            cwd=repo_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        malformed_authority_result = subprocess.run(
+            [remaining_release_readiness_evidence_path, malformed_authority],
+            cwd=repo_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    if (
+        pass_result.returncode != 0
+        or fail_result.returncode == 0
+        or missing_authority_result.returncode == 0
+        or missing_deployment_result.returncode == 0
+        or malformed_authority_result.returncode == 0
+    ):
+        return False
+    try:
+        pass_payload = json.loads(pass_result.stdout)
+    except json.JSONDecodeError:
+        return False
+    return (
+        pass_payload.get("status") == "pass"
+        and pass_payload.get("evidence_kind") == "remaining_release_readiness"
+        and "sql_admission_mutation_ci_failure_verified" in fail_result.stdout
+        and "placeholder" in fail_result.stdout.lower()
+        and "authority_store_id" in missing_authority_result.stdout
+        and "deployment_id" in missing_deployment_result.stdout
+        and "authority_store_id" in malformed_authority_result.stdout
+    )
+
+
+def crate_boundary_complete_claims():
+    claim = re.compile(
+        r"\b(?:crate|dependency)[ -]?boundar(?:y|ies)\b.{0,96}\b(?:complete|done|cleared|resolved|closed)\b"
+        r"|\b(?:complete|done|cleared|resolved|closed)\b.{0,96}\b(?:crate|dependency)[ -]?boundar(?:y|ies)\b",
+        re.IGNORECASE | re.DOTALL,
+    )
+    claims = []
+    for root in (repo_root / "docs", repo_root / "scripts"):
+        for path in sorted(root.rglob("*")):
+            if path.suffix not in {".md", ".sh", ".py"}:
+                continue
+            text = path.read_text(encoding="utf-8")
+            if claim.search(text):
+                claims.append(str(path.relative_to(repo_root)))
+    return claims
 
 
 def durability_false_ready_fixture_rejected():
@@ -476,15 +1491,25 @@ def external_s3_out_of_scope_fixture_completes_required_gates():
         if next_result.returncode != 0:
             return False
         next_data = json.loads(next_result.stdout)
+        blockers = {
+            blocker.get("gate"): blocker
+            for blocker in report_data.get("product_complete_blockers") or []
+            if isinstance(blocker, dict)
+        }
+        deferred_steps = set((report_data.get("completion_plan") or {}).get("deferred_steps") or [])
         return (
             gates.get("object_store_external_authority", {}).get("status") == "out_of_scope"
             and gates.get("object_store_durability_policy", {}).get("status") == "out_of_scope"
-            and report_data.get("product_complete") is True
+            and report_data.get("product_complete") is False
+            and report_data.get("local_diagnostic_complete") is False
             and report_data.get("completion_scope", {}).get("external_s3_required") is False
             and "object_store_external_authority" in report_data.get("completion_scope", {}).get("excluded_gates", [])
             and "object_store_durability_policy" in report_data.get("completion_scope", {}).get("excluded_gates", [])
-            and next_data.get("state") == "complete"
-            and next_data.get("next_step") is None
+            and blockers.get("object_store_external_authority", {}).get("status") == "out_of_scope"
+            and blockers.get("object_store_durability_policy", {}).get("status") == "out_of_scope"
+            and "object_store_external_authority" in deferred_steps
+            and "object_store_durability_policy" in deferred_steps
+            and next_data.get("product_complete") is False
         )
 
 
@@ -620,6 +1645,12 @@ def public_ingress_out_of_scope_local_tls_boundary_fixture():
         if next_result.returncode != 0:
             return False
         next_data = json.loads(next_result.stdout)
+        blockers = {
+            blocker.get("gate"): blocker
+            for blocker in report_data.get("product_complete_blockers") or []
+            if isinstance(blocker, dict)
+        }
+        deferred_steps = set((report_data.get("completion_plan") or {}).get("deferred_steps") or [])
         return (
             gates.get("tls_auth_boundary", {}).get("status") == "pass"
             and gates.get("public_ingress_tls_auth", {}).get("status") == "out_of_scope"
@@ -627,16 +1658,17 @@ def public_ingress_out_of_scope_local_tls_boundary_fixture():
             and "public_ingress_tls_auth" in report_data.get("completion_scope", {}).get("excluded_gates", [])
             and "public_ingress_tls_auth_out_of_scope_does_not_prove_public_dns_tls_or_external_client_reachability"
             in report_data.get("completion_scope", {}).get("warnings", [])
-            and report_data.get("product_complete") is True
-            and next_data.get("state") == "complete"
+            and report_data.get("product_complete") is False
+            and report_data.get("local_diagnostic_complete") is False
+            and blockers.get("public_ingress_tls_auth", {}).get("status") == "out_of_scope"
+            and "public_ingress_tls_auth" in deferred_steps
+            and next_data.get("product_complete") is False
         )
 
 
 checks = {
     "rejects stale durability attestation false-ready fixture": durability_false_ready_fixture_rejected(),
     "Hiqlite release input-required gate wins over will-run fixture": hiqlite_release_input_required_wins_over_will_run_fixture(),
-    "external S3 out-of-scope fixture completes required gates": external_s3_out_of_scope_fixture_completes_required_gates(),
-    "public ingress out-of-scope fixture uses local TLS/auth boundary": public_ingress_out_of_scope_local_tls_boundary_fixture(),
     "defines admin API curl helper": (
         "curl_admin_api()" in script
         and 'authorization: Bearer ${admin_bearer_token}' in script
@@ -1444,6 +2476,15 @@ checks = {
         and "product-complete wall-clock failover evidence" in doc
         and "VELORIX_STANDING_RUNTIME_FAILOVER_RELEASE_ATTEST=1" in doc
     ),
+    "stress chaos soak wrapper reuses product smokes and gates pod deletion": (
+        (repo_root / "scripts" / "run-vind-product-stress-chaos-soak.sh").is_file()
+        and "scripts/smoke-vind-rest-api.sh" in stress_chaos_soak
+        and "scripts/smoke-vind-standing-runtime-failover.sh" in stress_chaos_soak
+        and "VELORIX_CHAOS_ENABLE_POD_DELETE" in stress_chaos_soak
+        and "set VELORIX_CHAOS_ENABLE_POD_DELETE=1" in stress_chaos_soak
+        and "velorix_stress_chaos_soak" in stress_chaos_soak
+        and '"pod_delete_required_opt_in": True' in stress_chaos_soak
+    ),
     "release validator validates ingress/TLS/auth sibling evidence": (
         '"/api/auth/ingress_tls_auth_attestation"' in cli
         and 'format!("{attestation}/evidence")' in cli
@@ -1518,7 +2559,7 @@ checks = {
         and "VELORIX_API_URL/v1/query-policies/interactive" in rest_api_smoke
         and "VELORIX_API_URL/v1/views/positive_scores_by_user" in rest_api_smoke
         and "VELORIX_API_URL/v1/standing-runtime/owners" in rest_api_smoke
-        and "VELORIX_API_URL/v1/ingest" in rest_api_smoke
+        and "VELORIX_API_URL/v1/relations/scores/ingest" in rest_api_smoke
         and "VELORIX_API_URL/v1/views/positive_scores_by_user/query?max_rows=1000" in rest_api_smoke
         and "VELORIX_API_URL/v1/api/scores/positive?max_rows=1000" in rest_api_smoke
         and "VELORIX_API_URL/v1/openapi.json" in rest_api_smoke
@@ -1560,7 +2601,8 @@ checks = {
         and "public_ingress_tls_auth_out_of_scope_does_not_prove_public_dns_tls_or_external_client_reachability" in product_completion_report
         and "object_store_external_authority_out_of_scope_does_not_prove_object_store_durability" in product_completion_report
         and '"excluded_gates"' in product_completion_report
-        and '"accepted_gate_statuses": ["pass", "out_of_scope"]' in product_completion_report
+        and '"product_accepted_gate_statuses": ["pass"]' in product_completion_report
+        and '"local_diagnostic_accepted_gate_statuses": ["pass", "out_of_scope"]' in product_completion_report
         and '"input_summary_requires_input": input_summary_has_required_input'
         in product_completion_report
         and "input_required_steps" in product_completion_report
@@ -1612,9 +2654,12 @@ checks = {
         and "product_evidence_product_complete_blockers" in product_completion_report
         and "def gate_blocker(item):" in product_completion_report
         and '"gate": item.get("id")' in product_completion_report
-        and 'if item.get("status") in {"blocked", "diagnostic", "missing"}'
+        and 'if item.get("status") in {"blocked", "diagnostic", "missing", "out_of_scope"}'
         in product_completion_report
-        and 'product_complete = all(item["status"] in {"pass", "out_of_scope"} for item in gates)'
+        and 'product_complete = all(item["status"] == "pass" for item in gates)'
+        in product_completion_report
+        and "local_diagnostic_complete = all(" in product_completion_report
+        and 'item["status"] in {"pass", "out_of_scope"} for item in gates'
         in product_completion_report
         and "next_actions" in product_completion_report
         and "hiqlite-backend-time-release-preflight.json" in product_completion_report
@@ -1696,7 +2741,9 @@ checks = {
         and "`missing_subjects`/`invalid_subjects`" in doc
         and "completion_handoff" in doc
         and "complete-vind-product-env.json" in doc
-        and "derives\n`product_complete_blockers` from those non-passing in-scope gates"
+        and "release\n`product_complete=true` requires every product gate to be `pass`"
+        in doc
+        and "Out-of-scope gates remain in `product_complete_blockers` and\n`completion_plan.deferred_steps`"
         in doc
         and "product_completion_source.product_evidence_product_complete_blockers"
         in doc
@@ -2083,6 +3130,8 @@ checks = {
         and "product_complete_blockers" in refresh_deployed_images
         and "velorix-api deployed image digest was not recorded" in refresh_deployed_images
         and "velorix-meta deployed image digest was not recorded" in refresh_deployed_images
+        and "product.get(\"product_complete\") is True" in refresh_deployed_images
+        and not ('product["product_complete"] = len(blockers) == 0' in refresh_deployed_images)
         and "VELORIX_VIND_PRODUCT_DIR=target/velorix-product " in product_completion_report
         and "scripts/refresh-vind-product-deployed-images.sh" in product_completion_report
         and "VELORIX_API_IMAGE_DIGEST=sha256:REPLACE_WITH_API_DIGEST" in product_completion_report
@@ -2111,16 +3160,19 @@ external_object_store_optional_checks = {
     "assesses object-store durability without forging product-complete attestation",
 }
 
-# The current product-completion scope is intentionally local/no-PVC and
-# jarless. Actual external S3/OSS durability remains a follow-up gate; the
-# required contract here is that report/next-step tooling can mark those gates
-# out-of-scope without forging product-complete external authority evidence.
-checks["external S3 out-of-scope fixture completes required gates"] = (
+# The local/diagnostic scope can accept out-of-scope gates, but release
+# product_complete is stricter: every product gate must pass.
+checks["external S3 out-of-scope fixture blocks release product completion"] = (
     external_s3_out_of_scope_fixture_completes_required_gates()
     and "object_store_external_authority_out_of_scope_does_not_prove_object_store_durability"
     in product_completion_report
-    and '"accepted_gate_statuses": ["pass", "out_of_scope"]' in product_completion_report
+    and '"product_accepted_gate_statuses": ["pass"]' in product_completion_report
+    and '"local_diagnostic_accepted_gate_statuses": ["pass", "out_of_scope"]' in product_completion_report
     and 'gate.get("status") == "out_of_scope"' in next_product_step
+)
+
+checks["public ingress out-of-scope fixture uses local TLS/auth boundary without completing release product"] = (
+    public_ingress_out_of_scope_local_tls_boundary_fixture()
 )
 
 checks["uses target-backed local scratch instead of mktemp for ingress attestation"] = (
@@ -2234,6 +3286,94 @@ checks["existing product REST API smoke is executable and documented"] = (
     and "scripts/smoke-vind-rest-api.sh" in doc
 )
 
+checks["standalone REST join smoke proves two-relation materialized query"] = (
+    (repo_root / "scripts" / "smoke-vind-rest-join.sh").is_file()
+    and os.access(repo_root / "scripts" / "smoke-vind-rest-join.sh", os.X_OK)
+    and "VELORIX_JOIN_REST_API_SMOKE_ATTACH" in rest_join_smoke
+    and "join-rest-api-smoke.json" in rest_join_smoke
+    and "rest_join_readings_" in rest_join_smoke
+    and "rest_join_devices_" in rest_join_smoke
+    and "inputRelationRefs" in rest_join_smoke
+    and "join " in rest_join_smoke
+    and "VELORIX_API_URL/v1/relations" in rest_join_smoke
+    and "VELORIX_API_URL/v1/relations/ingest" in rest_join_smoke
+    and "relations-ingest-request.json" in rest_join_smoke
+    and "relations_ingest" in rest_join_smoke
+    and "join_frontier_path" in rest_join_smoke
+    and "join_frontier_contract" in rest_join_smoke
+    and "sequential_relation_ingest_frontier_vector" in rest_join_smoke
+    and "join_transaction_path" not in rest_join_smoke
+    and "join_transaction_contract" not in rest_join_smoke
+    and "relations_ingest_transaction" not in rest_join_smoke
+    and "VELORIX_API_URL/v1/views/${view_id}/query" in rest_join_smoke
+    and "velorix_join_rest_api_smoke" in rest_join_smoke
+    and "trusted_for_product_complete" in rest_join_smoke
+    and "Feldera" not in rest_join_smoke
+    and "DBSP" not in rest_join_smoke
+    and "pipeline-manager" not in rest_join_smoke
+    and "PersistentVolumeClaim" not in rest_join_smoke
+)
+
+old_atomic_join_claims = [
+    "Join views use `/v1/relations/ingest` as an atomic transaction path",
+    "needs atomic multi-relation join semantics must submit",
+    "producing one committed frontier vector across those relations",
+    "cannot claim atomic multi-relation transaction semantics for a join",
+    "Ingest one logical commit across one or more relations",
+    "one frontier-vector commit",
+    "join_transaction_path",
+    "join_transaction_contract",
+    "relations_ingest_transaction",
+]
+checks["public join contract is sequential frontier vectors, not atomic epochs"] = (
+    "Public 1.0 join consistency is a per-relation frontier-vector contract"
+    in materialized_view_roadmap
+    and "`/v1/relations/ingest` must not be described as an atomic multi-relation transaction API"
+    in materialized_view_roadmap.replace("\n", " ")
+    and "Every published runtime checkpoint for a join must carry the complete"
+    in materialized_view_roadmap
+    and "Output manifests must either record that vector directly or remain selected only through the checkpoint/pointer"
+    in ingest_admission_contract.replace("\n", " ")
+    and "does not add an atomic\nmulti-relation transaction boundary for joins"
+    in storage_contract
+    and "input_frontiers: Vec<RelationFrontier>" in (repo_root / "crates" / "velorix-core" / "src" / "standing_program.rs").read_text(encoding="utf-8")
+    and "runtime_tracks_input_frontiers_by_relation_stream_and_partition"
+    in (repo_root / "crates" / "velorix-runtime" / "tests" / "materialized_view_runtime.rs").read_text(encoding="utf-8")
+    and "runtime_materializes_two_relation_join_and_restores_epoch_consistent_state"
+    in (repo_root / "crates" / "velorix-runtime" / "tests" / "materialized_view_runtime.rs").read_text(encoding="utf-8")
+    and "let initial_frontiers = vec!["
+    in (repo_root / "crates" / "velorix-runtime" / "tests" / "materialized_view_runtime.rs").read_text(encoding="utf-8")
+    and "assert_eq!(first_commit.input_frontiers, initial_frontiers);"
+    in (repo_root / "crates" / "velorix-runtime" / "tests" / "materialized_view_runtime.rs").read_text(encoding="utf-8")
+    and "assert_eq!(checkpoint.input_frontiers, initial_frontiers);"
+    in (repo_root / "crates" / "velorix-runtime" / "tests" / "materialized_view_runtime.rs").read_text(encoding="utf-8")
+    and "restored.checkpoint().unwrap().input_frontiers"
+    in (repo_root / "crates" / "velorix-runtime" / "tests" / "materialized_view_runtime.rs").read_text(encoding="utf-8")
+    and "committed_offset_exclusive: 4"
+    in (repo_root / "crates" / "velorix-runtime" / "tests" / "materialized_view_runtime.rs").read_text(encoding="utf-8")
+    and "committed_offset_exclusive: 2"
+    in (repo_root / "crates" / "velorix-runtime" / "tests" / "materialized_view_runtime.rs").read_text(encoding="utf-8")
+    and "let advanced_frontiers = vec!["
+    in (repo_root / "crates" / "velorix-runtime" / "tests" / "materialized_view_runtime.rs").read_text(encoding="utf-8")
+    and "assert_eq!(second_commit.input_frontiers, advanced_frontiers);"
+    in (repo_root / "crates" / "velorix-runtime" / "tests" / "materialized_view_runtime.rs").read_text(encoding="utf-8")
+    and "committed_offset_exclusive: 5"
+    in (repo_root / "crates" / "velorix-runtime" / "tests" / "materialized_view_runtime.rs").read_text(encoding="utf-8")
+    and "Ingest ordered batches for one or more relations" in api
+    and "it is not an atomic multi-relation transaction API" in api
+    and not any(claim in materialized_view_roadmap for claim in old_atomic_join_claims)
+    and not any(claim in api for claim in old_atomic_join_claims)
+    and not any(claim in rest_join_smoke for claim in old_atomic_join_claims)
+)
+
+checks["standalone REST SQL-family smokes avoid old external runtime help text"] = (
+    all(path.is_file() and os.access(path, os.X_OK) for path in rest_sql_family_smoke_paths)
+    and "rest_select_star_accounts_" in rest_sql_family_smokes["smoke-vind-rest-select-star.sh"]
+    and "rest_avg_scores_" in rest_sql_family_smokes["smoke-vind-rest-avg.sh"]
+    and "rest_row_number_accounts_" in rest_sql_family_smokes["smoke-vind-rest-row-number.sh"]
+    and all(excludes_old_external_runtime_terms(text) for text in rest_sql_family_smokes.values())
+)
+
 checks["product run wires existing-product REST API smoke into default authenticated path"] = (
     "VELORIX_VIND_REST_API_SMOKE" in script
     and "run_rest_api_smoke()" in script
@@ -2245,12 +3385,65 @@ checks["product completion report summarizes blockers without forging evidence"]
     "velorix_product_completion_report" in product_completion_report
     and "product_complete_blockers" in product_completion_report
     and "completion_plan" in product_completion_report
+    and "architecture_critique_blockers" in product_completion_report
+    and "still blocks release readiness" in product_completion_report
+    and "Resolve docs/architecture-critique.md release-readiness blockers" in product_completion_report
+    and "remove the blocking verdict" in product_completion_report
+    and "remove the Block 1.0 verdict" not in product_completion_report
+    and "VELORIX_S3_CHECKPOINT_FAULT_MATRIX_EVIDENCE_PATH" in product_completion_report
+    and "VELORIX_HIQLITE_RESTORE_DRILL_EVIDENCE_PATH" in product_completion_report
+    and "VELORIX_UPGRADE_ROLLBACK_REPAIR_GC_FAULT_MATRIX_EVIDENCE_PATH"
+    in product_completion_report
+    and "VELORIX_QUERY_OUTPUT_ISOLATION_EVIDENCE_PATH" in product_completion_report
+    and "VELORIX_SECURITY_RELEASE_PROVENANCE_EVIDENCE_PATH" in product_completion_report
+    and "VELORIX_REMAINING_RELEASE_READINESS_EVIDENCE_PATH" in product_completion_report
+    and '"VELORIX_S3_CHECKPOINT_FAULT_MATRIX_EVIDENCE"' not in product_completion_report
+    and '"VELORIX_HIQLITE_RESTORE_DRILL_EVIDENCE"' not in product_completion_report
+    and '"VELORIX_UPGRADE_ROLLBACK_REPAIR_GC_FAULT_MATRIX_EVIDENCE"'
+    not in product_completion_report
+    and '"VELORIX_QUERY_OUTPUT_ISOLATION_EVIDENCE"' not in product_completion_report
+    and '"VELORIX_SECURITY_RELEASE_PROVENANCE_EVIDENCE"' not in product_completion_report
+    and '"VELORIX_REMAINING_RELEASE_READINESS_EVIDENCE"' not in product_completion_report
+    and "s3_checkpoint_fault_matrix" in product_completion_report
+    and "hiqlite_total_voter_loss_restore_drill" in product_completion_report
+    and "upgrade_rollback_repair_gc_fault_matrix" in product_completion_report
+    and "deployment_id, s3:// authority_store_id" in product_completion_report
+    and "rolling_upgrade, rollback_after_upgrade, corrupt_latest_checkpoint_repair" in product_completion_report
+    and "gc_concurrent_with_checkpoint_publication" in product_completion_report
+    and "gc_retains_repair_roots" in product_completion_report
+    and "six live S3 object-store fault scenario evidence files" in product_completion_report
+    and "five live S3 object-store fault scenario evidence files" not in product_completion_report
+    and "VELORIX_PRODUCT_DEPLOYMENT_ID=REPLACE_WITH_DEPLOYMENT_ID" in product_completion_report
+    and "VELORIX_AUTHORITY_STORE_ID=s3://REPLACE_WITH_BUCKET/REPLACE_WITH_PREFIX" in product_completion_report
+    and "check-s3-checkpoint-fault-matrix-evidence.sh" in product_completion_report
+    and "check-hiqlite-restore-drill-evidence.sh" in product_completion_report
+    and "check-upgrade-rollback-repair-gc-fault-matrix-evidence.sh"
+    in product_completion_report
+    and "Fail if architecture critique still blocks 1.0" in release_gate
+    and "docs/architecture-critique.md still declares a release-readiness blocker" in release_gate
+    and "^\\*\\*Block 1\\.0\\.\\*\\*" in release_gate
+    and "still blocks release readiness" in release_gate
     and '"derived_from": "report_gates"' in product_completion_report
-    and '"accepted_gate_statuses": ["pass", "out_of_scope"]' in product_completion_report
+    and '"product_accepted_gate_statuses": ["pass"]' in product_completion_report
+    and '"local_diagnostic_accepted_gate_statuses": ["pass", "out_of_scope"]' in product_completion_report
     and "object_store_external_authority_out_of_scope_does_not_prove_object_store_durability"
     in product_completion_report
-    and "product_complete = all(item[\"status\"] in {\"pass\", \"out_of_scope\"} for item in gates)"
+    and "product_complete = all(item[\"status\"] == \"pass\" for item in gates)"
     in product_completion_report
+    and '"derived_from": "missing_product_evidence"' in product_completion_report
+    and '"report_kind": "velorix_product_completion_report"' in product_completion_report
+    and '"product_completion_source": {' in product_completion_report
+    and "Product evidence is required before completion can be assessed" in product_completion_report
+    and "local_diagnostic_complete = all(" in product_completion_report
+    and "item[\"status\"] in {\"pass\", \"out_of_scope\"} for item in gates"
+    in product_completion_report
+    and 'if item.get("status") in {"blocked", "diagnostic", "missing", "out_of_scope"}'
+    in product_completion_report
+    and "Default local_diagnostic_complete may prove local/internal REST TLS/auth"
+    in complete_product_env
+    and "product_complete remains false until every release/product gate is required and passes"
+    in complete_product_env
+    and "Default product_complete therefore proves" not in complete_product_env
     and "scripts/report-vind-product-completion.sh" in script
 )
 
@@ -2258,10 +3451,17 @@ checks["top-level product completion driver sequences remaining gates"] = (
     (repo_root / "scripts" / "next-vind-product-step.sh").is_file()
     and "velorix_next_vind_product_step" in next_product_step
     and "EXECUTION_TO_GATE" in next_product_step
+    and "build_plan_step" in next_product_step
+    and "The completion plan still has required input." in next_product_step
     and '"external_s3": "object_store_external_authority"' in next_product_step
     and 'gate.get("status") == "out_of_scope"' in next_product_step
     and "scripts/complete-vind-product.sh" in doc
     and "scripts/write-complete-vind-product-input-preflight.py" in product_complete
+    and "run_completion_report()" in product_complete
+    and "product = load_json(product_evidence) if Path(product_evidence).is_file() else {}"
+    in product_complete
+    and '"will_run": local_execution_allowed and env.get("VELORIX_COMPLETE_PRODUCT_REPORT", "1") == "1"'
+    in product_complete
     and "VELORIX_PRODUCT_COMPLETE_REQUIRE_EXTERNAL_S3" in product_complete
     and "VELORIX_PRODUCT_COMPLETE_REQUIRE_PUBLIC_INGRESS" in product_complete
 )
@@ -2317,6 +3517,616 @@ checks["supports existing local Kubernetes context when docker vCluster is unava
     and "VELORIX_EXISTING_CONTEXT_ALLOW_REMOTE" in script
     and "VELORIX_IMAGE_LOAD_MODE" in script
     and "load_image_into_k3d()" in script
+)
+
+checks["crate-boundary policy passes strict mode"] = (
+    cargo_metadata_crate_boundary_policy_passes_strict()
+    and os.access(crate_boundary_policy_path, os.X_OK)
+    and "scripts/check-crate-boundary-policy.sh" in release_gate
+    and "RecoverLocal" not in cli
+    and "recover_local_runtime" not in cli
+    and "velorix_runtime::recovery" not in cli
+    and "velorix_runtime::benchmark_gate" not in cli
+    and "velorix_runtime::readiness" not in cli
+    and "RecoveredRuntime" not in cli
+    and "velorix_storage::" not in cli
+    and "velorix_storage::" not in api
+    and "velorix_meta::" not in api
+    and "velorix_k8s::" not in api
+    and "velorix_storage::" not in (repo_root / "crates" / "velorix-k8s" / "src" / "startup.rs").read_text(encoding="utf-8")
+    and "velorix_storage::" not in (repo_root / "crates" / "velorix-k8s" / "src" / "stream_watch.rs").read_text(encoding="utf-8")
+    and "velorix_storage::" not in (repo_root / "crates" / "velorix-k8s" / "src" / "ingest_writer.rs").read_text(encoding="utf-8")
+    and "velorix_storage::" not in (repo_root / "crates" / "velorix-k8s" / "src" / "lease.rs").read_text(encoding="utf-8")
+    and "velorix_storage::" not in (repo_root / "crates" / "velorix-k8s" / "src" / "worker_shard.rs").read_text(encoding="utf-8")
+    and "velorix_runtime::query_policy_catalog" not in api
+    and "velorix_runtime::materialized_view_runtime::CRATE_NAME" not in api
+    and "velorix_runtime::recovery::orders_sum_count_relation_catalog" not in api
+    and "velorix_runtime::" not in api
+    and "Direct crate boundaries must enforce the claimed ownership model"
+    in architecture_critique
+    and "velorix-api` previously depended directly on K8s, metadata, runtime and storage"
+    in architecture_critique
+    and "velorix-cli` no longer links\n  `velorix-runtime` or `velorix-storage`"
+    in architecture_critique
+    and "velorix-cli` directly depends on storage for admin/GC paths" not in architecture_critique
+    and "velorix-cli` directly depends on runtime and storage" not in architecture_critique
+    and "Make CLI and Kubernetes components protocol clients" in architecture_critique
+    and "Fail CI if API routes, CLI or K8s crates directly depend on engine internals or Velorix storage adapters"
+    in architecture_critique
+)
+
+checks["object_store duplicate is documented as expiring S3 compatibility exception"] = (
+    object_store_duplicate_exception.get("owner") == "runtime"
+    and object_store_duplicate_exception.get("expires_on") == "2026-08-31"
+    and "authority paths" in object_store_duplicate_exception.get("reason", "")
+    and "DataFusion's object_store 0.13" in object_store_duplicate_exception.get("reason", "")
+    and "Unify authority and scan object_store clients"
+    in object_store_duplicate_exception.get("replacement_plan", "")
+    and object_store_duplicate_exception.get("promotion_rule")
+    == "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    and runtime_cargo.get("dependencies", {}).get("object_store_13", {}).get("optional") is True
+    and "object_store_13" in runtime_cargo.get("features", {}).get("s3-compat-tests", [])
+    and "object_store` 0.12 for Velorix authority/catalog/probe writes"
+    in s3_compatible_test_harness
+    and "object_store` 0.13 for DataFusion 53 Parquet scans"
+    in s3_compatible_test_harness
+    and "This proves the current two-version\nobject-store boundary without adding an adapter"
+    in s3_compatible_test_harness
+)
+
+checks["product Dockerfiles reject external runtime artifact paths"] = (
+    os.access(no_external_runtime_artifacts_path, os.X_OK)
+    and no_external_runtime_artifact_policy_passes()
+    and "runtime_source_dirs" in Path(no_external_runtime_artifacts_path).read_text(encoding="utf-8")
+    and "crates/velorix-meta/src" in Path(no_external_runtime_artifacts_path).read_text(encoding="utf-8")
+    and "crates/velorix-ingest-writer/src" in Path(no_external_runtime_artifacts_path).read_text(encoding="utf-8")
+    and "cargo_files" in Path(no_external_runtime_artifacts_path).read_text(encoding="utf-8")
+    and "deployment_files" in Path(no_external_runtime_artifacts_path).read_text(encoding="utf-8")
+    and "scan_product_dependency_closure" in Path(no_external_runtime_artifacts_path).read_text(encoding="utf-8")
+    and "Check no external runtime artifacts" in release_gate
+    and "scripts/check-no-external-runtime-artifacts.sh" in release_gate
+    and "artifact:" not in api.split("struct ViewResponse", 1)[1].split("struct ViewCatalogResponse", 1)[0]
+    and "public_view_response_json_omits_legacy_artifact_key" in api
+)
+
+checks["release gate requires critique live evidence validators"] = (
+    "s3-checkpoint-fault-matrix-evidence-path" in release_gate
+    and "hiqlite-restore-drill-evidence-path" in release_gate
+    and "upgrade-rollback-repair-gc-fault-matrix-evidence-path" in release_gate
+    and "query-output-isolation-evidence-path" in release_gate
+    and "security-release-provenance-evidence-path" in release_gate
+    and "remaining-release-readiness-evidence-path" in release_gate
+    and "VELORIX_S3_CHECKPOINT_FAULT_MATRIX_EVIDENCE_PATH" in release_gate
+    and "VELORIX_HIQLITE_RESTORE_DRILL_EVIDENCE_PATH" in release_gate
+    and "VELORIX_UPGRADE_ROLLBACK_REPAIR_GC_FAULT_MATRIX_EVIDENCE_PATH" in release_gate
+    and "VELORIX_QUERY_OUTPUT_ISOLATION_EVIDENCE_PATH" in release_gate
+    and "VELORIX_SECURITY_RELEASE_PROVENANCE_EVIDENCE_PATH" in release_gate
+    and "VELORIX_REMAINING_RELEASE_READINESS_EVIDENCE_PATH" in release_gate
+    and "S3_CHECKPOINT_FAULT_MATRIX_RELEASE_PATH" in release_gate
+    and "HIQLITE_RESTORE_DRILL_RELEASE_PATH" in release_gate
+    and "UPGRADE_ROLLBACK_REPAIR_GC_FAULT_MATRIX_RELEASE_PATH" in release_gate
+    and "QUERY_OUTPUT_ISOLATION_RELEASE_PATH" in release_gate
+    and "SECURITY_RELEASE_PROVENANCE_RELEASE_PATH" in release_gate
+    and "REMAINING_RELEASE_READINESS_RELEASE_PATH" in release_gate
+    and 'test -f "$S3_CHECKPOINT_FAULT_MATRIX_RELEASE_PATH"' in release_gate
+    and 'test -f "$HIQLITE_RESTORE_DRILL_RELEASE_PATH"' in release_gate
+    and 'test -f "$UPGRADE_ROLLBACK_REPAIR_GC_FAULT_MATRIX_RELEASE_PATH"'
+    in release_gate
+    and 'test -f "$QUERY_OUTPUT_ISOLATION_RELEASE_PATH"' in release_gate
+    and 'test -f "$SECURITY_RELEASE_PROVENANCE_RELEASE_PATH"' in release_gate
+    and 'test -f "$REMAINING_RELEASE_READINESS_RELEASE_PATH"' in release_gate
+    and "release gate requires inputs.s3-checkpoint-fault-matrix-evidence-path" in release_gate
+    and "release gate requires inputs.hiqlite-restore-drill-evidence-path" in release_gate
+    and "release gate requires inputs.upgrade-rollback-repair-gc-fault-matrix-evidence-path"
+    in release_gate
+    and "release gate requires inputs.query-output-isolation-evidence-path" in release_gate
+    and "release gate requires inputs.security-release-provenance-evidence-path" in release_gate
+    and "release gate requires inputs.remaining-release-readiness-evidence-path" in release_gate
+    and "Validate critique release evidence" in release_gate
+    and "scripts/check-s3-checkpoint-fault-matrix-evidence.sh" in release_gate
+    and "scripts/check-hiqlite-restore-drill-evidence.sh" in release_gate
+    and "scripts/check-upgrade-rollback-repair-gc-fault-matrix-evidence.sh" in release_gate
+    and "scripts/check-query-output-isolation-evidence.sh" in release_gate
+    and "scripts/check-security-release-provenance-evidence.sh" in release_gate
+    and "scripts/check-remaining-release-readiness-evidence.sh" in release_gate
+    and "--kind critique --artifact" in release_gate
+    and "critique_siblings" in release_copy
+    and '"critique"' in release_copy
+    and '--s3-checkpoint-fault-matrix-evidence "$S3_CHECKPOINT_FAULT_MATRIX_RELEASE_PATH"'
+    in release_gate
+    and '--s3-checkpoint-fault-matrix-evidence "$VELORIX_S3_CHECKPOINT_FAULT_MATRIX_EVIDENCE_PATH"'
+    not in release_gate
+    and "--s3-checkpoint-fault-matrix-evidence" in release_doc
+    and 'scripts/check-s3-checkpoint-fault-matrix-evidence.sh "$VELORIX_S3_CHECKPOINT_FAULT_MATRIX_EVIDENCE_PATH"'
+    in release_doc
+    and '--hiqlite-restore-drill-evidence "$HIQLITE_RESTORE_DRILL_RELEASE_PATH"'
+    in release_gate
+    and '--hiqlite-restore-drill-evidence "$VELORIX_HIQLITE_RESTORE_DRILL_EVIDENCE_PATH"'
+    not in release_gate
+    and "--hiqlite-restore-drill-evidence" in release_doc
+    and 'scripts/check-hiqlite-restore-drill-evidence.sh "$VELORIX_HIQLITE_RESTORE_DRILL_EVIDENCE_PATH"'
+    in release_doc
+    and '--upgrade-rollback-repair-gc-fault-matrix-evidence "$UPGRADE_ROLLBACK_REPAIR_GC_FAULT_MATRIX_RELEASE_PATH"'
+    in release_gate
+    and '--upgrade-rollback-repair-gc-fault-matrix-evidence "$VELORIX_UPGRADE_ROLLBACK_REPAIR_GC_FAULT_MATRIX_EVIDENCE_PATH"'
+    not in release_gate
+    and "--upgrade-rollback-repair-gc-fault-matrix-evidence" in release_doc
+    and 'scripts/check-upgrade-rollback-repair-gc-fault-matrix-evidence.sh "$VELORIX_UPGRADE_ROLLBACK_REPAIR_GC_FAULT_MATRIX_EVIDENCE_PATH"'
+    in release_doc
+    and '--query-output-isolation-evidence "$QUERY_OUTPUT_ISOLATION_RELEASE_PATH"'
+    in release_gate
+    and '--query-output-isolation-evidence "$VELORIX_QUERY_OUTPUT_ISOLATION_EVIDENCE_PATH"'
+    not in release_gate
+    and "--query-output-isolation-evidence" in release_doc
+    and 'scripts/check-query-output-isolation-evidence.sh "$VELORIX_QUERY_OUTPUT_ISOLATION_EVIDENCE_PATH"'
+    in release_doc
+    and '--security-release-provenance-evidence "$SECURITY_RELEASE_PROVENANCE_RELEASE_PATH"'
+    in release_gate
+    and '--security-release-provenance-evidence "$VELORIX_SECURITY_RELEASE_PROVENANCE_EVIDENCE_PATH"'
+    not in release_gate
+    and "--security-release-provenance-evidence" in release_doc
+    and 'scripts/check-security-release-provenance-evidence.sh "$VELORIX_SECURITY_RELEASE_PROVENANCE_EVIDENCE_PATH"'
+    in release_doc
+    and '--remaining-release-readiness-evidence "$REMAINING_RELEASE_READINESS_RELEASE_PATH"'
+    in release_gate
+    and '--remaining-release-readiness-evidence "$VELORIX_REMAINING_RELEASE_READINESS_EVIDENCE_PATH"'
+    not in release_gate
+    and "--remaining-release-readiness-evidence" in release_doc
+    and 'scripts/check-remaining-release-readiness-evidence.sh "$VELORIX_REMAINING_RELEASE_READINESS_EVIDENCE_PATH"'
+    in release_doc
+    and '--release-commit "$RELEASE_COMMIT"' in release_gate
+    and '--release-commit "$RELEASE_COMMIT"' in release_doc
+    and 'release_commit = os.environ.get("VELORIX_RELEASE_COMMIT", "").strip()'
+    in product_completion_report
+    and "source_revision must match VELORIX_RELEASE_COMMIT" in product_completion_report
+    and "s3_checkpoint_fault_matrix_evidence: Option<PathBuf>" in cli
+    and "hiqlite_restore_drill_evidence: Option<PathBuf>" in cli
+    and "upgrade_rollback_repair_gc_fault_matrix_evidence: Option<PathBuf>" in cli
+    and "query_output_isolation_evidence: Option<PathBuf>" in cli
+    and "security_release_provenance_evidence: Option<PathBuf>" in cli
+    and "remaining_release_readiness_evidence: Option<PathBuf>" in cli
+    and "validate_critique_release_evidence_artifact" in cli
+    and cli.count(
+        "artifacts.release_commit.as_deref(),\n            release_artifacts_required,"
+    )
+    >= 6
+    and "validate_critique_release_identity(path, artifact, release_commit, release_artifacts_required)?;"
+    in cli
+    and "critique release evidence requires --release-commit" in cli
+    and "critique release evidence source_revision does not match release_commit" in cli
+    and "missing object /deployed_image_digests" in cli
+    and "missing deployed_image_digests.{role}" in cli
+    and 'validate_sha256_digest(path, digest, &format!("deployed_image_digests.{role}"))?;'
+    in cli
+    and '"s3-checkpoint-fault-matrix-evidence",\n            &artifacts.s3_checkpoint_fault_matrix_evidence'
+    in cli
+    and '"hiqlite-restore-drill-evidence",\n            &artifacts.hiqlite_restore_drill_evidence'
+    in cli
+    and '"upgrade-rollback-repair-gc-fault-matrix-evidence",\n            &artifacts.upgrade_rollback_repair_gc_fault_matrix_evidence'
+    in cli
+    and '"query-output-isolation-evidence",\n            &artifacts.query_output_isolation_evidence'
+    in cli
+    and '"security-release-provenance-evidence",\n            &artifacts.security_release_provenance_evidence'
+    in cli
+    and '"remaining-release-readiness-evidence",\n            &artifacts.remaining_release_readiness_evidence'
+    in cli
+    and "target/release-evidence/critique/**" in release_gate
+)
+
+checks["production readiness status delegates to generated evidence gate"] = (
+    "This document does not certify release readiness" in production_readiness_status
+    and "Release readiness is generated from the readiness report" in production_readiness_status
+    and "The static Markdown matrix was removed" in production_readiness_status
+    and "concrete evidence artifacts, not from this file" in production_readiness_status
+    and "$VELORIX_S3_CHECKPOINT_FAULT_MATRIX_EVIDENCE_PATH" in production_readiness_status
+    and "$VELORIX_HIQLITE_RESTORE_DRILL_EVIDENCE_PATH" in production_readiness_status
+    and "$VELORIX_UPGRADE_ROLLBACK_REPAIR_GC_FAULT_MATRIX_EVIDENCE_PATH"
+    in production_readiness_status
+    and "$VELORIX_QUERY_OUTPUT_ISOLATION_EVIDENCE_PATH" in production_readiness_status
+    and "$VELORIX_SECURITY_RELEASE_PROVENANCE_EVIDENCE_PATH" in production_readiness_status
+    and "$VELORIX_REMAINING_RELEASE_READINESS_EVIDENCE_PATH" in production_readiness_status
+    and "$S3_CHECKPOINT_FAULT_MATRIX_EVIDENCE\"" not in production_readiness_status
+    and "$HIQLITE_RESTORE_DRILL_EVIDENCE\"" not in production_readiness_status
+    and "$UPGRADE_ROLLBACK_REPAIR_GC_FAULT_MATRIX_EVIDENCE\""
+    not in production_readiness_status
+    and "$QUERY_OUTPUT_ISOLATION_EVIDENCE\"" not in production_readiness_status
+    and "$SECURITY_RELEASE_PROVENANCE_EVIDENCE\"" not in production_readiness_status
+    and "$REMAINING_RELEASE_READINESS_EVIDENCE\"" not in production_readiness_status
+)
+
+checks["dependency governance docs do not overclaim release readiness"] = (
+    "sufficient only for the\nartifact-gated `readiness-report` dependency-governance subcheck"
+    in dependency_governance_doc
+    and "does not satisfy the separate live release-readiness evidence\ngates"
+    in dependency_governance_doc
+    and "does not require a separate\n`cargo-vet` attestation" in dependency_governance_doc
+    and "not a release blocker" not in dependency_governance_doc
+    and "not a 1.0 release\nblocker" not in dependency_governance_doc
+)
+
+checks["Hiqlite backup-restore evidence validator is explicit configuration evidence"] = (
+    os.access(hiqlite_backup_restore_evidence_path, os.X_OK)
+    and hiqlite_backup_restore_evidence_policy_has_pass_fail_coverage()
+    and '"schema_version": 8' in first_e2e
+    and "HiqliteNoPvcThreeVoterBackupRestore" in control_readiness
+    and "kubernetes_status missing hiqlite_no_pvc_three_voter_backup_restore evidence"
+    in control_readiness
+    and "release_readiness_requires_hiqlite_no_pvc_backup_restore_evidence"
+    in control_readiness
+    and "first_e2e_readiness_does_not_require_release_fault_matrices" in control_readiness
+)
+
+checks["S3 checkpoint fault matrix evidence validator is live-release only"] = (
+    os.access(s3_checkpoint_fault_matrix_evidence_path, os.X_OK)
+    and s3_checkpoint_fault_matrix_evidence_policy_has_pass_fail_coverage()
+    and "s3_compatible_checkpoint_fault_matrix" in release_doc
+    and "S3-compatible delayed-visibility, retry, and fault-injection checkpoint matrix"
+    in release_doc
+)
+
+s3_fault_matrix_runner = Path(s3_checkpoint_fault_matrix_runner_path).read_text(encoding="utf-8")
+checks["S3 checkpoint fault matrix runner aggregates only real scenario evidence"] = (
+    os.access(s3_checkpoint_fault_matrix_runner_path, os.X_OK)
+    and "VELORIX_S3_COMPAT must be 1" in s3_fault_matrix_runner
+    and "VELORIX_PRODUCT_DEPLOYMENT_ID" in s3_fault_matrix_runner
+    and "VELORIX_AUTHORITY_STORE_ID" in s3_fault_matrix_runner
+    and "cargo test -p velorix-storage --test s3_compat --features s3-compat-tests"
+    in s3_fault_matrix_runner
+    and "missing scenario evidence" in s3_fault_matrix_runner
+    and "metadata_cas_failure.json" in s3_fault_matrix_runner
+    and '"metadata_cas_failure"' in s3_fault_matrix_runner
+    and '"live_s3_compatible": True' in s3_fault_matrix_runner
+    and "scripts/check-s3-checkpoint-fault-matrix-evidence.sh" in s3_fault_matrix_runner
+    and "VELORIX_S3_CHECKPOINT_FAULT_MATRIX_EVIDENCE_PATH" in s3_fault_matrix_runner
+    and "Override aggregate output with:" in s3_fault_matrix_runner
+    and "VELORIX_S3_CHECKPOINT_FAULT_MATRIX_EVIDENCE:-" not in s3_fault_matrix_runner
+    and "aggregate already-produced live scenario evidence\nwith `scripts/run-s3-checkpoint-fault-matrix.sh`"
+    in release_doc
+)
+
+checks["Hiqlite restore drill evidence validator proves total voter loss"] = (
+    os.access(hiqlite_restore_drill_evidence_path, os.X_OK)
+    and hiqlite_restore_drill_evidence_policy_has_pass_fail_coverage()
+    and "Record deployment_id and an s3:// authority_store_id"
+    in (repo_root / "scripts" / "run-hiqlite-restore-drill.sh").read_text(encoding="utf-8")
+    and "object_store_backup" in (repo_root / "scripts" / "run-hiqlite-restore-drill.sh").read_text(encoding="utf-8")
+    and "metadata_write_survival" in (repo_root / "scripts" / "run-hiqlite-restore-drill.sh").read_text(encoding="utf-8")
+    and "VELORIX_HIQLITE_RESTORE_DRILL_EVIDENCE_PATH"
+    in (repo_root / "scripts" / "run-hiqlite-restore-drill.sh").read_text(encoding="utf-8")
+    and "HIQLITE_RESTORE_DRILL_EVIDENCE:-"
+    not in (repo_root / "scripts" / "run-hiqlite-restore-drill.sh").read_text(encoding="utf-8")
+    and "deployment_id" in product_completion_report
+    and "s3:// authority_store_id" in product_completion_report
+    and "evidence_kind=hiqlite_total_voter_loss_restore_drill" in product_completion_report
+    and "post_restore_ingest_query" in product_completion_report
+    and "hiqlite_no_pvc_three_voter_backup_restore" in release_doc
+    and "hiqlite_total_voter_loss_restore_drill" in release_doc
+    and "compatibility evidence kind" in release_doc
+    and "live restore drill" in release_doc
+)
+
+upgrade_repair_gc_fault_matrix_runner = upgrade_repair_gc_fault_matrix_runner_path.read_text(
+    encoding="utf-8"
+)
+checks["upgrade rollback repair GC fault matrix evidence validator is live-release only"] = (
+    os.access(upgrade_repair_gc_fault_matrix_evidence_path, os.X_OK)
+    and upgrade_repair_gc_fault_matrix_evidence_policy_has_pass_fail_coverage()
+    and os.access(upgrade_repair_gc_fault_matrix_runner_path, os.X_OK)
+    and "live release matrix" in upgrade_repair_gc_fault_matrix_runner
+    and "Record deployment_id and an s3:// authority_store_id" in upgrade_repair_gc_fault_matrix_runner
+    and "rolling_upgrade" in upgrade_repair_gc_fault_matrix_runner
+    and "rollback_after_upgrade" in upgrade_repair_gc_fault_matrix_runner
+    and "corrupt_latest_checkpoint_repair" in upgrade_repair_gc_fault_matrix_runner
+    and "checkpoint publication" in upgrade_repair_gc_fault_matrix_runner
+    and "gc_retains_repair_roots" in upgrade_repair_gc_fault_matrix_runner
+    and "No pass artifact was produced" in upgrade_repair_gc_fault_matrix_runner
+    and "VELORIX_UPGRADE_ROLLBACK_REPAIR_GC_FAULT_MATRIX_EVIDENCE_PATH"
+    in upgrade_repair_gc_fault_matrix_runner
+    and "VELORIX_UPGRADE_ROLLBACK_REPAIR_GC_FAULT_MATRIX_EVIDENCE:-"
+    not in upgrade_repair_gc_fault_matrix_runner
+    and "check-upgrade-rollback-repair-gc-fault-matrix-evidence.sh"
+    in upgrade_repair_gc_fault_matrix_runner
+)
+
+query_output_isolation_runner = query_output_isolation_runner_path.read_text(encoding="utf-8")
+checks["query output isolation evidence validator is live-release only"] = (
+    os.access(query_output_isolation_evidence_path, os.X_OK)
+    and query_output_isolation_evidence_policy_has_pass_fail_coverage()
+    and os.access(query_output_isolation_runner_path, os.X_OK)
+    and "Live-only boundary" in query_output_isolation_runner
+    and "Record deployment_id and an s3:// authority_store_id" in query_output_isolation_runner
+    and "query_pod_iam_policy" in query_output_isolation_runner
+    and "object_store_audit_log" in query_output_isolation_runner
+    and "deployment_id" in product_completion_report
+    and "s3:// authority_store_id" in product_completion_report
+    and "evidence_kind=query_output_isolation" in product_completion_report
+    and "materialized_output_read" in product_completion_report
+    and "No pass artifact was produced" in query_output_isolation_runner
+    and "VELORIX_QUERY_OUTPUT_ISOLATION_EVIDENCE_PATH" in query_output_isolation_runner
+    and "VELORIX_QUERY_OUTPUT_ISOLATION_EVIDENCE:-" not in query_output_isolation_runner
+    and "query_output_isolation" in product_completion_report
+    and "query output isolation" in release_doc.lower()
+)
+
+security_release_provenance_runner = security_release_provenance_runner_path.read_text(
+    encoding="utf-8"
+)
+checks["security release provenance evidence validator is live-release only"] = (
+    os.access(security_release_provenance_evidence_path, os.X_OK)
+    and security_release_provenance_evidence_policy_has_pass_fail_coverage()
+    and os.access(security_release_provenance_runner_path, os.X_OK)
+    and "live security verification" in security_release_provenance_runner
+    and "deployment_id and an s3:// authority_store_id are recorded"
+    in security_release_provenance_runner
+    and "source_revision" in product_completion_report
+    and "deployed_image_digests" in product_completion_report
+    and "cross-tenant negatives" in product_completion_report
+    and "immutable test evidence" in product_completion_report
+    and "No pass artifact was produced" in security_release_provenance_runner
+    and "VELORIX_SECURITY_RELEASE_PROVENANCE_EVIDENCE_PATH"
+    in security_release_provenance_runner
+    and "VELORIX_SECURITY_RELEASE_PROVENANCE_EVIDENCE:-"
+    not in security_release_provenance_runner
+    and "security_release_provenance" in product_completion_report
+    and "security/release provenance" in release_doc.lower()
+    and "release image digests for `velorix-api` and `velorix-meta`"
+    in release_doc
+    and "Hiqlite authority image digest is\n  bound by the separate Hiqlite backend-time trusted provenance attestation"
+    in release_doc
+)
+
+remaining_release_readiness_runner = remaining_release_readiness_runner_path.read_text(
+    encoding="utf-8"
+)
+checks["remaining release readiness evidence validator is live-release only"] = (
+    os.access(remaining_release_readiness_evidence_path, os.X_OK)
+    and remaining_release_readiness_evidence_policy_has_pass_fail_coverage()
+    and os.access(remaining_release_readiness_runner_path, os.X_OK)
+    and "live/release readiness drills" in remaining_release_readiness_runner
+    and "deployment_id and an s3:// authority_store_id are recorded"
+    in remaining_release_readiness_runner
+    and "release-image contract tests" in remaining_release_readiness_runner
+    and "SQL admission corpus" in remaining_release_readiness_runner
+    and "VELORIX_REMAINING_RELEASE_READINESS_EVIDENCE_PATH"
+    in remaining_release_readiness_runner
+    and "VELORIX_REMAINING_RELEASE_READINESS_EVIDENCE:-"
+    not in remaining_release_readiness_runner
+    and "replay determinism" in product_completion_report
+    and "join frontier" in product_completion_report
+    and "scale soak" in product_completion_report
+    and "No pass artifact was produced" in remaining_release_readiness_runner
+    and "remaining_release_readiness" in product_completion_report
+    and "remaining release-readiness" in release_doc.lower()
+    and "unsupported plan/expression nodes" in release_doc
+    and "unsupported SQL leaves no persisted view metadata or runtime binding"
+    in " ".join(release_doc.split())
+)
+
+checks["metadata server production startup fails closed"] = (
+    "fn parse_meta_serve_config" in meta
+    and 'required_nonempty_config(vars, "VELORIX_META_MODE")' in meta
+    and 'required_nonempty_config(vars, "VELORIX_META_BACKEND")' in meta
+    and 'None if *mode == MetaServeMode::Development => "127.0.0.1:9090".to_string()' in meta
+    and 'None => anyhow::bail!("VELORIX_META_BIND is required in production mode")' in meta
+    and "development VELORIX_META_BIND must use a loopback address" in meta
+    and "production VELORIX_META_BACKEND must be durable; memory is development-only" in meta
+    and "VELORIX_META_BEARER_TOKEN is required in production mode" in meta
+    and "VELORIX_META_TRANSPORT_SECURITY is required in production mode" in meta
+    and "use `service-mesh-mtls` attestation" in meta
+    and "VELORIX_META_TRANSPORT_SECURITY_ATTESTATION is required in production mode" in meta
+    and "VELORIX_HIQLITE_API_SECRET" in meta
+    and "production VELORIX_HIQLITE_NODES must contain exactly three unique voter nodes" in meta
+    and "serve_config_requires_explicit_mode_and_backend" in meta
+    and "development_memory_config_defaults_to_loopback_only" in meta
+    and "production_config_rejects_missing_durable_backend_and_memory_backend" in meta
+    and "production_config_requires_auth_and_transport_security_attestation" in meta
+    and "production_hiqlite_requires_exactly_three_unique_voter_nodes" in meta
+    and "The metadata server is fail-open by default" in architecture_critique
+    and "Resolved by current code evidence: production startup now requires explicit"
+    in architecture_critique
+    and "requires exactly three unique Hiqlite voter nodes" in architecture_critique
+    and "development mode defaults to loopback-only binding" in architecture_critique
+)
+
+checks["public 1.0 exposes only materialized ingest acknowledgement"] = (
+    "pub enum IngestAckMode" in api
+    and "Materialized" in api.split("pub enum IngestAckMode", 1)[1].split("}", 1)[0]
+    and "AppendCommitted" not in api.split("pub enum IngestAckMode", 1)[1].split("}", 1)[0]
+    and '"enum": ["materialized"]' in api
+    and '"readOnly": true' in api
+    and '"append_committed_background_materialization"' not in readyz_source
+    and "pub ack_mode:" not in api.split("pub struct IngestRowsRequest", 1)[1].split("pub struct IngestEventTimeWatermarkRequest", 1)[0]
+    and "pub ack_mode:" not in api.split("pub struct IngestRelationRowsRequest", 1)[1].split("pub struct IngestEventTimeWatermarkRequest", 1)[0]
+    and "pub ack_mode:" not in api.split("pub struct IngestEpochRequest", 1)[1].split("pub enum IngestAckMode", 1)[0]
+    and "public 1.0 ingest API does not expose an async append-only acknowledgement"
+    in materialized_view_roadmap
+    and "does not expose acknowledgement negotiation to clients" in materialized_view_roadmap
+    and "## Storage-Layer Ingest Acknowledgement Semantics" in storage_contract
+    and "This section describes the storage-layer append/admission contract, not the\npublic relation ingest API."
+    in storage_contract
+    and "The public 1.0 relation ingest API uses the higher-level synchronous\n`materialized` acknowledgement"
+    in storage_contract
+    and "Ingest acknowledgement is scoped to durable input admission only"
+    not in storage_contract
+    and "## Storage-Layer Append Semantics" in ingest_storage_format_decision
+    and "This is not the public 1.0 relation ingest contract" in ingest_storage_format_decision
+    and "Public\n`/v1/relations/{relation_id}/ingest` and `/v1/relations/ingest` expose only the\nsynchronous `materialized` acknowledgement"
+    in ingest_storage_format_decision
+)
+
+checks["public 1.0 publishes only enforced materialization runtime budgets"] = (
+    '"enforced_public_1_0_limits"' in readyz_source
+    and '"max_output_delta_records_per_commit"' in readyz_source
+    and '"max_state_payload_bytes_per_checkpoint"' in readyz_source
+    and "VELORIX_STANDING_RUNTIME_MAX_OUTPUT_DELTA_RECORDS" in api
+    and "VELORIX_STANDING_RUNTIME_MAX_STATE_PAYLOAD_BYTES" in api
+    and "validate_standing_runtime_budget" in api
+    and "rest_materialization_rejects_output_delta_over_runtime_budget" in api
+    and "max_key_cardinality" not in readyz_source
+    and "join_fanout" not in readyz_source
+    and "join_fan_out" not in readyz_source
+)
+
+checks["materialization lag response is structured and output-only"] = (
+    '"code": "MATERIALIZATION_LAG"' in api
+    and '"query_authority": "published_materialized_output"' in api
+    and '"source_read_on_query_path": false' in api
+    and '"ahead_of_materialized_output"' in api
+    and '"not_queryable_until_backfill_checkpoint_published"' in api
+    and "query reads published materialized output only" in api
+    and "rest_late_view_query_reports_materialization_lag_without_blocking_later_ingest" in api
+)
+
+checks["public serving docs are materialized-output-only"] = (
+    "Public query responses read published\nmaterialized output only" in api_serving_scope
+    and "public generic `/v1/query` source scans" in api_serving_scope
+    and "public persisted table scan APIs" in api_serving_scope
+    and "public ad hoc persisted query execution" in api_serving_scope
+    and "DataFusion policy` covers internal/dev object-backed scans and bounded\n  post-filtering over materialized output"
+    in api_serving_scope
+    and "This is not a public 1.0 source-query authority" in datafusion_resource_policy
+    and "Public 1.0 query serving reads\npublished materialized output only" in datafusion_resource_policy
+    and "Public promoted\n`/v1/api/*` views may use query policies only to bound materialized-output\npost-filtering"
+    in datafusion_resource_policy
+)
+
+checks["public ingest materialization response hides internal convergence naming"] = (
+    '"checkpoint_publication_writes"' in api
+    and "compaction_scheduled" not in api.split("struct IngestMaterializationResponse", 1)[1].split("struct IngestTimingResponse", 1)[0]
+    and '"compaction_scheduled"' not in api.split("fn openapi_ingest_materialization_schema", 1)[1].split("fn openapi_ingest_timing_schema", 1)[0]
+    and '"stages"' not in api.split("fn openapi_ingest_timing_schema", 1)[1].split("fn openapi_ingest_ack_mode_schema", 1)[0]
+    and '"convergence_writes"' not in api
+    and '"materialize_convergence"' not in api
+    and '"checkpoint_publication_writes"' in rest_api_smoke
+    and "reject_public_internal_keys" in rest_api_smoke
+    and "convergence_writes" in rest_api_smoke
+    and "materialize_convergence" in rest_api_smoke
+    and "compaction_scheduled" in rest_api_smoke
+    and "background_tasks" in rest_api_smoke
+    and "`materialization.checkpoint_publication_writes`" in materialized_view_roadmap
+    and "detailed per-stage timings are intentionally not part of the public 1.0" in materialized_view_roadmap
+    and "`POST /v1/views/{view_id}/compact`" not in materialized_output_segment_index
+    and "no public compact\nendpoint is exposed" in materialized_output_segment_index
+)
+
+checks["legacy persisted source-scan surfaces stay default-off"] = (
+    runtime_cargo.get("features", {}).get("default") == []
+    and runtime_cargo.get("features", {}).get("legacy-source-scan-surfaces") == []
+    and "legacy-source-scan-surfaces" in runtime_cargo.get("features", {}).get("s3-compat-tests", [])
+    and "#[cfg(feature = \"legacy-source-scan-surfaces\")]\npub mod persisted_query;" in runtime_lib
+    and "#[cfg(feature = \"legacy-source-scan-surfaces\")]\npub mod persisted_table;" in runtime_lib
+    and "#[cfg(feature = \"legacy-source-scan-surfaces\")]\npub mod persisted_view;" in runtime_lib
+    and "Legacy persisted table scans are quarantined behind the default-off"
+    in object_store_capabilities_doc
+    and "Delete or quarantine `persisted_query`, `persisted_table` and `persisted_view`"
+    in architecture_critique
+)
+
+checks["public 1.0 rejects advanced view and partial backfill surfaces"] = (
+    "experimental_advanced_view_features: false" in api
+    and "fn validate_public_view_feature_admission" in api
+    and "advanced view SQL is experimental and disabled for the public 1.0 API" in api
+    and "VELORIX_EXPERIMENTAL_ADVANCED_VIEW_FEATURES" not in api
+    and "VELORIX_EXPERIMENTAL_ADVANCED_VIEW_FEATURES" not in materialized_view_roadmap
+    and "VELORIX_EXPERIMENTAL_ADVANCED_VIEW_FEATURES" not in (repo_root / "scripts" / "smoke-vind-rest-row-number.sh").read_text(encoding="utf-8")
+    and "contains_sql_function_call(&sql, \"tumble\")" in api
+    and "contains_sql_function_call(&sql, \"hop\")" in api
+    and "contains_sql_function_call(&sql, \"session\")" in api
+    and "contains_sql_keyword(&sql, \"over\")" in api
+    and "mode: Option<String>" not in api.split("struct BackfillViewRequest", 1)[1].split("struct BackfillRangeRequest", 1)[0]
+    and "range: Option<BackfillRangeRequest>" not in api.split("struct BackfillViewRequest", 1)[1].split("struct BackfillRangeRequest", 1)[0]
+    and "scope: Option<BackfillScopeRequest>" not in api.split("struct BackfillViewRequest", 1)[1].split("struct BackfillRangeRequest", 1)[0]
+    and "rest_late_view_backfill_rejects_offset_range_scope" in api
+    and "rest_late_view_backfill_rejects_predicate_request_scope" in api
+    and "rest_late_view_background_backfill_request_fails_closed" in api
+    and '.route("/v1/views/{view_id}/compact"' not in api
+    and '"/v1/views/{view_id}/compact".to_string()' not in api
+    and '"background_tasks": state.background_task_status()' not in api
+    and '"output_compaction": {' not in api
+    and "Verification commands for this internal experimental-only evidence" in materialized_view_roadmap
+    and "not make window SQL part of the public 1.0 contract" in materialized_view_roadmap
+    and "Operator-triggered full replay may be used to make a\nlate-created view queryable"
+    in materialized_view_roadmap
+    and "Public 1.0 does not expose request-scope, range, predicate, or\nbackground backfill"
+    in materialized_view_roadmap
+    and "the view backfill API advances" not in materialized_view_roadmap
+    and "VELORIX_OUTPUT_COMPACTION_INTERVAL_EPOCHS is experimental and disabled for the public 1.0 API" in api
+    and "product knob `VELORIX_OUTPUT_COMPACTION_INTERVAL_EPOCHS` is rejected by the public 1.0 API" in materialized_view_roadmap.replace("\n", " ")
+    and "`POST /v1/views/{view_id}/compact`" not in materialized_view_roadmap
+    and "`materialization.compaction_scheduled`" not in materialized_view_roadmap
+    and "`background_tasks.compaction_already_running`" not in materialized_view_roadmap
+    and "materialized output compaction endpoint" not in storage_contract
+    and "internal materialized-output compaction maintenance path" in storage_contract
+    and "background compaction endpoint unexpectedly appears in OpenAPI" in rest_api_smoke
+)
+
+checks["SQL admission corpus rejects unsupported views without metadata or runtime binding"] = (
+    "rest_sql_admission_corpus_fails_closed_without_metadata_or_runtime_binding" in api
+    and "corpus_window_aggregate_over" in api
+    and "corpus_tumble_window" in api
+    and "corpus_hop_window" in api
+    and "corpus_session_window" in api
+    and "corpus_rollup" in api
+    and "corpus_union_all" in api
+    and "corpus_cross_join" in api
+    and "corpus_non_equi_join" in api
+    and "corpus_three_table_join" in api
+    and "should not leave view metadata" in api
+    and "should not leave runtime binding" in api
+)
+
+checks["checkpoint recovery repair and GC blocker remains evidence-bound"] = (
+    "Recovery lacks a complete upgrade, repair and GC contract" in architecture_critique
+    and "Resolve docs/architecture-critique.md release-readiness blockers" in product_completion_report
+    and "Upgrade, Repair, And GC Reachability Contract" in checkpoint_recovery_index
+    and "Supported release N must read release N-1 checkpoint manifests" in checkpoint_recovery_index
+    and "durable admitted replay lower bounds" in checkpoint_recovery_index.replace("\n", " ")
+    and "explicit repair holds" in checkpoint_recovery_index
+    and "active reader generations" in checkpoint_recovery_index
+    and "materialized output compaction source/output manifests" in checkpoint_recovery_index
+    and "does not satisfy the\nlive upgrade, rollback, repair, and GC fault-injection matrix"
+    in checkpoint_recovery_index
+    and "S3-compatible delayed-visibility, retry, and\nfault-injection checkpoint matrix evidence"
+    in checkpoint_recovery_index
+    and "cannot publish a mixed checkpoint" in checkpoint_recovery_index
+    and "The GC root set is deliberately larger than the latest-N manifest policy" in storage_contract
+    and "supported upgrade/rollback window" in storage_contract
+    and "PRODUCTION_READINESS_SCHEMA_VERSION: u16 = 8" in control_readiness
+    and "S3CompatibleCheckpointFaultMatrix" in control_readiness
+    and "s3_compatible_test_status missing s3_compatible_checkpoint_fault_matrix evidence"
+    in control_readiness
+    and "UpgradeRollbackRepairGcFaultMatrix" in control_readiness
+    and "gc_status missing upgrade_rollback_repair_gc_fault_matrix evidence" in control_readiness
+    and "upgrade_rollback_repair_gc_fault_matrix" in product_completion_report
+    and "upgrade-rollback-repair-gc-fault-matrix.json" in product_completion_report
+    and "self.into_report_with_options(true)" in control_readiness
+    and "self.into_report_with_options(false)" in control_readiness
+    and "release_readiness_requires_s3_checkpoint_fault_matrix" in control_readiness
+    and "release_readiness_requires_upgrade_rollback_repair_gc_fault_matrix" in control_readiness
+    and "first_e2e_readiness_does_not_require_release_fault_matrices" in control_readiness
+    and "s3_compatible_test_status.evidence_kind" in release_doc
+    and "s3_compatible_checkpoint_fault_matrix" in release_doc
+    and "kubernetes_status.evidence_kind" in release_doc
+    and "hiqlite_no_pvc_three_voter_backup_restore" in release_doc
+    and "gc_status.evidence_kind" in release_doc
+    and "upgrade_rollback_repair_gc_fault_matrix" in release_doc
+    and '"/v1/standing-runtime/ingest-epoch-failures/repair"' in api
+    and "repair_ingest_epoch_runtime_failure" in api
+    and "standing_runtime_checkpoint_read_ignores_object_store_when_meta_pointer_is_empty_after_recovery"
+    in api
+    and "standing_runtime_checkpoint_read_uses_meta_pointer_when_latest_cache_is_stale" in api
+    and "standing_runtime_checkpoint_read_keeps_old_meta_pointer_when_new_checkpoint_is_orphaned"
+    in api
+    and "standing_runtime_checkpoint_read_fails_closed_when_output_delta_object_is_corrupt"
+    in api
+    and "standing_runtime_checkpoint_read_fails_closed_when_manifest_hash_mismatches_pointer"
+    in api
+    and "standing_runtime_checkpoint_read_fails_closed_when_pointer_body_mismatches_checkpoint_object"
+    in api
+    and "standing_runtime_output_serving_fails_closed_when_page_object_is_corrupt" in api
+    and "standing_runtime_output_compaction_publishes_checkpoint_bound_snapshot_without_republishing_checkpoint" in api
+    and "rest_view_compaction_and_openapi_paths_are_available_after_materialization" in api
+    and '!paths.contains_key("/v1/views/{view_id}/compact")' in api
 )
 
 checks["product ingress apply helper creates no-PVC Kubernetes ingress"] = (

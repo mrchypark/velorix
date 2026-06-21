@@ -83,8 +83,9 @@ guard, not a retention handle.
 - Production publication rejects a SlateDB child checkpoint when any visible
   parent or ancestor manifest in its lineage still carries raw/bootstrap state
   refs.
-- Local admin recovery rejects raw state refs unless `recover-local` is invoked
-  with the explicit `--allow-bootstrap-raw-state` bootstrap/migration flag.
+- CLI admin tooling no longer starts local engine recovery directly; raw
+  bootstrap/migration recovery remains confined to runtime recovery tests and
+  runtime-owned recovery paths.
 - `ref_type` is required outside migration mode.
 
 ## Remaining Gaps

@@ -5,6 +5,10 @@ import shutil
 from pathlib import Path
 
 
+def has_uri_scheme(value: str) -> bool:
+    return "://" in value.split("?", 1)[0].split("#", 1)[0]
+
+
 def sibling(base: Path, filename: str, label: str) -> Path:
     if not isinstance(filename, str) or not filename.strip():
         raise SystemExit(f"{label} has empty evidence filename")
@@ -236,6 +240,30 @@ def rustfs_production_gc_siblings(artifact: Path, doc: dict) -> list[Path]:
     return unique_paths(result)
 
 
+def critique_siblings(artifact: Path, doc: dict) -> list[Path]:
+    result = []
+    refs = doc.get("evidence_refs") or {}
+    if isinstance(refs, dict):
+        for key, value in refs.items():
+            if isinstance(value, str) and not has_uri_scheme(value):
+                result.append(sibling(artifact, value.split("#", 1)[0].split("?", 1)[0], key))
+    scenarios = doc.get("scenarios") or []
+    if isinstance(scenarios, list):
+        for index, scenario in enumerate(scenarios):
+            if not isinstance(scenario, dict):
+                continue
+            value = scenario.get("evidence")
+            if isinstance(value, str) and not has_uri_scheme(value):
+                result.append(
+                    sibling(
+                        artifact,
+                        value.split("#", 1)[0].split("?", 1)[0],
+                        f"scenario {index} evidence",
+                    )
+                )
+    return unique_paths(result)
+
+
 def unique_paths(paths: list[Path]) -> list[Path]:
     seen = set()
     result = []
@@ -254,7 +282,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--kind",
-        choices=["product", "ingest-writer-lifecycle", "rustfs-production-gc"],
+        choices=["product", "ingest-writer-lifecycle", "rustfs-production-gc", "critique"],
         required=True,
     )
     parser.add_argument("--artifact", required=True)
@@ -277,6 +305,8 @@ def main() -> None:
         siblings = lifecycle_siblings(artifact, doc, "ingest-writer lifecycle evidence")
     elif args.kind == "rustfs-production-gc":
         siblings = rustfs_production_gc_siblings(artifact, doc)
+    elif args.kind == "critique":
+        siblings = critique_siblings(artifact, doc)
     else:
         raise AssertionError(args.kind)
 

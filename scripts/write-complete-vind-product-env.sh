@@ -319,7 +319,7 @@ lines = [
     "# Actual external S3/OSS is excluded by default. Regenerate with VELORIX_PRODUCT_COMPLETE_REQUIRE_EXTERNAL_S3=1 to include S3 and durability-review inputs.",
     "# Public/enterprise ingress is excluded by default. Regenerate with VELORIX_PRODUCT_COMPLETE_REQUIRE_PUBLIC_INGRESS=1 to include public ingress/TLS/auth inputs.",
     "# Trusted Hiqlite release/Sigstore provenance is excluded by default. Regenerate with VELORIX_PRODUCT_COMPLETE_REQUIRE_HIQLITE_RELEASE=1 to include release identity and Sigstore inputs.",
-    "# Default product_complete therefore proves local/internal REST TLS/auth and Hiqlite backend-time boundary only; it does not prove public DNS, public TLS issuance, ingress-controller routing, external-client reachability, object-store durability, or Sigstore-backed release provenance.",
+    "# Default local_diagnostic_complete may prove local/internal REST TLS/auth and Hiqlite backend-time boundary only; product_complete remains false until every release/product gate is required and passes.",
     "# When S3 scope is enabled, reuse an existing Kubernetes S3 Secret by setting VELORIX_S3_CREDENTIALS_SECRET_MANAGED=0, setting VELORIX_S3_CREDENTIALS_SECRET_NAME, and blank AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY/AWS_SESSION_TOKEN.",
     "",
 ]

@@ -1,3 +1,5 @@
+#![cfg(feature = "legacy-source-scan-surfaces")]
+
 use std::{collections::BTreeMap, sync::Arc};
 
 use bytes::Bytes;

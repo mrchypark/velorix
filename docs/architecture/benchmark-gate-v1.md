@@ -66,9 +66,25 @@ benchmark results:
 - `checkpoint_publish`
 - `checkpoint_recovery`
 - `datafusion_table_scan`
+- `materialized_output_segment_pruning`
+- `materialized_output_recent_k`
+- `materialized_output_compaction_equivalence`
+- `materialized_output_compaction_debt`
+- `materialized_output_delete_vector`
+- `materialized_output_ttl_vector`
+- `materialized_output_late_materialization`
 - `slatedb_state_reopen`
 - `gc_dry_run_planning`
 - `gc_execution_evidence`
+
+The current `local_incremental` and `s3_incremental` benchmark workloads are
+storage/runtime primitive evidence, not public REST product-path evidence. In
+particular, `ingest_envelope_validation` measures direct
+`IngestAdmissionCoordinator` admission and the incremental state path uses
+`PrototypeIncrementalEngine`; these labels must not be cited as full relation
+ingest API to materialized-output evidence. Product-path ingest evidence should
+use a separate benchmark/workload label once it measures public relation ingest
+and materialized-output reads through the product API path.
 
 S3-compatible benchmark gates do not require `gc_execution_evidence`, because
 live GC deletion is a separate release artifact path rather than a timing
@@ -94,6 +110,29 @@ production GC evidence artifact.
 - Corrupt payload detection.
 - SlateDB checkpoint recovery path when enabled.
 
+## Materialized Output Segment Gates
+
+SmithDB's public design is useful to Velorix as a feature benchmark, not as a
+latency target. The gate is deliberately limited to materialized-output read
+evidence:
+
+- `materialized_output_segment_pruning`
+- `materialized_output_recent_k`
+- `materialized_output_compaction_equivalence`
+- `materialized_output_compaction_debt`
+- `materialized_output_delete_vector`
+- `materialized_output_ttl_vector`
+- `materialized_output_late_materialization`
+
+Each workload compares an oracle over materialized output pages with a bounded
+or optimized materialized-output read. Results must match exactly, selected
+pages or vectors must be content-hash verified, source relation batches must
+not be read, object request counts and bytes read must be recorded, and the
+optimized path must re-read selected objects through the object store path.
+These gates do not
+measure the production compaction scheduler itself or claim general Top-K
+support.
+
 ## Verification
 
 - Benchmark JSON validates against schema.
@@ -116,6 +155,7 @@ production GC evidence artifact.
   When explicitly enabled, it emits S3-compatible benchmark JSON for the
   authoritative object-store capability probe, ingest envelope validation,
   checkpoint publication, checkpoint recovery, bounded DataFusion Parquet scan,
-  SlateDB state reopen, and GC dry-run planning. Set
+  materialized output read gates, SlateDB state reopen, and GC dry-run planning.
+  Set
   `VELORIX_BENCHMARK_GATE_LEVEL=release` to emit release-level benchmark JSON;
   the default is nightly integration.

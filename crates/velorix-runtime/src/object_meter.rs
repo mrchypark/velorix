@@ -17,7 +17,7 @@ use datafusion::object_store::{
 use futures::{stream, StreamExt};
 use velorix_core::query::QueryPolicyError;
 
-use crate::benchmark_gate::ObjectRequestMetricsV1;
+use velorix_control::benchmark_gate::ObjectRequestMetricsV1;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ObjectStoreMeter {

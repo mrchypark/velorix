@@ -1,3 +1,5 @@
+#![cfg(feature = "legacy-source-scan-surfaces")]
+
 use std::{
     collections::BTreeMap,
     sync::{
@@ -2110,7 +2112,7 @@ async fn persisted_object_backed_table_query_propagates_datafusion_errors() {
 
     assert!(matches!(
         error,
-        PersistedTableError::RuntimeQuery(RuntimeQueryError::Query(QueryError::DataFusion(_)))
+        PersistedTableError::RuntimeQuery(RuntimeQueryError::Query(QueryError::Engine(_)))
     ));
 }
 

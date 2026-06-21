@@ -6,6 +6,7 @@ use arrow::record_batch::RecordBatch;
 use datafusion::object_store::ObjectStore as DataFusionObjectStore;
 use object_store::ObjectStore;
 use thiserror::Error;
+use velorix_control::query_policy_catalog::QueryPolicyCatalogStore;
 use velorix_core::relation::VelorixRelationCatalogV1;
 use velorix_storage::capability::AuthoritativeObjectStoreCapabilitiesV1;
 
@@ -20,7 +21,6 @@ use crate::{
         query_object_backed_input_with_policy, ProductionQueryRuntime, QueryExecutionLimiter,
         RuntimeQueryError,
     },
-    query_policy_catalog::QueryPolicyCatalogStore,
     storage_registry::StorageRegistry,
 };
 

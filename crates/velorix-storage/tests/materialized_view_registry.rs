@@ -3,7 +3,7 @@ use std::sync::Arc;
 use object_store::{memory::InMemory, path::Path, ObjectStore};
 use tempfile::TempDir;
 use velorix_core::{
-    standing_program::{NativeCodePolicy, RuntimePackageIdentity, StandingProgramIdentity},
+    standing_program::{BuiltinRuntimeIdentity, NativeCodePolicy, StandingProgramIdentity},
     view_contract::{
         view_spec_hash, ColumnSchema, RelationSchema, SqlDataType, SqlDialect, SqlSourceKind,
         StandingViewShape, StandingViewSpec, ViewContractError,
@@ -137,12 +137,12 @@ fn standing_program_identity(view_id: &str) -> StandingProgramIdentity {
         sql_hash: format!("sha256:{}", "1".repeat(64)),
         input_catalog_hash: format!("sha256:{}", "2".repeat(64)),
         output_schema_hash: format!("sha256:{}", "3".repeat(64)),
-        compiler_identity: "velorix-materialized-runtime:test".to_string(),
-        runtime_packages: vec![RuntimePackageIdentity {
+        planner_identity: "velorix-logical-view-planner:test".to_string(),
+        builtin_runtime_identities: vec![BuiltinRuntimeIdentity {
             name: "velorix_materialized_view_runtime".to_string(),
             version: "builtin-v1".to_string(),
         }],
-        package_feature_set: vec!["internal_materialized_runtime".to_string()],
+        runtime_capabilities: vec!["internal_materialized_runtime".to_string()],
         runtime_compatibility: "velorix-materialized-runtime-v1".to_string(),
         checkpoint_codec_identity: "velorix-materialized-view-state-v1".to_string(),
         native_code_policy: NativeCodePolicy::DisabledNoExternalDependencies,
@@ -161,6 +161,25 @@ async fn write_active_record_json(
     )
     .await
     .unwrap();
+}
+
+fn legacy_key(prefix: &str, suffix: &str) -> String {
+    format!("{prefix}{suffix}")
+}
+
+fn runtime_binding_with_legacy_identity(spec: &StandingViewSpec) -> serde_json::Value {
+    let mut value = serde_json::to_value(runtime_binding(spec)).unwrap();
+    let identity = value
+        .get_mut("standing_program_identity")
+        .and_then(serde_json::Value::as_object_mut)
+        .unwrap();
+    let planner = identity.remove("planner_identity").unwrap();
+    identity.insert(legacy_key("compiler", "_identity"), planner);
+    let runtimes = identity.remove("builtin_runtime_identities").unwrap();
+    identity.insert(legacy_key("runtime", "_packages"), runtimes);
+    let capabilities = identity.remove("runtime_capabilities").unwrap();
+    identity.insert(legacy_key("package", "_feature_set"), capabilities);
+    value
 }
 
 #[tokio::test]
@@ -212,6 +231,35 @@ async fn materialized_view_registry_reads_active_definition_by_view_id() {
 }
 
 #[tokio::test]
+async fn materialized_view_registry_writes_native_runtime_lifecycle_json() {
+    let (_temp_dir, store) = temp_store();
+    let registry = MaterializedViewRegistry::new(Arc::clone(&store));
+    let spec = sample_spec();
+
+    register_runtime_view(&registry, &spec).await;
+    let active_json = store
+        .get(&Path::from(format!(
+            "v1/views/{}/active.json",
+            spec.view_id
+        )))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let active: serde_json::Value = serde_json::from_slice(&active_json).unwrap();
+    let lifecycle = active["lifecycle"].as_object().unwrap();
+
+    assert_eq!(
+        lifecycle.get("runtime_engine").unwrap(),
+        "materialized_view_runtime"
+    );
+    assert_eq!(lifecycle.get("admission_status").unwrap(), "admitted");
+    assert!(!lifecycle.contains_key(&format!("{}{}", "compiler", "_backend")));
+    assert!(!lifecycle.contains_key(&format!("{}{}", "compile", "_status")));
+}
+
+#[tokio::test]
 async fn materialized_view_registry_lists_active_definitions() {
     let (_temp_dir, store) = temp_store();
     let registry = MaterializedViewRegistry::new(store);
@@ -258,31 +306,28 @@ async fn materialized_view_registry_preserves_active_view_response_schema() {
 }
 
 #[tokio::test]
-async fn materialized_view_registry_preserves_active_runtime_artifact_binding() {
+async fn materialized_view_registry_rejects_artifact_only_runtime_binding() {
     let (_temp_dir, store) = temp_store();
     let registry = MaterializedViewRegistry::new(store);
     let spec = sample_spec();
     let artifact = artifact_binding(&spec);
 
-    registry
+    let error = registry
         .register_with_api_metadata_and_artifact(&spec, None, Some(artifact.clone()))
         .await
-        .unwrap();
-    let active = registry.read_active(&spec.view_id).await.unwrap();
+        .unwrap_err();
 
-    assert_eq!(active.artifact, Some(artifact));
-    assert_eq!(
-        active.execution_mode,
-        MaterializedViewExecutionMode::StandingRuntime
-    );
-    assert_eq!(
-        active.lifecycle,
-        MaterializedViewLifecycleStatus::standing_runtime()
-    );
+    assert!(matches!(
+        error,
+        MaterializedViewRegistryError::InvalidExecutionMode {
+            reason: InvalidExecutionModeReason::StandingRuntimeMissingRuntimeBinding,
+            ..
+        }
+    ));
 }
 
 #[tokio::test]
-async fn materialized_view_registry_derives_execution_mode_for_old_active_records() {
+async fn materialized_view_registry_derives_execution_mode_for_old_active_records_with_runtime() {
     let (_temp_dir, store) = temp_store();
     let registry = MaterializedViewRegistry::new(Arc::clone(&store));
     let spec = sample_spec();
@@ -296,7 +341,7 @@ async fn materialized_view_registry_derives_execution_mode_for_old_active_record
             "schema_version": 1,
             "view_id": spec.view_id,
             "spec_hash": spec_hash,
-            "artifact": artifact_binding(&spec)
+            "runtime": runtime_binding(&spec)
         }),
     )
     .await;
@@ -307,6 +352,59 @@ async fn materialized_view_registry_derives_execution_mode_for_old_active_record
         active.execution_mode,
         MaterializedViewExecutionMode::StandingRuntime
     );
+}
+
+#[tokio::test]
+async fn materialized_view_registry_reads_legacy_active_runtime_lifecycle_and_identity_keys() {
+    let (_temp_dir, store) = temp_store();
+    let registry = MaterializedViewRegistry::new(Arc::clone(&store));
+    let spec = sample_spec();
+    let spec_hash = view_spec_hash(&spec).unwrap();
+
+    register_runtime_view(&registry, &spec).await;
+    write_active_record_json(
+        &store,
+        &spec.view_id,
+        serde_json::json!({
+            "schema_version": 3,
+            "view_id": spec.view_id,
+            "spec_hash": spec_hash,
+            "execution_mode": "standing_runtime",
+            "runtime": runtime_binding_with_legacy_identity(&spec),
+            "lifecycle": {
+                legacy_key("compiler", "_backend"): "materialized_view_runtime",
+                legacy_key("compile", "_status"): "success",
+                "deployment_status": "running"
+            }
+        }),
+    )
+    .await;
+
+    let active = registry.read_active(&spec.view_id).await.unwrap();
+
+    assert_eq!(active.lifecycle.runtime_engine, "materialized_view_runtime");
+    assert_eq!(
+        active.lifecycle.admission_status,
+        velorix_storage::materialized_view_registry::MaterializedViewAdmissionStatus::Admitted
+    );
+    assert_eq!(
+        active
+            .runtime
+            .unwrap()
+            .standing_program_identity
+            .planner_identity,
+        "velorix-logical-view-planner:test"
+    );
+}
+
+#[tokio::test]
+async fn materialized_view_registry_rejects_legacy_artifact_only_active_records() {
+    let (_temp_dir, store) = temp_store();
+    let registry = MaterializedViewRegistry::new(Arc::clone(&store));
+    let spec = sample_spec();
+    let spec_hash = view_spec_hash(&spec).unwrap();
+
+    register_runtime_view(&registry, &spec).await;
 
     write_active_record_json(
         &store,
@@ -314,7 +412,8 @@ async fn materialized_view_registry_derives_execution_mode_for_old_active_record
         serde_json::json!({
             "schema_version": 1,
             "view_id": spec.view_id,
-            "spec_hash": spec_hash
+            "spec_hash": spec_hash,
+            "artifact": artifact_binding(&spec)
         }),
     )
     .await;
@@ -323,7 +422,10 @@ async fn materialized_view_registry_derives_execution_mode_for_old_active_record
 
     assert!(matches!(
         error,
-        MaterializedViewRegistryError::InvalidExecutionMode { .. }
+        MaterializedViewRegistryError::InvalidExecutionMode {
+            reason: InvalidExecutionModeReason::StandingRuntimeMissingRuntimeBinding,
+            ..
+        }
     ));
 }
 
@@ -360,7 +462,7 @@ async fn materialized_view_registry_rejects_current_schema_active_record_without
 }
 
 #[tokio::test]
-async fn materialized_view_registry_rejects_standing_runtime_mode_without_artifact() {
+async fn materialized_view_registry_rejects_standing_runtime_mode_without_runtime_binding() {
     let (_temp_dir, store) = temp_store();
     let registry = MaterializedViewRegistry::new(Arc::clone(&store));
     let spec = sample_spec();
@@ -383,7 +485,10 @@ async fn materialized_view_registry_rejects_standing_runtime_mode_without_artifa
 
     assert!(matches!(
         error,
-        MaterializedViewRegistryError::InvalidExecutionMode { .. }
+        MaterializedViewRegistryError::InvalidExecutionMode {
+            reason: InvalidExecutionModeReason::StandingRuntimeMissingRuntimeBinding,
+            ..
+        }
     ));
 }
 

@@ -232,6 +232,7 @@ fi
 
 log_file="${product_dir}/port-forward.attach.log"
 pid_file="${product_dir}/port-forward.attach.pid"
+runner_pid_file="${product_dir}/port-forward.pid"
 tmux_session_file="${product_dir}/port-forward.attach.tmux-session"
 port_forward_command_file="${product_dir}/port-forward.attach.command.sh"
 target_ref="service/velorix-api"
@@ -334,6 +335,12 @@ if [ -f "$pid_file" ]; then
     kill "$old_pid" >/dev/null 2>&1 || true
   fi
 fi
+if [ -f "$runner_pid_file" ]; then
+  old_runner_pid="$(cat "$runner_pid_file" 2>/dev/null || true)"
+  if [ -n "$old_runner_pid" ] && kill -0 "$old_runner_pid" >/dev/null 2>&1; then
+    kill "$old_runner_pid" >/dev/null 2>&1 || true
+  fi
+fi
 if [ -f "$tmux_session_file" ]; then
   old_tmux_session="$(cat "$tmux_session_file" 2>/dev/null || true)"
   if [ -n "$old_tmux_session" ] && command -v tmux >/dev/null 2>&1; then
@@ -373,13 +380,13 @@ trap cleanup EXIT
 deadline=$((SECONDS + startup_timeout_seconds))
 api_url="http://127.0.0.1:${port}"
 while true; do
-  if curl -fsS --max-time 2 "${api_url}/healthz" >/dev/null 2>&1; then
-    break
-  fi
   if ! kill -0 "$port_forward_pid" >/dev/null 2>&1; then
     echo "kubectl port-forward exited before healthz became reachable" >&2
     cat "$log_file" >&2 || true
     exit 75
+  fi
+  if curl -fsS --max-time 2 "${api_url}/healthz" >/dev/null 2>&1; then
+    break
   fi
   if [ "$SECONDS" -ge "$deadline" ]; then
     echo "timed out waiting for ${api_url}/healthz" >&2

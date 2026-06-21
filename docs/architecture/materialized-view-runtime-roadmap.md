@@ -1,9 +1,11 @@
 # Materialized View Runtime Roadmap
 
-Status: First complete milestone and window foundation implemented and locally
-verified; follow-up SQL-family expansion remains tracked here.
+Status: First local-development materialized-view runtime milestone implemented
+and locally verified. This is local development evidence only, not
+release/product-complete evidence. Window, analytic, scoped backfill, and
+background scheduling work remains internal or experimental.
 Applies to: view admission, logical planning, incremental operators,
-materialized output serving, checkpoint/recovery, and window SQL.
+materialized output serving, checkpoint/recovery, and experimental window SQL.
 
 This roadmap expands the accepted
 [Materialized View Runtime](materialized-view-runtime.md) decision into an
@@ -177,10 +179,17 @@ Object or local storage should store durable data:
 Foyer and in-memory state may cache hot pages, state blocks, and checkpoint
 objects. They are never the correctness boundary.
 
-## First Complete Milestone
+Materialized output segment and page metadata are planning indexes, not progress
+authority. See
+[Materialized Output Segment Index V1](materialized-output-segment-index-v1.md).
+The checkpoint manifest remains authoritative, and every selected output page
+must still be verified against manifest-bound object refs and content hashes.
 
-The first complete implementation should intentionally exclude user-facing
-window SQL. It should prove the generic materialized view pipeline first.
+## First Local-Development Milestone
+
+The first local-development implementation milestone should intentionally
+exclude user-facing window SQL. It should prove the generic materialized view
+pipeline first.
 
 Required SQL families:
 
@@ -238,8 +247,13 @@ Current implementation evidence:
   runtime creation uses that stored plan instead of reparsing a fallback SQL
   shape at activation or restart.
 - Admission tests now cover unsupported one-input and join SQL families,
-  including window aggregates, distinct aggregates, HAVING, ORDER BY, CTEs, LEFT
-  JOIN, non-equality joins, and join WHERE clauses.
+  including window aggregates, distinct aggregates, LEFT JOIN, and non-equality
+  joins.
+- Identity CTE source filters are admitted for the supported one-input,
+  window, latest-by-key, and two-relation join shapes; supported two-relation
+  inner-join aggregate views can also apply admitted join `WHERE` predicates.
+- Single-relation and two-relation inner-join aggregate views support a simple
+  `HAVING` comparison against a projected aggregate output.
 - Runtime commit tests now assert ingest emits signed materialized output
   deltas in the commit result, including a changed-key-only delta with the old
   row retracted and the new row inserted. Snapshot output batches remain
@@ -277,7 +291,9 @@ Current implementation evidence:
   compiler, JAR, pipeline-manager, DBSP/Feldera, or PVC-dependent execution
   references re-enter the runtime path.
 
-Verification commands for this evidence:
+Verification commands for this internal experimental-only evidence. These
+commands do not make window SQL part of the public 1.0 contract; the product
+API admission path rejects window SQL.
 
 ```bash
 cargo test -p velorix-api --lib
@@ -293,7 +309,13 @@ cargo test -p velorix-storage object_key::tests::standing_runtime_output_delta_k
 cargo test -p velorix-meta --test meta_store standing_runtime_checkpoint_pointer
 cargo test -p velorix-runtime --test materialized_view_runtime runtime_materializes_filtered_single_relation_aggregate_view
 cargo test -p velorix-runtime --test materialized_view_runtime runtime_materializes_filtered_projected_aggregate_view
+cargo test -p velorix-runtime --test materialized_view_runtime runtime_materializes_single_relation_aggregate_having_view
+cargo test -p velorix-runtime --test materialized_view_runtime runtime_materializes_two_relation_join_having_view
 cargo test -p velorix-core --test view_plan filtered_projected_single_key_aggregate_sql_lowers_to_projected_accumulators
+cargo test -p velorix-core --test view_plan single_key_aggregate_sql_lowers_having_to_post_aggregate_filter
+cargo test -p velorix-core --test view_plan two_input_join_sql_lowers_having_to_post_aggregate_filter
+cargo test -p velorix-api rest_aggregate_having_view_materializes_outputs
+cargo test -p velorix-api rest_two_relation_join_having_view_materializes_outputs
 cargo test -p velorix-runtime --test materialized_view_runtime runtime_rejects_non_contiguous_input_offsets_without_advancing_frontier
 cargo test -p velorix-runtime --test no_external_runtime_dependencies
 cargo test -p velorix-core --test view_plan
@@ -301,8 +323,8 @@ cargo test -p velorix-core --test relation
 cargo test -p velorix-storage --test relation_catalog_registry
 ```
 
-Full workspace verification for the first complete milestone passed locally on
-2026-06-15:
+Full workspace verification for the first local-development milestone passed
+locally on 2026-06-15. This is not release evidence:
 
 ```bash
 cargo test --workspace
@@ -310,9 +332,11 @@ cargo fmt --all --check
 git diff --check --
 ```
 
-## Window Foundation Milestone
+## Experimental Window Foundation Milestone
 
-Before exposing window SQL, Velorix needs durable event-time semantics:
+Window SQL is not part of the public 1.0 default contract. The implementation
+evidence below is retained as internal/experimental groundwork. Before exposing
+window SQL by default, Velorix needs durable event-time semantics:
 
 - event-time column binding
 - per source-partition watermark frontier
@@ -385,6 +409,9 @@ Current implementation evidence:
   view registration, watermark-bearing ingest, query, crash-window replay after
   restart, and post-restart query for the first strict tumbling event-time
   aggregate family.
+- Hopping and session event-time aggregate views are admitted into the same
+  window runtime family and now have runtime plus REST relation/view/ingest/query
+  evidence.
 
 Verification commands for this evidence:
 
@@ -398,9 +425,12 @@ cargo test -p velorix-api rest_latest_bool_view_materialized_output_replays_late
 cargo test -p velorix-core --test view_plan tumbling
 cargo test -p velorix-core --test view_plan tumbling_event_time_aggregate_sql_lowers_min_max_avg_outputs
 cargo test -p velorix-runtime --test materialized_view_runtime tumbling
+cargo test -p velorix-runtime --test materialized_view_runtime runtime_materializes_hopping_event_time_windows
+cargo test -p velorix-runtime --test materialized_view_runtime runtime_materializes_session_event_time_windows
 cargo test -p velorix-runtime --test materialized_view_runtime runtime_materializes_tumbling_event_time_min_max_avg_and_restores_state
 cargo test -p velorix-api materialized_runtime_output_schema_supports_tumbling_event_time_window
 cargo test -p velorix-api rest_tumbling_window_view_materialized_output_replays_later_ingest_after_restart
+cargo test -p velorix-api rest_hopping_and_session_window_views_materialize_outputs
 ```
 
 Example target syntax:
@@ -419,18 +449,18 @@ group by user_id, window_start, window_end
 This syntax should be admitted only after the logical plan, checkpoint, replay,
 and output publication paths can prove deterministic results across restart.
 
-## Explicit Non-Goals For The First Complete Implementation
+## Explicit Non-Goals For The First Local-Development Implementation
 
 - full Arroyo/Flink-compatible window SQL
-- session windows
-- hopping windows with pane sharing
+- window families beyond the currently admitted tumbling, hopping, and session
+  aggregate shapes
 - window joins
 - temporal joins
 - processing-time triggers
 - early and late firing policies
 - custom trigger policies
 - arbitrary SQL
-- CTEs
+- CTE shapes beyond the currently admitted identity source-filter forms
 - nested subqueries
 - set operations
 - outer, semi, and anti joins
@@ -446,9 +476,114 @@ and output publication paths can prove deterministic results across restart.
 - source full-scan repair as the normal serving path
 - fake fallback execution
 
+## Ingest Optimization Contract
+
+The default REST ingest acknowledgement is `materialized`: an ingest request
+returns only after the durable ingest append has been applied to active
+materialized views and the checkpoint pointer has been published. This preserves
+the first-complete product contract that a successful ingest has automatically
+advanced materialized output.
+
+The public 1.0 ingest API does not expose an async append-only acknowledgement
+or an `ack_mode` request field. Stale clients that send `ack_mode` fail closed
+as unknown-field requests before materialization starts.
+Queries read published materialized output only; they do not replay source data
+or perform catch-up materialization on the read path. If a late-created view
+still needs historical input, queries return a materialization lag error until
+the fenced materializer/operator replay path advances and publishes the required
+output.
+
+Users ingest rows through `/v1/relations/{relation_id}/ingest` for one relation,
+or `/v1/relations/ingest` as a convenience surface for an ordered list of
+relation ingests. Active materialized views that depend on each relation update
+are updated automatically before that update's `materialized` ack returns.
+Internally both paths use the epoch materialization machinery so relation
+updates and view checkpoint publication share the same coalesced write path.
+`/v1/ingest/epoch` remains internal/test-only, not the product ingest API.
+
+### Public Join Frontier Contract
+
+Public 1.0 join consistency is a per-relation frontier-vector contract, not an
+atomic grouped multi-relation transaction contract. Each relation ingest advances
+only that relation's stream/partition frontier. For a two-relation join,
+sequential left/right ingests may publish and expose intermediate materialized
+join output at vectors such as `{left: N, right: M}` followed by
+`{left: N + 1, right: M}` and later `{left: N + 1, right: M + 1}`.
+
+`/v1/relations/ingest` must not be described as an atomic multi-relation
+transaction API. If it accepts multiple relation batches, the public contract is
+equivalent to a deterministic sequence of relation ingests with materialized
+acknowledgement per accepted relation update. It does not provide all-or-nothing
+rollback across relation batches, a single global epoch visible to clients, or a
+hidden guarantee that a join only becomes visible after both sides advance.
+
+Every published runtime checkpoint for a join must carry the complete
+per-relation input frontier vector it represents. Materialized output manifests
+must either carry the same vector directly or be readable only through a
+checkpoint/pointer that carries that vector. A standalone output manifest that
+can be selected without the checkpoint-bound input frontier vector is not
+sufficient product evidence.
+
+The internal ingest epoch remains an implementation batch unit only. It may
+coalesce relation updates and checkpoint/state writes behind the public relation
+ingest URLs, but it is not a public atomicity boundary and must not be used to
+claim atomic multi-relation join semantics.
+
+Relation ingest paths always use the synchronous `materialized`
+acknowledgement. The internal epoch is an implementation batch unit only; it
+does not expose acknowledgement negotiation to clients.
+
+Ingest checkpoints publish signed output delta refs and durable state payloads
+that include the checkpoint-bound published output. Query serving reads only
+that durable checkpoint-bound materialized output or a compacted output manifest
+bound to the same checkpoint. It does not read live in-process accumulator
+state. Full compacted materialized-output snapshots are internal maintenance
+artifacts for public 1.0, not a public endpoint or response mode. Public 1.0
+does not republish checkpoint pointers from compaction until immutable
+manifest-keyed checkpoint compaction is available.
+
+Backfill replays committed ingest evidence through the same materialized-view
+runtime path. Public 1.0 does not expose request-scope, range, predicate, or
+background backfill. Operator-triggered full replay may be used to make a
+late-created view queryable; disabled scopes fail admission instead of
+pretending to have materialized only a narrower request range.
+
+Background output compaction and scheduling are internal/experimental only. The
+product knob `VELORIX_OUTPUT_COMPACTION_INTERVAL_EPOCHS` is rejected by the
+public 1.0 API. Durable checkpoint writes are coalesced into
+ingest/materialization commits with output delta refs and state payloads rather
+than produced by a separate background checkpoint daemon.
+
+Every ingest response includes stable workload and materialization counters:
+
+- `timings.total_ms`, `timings.total_us`, `timings.batch_count`,
+  `timings.row_count`, `timings.avg_batch_us`, `timings.avg_row_us`,
+  and `timings.rows_per_second`
+- detailed per-stage timings are intentionally not part of the public 1.0
+  response contract; publish them through traces or metrics
+- `materialization.status`
+- `materialization.active_views`
+- `materialization.applied_batches`
+- `materialization.checkpoint_writes`
+- `materialization.applied_batches_per_checkpoint_write`
+- `materialization.output_delta_writes`
+- `materialization.state_payload_writes`
+- `materialization.checkpoint_record_writes`
+- `materialization.checkpoint_pointer_writes`
+- `materialization.latest_cache_writes`
+- `materialization.checkpoint_publication_writes`
+
+Internal background output compaction work must still be deduplicated per view,
+but public 1.0 responses must not expose background task names or scheduling
+state.
+
+These fields are diagnostic evidence, not correctness authority. Durable
+correctness still comes from the ingest log, signed output deltas, checkpoint
+state records, and Hiqlite checkpoint pointer authority.
+
 ## Acceptance Criteria
 
-The roadmap is complete when these checks pass:
+The local-development runtime milestone is satisfied when these checks pass:
 
 - a relation with non-prototype schema can be registered
 - a second relation with a different schema can be registered
@@ -458,12 +593,14 @@ The roadmap is complete when these checks pass:
 - supported SQL is represented by `VelorixLogicalViewPlanV1`
 - runtime construction uses the admitted plan
 - unsupported SQL produces a clear admission error
-- ingest publishes materialized output deltas
-- query reads the materialized output table/page index
+- ingest publishes materialized output deltas and durable state checkpoints
+- query reads checkpoint-bound published materialized output, with compacted
+  output snapshots as the maintenance/read-optimized surface
 - restart restores state from checkpoint metadata and durable objects
 - replay applies only epochs after the checkpoint
 - a missing or corrupted checkpoint object fails closed
-- a missing or corrupted output manifest fails closed
+- a missing or corrupted compacted output manifest fails closed when that
+  manifest is used
 - a non-contiguous epoch range does not silently advance the view frontier
 - no runtime path requires external package deployment, runtime compilation, or
   PVCs
@@ -477,9 +614,10 @@ The roadmap is complete when these checks pass:
 4. Replace runtime dispatch by input arity with plan-based dispatch.
 5. Implement generic filter/project/aggregate operators.
 6. Implement keyed inner equi-join state.
-7. Add materialized output delta/page manifests.
+7. Add materialized output delta refs and checkpoint state payloads.
 8. Add durable epoch manifests and contiguous frontier validation.
 9. Add checkpoint object roots and fail-closed recovery.
 10. Add end-to-end relation, ingest, view, query, restart tests.
 11. Add event-time and watermark metadata without exposing window SQL.
 12. Add tumbling event-time aggregate admission and runtime support.
+13. Add materialized output segment/page pruning.

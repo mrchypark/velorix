@@ -229,6 +229,21 @@ def build_step(report: dict, execution_step: str, state_override=None) -> dict:
     return payload
 
 
+def build_plan_step(step: dict, state_override=None) -> dict:
+    return {
+        "id": step.get("id"),
+        "gate": step.get("id"),
+        "title": step.get("title") or step.get("summary") or step.get("id"),
+        "state": state_override or step.get("state"),
+        "status": step.get("status"),
+        "command": step.get("command") or step.get("next_action"),
+        "summary": step.get("summary"),
+        "waiting_on": step.get("waiting_on") or [],
+        "missing_subjects": step.get("missing_subjects") or [],
+        "invalid_subjects": step.get("invalid_subjects") or [],
+    }
+
+
 def issue_lines(kind: str, issues):
     lines = []
     for issue in issues or []:
@@ -312,6 +327,7 @@ def render_doctor(result: dict) -> str:
     lines = [
         f"state={result['state']}",
         f"product_complete={str(result['product_complete']).lower()}",
+        f"local_diagnostic_complete={str(result['local_diagnostic_complete']).lower()}",
         f"reason={result['reason']}",
     ]
     next_step = result.get("next_step")
@@ -467,14 +483,33 @@ def choose_next(report: dict) -> dict:
                 "reason": "The next step is waiting for an earlier prerequisite gate.",
             }
     plan = report.get("completion_plan") or {}
+    plan_steps = {
+        step.get("id"): step
+        for step in plan.get("steps") or []
+        if isinstance(step, dict) and step.get("id")
+    }
     for gate_id in plan.get("input_required_steps") or []:
         for execution_step, mapped_gate in EXECUTION_TO_GATE.items():
             if mapped_gate == gate_id:
                 return {
                     "state": "input_required",
                     "next_step": build_step(report, execution_step, "input_required"),
-                "reason": "The gate-oriented completion plan still has required input.",
+                    "reason": "The gate-oriented completion plan still has required input.",
             }
+        if gate_id in plan_steps:
+            return {
+                "state": "input_required",
+                "next_step": build_plan_step(plan_steps[gate_id], "input_required"),
+                "reason": "The completion plan still has required input.",
+            }
+    for gate_id in plan.get("deferred_steps") or []:
+        for execution_step, mapped_gate in EXECUTION_TO_GATE.items():
+            if mapped_gate == gate_id:
+                return {
+                    "state": "deferred_product_gate",
+                    "next_step": build_step(report, execution_step, "deferred_product_gate"),
+                    "reason": "A product gate is out of local diagnostic scope and still blocks release product completion.",
+                }
     for step in run_order:
         if step in will_run:
             return {
@@ -495,6 +530,7 @@ result = {
     "report_kind": "velorix_next_vind_product_step",
     "product_completion_report": str(report_path),
     "product_complete": report.get("product_complete") is True,
+    "local_diagnostic_complete": report.get("local_diagnostic_complete") is True,
     "gate_summary": report.get("gate_summary") or {},
     **choose_next(report),
     "creates_product_complete_evidence": False,
@@ -508,6 +544,7 @@ elif doctor_output:
 else:
     print(f"state={result['state']}")
     print(f"product_complete={str(result['product_complete']).lower()}")
+    print(f"local_diagnostic_complete={str(result['local_diagnostic_complete']).lower()}")
     print(f"reason={result['reason']}")
     next_step = result.get("next_step")
     if next_step:

@@ -1,12 +1,14 @@
 use std::sync::Arc;
-use thiserror::Error;
-use velorix_storage::capability::{
-    probe_authoritative_object_store_capabilities, AuthoritativeObjectStoreCapabilitiesV1,
-    AuthoritativeObjectStoreCapabilityError, AuthoritativeObjectStoreCapabilityProbeError,
+pub use velorix_control::operator_authority::{
+    validate_operator_authority, ObjectStoreAuthorityRef, OperatorStartupError,
+    ValidatedOperatorAuthority,
+};
+use velorix_control::{
+    operator_authority as control_authority,
+    storage_admin::{AuthoritativeObjectStoreCapabilitiesV1, IngestAdmissionReconstructionReport},
 };
 
 use crate::{
-    crd::ObjectStoreAuthorityRef,
     stream_watch::{
         IngestAdmissionCoordinatorProvider, RelationCatalogSnapshotProvider, StreamWatchError,
     },
@@ -14,63 +16,8 @@ use crate::{
 };
 
 #[derive(Clone, Debug)]
-pub struct ValidatedOperatorAuthority {
-    authority: ObjectStoreAuthorityRef,
-    store: Arc<dyn object_store::ObjectStore>,
-    capabilities: AuthoritativeObjectStoreCapabilitiesV1,
-}
-
-impl ValidatedOperatorAuthority {
-    pub(crate) fn new(
-        authority: ObjectStoreAuthorityRef,
-        store: Arc<dyn object_store::ObjectStore>,
-        capabilities: AuthoritativeObjectStoreCapabilitiesV1,
-    ) -> Result<Self, OperatorStartupError> {
-        capabilities.validate_for_startup()?;
-
-        Ok(Self {
-            authority,
-            store,
-            capabilities,
-        })
-    }
-
-    pub fn authority(&self) -> &ObjectStoreAuthorityRef {
-        &self.authority
-    }
-
-    pub fn capabilities(&self) -> &AuthoritativeObjectStoreCapabilitiesV1 {
-        &self.capabilities
-    }
-
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        ObjectStoreAuthorityRef,
-        Arc<dyn object_store::ObjectStore>,
-        AuthoritativeObjectStoreCapabilitiesV1,
-    ) {
-        (self.authority, self.store, self.capabilities)
-    }
-}
-
-pub async fn validate_operator_authority(
-    authority: ObjectStoreAuthorityRef,
-    store: Arc<dyn object_store::ObjectStore>,
-    backend_name: impl AsRef<str>,
-    probe_prefix: impl AsRef<str>,
-) -> Result<ValidatedOperatorAuthority, OperatorStartupError> {
-    let capabilities =
-        probe_authoritative_object_store_capabilities(store.as_ref(), backend_name, probe_prefix)
-            .await?;
-    ValidatedOperatorAuthority::new(authority, store, capabilities)
-}
-
-#[derive(Clone, Debug)]
 pub struct OperatorAuthorityStartupComponents {
-    authority: ObjectStoreAuthorityRef,
-    store: Arc<dyn object_store::ObjectStore>,
-    capabilities: Arc<AuthoritativeObjectStoreCapabilitiesV1>,
+    inner: control_authority::OperatorAuthorityStartupComponents,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -86,46 +33,45 @@ impl ValidatedStartupAuthorityToken {
 
 #[derive(Clone, Debug)]
 pub struct OperatorAuthorityStartupReport {
-    pub ingest_admission: velorix_storage::log::IngestAdmissionReconstructionReport,
+    pub ingest_admission: IngestAdmissionReconstructionReport,
 }
 
 impl OperatorAuthorityStartupComponents {
     pub fn from_validated_authority(validated_authority: ValidatedOperatorAuthority) -> Self {
-        let (authority, store, capabilities) = validated_authority.into_parts();
         Self {
-            authority,
-            store,
-            capabilities: Arc::new(capabilities),
+            inner: control_authority::OperatorAuthorityStartupComponents::from_validated_authority(
+                validated_authority,
+            ),
         }
     }
 
     pub fn authority(&self) -> &ObjectStoreAuthorityRef {
-        &self.authority
+        self.inner.authority()
     }
 
     pub fn capabilities(&self) -> &AuthoritativeObjectStoreCapabilitiesV1 {
-        &self.capabilities
+        self.inner.capabilities()
     }
 
     pub fn store(&self) -> Arc<dyn object_store::ObjectStore> {
-        Arc::clone(&self.store)
+        self.inner.store()
     }
 
     pub fn relation_snapshot_provider(&self) -> RelationCatalogSnapshotProvider {
         RelationCatalogSnapshotProvider::from_authority_parts(
             ValidatedStartupAuthorityToken::new(),
-            self.authority.clone(),
-            Arc::clone(&self.store),
-            Arc::clone(&self.capabilities),
+            self.authority().clone(),
+            self.store(),
+            self.inner.capabilities_handle(),
         )
     }
 
     pub fn ingest_admission_coordinator_provider(&self) -> IngestAdmissionCoordinatorProvider {
         IngestAdmissionCoordinatorProvider::from_authority_parts(
             ValidatedStartupAuthorityToken::new(),
-            self.authority.clone(),
-            Arc::clone(&self.store),
-            Arc::clone(&self.capabilities),
+            self.authority().clone(),
+            self.store(),
+            self.inner.capabilities_handle(),
         )
     }
 
@@ -134,8 +80,8 @@ impl OperatorAuthorityStartupComponents {
     ) -> Result<CheckpointPublisherEpochStore, WorkerShardError> {
         CheckpointPublisherEpochStore::from_authority_parts(
             ValidatedStartupAuthorityToken::new(),
-            Arc::clone(&self.store),
-            Arc::clone(&self.capabilities),
+            self.store(),
+            self.inner.capabilities_handle(),
         )
     }
 
@@ -151,10 +97,8 @@ impl OperatorAuthorityStartupComponents {
     }
 }
 
-#[derive(Debug, Error)]
-pub enum OperatorStartupError {
-    #[error(transparent)]
-    Probe(#[from] AuthoritativeObjectStoreCapabilityProbeError),
-    #[error(transparent)]
-    Capabilities(#[from] AuthoritativeObjectStoreCapabilityError),
+impl From<OperatorStartupError> for StreamWatchError {
+    fn from(error: OperatorStartupError) -> Self {
+        StreamWatchError::snapshot(error.to_string())
+    }
 }

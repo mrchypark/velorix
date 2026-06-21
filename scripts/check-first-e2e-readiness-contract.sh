@@ -4,18 +4,33 @@ set -euo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
 script_path="${repo_root}/scripts/run-first-e2e-readiness.sh"
 doc_path="${repo_root}/docs/release/1.0-readiness-checklist.md"
+status_doc_path="${repo_root}/docs/architecture/production-readiness-status.md"
+workflow_path="${repo_root}/.github/workflows/release-gate.yml"
 
-python3 - "$script_path" "$doc_path" <<'PY'
+python3 - "$script_path" "$doc_path" "$status_doc_path" "$workflow_path" <<'PY'
 import re
 import sys
 
-script_path, doc_path = sys.argv[1:]
+script_path, doc_path, status_doc_path, workflow_path = sys.argv[1:]
 with open(script_path, "r", encoding="utf-8") as f:
     script = f.read()
 with open(doc_path, "r", encoding="utf-8") as f:
     doc = f.read()
+with open(status_doc_path, "r", encoding="utf-8") as f:
+    status_doc = f.read()
+with open(workflow_path, "r", encoding="utf-8") as f:
+    workflow = f.read()
 
 checks = {
+    "release readiness completion is evidence-bound, not static matrix-bound": (
+        "release-status-validate" not in doc
+        and "release-status-validate" not in workflow
+        and "--require-release-artifacts" in doc
+        and "--require-release-artifacts" in workflow
+        and "static Markdown matrix" in status_doc
+        and "does not certify release readiness" in status_doc
+        and "generated from the readiness report" in status_doc
+    ),
     "tracks explicit lifecycle override": (
         'ingest_writer_lifecycle_evidence_explicit=0' in script
         and 'VELORIX_FIRST_E2E_INGEST_WRITER_LIFECYCLE_EVIDENCE:-' in script

@@ -25,7 +25,8 @@ velorix-storage = { path = "../velorix-storage" }
 
 [features]
 default = []
-s3-compat-tests = ["object_store/aws", "object_store_13"]
+legacy-source-scan-surfaces = []
+s3-compat-tests = ["legacy-source-scan-surfaces", "object_store/aws", "object_store_13"]
 
 [[test]]
 name = "local_recovery"
@@ -40,11 +41,13 @@ required-features = ["s3-compat-tests"]
 name = "local_incremental"
 path = "../../benches/local_incremental.rs"
 harness = false
+required-features = ["legacy-source-scan-surfaces"]
 
 [[bench]]
 name = "s3_incremental"
 path = "../../benches/s3_incremental.rs"
 harness = false
+required-features = ["legacy-source-scan-surfaces"]
 
 [dev-dependencies]
 async-trait = { workspace = true }
@@ -54,6 +57,7 @@ futures = { workspace = true }
 object_store = { workspace = true }
 parquet = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 velorix-core = { path = "../velorix-core" }

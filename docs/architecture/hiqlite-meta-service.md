@@ -82,7 +82,12 @@ cargo run -p velorix-meta
 Run the durable backend with:
 
 ```bash
+VELORIX_META_MODE=production \
+VELORIX_META_BIND=0.0.0.0:9090 \
 VELORIX_META_BACKEND=hiqlite \
+VELORIX_META_BEARER_TOKEN="$VELORIX_META_BEARER_TOKEN" \
+VELORIX_META_TRANSPORT_SECURITY=service-mesh-mtls \
+VELORIX_META_TRANSPORT_SECURITY_ATTESTATION="<mesh-policy-or-evidence-ref>" \
 VELORIX_HIQLITE_NODES=velorix-meta-0:8200,velorix-meta-1:8200,velorix-meta-2:8200 \
 VELORIX_HIQLITE_API_SECRET="$HQL_SECRET_API" \
 cargo run -p velorix-meta --features hiqlite-backend
@@ -90,6 +95,11 @@ cargo run -p velorix-meta --features hiqlite-backend
 
 `VELORIX_HIQLITE_WITH_PROXY=1` enables hiqlite remote proxy mode when the
 deployment requires it.
+Production startup is fail-closed: it requires an explicit mode, bind address,
+durable backend, bearer token, transport-security attestation, and exactly
+three unique Hiqlite voter endpoints when `VELORIX_META_BACKEND=hiqlite`.
+The current binary does not configure native TLS; production transport security
+must be attested as an external service-mesh mTLS boundary.
 This backend can already be used for catalog/admission durability work, but it
 must not be used to satisfy `VELORIX_STANDING_RUNTIME_FENCING=required` until
 backend-time lease semantics are implemented and verified.
@@ -141,6 +151,12 @@ managed Hiqlite authority evidence, and copies a sanitized version into
 Product-complete still remains false until `authoritative_backend_time=true`,
 `bounded_wall_clock_failover=true`, and multi-replica adversarial fencing
 evidence exist.
+Release readiness also requires
+`kubernetes_status.evidence_kind=hiqlite_no_pvc_three_voter_backup_restore`
+from the validated Hiqlite authority attestation; the standalone
+`scripts/check-hiqlite-backup-restore-evidence.sh` check remains
+configuration-only and must not be treated as proof that a live restore drill
+succeeded.
 Release validation recognizes a future
 `metadata_store.hiqlite_backend_time_attestation` with sibling
 `hiqlite-backend-time-attestation.json`, parses that sibling evidence, and
@@ -213,7 +229,9 @@ Run the object-store backend with the same S3-compatible settings used by
 `velorix-api`:
 
 ```bash
+VELORIX_META_MODE=development \
 VELORIX_META_BACKEND=oss \
+VELORIX_META_BIND=127.0.0.1:9090 \
 VELORIX_S3_COMPAT=1 \
 AWS_ENDPOINT_URL=http://127.0.0.1:9000 \
 AWS_REGION=us-east-1 \
@@ -222,6 +240,12 @@ AWS_SECRET_ACCESS_KEY=minioadmin \
 VELORIX_S3_BUCKET=velorix \
 VELORIX_S3_PREFIX=meta \
 cargo run -p velorix-meta
+```
+
+For non-durable local API work, memory mode must also be explicit:
+
+```bash
+VELORIX_META_MODE=development VELORIX_META_BACKEND=memory cargo run -p velorix-meta
 ```
 
 Point `velorix-api` at the meta service with:

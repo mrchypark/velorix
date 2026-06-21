@@ -9,21 +9,20 @@ use arrow::{
     datatypes::{DataType, Field, Int16Type, Int32Type, Int64Type, Int8Type, Schema, TimeUnit},
     record_batch::RecordBatch,
 };
-use datafusion::prelude::SessionContext;
 use velorix_core::delta::{DeltaKey, DeltaRecord, DeltaValue};
 use velorix_core::relation::{
     arrow_record_batches_to_key_value_delta_batch,
     arrow_record_batches_to_orders_sum_count_delta_batch,
     arrow_record_batches_to_single_key_sum_count_delta_batch, datafusion_schema_from_catalog,
-    register_datafusion_catalog_batches, validate_record_batch_matches_catalog,
-    ArrowPhysicalTypeV1, DataFusionRegistrationModeV1, DataFusionRegistrationV1,
-    DictionaryKeyTypeV1, IncrementalAdapterBindingV1, IncrementalInputAdapterError,
-    IncrementalRelationBindingV1, RelationColumnV1, RelationOperationV1, RelationSchemaError,
-    RelationSemanticRoleV1, SchemaFingerprintV1, VelorixLogicalTypeV1, VelorixRelationCatalogV1,
-    VelorixRelationSchemaV1, CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID,
-    CATALOG_ROW_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID,
-    CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID, ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID,
-    RELATION_SCHEMA_VERSION_V1,
+    orders_sum_count_relation_catalog, validate_record_batch_matches_catalog, ArrowPhysicalTypeV1,
+    DataFusionRegistrationModeV1, DataFusionRegistrationV1, DictionaryKeyTypeV1,
+    IncrementalAdapterBindingV1, IncrementalInputAdapterError, IncrementalRelationBindingV1,
+    RelationColumnV1, RelationOperationV1, RelationSchemaError, RelationSemanticRoleV1,
+    SchemaFingerprintV1, VelorixLogicalTypeV1, VelorixRelationCatalogV1, VelorixRelationSchemaV1,
+    CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID, CATALOG_ROW_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID,
+    CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID, ORDERS_SUM_COUNT_ADAPTER_ID,
+    ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID, ORDERS_SUM_COUNT_RELATION_ID,
+    ORDERS_SUM_COUNT_RELATION_VERSION, RELATION_SCHEMA_VERSION_V1,
 };
 
 const ORDERS_RELATION_SCHEMA_FINGERPRINT: &str =
@@ -229,38 +228,23 @@ fn relation_catalog_validation_requires_cataloged_schema_fingerprint() {
     ));
 }
 
-#[tokio::test]
-async fn datafusion_registration_from_catalog_exposes_typed_columns() {
-    let catalog = orders_relation_catalog();
-    let batch = orders_input_batch(&["order-a"], &[42], &[1]);
-    let context = SessionContext::new();
+#[test]
+fn orders_sum_count_default_catalog_is_a_core_relation_contract() {
+    let catalog = orders_sum_count_relation_catalog().unwrap();
 
-    register_datafusion_catalog_batches(&context, &catalog, vec![batch]).unwrap();
-
-    let output = context
-        .sql("select order_id, amount, weight from orders")
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
-
+    catalog.validate().unwrap();
     assert_eq!(
-        output[0]
-            .schema()
-            .fields()
-            .iter()
-            .map(|field| field.name())
-            .collect::<Vec<_>>(),
-        vec!["order_id", "amount", "weight"]
+        catalog.relation_schema.relation_id,
+        ORDERS_SUM_COUNT_RELATION_ID
     );
-    assert_eq!(output[0].schema().field(1).data_type(), &DataType::Int64);
-
-    let error = context
-        .sql("select key_json, value_json from orders")
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("key_json"));
+    assert_eq!(
+        catalog.relation_schema.relation_version,
+        ORDERS_SUM_COUNT_RELATION_VERSION
+    );
+    assert_eq!(
+        catalog.incremental_adapter.adapter_id,
+        ORDERS_SUM_COUNT_ADAPTER_ID
+    );
 }
 
 #[test]
@@ -289,21 +273,6 @@ fn datafusion_schema_from_catalog_accepts_boolean_primary_key() {
     let schema = datafusion_schema_from_catalog(&catalog).unwrap();
 
     assert_eq!(schema.field(0).data_type(), &DataType::Boolean);
-}
-
-#[test]
-fn datafusion_registration_rejects_unsupported_view_mode() {
-    let mut catalog = orders_relation_catalog();
-    catalog.datafusion_registration.mode = DataFusionRegistrationModeV1::View;
-    let batch = orders_input_batch(&["order-a"], &[42], &[1]);
-    let context = SessionContext::new();
-
-    let error = register_datafusion_catalog_batches(&context, &catalog, vec![batch]).unwrap_err();
-
-    assert!(
-        error.to_string().contains("datafusion_registration.mode"),
-        "unexpected error: {error}"
-    );
 }
 
 #[test]

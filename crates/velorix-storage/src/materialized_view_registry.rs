@@ -59,15 +59,9 @@ pub enum MaterializedViewExecutionMode {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "snake_case")]
-pub enum MaterializedViewCompileStatus {
-    NotRequired,
+pub enum MaterializedViewAdmissionStatus {
     Pending,
-    CompilingSql,
-    SqlCompiled,
-    CompilingRust,
-    Success,
-    SqlError,
-    RustError,
+    Admitted,
     SystemError,
 }
 
@@ -85,8 +79,8 @@ pub enum MaterializedViewDeploymentStatus {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MaterializedViewLifecycleStatus {
-    pub compiler_backend: String,
-    pub compile_status: MaterializedViewCompileStatus,
+    pub runtime_engine: String,
+    pub admission_status: MaterializedViewAdmissionStatus,
     pub deployment_status: MaterializedViewDeploymentStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
@@ -95,8 +89,8 @@ pub struct MaterializedViewLifecycleStatus {
 impl MaterializedViewLifecycleStatus {
     pub fn standing_runtime() -> Self {
         Self {
-            compiler_backend: "materialized_view_runtime".to_string(),
-            compile_status: MaterializedViewCompileStatus::Success,
+            runtime_engine: "materialized_view_runtime".to_string(),
+            admission_status: MaterializedViewAdmissionStatus::Admitted,
             deployment_status: MaterializedViewDeploymentStatus::Running,
             message: None,
         }
@@ -104,8 +98,8 @@ impl MaterializedViewLifecycleStatus {
 
     pub fn standing_runtime_deploying(message: Option<String>) -> Self {
         Self {
-            compiler_backend: "materialized_view_runtime".to_string(),
-            compile_status: MaterializedViewCompileStatus::Success,
+            runtime_engine: "materialized_view_runtime".to_string(),
+            admission_status: MaterializedViewAdmissionStatus::Admitted,
             deployment_status: MaterializedViewDeploymentStatus::Deploying,
             message,
         }
@@ -128,6 +122,16 @@ pub struct ActiveMaterializedViewRecord {
     pub runtime: Option<MaterializedViewRuntimeBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifecycle: Option<MaterializedViewLifecycleStatus>,
+}
+
+struct ActiveMaterializedViewRecordInput<'a> {
+    view_id: &'a str,
+    spec_hash: &'a str,
+    api: Option<MaterializedViewApiMetadata>,
+    artifact: Option<MaterializedViewArtifactBinding>,
+    runtime: Option<MaterializedViewRuntimeBinding>,
+    execution_mode: Option<MaterializedViewExecutionMode>,
+    lifecycle: Option<MaterializedViewLifecycleStatus>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -245,19 +249,19 @@ pub struct MaterializedViewResponseColumnSpec {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InvalidExecutionModeReason {
-    StandingRuntimeMissingArtifact,
     StandingRuntimeMissingIdentity,
+    StandingRuntimeMissingRuntimeBinding,
     MissingExecutionModeForCurrentSchema { schema_version: u16 },
 }
 
 impl std::fmt::Display for InvalidExecutionModeReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::StandingRuntimeMissingArtifact => {
-                write!(f, "standing_runtime requires an artifact binding")
-            }
             Self::StandingRuntimeMissingIdentity => {
                 write!(f, "standing_runtime requires standing_program_identity")
+            }
+            Self::StandingRuntimeMissingRuntimeBinding => {
+                write!(f, "standing_runtime requires a native runtime binding")
             }
             Self::MissingExecutionModeForCurrentSchema { schema_version } => write!(
                 f,
@@ -433,15 +437,15 @@ impl MaterializedViewRegistry {
             }
         }
 
-        self.write_active_record(
-            spec.view_id.as_str(),
-            spec_hash.as_str(),
+        self.write_active_record(ActiveMaterializedViewRecordInput {
+            view_id: spec.view_id.as_str(),
+            spec_hash: spec_hash.as_str(),
             api,
             artifact,
             runtime,
             execution_mode,
             lifecycle,
-        )
+        })
         .await?;
 
         Ok(outcome)
@@ -472,7 +476,7 @@ impl MaterializedViewRegistry {
             .await?
             .bytes()
             .await?;
-        let record: ActiveMaterializedViewRecord = serde_json::from_slice(&bytes)?;
+        let record = active_materialized_view_record_from_slice(&bytes)?;
         self.validate_active_record_identity(view_id, &record, &object_key)?;
         let execution_mode = self.normalized_execution_mode(&record)?;
         let lifecycle = self.normalized_lifecycle(&record, &execution_mode);
@@ -507,7 +511,7 @@ impl MaterializedViewRegistry {
                 .await?
                 .bytes()
                 .await?;
-            let record: ActiveMaterializedViewRecord = serde_json::from_slice(&bytes)?;
+            let record = active_materialized_view_record_from_slice(&bytes)?;
             self.validate_active_record_identity(&record.view_id, &record, &object_key)?;
             let execution_mode = self.normalized_execution_mode(&record)?;
             let lifecycle = self.normalized_lifecycle(&record, &execution_mode);
@@ -540,7 +544,7 @@ impl MaterializedViewRegistry {
             version: get_result.meta.version.clone(),
         };
         let bytes = get_result.bytes().await?;
-        let existing: ActiveMaterializedViewRecord = serde_json::from_slice(&bytes)?;
+        let existing = active_materialized_view_record_from_slice(&bytes)?;
         self.validate_active_record_identity(view_id, &existing, &object_key)?;
         let existing_mode = self.normalized_execution_mode(&existing)?;
         if existing.spec_hash != spec_hash
@@ -671,14 +675,18 @@ impl MaterializedViewRegistry {
 
     async fn write_active_record(
         &self,
-        view_id: &str,
-        spec_hash: &str,
-        api: Option<MaterializedViewApiMetadata>,
-        artifact: Option<MaterializedViewArtifactBinding>,
-        runtime: Option<MaterializedViewRuntimeBinding>,
-        execution_mode: Option<MaterializedViewExecutionMode>,
-        lifecycle: Option<MaterializedViewLifecycleStatus>,
+        input: ActiveMaterializedViewRecordInput<'_>,
     ) -> Result<(), MaterializedViewRegistryError> {
+        let ActiveMaterializedViewRecordInput {
+            view_id,
+            spec_hash,
+            api,
+            artifact,
+            runtime,
+            execution_mode,
+            lifecycle,
+        } = input;
+
         let object_key = self.active_object_key(view_id)?;
         let execution_mode = match execution_mode {
             Some(mode) => {
@@ -717,7 +725,7 @@ impl MaterializedViewRegistry {
                     .await?
                     .bytes()
                     .await?;
-                let existing: ActiveMaterializedViewRecord = serde_json::from_slice(&bytes)?;
+                let existing = active_materialized_view_record_from_slice(&bytes)?;
                 if existing == record {
                     Ok(())
                 } else {
@@ -846,19 +854,14 @@ impl MaterializedViewRegistry {
         &self,
         view_id: &str,
         mode: &MaterializedViewExecutionMode,
-        artifact: &Option<MaterializedViewArtifactBinding>,
+        _artifact: &Option<MaterializedViewArtifactBinding>,
         runtime: &Option<MaterializedViewRuntimeBinding>,
     ) -> Result<(), MaterializedViewRegistryError> {
         let MaterializedViewExecutionMode::StandingRuntime = mode;
-        let has_artifact_identity = artifact
-            .as_ref()
-            .and_then(|artifact| artifact.standing_program_identity.as_ref())
-            .is_some();
-        let has_runtime_identity = runtime.is_some();
-        if !has_artifact_identity && !has_runtime_identity {
+        if runtime.is_none() {
             return Err(MaterializedViewRegistryError::InvalidExecutionMode {
                 view_id: view_id.to_string(),
-                reason: InvalidExecutionModeReason::StandingRuntimeMissingArtifact,
+                reason: InvalidExecutionModeReason::StandingRuntimeMissingRuntimeBinding,
             });
         }
 
@@ -868,6 +871,84 @@ impl MaterializedViewRegistry {
 
 fn normalize_api_path(path: &str) -> String {
     path.trim_matches('/').to_string()
+}
+
+fn active_materialized_view_record_from_slice(
+    bytes: &[u8],
+) -> Result<ActiveMaterializedViewRecord, serde_json::Error> {
+    let mut value: Value = serde_json::from_slice(bytes)?;
+    normalize_legacy_active_record_value(&mut value);
+    serde_json::from_value(value)
+}
+
+fn normalize_legacy_active_record_value(value: &mut Value) {
+    let Some(record) = value.as_object_mut() else {
+        return;
+    };
+    if let Some(lifecycle) = record.get_mut("lifecycle").and_then(Value::as_object_mut) {
+        let old_runtime_engine = legacy_key("compiler", "_backend");
+        if !lifecycle.contains_key("runtime_engine") {
+            if let Some(value) = lifecycle.remove(old_runtime_engine.as_str()) {
+                lifecycle.insert("runtime_engine".to_string(), value);
+            }
+        }
+        let old_admission_status = legacy_key("compile", "_status");
+        if !lifecycle.contains_key("admission_status") {
+            if let Some(mut value) = lifecycle.remove(old_admission_status.as_str()) {
+                if value.as_str() == Some("success") {
+                    value = Value::String("admitted".to_string());
+                }
+                lifecycle.insert("admission_status".to_string(), value);
+            }
+        }
+    }
+    if let Some(identity) = record
+        .get_mut("runtime")
+        .and_then(Value::as_object_mut)
+        .and_then(|runtime| runtime.get_mut("standing_program_identity"))
+    {
+        normalize_legacy_standing_program_identity_value(identity);
+    }
+    if let Some(identity) = record
+        .get_mut("artifact")
+        .and_then(Value::as_object_mut)
+        .and_then(|artifact| artifact.get_mut("standing_program_identity"))
+    {
+        normalize_legacy_standing_program_identity_value(identity);
+    }
+}
+
+fn normalize_legacy_standing_program_identity_value(value: &mut Value) {
+    let Some(identity) = value.as_object_mut() else {
+        return;
+    };
+    move_legacy_key(identity, "compiler", "_identity", "planner_identity");
+    move_legacy_key(
+        identity,
+        "runtime",
+        "_packages",
+        "builtin_runtime_identities",
+    );
+    move_legacy_key(identity, "package", "_feature_set", "runtime_capabilities");
+}
+
+fn move_legacy_key(
+    object: &mut serde_json::Map<String, Value>,
+    old_prefix: &str,
+    old_suffix: &str,
+    new_key: &str,
+) {
+    if object.contains_key(new_key) {
+        return;
+    }
+    let old_key = legacy_key(old_prefix, old_suffix);
+    if let Some(value) = object.remove(old_key.as_str()) {
+        object.insert(new_key.to_string(), value);
+    }
+}
+
+fn legacy_key(prefix: &str, suffix: &str) -> String {
+    format!("{prefix}{suffix}")
 }
 
 fn active_update_error_to_registry(

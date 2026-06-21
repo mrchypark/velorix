@@ -7,15 +7,11 @@ use kube::{
 };
 use std::sync::Arc;
 use thiserror::Error;
-use velorix_storage::{
-    capability::{
-        AuthoritativeNamespace, AuthoritativeObjectStoreCapabilitiesV1,
-        ObjectStoreCapabilityProfile,
-    },
-    checkpoint_index::manifest_body_digest,
-    log::{IngestAdmissionCoordinator, IngestAdmissionReconstructionReport},
-    relation_catalog_registry::{RelationCatalogRegistry, RelationCatalogRegistryError},
-    state::{CheckpointPublishError, CheckpointPublisher},
+use velorix_control::storage_admin::{
+    manifest_body_digest, AuthoritativeNamespace, AuthoritativeObjectStoreCapabilitiesV1,
+    CheckpointManifest, CheckpointPublishError, CheckpointPublisher, IngestAdmissionCoordinator,
+    IngestAdmissionReconstructionReport, ObjectStoreCapabilityProfile, RelationCatalogRegistry,
+    RelationCatalogRegistryError,
 };
 
 use crate::{
@@ -245,7 +241,7 @@ impl RelationCatalogSnapshotProvider {
 }
 
 fn checkpoint_manifest_proves_relation_identity(
-    _manifest: &velorix_storage::manifest::CheckpointManifest,
+    _manifest: &CheckpointManifest,
     _relation: &RelationVersionRef,
 ) -> bool {
     // CheckpointManifest v1 has no relation id/version/fingerprint fields. A matching
@@ -257,9 +253,7 @@ fn snapshot_error(error: CheckpointPublishError) -> StreamWatchError {
     StreamWatchError::snapshot(error.to_string())
 }
 
-fn digest_manifest(
-    manifest: &velorix_storage::manifest::CheckpointManifest,
-) -> Result<String, StreamWatchError> {
+fn digest_manifest(manifest: &CheckpointManifest) -> Result<String, StreamWatchError> {
     serde_json::to_vec(manifest)
         .map(|bytes| manifest_body_digest(&bytes))
         .map_err(|error| StreamWatchError::snapshot(error.to_string()))

@@ -8,6 +8,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod materialized_output_workloads;
+
 use arrow::{
     array::{ArrayRef, Int64Array, StringArray},
     datatypes::{DataType, Field, Schema},
@@ -231,6 +233,13 @@ async fn run() -> BenchResult<()> {
         &capabilities,
     )
     .await?;
+    let materialized_output_workloads =
+        materialized_output_workloads::run_materialized_output_workloads(
+            Arc::clone(&store),
+            || metered_store.snapshot(),
+            CHECKPOINT_VERSION,
+        )
+        .await?;
 
     let records_per_second = total_records as f64 / ingest_elapsed.as_secs_f64();
     let mut object_requests = metered_store.snapshot();
@@ -258,56 +267,60 @@ async fn run() -> BenchResult<()> {
             spill_bytes: 0,
             scan_bytes: datafusion_scan.scan_bytes,
         },
-        workload_metrics: vec![
-            workload_metric(
-                "object_store_capability_probe",
-                &[capability_probe_elapsed],
-                capability_probe_requests,
-                0,
-            ),
-            workload_metric(
-                "ingest_envelope_validation",
-                &ingest_samples,
-                ingest_requests,
-                0,
-            ),
-            workload_metric(
-                "checkpoint_publish",
-                &[checkpoint_elapsed],
-                checkpoint_requests,
-                0,
-            ),
-            workload_metric(
-                "checkpoint_recovery",
-                &[recovery_elapsed],
-                recovery_requests,
-                0,
-            ),
-            workload_metric(
-                "datafusion_table_scan",
-                &datafusion_scan.samples,
-                datafusion_scan.object_requests,
-                datafusion_scan.scan_bytes,
-            ),
-            workload_metric(
-                "slatedb_state_reopen",
-                &slatedb_state_reopen.samples,
-                slatedb_state_reopen.object_requests,
-                slatedb_state_reopen.scan_bytes,
-            ),
-            workload_metric(
-                "gc_dry_run_planning",
-                &gc_dry_run_planning.measurement.samples,
-                gc_dry_run_planning.measurement.object_requests,
-                gc_dry_run_planning.measurement.scan_bytes,
-            ),
-            workload_metric(
-                "gc_execution_evidence",
-                &gc_execution_evidence.samples,
-                gc_execution_evidence.object_requests,
-                gc_execution_evidence.scan_bytes,
-            ),
-        ],
+        workload_metrics: {
+            let mut workload_metrics = vec![
+                workload_metric(
+                    "object_store_capability_probe",
+                    &[capability_probe_elapsed],
+                    capability_probe_requests,
+                    0,
+                ),
+                workload_metric(
+                    "ingest_envelope_validation",
+                    &ingest_samples,
+                    ingest_requests,
+                    0,
+                ),
+                workload_metric(
+                    "checkpoint_publish",
+                    &[checkpoint_elapsed],
+                    checkpoint_requests,
+                    0,
+                ),
+                workload_metric(
+                    "checkpoint_recovery",
+                    &[recovery_elapsed],
+                    recovery_requests,
+                    0,
+                ),
+                workload_metric(
+                    "datafusion_table_scan",
+                    &datafusion_scan.samples,
+                    datafusion_scan.object_requests,
+                    datafusion_scan.scan_bytes,
+                ),
+                workload_metric(
+                    "slatedb_state_reopen",
+                    &slatedb_state_reopen.samples,
+                    slatedb_state_reopen.object_requests,
+                    slatedb_state_reopen.scan_bytes,
+                ),
+                workload_metric(
+                    "gc_dry_run_planning",
+                    &gc_dry_run_planning.measurement.samples,
+                    gc_dry_run_planning.measurement.object_requests,
+                    gc_dry_run_planning.measurement.scan_bytes,
+                ),
+                workload_metric(
+                    "gc_execution_evidence",
+                    &gc_execution_evidence.samples,
+                    gc_execution_evidence.object_requests,
+                    gc_execution_evidence.scan_bytes,
+                ),
+            ];
+            workload_metrics.extend(materialized_output_workloads);
+            workload_metrics
+        },
     };
     result.validate()?;
 
@@ -686,6 +699,7 @@ async fn append_ingest_envelope(
             partition_id: PARTITION_ID,
             start_offset_inclusive,
             end_offset_exclusive,
+            event_time_watermark: None,
         },
         &[batch],
     )?;

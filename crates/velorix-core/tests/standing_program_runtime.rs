@@ -9,8 +9,8 @@ use velorix_core::{
     delta::DeltaBatch,
     engine::LogicalEpoch,
     standing_program::{
-        DurableStateRoot, EpochCommit, EpochIdempotencyKey, NativeCodePolicy, RelationFrontier,
-        RelationInputBatch, RuntimeCheckpoint, RuntimePackageIdentity, ScopedViewId,
+        BuiltinRuntimeIdentity, DurableStateRoot, EpochCommit, EpochIdempotencyKey,
+        NativeCodePolicy, RelationFrontier, RelationInputBatch, RuntimeCheckpoint, ScopedViewId,
         SnapshotPageRequest, StandingProgramIdentity, StandingProgramRuntime,
         StandingProgramRuntimeError, ViewFrontier, ViewOutputBatch, ViewOutputDelta,
     },
@@ -25,13 +25,13 @@ fn valid_identity() -> StandingProgramIdentity {
         sql_hash: format!("sha256:{}", "1".repeat(64)),
         input_catalog_hash: format!("sha256:{}", "2".repeat(64)),
         output_schema_hash: format!("sha256:{}", "3".repeat(64)),
-        compiler_identity: "velorix-materialized-runtime@1".to_string(),
-        runtime_packages: vec![RuntimePackageIdentity {
-            name: "DAG".to_string(),
-            version: "0.299.0".to_string(),
+        planner_identity: "velorix-logical-view-planner@1".to_string(),
+        builtin_runtime_identities: vec![BuiltinRuntimeIdentity {
+            name: "velorix_native_materialized_runtime".to_string(),
+            version: "builtin-v1".to_string(),
         }],
-        package_feature_set: vec!["backend-mode".to_string()],
-        runtime_compatibility: "DAG-runtime-0.299.0".to_string(),
+        runtime_capabilities: vec!["materialized-view-runtime".to_string()],
+        runtime_compatibility: "velorix-native-materialized-runtime-v1".to_string(),
         checkpoint_codec_identity: "velorix-standing-program-checkpoint-v1".to_string(),
         native_code_policy: NativeCodePolicy::DisabledNoExternalDependencies,
     }
@@ -55,14 +55,14 @@ fn sample_batch() -> RecordBatch {
 #[test]
 fn standing_program_identity_rejects_missing_runtime_identity() {
     let mut identity = valid_identity();
-    identity.runtime_packages.clear();
+    identity.builtin_runtime_identities.clear();
 
     let error = identity.validate().unwrap_err();
 
     assert!(matches!(
         error,
         StandingProgramRuntimeError::InvalidProgramIdentity {
-            field: "runtime_packages"
+            field: "builtin_runtime_identities"
         }
     ));
 }
@@ -93,6 +93,8 @@ fn runtime_checkpoint_rejects_program_identity_mismatch() {
         input_frontiers: vec![RelationFrontier {
             relation_id: "orders".to_string(),
             relation_version: "2026-05-05.v1".to_string(),
+            stream_id: "test-stream".to_string(),
+            partition_id: 0,
             committed_offset_exclusive: 10,
         }],
         input_event_time_frontiers: Vec::new(),
@@ -162,6 +164,8 @@ impl StandingProgramRuntime for FakeStandingProgramRuntime {
             input_frontiers: vec![RelationFrontier {
                 relation_id: "orders".to_string(),
                 relation_version: "2026-05-05.v1".to_string(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
                 committed_offset_exclusive: 1,
             }],
             input_event_time_frontiers: Vec::new(),
@@ -236,6 +240,8 @@ fn standing_program_runtime_applies_relation_scoped_epoch_and_emits_view_scoped_
             vec![RelationInputBatch {
                 relation_id: "orders".to_string(),
                 relation_version: "2026-05-05.v1".to_string(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
                 schema_fingerprint: format!("sha256:{}", "2".repeat(64)),
                 start_offset_inclusive: 0,
                 end_offset_exclusive: 1,

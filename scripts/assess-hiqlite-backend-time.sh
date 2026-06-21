@@ -300,7 +300,9 @@ def scan_velorix_meta_source(repo_root: Path) -> dict:
     checkpoint_publish_update_uses_authority_time = (
         authority_txn_call_present(publish_impl)
         and authority_time_param_present(publish_impl)
-        and "owner.expires_at_unix_ms > $12" in publish_impl
+        and "UPDATE velorix_standing_runtime_checkpoints" in publish_impl
+        and "owner.expires_at_unix_ms > $6" in publish_impl
+        and "hiqlite::Param::StmtOutputIndexed(0, 0)" in publish_impl
     )
     checkpoint_publish_insert_uses_authority_time = (
         (
@@ -313,15 +315,15 @@ def scan_velorix_meta_source(repo_root: Path) -> dict:
             + publish_impl.count("hiqlite::Param::raft_serialized_unix_ms()")
         )
         >= 2
-        and "owner.expires_at_unix_ms > $9" in publish_impl
+        and "INSERT OR IGNORE INTO velorix_standing_runtime_checkpoints" in publish_impl
+        and "owner.expires_at_unix_ms > $6" in publish_impl
+        and "hiqlite::Param::StmtOutputIndexed(0, 0)" in publish_impl
     )
     checkpoint_publish_rejects_scope_mismatch = (
-        "AND $13 = $4" in publish_impl
-        and "AND $14 = $5" in publish_impl
-        and "AND $15 = $6" in publish_impl
-        and "AND $10 = $1" in publish_impl
-        and "AND $11 = $2" in publish_impl
-        and "AND $12 = $3" in publish_impl
+        publish_impl.count("AND $7 = $1") >= 2
+        and publish_impl.count("AND $8 = $2") >= 2
+        and publish_impl.count("AND $9 = $3") >= 2
+        and publish_impl.count("hiqlite::Param::StmtOutputIndexed(0, 0)") >= 2
     )
     unsafe_runtime_sources_absent = all(
         forbidden not in hiqlite_impl

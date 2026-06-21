@@ -1,7 +1,6 @@
-use std::{collections::BTreeMap, fmt};
+use std::collections::BTreeMap;
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use k8s_openapi::{
     api::core::v1::{Container, EnvVar, Pod, PodSpec, Volume, VolumeMount},
     apimachinery::pkg::apis::meta::v1::ObjectMeta,
@@ -11,15 +10,27 @@ use kube::{
     Client,
 };
 use thiserror::Error;
-use velorix_storage::log::{
-    AppendValidatedEnvelopeOutcome, IngestAdmissionCoordinator,
-    IngestAdmissionReconstructionReport, IngestCommitGuard,
+use velorix_control::{
+    ingest_writer_runtime::{IngestWriterRuntimeError, IngestWriterRuntimeStartup},
+    storage_admin::{IngestAdmissionCoordinator, IngestAdmissionReconstructionReport},
 };
 
 use crate::{
     crd::ObjectStoreAuthorityRef, startup::OperatorAuthorityStartupComponents,
     stream_watch::StreamWatchError,
 };
+
+pub type DeployedIngestWriterRuntime =
+    velorix_control::ingest_writer_runtime::DeployedIngestWriterRuntime<
+        ObjectStoreAuthorityRef,
+        StreamWatchError,
+    >;
+
+impl From<IngestWriterRuntimeError> for StreamWatchError {
+    fn from(error: IngestWriterRuntimeError) -> Self {
+        StreamWatchError::snapshot(error.to_string())
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IngestWriterRuntimeIdentity {
@@ -482,99 +493,31 @@ fn stable_hash8(value: &str) -> String {
     format!("{:08x}", hash as u32)
 }
 
-pub struct DeployedIngestWriterRuntime {
-    authority: ObjectStoreAuthorityRef,
-    coordinator: IngestAdmissionCoordinator,
-    startup_report: IngestAdmissionReconstructionReport,
-}
+#[async_trait]
+impl IngestWriterRuntimeStartup<ObjectStoreAuthorityRef> for OperatorAuthorityStartupComponents {
+    type Error = StreamWatchError;
 
-impl fmt::Debug for DeployedIngestWriterRuntime {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DeployedIngestWriterRuntime")
-            .field("authority", &self.authority)
-            .field("startup_report", &self.startup_report)
-            .finish_non_exhaustive()
-    }
-}
-
-impl DeployedIngestWriterRuntime {
-    pub async fn from_startup_components(
-        startup_components: &OperatorAuthorityStartupComponents,
-    ) -> Result<Self, StreamWatchError> {
-        let provider = startup_components.ingest_admission_coordinator_provider();
-        let (coordinator, startup_report) =
-            provider.coordinator_after_startup_reconstruction().await?;
-
-        Ok(Self {
-            authority: startup_components.authority().clone(),
-            coordinator,
-            startup_report,
-        })
+    fn authority(&self) -> ObjectStoreAuthorityRef {
+        OperatorAuthorityStartupComponents::authority(self).clone()
     }
 
-    pub fn from_startup_components_without_reconstruction(
-        startup_components: &OperatorAuthorityStartupComponents,
-    ) -> Result<Self, StreamWatchError> {
-        let provider = startup_components.ingest_admission_coordinator_provider();
-        let coordinator = provider.coordinator_without_startup_reconstruction()?;
-        let startup_report = IngestAdmissionReconstructionReport {
-            active_admission_records: 0,
-            expired_orphan_admission_records: 0,
-        };
-
-        Ok(Self {
-            authority: startup_components.authority().clone(),
-            coordinator,
-            startup_report,
-        })
-    }
-
-    pub fn authority(&self) -> &ObjectStoreAuthorityRef {
-        &self.authority
-    }
-
-    pub fn startup_report(&self) -> &IngestAdmissionReconstructionReport {
-        &self.startup_report
-    }
-
-    pub async fn append_catalog_validated_envelope(
+    fn coordinator_without_startup_reconstruction(
         &self,
-        payload: Bytes,
-    ) -> Result<AppendValidatedEnvelopeOutcome, StreamWatchError> {
-        self.coordinator
-            .append_catalog_validated_envelope(payload)
-            .await
-            .map_err(|error| StreamWatchError::snapshot(error.to_string()))
+    ) -> Result<IngestAdmissionCoordinator, Self::Error> {
+        let provider = self.ingest_admission_coordinator_provider();
+        provider.coordinator_without_startup_reconstruction()
     }
 
-    pub async fn append_catalog_validated_envelope_with_commit_guard(
+    async fn coordinator_after_startup_reconstruction(
         &self,
-        payload: Bytes,
-        commit_guard: &dyn IngestCommitGuard,
-    ) -> Result<AppendValidatedEnvelopeOutcome, StreamWatchError> {
-        self.coordinator
-            .append_catalog_validated_envelope_with_commit_guard(payload, commit_guard)
-            .await
-            .map_err(|error| StreamWatchError::snapshot(error.to_string()))
-    }
-
-    pub async fn append_catalog_validated_envelope_after_external_admission(
-        &self,
-        payload: Bytes,
-    ) -> Result<AppendValidatedEnvelopeOutcome, StreamWatchError> {
-        self.coordinator
-            .append_catalog_validated_envelope_after_external_admission(payload)
-            .await
-            .map_err(|error| StreamWatchError::snapshot(error.to_string()))
-    }
-
-    pub async fn append_validated_envelope_after_external_admission(
-        &self,
-        payload: Bytes,
-    ) -> Result<AppendValidatedEnvelopeOutcome, StreamWatchError> {
-        self.coordinator
-            .append_validated_envelope_after_external_admission(payload)
-            .await
-            .map_err(|error| StreamWatchError::snapshot(error.to_string()))
+    ) -> Result<
+        (
+            IngestAdmissionCoordinator,
+            IngestAdmissionReconstructionReport,
+        ),
+        Self::Error,
+    > {
+        let provider = self.ingest_admission_coordinator_provider();
+        provider.coordinator_after_startup_reconstruction().await
     }
 }
