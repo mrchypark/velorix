@@ -4,6 +4,8 @@
 
 pub use velorix_control::benchmark_gate;
 pub mod cache;
+pub mod disk_state;
+pub mod general_circuit_runtime;
 pub mod leased_checkpoint;
 pub use velorix_control::materialized_view_runtime;
 mod object_meter;
