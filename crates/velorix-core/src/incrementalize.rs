@@ -140,7 +140,8 @@ pub fn eval_node_incremental(
         // Stateful operators: require external state management
         // ----------------------------------------------------------------
         CircuitNode::Join { .. } | CircuitNode::Aggregate { .. } | CircuitNode::Distinct { .. }
-        | CircuitNode::TopK { .. } | CircuitNode::TumblingWindow { .. } => {
+        | CircuitNode::TopK { .. } | CircuitNode::TumblingWindow { .. }
+        | CircuitNode::RowNumber { .. } => {
             // Stateful operators are managed by the runtime, not here.
             // This function handles only stateless pass-through.
             // The runtime calls dedicated methods on `GeneralCircuitRuntime`.

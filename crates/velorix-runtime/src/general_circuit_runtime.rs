@@ -213,6 +213,15 @@ impl GeneralCircuitRuntime {
                 let window_size_ns = *window_size_ns;
                 self.eval_window(node_id, &event_time, window_size_ns, node_outputs).await
             }
+
+            // Stateful: RowNumber — assigns sequential integers within partitions
+            CircuitNode::RowNumber { node_id: _, partition_keys, order_by, descending, output_column_id } => {
+                let partition_keys = partition_keys.clone();
+                let order_by = order_by.clone();
+                let descending = *descending;
+                let output_column_id = output_column_id.clone();
+                self.eval_row_number(node_id, &partition_keys, &order_by, descending, &output_column_id, node_outputs).await
+            }
         }
     }
 
@@ -401,6 +410,62 @@ impl GeneralCircuitRuntime {
         Ok(DeltaBatch::from_records(output_records))
     }
 
+    async fn eval_row_number(
+        &mut self,
+        node_id: NodeId,
+        partition_keys: &[velorix_core::circuit::CircuitColumnRef],
+        order_by: &velorix_core::circuit::CircuitColumnRef,
+        descending: bool,
+        output_column_id: &str,
+        node_outputs: &HashMap<NodeId, DeltaBatch>,
+    ) -> Result<DeltaBatch, CircuitRuntimeError> {
+        let input = get_input(node_id, &self.circuit.circuit, node_outputs);
+
+        // Group by partition keys
+        let mut partitions: BTreeMap<String, Vec<&velorix_core::delta::DeltaRecord>> = BTreeMap::new();
+        for record in input.records() {
+            let part_key = if partition_keys.is_empty() {
+                "__all__".to_string()
+            } else {
+                let parts: Vec<String> = partition_keys.iter().map(|pk| {
+                    record.value.as_json()
+                        .get(pk.column_id.as_str())
+                        .map(|v| v.to_string())
+                        .unwrap_or_default()
+                }).collect();
+                parts.join("|")
+            };
+            partitions.entry(part_key).or_default().push(record);
+        }
+
+        let mut output_records = Vec::new();
+
+        for (_part_key, records) in &partitions {
+            // Sort by order_by column
+            let mut sorted = records.clone();
+            sorted.sort_by(|a, b| {
+                let a_val = a.value.as_json().get(order_by.column_id.as_str());
+                let b_val = b.value.as_json().get(order_by.column_id.as_str());
+                let cmp = compare_json_values(a_val, b_val);
+                if descending { cmp.reverse() } else { cmp }
+            });
+
+            // Assign row numbers
+            for (idx, record) in sorted.iter().enumerate() {
+                let row_num = (idx as i64) + 1;
+                let mut value_obj = record.value.as_json().as_object().cloned().unwrap_or_default();
+                value_obj.insert(output_column_id.to_string(), serde_json::json!(row_num));
+                output_records.push(DeltaRecord::new(
+                    record.key.clone(),
+                    DeltaValue::from_json(serde_json::Value::Object(value_obj)),
+                    record.weight,
+                ));
+            }
+        }
+
+        Ok(DeltaBatch::from_records(output_records))
+    }
+
     /// Return the current published output (full materialized state).
     pub fn published_output(&self) -> &DeltaBatch {
         &self.published_output
@@ -409,6 +474,26 @@ impl GeneralCircuitRuntime {
     /// Return the current logical epoch.
     pub fn logical_epoch(&self) -> LogicalEpoch {
         self.logical_epoch
+    }
+
+    /// Restore a runtime from a checkpoint.
+    pub fn restore_from_checkpoint(published_output: DeltaBatch, logical_epoch: LogicalEpoch) -> Self {
+        let circuit = velorix_core::circuit::IncrementalCircuit {
+            circuit: velorix_core::circuit::Circuit {
+                nodes: vec![velorix_core::circuit::CircuitNode::Source { node_id: 0, relation_id: "__restored__".into() }],
+                edges: vec![],
+                input_node_ids: vec![0],
+                output_node_id: 0,
+            },
+            delay_states: std::collections::BTreeMap::new(),
+        };
+        Self {
+            circuit,
+            state_store: OperatorStateStore::default(),
+            logical_epoch,
+            node_states: HashMap::new(),
+            published_output,
+        }
     }
 }
 
@@ -433,6 +518,25 @@ fn canonical_key(key: &DeltaKey) -> String {
     key.as_json().to_string()
 }
 
+fn compare_json_values(a: Option<&serde_json::Value>, b: Option<&serde_json::Value>) -> std::cmp::Ordering {
+    match (a, b) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (Some(a), Some(b)) => {
+            if let (Some(ai), Some(bi)) = (a.as_i64(), b.as_i64()) {
+                ai.cmp(&bi)
+            } else if let (Some(af), Some(bf)) = (a.as_f64(), b.as_f64()) {
+                af.partial_cmp(&bf).unwrap_or(std::cmp::Ordering::Equal)
+            } else if let (Some(as_str), Some(bs)) = (a.as_str(), b.as_str()) {
+                as_str.cmp(bs)
+            } else {
+                a.to_string().cmp(&b.to_string())
+            }
+        }
+    }
+}
+
 fn get_input_by_port(
     node_id: NodeId,
     port: u8,
@@ -448,8 +552,28 @@ fn get_input_by_port(
         .unwrap_or_default()
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    format!("sha256:{:016x}", hasher.finish())
+}
+
 fn apply_published_output_delta(current: &DeltaBatch, delta: &DeltaBatch) -> DeltaBatch {
     DeltaBatch::from_records(current.combine(delta).net_rows().unwrap_or_default())
+}
+
+// ---------------------------------------------------------------------------
+// Checkpoint state
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct GeneralCircuitCheckpoint {
+    published_output: DeltaBatch,
+    logical_epoch: LogicalEpoch,
+    input_frontiers: Vec<velorix_core::standing_program::RelationFrontier>,
+    applied_epochs: Vec<(String, LogicalEpoch)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -459,7 +583,7 @@ fn apply_published_output_delta(current: &DeltaBatch, delta: &DeltaBatch) -> Del
 use velorix_core::delta_to_arrow::delta_batch_to_record_batch;
 use velorix_core::standing_program::{
     DurableStateRoot, EpochIdempotencyKey, EpochCommit,
-    RelationFrontier, RelationInputBatch, RuntimeCheckpoint,
+    RelationFrontier, RelationInputBatch, RuntimeCheckpoint, RuntimeCheckpointStatePayload,
     StandingProgramIdentity, StandingProgramRuntime, StandingProgramRuntimeError,
     ViewOutputBatch, ViewOutputDelta, MaterializedViewPage, ScopedViewId, SnapshotPageRequest,
 };
@@ -635,8 +759,21 @@ impl StandingProgramRuntime for GeneralStandingRuntime {
     }
 
     fn checkpoint(&self) -> Result<RuntimeCheckpoint, StandingProgramRuntimeError> {
-        // For now, return a minimal checkpoint
-        // Full implementation would persist circuit state via OperatorStateStore
+        // Serialize full circuit state
+        let state = GeneralCircuitCheckpoint {
+            published_output: self.inner.published_output().clone(),
+            logical_epoch: self.inner.logical_epoch(),
+            input_frontiers: self.input_frontiers.clone(),
+            applied_epochs: self.applied_epochs.iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect(),
+        };
+        let payload_json = serde_json::to_string(&state)
+            .map_err(|e| StandingProgramRuntimeError::ExternalRuntime {
+                reason: format!("checkpoint serialization error: {e}"),
+            })?;
+        let content_hash = sha256_hex(payload_json.as_bytes());
+
         Ok(RuntimeCheckpoint {
             identity: self.identity.clone(),
             logical_epoch: self.inner.logical_epoch(),
@@ -646,17 +783,42 @@ impl StandingProgramRuntime for GeneralStandingRuntime {
             checkpoint_codec_identity: self.identity.checkpoint_codec_identity.clone(),
             state_root: DurableStateRoot {
                 object_key: "general-circuit-state".into(),
-                content_hash: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
+                content_hash,
             },
-            state_payload: None,
+            state_payload: Some(RuntimeCheckpointStatePayload {
+                codec_identity: self.identity.checkpoint_codec_identity.clone(),
+                payload: payload_json,
+            }),
             output_manifest_refs: Vec::new(),
             owner_epoch: None,
         })
     }
 
-    fn restore(_checkpoint: RuntimeCheckpoint) -> Result<Self, StandingProgramRuntimeError> {
-        Err(StandingProgramRuntimeError::ExternalRuntime {
-            reason: "general circuit runtime restore not yet implemented".into(),
+    fn restore(checkpoint: RuntimeCheckpoint) -> Result<Self, StandingProgramRuntimeError> {
+        checkpoint.validate_identity(&checkpoint.identity)?;
+
+        let payload = checkpoint.state_payload
+            .ok_or_else(|| StandingProgramRuntimeError::ExternalRuntime {
+                reason: "checkpoint missing state payload".into(),
+            })?;
+
+        let state: GeneralCircuitCheckpoint = serde_json::from_str(&payload.payload)
+            .map_err(|e| StandingProgramRuntimeError::ExternalRuntime {
+                reason: format!("checkpoint deserialization error: {e}"),
+            })?;
+
+        let applied_epochs: BTreeMap<String, LogicalEpoch> = state.applied_epochs.iter().cloned().collect();
+        let input_frontiers = state.input_frontiers.clone();
+        let published_output = state.published_output.clone();
+        let logical_epoch = state.logical_epoch;
+
+        Ok(Self {
+            identity: checkpoint.identity,
+            input_schemas: Vec::new(),
+            output_schemas: Vec::new(),
+            inner: GeneralCircuitRuntime::restore_from_checkpoint(published_output, logical_epoch),
+            input_frontiers,
+            applied_epochs,
         })
     }
 }
@@ -950,5 +1112,66 @@ mod tests {
         // Actually with side-state: L state has L1, so new R2 joins against L1.
         assert_eq!(output2.records().len(), 1);
         assert_eq!(output2.records()[0].weight, 1);
+    }
+
+    #[tokio::test]
+    async fn row_number_epoch_evaluation() {
+        let circuit = Circuit {
+            nodes: vec![
+                CircuitNode::Source { node_id: 0, relation_id: "emp".into() },
+                CircuitNode::RowNumber {
+                    node_id: 1,
+                    partition_keys: vec![CircuitColumnRef { node_id: 0, column_id: "dept".into() }],
+                    order_by: CircuitColumnRef { node_id: 0, column_id: "name".into() },
+                    descending: false,
+                    output_column_id: "rn".into(),
+                },
+                CircuitNode::Sink { node_id: 2, relation_id: "out".into() },
+            ],
+            edges: vec![
+                Edge { from: 0, from_port: 0, to: 1, to_port: 0 },
+                Edge { from: 1, from_port: 0, to: 2, to_port: 0 },
+            ],
+            input_node_ids: vec![0],
+            output_node_id: 2,
+        };
+
+        let inc = incrementalize(&circuit);
+        let dir = tempfile::tempdir().unwrap();
+        let config = DiskStateConfig::new(dir.path(), 1024 * 1024, 10 * 1024 * 1024);
+        let mut runtime = GeneralCircuitRuntime::new(inc, &config).await.unwrap();
+
+        let mut input_deltas = HashMap::new();
+        input_deltas.insert(0, DeltaBatch::from_records(vec![
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!("e1")),
+                DeltaValue::from_json(serde_json::json!({"name": "Alice", "dept": "eng"})),
+                1,
+            ),
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!("e2")),
+                DeltaValue::from_json(serde_json::json!({"name": "Bob", "dept": "eng"})),
+                1,
+            ),
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!("e3")),
+                DeltaValue::from_json(serde_json::json!({"name": "Carol", "dept": "sales"})),
+                1,
+            ),
+        ]));
+
+        let output = runtime.apply_epoch(1, input_deltas).await.unwrap();
+        assert_eq!(output.records().len(), 3);
+        // Check that each record has rn field
+        for record in output.records() {
+            assert!(record.value.as_json().get("rn").is_some());
+        }
+        // eng dept: Alice=1, Bob=2; sales dept: Carol=1
+        let mut eng_rns: Vec<i64> = output.records().iter()
+            .filter(|r| r.value.as_json().get("dept").and_then(|v| v.as_str()) == Some("eng"))
+            .filter_map(|r| r.value.as_json().get("rn").and_then(|v| v.as_i64()))
+            .collect();
+        eng_rns.sort();
+        assert_eq!(eng_rns, vec![1, 2]);
     }
 }

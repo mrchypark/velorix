@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use sqlparser::ast::{
     BinaryOperator, Expr, GroupByExpr, JoinConstraint, JoinOperator,
     Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins,
-    Value as SqlValue,
+    Value as SqlValue, WindowType,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -167,17 +167,9 @@ fn translate_query(query: &Query, ctx: &mut Builder) -> Result<NodeId, SqlToCirc
         if let Some(ref order_by) = query.order_by {
             if let sqlparser::ast::OrderByKind::Expressions(ref exprs) = order_by.kind {
                 if let Some(first_order) = exprs.first() {
-                    let (col, descending) = match &first_order.expr {
-                        Expr::Identifier(i) => (i.value.clone(), first_order.options.asc == Some(false)),
-                        Expr::CompoundIdentifier(idents) if idents.len() == 2 => {
-                            (idents[1].value.clone(), first_order.options.asc == Some(false))
-                        }
-                        _ => return Err(SqlToCircuitError::Unsupported {
-                            reason: "ORDER BY requires a column reference".into(),
-                        }),
-                    };
-                    let order_col = CircuitColumnRef { node_id: current, column_id: col };
-                    let kid = ctx.alloc(CircuitNode::TopK { node_id: 0, order_by: order_col, descending, limit, offset });
+                    let cr = col_ref(&first_order.expr, current)?;
+                    let descending = first_order.options.asc == Some(false);
+                    let kid = ctx.alloc(CircuitNode::TopK { node_id: 0, order_by: cr, descending, limit, offset });
                     ctx.connect(current, kid);
                     current = kid;
                 }
@@ -224,6 +216,45 @@ fn translate_select(select: &Select, ctx: &mut Builder) -> Result<NodeId, SqlToC
             let fid = ctx.alloc(CircuitNode::Filter { node_id: 0, predicates: preds });
             ctx.connect(current, fid);
             current = fid;
+        }
+    }
+
+    // Window functions in SELECT projection → RowNumber node
+    for item in &select.projection {
+        let (func, output_col) = match item {
+            SelectItem::UnnamedExpr(Expr::Function(func)) => {
+                (func, "row_number".to_string())
+            }
+            SelectItem::ExprWithAlias { expr: Expr::Function(func), alias } => {
+                (func, alias.value.clone())
+            }
+            _ => continue,
+        };
+        let name = func.name.to_string().to_uppercase();
+        if name == "ROW_NUMBER" {
+            if let Some(WindowType::WindowSpec(spec)) = &func.over {
+                let partition_keys: Vec<CircuitColumnRef> = spec.partition_by.iter()
+                    .filter_map(|e| col_ref(e, current).ok())
+                    .collect();
+                let order_by = if let Some(first) = spec.order_by.first() {
+                    col_ref(&first.expr, current)?
+                } else {
+                    return Err(SqlToCircuitError::Unsupported {
+                        reason: "ROW_NUMBER requires ORDER BY".into(),
+                    });
+                };
+                let descending = spec.order_by.first()
+                    .map_or(false, |o| o.options.asc == Some(false));
+                let rid = ctx.alloc(CircuitNode::RowNumber {
+                    node_id: 0,
+                    partition_keys,
+                    order_by,
+                    descending,
+                    output_column_id: output_col,
+                });
+                ctx.connect(current, rid);
+                current = rid;
+            }
         }
     }
 
@@ -408,9 +439,15 @@ fn extract_proj(
     let mut cols = Vec::new();
     for item in &select.projection {
         match item {
+            SelectItem::UnnamedExpr(Expr::Function(func)) if func.over.is_some() => {
+                // Window functions are handled by RowNumber node, skip in projection
+            }
             SelectItem::UnnamedExpr(e) => {
                 let cr = col_ref(e, node)?;
                 cols.push(CircuitProjection { source_column: cr.clone(), output_column_id: cr.column_id });
+            }
+            SelectItem::ExprWithAlias { expr: Expr::Function(func), .. } if func.over.is_some() => {
+                // Window functions with alias are handled by RowNumber node
             }
             SelectItem::ExprWithAlias { expr, alias } => {
                 let cr = col_ref(expr, node)?;
@@ -515,5 +552,54 @@ mod tests {
         assert!(c.nodes.iter().any(|n| matches!(n, CircuitNode::Aggregate { .. })));
         assert!(c.nodes.iter().any(|n| matches!(n, CircuitNode::Filter { .. })));
         assert!(c.nodes.iter().any(|n| matches!(n, CircuitNode::TopK { limit: 5, .. })));
+    }
+
+    #[test]
+    fn select_order_by_aggregate_function() {
+        let c = sql_to_circuit(
+            "SELECT dept, SUM(sal) FROM emp GROUP BY dept ORDER BY SUM(sal) DESC",
+            &[tbl("emp", &["dept", "sal"])],
+        ).unwrap();
+        // Source → Aggregate → TopK
+        assert!(c.nodes.iter().any(|n| matches!(n, CircuitNode::Aggregate { .. })));
+        assert!(c.nodes.iter().any(|n| matches!(n, CircuitNode::TopK { descending: true, .. })));
+    }
+
+    #[test]
+    fn select_order_by_count_star() {
+        let c = sql_to_circuit(
+            "SELECT dept, COUNT(*) FROM emp GROUP BY dept ORDER BY COUNT(*) DESC LIMIT 3",
+            &[tbl("emp", &["dept", "sal"])],
+        ).unwrap();
+        assert!(c.nodes.iter().any(|n| matches!(n, CircuitNode::TopK { limit: 3, descending: true, .. })));
+    }
+
+    #[test]
+    fn select_row_number_window_function() {
+        let c = sql_to_circuit(
+            "SELECT name, dept, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY name) AS rn FROM emp",
+            &[tbl("emp", &["name", "dept", "sal"])],
+        ).unwrap();
+        assert!(c.nodes.iter().any(|n| matches!(n, CircuitNode::RowNumber { .. })));
+    }
+
+    #[test]
+    fn select_row_number_no_partition() {
+        let c = sql_to_circuit(
+            "SELECT name, ROW_NUMBER() OVER (ORDER BY name DESC) AS rn FROM emp",
+            &[tbl("emp", &["name"])],
+        ).unwrap();
+        assert!(c.nodes.iter().any(|n| matches!(n, CircuitNode::RowNumber { descending: true, .. })));
+    }
+
+    #[test]
+    fn select_having_order_by_limit_combined() {
+        let c = sql_to_circuit(
+            "SELECT dept, SUM(sal) as total, COUNT(*) as cnt FROM emp GROUP BY dept HAVING COUNT(*) > 3 ORDER BY total DESC, cnt ASC LIMIT 10",
+            &[tbl("emp", &["dept", "sal"])],
+        ).unwrap();
+        assert!(c.nodes.iter().any(|n| matches!(n, CircuitNode::Aggregate { .. })));
+        assert!(c.nodes.iter().any(|n| matches!(n, CircuitNode::Filter { .. })));
+        assert!(c.nodes.iter().any(|n| matches!(n, CircuitNode::TopK { limit: 10, .. })));
     }
 }

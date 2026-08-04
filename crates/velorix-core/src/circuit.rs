@@ -150,6 +150,14 @@ pub enum CircuitNode {
         event_time: CircuitColumnRef,
         window_size_ns: i64,
     },
+    /// Row number window function: assigns sequential integers within partitions.
+    RowNumber {
+        node_id: NodeId,
+        partition_keys: Vec<CircuitColumnRef>,
+        order_by: CircuitColumnRef,
+        descending: bool,
+        output_column_id: String,
+    },
     /// Emit the result to an output relation.
     Sink {
         node_id: NodeId,

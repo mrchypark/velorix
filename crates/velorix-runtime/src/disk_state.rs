@@ -70,6 +70,28 @@ pub struct OperatorStateStore {
     cache: HybridCache<String, Vec<u8>>,
 }
 
+impl Default for OperatorStateStore {
+    fn default() -> Self {
+        // Use a temporary directory for in-memory-only cache
+        let temp_dir = std::env::temp_dir().join(format!("velorix-state-{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).ok();
+        let device = FsDeviceBuilder::new(&temp_dir)
+            .with_capacity(1024 * 1024) // 1MB
+            .build()
+            .expect("failed to build default device");
+        let cache = futures::executor::block_on(
+            HybridCacheBuilder::new()
+                .with_name("velorix-default-state")
+                .memory(1024 * 1024) // 1MB in-memory
+                .with_weighter(|_key, value: &Vec<u8>| value.len())
+                .storage()
+                .with_engine_config(BlockEngineConfig::new(device))
+                .build()
+        ).expect("failed to build default cache");
+        Self { cache }
+    }
+}
+
 impl OperatorStateStore {
     /// Open (or create) the state store at the given directory.
     pub async fn open(config: &DiskStateConfig) -> Result<Self, DiskStateError> {
