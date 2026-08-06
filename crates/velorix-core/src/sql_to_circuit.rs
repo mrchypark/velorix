@@ -460,6 +460,14 @@ fn extract_first_col_ref(expr: &Expr, node: NodeId) -> Option<CircuitColumnRef> 
             }
         }
         Expr::Cast { expr, .. } => extract_first_col_ref(expr, node),
+        Expr::Case { conditions, else_result, .. } => {
+            for clause in conditions {
+                if let Some(col) = extract_first_col_ref(&clause.result, node) {
+                    return Some(col);
+                }
+            }
+            else_result.as_ref().and_then(|e| extract_first_col_ref(e, node))
+        }
         _ => None,
     }
 }
