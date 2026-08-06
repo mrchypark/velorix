@@ -8106,8 +8106,6 @@ async fn standing_runtime_page_from_output_manifest(
     }
     let published_output =
         standing_runtime_published_output_from_manifest_page(state, &manifest).await?;
-    let aggregate_outputs =
-        standing_runtime_output_aggregate_outputs_for_checkpoint(&record.checkpoint)?;
     let scoped_view = ScopedViewId {
         tenant_id: identity.tenant_id.clone(),
         program_id: identity.program_id.clone(),
@@ -8119,7 +8117,6 @@ async fn standing_runtime_page_from_output_manifest(
         scoped_view,
         record.checkpoint.logical_epoch,
         page_request,
-        aggregate_outputs.as_deref(),
     )
     .map_err(ApiError::bad_request)?;
     Ok(Some(page))
@@ -8200,8 +8197,6 @@ async fn standing_runtime_page_from_checkpoint_published_output(
         })?;
     let published_output: DeltaBatch = serde_json::from_value(published_output)
         .map_err(|source| ApiError::bad_request(source.to_string()))?;
-    let aggregate_outputs =
-        standing_runtime_output_aggregate_outputs_for_checkpoint(&record.checkpoint)?;
     let scoped_view = ScopedViewId {
         tenant_id: identity.tenant_id.clone(),
         program_id: identity.program_id.clone(),
@@ -8213,7 +8208,6 @@ async fn standing_runtime_page_from_checkpoint_published_output(
         scoped_view,
         record.checkpoint.logical_epoch,
         page_request,
-        aggregate_outputs.as_deref(),
     )
     .map_err(ApiError::bad_request)?;
     Ok(Some(page))
@@ -8244,42 +8238,6 @@ async fn standing_runtime_published_output_from_manifest_page(
     }
     serde_json::from_value(page_record.published_output)
         .map_err(|source| ApiError::bad_request(source.to_string()))
-}
-
-fn standing_runtime_output_aggregate_outputs_for_checkpoint(
-    checkpoint: &RuntimeCheckpoint,
-) -> Result<Option<Vec<SupportedAggregateOutput>>, ApiError> {
-    let Some(state_payload) = &checkpoint.state_payload else {
-        return Ok(None);
-    };
-    let payload: Value = serde_json::from_str(&state_payload.payload)
-        .map_err(|source| ApiError::bad_request(source.to_string()))?;
-    match payload.get("runtime_kind").and_then(Value::as_str) {
-        Some("filter_project" | "analytic_row_number" | "latest_by_key") => return Ok(None),
-        Some("two_input_join_sum_count") => {
-            let Some(plan) = payload.get("plan").filter(|plan| !plan.is_null()) else {
-                return Ok(None);
-            };
-            let plan: SupportedJoinViewPlan = serde_json::from_value(plan.clone())
-                .map_err(|source| ApiError::bad_request(source.to_string()))?;
-            return Ok(Some(supported_join_view_plan_aggregate_outputs(&plan)));
-        }
-        Some("tumbling_event_time_aggregate") => {
-            let Some(plan) = payload.get("plan").filter(|plan| !plan.is_null()) else {
-                return Ok(None);
-            };
-            let plan: SupportedTumblingWindowPlan = serde_json::from_value(plan.clone())
-                .map_err(|source| ApiError::bad_request(source.to_string()))?;
-            return Ok(Some(plan.aggregate_outputs));
-        }
-        Some(_) | None => {}
-    }
-    let Some(plan) = payload.get("plan").filter(|plan| !plan.is_null()) else {
-        return Ok(None);
-    };
-    let plan: SupportedViewPlan = serde_json::from_value(plan.clone())
-        .map_err(|source| ApiError::bad_request(source.to_string()))?;
-    Ok(Some(supported_view_plan_aggregate_outputs(&plan)))
 }
 
 async fn openapi_json(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
@@ -26820,5 +26778,228 @@ mod tests {
                 adapter_id: CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID.to_string(),
             },
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Scenario tests: full Relation → View → Ingest → Query flows
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn scenario_relation_view_ingest_query_aggregate() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state = test_api_state_with_store(store, "test-owner", false).await;
+        let router = app(state);
+
+        let (status, _) = call_json(&router, Method::GET, "/healthz", Value::Null).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, resp) = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert!(
+            status == StatusCode::CREATED || status == StatusCode::OK,
+            "create relation: status={status} resp={resp}"
+        );
+
+        let (status, resp) = call_json(
+            &router,
+            Method::POST,
+            "/v1/views",
+            json!({
+                "view_id": "user_score_totals",
+                "sql": "select user_id, sum(score) as total, count(*) as cnt from scores group by user_id",
+                "input_relation_id": "scores",
+                "input_relation_version": "2026-05-24.v1",
+                "source_kind": "standing_view"
+            }),
+        )
+        .await;
+        assert!(
+            status == StatusCode::CREATED || status == StatusCode::OK,
+            "create view: status={status} resp={resp}"
+        );
+
+        let (status, resp) = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "scores",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "scores-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 0,
+                    "rows": [
+                        {"user_id": "alice", "score": 100, "delta": 1},
+                        {"user_id": "bob", "score": 200, "delta": 1},
+                        {"user_id": "alice", "score": 150, "delta": 1}
+                    ]
+                }]
+            }),
+        )
+        .await;
+        assert!(
+            status == StatusCode::CREATED || status == StatusCode::OK,
+            "ingest: status={status} resp={resp}"
+        );
+
+        let (status, resp) = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/user_score_totals/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "query: status={status} resp={resp}");
+
+        let rows = resp["rows"].as_array().expect("expected rows array");
+        assert!(
+            !rows.is_empty(),
+            "expected at least one row in materialized view"
+        );
+    }
+
+    #[tokio::test]
+    async fn scenario_multi_epoch_incremental() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state = test_api_state_with_store(store, "test-owner", false).await;
+        let router = app(state);
+
+        call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+
+        call_json(
+            &router,
+            Method::POST,
+            "/v1/views",
+            json!({
+                "view_id": "user_score_totals",
+                "sql": "select user_id, sum(score) as total, count(*) as cnt from scores group by user_id",
+                "input_relation_id": "scores",
+                "input_relation_version": "2026-05-24.v1",
+                "source_kind": "standing_view"
+            }),
+        )
+        .await;
+
+        let (status, _) = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "scores",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "s1",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 0,
+                    "rows": [
+                        {"user_id": "alice", "score": 100, "delta": 1}
+                    ]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (_, resp) = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/user_score_totals/query",
+            json!({}),
+        )
+        .await;
+        let rows = resp["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "expected 1 row after epoch 1");
+
+        let (status, _) = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "scores",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "s1",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 1,
+                    "rows": [
+                        {"user_id": "alice", "score": 50, "delta": 1},
+                        {"user_id": "bob", "score": 200, "delta": 1}
+                    ]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (_, resp) = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/user_score_totals/query",
+            json!({}),
+        )
+        .await;
+        let rows = resp["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 2, "expected 2 rows after epoch 2");
+    }
+
+    #[tokio::test]
+    async fn scenario_list_views_empty_then_create() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state = test_api_state_with_store(store, "test-owner", false).await;
+        let router = app(state);
+
+        let (status, resp) = call_json(&router, Method::GET, "/v1/views", Value::Null).await;
+        assert_eq!(status, StatusCode::OK);
+        let views = resp["views"].as_array().expect("expected views array");
+        assert!(views.is_empty(), "expected no views initially");
+
+        call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+
+        call_json(
+            &router,
+            Method::POST,
+            "/v1/views",
+            json!({
+                "view_id": "test_view",
+                "sql": "select user_id, sum(score) as total from scores group by user_id",
+                "input_relation_id": "scores",
+                "input_relation_version": "2026-05-24.v1",
+                "source_kind": "standing_view"
+            }),
+        )
+        .await;
+
+        let (status, resp) = call_json(&router, Method::GET, "/v1/views", Value::Null).await;
+        assert_eq!(status, StatusCode::OK);
+        let views = resp["views"].as_array().unwrap();
+        assert_eq!(views.len(), 1, "expected 1 view after creation");
+        assert_eq!(views[0]["view_id"], "test_view");
     }
 }

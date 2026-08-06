@@ -131,6 +131,7 @@ pub enum CircuitNode {
         node_id: NodeId,
         group_keys: Vec<CircuitColumnRef>,
         functions: Vec<CircuitAggFunc>,
+        output_aliases: Vec<String>,
     },
     /// Distinct (bag → set conversion).
     Distinct {
@@ -157,6 +158,13 @@ pub enum CircuitNode {
         order_by: CircuitColumnRef,
         descending: bool,
         output_column_id: String,
+    },
+    /// Latest-by-key: maintains the most recent value per key, ordered by a column.
+    LatestByKey {
+        node_id: NodeId,
+        key: CircuitColumnRef,
+        order_by: CircuitColumnRef,
+        descending: bool,
     },
     /// Emit the result to an output relation.
     Sink {

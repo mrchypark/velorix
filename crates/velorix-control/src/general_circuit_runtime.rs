@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use velorix_core::circuit::{
-    CircuitNode, IncrementalCircuit, NodeId,
+    CircuitAggFunc, CircuitNode, IncrementalCircuit, NodeId,
 };
 use velorix_core::delta::{DeltaBatch, DeltaKey, DeltaRecord, DeltaValue};
 use velorix_core::engine::{AggregateValueMode, LogicalEpoch};
@@ -257,7 +257,8 @@ impl GeneralCircuitRuntime {
                 let input = get_input(node_id, &self.circuit.circuit, node_outputs);
                 let mut edge_deltas = BTreeMap::new();
                 edge_deltas.insert((0, 0u8), input);
-                Ok(eval_node_incremental(node, &edge_deltas)?)
+                let result = eval_node_incremental(node, &edge_deltas)?;
+                Ok(result)
             }
             CircuitNode::Project { .. } => {
                 let input = get_input(node_id, &self.circuit.circuit, node_outputs);
@@ -275,7 +276,8 @@ impl GeneralCircuitRuntime {
                 let input = get_input(node_id, &self.circuit.circuit, node_outputs);
                 let mut edge_deltas = BTreeMap::new();
                 edge_deltas.insert((0, 0u8), input);
-                Ok(eval_node_incremental(node, &edge_deltas)?)
+                let result = eval_node_incremental(node, &edge_deltas)?;
+                Ok(result)
             }
 
             // Stateful: Aggregate
@@ -338,6 +340,51 @@ impl GeneralCircuitRuntime {
     ) -> Result<DeltaBatch, CircuitRuntimeError> {
         let input = get_input(node_id, &self.circuit.circuit, node_outputs);
 
+        // Find the Aggregate node to get function info — find first value-based agg
+        let value_column: Option<String> = self.circuit.circuit.nodes.get(node_id).and_then(|n| {
+            if let CircuitNode::Aggregate { functions, .. } = n {
+                functions.iter().find_map(|f| match f {
+                    CircuitAggFunc::Sum(col) | CircuitAggFunc::Min(col) | CircuitAggFunc::Max(col) | CircuitAggFunc::Avg(col) => Some(col.column_id.clone()),
+                    CircuitAggFunc::Count | CircuitAggFunc::CountDistinct(_) => None,
+                })
+            } else {
+                None
+            }
+        });
+
+        // If value_column is specified and input values are JSON objects, extract the column
+        let projected_input = if let Some(ref col_name) = value_column {
+            // Check if input values are JSON objects (from SQL circuit) or plain integers (from hand-crafted tests)
+            let needs_projection = input.records().first()
+                .map(|rec| rec.value.as_json().is_object())
+                .unwrap_or(false);
+            if needs_projection {
+                let records: Vec<_> = input.records().iter().filter_map(|rec| {
+                    let val = rec.value.as_json().get(col_name.as_str())?;
+                    Some(DeltaRecord::new(
+                        rec.key.clone(),
+                        DeltaValue::from_json(val.clone()),
+                        rec.weight,
+                    ))
+                }).collect();
+                DeltaBatch::from_records(records)
+            } else {
+                input
+            }
+        } else if input.records().first().map(|r| r.value.as_json().is_object()).unwrap_or(false) {
+            // Count-only aggregate: project all records to value=1 (weight handles the counting)
+            let records: Vec<_> = input.records().iter().map(|rec| {
+                DeltaRecord::new(
+                    rec.key.clone(),
+                    DeltaValue::from_json(serde_json::json!(1)),
+                    rec.weight,
+                )
+            }).collect();
+            DeltaBatch::from_records(records)
+        } else {
+            input
+        };
+
         // Get or create aggregate state (with extrema tracking for min/max)
         if !self.node_states.contains_key(&node_id) {
             self.node_states.insert(
@@ -345,7 +392,7 @@ impl GeneralCircuitRuntime {
                 OperatorState::Aggregate(
                     KeyedSumCountAggregate::with_value_mode_and_extrema(
                         AggregateValueMode::Integer,
-                        true, // track_extrema for min/max support
+                        true, // track_extrema for min/max
                     )
                 )
             );
@@ -358,7 +405,62 @@ impl GeneralCircuitRuntime {
             OperatorState::Aggregate(ref mut a) => a,
             _ => unreachable!("node {node_id} should be Aggregate"),
         };
-        let output = agg.apply(&input)?;
+        let output = agg.apply(&projected_input)?;
+
+        // Rename aggregate output fields to match SQL aliases and compute derived fields
+        let output = if let CircuitNode::Aggregate { functions, output_aliases, group_keys, .. } = &self.circuit.circuit.nodes[node_id] {
+            let agg_aliases: Vec<String> = output_aliases.iter()
+                .skip(group_keys.len())
+                .cloned()
+                .collect();
+            let agg_names: Vec<&str> = functions.iter().map(|f| match f {
+                CircuitAggFunc::Sum(_) => "sum",
+                CircuitAggFunc::Count => "count",
+                CircuitAggFunc::Min(_) => "min",
+                CircuitAggFunc::Max(_) => "max",
+                CircuitAggFunc::Avg(_) => "avg",
+                CircuitAggFunc::CountDistinct(_) => "count_distinct",
+            }).collect();
+
+            let records: Vec<_> = output.records().iter().map(|rec| {
+                if let serde_json::Value::Object(obj) = rec.value.as_json() {
+                    let mut new_obj = obj.clone();
+
+                    // Compute derived fields (avg = sum / count)
+                    if agg_names.contains(&"avg") {
+                        if let (Some(sum_val), Some(count_val)) = (new_obj.get("sum"), new_obj.get("count")) {
+                            if let (Some(s), Some(c)) = (sum_val.as_f64(), count_val.as_f64()) {
+                                if c > 0.0 {
+                                    let avg_alias = agg_aliases.iter()
+                                        .zip(agg_names.iter())
+                                        .find(|(_, name)| **name == "avg")
+                                        .map(|(alias, _)| alias.clone())
+                                        .unwrap_or_else(|| "avg".to_string());
+                                    new_obj.insert(avg_alias, serde_json::json!(s / c));
+                                }
+                            }
+                        }
+                    }
+
+                    // Rename fields
+                    for (agg_name, agg_alias) in agg_names.iter().zip(agg_aliases.iter()) {
+                        if *agg_name != agg_alias.as_str() {
+                            if let Some(val) = new_obj.remove(*agg_name) {
+                                new_obj.insert(agg_alias.clone(), val);
+                            }
+                        }
+                    }
+
+                    DeltaRecord::new(rec.key.clone(), DeltaValue::from_json(serde_json::Value::Object(new_obj)), rec.weight)
+                } else {
+                    rec.clone()
+                }
+            }).collect();
+            DeltaBatch::from_records(records)
+        } else {
+            output
+        };
+
         // Persist state to disk
         let state = agg.state();
         self.state_store.save(&state_key, &state)?;
@@ -389,12 +491,20 @@ impl GeneralCircuitRuntime {
         &mut self,
         node_id: NodeId,
         _join_type: &velorix_core::circuit::JoinType,
-        _left_key: &velorix_core::circuit::CircuitColumnRef,
-        _right_key: &velorix_core::circuit::CircuitColumnRef,
+        left_key: &velorix_core::circuit::CircuitColumnRef,
+        right_key: &velorix_core::circuit::CircuitColumnRef,
         node_outputs: &HashMap<NodeId, DeltaBatch>,
     ) -> Result<DeltaBatch, CircuitRuntimeError> {
-        let left_input = get_input_by_port(node_id, 0, &self.circuit.circuit, node_outputs);
-        let right_input = get_input_by_port(node_id, 1, &self.circuit.circuit, node_outputs);
+        let input_edges = self.circuit.circuit.input_edges(node_id);
+        let left_input_raw = input_edges.first()            .and_then(|e| node_outputs.get(&e.from).cloned())
+            .unwrap_or_default();
+        let right_input_raw = input_edges.get(1)
+            .and_then(|e| node_outputs.get(&e.from).cloned())
+            .unwrap_or_default();
+
+        // Re-key inputs so the join matches on the join key column value
+        let left_input = rekey_batch_by_column(&left_input_raw, &left_key.column_id);
+        let right_input = rekey_batch_by_column(&right_input_raw, &right_key.column_id);
 
         // Get or create join state
         if !self.node_states.contains_key(&node_id) {
@@ -735,12 +845,27 @@ fn get_input_by_port(
         .unwrap_or_default()
 }
 
+fn rekey_batch_by_column(batch: &DeltaBatch, column_id: &str) -> DeltaBatch {
+    let records: Vec<_> = batch.records().iter().map(|rec| {
+        let new_key = if let serde_json::Value::Object(obj) = rec.value.as_json() {
+            if let Some(val) = obj.get(column_id) {
+                DeltaKey::from_json(val.clone())
+            } else {
+                rec.key.clone()
+            }
+        } else {
+            rec.key.clone()
+        };
+        DeltaRecord::new(new_key, rec.value.clone(), rec.weight)
+    }).collect();
+    DeltaBatch::from_records(records)
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    format!("sha256:{:016x}", hasher.finish())
+    use sha2::{Sha256, Digest};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("sha256:{:x}", hasher.finalize())
 }
 
 fn apply_published_output_delta(current: &DeltaBatch, delta: &DeltaBatch) -> DeltaBatch {
@@ -1187,6 +1312,7 @@ mod tests {
                     node_id: 1,
                     group_keys: vec![CircuitColumnRef { node_id: 0, column_id: "key".into() }],
                     functions: vec![CircuitAggFunc::Sum(CircuitColumnRef { node_id: 0, column_id: "value".into() })],
+                    output_aliases: vec!["key".into(), "sum".into()],
                 },
                 CircuitNode::Sink { node_id: 2, relation_id: "v".into() },
             ],
@@ -1356,5 +1482,622 @@ mod tests {
             .collect();
         eng_rns.sort();
         assert_eq!(eng_rns, vec![1, 2]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Filter/Project tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn filter_with_multiple_predicates() {
+        // WHERE x > 5 AND y < 10
+        let circuit = Circuit {
+            nodes: vec![
+                CircuitNode::Source { node_id: 0, relation_id: "t".into() },
+                CircuitNode::Filter {
+                    node_id: 1,
+                    predicates: vec![
+                        CircuitPredicate {
+                            column: CircuitColumnRef { node_id: 0, column_id: "x".into() },
+                            op: CircuitPredicateOp::Gt,
+                            literal: serde_json::json!(5),
+                        },
+                        CircuitPredicate {
+                            column: CircuitColumnRef { node_id: 0, column_id: "y".into() },
+                            op: CircuitPredicateOp::Lt,
+                            literal: serde_json::json!(10),
+                        },
+                    ],
+                },
+                CircuitNode::Sink { node_id: 2, relation_id: "v".into() },
+            ],
+            edges: vec![
+                Edge { from: 0, from_port: 0, to: 1, to_port: 0 },
+                Edge { from: 1, from_port: 0, to: 2, to_port: 0 },
+            ],
+            input_node_ids: vec![0],
+            output_node_id: 2,
+        };
+
+        let inc = incrementalize(&circuit);
+        let dir = tempfile::tempdir().unwrap();
+        let config = DiskStateConfig::new(dir.path(), 1024 * 1024, 10 * 1024 * 1024);
+        let mut runtime = GeneralCircuitRuntime::new(inc, &config).await.unwrap();
+
+        let mut input_deltas = HashMap::new();
+        input_deltas.insert(0, DeltaBatch::from_records(vec![
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!("r1")),
+                DeltaValue::from_json(serde_json::json!({"x": 10, "y": 5})),
+                1,
+            ),
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!("r2")),
+                DeltaValue::from_json(serde_json::json!({"x": 3, "y": 5})),
+                1,
+            ),
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!("r3")),
+                DeltaValue::from_json(serde_json::json!({"x": 10, "y": 15})),
+                1,
+            ),
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!("r4")),
+                DeltaValue::from_json(serde_json::json!({"x": 8, "y": 7})),
+                1,
+            ),
+        ]));
+
+        let output = runtime.apply_epoch(1, input_deltas).await.unwrap();
+        // Only r1 (x=10,y=5) and r4 (x=8,y=7) pass both filters
+        assert_eq!(output.records().len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Aggregate tests: COUNT, MIN, MAX, AVG
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn aggregate_count() {
+        let circuit = Circuit {
+            nodes: vec![
+                CircuitNode::Source { node_id: 0, relation_id: "t".into() },
+                CircuitNode::Aggregate {
+                    node_id: 1,
+                    group_keys: vec![CircuitColumnRef { node_id: 0, column_id: "key".into() }],
+                    functions: vec![CircuitAggFunc::Count],
+                    output_aliases: vec!["key".into(), "count".into()],
+                },
+                CircuitNode::Sink { node_id: 2, relation_id: "v".into() },
+            ],
+            edges: vec![
+                Edge { from: 0, from_port: 0, to: 1, to_port: 0 },
+                Edge { from: 1, from_port: 0, to: 2, to_port: 0 },
+            ],
+            input_node_ids: vec![0],
+            output_node_id: 2,
+        };
+
+        let inc = incrementalize(&circuit);
+        let dir = tempfile::tempdir().unwrap();
+        let config = DiskStateConfig::new(dir.path(), 1024 * 1024, 10 * 1024 * 1024);
+        let mut runtime = GeneralCircuitRuntime::new(inc, &config).await.unwrap();
+
+        // Aggregate expects: key = group key, value = integer to aggregate
+        let mut input_deltas = HashMap::new();
+        input_deltas.insert(0, DeltaBatch::from_records(vec![
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!("a")),
+                DeltaValue::from_json(serde_json::json!(1)),
+                1,
+            ),
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!("a")),
+                DeltaValue::from_json(serde_json::json!(2)),
+                1,
+            ),
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!("b")),
+                DeltaValue::from_json(serde_json::json!(3)),
+                1,
+            ),
+        ]));
+
+        let output = runtime.apply_epoch(1, input_deltas).await.unwrap();
+        // Two groups: a (count=2) and b (count=1)
+        assert_eq!(output.records().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn aggregate_min_max() {
+        let circuit = Circuit {
+            nodes: vec![
+                CircuitNode::Source { node_id: 0, relation_id: "t".into() },
+                CircuitNode::Aggregate {
+                    node_id: 1,
+                    group_keys: vec![CircuitColumnRef { node_id: 0, column_id: "key".into() }],
+                    functions: vec![
+                        CircuitAggFunc::Min(CircuitColumnRef { node_id: 0, column_id: "val".into() }),
+                        CircuitAggFunc::Max(CircuitColumnRef { node_id: 0, column_id: "val".into() }),
+                    ],
+                    output_aliases: vec!["key".into(), "min".into(), "max".into()],
+                },
+                CircuitNode::Sink { node_id: 2, relation_id: "v".into() },
+            ],
+            edges: vec![
+                Edge { from: 0, from_port: 0, to: 1, to_port: 0 },
+                Edge { from: 1, from_port: 0, to: 2, to_port: 0 },
+            ],
+            input_node_ids: vec![0],
+            output_node_id: 2,
+        };
+
+        let inc = incrementalize(&circuit);
+        let dir = tempfile::tempdir().unwrap();
+        let config = DiskStateConfig::new(dir.path(), 1024 * 1024, 10 * 1024 * 1024);
+        let mut runtime = GeneralCircuitRuntime::new(inc, &config).await.unwrap();
+
+        // Aggregate expects: key = group key, value = integer to aggregate
+        let mut input_deltas = HashMap::new();
+        input_deltas.insert(0, DeltaBatch::from_records(vec![
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!("a")),
+                DeltaValue::from_json(serde_json::json!(10)),
+                1,
+            ),
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!("a")),
+                DeltaValue::from_json(serde_json::json!(5)),
+                1,
+            ),
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!("a")),
+                DeltaValue::from_json(serde_json::json!(20)),
+                1,
+            ),
+        ]));
+
+        let output = runtime.apply_epoch(1, input_deltas).await.unwrap();
+        // One group: a (min=5, max=20)
+        assert_eq!(output.records().len(), 1);
+        let val = &output.records()[0].value.as_json();
+        assert_eq!(val.get("min").and_then(|v| v.as_i64()), Some(5));
+        assert_eq!(val.get("max").and_then(|v| v.as_i64()), Some(20));
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-epoch incremental state tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn aggregate_multi_epoch_incremental() {
+        let circuit = Circuit {
+            nodes: vec![
+                CircuitNode::Source { node_id: 0, relation_id: "t".into() },
+                CircuitNode::Aggregate {
+                    node_id: 1,
+                    group_keys: vec![CircuitColumnRef { node_id: 0, column_id: "key".into() }],
+                    functions: vec![CircuitAggFunc::Sum(CircuitColumnRef { node_id: 0, column_id: "val".into() })],
+                    output_aliases: vec!["key".into(), "sum".into()],
+                },
+                CircuitNode::Sink { node_id: 2, relation_id: "v".into() },
+            ],
+            edges: vec![
+                Edge { from: 0, from_port: 0, to: 1, to_port: 0 },
+                Edge { from: 1, from_port: 0, to: 2, to_port: 0 },
+            ],
+            input_node_ids: vec![0],
+            output_node_id: 2,
+        };
+
+        let inc = incrementalize(&circuit);
+        let dir = tempfile::tempdir().unwrap();
+        let config = DiskStateConfig::new(dir.path(), 1024 * 1024, 10 * 1024 * 1024);
+        let mut runtime = GeneralCircuitRuntime::new(inc, &config).await.unwrap();
+
+        // Epoch 1: insert key=a val=10
+        let mut input1 = HashMap::new();
+        input1.insert(0, DeltaBatch::from_records(vec![
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!("a")),
+                DeltaValue::from_json(serde_json::json!(10)),
+                1,
+            ),
+        ]));
+        let output1 = runtime.apply_epoch(1, input1).await.unwrap();
+        assert_eq!(output1.records().len(), 1);
+        assert_eq!(output1.records()[0].value.as_json().get("sum").and_then(|v| v.as_i64()), Some(10));
+
+        // Epoch 2: insert key=a val=5
+        let mut input2 = HashMap::new();
+        input2.insert(0, DeltaBatch::from_records(vec![
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!("a")),
+                DeltaValue::from_json(serde_json::json!(5)),
+                1,
+            ),
+        ]));
+        let output2 = runtime.apply_epoch(2, input2).await.unwrap();
+        // Incremental aggregate emits retraction for old value + insertion for new value
+        assert!(output2.records().len() >= 1, "expected at least one record in incremental output");
+    }
+
+    // -----------------------------------------------------------------------
+    // Retraction tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn filter_retraction() {
+        let inc = incrementalize(&simple_filter_circuit());
+        let dir = tempfile::tempdir().unwrap();
+        let config = DiskStateConfig::new(dir.path(), 1024 * 1024, 10 * 1024 * 1024);
+        let mut runtime = GeneralCircuitRuntime::new(inc, &config).await.unwrap();
+
+        // Epoch 1: insert row that passes filter
+        let mut input1 = HashMap::new();
+        input1.insert(0, DeltaBatch::from_records(vec![
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!("r1")),
+                DeltaValue::from_json(serde_json::json!({"x": 10})),
+                1,
+            ),
+        ]));
+        let output1 = runtime.apply_epoch(1, input1).await.unwrap();
+        assert_eq!(output1.records().len(), 1);
+        assert_eq!(output1.records()[0].weight, 1);
+
+        // Epoch 2: retract the row (weight = -1)
+        let mut input2 = HashMap::new();
+        input2.insert(0, DeltaBatch::from_records(vec![
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!("r1")),
+                DeltaValue::from_json(serde_json::json!({"x": 10})),
+                -1,
+            ),
+        ]));
+        let output2 = runtime.apply_epoch(2, input2).await.unwrap();
+        assert_eq!(output2.records().len(), 1);
+        assert_eq!(output2.records()[0].weight, -1);
+    }
+
+    // -----------------------------------------------------------------------
+    // LatestByKey (ARG_MAX/ARG_MIN) test
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn latest_by_key_basic() {
+        let circuit = Circuit {
+            nodes: vec![
+                CircuitNode::Source { node_id: 0, relation_id: "t".into() },
+                CircuitNode::LatestByKey {
+                    node_id: 1,
+                    key: CircuitColumnRef { node_id: 0, column_id: "user_id".into() },
+                    order_by: CircuitColumnRef { node_id: 0, column_id: "ts".into() },
+                    descending: true,
+                },
+                CircuitNode::Sink { node_id: 2, relation_id: "v".into() },
+            ],
+            edges: vec![
+                Edge { from: 0, from_port: 0, to: 1, to_port: 0 },
+                Edge { from: 1, from_port: 0, to: 2, to_port: 0 },
+            ],
+            input_node_ids: vec![0],
+            output_node_id: 2,
+        };
+
+        let inc = incrementalize(&circuit);
+        let dir = tempfile::tempdir().unwrap();
+        let config = DiskStateConfig::new(dir.path(), 1024 * 1024, 10 * 1024 * 1024);
+        let mut runtime = GeneralCircuitRuntime::new(inc, &config).await.unwrap();
+
+        // Epoch 1: insert two events for user "u1"
+        let mut input1 = HashMap::new();
+        input1.insert(0, DeltaBatch::from_records(vec![
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!("r1")),
+                DeltaValue::from_json(serde_json::json!({"user_id": "u1", "ts": 100, "action": "login"})),
+                1,
+            ),
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!("r2")),
+                DeltaValue::from_json(serde_json::json!({"user_id": "u1", "ts": 200, "action": "click"})),
+                1,
+            ),
+        ]));
+        let output1 = runtime.apply_epoch(1, input1).await.unwrap();
+        // Should emit retraction for ts=100 and insertion for ts=200
+        assert!(output1.records().len() >= 1);
+
+        // Epoch 2: insert newer event
+        let mut input2 = HashMap::new();
+        input2.insert(0, DeltaBatch::from_records(vec![
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!("r3")),
+                DeltaValue::from_json(serde_json::json!({"user_id": "u1", "ts": 300, "action": "purchase"})),
+                1,
+            ),
+        ]));
+        let output2 = runtime.apply_epoch(2, input2).await.unwrap();
+        // Should emit retraction for ts=200 and insertion for ts=300
+        assert!(output2.records().len() >= 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Checkpoint/Restore test
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn checkpoint_restore_round_trip() {
+        let circuit = Circuit {
+            nodes: vec![
+                CircuitNode::Source { node_id: 0, relation_id: "t".into() },
+                CircuitNode::Aggregate {
+                    node_id: 1,
+                    group_keys: vec![CircuitColumnRef { node_id: 0, column_id: "key".into() }],
+                    functions: vec![CircuitAggFunc::Sum(CircuitColumnRef { node_id: 0, column_id: "val".into() })],
+                    output_aliases: vec!["key".into(), "sum".into()],
+                },
+                CircuitNode::Sink { node_id: 2, relation_id: "v".into() },
+            ],
+            edges: vec![
+                Edge { from: 0, from_port: 0, to: 1, to_port: 0 },
+                Edge { from: 1, from_port: 0, to: 2, to_port: 0 },
+            ],
+            input_node_ids: vec![0],
+            output_node_id: 2,
+        };
+
+        let inc = incrementalize(&circuit);
+        let dir = tempfile::tempdir().unwrap();
+        let config = DiskStateConfig::new(dir.path(), 1024 * 1024, 10 * 1024 * 1024);
+        let mut runtime = GeneralCircuitRuntime::new(inc, &config).await.unwrap();
+
+        // Run epoch 1
+        let mut input1 = HashMap::new();
+        input1.insert(0, DeltaBatch::from_records(vec![
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!("a")),
+                DeltaValue::from_json(serde_json::json!(10)),
+                1,
+            ),
+        ]));
+        let _output1 = runtime.apply_epoch(1, input1).await.unwrap();
+
+        // Save checkpoint state
+        let published_output = runtime.published_output().clone();
+        let logical_epoch = runtime.logical_epoch();
+
+        // Create new runtime from checkpoint
+        let mut runtime2 = GeneralCircuitRuntime::restore_from_checkpoint(
+            published_output.clone(),
+            logical_epoch,
+        );
+
+        // Verify restored state
+        assert_eq!(runtime2.logical_epoch(), 1);
+        assert_eq!(runtime2.published_output().records().len(), published_output.records().len());
+    }
+
+    // -----------------------------------------------------------------------
+    // SQL-to-Circuit-to-Runtime integration tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn sql_filter_where_integration() {
+        use velorix_core::sql_to_circuit::{sql_to_circuit, TableSchema};
+
+        let tables = vec![TableSchema {
+            name: "users".into(),
+            columns: vec!["id".into(), "name".into(), "age".into()],
+        }];
+
+        let circuit = sql_to_circuit("SELECT id, name FROM users WHERE age > 18", &tables).unwrap();
+        let inc = incrementalize(&circuit);
+        let dir = tempfile::tempdir().unwrap();
+        let config = DiskStateConfig::new(dir.path(), 1024 * 1024, 10 * 1024 * 1024);
+        let mut runtime = GeneralCircuitRuntime::new(inc, &config).await.unwrap();
+
+        let mut input_deltas = HashMap::new();
+        input_deltas.insert(0, DeltaBatch::from_records(vec![
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!("u1")),
+                DeltaValue::from_json(serde_json::json!({"id": 1, "name": "Alice", "age": 25})),
+                1,
+            ),
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!("u2")),
+                DeltaValue::from_json(serde_json::json!({"id": 2, "name": "Bob", "age": 15})),
+                1,
+            ),
+        ]));
+
+        let output = runtime.apply_epoch(1, input_deltas).await.unwrap();
+        // Only Alice (age=25) passes the filter
+        assert_eq!(output.records().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sql_aggregate_group_by_integration() {
+        use velorix_core::sql_to_circuit::{sql_to_circuit, TableSchema};
+
+        let tables = vec![TableSchema {
+            name: "orders".into(),
+            columns: vec!["id".into(), "customer".into(), "amount".into()],
+        }];
+
+        let circuit = sql_to_circuit("SELECT customer, SUM(amount) FROM orders GROUP BY customer", &tables).unwrap();
+        let inc = incrementalize(&circuit);
+        let dir = tempfile::tempdir().unwrap();
+        let config = DiskStateConfig::new(dir.path(), 1024 * 1024, 10 * 1024 * 1024);
+        let mut runtime = GeneralCircuitRuntime::new(inc, &config).await.unwrap();
+
+        // The aggregate evaluator expects: key = group key, value = integer to aggregate
+        // So we need to provide DeltaValues that are simple integers
+        let mut input_deltas = HashMap::new();
+        input_deltas.insert(0, DeltaBatch::from_records(vec![
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!("Alice")),
+                DeltaValue::from_json(serde_json::json!(100)),
+                1,
+            ),
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!("Alice")),
+                DeltaValue::from_json(serde_json::json!(50)),
+                1,
+            ),
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!("Bob")),
+                DeltaValue::from_json(serde_json::json!(200)),
+                1,
+            ),
+        ]));
+
+        let output = runtime.apply_epoch(1, input_deltas).await.unwrap();
+        // Two groups: Alice (sum=150) and Bob (sum=200)
+        assert_eq!(output.records().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn sql_join_integration() {
+        use velorix_core::sql_to_circuit::{sql_to_circuit, TableSchema};
+
+        let tables = vec![
+            TableSchema {
+                name: "customers".into(),
+                columns: vec!["id".into(), "name".into()],
+            },
+            TableSchema {
+                name: "orders".into(),
+                columns: vec!["id".into(), "customer_id".into(), "amount".into()],
+            },
+        ];
+
+        let circuit = sql_to_circuit(
+            "SELECT c.name, o.amount FROM customers c JOIN orders o ON c.id = o.customer_id",
+            &tables,
+        ).unwrap();
+        let inc = incrementalize(&circuit);
+        let dir = tempfile::tempdir().unwrap();
+        let config = DiskStateConfig::new(dir.path(), 1024 * 1024, 10 * 1024 * 1024);
+        let mut runtime = GeneralCircuitRuntime::new(inc, &config).await.unwrap();
+
+        let mut input_deltas = HashMap::new();
+        // Left input (customers) — DeltaKey must match join key
+        input_deltas.insert(0, DeltaBatch::from_records(vec![
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!("1")),
+                DeltaValue::from_json(serde_json::json!({"id": 1, "name": "Alice"})),
+                1,
+            ),
+        ]));
+        // Right input (orders) — DeltaKey must match left for join
+        input_deltas.insert(1, DeltaBatch::from_records(vec![
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!("1")),
+                DeltaValue::from_json(serde_json::json!({"id": 101, "customer_id": 1, "amount": 100})),
+                1,
+            ),
+        ]));
+
+        let output = runtime.apply_epoch(1, input_deltas).await.unwrap();
+        // One join match: Alice's order
+        assert_eq!(output.records().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sql_row_number_integration() {
+        use velorix_core::sql_to_circuit::{sql_to_circuit, TableSchema};
+
+        let tables = vec![TableSchema {
+            name: "employees".into(),
+            columns: vec!["id".into(), "name".into(), "dept".into(), "salary".into()],
+        }];
+
+        let circuit = sql_to_circuit(
+            "SELECT id, name, dept, salary, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) as rn FROM employees",
+            &tables,
+        ).unwrap();
+        let inc = incrementalize(&circuit);
+        let dir = tempfile::tempdir().unwrap();
+        let config = DiskStateConfig::new(dir.path(), 1024 * 1024, 10 * 1024 * 1024);
+        let mut runtime = GeneralCircuitRuntime::new(inc, &config).await.unwrap();
+
+        let mut input_deltas = HashMap::new();
+        input_deltas.insert(0, DeltaBatch::from_records(vec![
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!("e1")),
+                DeltaValue::from_json(serde_json::json!({"id": 1, "name": "Alice", "dept": "eng", "salary": 100000})),
+                1,
+            ),
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!("e2")),
+                DeltaValue::from_json(serde_json::json!({"id": 2, "name": "Bob", "dept": "eng", "salary": 90000})),
+                1,
+            ),
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!("e3")),
+                DeltaValue::from_json(serde_json::json!({"id": 3, "name": "Carol", "dept": "sales", "salary": 80000})),
+                1,
+            ),
+        ]));
+
+        let output = runtime.apply_epoch(1, input_deltas).await.unwrap();
+        assert_eq!(output.records().len(), 3);
+        for record in output.records() {
+            assert!(record.value.as_json().get("rn").is_some());
+        }
+        let mut eng_rns: Vec<i64> = output.records().iter()
+            .filter(|r| r.value.as_json().get("dept").and_then(|v| v.as_str()) == Some("eng"))
+            .filter_map(|r| r.value.as_json().get("rn").and_then(|v| v.as_i64()))
+            .collect();
+        eng_rns.sort();
+        assert_eq!(eng_rns, vec![1, 2]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Edge case tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn empty_input_epoch() {
+        let inc = incrementalize(&simple_filter_circuit());
+        let dir = tempfile::tempdir().unwrap();
+        let config = DiskStateConfig::new(dir.path(), 1024 * 1024, 10 * 1024 * 1024);
+        let mut runtime = GeneralCircuitRuntime::new(inc, &config).await.unwrap();
+
+        // Empty input
+        let input_deltas = HashMap::new();
+        let output = runtime.apply_epoch(1, input_deltas).await.unwrap();
+        assert_eq!(output.records().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn non_monotonic_epoch_rejected() {
+        let inc = incrementalize(&simple_filter_circuit());
+        let dir = tempfile::tempdir().unwrap();
+        let config = DiskStateConfig::new(dir.path(), 1024 * 1024, 10 * 1024 * 1024);
+        let mut runtime = GeneralCircuitRuntime::new(inc, &config).await.unwrap();
+
+        let mut input1 = HashMap::new();
+        input1.insert(0, DeltaBatch::from_records(vec![
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!("r1")),
+                DeltaValue::from_json(serde_json::json!({"x": 10})),
+                1,
+            ),
+        ]));
+        let _output1 = runtime.apply_epoch(2, input1).await.unwrap();
+
+        // Try to go back to epoch 1 (non-monotonic)
+        let mut input2 = HashMap::new();
+        input2.insert(0, DeltaBatch::from_records(vec![
+            DeltaRecord::new(
+                DeltaKey::from_json(serde_json::json!("r2")),
+                DeltaValue::from_json(serde_json::json!({"x": 20})),
+                1,
+            ),
+        ]));
+        let result = runtime.apply_epoch(1, input2).await;
+        assert!(result.is_err());
     }
 }

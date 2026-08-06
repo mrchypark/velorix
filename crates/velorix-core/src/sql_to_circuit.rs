@@ -124,6 +124,16 @@ impl<'a> Builder<'a> {
 }
 
 fn translate_query(query: &Query, ctx: &mut Builder) -> Result<NodeId, SqlToCircuitError> {
+    // Process CTEs (WITH clause) if present
+    if let Some(ref with) = query.with {
+        for cte in &with.cte_tables {
+            let cte_name = cte.alias.name.value.to_lowercase();
+            let cte_query = &cte.query;
+            let cte_node = translate_query(cte_query, ctx)?;
+            ctx.source_map.insert(cte_name, cte_node);
+        }
+    }
+
     let mut current = match *query.body {
         SetExpr::Select(ref select) => translate_select(select, ctx),
         _ => Err(SqlToCircuitError::Unsupported {
@@ -203,8 +213,8 @@ fn translate_select(select: &Select, ctx: &mut Builder) -> Result<NodeId, SqlToC
     // GROUP BY → Aggregate
     let has_group = matches!(&select.group_by, GroupByExpr::Expressions(e, _) if !e.is_empty());
     if has_group {
-        let (keys, funcs) = extract_agg(select, current)?;
-        let aid = ctx.alloc(CircuitNode::Aggregate { node_id: 0, group_keys: keys, functions: funcs });
+        let (keys, funcs, output_aliases) = extract_agg(select, current)?;
+        let aid = ctx.alloc(CircuitNode::Aggregate { node_id: 0, group_keys: keys, functions: funcs, output_aliases });
         ctx.connect(current, aid);
         current = aid;
     }
@@ -219,7 +229,7 @@ fn translate_select(select: &Select, ctx: &mut Builder) -> Result<NodeId, SqlToC
         }
     }
 
-    // Window functions in SELECT projection → RowNumber node
+    // Window functions in SELECT projection → RowNumber or LatestByKey node
     for item in &select.projection {
         let (func, output_col) = match item {
             SelectItem::UnnamedExpr(Expr::Function(func)) => {
@@ -255,7 +265,38 @@ fn translate_select(select: &Select, ctx: &mut Builder) -> Result<NodeId, SqlToC
                 ctx.connect(current, rid);
                 current = rid;
             }
+        } else if name == "ARG_MAX" || name == "ARG_MIN" {
+            // ARG_MAX(value_col, order_col) or ARG_MIN(value_col, order_col)
+            if let sqlparser::ast::FunctionArguments::List(list) = &func.args {
+                if list.args.len() == 2 {
+                    let value_arg = &list.args[0];
+                    let order_arg = &list.args[1];
+                    if let (
+                        sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(value_expr)),
+                        sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(order_expr)),
+                    ) = (value_arg, order_arg) {
+                        let value_col = col_ref(value_expr, current)?;
+                        let order_col = col_ref(order_expr, current)?;
+                        let descending = name == "ARG_MAX";
+                        let lid = ctx.alloc(CircuitNode::LatestByKey {
+                            node_id: 0,
+                            key: value_col,
+                            order_by: order_col,
+                            descending,
+                        });
+                        ctx.connect(current, lid);
+                        current = lid;
+                    }
+                }
+            }
         }
+    }
+
+    // SELECT DISTINCT → Distinct node
+    if select.distinct.is_some() {
+        let did = ctx.alloc(CircuitNode::Distinct { node_id: 0 });
+        ctx.connect(current, did);
+        current = did;
     }
 
     // SELECT projection → Project (skip for SELECT * without group by)
@@ -392,27 +433,75 @@ fn literal(expr: &Expr) -> Result<serde_json::Value, SqlToCircuitError> {
     }
 }
 
+fn extract_first_col_ref(expr: &Expr, node: NodeId) -> Option<CircuitColumnRef> {
+    match expr {
+        Expr::Identifier(i) => Some(CircuitColumnRef { node_id: node, column_id: i.value.clone() }),
+        Expr::CompoundIdentifier(idents) => {
+            idents.last().map(|i| CircuitColumnRef { node_id: node, column_id: i.value.clone() })
+        }
+        Expr::Nested(e) => extract_first_col_ref(e, node),
+        Expr::BinaryOp { left, right, .. } => {
+            extract_first_col_ref(left, node).or_else(|| extract_first_col_ref(right, node))
+        }
+        Expr::Function(func) => {
+            match &func.args {
+                sqlparser::ast::FunctionArguments::List(list) => {
+                    list.args.iter().find_map(|a| {
+                        if let sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(e)
+                        ) = a {
+                            extract_first_col_ref(e, node)
+                        } else {
+                            None
+                        }
+                    })
+                }
+                _ => None,
+            }
+        }
+        Expr::Cast { expr, .. } => extract_first_col_ref(expr, node),
+        _ => None,
+    }
+}
+
 fn extract_agg(
     select: &Select, node: NodeId,
-) -> Result<(Vec<CircuitColumnRef>, Vec<CircuitAggFunc>), SqlToCircuitError> {
+) -> Result<(Vec<CircuitColumnRef>, Vec<CircuitAggFunc>, Vec<String>), SqlToCircuitError> {
     let keys = match &select.group_by {
         GroupByExpr::Expressions(exprs, _) => {
             exprs.iter().map(|e| col_ref(e, node)).collect::<Result<Vec<_>, _>>()?
         }
         _ => vec![],
     };
+    let mut aliases = Vec::new();
     let mut funcs = Vec::new();
     for item in &select.projection {
-        if let SelectItem::UnnamedExpr(Expr::Function(func)) = item {
+        let (func_opt, alias_opt) = match item {
+            SelectItem::UnnamedExpr(Expr::Function(func)) => (Some(func), None),
+            SelectItem::ExprWithAlias { expr: Expr::Function(func), alias } => (Some(func), Some(alias.value.clone())),
+            SelectItem::UnnamedExpr(e) => {
+                if let Ok(cr) = col_ref(e, node) {
+                    aliases.push(cr.column_id.clone());
+                }
+                (None, None)
+            }
+            SelectItem::ExprWithAlias { expr, alias } => {
+                if let Ok(_cr) = col_ref(expr, node) {
+                    aliases.push(alias.value.clone());
+                }
+                (None, None)
+            }
+            _ => (None, None),
+        };
+        if let Some(func) = func_opt {
             let name = func.name.to_string().to_uppercase();
-            // For now, extract the first argument as a column reference if it's an identifier
             let first_arg_col = match &func.args {
                 sqlparser::ast::FunctionArguments::List(list) => {
                     list.args.iter().find_map(|a| {
                         if let sqlparser::ast::FunctionArg::Unnamed(
-                            sqlparser::ast::FunctionArgExpr::Expr(Expr::Identifier(i))
+                            sqlparser::ast::FunctionArgExpr::Expr(e)
                         ) = a {
-                            Some(CircuitColumnRef { node_id: node, column_id: i.value.clone() })
+                            extract_first_col_ref(e, node)
                         } else {
                             None
                         }
@@ -428,9 +517,10 @@ fn extract_agg(
                 "AVG" => if let Some(c) = first_arg_col { funcs.push(CircuitAggFunc::Avg(c)); },
                 _ => {}
             }
+            aliases.push(alias_opt.unwrap_or_else(|| name.to_lowercase()));
         }
     }
-    Ok((keys, funcs))
+    Ok((keys, funcs, aliases))
 }
 
 fn extract_proj(
@@ -440,14 +530,23 @@ fn extract_proj(
     for item in &select.projection {
         match item {
             SelectItem::UnnamedExpr(Expr::Function(func)) if func.over.is_some() => {
-                // Window functions are handled by RowNumber node, skip in projection
+                // Window functions are handled by RowNumber node before this point.
+                // Include the output column from the RowNumber node.
+                cols.push(CircuitProjection {
+                    source_column: CircuitColumnRef { node_id: node, column_id: "rn".into() },
+                    output_column_id: "rn".into(),
+                });
             }
             SelectItem::UnnamedExpr(e) => {
                 let cr = col_ref(e, node)?;
                 cols.push(CircuitProjection { source_column: cr.clone(), output_column_id: cr.column_id });
             }
-            SelectItem::ExprWithAlias { expr: Expr::Function(func), .. } if func.over.is_some() => {
+            SelectItem::ExprWithAlias { expr: Expr::Function(func), alias } if func.over.is_some() => {
                 // Window functions with alias are handled by RowNumber node
+                cols.push(CircuitProjection {
+                    source_column: CircuitColumnRef { node_id: node, column_id: "rn".into() },
+                    output_column_id: alias.value.clone(),
+                });
             }
             SelectItem::ExprWithAlias { expr, alias } => {
                 let cr = col_ref(expr, node)?;

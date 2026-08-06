@@ -141,7 +141,7 @@ pub fn eval_node_incremental(
         // ----------------------------------------------------------------
         CircuitNode::Join { .. } | CircuitNode::Aggregate { .. } | CircuitNode::Distinct { .. }
         | CircuitNode::TopK { .. } | CircuitNode::TumblingWindow { .. }
-        | CircuitNode::RowNumber { .. } => {
+        | CircuitNode::RowNumber { .. } | CircuitNode::LatestByKey { .. } => {
             // Stateful operators are managed by the runtime, not here.
             // This function handles only stateless pass-through.
             // The runtime calls dedicated methods on `GeneralCircuitRuntime`.
