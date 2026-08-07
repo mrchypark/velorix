@@ -111,8 +111,12 @@ pub fn eval_node_incremental(
                         projected.insert(col.output_column_id.clone(), v.clone());
                     }
                 }
+                let key_val = columns.first()
+                    .and_then(|col| projected.get(&col.output_column_id))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
                 Ok((
-                    crate::delta::DeltaKey::from_json(serde_json::Value::Object(projected.clone())),
+                    crate::delta::DeltaKey::from_json(key_val),
                     crate::delta::DeltaValue::from_json(serde_json::Value::Object(projected)),
                 ))
             })?)
@@ -237,6 +241,16 @@ fn evaluate_expr(
                 serde_json::Value::Number(n) => {
                     let f = n.as_f64().unwrap_or(0.0);
                     serde_json::json!(-f)
+                }
+                other => other,
+            })
+        }
+        CircuitExpr::Abs(e) => {
+            let v = evaluate_expr(e, value)?;
+            Ok(match v {
+                serde_json::Value::Number(n) => {
+                    let f = n.as_f64().unwrap_or(0.0);
+                    serde_json::json!(f.abs())
                 }
                 other => other,
             })

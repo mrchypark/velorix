@@ -55,7 +55,14 @@ pub fn delta_batch_to_record_batch(
         if row.weight != 1 {
             return Err(DeltaToArrowError::NonUnitWeight(row.weight));
         }
-        keys.push(row.key.as_json().clone());
+        let key_val = row.key.as_json().clone();
+        // If key is an object, try to extract the primary key column value
+        let key_val = if let Some(obj) = key_val.as_object() {
+            obj.get(key_col.name.as_str()).cloned().unwrap_or(key_val)
+        } else {
+            key_val
+        };
+        keys.push(key_val);
 
         if !value_cols.is_empty() {
             let obj = row.value.as_json().as_object().ok_or_else(|| {

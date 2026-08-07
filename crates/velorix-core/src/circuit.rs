@@ -54,6 +54,7 @@ pub enum CircuitExpr {
     Mul(Box<CircuitExpr>, Box<CircuitExpr>),
     Div(Box<CircuitExpr>, Box<CircuitExpr>),
     Neg(Box<CircuitExpr>),
+    Abs(Box<CircuitExpr>),
     Cast {
         expr: Box<CircuitExpr>,
         to_type: CircuitDataType,

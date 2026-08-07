@@ -1188,10 +1188,9 @@ fn arrow_batches_to_delta_batch(
                 serde_json::Value::String(format!("row_{row_idx}"))
             };
 
-            // Pack remaining columns into value object
+            // Pack all columns into value object
             let mut value_obj = serde_json::Map::new();
             for (col_idx, field) in schema.fields().iter().enumerate() {
-                if col_idx == 0 { continue; } // skip key column
                 let col_name = field.name().clone();
                 if let Some(arr) = columns.get(col_idx) {
                     if let Some(str_arr) = arr.as_any().downcast_ref::<StringArray>() {
