@@ -65,6 +65,8 @@ const PARTITION_ID: u32 = 0;
 const BATCH_COUNT: u64 = 256;
 const RECORDS_PER_BATCH: u64 = 16;
 const CHECKPOINT_VERSION: u64 = 0;
+const CHECKPOINT_SAMPLE_COUNT: usize = 9;
+const RECOVERY_SAMPLE_COUNT: usize = 9;
 const STATE_OWNER: &str = "orders_sum_count";
 const GC_EXECUTION_RUN_ID: &str = "local-incremental-gc-execution";
 const MATERIALIZED_VIEW_SQL: &str =
@@ -176,7 +178,7 @@ async fn run() -> BenchResult<()> {
             PARTITION_ID,
             CHECKPOINT_VERSION,
             "local-incremental-state",
-            Bytes::from(checkpoint_bytes),
+            Bytes::from(checkpoint_bytes.clone()),
         )?)
         .await?;
     let checkpoint_state_key = state_ref.object_key.as_str().to_string();
@@ -198,7 +200,55 @@ async fn run() -> BenchResult<()> {
         })
         .await?;
     let checkpoint_elapsed = checkpoint_started.elapsed();
-    let checkpoint_requests = request_delta(&metered_store.snapshot(), &checkpoint_requests_before);
+    let mut checkpoint_samples = vec![checkpoint_elapsed];
+    let mut checkpoint_requests =
+        request_delta(&metered_store.snapshot(), &checkpoint_requests_before);
+    for sample_index in 1..CHECKPOINT_SAMPLE_COUNT {
+        let (_sample_temp_dir, sample_metered_store, sample_store) = temp_store()?;
+        let sample_capabilities = probe_authoritative_object_store_capabilities(
+            sample_store.as_ref(),
+            "local-benchmark",
+            &format!("checkpoint-publish-sample-{sample_index}"),
+        )
+        .await?;
+        let sample_publisher = CheckpointPublisher::new_checked(
+            Arc::clone(&sample_store),
+            capability_profile(&sample_capabilities, AuthoritativeNamespace::Checkpoint)?,
+        )?;
+        let requests_before = sample_metered_store.snapshot();
+        let started = Instant::now();
+        let state_ref = sample_publisher
+            .write_state_object(&StateObjectWrite::new(
+                STATE_OWNER,
+                PARTITION_ID,
+                CHECKPOINT_VERSION,
+                "local-incremental-state",
+                Bytes::from(checkpoint_bytes.clone()),
+            )?)
+            .await?;
+        sample_publisher
+            .publish_manifest(&CheckpointManifest {
+                schema_version: 1,
+                checkpoint_version: CHECKPOINT_VERSION,
+                input_ranges: vec![InputRange {
+                    stream_id: STREAM_ID.to_string(),
+                    partition_id: PARTITION_ID,
+                    start_offset_inclusive: 0,
+                    end_offset_exclusive: total_records,
+                }],
+                state_objects: vec![state_ref],
+                output_objects: vec![],
+                parent_checkpoint: None,
+                created_at: "2026-05-03T00:00:00Z".to_string(),
+            })
+            .await?;
+        checkpoint_samples.push(started.elapsed());
+        add_request_delta(
+            &mut checkpoint_requests,
+            &sample_metered_store.snapshot(),
+            &requests_before,
+        );
+    }
 
     let tail_input = workload_batch(BATCH_COUNT, RECORDS_PER_BATCH);
     let requests_before = metered_store.snapshot();
@@ -217,24 +267,32 @@ async fn run() -> BenchResult<()> {
         &requests_before,
     );
 
-    let recovery_requests_before = metered_store.snapshot();
-    let recovery_started = Instant::now();
-    let checkpoint_bytes = publisher.read_state_object(&checkpoint_state_ref).await?;
-    let checkpoint: RuntimeCheckpoint = serde_json::from_slice(&checkpoint_bytes)?;
-    let mut recovered = restore_standing_runtime(checkpoint).map_err(std::io::Error::other)?;
-    recovered.apply_changes(
-        BATCH_COUNT + 1,
-        EpochIdempotencyKey::new("local-benchmark-tail")?,
-        vec![relation_input_batch(
-            &catalog,
-            total_records,
-            total_records + RECORDS_PER_BATCH,
-            ingest_record_batch(&tail_input)?,
-        )],
-    )?;
-    let recovery_elapsed = recovery_started.elapsed();
-    let recovery_requests = request_delta(&metered_store.snapshot(), &recovery_requests_before);
-    assert_materialized_view(&*recovered, BATCH_COUNT + 1)?;
+    let mut recovery_samples = Vec::with_capacity(RECOVERY_SAMPLE_COUNT);
+    let mut recovery_requests = empty_object_requests();
+    for _ in 0..RECOVERY_SAMPLE_COUNT {
+        let requests_before = metered_store.snapshot();
+        let recovery_started = Instant::now();
+        let checkpoint_bytes = publisher.read_state_object(&checkpoint_state_ref).await?;
+        let checkpoint: RuntimeCheckpoint = serde_json::from_slice(&checkpoint_bytes)?;
+        let mut recovered = restore_standing_runtime(checkpoint).map_err(std::io::Error::other)?;
+        recovered.apply_changes(
+            BATCH_COUNT + 1,
+            EpochIdempotencyKey::new("local-benchmark-tail")?,
+            vec![relation_input_batch(
+                &catalog,
+                total_records,
+                total_records + RECORDS_PER_BATCH,
+                ingest_record_batch(&tail_input)?,
+            )],
+        )?;
+        recovery_samples.push(recovery_started.elapsed());
+        add_request_delta(
+            &mut recovery_requests,
+            &metered_store.snapshot(),
+            &requests_before,
+        );
+        assert_materialized_view(&*recovered, BATCH_COUNT + 1)?;
+    }
 
     let gc_dry_run_planning = gc_dry_run_planning(
         &publisher,
@@ -273,9 +331,9 @@ async fn run() -> BenchResult<()> {
             bytes_per_row: bytes_per_row(object_requests.bytes_written, total_records),
             put_per_gib: put_per_gib(object_requests.put_count, object_requests.bytes_written),
             object_requests,
-            checkpoint_p50_ms: millis(checkpoint_elapsed),
-            checkpoint_p95_ms: millis(checkpoint_elapsed),
-            recovery_p95_ms: millis(recovery_elapsed),
+            checkpoint_p50_ms: percentile_ms(&checkpoint_samples, 0.50),
+            checkpoint_p95_ms: percentile_ms(&checkpoint_samples, 0.95),
+            recovery_p95_ms: percentile_ms(&recovery_samples, 0.95),
             peak_rss_bytes: current_rss_bytes().unwrap_or(0),
             spill_bytes: 0,
             scan_bytes: 0,
@@ -302,13 +360,13 @@ async fn run() -> BenchResult<()> {
                 ),
                 workload_metric(
                     "checkpoint_publish",
-                    &[checkpoint_elapsed],
+                    &checkpoint_samples,
                     checkpoint_requests,
                     0,
                 ),
                 workload_metric(
                     "checkpoint_recovery",
-                    &[recovery_elapsed],
+                    &recovery_samples,
                     recovery_requests,
                     0,
                 ),
