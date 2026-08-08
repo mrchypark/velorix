@@ -5,7 +5,7 @@ use futures::TryStreamExt;
 use object_store::{local::LocalFileSystem, path::Path, ObjectStore, ObjectStoreExt};
 use tempfile::TempDir;
 use velorix_control::lease::{PartitionLeaseGrant, PartitionLeaseKey};
-use velorix_runtime::leased_checkpoint::{LeasedCheckpointError, LeasedCheckpointPublisher};
+use velorix_control::leased_checkpoint::{LeasedCheckpointError, LeasedCheckpointPublisher};
 use velorix_storage::{
     capability::{
         AuthoritativeNamespace, AuthoritativeObjectStoreCapabilitiesV1,

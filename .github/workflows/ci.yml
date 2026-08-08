@@ -150,7 +150,7 @@ jobs:
       - name: Run local benchmark
         run: |
           mkdir -p target/velorix-bench
-          cargo bench -p velorix-runtime --features legacy-source-scan-surfaces --bench local_incremental > target/velorix-bench/local-pr-smoke.json
+          cargo bench -p velorix-runtime --bench local_incremental > target/velorix-bench/local-pr-smoke.json
 
       - name: Validate benchmark JSON
         run: cargo run -p velorix-cli -- benchmark-validate --result target/velorix-bench/local-pr-smoke.json

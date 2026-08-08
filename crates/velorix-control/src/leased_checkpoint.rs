@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
+use crate::lease::PartitionLeaseGrant;
 use object_store::ObjectStore;
 use thiserror::Error;
-use velorix_control::lease::PartitionLeaseGrant;
 use velorix_storage::{
     capability::{AuthoritativeNamespace, AuthoritativeObjectStoreCapabilitiesV1},
     manifest::{

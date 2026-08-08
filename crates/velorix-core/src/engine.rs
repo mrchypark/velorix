@@ -92,12 +92,12 @@ pub trait IncrementalEngine {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct PrototypeIncrementalEngine {
+pub struct KeyedAggregateKernel {
     logical_epoch: LogicalEpoch,
     aggregate: KeyedSumCountAggregate,
 }
 
-impl PrototypeIncrementalEngine {
+impl KeyedAggregateKernel {
     pub fn new() -> Self {
         Self::default()
     }
@@ -142,7 +142,7 @@ impl PrototypeIncrementalEngine {
     }
 }
 
-impl IncrementalEngine for PrototypeIncrementalEngine {
+impl IncrementalEngine for KeyedAggregateKernel {
     fn logical_epoch(&self) -> LogicalEpoch {
         self.logical_epoch
     }

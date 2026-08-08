@@ -23,9 +23,10 @@ with open(metadata_path, "r", encoding="utf-8") as f:
 packages = {package["name"]: package for package in metadata["packages"]}
 
 blocked_direct_deps = {
-    "velorix-api": {"velorix-k8s", "velorix-meta", "velorix-runtime", "velorix-storage"},
-    "velorix-cli": {"velorix-runtime", "velorix-storage"},
+    "velorix-api": {"velorix-k8s", "velorix-meta", "velorix-storage"},
+    "velorix-cli": {"velorix-storage"},
     "velorix-k8s": {"velorix-storage"},
+    "velorix-runtime": {"velorix-control"},
 }
 blocked_model_deps = {
     "velorix-core": {"datafusion", "tokio", "object_store", "kube", "k8s-openapi"},

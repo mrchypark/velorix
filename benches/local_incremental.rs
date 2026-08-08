@@ -16,23 +16,20 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use bytes::Bytes;
-use datafusion::object_store::{
-    memory::InMemory as DataFusionInMemory, path::Path as DataFusionPath,
-    ObjectStore as DataFusionObjectStore, ObjectStoreExt as DataFusionObjectStoreExt,
-};
 use futures::stream::BoxStream;
 use object_store::{
     local::LocalFileSystem, path::Path, CopyOptions, GetOptions, GetRange, GetResult, ListResult,
     MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload,
     PutResult,
 };
-use parquet::arrow::ArrowWriter;
 use serde_json::json;
 use tempfile::TempDir;
 use velorix_core::{
     delta::{DeltaBatch, DeltaKey, DeltaRecord, DeltaValue},
-    query::QueryPolicy,
-    relation::VelorixRelationCatalogV1,
+    relation::{
+        orders_sum_count_relation_catalog, VelorixRelationCatalogV1, ORDERS_SUM_COUNT_RELATION_ID,
+        ORDERS_SUM_COUNT_RELATION_VERSION,
+    },
     standing_program::{
         BuiltinRuntimeIdentity, EpochIdempotencyKey, NativeCodePolicy, RelationInputBatch,
         RuntimeCheckpoint, ScopedViewId, SnapshotPageRequest, StandingProgramIdentity,
@@ -49,16 +46,6 @@ use velorix_runtime::benchmark_gate::{
 use velorix_runtime::materialized_view_runtime::{
     create_standing_runtime_with_sql_and_catalogs, restore_standing_runtime, CRATE_NAME,
 };
-use velorix_runtime::persisted_table::{
-    query_production_persisted_object_backed_input_with_metrics,
-    CreateProductionPersistedTableSpecRequest, PersistedTableStore, ProductionPersistedTableFormat,
-};
-use velorix_runtime::query_policy_catalog::QueryPolicyCatalogStore;
-use velorix_runtime::recovery::{
-    orders_sum_count_relation_catalog, ORDERS_SUM_COUNT_OWNER, ORDERS_SUM_COUNT_RELATION_ID,
-    ORDERS_SUM_COUNT_RELATION_VERSION,
-};
-use velorix_runtime::storage_registry::StorageRegistry;
 use velorix_storage::{
     capability::{
         probe_authoritative_object_store_capabilities, AuthoritativeNamespace,
@@ -78,6 +65,7 @@ const PARTITION_ID: u32 = 0;
 const BATCH_COUNT: u64 = 256;
 const RECORDS_PER_BATCH: u64 = 16;
 const CHECKPOINT_VERSION: u64 = 0;
+const STATE_OWNER: &str = "orders_sum_count";
 const GC_EXECUTION_RUN_ID: &str = "local-incremental-gc-execution";
 const MATERIALIZED_VIEW_SQL: &str =
     "select account_id, sum(amount) as sum, count(*) as count from orders group by account_id";
@@ -184,7 +172,7 @@ async fn run() -> BenchResult<()> {
     let checkpoint_bytes = serde_json::to_vec(&checkpoint)?;
     let state_ref = publisher
         .write_state_object(&StateObjectWrite::new(
-            ORDERS_SUM_COUNT_OWNER,
+            STATE_OWNER,
             PARTITION_ID,
             CHECKPOINT_VERSION,
             "local-incremental-state",
@@ -263,12 +251,6 @@ async fn run() -> BenchResult<()> {
         &capabilities,
     )
     .await?;
-    let datafusion_scan = datafusion_table_scan(
-        Arc::clone(&store),
-        Arc::clone(&metered_store),
-        &capabilities,
-    )
-    .await?;
     let materialized_output_workloads =
         materialized_output_workloads::run_materialized_output_workloads(
             Arc::clone(&store),
@@ -278,12 +260,7 @@ async fn run() -> BenchResult<()> {
         .await?;
 
     let records_per_second = total_records as f64 / materialized_view_apply_elapsed.as_secs_f64();
-    let mut object_requests = metered_store.snapshot();
-    add_request_delta(
-        &mut object_requests,
-        &datafusion_scan.object_requests,
-        &empty_object_requests(),
-    );
+    let object_requests = metered_store.snapshot();
     let result = BenchmarkGateResultV1 {
         schema_version: 1,
         commit: git_commit(),
@@ -301,7 +278,7 @@ async fn run() -> BenchResult<()> {
             recovery_p95_ms: millis(recovery_elapsed),
             peak_rss_bytes: current_rss_bytes().unwrap_or(0),
             spill_bytes: 0,
-            scan_bytes: datafusion_scan.scan_bytes,
+            scan_bytes: 0,
         },
         workload_metrics: {
             let mut workload_metrics = vec![
@@ -334,12 +311,6 @@ async fn run() -> BenchResult<()> {
                     &[recovery_elapsed],
                     recovery_requests,
                     0,
-                ),
-                workload_metric(
-                    "datafusion_table_scan",
-                    &datafusion_scan.samples,
-                    datafusion_scan.object_requests,
-                    datafusion_scan.scan_bytes,
                 ),
                 workload_metric(
                     "slatedb_state_reopen",
@@ -378,14 +349,14 @@ async fn gc_dry_run_planning(
     parent_end_offset_exclusive: u64,
 ) -> BenchResult<GcDryRunPlanningWorkload> {
     let retained_state = StateObjectWrite::new(
-        ORDERS_SUM_COUNT_OWNER,
+        STATE_OWNER,
         PARTITION_ID,
         CHECKPOINT_VERSION + 1,
         "gc-retained-state",
         Bytes::from_static(b"gc-retained-state"),
     )?;
     let orphan_state = StateObjectWrite::new(
-        ORDERS_SUM_COUNT_OWNER,
+        STATE_OWNER,
         PARTITION_ID,
         CHECKPOINT_VERSION + 1,
         "gc-orphan-state",
@@ -511,77 +482,6 @@ async fn gc_execution_evidence(
     })
 }
 
-async fn datafusion_table_scan(
-    authority_store: Arc<dyn ObjectStore>,
-    metered_store: Arc<MeteredObjectStore>,
-    capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
-) -> BenchResult<MeasuredWorkload> {
-    let inner: Arc<dyn DataFusionObjectStore> = Arc::new(DataFusionInMemory::new());
-    let input = parquet_input_batch()?;
-    let input_bytes = parquet_bytes(&input)?;
-    let scan_bytes = input_bytes.len() as u64;
-    let object_key_prefix = "tenants/tenant-a/tables/orders";
-    let snapshot_ref = "snapshots/local-benchmark";
-    let parquet_path = format!("{object_key_prefix}/{snapshot_ref}/part-000.parquet");
-
-    inner
-        .put(
-            &DataFusionPath::from(parquet_path.as_str()),
-            input_bytes.into(),
-        )
-        .await?;
-
-    let requests_before = metered_store.snapshot();
-    create_production_query_policy(&authority_store, capabilities).await?;
-    let mut registry = StorageRegistry::new();
-    registry.register_production_with_capabilities(
-        "primary",
-        "memory://velorix/",
-        Arc::clone(&inner),
-        capabilities.clone(),
-    )?;
-    PersistedTableStore::new_checked(Arc::clone(&authority_store), capabilities)?
-        .create_production(
-            Arc::clone(&authority_store),
-            Arc::clone(&authority_store),
-            &registry,
-            capabilities,
-            production_request("primary", object_key_prefix, snapshot_ref)?,
-        )
-        .await?;
-
-    let started = Instant::now();
-    let output = query_production_persisted_object_backed_input_with_metrics(
-        Arc::clone(&authority_store),
-        Arc::clone(&authority_store),
-        Arc::clone(&authority_store),
-        &registry,
-        capabilities,
-        "tenant-a",
-        "orders-current",
-        "select account_id, sum(amount) as total_value, sum(weight) as total_weight \
-         from orders where weight > 0 group by account_id order by account_id",
-    )
-    .await?;
-    let elapsed = started.elapsed();
-
-    assert_eq!(output.batches.len(), 1);
-    assert_eq!(output.batches[0].num_rows(), 2);
-
-    let mut object_requests = request_delta(&metered_store.snapshot(), &requests_before);
-    add_request_delta(
-        &mut object_requests,
-        &output.object_requests,
-        &empty_object_requests(),
-    );
-
-    Ok(MeasuredWorkload {
-        samples: vec![elapsed],
-        object_requests,
-        scan_bytes,
-    })
-}
-
 async fn slatedb_state_reopen(
     object_store: Arc<dyn ObjectStore>,
     metered_store: Arc<MeteredObjectStore>,
@@ -589,7 +489,7 @@ async fn slatedb_state_reopen(
 ) -> BenchResult<MeasuredWorkload> {
     let payload = Bytes::from_static(br#"{"state":"slatedb-reopen-smoke","version":1}"#);
     let state = StateObjectWrite::new(
-        ORDERS_SUM_COUNT_OWNER,
+        STATE_OWNER,
         PARTITION_ID,
         CHECKPOINT_VERSION + 1,
         "slatedb-state-reopen",
@@ -771,35 +671,6 @@ fn assert_materialized_view(
     Ok(())
 }
 
-fn parquet_input_batch() -> BenchResult<RecordBatch> {
-    Ok(RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("account_id", DataType::Utf8, false),
-            Field::new("amount", DataType::Int64, false),
-            Field::new("weight", DataType::Int64, false),
-        ])),
-        vec![
-            Arc::new(StringArray::from(vec![
-                "account-a",
-                "account-a",
-                "account-b",
-            ])) as ArrayRef,
-            Arc::new(Int64Array::from(vec![10, 5, 7])) as ArrayRef,
-            Arc::new(Int64Array::from(vec![1, 1, 1])) as ArrayRef,
-        ],
-    )?)
-}
-
-fn parquet_bytes(batch: &RecordBatch) -> BenchResult<Bytes> {
-    let mut bytes = Vec::new();
-    {
-        let mut writer = ArrowWriter::try_new(&mut bytes, batch.schema(), None)?;
-        writer.write(batch)?;
-        writer.close()?;
-    }
-    Ok(Bytes::from(bytes))
-}
-
 fn ingest_record_batch(input: &DeltaBatch) -> BenchResult<RecordBatch> {
     let keys = input
         .records()
@@ -872,16 +743,6 @@ async fn append_ingest_envelope(
     Ok(())
 }
 
-async fn create_production_query_policy(
-    store: &Arc<dyn ObjectStore>,
-    capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
-) -> BenchResult<()> {
-    QueryPolicyCatalogStore::new_checked(Arc::clone(store), capabilities)?
-        .create_for_production_table_scan("tenant-a", "standard", production_query_policy())
-        .await?;
-    Ok(())
-}
-
 fn capability_profile(
     capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
     namespace: AuthoritativeNamespace,
@@ -891,42 +752,6 @@ fn capability_profile(
             "missing capability profile for authoritative namespace `{namespace}`"
         ))) as Box<dyn Error + Send + Sync>
     })
-}
-
-fn production_request(
-    store_id: &str,
-    object_key_prefix: &str,
-    snapshot_ref: &str,
-) -> BenchResult<CreateProductionPersistedTableSpecRequest> {
-    let catalog = orders_sum_count_relation_catalog()?;
-    Ok(CreateProductionPersistedTableSpecRequest {
-        table_id: "orders-current".to_string(),
-        tenant_id: "tenant-a".to_string(),
-        store_id: store_id.to_string(),
-        object_key_prefix: object_key_prefix.to_string(),
-        snapshot_ref: snapshot_ref.to_string(),
-        format: ProductionPersistedTableFormat::Parquet,
-        relation_id: ORDERS_SUM_COUNT_RELATION_ID.to_string(),
-        relation_version: ORDERS_SUM_COUNT_RELATION_VERSION.to_string(),
-        schema_fingerprint: catalog.schema_fingerprint.as_str().to_string(),
-        query_policy_id: "standard".to_string(),
-    })
-}
-
-fn production_query_policy() -> QueryPolicy {
-    QueryPolicy {
-        max_sql_bytes: Some(16 * 1024),
-        planning_timeout_ms: Some(1_000),
-        execution_timeout_ms: Some(10_000),
-        max_output_rows: Some(1_000),
-        max_output_bytes: Some(1_000_000),
-        max_scan_files: Some(100),
-        max_scan_bytes: Some(128 * 1024 * 1024),
-        max_object_requests: Some(1_000),
-        memory_limit_bytes: Some(512 * 1024 * 1024),
-        spill_limit_bytes: Some(1024 * 1024 * 1024),
-        ..QueryPolicy::default()
-    }
 }
 
 fn millis(duration: Duration) -> f64 {

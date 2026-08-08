@@ -9,10 +9,9 @@ all-features = true
 version = 2
 yanked = "deny"
 ignore = [
-  # The authority path now uses object_store 0.14 / quick-xml 0.41. DataFusion
-  # 54 still constrains its scan client to object_store 0.13, and the pinned
-  # Hiqlite graph carries s3-simple with quick-xml 0.39. Both remaining risks
-  # have owner/expiry records in dependency-governance.json.
+  # The authority path uses object_store 0.14 / quick-xml 0.41. The remaining
+  # quick-xml 0.39 path is pinned Hiqlite -> cryptr -> s3-simple and has
+  # owner/expiry records in dependency-governance.json.
   "RUSTSEC-2026-0194",
   "RUSTSEC-2026-0195",
 ]

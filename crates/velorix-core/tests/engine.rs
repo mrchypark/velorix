@@ -3,7 +3,7 @@ use velorix_core::{
     delta::{DeltaBatch, DeltaKey, DeltaRecord, DeltaValue},
     engine::{
         AggregateValueMode, EngineCheckpoint, EngineCheckpointPayload, IncrementalEngine,
-        PrototypeIncrementalEngine, ENGINE_CHECKPOINT_PAYLOAD_SCHEMA_VERSION,
+        KeyedAggregateKernel, ENGINE_CHECKPOINT_PAYLOAD_SCHEMA_VERSION,
     },
 };
 
@@ -35,13 +35,13 @@ fn batch(records: impl IntoIterator<Item = DeltaRecord>) -> DeltaBatch {
     DeltaBatch::from_records(records)
 }
 
-fn net_state(engine: &PrototypeIncrementalEngine) -> Vec<DeltaRecord> {
+fn net_state(engine: &KeyedAggregateKernel) -> Vec<DeltaRecord> {
     engine.materialized_state().net_rows().unwrap()
 }
 
 #[test]
-fn prototype_incremental_engine_cancels_insert_and_retract_when_signed_changes_balance() {
-    let mut engine = PrototypeIncrementalEngine::new();
+fn keyed_aggregate_kernel_cancels_insert_and_retract_when_signed_changes_balance() {
+    let mut engine = KeyedAggregateKernel::new();
 
     engine
         .push_changes(1, &batch([input_delta("account-a", 10, 1)]))
@@ -55,8 +55,8 @@ fn prototype_incremental_engine_cancels_insert_and_retract_when_signed_changes_b
 }
 
 #[test]
-fn prototype_incremental_engine_materialized_state_is_invariant_to_input_chunking() {
-    let mut one_batch = PrototypeIncrementalEngine::new();
+fn keyed_aggregate_kernel_materialized_state_is_invariant_to_input_chunking() {
+    let mut one_batch = KeyedAggregateKernel::new();
     one_batch
         .push_changes(
             1,
@@ -68,7 +68,7 @@ fn prototype_incremental_engine_materialized_state_is_invariant_to_input_chunkin
         )
         .unwrap();
 
-    let mut many_batches = PrototypeIncrementalEngine::new();
+    let mut many_batches = KeyedAggregateKernel::new();
     many_batches
         .push_changes(1, &batch([input_delta("account-a", 10, 1)]))
         .unwrap();
@@ -83,8 +83,8 @@ fn prototype_incremental_engine_materialized_state_is_invariant_to_input_chunkin
 }
 
 #[test]
-fn prototype_incremental_engine_rejects_non_monotonic_logical_epochs() {
-    let mut engine = PrototypeIncrementalEngine::new();
+fn keyed_aggregate_kernel_rejects_non_monotonic_logical_epochs() {
+    let mut engine = KeyedAggregateKernel::new();
     engine
         .push_changes(1, &batch([input_delta("account-a", 10, 1)]))
         .unwrap();
@@ -97,7 +97,7 @@ fn prototype_incremental_engine_rejects_non_monotonic_logical_epochs() {
 }
 
 #[test]
-fn prototype_incremental_engine_checkpoint_plus_replay_matches_uninterrupted_run() {
+fn keyed_aggregate_kernel_checkpoint_plus_replay_matches_uninterrupted_run() {
     let checkpoint_input = batch([
         input_delta("account-a", 10, 1),
         input_delta("account-a", 5, 1),
@@ -108,26 +108,26 @@ fn prototype_incremental_engine_checkpoint_plus_replay_matches_uninterrupted_run
         input_delta("account-b", 2, -1),
     ]);
 
-    let mut uninterrupted = PrototypeIncrementalEngine::new();
+    let mut uninterrupted = KeyedAggregateKernel::new();
     uninterrupted.push_changes(1, &checkpoint_input).unwrap();
     uninterrupted.push_changes(2, &replay_input).unwrap();
 
-    let mut checkpointed = PrototypeIncrementalEngine::new();
+    let mut checkpointed = KeyedAggregateKernel::new();
     checkpointed.push_changes(1, &checkpoint_input).unwrap();
     let checkpoint = checkpointed.checkpoint_state();
-    let mut restored = PrototypeIncrementalEngine::from_checkpoint(checkpoint).unwrap();
+    let mut restored = KeyedAggregateKernel::from_checkpoint(checkpoint).unwrap();
     restored.push_changes(2, &replay_input).unwrap();
 
     assert_eq!(net_state(&restored), net_state(&uninterrupted));
 }
 
 #[test]
-fn prototype_incremental_engine_hydrates_decimal128_checkpoint_with_selected_mode() {
+fn keyed_aggregate_kernel_hydrates_decimal128_checkpoint_with_selected_mode() {
     let checkpoint = EngineCheckpoint::new(
         1,
         batch([state_delta("account-a", json!("0.10"), json!(1))]),
     );
-    let mut restored = PrototypeIncrementalEngine::from_checkpoint_with_aggregate_value_mode(
+    let mut restored = KeyedAggregateKernel::from_checkpoint_with_aggregate_value_mode(
         checkpoint,
         AggregateValueMode::Decimal128 {
             precision: 38,
@@ -147,13 +147,13 @@ fn prototype_incremental_engine_hydrates_decimal128_checkpoint_with_selected_mod
 }
 
 #[test]
-fn prototype_incremental_engine_rejects_malformed_checkpoint_state() {
+fn keyed_aggregate_kernel_rejects_malformed_checkpoint_state() {
     let malformed = EngineCheckpoint::new(
         7,
         batch([state_delta("account-a", json!(10), json!("not-an-integer"))]),
     );
 
-    let err = PrototypeIncrementalEngine::from_checkpoint(malformed).unwrap_err();
+    let err = KeyedAggregateKernel::from_checkpoint(malformed).unwrap_err();
 
     assert!(err.to_string().contains("aggregate state value"));
 }

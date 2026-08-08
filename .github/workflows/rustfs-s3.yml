@@ -3,11 +3,6 @@ name: RustFS S3-Compatible Gate
 on:
   workflow_dispatch:
     inputs:
-      run-benchmark:
-        description: Run the env-gated s3_incremental benchmark after storage/runtime tests.
-        required: false
-        default: false
-        type: boolean
       rustfs-image:
         description: RustFS container image to use for the S3-compatible gate.
         required: false
@@ -15,10 +10,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  VELORIX_RUSTFS_RUN_BENCHMARK: ${{ inputs.run-benchmark && '1' || '0' }}
   VELORIX_RUSTFS_IMAGE: ${{ inputs.rustfs-image }}
   VELORIX_RUSTFS_EVIDENCE_PATH: target/velorix-s3/rustfs-s3-gate-evidence.json
-  VELORIX_RUSTFS_BENCHMARK_PATH: target/velorix-bench/rustfs-s3-nightly.json
 
 jobs:
   rustfs-s3:
@@ -44,5 +37,4 @@ jobs:
           name: rustfs-s3-compatible-evidence
           path: |
             target/velorix-s3/rustfs-s3-gate-evidence.json
-            target/velorix-bench/rustfs-s3-nightly.json
           if-no-files-found: warn

@@ -210,11 +210,14 @@ with open(repo_root / "docs" / "architecture" / "checkpoint-recovery-index-v1.md
     checkpoint_recovery_index = f.read()
 with open(repo_root / "docs" / "architecture" / "storage-contract.md", "r", encoding="utf-8") as f:
     storage_contract = f.read()
-with open(repo_root / "crates" / "velorix-api" / "src" / "lib.rs", "r", encoding="utf-8") as f:
-    api = f.read()
+api = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in sorted((repo_root / "crates" / "velorix-api" / "src").glob("*.rs"))
+)
 with open(repo_root / "crates" / "velorix-control" / "src" / "readiness.rs", "r", encoding="utf-8") as f:
     control_readiness = f.read()
 runtime_cargo = tomllib.loads((repo_root / "crates" / "velorix-runtime" / "Cargo.toml").read_text(encoding="utf-8"))
+api_cargo = tomllib.loads((repo_root / "crates" / "velorix-api" / "Cargo.toml").read_text(encoding="utf-8"))
 object_store_duplicate_exception = next(
     (
         item
@@ -246,13 +249,14 @@ def known_crate_boundary_direct_dependencies():
     blocked = {
         "velorix-api": direct_dependencies(
             "velorix-api",
-            ["velorix-k8s", "velorix-meta", "velorix-runtime", "velorix-storage"],
+            ["velorix-k8s", "velorix-meta", "velorix-storage"],
         ),
         "velorix-cli": direct_dependencies(
             "velorix-cli",
-            ["velorix-runtime", "velorix-storage"],
+            ["velorix-storage"],
         ),
         "velorix-k8s": direct_dependencies("velorix-k8s", ["velorix-storage"]),
+        "velorix-runtime": direct_dependencies("velorix-runtime", ["velorix-control"]),
     }
     return {crate: deps for crate, deps in blocked.items() if deps}
 
@@ -3526,8 +3530,6 @@ checks["crate-boundary policy passes strict mode"] = (
     and "RecoverLocal" not in cli
     and "recover_local_runtime" not in cli
     and "velorix_runtime::recovery" not in cli
-    and "velorix_runtime::benchmark_gate" not in cli
-    and "velorix_runtime::readiness" not in cli
     and "RecoveredRuntime" not in cli
     and "velorix_storage::" not in cli
     and "velorix_storage::" not in api
@@ -3538,16 +3540,9 @@ checks["crate-boundary policy passes strict mode"] = (
     and "velorix_storage::" not in (repo_root / "crates" / "velorix-k8s" / "src" / "ingest_writer.rs").read_text(encoding="utf-8")
     and "velorix_storage::" not in (repo_root / "crates" / "velorix-k8s" / "src" / "lease.rs").read_text(encoding="utf-8")
     and "velorix_storage::" not in (repo_root / "crates" / "velorix-k8s" / "src" / "worker_shard.rs").read_text(encoding="utf-8")
-    and "velorix_runtime::query_policy_catalog" not in api
-    and "velorix_runtime::materialized_view_runtime::CRATE_NAME" not in api
-    and "velorix_runtime::recovery::orders_sum_count_relation_catalog" not in api
-    and "velorix_runtime::" not in api
-    and "Direct crate boundaries must enforce the claimed ownership model"
-    in architecture_critique
-    and "velorix-api` previously depended directly on K8s, metadata, runtime and storage"
-    in architecture_critique
-    and "velorix-cli` no longer links\n  `velorix-runtime` or `velorix-storage`"
-    in architecture_critique
+    and "velorix-runtime" in api_cargo.get("dependencies", {})
+    and "velorix-control" not in runtime_cargo.get("dependencies", {})
+    and "pub mod materialized_view_runtime;" in runtime_lib
     and "velorix-cli` directly depends on storage for admin/GC paths" not in architecture_critique
     and "velorix-cli` directly depends on runtime and storage" not in architecture_critique
     and "Make CLI and Kubernetes components protocol clients" in architecture_critique
@@ -3555,7 +3550,7 @@ checks["crate-boundary policy passes strict mode"] = (
     in architecture_critique
 )
 
-checks["object_store duplicate is documented as expiring S3 compatibility exception"] = (
+checks["object_store duplicate is documented as expiring DataFusion exception"] = (
     object_store_duplicate_exception.get("owner") == "runtime"
     and object_store_duplicate_exception.get("expires_on") == "2026-08-31"
     and "authority paths" in object_store_duplicate_exception.get("reason", "")
@@ -3564,14 +3559,7 @@ checks["object_store duplicate is documented as expiring S3 compatibility except
     in object_store_duplicate_exception.get("replacement_plan", "")
     and object_store_duplicate_exception.get("promotion_rule")
     == "deny_after_expiry_or_renew_with_owner_and_updated_plan"
-    and runtime_cargo.get("dependencies", {}).get("object_store_13", {}).get("optional") is True
-    and "object_store_13" in runtime_cargo.get("features", {}).get("s3-compat-tests", [])
-    and "object_store` 0.14 for Velorix authority/catalog/probe writes"
-    in s3_compatible_test_harness
-    and "object_store` 0.13 for DataFusion 54 Parquet scans"
-    in s3_compatible_test_harness
-    and "This proves the current two-version\nobject-store boundary without adding an adapter"
-    in s3_compatible_test_harness
+    and "object_store_13" not in runtime_cargo.get("dependencies", {})
 )
 
 checks["product Dockerfiles reject external runtime artifact paths"] = (
@@ -4009,16 +3997,15 @@ checks["public ingest materialization response hides internal convergence naming
     and "no public compact\nendpoint is exposed" in materialized_output_segment_index
 )
 
-checks["legacy persisted source-scan surfaces stay default-off"] = (
+checks["legacy persisted source-scan surfaces are removed"] = (
     runtime_cargo.get("features", {}).get("default") == []
-    and runtime_cargo.get("features", {}).get("legacy-source-scan-surfaces") == []
-    and "legacy-source-scan-surfaces" in runtime_cargo.get("features", {}).get("s3-compat-tests", [])
-    and "#[cfg(feature = \"legacy-source-scan-surfaces\")]\npub mod persisted_query;" in runtime_lib
-    and "#[cfg(feature = \"legacy-source-scan-surfaces\")]\npub mod persisted_table;" in runtime_lib
-    and "#[cfg(feature = \"legacy-source-scan-surfaces\")]\npub mod persisted_view;" in runtime_lib
-    and "Legacy persisted table scans are quarantined behind the default-off"
+    and "legacy-source-scan-surfaces" not in runtime_cargo.get("features", {})
+    and "persisted_query" not in runtime_lib
+    and "persisted_table" not in runtime_lib
+    and "persisted_view" not in runtime_lib
+    and "Legacy persisted-source query surfaces and their compatibility feature have\n  been removed"
     in object_store_capabilities_doc
-    and "Delete or quarantine `persisted_query`, `persisted_table` and `persisted_view`"
+    and "Completed: delete `persisted_query`, `persisted_table` and"
     in architecture_critique
 )
 

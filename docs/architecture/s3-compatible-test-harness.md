@@ -16,8 +16,6 @@ enabled:
 
 ```bash
 cargo test -p velorix-storage --test s3_compat --features s3-compat-tests
-cargo test -p velorix-runtime --test s3_compat_query --features s3-compat-tests
-cargo bench -p velorix-runtime --bench s3_incremental --features s3-compat-tests
 ```
 
 When that target is enabled, the test still skips unless:
@@ -42,7 +40,7 @@ keys. Live tests clean up written objects with best-effort deletes.
 
 ## Storage Harness
 
-`crates/velorix-storage/tests/s3_compat.rs` builds an `object_store` 0.12
+`crates/velorix-storage/tests/s3_compat.rs` builds the workspace `object_store`
 `AmazonS3` client from the environment and validates these observable
 behaviors:
 
@@ -57,23 +55,6 @@ behaviors:
 
 These are capability checks for production assumptions, not replacements for
 Velorix checkpoint, ingest, output, or catalog manifests.
-
-## Runtime Query Harness
-
-`crates/velorix-runtime/tests/s3_compat_query.rs` is also feature-gated and
-skipped by default. When enabled, it builds both object-store clients used by
-the runtime boundary:
-
-- `object_store` 0.14 for Velorix authority/catalog/probe writes.
-- `object_store` 0.13 for DataFusion 54 Parquet scans.
-
-The test writes Parquet under the configured S3-compatible prefix, registers a
-production table through the storage registry's authority-store probe path,
-stores the relation catalog and query policy in object storage, writes
-catalog-aware ingest envelopes for recovery coverage, and verifies a DataFusion
-aggregate query over the registered table. This proves the current two-version
-object-store boundary without adding an adapter or changing SlateDB/DataFusion
-dependency versions.
 
 ## Skip Behavior
 
@@ -145,9 +126,6 @@ It runs:
 ```bash
 cargo test -p velorix-storage --test s3_compat --features s3-compat-tests
 cargo test -p velorix-storage --test multi_process_ingest_admission --features s3-compat-tests
-cargo test -p velorix-runtime --test s3_compat_query --features s3-compat-tests
-cargo bench -p velorix-runtime --bench s3_incremental --features s3-compat-tests
-cargo run -p velorix-cli -- benchmark-validate --result target/velorix-bench/rustfs-s3-nightly.json
 ```
 
 The `s3_compat` target also executes a manifest-retiring GC run inside an

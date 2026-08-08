@@ -66,7 +66,6 @@ benchmark results:
 - `native_sql_materialized_view_apply`
 - `checkpoint_publish`
 - `checkpoint_recovery`
-- `datafusion_table_scan`
 - `materialized_output_segment_pruning`
 - `materialized_output_recent_k`
 - `materialized_output_compaction_equivalence`
@@ -78,8 +77,8 @@ benchmark results:
 - `gc_dry_run_planning`
 - `gc_execution_evidence`
 
-The current `local_incremental` and `s3_incremental` benchmark workloads are
-storage/runtime primitive evidence, not public REST product-path evidence.
+The current `local_incremental` benchmark is storage/runtime primitive
+evidence, not public REST product-path evidence.
 `local_incremental` admits SQL through the production logical-plan factory,
 applies Arrow relation batches to the selected standing runtime, checkpoints
 and restores that runtime, and verifies its materialized output after replay.
@@ -155,12 +154,6 @@ support.
   baseline.
 - Release gating fails closed when no S3-compatible result path is provided or
   when the S3-compatible result regresses against the live baseline.
-- `s3_incremental` fails closed unless `VELORIX_S3_COMPAT=1` is set. With the
-  flag set, it still requires real S3-compatible object-store configuration.
-  When explicitly enabled, it emits S3-compatible benchmark JSON for the
-  authoritative object-store capability probe, ingest envelope validation,
-  checkpoint publication, checkpoint recovery, bounded DataFusion Parquet scan,
-  materialized output read gates, SlateDB state reopen, and GC dry-run planning.
-  Set
-  `VELORIX_BENCHMARK_GATE_LEVEL=release` to emit release-level benchmark JSON;
-  the default is nightly integration.
+- S3-compatible benchmark gates consume an explicitly supplied benchmark
+  result. The removed source-scan benchmark is not accepted as standing-runtime
+  performance evidence.

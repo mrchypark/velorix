@@ -22,6 +22,7 @@ sha2 = { workspace = true }
 tokio = { workspace = true }
 velorix-core = { path = "../velorix-core" }
 velorix-control = { path = "../velorix-control" }
+velorix-runtime = { path = "../velorix-runtime" }
 
 [dev-dependencies]
 http-body-util = "0.1"

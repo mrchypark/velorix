@@ -2,20 +2,7 @@
 
 #![forbid(unsafe_code)]
 
-pub use velorix_control::benchmark_gate;
-pub mod cache;
-pub mod leased_checkpoint;
-pub use velorix_control::materialized_view_runtime;
-mod object_meter;
-#[cfg(feature = "legacy-source-scan-surfaces")]
-pub mod persisted_query;
-#[cfg(feature = "legacy-source-scan-surfaces")]
-pub mod persisted_table;
-#[cfg(feature = "legacy-source-scan-surfaces")]
-pub mod persisted_view;
-pub mod query;
+pub mod benchmark_gate;
+pub mod materialized_view_runtime;
 pub mod query_policy_catalog;
-mod query_runtime;
-pub use velorix_control::readiness;
-pub mod recovery;
-pub mod storage_registry;
+pub mod runtime_contract;

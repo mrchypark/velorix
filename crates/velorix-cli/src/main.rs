@@ -26,10 +26,6 @@ use sigstore_types::{Bundle as SigstoreBundle, Sha256Hash as SigstoreSha256Hash}
 use sigstore_verify::{
     verify as verify_sigstore_bundle, VerificationPolicy as SigstoreVerificationPolicy,
 };
-use velorix_control::benchmark_gate::{
-    BenchmarkBackend, BenchmarkBudgetV1, BenchmarkEvidenceScope, BenchmarkGateLevel,
-    BenchmarkGateResultV1,
-};
 use velorix_control::readiness::{ProductionReadinessEvidenceV1, ProductionReadinessReportV1};
 use velorix_control::storage_admin::{
     probe_authoritative_object_store_capabilities, AppendValidatedEnvelopeOutcome,
@@ -51,6 +47,10 @@ use velorix_meta::{
     STANDING_RUNTIME_LEASE_EXPIRY_SEMANTICS_BACKEND_WALL_CLOCK_TTL,
     STANDING_RUNTIME_OWNER_SCOPE_KIND_TENANT_PROGRAM_VIEW,
 };
+use velorix_runtime::benchmark_gate::{
+    BenchmarkBackend, BenchmarkBudgetV1, BenchmarkEvidenceScope, BenchmarkGateLevel,
+    BenchmarkGateResultV1,
+};
 
 const OBJECT_STORE_CAPABILITY_PROBE_WORKLOAD: &str = "object_store_capability_probe";
 const LOCAL_BENCHMARK_GATE_WORKLOADS: &[&str] = &[
@@ -59,7 +59,6 @@ const LOCAL_BENCHMARK_GATE_WORKLOADS: &[&str] = &[
     "native_sql_materialized_view_apply",
     "checkpoint_publish",
     "checkpoint_recovery",
-    "datafusion_table_scan",
     "materialized_output_segment_pruning",
     "materialized_output_recent_k",
     "materialized_output_compaction_equivalence",
@@ -76,7 +75,6 @@ const S3_COMPATIBLE_BENCHMARK_GATE_WORKLOADS: &[&str] = &[
     "ingest_envelope_validation",
     "checkpoint_publish",
     "checkpoint_recovery",
-    "datafusion_table_scan",
     "materialized_output_segment_pruning",
     "materialized_output_recent_k",
     "materialized_output_compaction_equivalence",

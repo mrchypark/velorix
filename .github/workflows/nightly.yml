@@ -106,19 +106,9 @@ jobs:
           VELORIX_S3_COMPAT: "1"
         run: |
           cargo test -p velorix-storage --test s3_compat --features s3-compat-tests
-          cargo test -p velorix-runtime --test s3_compat_query --features s3-compat-tests
-
-      - name: Run live S3-compatible benchmark
-        if: steps.config.outputs.live_s3_configured == 'true' && steps.config.outputs.benchmark_configured != 'true'
-        env:
-          VELORIX_S3_COMPAT: "1"
-        run: |
-          mkdir -p "$(dirname "${{ steps.config.outputs.benchmark_result_path }}")"
-          cargo bench -p velorix-runtime --bench s3_incremental --features s3-compat-tests \
-            > "${{ steps.config.outputs.benchmark_result_path }}"
 
       - name: Run nightly benchmark gate
-        if: steps.config.outputs.benchmark_configured == 'true' || steps.config.outputs.live_s3_configured == 'true'
+        if: steps.config.outputs.benchmark_configured == 'true'
         run: |
           test -f "${{ steps.config.outputs.benchmark_result_path }}"
           mkdir -p target/velorix-bench
@@ -130,7 +120,7 @@ jobs:
             --json > target/velorix-bench/s3-nightly-gate.json
 
       - name: Upload nightly benchmark result
-        if: always() && (steps.config.outputs.benchmark_configured == 'true' || steps.config.outputs.live_s3_configured == 'true')
+        if: always() && steps.config.outputs.benchmark_configured == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: s3-nightly-benchmark

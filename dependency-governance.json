@@ -130,8 +130,8 @@
       "crate": "quick-xml",
       "owner": "runtime",
       "expires_on": "2026-08-31",
-      "reason": "object_store 0.14 uses fixed quick-xml 0.41, while DataFusion 54 and the pinned Hiqlite dependency graph still carry quick-xml 0.39.",
-      "replacement_plan": "Upgrade DataFusion's object_store line and the Hiqlite/cryptr S3 dependency when their upstream ranges move to quick-xml 0.41 or newer.",
+      "reason": "object_store 0.14 uses fixed quick-xml 0.41, while the pinned Hiqlite -> cryptr -> s3-simple dependency path still carries quick-xml 0.39.",
+      "replacement_plan": "Upgrade the Hiqlite/cryptr S3 dependency when its upstream range moves to quick-xml 0.41 or newer.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
@@ -409,8 +409,8 @@
       "crate": "quick-xml:RUSTSEC-2026-0194",
       "owner": "storage",
       "expires_on": "2026-08-31",
-      "reason": "The authority path is fixed on quick-xml 0.41, but DataFusion 54's object_store 0.13 S3 compatibility path and the pinned Hiqlite/cryptr S3 dependency still select quick-xml 0.39.",
-      "replacement_plan": "Upgrade DataFusion's object_store dependency and the Hiqlite/cryptr S3 dependency to quick-xml 0.41 or newer, then remove the deny.toml exception.",
+      "reason": "The authority path is fixed on quick-xml 0.41, but the pinned Hiqlite -> cryptr -> s3-simple dependency path still selects quick-xml 0.39.",
+      "replacement_plan": "Upgrade the Hiqlite/cryptr S3 dependency to quick-xml 0.41 or newer, then remove the deny.toml exception.",
       "promotion_rule": "deny_after_expiry_or_renew_with_security_approval_and_updated_plan"
     },
     {
@@ -418,8 +418,8 @@
       "crate": "quick-xml:RUSTSEC-2026-0195",
       "owner": "storage",
       "expires_on": "2026-08-31",
-      "reason": "The authority path is fixed on quick-xml 0.41, but DataFusion 54's object_store 0.13 S3 compatibility path and the pinned Hiqlite/cryptr S3 dependency still select quick-xml 0.39.",
-      "replacement_plan": "Upgrade DataFusion's object_store dependency and the Hiqlite/cryptr S3 dependency to quick-xml 0.41 or newer, then remove the deny.toml exception.",
+      "reason": "The authority path is fixed on quick-xml 0.41, but the pinned Hiqlite -> cryptr -> s3-simple dependency path still selects quick-xml 0.39.",
+      "replacement_plan": "Upgrade the Hiqlite/cryptr S3 dependency to quick-xml 0.41 or newer, then remove the deny.toml exception.",
       "promotion_rule": "deny_after_expiry_or_renew_with_security_approval_and_updated_plan"
     }
   ]

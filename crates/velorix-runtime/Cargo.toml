@@ -9,45 +9,22 @@ arrow = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 datafusion = { workspace = true }
-foyer = { workspace = true }
 futures = { workspace = true }
 object_store = { workspace = true }
-object_store_13 = { package = "object_store", version = "0.13.2", default-features = false, features = ["aws"], optional = true }
-parquet = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-url = { workspace = true }
 velorix-core = { path = "../velorix-core" }
-velorix-control = { path = "../velorix-control" }
 velorix-storage = { path = "../velorix-storage" }
 
 [features]
 default = []
-legacy-source-scan-surfaces = []
-s3-compat-tests = ["legacy-source-scan-surfaces", "object_store/aws", "object_store_13"]
-
-[[test]]
-name = "local_recovery"
-path = "../../tests/e2e/local_recovery.rs"
-
-[[test]]
-name = "s3_compat_query"
-path = "tests/s3_compat_query.rs"
-required-features = ["s3-compat-tests"]
 
 [[bench]]
 name = "local_incremental"
 path = "../../benches/local_incremental.rs"
 harness = false
-required-features = ["legacy-source-scan-surfaces"]
-
-[[bench]]
-name = "s3_incremental"
-path = "../../benches/s3_incremental.rs"
-harness = false
-required-features = ["legacy-source-scan-surfaces"]
 
 [dev-dependencies]
 async-trait = { workspace = true }
@@ -55,7 +32,6 @@ bytes = { workspace = true }
 datafusion = { workspace = true }
 futures = { workspace = true }
 object_store = { workspace = true }
-parquet = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }

@@ -79,11 +79,8 @@ durability capabilities for every authoritative namespace.
 - Diagnostics report backend, namespace, and missing capability status for every
   authoritative namespace.
 - Complete namespace declarations pass validation.
-- Legacy persisted table scans are quarantined behind the default-off
-  `legacy-source-scan-surfaces` feature. When that feature is explicitly enabled
-  for compatibility tests, those scans still reject stores registered without
-  production capabilities and accept stores registered with complete declared
-  namespace capabilities.
+- Legacy persisted-source query surfaces and their compatibility feature have
+  been removed. Public queries read materialized output only.
 - Checked production SlateDB recovery opens the state store only through shared
   startup `AuthoritativeObjectStoreCapabilitiesV1` evidence and requires both
   checkpoint and state namespaces before opening SlateDB.

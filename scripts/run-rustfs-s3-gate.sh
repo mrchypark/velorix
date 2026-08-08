@@ -16,12 +16,11 @@ port="${VELORIX_RUSTFS_PORT:-9000}"
 region="${AWS_REGION:-us-east-1}"
 bucket="${VELORIX_S3_BUCKET:-velorix-rustfs}"
 prefix="${VELORIX_S3_PREFIX:-rustfs-s3-gate/${run_id}}"
-run_benchmark="${VELORIX_RUSTFS_RUN_BENCHMARK:-1}"
 cleanup="${VELORIX_RUSTFS_CLEANUP:-1}"
 min_free_kib="${VELORIX_RUSTFS_MIN_FREE_KIB:-4194304}"
 cargo_target_dir="${VELORIX_RUSTFS_CARGO_TARGET_DIR:-${repo_root}/target/rustfs-s3-gate}"
 evidence_path="${VELORIX_RUSTFS_EVIDENCE_PATH:-target/velorix-s3/rustfs-s3-gate-evidence.json}"
-benchmark_path="${VELORIX_RUSTFS_BENCHMARK_PATH:-target/velorix-bench/rustfs-s3-nightly.json}"
+benchmark_path=""
 production_gc_seed_path="${VELORIX_RUSTFS_PRODUCTION_GC_SEED_PATH:-target/release-evidence/rustfs-production-gc-seed.json}"
 production_gc_run_path="${VELORIX_RUSTFS_PRODUCTION_GC_RUN_PATH:-target/release-evidence/rustfs-production-gc-run.json}"
 production_gc_path="${VELORIX_RUSTFS_PRODUCTION_GC_PATH:-target/release-evidence/rustfs-production-gc.json}"
@@ -286,8 +285,8 @@ preflight_docker_networks
 
 cd "$repo_root"
 trap cleanup_rustfs EXIT
-mkdir -p "$(dirname "$evidence_path")" "$(dirname "$benchmark_path")" "$(dirname "$production_gc_seed_path")" "$(dirname "$production_gc_run_path")" "$(dirname "$production_gc_path")" "$(dirname "$production_gc_validation_path")"
-rm -f "$evidence_path" "$benchmark_path" "$production_gc_seed_path" "$production_gc_run_path" "$production_gc_path" "$production_gc_validation_path"
+mkdir -p "$(dirname "$evidence_path")" "$(dirname "$production_gc_seed_path")" "$(dirname "$production_gc_run_path")" "$(dirname "$production_gc_path")" "$(dirname "$production_gc_validation_path")"
+rm -f "$evidence_path" "$production_gc_seed_path" "$production_gc_run_path" "$production_gc_path" "$production_gc_validation_path"
 
 if docker container inspect "$container" >/dev/null 2>&1; then
   echo "docker container already exists: ${container}" >&2
@@ -339,14 +338,7 @@ fi
 
 cargo test -p velorix-storage --test s3_compat --features s3-compat-tests -- --nocapture --test-threads=1
 cargo test -p velorix-storage --test multi_process_ingest_admission --features s3-compat-tests -- --nocapture --test-threads=1
-cargo test -p velorix-runtime --test s3_compat_query --features s3-compat-tests -- --nocapture --test-threads=1
-
 benchmark_ran=false
-if [ "$run_benchmark" = "1" ]; then
-  cargo bench -p velorix-runtime --bench s3_incremental --features s3-compat-tests > "$benchmark_path"
-  cargo run -p velorix-cli -- benchmark-validate --result "$benchmark_path"
-  benchmark_ran=true
-fi
 
 production_gc_generated=false
 if [ "$run_production_gc_evidence" = "1" ]; then
@@ -431,7 +423,6 @@ evidence = {
     "live_tests": [
         "cargo test -p velorix-storage --test s3_compat --features s3-compat-tests",
         "cargo test -p velorix-storage --test multi_process_ingest_admission --features s3-compat-tests",
-        "cargo test -p velorix-runtime --test s3_compat_query --features s3-compat-tests",
     ],
     "benchmark": {
         "ran": benchmark_ran == "true",

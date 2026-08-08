@@ -500,7 +500,9 @@ Verification:
 
 4. **Move `ownership` out of `velorix-storage`.** Storage owns immutable bytes and manifests; metadata/control owns leases, fencing and authoritative progress.
 
-5. **Delete or quarantine `persisted_query`, `persisted_table` and `persisted_view` until each is proven necessary for the native MV path.** These names indicate alternate execution surfaces capable of retaining legacy source-scan behavior.
+5. **Completed: delete `persisted_query`, `persisted_table` and
+   `persisted_view`.** The runtime now exposes only native materialized-view
+   execution and materialized-output query contracts.
 
 6. **Keep direct storage/engine dependencies out of `velorix-cli`, `velorix-k8s`
    and route code.** Administrative clients should call authenticated APIs or

@@ -288,18 +288,6 @@ impl ObjectKey {
         )))
     }
 
-    pub fn persisted_query(query_id: &str) -> Result<Self, ObjectKeyError> {
-        validate_segment("query_id", query_id)?;
-
-        Ok(Self(format!("v1/queries/{query_id}.query.json")))
-    }
-
-    pub fn query_table(table_id: &str) -> Result<Self, ObjectKeyError> {
-        validate_segment("table_id", table_id)?;
-
-        Ok(Self(format!("v1/tables/{table_id}.table.json")))
-    }
-
     pub fn query_policy(tenant_id: &str, query_policy_id: &str) -> Result<Self, ObjectKeyError> {
         validate_segment("tenant_id", tenant_id)?;
         validate_segment("query_policy_id", query_policy_id)?;
@@ -1493,46 +1481,6 @@ mod tests {
         assert_eq!(parts.stream_id, "orders");
         assert_eq!(parts.partition_id, 7);
         assert_eq!(parts.owner_epoch, 42);
-    }
-
-    #[test]
-    fn persisted_query_key_is_deterministic() {
-        let key = ObjectKey::persisted_query("orders-by-account").unwrap();
-        let restarted = ObjectKey::persisted_query("orders-by-account").unwrap();
-
-        assert_eq!(key.as_str(), "v1/queries/orders-by-account.query.json");
-        assert_eq!(key, restarted);
-        assert_eq!(ObjectKey::parse(key.as_str()).unwrap(), key);
-    }
-
-    #[test]
-    fn persisted_query_key_rejects_path_unsafe_query_ids() {
-        for query_id in ["", ".", "..", "orders/by-account", "orders by account"] {
-            assert!(
-                ObjectKey::persisted_query(query_id).is_err(),
-                "accepted invalid query id: {query_id}"
-            );
-        }
-    }
-
-    #[test]
-    fn query_table_key_is_deterministic() {
-        let key = ObjectKey::query_table("orders-current").unwrap();
-        let restarted = ObjectKey::query_table("orders-current").unwrap();
-
-        assert_eq!(key.as_str(), "v1/tables/orders-current.table.json");
-        assert_eq!(key, restarted);
-        assert_eq!(ObjectKey::parse(key.as_str()).unwrap(), key);
-    }
-
-    #[test]
-    fn query_table_key_rejects_path_unsafe_table_ids() {
-        for table_id in ["", ".", "..", "orders/current", "orders current"] {
-            assert!(
-                ObjectKey::query_table(table_id).is_err(),
-                "accepted invalid table id: {table_id}"
-            );
-        }
     }
 
     #[test]
