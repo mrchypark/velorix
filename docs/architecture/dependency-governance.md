@@ -1,6 +1,6 @@
 # Dependency Governance
 
-Velorix runs `cargo deny check -W unmaintained` in CI.
+Velorix runs `cargo-deny 0.20.2` with `cargo deny check -W unmaintained` in CI.
 CI also installs Rust `1.95.0` and runs
 `cargo check --workspace --all-targets --locked` to enforce the declared MSRV
 against the locked dependency graph.

@@ -316,6 +316,15 @@
     },
     {
       "kind": "duplicate",
+      "crate": "md-5",
+      "owner": "runtime",
+      "expires_on": "2026-08-31",
+      "reason": "DataFusion object_store 0.13 and Velorix object_store 0.14 select adjacent md-5 release lines.",
+      "replacement_plan": "Remove when DataFusion and Velorix can share one object_store release line.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
       "crate": "spin",
       "owner": "metadata",
       "expires_on": "2026-08-31",
