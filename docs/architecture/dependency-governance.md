@@ -44,7 +44,7 @@ carries that support. Each package review names an owner, review date, local
 audit status, feature policy, and replacement plan. This is the required local
 audit workflow for the release gate.
 
-Every declared duplicate, unmaintained, or advisory exception must also name an
+Every declared duplicate, unmaintained, advisory, or yanked exception must also name an
 owner, expiry date, reason, replacement plan, and promotion rule. Expired
 exceptions fail closed: either the warning is removed, the package is upgraded
 or replaced, or the exception is renewed with a current owner and plan.
@@ -63,6 +63,11 @@ routine upstream movement.
 Unmaintained advisories are also warnings today. Each allowed exception is
 tracked in the governance manifest with an owner, expiry, reason, replacement
 plan, and promotion rule.
+
+Yanked packages remain visible as cargo-deny warnings and require the same
+owner, expiry, and replacement-plan fields. Advisories suppressed in
+`deny.toml` must still have one manifest record per advisory ID; suppression
+does not constitute security approval.
 
 The current generated 1.0 readiness report does not require a separate
 `cargo-vet` attestation. Decisions about whether duplicate-version,

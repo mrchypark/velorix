@@ -380,6 +380,35 @@ struct GenericAppliedEpoch {
     logical_epoch: LogicalEpoch,
 }
 
+const MAX_RETAINED_IDEMPOTENCY_KEYS: usize = 1_024;
+
+/// Keeps checkpointed idempotency history to 1,024 entries while retaining the most recent epochs.
+///
+/// Idempotency keys older than this window may be applied again once evicted; callers must
+/// therefore retry promptly rather than rely on the runtime as an unbounded deduplication log.
+fn retain_recent_applied_epochs(applied_epochs: &mut BTreeMap<String, LogicalEpoch>) {
+    applied_epochs.retain(|key, _| key.len() <= EpochIdempotencyKey::MAX_BYTES);
+    let overflow = applied_epochs
+        .len()
+        .saturating_sub(MAX_RETAINED_IDEMPOTENCY_KEYS);
+    if overflow == 0 {
+        return;
+    }
+
+    let mut oldest_first = applied_epochs
+        .iter()
+        .map(|(idempotency_key, logical_epoch)| (idempotency_key.clone(), *logical_epoch))
+        .collect::<Vec<_>>();
+    oldest_first.sort_unstable_by(|(left_key, left_epoch), (right_key, right_epoch)| {
+        left_epoch
+            .cmp(right_epoch)
+            .then_with(|| left_key.cmp(right_key))
+    });
+    for (idempotency_key, _) in oldest_first.into_iter().take(overflow) {
+        applied_epochs.remove(&idempotency_key);
+    }
+}
+
 pub struct FilterProjectRuntime {
     identity: StandingProgramIdentity,
     catalog: VelorixRelationCatalogV1,
@@ -828,6 +857,7 @@ impl StandingProgramRuntime for TumblingEventTimeAggregateRuntime {
         self.input_event_time_frontiers = next_event_time_frontiers.clone();
         self.applied_epochs
             .insert(idempotency_key_text, logical_epoch);
+        retain_recent_applied_epochs(&mut self.applied_epochs);
         self.logical_epoch = logical_epoch;
 
         Ok(EpochCommit {
@@ -945,6 +975,12 @@ impl StandingProgramRuntime for TumblingEventTimeAggregateRuntime {
             return Err(invalid_checkpoint());
         }
         validate_published_output(&payload.published_output)?;
+        let mut applied_epochs = payload
+            .applied_epochs
+            .into_iter()
+            .map(|entry| (entry.idempotency_key, entry.logical_epoch))
+            .collect();
+        retain_recent_applied_epochs(&mut applied_epochs);
         Ok(Self {
             identity: checkpoint.identity,
             catalog: payload.catalog,
@@ -957,11 +993,7 @@ impl StandingProgramRuntime for TumblingEventTimeAggregateRuntime {
             published_output: payload.published_output,
             input_frontiers: checkpoint.input_frontiers,
             input_event_time_frontiers: checkpoint.input_event_time_frontiers,
-            applied_epochs: payload
-                .applied_epochs
-                .into_iter()
-                .map(|entry| (entry.idempotency_key, entry.logical_epoch))
-                .collect(),
+            applied_epochs,
             logical_epoch: checkpoint.logical_epoch,
         })
     }
@@ -1199,6 +1231,7 @@ impl StandingProgramRuntime for FilterProjectRuntime {
         self.input_event_time_frontiers = input_event_time_frontiers.clone();
         self.applied_epochs
             .insert(idempotency_key_text, logical_epoch);
+        retain_recent_applied_epochs(&mut self.applied_epochs);
         self.logical_epoch = logical_epoch;
 
         Ok(EpochCommit {
@@ -1325,6 +1358,12 @@ impl StandingProgramRuntime for FilterProjectRuntime {
             validate_published_output(&full_output)?;
         }
         validate_published_output(&payload.published_output)?;
+        let mut applied_epochs = payload
+            .applied_epochs
+            .into_iter()
+            .map(|entry| (entry.idempotency_key, entry.logical_epoch))
+            .collect();
+        retain_recent_applied_epochs(&mut applied_epochs);
         Ok(Self {
             identity: checkpoint.identity,
             catalog: payload.catalog,
@@ -1337,11 +1376,7 @@ impl StandingProgramRuntime for FilterProjectRuntime {
             published_output: payload.published_output,
             input_frontiers: checkpoint.input_frontiers,
             input_event_time_frontiers: checkpoint.input_event_time_frontiers,
-            applied_epochs: payload
-                .applied_epochs
-                .into_iter()
-                .map(|entry| (entry.idempotency_key, entry.logical_epoch))
-                .collect(),
+            applied_epochs,
             logical_epoch: checkpoint.logical_epoch,
         })
     }
@@ -1561,6 +1596,7 @@ impl StandingProgramRuntime for LatestByKeyRuntime {
         self.input_event_time_frontiers = executor_commit.input_event_time_frontiers.clone();
         self.applied_epochs
             .insert(idempotency_key_text, logical_epoch);
+        retain_recent_applied_epochs(&mut self.applied_epochs);
         self.logical_epoch = logical_epoch;
 
         Ok(EpochCommit {
@@ -1684,6 +1720,12 @@ impl StandingProgramRuntime for LatestByKeyRuntime {
             });
         };
         validate_published_output(&published_output)?;
+        let mut applied_epochs = payload
+            .applied_epochs
+            .into_iter()
+            .map(|entry| (entry.idempotency_key, entry.logical_epoch))
+            .collect();
+        retain_recent_applied_epochs(&mut applied_epochs);
         Ok(Self {
             identity: checkpoint.identity,
             catalog: payload.catalog,
@@ -1696,11 +1738,7 @@ impl StandingProgramRuntime for LatestByKeyRuntime {
             published_output,
             input_frontiers: checkpoint.input_frontiers,
             input_event_time_frontiers: checkpoint.input_event_time_frontiers,
-            applied_epochs: payload
-                .applied_epochs
-                .into_iter()
-                .map(|entry| (entry.idempotency_key, entry.logical_epoch))
-                .collect(),
+            applied_epochs,
             logical_epoch: checkpoint.logical_epoch,
         })
     }
@@ -1953,6 +1991,7 @@ impl StandingProgramRuntime for AnalyticRowNumberRuntime {
         self.input_event_time_frontiers = input_event_time_frontiers.clone();
         self.applied_epochs
             .insert(idempotency_key_text, logical_epoch);
+        retain_recent_applied_epochs(&mut self.applied_epochs);
         self.logical_epoch = logical_epoch;
 
         Ok(EpochCommit {
@@ -2082,6 +2121,12 @@ impl StandingProgramRuntime for AnalyticRowNumberRuntime {
             &payload.catalog,
             &payload.plan,
         )?;
+        let mut applied_epochs = payload
+            .applied_epochs
+            .into_iter()
+            .map(|entry| (entry.idempotency_key, entry.logical_epoch))
+            .collect();
+        retain_recent_applied_epochs(&mut applied_epochs);
         Ok(Self {
             identity: checkpoint.identity,
             catalog: payload.catalog,
@@ -2094,11 +2139,7 @@ impl StandingProgramRuntime for AnalyticRowNumberRuntime {
             published_output: payload.published_output,
             input_frontiers: checkpoint.input_frontiers,
             input_event_time_frontiers: checkpoint.input_event_time_frontiers,
-            applied_epochs: payload
-                .applied_epochs
-                .into_iter()
-                .map(|entry| (entry.idempotency_key, entry.logical_epoch))
-                .collect(),
+            applied_epochs,
             logical_epoch: checkpoint.logical_epoch,
         })
     }
@@ -2909,6 +2950,7 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
             self.input_event_time_frontiers = input_event_time_frontiers.clone();
             self.applied_epochs
                 .insert(idempotency_key_text, logical_epoch);
+            retain_recent_applied_epochs(&mut self.applied_epochs);
 
             return Ok(EpochCommit {
                 logical_epoch,
@@ -2974,6 +3016,7 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
         self.input_event_time_frontiers = executor_commit.input_event_time_frontiers.clone();
         self.applied_epochs
             .insert(idempotency_key_text, logical_epoch);
+        retain_recent_applied_epochs(&mut self.applied_epochs);
 
         Ok(EpochCommit {
             logical_epoch,
@@ -3110,6 +3153,12 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
         };
         validate_published_output(&published_output)?;
         validate_published_output(&filtered_aggregate_state)?;
+        let mut applied_epochs = payload
+            .applied_epochs
+            .into_iter()
+            .map(|entry| (entry.idempotency_key, entry.logical_epoch))
+            .collect();
+        retain_recent_applied_epochs(&mut applied_epochs);
         Ok(Self {
             identity: checkpoint.identity,
             catalog: payload.catalog,
@@ -3123,11 +3172,7 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
             filtered_aggregate_state,
             input_frontiers: checkpoint.input_frontiers,
             input_event_time_frontiers: checkpoint.input_event_time_frontiers,
-            applied_epochs: payload
-                .applied_epochs
-                .into_iter()
-                .map(|entry| (entry.idempotency_key, entry.logical_epoch))
-                .collect(),
+            applied_epochs,
         })
     }
 }
@@ -3411,6 +3456,7 @@ impl StandingProgramRuntime for TwoInputJoinRuntime {
             self.input_event_time_frontiers = input_event_time_frontiers.clone();
             self.applied_epochs
                 .insert(idempotency_key_text, logical_epoch);
+            retain_recent_applied_epochs(&mut self.applied_epochs);
 
             return Ok(EpochCommit {
                 logical_epoch,
@@ -3477,6 +3523,7 @@ impl StandingProgramRuntime for TwoInputJoinRuntime {
         self.input_event_time_frontiers = executor_commit.input_event_time_frontiers.clone();
         self.applied_epochs
             .insert(idempotency_key_text, logical_epoch);
+        retain_recent_applied_epochs(&mut self.applied_epochs);
 
         Ok(EpochCommit {
             logical_epoch,
@@ -3605,6 +3652,12 @@ impl StandingProgramRuntime for TwoInputJoinRuntime {
         };
         validate_published_output(&published_output)?;
         validate_published_output(&filtered_aggregate_state)?;
+        let mut applied_epochs = payload
+            .applied_epochs
+            .into_iter()
+            .map(|entry| (entry.idempotency_key, entry.logical_epoch))
+            .collect();
+        retain_recent_applied_epochs(&mut applied_epochs);
         Ok(Self {
             identity: checkpoint.identity,
             catalogs: payload.catalogs,
@@ -3619,11 +3672,7 @@ impl StandingProgramRuntime for TwoInputJoinRuntime {
             filtered_aggregate_state,
             input_frontiers: checkpoint.input_frontiers,
             input_event_time_frontiers: checkpoint.input_event_time_frontiers,
-            applied_epochs: payload
-                .applied_epochs
-                .into_iter()
-                .map(|entry| (entry.idempotency_key, entry.logical_epoch))
-                .collect(),
+            applied_epochs,
         })
     }
 }
@@ -3865,8 +3914,8 @@ fn validate_join_plan_matches_catalogs(
         });
     }
     let aggregate_outputs = supported_join_view_plan_aggregate_outputs(plan);
-    if plan.join_kind == SupportedJoinKind::Left {
-        if plan.group_key_relation_id != plan.left_input_relation_id
+    if plan.join_kind == SupportedJoinKind::Left
+        && (plan.group_key_relation_id != plan.left_input_relation_id
             || plan.group_key_column_id != plan.left_join_key_column_id
             || plan
                 .aggregate_filter_exprs
@@ -3878,12 +3927,11 @@ fn validate_join_plan_matches_catalogs(
             || plan
                 .predicate_expr
                 .as_ref()
-                .is_some_and(|expr| !join_predicate_expr_is_left_only(expr, plan))
-        {
-            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
-                field: "generic_join_view_plan.left_join",
-            });
-        }
+                .is_some_and(|expr| !join_predicate_expr_is_left_only(expr, plan)))
+    {
+        return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+            field: "generic_join_view_plan.left_join",
+        });
     }
     let right_value_column_ids = supported_join_view_plan_right_value_column_ids(plan);
     for column_id in &right_value_column_ids {
@@ -4666,6 +4714,7 @@ fn validate_latest_supported_schemas(
     if plan.input_relation_id != catalog.relation_schema.relation_id
         || plan.key_column_id != key_column.column_id
         || ordering_column.column_id == catalog.relation_schema.weight_column_id
+        || ordering_column.nullable
         || value_column.column_id == catalog.relation_schema.weight_column_id
     {
         return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
@@ -4713,7 +4762,7 @@ fn validate_latest_supported_schemas(
         || key.nullable
         || value.name != plan.output_value_column_id
         || value.data_type != expected_value_type
-        || value.nullable
+        || value.nullable != value_column.nullable
     {
         return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
             field: "output_schema",
@@ -5050,14 +5099,22 @@ fn validate_plan_matches_catalog(
                 LogicalPlanAggregateFunctionV1::Count
                     | LogicalPlanAggregateFunctionV1::CountDistinct
             ) {
-                catalog_column(catalog, input_column_id)?;
+                let column = catalog_column(catalog, input_column_id)?;
                 if single_key_count_only_input_column(plan).is_none()
                     && single_key_count_distinct_input_column(plan).is_none()
                     && input_column_id != &plan.sum_value_column_id
                 {
-                    return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
-                        field: "generic_view_plan.aggregate_outputs",
-                    });
+                    let nullable_count_distinct = column.nullable
+                        && output.function == LogicalPlanAggregateFunctionV1::CountDistinct;
+                    if multi_input_column_ids.is_none()
+                        || column.column_id == catalog.relation_schema.weight_column_id
+                        || (column.nullable && !nullable_count_distinct)
+                        || column.physical_arrow_type != ArrowPhysicalTypeV1::Int64
+                    {
+                        return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                            field: "generic_view_plan.aggregate_outputs",
+                        });
+                    }
                 }
             } else if input_column_id != &plan.sum_value_column_id {
                 if multi_input_column_ids.is_none() {
@@ -5446,9 +5503,18 @@ fn apply_filtered_single_key_aggregate_delta(
                     delta: record.weight,
                 },
                 LogicalPlanAggregateFunctionV1::CountDistinct => {
+                    let input_value = aggregate_input_value(
+                        aggregate,
+                        plan.sum_value_column_id.as_str(),
+                        record,
+                        catalog,
+                    )?;
+                    if input_value.is_null() {
+                        continue;
+                    }
                     FilteredAggregateUpdate::Multiset {
                         aggregate: aggregate.clone(),
-                        value: record.value.as_json().clone(),
+                        value: input_value,
                     }
                 }
                 LogicalPlanAggregateFunctionV1::Min | LogicalPlanAggregateFunctionV1::Max => {
@@ -5939,6 +6005,22 @@ fn aggregate_input_i64_value(
     evaluate_projection_expr(expression, &input, catalog)
 }
 
+fn aggregate_input_value(
+    aggregate: &SupportedAggregateOutput,
+    value_column_id: &str,
+    record: &DeltaRecord,
+    catalog: &VelorixRelationCatalogV1,
+) -> Result<Value, StandingProgramRuntimeError> {
+    let Some(expression) = &aggregate.input_expression else {
+        return Ok(aggregate_input_record_value(aggregate, value_column_id, record).clone());
+    };
+    let mut input = Map::new();
+    input.insert(value_column_id.to_string(), record.value.as_json().clone());
+    Ok(Value::Number(JsonNumber::from(evaluate_projection_expr(
+        expression, &input, catalog,
+    )?)))
+}
+
 fn aggregate_input_f64_value(
     aggregate: &SupportedAggregateOutput,
     value_column_id: &str,
@@ -6415,8 +6497,7 @@ fn filter_delta_batch_for_analytic_row_number_plan(
     };
     let mut records = Vec::new();
     for record in delta.records() {
-        if analytic_row_number_predicate_expr_matches_record(predicate_expr, catalog, plan, record)?
-        {
+        if analytic_row_number_predicate_expr_matches_record(predicate_expr, catalog, record)? {
             records.push(record.clone());
         }
     }
@@ -6426,7 +6507,6 @@ fn filter_delta_batch_for_analytic_row_number_plan(
 fn analytic_row_number_predicate_expr_matches_record(
     predicate_expr: &RowPredicateExpr,
     catalog: &VelorixRelationCatalogV1,
-    plan: &SupportedAnalyticRowNumberPlan,
     record: &DeltaRecord,
 ) -> Result<bool, StandingProgramRuntimeError> {
     match predicate_expr {
@@ -6461,12 +6541,12 @@ fn analytic_row_number_predicate_expr_matches_record(
             )
         }
         RowPredicateExpr::And { left, right } => Ok(
-            analytic_row_number_predicate_expr_matches_record(left, catalog, plan, record)?
-                && analytic_row_number_predicate_expr_matches_record(right, catalog, plan, record)?,
+            analytic_row_number_predicate_expr_matches_record(left, catalog, record)?
+                && analytic_row_number_predicate_expr_matches_record(right, catalog, record)?,
         ),
         RowPredicateExpr::Or { left, right } => Ok(
-            analytic_row_number_predicate_expr_matches_record(left, catalog, plan, record)?
-                || analytic_row_number_predicate_expr_matches_record(right, catalog, plan, record)?,
+            analytic_row_number_predicate_expr_matches_record(left, catalog, record)?
+                || analytic_row_number_predicate_expr_matches_record(right, catalog, record)?,
         ),
     }
 }
@@ -6594,11 +6674,11 @@ fn scalar_int64_expression_comparison_matches_input(
             field: "scalar_int64_predicate_expression",
         });
     }
-    Ok(compare_ord(
+    compare_ord(
         i128::from(evaluate_projection_expr(left, input, catalog)?),
         comparison_op,
         i128::from(evaluate_projection_expr(right, input, catalog)?),
-    )?)
+    )
 }
 
 fn projection_predicate_expr_matches_input(
@@ -7148,6 +7228,7 @@ fn join_scalar_int64_predicate_expr_matches_joined_record(
     scalar_int64_comparison_matches_input(left, comparison_op, literal, &input, catalog)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn join_scalar_int64_expression_comparison_matches_joined_record(
     left_relation_id: &str,
     left: &SupportedProjectionExpr,
@@ -8468,7 +8549,7 @@ impl AnalyticRowNumberState {
             .map_or(0_i64, |row| row.weight)
             .checked_add(record.weight)
             .ok_or_else(invalid_runtime_state)?;
-        if next_weight < 0 || next_weight > 1 {
+        if !(0..=1).contains(&next_weight) {
             return Err(invalid_runtime_state());
         }
         if next_weight == 0 {

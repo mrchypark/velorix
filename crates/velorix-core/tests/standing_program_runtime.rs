@@ -226,6 +226,12 @@ impl StandingProgramRuntime for FakeStandingProgramRuntime {
 }
 
 #[test]
+fn epoch_idempotency_keys_have_a_checkpoint_safe_size_bound() {
+    assert!(EpochIdempotencyKey::new("k".repeat(EpochIdempotencyKey::MAX_BYTES)).is_ok());
+    assert!(EpochIdempotencyKey::new("k".repeat(EpochIdempotencyKey::MAX_BYTES + 1)).is_err());
+}
+
+#[test]
 fn standing_program_runtime_applies_relation_scoped_epoch_and_emits_view_scoped_commit() {
     let identity = valid_identity();
     let mut runtime = FakeStandingProgramRuntime {

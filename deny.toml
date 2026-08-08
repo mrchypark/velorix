@@ -7,8 +7,17 @@ all-features = true
 
 [advisories]
 version = 2
-yanked = "deny"
-ignore = []
+# `spin 0.9.8` is selected through flume by the pinned Hiqlite graph. Keep it
+# visible in CI and governed by an expiring manifest exception.
+yanked = "warn"
+ignore = [
+  # object_store 0.12/0.13 constrain quick-xml below the fixed 0.41 release.
+  # DataFusion 53/54 still constrains its scan client to object_store 0.13, so
+  # removal requires coordinated upstream dependency convergence. Both risks
+  # have owner/expiry records in dependency-governance.json.
+  "RUSTSEC-2026-0194",
+  "RUSTSEC-2026-0195",
+]
 
 [licenses]
 version = 2
@@ -20,6 +29,7 @@ allow = [
   "BSL-1.0",
   "bzip2-1.0.6",
   "CC0-1.0",
+  "CDLA-Permissive-2.0",
   "ISC",
   "MIT",
   "MIT-0",

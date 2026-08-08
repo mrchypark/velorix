@@ -62,6 +62,12 @@ pub fn delta_batch_to_record_batch(
         } else {
             key_val
         };
+        if key_val.is_null() {
+            return Err(DeltaToArrowError::InvalidValueType {
+                name: key_col.name.clone(),
+                expected: "non-nullable".into(),
+            });
+        }
         keys.push(key_val);
 
         if !value_cols.is_empty() {
@@ -113,7 +119,7 @@ pub fn arrow_data_type(data_type: &SqlDataType) -> Result<DataType, DeltaToArrow
         SqlDataType::Float64 => Ok(DataType::Float64),
         SqlDataType::Bool => Ok(DataType::Boolean),
         SqlDataType::Decimal { precision, scale } => {
-            Ok(DataType::Decimal128(*precision as u8, *scale as i8))
+            Ok(DataType::Decimal128(*precision, *scale as i8))
         }
         SqlDataType::Json => Ok(DataType::Utf8),
         SqlDataType::Date => Ok(DataType::Date32),
@@ -253,5 +259,32 @@ mod tests {
         let batch = DeltaBatch::default();
         let rb = delta_batch_to_record_batch(&schema, &batch).unwrap();
         assert_eq!(rb.num_rows(), 0);
+    }
+
+    #[test]
+    fn delta_to_arrow_rejects_null_non_nullable_key() {
+        let schema = RelationSchema {
+            relation_id: "test".into(),
+            relation_name: "test".into(),
+            relation_version: "1".into(),
+            schema_fingerprint: "fp".into(),
+            columns: vec![ColumnSchema {
+                name: "key".into(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            }],
+            primary_key: vec!["key".into()],
+        };
+        let batch = DeltaBatch::from_records(vec![DeltaRecord::new(
+            DeltaKey::from_json(serde_json::Value::Null),
+            DeltaValue::from_json(serde_json::json!({"key": null})),
+            1,
+        )]);
+
+        assert!(matches!(
+            delta_batch_to_record_batch(&schema, &batch),
+            Err(DeltaToArrowError::InvalidValueType { name, expected })
+                if name == "key" && expected == "non-nullable"
+        ));
     }
 }

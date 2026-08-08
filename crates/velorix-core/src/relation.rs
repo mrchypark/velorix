@@ -1246,20 +1246,26 @@ pub fn arrow_record_batches_to_key_latest_by_delta_batch(
         let weight = int64_column(batch, weight_column.name.as_str())?;
 
         for row in 0..batch.num_rows() {
-            if key.is_null(row)
-                || value.is_null(row)
-                || ordering.is_null(row)
-                || weight.is_null(row)
-            {
+            if key.is_null(row) || ordering.is_null(row) || weight.is_null(row) {
                 return Err(IncrementalInputAdapterError::MalformedArrowInput {
                     reason: "materialized view input columns must be non-null".to_string(),
                 });
             }
+            let value = if value.is_null(row) {
+                if !value_column.nullable {
+                    return Err(IncrementalInputAdapterError::MalformedArrowInput {
+                        reason: "materialized view input columns must be non-null".to_string(),
+                    });
+                }
+                Value::Null
+            } else {
+                value.json_value(row)?
+            };
 
             records.push(DeltaRecord::new(
                 key.delta_key(row)?,
                 DeltaValue::from_json(json!({
-                    "value": value.json_value(row)?,
+                    "value": value,
                     "ordering": ordering.json_value(row)?,
                 })),
                 weight.value(row),

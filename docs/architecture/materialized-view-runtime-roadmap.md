@@ -246,12 +246,16 @@ Current implementation evidence:
 - Active runtime bindings persist the admitted `VelorixLogicalViewPlanV1`, and
   runtime creation uses that stored plan instead of reparsing a fallback SQL
   shape at activation or restart.
-- Admission tests now cover unsupported one-input and join SQL families,
-  including window aggregates, distinct aggregates, LEFT JOIN, and non-equality
-  joins.
+- Admission tests cover unsupported one-input and join SQL families, including
+  non-equality joins and SQL outside the narrow family-specific scopes. The
+  supported aggregate runtime includes `COUNT(DISTINCT ...)`; the supported
+  join runtime includes a constrained `LEFT JOIN` that preserves unmatched left
+  rows. The exact contract, including left-join restrictions and experimental
+  SQL, is documented in [Supported materialized-view SQL](supported-sql.md).
 - Identity CTE source filters are admitted for the supported one-input,
   window, latest-by-key, and two-relation join shapes; supported two-relation
-  inner-join aggregate views can also apply admitted join `WHERE` predicates.
+  join aggregate views can also apply admitted join `WHERE` predicates within
+  their family-specific scope.
 - Single-relation and two-relation inner-join aggregate views support a simple
   `HAVING` comparison against a projected aggregate output.
 - Runtime commit tests now assert ingest emits signed materialized output

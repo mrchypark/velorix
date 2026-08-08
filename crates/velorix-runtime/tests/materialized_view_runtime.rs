@@ -119,6 +119,77 @@ fn runtime_materializes_sum_count_for_relation_without_value_semantic_role() {
 }
 
 #[test]
+fn runtime_bounds_restored_idempotency_history_and_preserves_recent_duplicates() {
+    let catalog = purchases_catalog_without_value_role();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = purchases_output_schema();
+    let sql =
+        "select user_id, sum(amount) as sum, count(*) as count from purchases group by user_id";
+    let identity = standing_identity(sql);
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(1, EpochIdempotencyKey::new("seed").unwrap(), Vec::new())
+        .unwrap();
+
+    let mut checkpoint = runtime.checkpoint().unwrap();
+    let state_payload = checkpoint.state_payload.as_mut().unwrap();
+    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    payload["applied_epochs"] = Value::Array(
+        (1..=1_025)
+            .map(|logical_epoch| {
+                json!({
+                    "idempotency_key": format!("epoch-{logical_epoch}"),
+                    "logical_epoch": logical_epoch,
+                })
+            })
+            .collect(),
+    );
+    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    checkpoint.state_root.content_hash = stable_bytes_hash(state_payload.payload.as_bytes());
+
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    let checkpoint = restored.checkpoint().unwrap();
+    let payload: Value = serde_json::from_str(&checkpoint.state_payload.unwrap().payload).unwrap();
+    let applied_epochs = payload["applied_epochs"].as_array().unwrap();
+    assert_eq!(applied_epochs.len(), 1_024);
+    assert!(applied_epochs
+        .iter()
+        .any(|entry| entry["idempotency_key"] == "epoch-1025"));
+    assert!(!applied_epochs
+        .iter()
+        .any(|entry| entry["idempotency_key"] == "epoch-1"));
+
+    let duplicate = restored
+        .apply_changes(
+            1_025,
+            EpochIdempotencyKey::new("epoch-1025").unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
+    assert!(duplicate.output_deltas.is_empty());
+    assert!(matches!(
+        restored.apply_changes(
+            1_026,
+            EpochIdempotencyKey::new("epoch-1025").unwrap(),
+            Vec::new(),
+        ),
+        Err(StandingProgramRuntimeError::IdempotencyKeyConflict {
+            first_epoch: 1_025,
+            attempted_epoch: 1_026,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn runtime_materializes_sum_arithmetic_expression() {
     let catalog = purchases_catalog_without_value_role();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
@@ -2969,6 +3040,124 @@ fn runtime_materializes_single_key_aggregates_over_multiple_raw_int64_input_colu
         runtime.as_ref(),
         2,
         &[("alice", 7, -2, -2, -2.0, 1), ("bob", 7, -4, 8, 2.0, 2)],
+    );
+}
+
+#[test]
+fn runtime_materializes_multi_input_count_distinct_by_selected_value_across_restore_and_retractions(
+) {
+    let mut catalog = scores_with_adjustment_catalog();
+    let adjustment = catalog
+        .relation_schema
+        .columns
+        .iter_mut()
+        .find(|column| column.column_id == "user_id_adjustment")
+        .unwrap();
+    adjustment.nullable = true;
+    let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema)
+        .expect("nullable adjustment catalog should fingerprint");
+    catalog.schema_fingerprint = schema_fingerprint.clone();
+    catalog.incremental_relation.schema_fingerprint = schema_fingerprint;
+
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = scores_multi_input_distinct_output_schema();
+    let sql = "select user_id, sum(score) as sum_score, count(distinct user_id_adjustment) as distinct_adjustments from scores group by user_id";
+    let identity = standing_identity_with_view(sql, "scores_by_user_distinct_adjustment");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("epoch-1").unwrap(),
+            vec![RelationInputBatch {
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "scores-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 4,
+                event_time_watermark: None,
+                batches: vec![scores_with_nullable_adjustment_rows_batch(&[
+                    ("alice", 10, Some(3), 1),
+                    ("alice", 7, Some(3), 1),
+                    ("alice", 5, Some(5), 1),
+                    ("alice", 2, None, 1),
+                ])],
+            }],
+        )
+        .unwrap();
+    assert_sum_count_page(
+        runtime.as_ref(),
+        "scores_by_user_distinct_adjustment",
+        1,
+        &[("alice", 24, 2)],
+    );
+
+    let mut restored = restore_standing_runtime(runtime.checkpoint().unwrap()).unwrap();
+    restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("epoch-2").unwrap(),
+            vec![RelationInputBatch {
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "scores-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 4,
+                end_offset_exclusive: 5,
+                event_time_watermark: None,
+                batches: vec![scores_with_nullable_adjustment_rows_batch(&[(
+                    "alice",
+                    10,
+                    Some(3),
+                    -1,
+                )])],
+            }],
+        )
+        .unwrap();
+    assert_sum_count_page(
+        restored.as_ref(),
+        "scores_by_user_distinct_adjustment",
+        2,
+        &[("alice", 14, 2)],
+    );
+
+    restored
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("epoch-3").unwrap(),
+            vec![RelationInputBatch {
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "scores-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 5,
+                end_offset_exclusive: 6,
+                event_time_watermark: None,
+                batches: vec![scores_with_nullable_adjustment_rows_batch(&[(
+                    "alice",
+                    7,
+                    Some(3),
+                    -1,
+                )])],
+            }],
+        )
+        .unwrap();
+    assert_sum_count_page(
+        restored.as_ref(),
+        "scores_by_user_distinct_adjustment",
+        3,
+        &[("alice", 7, 1)],
     );
 }
 
@@ -6361,6 +6550,65 @@ fn runtime_materializes_left_join_left_only_aggregates_for_unmatched_left_rows()
             ("charlie", 30, 1, 30, 30, 30.0),
         ],
     );
+
+    // The right relation is keyed by account_id, so an unmatched left row and
+    // its later single match each contribute exactly once. Matching and then
+    // retracting the right row after recovery must not duplicate or remove the
+    // left-only aggregate.
+    let mut restored = restore_standing_runtime(runtime.checkpoint().unwrap()).unwrap();
+    restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("epoch-2").unwrap(),
+            vec![RelationInputBatch {
+                relation_id: accounts.relation_schema.relation_id.clone(),
+                relation_version: accounts.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: accounts.schema_fingerprint.to_string(),
+                start_offset_inclusive: 2,
+                end_offset_exclusive: 3,
+                event_time_watermark: None,
+                batches: vec![accounts_rows_batch(&[("charlie", 100, "gold", 1)])],
+            }],
+        )
+        .unwrap();
+    assert_join_stats_page(
+        restored.as_ref(),
+        2,
+        &[
+            ("alice", 17, 2, 7, 10, 8.5),
+            ("bob", 5, 1, 5, 5, 5.0),
+            ("charlie", 30, 1, 30, 30, 30.0),
+        ],
+    );
+
+    restored
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("epoch-3").unwrap(),
+            vec![RelationInputBatch {
+                relation_id: accounts.relation_schema.relation_id.clone(),
+                relation_version: accounts.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: accounts.schema_fingerprint.to_string(),
+                start_offset_inclusive: 3,
+                end_offset_exclusive: 4,
+                event_time_watermark: None,
+                batches: vec![accounts_rows_batch(&[("charlie", 100, "gold", -1)])],
+            }],
+        )
+        .unwrap();
+    assert_join_stats_page(
+        restored.as_ref(),
+        3,
+        &[
+            ("alice", 17, 2, 7, 10, 8.5),
+            ("bob", 5, 1, 5, 5, 5.0),
+            ("charlie", 30, 1, 30, 30, 30.0),
+        ],
+    );
 }
 
 #[test]
@@ -8434,6 +8682,75 @@ fn runtime_materializes_two_relation_join_with_left_where_filter() {
         .unwrap();
 
     assert_join_page(runtime.as_ref(), 1, &[("alice", 14, 3)]);
+
+    let mut restored = restore_standing_runtime(runtime.checkpoint().unwrap()).unwrap();
+    restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("epoch-2").unwrap(),
+            vec![
+                RelationInputBatch {
+                    relation_id: scores.relation_schema.relation_id.clone(),
+                    relation_version: scores.relation_schema.relation_version.clone(),
+                    stream_id: "test-stream".to_string(),
+                    partition_id: 0,
+                    schema_fingerprint: scores.schema_fingerprint.to_string(),
+                    start_offset_inclusive: 6,
+                    end_offset_exclusive: 9,
+                    event_time_watermark: None,
+                    batches: vec![scores_rows_batch(&[
+                        ("alice", 20, 1),  // passes the left predicate
+                        ("alice", 200, 1), // fails `score < 100`
+                        ("alice", -3, -1), // retracts a passing row
+                    ])],
+                },
+                RelationInputBatch {
+                    relation_id: accounts.relation_schema.relation_id.clone(),
+                    relation_version: accounts.relation_schema.relation_version.clone(),
+                    stream_id: "test-stream".to_string(),
+                    partition_id: 0,
+                    schema_fingerprint: accounts.schema_fingerprint.to_string(),
+                    start_offset_inclusive: 3,
+                    end_offset_exclusive: 4,
+                    event_time_watermark: None,
+                    batches: vec![accounts_rows_batch(&[("charlie", 100, "gold", 1)])],
+                },
+            ],
+        )
+        .unwrap();
+    assert_join_page(restored.as_ref(), 2, &[("alice", 37, 3), ("charlie", 8, 1)]);
+
+    restored
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("epoch-3").unwrap(),
+            vec![
+                RelationInputBatch {
+                    relation_id: scores.relation_schema.relation_id.clone(),
+                    relation_version: scores.relation_schema.relation_version.clone(),
+                    stream_id: "test-stream".to_string(),
+                    partition_id: 0,
+                    schema_fingerprint: scores.schema_fingerprint.to_string(),
+                    start_offset_inclusive: 9,
+                    end_offset_exclusive: 10,
+                    event_time_watermark: None,
+                    batches: vec![scores_rows_batch(&[("alice", 20, -1)])],
+                },
+                RelationInputBatch {
+                    relation_id: accounts.relation_schema.relation_id.clone(),
+                    relation_version: accounts.relation_schema.relation_version.clone(),
+                    stream_id: "test-stream".to_string(),
+                    partition_id: 0,
+                    schema_fingerprint: accounts.schema_fingerprint.to_string(),
+                    start_offset_inclusive: 4,
+                    end_offset_exclusive: 5,
+                    event_time_watermark: None,
+                    batches: vec![accounts_rows_batch(&[("charlie", 100, "gold", -1)])],
+                },
+            ],
+        )
+        .unwrap();
+    assert_join_page(restored.as_ref(), 3, &[("alice", 17, 2)]);
 }
 
 #[test]
@@ -12538,6 +12855,33 @@ fn scores_multi_input_stats_output_schema() -> RelationSchema {
     }
 }
 
+fn scores_multi_input_distinct_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "scores_by_user_distinct_adjustment".to_string(),
+        relation_name: "scores_by_user_distinct_adjustment".to_string(),
+        relation_version: "2026-05-24.v1".to_string(),
+        schema_fingerprint: "scores-multi-input-distinct-v1".to_string(),
+        columns: vec![
+            ColumnSchema {
+                name: "user_id".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "sum_score".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "distinct_adjustments".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["user_id".to_string()],
+    }
+}
+
 fn purchases_count_output_schema() -> RelationSchema {
     RelationSchema {
         relation_id: "purchases_by_user_count".to_string(),
@@ -13871,6 +14215,42 @@ fn scores_with_adjustment_rows_batch(rows: &[(&str, i64, i64, i64)]) -> RecordBa
             Field::new("user_id", DataType::Utf8, false),
             Field::new("score", DataType::Int64, false),
             Field::new("user_id_adjustment", DataType::Int64, false),
+            Field::new("delta", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|(user_id, _, _, _)| *user_id)
+                    .collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(Int64Array::from(
+                rows.iter()
+                    .map(|(_, score, _, _)| *score)
+                    .collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(Int64Array::from(
+                rows.iter()
+                    .map(|(_, _, adjustment, _)| *adjustment)
+                    .collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(Int64Array::from(
+                rows.iter()
+                    .map(|(_, _, _, delta)| *delta)
+                    .collect::<Vec<_>>(),
+            )) as _,
+        ],
+    )
+    .unwrap()
+}
+
+fn scores_with_nullable_adjustment_rows_batch(
+    rows: &[(&str, i64, Option<i64>, i64)],
+) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("score", DataType::Int64, false),
+            Field::new("user_id_adjustment", DataType::Int64, true),
             Field::new("delta", DataType::Int64, false),
         ])),
         vec![

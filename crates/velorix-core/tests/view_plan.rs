@@ -3568,17 +3568,16 @@ fn two_input_join_sql_rejects_mixed_side_scalar_int64_residual_predicates() {
     let accounts = accounts_catalog();
     let catalogs = [scores, accounts];
 
-    for sql in [
-        "select a.account_id, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.user_id = a.account_id where s.score + a.limit > 10 group by a.account_id",
-    ] {
-        let error = validate_supported_join_view_sql(sql, &catalogs).unwrap_err();
+    let sql = "select a.account_id, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.user_id = a.account_id where s.score + a.limit > 10 group by a.account_id";
+    let error = validate_supported_join_view_sql(sql, &catalogs).unwrap_err();
 
-        assert!(matches!(error, ViewPlanError::UnsupportedShape { .. }));
-        assert!(
-            error.to_string().contains("exactly one joined relation side"),
-            "expected explicit cross-side scalar predicate rejection for SQL `{sql}`, got `{error}`"
-        );
-    }
+    assert!(matches!(error, ViewPlanError::UnsupportedShape { .. }));
+    assert!(
+        error
+            .to_string()
+            .contains("exactly one joined relation side"),
+        "expected explicit cross-side scalar predicate rejection for SQL `{sql}`, got `{error}`"
+    );
 }
 
 #[test]
@@ -3730,6 +3729,31 @@ fn latest_by_key_fixture_sql_accepts_arg_max_shape() {
     assert_eq!(plan.ordering_column_id, "event_time");
     assert_eq!(plan.output_value_column_id, "enabled");
     assert!(plan.predicate_expr.is_some());
+}
+
+#[test]
+fn latest_by_key_sql_rejects_nullable_ordering_column() {
+    let mut catalog = device_status_catalog();
+    catalog
+        .relation_schema
+        .columns
+        .iter_mut()
+        .find(|column| column.column_id == "event_time")
+        .unwrap()
+        .nullable = true;
+    let schema_fingerprint =
+        SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema).unwrap();
+    catalog.schema_fingerprint = schema_fingerprint.clone();
+    catalog.incremental_relation.schema_fingerprint = schema_fingerprint;
+
+    let error = validate_supported_latest_by_key_sql(
+        "select device_id, arg_max(enabled, event_time) as enabled from device_status group by device_id",
+        &catalog,
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, ViewPlanError::UnsupportedShape { .. }));
+    assert!(error.to_string().contains("must be non-nullable"));
 }
 
 #[test]
@@ -8016,14 +8040,10 @@ fn two_input_join_sql_rejects_right_side_and_mismatched_value_aggregates() {
     let scores = scores_catalog();
     let accounts = accounts_catalog();
 
-    for sql in [
-        "select a.account_id, sum(s.score) as sum, count(*) as count, avg(s.user_id) as avg_user from scores s join accounts a on s.user_id = a.account_id group by a.account_id",
-    ] {
-        let error = validate_supported_join_view_sql(sql, &[scores.clone(), accounts.clone()])
-            .unwrap_err();
+    let sql = "select a.account_id, sum(s.score) as sum, count(*) as count, avg(s.user_id) as avg_user from scores s join accounts a on s.user_id = a.account_id group by a.account_id";
+    let error = validate_supported_join_view_sql(sql, &[scores, accounts]).unwrap_err();
 
-        assert!(matches!(error, ViewPlanError::UnsupportedShape { .. }));
-    }
+    assert!(matches!(error, ViewPlanError::UnsupportedShape { .. }));
 }
 
 #[test]

@@ -40,6 +40,7 @@ jobs:
           bash -n scripts/check-vind-product-contract.sh
           bash -n scripts/check-release-evidence-copy-contract.sh
           bash -n scripts/check-rustfs-s3-gate-contract.sh
+          bash -n scripts/check-no-external-runtime-artifacts.sh
           python3 -m py_compile scripts/copy-readiness-sibling-evidence.py
 
       - name: Check first-E2E readiness contract
@@ -48,6 +49,7 @@ jobs:
           scripts/check-vind-product-contract.sh
           scripts/check-release-evidence-copy-contract.sh
           scripts/check-rustfs-s3-gate-contract.sh
+          scripts/check-no-external-runtime-artifacts.sh
 
   msrv:
     name: MSRV check
@@ -148,7 +150,7 @@ jobs:
       - name: Run local benchmark
         run: |
           mkdir -p target/velorix-bench
-          cargo bench --bench local_incremental > target/velorix-bench/local-pr-smoke.json
+          cargo bench -p velorix-runtime --features legacy-source-scan-surfaces --bench local_incremental > target/velorix-bench/local-pr-smoke.json
 
       - name: Validate benchmark JSON
         run: cargo run -p velorix-cli -- benchmark-validate --result target/velorix-bench/local-pr-smoke.json

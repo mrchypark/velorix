@@ -30,3 +30,10 @@ The static Markdown matrix was removed because it could say `complete` while
 required artifacts were missing, local-only, stale, or failed their artifact
 requirements. The release decision must come from the generated readiness report
 and its concrete evidence artifacts, not from this file.
+
+For RustFS production GC evidence, `gc-seed-s3-compatible-fixture` prepares
+the retired-checkpoint fixture and `gc-execute-s3-compatible` can create the live `GcRunV1`
+on the same authority. `gc-production-evidence` separately emits the
+verification artifact, and `rustfs-production-gc-evidence-validate` binds
+the seed, execute, and production evidence to one authority, run id, retention
+policy, and persisted-run digest.

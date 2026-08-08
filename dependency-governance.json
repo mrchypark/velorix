@@ -208,15 +208,6 @@
     },
     {
       "kind": "duplicate",
-      "crate": "constant_time_eq",
-      "owner": "metadata",
-      "expires_on": "2026-08-31",
-      "reason": "The pinned mrchypark/hiqlite metadata backend introduces constant_time_eq versions alongside existing crypto/storage transitive dependencies.",
-      "replacement_plan": "Upgrade hiqlite and crypto/storage dependencies when upstream ranges converge.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
-    },
-    {
-      "kind": "duplicate",
       "crate": "fs4",
       "owner": "state",
       "expires_on": "2026-08-31",
@@ -258,15 +249,6 @@
       "expires_on": "2026-08-31",
       "reason": "The pinned mrchypark/hiqlite metadata backend and existing rustls/ring graph introduce multiple untrusted versions while TLS dependencies converge.",
       "replacement_plan": "Upgrade hiqlite and TLS dependencies when upstream untrusted ranges converge.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
-    },
-    {
-      "kind": "duplicate",
-      "crate": "cookie",
-      "owner": "metadata",
-      "expires_on": "2026-08-31",
-      "reason": "The pinned mrchypark/hiqlite full client feature set must match the server stream API and introduces axum-extra/cookie alongside existing HTTP transitive dependencies.",
-      "replacement_plan": "Upgrade hiqlite and HTTP dependencies, or switch to upstream hiqlite, when the cookie dependency ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
@@ -315,6 +297,69 @@
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
+      "kind": "duplicate",
+      "crate": "block-buffer",
+      "owner": "metadata",
+      "expires_on": "2026-08-31",
+      "reason": "Current hashing and crypto transitive families select multiple block-buffer versions.",
+      "replacement_plan": "Upgrade the hashing and crypto dependency families when their block-buffer ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "const-oid",
+      "owner": "metadata",
+      "expires_on": "2026-08-31",
+      "reason": "The pinned metadata and signing dependency families select multiple const-oid versions.",
+      "replacement_plan": "Upgrade the metadata and signing dependency families when their const-oid ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "crypto-common",
+      "owner": "metadata",
+      "expires_on": "2026-08-31",
+      "reason": "Current hashing and crypto transitive families select multiple crypto-common versions.",
+      "replacement_plan": "Upgrade the hashing and crypto dependency families when their crypto-common ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "derive_more",
+      "owner": "metadata",
+      "expires_on": "2026-08-31",
+      "reason": "Current metadata and signing dependency families select multiple derive_more versions.",
+      "replacement_plan": "Upgrade the metadata and signing dependency families when their derive_more ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "derive_more-impl",
+      "owner": "metadata",
+      "expires_on": "2026-08-31",
+      "reason": "The derive_more duplicate brings matching derive_more-impl versions.",
+      "replacement_plan": "Remove alongside the derive_more duplicate when upstream ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "digest",
+      "owner": "metadata",
+      "expires_on": "2026-08-31",
+      "reason": "Current hashing and crypto transitive families select multiple digest versions.",
+      "replacement_plan": "Upgrade the hashing and crypto dependency families when their digest ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "rand_chacha",
+      "owner": "metadata",
+      "expires_on": "2026-08-31",
+      "reason": "Current random and crypto transitive families select multiple rand_chacha versions.",
+      "replacement_plan": "Upgrade the random and crypto dependency families when their rand_chacha ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
       "kind": "unmaintained",
       "crate": "bincode",
       "owner": "metadata",
@@ -331,6 +376,33 @@
       "reason": "Temporary allowance for a transitive unmaintained advisory while upstream replacement options are tracked.",
       "replacement_plan": "Remove the transitive paste dependency through upstream package upgrades or replace the dependent package before expiry.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "advisory",
+      "crate": "quick-xml:RUSTSEC-2026-0194",
+      "owner": "storage",
+      "expires_on": "2026-08-31",
+      "reason": "quick-xml 0.38/0.39 is reachable through production object_store clients; current SlateDB and DataFusion dependency ranges prevent selecting the fixed quick-xml 0.41 line.",
+      "replacement_plan": "Upgrade the authority-path and DataFusion object_store dependency families when compatible upstream releases can share a fixed quick-xml line, then remove the deny.toml exception.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_security_approval_and_updated_plan"
+    },
+    {
+      "kind": "advisory",
+      "crate": "quick-xml:RUSTSEC-2026-0195",
+      "owner": "storage",
+      "expires_on": "2026-08-31",
+      "reason": "quick-xml 0.38/0.39 is reachable through production object_store clients; current SlateDB and DataFusion dependency ranges prevent selecting the fixed quick-xml 0.41 line.",
+      "replacement_plan": "Upgrade the authority-path and DataFusion object_store dependency families when compatible upstream releases can share a fixed quick-xml line, then remove the deny.toml exception.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_security_approval_and_updated_plan"
+    },
+    {
+      "kind": "yanked",
+      "crate": "spin",
+      "owner": "metadata",
+      "expires_on": "2026-08-31",
+      "reason": "The pinned Hiqlite graph selects flume 0.12 and its yanked spin 0.9.8 dependency in the production metadata path.",
+      "replacement_plan": "Upgrade the pinned Hiqlite/flume dependency graph to a release that no longer selects spin 0.9.8, then restore yanked=deny.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_security_approval_and_updated_plan"
     }
   ]
 }

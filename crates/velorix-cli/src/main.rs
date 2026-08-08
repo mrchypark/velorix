@@ -161,6 +161,7 @@ struct Cli {
     command: Option<Command>,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum Command {
     CheckpointInspectLocal {
@@ -1028,6 +1029,7 @@ fn validate_readiness_release_artifacts(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_critique_release_evidence_artifact(
     path: &Path,
     expected_evidence_kinds: &[&str],
@@ -1224,15 +1226,14 @@ fn validate_critique_release_evidence_kind_specific_fields(
                 );
             }
         }
-        "query_output_isolation" => {
+        "query_output_isolation"
             if require_json_str(path, artifact, "/query_authority")?
-                != "published_materialized_output"
-            {
-                bail!(
-                    "{} query output isolation requires query_authority=published_materialized_output",
-                    path.display()
-                );
-            }
+                != "published_materialized_output" =>
+        {
+            bail!(
+                "{} query output isolation requires query_authority=published_materialized_output",
+                path.display()
+            );
         }
         _ => {}
     }
@@ -1506,6 +1507,7 @@ fn validate_security_release_provenance_identity(
 mod tests {
     use super::*;
     use serde_json::json;
+    use tempfile::tempdir;
 
     fn write_artifact(name: &str, value: serde_json::Value) -> PathBuf {
         let mut path = env::temp_dir();
@@ -2233,6 +2235,154 @@ mod tests {
 
         fs::remove_file(path).ok();
         assert!(result.is_err());
+    }
+
+    fn write_rustfs_production_gc_family(dir: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let gate = dir.join("rustfs-s3-gate-evidence.json");
+        let seed = dir.join("rustfs-production-gc-seed.json");
+        let execute = dir.join("rustfs-production-gc-run.json");
+        let production = dir.join("rustfs-production-gc.json");
+        let authority_store_id = "s3://rustfs/velorix-rustfs/rustfs-s3-gate/test/production-gc";
+        let gc_run_id = "rustfs-production-gc-test";
+        let deleted_object_key = "v1/state/orders_sum_count/p=0000000000/chk=00000000000000000000/rustfs-production-gc-test-state-0000.state";
+
+        fs::write(&gate, serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "evidence_kind": "rustfs_s3_compatible_gate",
+            "readiness_evidence_kind": ["s3_compatible", "s3_compatible_integration_harness"],
+            "gate_detail_kind": ["s3_compatible_ingest_admission_crash_restart", "s3_compatible_gc_execution_retention"],
+            "backend_evidence_scope": "live_or_native",
+            "production_gc_artifact": {
+                "generated": true,
+                "evidence_kind": "production_gc_run_evidence",
+                "fixture_kind": "release_smoke_gc_fixture",
+                "seed_artifact_path": seed.display().to_string(),
+                "execute_artifact_path": execute.display().to_string(),
+                "artifact_path": production.display().to_string(),
+                "deployment_id": "rustfs-s3-gate",
+                "authority_store_id": authority_store_id,
+                "gc_run_id": gc_run_id,
+                "prefix": "rustfs-s3-gate/test/production-gc",
+                "retain_latest_manifests": 1,
+                "expected_min_deleted_candidates": 1
+            }
+        })).unwrap()).unwrap();
+        fs::write(&seed, serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "status": "pass",
+            "evidence_kind": "s3_compatible_gc_seed_fixture",
+            "fixture_kind": "release_smoke_gc_fixture",
+            "authority_store_id": authority_store_id,
+            "seed_id": gc_run_id,
+            "checkpoint_versions": [0, 1],
+            "state_object_ids": ["rustfs-production-gc-test-state-0000", "rustfs-production-gc-test-state-0001"],
+            "expected_deleted_object_keys": [deleted_object_key],
+            "state_objects_written": 2,
+            "expected_min_deleted_candidates": 1,
+            "expected_deleted_candidates_at_retain_latest_manifests": 1
+        })).unwrap()).unwrap();
+        fs::write(&execute, serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "run_id": gc_run_id,
+            "policy": {"retain_latest_manifests": 1},
+            "plan": {"retained_manifest_versions": [1], "candidates": [{"object_key": deleted_object_key, "kind": "raw_state_object"}]},
+            "report": {"deleted": [{"object_key": deleted_object_key, "kind": "raw_state_object"}], "skipped": []}
+        })).unwrap()).unwrap();
+        let run: GarbageCollectionRunV1 =
+            serde_json::from_slice(&fs::read(&execute).unwrap()).unwrap();
+        fs::write(
+            &production,
+            serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "status": "pass",
+                "evidence_kind": "production_gc_run_evidence",
+                "deployment_id": "rustfs-s3-gate",
+                "authority_store_id": authority_store_id,
+                "gc_run_id": gc_run_id,
+                "listing_consistency_checked": true,
+                "checkpoint_retention_records_checked": true,
+                "checkpoint_gc_transition_records_checked": true,
+                "verified_gc_run_digest": garbage_collection_run_digest(&run).unwrap(),
+                "verified_gc_run_deleted_count": 1,
+                "verified_gc_run_retain_latest_manifests": 1,
+                "verified_gc_run_deleted_object_keys": gc_run_deleted_object_keys(&run)
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        (gate, seed, execute, production)
+    }
+
+    #[test]
+    fn rustfs_production_gc_evidence_validate_rejects_stale_execute_digest() {
+        let dir = tempdir().unwrap();
+        let (gate, seed, execute, production) = write_rustfs_production_gc_family(dir.path());
+        let mut run: serde_json::Value =
+            serde_json::from_slice(&fs::read(&execute).unwrap()).unwrap();
+        run["report"]["skipped"] = json!([{
+            "object_key": "v1/state/other/p=0000000000/chk=00000000000000000000/stale.state",
+            "kind": "raw_state_object"
+        }]);
+        fs::write(&execute, serde_json::to_vec(&run).unwrap()).unwrap();
+
+        let error =
+            validate_rustfs_production_gc_evidence_family(&gate, &seed, &execute, &production)
+                .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("verified_gc_run_digest"),
+            "unexpected validation error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn rustfs_production_gc_evidence_validate_rejects_seed_id_substring_key() {
+        let dir = tempdir().unwrap();
+        let (gate, seed, execute, production) = write_rustfs_production_gc_family(dir.path());
+        let different_key = "v1/state/other_owner/p=0000000000/chk=00000000000000000000/rustfs-production-gc-test-state-0000.state";
+        let mut run: serde_json::Value =
+            serde_json::from_slice(&fs::read(&execute).unwrap()).unwrap();
+        run["plan"]["candidates"][0]["object_key"] = json!(different_key);
+        run["report"]["deleted"][0]["object_key"] = json!(different_key);
+        fs::write(&execute, serde_json::to_vec(&run).unwrap()).unwrap();
+        let run: GarbageCollectionRunV1 =
+            serde_json::from_slice(&fs::read(&execute).unwrap()).unwrap();
+        let mut evidence: serde_json::Value =
+            serde_json::from_slice(&fs::read(&production).unwrap()).unwrap();
+        evidence["verified_gc_run_digest"] = json!(garbage_collection_run_digest(&run).unwrap());
+        evidence["verified_gc_run_deleted_object_keys"] = json!(gc_run_deleted_object_keys(&run));
+        fs::write(&production, serde_json::to_vec(&evidence).unwrap()).unwrap();
+
+        let error =
+            validate_rustfs_production_gc_evidence_family(&gate, &seed, &execute, &production)
+                .unwrap_err();
+        assert!(format!("{error:#}").contains("deleted keys do not match seeded expectation"));
+    }
+
+    #[tokio::test]
+    async fn gc_production_evidence_rejects_empty_live_gc_run() {
+        let dir = tempdir().unwrap();
+        let store = local_object_store(dir.path()).unwrap();
+        let run = execute_s3_compatible_garbage_collection(
+            Arc::clone(&store),
+            "s3://velorix-test",
+            "run-empty",
+            GarbageCollectionPolicy {
+                retain_latest_manifests: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let error = generate_production_gc_run_evidence(
+            store,
+            "prod-a".to_string(),
+            "s3://velorix-test".to_string(),
+            "run-empty".to_string(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(run.report.deleted.is_empty());
+        assert!(format!("{error:#}").contains("at least one deleted candidate"));
     }
 }
 
@@ -8799,6 +8949,7 @@ enum DependencyGovernanceExceptionKind {
     Duplicate,
     Unmaintained,
     Advisory,
+    Yanked,
 }
 
 impl DependencyGovernanceExceptionKind {
@@ -8807,6 +8958,7 @@ impl DependencyGovernanceExceptionKind {
             Self::Duplicate => "duplicate",
             Self::Unmaintained => "unmaintained",
             Self::Advisory => "advisory",
+            Self::Yanked => "yanked",
         }
     }
 }
@@ -8832,6 +8984,7 @@ const REQUIRED_PACKAGE_REVIEW_SUBJECTS: &[&str] = &[
 enum CargoDenyWarningKind {
     Duplicate,
     Unmaintained,
+    Yanked,
 }
 
 impl DependencyGovernanceManifestV1 {
@@ -8898,6 +9051,7 @@ impl CargoDenyWarningKind {
         match kind {
             DependencyGovernanceExceptionKind::Duplicate => Some(Self::Duplicate),
             DependencyGovernanceExceptionKind::Unmaintained => Some(Self::Unmaintained),
+            DependencyGovernanceExceptionKind::Yanked => Some(Self::Yanked),
             DependencyGovernanceExceptionKind::Advisory => None,
         }
     }
@@ -8906,6 +9060,7 @@ impl CargoDenyWarningKind {
         match code {
             "duplicate" => Some(Self::Duplicate),
             "unmaintained" => Some(Self::Unmaintained),
+            "yanked" => Some(Self::Yanked),
             _ => None,
         }
     }
@@ -8914,6 +9069,7 @@ impl CargoDenyWarningKind {
         match self {
             Self::Duplicate => "duplicate",
             Self::Unmaintained => "unmaintained",
+            Self::Yanked => "yanked",
         }
     }
 }
@@ -8967,6 +9123,15 @@ fn parse_cargo_deny_warning_diagnostics(
                 };
                 warnings.insert(DependencyGovernanceWarning { kind, crate_name });
             }
+            CargoDenyWarningKind::Yanked => {
+                let Some(crate_name) = cargo_deny_graph_crate_name(&value) else {
+                    bail!(
+                        "cargo-deny yanked warning on line {} did not include a crate name",
+                        index + 1
+                    );
+                };
+                warnings.insert(DependencyGovernanceWarning { kind, crate_name });
+            }
         }
     }
 
@@ -9010,6 +9175,14 @@ fn unmaintained_diagnostic_crate_name(value: &serde_json::Value) -> Option<Strin
                 .as_str()
                 .and_then(|message| message.split_once(" - ").map(|(crate_name, _)| crate_name))
         })
+        .map(str::to_string)
+}
+
+fn cargo_deny_graph_crate_name(value: &serde_json::Value) -> Option<String> {
+    value["fields"]["graphs"]
+        .as_array()
+        .and_then(|graphs| graphs.first())
+        .and_then(|graph| graph["Krate"]["name"].as_str())
         .map(str::to_string)
 }
 

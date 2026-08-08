@@ -9,8 +9,6 @@
 
 pub mod benchmark_gate;
 pub mod control_plane_contract;
-pub mod disk_state;
-pub mod general_circuit_runtime;
 pub mod ingest_writer_runtime;
 pub mod lease;
 pub mod materialized_view_runtime;

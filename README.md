@@ -47,6 +47,10 @@ relation ingest changes are committed.
 Unsupported SQL or unsupported view shapes fail during admission. Velorix must
 not fake support by silently falling back to full-source recomputation.
 
+The exact production, experimental, query-time, and rejected SQL scopes are in
+[Supported materialized-view SQL](docs/architecture/supported-sql.md) and the
+[native runtime Rust API migration](docs/release/0.1-native-runtime-migration.md).
+
 ## Local Development
 
 Common checks:

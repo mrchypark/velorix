@@ -5756,6 +5756,7 @@ fn standing_runtime_replay_plan_from_record_ref(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn standing_runtime_checkpoint_pointer_from_key(
     checkpoint_key: &ObjectKey,
     tenant_id: &str,
@@ -7629,7 +7630,7 @@ async fn query_active_view_output_rows_impl(
                 let page_request =
                     page_request_with_query_policy_limit(page_request, query_policy.policy);
                 let page = standing_runtime_page(&state, &active, &output_id, page_request).await?;
-                validate_standing_runtime_template_page(
+                validate_standing_runtime_full_snapshot_page(
                     &active,
                     &output_id,
                     &page,
@@ -7894,7 +7895,7 @@ async fn query_standing_runtime_rows_with_template(
         parameters,
     )?;
     let page = standing_runtime_page(state, active, output_id, page_request).await?;
-    validate_standing_runtime_template_page(active, output_id, &page, requested_epoch)?;
+    validate_standing_runtime_full_snapshot_page(active, output_id, &page, requested_epoch)?;
     let batches = query_record_batches_table_with_bindings_and_policy_and_limiter(
         output_id,
         page.batches,
@@ -7913,7 +7914,7 @@ async fn query_standing_runtime_rows_with_template(
     ))
 }
 
-fn validate_standing_runtime_template_page(
+fn validate_standing_runtime_full_snapshot_page(
     active: &ActiveMaterializedView,
     output_id: &str,
     page: &MaterializedViewPage,
@@ -7946,7 +7947,7 @@ fn validate_standing_runtime_template_page(
     }
     if page.next_page_token.is_some() {
         return Err(ApiError::conflict(format!(
-            "full snapshot is unavailable for templated standing runtime view `{}`",
+            "full materialized snapshot is unavailable for standing runtime view `{}`",
             active.spec.view_id
         )));
     }
@@ -8428,8 +8429,8 @@ async fn openapi_json(State(state): State<ApiState>) -> Result<Json<Value>, ApiE
                         "x-velorix-output-relation-id": output.relation_id,
                         "x-velorix-output-schema-fingerprint": output.schema_fingerprint,
                         "parameters": openapi_view_query_parameters(
-                            &response.request,
-                            response.sql_template.is_some(),
+                            &[],
+                            true,
                             true,
                         ),
                         "responses": { "200": { "description": "Rows" } }
@@ -9139,14 +9140,141 @@ async fn validate_standing_runtime_create_api_metadata(
     let bound_sql = render_view_sql_template_for_validation(sql_template, &api.request)?;
     validate_record_batch_table_query_with_bindings_and_policy(
         &output_id,
-        table_schema,
+        table_schema.clone(),
         &normalize_view_query_sql(&bound_sql.sql, &output_id),
         &bound_sql.bind_values,
         QueryPolicy::default(),
     )
     .await
     .map_err(ApiError::bad_request)?;
+    validate_sql_template_response_schema_bindings(
+        view_id,
+        api.response_schema.as_ref(),
+        &output_id,
+        table_schema,
+        &normalize_view_query_sql(&bound_sql.sql, &output_id),
+        &bound_sql.bind_values,
+    )
+    .await?;
     Ok(())
+}
+
+/// Admits a response schema only when every direct source has one compatible
+/// result column in the rendered template query.  The legacy `key.*` and
+/// `value.*` JSON paths deliberately remain dynamic: their object members are
+/// encoded inside a UTF-8 JSON result column and therefore have no planner
+/// field to inspect at admission time.
+async fn validate_sql_template_response_schema_bindings(
+    view_id: &str,
+    response_schema: Option<&MaterializedViewResponseSchema>,
+    output_id: &str,
+    table_schema: Arc<Schema>,
+    sql: &str,
+    bind_values: &[QueryBindValue],
+) -> Result<(), ApiError> {
+    let Some(response_schema) = response_schema else {
+        return Ok(());
+    };
+
+    let batches = query_record_batches_table_with_bindings_and_policy_and_limiter(
+        output_id,
+        vec![RecordBatch::new_empty(table_schema)],
+        sql,
+        bind_values,
+        QueryPolicy::default(),
+        None,
+    )
+    .await
+    .map_err(ApiError::bad_request)?;
+    let result_schema = batches.first().map(RecordBatch::schema).ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "standing runtime view `{view_id}` sql_template produced no result schema during admission"
+        ))
+    })?;
+    if batches
+        .iter()
+        .any(|batch| batch.schema().as_ref() != result_schema.as_ref())
+    {
+        return Err(ApiError::bad_request(format!(
+            "standing runtime view `{view_id}` sql_template produced inconsistent result schemas during admission"
+        )));
+    }
+
+    for column in &response_schema.columns {
+        validate_response_schema_template_column(view_id, column, result_schema.as_ref())?;
+    }
+    Ok(())
+}
+
+fn validate_response_schema_template_column(
+    view_id: &str,
+    column: &MaterializedViewResponseColumnSpec,
+    result_schema: &Schema,
+) -> Result<(), ApiError> {
+    let mut source_parts = column.source.split('.');
+    let root = source_parts.next().unwrap_or_default();
+    let is_nested = source_parts.next().is_some();
+    let matching_fields = result_schema
+        .fields()
+        .iter()
+        .filter(|field| field.name() == root)
+        .collect::<Vec<_>>();
+
+    let [field] = matching_fields.as_slice() else {
+        let detail = if matching_fields.is_empty() {
+            "is not a template result column"
+        } else {
+            "is ambiguous in the template result"
+        };
+        return Err(ApiError::bad_request(format!(
+            "standing runtime view `{view_id}` response schema column `{}` source `{}` {detail}",
+            column.name, column.source
+        )));
+    };
+
+    if is_nested && is_legacy_dynamic_response_source(root, field.data_type()) {
+        return Ok(());
+    }
+    if is_nested {
+        return Err(ApiError::bad_request(format!(
+            "standing runtime view `{view_id}` response schema column `{}` source `{}` cannot address a nested template result column",
+            column.name, column.source
+        )));
+    }
+    if response_type_accepts_template_result(&column.r#type, field.data_type()) {
+        return Ok(());
+    }
+    Err(ApiError::bad_request(format!(
+        "standing runtime view `{view_id}` response schema column `{}` type `{}` is incompatible with template result source `{}` type `{:?}`",
+        column.name, column.r#type, column.source, field.data_type()
+    )))
+}
+
+fn is_legacy_dynamic_response_source(root: &str, data_type: &DataType) -> bool {
+    matches!(root, "key" | "key_json" | "value" | "value_json")
+        && matches!(data_type, DataType::Utf8)
+}
+
+fn response_type_accepts_template_result(response_type: &str, data_type: &DataType) -> bool {
+    match response_type {
+        "string" | "date" | "time" | "timestamp" | "uuid" => {
+            matches!(data_type, DataType::Utf8)
+        }
+        "int64" | "integer" => matches!(
+            data_type,
+            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+        ),
+        "float64" | "number" => matches!(data_type, DataType::Float32 | DataType::Float64),
+        "bool" | "boolean" => matches!(data_type, DataType::Boolean),
+        "decimal" => matches!(data_type, DataType::Decimal128(_, _) | DataType::Utf8),
+        "binary_hex" => matches!(data_type, DataType::Binary),
+        "array" => matches!(data_type, DataType::List(_)),
+        "object" => matches!(data_type, DataType::Struct(_) | DataType::Map(_, _)),
+        // `json` deliberately accepts every Arrow value supported by the row
+        // encoder, because the response coercion preserves JSON values.
+        "json" => !matches!(data_type, DataType::Null),
+        _ => false,
+    }
 }
 
 fn validate_view_api_output_binding(
@@ -9207,6 +9335,11 @@ fn validate_standing_runtime_query_contract(
     page_request: &SnapshotPageRequest,
 ) -> Result<(), ApiError> {
     if request_sql.is_some() {
+        if page_request.page_token.is_some() {
+            return Err(ApiError::bad_request(format!(
+                "cursor pagination is not supported for raw SQL standing runtime view `{view_id}` because SQL must read a full materialized snapshot"
+            )));
+        }
         return Ok(());
     }
     if api.sql_template.is_none() && (!api.request.is_empty() || !parameters.is_empty()) {
@@ -13877,6 +14010,113 @@ mod tests {
         },
     };
 
+    fn template_result_schema() -> RelationSchema {
+        RelationSchema {
+            relation_id: "template_output".to_string(),
+            relation_name: "template_output".to_string(),
+            relation_version: "v1".to_string(),
+            schema_fingerprint: "sha256:template-output".to_string(),
+            columns: vec![
+                ColumnSchema {
+                    name: "name".to_string(),
+                    data_type: SqlDataType::Utf8,
+                    nullable: false,
+                },
+                ColumnSchema {
+                    name: "amount".to_string(),
+                    data_type: SqlDataType::Int64,
+                    nullable: true,
+                },
+                ColumnSchema {
+                    name: "value".to_string(),
+                    data_type: SqlDataType::Json,
+                    nullable: true,
+                },
+            ],
+            primary_key: vec!["name".to_string()],
+        }
+    }
+
+    fn response_column(
+        name: &str,
+        r#type: &str,
+        source: &str,
+    ) -> MaterializedViewResponseColumnSpec {
+        MaterializedViewResponseColumnSpec {
+            name: name.to_string(),
+            r#type: r#type.to_string(),
+            source: source.to_string(),
+            description: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn sql_template_response_schema_sources_are_admitted_against_result_schema() {
+        let output = template_result_schema();
+        let table_schema = arrow_schema_from_incremental_relation_schema(&output).unwrap();
+        let response_schema = MaterializedViewResponseSchema {
+            columns: vec![
+                response_column("display_name", "string", "name"),
+                response_column("amount", "integer", "amount"),
+                // Legacy views expose JSON payloads as `value`; planner fields
+                // cannot describe their dynamic members at admission time.
+                response_column("nested_name", "string", "value.profile.name"),
+            ],
+        };
+
+        validate_sql_template_response_schema_bindings(
+            "template_view",
+            Some(&response_schema),
+            "template_output",
+            table_schema,
+            "select name, amount, value from template_output",
+            &[],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sql_template_response_schema_rejects_unknown_wrong_type_and_ambiguous_sources() {
+        let output = template_result_schema();
+        let schema = arrow_schema_from_incremental_relation_schema(&output).unwrap();
+        for (response_schema, sql, expected) in [
+            (
+                MaterializedViewResponseSchema {
+                    columns: vec![response_column("missing", "string", "missing")],
+                },
+                "select name, amount from template_output",
+                "is not a template result column",
+            ),
+            (
+                MaterializedViewResponseSchema {
+                    columns: vec![response_column("amount", "integer", "name")],
+                },
+                "select name, amount from template_output",
+                "is incompatible",
+            ),
+            (
+                MaterializedViewResponseSchema {
+                    columns: vec![response_column("duplicate", "string", "duplicate")],
+                },
+                "select name as duplicate, amount as duplicate from template_output",
+                "same name",
+            ),
+        ] {
+            let error = validate_sql_template_response_schema_bindings(
+                "template_view",
+                Some(&response_schema),
+                "template_output",
+                schema.clone(),
+                sql,
+                &[],
+            )
+            .await
+            .unwrap_err();
+            assert!(error.message.contains(expected), "{error:?}");
+        }
+    }
+
     fn legacy_key(prefix: &str, suffix: &str) -> String {
         format!("{prefix}{suffix}")
     }
@@ -16004,6 +16244,208 @@ mod tests {
         assert_eq!(
             query_response.1["rows"],
             json!([{"device": "device-a", "enabled": true}])
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_latest_by_key_nullable_value_survives_query_and_restart() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state =
+            test_api_state_with_store(store.clone(), "api-test-latest-nullable-a", false).await;
+        let router = app(state);
+
+        let mut catalog = test_device_status_catalog();
+        catalog
+            .relation_schema
+            .columns
+            .iter_mut()
+            .find(|column| column.column_id == "enabled")
+            .expect("device status fixture has enabled")
+            .nullable = true;
+        let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema)
+            .expect("nullable latest-by-key input schema should fingerprint");
+        catalog.schema_fingerprint = schema_fingerprint.clone();
+        catalog.incremental_relation.schema_fingerprint = schema_fingerprint;
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": catalog,
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(
+            relation_response.0,
+            StatusCode::CREATED,
+            "{relation_response:?}"
+        );
+
+        let view_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views",
+            json!({
+                "view_id": "latest_nullable_device_status",
+                "sql": "select device_id as device, arg_max(enabled, event_time) as enabled from device_status group by device_id",
+                "input_relation_id": "device_status",
+                "input_relation_version": "2026-05-24.v1",
+                "source_kind": "standing_view"
+            }),
+        )
+        .await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+        let ingest_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "device_status",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "nullable-device-status-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 0,
+                    "rows": [
+                        {"device_id": "device-a", "enabled": true, "event_time": 100, "delta": 1},
+                        {"device_id": "device-a", "enabled": null, "event_time": 110, "delta": 1},
+                        {"device_id": "device-b", "enabled": false, "event_time": 120, "delta": 1}
+                    ]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(
+            ingest_response.0,
+            StatusCode::CREATED,
+            "{ingest_response:?}"
+        );
+
+        let expected_rows = json!([
+            {"device": "device-a", "enabled": null},
+            {"device": "device-b", "enabled": false}
+        ]);
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/latest_nullable_device_status/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query_response.0, StatusCode::OK, "{query_response:?}");
+        assert_eq!(
+            query_response.1["rows"], expected_rows,
+            "{query_response:?}"
+        );
+
+        let restarted_state =
+            test_api_state_with_store(store, "api-test-latest-nullable-b", true).await;
+        assert_eq!(
+            restarted_state
+                .restore_standing_program_runtimes_from_active_views()
+                .await
+                .unwrap(),
+            1
+        );
+        let restarted_router = app(restarted_state);
+        let restarted_query = call_json(
+            &restarted_router,
+            Method::POST,
+            "/v1/views/latest_nullable_device_status/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(restarted_query.0, StatusCode::OK, "{restarted_query:?}");
+        assert_eq!(
+            restarted_query.1["rows"], expected_rows,
+            "{restarted_query:?}"
+        );
+
+        let append_newer_value = call_json(
+            &restarted_router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "device_status",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "nullable-device-status-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 3,
+                    "rows": [
+                        {"device_id": "device-a", "enabled": false, "event_time": 120, "delta": 1}
+                    ]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(
+            append_newer_value.0,
+            StatusCode::CREATED,
+            "{append_newer_value:?}"
+        );
+        let newest_value_query = call_json(
+            &restarted_router,
+            Method::POST,
+            "/v1/views/latest_nullable_device_status/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(
+            newest_value_query.0,
+            StatusCode::OK,
+            "{newest_value_query:?}"
+        );
+        assert_eq!(
+            newest_value_query.1["rows"],
+            json!([
+                {"device": "device-a", "enabled": false},
+                {"device": "device-b", "enabled": false}
+            ]),
+            "{newest_value_query:?}"
+        );
+
+        let retract_newer_value = call_json(
+            &restarted_router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({
+                "batches": [{
+                    "relation_id": "device_status",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "nullable-device-status-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 4,
+                    "rows": [
+                        {"device_id": "device-a", "enabled": false, "event_time": 120, "delta": -1}
+                    ]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(
+            retract_newer_value.0,
+            StatusCode::CREATED,
+            "{retract_newer_value:?}"
+        );
+        let restored_latest_query = call_json(
+            &restarted_router,
+            Method::POST,
+            "/v1/views/latest_nullable_device_status/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(
+            restored_latest_query.0,
+            StatusCode::OK,
+            "{restored_latest_query:?}"
+        );
+        assert_eq!(
+            restored_latest_query.1["rows"], expected_rows,
+            "{restored_latest_query:?}"
         );
     }
 
@@ -24000,6 +24442,168 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn raw_sql_count_and_sum_fail_closed_when_the_materialized_input_is_paged() {
+        let state = test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "api-test-raw-sql-page-cap-owner",
+            false,
+        )
+        .await;
+        let router = app(state);
+
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": test_scores_catalog(),
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(relation_response.0, StatusCode::CREATED);
+
+        let policy_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/query-policies",
+            json!({
+                "query_policy_id": "raw-sql-page-cap",
+                "policy": {
+                    "max_sql_bytes": 16384,
+                    "planning_timeout_ms": 1000,
+                    "execution_timeout_ms": 1000,
+                    "max_output_rows": 2,
+                    "max_output_bytes": 1048576,
+                    "max_scan_files": 1,
+                    "max_scan_bytes": 1048576,
+                    "max_object_requests": 1,
+                    "max_concurrent_queries": 1,
+                    "memory_limit_bytes": 1048576,
+                    "spill_limit_bytes": 1048576
+                }
+            }),
+        )
+        .await;
+        assert_eq!(policy_response.0, StatusCode::CREATED);
+
+        for (view_id, query_policy_id) in [
+            ("scores_raw_sql_explicit_page_cap", None),
+            ("scores_raw_sql_policy_page_cap", Some("raw-sql-page-cap")),
+        ] {
+            let view_response = call_json(
+                &router,
+                Method::POST,
+                "/v1/views",
+                json!(CreateViewRequest {
+                    view_id: view_id.to_string(),
+                    url_path: None,
+                    output_relation_id: None,
+                    input_relation_id: "scores".to_string(),
+                    input_relation_version: "2026-05-24.v1".to_string(),
+                    input_relation_refs: Vec::new(),
+                    input_relations: Vec::new(),
+                    sql: "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id".to_string(),
+                    source_kind: SqlSourceKind::StandingView,
+                    output_relation_ids: Vec::new(),
+                    sql_template: None,
+                    description: None,
+                    request: Vec::new(),
+                    response_schema: None,
+                    response_formats: vec!["json".to_string()],
+                    query_policy_id: query_policy_id.map(str::to_string),
+                }),
+            )
+            .await;
+            assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+        }
+
+        let ingest_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/ingest",
+            json!({
+                "relation_id": "scores",
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "scores-raw-sql-page-cap-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "rows": [
+                    {"user_id": "alice", "score": 10, "delta": 1},
+                    {"user_id": "bob", "score": 20, "delta": 1},
+                    {"user_id": "carol", "score": 30, "delta": 1},
+                    {"user_id": "dave", "score": 40, "delta": 1}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(
+            ingest_response.0,
+            StatusCode::CREATED,
+            "{ingest_response:?}"
+        );
+
+        let paged_output = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/scores_raw_sql_explicit_page_cap/query",
+            json!({"max_rows": 2}),
+        )
+        .await;
+        assert_eq!(paged_output.0, StatusCode::OK, "{paged_output:?}");
+        let page_token = paged_output.1["next_page_token"]
+            .as_str()
+            .expect("direct materialized read should expose a next page")
+            .to_string();
+        let cursor_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/scores_raw_sql_explicit_page_cap/query",
+            json!({
+                "sql": "select count(*) as total_count from scores_raw_sql_explicit_page_cap",
+                "page_token": page_token
+            }),
+        )
+        .await;
+        assert_eq!(
+            cursor_response.0,
+            StatusCode::BAD_REQUEST,
+            "{cursor_response:?}"
+        );
+        assert!(cursor_response.1["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cursor pagination is not supported for raw SQL"));
+
+        let sql = "select count(*) as total_count, sum(sum) as total_sum from {view}";
+        for (view_id, request) in [
+            (
+                "scores_raw_sql_explicit_page_cap",
+                json!({"sql": sql.replace("{view}", "scores_raw_sql_explicit_page_cap"), "max_rows": 2}),
+            ),
+            (
+                "scores_raw_sql_policy_page_cap",
+                json!({"sql": sql.replace("{view}", "scores_raw_sql_policy_page_cap")}),
+            ),
+        ] {
+            let response = call_json(
+                &router,
+                Method::POST,
+                &format!("/v1/views/{view_id}/query"),
+                request,
+            )
+            .await;
+            assert_eq!(response.0, StatusCode::CONFLICT, "{response:?}");
+            assert!(response.1["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("full materialized snapshot"));
+            assert!(response.1.get("rows").is_none(), "{response:?}");
+            assert!(response.1.get("next_page_token").is_none(), "{response:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn rest_two_relation_join_view_materialized_output_survives_api_restart() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let state = test_api_state_with_store(store.clone(), "api-test-join-owner-a", false).await;
@@ -26981,8 +27585,12 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "query: {resp}");
-        let rows = resp["rows"].as_array().unwrap();
-        assert_eq!(rows.len(), 1, "expected 1 row after epoch 1");
+        assert_eq!(resp["logical_epoch"], 1, "query: {resp}");
+        assert_eq!(
+            resp["rows"],
+            json!([{"user_id": "alice", "total": 100, "cnt": 1}]),
+            "epoch 1 must publish the exact aggregate row, value, and multiplicity: {resp}"
+        );
 
         let (status, _) = call_json(
             &router,
@@ -27013,8 +27621,15 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "query: {resp}");
-        let rows = resp["rows"].as_array().unwrap();
-        assert_eq!(rows.len(), 2, "expected 2 rows after epoch 2");
+        assert_eq!(resp["logical_epoch"], 3, "query: {resp}");
+        assert_eq!(
+            resp["rows"],
+            json!([
+                {"user_id": "alice", "total": 150, "cnt": 2},
+                {"user_id": "bob", "total": 200, "cnt": 1}
+            ]),
+            "epoch 2 must replace stale values and preserve per-key multiplicities: {resp}"
+        );
     }
 
     #[tokio::test]

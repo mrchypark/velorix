@@ -86,9 +86,16 @@ pub enum NativeCodePolicy {
 pub struct EpochIdempotencyKey(String);
 
 impl EpochIdempotencyKey {
+    pub const MAX_BYTES: usize = 256;
+
     pub fn new(value: impl Into<String>) -> Result<Self, StandingProgramRuntimeError> {
         let value = value.into();
         require_non_empty("idempotency_key", &value)?;
+        if value.len() > Self::MAX_BYTES {
+            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "idempotency_key",
+            });
+        }
         Ok(Self(value))
     }
 

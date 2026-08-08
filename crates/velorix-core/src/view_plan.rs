@@ -385,17 +385,12 @@ pub enum SupportedAnalyticWindowFunction {
     DenseRank,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LogicalPlanLatestByKeyFunctionV1 {
+    #[default]
     ArgMax,
     ArgMin,
-}
-
-impl Default for LogicalPlanLatestByKeyFunctionV1 {
-    fn default() -> Self {
-        Self::ArgMax
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -4163,6 +4158,7 @@ fn catalog_column_by_id<'a>(
         })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_join_group_by_key(
     select: &Select,
     left_alias: &str,
@@ -5893,6 +5889,7 @@ fn validate_filter_project_selection(
     .map(Some)
 }
 
+#[allow(clippy::only_used_in_recursion)]
 fn validate_filter_project_predicate_expr(
     selection: &Expr,
     catalog: &VelorixRelationCatalogV1,
@@ -6724,6 +6721,7 @@ fn validate_latest_predicate_expr(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_having(
     select: &Select,
     catalog: &VelorixRelationCatalogV1,
@@ -8003,12 +8001,8 @@ fn validate_raw_int64_multi_input_aggregates(
             | LogicalPlanAggregateFunctionV1::Min
             | LogicalPlanAggregateFunctionV1::Max
             | LogicalPlanAggregateFunctionV1::Avg
-            | LogicalPlanAggregateFunctionV1::Count => {}
-            LogicalPlanAggregateFunctionV1::CountDistinct => {
-                return unsupported(
-                    "multi-input single-key aggregates do not support count(DISTINCT ...)",
-                );
-            }
+            | LogicalPlanAggregateFunctionV1::Count
+            | LogicalPlanAggregateFunctionV1::CountDistinct => {}
         }
         let Some(input_column_id) = output.input_column_id.as_deref() else {
             continue;
@@ -8022,12 +8016,14 @@ fn validate_raw_int64_multi_input_aggregates(
                 reason: "multi-input aggregate input column is missing from relation catalog"
                     .to_string(),
             })?;
+        let nullable_count_distinct =
+            column.nullable && output.function == LogicalPlanAggregateFunctionV1::CountDistinct;
         if column.column_id == catalog.relation_schema.weight_column_id
-            || column.nullable
+            || (column.nullable && !nullable_count_distinct)
             || column.physical_arrow_type != ArrowPhysicalTypeV1::Int64
         {
             return unsupported(
-                "multi-input single-key aggregates currently support non-null Int64 input columns",
+                "multi-input single-key aggregates currently support non-null Int64 inputs and nullable Int64 count(DISTINCT ...) inputs",
             );
         }
     }
@@ -8243,6 +8239,7 @@ impl<'a> JoinAggregateTopKFunctionContext<'a> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn order_by_single_aggregate_function_output_column_id(
     expr: &Expr,
     aggregate_outputs: &[SupportedAggregateOutput],
@@ -8761,12 +8758,12 @@ fn validate_literal_fetch(fetch: &Fetch) -> Result<usize, ViewPlanError> {
 
 fn validate_positive_integer_literal(expr: &Expr, clause: &str) -> Result<usize, ViewPlanError> {
     let Expr::Value(value) = expr else {
-        return unsupported(&format!(
+        return unsupported(format!(
             "materialized top-k {clause} must be a positive integer literal"
         ));
     };
     let SqlValue::Number(text, false) = &value.value else {
-        return unsupported(&format!(
+        return unsupported(format!(
             "materialized top-k {clause} must be a positive integer literal"
         ));
     };
@@ -8776,7 +8773,7 @@ fn validate_positive_integer_literal(expr: &Expr, clause: &str) -> Result<usize,
             reason: format!("materialized top-k {clause} must be a positive integer literal"),
         })?;
     if limit == 0 {
-        return unsupported(&format!(
+        return unsupported(format!(
             "materialized top-k {clause} must be greater than zero"
         ));
     }
@@ -8788,12 +8785,12 @@ fn validate_non_negative_integer_literal(
     clause: &str,
 ) -> Result<usize, ViewPlanError> {
     let Expr::Value(value) = expr else {
-        return unsupported(&format!(
+        return unsupported(format!(
             "materialized top-k {clause} must be a non-negative integer literal"
         ));
     };
     let SqlValue::Number(text, false) = &value.value else {
-        return unsupported(&format!(
+        return unsupported(format!(
             "materialized top-k {clause} must be a non-negative integer literal"
         ));
     };
@@ -10764,20 +10761,19 @@ fn validate_join_value_aggregate_argument<'a>(
     }
 }
 
+type JoinValueAggregateExpressionMatch<'a> = (
+    SupportedAggregateInputRelationSide,
+    &'a VelorixRelationCatalogV1,
+    &'a RelationColumnV1,
+    Option<SupportedProjectionExpr>,
+);
+
 fn join_value_aggregate_expression_match<'a>(
     argument: &Expr,
     relation_alias: &str,
     catalog: &'a VelorixRelationCatalogV1,
     side: SupportedAggregateInputRelationSide,
-) -> Result<
-    Option<(
-        SupportedAggregateInputRelationSide,
-        &'a VelorixRelationCatalogV1,
-        &'a RelationColumnV1,
-        Option<SupportedProjectionExpr>,
-    )>,
-    ViewPlanError,
-> {
+) -> Result<Option<JoinValueAggregateExpressionMatch<'a>>, ViewPlanError> {
     let Ok(expression) =
         supported_filter_project_projection_expr(argument, catalog, Some(relation_alias))
     else {
@@ -11343,6 +11339,9 @@ fn validate_latest_ordering_column(
 ) -> Result<(), ViewPlanError> {
     if column.column_id == catalog.relation_schema.weight_column_id {
         return unsupported("latest-by-key ordering must not reference the weight column");
+    }
+    if column.nullable {
+        return unsupported("latest-by-key ordering column must be non-nullable");
     }
     match &column.physical_arrow_type {
         ArrowPhysicalTypeV1::Int64
