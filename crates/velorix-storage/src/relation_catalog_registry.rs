@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use object_store::{path::Path, ObjectStore, PutMode};
+use object_store::{path::Path, ObjectStore, ObjectStoreExt, PutMode};
 use thiserror::Error;
 use velorix_core::relation::{RelationSchemaError, VelorixRelationCatalogV1};
 

@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use bytes::Bytes;
 use futures::TryStreamExt;
-use object_store::{local::LocalFileSystem, path::Path, ObjectStore};
+use object_store::{local::LocalFileSystem, path::Path, ObjectStore, ObjectStoreExt};
 use tempfile::TempDir;
 use velorix_control::lease::{PartitionLeaseGrant, PartitionLeaseKey};
 use velorix_runtime::leased_checkpoint::{LeasedCheckpointError, LeasedCheckpointPublisher};

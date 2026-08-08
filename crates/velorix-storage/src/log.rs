@@ -10,7 +10,7 @@ use arrow::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{lock::Mutex as AsyncMutex, TryStreamExt};
-use object_store::{path::Path, ObjectStore, PutMode};
+use object_store::{path::Path, ObjectStore, ObjectStoreExt, PutMode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;

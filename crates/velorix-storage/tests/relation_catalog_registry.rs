@@ -318,7 +318,7 @@ async fn relation_catalog_registry_rejects_unsupported_adapter_on_read() {
         )
         .unwrap();
 
-    object_store::ObjectStore::put(
+    object_store::ObjectStoreExt::put(
         &*store,
         &object_store::path::Path::from(path.as_str()),
         serde_json::to_vec(&catalog).unwrap().into(),
@@ -363,7 +363,7 @@ async fn relation_catalog_registry_accepts_multi_value_roles_on_read() {
         )
         .unwrap();
 
-    object_store::ObjectStore::put(
+    object_store::ObjectStoreExt::put(
         &*store,
         &object_store::path::Path::from(path.as_str()),
         serde_json::to_vec(&catalog).unwrap().into(),
@@ -393,7 +393,7 @@ async fn relation_catalog_registry_rejects_unknown_or_malformed_stored_fields_on
         )
         .unwrap();
 
-    object_store::ObjectStore::put(
+    object_store::ObjectStoreExt::put(
         &*store,
         &object_store::path::Path::from(path.as_str()),
         br#"{"schema_version":1,"unexpected":true}"#.as_slice().into(),
@@ -413,7 +413,7 @@ async fn relation_catalog_registry_rejects_unknown_or_malformed_stored_fields_on
 
     let mut malformed = catalog.clone();
     malformed.datafusion_registration.name.clear();
-    object_store::ObjectStore::put(
+    object_store::ObjectStoreExt::put(
         &*store,
         &object_store::path::Path::from(path.as_str()),
         serde_json::to_vec(&malformed).unwrap().into(),
@@ -457,7 +457,7 @@ async fn relation_catalog_registry_rejects_stored_body_identity_mismatch_on_read
         )
         .unwrap();
 
-    object_store::ObjectStore::put(
+    object_store::ObjectStoreExt::put(
         &*store,
         &object_store::path::Path::from(path.as_str()),
         serde_json::to_vec(&wrong_body).unwrap().into(),

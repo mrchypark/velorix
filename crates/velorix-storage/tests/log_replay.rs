@@ -6,7 +6,7 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use bytes::Bytes;
-use object_store::{local::LocalFileSystem, path::Path, ObjectStore};
+use object_store::{local::LocalFileSystem, path::Path, ObjectStore, ObjectStoreExt};
 use tempfile::TempDir;
 use velorix_storage::{
     ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},

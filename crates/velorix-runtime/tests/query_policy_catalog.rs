@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use bytes::Bytes;
-use object_store::{local::LocalFileSystem, path::Path, ObjectStore};
+use object_store::{local::LocalFileSystem, path::Path, ObjectStore, ObjectStoreExt};
 use serde_json::json;
 use tempfile::TempDir;
 use velorix_core::query::{QueryExecutionPolicyV1, QueryPolicyError};

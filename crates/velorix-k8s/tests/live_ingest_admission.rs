@@ -14,7 +14,7 @@ use kube::{
     api::{Api, DeleteParams, PostParams},
     Client,
 };
-use object_store::{local::LocalFileSystem, path::Path, ObjectStore, PutMode};
+use object_store::{local::LocalFileSystem, path::Path, ObjectStore, ObjectStoreExt, PutMode};
 use serde_json::json;
 use tempfile::TempDir;
 use velorix_k8s::{

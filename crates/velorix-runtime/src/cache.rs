@@ -1,7 +1,7 @@
 use std::{path::Path as FsPath, sync::Arc};
 
 use foyer::{BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder};
-use object_store::{path::Path, ObjectStore};
+use object_store::{path::Path, ObjectStore, ObjectStoreExt};
 use thiserror::Error;
 use velorix_storage::capability::{
     AuthoritativeObjectStoreCapabilitiesV1, AuthoritativeObjectStoreCapabilityError,

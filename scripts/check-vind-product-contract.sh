@@ -3566,9 +3566,9 @@ checks["object_store duplicate is documented as expiring S3 compatibility except
     == "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     and runtime_cargo.get("dependencies", {}).get("object_store_13", {}).get("optional") is True
     and "object_store_13" in runtime_cargo.get("features", {}).get("s3-compat-tests", [])
-    and "object_store` 0.12 for Velorix authority/catalog/probe writes"
+    and "object_store` 0.14 for Velorix authority/catalog/probe writes"
     in s3_compatible_test_harness
-    and "object_store` 0.13 for DataFusion 53 Parquet scans"
+    and "object_store` 0.13 for DataFusion 54 Parquet scans"
     in s3_compatible_test_harness
     and "This proves the current two-version\nobject-store boundary without adding an adapter"
     in s3_compatible_test_harness

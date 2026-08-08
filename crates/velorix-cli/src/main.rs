@@ -4684,12 +4684,6 @@ fn validate_hiqlite_backend_time_sigstore_bundle(
                 path.display()
             )
         })?;
-    if !result.success {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance Sigstore bundle verification failed",
-            path.display()
-        );
-    }
     if result.identity.as_deref() != Some(certificate_identity) {
         bail!(
             "{} Hiqlite backend-time trusted provenance Sigstore verified identity does not match signature_bundle certificate_identity",

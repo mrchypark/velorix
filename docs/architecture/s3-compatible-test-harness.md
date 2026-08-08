@@ -64,8 +64,8 @@ Velorix checkpoint, ingest, output, or catalog manifests.
 skipped by default. When enabled, it builds both object-store clients used by
 the runtime boundary:
 
-- `object_store` 0.12 for Velorix authority/catalog/probe writes.
-- `object_store` 0.13 for DataFusion 53 Parquet scans.
+- `object_store` 0.14 for Velorix authority/catalog/probe writes.
+- `object_store` 0.13 for DataFusion 54 Parquet scans.
 
 The test writes Parquet under the configured S3-compatible prefix, registers a
 production table through the storage registry's authority-store probe path,
@@ -219,7 +219,7 @@ sharing the S3-compatible gate.
 ## Out Of Scope
 
 The current slice intentionally does not validate Foyer, Kubernetes
-coordination, or release-quality S3-compatible baselines. DataFusion 53 uses
-`object_store` 0.13 while Velorix storage uses `object_store` 0.12; the runtime
+coordination, or release-quality S3-compatible baselines. DataFusion 54 uses
+`object_store` 0.13 while Velorix storage uses `object_store` 0.14; the runtime
 query harness and benchmark keep those clients explicit instead of adding an
 adapter between the versions.

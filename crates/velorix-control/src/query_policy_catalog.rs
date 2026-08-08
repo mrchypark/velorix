@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use object_store::{path::Path, ObjectStore, PutMode};
+use object_store::{path::Path, ObjectStore, ObjectStoreExt, PutMode};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use velorix_core::query::{QueryExecutionPolicyV1, QueryPolicyError};

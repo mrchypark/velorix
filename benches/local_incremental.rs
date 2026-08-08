@@ -22,7 +22,7 @@ use datafusion::object_store::{
 };
 use futures::stream::BoxStream;
 use object_store::{
-    local::LocalFileSystem, path::Path, GetOptions, GetRange, GetResult, ListResult,
+    local::LocalFileSystem, path::Path, CopyOptions, GetOptions, GetRange, GetResult, ListResult,
     MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload,
     PutResult,
 };
@@ -929,14 +929,6 @@ impl ObjectStore for MeteredObjectStore {
         Ok(result)
     }
 
-    async fn get_range(&self, location: &Path, range: Range<u64>) -> object_store::Result<Bytes> {
-        let bytes = self.inner.get_range(location, range).await?;
-        self.range_read_count.fetch_add(1, Ordering::SeqCst);
-        self.bytes_read
-            .fetch_add(bytes.len() as u64, Ordering::SeqCst);
-        Ok(bytes)
-    }
-
     async fn get_ranges(
         &self,
         location: &Path,
@@ -952,8 +944,11 @@ impl ObjectStore for MeteredObjectStore {
         Ok(bytes)
     }
 
-    async fn delete(&self, location: &Path) -> object_store::Result<()> {
-        self.inner.delete(location).await
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(locations)
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
@@ -975,12 +970,13 @@ impl ObjectStore for MeteredObjectStore {
         self.inner.list_with_delimiter(prefix).await
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-        self.inner.copy(from, to).await
-    }
-
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-        self.inner.copy_if_not_exists(from, to).await
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
     }
 }
 

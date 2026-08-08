@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use object_store::{memory::InMemory, path::Path, ObjectStore};
+use object_store::{memory::InMemory, path::Path, ObjectStore, ObjectStoreExt};
 use tempfile::TempDir;
 use velorix_core::{
     standing_program::{BuiltinRuntimeIdentity, NativeCodePolicy, StandingProgramIdentity},
@@ -154,7 +154,7 @@ async fn write_active_record_json(
     view_id: &str,
     value: serde_json::Value,
 ) {
-    object_store::ObjectStore::put(
+    object_store::ObjectStoreExt::put(
         &**store,
         &Path::from(format!("v1/views/{view_id}/active.json")),
         serde_json::to_vec(&value).unwrap().into(),
@@ -603,7 +603,7 @@ async fn materialized_view_registry_rejects_same_key_with_different_body() {
     let spec_hash = view_spec_hash(&spec).unwrap();
     let path = registry.object_key(&spec.view_id, &spec_hash).unwrap();
 
-    object_store::ObjectStore::put(
+    object_store::ObjectStoreExt::put(
         &*store,
         &object_store::path::Path::from(path.as_str()),
         serde_json::to_vec(&wrong_body).unwrap().into(),

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use datafusion::object_store::ObjectStore as DataFusionObjectStore;
-use object_store::{path::Path, ObjectStore, PutMode};
+use object_store::{path::Path, ObjectStore, ObjectStoreExt, PutMode};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;

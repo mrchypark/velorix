@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::query::{validate_input_query_with_policy, validate_table_query_with_policy};
 use bytes::Bytes;
-use object_store::{path::Path, ObjectStore, PutMode};
+use object_store::{path::Path, ObjectStore, ObjectStoreExt, PutMode};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use velorix_core::{

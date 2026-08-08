@@ -2,7 +2,7 @@
   "schema_version": 1,
   "msrv": {
     "minimum_rust_version": "1.93.1",
-    "policy": "CI and package updates keep the workspace buildable on the declared MSRV; the current floor follows DataFusion 53.1.0, kube 3.1.0, and the internal materialized view runtime."
+    "policy": "CI and package updates keep the workspace buildable on the declared MSRV; the current floor follows DataFusion 54.1.0, kube 4.2.0, and the internal materialized view runtime."
   },
   "package_reviews": [
     {
@@ -121,7 +121,7 @@
       "crate": "object_store",
       "owner": "runtime",
       "expires_on": "2026-08-31",
-      "reason": "Velorix intentionally carries object_store 0.12 for authority paths and DataFusion's object_store 0.13 for scan paths until the version boundary can be unified.",
+      "reason": "Velorix intentionally carries object_store 0.14 for authority paths and DataFusion's object_store 0.13 for scan paths until the version boundary can be unified.",
       "replacement_plan": "Unify authority and scan object_store clients when DataFusion and Velorix authority paths can share one compatible version.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
@@ -130,8 +130,8 @@
       "crate": "quick-xml",
       "owner": "runtime",
       "expires_on": "2026-08-31",
-      "reason": "Duplicate versions are introduced by Kubernetes/DataFusion transitive dependencies while upstream graphs converge.",
-      "replacement_plan": "Upgrade Kubernetes/DataFusion transitive dependency families when upstream ranges converge.",
+      "reason": "object_store 0.14 uses fixed quick-xml 0.41, while DataFusion 54 and the pinned Hiqlite dependency graph still carry quick-xml 0.39.",
+      "replacement_plan": "Upgrade DataFusion's object_store line and the Hiqlite/cryptr S3 dependency when their upstream ranges move to quick-xml 0.41 or newer.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
@@ -226,15 +226,6 @@
     },
     {
       "kind": "duplicate",
-      "crate": "rustls-platform-verifier",
-      "owner": "metadata",
-      "expires_on": "2026-08-31",
-      "reason": "The pinned mrchypark/hiqlite metadata backend and existing TLS clients introduce multiple rustls-platform-verifier lines while upstream TLS ranges converge.",
-      "replacement_plan": "Upgrade hiqlite and TLS dependencies when upstream rustls-platform-verifier ranges converge.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
-    },
-    {
-      "kind": "duplicate",
       "crate": "sha2",
       "owner": "metadata",
       "expires_on": "2026-08-31",
@@ -249,51 +240,6 @@
       "expires_on": "2026-08-31",
       "reason": "The pinned mrchypark/hiqlite metadata backend and existing rustls/ring graph introduce multiple untrusted versions while TLS dependencies converge.",
       "replacement_plan": "Upgrade hiqlite and TLS dependencies when upstream untrusted ranges converge.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
-    },
-    {
-      "kind": "duplicate",
-      "crate": "phf",
-      "owner": "metadata",
-      "expires_on": "2026-08-31",
-      "reason": "The pinned mrchypark/hiqlite full client feature set must match the server stream API and introduces server-side transitive dependencies that carry phf alongside existing parsers.",
-      "replacement_plan": "Upgrade hiqlite and parser/HTTP dependencies when upstream phf dependency ranges converge.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
-    },
-    {
-      "kind": "duplicate",
-      "crate": "phf_shared",
-      "owner": "metadata",
-      "expires_on": "2026-08-31",
-      "reason": "The pinned mrchypark/hiqlite full client feature set must match the server stream API and follows the phf duplicate introduced by server-compatible features.",
-      "replacement_plan": "Upgrade alongside phf when upstream dependency ranges converge.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
-    },
-    {
-      "kind": "duplicate",
-      "crate": "serde_spanned",
-      "owner": "metadata",
-      "expires_on": "2026-08-31",
-      "reason": "The pinned mrchypark/hiqlite full client feature set must match the server stream API and introduces toml 1.x dependencies alongside existing toml 0.8 users.",
-      "replacement_plan": "Upgrade hiqlite and toml/figment users when their dependency ranges converge.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
-    },
-    {
-      "kind": "duplicate",
-      "crate": "toml",
-      "owner": "metadata",
-      "expires_on": "2026-08-31",
-      "reason": "The pinned mrchypark/hiqlite full client feature set must match the server stream API and introduces toml 1.x alongside existing toml 0.8 users.",
-      "replacement_plan": "Upgrade hiqlite and toml/figment users when their dependency ranges converge.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
-    },
-    {
-      "kind": "duplicate",
-      "crate": "toml_datetime",
-      "owner": "metadata",
-      "expires_on": "2026-08-31",
-      "reason": "The pinned mrchypark/hiqlite full client feature set must match the server stream API and follows the toml duplicate introduced by server-compatible features.",
-      "replacement_plan": "Upgrade alongside toml when upstream dependency ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
@@ -360,6 +306,78 @@
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
+      "kind": "duplicate",
+      "crate": "itertools",
+      "owner": "runtime",
+      "expires_on": "2026-08-31",
+      "reason": "DataFusion and object_store 0.14 currently select adjacent itertools release lines.",
+      "replacement_plan": "Unify when the DataFusion and object_store dependency ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "spin",
+      "owner": "metadata",
+      "expires_on": "2026-08-31",
+      "reason": "Hiqlite and SlateDB-related dependency families select supported but distinct spin release lines.",
+      "replacement_plan": "Upgrade the metadata and storage dependency families when their spin ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "syn",
+      "owner": "runtime",
+      "expires_on": "2026-08-31",
+      "reason": "Current derive macro families span syn 2 and syn 3 while upstream migrations are incomplete.",
+      "replacement_plan": "Upgrade remaining derive macro dependencies when they support a shared syn line.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "phf",
+      "owner": "metadata",
+      "expires_on": "2026-08-31",
+      "reason": "The pinned mrchypark/hiqlite full client feature set must match the server stream API and introduces server-side transitive dependencies that carry phf alongside existing parsers.",
+      "replacement_plan": "Upgrade hiqlite and parser/HTTP dependencies when upstream phf dependency ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "phf_shared",
+      "owner": "metadata",
+      "expires_on": "2026-08-31",
+      "reason": "The pinned mrchypark/hiqlite full client feature set must match the server stream API and follows the phf duplicate introduced by server-compatible features.",
+      "replacement_plan": "Upgrade alongside phf when upstream dependency ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "serde_spanned",
+      "owner": "metadata",
+      "expires_on": "2026-08-31",
+      "reason": "The pinned mrchypark/hiqlite full client feature set must match the server stream API and introduces toml 1.x dependencies alongside existing toml 0.8 users.",
+      "replacement_plan": "Upgrade hiqlite and toml/figment users when their dependency ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "toml",
+      "owner": "metadata",
+      "expires_on": "2026-08-31",
+      "reason": "The pinned mrchypark/hiqlite full client feature set must match the server stream API and introduces toml 1.x alongside existing toml 0.8 users.",
+      "replacement_plan": "Upgrade hiqlite and toml/figment users when their dependency ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "toml_datetime",
+      "owner": "metadata",
+      "expires_on": "2026-08-31",
+      "reason": "The pinned mrchypark/hiqlite full client feature set must match the server stream API and follows the toml duplicate introduced by server-compatible features.",
+      "replacement_plan": "Upgrade alongside toml when upstream dependency ranges converge.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
       "kind": "unmaintained",
       "crate": "bincode",
       "owner": "metadata",
@@ -382,8 +400,8 @@
       "crate": "quick-xml:RUSTSEC-2026-0194",
       "owner": "storage",
       "expires_on": "2026-08-31",
-      "reason": "quick-xml 0.38/0.39 is reachable through production object_store clients; current SlateDB and DataFusion dependency ranges prevent selecting the fixed quick-xml 0.41 line.",
-      "replacement_plan": "Upgrade the authority-path and DataFusion object_store dependency families when compatible upstream releases can share a fixed quick-xml line, then remove the deny.toml exception.",
+      "reason": "The authority path is fixed on quick-xml 0.41, but DataFusion 54's object_store 0.13 S3 compatibility path and the pinned Hiqlite/cryptr S3 dependency still select quick-xml 0.39.",
+      "replacement_plan": "Upgrade DataFusion's object_store dependency and the Hiqlite/cryptr S3 dependency to quick-xml 0.41 or newer, then remove the deny.toml exception.",
       "promotion_rule": "deny_after_expiry_or_renew_with_security_approval_and_updated_plan"
     },
     {
@@ -391,17 +409,8 @@
       "crate": "quick-xml:RUSTSEC-2026-0195",
       "owner": "storage",
       "expires_on": "2026-08-31",
-      "reason": "quick-xml 0.38/0.39 is reachable through production object_store clients; current SlateDB and DataFusion dependency ranges prevent selecting the fixed quick-xml 0.41 line.",
-      "replacement_plan": "Upgrade the authority-path and DataFusion object_store dependency families when compatible upstream releases can share a fixed quick-xml line, then remove the deny.toml exception.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_security_approval_and_updated_plan"
-    },
-    {
-      "kind": "yanked",
-      "crate": "spin",
-      "owner": "metadata",
-      "expires_on": "2026-08-31",
-      "reason": "The pinned Hiqlite graph selects flume 0.12 and its yanked spin 0.9.8 dependency in the production metadata path.",
-      "replacement_plan": "Upgrade the pinned Hiqlite/flume dependency graph to a release that no longer selects spin 0.9.8, then restore yanked=deny.",
+      "reason": "The authority path is fixed on quick-xml 0.41, but DataFusion 54's object_store 0.13 S3 compatibility path and the pinned Hiqlite/cryptr S3 dependency still select quick-xml 0.39.",
+      "replacement_plan": "Upgrade DataFusion's object_store dependency and the Hiqlite/cryptr S3 dependency to quick-xml 0.41 or newer, then remove the deny.toml exception.",
       "promotion_rule": "deny_after_expiry_or_renew_with_security_approval_and_updated_plan"
     }
   ]

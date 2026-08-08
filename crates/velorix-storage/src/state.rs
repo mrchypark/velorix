@@ -5,7 +5,7 @@ use std::{
 
 use bytes::Bytes;
 use futures::TryStreamExt;
-use object_store::{path::Path, ObjectStore, PutMode};
+use object_store::{path::Path, ObjectStore, ObjectStoreExt, PutMode};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 

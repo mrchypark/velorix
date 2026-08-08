@@ -19,7 +19,9 @@ use bytes::Bytes;
 use futures::TryStreamExt;
 #[cfg(feature = "s3-compat-tests")]
 use object_store::{aws::AmazonS3Builder, prefix::PrefixStore};
-use object_store::{local::LocalFileSystem, path::Path as ObjectStorePath, ObjectStore, PutMode};
+use object_store::{
+    local::LocalFileSystem, path::Path as ObjectStorePath, ObjectStore, ObjectStoreExt, PutMode,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tempfile::TempDir;

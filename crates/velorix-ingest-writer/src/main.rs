@@ -22,6 +22,7 @@ use clap::{Parser, Subcommand};
 use kube::Client;
 use object_store::{
     aws::AmazonS3Builder, path::Path as ObjectStorePath, prefix::PrefixStore, ObjectStore,
+    ObjectStoreExt,
 };
 use serde::{Deserialize, Serialize};
 use velorix_control::lease::{

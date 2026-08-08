@@ -10,7 +10,7 @@ use arrow::{
 };
 use bytes::Bytes;
 use futures::TryStreamExt;
-use object_store::{local::LocalFileSystem, path::Path, ObjectStore, PutMode};
+use object_store::{local::LocalFileSystem, path::Path, ObjectStore, ObjectStoreExt, PutMode};
 use serde_json::json;
 use tempfile::TempDir;
 use velorix_core::{

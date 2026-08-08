@@ -83,12 +83,12 @@ mod live_s3 {
         aws::{AmazonS3, AmazonS3Builder as AuthorityS3Builder},
         path::Path,
         prefix::PrefixStore,
-        GetOptions, GetRange, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-        PutMultipartOptions, PutOptions, PutPayload, PutResult,
+        CopyOptions, GetOptions, GetRange, GetResult, ListResult, MultipartUpload, ObjectMeta,
+        ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
     };
     use object_store_13::{
         aws::AmazonS3Builder as DataFusionS3Builder, prefix::PrefixStore as DataFusionPrefixStore,
-        ObjectStoreExt,
+        ObjectStoreExt as DataFusionObjectStoreExt,
     };
     use parquet::arrow::ArrowWriter;
     use serde_json::json;
@@ -1080,18 +1080,6 @@ mod live_s3 {
             Ok(result)
         }
 
-        async fn get_range(
-            &self,
-            location: &Path,
-            range: Range<u64>,
-        ) -> object_store::Result<Bytes> {
-            let bytes = self.inner.get_range(location, range).await?;
-            self.range_read_count.fetch_add(1, Ordering::SeqCst);
-            self.bytes_read
-                .fetch_add(bytes.len() as u64, Ordering::SeqCst);
-            Ok(bytes)
-        }
-
         async fn get_ranges(
             &self,
             location: &Path,
@@ -1107,8 +1095,11 @@ mod live_s3 {
             Ok(bytes)
         }
 
-        async fn delete(&self, location: &Path) -> object_store::Result<()> {
-            self.inner.delete(location).await
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
         }
 
         fn list(
@@ -1136,12 +1127,13 @@ mod live_s3 {
             self.inner.list_with_delimiter(prefix).await
         }
 
-        async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-            self.inner.copy(from, to).await
-        }
-
-        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-            self.inner.copy_if_not_exists(from, to).await
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
         }
     }
 

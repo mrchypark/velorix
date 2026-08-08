@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use object_store::{memory::InMemory, path::Path, ObjectStore};
+use object_store::{memory::InMemory, path::Path, ObjectStore, ObjectStoreExt};
 use serde_json::{json, Value};
 use velorix_k8s::{
     controller::AuthoritySnapshot,

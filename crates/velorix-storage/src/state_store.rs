@@ -2,7 +2,7 @@ use std::{fmt, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use object_store::{path::Path, ObjectStore, PutMode};
+use object_store::{path::Path, ObjectStore, ObjectStoreExt, PutMode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use slatedb::{ErrorKind, IsolationLevel};

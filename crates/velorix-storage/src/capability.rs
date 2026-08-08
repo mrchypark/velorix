@@ -6,7 +6,7 @@ use std::{
 
 use bytes::Bytes;
 use futures::TryStreamExt;
-use object_store::{path::Path, ObjectStore, PutMode, UpdateVersion};
+use object_store::{path::Path, ObjectStore, ObjectStoreExt, PutMode, UpdateVersion};
 use thiserror::Error;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -381,7 +381,7 @@ pub async fn probe_object_store_capabilities(
                 });
             }
         },
-        Err(object_store::Error::NotImplemented) => false,
+        Err(object_store::Error::NotImplemented { .. }) => false,
         Err(source) => {
             let _ = store.delete(&path).await;
             return Err(ObjectStoreCapabilityProbeError::Write {

@@ -14,33 +14,33 @@ resolver = "2"
 
 [workspace.dependencies]
 anyhow = "1"
-arrow = { version = "58.2.0", default-features = false }
+arrow = { version = "58.4.0", default-features = false }
 async-trait = "0.1"
 axum = "0.8"
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 base64 = "0.22"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
-datafusion = { version = "53.1.0", default-features = false, features = ["sql", "parquet"] }
+datafusion = { version = "54.1.0", default-features = false, features = ["sql", "parquet"] }
 foyer = "0.22"
 futures = "0.3"
-k8s-openapi = "0.27.1"
-kube = { version = "3.1.0", default-features = false }
-object_store = "0.12"
-parquet = "58.2.0"
+k8s-openapi = "0.28.0"
+kube = { version = "4.2.0", default-features = false }
+object_store = "0.14.1"
+parquet = "58.4.0"
 percent-encoding = "2"
 proptest = "1"
 schemars = "1.2.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-sqlparser = "0.61.0"
+sqlparser = "0.62.0"
 ring = "0.17"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-slatedb = { version = "0.12.1", default-features = false }
-sigstore-trust-root = { version = "0.8", default-features = false }
-sigstore-types = "0.8"
-sigstore-verify = { version = "0.8", default-features = false, features = ["rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+slatedb = { version = "0.15.0", default-features = false }
+sigstore-trust-root = { version = "0.11", default-features = false }
+sigstore-types = "0.11"
+sigstore-verify = { version = "0.11", default-features = false, features = ["rustls"] }
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

@@ -36,7 +36,7 @@ use object_store::{
     aws::{AmazonS3Builder, S3ConditionalPut},
     path::Path as ObjectPath,
     prefix::PrefixStore,
-    ObjectStore, PutMode,
+    ObjectStore, ObjectStoreExt, PutMode,
 };
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use serde::{Deserialize, Serialize};
@@ -13996,9 +13996,9 @@ mod tests {
     use axum::http::Method;
     use futures::stream::BoxStream;
     use object_store::{
-        memory::InMemory, path::Path, GetOptions, GetResult, ListResult, MultipartUpload,
-        ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
-        Result as ObjectStoreResult,
+        memory::InMemory, path::Path, CopyOptions, GetOptions, GetResult, ListResult,
+        MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload,
+        PutResult, Result as ObjectStoreResult,
     };
     use std::{fmt, time::Duration};
     use tower::ServiceExt as _;
@@ -14266,8 +14266,11 @@ mod tests {
             self.inner.list(prefix)
         }
 
-        async fn delete(&self, location: &Path) -> ObjectStoreResult<()> {
-            self.inner.delete(location).await
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, ObjectStoreResult<Path>>,
+        ) -> BoxStream<'static, ObjectStoreResult<Path>> {
+            self.inner.delete_stream(locations)
         }
 
         async fn list_with_delimiter(
@@ -14277,12 +14280,13 @@ mod tests {
             self.inner.list_with_delimiter(prefix).await
         }
 
-        async fn copy(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
-            self.inner.copy(from, to).await
-        }
-
-        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
-            self.inner.copy_if_not_exists(from, to).await
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> ObjectStoreResult<()> {
+            self.inner.copy_opts(from, to, options).await
         }
     }
 
@@ -15103,7 +15107,7 @@ mod tests {
         identity.insert(legacy_key("runtime", "_packages"), runtimes);
         let capabilities = identity.remove("runtime_capabilities").unwrap();
         identity.insert(legacy_key("package", "_feature_set"), capabilities);
-        object_store::ObjectStore::put(
+        object_store::ObjectStoreExt::put(
             &*state.store,
             &Path::from(checkpoint_key.as_str()),
             serde_json::to_vec(&record).unwrap().into(),

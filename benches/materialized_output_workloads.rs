@@ -6,7 +6,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use object_store::{path::Path, ObjectStore};
+use object_store::{path::Path, ObjectStore, ObjectStoreExt};
 use sha2::{Digest, Sha256};
 use velorix_runtime::benchmark_gate::{BenchmarkWorkloadMetricsV1, ObjectRequestMetricsV1};
 use velorix_storage::object_key::ObjectKey;

@@ -16,7 +16,10 @@ use datafusion::object_store::{
     memory::InMemory as DataFusionInMemory, path::Path as DataFusionPath,
     ObjectStore as DataFusionObjectStore, ObjectStoreExt as DataFusionObjectStoreExt,
 };
-use object_store::{local::LocalFileSystem, path::Path, ObjectStore};
+use object_store::{
+    local::LocalFileSystem, path::Path, CopyOptions, ObjectStore,
+    ObjectStoreExt as AuthorityObjectStoreExt,
+};
 use parquet::arrow::ArrowWriter;
 use serde_json::json;
 use tempfile::TempDir;
@@ -120,8 +123,11 @@ impl ObjectStore for CountingStore {
         self.inner.get_opts(location, options).await
     }
 
-    async fn delete(&self, location: &Path) -> object_store::Result<()> {
-        self.inner.delete(location).await
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(locations)
     }
 
     fn list(
@@ -138,12 +144,13 @@ impl ObjectStore for CountingStore {
         self.inner.list_with_delimiter(prefix).await
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-        self.inner.copy(from, to).await
-    }
-
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-        self.inner.copy_if_not_exists(from, to).await
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
     }
 }
 

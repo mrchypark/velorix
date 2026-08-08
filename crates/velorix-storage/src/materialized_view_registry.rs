@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::TryStreamExt;
-use object_store::{path::Path, ObjectStore, PutMode, UpdateVersion};
+use object_store::{path::Path, ObjectStore, ObjectStoreExt, PutMode, UpdateVersion};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};

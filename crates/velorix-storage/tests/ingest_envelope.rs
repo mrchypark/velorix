@@ -11,7 +11,7 @@ use arrow::{
 };
 use async_trait::async_trait;
 use bytes::Bytes;
-use object_store::{local::LocalFileSystem, path::Path, ObjectStore, PutMode};
+use object_store::{local::LocalFileSystem, path::Path, ObjectStore, ObjectStoreExt, PutMode};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
