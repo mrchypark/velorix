@@ -162,6 +162,7 @@ jobs:
             --backend local \
             --baseline baselines/benchmark/local/pr-smoke.json \
             --result target/velorix-bench/local-pr-smoke.json \
+            --max-regression-fraction 0.25 \
             --json > target/velorix-bench/local-pr-smoke-gate.json
 
       - name: Upload benchmark result

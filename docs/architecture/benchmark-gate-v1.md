@@ -146,7 +146,10 @@ support.
 - Local and S3 baselines cannot be mixed.
 - Missing object request metrics invalidates the result.
 - PR smoke writes `target/velorix-bench/local-pr-smoke.json`, gates it against
-  `baselines/benchmark/local/pr-smoke.json`, and uploads the result artifact.
+  `baselines/benchmark/local/pr-smoke.json` with a 25% single-run regression
+  budget, and uploads the result artifact even when the gate fails. Nightly and
+  release evidence should use tighter repeated measurements on controlled
+  runners rather than reusing this smoke tolerance.
 - Nightly S3-compatible gating fails closed when no S3-compatible result path is
   configured or when the S3-compatible result regresses against the live
   baseline.
