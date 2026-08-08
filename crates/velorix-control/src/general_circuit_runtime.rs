@@ -211,6 +211,7 @@ impl GeneralCircuitRuntime {
         logical_epoch: LogicalEpoch,
         input_deltas: HashMap<NodeId, DeltaBatch>,
     ) -> Result<DeltaBatch, CircuitRuntimeError> {
+        eprintln!("[EPOCH] START logical_epoch={} published_before={}", logical_epoch, self.published_output.records().len());
         // Validate monotonic epoch
         if logical_epoch <= self.logical_epoch {
             return Err(CircuitRuntimeError::NonMonotonicEpoch {
@@ -219,7 +220,7 @@ impl GeneralCircuitRuntime {
             });
         }
 
-        // Walk circuit in topological order
+    // Walk circuit in topological order
         let order = self.circuit.circuit.topological_order();
         let mut node_outputs: HashMap<NodeId, DeltaBatch> = HashMap::new();
 
@@ -234,8 +235,18 @@ impl GeneralCircuitRuntime {
             .cloned()
             .unwrap_or_default();
 
-        // Update published output
-        self.published_output = apply_published_output_delta(&self.published_output, &output);
+        // Update published output. For non-incremental operators (TopK, RowNumber,
+        // LatestByKey), the output is a full snapshot and should REPLACE the
+        // published output, not be combined with it.
+        let output_is_snapshot = matches!(
+            self.circuit.circuit.nodes.get(self.circuit.circuit.output_node_id),
+            Some(CircuitNode::TopK { .. } | CircuitNode::RowNumber { .. } | CircuitNode::LatestByKey { .. })
+        );
+        if output_is_snapshot {
+            self.published_output = output.clone();
+        } else {
+            self.published_output = apply_published_output_delta(&self.published_output, &output);
+        }
         self.logical_epoch = logical_epoch;
 
         Ok(output)
