@@ -2,7 +2,7 @@
 
 **Current status.** The original contract blockers for ingest acknowledgement, output-only query serving, metadata startup safety, and join frontier shape are resolved in the current docs/code contracts: public 1.0 ingest uses synchronous `materialized` acknowledgement, queries read published materialized output, production metadata startup fails closed, and joins use sequential per-relation frontier vectors. This critique still blocks release readiness where live evidence is missing, especially cross-store checkpoint fault injection, trusted disaster recovery, repair/GC/upgrade evidence, and adversarial scale/retention proof.
 
-This is an architecture/contract review of the supplied bundle, not a full implementation audit. Line references are to `attachments-bundle.txt`. 
+This is an architecture/contract review of the supplied bundle, not a full implementation audit. Line references are to `attachments-bundle.txt`.
 
 ## Top 10 risks
 
