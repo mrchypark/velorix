@@ -165,6 +165,7 @@ jobs:
             --json > target/velorix-bench/local-pr-smoke-gate.json
 
       - name: Upload benchmark result
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: local-pr-smoke-benchmark

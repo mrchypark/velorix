@@ -56,6 +56,7 @@ const OBJECT_STORE_CAPABILITY_PROBE_WORKLOAD: &str = "object_store_capability_pr
 const LOCAL_BENCHMARK_GATE_WORKLOADS: &[&str] = &[
     OBJECT_STORE_CAPABILITY_PROBE_WORKLOAD,
     "ingest_envelope_validation",
+    "native_sql_materialized_view_apply",
     "checkpoint_publish",
     "checkpoint_recovery",
     "datafusion_table_scan",

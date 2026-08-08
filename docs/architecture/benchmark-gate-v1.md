@@ -63,6 +63,7 @@ benchmark results:
 
 - `object_store_capability_probe`
 - `ingest_envelope_validation`
+- `native_sql_materialized_view_apply`
 - `checkpoint_publish`
 - `checkpoint_recovery`
 - `datafusion_table_scan`
@@ -78,13 +79,14 @@ benchmark results:
 - `gc_execution_evidence`
 
 The current `local_incremental` and `s3_incremental` benchmark workloads are
-storage/runtime primitive evidence, not public REST product-path evidence. In
-particular, `ingest_envelope_validation` measures direct
-`IngestAdmissionCoordinator` admission and the incremental state path uses
-`PrototypeIncrementalEngine`; these labels must not be cited as full relation
-ingest API to materialized-output evidence. Product-path ingest evidence should
-use a separate benchmark/workload label once it measures public relation ingest
-and materialized-output reads through the product API path.
+storage/runtime primitive evidence, not public REST product-path evidence.
+`local_incremental` admits SQL through the production logical-plan factory,
+applies Arrow relation batches to the selected standing runtime, checkpoints
+and restores that runtime, and verifies its materialized output after replay.
+`ingest_envelope_validation` still measures direct
+`IngestAdmissionCoordinator` admission, so these labels must not be cited as
+full HTTP relation-ingest evidence. Product-path HTTP evidence should use a
+separate workload label once it measures the public API boundary end to end.
 
 S3-compatible benchmark gates do not require `gc_execution_evidence`, because
 live GC deletion is a separate release artifact path rather than a timing

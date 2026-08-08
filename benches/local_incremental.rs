@@ -31,12 +31,23 @@ use serde_json::json;
 use tempfile::TempDir;
 use velorix_core::{
     delta::{DeltaBatch, DeltaKey, DeltaRecord, DeltaValue},
-    engine::{IncrementalEngine, PrototypeIncrementalEngine},
     query::QueryPolicy,
+    relation::VelorixRelationCatalogV1,
+    standing_program::{
+        BuiltinRuntimeIdentity, EpochIdempotencyKey, NativeCodePolicy, RelationInputBatch,
+        RuntimeCheckpoint, ScopedViewId, SnapshotPageRequest, StandingProgramIdentity,
+        StandingProgramRuntime,
+    },
+    view_contract::{
+        catalog_input_relation_schema, stable_bytes_hash, ColumnSchema, RelationSchema, SqlDataType,
+    },
 };
 use velorix_runtime::benchmark_gate::{
     BenchmarkBackend, BenchmarkEvidenceScope, BenchmarkGateLevel, BenchmarkGateResultV1,
     BenchmarkMetricsV1, BenchmarkWorkloadMetricsV1, ObjectRequestMetricsV1,
+};
+use velorix_runtime::materialized_view_runtime::{
+    create_standing_runtime_with_sql_and_catalogs, restore_standing_runtime, CRATE_NAME,
 };
 use velorix_runtime::persisted_table::{
     query_production_persisted_object_backed_input_with_metrics,
@@ -44,8 +55,8 @@ use velorix_runtime::persisted_table::{
 };
 use velorix_runtime::query_policy_catalog::QueryPolicyCatalogStore;
 use velorix_runtime::recovery::{
-    orders_sum_count_relation_catalog, RecoveredRuntime, ORDERS_SUM_COUNT_OWNER,
-    ORDERS_SUM_COUNT_RELATION_ID, ORDERS_SUM_COUNT_RELATION_VERSION,
+    orders_sum_count_relation_catalog, ORDERS_SUM_COUNT_OWNER, ORDERS_SUM_COUNT_RELATION_ID,
+    ORDERS_SUM_COUNT_RELATION_VERSION,
 };
 use velorix_runtime::storage_registry::StorageRegistry;
 use velorix_storage::{
@@ -64,10 +75,13 @@ use velorix_storage::{
 
 const STREAM_ID: &str = "orders";
 const PARTITION_ID: u32 = 0;
-const BATCH_COUNT: u64 = 64;
+const BATCH_COUNT: u64 = 256;
 const RECORDS_PER_BATCH: u64 = 16;
 const CHECKPOINT_VERSION: u64 = 0;
 const GC_EXECUTION_RUN_ID: &str = "local-incremental-gc-execution";
+const MATERIALIZED_VIEW_SQL: &str =
+    "select account_id, sum(amount) as sum, count(*) as count from orders group by account_id";
+const MATERIALIZED_VIEW_ID: &str = "orders_by_account";
 
 type BenchResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -108,20 +122,30 @@ async fn run() -> BenchResult<()> {
         Arc::clone(&store),
         capability_profile(&capabilities, AuthoritativeNamespace::Checkpoint)?,
     )?;
-    let mut engine = PrototypeIncrementalEngine::new();
+    let catalog = orders_sum_count_relation_catalog()?;
+    let input_schema = catalog_input_relation_schema(&catalog)?;
+    let output_schema = materialized_view_output_schema();
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &standing_identity(MATERIALIZED_VIEW_SQL),
+        std::slice::from_ref(&catalog),
+        MATERIALIZED_VIEW_SQL,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .map_err(std::io::Error::other)?;
 
     RelationCatalogRegistry::new_checked(
         Arc::clone(&store),
         capability_profile(&capabilities, AuthoritativeNamespace::RelationCatalog)?,
     )?
-    .create(&orders_sum_count_relation_catalog()?)
+    .create(&catalog)
     .await?;
 
     let mut total_records = 0;
     let mut ingest_samples = Vec::new();
+    let mut materialized_view_apply_samples = Vec::new();
+    let mut materialized_view_apply_elapsed = Duration::ZERO;
     let mut ingest_requests = empty_object_requests();
-    let ingest_started = Instant::now();
-
     for batch_index in 0..BATCH_COUNT {
         let input = workload_batch(batch_index, RECORDS_PER_BATCH);
         let start_offset = total_records;
@@ -136,25 +160,39 @@ async fn run() -> BenchResult<()> {
             &metered_store.snapshot(),
             &requests_before,
         );
-        engine.push_changes(batch_index + 1, &input)?;
+        let materialization_started = Instant::now();
+        runtime.apply_changes(
+            batch_index + 1,
+            EpochIdempotencyKey::new(format!("local-benchmark-epoch-{}", batch_index + 1))?,
+            vec![relation_input_batch(
+                &catalog,
+                start_offset,
+                end_offset,
+                ingest_record_batch(&input)?,
+            )],
+        )?;
+        let materialization_elapsed = materialization_started.elapsed();
+        materialized_view_apply_samples.push(materialization_elapsed);
+        materialized_view_apply_elapsed += materialization_elapsed;
 
         total_records = end_offset;
     }
 
-    let ingest_elapsed = ingest_started.elapsed();
     let checkpoint_requests_before = metered_store.snapshot();
     let checkpoint_started = Instant::now();
-    let checkpoint = engine.checkpoint_state();
+    let checkpoint = runtime.checkpoint()?;
+    let checkpoint_bytes = serde_json::to_vec(&checkpoint)?;
     let state_ref = publisher
         .write_state_object(&StateObjectWrite::new(
             ORDERS_SUM_COUNT_OWNER,
             PARTITION_ID,
             CHECKPOINT_VERSION,
             "local-incremental-state",
-            Bytes::from(serde_json::to_vec(&checkpoint.to_payload())?),
+            Bytes::from(checkpoint_bytes),
         )?)
         .await?;
     let checkpoint_state_key = state_ref.object_key.as_str().to_string();
+    let checkpoint_state_ref = state_ref.clone();
     publisher
         .publish_manifest(&CheckpointManifest {
             schema_version: 1,
@@ -193,24 +231,22 @@ async fn run() -> BenchResult<()> {
 
     let recovery_requests_before = metered_store.snapshot();
     let recovery_started = Instant::now();
-    let recovered = RecoveredRuntime::recover_with_owner_and_relation_catalog_record_checked(
-        Arc::clone(&store),
-        ORDERS_SUM_COUNT_OWNER,
-        ORDERS_SUM_COUNT_RELATION_ID,
-        ORDERS_SUM_COUNT_RELATION_VERSION,
-        &capabilities,
-    )
-    .await?;
+    let checkpoint_bytes = publisher.read_state_object(&checkpoint_state_ref).await?;
+    let checkpoint: RuntimeCheckpoint = serde_json::from_slice(&checkpoint_bytes)?;
+    let mut recovered = restore_standing_runtime(checkpoint).map_err(std::io::Error::other)?;
+    recovered.apply_changes(
+        BATCH_COUNT + 1,
+        EpochIdempotencyKey::new("local-benchmark-tail")?,
+        vec![relation_input_batch(
+            &catalog,
+            total_records,
+            total_records + RECORDS_PER_BATCH,
+            ingest_record_batch(&tail_input)?,
+        )],
+    )?;
     let recovery_elapsed = recovery_started.elapsed();
     let recovery_requests = request_delta(&metered_store.snapshot(), &recovery_requests_before);
-    let recovered_rows = recovered.materialized_state().net_rows()?;
-
-    assert_eq!(
-        recovered.latest_checkpoint_version(),
-        Some(CHECKPOINT_VERSION)
-    );
-    assert_eq!(recovered.replayed_batch_count(), 1);
-    assert!(!recovered_rows.is_empty());
+    assert_materialized_view(&*recovered, BATCH_COUNT + 1)?;
 
     let gc_dry_run_planning = gc_dry_run_planning(
         &publisher,
@@ -241,7 +277,7 @@ async fn run() -> BenchResult<()> {
         )
         .await?;
 
-    let records_per_second = total_records as f64 / ingest_elapsed.as_secs_f64();
+    let records_per_second = total_records as f64 / materialized_view_apply_elapsed.as_secs_f64();
     let mut object_requests = metered_store.snapshot();
     add_request_delta(
         &mut object_requests,
@@ -279,6 +315,12 @@ async fn run() -> BenchResult<()> {
                     "ingest_envelope_validation",
                     &ingest_samples,
                     ingest_requests,
+                    0,
+                ),
+                workload_metric(
+                    "native_sql_materialized_view_apply",
+                    &materialized_view_apply_samples,
+                    empty_object_requests(),
                     0,
                 ),
                 workload_metric(
@@ -607,6 +649,126 @@ fn workload_batch(batch_index: u64, records: u64) -> DeltaBatch {
             1,
         )
     }))
+}
+
+fn materialized_view_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: MATERIALIZED_VIEW_ID.to_string(),
+        relation_name: MATERIALIZED_VIEW_ID.to_string(),
+        relation_version: "v1".to_string(),
+        schema_fingerprint: stable_bytes_hash(b"orders-by-account-output-v1"),
+        columns: vec![
+            ColumnSchema {
+                name: "account_id".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "sum".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "count".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["account_id".to_string()],
+    }
+}
+
+fn standing_identity(sql: &str) -> StandingProgramIdentity {
+    StandingProgramIdentity {
+        tenant_id: "tenant-a".to_string(),
+        program_id: "local-incremental-benchmark".to_string(),
+        view_ids: vec![MATERIALIZED_VIEW_ID.to_string()],
+        sql_hash: stable_bytes_hash(sql.as_bytes()),
+        input_catalog_hash: stable_bytes_hash(b"orders-sum-count-catalog-v1"),
+        output_schema_hash: stable_bytes_hash(b"orders-by-account-output-v1"),
+        planner_identity: "velorix-logical-view-planner@1".to_string(),
+        builtin_runtime_identities: vec![BuiltinRuntimeIdentity {
+            name: CRATE_NAME.to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        }],
+        runtime_capabilities: vec!["materialized-view-runtime-v1".to_string()],
+        runtime_compatibility: "velorix-materialized-view-runtime-v1".to_string(),
+        checkpoint_codec_identity: "velorix-standing-program-checkpoint-v1".to_string(),
+        native_code_policy: NativeCodePolicy::DisabledNoExternalDependencies,
+    }
+}
+
+fn relation_input_batch(
+    catalog: &VelorixRelationCatalogV1,
+    start_offset_inclusive: u64,
+    end_offset_exclusive: u64,
+    batch: RecordBatch,
+) -> RelationInputBatch {
+    RelationInputBatch {
+        relation_id: catalog.relation_schema.relation_id.clone(),
+        relation_version: catalog.relation_schema.relation_version.clone(),
+        stream_id: STREAM_ID.to_string(),
+        partition_id: PARTITION_ID,
+        schema_fingerprint: catalog.schema_fingerprint.to_string(),
+        start_offset_inclusive,
+        end_offset_exclusive,
+        event_time_watermark: None,
+        batches: vec![batch],
+    }
+}
+
+fn assert_materialized_view(
+    runtime: &(dyn StandingProgramRuntime + Send),
+    logical_epoch: u64,
+) -> BenchResult<()> {
+    let page = runtime.materialized_view_page(
+        ScopedViewId {
+            tenant_id: "tenant-a".to_string(),
+            program_id: "local-incremental-benchmark".to_string(),
+            view_id: MATERIALIZED_VIEW_ID.to_string(),
+        },
+        SnapshotPageRequest {
+            committed_epoch: Some(logical_epoch),
+            page_token: None,
+            max_rows: None,
+        },
+    )?;
+    if page.logical_epoch != logical_epoch || page.batches.len() != 1 {
+        return Err(std::io::Error::other("unexpected materialized view page").into());
+    }
+    let batch = &page.batches[0];
+    let accounts = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| std::io::Error::other("materialized account column is not utf8"))?;
+    let sums = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| std::io::Error::other("materialized sum column is not int64"))?;
+    let counts = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| std::io::Error::other("materialized count column is not int64"))?;
+    if batch.num_rows() != RECORDS_PER_BATCH as usize {
+        return Err(std::io::Error::other("materialized view contents are incorrect").into());
+    }
+    for row in 0..batch.num_rows() {
+        let account_index = accounts
+            .value(row)
+            .strip_prefix("account-")
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(|| std::io::Error::other("materialized account key is malformed"))?;
+        let expected_sum = (0..=BATCH_COUNT)
+            .map(|batch_index| ((batch_index + account_index) % 101) as i64)
+            .sum::<i64>();
+        if sums.value(row) != expected_sum || counts.value(row) != BATCH_COUNT as i64 + 1 {
+            return Err(std::io::Error::other("materialized view contents are incorrect").into());
+        }
+    }
+    Ok(())
 }
 
 fn parquet_input_batch() -> BenchResult<RecordBatch> {
