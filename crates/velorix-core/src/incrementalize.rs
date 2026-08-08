@@ -13,9 +13,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::circuit::{
-    Circuit, CircuitNode, DelayState, Edge, EdgeKey, IncrementalCircuit, NodeId,
-};
+use crate::circuit::{Circuit, CircuitNode, DelayState, Edge, EdgeKey, IncrementalCircuit, NodeId};
 
 // ---------------------------------------------------------------------------
 // Algorithm entry point
@@ -80,24 +78,14 @@ pub fn eval_node_incremental(
         CircuitNode::Source { .. } => {
             // Source nodes produce the raw input delta; it arrives via
             // input_deltas keyed by their own id (injected by the runtime).
-            Ok(input_deltas
-                .values()
-                .cloned()
-                .next()
-                .unwrap_or_default())
+            Ok(input_deltas.values().cloned().next().unwrap_or_default())
         }
 
-        CircuitNode::Filter { predicates, .. } => {
+        CircuitNode::Filter { predicate, .. } => {
             let input = first_input(input_deltas)?;
             Ok(crate::operator::filter_delta_batch(&input, |record| {
-                for pred in predicates {
-                    if !evaluate_predicate(pred, &record.value)
-                        .map_err(crate::operator::OperatorError::from)?
-                    {
-                        return Ok(false);
-                    }
-                }
-                Ok(true)
+                evaluate_filter_expr(predicate, &record.value)
+                    .map_err(crate::operator::OperatorError::from)
             })?)
         }
 
@@ -111,7 +99,8 @@ pub fn eval_node_incremental(
                         projected.insert(col.output_column_id.clone(), v.clone());
                     }
                 }
-                let key_val = columns.first()
+                let key_val = columns
+                    .first()
                     .and_then(|col| projected.get(&col.output_column_id))
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
@@ -131,10 +120,15 @@ pub fn eval_node_incremental(
             Ok(crate::operator::map_delta_batch(&input, |record| {
                 let val = evaluate_expr(expr, &record.value)
                     .map_err(crate::operator::OperatorError::from)?;
-                let mut obj = record.value.as_json().as_object().cloned().unwrap_or_default();
+                let mut obj = record
+                    .value
+                    .as_json()
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default();
                 obj.insert(output_column_id.clone(), val);
                 Ok((
-                    crate::delta::DeltaKey::from_json(serde_json::Value::Object(obj.clone())),
+                    record.key.clone(),
                     crate::delta::DeltaValue::from_json(serde_json::Value::Object(obj)),
                 ))
             })?)
@@ -143,9 +137,13 @@ pub fn eval_node_incremental(
         // ----------------------------------------------------------------
         // Stateful operators: require external state management
         // ----------------------------------------------------------------
-        CircuitNode::Join { .. } | CircuitNode::Aggregate { .. } | CircuitNode::Distinct { .. }
-        | CircuitNode::TopK { .. } | CircuitNode::TumblingWindow { .. }
-        | CircuitNode::RowNumber { .. } | CircuitNode::LatestByKey { .. } => {
+        CircuitNode::Join { .. }
+        | CircuitNode::Aggregate { .. }
+        | CircuitNode::Distinct { .. }
+        | CircuitNode::TopK { .. }
+        | CircuitNode::TumblingWindow { .. }
+        | CircuitNode::RowNumber { .. }
+        | CircuitNode::LatestByKey { .. } => {
             // Stateful operators are managed by the runtime, not here.
             // This function handles only stateless pass-through.
             // The runtime calls dedicated methods on `GeneralCircuitRuntime`.
@@ -159,6 +157,58 @@ pub fn eval_node_incremental(
 // ---------------------------------------------------------------------------
 // Predicate and expression evaluation
 // ---------------------------------------------------------------------------
+
+/// Evaluate a compound filter expression against a record's value.
+fn evaluate_filter_expr(
+    expr: &crate::circuit::CircuitFilterExpr,
+    value: &crate::delta::DeltaValue,
+) -> Result<bool, IncrementalError> {
+    use crate::circuit::CircuitFilterExpr;
+    match expr {
+        CircuitFilterExpr::AlwaysTrue => Ok(true),
+        CircuitFilterExpr::Predicate(pred) => evaluate_predicate(pred, value),
+        CircuitFilterExpr::Comparison { left, op, right } => {
+            let left = evaluate_expr(left, value)?;
+            let right = evaluate_expr(right, value)?;
+            Ok(evaluate_comparison(&left, *op, &right))
+        }
+        CircuitFilterExpr::And(children) => {
+            for child in children {
+                if !evaluate_filter_expr(child, value)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        CircuitFilterExpr::Or(children) => {
+            for child in children {
+                if evaluate_filter_expr(child, value)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        CircuitFilterExpr::Not(child) => Ok(!evaluate_filter_expr(child, value)?),
+    }
+}
+
+fn evaluate_comparison(
+    left: &serde_json::Value,
+    op: crate::circuit::CircuitPredicateOp,
+    right: &serde_json::Value,
+) -> bool {
+    use crate::circuit::CircuitPredicateOp;
+    match op {
+        CircuitPredicateOp::Eq => left == right,
+        CircuitPredicateOp::Ne => left != right,
+        CircuitPredicateOp::Lt => compare_json_value(Some(left), right).is_some_and(|o| o.is_lt()),
+        CircuitPredicateOp::Le => compare_json_value(Some(left), right).is_some_and(|o| o.is_le()),
+        CircuitPredicateOp::Gt => compare_json_value(Some(left), right).is_some_and(|o| o.is_gt()),
+        CircuitPredicateOp::Ge => compare_json_value(Some(left), right).is_some_and(|o| o.is_ge()),
+        CircuitPredicateOp::IsDistinctFrom => left != right,
+        _ => false,
+    }
+}
 
 fn evaluate_predicate(
     pred: &crate::circuit::CircuitPredicate,
@@ -182,14 +232,118 @@ fn evaluate_predicate(
             compare_json(col_val, lit),
             Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
         ),
-        CircuitPredicateOp::IsNull => col_val.is_none() || col_val == Some(&serde_json::Value::Null),
-        CircuitPredicateOp::IsNotNull => col_val.is_some() && col_val != Some(&serde_json::Value::Null),
+        CircuitPredicateOp::IsNull => {
+            col_val.is_none() || col_val == Some(&serde_json::Value::Null)
+        }
+        CircuitPredicateOp::IsNotNull => {
+            col_val.is_some() && col_val != Some(&serde_json::Value::Null)
+        }
+        CircuitPredicateOp::IsDistinctFrom => {
+            // IS DISTINCT FROM: true when (col IS NULL AND lit IS NOT NULL) or (col IS NOT NULL AND lit IS NULL) or col != lit
+            match (col_val, lit) {
+                (None, serde_json::Value::Null) => false,
+                (None, _) | (Some(serde_json::Value::Null), _)
+                    if lit != &serde_json::Value::Null =>
+                {
+                    true
+                }
+                (_, serde_json::Value::Null) if col_val != Some(&serde_json::Value::Null) => true,
+                (Some(a), b) => a != b,
+                _ => false,
+            }
+        }
+        CircuitPredicateOp::In => {
+            // literal is the first element; literals contains all values
+            let all_vals = if pred.literals.is_empty() {
+                vec![lit.clone()]
+            } else {
+                pred.literals.clone()
+            };
+            match col_val {
+                None => false,
+                Some(cv) => all_vals.iter().any(|v| cv == v),
+            }
+        }
+        CircuitPredicateOp::NotIn => {
+            let all_vals = if pred.literals.is_empty() {
+                vec![lit.clone()]
+            } else {
+                pred.literals.clone()
+            };
+            match col_val {
+                None => true,
+                Some(cv) => all_vals.iter().all(|v| cv != v),
+            }
+        }
+        CircuitPredicateOp::Between => {
+            // literals[0] = low, literals[1] = high
+            if pred.literals.len() >= 2 {
+                let low = &pred.literals[0];
+                let high = &pred.literals[1];
+                matches!(
+                    compare_json(col_val, low),
+                    Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+                ) && matches!(
+                    compare_json(col_val, high),
+                    Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+                )
+            } else {
+                false
+            }
+        }
+        CircuitPredicateOp::Like => {
+            if let Some(serde_json::Value::String(pattern)) = col_val {
+                let pattern_str = lit.as_str().unwrap_or("");
+                simple_like(pattern, pattern_str)
+            } else {
+                false
+            }
+        }
     };
 
     Ok(result)
 }
 
-fn compare_json(a: Option<&serde_json::Value>, b: &serde_json::Value) -> Option<std::cmp::Ordering> {
+/// Simple SQL LIKE pattern matching (% = any chars, _ = single char).
+fn simple_like(value: &str, pattern: &str) -> bool {
+    // Convert SQL LIKE pattern to a simple regex-like match
+    let mut pi = 0;
+    let mut vi = 0;
+    let mut star_pi = usize::MAX;
+    let mut star_vi = 0;
+
+    while vi < value.len() {
+        if pi < pattern.len()
+            && (pattern.as_bytes()[pi] == b'%' || pattern.as_bytes()[pi] == value.as_bytes()[vi])
+        {
+            if pattern.as_bytes()[pi] == b'%' {
+                star_pi = pi;
+                star_vi = vi;
+                pi += 1;
+            } else {
+                pi += 1;
+                vi += 1;
+            }
+        } else if star_pi != usize::MAX {
+            pi = star_pi + 1;
+            star_vi += 1;
+            vi = star_vi;
+        } else {
+            return false;
+        }
+    }
+
+    while pi < pattern.len() && pattern.as_bytes()[pi] == b'%' {
+        pi += 1;
+    }
+
+    pi == pattern.len()
+}
+
+fn compare_json(
+    a: Option<&serde_json::Value>,
+    b: &serde_json::Value,
+) -> Option<std::cmp::Ordering> {
     let a = a?;
     match (a, b) {
         (serde_json::Value::Number(a), serde_json::Value::Number(b)) => {
@@ -198,6 +352,7 @@ fn compare_json(a: Option<&serde_json::Value>, b: &serde_json::Value) -> Option<
             a_f.partial_cmp(&b_f)
         }
         (serde_json::Value::String(a), serde_json::Value::String(b)) => Some(a.cmp(b)),
+        (serde_json::Value::Bool(a), serde_json::Value::Bool(b)) => Some(a.cmp(b)),
         _ => None,
     }
 }
@@ -235,12 +390,21 @@ fn evaluate_expr(
             let rv = evaluate_expr(r, value)?;
             Ok(json_div(&lv, &rv))
         }
+        CircuitExpr::Modulo(l, r) => {
+            let lv = evaluate_expr(l, value)?;
+            let rv = evaluate_expr(r, value)?;
+            Ok(json_modulo(&lv, &rv))
+        }
         CircuitExpr::Neg(e) => {
             let v = evaluate_expr(e, value)?;
             Ok(match v {
                 serde_json::Value::Number(n) => {
-                    let f = n.as_f64().unwrap_or(0.0);
-                    serde_json::json!(-f)
+                    if let Some(value) = n.as_i64().and_then(i64::checked_neg) {
+                        serde_json::json!(value)
+                    } else {
+                        let value = n.as_f64().unwrap_or(0.0);
+                        serde_json::json!(-value)
+                    }
                 }
                 other => other,
             })
@@ -256,6 +420,81 @@ fn evaluate_expr(
             })
         }
         CircuitExpr::Cast { expr, .. } => evaluate_expr(expr, value),
+        CircuitExpr::Greatest(args) => {
+            let mut best: Option<serde_json::Value> = None;
+            for arg in args {
+                let v = evaluate_expr(arg, value)?;
+                if let Some(ref b) = best {
+                    if let Some(std::cmp::Ordering::Greater) = compare_json_value(Some(&v), b) {
+                        best = Some(v);
+                    }
+                } else {
+                    best = Some(v);
+                }
+            }
+            Ok(best.unwrap_or(serde_json::Value::Null))
+        }
+        CircuitExpr::Least(args) => {
+            let mut best: Option<serde_json::Value> = None;
+            for arg in args {
+                let v = evaluate_expr(arg, value)?;
+                if let Some(ref b) = best {
+                    if let Some(std::cmp::Ordering::Less) = compare_json_value(Some(&v), b) {
+                        best = Some(v);
+                    }
+                } else {
+                    best = Some(v);
+                }
+            }
+            Ok(best.unwrap_or(serde_json::Value::Null))
+        }
+        CircuitExpr::If {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            if evaluate_filter_expr(condition, value)? {
+                evaluate_expr(then_expr, value)
+            } else {
+                evaluate_expr(else_expr, value)
+            }
+        }
+        CircuitExpr::CaseWhen {
+            when_clauses,
+            else_result,
+        } => {
+            for (cond, result) in when_clauses {
+                if evaluate_filter_expr(cond, value)? {
+                    return evaluate_expr(result, value);
+                }
+            }
+            match else_result {
+                Some(e) => evaluate_expr(e, value),
+                None => Ok(serde_json::Value::Null),
+            }
+        }
+        CircuitExpr::AggregateRef(col_name) => Ok(value
+            .as_json()
+            .get(col_name.as_str())
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)),
+    }
+}
+
+fn compare_json_value(
+    a: Option<&serde_json::Value>,
+    b: &serde_json::Value,
+) -> Option<std::cmp::Ordering> {
+    let a = a?;
+    match (a, b) {
+        (serde_json::Value::Number(a), serde_json::Value::Number(b)) => {
+            let a_f = a.as_f64()?;
+            let b_f = b.as_f64()?;
+            a_f.partial_cmp(&b_f)
+        }
+        (serde_json::Value::String(a), serde_json::Value::String(b)) => Some(a.cmp(b)),
+        (serde_json::Value::Bool(a), serde_json::Value::Bool(b)) => Some(a.cmp(b)),
+        _ => None,
     }
 }
 
@@ -301,6 +540,21 @@ fn json_div(a: &serde_json::Value, b: &serde_json::Value) -> serde_json::Value {
                 serde_json::Value::Null
             } else {
                 serde_json::json!(av / bv)
+            }
+        }
+        _ => serde_json::Value::Null,
+    }
+}
+
+fn json_modulo(a: &serde_json::Value, b: &serde_json::Value) -> serde_json::Value {
+    match (a, b) {
+        (serde_json::Value::Number(a), serde_json::Value::Number(b)) => {
+            let ai = a.as_i64().unwrap_or(0);
+            let bi = b.as_i64().unwrap_or(1);
+            if bi == 0 {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(ai % bi)
             }
         }
         _ => serde_json::Value::Null,
@@ -368,17 +622,23 @@ mod tests {
         }
     }
 
-    fn filter_node(id: NodeId, col: &str, op: CircuitPredicateOp, lit: serde_json::Value) -> CircuitNode {
+    fn filter_node(
+        id: NodeId,
+        col: &str,
+        op: CircuitPredicateOp,
+        lit: serde_json::Value,
+    ) -> CircuitNode {
         CircuitNode::Filter {
             node_id: id,
-            predicates: vec![CircuitPredicate {
+            predicate: CircuitFilterExpr::Predicate(CircuitPredicate {
                 column: CircuitColumnRef {
                     node_id: id - 1,
                     column_id: col.into(),
                 },
                 op,
                 literal: lit,
-            }],
+                literals: vec![],
+            }),
         }
     }
 
@@ -386,7 +646,12 @@ mod tests {
     fn incrementalize_adds_delay_states_for_all_edges() {
         let circuit = Circuit {
             nodes: vec![source_node(0, "t"), source_node(1, "u")],
-            edges: vec![Edge { from: 0, from_port: 0, to: 1, to_port: 0 }],
+            edges: vec![Edge {
+                from: 0,
+                from_port: 0,
+                to: 1,
+                to_port: 0,
+            }],
             input_node_ids: vec![0],
             output_node_id: 1,
         };
@@ -425,13 +690,11 @@ mod tests {
         let mut delay = DelayState::default();
 
         // Epoch 1: insert (k1, v1)
-        let batch1 = DeltaBatch::from_records(vec![
-            DeltaRecord::new(
-                DeltaKey::from_json(json!("k1")),
-                DeltaValue::from_json(json!({"x": 1})),
-                1,
-            ),
-        ]);
+        let batch1 = DeltaBatch::from_records(vec![DeltaRecord::new(
+            DeltaKey::from_json(json!("k1")),
+            DeltaValue::from_json(json!({"x": 1})),
+            1,
+        )]);
         let delta1 = delay.advance(&batch1).unwrap();
         assert_eq!(delta1.records().len(), 1);
         assert_eq!(delta1.records()[0].weight, 1);

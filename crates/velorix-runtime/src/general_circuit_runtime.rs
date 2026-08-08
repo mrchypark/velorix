@@ -9,9 +9,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use velorix_core::circuit::{
-    CircuitNode, IncrementalCircuit, NodeId,
-};
+use velorix_core::circuit::{CircuitNode, IncrementalCircuit, NodeId};
 use velorix_core::delta::{DeltaBatch, DeltaKey, DeltaRecord, DeltaValue};
 use velorix_core::engine::{AggregateValueMode, LogicalEpoch};
 use velorix_core::incrementalize::{eval_node_incremental, IncrementalError};
@@ -46,14 +44,14 @@ pub enum CircuitRuntimeError {
     #[error("operator error: {0}")]
     Operator(#[from] OperatorError),
     #[error("logical epoch must increase monotonically: current={current}, attempted={attempted}")]
-    NonMonotonicEpoch { current: LogicalEpoch, attempted: LogicalEpoch },
+    NonMonotonicEpoch {
+        current: LogicalEpoch,
+        attempted: LogicalEpoch,
+    },
 }
 
 /// Default join value combiner: merges left and right values into a single object.
-fn default_join_values(
-    left: &DeltaValue,
-    right: &DeltaValue,
-) -> Result<DeltaValue, OperatorError> {
+fn default_join_values(left: &DeltaValue, right: &DeltaValue) -> Result<DeltaValue, OperatorError> {
     let merged = match (left.as_json(), right.as_json()) {
         (serde_json::Value::Object(lm), serde_json::Value::Object(rm)) => {
             let mut m = lm.clone();
@@ -71,7 +69,8 @@ fn default_join_values(
 // Stateful operator state
 // ---------------------------------------------------------------------------
 
-type JoinOperator = KeyedEquiJoin<fn(&DeltaValue, &DeltaValue) -> Result<DeltaValue, OperatorError>>;
+type JoinOperator =
+    KeyedEquiJoin<fn(&DeltaValue, &DeltaValue) -> Result<DeltaValue, OperatorError>>;
 
 /// State for LatestByKey operator: tracks per-key latest value and ordering.
 #[derive(Clone, Debug, Default)]
@@ -105,9 +104,10 @@ impl LatestByKeyState {
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
 
-            let entry = self.entries.entry(key.clone()).or_insert_with(|| {
-                (order_val.clone(), record.value.clone(), 0i64)
-            });
+            let entry = self
+                .entries
+                .entry(key.clone())
+                .or_insert_with(|| (order_val.clone(), record.value.clone(), 0i64));
 
             let old_weight = entry.2;
             let new_weight = old_weight + record.weight;
@@ -225,12 +225,15 @@ impl GeneralCircuitRuntime {
 
         for node_id in &order {
             let node = self.circuit.circuit.nodes[*node_id].clone();
-            let output = self.eval_node(&node, *node_id, &input_deltas, &mut node_outputs).await?;
+            let output = self
+                .eval_node(&node, *node_id, &input_deltas, &mut node_outputs)
+                .await?;
             node_outputs.insert(*node_id, output);
         }
 
         // Collect output delta
-        let output = node_outputs.get(&self.circuit.circuit.output_node_id)
+        let output = node_outputs
+            .get(&self.circuit.circuit.output_node_id)
             .cloned()
             .unwrap_or_default();
 
@@ -279,54 +282,88 @@ impl GeneralCircuitRuntime {
             }
 
             // Stateful: Aggregate
-            CircuitNode::Aggregate { .. } => {
-                self.eval_aggregate(node_id, node_outputs).await
-            }
+            CircuitNode::Aggregate { .. } => self.eval_aggregate(node_id, node_outputs).await,
 
             // Stateful: Distinct
-            CircuitNode::Distinct { .. } => {
-                self.eval_distinct(node_id, node_outputs).await
-            }
+            CircuitNode::Distinct { .. } => self.eval_distinct(node_id, node_outputs).await,
 
             // Stateful: Join — incremental join with side-state
-            CircuitNode::Join { node_id: _, left_key, right_key, join_type } => {
+            CircuitNode::Join {
+                node_id: _,
+                left_key,
+                right_key,
+                join_type,
+            } => {
                 let join_type = join_type.clone();
                 let left_key = left_key.clone();
                 let right_key = right_key.clone();
-                self.eval_join(node_id, &join_type, &left_key, &right_key, node_outputs).await
+                self.eval_join(node_id, &join_type, &left_key, &right_key, node_outputs)
+                    .await
             }
 
             // TopK — sort by order_by column and take top N
-            CircuitNode::TopK { order_by, descending, limit, offset, .. } => {
+            CircuitNode::TopK {
+                order_by,
+                descending,
+                limit,
+                offset,
+                ..
+            } => {
                 let order_by = order_by.clone();
                 let descending = *descending;
                 let limit = *limit;
                 let offset = *offset;
-                self.eval_top_k(node_id, &order_by, descending, limit, offset, node_outputs).await
+                self.eval_top_k(node_id, &order_by, descending, limit, offset, node_outputs)
+                    .await
             }
 
             // Stateful: Window — tumbling event-time window
-            CircuitNode::TumblingWindow { event_time, window_size_ns, .. } => {
+            CircuitNode::TumblingWindow {
+                event_time,
+                window_size_ns,
+                ..
+            } => {
                 let event_time = event_time.clone();
                 let window_size_ns = *window_size_ns;
-                self.eval_window(node_id, &event_time, window_size_ns, node_outputs).await
+                self.eval_window(node_id, &event_time, window_size_ns, node_outputs)
+                    .await
             }
 
             // Stateful: RowNumber — assigns sequential integers within partitions
-            CircuitNode::RowNumber { node_id: _, partition_keys, order_by, descending, output_column_id } => {
+            CircuitNode::RowNumber {
+                node_id: _,
+                partition_keys,
+                order_by,
+                descending,
+                output_column_id,
+            } => {
                 let partition_keys = partition_keys.clone();
                 let order_by = order_by.clone();
                 let descending = *descending;
                 let output_column_id = output_column_id.clone();
-                self.eval_row_number(node_id, &partition_keys, &order_by, descending, &output_column_id, node_outputs).await
+                self.eval_row_number(
+                    node_id,
+                    &partition_keys,
+                    &order_by,
+                    descending,
+                    &output_column_id,
+                    node_outputs,
+                )
+                .await
             }
 
             // Stateful: LatestByKey — maintains most recent value per key
-            CircuitNode::LatestByKey { key, order_by, descending, .. } => {
+            CircuitNode::LatestByKey {
+                key,
+                order_by,
+                descending,
+                ..
+            } => {
                 let key = key.clone();
                 let order_by = order_by.clone();
                 let descending = *descending;
-                self.eval_latest_by_key(node_id, &key, &order_by, descending, node_outputs).await
+                self.eval_latest_by_key(node_id, &key, &order_by, descending, node_outputs)
+                    .await
             }
         }
     }
@@ -342,12 +379,10 @@ impl GeneralCircuitRuntime {
         if !self.node_states.contains_key(&node_id) {
             self.node_states.insert(
                 node_id,
-                OperatorState::Aggregate(
-                    KeyedSumCountAggregate::with_value_mode_and_extrema(
-                        AggregateValueMode::Integer,
-                        true, // track_extrema for min/max support
-                    )
-                )
+                OperatorState::Aggregate(KeyedSumCountAggregate::with_value_mode_and_extrema(
+                    AggregateValueMode::Integer,
+                    true, // track_extrema for min/max support
+                )),
             );
         }
 
@@ -398,7 +433,10 @@ impl GeneralCircuitRuntime {
 
         // Get or create join state
         if !self.node_states.contains_key(&node_id) {
-            let join: JoinOperator = KeyedEquiJoin::new(default_join_values as fn(&DeltaValue, &DeltaValue) -> Result<DeltaValue, OperatorError>);
+            let join: JoinOperator = KeyedEquiJoin::new(
+                default_join_values
+                    as fn(&DeltaValue, &DeltaValue) -> Result<DeltaValue, OperatorError>,
+            );
             self.node_states.insert(node_id, OperatorState::Join(join));
         }
 
@@ -427,8 +465,10 @@ impl GeneralCircuitRuntime {
         // Persist join state to disk
         let left_state = join.left_state();
         let right_state = join.right_state();
-        self.state_store.save(&format!("{state_key}-left"), &left_state)?;
-        self.state_store.save(&format!("{state_key}-right"), &right_state)?;
+        self.state_store
+            .save(&format!("{state_key}-left"), &left_state)?;
+        self.state_store
+            .save(&format!("{state_key}-right"), &right_state)?;
 
         Ok(output)
     }
@@ -444,7 +484,10 @@ impl GeneralCircuitRuntime {
 
         // Get or create window state
         if !self.node_states.contains_key(&node_id) {
-            self.node_states.insert(node_id, OperatorState::Window(TumblingWindowState::default()));
+            self.node_states.insert(
+                node_id,
+                OperatorState::Window(TumblingWindowState::default()),
+            );
         }
 
         let state_key = operator_state_key(node_id, "window");
@@ -459,7 +502,9 @@ impl GeneralCircuitRuntime {
 
         for record in input.records() {
             // Extract event time from value
-            let event_time_ns = record.value.as_json()
+            let event_time_ns = record
+                .value
+                .as_json()
                 .get(event_time_col.column_id.as_str())
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
@@ -478,7 +523,9 @@ impl GeneralCircuitRuntime {
             let entry = window.entry(key).or_insert_with(|| serde_json::json!({}));
 
             // Merge value into accumulated state
-            if let (Some(obj), Some(new_val)) = (entry.as_object_mut(), record.value.as_json().as_object()) {
+            if let (Some(obj), Some(new_val)) =
+                (entry.as_object_mut(), record.value.as_json().as_object())
+            {
                 for (k, v) in new_val {
                     if *k == event_time_col.column_id {
                         continue; // skip event_time column
@@ -486,7 +533,10 @@ impl GeneralCircuitRuntime {
                     // Simple sum accumulation for numeric values
                     if let Some(existing) = obj.get(k).and_then(|e| e.as_i64()) {
                         if let Some(inc) = v.as_i64() {
-                            obj.insert(k.clone(), serde_json::json!(existing + inc * record.weight));
+                            obj.insert(
+                                k.clone(),
+                                serde_json::json!(existing + inc * record.weight),
+                            );
                         }
                     } else {
                         obj.insert(k.clone(), v.clone());
@@ -505,7 +555,11 @@ impl GeneralCircuitRuntime {
                 completed_windows.push(window_start);
                 for (key, value) in values {
                     output_records.push(DeltaRecord::new(
-                        DeltaKey::from_json(serde_json::json!([serde_json::Value::String(key.clone()), window_start, window_end])),
+                        DeltaKey::from_json(serde_json::json!([
+                            serde_json::Value::String(key.clone()),
+                            window_start,
+                            window_end
+                        ])),
                         DeltaValue::from_json(value.clone()),
                         1,
                     ));
@@ -519,7 +573,8 @@ impl GeneralCircuitRuntime {
         }
 
         // Persist window state (simplified - full implementation would serialize window_state)
-        self.state_store.save(&state_key, &DeltaBatch::from_records(vec![]))?;
+        self.state_store
+            .save(&state_key, &DeltaBatch::from_records(vec![]))?;
 
         Ok(DeltaBatch::from_records(output_records))
     }
@@ -536,17 +591,23 @@ impl GeneralCircuitRuntime {
         let input = get_input(node_id, &self.circuit.circuit, node_outputs);
 
         // Group by partition keys
-        let mut partitions: BTreeMap<String, Vec<&velorix_core::delta::DeltaRecord>> = BTreeMap::new();
+        let mut partitions: BTreeMap<String, Vec<&velorix_core::delta::DeltaRecord>> =
+            BTreeMap::new();
         for record in input.records() {
             let part_key = if partition_keys.is_empty() {
                 "__all__".to_string()
             } else {
-                let parts: Vec<String> = partition_keys.iter().map(|pk| {
-                    record.value.as_json()
-                        .get(pk.column_id.as_str())
-                        .map(|v| v.to_string())
-                        .unwrap_or_default()
-                }).collect();
+                let parts: Vec<String> = partition_keys
+                    .iter()
+                    .map(|pk| {
+                        record
+                            .value
+                            .as_json()
+                            .get(pk.column_id.as_str())
+                            .map(|v| v.to_string())
+                            .unwrap_or_default()
+                    })
+                    .collect();
                 parts.join("|")
             };
             partitions.entry(part_key).or_default().push(record);
@@ -561,13 +622,22 @@ impl GeneralCircuitRuntime {
                 let a_val = a.value.as_json().get(order_by.column_id.as_str());
                 let b_val = b.value.as_json().get(order_by.column_id.as_str());
                 let cmp = compare_json_values(a_val, b_val);
-                if descending { cmp.reverse() } else { cmp }
+                if descending {
+                    cmp.reverse()
+                } else {
+                    cmp
+                }
             });
 
             // Assign row numbers
             for (idx, record) in sorted.iter().enumerate() {
                 let row_num = (idx as i64) + 1;
-                let mut value_obj = record.value.as_json().as_object().cloned().unwrap_or_default();
+                let mut value_obj = record
+                    .value
+                    .as_json()
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default();
                 value_obj.insert(output_column_id.to_string(), serde_json::json!(row_num));
                 output_records.push(DeltaRecord::new(
                     record.key.clone(),
@@ -592,7 +662,10 @@ impl GeneralCircuitRuntime {
 
         // Get or create LatestByKey state
         if !self.node_states.contains_key(&node_id) {
-            self.node_states.insert(node_id, OperatorState::LatestByKey(LatestByKeyState::default()));
+            self.node_states.insert(
+                node_id,
+                OperatorState::LatestByKey(LatestByKeyState::default()),
+            );
         }
 
         let state_key = operator_state_key(node_id, "latest_by_key");
@@ -602,17 +675,24 @@ impl GeneralCircuitRuntime {
             _ => unreachable!("node {node_id} should be LatestByKey"),
         };
 
-        let output = state.apply_delta(&input, &key_col.column_id, &order_col.column_id, descending);
+        let output =
+            state.apply_delta(&input, &key_col.column_id, &order_col.column_id, descending);
 
         // Persist state to disk
         // Serialize state as a simple DeltaBatch of entries
-        let state_records: Vec<_> = state.entries.iter().map(|(k, (order, val, weight))| {
-            DeltaRecord::new(
-                DeltaKey::from_json(serde_json::json!(k)),
-                DeltaValue::from_json(serde_json::json!({"order": order, "value": val.as_json()})),
-                *weight,
-            )
-        }).collect();
+        let state_records: Vec<_> = state
+            .entries
+            .iter()
+            .map(|(k, (order, val, weight))| {
+                DeltaRecord::new(
+                    DeltaKey::from_json(serde_json::json!(k)),
+                    DeltaValue::from_json(
+                        serde_json::json!({"order": order, "value": val.as_json()}),
+                    ),
+                    *weight,
+                )
+            })
+            .collect();
         let state_batch = DeltaBatch::from_records(state_records);
         self.state_store.save(&state_key, &state_batch)?;
 
@@ -636,7 +716,11 @@ impl GeneralCircuitRuntime {
             let a_val = a.value.as_json().get(order_col.column_id.as_str());
             let b_val = b.value.as_json().get(order_col.column_id.as_str());
             let cmp = compare_json_values(a_val, b_val);
-            if descending { cmp.reverse() } else { cmp }
+            if descending {
+                cmp.reverse()
+            } else {
+                cmp
+            }
         });
 
         // Apply offset and limit
@@ -660,10 +744,16 @@ impl GeneralCircuitRuntime {
     }
 
     /// Restore a runtime from a checkpoint.
-    pub fn restore_from_checkpoint(published_output: DeltaBatch, logical_epoch: LogicalEpoch) -> Self {
+    pub fn restore_from_checkpoint(
+        published_output: DeltaBatch,
+        logical_epoch: LogicalEpoch,
+    ) -> Self {
         let circuit = velorix_core::circuit::IncrementalCircuit {
             circuit: velorix_core::circuit::Circuit {
-                nodes: vec![velorix_core::circuit::CircuitNode::Source { node_id: 0, relation_id: "__restored__".into() }],
+                nodes: vec![velorix_core::circuit::CircuitNode::Source {
+                    node_id: 0,
+                    relation_id: "__restored__".into(),
+                }],
                 edges: vec![],
                 input_node_ids: vec![0],
                 output_node_id: 0,
@@ -689,7 +779,8 @@ fn get_input(
     circuit: &velorix_core::circuit::Circuit,
     node_outputs: &HashMap<NodeId, DeltaBatch>,
 ) -> DeltaBatch {
-    circuit.input_edges(node_id)
+    circuit
+        .input_edges(node_id)
         .iter()
         .filter_map(|e| node_outputs.get(&e.from))
         .cloned()
@@ -701,7 +792,10 @@ fn canonical_key(key: &DeltaKey) -> String {
     key.as_json().to_string()
 }
 
-fn compare_json_values(a: Option<&serde_json::Value>, b: Option<&serde_json::Value>) -> std::cmp::Ordering {
+fn compare_json_values(
+    a: Option<&serde_json::Value>,
+    b: Option<&serde_json::Value>,
+) -> std::cmp::Ordering {
     match (a, b) {
         (None, None) => std::cmp::Ordering::Equal,
         (None, Some(_)) => std::cmp::Ordering::Less,
@@ -726,7 +820,8 @@ fn get_input_by_port(
     circuit: &velorix_core::circuit::Circuit,
     node_outputs: &HashMap<NodeId, DeltaBatch>,
 ) -> DeltaBatch {
-    circuit.input_edges(node_id)
+    circuit
+        .input_edges(node_id)
         .iter()
         .filter(|e| e.to_port == port)
         .filter_map(|e| node_outputs.get(&e.from))
@@ -765,10 +860,10 @@ struct GeneralCircuitCheckpoint {
 
 use velorix_core::delta_to_arrow::delta_batch_to_record_batch;
 use velorix_core::standing_program::{
-    DurableStateRoot, EpochIdempotencyKey, EpochCommit,
-    RelationFrontier, RelationInputBatch, RuntimeCheckpoint, RuntimeCheckpointStatePayload,
-    StandingProgramIdentity, StandingProgramRuntime, StandingProgramRuntimeError,
-    ViewOutputBatch, ViewOutputDelta, MaterializedViewPage, ScopedViewId, SnapshotPageRequest,
+    DurableStateRoot, EpochCommit, EpochIdempotencyKey, MaterializedViewPage, RelationFrontier,
+    RelationInputBatch, RuntimeCheckpoint, RuntimeCheckpointStatePayload, ScopedViewId,
+    SnapshotPageRequest, StandingProgramIdentity, StandingProgramRuntime,
+    StandingProgramRuntimeError, ViewOutputBatch, ViewOutputDelta,
 };
 use velorix_core::view_contract::RelationSchema;
 
@@ -864,9 +959,16 @@ impl StandingProgramRuntime for GeneralStandingRuntime {
         let mut input_deltas: HashMap<NodeId, DeltaBatch> = HashMap::new();
 
         // Map input relation_id to circuit source node_id
-        let source_map: HashMap<String, NodeId> = self.inner.circuit.circuit.input_node_ids.iter()
+        let source_map: HashMap<String, NodeId> = self
+            .inner
+            .circuit
+            .circuit
+            .input_node_ids
+            .iter()
             .filter_map(|&nid| {
-                if let CircuitNode::Source { relation_id, .. } = &self.inner.circuit.circuit.nodes[nid] {
+                if let CircuitNode::Source { relation_id, .. } =
+                    &self.inner.circuit.circuit.nodes[nid]
+                {
                     Some((relation_id.clone(), nid))
                 } else {
                     None
@@ -876,11 +978,11 @@ impl StandingProgramRuntime for GeneralStandingRuntime {
 
         for input in &input_changes {
             // Find the source node for this relation
-            let node_id = source_map.get(&input.relation_id)
-                .copied()
-                .ok_or_else(|| StandingProgramRuntimeError::ExternalRuntime {
+            let node_id = source_map.get(&input.relation_id).copied().ok_or_else(|| {
+                StandingProgramRuntimeError::ExternalRuntime {
                     reason: format!("unknown input relation: {}", input.relation_id),
-                })?;
+                }
+            })?;
 
             // Convert Arrow RecordBatches to DeltaBatch using generic conversion
             // For now, use a simple row-based conversion
@@ -899,7 +1001,8 @@ impl StandingProgramRuntime for GeneralStandingRuntime {
                 reason: format!("circuit eval error: {e}"),
             })?;
 
-        self.applied_epochs.insert(idempotency_key_text, logical_epoch);
+        self.applied_epochs
+            .insert(idempotency_key_text, logical_epoch);
 
         Ok(EpochCommit {
             logical_epoch,
@@ -921,15 +1024,21 @@ impl StandingProgramRuntime for GeneralStandingRuntime {
         _page: SnapshotPageRequest,
     ) -> Result<MaterializedViewPage, StandingProgramRuntimeError> {
         // Find the output schema for this view
-        let schema = self.output_schemas.iter()
-            .find(|s| s.relation_id == view.view_id || self.identity.view_ids.contains(&view.view_id))
+        let schema = self
+            .output_schemas
+            .iter()
+            .find(|s| {
+                s.relation_id == view.view_id || self.identity.view_ids.contains(&view.view_id)
+            })
             .ok_or_else(|| StandingProgramRuntimeError::UnknownView {
                 view_id: view.view_id.clone(),
             })?;
 
-        let batch = delta_batch_to_record_batch(schema, self.inner.published_output())
-            .map_err(|e| StandingProgramRuntimeError::ExternalRuntime {
-                reason: format!("delta-to-arrow conversion error: {e}"),
+        let batch =
+            delta_batch_to_record_batch(schema, self.inner.published_output()).map_err(|e| {
+                StandingProgramRuntimeError::ExternalRuntime {
+                    reason: format!("delta-to-arrow conversion error: {e}"),
+                }
             })?;
 
         Ok(MaterializedViewPage {
@@ -947,14 +1056,17 @@ impl StandingProgramRuntime for GeneralStandingRuntime {
             published_output: self.inner.published_output().clone(),
             logical_epoch: self.inner.logical_epoch(),
             input_frontiers: self.input_frontiers.clone(),
-            applied_epochs: self.applied_epochs.iter()
+            applied_epochs: self
+                .applied_epochs
+                .iter()
                 .map(|(k, v)| (k.clone(), *v))
                 .collect(),
         };
-        let payload_json = serde_json::to_string(&state)
-            .map_err(|e| StandingProgramRuntimeError::ExternalRuntime {
+        let payload_json = serde_json::to_string(&state).map_err(|e| {
+            StandingProgramRuntimeError::ExternalRuntime {
                 reason: format!("checkpoint serialization error: {e}"),
-            })?;
+            }
+        })?;
         let content_hash = sha256_hex(payload_json.as_bytes());
 
         Ok(RuntimeCheckpoint {
@@ -980,17 +1092,21 @@ impl StandingProgramRuntime for GeneralStandingRuntime {
     fn restore(checkpoint: RuntimeCheckpoint) -> Result<Self, StandingProgramRuntimeError> {
         checkpoint.validate_identity(&checkpoint.identity)?;
 
-        let payload = checkpoint.state_payload
-            .ok_or_else(|| StandingProgramRuntimeError::ExternalRuntime {
+        let payload = checkpoint.state_payload.ok_or_else(|| {
+            StandingProgramRuntimeError::ExternalRuntime {
                 reason: "checkpoint missing state payload".into(),
+            }
+        })?;
+
+        let state: GeneralCircuitCheckpoint =
+            serde_json::from_str(&payload.payload).map_err(|e| {
+                StandingProgramRuntimeError::ExternalRuntime {
+                    reason: format!("checkpoint deserialization error: {e}"),
+                }
             })?;
 
-        let state: GeneralCircuitCheckpoint = serde_json::from_str(&payload.payload)
-            .map_err(|e| StandingProgramRuntimeError::ExternalRuntime {
-                reason: format!("checkpoint deserialization error: {e}"),
-            })?;
-
-        let applied_epochs: BTreeMap<String, LogicalEpoch> = state.applied_epochs.iter().cloned().collect();
+        let applied_epochs: BTreeMap<String, LogicalEpoch> =
+            state.applied_epochs.iter().cloned().collect();
         let input_frontiers = state.input_frontiers.clone();
         let published_output = state.published_output.clone();
         let logical_epoch = state.logical_epoch;
@@ -1030,8 +1146,8 @@ impl GeneralStandingRuntime {
 fn arrow_batches_to_delta_batch(
     input: &RelationInputBatch,
 ) -> Result<DeltaBatch, StandingProgramRuntimeError> {
+    use arrow::array::{Array, Int64Array, StringArray};
     use velorix_core::delta::{DeltaKey, DeltaRecord, DeltaValue};
-    use arrow::array::{Array, StringArray, Int64Array};
 
     let mut records = Vec::new();
 
@@ -1066,11 +1182,16 @@ fn arrow_batches_to_delta_batch(
             // Pack remaining columns into value object
             let mut value_obj = serde_json::Map::new();
             for (col_idx, field) in schema.fields().iter().enumerate() {
-                if col_idx == 0 { continue; } // skip key column
+                if col_idx == 0 {
+                    continue;
+                } // skip key column
                 let col_name = field.name().clone();
                 if let Some(arr) = columns.get(col_idx) {
                     if let Some(str_arr) = arr.as_any().downcast_ref::<StringArray>() {
-                        value_obj.insert(col_name, serde_json::Value::String(str_arr.value(row_idx).to_string()));
+                        value_obj.insert(
+                            col_name,
+                            serde_json::Value::String(str_arr.value(row_idx).to_string()),
+                        );
                     } else if let Some(int_arr) = arr.as_any().downcast_ref::<Int64Array>() {
                         value_obj.insert(col_name, serde_json::json!(int_arr.value(row_idx)));
                     }
@@ -1099,7 +1220,9 @@ fn advance_input_frontier(
             && f.stream_id == input.stream_id
             && f.partition_id == input.partition_id
     }) {
-        existing.committed_offset_exclusive = existing.committed_offset_exclusive.max(input.end_offset_exclusive);
+        existing.committed_offset_exclusive = existing
+            .committed_offset_exclusive
+            .max(input.end_offset_exclusive);
     } else {
         frontiers.push(RelationFrontier {
             relation_id: input.relation_id.clone(),
@@ -1122,20 +1245,40 @@ mod tests {
     fn simple_filter_circuit() -> Circuit {
         Circuit {
             nodes: vec![
-                CircuitNode::Source { node_id: 0, relation_id: "t".into() },
+                CircuitNode::Source {
+                    node_id: 0,
+                    relation_id: "t".into(),
+                },
                 CircuitNode::Filter {
                     node_id: 1,
-                    predicates: vec![CircuitPredicate {
-                        column: CircuitColumnRef { node_id: 0, column_id: "x".into() },
+                    predicate: CircuitFilterExpr::Predicate(CircuitPredicate {
+                        column: CircuitColumnRef {
+                            node_id: 0,
+                            column_id: "x".into(),
+                        },
                         op: CircuitPredicateOp::Gt,
                         literal: serde_json::json!(5),
-                    }],
+                        literals: vec![],
+                    }),
                 },
-                CircuitNode::Sink { node_id: 2, relation_id: "v".into() },
+                CircuitNode::Sink {
+                    node_id: 2,
+                    relation_id: "v".into(),
+                },
             ],
             edges: vec![
-                Edge { from: 0, from_port: 0, to: 1, to_port: 0 },
-                Edge { from: 1, from_port: 0, to: 2, to_port: 0 },
+                Edge {
+                    from: 0,
+                    from_port: 0,
+                    to: 1,
+                    to_port: 0,
+                },
+                Edge {
+                    from: 1,
+                    from_port: 0,
+                    to: 2,
+                    to_port: 0,
+                },
             ],
             input_node_ids: vec![0],
             output_node_id: 2,
@@ -1159,18 +1302,21 @@ mod tests {
 
         // Input: two rows, one passes filter (x=10), one doesn't (x=3)
         let mut input_deltas = HashMap::new();
-        input_deltas.insert(0, DeltaBatch::from_records(vec![
-            DeltaRecord::new(
-                DeltaKey::from_json(serde_json::json!("r1")),
-                DeltaValue::from_json(serde_json::json!({"x": 10})),
-                1,
-            ),
-            DeltaRecord::new(
-                DeltaKey::from_json(serde_json::json!("r2")),
-                DeltaValue::from_json(serde_json::json!({"x": 3})),
-                1,
-            ),
-        ]));
+        input_deltas.insert(
+            0,
+            DeltaBatch::from_records(vec![
+                DeltaRecord::new(
+                    DeltaKey::from_json(serde_json::json!("r1")),
+                    DeltaValue::from_json(serde_json::json!({"x": 10})),
+                    1,
+                ),
+                DeltaRecord::new(
+                    DeltaKey::from_json(serde_json::json!("r2")),
+                    DeltaValue::from_json(serde_json::json!({"x": 3})),
+                    1,
+                ),
+            ]),
+        );
 
         let output = runtime.apply_epoch(1, input_deltas).await.unwrap();
         // Only x=10 should pass
@@ -1182,17 +1328,40 @@ mod tests {
     async fn aggregate_epoch_evaluation() {
         let circuit = Circuit {
             nodes: vec![
-                CircuitNode::Source { node_id: 0, relation_id: "t".into() },
+                CircuitNode::Source {
+                    node_id: 0,
+                    relation_id: "t".into(),
+                },
                 CircuitNode::Aggregate {
                     node_id: 1,
-                    group_keys: vec![CircuitColumnRef { node_id: 0, column_id: "key".into() }],
-                    functions: vec![CircuitAggFunc::Sum(CircuitColumnRef { node_id: 0, column_id: "value".into() })],
+                    group_keys: vec![CircuitColumnRef {
+                        node_id: 0,
+                        column_id: "key".into(),
+                    }],
+                    functions: vec![CircuitAggFunc::Sum(CircuitColumnRef {
+                        node_id: 0,
+                        column_id: "value".into(),
+                    })],
+                    output_aliases: vec![],
                 },
-                CircuitNode::Sink { node_id: 2, relation_id: "v".into() },
+                CircuitNode::Sink {
+                    node_id: 2,
+                    relation_id: "v".into(),
+                },
             ],
             edges: vec![
-                Edge { from: 0, from_port: 0, to: 1, to_port: 0 },
-                Edge { from: 1, from_port: 0, to: 2, to_port: 0 },
+                Edge {
+                    from: 0,
+                    from_port: 0,
+                    to: 1,
+                    to_port: 0,
+                },
+                Edge {
+                    from: 1,
+                    from_port: 0,
+                    to: 2,
+                    to_port: 0,
+                },
             ],
             input_node_ids: vec![0],
             output_node_id: 2,
@@ -1206,23 +1375,26 @@ mod tests {
         // The aggregate expects DeltaValue to be a simple integer (the value to sum).
         // The key is the group key.
         let mut input_deltas = HashMap::new();
-        input_deltas.insert(0, DeltaBatch::from_records(vec![
-            DeltaRecord::new(
-                DeltaKey::from_json(serde_json::json!("a")),
-                DeltaValue::from_json(serde_json::json!(10)),
-                1,
-            ),
-            DeltaRecord::new(
-                DeltaKey::from_json(serde_json::json!("a")),
-                DeltaValue::from_json(serde_json::json!(5)),
-                1,
-            ),
-            DeltaRecord::new(
-                DeltaKey::from_json(serde_json::json!("b")),
-                DeltaValue::from_json(serde_json::json!(8)),
-                1,
-            ),
-        ]));
+        input_deltas.insert(
+            0,
+            DeltaBatch::from_records(vec![
+                DeltaRecord::new(
+                    DeltaKey::from_json(serde_json::json!("a")),
+                    DeltaValue::from_json(serde_json::json!(10)),
+                    1,
+                ),
+                DeltaRecord::new(
+                    DeltaKey::from_json(serde_json::json!("a")),
+                    DeltaValue::from_json(serde_json::json!(5)),
+                    1,
+                ),
+                DeltaRecord::new(
+                    DeltaKey::from_json(serde_json::json!("b")),
+                    DeltaValue::from_json(serde_json::json!(8)),
+                    1,
+                ),
+            ]),
+        );
 
         let output = runtime.apply_epoch(1, input_deltas).await.unwrap();
         // Two groups: a (sum=15) and b (sum=8)
@@ -1234,20 +1406,50 @@ mod tests {
         // Two sources → join on "key" → sink
         let circuit = Circuit {
             nodes: vec![
-                CircuitNode::Source { node_id: 0, relation_id: "left".into() },
-                CircuitNode::Source { node_id: 1, relation_id: "right".into() },
+                CircuitNode::Source {
+                    node_id: 0,
+                    relation_id: "left".into(),
+                },
+                CircuitNode::Source {
+                    node_id: 1,
+                    relation_id: "right".into(),
+                },
                 CircuitNode::Join {
                     node_id: 2,
                     join_type: JoinType::Inner,
-                    left_key: CircuitColumnRef { node_id: 0, column_id: "key".into() },
-                    right_key: CircuitColumnRef { node_id: 1, column_id: "key".into() },
+                    left_key: CircuitColumnRef {
+                        node_id: 0,
+                        column_id: "key".into(),
+                    },
+                    right_key: CircuitColumnRef {
+                        node_id: 1,
+                        column_id: "key".into(),
+                    },
                 },
-                CircuitNode::Sink { node_id: 3, relation_id: "out".into() },
+                CircuitNode::Sink {
+                    node_id: 3,
+                    relation_id: "out".into(),
+                },
             ],
             edges: vec![
-                Edge { from: 0, from_port: 0, to: 2, to_port: 0 },
-                Edge { from: 1, from_port: 0, to: 2, to_port: 1 },
-                Edge { from: 2, from_port: 0, to: 3, to_port: 0 },
+                Edge {
+                    from: 0,
+                    from_port: 0,
+                    to: 2,
+                    to_port: 0,
+                },
+                Edge {
+                    from: 1,
+                    from_port: 0,
+                    to: 2,
+                    to_port: 1,
+                },
+                Edge {
+                    from: 2,
+                    from_port: 0,
+                    to: 3,
+                    to_port: 0,
+                },
             ],
             input_node_ids: vec![0, 1],
             output_node_id: 3,
@@ -1260,20 +1462,22 @@ mod tests {
 
         // Epoch 1: insert left row (key=A) and right row (key=A)
         let mut input_deltas = HashMap::new();
-        input_deltas.insert(0, DeltaBatch::from_records(vec![
-            DeltaRecord::new(
+        input_deltas.insert(
+            0,
+            DeltaBatch::from_records(vec![DeltaRecord::new(
                 DeltaKey::from_json(serde_json::json!("key-A")),
                 DeltaValue::from_json(serde_json::json!({"key": "A", "val": "L1"})),
                 1,
-            ),
-        ]));
-        input_deltas.insert(1, DeltaBatch::from_records(vec![
-            DeltaRecord::new(
+            )]),
+        );
+        input_deltas.insert(
+            1,
+            DeltaBatch::from_records(vec![DeltaRecord::new(
                 DeltaKey::from_json(serde_json::json!("key-A")),
                 DeltaValue::from_json(serde_json::json!({"key": "A", "val": "R1"})),
                 1,
-            ),
-        ]));
+            )]),
+        );
 
         let output = runtime.apply_epoch(1, input_deltas).await.unwrap();
         // One match: L1 joined with R1
@@ -1282,13 +1486,14 @@ mod tests {
 
         // Epoch 2: insert another right row with same key
         let mut input_deltas2 = HashMap::new();
-        input_deltas2.insert(1, DeltaBatch::from_records(vec![
-            DeltaRecord::new(
+        input_deltas2.insert(
+            1,
+            DeltaBatch::from_records(vec![DeltaRecord::new(
                 DeltaKey::from_json(serde_json::json!("key-A")),
                 DeltaValue::from_json(serde_json::json!({"key": "A", "val": "R2"})),
                 1,
-            ),
-        ]));
+            )]),
+        );
 
         let output2 = runtime.apply_epoch(2, input_deltas2).await.unwrap();
         // L1 matches R1 (old state) and R2 (new) — but R1 was already consumed in epoch 1.
@@ -1301,19 +1506,41 @@ mod tests {
     async fn row_number_epoch_evaluation() {
         let circuit = Circuit {
             nodes: vec![
-                CircuitNode::Source { node_id: 0, relation_id: "emp".into() },
+                CircuitNode::Source {
+                    node_id: 0,
+                    relation_id: "emp".into(),
+                },
                 CircuitNode::RowNumber {
                     node_id: 1,
-                    partition_keys: vec![CircuitColumnRef { node_id: 0, column_id: "dept".into() }],
-                    order_by: CircuitColumnRef { node_id: 0, column_id: "name".into() },
+                    partition_keys: vec![CircuitColumnRef {
+                        node_id: 0,
+                        column_id: "dept".into(),
+                    }],
+                    order_by: CircuitColumnRef {
+                        node_id: 0,
+                        column_id: "name".into(),
+                    },
                     descending: false,
                     output_column_id: "rn".into(),
                 },
-                CircuitNode::Sink { node_id: 2, relation_id: "out".into() },
+                CircuitNode::Sink {
+                    node_id: 2,
+                    relation_id: "out".into(),
+                },
             ],
             edges: vec![
-                Edge { from: 0, from_port: 0, to: 1, to_port: 0 },
-                Edge { from: 1, from_port: 0, to: 2, to_port: 0 },
+                Edge {
+                    from: 0,
+                    from_port: 0,
+                    to: 1,
+                    to_port: 0,
+                },
+                Edge {
+                    from: 1,
+                    from_port: 0,
+                    to: 2,
+                    to_port: 0,
+                },
             ],
             input_node_ids: vec![0],
             output_node_id: 2,
@@ -1325,23 +1552,26 @@ mod tests {
         let mut runtime = GeneralCircuitRuntime::new(inc, &config).await.unwrap();
 
         let mut input_deltas = HashMap::new();
-        input_deltas.insert(0, DeltaBatch::from_records(vec![
-            DeltaRecord::new(
-                DeltaKey::from_json(serde_json::json!("e1")),
-                DeltaValue::from_json(serde_json::json!({"name": "Alice", "dept": "eng"})),
-                1,
-            ),
-            DeltaRecord::new(
-                DeltaKey::from_json(serde_json::json!("e2")),
-                DeltaValue::from_json(serde_json::json!({"name": "Bob", "dept": "eng"})),
-                1,
-            ),
-            DeltaRecord::new(
-                DeltaKey::from_json(serde_json::json!("e3")),
-                DeltaValue::from_json(serde_json::json!({"name": "Carol", "dept": "sales"})),
-                1,
-            ),
-        ]));
+        input_deltas.insert(
+            0,
+            DeltaBatch::from_records(vec![
+                DeltaRecord::new(
+                    DeltaKey::from_json(serde_json::json!("e1")),
+                    DeltaValue::from_json(serde_json::json!({"name": "Alice", "dept": "eng"})),
+                    1,
+                ),
+                DeltaRecord::new(
+                    DeltaKey::from_json(serde_json::json!("e2")),
+                    DeltaValue::from_json(serde_json::json!({"name": "Bob", "dept": "eng"})),
+                    1,
+                ),
+                DeltaRecord::new(
+                    DeltaKey::from_json(serde_json::json!("e3")),
+                    DeltaValue::from_json(serde_json::json!({"name": "Carol", "dept": "sales"})),
+                    1,
+                ),
+            ]),
+        );
 
         let output = runtime.apply_epoch(1, input_deltas).await.unwrap();
         assert_eq!(output.records().len(), 3);
@@ -1350,7 +1580,9 @@ mod tests {
             assert!(record.value.as_json().get("rn").is_some());
         }
         // eng dept: Alice=1, Bob=2; sales dept: Carol=1
-        let mut eng_rns: Vec<i64> = output.records().iter()
+        let mut eng_rns: Vec<i64> = output
+            .records()
+            .iter()
             .filter(|r| r.value.as_json().get("dept").and_then(|v| v.as_str()) == Some("eng"))
             .filter_map(|r| r.value.as_json().get("rn").and_then(|v| v.as_i64()))
             .collect();

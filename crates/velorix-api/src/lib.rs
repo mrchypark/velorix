@@ -8106,6 +8106,8 @@ async fn standing_runtime_page_from_output_manifest(
     }
     let published_output =
         standing_runtime_published_output_from_manifest_page(state, &manifest).await?;
+    let aggregate_outputs =
+        standing_runtime_output_aggregate_outputs_for_checkpoint(&record.checkpoint)?;
     let scoped_view = ScopedViewId {
         tenant_id: identity.tenant_id.clone(),
         program_id: identity.program_id.clone(),
@@ -8117,6 +8119,7 @@ async fn standing_runtime_page_from_output_manifest(
         scoped_view,
         record.checkpoint.logical_epoch,
         page_request,
+        aggregate_outputs.as_deref(),
     )
     .map_err(ApiError::bad_request)?;
     Ok(Some(page))
@@ -8197,6 +8200,8 @@ async fn standing_runtime_page_from_checkpoint_published_output(
         })?;
     let published_output: DeltaBatch = serde_json::from_value(published_output)
         .map_err(|source| ApiError::bad_request(source.to_string()))?;
+    let aggregate_outputs =
+        standing_runtime_output_aggregate_outputs_for_checkpoint(&record.checkpoint)?;
     let scoped_view = ScopedViewId {
         tenant_id: identity.tenant_id.clone(),
         program_id: identity.program_id.clone(),
@@ -8208,6 +8213,7 @@ async fn standing_runtime_page_from_checkpoint_published_output(
         scoped_view,
         record.checkpoint.logical_epoch,
         page_request,
+        aggregate_outputs.as_deref(),
     )
     .map_err(ApiError::bad_request)?;
     Ok(Some(page))
@@ -8238,6 +8244,42 @@ async fn standing_runtime_published_output_from_manifest_page(
     }
     serde_json::from_value(page_record.published_output)
         .map_err(|source| ApiError::bad_request(source.to_string()))
+}
+
+fn standing_runtime_output_aggregate_outputs_for_checkpoint(
+    checkpoint: &RuntimeCheckpoint,
+) -> Result<Option<Vec<SupportedAggregateOutput>>, ApiError> {
+    let Some(state_payload) = &checkpoint.state_payload else {
+        return Ok(None);
+    };
+    let payload: Value = serde_json::from_str(&state_payload.payload)
+        .map_err(|source| ApiError::bad_request(source.to_string()))?;
+    match payload.get("runtime_kind").and_then(Value::as_str) {
+        Some("filter_project" | "analytic_row_number" | "latest_by_key") => return Ok(None),
+        Some("two_input_join_sum_count") => {
+            let Some(plan) = payload.get("plan").filter(|plan| !plan.is_null()) else {
+                return Ok(None);
+            };
+            let plan: SupportedJoinViewPlan = serde_json::from_value(plan.clone())
+                .map_err(|source| ApiError::bad_request(source.to_string()))?;
+            return Ok(Some(supported_join_view_plan_aggregate_outputs(&plan)));
+        }
+        Some("tumbling_event_time_aggregate") => {
+            let Some(plan) = payload.get("plan").filter(|plan| !plan.is_null()) else {
+                return Ok(None);
+            };
+            let plan: SupportedTumblingWindowPlan = serde_json::from_value(plan.clone())
+                .map_err(|source| ApiError::bad_request(source.to_string()))?;
+            return Ok(Some(plan.aggregate_outputs));
+        }
+        Some(_) | None => {}
+    }
+    let Some(plan) = payload.get("plan").filter(|plan| !plan.is_null()) else {
+        return Ok(None);
+    };
+    let plan: SupportedViewPlan = serde_json::from_value(plan.clone())
+        .map_err(|source| ApiError::bad_request(source.to_string()))?;
+    Ok(Some(supported_view_plan_aggregate_outputs(&plan)))
 }
 
 async fn openapi_json(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
@@ -11735,7 +11777,7 @@ fn latest_by_key_output_schema(
         ColumnSchema {
             name: plan.output_value_column_id.clone(),
             data_type: sql_type_from_catalog_column(value_column)?,
-            nullable: false,
+            nullable: value_column.nullable,
         },
     ];
     let primary_key = vec![output_key_name];
@@ -15591,7 +15633,18 @@ mod tests {
 
     #[test]
     fn latest_by_key_output_schema_uses_arg_max_value_type() {
-        let catalog = test_device_status_catalog();
+        let mut catalog = test_device_status_catalog();
+        catalog
+            .relation_schema
+            .columns
+            .iter_mut()
+            .find(|column| column.column_id == "enabled")
+            .unwrap()
+            .nullable = true;
+        let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema)
+            .expect("nullable latest-by-key input schema should fingerprint");
+        catalog.schema_fingerprint = schema_fingerprint.clone();
+        catalog.incremental_relation.schema_fingerprint = schema_fingerprint;
         let plan = validate_supported_latest_by_key_sql(
             "select device_id as device, arg_max(enabled, event_time) as enabled from device_status group by device_id",
             &catalog,
@@ -15612,6 +15665,7 @@ mod tests {
                 ("enabled", &SqlDataType::Bool)
             ]
         );
+        assert!(schema.columns[1].nullable);
         assert_eq!(schema.primary_key, vec!["device"]);
     }
 
@@ -26884,7 +26938,7 @@ mod tests {
         )
         .await;
 
-        call_json(
+        let (status, resp) = call_json(
             &router,
             Method::POST,
             "/v1/views",
@@ -26897,6 +26951,7 @@ mod tests {
             }),
         )
         .await;
+        assert_eq!(status, StatusCode::CREATED, "create view: {resp}");
 
         let (status, _) = call_json(
             &router,
@@ -26918,13 +26973,14 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::CREATED);
 
-        let (_, resp) = call_json(
+        let (status, resp) = call_json(
             &router,
             Method::POST,
             "/v1/views/user_score_totals/query",
             json!({}),
         )
         .await;
+        assert_eq!(status, StatusCode::OK, "query: {resp}");
         let rows = resp["rows"].as_array().unwrap();
         assert_eq!(rows.len(), 1, "expected 1 row after epoch 1");
 
@@ -26949,13 +27005,14 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::CREATED);
 
-        let (_, resp) = call_json(
+        let (status, resp) = call_json(
             &router,
             Method::POST,
             "/v1/views/user_score_totals/query",
             json!({}),
         )
         .await;
+        assert_eq!(status, StatusCode::OK, "query: {resp}");
         let rows = resp["rows"].as_array().unwrap();
         assert_eq!(rows.len(), 2, "expected 2 rows after epoch 2");
     }

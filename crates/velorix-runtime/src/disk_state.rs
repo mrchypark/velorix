@@ -6,9 +6,7 @@
 
 use std::path::PathBuf;
 
-use foyer::{
-    BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder,
-};
+use foyer::{BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder};
 use thiserror::Error;
 use velorix_core::circuit::NodeId;
 use velorix_core::delta::DeltaBatch;
@@ -86,8 +84,9 @@ impl Default for OperatorStateStore {
                 .with_weighter(|_key, value: &Vec<u8>| value.len())
                 .storage()
                 .with_engine_config(BlockEngineConfig::new(device))
-                .build()
-        ).expect("failed to build default cache");
+                .build(),
+        )
+        .expect("failed to build default cache");
         Self { cache }
     }
 }
@@ -176,8 +175,8 @@ pub fn operator_state_key(node_id: NodeId, suffix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use velorix_core::delta::{DeltaKey, DeltaRecord, DeltaValue};
     use serde_json::json;
+    use velorix_core::delta::{DeltaKey, DeltaRecord, DeltaValue};
 
     #[tokio::test]
     async fn save_and_load_round_trip() {
@@ -185,13 +184,11 @@ mod tests {
         let config = DiskStateConfig::new(dir.path(), 1024 * 1024, 10 * 1024 * 1024);
         let store = OperatorStateStore::open(&config).await.unwrap();
 
-        let batch = DeltaBatch::from_records(vec![
-            DeltaRecord::new(
-                DeltaKey::from_json(json!("k1")),
-                DeltaValue::from_json(json!({"v": 1})),
-                1,
-            ),
-        ]);
+        let batch = DeltaBatch::from_records(vec![DeltaRecord::new(
+            DeltaKey::from_json(json!("k1")),
+            DeltaValue::from_json(json!({"v": 1})),
+            1,
+        )]);
 
         store.save("test-op", &batch).unwrap();
         let loaded = store.load("test-op").await.unwrap().unwrap();
@@ -204,23 +201,19 @@ mod tests {
         let config = DiskStateConfig::new(dir.path(), 1024 * 1024, 10 * 1024 * 1024);
         let store = OperatorStateStore::open(&config).await.unwrap();
 
-        let delta1 = DeltaBatch::from_records(vec![
-            DeltaRecord::new(
-                DeltaKey::from_json(json!("k1")),
-                DeltaValue::from_json(json!({"sum": 10})),
-                1,
-            ),
-        ]);
+        let delta1 = DeltaBatch::from_records(vec![DeltaRecord::new(
+            DeltaKey::from_json(json!("k1")),
+            DeltaValue::from_json(json!({"sum": 10})),
+            1,
+        )]);
         store.apply_delta("agg", &delta1).await.unwrap();
 
         // Same key and value: weight accumulates
-        let delta2 = DeltaBatch::from_records(vec![
-            DeltaRecord::new(
-                DeltaKey::from_json(json!("k1")),
-                DeltaValue::from_json(json!({"sum": 10})),
-                1,
-            ),
-        ]);
+        let delta2 = DeltaBatch::from_records(vec![DeltaRecord::new(
+            DeltaKey::from_json(json!("k1")),
+            DeltaValue::from_json(json!({"sum": 10})),
+            1,
+        )]);
         let state = store.apply_delta("agg", &delta2).await.unwrap();
 
         // Two inserts of the same key-value pair: weight becomes 2
@@ -234,13 +227,11 @@ mod tests {
         let config = DiskStateConfig::new(dir.path(), 1024 * 1024, 10 * 1024 * 1024);
         let store = OperatorStateStore::open(&config).await.unwrap();
 
-        let batch = DeltaBatch::from_records(vec![
-            DeltaRecord::new(
-                DeltaKey::from_json(json!("k1")),
-                DeltaValue::from_json(json!({"v": 1})),
-                1,
-            ),
-        ]);
+        let batch = DeltaBatch::from_records(vec![DeltaRecord::new(
+            DeltaKey::from_json(json!("k1")),
+            DeltaValue::from_json(json!({"v": 1})),
+            1,
+        )]);
         store.save("test", &batch).unwrap();
         assert!(store.load("test").await.unwrap().is_some());
 

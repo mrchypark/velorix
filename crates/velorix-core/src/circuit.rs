@@ -30,6 +30,11 @@ pub struct CircuitPredicate {
     pub column: CircuitColumnRef,
     pub op: CircuitPredicateOp,
     pub literal: Value,
+    /// Additional literal values for multi-value predicates (In, NotIn, Between).
+    /// For `In`/`NotIn`: all values in the list. `literal` is the first element.
+    /// For `Between`: [low, high]. `literal` is kept for backward compat but unused.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub literals: Vec<Value>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -43,6 +48,43 @@ pub enum CircuitPredicateOp {
     Ge,
     IsNull,
     IsNotNull,
+    In,
+    NotIn,
+    Between,
+    Like,
+    IsDistinctFrom,
+}
+
+/// Compound filter expression that supports AND, OR, NOT, and simple predicates.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum CircuitFilterExpr {
+    Predicate(CircuitPredicate),
+    Comparison {
+        left: CircuitExpr,
+        op: CircuitPredicateOp,
+        right: CircuitExpr,
+    },
+    And(Vec<CircuitFilterExpr>),
+    Or(Vec<CircuitFilterExpr>),
+    Not(Box<CircuitFilterExpr>),
+    /// Always-true predicate (pass-through).
+    AlwaysTrue,
+}
+
+impl CircuitFilterExpr {
+    /// Wrap a list of predicates into a single filter expression (AND-conjunction).
+    pub fn from_predicates(preds: Vec<CircuitPredicate>) -> Self {
+        match preds.len() {
+            0 => CircuitFilterExpr::AlwaysTrue,
+            1 => CircuitFilterExpr::Predicate(preds.into_iter().next().unwrap()),
+            _ => CircuitFilterExpr::And(
+                preds
+                    .into_iter()
+                    .map(CircuitFilterExpr::Predicate)
+                    .collect(),
+            ),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -53,12 +95,26 @@ pub enum CircuitExpr {
     Sub(Box<CircuitExpr>, Box<CircuitExpr>),
     Mul(Box<CircuitExpr>, Box<CircuitExpr>),
     Div(Box<CircuitExpr>, Box<CircuitExpr>),
+    Modulo(Box<CircuitExpr>, Box<CircuitExpr>),
     Neg(Box<CircuitExpr>),
     Abs(Box<CircuitExpr>),
     Cast {
         expr: Box<CircuitExpr>,
         to_type: CircuitDataType,
     },
+    Greatest(Vec<CircuitExpr>),
+    Least(Vec<CircuitExpr>),
+    If {
+        condition: Box<CircuitFilterExpr>,
+        then_expr: Box<CircuitExpr>,
+        else_expr: Box<CircuitExpr>,
+    },
+    CaseWhen {
+        when_clauses: Vec<(CircuitFilterExpr, CircuitExpr)>,
+        else_result: Option<Box<CircuitExpr>>,
+    },
+    /// Reference to an aggregate output column (used in HAVING predicates).
+    AggregateRef(String),
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -104,10 +160,10 @@ pub enum CircuitNode {
         node_id: NodeId,
         relation_id: String,
     },
-    /// Filter rows by predicate.
+    /// Filter rows by compound predicate expression.
     Filter {
         node_id: NodeId,
-        predicates: Vec<CircuitPredicate>,
+        predicate: CircuitFilterExpr,
     },
     /// Project / rename columns.
     Project {
@@ -135,9 +191,7 @@ pub enum CircuitNode {
         output_aliases: Vec<String>,
     },
     /// Distinct (bag → set conversion).
-    Distinct {
-        node_id: NodeId,
-    },
+    Distinct { node_id: NodeId },
     /// Top-K limit.
     TopK {
         node_id: NodeId,
@@ -223,9 +277,8 @@ impl Circuit {
             in_degree[edge.to] += 1;
         }
 
-        let mut queue: std::collections::VecDeque<NodeId> = (0..n)
-            .filter(|&id| in_degree[id] == 0)
-            .collect();
+        let mut queue: std::collections::VecDeque<NodeId> =
+            (0..n).filter(|&id| in_degree[id] == 0).collect();
         let mut order = Vec::with_capacity(n);
 
         while let Some(id) = queue.pop_front() {
@@ -314,13 +367,32 @@ mod tests {
     fn circuit_topological_order_respects_edges() {
         let circuit = Circuit {
             nodes: vec![
-                CircuitNode::Source { node_id: 0, relation_id: "t".into() },
-                CircuitNode::Filter { node_id: 1, predicates: vec![] },
-                CircuitNode::Sink { node_id: 2, relation_id: "v".into() },
+                CircuitNode::Source {
+                    node_id: 0,
+                    relation_id: "t".into(),
+                },
+                CircuitNode::Filter {
+                    node_id: 1,
+                    predicate: CircuitFilterExpr::AlwaysTrue,
+                },
+                CircuitNode::Sink {
+                    node_id: 2,
+                    relation_id: "v".into(),
+                },
             ],
             edges: vec![
-                Edge { from: 0, from_port: 0, to: 1, to_port: 0 },
-                Edge { from: 1, from_port: 0, to: 2, to_port: 0 },
+                Edge {
+                    from: 0,
+                    from_port: 0,
+                    to: 1,
+                    to_port: 0,
+                },
+                Edge {
+                    from: 1,
+                    from_port: 0,
+                    to: 2,
+                    to_port: 0,
+                },
             ],
             input_node_ids: vec![0],
             output_node_id: 2,
@@ -333,13 +405,11 @@ mod tests {
     #[test]
     fn delay_state_advance_produces_delta() {
         let mut delay = DelayState::default();
-        let batch = DeltaBatch::from_records(vec![
-            DeltaRecord::new(
-                DeltaKey::from_json(serde_json::json!("k1")),
-                DeltaValue::from_json(serde_json::json!({"v": 1})),
-                1,
-            ),
-        ]);
+        let batch = DeltaBatch::from_records(vec![DeltaRecord::new(
+            DeltaKey::from_json(serde_json::json!("k1")),
+            DeltaValue::from_json(serde_json::json!({"v": 1})),
+            1,
+        )]);
 
         let delta = delay.advance(&batch).unwrap();
         assert_eq!(delta.records().len(), 1);

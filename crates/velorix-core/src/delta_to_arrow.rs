@@ -72,7 +72,10 @@ pub fn delta_batch_to_record_batch(
                 }
             })?;
             for (i, col) in value_cols.iter().enumerate() {
-                let val = obj.get(col.name.as_str()).cloned().unwrap_or(serde_json::Value::Null);
+                let val = obj
+                    .get(col.name.as_str())
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
                 value_arrays[i].push(val);
             }
         }
@@ -131,31 +134,19 @@ fn json_to_arrow_array(
 ) -> Result<ArrayRef, DeltaToArrowError> {
     match data_type {
         SqlDataType::Utf8 | SqlDataType::Json => {
-            let strs: Vec<Option<&str>> = values
-                .iter()
-                .map(|v| v.as_str())
-                .collect();
+            let strs: Vec<Option<&str>> = values.iter().map(|v| v.as_str()).collect();
             Ok(Arc::new(StringArray::from(strs)))
         }
         SqlDataType::Int64 => {
-            let nums: Vec<Option<i64>> = values
-                .iter()
-                .map(|v| v.as_i64())
-                .collect();
+            let nums: Vec<Option<i64>> = values.iter().map(|v| v.as_i64()).collect();
             Ok(Arc::new(arrow::array::Int64Array::from(nums)))
         }
         SqlDataType::Float64 => {
-            let nums: Vec<Option<f64>> = values
-                .iter()
-                .map(|v| v.as_f64())
-                .collect();
+            let nums: Vec<Option<f64>> = values.iter().map(|v| v.as_f64()).collect();
             Ok(Arc::new(arrow::array::Float64Array::from(nums)))
         }
         SqlDataType::Bool => {
-            let bools: Vec<Option<bool>> = values
-                .iter()
-                .map(|v| v.as_bool())
-                .collect();
+            let bools: Vec<Option<bool>> = values.iter().map(|v| v.as_bool()).collect();
             Ok(Arc::new(arrow::array::BooleanArray::from(bools)))
         }
         _ => Err(DeltaToArrowError::InvalidValueType {
@@ -177,31 +168,19 @@ fn json_to_arrow_array_nullable(
     }
     match &column.data_type {
         SqlDataType::Utf8 | SqlDataType::Json => {
-            let strs: Vec<Option<&str>> = values
-                .iter()
-                .map(|v| v.as_str())
-                .collect();
+            let strs: Vec<Option<&str>> = values.iter().map(|v| v.as_str()).collect();
             Ok(Arc::new(StringArray::from(strs)))
         }
         SqlDataType::Int64 => {
-            let nums: Vec<Option<i64>> = values
-                .iter()
-                .map(|v| v.as_i64())
-                .collect();
+            let nums: Vec<Option<i64>> = values.iter().map(|v| v.as_i64()).collect();
             Ok(Arc::new(arrow::array::Int64Array::from(nums)))
         }
         SqlDataType::Float64 => {
-            let nums: Vec<Option<f64>> = values
-                .iter()
-                .map(|v| v.as_f64())
-                .collect();
+            let nums: Vec<Option<f64>> = values.iter().map(|v| v.as_f64()).collect();
             Ok(Arc::new(arrow::array::Float64Array::from(nums)))
         }
         SqlDataType::Bool => {
-            let bools: Vec<Option<bool>> = values
-                .iter()
-                .map(|v| v.as_bool())
-                .collect();
+            let bools: Vec<Option<bool>> = values.iter().map(|v| v.as_bool()).collect();
             Ok(Arc::new(arrow::array::BooleanArray::from(bools)))
         }
         _ => Err(DeltaToArrowError::InvalidValueType {
@@ -224,8 +203,16 @@ mod tests {
             relation_version: "1".into(),
             schema_fingerprint: "fp".into(),
             columns: vec![
-                ColumnSchema { name: "key".into(), data_type: SqlDataType::Utf8, nullable: false },
-                ColumnSchema { name: "value".into(), data_type: SqlDataType::Int64, nullable: false },
+                ColumnSchema {
+                    name: "key".into(),
+                    data_type: SqlDataType::Utf8,
+                    nullable: false,
+                },
+                ColumnSchema {
+                    name: "value".into(),
+                    data_type: SqlDataType::Int64,
+                    nullable: false,
+                },
             ],
             primary_key: vec!["key".into()],
         };
@@ -255,9 +242,11 @@ mod tests {
             relation_name: "test".into(),
             relation_version: "1".into(),
             schema_fingerprint: "fp".into(),
-            columns: vec![
-                ColumnSchema { name: "key".into(), data_type: SqlDataType::Utf8, nullable: false },
-            ],
+            columns: vec![ColumnSchema {
+                name: "key".into(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            }],
             primary_key: vec!["key".into()],
         };
 
