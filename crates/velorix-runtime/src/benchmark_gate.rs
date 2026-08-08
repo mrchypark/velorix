@@ -251,12 +251,16 @@ impl BenchmarkGateResultV1 {
             });
         }
 
-        compare_higher_is_better(
-            "rows_per_second",
-            self.metrics.rows_per_second,
-            baseline.metrics.rows_per_second,
-            budget.max_regression_fraction,
-        )?;
+        let compare_wall_clock = self.compares_wall_clock_metrics();
+
+        if compare_wall_clock {
+            compare_higher_is_better(
+                "rows_per_second",
+                self.metrics.rows_per_second,
+                baseline.metrics.rows_per_second,
+                budget.max_regression_fraction,
+            )?;
+        }
         compare_lower_is_better(
             "bytes_per_row",
             self.metrics.bytes_per_row,
@@ -293,30 +297,32 @@ impl BenchmarkGateResultV1 {
             baseline.metrics.object_requests.range_read_count as f64,
             budget.max_regression_fraction,
         )?;
-        compare_lower_is_better(
-            "checkpoint_p50_ms",
-            self.metrics.checkpoint_p50_ms,
-            baseline.metrics.checkpoint_p50_ms,
-            budget.max_regression_fraction,
-        )?;
-        compare_lower_is_better(
-            "checkpoint_p95_ms",
-            self.metrics.checkpoint_p95_ms,
-            baseline.metrics.checkpoint_p95_ms,
-            budget.max_regression_fraction,
-        )?;
-        compare_lower_is_better(
-            "recovery_p95_ms",
-            self.metrics.recovery_p95_ms,
-            baseline.metrics.recovery_p95_ms,
-            budget.max_regression_fraction,
-        )?;
-        compare_lower_is_better(
-            "peak_rss_bytes",
-            self.metrics.peak_rss_bytes as f64,
-            baseline.metrics.peak_rss_bytes as f64,
-            budget.max_regression_fraction,
-        )?;
+        if compare_wall_clock {
+            compare_lower_is_better(
+                "checkpoint_p50_ms",
+                self.metrics.checkpoint_p50_ms,
+                baseline.metrics.checkpoint_p50_ms,
+                budget.max_regression_fraction,
+            )?;
+            compare_lower_is_better(
+                "checkpoint_p95_ms",
+                self.metrics.checkpoint_p95_ms,
+                baseline.metrics.checkpoint_p95_ms,
+                budget.max_regression_fraction,
+            )?;
+            compare_lower_is_better(
+                "recovery_p95_ms",
+                self.metrics.recovery_p95_ms,
+                baseline.metrics.recovery_p95_ms,
+                budget.max_regression_fraction,
+            )?;
+            compare_lower_is_better(
+                "peak_rss_bytes",
+                self.metrics.peak_rss_bytes as f64,
+                baseline.metrics.peak_rss_bytes as f64,
+                budget.max_regression_fraction,
+            )?;
+        }
         compare_lower_is_better(
             "spill_bytes",
             self.metrics.spill_bytes as f64,
@@ -333,6 +339,7 @@ impl BenchmarkGateResultV1 {
             &self.workload_metrics,
             &baseline.workload_metrics,
             budget.max_regression_fraction,
+            compare_wall_clock,
         )
     }
 
@@ -352,6 +359,10 @@ impl BenchmarkGateResultV1 {
         }
 
         Ok(())
+    }
+
+    pub fn compares_wall_clock_metrics(&self) -> bool {
+        !(self.gate_level == BenchmarkGateLevel::PrSmoke && self.backend == BenchmarkBackend::Local)
     }
 
     pub fn reject_placeholder_s3_commit(&self) -> Result<(), BenchmarkGateError> {
@@ -415,6 +426,7 @@ fn compare_workload_metrics(
     current: &[BenchmarkWorkloadMetricsV1],
     baseline: &[BenchmarkWorkloadMetricsV1],
     budget_fraction: f64,
+    compare_wall_clock: bool,
 ) -> Result<(), BenchmarkGateError> {
     for baseline_workload in baseline {
         if !current
@@ -437,7 +449,7 @@ fn compare_workload_metrics(
             });
         };
 
-        if is_performance_workload(&current_workload.name) {
+        if compare_wall_clock && is_performance_workload(&current_workload.name) {
             compare_lower_workload_metric(
                 &current_workload.name,
                 "p50_ms",

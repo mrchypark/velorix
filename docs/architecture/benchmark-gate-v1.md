@@ -27,22 +27,34 @@ and object request metrics for object-backed workloads.
 Initial gates should use regression budgets rather than absolute targets. Local
 filesystem and S3-compatible baselines are separate and not interchangeable.
 The committed local PR-smoke baseline is a non-placeholder, conservative
-threshold derived from a measured local run. It checks schema, required workload
-coverage, non-placeholder commit provenance, and gate wiring, not stable local
-machine performance. S3-compatible nightly and release baselines require live
-measured S3-compatible evidence and must not use placeholders. The committed
-S3-compatible baselines were refreshed from the RustFS-backed live S3 API gate
-on 2026-05-18 at commit `1d477916d9341a478473e4cee0c4d63eb84e968b`; the
-nightly and release gate artifacts both compare the generated result against
-the matching committed baseline with `backend_evidence_scope=live_or_native`.
+threshold derived from repeated local measurements. The current baseline is the
+component-wise conservative envelope of seven runs at commit
+`fec9e8cce84a96c2747a700430f9091f172f550a` on 2026-08-09: minimum throughput
+and maximum latency, resource, scan, and object-request values. All seven source
+runs pass the resulting baseline with the PR gate's 25% budget. The local PR
+gate blocks on deterministic structural and cost metrics: bytes per row, PUTs
+per GiB, object request counts and bytes, spill bytes, and scan bytes. It still
+records throughput, latency, and peak RSS, but those host-sensitive values are
+informational on shared PR runners. Stable wall-clock and memory regression
+checks belong to repeated nightly and release measurements on controlled
+runners. The local gate also checks schema, required workload coverage,
+non-placeholder commit provenance, and gate wiring. S3-compatible nightly and
+release baselines require live measured S3-compatible evidence and must not use
+placeholders. The committed S3-compatible baselines were refreshed from the
+RustFS-backed live S3 API gate on 2026-05-18 at commit
+`1d477916d9341a478473e4cee0c4d63eb84e968b`; the nightly and release gate
+artifacts both compare the generated result against the matching committed
+baseline with `backend_evidence_scope=live_or_native`.
 
-`local_incremental` is a bootstrap harness, not production readiness evidence.
-It currently emits real local workload details for the authoritative
-object-store capability probe, catalog-aware ingest envelope admission,
-checkpoint publication, checkpoint recovery, and a bounded DataFusion Parquet
-table scan. The DataFusion workload is instrumentation evidence that the local
-query path lists and reads Parquet objects under policy; it is not production
-scan latency evidence. The SlateDB workload writes a small checkpoint state
+`local_incremental` is a production-runtime smoke harness, not full product-path
+readiness evidence. It emits real local workload details for the authoritative
+object-store capability probe, catalog-aware ingest envelope admission, SQL
+admission through the production logical-plan factory, incremental materialized
+runtime application, checkpoint publication, checkpoint recovery, and
+materialized-output read primitives. It does not benchmark the removed legacy
+persisted-source DataFusion scan surface. Checkpoint publication and recovery
+each use nine samples so their reported p50/p95 values are not single-operation
+timings. The SlateDB workload writes a small checkpoint state
 payload through `SlateDbStateStore`, closes and drops the store, reopens the
 same object-store path, reads the state back, and records elapsed latency plus
 the local metered object-store requests visible through the harness wrapper.
@@ -102,7 +114,7 @@ production GC evidence artifact.
 - High-cardinality aggregate.
 - Recovery after many checkpoints.
 - Checkpoint publication latency.
-- DataFusion bounded Parquet scan.
+- Materialized-output query and bounded segment reads.
 - SlateDB state write/read/reopen latency.
 - GC dry-run planning latency.
 - Local-only GC execution evidence latency.
@@ -145,10 +157,12 @@ support.
 - Local and S3 baselines cannot be mixed.
 - Missing object request metrics invalidates the result.
 - PR smoke writes `target/velorix-bench/local-pr-smoke.json`, gates it against
-  `baselines/benchmark/local/pr-smoke.json` with a 25% single-run regression
-  budget, and uploads the result artifact even when the gate fails. Nightly and
-  release evidence should use tighter repeated measurements on controlled
-  runners rather than reusing this smoke tolerance.
+  `baselines/benchmark/local/pr-smoke.json` with a 25% deterministic-cost
+  regression budget, and uploads the result artifact even when the gate fails.
+  Throughput, latency, and peak RSS remain present in the artifact but do not
+  block this shared-runner gate. Nightly and release evidence uses the same
+  comparator with wall-clock and memory checks enabled against controlled-runner
+  baselines.
 - Nightly S3-compatible gating fails closed when no S3-compatible result path is
   configured or when the S3-compatible result regresses against the live
   baseline.

@@ -2383,6 +2383,27 @@ mod tests {
         assert!(run.report.deleted.is_empty());
         assert!(format!("{error:#}").contains("at least one deleted candidate"));
     }
+
+    #[test]
+    fn local_pr_smoke_evidence_reports_only_deterministic_cost_comparisons() {
+        let result = BenchmarkGateResultV1::from_json_str(include_str!(
+            "../../../baselines/benchmark/local/pr-smoke.json"
+        ))
+        .unwrap();
+        let evidence = BenchmarkGateEvidenceV1::passed(
+            Path::new("baseline.json"),
+            Path::new("result.json"),
+            &result,
+            &result,
+            0.25,
+        );
+
+        assert!(evidence.performance_compared_workloads.is_empty());
+        assert_eq!(
+            evidence.deterministic_cost_compared_workloads,
+            evidence.workload_metrics
+        );
+    }
 }
 
 fn require_artifact_path(name: &str, path: &Option<PathBuf>) -> anyhow::Result<()> {
@@ -9761,6 +9782,7 @@ struct BenchmarkGateEvidenceV1 {
     result_commit: String,
     max_regression_fraction: Option<f64>,
     workload_metrics: Vec<String>,
+    deterministic_cost_compared_workloads: Vec<String>,
     performance_compared_workloads: Vec<String>,
     functional_shape_checked_workloads: Vec<String>,
 }
@@ -9781,7 +9803,8 @@ impl BenchmarkGateEvidenceV1 {
             result_commit: result.commit.clone(),
             max_regression_fraction: None,
             workload_metrics: workload_metric_names(result),
-            performance_compared_workloads: performance_compared_workload_names(result),
+            deterministic_cost_compared_workloads: Vec::new(),
+            performance_compared_workloads: Vec::new(),
             functional_shape_checked_workloads: functional_shape_checked_workload_names(result),
         }
     }
@@ -9807,6 +9830,7 @@ impl BenchmarkGateEvidenceV1 {
             result_commit: result.commit.clone(),
             max_regression_fraction: Some(max_regression_fraction),
             workload_metrics: workload_metric_names(result),
+            deterministic_cost_compared_workloads: workload_metric_names(result),
             performance_compared_workloads: performance_compared_workload_names(result),
             functional_shape_checked_workloads: functional_shape_checked_workload_names(result),
         }
@@ -9829,6 +9853,10 @@ fn workload_metric_names(result: &BenchmarkGateResultV1) -> Vec<String> {
 }
 
 fn performance_compared_workload_names(result: &BenchmarkGateResultV1) -> Vec<String> {
+    if !result.compares_wall_clock_metrics() {
+        return Vec::new();
+    }
+
     result
         .workload_metrics
         .iter()

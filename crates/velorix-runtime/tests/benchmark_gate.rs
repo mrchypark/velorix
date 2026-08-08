@@ -265,8 +265,8 @@ fn benchmark_result_rejects_unexpected_gate_or_backend() {
 
 #[test]
 fn benchmark_comparison_fails_when_synthetic_regression_exceeds_budget() {
-    let mut current = local_smoke_result();
-    let baseline = local_smoke_result();
+    let mut current = s3_nightly_result();
+    let baseline = s3_nightly_result();
     current.metrics.rows_per_second = baseline.metrics.rows_per_second * 0.88;
 
     let error = current
@@ -290,8 +290,8 @@ fn benchmark_comparison_ignores_capability_probe_latency_regression() {
 
 #[test]
 fn benchmark_comparison_fails_when_performance_workload_latency_regresses_over_budget() {
-    let mut current = local_smoke_result();
-    let baseline = local_smoke_result();
+    let mut current = s3_nightly_result();
+    let baseline = s3_nightly_result();
     current.workload_metrics[1].p95_ms = baseline.workload_metrics[1].p95_ms * 1.20;
 
     let error = current
@@ -371,9 +371,26 @@ fn benchmark_comparison_fails_when_current_lacks_baseline_workload_metric() {
 
 #[test]
 fn benchmark_comparison_passes_when_synthetic_regression_is_within_budget() {
+    let mut current = s3_nightly_result();
+    let baseline = s3_nightly_result();
+    current.metrics.rows_per_second = baseline.metrics.rows_per_second * 0.91;
+
+    current
+        .compare_against(&baseline, BenchmarkBudgetV1::relative(0.10))
+        .unwrap();
+}
+
+#[test]
+fn local_pr_smoke_ignores_wall_clock_regressions() {
     let mut current = local_smoke_result();
     let baseline = local_smoke_result();
-    current.metrics.rows_per_second = baseline.metrics.rows_per_second * 0.91;
+    current.metrics.rows_per_second = 1.0;
+    current.metrics.checkpoint_p50_ms *= 10.0;
+    current.metrics.checkpoint_p95_ms *= 10.0;
+    current.metrics.recovery_p95_ms *= 10.0;
+    current.metrics.peak_rss_bytes = 1;
+    current.workload_metrics[1].p50_ms *= 10.0;
+    current.workload_metrics[1].p95_ms *= 10.0;
 
     current
         .compare_against(&baseline, BenchmarkBudgetV1::relative(0.10))
