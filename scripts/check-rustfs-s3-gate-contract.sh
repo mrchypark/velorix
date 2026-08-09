@@ -33,7 +33,7 @@ checks = {
         and "VELORIX_RUSTFS_PRODUCTION_GC_SEED_PATH" in script
         and "VELORIX_RUSTFS_PRODUCTION_GC_RUN_PATH" in script
         and "VELORIX_RUSTFS_PRODUCTION_GC_VALIDATION_PATH" in script
-        and 'rm -f "$evidence_path" "$benchmark_path" "$production_gc_seed_path" "$production_gc_run_path" "$production_gc_path" "$production_gc_validation_path"'
+        and 'rm -f "$evidence_path" "$production_gc_seed_path" "$production_gc_run_path" "$production_gc_path" "$production_gc_validation_path"'
         in script
     ),
     "validates fixed retain-latest policy before running GC": (

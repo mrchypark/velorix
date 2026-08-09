@@ -208,24 +208,6 @@
     },
     {
       "kind": "duplicate",
-      "crate": "fs4",
-      "owner": "state",
-      "expires_on": "2026-08-31",
-      "reason": "The current SlateDB/object-store and metadata dependency graph introduces fs4 versions from multiple storage stacks while upstream ranges converge.",
-      "replacement_plan": "Upgrade SlateDB, object_store, and metadata dependencies when their fs4 dependency ranges converge.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
-    },
-    {
-      "kind": "duplicate",
-      "crate": "reqwest",
-      "owner": "metadata",
-      "expires_on": "2026-08-31",
-      "reason": "The pinned mrchypark/hiqlite metadata backend introduces a reqwest line alongside the existing HTTP client graph.",
-      "replacement_plan": "Upgrade hiqlite and HTTP client dependencies when upstream reqwest ranges converge.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
-    },
-    {
-      "kind": "duplicate",
       "crate": "sha2",
       "owner": "metadata",
       "expires_on": "2026-08-31",
@@ -312,15 +294,6 @@
       "expires_on": "2026-08-31",
       "reason": "DataFusion and object_store 0.14 currently select adjacent itertools release lines.",
       "replacement_plan": "Unify when the DataFusion and object_store dependency ranges converge.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
-    },
-    {
-      "kind": "duplicate",
-      "crate": "md-5",
-      "owner": "runtime",
-      "expires_on": "2026-08-31",
-      "reason": "DataFusion object_store 0.13 and Velorix object_store 0.14 select adjacent md-5 release lines.",
-      "replacement_plan": "Remove when DataFusion and Velorix can share one object_store release line.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
