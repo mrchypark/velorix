@@ -1,0 +1,38 @@
+[package]
+name = "velorix-meta"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[features]
+hiqlite-backend = ["dep:hiqlite"]
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+# Pin the fork commit that contains Raft-serialized timestamp transactions.
+# The remote client and standalone server must compile the same streaming API
+# enum shape. The server image uses `--features server`, which enables `full`.
+hiqlite = { git = "https://github.com/mrchypark/hiqlite.git", rev = "26c6d22a72d7bd0a1e2de073fc4c076ddad4e588", package = "hiqlite", default-features = false, features = ["full"], optional = true }
+object_store = { workspace = true, features = ["aws"] }
+prost = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+velorix-core = { path = "../velorix-core" }
+velorix-storage = { path = "../velorix-storage" }
+
+# Durable backend target:
+# Use mrchypark/hiqlite at 26c6d22a72d7bd0a1e2de073fc4c076ddad4e588 until
+# sebadob/hiqlite includes the same Raft-serialized timestamp API in a release.
+
+[build-dependencies]
+protoc-bin-vendored = { workspace = true }
+tonic-prost-build = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio-stream = { workspace = true, features = ["net"] }

@@ -1,0 +1,40 @@
+[package]
+name = "velorix-runtime"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+arrow = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+datafusion = { workspace = true }
+futures = { workspace = true }
+object_store = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+velorix-core = { path = "../velorix-core" }
+velorix-storage = { path = "../velorix-storage" }
+
+[features]
+default = []
+
+[[bench]]
+name = "local_incremental"
+path = "../../benches/local_incremental.rs"
+harness = false
+
+[dev-dependencies]
+async-trait = { workspace = true }
+bytes = { workspace = true }
+datafusion = { workspace = true }
+futures = { workspace = true }
+object_store = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+velorix-core = { path = "../velorix-core" }
+velorix-storage = { path = "../velorix-storage" }

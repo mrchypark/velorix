@@ -1,0 +1,30 @@
+# syntax=docker/dockerfile:1.7
+FROM rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 AS builder
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends protobuf-compiler clang \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+COPY --from=velorix-hiqlite-source . ./hiqlite
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    RUSTFLAGS="-C strip=symbols" cargo install \
+      --path /workspace/hiqlite/hiqlite \
+      --features server \
+      --no-default-features \
+      --locked \
+      --root /workspace/hiqlite-install \
+      hiqlite
+
+FROM debian:bookworm-slim@sha256:0104b334637a5f19aa9c983a91b54c89887c0984081f2068983107a6f6c21eeb AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /workspace/hiqlite-install/bin/hiqlite /usr/local/bin/hiqlite
+
+USER 65532:65532
+EXPOSE 8100 8200
+ENTRYPOINT ["/usr/local/bin/hiqlite"]

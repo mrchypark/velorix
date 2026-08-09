@@ -1,0 +1,152 @@
+syntax = "proto3";
+
+package velorix.meta.v1;
+
+service VelorixMeta {
+  rpc ReadMetaStoreCapabilities(ReadMetaStoreCapabilitiesRequest) returns (ReadMetaStoreCapabilitiesResponse);
+  rpc StoreRelationCatalog(StoreRelationCatalogRequest) returns (StoreRelationCatalogResponse);
+  rpc ReadRelationCatalog(ReadRelationCatalogRequest) returns (ReadRelationCatalogResponse);
+  rpc ReserveIngestRange(ReserveIngestRangeRequest) returns (ReserveIngestRangeResponse);
+  rpc AcquireStandingRuntimeOwner(AcquireStandingRuntimeOwnerRequest) returns (AcquireStandingRuntimeOwnerResponse);
+  rpc ReadStandingRuntimeOwner(ReadStandingRuntimeOwnerRequest) returns (ReadStandingRuntimeOwnerResponse);
+  rpc PublishStandingRuntimeCheckpoint(PublishStandingRuntimeCheckpointRequest) returns (PublishStandingRuntimeCheckpointResponse);
+  rpc ReadStandingRuntimeCheckpoint(ReadStandingRuntimeCheckpointRequest) returns (ReadStandingRuntimeCheckpointResponse);
+}
+
+message ReadMetaStoreCapabilitiesRequest {}
+
+message StandingRuntimeFencingCapability {
+  uint32 capability_schema_version = 1;
+  string backend_name = 2;
+  string owner_scope_kind = 3;
+  bool linearizable_owner_lease = 4;
+  bool durable_monotonic_owner_epoch = 5;
+  bool authoritative_backend_time = 6;
+  bool owner_validated_checkpoint_publish = 7;
+  bool publish_checks_owner_and_latest_atomically = 8;
+  bool publish_rejects_expired_owner = 9;
+  bool latest_read_linearizable = 10;
+  bool publish_rejects_scope_mismatch = 11;
+  uint64 max_owner_ttl_ms = 12;
+  bool control_plane_auth_enforced = 13;
+  bool production_multi_writer_safe = 14;
+  string backend_time_source_kind = 15;
+  string backend_time_blocked_reason = 16;
+  string lease_authority_kind = 17;
+  string lease_expiry_semantics = 18;
+  bool bounded_wall_clock_failover = 19;
+  uint64 failover_time_bound_ms = 20;
+  bool multi_writer_fencing_safe = 21;
+  bool production_bounded_failover_safe = 22;
+}
+
+message ReadMetaStoreCapabilitiesResponse {
+  StandingRuntimeFencingCapability standing_runtime_fencing = 1;
+}
+
+message StoreRelationCatalogRequest {
+  bytes catalog_json = 1;
+}
+
+message StoreRelationCatalogResponse {
+  string outcome = 1;
+}
+
+message ReadRelationCatalogRequest {
+  string relation_id = 1;
+  string relation_version = 2;
+}
+
+message ReadRelationCatalogResponse {
+  bytes catalog_json = 1;
+}
+
+message ReserveIngestRangeRequest {
+  string stream_id = 1;
+  uint32 partition_id = 2;
+  uint64 start_offset_inclusive = 3;
+  uint64 end_offset_exclusive = 4;
+  string batch_key = 5;
+  string payload_digest = 6;
+  string relation_id = 7;
+  string relation_version = 8;
+  string schema_fingerprint = 9;
+  uint64 writer_epoch = 10;
+}
+
+message ReserveIngestRangeResponse {
+  string outcome = 1;
+}
+
+message StandingRuntimeCheckpointPointer {
+  string tenant_id = 1;
+  string program_id = 2;
+  string view_id = 3;
+  string checkpoint_key = 4;
+  uint64 logical_epoch = 5;
+  string content_hash = 6;
+  repeated string output_manifest_refs = 7;
+  string manifest_hash = 8;
+}
+
+message StandingRuntimeOwnerClaim {
+  string tenant_id = 1;
+  string program_id = 2;
+  string view_id = 3;
+  string owner_id = 4;
+  uint64 owner_epoch = 5;
+  uint64 expires_at_unix_ms = 6;
+}
+
+message StandingRuntimeOwnerToken {
+  string tenant_id = 1;
+  string program_id = 2;
+  string view_id = 3;
+  string owner_id = 4;
+  uint64 owner_epoch = 5;
+}
+
+message AcquireStandingRuntimeOwnerRequest {
+  string tenant_id = 1;
+  string program_id = 2;
+  string view_id = 3;
+  string owner_id = 4;
+  uint64 ttl_ms = 5;
+}
+
+message AcquireStandingRuntimeOwnerResponse {
+  string outcome = 1;
+  StandingRuntimeOwnerClaim claim = 2;
+}
+
+message ReadStandingRuntimeOwnerRequest {
+  string tenant_id = 1;
+  string program_id = 2;
+  string view_id = 3;
+}
+
+message ReadStandingRuntimeOwnerResponse {
+  bool found = 1;
+  StandingRuntimeOwnerClaim claim = 2;
+}
+
+message PublishStandingRuntimeCheckpointRequest {
+  StandingRuntimeCheckpointPointer expected_previous = 1;
+  StandingRuntimeCheckpointPointer candidate = 2;
+  StandingRuntimeOwnerToken owner = 3;
+}
+
+message PublishStandingRuntimeCheckpointResponse {
+  string outcome = 1;
+}
+
+message ReadStandingRuntimeCheckpointRequest {
+  string tenant_id = 1;
+  string program_id = 2;
+  string view_id = 3;
+}
+
+message ReadStandingRuntimeCheckpointResponse {
+  bool found = 1;
+  StandingRuntimeCheckpointPointer pointer = 2;
+}

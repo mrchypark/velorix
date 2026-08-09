@@ -1,0 +1,30 @@
+[package]
+name = "velorix-storage"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+arrow = { workspace = true, features = ["ipc"] }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+futures = "0.3"
+object_store = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+slatedb = { workspace = true }
+thiserror = { workspace = true }
+velorix-core = { path = "../velorix-core" }
+
+[features]
+s3-compat-tests = ["object_store/aws"]
+
+[[test]]
+name = "s3_compat"
+path = "tests/s3_compat.rs"
+required-features = ["s3-compat-tests"]
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }

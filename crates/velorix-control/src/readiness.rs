@@ -1,0 +1,787 @@
+use serde::{Deserialize, Serialize};
+
+const PRODUCTION_READINESS_SCHEMA_VERSION: u16 = 8;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductionReadinessEvidenceV1 {
+    pub schema_version: u16,
+    pub deployment_id: String,
+    pub authority_store_id: String,
+    pub capability_status: ReadinessCheck,
+    pub s3_compatible_test_status: ReadinessCheck,
+    pub ownership_status: ReadinessCheck,
+    pub checkpoint_status: ReadinessCheck,
+    pub ingest_status: ReadinessCheck,
+    pub standing_runtime_status: ReadinessCheck,
+    pub relation_catalog_status: ReadinessCheck,
+    pub state_status: ReadinessCheck,
+    pub query_policy_status: ReadinessCheck,
+    pub table_catalog_status: ReadinessCheck,
+    pub dependency_governance_status: ReadinessCheck,
+    pub benchmark_gate_status: ReadinessCheck,
+    pub gc_status: ReadinessCheck,
+    pub kubernetes_status: ReadinessCheck,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadinessCheck {
+    pub status: ReadinessStatus,
+    pub evidence: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_kind: Vec<ReadinessEvidenceKind>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadinessStatus {
+    Pass,
+    Fail,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadinessEvidenceKind {
+    S3Compatible,
+    S3CompatibleIntegrationHarness,
+    S3CompatibleCheckpointFaultMatrix,
+    KubernetesLeaseClient,
+    BootstrapRawStatePath,
+    DurableOwnershipEpochRecord,
+    PublishedCheckpointLifecycleRecord,
+    CheckpointRecoveryTransitionRecord,
+    CatalogBackedIngestAdmission,
+    DeployedIngestAdmission,
+    IngestWriterLifecycleAttestation,
+    StandingRuntimeFencingCapability,
+    MultiReplicaStandingRuntimeFencingSmoke,
+    LocalApiPodFailoverSmoke,
+    RelationCatalogRecord,
+    RelationCatalogRegistry,
+    RelationCatalogClosedAdapterScope,
+    RelationCatalogUnsupportedAdapterFailClosed,
+    SlateDbCheckpointRef,
+    SlateDbCheckedRecovery,
+    QueryPolicyCatalog,
+    RegistryBackedTableCatalog,
+    DependencyGovernanceValidated,
+    S3CompatibleBenchmarkGate,
+    GcRunEvidence,
+    ProductionGcRunEvidence,
+    RustfsProductionGcEvidenceFamilyValidated,
+    HiqliteNoPvcThreeVoterBackupRestore,
+    CheckpointRetentionRecord,
+    UpgradeRollbackRepairGcFaultMatrix,
+    QueryOutputIsolation,
+    SecurityReleaseProvenance,
+    RemainingReleaseReadiness,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductionReadinessReportV1 {
+    pub schema_version: u16,
+    pub deployment_id: String,
+    pub authority_store_id: String,
+    pub capability_status: ReadinessCheck,
+    pub s3_compatible_test_status: ReadinessCheck,
+    pub ownership_status: ReadinessCheck,
+    pub checkpoint_status: ReadinessCheck,
+    pub ingest_status: ReadinessCheck,
+    pub standing_runtime_status: ReadinessCheck,
+    pub relation_catalog_status: ReadinessCheck,
+    pub state_status: ReadinessCheck,
+    pub query_policy_status: ReadinessCheck,
+    pub table_catalog_status: ReadinessCheck,
+    pub dependency_governance_status: ReadinessCheck,
+    pub benchmark_gate_status: ReadinessCheck,
+    pub gc_status: ReadinessCheck,
+    pub kubernetes_status: ReadinessCheck,
+    pub production_ready: bool,
+    pub blocking_reasons: Vec<String>,
+}
+
+impl ProductionReadinessEvidenceV1 {
+    pub fn from_json_str(value: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(value)
+    }
+
+    pub fn try_into_report(self) -> Result<ProductionReadinessReportV1, String> {
+        validate_readiness_schema_version(&self)?;
+        Ok(self.into_report_with_options(true))
+    }
+
+    pub fn try_into_first_e2e_report(self) -> Result<ProductionReadinessReportV1, String> {
+        validate_readiness_schema_version(&self)?;
+        let mut report = self.into_report_with_options(false);
+        report.production_ready = report.blocking_reasons.is_empty();
+        Ok(report)
+    }
+
+    pub fn into_report(self) -> ProductionReadinessReportV1 {
+        self.into_report_with_options(true)
+    }
+
+    fn into_report_with_options(
+        self,
+        require_release_evidence: bool,
+    ) -> ProductionReadinessReportV1 {
+        let mut blocking_reasons = Vec::new();
+
+        if self.deployment_id.trim().is_empty() {
+            blocking_reasons.push("deployment_id is empty".to_string());
+        }
+        if self.authority_store_id.trim().is_empty() {
+            blocking_reasons.push("authority_store_id is empty".to_string());
+        } else if is_local_dev_authority_store(&self.authority_store_id) {
+            blocking_reasons.push("authority_store_id uses local/dev authority".to_string());
+        }
+
+        push_check_blockers(
+            &mut blocking_reasons,
+            "capability_status",
+            &self.capability_status,
+        );
+        push_check_blockers(
+            &mut blocking_reasons,
+            "s3_compatible_test_status",
+            &self.s3_compatible_test_status,
+        );
+        push_check_blockers(
+            &mut blocking_reasons,
+            "ownership_status",
+            &self.ownership_status,
+        );
+        push_check_blockers(
+            &mut blocking_reasons,
+            "checkpoint_status",
+            &self.checkpoint_status,
+        );
+        push_check_blockers(&mut blocking_reasons, "ingest_status", &self.ingest_status);
+        push_check_blockers(
+            &mut blocking_reasons,
+            "standing_runtime_status",
+            &self.standing_runtime_status,
+        );
+        push_check_blockers(
+            &mut blocking_reasons,
+            "relation_catalog_status",
+            &self.relation_catalog_status,
+        );
+        push_check_blockers(&mut blocking_reasons, "state_status", &self.state_status);
+        push_check_blockers(
+            &mut blocking_reasons,
+            "query_policy_status",
+            &self.query_policy_status,
+        );
+        push_check_blockers(
+            &mut blocking_reasons,
+            "table_catalog_status",
+            &self.table_catalog_status,
+        );
+        push_check_blockers(
+            &mut blocking_reasons,
+            "dependency_governance_status",
+            &self.dependency_governance_status,
+        );
+        push_check_blockers(
+            &mut blocking_reasons,
+            "benchmark_gate_status",
+            &self.benchmark_gate_status,
+        );
+        push_check_blockers(&mut blocking_reasons, "gc_status", &self.gc_status);
+        push_check_blockers(
+            &mut blocking_reasons,
+            "kubernetes_status",
+            &self.kubernetes_status,
+        );
+
+        if !self
+            .capability_status
+            .has_evidence(ReadinessEvidenceKind::S3Compatible)
+        {
+            blocking_reasons.push("capability_status missing s3_compatible evidence".to_string());
+        }
+        if require_release_evidence
+            && !self
+                .capability_status
+                .has_evidence(ReadinessEvidenceKind::RemainingReleaseReadiness)
+        {
+            blocking_reasons
+                .push("capability_status missing remaining_release_readiness evidence".to_string());
+        }
+        if !self
+            .s3_compatible_test_status
+            .has_evidence(ReadinessEvidenceKind::S3CompatibleIntegrationHarness)
+        {
+            blocking_reasons.push(
+                "s3_compatible_test_status missing s3_compatible_integration_harness evidence"
+                    .to_string(),
+            );
+        }
+        if require_release_evidence
+            && !self
+                .s3_compatible_test_status
+                .has_evidence(ReadinessEvidenceKind::S3CompatibleCheckpointFaultMatrix)
+        {
+            blocking_reasons.push(
+                "s3_compatible_test_status missing s3_compatible_checkpoint_fault_matrix evidence"
+                    .to_string(),
+            );
+        }
+        if !self
+            .kubernetes_status
+            .has_evidence(ReadinessEvidenceKind::KubernetesLeaseClient)
+        {
+            blocking_reasons
+                .push("kubernetes_status missing kubernetes_lease_client evidence".to_string());
+        }
+        if require_release_evidence
+            && !self
+                .kubernetes_status
+                .has_evidence(ReadinessEvidenceKind::HiqliteNoPvcThreeVoterBackupRestore)
+        {
+            blocking_reasons.push(
+                "kubernetes_status missing hiqlite_no_pvc_three_voter_backup_restore evidence"
+                    .to_string(),
+            );
+        }
+        if !self
+            .ownership_status
+            .has_evidence(ReadinessEvidenceKind::DurableOwnershipEpochRecord)
+        {
+            blocking_reasons.push(
+                "ownership_status missing durable_ownership_epoch_record evidence".to_string(),
+            );
+        }
+        if !self
+            .checkpoint_status
+            .has_evidence(ReadinessEvidenceKind::PublishedCheckpointLifecycleRecord)
+        {
+            blocking_reasons.push(
+                "checkpoint_status missing published_checkpoint_lifecycle_record evidence"
+                    .to_string(),
+            );
+        }
+        if !self
+            .checkpoint_status
+            .has_evidence(ReadinessEvidenceKind::CheckpointRecoveryTransitionRecord)
+        {
+            blocking_reasons.push(
+                "checkpoint_status missing checkpoint_recovery_transition_record evidence"
+                    .to_string(),
+            );
+        }
+        if !self
+            .ingest_status
+            .has_evidence(ReadinessEvidenceKind::CatalogBackedIngestAdmission)
+        {
+            blocking_reasons
+                .push("ingest_status missing catalog_backed_ingest_admission evidence".to_string());
+        }
+        if !self
+            .ingest_status
+            .has_evidence(ReadinessEvidenceKind::DeployedIngestAdmission)
+        {
+            blocking_reasons
+                .push("ingest_status missing deployed_ingest_admission evidence".to_string());
+        }
+        if !self
+            .ingest_status
+            .has_evidence(ReadinessEvidenceKind::IngestWriterLifecycleAttestation)
+        {
+            blocking_reasons.push(
+                "ingest_status missing ingest_writer_lifecycle_attestation evidence".to_string(),
+            );
+        }
+        if !self
+            .standing_runtime_status
+            .has_evidence(ReadinessEvidenceKind::StandingRuntimeFencingCapability)
+        {
+            blocking_reasons.push(
+                "standing_runtime_status missing standing_runtime_fencing_capability evidence"
+                    .to_string(),
+            );
+        }
+        if !self
+            .standing_runtime_status
+            .has_evidence(ReadinessEvidenceKind::MultiReplicaStandingRuntimeFencingSmoke)
+        {
+            blocking_reasons.push(
+                "standing_runtime_status missing multi_replica_standing_runtime_fencing_smoke evidence"
+                    .to_string(),
+            );
+        }
+        if !self
+            .standing_runtime_status
+            .has_evidence(ReadinessEvidenceKind::LocalApiPodFailoverSmoke)
+        {
+            blocking_reasons.push(
+                "standing_runtime_status missing local_api_pod_failover_smoke evidence".to_string(),
+            );
+        }
+        if !self
+            .relation_catalog_status
+            .has_evidence(ReadinessEvidenceKind::RelationCatalogRecord)
+        {
+            blocking_reasons.push(
+                "relation_catalog_status missing relation_catalog_record evidence".to_string(),
+            );
+        }
+        if !self
+            .relation_catalog_status
+            .has_evidence(ReadinessEvidenceKind::RelationCatalogRegistry)
+        {
+            blocking_reasons.push(
+                "relation_catalog_status missing relation_catalog_registry evidence".to_string(),
+            );
+        }
+        if !self
+            .relation_catalog_status
+            .has_evidence(ReadinessEvidenceKind::RelationCatalogClosedAdapterScope)
+        {
+            blocking_reasons.push(
+                "relation_catalog_status missing relation_catalog_closed_adapter_scope evidence"
+                    .to_string(),
+            );
+        }
+        if !self
+            .relation_catalog_status
+            .has_evidence(ReadinessEvidenceKind::RelationCatalogUnsupportedAdapterFailClosed)
+        {
+            blocking_reasons.push(
+                "relation_catalog_status missing relation_catalog_unsupported_adapter_fail_closed evidence"
+                    .to_string(),
+            );
+        }
+        if self
+            .state_status
+            .has_evidence(ReadinessEvidenceKind::BootstrapRawStatePath)
+        {
+            blocking_reasons.push("state_status uses bootstrap raw state path".to_string());
+        }
+        if !self
+            .state_status
+            .has_evidence(ReadinessEvidenceKind::SlateDbCheckpointRef)
+        {
+            blocking_reasons
+                .push("state_status missing slate_db_checkpoint_ref evidence".to_string());
+        }
+        if !self
+            .state_status
+            .has_evidence(ReadinessEvidenceKind::SlateDbCheckedRecovery)
+        {
+            blocking_reasons
+                .push("state_status missing slate_db_checked_recovery evidence".to_string());
+        }
+        if !self
+            .query_policy_status
+            .has_evidence(ReadinessEvidenceKind::QueryPolicyCatalog)
+        {
+            blocking_reasons
+                .push("query_policy_status missing query_policy_catalog evidence".to_string());
+        }
+        if require_release_evidence
+            && !self
+                .query_policy_status
+                .has_evidence(ReadinessEvidenceKind::QueryOutputIsolation)
+        {
+            blocking_reasons
+                .push("query_policy_status missing query_output_isolation evidence".to_string());
+        }
+        if !self
+            .table_catalog_status
+            .has_evidence(ReadinessEvidenceKind::RegistryBackedTableCatalog)
+        {
+            blocking_reasons.push(
+                "table_catalog_status missing registry_backed_table_catalog evidence".to_string(),
+            );
+        }
+        if !self
+            .benchmark_gate_status
+            .has_evidence(ReadinessEvidenceKind::S3CompatibleBenchmarkGate)
+        {
+            blocking_reasons.push(
+                "benchmark_gate_status missing s3_compatible_benchmark_gate evidence".to_string(),
+            );
+        }
+        if !self
+            .gc_status
+            .has_evidence(ReadinessEvidenceKind::GcRunEvidence)
+        {
+            blocking_reasons.push("gc_status missing gc_run_evidence evidence".to_string());
+        }
+        if !self
+            .gc_status
+            .has_evidence(ReadinessEvidenceKind::ProductionGcRunEvidence)
+        {
+            blocking_reasons
+                .push("gc_status missing production_gc_run_evidence evidence".to_string());
+        }
+        if !self
+            .gc_status
+            .has_evidence(ReadinessEvidenceKind::RustfsProductionGcEvidenceFamilyValidated)
+        {
+            blocking_reasons.push(
+                "gc_status missing rustfs_production_gc_evidence_family_validated evidence"
+                    .to_string(),
+            );
+        }
+        if !self
+            .gc_status
+            .has_evidence(ReadinessEvidenceKind::CheckpointRetentionRecord)
+        {
+            blocking_reasons
+                .push("gc_status missing checkpoint_retention_record evidence".to_string());
+        }
+        if require_release_evidence
+            && !self
+                .gc_status
+                .has_evidence(ReadinessEvidenceKind::UpgradeRollbackRepairGcFaultMatrix)
+        {
+            blocking_reasons.push(
+                "gc_status missing upgrade_rollback_repair_gc_fault_matrix evidence".to_string(),
+            );
+        }
+        if !self
+            .dependency_governance_status
+            .has_evidence(ReadinessEvidenceKind::DependencyGovernanceValidated)
+        {
+            blocking_reasons.push(
+                "dependency_governance_status missing dependency_governance_validated evidence"
+                    .to_string(),
+            );
+        }
+        if require_release_evidence
+            && !self
+                .dependency_governance_status
+                .has_evidence(ReadinessEvidenceKind::SecurityReleaseProvenance)
+        {
+            blocking_reasons.push(
+                "dependency_governance_status missing security_release_provenance evidence"
+                    .to_string(),
+            );
+        }
+
+        ProductionReadinessReportV1 {
+            schema_version: self.schema_version,
+            deployment_id: self.deployment_id,
+            authority_store_id: self.authority_store_id,
+            capability_status: self.capability_status,
+            s3_compatible_test_status: self.s3_compatible_test_status,
+            ownership_status: self.ownership_status,
+            checkpoint_status: self.checkpoint_status,
+            ingest_status: self.ingest_status,
+            standing_runtime_status: self.standing_runtime_status,
+            relation_catalog_status: self.relation_catalog_status,
+            state_status: self.state_status,
+            query_policy_status: self.query_policy_status,
+            table_catalog_status: self.table_catalog_status,
+            dependency_governance_status: self.dependency_governance_status,
+            benchmark_gate_status: self.benchmark_gate_status,
+            gc_status: self.gc_status,
+            kubernetes_status: self.kubernetes_status,
+            production_ready: blocking_reasons.is_empty(),
+            blocking_reasons,
+        }
+    }
+}
+
+impl ProductionReadinessReportV1 {
+    pub fn to_json_pretty(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+}
+
+impl ReadinessCheck {
+    fn has_evidence(&self, kind: ReadinessEvidenceKind) -> bool {
+        self.evidence_kind.contains(&kind)
+    }
+}
+
+fn push_check_blockers(blocking_reasons: &mut Vec<String>, field: &str, check: &ReadinessCheck) {
+    push_failed_check(blocking_reasons, field, check);
+    push_blank_evidence_check(blocking_reasons, field, check);
+    push_placeholder_evidence_check(blocking_reasons, field, check);
+}
+
+fn push_failed_check(blocking_reasons: &mut Vec<String>, field: &str, check: &ReadinessCheck) {
+    if check.status == ReadinessStatus::Fail {
+        blocking_reasons.push(format!("{field} failed: {}", check.evidence));
+    }
+}
+
+fn push_blank_evidence_check(
+    blocking_reasons: &mut Vec<String>,
+    field: &str,
+    check: &ReadinessCheck,
+) {
+    if check.status == ReadinessStatus::Pass && check.evidence.trim().is_empty() {
+        blocking_reasons.push(format!("{field} missing evidence text"));
+    }
+}
+
+fn push_placeholder_evidence_check(
+    blocking_reasons: &mut Vec<String>,
+    field: &str,
+    check: &ReadinessCheck,
+) {
+    if check.status != ReadinessStatus::Pass {
+        return;
+    }
+
+    let evidence = check.evidence.to_lowercase();
+    for (marker, reason) in [
+        ("placeholder", "placeholder"),
+        ("bootstrap", "bootstrap"),
+        ("local-only", "local-only"),
+        ("local only", "local-only"),
+        ("local filesystem", "local filesystem"),
+        ("emulator", "emulator"),
+    ] {
+        if evidence.contains(marker) {
+            blocking_reasons.push(format!("{field} uses {reason} evidence"));
+            return;
+        }
+    }
+}
+
+fn is_local_dev_authority_store(authority_store_id: &str) -> bool {
+    let authority_store_id = authority_store_id.to_lowercase();
+    [
+        "memory://",
+        "file://",
+        "localhost",
+        "127.0.0.1",
+        "emulator",
+        "local-only",
+        "local only",
+        "local filesystem",
+    ]
+    .iter()
+    .any(|marker| authority_store_id.contains(marker))
+}
+
+pub fn validate_readiness_schema_version(
+    evidence: &ProductionReadinessEvidenceV1,
+) -> Result<(), String> {
+    if evidence.schema_version == PRODUCTION_READINESS_SCHEMA_VERSION {
+        Ok(())
+    } else {
+        Err(format!(
+            "unsupported readiness schema_version {}, expected {PRODUCTION_READINESS_SCHEMA_VERSION}",
+            evidence.schema_version
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn passing_check(evidence_kind: Vec<ReadinessEvidenceKind>) -> ReadinessCheck {
+        ReadinessCheck {
+            status: ReadinessStatus::Pass,
+            evidence: "release evidence".to_string(),
+            evidence_kind,
+        }
+    }
+
+    fn release_ready_evidence() -> ProductionReadinessEvidenceV1 {
+        ProductionReadinessEvidenceV1 {
+            schema_version: PRODUCTION_READINESS_SCHEMA_VERSION,
+            deployment_id: "release-deployment".to_string(),
+            authority_store_id: "s3://release-authority/prefix".to_string(),
+            capability_status: passing_check(vec![
+                ReadinessEvidenceKind::S3Compatible,
+                ReadinessEvidenceKind::RemainingReleaseReadiness,
+            ]),
+            s3_compatible_test_status: passing_check(vec![
+                ReadinessEvidenceKind::S3CompatibleIntegrationHarness,
+                ReadinessEvidenceKind::S3CompatibleCheckpointFaultMatrix,
+            ]),
+            ownership_status: passing_check(vec![
+                ReadinessEvidenceKind::DurableOwnershipEpochRecord,
+            ]),
+            checkpoint_status: passing_check(vec![
+                ReadinessEvidenceKind::PublishedCheckpointLifecycleRecord,
+                ReadinessEvidenceKind::CheckpointRecoveryTransitionRecord,
+            ]),
+            ingest_status: passing_check(vec![
+                ReadinessEvidenceKind::CatalogBackedIngestAdmission,
+                ReadinessEvidenceKind::DeployedIngestAdmission,
+                ReadinessEvidenceKind::IngestWriterLifecycleAttestation,
+            ]),
+            standing_runtime_status: passing_check(vec![
+                ReadinessEvidenceKind::StandingRuntimeFencingCapability,
+                ReadinessEvidenceKind::MultiReplicaStandingRuntimeFencingSmoke,
+                ReadinessEvidenceKind::LocalApiPodFailoverSmoke,
+            ]),
+            relation_catalog_status: passing_check(vec![
+                ReadinessEvidenceKind::RelationCatalogRecord,
+                ReadinessEvidenceKind::RelationCatalogRegistry,
+                ReadinessEvidenceKind::RelationCatalogClosedAdapterScope,
+                ReadinessEvidenceKind::RelationCatalogUnsupportedAdapterFailClosed,
+            ]),
+            state_status: passing_check(vec![
+                ReadinessEvidenceKind::SlateDbCheckpointRef,
+                ReadinessEvidenceKind::SlateDbCheckedRecovery,
+            ]),
+            query_policy_status: passing_check(vec![
+                ReadinessEvidenceKind::QueryPolicyCatalog,
+                ReadinessEvidenceKind::QueryOutputIsolation,
+            ]),
+            table_catalog_status: passing_check(vec![
+                ReadinessEvidenceKind::RegistryBackedTableCatalog,
+            ]),
+            dependency_governance_status: passing_check(vec![
+                ReadinessEvidenceKind::DependencyGovernanceValidated,
+                ReadinessEvidenceKind::SecurityReleaseProvenance,
+            ]),
+            benchmark_gate_status: passing_check(vec![
+                ReadinessEvidenceKind::S3CompatibleBenchmarkGate,
+            ]),
+            gc_status: passing_check(vec![
+                ReadinessEvidenceKind::GcRunEvidence,
+                ReadinessEvidenceKind::ProductionGcRunEvidence,
+                ReadinessEvidenceKind::RustfsProductionGcEvidenceFamilyValidated,
+                ReadinessEvidenceKind::CheckpointRetentionRecord,
+                ReadinessEvidenceKind::UpgradeRollbackRepairGcFaultMatrix,
+            ]),
+            kubernetes_status: passing_check(vec![
+                ReadinessEvidenceKind::KubernetesLeaseClient,
+                ReadinessEvidenceKind::HiqliteNoPvcThreeVoterBackupRestore,
+            ]),
+        }
+    }
+
+    #[test]
+    fn release_readiness_requires_upgrade_rollback_repair_gc_fault_matrix() {
+        let mut evidence = release_ready_evidence();
+        evidence
+            .gc_status
+            .evidence_kind
+            .retain(|kind| *kind != ReadinessEvidenceKind::UpgradeRollbackRepairGcFaultMatrix);
+
+        let report = evidence.try_into_report().unwrap();
+
+        assert!(!report.production_ready);
+        assert!(report.blocking_reasons.iter().any(|reason| {
+            reason == "gc_status missing upgrade_rollback_repair_gc_fault_matrix evidence"
+        }));
+    }
+
+    #[test]
+    fn release_readiness_requires_s3_checkpoint_fault_matrix() {
+        let mut evidence = release_ready_evidence();
+        evidence
+            .s3_compatible_test_status
+            .evidence_kind
+            .retain(|kind| *kind != ReadinessEvidenceKind::S3CompatibleCheckpointFaultMatrix);
+
+        let report = evidence.try_into_report().unwrap();
+
+        assert!(!report.production_ready);
+        assert!(report.blocking_reasons.iter().any(|reason| {
+            reason == "s3_compatible_test_status missing s3_compatible_checkpoint_fault_matrix evidence"
+        }));
+    }
+
+    #[test]
+    fn release_readiness_requires_hiqlite_no_pvc_backup_restore_evidence() {
+        let mut evidence = release_ready_evidence();
+        evidence
+            .kubernetes_status
+            .evidence_kind
+            .retain(|kind| *kind != ReadinessEvidenceKind::HiqliteNoPvcThreeVoterBackupRestore);
+
+        let report = evidence.try_into_report().unwrap();
+
+        assert!(!report.production_ready);
+        assert!(report.blocking_reasons.iter().any(|reason| {
+            reason == "kubernetes_status missing hiqlite_no_pvc_three_voter_backup_restore evidence"
+        }));
+    }
+
+    #[test]
+    fn release_readiness_requires_query_output_isolation() {
+        let mut evidence = release_ready_evidence();
+        evidence
+            .query_policy_status
+            .evidence_kind
+            .retain(|kind| *kind != ReadinessEvidenceKind::QueryOutputIsolation);
+
+        let report = evidence.try_into_report().unwrap();
+
+        assert!(!report.production_ready);
+        assert!(report.blocking_reasons.iter().any(|reason| {
+            reason == "query_policy_status missing query_output_isolation evidence"
+        }));
+    }
+
+    #[test]
+    fn release_readiness_requires_security_release_provenance() {
+        let mut evidence = release_ready_evidence();
+        evidence
+            .dependency_governance_status
+            .evidence_kind
+            .retain(|kind| *kind != ReadinessEvidenceKind::SecurityReleaseProvenance);
+
+        let report = evidence.try_into_report().unwrap();
+
+        assert!(!report.production_ready);
+        assert!(report.blocking_reasons.iter().any(|reason| {
+            reason == "dependency_governance_status missing security_release_provenance evidence"
+        }));
+    }
+
+    #[test]
+    fn release_readiness_requires_remaining_release_readiness() {
+        let mut evidence = release_ready_evidence();
+        evidence
+            .capability_status
+            .evidence_kind
+            .retain(|kind| *kind != ReadinessEvidenceKind::RemainingReleaseReadiness);
+
+        let report = evidence.try_into_report().unwrap();
+
+        assert!(!report.production_ready);
+        assert!(report.blocking_reasons.iter().any(|reason| {
+            reason == "capability_status missing remaining_release_readiness evidence"
+        }));
+    }
+
+    #[test]
+    fn first_e2e_readiness_does_not_require_release_fault_matrices() {
+        let mut evidence = release_ready_evidence();
+        evidence
+            .gc_status
+            .evidence_kind
+            .retain(|kind| *kind != ReadinessEvidenceKind::UpgradeRollbackRepairGcFaultMatrix);
+        evidence
+            .s3_compatible_test_status
+            .evidence_kind
+            .retain(|kind| *kind != ReadinessEvidenceKind::S3CompatibleCheckpointFaultMatrix);
+        evidence
+            .kubernetes_status
+            .evidence_kind
+            .retain(|kind| *kind != ReadinessEvidenceKind::HiqliteNoPvcThreeVoterBackupRestore);
+        evidence
+            .query_policy_status
+            .evidence_kind
+            .retain(|kind| *kind != ReadinessEvidenceKind::QueryOutputIsolation);
+        evidence
+            .dependency_governance_status
+            .evidence_kind
+            .retain(|kind| *kind != ReadinessEvidenceKind::SecurityReleaseProvenance);
+        evidence
+            .capability_status
+            .evidence_kind
+            .retain(|kind| *kind != ReadinessEvidenceKind::RemainingReleaseReadiness);
+
+        let report = evidence.try_into_first_e2e_report().unwrap();
+
+        assert!(report.production_ready);
+    }
+}

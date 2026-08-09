@@ -1,0 +1,25 @@
+[package]
+name = "velorix-control"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+async-trait = { workspace = true }
+bytes = { workspace = true }
+object_store = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+velorix-meta = { path = "../velorix-meta" }
+velorix-storage = { path = "../velorix-storage" }
+
+[dev-dependencies]
+bytes = { workspace = true }
+futures = { workspace = true }
+object_store = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }

@@ -1,0 +1,27 @@
+[package]
+name = "velorix-k8s"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+async-trait = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+k8s-openapi = { workspace = true, features = ["v1_35", "schemars"] }
+kube = { workspace = true, features = ["client", "derive", "ring", "runtime", "rustls-tls"] }
+object_store = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["process"] }
+velorix-control = { path = "../velorix-control" }
+
+[dev-dependencies]
+arrow = { workspace = true, features = ["ipc"] }
+http = "1"
+http-body-util = "0.1"
+tempfile = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
+velorix-storage = { path = "../velorix-storage" }

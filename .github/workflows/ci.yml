@@ -1,0 +1,173 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: cargo fmt
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+  script-contracts:
+    name: script contracts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check shell syntax
+        run: |
+          bash -n scripts/run-first-e2e-readiness.sh
+          bash -n scripts/run-vind-product.sh
+          bash -n scripts/check-first-e2e-readiness-contract.sh
+          bash -n scripts/check-vind-product-contract.sh
+          bash -n scripts/check-release-evidence-copy-contract.sh
+          bash -n scripts/check-rustfs-s3-gate-contract.sh
+          bash -n scripts/check-no-external-runtime-artifacts.sh
+          python3 -m py_compile scripts/copy-readiness-sibling-evidence.py
+
+      - name: Check first-E2E readiness contract
+        run: |
+          scripts/check-first-e2e-readiness-contract.sh
+          scripts/check-vind-product-contract.sh
+          scripts/check-release-evidence-copy-contract.sh
+          scripts/check-rustfs-s3-gate-contract.sh
+          scripts/check-no-external-runtime-artifacts.sh
+
+  msrv:
+    name: MSRV check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check workspace on MSRV
+        run: cargo check --workspace --all-targets --locked
+
+  clippy:
+    name: cargo clippy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check lints
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run workspace tests
+        run: cargo test --workspace
+
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20.2
+
+      - name: Check dependencies
+        run: |
+          mkdir -p target/dependency-governance
+          cargo deny -f json check -W unmaintained 2> target/dependency-governance/cargo-deny.jsonl
+
+      - name: Validate dependency governance manifest
+        run: |
+          cargo run -p velorix-cli -- dependency-governance-validate \
+            --manifest dependency-governance.json \
+            --cargo-deny-json target/dependency-governance/cargo-deny.jsonl \
+            --json > target/dependency-governance/dependency-governance-evidence.json
+
+      - name: Upload dependency governance evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-governance-evidence
+          path: target/dependency-governance/*
+
+  benchmark-smoke:
+    name: benchmark PR smoke gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run local benchmark
+        run: |
+          mkdir -p target/velorix-bench
+          cargo bench -p velorix-runtime --bench local_incremental > target/velorix-bench/local-pr-smoke.json
+
+      - name: Validate benchmark JSON
+        run: cargo run -p velorix-cli -- benchmark-validate --result target/velorix-bench/local-pr-smoke.json
+
+      - name: Run benchmark gate
+        run: |
+          cargo run -p velorix-cli -- benchmark-gate \
+            --gate-level pr-smoke \
+            --backend local \
+            --baseline baselines/benchmark/local/pr-smoke.json \
+            --result target/velorix-bench/local-pr-smoke.json \
+            --max-regression-fraction 0.25 \
+            --json > target/velorix-bench/local-pr-smoke-gate.json
+
+      - name: Upload benchmark result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-pr-smoke-benchmark
+          path: target/velorix-bench/*.json

@@ -1,0 +1,40 @@
+name: RustFS S3-Compatible Gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      rustfs-image:
+        description: RustFS container image to use for the S3-compatible gate.
+        required: false
+        default: rustfs/rustfs:latest
+
+env:
+  CARGO_TERM_COLOR: always
+  VELORIX_RUSTFS_IMAGE: ${{ inputs.rustfs-image }}
+  VELORIX_RUSTFS_EVIDENCE_PATH: target/velorix-s3/rustfs-s3-gate-evidence.json
+
+jobs:
+  rustfs-s3:
+    name: RustFS S3-compatible gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run RustFS S3-compatible gate
+        run: scripts/run-rustfs-s3-gate.sh
+
+      - name: Upload RustFS S3-compatible evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustfs-s3-compatible-evidence
+          path: |
+            target/velorix-s3/rustfs-s3-gate-evidence.json
+          if-no-files-found: warn
