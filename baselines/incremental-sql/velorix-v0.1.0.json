@@ -1,0 +1,114 @@
+{
+  "schema_version": 2,
+  "corpus_version": "incremental-sql-corpus-v1",
+  "engine": {
+    "name": "velorix",
+    "version": "0.1.0",
+    "source_revision": "fa06440d95ed4b24bd99d60a9f4d9851c02932f4+worktree",
+    "configuration": {
+      "batch_oracle": "datafusion",
+      "runner": "velorix-runtime-example-v1",
+      "workers": "1"
+    },
+    "durability_mode": "in_memory_runtime_checkpoint_restore",
+    "input_semantics": "primary_key_updates_lowered_to_signed_rows",
+    "state_retention_policy": "all_history_unless_plan_declares_watermark_bound"
+  },
+  "protocol": {
+    "warm_up_iterations": 0,
+    "measured_iterations": 1,
+    "initial_rows": 7,
+    "change_events": 4,
+    "change_mix": {
+      "delete": 1,
+      "insert": 2,
+      "update": 1
+    }
+  },
+  "correctness": [
+    {
+      "workload_id": "filter_project",
+      "outcome": {
+        "status": "passed",
+        "expected_digest": "sha256:8d2e63313819ec46a8773c837840b52f1185cf03ca6da41fd547ba3aaf034b60",
+        "observed_digest": "sha256:8d2e63313819ec46a8773c837840b52f1185cf03ca6da41fd547ba3aaf034b60",
+        "verified_phases": [
+          "initial_load",
+          "insert",
+          "update",
+          "delete",
+          "checkpoint_restart",
+          "replay_tail"
+        ],
+        "plan_evidence": {
+          "native_logical_plan": {
+            "availability": "available",
+            "identity": "velorix-logical-view-plan-sha256-v1:sha256:cbc1f8bc86bee5aa98f6e2418a6a8f225326bd2a543d327fe823fcb7457d34bb"
+          },
+          "native_physical_dag": {
+            "availability": "available",
+            "identity": "velorix-physical-operator-dag-sha256-v1:sha256:606c7d0cc85ca00a4616a423fe5d81905b8c656cbcb9aa9832305c476eb4b5e9"
+          },
+          "diagnostic_explain_digest": null
+        }
+      }
+    },
+    {
+      "workload_id": "aggregate",
+      "outcome": {
+        "status": "unsupported",
+        "reason": "view SQL is outside the supported materialization scope: filter/project materialized views must not use GROUP BY"
+      }
+    },
+    {
+      "workload_id": "distinct_aggregate",
+      "outcome": {
+        "status": "unsupported",
+        "reason": "view SQL is outside the supported materialization scope: filter/project materialized views must not use GROUP BY"
+      }
+    },
+    {
+      "workload_id": "inner_join",
+      "outcome": {
+        "status": "unsupported",
+        "reason": "view SQL is outside the supported materialization scope: JOIN ON must compare the primary key columns of both inputs"
+      }
+    },
+    {
+      "workload_id": "left_join",
+      "outcome": {
+        "status": "unsupported",
+        "reason": "view SQL is outside the supported materialization scope: JOIN ON must compare the primary key columns of both inputs"
+      }
+    },
+    {
+      "workload_id": "top_k",
+      "outcome": {
+        "status": "unsupported",
+        "reason": "view SQL is outside the supported materialization scope: filter/project materialized views must not use GROUP BY"
+      }
+    },
+    {
+      "workload_id": "fixed_window",
+      "outcome": {
+        "status": "unsupported",
+        "reason": "view SQL is outside the supported materialization scope: table functions, hints, versions, samples, and partitions are unsupported"
+      }
+    },
+    {
+      "workload_id": "ranking",
+      "outcome": {
+        "status": "unsupported",
+        "reason": "view SQL is outside the supported materialization scope: first filter/project projection must be the primary key column"
+      }
+    },
+    {
+      "workload_id": "chained_view",
+      "outcome": {
+        "status": "unsupported",
+        "reason": "Velorix does not yet admit chained materialized-view statements into one runtime DAG"
+      }
+    }
+  ],
+  "performance": []
+}

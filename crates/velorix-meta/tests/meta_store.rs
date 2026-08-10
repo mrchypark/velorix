@@ -3,11 +3,20 @@ use std::sync::Arc;
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 use velorix_core::relation::SchemaFingerprintV1;
+use velorix_core::standing_program::{
+    RuntimeCheckpointInputCoverageV1, RuntimeCheckpointPartitionCoverageV1,
+    RuntimeCheckpointRelationCoverageV1, RUNTIME_CHECKPOINT_INPUT_COVERAGE_SCHEMA_VERSION_V1,
+};
 use velorix_meta::{
-    AcquireStandingRuntimeOwnerOutcome, AcquireStandingRuntimeOwnerRequest, InMemoryMetaStore,
-    IngestRangeReservation, MetaStore, OssMetaStore, PublishStandingRuntimeCheckpointOutcome,
-    PublishStandingRuntimeCheckpointRequest, ReserveIngestRangeOutcome,
-    StandingRuntimeCheckpointPointer, StandingRuntimeOwnerToken, StoreRelationCatalogOutcome,
+    AcquireStandingRuntimeOwnerOutcome, AcquireStandingRuntimeOwnerRequest,
+    BeginViewBootstrapOutcome, BeginViewBootstrapRequest, CaptureIngestSourceCutRequest,
+    CommitIngestRangeOutcome, FixViewBootstrapActivationCutOutcome,
+    FixViewBootstrapActivationCutRequest, InMemoryMetaStore, IngestRangeReservation,
+    IngestSourceCutV1, IngestSourceRelationIdentityV1, MetaStore, OssMetaStore,
+    PromoteViewBootstrapOutcome, PromoteViewBootstrapRequest,
+    PublishStandingRuntimeCheckpointOutcome, PublishStandingRuntimeCheckpointRequest,
+    ReserveIngestRangeOutcome, StandingRuntimeCheckpointPointer, StandingRuntimeOwnerToken,
+    StoreRelationCatalogOutcome, ViewBootstrapLifecycleV1,
     STANDING_RUNTIME_BACKEND_TIME_SOURCE_PROCESS_CLOCK,
     STANDING_RUNTIME_BACKEND_TIME_SOURCE_UNAVAILABLE,
 };
@@ -131,6 +140,413 @@ async fn ingest_range_reservation_allows_adjacent_ranges_and_duplicate_retry() {
 }
 
 #[tokio::test]
+async fn ingest_source_cut_stops_before_uncommitted_reservation_hole() {
+    let store = InMemoryMetaStore::default();
+    let first = reservation("orders", 0, 0, 10, "sha256:first");
+    let hole = reservation("orders", 0, 10, 20, "sha256:hole");
+    let higher = reservation("orders", 0, 20, 30, "sha256:higher");
+    for range in [&first, &hole, &higher] {
+        assert_eq!(
+            store.reserve_ingest_range(range.clone()).await.unwrap(),
+            ReserveIngestRangeOutcome::Reserved
+        );
+    }
+    assert_eq!(
+        store.commit_ingest_range(first.clone()).await.unwrap(),
+        CommitIngestRangeOutcome::Committed
+    );
+    assert_eq!(
+        store.commit_ingest_range(higher).await.unwrap(),
+        CommitIngestRangeOutcome::Committed
+    );
+
+    let cut = store
+        .capture_ingest_source_cut(orders_source_cut_request())
+        .await
+        .unwrap();
+    assert_eq!(cut.input_catalog_epoch, 3);
+    assert_eq!(cut.relations[0].partitions.len(), 1);
+    assert_eq!(cut.relations[0].partitions[0].base_offset_inclusive, 0);
+    assert_eq!(
+        cut.relations[0].partitions[0].committed_offset_exclusive,
+        10
+    );
+
+    assert_eq!(
+        store.commit_ingest_range(hole.clone()).await.unwrap(),
+        CommitIngestRangeOutcome::Committed
+    );
+    assert_eq!(
+        store.commit_ingest_range(hole).await.unwrap(),
+        CommitIngestRangeOutcome::Duplicate
+    );
+    let advanced = store
+        .capture_ingest_source_cut(orders_source_cut_request())
+        .await
+        .unwrap();
+    assert_eq!(
+        advanced.relations[0].partitions[0].committed_offset_exclusive,
+        30
+    );
+}
+
+#[tokio::test]
+async fn ingest_source_cut_catalog_epoch_distinguishes_later_partition_discovery() {
+    let store = InMemoryMetaStore::default();
+    let first = reservation("orders", 0, 42, 43, "sha256:first");
+    store.reserve_ingest_range(first.clone()).await.unwrap();
+    store.commit_ingest_range(first).await.unwrap();
+    let before = store
+        .capture_ingest_source_cut(orders_source_cut_request())
+        .await
+        .unwrap();
+
+    let later = reservation("orders", 1, 0, 1, "sha256:later");
+    store.reserve_ingest_range(later.clone()).await.unwrap();
+    store.commit_ingest_range(later).await.unwrap();
+    let after = store
+        .capture_ingest_source_cut(orders_source_cut_request())
+        .await
+        .unwrap();
+
+    assert_eq!(before.input_catalog_epoch, 1);
+    assert_eq!(before.relations[0].partitions.len(), 1);
+    assert_eq!(before.relations[0].partitions[0].base_offset_inclusive, 42);
+    assert_eq!(after.input_catalog_epoch, 2);
+    assert_eq!(after.relations[0].partitions.len(), 2);
+}
+
+#[tokio::test]
+async fn ingest_source_cut_rejects_commit_without_exact_reservation() {
+    let store = InMemoryMetaStore::default();
+    assert_eq!(
+        store
+            .commit_ingest_range(reservation("orders", 0, 0, 1, "sha256:missing"))
+            .await
+            .unwrap(),
+        CommitIngestRangeOutcome::Conflict
+    );
+}
+
+#[tokio::test]
+async fn view_bootstrap_atomically_freezes_source_cut_and_is_idempotent() {
+    let store = InMemoryMetaStore::default();
+    let first = reservation("orders", 0, 0, 10, "sha256:first");
+    store.reserve_ingest_range(first.clone()).await.unwrap();
+    store.commit_ingest_range(first).await.unwrap();
+    let request = orders_view_bootstrap_request();
+
+    let created = match store.begin_view_bootstrap(request.clone()).await.unwrap() {
+        BeginViewBootstrapOutcome::Created(control) => control,
+        other => panic!("unexpected bootstrap outcome: {other:?}"),
+    };
+    assert_eq!(created.lifecycle, ViewBootstrapLifecycleV1::Bootstrapping);
+    assert_eq!(created.bootstrap_generation, 1);
+    assert_eq!(created.bootstrap_cut.input_catalog_epoch, 1);
+    assert_eq!(
+        created.bootstrap_cut.relations[0].partitions[0].committed_offset_exclusive,
+        10
+    );
+
+    let tail = reservation("orders", 0, 10, 20, "sha256:tail");
+    store.reserve_ingest_range(tail.clone()).await.unwrap();
+    store.commit_ingest_range(tail).await.unwrap();
+    let persisted = store
+        .read_view_bootstrap("default", "orders-view", "orders-view")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted, created);
+    assert_eq!(
+        persisted.bootstrap_cut.relations[0].partitions[0].committed_offset_exclusive,
+        10
+    );
+
+    assert!(matches!(
+        store.begin_view_bootstrap(request.clone()).await.unwrap(),
+        BeginViewBootstrapOutcome::Duplicate(control) if control == created
+    ));
+    let mut conflicting = request;
+    conflicting.plan_hash = "sha256:other".to_string();
+    assert_eq!(
+        store.begin_view_bootstrap(conflicting).await.unwrap(),
+        BeginViewBootstrapOutcome::Conflict
+    );
+}
+
+#[tokio::test]
+async fn view_bootstrap_sealed_partition_base_rejects_late_lower_range() {
+    let store = InMemoryMetaStore::default();
+    let first = reservation("orders", 0, 42, 43, "sha256:first");
+    store.reserve_ingest_range(first.clone()).await.unwrap();
+    store.commit_ingest_range(first).await.unwrap();
+    store
+        .begin_view_bootstrap(orders_view_bootstrap_request())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .reserve_ingest_range(reservation("orders", 0, 0, 1, "sha256:too-low"))
+            .await
+            .unwrap(),
+        ReserveIngestRangeOutcome::Conflict
+    );
+    assert_eq!(
+        store
+            .reserve_ingest_range(reservation("orders", 0, 43, 44, "sha256:tail"))
+            .await
+            .unwrap(),
+        ReserveIngestRangeOutcome::Reserved
+    );
+    assert_eq!(
+        store
+            .reserve_ingest_range(reservation("orders", 1, 0, 1, "sha256:new-partition"))
+            .await
+            .unwrap(),
+        ReserveIngestRangeOutcome::Reserved
+    );
+}
+
+#[tokio::test]
+async fn view_bootstrap_new_partition_reserved_before_snapshot_and_committed_after_is_tail() {
+    let store = InMemoryMetaStore::default();
+    let initial = reservation("orders", 0, 0, 10, "sha256:initial");
+    store.reserve_ingest_range(initial.clone()).await.unwrap();
+    store.commit_ingest_range(initial).await.unwrap();
+    let in_flight_new_partition = reservation("orders", 1, 0, 1, "sha256:in-flight-new-partition");
+    store
+        .reserve_ingest_range(in_flight_new_partition.clone())
+        .await
+        .unwrap();
+
+    let frozen = match store
+        .begin_view_bootstrap(orders_view_bootstrap_request())
+        .await
+        .unwrap()
+    {
+        BeginViewBootstrapOutcome::Created(control) => control.bootstrap_cut,
+        other => panic!("unexpected bootstrap outcome: {other:?}"),
+    };
+    assert_eq!(frozen.input_catalog_epoch, 2);
+    assert_eq!(frozen.relations[0].partitions.len(), 2);
+    let frozen_new_partition = frozen.relations[0]
+        .partitions
+        .iter()
+        .find(|partition| partition.partition_id == 1)
+        .unwrap();
+    assert_eq!(frozen_new_partition.base_offset_inclusive, 0);
+    assert_eq!(frozen_new_partition.committed_offset_exclusive, 0);
+
+    assert_eq!(
+        store
+            .commit_ingest_range(in_flight_new_partition)
+            .await
+            .unwrap(),
+        CommitIngestRangeOutcome::Committed
+    );
+    let current = store
+        .capture_ingest_source_cut(orders_source_cut_request())
+        .await
+        .unwrap();
+    assert_eq!(
+        current.relations[0]
+            .partitions
+            .iter()
+            .find(|partition| partition.partition_id == 1)
+            .unwrap()
+            .committed_offset_exclusive,
+        1
+    );
+    assert_eq!(
+        store
+            .read_view_bootstrap("default", "orders-view", "orders-view")
+            .await
+            .unwrap()
+            .unwrap()
+            .bootstrap_cut,
+        frozen
+    );
+}
+
+#[tokio::test]
+async fn view_bootstrap_activation_cut_and_promotion_fail_closed_across_tail_race() {
+    let store = InMemoryMetaStore::default();
+    let first = reservation("orders", 0, 0, 10, "sha256:first");
+    store.reserve_ingest_range(first.clone()).await.unwrap();
+    store.commit_ingest_range(first).await.unwrap();
+    let control = match store
+        .begin_view_bootstrap(orders_view_bootstrap_request())
+        .await
+        .unwrap()
+    {
+        BeginViewBootstrapOutcome::Created(control) => control,
+        other => panic!("unexpected bootstrap outcome: {other:?}"),
+    };
+    let owner = acquire_owner_for_scope(&store, "orders-view", "orders-view", "owner-a").await;
+    let first_pointer = checkpoint_pointer_for_cut(
+        1,
+        "a",
+        control.bootstrap_generation,
+        &control.plan_hash,
+        &control.bootstrap_cut,
+    );
+    assert_eq!(
+        store
+            .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
+                expected_previous: None,
+                candidate: first_pointer.clone(),
+                owner: owner.clone(),
+            })
+            .await
+            .unwrap(),
+        PublishStandingRuntimeCheckpointOutcome::Published
+    );
+
+    let tail = reservation("orders", 0, 10, 20, "sha256:tail");
+    store.reserve_ingest_range(tail.clone()).await.unwrap();
+    store.commit_ingest_range(tail).await.unwrap();
+    let new_partition = reservation("orders", 1, 0, 1, "sha256:new-partition");
+    store
+        .reserve_ingest_range(new_partition.clone())
+        .await
+        .unwrap();
+    store.commit_ingest_range(new_partition).await.unwrap();
+
+    let fixed = match store
+        .fix_view_bootstrap_activation_cut(FixViewBootstrapActivationCutRequest {
+            tenant_id: "default".to_string(),
+            program_id: "orders-view".to_string(),
+            view_id: "orders-view".to_string(),
+            bootstrap_generation: control.bootstrap_generation,
+            plan_hash: control.plan_hash.clone(),
+            owner: owner.clone(),
+        })
+        .await
+        .unwrap()
+    {
+        FixViewBootstrapActivationCutOutcome::Fixed(control) => control,
+        other => panic!("unexpected activation-cut outcome: {other:?}"),
+    };
+    let activation_cut = fixed.activation_cut.clone().unwrap();
+    assert_eq!(activation_cut.input_catalog_epoch, 3);
+    assert_eq!(activation_cut.relations[0].partitions.len(), 2);
+    assert_eq!(
+        store
+            .promote_view_bootstrap(PromoteViewBootstrapRequest {
+                tenant_id: "default".to_string(),
+                program_id: "orders-view".to_string(),
+                view_id: "orders-view".to_string(),
+                bootstrap_generation: control.bootstrap_generation,
+                plan_hash: control.plan_hash.clone(),
+                checkpoint: first_pointer.clone(),
+                owner: owner.clone(),
+            })
+            .await
+            .unwrap(),
+        PromoteViewBootstrapOutcome::Conflict
+    );
+
+    let mut covering_pointer = checkpoint_pointer_for_cut(
+        2,
+        "b",
+        control.bootstrap_generation,
+        &control.plan_hash,
+        &activation_cut,
+    );
+    bind_checkpoint_predecessor(&mut covering_pointer, &first_pointer);
+    store
+        .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
+            expected_previous: Some(first_pointer),
+            candidate: covering_pointer.clone(),
+            owner: owner.clone(),
+        })
+        .await
+        .unwrap();
+    let mut mutated_pointer = covering_pointer.clone();
+    let output_hash = "d".repeat(64);
+    mutated_pointer.output_manifest_refs = vec![format!(
+        "{}v1/standing-runtime-output-manifests/default/orders-view/orders-view/epochs/00000000000000000002/sha256/{output_hash}.output-manifest.json",
+        velorix_meta::STANDING_RUNTIME_OUTPUT_MANIFEST_REF_PREFIX,
+    )];
+    assert_eq!(
+        store
+            .promote_view_bootstrap(PromoteViewBootstrapRequest {
+                tenant_id: "default".to_string(),
+                program_id: "orders-view".to_string(),
+                view_id: "orders-view".to_string(),
+                bootstrap_generation: control.bootstrap_generation,
+                plan_hash: control.plan_hash.clone(),
+                checkpoint: mutated_pointer,
+                owner: owner.clone(),
+            })
+            .await
+            .unwrap(),
+        PromoteViewBootstrapOutcome::Conflict
+    );
+    let promotion_request = PromoteViewBootstrapRequest {
+        tenant_id: "default".to_string(),
+        program_id: "orders-view".to_string(),
+        view_id: "orders-view".to_string(),
+        bootstrap_generation: control.bootstrap_generation,
+        plan_hash: control.plan_hash.clone(),
+        checkpoint: covering_pointer.clone(),
+        owner: owner.clone(),
+    };
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let mut workers = Vec::new();
+    for _ in 0..2 {
+        let store = store.clone();
+        let request = promotion_request.clone();
+        let barrier = Arc::clone(&barrier);
+        workers.push(tokio::spawn(async move {
+            barrier.wait().await;
+            store.promote_view_bootstrap(request).await.unwrap()
+        }));
+    }
+    barrier.wait().await;
+    let first = workers.remove(0).await.unwrap();
+    let second = workers.remove(0).await.unwrap();
+    let outcomes = [first, second];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, PromoteViewBootstrapOutcome::Promoted(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, PromoteViewBootstrapOutcome::Duplicate(_)))
+            .count(),
+        1
+    );
+    let promoted = store
+        .read_view_bootstrap("default", "orders-view", "orders-view")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(promoted.lifecycle, ViewBootstrapLifecycleV1::Active);
+    assert_eq!(promoted.active_checkpoint, Some(covering_pointer.clone()));
+    assert!(matches!(
+        store
+            .promote_view_bootstrap(PromoteViewBootstrapRequest {
+                tenant_id: "default".to_string(),
+                program_id: "orders-view".to_string(),
+                view_id: "orders-view".to_string(),
+                bootstrap_generation: control.bootstrap_generation,
+                plan_hash: control.plan_hash.clone(),
+                checkpoint: covering_pointer.clone(),
+                owner: owner.clone(),
+            })
+            .await
+            .unwrap(),
+        PromoteViewBootstrapOutcome::Duplicate(_)
+    ));
+}
+
+#[tokio::test]
 async fn oss_meta_store_persists_relation_catalogs_and_ingest_admission_in_object_store() {
     let temp = TempDir::new().unwrap();
     let object_store = Arc::new(LocalFileSystem::new_with_prefix(temp.path()).unwrap());
@@ -182,7 +598,8 @@ async fn standing_runtime_checkpoint_publish_is_linearizable_and_idempotent() {
     let owner = acquire_owner(&store, "owner-a").await;
     let first = checkpoint_pointer(1, "a");
     let retry = first.clone();
-    let second = checkpoint_pointer(2, "b");
+    let mut second = checkpoint_pointer(2, "b");
+    bind_checkpoint_predecessor(&mut second, &first);
     let conflicting_second = checkpoint_pointer(2, "c");
 
     let published = store
@@ -240,8 +657,10 @@ async fn standing_runtime_checkpoint_publish_conflicts_on_stale_expected_previou
     let store = InMemoryMetaStore::default();
     let owner = acquire_owner(&store, "owner-a").await;
     let first = checkpoint_pointer(1, "a");
-    let second = checkpoint_pointer(2, "b");
-    let third = checkpoint_pointer(3, "c");
+    let mut second = checkpoint_pointer(2, "b");
+    bind_checkpoint_predecessor(&mut second, &first);
+    let mut third = checkpoint_pointer(3, "c");
+    bind_checkpoint_predecessor(&mut third, &first);
 
     store
         .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
@@ -281,18 +700,85 @@ async fn standing_runtime_checkpoint_publish_conflicts_on_stale_expected_previou
 }
 
 #[tokio::test]
+async fn standing_runtime_checkpoint_publish_rejects_rollback_fork_and_aba() {
+    let store = InMemoryMetaStore::default();
+    let owner = acquire_owner(&store, "owner-a").await;
+    let first = checkpoint_pointer(1, "a");
+    store
+        .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
+            expected_previous: None,
+            candidate: first.clone(),
+            owner: owner.clone(),
+        })
+        .await
+        .unwrap();
+
+    let unbound_fork = checkpoint_pointer(2, "b");
+    assert!(store
+        .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
+            expected_previous: Some(first.clone()),
+            candidate: unbound_fork,
+            owner: owner.clone(),
+        })
+        .await
+        .is_err());
+
+    let mut second = checkpoint_pointer(2, "b");
+    bind_checkpoint_predecessor(&mut second, &first);
+    store
+        .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
+            expected_previous: Some(first.clone()),
+            candidate: second.clone(),
+            owner: owner.clone(),
+        })
+        .await
+        .unwrap();
+
+    assert!(store
+        .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
+            expected_previous: Some(second.clone()),
+            candidate: first.clone(),
+            owner: owner.clone(),
+        })
+        .await
+        .is_err());
+
+    let mut divergent = checkpoint_pointer(3, "c");
+    bind_checkpoint_predecessor(&mut divergent, &first);
+    assert!(store
+        .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
+            expected_previous: Some(second.clone()),
+            candidate: divergent,
+            owner,
+        })
+        .await
+        .is_err());
+    assert_eq!(
+        store
+            .read_standing_runtime_checkpoint("default", "program", "view")
+            .await
+            .unwrap(),
+        Some(second)
+    );
+}
+
+#[tokio::test]
 async fn standing_runtime_checkpoint_pointer_preserves_output_manifest_refs() {
     let store = InMemoryMetaStore::default();
     let owner = acquire_owner(&store, "owner-a").await;
     let mut pointer = checkpoint_pointer(1, "a");
     let output_hash = "b".repeat(64);
     let delta_hash = "c".repeat(64);
+    let commit_hash = "d".repeat(64);
     pointer.output_manifest_refs = vec![format!(
         "{}v1/standing-runtime-output-manifests/default/program/view/epochs/00000000000000000001/sha256/{output_hash}.output-manifest.json",
         velorix_meta::STANDING_RUNTIME_OUTPUT_MANIFEST_REF_PREFIX,
     ), format!(
         "{}v1/standing-runtime-output-deltas/default/program/view/epochs/00000000000000000001/sha256/{delta_hash}.output-delta.json",
         velorix_meta::STANDING_RUNTIME_OUTPUT_DELTA_REF_PREFIX,
+    ), format!(
+        "{}v1/standing-runtime-output-deltas/default/program/view/epochs/00000000000000000001/sha256/{commit_hash}.output-delta.json",
+        velorix_meta::STANDING_RUNTIME_OUTPUT_COMMIT_REF_PREFIX,
     )];
 
     let outcome = store
@@ -310,6 +796,138 @@ async fn standing_runtime_checkpoint_pointer_preserves_output_manifest_refs() {
 
     assert_eq!(outcome, PublishStandingRuntimeCheckpointOutcome::Published);
     assert_eq!(latest, Some(pointer));
+}
+
+#[tokio::test]
+async fn standing_runtime_checkpoint_pointer_rejects_non_monotonic_successor() {
+    let store = InMemoryMetaStore::default();
+    let owner = acquire_owner(&store, "owner-a").await;
+    let error = store
+        .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
+            expected_previous: Some(checkpoint_pointer(2, "b")),
+            candidate: checkpoint_pointer(1, "a"),
+            owner,
+        })
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("logical epoch must increase"));
+}
+
+#[tokio::test]
+async fn standing_runtime_checkpoint_same_state_requires_and_accepts_a_distinct_next_epoch_key() {
+    let store = InMemoryMetaStore::default();
+    let owner = acquire_owner(&store, "owner-a").await;
+    let previous = checkpoint_pointer(1, "a");
+    let mut candidate = checkpoint_pointer(2, "a");
+    bind_checkpoint_predecessor(&mut candidate, &previous);
+    assert_eq!(previous.content_hash, candidate.content_hash);
+    assert_ne!(previous.checkpoint_key, candidate.checkpoint_key);
+
+    assert_eq!(
+        store
+            .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
+                expected_previous: None,
+                candidate: previous.clone(),
+                owner: owner.clone(),
+            })
+            .await
+            .unwrap(),
+        PublishStandingRuntimeCheckpointOutcome::Published
+    );
+    assert_eq!(
+        store
+            .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
+                expected_previous: Some(previous),
+                candidate: candidate.clone(),
+                owner,
+            })
+            .await
+            .unwrap(),
+        PublishStandingRuntimeCheckpointOutcome::Published
+    );
+    assert_eq!(
+        store
+            .read_standing_runtime_checkpoint("default", "program", "view")
+            .await
+            .unwrap(),
+        Some(candidate)
+    );
+}
+
+#[tokio::test]
+async fn standing_runtime_checkpoint_pointer_preserves_validated_input_coverage() {
+    let store = InMemoryMetaStore::default();
+    let owner = acquire_owner(&store, "owner-a").await;
+    let mut pointer = checkpoint_pointer(1, "a");
+    let coverage = RuntimeCheckpointInputCoverageV1 {
+        schema_version: RUNTIME_CHECKPOINT_INPUT_COVERAGE_SCHEMA_VERSION_V1,
+        view_generation: 3,
+        plan_hash: format!("sha256:{}", "b".repeat(64)),
+        input_catalog_epoch: 11,
+        relations: vec![RuntimeCheckpointRelationCoverageV1 {
+            relation_id: "orders".to_string(),
+            relation_version: "v1".to_string(),
+            relation_generation: 1,
+            schema_fingerprint: format!("sha256:{}", "c".repeat(64)),
+            partitions: vec![RuntimeCheckpointPartitionCoverageV1 {
+                stream_id: "orders".to_string(),
+                stream_generation: 1,
+                partition_id: 0,
+                partition_generation: 1,
+                covered_from_offset_inclusive: 0,
+                processed_offset_exclusive: 42,
+            }],
+        }],
+    };
+    pointer.bootstrap_generation = coverage.view_generation;
+    pointer.plan_hash = coverage.plan_hash.clone();
+    pointer.coverage_hash = coverage.stable_hash().unwrap();
+    pointer.input_coverage = Some(coverage);
+
+    let outcome = store
+        .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
+            expected_previous: None,
+            candidate: pointer.clone(),
+            owner,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, PublishStandingRuntimeCheckpointOutcome::Published);
+    assert_eq!(
+        store
+            .read_standing_runtime_checkpoint("default", "program", "view")
+            .await
+            .unwrap(),
+        Some(pointer)
+    );
+}
+
+#[tokio::test]
+async fn standing_runtime_checkpoint_pointer_rejects_mismatched_coverage_hash() {
+    let store = InMemoryMetaStore::default();
+    let owner = acquire_owner(&store, "owner-a").await;
+    let mut pointer = checkpoint_pointer(1, "a");
+    pointer.bootstrap_generation = 1;
+    pointer.plan_hash = format!("sha256:{}", "b".repeat(64));
+    pointer.coverage_hash = format!("sha256:{}", "c".repeat(64));
+    pointer.input_coverage = Some(RuntimeCheckpointInputCoverageV1 {
+        schema_version: RUNTIME_CHECKPOINT_INPUT_COVERAGE_SCHEMA_VERSION_V1,
+        view_generation: 1,
+        plan_hash: pointer.plan_hash.clone(),
+        input_catalog_epoch: 0,
+        relations: Vec::new(),
+    });
+
+    assert!(store
+        .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
+            expected_previous: None,
+            candidate: pointer,
+            owner,
+        })
+        .await
+        .is_err());
 }
 
 #[tokio::test]
@@ -495,6 +1113,30 @@ fn reservation(
     }
 }
 
+fn orders_source_cut_request() -> CaptureIngestSourceCutRequest {
+    CaptureIngestSourceCutRequest {
+        relations: vec![IngestSourceRelationIdentityV1 {
+            relation_id: "orders".to_string(),
+            relation_version: "v1".to_string(),
+            relation_generation: 1,
+            schema_fingerprint:
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+        }],
+    }
+}
+
+fn orders_view_bootstrap_request() -> BeginViewBootstrapRequest {
+    BeginViewBootstrapRequest {
+        tenant_id: "default".to_string(),
+        program_id: "orders-view".to_string(),
+        view_id: "orders-view".to_string(),
+        plan_hash: "sha256:plan".to_string(),
+        view_spec_json: br#"{"view_id":"orders-view"}"#.to_vec(),
+        relations: orders_source_cut_request().relations,
+    }
+}
+
 fn checkpoint_pointer(epoch: u64, hash_seed: &str) -> StandingRuntimeCheckpointPointer {
     let hash = format!("{hash_seed:0<64}");
     StandingRuntimeCheckpointPointer {
@@ -508,12 +1150,106 @@ fn checkpoint_pointer(epoch: u64, hash_seed: &str) -> StandingRuntimeCheckpointP
         content_hash: format!("sha256:{hash}"),
         manifest_hash: format!("sha256:{hash}"),
         output_manifest_refs: Vec::new(),
+        bootstrap_generation: 0,
+        plan_hash: String::new(),
+        coverage_hash: String::new(),
+        input_coverage: None,
+        previous_checkpoint_key: String::new(),
+        previous_manifest_hash: String::new(),
     }
+}
+
+fn bind_checkpoint_predecessor(
+    candidate: &mut StandingRuntimeCheckpointPointer,
+    previous: &StandingRuntimeCheckpointPointer,
+) {
+    candidate.previous_checkpoint_key = previous.checkpoint_key.clone();
+    candidate.previous_manifest_hash = previous.manifest_hash.clone();
+}
+
+fn checkpoint_pointer_for_cut(
+    epoch: u64,
+    hash_seed: &str,
+    view_generation: u64,
+    plan_hash: &str,
+    cut: &IngestSourceCutV1,
+) -> StandingRuntimeCheckpointPointer {
+    let mut pointer = checkpoint_pointer(epoch, hash_seed);
+    pointer.program_id = "orders-view".to_string();
+    pointer.view_id = "orders-view".to_string();
+    let content_hex = pointer.content_hash.strip_prefix("sha256:").unwrap();
+    pointer.checkpoint_key = format!(
+        "v1/standing-runtime-checkpoints/default/orders-view/orders-view/epochs/{epoch:020}/sha256/{content_hex}.checkpoint.json"
+    );
+    let coverage = RuntimeCheckpointInputCoverageV1 {
+        schema_version: RUNTIME_CHECKPOINT_INPUT_COVERAGE_SCHEMA_VERSION_V1,
+        view_generation,
+        plan_hash: plan_hash.to_string(),
+        input_catalog_epoch: cut.input_catalog_epoch,
+        relations: cut
+            .relations
+            .iter()
+            .map(|relation| RuntimeCheckpointRelationCoverageV1 {
+                relation_id: relation.relation.relation_id.clone(),
+                relation_version: relation.relation.relation_version.clone(),
+                relation_generation: relation.relation.relation_generation,
+                schema_fingerprint: relation.relation.schema_fingerprint.clone(),
+                partitions: relation
+                    .partitions
+                    .iter()
+                    .map(|partition| RuntimeCheckpointPartitionCoverageV1 {
+                        stream_id: partition.stream_id.clone(),
+                        stream_generation: partition.stream_generation,
+                        partition_id: partition.partition_id,
+                        partition_generation: partition.partition_generation,
+                        covered_from_offset_inclusive: partition.base_offset_inclusive,
+                        processed_offset_exclusive: partition.committed_offset_exclusive,
+                    })
+                    .collect(),
+            })
+            .collect(),
+    };
+    pointer.bootstrap_generation = view_generation;
+    pointer.plan_hash = plan_hash.to_string();
+    pointer.coverage_hash = coverage.stable_hash().unwrap();
+    pointer.input_coverage = Some(coverage);
+    pointer
 }
 
 async fn acquire_owner(store: &InMemoryMetaStore, owner_id: &str) -> StandingRuntimeOwnerToken {
     match store
         .acquire_standing_runtime_owner(owner_request(owner_id, 30_000))
+        .await
+        .unwrap()
+    {
+        AcquireStandingRuntimeOwnerOutcome::Acquired(claim)
+        | AcquireStandingRuntimeOwnerOutcome::Renewed(claim) => StandingRuntimeOwnerToken {
+            tenant_id: claim.tenant_id,
+            program_id: claim.program_id,
+            view_id: claim.view_id,
+            owner_id: claim.owner_id,
+            owner_epoch: claim.owner_epoch,
+        },
+        AcquireStandingRuntimeOwnerOutcome::Conflict(claim) => {
+            panic!("unexpected owner conflict: {claim:?}")
+        }
+    }
+}
+
+async fn acquire_owner_for_scope(
+    store: &InMemoryMetaStore,
+    program_id: &str,
+    view_id: &str,
+    owner_id: &str,
+) -> StandingRuntimeOwnerToken {
+    match store
+        .acquire_standing_runtime_owner(AcquireStandingRuntimeOwnerRequest {
+            tenant_id: "default".to_string(),
+            program_id: program_id.to_string(),
+            view_id: view_id.to_string(),
+            owner_id: owner_id.to_string(),
+            ttl_ms: 30_000,
+        })
         .await
         .unwrap()
     {

@@ -1385,6 +1385,34 @@ async fn gc_verify_run_retention_evidence_rejects_missing_retention_record() {
 }
 
 #[tokio::test]
+async fn garbage_collection_never_reclaims_immutable_ingest_log_ranges() {
+    let (_temp_dir, store) = temp_store();
+    let publisher = CheckpointPublisher::new(Arc::clone(&store));
+    let ingest_key = ObjectKey::ingest_batch("orders", 0, 0, 1).unwrap();
+    let ingest_path = Path::from(ingest_key.as_str());
+    store
+        .put(&ingest_path, Bytes::from_static(b"retained-ingest").into())
+        .await
+        .unwrap();
+
+    let plan = publisher
+        .plan_garbage_collection(GarbageCollectionPolicy {
+            retain_latest_manifests: 1,
+        })
+        .await
+        .unwrap();
+    assert!(plan
+        .candidates
+        .iter()
+        .all(|candidate| candidate.object_key != ingest_key));
+    publisher
+        .execute_garbage_collection_plan(&plan)
+        .await
+        .unwrap();
+    assert!(store.head(&ingest_path).await.is_ok());
+}
+
+#[tokio::test]
 async fn gc_verify_run_retention_evidence_rejects_missing_gc_transition_record() {
     let (_temp_dir, store) = temp_store();
     let publisher = CheckpointPublisher::new(Arc::clone(&store));

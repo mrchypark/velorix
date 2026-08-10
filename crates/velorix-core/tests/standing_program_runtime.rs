@@ -9,10 +9,12 @@ use velorix_core::{
     delta::DeltaBatch,
     engine::LogicalEpoch,
     standing_program::{
-        BuiltinRuntimeIdentity, DurableStateRoot, EpochCommit, EpochIdempotencyKey,
-        NativeCodePolicy, RelationFrontier, RelationInputBatch, RuntimeCheckpoint, ScopedViewId,
-        SnapshotPageRequest, StandingProgramIdentity, StandingProgramRuntime,
-        StandingProgramRuntimeError, ViewFrontier, ViewOutputBatch, ViewOutputDelta,
+        BuiltinRuntimeIdentity, CausalCutV1, CausalViewCursorV1, DurableStateRoot, EpochCommit,
+        EpochIdempotencyKey, NativeCodePolicy, RelationFrontier, RelationInputBatch,
+        RuntimeCheckpoint, RuntimeCheckpointInputCoverageV1, RuntimeCheckpointPartitionCoverageV1,
+        RuntimeCheckpointRelationCoverageV1, ScopedViewId, SnapshotPageRequest,
+        StandingProgramIdentity, StandingProgramRuntime, StandingProgramRuntimeError, ViewFrontier,
+        ViewOutputBatch, ViewOutputDelta, RUNTIME_CHECKPOINT_INPUT_COVERAGE_SCHEMA_VERSION_V1,
     },
     view_contract::{ColumnSchema, RelationSchema, SqlDataType},
 };
@@ -110,6 +112,8 @@ fn runtime_checkpoint_rejects_program_identity_mismatch() {
         state_payload: None,
         output_manifest_refs: vec!["v1/outputs/orders_by_region/42.json".to_string()],
         owner_epoch: Some(9),
+        input_coverage: None,
+        causal_cut: None,
     };
 
     let error = checkpoint.validate_identity(&identity).unwrap_err();
@@ -118,6 +122,212 @@ fn runtime_checkpoint_rejects_program_identity_mismatch() {
         error,
         StandingProgramRuntimeError::ProgramIdentityMismatch { .. }
     ));
+}
+
+#[test]
+fn runtime_checkpoint_input_coverage_hash_is_order_independent() {
+    let relation = |relation_id: &str, partition_ids: &[u32]| RuntimeCheckpointRelationCoverageV1 {
+        relation_id: relation_id.to_string(),
+        relation_version: "v1".to_string(),
+        relation_generation: 1,
+        schema_fingerprint: format!("sha256:{}", relation_id.repeat(64)),
+        partitions: partition_ids
+            .iter()
+            .map(|partition_id| RuntimeCheckpointPartitionCoverageV1 {
+                stream_id: "stream-a".to_string(),
+                stream_generation: 1,
+                partition_id: *partition_id,
+                partition_generation: 1,
+                covered_from_offset_inclusive: 0,
+                processed_offset_exclusive: u64::from(*partition_id) + 10,
+            })
+            .collect(),
+    };
+    let coverage = |relations| RuntimeCheckpointInputCoverageV1 {
+        schema_version: RUNTIME_CHECKPOINT_INPUT_COVERAGE_SCHEMA_VERSION_V1,
+        view_generation: 1,
+        plan_hash: format!("sha256:{}", "a".repeat(64)),
+        input_catalog_epoch: 7,
+        relations,
+    };
+
+    let left = coverage(vec![relation("b", &[2, 1]), relation("a", &[1, 0])]);
+    let right = coverage(vec![relation("a", &[0, 1]), relation("b", &[1, 2])]);
+
+    assert_eq!(left.stable_hash().unwrap(), right.stable_hash().unwrap());
+}
+
+#[test]
+fn runtime_checkpoint_input_coverage_rejects_duplicate_partition_identity() {
+    let partition = RuntimeCheckpointPartitionCoverageV1 {
+        stream_id: "stream-a".to_string(),
+        stream_generation: 1,
+        partition_id: 0,
+        partition_generation: 1,
+        covered_from_offset_inclusive: 0,
+        processed_offset_exclusive: 10,
+    };
+    let coverage = RuntimeCheckpointInputCoverageV1 {
+        schema_version: RUNTIME_CHECKPOINT_INPUT_COVERAGE_SCHEMA_VERSION_V1,
+        view_generation: 1,
+        plan_hash: format!("sha256:{}", "a".repeat(64)),
+        input_catalog_epoch: 7,
+        relations: vec![RuntimeCheckpointRelationCoverageV1 {
+            relation_id: "orders".to_string(),
+            relation_version: "v1".to_string(),
+            relation_generation: 1,
+            schema_fingerprint: format!("sha256:{}", "b".repeat(64)),
+            partitions: vec![partition.clone(), partition],
+        }],
+    };
+
+    assert!(coverage.stable_hash().is_err());
+}
+
+#[test]
+fn causal_cut_digest_is_canonical_for_mixed_source_and_view_inputs() {
+    let coverage = RuntimeCheckpointInputCoverageV1 {
+        schema_version: RUNTIME_CHECKPOINT_INPUT_COVERAGE_SCHEMA_VERSION_V1,
+        view_generation: 4,
+        plan_hash: format!("sha256:{}", "a".repeat(64)),
+        input_catalog_epoch: 7,
+        relations: vec![RuntimeCheckpointRelationCoverageV1 {
+            relation_id: "orders".to_string(),
+            relation_version: "v1".to_string(),
+            relation_generation: 2,
+            schema_fingerprint: format!("sha256:{}", "b".repeat(64)),
+            partitions: vec![RuntimeCheckpointPartitionCoverageV1 {
+                stream_id: "orders-stream".to_string(),
+                stream_generation: 3,
+                partition_id: 0,
+                partition_generation: 5,
+                covered_from_offset_inclusive: 0,
+                processed_offset_exclusive: 11,
+            }],
+        }],
+    };
+    let cursor = |edge: &str, epoch| CausalViewCursorV1 {
+        input_edge: edge.to_string(),
+        producer_tenant_id: "default".to_string(),
+        producer_program_id: edge.to_string(),
+        producer_view_id: edge.to_string(),
+        producer_generation: 9,
+        output_stream: format!("view/{edge}/generation/9/output/primary"),
+        output_epoch: epoch,
+        commit_digest: format!(
+            "sha256:{}",
+            edge.chars().next().unwrap().to_string().repeat(64)
+        ),
+    };
+    let left =
+        CausalCutV1::from_input_coverage(&coverage, vec![cursor("b", 8), cursor("a", 7)]).unwrap();
+    let right =
+        CausalCutV1::from_input_coverage(&coverage, vec![cursor("a", 7), cursor("b", 8)]).unwrap();
+
+    assert_eq!(left, right);
+    assert_eq!(
+        left.stable_digest().unwrap(),
+        right.stable_digest().unwrap()
+    );
+    let mut cross_tenant = right.clone();
+    cross_tenant.direct_view_cursors[0].producer_tenant_id = "other".to_string();
+    assert_ne!(
+        right.stable_digest().unwrap(),
+        cross_tenant.stable_digest().unwrap()
+    );
+    let mut advanced = right;
+    advanced.direct_view_cursors[0].output_epoch += 1;
+    assert_ne!(
+        left.stable_digest().unwrap(),
+        advanced.stable_digest().unwrap()
+    );
+}
+
+#[test]
+fn causal_cut_accepts_initial_catalog_epoch_with_source_frontiers() {
+    let coverage = RuntimeCheckpointInputCoverageV1 {
+        schema_version: RUNTIME_CHECKPOINT_INPUT_COVERAGE_SCHEMA_VERSION_V1,
+        view_generation: 1,
+        plan_hash: format!("sha256:{}", "a".repeat(64)),
+        input_catalog_epoch: 0,
+        relations: vec![RuntimeCheckpointRelationCoverageV1 {
+            relation_id: "orders".to_string(),
+            relation_version: "v1".to_string(),
+            relation_generation: 1,
+            schema_fingerprint: format!("sha256:{}", "b".repeat(64)),
+            partitions: vec![RuntimeCheckpointPartitionCoverageV1 {
+                stream_id: "orders-stream".to_string(),
+                stream_generation: 1,
+                partition_id: 0,
+                partition_generation: 1,
+                covered_from_offset_inclusive: 0,
+                processed_offset_exclusive: 1,
+            }],
+        }],
+    };
+
+    assert!(CausalCutV1::from_input_coverage(&coverage, Vec::new()).is_ok());
+}
+
+#[test]
+fn causal_cut_rejects_duplicate_view_edges_and_source_coverage_mismatch() {
+    let coverage = RuntimeCheckpointInputCoverageV1 {
+        schema_version: RUNTIME_CHECKPOINT_INPUT_COVERAGE_SCHEMA_VERSION_V1,
+        view_generation: 1,
+        plan_hash: format!("sha256:{}", "a".repeat(64)),
+        input_catalog_epoch: 0,
+        relations: Vec::new(),
+    };
+    let cursor = CausalViewCursorV1 {
+        input_edge: "upstream->consumer".to_string(),
+        producer_tenant_id: "default".to_string(),
+        producer_program_id: "upstream".to_string(),
+        producer_view_id: "upstream".to_string(),
+        producer_generation: 2,
+        output_stream: "view/upstream/generation/2/output/primary".to_string(),
+        output_epoch: 9,
+        commit_digest: format!("sha256:{}", "c".repeat(64)),
+    };
+    assert!(CausalCutV1::from_input_coverage(&coverage, vec![cursor.clone(), cursor],).is_err());
+
+    let mut checkpoint = RuntimeCheckpoint {
+        identity: valid_identity(),
+        logical_epoch: 1,
+        input_frontiers: Vec::new(),
+        input_event_time_frontiers: Vec::new(),
+        output_frontiers: Vec::new(),
+        checkpoint_codec_identity: "velorix-checkpoint-v1".to_string(),
+        state_root: DurableStateRoot {
+            object_key: "v1/state/program-orders/root".to_string(),
+            content_hash: format!("sha256:{}", "4".repeat(64)),
+        },
+        state_payload: None,
+        output_manifest_refs: Vec::new(),
+        owner_epoch: None,
+        input_coverage: Some(coverage.clone()),
+        causal_cut: Some(
+            CausalCutV1::from_input_coverage(
+                &coverage,
+                vec![CausalViewCursorV1 {
+                    input_edge: "upstream->consumer".to_string(),
+                    producer_tenant_id: "default".to_string(),
+                    producer_program_id: "upstream".to_string(),
+                    producer_view_id: "upstream".to_string(),
+                    producer_generation: 2,
+                    output_stream: "view/upstream/generation/2/output/primary".to_string(),
+                    output_epoch: 9,
+                    commit_digest: format!("sha256:{}", "c".repeat(64)),
+                }],
+            )
+            .unwrap(),
+        ),
+    };
+    checkpoint
+        .causal_cut
+        .as_mut()
+        .unwrap()
+        .direct_source_catalog_epoch = 7;
+    assert!(checkpoint.validate_identity(&checkpoint.identity).is_err());
 }
 
 struct FakeStandingProgramRuntime {
@@ -213,6 +423,8 @@ impl StandingProgramRuntime for FakeStandingProgramRuntime {
             state_payload: None,
             output_manifest_refs: Vec::new(),
             owner_epoch: None,
+            input_coverage: None,
+            causal_cut: None,
         })
     }
 

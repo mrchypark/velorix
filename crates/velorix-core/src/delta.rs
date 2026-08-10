@@ -294,6 +294,82 @@ mod tests {
         assert_eq!(decoded, batch);
     }
 
+    #[test]
+    fn delta_key_codec_fixture_round_trips_composite_null_key() {
+        let batch = DeltaBatch::from_records([DeltaRecord::new(
+            DeltaKey::from_json(json!([null, "tenant-a", 42])),
+            DeltaValue::from_json(json!({"value": 7})),
+            1,
+        )]);
+        let encoded = serde_json::to_string(&batch).unwrap();
+        assert_eq!(
+            encoded,
+            r#"{"records":[{"key":[null,"tenant-a",42],"value":{"value":7},"weight":1}]}"#
+        );
+        assert_eq!(serde_json::from_str::<DeltaBatch>(&encoded).unwrap(), batch);
+    }
+
+    #[test]
+    fn delta_batch_consolidates_composite_null_key_duplicates() {
+        let key = DeltaKey::from_json(json!([null, "tenant-a"]));
+        let value = DeltaValue::from_json(json!({"value": 7}));
+        let batch = DeltaBatch::from_records([
+            DeltaRecord::new(key.clone(), value.clone(), 1),
+            DeltaRecord::new(key.clone(), value.clone(), 1),
+            DeltaRecord::new(key.clone(), value.clone(), -1),
+        ]);
+
+        assert_eq!(
+            batch.net_rows().unwrap(),
+            vec![DeltaRecord::new(key, value, 1)]
+        );
+    }
+
+    #[test]
+    fn delta_batch_key_change_retracts_old_key_and_inserts_new_key() {
+        let old = DeltaRecord::new(
+            DeltaKey::from_json(json!(["tenant-a", "old"])),
+            DeltaValue::from_json(json!({"value": 7})),
+            -1,
+        );
+        let new = DeltaRecord::new(
+            DeltaKey::from_json(json!(["tenant-a", "new"])),
+            DeltaValue::from_json(json!({"value": 7})),
+            1,
+        );
+        let net = DeltaBatch::from_records([new.clone(), old.clone()])
+            .net_rows()
+            .unwrap();
+
+        assert_eq!(net, vec![new, old]);
+    }
+
+    #[test]
+    fn delta_batch_final_duplicate_deletion_removes_the_row() {
+        let key = DeltaKey::from_json(json!(["tenant-a", "row-1"]));
+        let value = DeltaValue::from_json(json!({"value": 7}));
+        let duplicates = DeltaBatch::from_records([
+            DeltaRecord::new(key.clone(), value.clone(), 1),
+            DeltaRecord::new(key.clone(), value.clone(), 1),
+        ]);
+        let one_deleted = duplicates.combine(&DeltaBatch::from_records([DeltaRecord::new(
+            key.clone(),
+            value.clone(),
+            -1,
+        )]));
+        assert_eq!(
+            one_deleted.net_rows().unwrap(),
+            vec![DeltaRecord::new(key.clone(), value.clone(), 1)]
+        );
+        assert!(one_deleted
+            .combine(&DeltaBatch::from_records([DeltaRecord::new(
+                key, value, -1,
+            )]))
+            .net_rows()
+            .unwrap()
+            .is_empty());
+    }
+
     proptest! {
         #[test]
         fn delta_batch_combine_is_associative(
@@ -312,6 +388,14 @@ mod tests {
             let inverse = batch.inverse().unwrap();
 
             prop_assert!(batch.combine(&inverse).net_rows().unwrap().is_empty());
+        }
+
+        #[test]
+        fn delta_key_json_codec_round_trip_is_lossless(key in key_strategy()) {
+            let encoded = serde_json::to_string(&key).unwrap();
+            let decoded: DeltaKey = serde_json::from_str(&encoded).unwrap();
+
+            prop_assert_eq!(decoded, key);
         }
     }
 

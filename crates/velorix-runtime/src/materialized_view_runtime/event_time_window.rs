@@ -324,6 +324,8 @@ impl StandingProgramRuntime for TumblingEventTimeAggregateRuntime {
             }),
             output_manifest_refs: Vec::new(),
             owner_epoch: None,
+            input_coverage: None,
+            causal_cut: None,
         })
     }
 

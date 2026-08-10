@@ -10,8 +10,8 @@ use thiserror::Error;
 use velorix_core::{
     standing_program::StandingProgramIdentity,
     view_contract::{
-        validate_materialized_standing_view_spec, view_spec_hash, StandingViewSpec,
-        ViewContractError,
+        validate_materialized_standing_view_spec, validate_published_relation_binding_v1,
+        view_spec_hash, PublishedRelationBindingV1, StandingViewSpec, ViewContractError,
     },
     view_plan::VelorixLogicalViewPlanV1,
 };
@@ -167,6 +167,8 @@ pub struct MaterializedViewRuntimeBinding {
     pub standing_program_identity: StandingProgramIdentity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logical_plan: Option<VelorixLogicalViewPlanV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub published_relations: Vec<PublishedRelationBindingV1>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -863,6 +865,24 @@ impl MaterializedViewRegistry {
                 view_id: view_id.to_string(),
                 reason: InvalidExecutionModeReason::StandingRuntimeMissingRuntimeBinding,
             });
+        }
+
+        if let Some(runtime) = runtime {
+            for published in &runtime.published_relations {
+                validate_published_relation_binding_v1(published)?;
+                if published.producer_view_id != view_id
+                    || !runtime
+                        .standing_program_identity
+                        .view_ids
+                        .contains(&published.relation.relation_id)
+                {
+                    return Err(MaterializedViewRegistryError::Validation(
+                        ViewContractError::InvalidField {
+                            field: "published_relation.producer_binding",
+                        },
+                    ));
+                }
+            }
         }
 
         Ok(())

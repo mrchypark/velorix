@@ -529,6 +529,24 @@ fn generic_catalog_incremental_input_rejects_non_finite_float64_primary_key() {
 }
 
 #[test]
+fn generic_catalog_incremental_input_normalizes_negative_zero_float64_primary_key() {
+    let catalog = float_key_account_balance_relation_catalog();
+    let batch = float_key_account_balance_input_batch(&[-0.0, 0.0], &[500, 500], &[1, -1]);
+
+    let delta = arrow_record_batches_to_single_key_sum_count_delta_batch(
+        &catalog,
+        "account_balances",
+        "2026-05-13.v1",
+        catalog.schema_fingerprint.as_str(),
+        &[batch],
+    )
+    .unwrap();
+
+    assert_eq!(delta.records()[0].key, delta.records()[1].key);
+    assert!(delta.net_rows().unwrap().is_empty());
+}
+
+#[test]
 fn generic_catalog_incremental_input_accepts_float64_value_column() {
     let catalog = float_account_balance_relation_catalog();
     let batch = float_account_balance_input_batch(&[1001, 1002], &[50.25, -12.5], &[1, -1]);

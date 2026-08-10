@@ -1,0 +1,196 @@
+{
+  "schema_version": 2,
+  "corpus_version": "incremental-sql-corpus-v1",
+  "engine": {
+    "name": "greptimedb",
+    "version": "1.1.4",
+    "source_revision": "16e9abe4a9b0512ef9d800cb8c8f68d4167327bd",
+    "configuration": {
+      "binary_sha256": "909260a2a52fdfed17d0583321aeaee84380d8ffe4538f94d8ceda6dc6bd8366",
+      "deployment": "standalone_local_file_storage",
+      "flow_modes": "streaming_filter_and_window; eval_interval_full_query_aggregate_join_topk_chain",
+      "oracle": "duckdb_batch_recomputation_per_phase",
+      "runner": "greptimedb-flow-baseline-v1"
+    },
+    "durability_mode": "standalone_local_file_storage_restart",
+    "input_semantics": "primary_key_update_lowered_to_delete_then_insert",
+    "state_retention_policy": "source_history_retained; no_expire_after"
+  },
+  "protocol": {
+    "warm_up_iterations": 0,
+    "measured_iterations": 1,
+    "initial_rows": 7,
+    "change_events": 4,
+    "change_mix": {
+      "delete": 1,
+      "insert": 2,
+      "update": 1
+    }
+  },
+  "correctness": [
+    {
+      "workload_id": "filter_project",
+      "outcome": {
+        "status": "failed",
+        "reason": "phase delete mismatch: expected [{\"doubled\":120,\"order_id\":\"o2\"},{\"doubled\":140,\"order_id\":\"o3\"}], observed [{\"doubled\":120,\"order_id\":\"o2\"},{\"doubled\":140,\"order_id\":\"o3\"},{\"doubled\":200,\"order_id\":\"o1\"}]"
+      }
+    },
+    {
+      "workload_id": "aggregate",
+      "outcome": {
+        "status": "passed",
+        "expected_digest": "sha256:ba88faedf6fc2a6d0403c7c61de18923befdd2faa01f78e361505a91ecf3c1fa",
+        "observed_digest": "sha256:ba88faedf6fc2a6d0403c7c61de18923befdd2faa01f78e361505a91ecf3c1fa",
+        "verified_phases": [
+          "initial_load",
+          "insert",
+          "update",
+          "delete",
+          "checkpoint_restart",
+          "replay_tail"
+        ],
+        "plan_evidence": {
+          "native_logical_plan": {
+            "availability": "unavailable",
+            "reason_code": "greptimedb_flow_does_not_expose_stable_native_logical_identity"
+          },
+          "native_physical_dag": {
+            "availability": "unavailable",
+            "reason_code": "greptimedb_flow_does_not_expose_stable_native_physical_dag_identity"
+          },
+          "diagnostic_explain_digest": null
+        }
+      }
+    },
+    {
+      "workload_id": "distinct_aggregate",
+      "outcome": {
+        "status": "passed",
+        "expected_digest": "sha256:7cc6bff2aa6230a1b905a9588d92a8c7ac6f8abe34b611853d23107c9ce6f331",
+        "observed_digest": "sha256:7cc6bff2aa6230a1b905a9588d92a8c7ac6f8abe34b611853d23107c9ce6f331",
+        "verified_phases": [
+          "initial_load",
+          "insert",
+          "update",
+          "delete",
+          "checkpoint_restart",
+          "replay_tail"
+        ],
+        "plan_evidence": {
+          "native_logical_plan": {
+            "availability": "unavailable",
+            "reason_code": "greptimedb_flow_does_not_expose_stable_native_logical_identity"
+          },
+          "native_physical_dag": {
+            "availability": "unavailable",
+            "reason_code": "greptimedb_flow_does_not_expose_stable_native_physical_dag_identity"
+          },
+          "diagnostic_explain_digest": null
+        }
+      }
+    },
+    {
+      "workload_id": "inner_join",
+      "outcome": {
+        "status": "passed",
+        "expected_digest": "sha256:1fda15cacae2dc8f80c9f12513bffaada8a7d00424829f051419139dc89b5eb6",
+        "observed_digest": "sha256:1fda15cacae2dc8f80c9f12513bffaada8a7d00424829f051419139dc89b5eb6",
+        "verified_phases": [
+          "initial_load",
+          "insert",
+          "update",
+          "delete",
+          "checkpoint_restart",
+          "replay_tail"
+        ],
+        "plan_evidence": {
+          "native_logical_plan": {
+            "availability": "unavailable",
+            "reason_code": "greptimedb_flow_does_not_expose_stable_native_logical_identity"
+          },
+          "native_physical_dag": {
+            "availability": "unavailable",
+            "reason_code": "greptimedb_flow_does_not_expose_stable_native_physical_dag_identity"
+          },
+          "diagnostic_explain_digest": null
+        }
+      }
+    },
+    {
+      "workload_id": "left_join",
+      "outcome": {
+        "status": "passed",
+        "expected_digest": "sha256:470092ee2c9b264f0f25fce527ab7dc41fd6f1efe130ed3642d511bb293a4b3e",
+        "observed_digest": "sha256:470092ee2c9b264f0f25fce527ab7dc41fd6f1efe130ed3642d511bb293a4b3e",
+        "verified_phases": [
+          "initial_load",
+          "insert",
+          "update",
+          "delete",
+          "checkpoint_restart",
+          "replay_tail"
+        ],
+        "plan_evidence": {
+          "native_logical_plan": {
+            "availability": "unavailable",
+            "reason_code": "greptimedb_flow_does_not_expose_stable_native_logical_identity"
+          },
+          "native_physical_dag": {
+            "availability": "unavailable",
+            "reason_code": "greptimedb_flow_does_not_expose_stable_native_physical_dag_identity"
+          },
+          "diagnostic_explain_digest": null
+        }
+      }
+    },
+    {
+      "workload_id": "top_k",
+      "outcome": {
+        "status": "failed",
+        "reason": "phase delete mismatch: expected [{\"customer_id\":\"c2\",\"total\":100}], observed [{\"customer_id\":\"c1\",\"total\":160},{\"customer_id\":\"c2\",\"total\":100}]"
+      }
+    },
+    {
+      "workload_id": "fixed_window",
+      "outcome": {
+        "status": "failed",
+        "reason": "phase delete mismatch: expected [{\"customer_id\":\"c1\",\"total\":60,\"window_start\":\"2026-08-09T00:00:00Z\"},{\"customer_id\":\"c2\",\"total\":100,\"window_start\":\"2026-08-09T00:02:00Z\"}], observed [{\"customer_id\":\"c1\",\"total\":160,\"window_start\":\"2026-08-09T00:00:00Z\"},{\"customer_id\":\"c2\",\"total\":100,\"window_start\":\"2026-08-09T00:02:00Z\"}]"
+      }
+    },
+    {
+      "workload_id": "ranking",
+      "outcome": {
+        "status": "unsupported",
+        "reason": "ERROR:  Flow plan error: Window function is not supported yet. Please use aggregation function instead."
+      }
+    },
+    {
+      "workload_id": "chained_view",
+      "outcome": {
+        "status": "passed",
+        "expected_digest": "sha256:1fda15cacae2dc8f80c9f12513bffaada8a7d00424829f051419139dc89b5eb6",
+        "observed_digest": "sha256:1fda15cacae2dc8f80c9f12513bffaada8a7d00424829f051419139dc89b5eb6",
+        "verified_phases": [
+          "initial_load",
+          "insert",
+          "update",
+          "delete",
+          "checkpoint_restart",
+          "replay_tail"
+        ],
+        "plan_evidence": {
+          "native_logical_plan": {
+            "availability": "unavailable",
+            "reason_code": "greptimedb_flow_does_not_expose_stable_native_logical_identity"
+          },
+          "native_physical_dag": {
+            "availability": "unavailable",
+            "reason_code": "greptimedb_flow_does_not_expose_stable_native_physical_dag_identity"
+          },
+          "diagnostic_explain_digest": null
+        }
+      }
+    }
+  ],
+  "performance": []
+}

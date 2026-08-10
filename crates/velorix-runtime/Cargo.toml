@@ -3,6 +3,7 @@ name = "velorix-runtime"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
+autobenches = false
 
 [dependencies]
 arrow = { workspace = true }
@@ -23,7 +24,6 @@ default = []
 
 [[bench]]
 name = "local_incremental"
-path = "../../benches/local_incremental.rs"
 harness = false
 
 [dev-dependencies]

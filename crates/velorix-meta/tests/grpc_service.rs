@@ -1,17 +1,27 @@
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{metadata::MetadataValue, transport::Server, Request};
+use velorix_core::standing_program::{
+    RuntimeCheckpointInputCoverageV1, RuntimeCheckpointPartitionCoverageV1,
+    RuntimeCheckpointRelationCoverageV1, RUNTIME_CHECKPOINT_INPUT_COVERAGE_SCHEMA_VERSION_V1,
+};
 use velorix_meta::{
     proto::{
         velorix_meta_server::{VelorixMeta, VelorixMetaServer},
         AcquireStandingRuntimeOwnerRequest as ProtoAcquireStandingRuntimeOwnerRequest,
+        BeginViewBootstrapRequest as ProtoBeginViewBootstrapRequest,
+        CaptureIngestSourceCutRequest as ProtoCaptureIngestSourceCutRequest,
         PublishStandingRuntimeCheckpointRequest, ReadMetaStoreCapabilitiesRequest,
         ReadRelationCatalogRequest, ReadStandingRuntimeCheckpointRequest,
-        ReadStandingRuntimeOwnerRequest, ReserveIngestRangeRequest,
-        StandingRuntimeCheckpointPointer as ProtoCheckpointPointer,
+        ReadStandingRuntimeOwnerRequest, ReadViewBootstrapRequest as ProtoReadViewBootstrapRequest,
+        ReserveIngestRangeRequest, StandingRuntimeCheckpointPointer as ProtoCheckpointPointer,
         StandingRuntimeOwnerToken as ProtoOwnerToken, StoreRelationCatalogRequest,
     },
-    validate_bearer_token, AcquireStandingRuntimeOwnerOutcome, GrpcMetaStore, InMemoryMetaStore,
-    MetaGrpcService, MetaStore, PublishStandingRuntimeCheckpointOutcome,
+    validate_bearer_token, AcquireStandingRuntimeOwnerOutcome, BeginViewBootstrapOutcome,
+    BeginViewBootstrapRequest, CaptureIngestSourceCutRequest, CommitIngestRangeOutcome,
+    FixViewBootstrapActivationCutOutcome, FixViewBootstrapActivationCutRequest, GrpcMetaStore,
+    InMemoryMetaStore, IngestRangeReservation, IngestSourceRelationIdentityV1, MetaGrpcService,
+    MetaStore, PromoteViewBootstrapOutcome, PromoteViewBootstrapRequest,
+    PublishStandingRuntimeCheckpointOutcome, ReserveIngestRangeOutcome,
     StandingRuntimeCheckpointPointer, StandingRuntimeOwnerToken, StoreRelationCatalogOutcome,
 };
 
@@ -156,6 +166,46 @@ async fn grpc_service_rejects_every_rpc_without_valid_bearer_token() {
     );
     assert_eq!(
         service
+            .commit_ingest_range(wrong_bearer_request(reserve_ingest_range_request(&catalog)))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unauthenticated
+    );
+    assert_eq!(
+        service
+            .capture_ingest_source_cut(wrong_bearer_request(ProtoCaptureIngestSourceCutRequest {
+                request_json: serde_json::to_vec(&source_cut_request(&catalog)).unwrap(),
+            },))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unauthenticated
+    );
+    assert_eq!(
+        service
+            .begin_view_bootstrap(wrong_bearer_request(ProtoBeginViewBootstrapRequest {
+                request_json: serde_json::to_vec(&view_bootstrap_request(&catalog)).unwrap(),
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unauthenticated
+    );
+    assert_eq!(
+        service
+            .read_view_bootstrap(wrong_bearer_request(ProtoReadViewBootstrapRequest {
+                tenant_id: "default".to_string(),
+                program_id: "orders-view".to_string(),
+                view_id: "orders-view".to_string(),
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unauthenticated
+    );
+    assert_eq!(
+        service
             .acquire_standing_runtime_owner(wrong_bearer_request(proto_owner_request("owner-a")))
             .await
             .unwrap_err()
@@ -282,6 +332,155 @@ async fn grpc_meta_store_round_trips_through_service_endpoint() {
 }
 
 #[tokio::test]
+async fn grpc_meta_store_reserves_commits_and_captures_ingest_source_cut() {
+    let endpoint = spawn_meta_service().await;
+    let store = GrpcMetaStore::connect(endpoint).await.unwrap();
+    let catalog = common::orders_relation_catalog("v1");
+    let reservation = ingest_range_reservation(&catalog);
+
+    assert_eq!(
+        store
+            .reserve_ingest_range(reservation.clone())
+            .await
+            .unwrap(),
+        ReserveIngestRangeOutcome::Reserved
+    );
+    assert_eq!(
+        store.commit_ingest_range(reservation).await.unwrap(),
+        CommitIngestRangeOutcome::Committed
+    );
+    let cut = store
+        .capture_ingest_source_cut(source_cut_request(&catalog))
+        .await
+        .unwrap();
+
+    assert_eq!(cut.input_catalog_epoch, 1);
+    assert_eq!(cut.relations.len(), 1);
+    assert_eq!(cut.relations[0].partitions.len(), 1);
+    assert_eq!(cut.relations[0].partitions[0].base_offset_inclusive, 0);
+    assert_eq!(
+        cut.relations[0].partitions[0].committed_offset_exclusive,
+        100
+    );
+    let bootstrap = match store
+        .begin_view_bootstrap(view_bootstrap_request(&catalog))
+        .await
+        .unwrap()
+    {
+        BeginViewBootstrapOutcome::Created(control) => control,
+        other => panic!("unexpected bootstrap outcome: {other:?}"),
+    };
+    assert_eq!(bootstrap.bootstrap_cut, cut);
+    assert_eq!(
+        store
+            .read_view_bootstrap("default", "orders-view", "orders-view")
+            .await
+            .unwrap(),
+        Some(bootstrap.clone())
+    );
+
+    let owner = match store
+        .acquire_standing_runtime_owner(velorix_meta::AcquireStandingRuntimeOwnerRequest {
+            tenant_id: "default".to_string(),
+            program_id: "orders-view".to_string(),
+            view_id: "orders-view".to_string(),
+            owner_id: "owner-a".to_string(),
+            ttl_ms: 30_000,
+        })
+        .await
+        .unwrap()
+    {
+        AcquireStandingRuntimeOwnerOutcome::Acquired(claim) => StandingRuntimeOwnerToken {
+            tenant_id: claim.tenant_id,
+            program_id: claim.program_id,
+            view_id: claim.view_id,
+            owner_id: claim.owner_id,
+            owner_epoch: claim.owner_epoch,
+        },
+        other => panic!("unexpected owner outcome: {other:?}"),
+    };
+    let mut pointer = checkpoint_pointer(1, "a");
+    pointer.program_id = "orders-view".to_string();
+    pointer.view_id = "orders-view".to_string();
+    pointer.checkpoint_key = format!(
+        "v1/standing-runtime-checkpoints/default/orders-view/orders-view/epochs/{:020}/sha256/{}.checkpoint.json",
+        pointer.logical_epoch,
+        pointer.content_hash.strip_prefix("sha256:").unwrap()
+    );
+    let coverage = RuntimeCheckpointInputCoverageV1 {
+        schema_version: RUNTIME_CHECKPOINT_INPUT_COVERAGE_SCHEMA_VERSION_V1,
+        view_generation: bootstrap.bootstrap_generation,
+        plan_hash: bootstrap.plan_hash.clone(),
+        input_catalog_epoch: cut.input_catalog_epoch,
+        relations: cut
+            .relations
+            .iter()
+            .map(|relation| RuntimeCheckpointRelationCoverageV1 {
+                relation_id: relation.relation.relation_id.clone(),
+                relation_version: relation.relation.relation_version.clone(),
+                relation_generation: relation.relation.relation_generation,
+                schema_fingerprint: relation.relation.schema_fingerprint.clone(),
+                partitions: relation
+                    .partitions
+                    .iter()
+                    .map(|partition| RuntimeCheckpointPartitionCoverageV1 {
+                        stream_id: partition.stream_id.clone(),
+                        stream_generation: partition.stream_generation,
+                        partition_id: partition.partition_id,
+                        partition_generation: partition.partition_generation,
+                        covered_from_offset_inclusive: partition.base_offset_inclusive,
+                        processed_offset_exclusive: partition.committed_offset_exclusive,
+                    })
+                    .collect(),
+            })
+            .collect(),
+    };
+    pointer.bootstrap_generation = bootstrap.bootstrap_generation;
+    pointer.plan_hash = bootstrap.plan_hash.clone();
+    pointer.coverage_hash = coverage.stable_hash().unwrap();
+    pointer.input_coverage = Some(coverage);
+    store
+        .publish_standing_runtime_checkpoint(
+            velorix_meta::PublishStandingRuntimeCheckpointRequest {
+                expected_previous: None,
+                candidate: pointer.clone(),
+                owner: owner.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .fix_view_bootstrap_activation_cut(FixViewBootstrapActivationCutRequest {
+                tenant_id: "default".to_string(),
+                program_id: "orders-view".to_string(),
+                view_id: "orders-view".to_string(),
+                bootstrap_generation: bootstrap.bootstrap_generation,
+                plan_hash: bootstrap.plan_hash.clone(),
+                owner: owner.clone(),
+            })
+            .await
+            .unwrap(),
+        FixViewBootstrapActivationCutOutcome::Fixed(_)
+    ));
+    assert!(matches!(
+        store
+            .promote_view_bootstrap(PromoteViewBootstrapRequest {
+                tenant_id: "default".to_string(),
+                program_id: "orders-view".to_string(),
+                view_id: "orders-view".to_string(),
+                bootstrap_generation: bootstrap.bootstrap_generation,
+                plan_hash: bootstrap.plan_hash,
+                checkpoint: pointer,
+                owner,
+            })
+            .await
+            .unwrap(),
+        PromoteViewBootstrapOutcome::Promoted(_)
+    ));
+}
+
+#[tokio::test]
 async fn grpc_meta_store_sends_bearer_token_to_authenticated_service() {
     let endpoint = spawn_authenticated_meta_service("secret").await;
     let unauthenticated = GrpcMetaStore::connect(endpoint.clone()).await.unwrap();
@@ -335,6 +534,19 @@ async fn grpc_meta_store_publishes_standing_runtime_checkpoint_pointer() {
             velorix_meta::PublishStandingRuntimeCheckpointRequest {
                 expected_previous: None,
                 candidate: pointer.clone(),
+                owner: owner.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    let mut successor = checkpoint_pointer(2, "c");
+    successor.previous_checkpoint_key = pointer.checkpoint_key.clone();
+    successor.previous_manifest_hash = pointer.manifest_hash.clone();
+    let successor_outcome = store
+        .publish_standing_runtime_checkpoint(
+            velorix_meta::PublishStandingRuntimeCheckpointRequest {
+                expected_previous: Some(pointer),
+                candidate: successor.clone(),
                 owner,
             },
         )
@@ -346,7 +558,11 @@ async fn grpc_meta_store_publishes_standing_runtime_checkpoint_pointer() {
         .unwrap();
 
     assert_eq!(outcome, PublishStandingRuntimeCheckpointOutcome::Published);
-    assert_eq!(read, Some(pointer));
+    assert_eq!(
+        successor_outcome,
+        PublishStandingRuntimeCheckpointOutcome::Published
+    );
+    assert_eq!(read, Some(successor));
 }
 
 #[tokio::test]
@@ -413,6 +629,12 @@ fn checkpoint_pointer(epoch: u64, hash_seed: &str) -> StandingRuntimeCheckpointP
         content_hash: proto.content_hash,
         manifest_hash: proto.manifest_hash,
         output_manifest_refs: proto.output_manifest_refs,
+        bootstrap_generation: proto.bootstrap_generation,
+        plan_hash: proto.plan_hash,
+        coverage_hash: proto.coverage_hash,
+        input_coverage: None,
+        previous_checkpoint_key: proto.previous_checkpoint_key,
+        previous_manifest_hash: proto.previous_manifest_hash,
     }
 }
 
@@ -429,6 +651,12 @@ fn proto_checkpoint_pointer(epoch: u64, hash_seed: &str) -> ProtoCheckpointPoint
         content_hash: format!("sha256:{hash}"),
         manifest_hash: format!("sha256:{hash}"),
         output_manifest_refs: Vec::new(),
+        bootstrap_generation: 0,
+        plan_hash: String::new(),
+        coverage_hash: String::new(),
+        input_coverage_json: Vec::new(),
+        previous_checkpoint_key: String::new(),
+        previous_manifest_hash: String::new(),
     }
 }
 
@@ -489,6 +717,50 @@ fn reserve_ingest_range_request(
         relation_version: "v1".to_string(),
         schema_fingerprint: catalog.schema_fingerprint.as_str().to_string(),
         writer_epoch: 7,
+    }
+}
+
+fn ingest_range_reservation(
+    catalog: &velorix_core::relation::VelorixRelationCatalogV1,
+) -> IngestRangeReservation {
+    IngestRangeReservation {
+        stream_id: "orders".to_string(),
+        partition_id: 0,
+        start_offset_inclusive: 0,
+        end_offset_exclusive: 100,
+        batch_key: "v1/ingest/orders/p=0000000000/00000000000000000000-00000000000000000100.batch"
+            .to_string(),
+        payload_digest: "sha256:first".to_string(),
+        relation_id: "orders".to_string(),
+        relation_version: "v1".to_string(),
+        schema_fingerprint: catalog.schema_fingerprint.as_str().to_string(),
+        writer_epoch: 7,
+    }
+}
+
+fn source_cut_request(
+    catalog: &velorix_core::relation::VelorixRelationCatalogV1,
+) -> CaptureIngestSourceCutRequest {
+    CaptureIngestSourceCutRequest {
+        relations: vec![IngestSourceRelationIdentityV1 {
+            relation_id: "orders".to_string(),
+            relation_version: "v1".to_string(),
+            relation_generation: 1,
+            schema_fingerprint: catalog.schema_fingerprint.as_str().to_string(),
+        }],
+    }
+}
+
+fn view_bootstrap_request(
+    catalog: &velorix_core::relation::VelorixRelationCatalogV1,
+) -> BeginViewBootstrapRequest {
+    BeginViewBootstrapRequest {
+        tenant_id: "default".to_string(),
+        program_id: "orders-view".to_string(),
+        view_id: "orders-view".to_string(),
+        plan_hash: "sha256:plan".to_string(),
+        view_spec_json: br#"{"view_id":"orders-view"}"#.to_vec(),
+        relations: source_cut_request(catalog).relations,
     }
 }
 

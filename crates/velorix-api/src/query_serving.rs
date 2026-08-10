@@ -463,8 +463,32 @@ pub(super) async fn ensure_view_query_ready(
     state: &ApiState,
     active: ActiveMaterializedView,
 ) -> Result<ActiveMaterializedView, ApiError> {
-    let _ = state;
     if view_query_availability(&active.lifecycle) {
+        if let Some(meta_store) = state.meta_store.as_ref() {
+            let identity = active_standing_runtime_identity(&active).ok_or_else(|| {
+                ApiError::service_unavailable(format!(
+                    "standing_runtime_not_deployed: view `{}` has no runtime identity",
+                    active.spec.view_id
+                ))
+            })?;
+            let control = meta_store
+                .read_view_bootstrap(
+                    &identity.tenant_id,
+                    &identity.program_id,
+                    &active.spec.view_id,
+                )
+                .await
+                .map_err(meta_error_to_api)?;
+            if !control.is_some_and(|control| {
+                control.lifecycle == ViewBootstrapLifecycleV1::Active
+                    && control.active_checkpoint.is_some()
+            }) {
+                return Err(ApiError::service_unavailable(format!(
+                    "MATERIALIZATION_LAG: authoritative activation is incomplete for view `{}`",
+                    active.spec.view_id
+                )));
+            }
+        }
         return Ok(active);
     }
     if view_has_backfill_required_lag(&active) {
@@ -584,6 +608,7 @@ pub(super) async fn run_active_view_backfill_step(
     )
     .await?;
     if range.is_none() && scope.is_none() && replay.remaining_batches == 0 {
+        activate_authoritative_view_bootstrap(state, identity, &active.spec.view_id).await?;
         state
             .view_registry()?
             .update_standing_runtime_lifecycle(
@@ -604,6 +629,84 @@ pub(super) async fn run_active_view_backfill_step(
         active: refreshed,
         replay,
     })
+}
+
+async fn activate_authoritative_view_bootstrap(
+    state: &ApiState,
+    identity: &StandingProgramIdentity,
+    view_id: &str,
+) -> Result<(), ApiError> {
+    let Some(meta_store) = state.meta_store.as_ref() else {
+        return Ok(());
+    };
+    let control = meta_store
+        .read_view_bootstrap(&identity.tenant_id, &identity.program_id, view_id)
+        .await
+        .map_err(meta_error_to_api)?
+        .ok_or_else(|| {
+            ApiError::service_unavailable(format!(
+                "authoritative view bootstrap control is unavailable for `{view_id}`"
+            ))
+        })?;
+    if control.lifecycle == ViewBootstrapLifecycleV1::Active {
+        return Ok(());
+    }
+    let owner = state
+        .acquire_standing_runtime_owner(identity, view_id)
+        .await?
+        .ok_or_else(|| {
+            ApiError::service_unavailable(
+                "authoritative view activation requires a metadata owner fence",
+            )
+        })?;
+    let fixed = meta_store
+        .fix_view_bootstrap_activation_cut(FixViewBootstrapActivationCutRequest {
+            tenant_id: identity.tenant_id.clone(),
+            program_id: identity.program_id.clone(),
+            view_id: view_id.to_string(),
+            bootstrap_generation: control.bootstrap_generation,
+            plan_hash: control.plan_hash.clone(),
+            owner: owner.clone(),
+        })
+        .await
+        .map_err(meta_error_to_api)?;
+    let fixed_control = match fixed {
+        FixViewBootstrapActivationCutOutcome::Fixed(control)
+        | FixViewBootstrapActivationCutOutcome::Duplicate(control) => control,
+        FixViewBootstrapActivationCutOutcome::Conflict => {
+            return Err(ApiError::conflict(format!(
+                "view `{view_id}` activation cut could not be fixed because the current checkpoint does not cover the bootstrap cut"
+            )))
+        }
+    };
+    let checkpoint = meta_store
+        .read_standing_runtime_checkpoint(&identity.tenant_id, &identity.program_id, view_id)
+        .await
+        .map_err(meta_error_to_api)?
+        .ok_or_else(|| {
+            ApiError::service_unavailable(format!(
+                "authoritative standing runtime checkpoint is unavailable for `{view_id}`"
+            ))
+        })?;
+    match meta_store
+        .promote_view_bootstrap(PromoteViewBootstrapRequest {
+            tenant_id: identity.tenant_id.clone(),
+            program_id: identity.program_id.clone(),
+            view_id: view_id.to_string(),
+            bootstrap_generation: fixed_control.bootstrap_generation,
+            plan_hash: fixed_control.plan_hash,
+            checkpoint,
+            owner,
+        })
+        .await
+        .map_err(meta_error_to_api)?
+    {
+        PromoteViewBootstrapOutcome::Promoted(_)
+        | PromoteViewBootstrapOutcome::Duplicate(_) => Ok(()),
+        PromoteViewBootstrapOutcome::Conflict => Err(ApiError::conflict(format!(
+            "view `{view_id}` activation was fenced because the current checkpoint does not cover the fixed activation cut"
+        ))),
+    }
 }
 
 pub(super) async fn query_standing_runtime_rows_with_template(
@@ -990,13 +1093,40 @@ pub(super) fn standing_runtime_output_aggregate_outputs_for_checkpoint(
         .map_err(|source| ApiError::bad_request(source.to_string()))?;
     match payload.get("runtime_kind").and_then(Value::as_str) {
         Some("filter_project" | "analytic_row_number" | "latest_by_key") => return Ok(None),
-        Some("two_input_join_sum_count") => {
+        Some("two_input_join_sum_count" | "two_input_join_common_dag_reference_v1") => {
             let Some(plan) = payload.get("plan").filter(|plan| !plan.is_null()) else {
                 return Ok(None);
             };
             let plan: SupportedJoinViewPlan = serde_json::from_value(plan.clone())
                 .map_err(|source| ApiError::bad_request(source.to_string()))?;
             return Ok(Some(supported_join_view_plan_aggregate_outputs(&plan)));
+        }
+        Some("three_input_inner_join_count_dag_v1") => {
+            let Some(logical_plan) = payload
+                .get("logical_plan")
+                .filter(|logical_plan| !logical_plan.is_null())
+            else {
+                return Err(ApiError::bad_request(
+                    "three-input join checkpoint is missing its admitted plan",
+                ));
+            };
+            let logical_plan: VelorixLogicalViewPlanV1 =
+                serde_json::from_value(logical_plan.clone())
+                    .map_err(|source| ApiError::bad_request(source.to_string()))?;
+            let VelorixLogicalViewExecutionV1::ThreeInputInnerJoinCount { plan } =
+                logical_plan.execution
+            else {
+                return Err(ApiError::bad_request(
+                    "three-input join checkpoint execution does not match its runtime kind",
+                ));
+            };
+            return Ok(Some(vec![SupportedAggregateOutput {
+                function: LogicalPlanAggregateFunctionV1::Count,
+                input_column_id: None,
+                input_relation_side: None,
+                input_expression: None,
+                output_column_id: plan.count_output_column_id,
+            }]));
         }
         Some("tumbling_event_time_aggregate") => {
             let Some(plan) = payload.get("plan").filter(|plan| !plan.is_null()) else {

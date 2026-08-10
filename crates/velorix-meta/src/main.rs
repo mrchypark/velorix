@@ -631,6 +631,12 @@ fn smoke_checkpoint_pointer(
         content_hash,
         manifest_hash: format!("sha256:{}", hash_char.to_string().repeat(64)),
         output_manifest_refs: Vec::new(),
+        bootstrap_generation: 0,
+        plan_hash: String::new(),
+        coverage_hash: String::new(),
+        input_coverage: None,
+        previous_checkpoint_key: String::new(),
+        previous_manifest_hash: String::new(),
     })
 }
 

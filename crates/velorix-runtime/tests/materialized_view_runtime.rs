@@ -8,10 +8,18 @@ use arrow::{
 use serde_json::{json, Value};
 use velorix_core::{
     delta::{DeltaBatch, DeltaKey, DeltaRecord, DeltaValue},
+    native_operator::{
+        NativeAggregateOperator, NativeBinaryJoinOperator, NativeLeftJoinOperator,
+        NativeOperatorEdgeV1, NativeOperatorGraph, NativeOperatorGraphCheckpointV1,
+        NativeOperatorInputV1, NativeOperatorStateV1,
+    },
+    operator::AggregateValueMode,
+    operator_contract::ChangelogModeV1,
     relation::{
-        ArrowPhysicalTypeV1, DataFusionRegistrationModeV1, DataFusionRegistrationV1,
-        IncrementalAdapterBindingV1, IncrementalRelationBindingV1, RelationColumnV1,
-        RelationOperationV1, RelationSemanticRoleV1, SchemaFingerprintV1, VelorixLogicalTypeV1,
+        arrow_record_batches_to_key_value_delta_batch, ArrowPhysicalTypeV1,
+        DataFusionRegistrationModeV1, DataFusionRegistrationV1, IncrementalAdapterBindingV1,
+        IncrementalRelationBindingV1, RelationColumnV1, RelationOperationV1,
+        RelationSemanticRoleV1, SchemaFingerprintV1, VelorixLogicalTypeV1,
         VelorixRelationCatalogV1, VelorixRelationSchemaV1, CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID,
         CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID, RELATION_SCHEMA_VERSION_V1,
     },
@@ -26,21 +34,430 @@ use velorix_core::{
     view_plan::{
         logical_view_plan_hash, lower_supported_analytic_row_number_sql_to_logical_plan,
         lower_supported_filter_project_sql_to_logical_plan,
-        lower_supported_join_view_sql_to_logical_plan, LogicalPlanAggregateAccumulatorV1,
-        LogicalPlanAggregateFunctionV1, LogicalPlanColumnRef, LogicalPlanRelationRef,
-        LogicalPlanStateKindV1, LogicalPlanStateRequirementV1, PredicateOp, RowPredicate,
-        RowPredicateExpr, SupportedAggregateInputRelationSide, SupportedAggregateOutput,
-        SupportedAnalyticRowNumberPlan, SupportedAnalyticWindowFunction, SupportedProjectionExpr,
-        VelorixLogicalViewExecutionV1, VelorixLogicalViewPlanNodeV1, VelorixLogicalViewPlanV1,
-        LOGICAL_VIEW_OUTPUT_CODEC_VERSION_V1, LOGICAL_VIEW_PLAN_CAPABILITY_VERSION_V1,
-        LOGICAL_VIEW_PLAN_VERSION_V1, LOGICAL_VIEW_STATE_CODEC_VERSION_V1,
+        lower_supported_join_view_sql_to_logical_plan,
+        lower_supported_three_input_inner_join_count_sql_to_logical_plan_with_policy,
+        LogicalPlanAggregateFunctionV1, RowPredicateExpr, SupportedAggregateOutput,
+        SupportedProjectionExpr, VelorixLogicalViewExecutionV1, VelorixLogicalViewPlanV1,
+        COMPOSITE_PK_POSITIONAL_JSON_ARRAY_JOIN_KEY_CODEC_V1,
+        THREE_INPUT_LEGACY_SQL_ENCOUNTER_JOIN_ORDER_V1,
     },
 };
 use velorix_runtime::materialized_view_runtime::{
+    bind_join_execution_v1,
+    create_common_dag_reference_standing_runtime_with_logical_plan_and_catalogs,
     create_standing_runtime, create_standing_runtime_with_logical_plan_and_catalogs,
     create_standing_runtime_with_sql_and_catalogs, materialized_delta_to_page,
-    restore_standing_runtime, CRATE_NAME,
+    restore_common_dag_reference_standing_runtime, restore_standing_runtime, JoinExecutionModeV1,
+    JoinSpecializationComparisonGraph, TwoInputJoinRuntime, CRATE_NAME,
 };
+
+#[test]
+fn public_exists_and_not_exists_materialize_through_restart_with_duplicate_matches() {
+    for (label, negated) in [("semi", false), ("anti", true)] {
+        let scores = scores_catalog();
+        let accounts = accounts_catalog();
+        let catalogs = vec![scores.clone(), accounts.clone()];
+        let input_schemas = catalogs
+            .iter()
+            .map(|catalog| catalog_input_relation_schema(catalog).unwrap())
+            .collect::<Vec<_>>();
+        let output = scores_projection_output_schema();
+        let sql = format!(
+            "select s.user_id, s.score from scores s where {}exists (select 1 from accounts a where a.account_id = s.user_id)",
+            if negated { "not " } else { "" }
+        );
+        let identity = standing_identity_with_view(&sql, "positive_scores");
+        let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+            &identity,
+            &catalogs,
+            &sql,
+            &input_schemas,
+            std::slice::from_ref(&output),
+        )
+        .unwrap();
+
+        runtime
+            .apply_changes(
+                1,
+                EpochIdempotencyKey::new(format!("{label}-epoch-1")).unwrap(),
+                vec![
+                    relation_input(
+                        &scores,
+                        &format!("{label}-scores"),
+                        0,
+                        2,
+                        scores_rows_batch(&[("alice", 10, 1), ("bob", 5, 1)]),
+                    ),
+                    relation_input(
+                        &accounts,
+                        &format!("{label}-accounts"),
+                        0,
+                        1,
+                        accounts_rows_batch(&[("alice", 100, "gold", 1)]),
+                    ),
+                ],
+            )
+            .unwrap();
+        assert_projected_scores_page(
+            runtime.as_ref(),
+            1,
+            if negated {
+                &[("bob", 5)]
+            } else {
+                &[("alice", 10)]
+            },
+        );
+
+        let checkpoint = runtime.checkpoint().unwrap();
+        let payload = checkpoint.state_payload.as_ref().unwrap().payload.as_str();
+        assert!(payload.contains(if negated {
+            "velorix-native-anti-join-v1"
+        } else {
+            "velorix-native-semi-join-v1"
+        }));
+        let mut restored = restore_standing_runtime(checkpoint).unwrap();
+        restored
+            .apply_changes(
+                2,
+                EpochIdempotencyKey::new(format!("{label}-epoch-2")).unwrap(),
+                vec![relation_input(
+                    &accounts,
+                    &format!("{label}-accounts"),
+                    1,
+                    4,
+                    accounts_rows_batch(&[
+                        ("alice", 100, "gold", -1),
+                        ("bob", 50, "gold", 1),
+                        ("bob", 75, "silver", 1),
+                    ]),
+                )],
+            )
+            .unwrap();
+        assert_projected_scores_page(
+            restored.as_ref(),
+            2,
+            if negated {
+                &[("alice", 10)]
+            } else {
+                &[("bob", 5)]
+            },
+        );
+
+        restored
+            .apply_changes(
+                3,
+                EpochIdempotencyKey::new(format!("{label}-epoch-3")).unwrap(),
+                vec![
+                    relation_input(
+                        &scores,
+                        &format!("{label}-scores"),
+                        2,
+                        4,
+                        scores_rows_batch(&[("alice", 10, -1), ("alice", 12, 1)]),
+                    ),
+                    relation_input(
+                        &accounts,
+                        &format!("{label}-accounts"),
+                        4,
+                        5,
+                        accounts_rows_batch(&[("bob", 50, "gold", -1)]),
+                    ),
+                ],
+            )
+            .unwrap();
+        assert_projected_scores_page(
+            restored.as_ref(),
+            3,
+            if negated {
+                &[("alice", 12)]
+            } else {
+                &[("bob", 5)]
+            },
+        );
+
+        let mut restored = restore_standing_runtime(restored.checkpoint().unwrap()).unwrap();
+        restored
+            .apply_changes(
+                4,
+                EpochIdempotencyKey::new(format!("{label}-epoch-4")).unwrap(),
+                vec![relation_input(
+                    &accounts,
+                    &format!("{label}-accounts"),
+                    5,
+                    6,
+                    accounts_rows_batch(&[("bob", 75, "silver", -1)]),
+                )],
+            )
+            .unwrap();
+        assert_projected_scores_page(
+            restored.as_ref(),
+            4,
+            if negated {
+                &[("alice", 12), ("bob", 5)]
+            } else {
+                &[]
+            },
+        );
+    }
+}
+
+#[test]
+fn runtime_materializes_global_count_empty_input_and_final_retract_across_restore() {
+    let catalog = scores_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = global_count_output_schema();
+    let sql = "select count(*) as count from scores";
+    let identity = standing_identity(sql);
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    let empty = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: identity.tenant_id.clone(),
+                program_id: identity.program_id.clone(),
+                view_id: identity.view_ids[0].clone(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(0),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    assert_global_count_batch(&empty.batches[0], 0);
+
+    let inserted = runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("global-count-epoch-1").unwrap(),
+            vec![RelationInputBatch {
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "global-count-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 3,
+                event_time_watermark: None,
+                batches: vec![scores_rows_batch(&[
+                    ("alice", 10, 1),
+                    ("bob", 5, 1),
+                    ("alice", 7, 1),
+                ])],
+            }],
+        )
+        .unwrap();
+    assert_global_count_batch(&inserted.output_batches[0].batches[0], 3);
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    let payload = checkpoint
+        .state_payload
+        .as_ref()
+        .expect("global aggregate checkpoint payload")
+        .payload
+        .as_str();
+    assert!(payload.contains("aggregate_singleton_state"));
+    assert!(payload.contains("aggregate_singleton_publication"));
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    let deleted = restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("global-count-epoch-2").unwrap(),
+            vec![RelationInputBatch {
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "global-count-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 3,
+                end_offset_exclusive: 6,
+                event_time_watermark: None,
+                batches: vec![scores_rows_batch(&[
+                    ("alice", 10, -1),
+                    ("bob", 5, -1),
+                    ("alice", 7, -1),
+                ])],
+            }],
+        )
+        .unwrap();
+    assert_global_count_batch(&deleted.output_batches[0].batches[0], 0);
+}
+
+#[test]
+fn runtime_materializes_composite_computed_group_keys() {
+    let catalog = scores_with_category_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = composite_bucket_output_schema();
+    let sql = "select user_id, score / 10 as bucket, sum(score) as sum, count(*) as count from scores group by user_id, bucket";
+    let identity = standing_identity(sql);
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    let commit = runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("composite-group-epoch-1").unwrap(),
+            vec![RelationInputBatch {
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "composite-group-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 3,
+                event_time_watermark: None,
+                batches: vec![scores_with_category_batch()],
+            }],
+        )
+        .unwrap();
+
+    let batch = &commit.output_batches[0].batches[0];
+    assert_eq!(batch.num_rows(), 2);
+    let users = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let buckets = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let sums = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let counts = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(
+        users.iter().collect::<Vec<_>>(),
+        vec![Some("u1"), Some("u1")]
+    );
+    assert_eq!(buckets.values(), &[0, 1]);
+    assert_eq!(sums.values(), &[12, 15]);
+    assert_eq!(counts.values(), &[2, 1]);
+}
+
+#[test]
+fn runtime_materializes_registered_composite_group_keys_with_null() {
+    let catalog = scores_with_category_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = composite_category_output_schema();
+    let sql = "select user_id, category, sum(score) as sum, count(*) as count from scores group by user_id, category";
+    let identity = standing_identity(sql);
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    let commit = runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("registered-composite-group-epoch-1").unwrap(),
+            vec![RelationInputBatch {
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "registered-composite-group-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 3,
+                event_time_watermark: None,
+                batches: vec![scores_with_category_batch()],
+            }],
+        )
+        .unwrap();
+
+    let batch = &commit.output_batches[0].batches[0];
+    let categories = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let sums = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let mut rows = (0..batch.num_rows())
+        .map(|index| {
+            (
+                (!categories.is_null(index)).then(|| categories.value(index).to_string()),
+                sums.value(index),
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort();
+    assert_eq!(rows, vec![(None, 15), (Some("a".to_string()), 12)]);
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    assert!(checkpoint
+        .state_payload
+        .as_ref()
+        .unwrap()
+        .payload
+        .contains("\"category\":null"));
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    let retracted = restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("registered-composite-group-epoch-2").unwrap(),
+            vec![RelationInputBatch {
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "registered-composite-group-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 3,
+                end_offset_exclusive: 4,
+                event_time_watermark: None,
+                batches: vec![scores_with_category_rows_batch(&[("u1", 15, None, -1)])],
+            }],
+        )
+        .unwrap();
+    let batch = &retracted.output_batches[0].batches[0];
+    assert_eq!(batch.num_rows(), 1);
+    let categories = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(categories.value(0), "a");
+    let removed_group = retracted.output_deltas[0]
+        .delta
+        .records()
+        .iter()
+        .find(|record| {
+            record.weight == -1
+                && record
+                    .key
+                    .as_json()
+                    .as_object()
+                    .and_then(|key| key.get("category"))
+                    == Some(&Value::Null)
+        });
+    assert!(removed_group.is_some());
+}
 
 #[test]
 fn runtime_materializes_sum_count_for_relation_without_value_semantic_role() {
@@ -116,6 +533,171 @@ fn runtime_materializes_sum_count_for_relation_without_value_semantic_role() {
     assert_eq!(user_ids.value(1), "bob");
     assert_eq!(sums.value(1), 5);
     assert_eq!(counts.value(1), 1);
+}
+
+#[test]
+fn runtime_repeated_epoch_is_idempotent_before_and_after_restore() {
+    let catalog = purchases_catalog_without_value_role();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = purchases_output_schema();
+    let sql =
+        "select user_id, sum(amount) as sum, count(*) as count from purchases group by user_id";
+    let identity = standing_identity(sql);
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    let input = RelationInputBatch {
+        relation_id: catalog.relation_schema.relation_id.clone(),
+        relation_version: catalog.relation_schema.relation_version.clone(),
+        stream_id: "idempotent-stream".to_string(),
+        partition_id: 0,
+        schema_fingerprint: catalog.schema_fingerprint.to_string(),
+        start_offset_inclusive: 0,
+        end_offset_exclusive: 3,
+        event_time_watermark: None,
+        batches: vec![purchases_batch()],
+    };
+    let key = EpochIdempotencyKey::new("repeated-epoch").unwrap();
+    runtime
+        .apply_changes(1, key.clone(), vec![input.clone()])
+        .unwrap();
+    let checkpoint = runtime.checkpoint().unwrap();
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "purchases_by_user".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(1),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+
+    let duplicate = runtime
+        .apply_changes(1, key.clone(), vec![input.clone()])
+        .unwrap();
+    assert!(duplicate.output_deltas.is_empty());
+    assert_eq!(runtime.checkpoint().unwrap(), checkpoint);
+    assert_eq!(
+        runtime
+            .materialized_view_page(
+                ScopedViewId {
+                    tenant_id: "tenant-a".to_string(),
+                    program_id: "program-purchases".to_string(),
+                    view_id: "purchases_by_user".to_string(),
+                },
+                SnapshotPageRequest {
+                    committed_epoch: Some(1),
+                    page_token: None,
+                    max_rows: None,
+                },
+            )
+            .unwrap()
+            .batches,
+        page.batches
+    );
+
+    let mut restored = restore_standing_runtime(checkpoint.clone()).unwrap();
+    let restored_duplicate = restored.apply_changes(1, key, vec![input]).unwrap();
+    assert!(restored_duplicate.output_deltas.is_empty());
+    assert_eq!(restored.checkpoint().unwrap(), checkpoint);
+}
+
+#[test]
+fn runtime_same_epoch_input_permutations_have_identical_state_output_and_restore() {
+    let catalog = purchases_catalog_without_value_role();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = purchases_output_schema();
+    let sql =
+        "select user_id, sum(amount) as sum, count(*) as count from purchases group by user_id";
+    let identity = standing_identity(sql);
+    let inputs = [(0, "alice", 10), (1, "bob", 5), (2, "alice", 7)].map(
+        |(partition_id, user_id, amount)| RelationInputBatch {
+            relation_id: catalog.relation_schema.relation_id.clone(),
+            relation_version: catalog.relation_schema.relation_version.clone(),
+            stream_id: "permutation-stream".to_string(),
+            partition_id,
+            schema_fingerprint: catalog.schema_fingerprint.to_string(),
+            start_offset_inclusive: 0,
+            end_offset_exclusive: 1,
+            event_time_watermark: None,
+            batches: vec![purchases_rows_batch(&[(user_id, amount, 1)])],
+        },
+    );
+    let mut baseline = None;
+    for order in [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ] {
+        let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+            &identity,
+            std::slice::from_ref(&catalog),
+            sql,
+            std::slice::from_ref(&input_schema),
+            std::slice::from_ref(&output_schema),
+        )
+        .unwrap();
+        runtime
+            .apply_changes(
+                1,
+                EpochIdempotencyKey::new("permuted-epoch").unwrap(),
+                order.iter().map(|index| inputs[*index].clone()).collect(),
+            )
+            .unwrap();
+        let checkpoint = runtime.checkpoint().unwrap();
+        let page = runtime
+            .materialized_view_page(
+                ScopedViewId {
+                    tenant_id: "tenant-a".to_string(),
+                    program_id: "program-purchases".to_string(),
+                    view_id: "purchases_by_user".to_string(),
+                },
+                SnapshotPageRequest {
+                    committed_epoch: Some(1),
+                    page_token: None,
+                    max_rows: None,
+                },
+            )
+            .unwrap();
+        let restored = restore_standing_runtime(checkpoint.clone()).unwrap();
+        let restored_page = restored
+            .materialized_view_page(
+                ScopedViewId {
+                    tenant_id: "tenant-a".to_string(),
+                    program_id: "program-purchases".to_string(),
+                    view_id: "purchases_by_user".to_string(),
+                },
+                SnapshotPageRequest {
+                    committed_epoch: Some(1),
+                    page_token: None,
+                    max_rows: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(restored_page.batches, page.batches);
+        let evidence = (
+            checkpoint.state_root.content_hash,
+            checkpoint.state_payload.unwrap().payload,
+            page.batches,
+        );
+        match &baseline {
+            Some(baseline) => assert_eq!(&evidence, baseline),
+            None => baseline = Some(evidence),
+        }
+    }
 }
 
 #[test]
@@ -2582,6 +3164,64 @@ fn runtime_rejects_row_number_logical_plan_that_does_not_match_sql() {
 }
 
 #[test]
+fn runtime_rejects_tampered_operator_contract_before_construction() {
+    let catalog = scores_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = scores_row_number_output_schema();
+    let sql = "select user_id, row_number() over (partition by score order by score desc, user_id asc) as rank from scores where score > 0";
+    let identity = standing_identity_with_view(sql, "scores_ranked");
+    let mut logical_plan =
+        lower_supported_analytic_row_number_sql_to_logical_plan(sql, &catalog, &output_schema)
+            .unwrap();
+    logical_plan.operator_dag_contract.operators[0].outputs[0].changelog =
+        ChangelogModeV1::AppendOnly;
+
+    let error = match create_standing_runtime_with_logical_plan_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        logical_plan,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    ) {
+        Ok(_) => panic!("runtime accepted a tampered operator contract"),
+        Err(error) => error,
+    };
+
+    assert!(error.contains("analytic_row_number_view_plan"));
+}
+
+#[test]
+fn runtime_rejects_tampered_execution_implementation_before_construction() {
+    let catalog = scores_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = scores_row_number_output_schema();
+    let sql = "select user_id, row_number() over (partition by score order by score desc, user_id asc) as rank from scores where score > 0";
+    let identity = standing_identity_with_view(sql, "scores_ranked");
+    let mut logical_plan =
+        lower_supported_analytic_row_number_sql_to_logical_plan(sql, &catalog, &output_schema)
+            .unwrap();
+    logical_plan
+        .execution_implementation
+        .as_mut()
+        .unwrap()
+        .implementation_id = "velorix-generic-dag-v1".to_string();
+    logical_plan.plan_hash = Some(logical_view_plan_hash(&logical_plan).unwrap());
+
+    let error = match create_standing_runtime_with_logical_plan_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        logical_plan,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    ) {
+        Ok(_) => panic!("runtime accepted a tampered execution implementation"),
+        Err(error) => error,
+    };
+
+    assert!(error.contains("analytic_row_number_view_plan"));
+}
+
+#[test]
 fn runtime_materializes_row_number_with_precise_large_int64_ordering() {
     let catalog = scores_with_adjustment_catalog();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
@@ -3651,7 +4291,10 @@ fn runtime_rejects_filter_project_case_bool_predicate_non_bool_literal() {
         Err(error) => error,
     };
 
-    assert!(error.contains("filter_project_projection_expr"), "{error}");
+    assert!(
+        error.contains("logical_filter_project_view_plan"),
+        "the implementation-bound physical DAG must reject the crafted plan before execution: {error}"
+    );
 }
 
 #[test]
@@ -4851,7 +5494,7 @@ fn runtime_materializes_single_relation_having_count_distinct_function_view() {
 }
 
 #[test]
-fn runtime_accepts_sparse_forward_offsets_and_rejects_overlapping_offsets() {
+fn runtime_rejects_non_contiguous_input_offsets_without_advancing_frontier() {
     let catalog = purchases_catalog_without_value_role();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
     let output_schema = purchases_output_schema();
@@ -4890,8 +5533,9 @@ fn runtime_accepts_sparse_forward_offsets_and_rejects_overlapping_offsets() {
         first_commit.input_frontiers[0].committed_offset_exclusive,
         3
     );
+    let checkpoint_before_gap = runtime.checkpoint().unwrap();
 
-    let sparse_commit = runtime
+    let sparse_error = runtime
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
@@ -4907,15 +5551,17 @@ fn runtime_accepts_sparse_forward_offsets_and_rejects_overlapping_offsets() {
                 batches: vec![purchases_batch()],
             }],
         )
-        .unwrap();
+        .unwrap_err();
 
-    assert_eq!(sparse_commit.input_frontiers.len(), 1);
-    assert_eq!(
-        sparse_commit.input_frontiers[0].committed_offset_exclusive,
-        6
-    );
+    assert!(matches!(
+        sparse_error,
+        StandingProgramRuntimeError::InvalidProgramIdentity {
+            field: "input_frontier.offset_range"
+        }
+    ));
+    assert_eq!(runtime.checkpoint().unwrap(), checkpoint_before_gap);
 
-    let err = runtime
+    runtime
         .apply_changes(
             3,
             EpochIdempotencyKey::new("epoch-3").unwrap(),
@@ -4925,7 +5571,25 @@ fn runtime_accepts_sparse_forward_offsets_and_rejects_overlapping_offsets() {
                 stream_id: "test-stream".to_string(),
                 partition_id: 0,
                 schema_fingerprint: catalog.schema_fingerprint.to_string(),
-                start_offset_inclusive: 5,
+                start_offset_inclusive: 3,
+                end_offset_exclusive: 5,
+                event_time_watermark: None,
+                batches: vec![purchases_batch()],
+            }],
+        )
+        .unwrap();
+
+    let err = runtime
+        .apply_changes(
+            4,
+            EpochIdempotencyKey::new("epoch-4").unwrap(),
+            vec![RelationInputBatch {
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 4,
                 end_offset_exclusive: 7,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
@@ -4941,7 +5605,7 @@ fn runtime_accepts_sparse_forward_offsets_and_rejects_overlapping_offsets() {
         frontier.relation_version,
         catalog.relation_schema.relation_version
     );
-    assert_eq!(frontier.committed_offset_exclusive, 6);
+    assert_eq!(frontier.committed_offset_exclusive, 5);
 
     assert!(matches!(
         err,
@@ -6418,24 +7082,27 @@ fn runtime_materializes_two_relation_join_and_restores_epoch_consistent_state() 
 
     let initial_frontiers = vec![
         RelationFrontier {
-            relation_id: scores.relation_schema.relation_id.clone(),
-            relation_version: scores.relation_schema.relation_version.clone(),
-            stream_id: "test-stream".to_string(),
-            partition_id: 0,
-            committed_offset_exclusive: 4,
-        },
-        RelationFrontier {
             relation_id: accounts.relation_schema.relation_id.clone(),
             relation_version: accounts.relation_schema.relation_version.clone(),
             stream_id: "test-stream".to_string(),
             partition_id: 0,
             committed_offset_exclusive: 2,
         },
+        RelationFrontier {
+            relation_id: scores.relation_schema.relation_id.clone(),
+            relation_version: scores.relation_schema.relation_version.clone(),
+            stream_id: "test-stream".to_string(),
+            partition_id: 0,
+            committed_offset_exclusive: 4,
+        },
     ];
     assert_eq!(first_commit.input_frontiers, initial_frontiers);
 
     let checkpoint = runtime.checkpoint().unwrap();
     assert_eq!(checkpoint.input_frontiers, initial_frontiers);
+    let scalar_payload: Value =
+        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+    assert!(scalar_payload.get("join_key_codec_id").is_none());
     let mut restored = restore_standing_runtime(checkpoint).unwrap();
     assert_eq!(
         restored.checkpoint().unwrap().input_frontiers,
@@ -6464,18 +7131,18 @@ fn runtime_materializes_two_relation_join_and_restores_epoch_consistent_state() 
 
     let advanced_frontiers = vec![
         RelationFrontier {
-            relation_id: scores.relation_schema.relation_id.clone(),
-            relation_version: scores.relation_schema.relation_version.clone(),
-            stream_id: "test-stream".to_string(),
-            partition_id: 0,
-            committed_offset_exclusive: 5,
-        },
-        RelationFrontier {
             relation_id: accounts.relation_schema.relation_id.clone(),
             relation_version: accounts.relation_schema.relation_version.clone(),
             stream_id: "test-stream".to_string(),
             partition_id: 0,
             committed_offset_exclusive: 2,
+        },
+        RelationFrontier {
+            relation_id: scores.relation_schema.relation_id.clone(),
+            relation_version: scores.relation_schema.relation_version.clone(),
+            stream_id: "test-stream".to_string(),
+            partition_id: 0,
+            committed_offset_exclusive: 5,
         },
     ];
     assert_eq!(second_commit.input_frontiers, advanced_frontiers);
@@ -6483,6 +7150,1419 @@ fn runtime_materializes_two_relation_join_and_restores_epoch_consistent_state() 
         restored.checkpoint().unwrap().input_frontiers,
         advanced_frontiers
     );
+}
+
+#[test]
+fn runtime_materializes_composite_primary_key_join_across_retract_and_restart() {
+    let (scores, accounts) = composite_join_catalogs();
+    let input_schemas = vec![
+        catalog_input_relation_schema(&scores).unwrap(),
+        catalog_input_relation_schema(&accounts).unwrap(),
+    ];
+    let output_schema = composite_join_output_schema();
+    let sql = "select a.account_tenant_id as tenant_id, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.user_id = a.account_id and s.tenant_id = a.account_tenant_id group by a.account_tenant_id";
+    let identity = standing_identity_with_view(sql, "scores_by_tenant");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &[scores.clone(), accounts.clone()],
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("composite-join-epoch-1").unwrap(),
+            vec![
+                relation_input(
+                    &scores,
+                    "composite-join-scores",
+                    0,
+                    3,
+                    composite_scores_rows_batch(&[
+                        ("alice", 10, "t1", 2),
+                        ("bob", 5, "t1", 1),
+                        ("alice", 7, "t2", 1),
+                    ]),
+                ),
+                relation_input(
+                    &accounts,
+                    "composite-join-accounts",
+                    0,
+                    2,
+                    composite_accounts_rows_batch(&[
+                        ("alice", 100, "gold", "t1", 3),
+                        ("bob", 50, "gold", "t1", 1),
+                    ]),
+                ),
+            ],
+        )
+        .unwrap();
+    assert_join_page_for_view(runtime.as_ref(), "scores_by_tenant", 1, &[("t1", 65, 7)]);
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    let checkpoint_payload: Value =
+        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+    assert_eq!(
+        checkpoint_payload["join_key_codec_id"],
+        "velorix-composite-pk-positional-json-array-join-key-v1"
+    );
+    for replacement in [None, Some("unknown-composite-key-codec-v9")] {
+        let mut tampered = checkpoint.clone();
+        let state_payload = tampered.state_payload.as_mut().unwrap();
+        let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+        match replacement {
+            Some(codec) => {
+                payload["join_key_codec_id"] = Value::String(codec.into());
+            }
+            None => {
+                payload.as_object_mut().unwrap().remove("join_key_codec_id");
+            }
+        }
+        state_payload.payload = serde_json::to_string(&payload).unwrap();
+        tampered.state_root.content_hash = stable_bytes_hash(state_payload.payload.as_bytes());
+        assert!(restore_standing_runtime(tampered).is_err());
+    }
+    let mut tampered_binding = checkpoint.clone();
+    let state_payload = tampered_binding.state_payload.as_mut().unwrap();
+    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    payload["execution_binding"]["implementation"]["join_key_codec_id"] =
+        Value::String("unknown-composite-key-codec-v9".into());
+    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    tampered_binding.state_root.content_hash = stable_bytes_hash(state_payload.payload.as_bytes());
+    assert!(restore_standing_runtime(tampered_binding).is_err());
+
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    assert_join_page_for_view(restored.as_ref(), "scores_by_tenant", 1, &[("t1", 65, 7)]);
+
+    restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("composite-join-epoch-2").unwrap(),
+            vec![
+                relation_input(
+                    &scores,
+                    "composite-join-scores",
+                    3,
+                    4,
+                    composite_scores_rows_batch(&[("alice", 10, "t1", -1)]),
+                ),
+                relation_input(
+                    &accounts,
+                    "composite-join-accounts",
+                    2,
+                    3,
+                    composite_accounts_rows_batch(&[("alice", 100, "gold", "t2", 2)]),
+                ),
+            ],
+        )
+        .unwrap();
+    assert_join_page_for_view(
+        restored.as_ref(),
+        "scores_by_tenant",
+        2,
+        &[("t1", 35, 4), ("t2", 14, 2)],
+    );
+
+    restored
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("composite-join-epoch-3").unwrap(),
+            vec![relation_input(
+                &accounts,
+                "composite-join-accounts",
+                3,
+                4,
+                composite_accounts_rows_batch(&[("alice", 100, "gold", "t1", -3)]),
+            )],
+        )
+        .unwrap();
+    assert_join_page_for_view(
+        restored.as_ref(),
+        "scores_by_tenant",
+        3,
+        &[("t1", 5, 1), ("t2", 14, 2)],
+    );
+}
+
+#[test]
+fn runtime_materializes_three_input_composite_pk_join_through_binary_dag() {
+    let [scores, accounts, profiles] = three_input_composite_join_catalogs();
+    let catalogs = vec![scores.clone(), accounts.clone(), profiles.clone()];
+    let input_schemas = catalogs
+        .iter()
+        .map(|catalog| catalog_input_relation_schema(catalog).unwrap())
+        .collect::<Vec<_>>();
+    let output_schema = three_input_join_count_output_schema();
+    let sql = "select s.tenant_id, s.user_id, count(*) as count from scores s join accounts a on s.tenant_id = a.account_tenant_id and s.user_id = a.account_id join profiles p on s.tenant_id = p.account_tenant_id and s.user_id = p.account_id group by s.tenant_id, s.user_id";
+    let identity = standing_identity_with_view(sql, "three_input_counts");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &catalogs,
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("three-input-epoch-1").unwrap(),
+            vec![
+                relation_input(
+                    &scores,
+                    "three-input-scores",
+                    0,
+                    2,
+                    composite_scores_rows_batch(&[("alice", 10, "t1", 2), ("bob", 5, "t1", 1)]),
+                ),
+                relation_input(
+                    &accounts,
+                    "three-input-accounts",
+                    0,
+                    2,
+                    composite_accounts_rows_batch(&[
+                        ("alice", 100, "gold", "t1", 3),
+                        ("bob", 50, "silver", "t1", 1),
+                    ]),
+                ),
+                relation_input(
+                    &profiles,
+                    "three-input-profiles",
+                    0,
+                    1,
+                    composite_accounts_rows_batch(&[("alice", 0, "active", "t1", 4)]),
+                ),
+            ],
+        )
+        .unwrap();
+    assert_three_input_count_page(runtime.as_ref(), 1, &[("t1", "alice", 24)]);
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    assert_eq!(checkpoint.input_frontiers.len(), 3);
+    let payload: Value =
+        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+    assert_eq!(
+        payload["logical_plan"]["execution_implementation"]["join_key_codec_id"],
+        COMPOSITE_PK_POSITIONAL_JSON_ARRAY_JOIN_KEY_CODEC_V1
+    );
+    assert_eq!(payload["graph"]["operators"].as_array().unwrap().len(), 4);
+
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    assert_three_input_count_page(restored.as_ref(), 1, &[("t1", "alice", 24)]);
+    restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("three-input-epoch-2").unwrap(),
+            vec![relation_input(
+                &scores,
+                "three-input-scores",
+                2,
+                3,
+                composite_scores_rows_batch(&[("alice", 10, "t1", -1)]),
+            )],
+        )
+        .unwrap();
+    assert_three_input_count_page(restored.as_ref(), 2, &[("t1", "alice", 12)]);
+    restored
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("three-input-epoch-3").unwrap(),
+            vec![relation_input(
+                &accounts,
+                "three-input-accounts",
+                2,
+                3,
+                composite_accounts_rows_batch(&[("alice", 100, "gold", "t1", -1)]),
+            )],
+        )
+        .unwrap();
+    assert_three_input_count_page(restored.as_ref(), 3, &[("t1", "alice", 8)]);
+    restored
+        .apply_changes(
+            4,
+            EpochIdempotencyKey::new("three-input-epoch-4").unwrap(),
+            vec![relation_input(
+                &profiles,
+                "three-input-profiles",
+                1,
+                2,
+                composite_accounts_rows_batch(&[("alice", 0, "active", "t1", 1)]),
+            )],
+        )
+        .unwrap();
+    assert_three_input_count_page(restored.as_ref(), 4, &[("t1", "alice", 10)]);
+}
+
+#[test]
+fn three_input_join_order_policy_preserves_results_state_and_legacy_restore() {
+    let [scores, accounts, profiles] = three_input_composite_join_catalogs();
+    let catalogs = vec![scores.clone(), accounts.clone(), profiles.clone()];
+    let input_schemas = catalogs
+        .iter()
+        .map(|catalog| catalog_input_relation_schema(catalog).unwrap())
+        .collect::<Vec<_>>();
+    let output_schema = three_input_join_count_output_schema();
+    let sql = "select s.tenant_id, s.user_id, count(*) as count from scores s join accounts a on s.tenant_id = a.account_tenant_id and s.user_id = a.account_id join profiles p on s.tenant_id = p.account_tenant_id and s.user_id = p.account_id group by s.tenant_id, s.user_id";
+    let reordered_sql = "select s.tenant_id, s.user_id, count(*) as count from scores s join profiles p on s.tenant_id = p.account_tenant_id and s.user_id = p.account_id join accounts a on s.tenant_id = a.account_tenant_id and s.user_id = a.account_id group by s.tenant_id, s.user_id";
+    let changes = || {
+        vec![
+            relation_input(
+                &scores,
+                "join-order-scores",
+                0,
+                2,
+                composite_scores_rows_batch(&[("alice", 10, "t1", 2), ("bob", 5, "t1", 1)]),
+            ),
+            relation_input(
+                &accounts,
+                "join-order-accounts",
+                0,
+                2,
+                composite_accounts_rows_batch(&[
+                    ("alice", 100, "gold", "t1", 3),
+                    ("bob", 50, "silver", "t1", 1),
+                ]),
+            ),
+            relation_input(
+                &profiles,
+                "join-order-profiles",
+                0,
+                1,
+                composite_accounts_rows_batch(&[("alice", 0, "active", "t1", 4)]),
+            ),
+        ]
+    };
+
+    let mut canonical = create_standing_runtime_with_sql_and_catalogs(
+        &standing_identity_with_view(sql, "three_input_counts"),
+        &catalogs,
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    let mut reordered = create_standing_runtime_with_sql_and_catalogs(
+        &standing_identity_with_view(reordered_sql, "three_input_counts"),
+        &catalogs,
+        reordered_sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    canonical
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("join-order-canonical").unwrap(),
+            changes(),
+        )
+        .unwrap();
+    reordered
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("join-order-reordered").unwrap(),
+            changes(),
+        )
+        .unwrap();
+    assert_three_input_count_page(canonical.as_ref(), 1, &[("t1", "alice", 24)]);
+    assert_three_input_count_page(reordered.as_ref(), 1, &[("t1", "alice", 24)]);
+    let canonical_checkpoint = canonical.checkpoint().unwrap();
+    let reordered_checkpoint = reordered.checkpoint().unwrap();
+    let canonical_payload: Value =
+        serde_json::from_str(&canonical_checkpoint.state_payload.as_ref().unwrap().payload)
+            .unwrap();
+    let reordered_payload: Value =
+        serde_json::from_str(&reordered_checkpoint.state_payload.as_ref().unwrap().payload)
+            .unwrap();
+    assert_eq!(canonical_payload["graph"], reordered_payload["graph"]);
+    assert_eq!(
+        canonical_payload["published_output"],
+        reordered_payload["published_output"]
+    );
+    assert_three_input_count_page(
+        restore_standing_runtime(canonical_checkpoint)
+            .unwrap()
+            .as_ref(),
+        1,
+        &[("t1", "alice", 24)],
+    );
+    assert_three_input_count_page(
+        restore_standing_runtime(reordered_checkpoint)
+            .unwrap()
+            .as_ref(),
+        1,
+        &[("t1", "alice", 24)],
+    );
+
+    let legacy_plan = lower_supported_three_input_inner_join_count_sql_to_logical_plan_with_policy(
+        sql,
+        &catalogs,
+        &output_schema,
+        THREE_INPUT_LEGACY_SQL_ENCOUNTER_JOIN_ORDER_V1,
+    )
+    .unwrap();
+    let legacy_identity = standing_identity_with_view(sql, "three_input_counts");
+    let mut legacy = create_standing_runtime_with_logical_plan_and_catalogs(
+        &legacy_identity,
+        &catalogs,
+        legacy_plan,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    legacy
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("join-order-legacy").unwrap(),
+            changes(),
+        )
+        .unwrap();
+    let restored_legacy = restore_standing_runtime(legacy.checkpoint().unwrap()).unwrap();
+    assert_three_input_count_page(restored_legacy.as_ref(), 1, &[("t1", "alice", 24)]);
+}
+
+#[test]
+fn three_input_join_epoch_rolls_back_on_overflow_and_restore_rejects_torn_checkpoint() {
+    let [scores, accounts, profiles] = three_input_composite_join_catalogs();
+    let catalogs = vec![scores.clone(), accounts.clone(), profiles.clone()];
+    let input_schemas = catalogs
+        .iter()
+        .map(|catalog| catalog_input_relation_schema(catalog).unwrap())
+        .collect::<Vec<_>>();
+    let output_schema = three_input_join_count_output_schema();
+    let sql = "select s.tenant_id, s.user_id, count(*) as count from scores s join accounts a on s.tenant_id = a.account_tenant_id and s.user_id = a.account_id join profiles p on s.tenant_id = p.account_tenant_id and s.user_id = p.account_id group by s.tenant_id, s.user_id";
+    let identity = standing_identity_with_view(sql, "three_input_counts");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &catalogs,
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    let empty = runtime.checkpoint().unwrap();
+
+    let overflow = runtime.apply_changes(
+        1,
+        EpochIdempotencyKey::new("three-input-overflow").unwrap(),
+        vec![
+            relation_input(
+                &scores,
+                "three-input-scores",
+                0,
+                1,
+                composite_scores_rows_batch(&[("alice", 10, "t1", i64::MAX)]),
+            ),
+            relation_input(
+                &accounts,
+                "three-input-accounts",
+                0,
+                1,
+                composite_accounts_rows_batch(&[("alice", 100, "gold", "t1", 1)]),
+            ),
+            relation_input(
+                &profiles,
+                "three-input-profiles",
+                0,
+                1,
+                composite_accounts_rows_batch(&[("alice", 0, "active", "t1", 2)]),
+            ),
+        ],
+    );
+    assert!(overflow.is_err());
+    assert_eq!(runtime.checkpoint().unwrap(), empty);
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("three-input-safe").unwrap(),
+            vec![
+                relation_input(
+                    &scores,
+                    "three-input-scores",
+                    0,
+                    1,
+                    composite_scores_rows_batch(&[("alice", 10, "t1", 1)]),
+                ),
+                relation_input(
+                    &accounts,
+                    "three-input-accounts",
+                    0,
+                    1,
+                    composite_accounts_rows_batch(&[("alice", 100, "gold", "t1", 1)]),
+                ),
+                relation_input(
+                    &profiles,
+                    "three-input-profiles",
+                    0,
+                    1,
+                    composite_accounts_rows_batch(&[("alice", 0, "active", "t1", 1)]),
+                ),
+            ],
+        )
+        .unwrap();
+    assert_three_input_count_page(runtime.as_ref(), 1, &[("t1", "alice", 1)]);
+
+    let committed = runtime.checkpoint().unwrap();
+    let gap = runtime.apply_changes(
+        2,
+        EpochIdempotencyKey::new("three-input-gap").unwrap(),
+        vec![relation_input(
+            &profiles,
+            "three-input-profiles",
+            2,
+            3,
+            composite_accounts_rows_batch(&[("alice", 0, "active", "t1", 1)]),
+        )],
+    );
+    assert!(gap.is_err());
+    assert_eq!(runtime.checkpoint().unwrap(), committed);
+
+    let mut torn_output = committed.clone();
+    let state_payload = torn_output.state_payload.as_mut().unwrap();
+    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    payload["published_output"] = json!({"records": []});
+    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    assert!(restore_standing_runtime(torn_output).is_err());
+
+    let mut torn_epoch = committed;
+    let state_payload = torn_epoch.state_payload.as_mut().unwrap();
+    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    payload["graph"]["logical_epoch"] = json!(2);
+    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    assert!(restore_standing_runtime(torn_epoch).is_err());
+
+    let mut unknown_policy = runtime.checkpoint().unwrap();
+    let state_payload = unknown_policy.state_payload.as_mut().unwrap();
+    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    payload["logical_plan"]["execution"]["plan"]["join_order_policy_id"] =
+        json!("unknown-three-input-policy");
+    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    assert!(restore_standing_runtime(unknown_policy).is_err());
+}
+
+fn assert_three_input_count_page(
+    runtime: &(dyn StandingProgramRuntime + Send),
+    epoch: u64,
+    expected: &[(&str, &str, i64)],
+) {
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".into(),
+                program_id: "program-purchases".into(),
+                view_id: "three_input_counts".into(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(epoch),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let tenants = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let users = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let counts = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let actual = (0..batch.num_rows())
+        .map(|index| {
+            (
+                tenants.value(index),
+                users.value(index),
+                counts.value(index),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn runtime_materializes_non_primary_duplicate_join_across_retract_and_restart() {
+    let scores = generic_adapter_catalog(scores_catalog());
+    let accounts = generic_adapter_catalog(accounts_catalog());
+    let input_schemas = vec![
+        catalog_input_relation_schema(&scores).unwrap(),
+        catalog_input_relation_schema(&accounts).unwrap(),
+    ];
+    let output_schema = non_primary_join_output_schema();
+    let sql = "select a.limit as bucket, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.score = a.limit group by a.limit";
+    let identity = standing_identity_with_view(sql, "scores_by_bucket");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &[scores.clone(), accounts.clone()],
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("non-primary-join-epoch-1").unwrap(),
+            vec![
+                relation_input(
+                    &scores,
+                    "non-primary-join-scores",
+                    0,
+                    3,
+                    scores_rows_batch(&[("left-a", 10, 2), ("left-b", 10, 1), ("left-c", 5, 1)]),
+                ),
+                relation_input(
+                    &accounts,
+                    "non-primary-join-accounts",
+                    0,
+                    3,
+                    accounts_rows_batch(&[
+                        ("right-a", 10, "gold", 3),
+                        ("right-b", 10, "silver", 1),
+                        ("right-c", 5, "gold", 1),
+                    ]),
+                ),
+            ],
+        )
+        .unwrap();
+    assert_int_join_page_for_view(
+        runtime.as_ref(),
+        "scores_by_bucket",
+        1,
+        &[(10, 120, 12), (5, 5, 1)],
+    );
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    let payload: Value =
+        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+    assert_eq!(
+        payload["join_key_codec_id"],
+        "velorix-non-primary-non-null-scalar-join-key-v1"
+    );
+    let mut wrong_domain = checkpoint.clone();
+    let state_payload = wrong_domain.state_payload.as_mut().unwrap();
+    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    payload["join_key_codec_id"] =
+        Value::String("velorix-composite-pk-positional-json-array-join-key-v1".into());
+    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    wrong_domain.state_root.content_hash = stable_bytes_hash(state_payload.payload.as_bytes());
+    assert!(restore_standing_runtime(wrong_domain).is_err());
+
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    assert_int_join_page_for_view(
+        restored.as_ref(),
+        "scores_by_bucket",
+        1,
+        &[(10, 120, 12), (5, 5, 1)],
+    );
+    restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("non-primary-join-epoch-2").unwrap(),
+            vec![
+                relation_input(
+                    &scores,
+                    "non-primary-join-scores",
+                    3,
+                    4,
+                    scores_rows_batch(&[("left-a", 10, -1)]),
+                ),
+                relation_input(
+                    &accounts,
+                    "non-primary-join-accounts",
+                    3,
+                    6,
+                    accounts_rows_batch(&[
+                        ("right-a", 10, "gold", -2),
+                        ("right-d", 5, "bronze", 2),
+                    ]),
+                ),
+            ],
+        )
+        .unwrap();
+    assert_int_join_page_for_view(
+        restored.as_ref(),
+        "scores_by_bucket",
+        2,
+        &[(10, 40, 4), (5, 15, 3)],
+    );
+}
+
+#[test]
+fn runtime_materializes_atomic_self_join_fanout_across_retract_and_restart() {
+    let scores = generic_adapter_catalog(scores_catalog());
+    let input_schema = catalog_input_relation_schema(&scores).unwrap();
+    let output_schema = global_count_output_schema();
+    let sql = "select count(*) as count from scores l join scores r on l.score = r.score";
+    let identity = standing_identity_with_view(sql, "score_self_join_count");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&scores),
+        sql,
+        std::slice::from_ref(&input_schema),
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    let empty = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: identity.tenant_id.clone(),
+                program_id: identity.program_id.clone(),
+                view_id: identity.view_ids[0].clone(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(0),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    assert_global_count_batch(&empty.batches[0], 0);
+
+    let before_failed_fanout = runtime.checkpoint().unwrap();
+    assert!(runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("self-join-failed-fanout").unwrap(),
+            vec![relation_input(
+                &scores,
+                "self-join-scores",
+                0,
+                1,
+                scores_rows_batch(&[("overflow", 99, i64::MAX)]),
+            )],
+        )
+        .is_err());
+    let after_failed_fanout = runtime.checkpoint().unwrap();
+    assert_eq!(
+        before_failed_fanout.state_payload,
+        after_failed_fanout.state_payload
+    );
+    assert_eq!(
+        before_failed_fanout.input_frontiers,
+        after_failed_fanout.input_frontiers
+    );
+    assert_eq!(runtime.logical_epoch(), 0);
+
+    let inserted = runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("self-join-epoch-1").unwrap(),
+            vec![relation_input(
+                &scores,
+                "self-join-scores",
+                0,
+                4,
+                scores_rows_batch(&[("left-a", 10, 2), ("left-b", 10, 1), ("left-c", 5, 1)]),
+            )],
+        )
+        .unwrap();
+    assert_global_count_batch(&inserted.output_batches[0].batches[0], 10);
+    assert_eq!(inserted.input_frontiers.len(), 1);
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    let payload: Value =
+        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+    assert_eq!(payload["input_schemas"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        payload["execution_binding"]["implementation"]["input_fanout_protocol_id"],
+        "velorix-self-join-left-then-right-atomic-fanout-v1"
+    );
+    assert!(!payload["left_state"]["records"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(!payload["right_state"]["records"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+
+    let retracted = restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("self-join-epoch-2").unwrap(),
+            vec![relation_input(
+                &scores,
+                "self-join-scores",
+                4,
+                5,
+                scores_rows_batch(&[("left-a", 10, -1)]),
+            )],
+        )
+        .unwrap();
+    assert_global_count_batch(&retracted.output_batches[0].batches[0], 5);
+
+    let emptied = restored
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("self-join-epoch-3").unwrap(),
+            vec![relation_input(
+                &scores,
+                "self-join-scores",
+                5,
+                8,
+                scores_rows_batch(&[("left-a", 10, -1), ("left-b", 10, -1), ("left-c", 5, -1)]),
+            )],
+        )
+        .unwrap();
+    assert_global_count_batch(&emptied.output_batches[0].batches[0], 0);
+}
+
+#[test]
+fn inner_aggregate_join_specialization_matches_native_dag_delta_state_and_restart() {
+    let scores = scores_catalog();
+    let accounts = accounts_catalog();
+    let input_schemas = vec![
+        catalog_input_relation_schema(&scores).unwrap(),
+        catalog_input_relation_schema(&accounts).unwrap(),
+    ];
+    let output_schema = join_output_schema();
+    let sql = "select a.account_id, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.user_id = a.account_id group by a.account_id";
+    let identity = standing_identity_with_view(sql, "scores_by_account");
+    let mut uninterrupted_runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &[scores.clone(), accounts.clone()],
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    let mut uninterrupted_graph = native_inner_join_aggregate_graph();
+
+    let first_scores = scores_rows_batch(&[
+        ("alice", 10, 1),
+        ("alice", 7, 1),
+        ("bob", 5, 1),
+        ("charlie", 30, 1),
+    ]);
+    let first_accounts = accounts_alice_bob_batch();
+    let specialized = uninterrupted_runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("equivalence-inner-1").unwrap(),
+            vec![
+                join_relation_input(&scores, 0, 4, vec![first_scores.clone()]),
+                join_relation_input(&accounts, 0, 2, vec![first_accounts.clone()]),
+            ],
+        )
+        .unwrap();
+    let generic = apply_native_join_epoch(
+        &mut uninterrupted_graph,
+        1,
+        native_join_input(&scores, "user_id", "score", &[first_scores]),
+        native_join_input(&accounts, "account_id", "limit", &[first_accounts]),
+    );
+    assert!(
+        specialization_delta_difference(&specialized.output_deltas[0].delta, &generic).is_none()
+    );
+    assert_inner_join_specialization_state_equivalent(
+        uninterrupted_runtime.as_ref(),
+        &uninterrupted_graph,
+    );
+
+    let mut restored_runtime =
+        restore_standing_runtime(uninterrupted_runtime.checkpoint().unwrap()).unwrap();
+    let graph_checkpoint = uninterrupted_graph.checkpoint().unwrap();
+    let mut restored_graph = native_inner_join_aggregate_graph();
+    restored_graph.restore(&graph_checkpoint).unwrap();
+
+    let changed_scores = scores_rows_batch(&[("alice", 7, -1), ("charlie", 30, -1), ("bob", 2, 1)]);
+    let changed_accounts =
+        accounts_rows_batch(&[("charlie", 90, "silver", 1), ("bob", 50, "gold", -1)]);
+    let runtime_tail = vec![
+        join_relation_input(&scores, 4, 7, vec![changed_scores.clone()]),
+        join_relation_input(&accounts, 2, 4, vec![changed_accounts.clone()]),
+    ];
+    let graph_left = native_join_input(&scores, "user_id", "score", &[changed_scores]);
+    let graph_right = native_join_input(&accounts, "account_id", "limit", &[changed_accounts]);
+    let uninterrupted_specialized = uninterrupted_runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("equivalence-inner-2").unwrap(),
+            runtime_tail.clone(),
+        )
+        .unwrap();
+    let restored_specialized = restored_runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("equivalence-inner-2").unwrap(),
+            runtime_tail,
+        )
+        .unwrap();
+    let uninterrupted_generic = apply_native_join_epoch(
+        &mut uninterrupted_graph,
+        2,
+        graph_left.clone(),
+        graph_right.clone(),
+    );
+    let restored_generic = apply_native_join_epoch(&mut restored_graph, 2, graph_left, graph_right);
+
+    for delta in [
+        &restored_specialized.output_deltas[0].delta,
+        &uninterrupted_generic,
+        &restored_generic,
+    ] {
+        assert!(specialization_delta_difference(
+            &uninterrupted_specialized.output_deltas[0].delta,
+            delta,
+        )
+        .is_none());
+    }
+    assert_eq!(
+        restored_runtime.checkpoint().unwrap(),
+        uninterrupted_runtime.checkpoint().unwrap()
+    );
+    assert_eq!(
+        restored_graph.checkpoint().unwrap(),
+        uninterrupted_graph.checkpoint().unwrap()
+    );
+    assert_inner_join_specialization_state_equivalent(
+        uninterrupted_runtime.as_ref(),
+        &uninterrupted_graph,
+    );
+    assert_inner_join_specialization_state_equivalent(restored_runtime.as_ref(), &restored_graph);
+}
+
+#[test]
+fn narrow_left_join_specialization_matches_native_dag_delta_state_and_restart() {
+    let scores = scores_catalog();
+    let accounts = accounts_catalog();
+    let input_schemas = vec![
+        catalog_input_relation_schema(&scores).unwrap(),
+        catalog_input_relation_schema(&accounts).unwrap(),
+    ];
+    let output_schema = join_output_schema();
+    let sql = "select s.user_id as account_id, sum(s.score) as sum, count(*) as count from scores s left join accounts a on s.user_id = a.account_id group by s.user_id";
+    let identity = standing_identity_with_view(sql, "scores_by_account");
+    let mut uninterrupted_runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &[scores.clone(), accounts.clone()],
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    let mut uninterrupted_graph = native_left_join_aggregate_graph();
+
+    let first_scores = scores_rows_batch(&[
+        ("alice", 10, 1),
+        ("alice", 7, 1),
+        ("bob", 5, 1),
+        ("charlie", 30, 1),
+    ]);
+    let first_accounts = accounts_alice_bob_batch();
+    let specialized = uninterrupted_runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("equivalence-left-1").unwrap(),
+            vec![
+                join_relation_input(&scores, 0, 4, vec![first_scores.clone()]),
+                join_relation_input(&accounts, 0, 2, vec![first_accounts.clone()]),
+            ],
+        )
+        .unwrap();
+    let generic = apply_native_join_epoch(
+        &mut uninterrupted_graph,
+        1,
+        native_join_input(&scores, "user_id", "score", &[first_scores]),
+        native_join_input(&accounts, "account_id", "limit", &[first_accounts]),
+    );
+    assert!(
+        specialization_delta_difference(&specialized.output_deltas[0].delta, &generic).is_none()
+    );
+    assert_left_join_specialization_state_equivalent(
+        uninterrupted_runtime.as_ref(),
+        &uninterrupted_graph,
+    );
+
+    let mut restored_runtime =
+        restore_standing_runtime(uninterrupted_runtime.checkpoint().unwrap()).unwrap();
+    let graph_checkpoint = uninterrupted_graph.checkpoint().unwrap();
+    let mut restored_graph = native_left_join_aggregate_graph();
+    restored_graph.restore(&graph_checkpoint).unwrap();
+
+    let changed_scores = scores_rows_batch(&[
+        ("alice", 7, -1),
+        ("bob", 5, -1),
+        ("bob", 8, 1),
+        ("dora", 4, 1),
+    ]);
+    let changed_accounts =
+        accounts_rows_batch(&[("charlie", 90, "silver", 1), ("alice", 100, "gold", -1)]);
+    let runtime_tail = vec![
+        join_relation_input(&scores, 4, 8, vec![changed_scores.clone()]),
+        join_relation_input(&accounts, 2, 4, vec![changed_accounts.clone()]),
+    ];
+    let graph_left = native_join_input(&scores, "user_id", "score", &[changed_scores]);
+    let graph_right = native_join_input(&accounts, "account_id", "limit", &[changed_accounts]);
+    let uninterrupted_specialized = uninterrupted_runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("equivalence-left-2").unwrap(),
+            runtime_tail.clone(),
+        )
+        .unwrap();
+    let restored_specialized = restored_runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("equivalence-left-2").unwrap(),
+            runtime_tail,
+        )
+        .unwrap();
+    let uninterrupted_generic = apply_native_join_epoch(
+        &mut uninterrupted_graph,
+        2,
+        graph_left.clone(),
+        graph_right.clone(),
+    );
+    let restored_generic = apply_native_join_epoch(&mut restored_graph, 2, graph_left, graph_right);
+
+    for delta in [
+        &restored_specialized.output_deltas[0].delta,
+        &uninterrupted_generic,
+        &restored_generic,
+    ] {
+        assert!(specialization_delta_difference(
+            &uninterrupted_specialized.output_deltas[0].delta,
+            delta,
+        )
+        .is_none());
+    }
+    assert_eq!(
+        restored_runtime.checkpoint().unwrap(),
+        uninterrupted_runtime.checkpoint().unwrap()
+    );
+    assert_eq!(
+        restored_graph.checkpoint().unwrap(),
+        uninterrupted_graph.checkpoint().unwrap()
+    );
+    assert_left_join_specialization_state_equivalent(
+        uninterrupted_runtime.as_ref(),
+        &uninterrupted_graph,
+    );
+    assert_left_join_specialization_state_equivalent(restored_runtime.as_ref(), &restored_graph);
+}
+
+#[test]
+fn specialization_equivalence_harness_detects_a_mutated_delta() {
+    let correct = DeltaBatch::from_records([DeltaRecord::new(
+        DeltaKey::from_json(json!("alice")),
+        DeltaValue::from_json(json!({ "sum": 10, "count": 1 })),
+        1,
+    )]);
+    let mutant = DeltaBatch::from_records([DeltaRecord::new(
+        DeltaKey::from_json(json!("alice")),
+        DeltaValue::from_json(json!({ "sum": 11, "count": 1 })),
+        1,
+    )]);
+    assert!(specialization_delta_difference(&correct, &mutant).is_some());
+}
+
+#[test]
+fn retained_join_specializations_toggle_to_common_dag_with_equivalent_recovery() {
+    let mut full_join_output_schema = join_output_schema();
+    full_join_output_schema.columns[1].nullable = true;
+    let cases = [
+        (
+            "select a.account_id, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.user_id = a.account_id group by a.account_id",
+            join_output_schema(),
+            "scores_by_account",
+        ),
+        (
+            "select s.user_id as account_id, sum(s.score) as sum, count(*) as count from scores s left join accounts a on s.user_id = a.account_id group by s.user_id",
+            join_output_schema(),
+            "scores_by_account_left",
+        ),
+        (
+            "select a.account_id, sum(s.score) as sum, count(*) as count, count(a.limit) as count_limit, count(distinct a.limit) as distinct_limits, sum(a.limit) as limit_sum, min(a.limit) as min_limit, max(a.limit) as max_limit, avg(a.limit) as avg_limit from scores s join accounts a on s.user_id = a.account_id group by a.account_id",
+            join_right_stats_output_schema(),
+            "scores_by_account_limits",
+        ),
+        (
+            "select coalesce(s.user_id, a.account_id) as account_id, sum(s.score) as sum, count(*) as count from scores s full outer join accounts a on s.user_id = a.account_id group by coalesce(s.user_id, a.account_id)",
+            full_join_output_schema,
+            "scores_by_account",
+        ),
+    ];
+
+    for (sql, output_schema, view_id) in cases {
+        let scores = scores_catalog();
+        let accounts = accounts_catalog();
+        let catalogs = vec![scores.clone(), accounts.clone()];
+        let input_schemas = vec![
+            catalog_input_relation_schema(&scores).unwrap(),
+            catalog_input_relation_schema(&accounts).unwrap(),
+        ];
+        let identity = standing_identity_with_view(sql, view_id);
+        let logical_plan =
+            lower_supported_join_view_sql_to_logical_plan(sql, &catalogs, &output_schema).unwrap();
+        let selected_binding =
+            bind_join_execution_v1(&logical_plan, JoinExecutionModeV1::SelectedSpecialization)
+                .unwrap();
+        let reference_binding =
+            bind_join_execution_v1(&logical_plan, JoinExecutionModeV1::CommonDagReference).unwrap();
+        assert_eq!(
+            selected_binding.common_logical_dag_hash,
+            reference_binding.common_logical_dag_hash
+        );
+        assert_ne!(
+            selected_binding.implementation.implementation_id,
+            reference_binding.implementation.implementation_id
+        );
+        assert_ne!(
+            selected_binding.implementation.physical_operator_dag_hash,
+            reference_binding.implementation.physical_operator_dag_hash
+        );
+        assert_eq!(
+            selected_binding.implementation.output_codec_id,
+            reference_binding.implementation.output_codec_id
+        );
+        assert_eq!(
+            selected_binding
+                .implementation
+                .output_publication_protocol_id,
+            reference_binding
+                .implementation
+                .output_publication_protocol_id
+        );
+
+        let mut selected = create_standing_runtime_with_logical_plan_and_catalogs(
+            &identity,
+            &catalogs,
+            logical_plan.clone(),
+            &input_schemas,
+            std::slice::from_ref(&output_schema),
+        )
+        .unwrap();
+        let mut reference =
+            create_common_dag_reference_standing_runtime_with_logical_plan_and_catalogs(
+                &identity,
+                &catalogs,
+                logical_plan,
+                &input_schemas,
+                std::slice::from_ref(&output_schema),
+            )
+            .unwrap();
+
+        let first = vec![
+            join_relation_input(
+                &scores,
+                0,
+                4,
+                vec![scores_rows_batch(&[
+                    ("alice", 10, 1),
+                    ("alice", 7, 1),
+                    ("bob", 5, 1),
+                    ("charlie", 30, 1),
+                ])],
+            ),
+            join_relation_input(&accounts, 0, 2, vec![accounts_alice_bob_batch()]),
+        ];
+        assert_join_runtime_epoch_equivalent(&mut selected, &mut reference, 1, first);
+
+        let changed = vec![
+            join_relation_input(
+                &scores,
+                4,
+                7,
+                vec![scores_rows_batch(&[
+                    ("alice", 7, -1),
+                    ("bob", 5, -1),
+                    ("bob", 8, 1),
+                ])],
+            ),
+            join_relation_input(
+                &accounts,
+                2,
+                5,
+                vec![accounts_rows_batch(&[
+                    ("alice", 100, "gold", -1),
+                    ("alice", 80, "silver", 1),
+                    ("charlie", 90, "silver", 1),
+                ])],
+            ),
+        ];
+        assert_join_runtime_epoch_equivalent(&mut selected, &mut reference, 2, changed);
+
+        let selected_checkpoint = selected.checkpoint().unwrap();
+        let reference_checkpoint = reference.checkpoint().unwrap();
+        assert_join_checkpoint_canonical_equivalent(&selected_checkpoint, &reference_checkpoint);
+        assert!(TwoInputJoinRuntime::restore(reference_checkpoint.clone()).is_err());
+        assert!(
+            restore_common_dag_reference_standing_runtime(selected_checkpoint.clone()).is_err()
+        );
+        let automatically_restored_reference =
+            restore_standing_runtime(reference_checkpoint.clone()).unwrap();
+        assert_join_checkpoint_canonical_equivalent(
+            &selected_checkpoint,
+            &automatically_restored_reference.checkpoint().unwrap(),
+        );
+        drop(selected);
+        drop(reference);
+        let mut selected = restore_standing_runtime(selected_checkpoint).unwrap();
+        let mut reference =
+            restore_common_dag_reference_standing_runtime(reference_checkpoint).unwrap();
+        assert_join_checkpoint_canonical_equivalent(
+            &selected.checkpoint().unwrap(),
+            &reference.checkpoint().unwrap(),
+        );
+
+        let tail = vec![
+            join_relation_input(
+                &scores,
+                7,
+                9,
+                vec![scores_rows_batch(&[("charlie", 30, -1), ("dora", 4, 1)])],
+            ),
+            join_relation_input(
+                &accounts,
+                5,
+                7,
+                vec![accounts_rows_batch(&[
+                    ("charlie", 90, "silver", -1),
+                    ("bob", 50, "gold", -1),
+                ])],
+            ),
+        ];
+        assert_join_runtime_epoch_equivalent(&mut selected, &mut reference, 3, tail);
+        assert_join_checkpoint_canonical_equivalent(
+            &selected.checkpoint().unwrap(),
+            &reference.checkpoint().unwrap(),
+        );
+    }
+}
+
+#[test]
+fn general_aggregate_join_specialization_matches_native_dag_state_and_restart() {
+    let scores = scores_catalog();
+    let accounts = accounts_catalog();
+    let catalogs = vec![scores.clone(), accounts.clone()];
+    let input_schemas = vec![
+        catalog_input_relation_schema(&scores).unwrap(),
+        catalog_input_relation_schema(&accounts).unwrap(),
+    ];
+    let output_schema = join_right_stats_output_schema();
+    let sql = "select a.account_id, sum(s.score) as sum, count(*) as count, count(a.limit) as count_limit, count(distinct a.limit) as distinct_limits, sum(a.limit) as limit_sum, min(a.limit) as min_limit, max(a.limit) as max_limit, avg(a.limit) as avg_limit from scores s join accounts a on s.user_id = a.account_id group by a.account_id";
+    let identity = standing_identity_with_view(sql, "scores_by_account_limits");
+    let logical_plan =
+        lower_supported_join_view_sql_to_logical_plan(sql, &catalogs, &output_schema).unwrap();
+    let VelorixLogicalViewExecutionV1::TwoInputJoinSumCount { plan } = &logical_plan.execution
+    else {
+        panic!("expected join execution");
+    };
+    let supported_plan = plan.as_ref().clone();
+    let mut uninterrupted_runtime = create_standing_runtime_with_logical_plan_and_catalogs(
+        &identity,
+        &catalogs,
+        logical_plan,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    let mut uninterrupted_graph = JoinSpecializationComparisonGraph::new(
+        catalogs.clone(),
+        supported_plan.clone(),
+        output_schema.clone(),
+    )
+    .unwrap();
+
+    let first_inputs = vec![
+        join_relation_input(
+            &scores,
+            0,
+            3,
+            vec![scores_rows_batch(&[
+                ("alice", 10, 1),
+                ("bob", 5, 1),
+                ("alice", 7, 1),
+            ])],
+        ),
+        join_relation_input(&accounts, 0, 2, vec![accounts_alice_bob_batch()]),
+    ];
+    let specialized = uninterrupted_runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("equivalence-general-1").unwrap(),
+            first_inputs.clone(),
+        )
+        .unwrap();
+    let generic = uninterrupted_graph.apply_epoch(1, first_inputs).unwrap();
+    assert!(
+        specialization_delta_difference(&specialized.output_deltas[0].delta, &generic).is_none()
+    );
+    assert_general_join_specialization_state_equivalent(
+        uninterrupted_runtime.as_ref(),
+        &uninterrupted_graph,
+    );
+
+    let mut restored_runtime =
+        restore_standing_runtime(uninterrupted_runtime.checkpoint().unwrap()).unwrap();
+    let graph_checkpoint = uninterrupted_graph.checkpoint().unwrap();
+    let mut restored_graph = JoinSpecializationComparisonGraph::restore(
+        catalogs,
+        supported_plan,
+        output_schema,
+        &graph_checkpoint,
+    )
+    .unwrap();
+    let tail = vec![join_relation_input(
+        &accounts,
+        2,
+        4,
+        vec![accounts_rows_batch(&[
+            ("alice", 100, "gold", -1),
+            ("alice", 80, "gold", 1),
+        ])],
+    )];
+    let live = uninterrupted_runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("equivalence-general-2").unwrap(),
+            tail.clone(),
+        )
+        .unwrap();
+    let restored = restored_runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("equivalence-general-2").unwrap(),
+            tail.clone(),
+        )
+        .unwrap();
+    let generic_live = uninterrupted_graph.apply_epoch(2, tail.clone()).unwrap();
+    let generic_restored = restored_graph.apply_epoch(2, tail).unwrap();
+    for delta in [
+        &restored.output_deltas[0].delta,
+        &generic_live,
+        &generic_restored,
+    ] {
+        assert!(specialization_delta_difference(&live.output_deltas[0].delta, delta).is_none());
+    }
+    assert_eq!(
+        restored_runtime.checkpoint().unwrap(),
+        uninterrupted_runtime.checkpoint().unwrap()
+    );
+    assert_eq!(
+        restored_graph.checkpoint().unwrap(),
+        uninterrupted_graph.checkpoint().unwrap()
+    );
+    assert_general_join_specialization_state_equivalent(
+        uninterrupted_runtime.as_ref(),
+        &uninterrupted_graph,
+    );
+    assert_general_join_specialization_state_equivalent(restored_runtime.as_ref(), &restored_graph);
+}
+
+#[test]
+fn general_aggregate_join_comparison_covers_filters_and_expression_inputs() {
+    let scores = scores_catalog();
+    let accounts = accounts_catalog();
+    let catalogs = vec![scores.clone(), accounts.clone()];
+    let input_schemas = vec![
+        catalog_input_relation_schema(&scores).unwrap(),
+        catalog_input_relation_schema(&accounts).unwrap(),
+    ];
+    let cases = vec![
+        (
+            "select a.account_id, sum(s.score) filter (where s.score > 5) as sum, count(*) filter (where s.score > 0) as count from scores s join accounts a on s.user_id = a.account_id group by a.account_id",
+            join_output_schema(),
+            "scores_by_account",
+        ),
+        (
+            "select a.account_id, sum(s.score + 1) as sum, count(*) as count from scores s join accounts a on s.user_id = a.account_id group by a.account_id",
+            join_output_schema(),
+            "scores_by_account",
+        ),
+        (
+            "select a.account_id, sum(s.score) as sum, sum(a.limit + 1) as adjusted_sum, count(*) as count from scores s join accounts a on s.user_id = a.account_id group by a.account_id",
+            join_adjusted_sum_output_schema(),
+            "scores_by_account_adjusted",
+        ),
+        (
+            "select a.account_id, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.user_id = a.account_id group by a.account_id having sum(s.score) > 5 order by sum desc limit 1",
+            join_output_schema(),
+            "scores_by_account",
+        ),
+    ];
+
+    for (case_index, (sql, output_schema, view_id)) in cases.into_iter().enumerate() {
+        let identity = standing_identity_with_view(sql, view_id);
+        let logical_plan =
+            lower_supported_join_view_sql_to_logical_plan(sql, &catalogs, &output_schema).unwrap();
+        let VelorixLogicalViewExecutionV1::TwoInputJoinSumCount { plan } = &logical_plan.execution
+        else {
+            panic!("expected join execution");
+        };
+        let mut comparison = JoinSpecializationComparisonGraph::new(
+            catalogs.clone(),
+            plan.as_ref().clone(),
+            output_schema.clone(),
+        )
+        .unwrap();
+        let mut runtime = create_standing_runtime_with_logical_plan_and_catalogs(
+            &identity,
+            &catalogs,
+            logical_plan,
+            &input_schemas,
+            std::slice::from_ref(&output_schema),
+        )
+        .unwrap();
+        let inputs = vec![
+            join_relation_input(&scores, 0, 3, vec![scores_batch()]),
+            join_relation_input(&accounts, 0, 2, vec![accounts_alice_bob_batch()]),
+        ];
+        let specialized = runtime
+            .apply_changes(
+                1,
+                EpochIdempotencyKey::new(format!("equivalence-general-case-{case_index}")).unwrap(),
+                inputs.clone(),
+            )
+            .unwrap();
+        let generic = comparison.apply_epoch(1, inputs).unwrap();
+        assert!(
+            specialization_delta_difference(&specialized.output_deltas[0].delta, &generic,)
+                .is_none()
+        );
+        assert_general_join_specialization_state_equivalent(runtime.as_ref(), &comparison);
+
+        let tail = vec![join_relation_input(
+            &scores,
+            3,
+            6,
+            vec![scores_rows_batch(&[
+                ("alice", 10, -1),
+                ("alice", 7, -1),
+                ("bob", 20, 1),
+            ])],
+        )];
+        let specialized = runtime
+            .apply_changes(
+                2,
+                EpochIdempotencyKey::new(format!("equivalence-general-case-{case_index}-tail"))
+                    .unwrap(),
+                tail.clone(),
+            )
+            .unwrap();
+        let generic = comparison.apply_epoch(2, tail).unwrap();
+        assert!(
+            specialization_delta_difference(&specialized.output_deltas[0].delta, &generic,)
+                .is_none()
+        );
+        assert_general_join_specialization_state_equivalent(runtime.as_ref(), &comparison);
+    }
 }
 
 #[test]
@@ -6609,6 +8689,570 @@ fn runtime_materializes_left_join_left_only_aggregates_for_unmatched_left_rows()
             ("charlie", 30, 1, 30, 30, 30.0),
         ],
     );
+}
+
+#[test]
+fn runtime_materializes_full_join_symmetric_transitions_and_restores_state() {
+    let scores = scores_catalog();
+    let accounts = accounts_nullable_limit_catalog();
+    let input_schemas = vec![
+        catalog_input_relation_schema(&scores).unwrap(),
+        catalog_input_relation_schema(&accounts).unwrap(),
+    ];
+    let mut output_schema = join_output_schema();
+    output_schema.columns[1].nullable = true;
+    let sql = "select coalesce(s.user_id, a.account_id) as account_id, sum(s.score) as sum, count(*) as count from scores s full outer join accounts a on s.user_id = a.account_id group by coalesce(s.user_id, a.account_id)";
+    let identity = standing_identity_with_view(sql, "scores_by_account");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &[scores.clone(), accounts.clone()],
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("full-join-epoch-1").unwrap(),
+            vec![
+                join_relation_input(
+                    &scores,
+                    0,
+                    2,
+                    vec![scores_rows_batch(&[("alice", 10, 1), ("charlie", 30, 1)])],
+                ),
+                join_relation_input(
+                    &accounts,
+                    0,
+                    2,
+                    vec![accounts_nullable_limit_rows_batch(&[
+                        ("alice", Some(100), "gold", 1),
+                        ("bob", None, "gold", 1),
+                    ])],
+                ),
+            ],
+        )
+        .unwrap();
+    assert_nullable_join_page(
+        runtime.as_ref(),
+        1,
+        &[
+            ("alice", Some(10), 1),
+            ("bob", None, 1),
+            ("charlie", Some(30), 1),
+        ],
+    );
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    let payload: Value =
+        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+    assert_eq!(payload["plan"]["join_kind"], "full");
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+
+    restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("full-join-epoch-2").unwrap(),
+            vec![
+                join_relation_input(&scores, 2, 3, vec![scores_rows_batch(&[("bob", 5, 1)])]),
+                join_relation_input(
+                    &accounts,
+                    2,
+                    3,
+                    vec![accounts_nullable_limit_rows_batch(&[(
+                        "charlie",
+                        Some(90),
+                        "silver",
+                        1,
+                    )])],
+                ),
+            ],
+        )
+        .unwrap();
+    assert_nullable_join_page(
+        restored.as_ref(),
+        2,
+        &[
+            ("alice", Some(10), 1),
+            ("bob", Some(5), 1),
+            ("charlie", Some(30), 1),
+        ],
+    );
+
+    restored
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("full-join-epoch-3").unwrap(),
+            vec![
+                join_relation_input(&scores, 3, 4, vec![scores_rows_batch(&[("alice", 7, 1)])]),
+                join_relation_input(
+                    &accounts,
+                    3,
+                    4,
+                    vec![accounts_nullable_limit_rows_batch(&[(
+                        "alice",
+                        Some(100),
+                        "gold",
+                        1,
+                    )])],
+                ),
+            ],
+        )
+        .unwrap();
+    assert_nullable_join_page(
+        restored.as_ref(),
+        3,
+        &[
+            ("alice", Some(34), 4),
+            ("bob", Some(5), 1),
+            ("charlie", Some(30), 1),
+        ],
+    );
+
+    let mut restored = restore_standing_runtime(restored.checkpoint().unwrap()).unwrap();
+    for (epoch, start_offset, expected_sum, expected_count) in
+        [(4, 4, Some(17), 2), (5, 5, Some(17), 2)]
+    {
+        restored
+            .apply_changes(
+                epoch,
+                EpochIdempotencyKey::new(format!("full-join-epoch-{epoch}")).unwrap(),
+                vec![join_relation_input(
+                    &accounts,
+                    start_offset,
+                    start_offset + 1,
+                    vec![accounts_nullable_limit_rows_batch(&[(
+                        "alice",
+                        Some(100),
+                        "gold",
+                        -1,
+                    )])],
+                )],
+            )
+            .unwrap();
+        assert_nullable_join_page(
+            restored.as_ref(),
+            epoch,
+            &[
+                ("alice", expected_sum, expected_count),
+                ("bob", Some(5), 1),
+                ("charlie", Some(30), 1),
+            ],
+        );
+    }
+
+    restored
+        .apply_changes(
+            6,
+            EpochIdempotencyKey::new("full-join-epoch-6").unwrap(),
+            vec![join_relation_input(
+                &scores,
+                4,
+                6,
+                vec![scores_rows_batch(&[("alice", 10, -1), ("alice", 7, -1)])],
+            )],
+        )
+        .unwrap();
+    assert_nullable_join_page(
+        restored.as_ref(),
+        6,
+        &[("bob", Some(5), 1), ("charlie", Some(30), 1)],
+    );
+
+    restored
+        .apply_changes(
+            7,
+            EpochIdempotencyKey::new("full-join-epoch-7").unwrap(),
+            vec![
+                join_relation_input(&scores, 6, 7, vec![scores_rows_batch(&[("bob", 5, -1)])]),
+                join_relation_input(
+                    &accounts,
+                    6,
+                    7,
+                    vec![accounts_nullable_limit_rows_batch(&[(
+                        "charlie",
+                        Some(90),
+                        "silver",
+                        -1,
+                    )])],
+                ),
+            ],
+        )
+        .unwrap();
+    assert_nullable_join_page(
+        restored.as_ref(),
+        7,
+        &[("bob", None, 1), ("charlie", Some(30), 1)],
+    );
+
+    restored
+        .apply_changes(
+            8,
+            EpochIdempotencyKey::new("full-join-epoch-8").unwrap(),
+            vec![join_relation_input(
+                &scores,
+                7,
+                9,
+                vec![scores_rows_batch(&[("charlie", 30, -1), ("bob", 30, 1)])],
+            )],
+        )
+        .unwrap();
+    assert_nullable_join_page(restored.as_ref(), 8, &[("bob", Some(30), 1)]);
+}
+
+#[test]
+fn runtime_materializes_left_join_right_aggregate_filter_and_restores_state() {
+    let scores = scores_catalog();
+    let accounts = accounts_catalog();
+    let input_schemas = vec![
+        catalog_input_relation_schema(&scores).unwrap(),
+        catalog_input_relation_schema(&accounts).unwrap(),
+    ];
+    let output_schema = left_join_right_sum_output_schema();
+    let sql = "select s.user_id as account_id, sum(s.score) as sum, sum(a.limit) filter (where a.limit > 60) as limit_sum, count(*) as count from scores s left join accounts a on s.user_id = a.account_id group by s.user_id";
+    let identity = standing_identity_with_view(sql, "left_join_right_sum");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &[scores.clone(), accounts.clone()],
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("epoch-1").unwrap(),
+            vec![
+                join_relation_input(
+                    &scores,
+                    0,
+                    4,
+                    vec![scores_rows_batch(&[
+                        ("alice", 10, 1),
+                        ("alice", 7, 1),
+                        ("bob", 5, 1),
+                        ("charlie", 30, 1),
+                    ])],
+                ),
+                join_relation_input(&accounts, 0, 2, vec![accounts_alice_bob_batch()]),
+            ],
+        )
+        .unwrap();
+
+    assert_left_join_right_sum_page(
+        runtime.as_ref(),
+        1,
+        &[
+            ("alice", 17, Some(200), 2),
+            ("bob", 5, None, 1),
+            ("charlie", 30, None, 1),
+        ],
+    );
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    let mut tampered = checkpoint.clone();
+    let state_payload = tampered.state_payload.as_mut().unwrap();
+    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    payload["plan"]["right_value_column_ids"] = json!(["missing_right_value"]);
+    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    tampered.state_root.content_hash = stable_bytes_hash(state_payload.payload.as_bytes());
+    assert!(restore_standing_runtime(tampered).is_err());
+
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("epoch-2").unwrap(),
+            vec![join_relation_input(
+                &accounts,
+                2,
+                3,
+                vec![accounts_rows_batch(&[("alice", 100, "gold", -1)])],
+            )],
+        )
+        .unwrap();
+    assert_left_join_right_sum_page(
+        restored.as_ref(),
+        2,
+        &[
+            ("alice", 17, None, 2),
+            ("bob", 5, None, 1),
+            ("charlie", 30, None, 1),
+        ],
+    );
+}
+
+#[test]
+fn runtime_materializes_left_join_empty_right_aggregates_as_sql_null() {
+    let scores = scores_catalog();
+    let accounts = accounts_nullable_limit_catalog();
+    let input_schemas = vec![
+        catalog_input_relation_schema(&scores).unwrap(),
+        catalog_input_relation_schema(&accounts).unwrap(),
+    ];
+    let mut output_schema = join_right_stats_output_schema();
+    for index in [1, 5, 6, 7, 8] {
+        output_schema.columns[index].nullable = true;
+    }
+    let sql = "select s.user_id as account_id, sum(s.score) as sum, count(*) as count, count(a.limit) as count_limit, count(distinct a.limit) as distinct_limits, sum(a.limit) as limit_sum, min(a.limit) as min_limit, max(a.limit) as max_limit, avg(a.limit) as avg_limit from scores s left join accounts a on s.user_id = a.account_id group by s.user_id";
+    let identity = standing_identity_with_view(sql, "scores_by_account_limits");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &[scores.clone(), accounts.clone()],
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("epoch-1").unwrap(),
+            vec![
+                join_relation_input(
+                    &scores,
+                    0,
+                    3,
+                    vec![scores_rows_batch(&[
+                        ("alice", 10, 1),
+                        ("alice", 7, 1),
+                        ("bob", 5, 1),
+                    ])],
+                ),
+                join_relation_input(
+                    &accounts,
+                    0,
+                    1,
+                    vec![accounts_nullable_limit_rows_batch(&[(
+                        "alice", None, "gold", 1,
+                    )])],
+                ),
+            ],
+        )
+        .unwrap();
+    assert_left_join_empty_right_stats_page(runtime.as_ref(), 1, &["alice", "bob"]);
+
+    let mut restored = restore_standing_runtime(runtime.checkpoint().unwrap()).unwrap();
+    restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("epoch-2").unwrap(),
+            vec![join_relation_input(
+                &accounts,
+                1,
+                4,
+                vec![accounts_nullable_limit_rows_batch(&[
+                    ("alice", None, "gold", -1),
+                    ("alice", Some(80), "gold", 1),
+                    ("bob", Some(50), "gold", 1),
+                ])],
+            )],
+        )
+        .unwrap();
+    assert_join_right_stats_page(
+        restored.as_ref(),
+        2,
+        &[
+            ("alice", 17, 2, 2, 1, 160, 80, 80, 80.0),
+            ("bob", 5, 1, 1, 1, 50, 50, 50, 50.0),
+        ],
+    );
+}
+
+#[test]
+fn runtime_materializes_left_join_post_join_right_filter() {
+    let scores = scores_catalog();
+    let accounts = accounts_catalog();
+    let input_schemas = vec![
+        catalog_input_relation_schema(&scores).unwrap(),
+        catalog_input_relation_schema(&accounts).unwrap(),
+    ];
+    let mut output_schema = join_output_schema();
+    output_schema.columns[1].nullable = true;
+    let sql = "select s.user_id as account_id, sum(s.score) as sum, count(*) as count from scores s left join accounts a on s.user_id = a.account_id where a.limit > 60 group by s.user_id";
+    let identity = standing_identity_with_view(sql, "scores_by_account");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &[scores.clone(), accounts.clone()],
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("epoch-1").unwrap(),
+            vec![
+                join_relation_input(
+                    &scores,
+                    0,
+                    4,
+                    vec![scores_rows_batch(&[
+                        ("alice", 10, 1),
+                        ("alice", 7, 1),
+                        ("bob", 5, 1),
+                        ("charlie", 30, 1),
+                    ])],
+                ),
+                join_relation_input(&accounts, 0, 2, vec![accounts_alice_bob_batch()]),
+            ],
+        )
+        .unwrap();
+    assert_join_page(runtime.as_ref(), 1, &[("alice", 17, 2)]);
+
+    let mut restored = restore_standing_runtime(runtime.checkpoint().unwrap()).unwrap();
+    restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("epoch-2").unwrap(),
+            vec![join_relation_input(
+                &accounts,
+                2,
+                3,
+                vec![accounts_rows_batch(&[("alice", 100, "gold", -1)])],
+            )],
+        )
+        .unwrap();
+    assert_join_page(restored.as_ref(), 2, &[]);
+}
+
+#[test]
+fn runtime_materializes_null_accepting_left_join_where_after_the_join() {
+    let scores = scores_catalog();
+    let accounts = accounts_catalog();
+    let input_schemas = vec![
+        catalog_input_relation_schema(&scores).unwrap(),
+        catalog_input_relation_schema(&accounts).unwrap(),
+    ];
+    let mut output_schema = join_output_schema();
+    output_schema.columns[1].nullable = true;
+    let sql = "select s.user_id as account_id, sum(s.score) as sum, count(*) as count from scores s left join accounts a on s.user_id = a.account_id where a.limit is null group by s.user_id";
+    let identity = standing_identity_with_view(sql, "scores_by_account");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &[scores.clone(), accounts.clone()],
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("epoch-1").unwrap(),
+            vec![
+                join_relation_input(
+                    &scores,
+                    0,
+                    4,
+                    vec![scores_rows_batch(&[
+                        ("alice", 10, 1),
+                        ("alice", 7, 1),
+                        ("bob", 5, 1),
+                        ("charlie", 30, 1),
+                    ])],
+                ),
+                join_relation_input(&accounts, 0, 2, vec![accounts_alice_bob_batch()]),
+            ],
+        )
+        .unwrap();
+    assert_join_page(runtime.as_ref(), 1, &[("charlie", 30, 1)]);
+
+    let mut restored = restore_standing_runtime(runtime.checkpoint().unwrap()).unwrap();
+    restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("epoch-2").unwrap(),
+            vec![join_relation_input(
+                &accounts,
+                2,
+                3,
+                vec![accounts_rows_batch(&[("alice", 100, "gold", -1)])],
+            )],
+        )
+        .unwrap();
+    assert_join_page(
+        restored.as_ref(),
+        2,
+        &[("alice", 17, 2), ("charlie", 30, 1)],
+    );
+}
+
+#[test]
+fn runtime_materializes_right_join_by_swapping_to_left_join_state() {
+    let scores = scores_catalog();
+    let accounts = accounts_catalog();
+    let input_schemas = vec![
+        catalog_input_relation_schema(&scores).unwrap(),
+        catalog_input_relation_schema(&accounts).unwrap(),
+    ];
+    let output_schema = join_output_schema();
+    let sql = "select a.account_id, sum(a.limit) as sum, count(*) as count from scores s right join accounts a on s.user_id = a.account_id group by a.account_id";
+    let identity = standing_identity_with_view(sql, "scores_by_account");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &[scores.clone(), accounts.clone()],
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("epoch-1").unwrap(),
+            vec![
+                RelationInputBatch {
+                    relation_id: scores.relation_schema.relation_id.clone(),
+                    relation_version: scores.relation_schema.relation_version.clone(),
+                    stream_id: "test-stream".to_string(),
+                    partition_id: 0,
+                    schema_fingerprint: scores.schema_fingerprint.to_string(),
+                    start_offset_inclusive: 0,
+                    end_offset_exclusive: 1,
+                    event_time_watermark: None,
+                    batches: vec![scores_rows_batch(&[("alice", 10, 1)])],
+                },
+                RelationInputBatch {
+                    relation_id: accounts.relation_schema.relation_id.clone(),
+                    relation_version: accounts.relation_schema.relation_version.clone(),
+                    stream_id: "test-stream".to_string(),
+                    partition_id: 0,
+                    schema_fingerprint: accounts.schema_fingerprint.to_string(),
+                    start_offset_inclusive: 0,
+                    end_offset_exclusive: 2,
+                    event_time_watermark: None,
+                    batches: vec![accounts_alice_bob_batch()],
+                },
+            ],
+        )
+        .unwrap();
+    assert_join_page(runtime.as_ref(), 1, &[("alice", 100, 1), ("bob", 50, 1)]);
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    let payload: Value =
+        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+    assert_eq!(payload["plan"]["join_kind"], "left");
+    assert_eq!(
+        payload["plan"]["left_input_relation_id"],
+        accounts.relation_schema.relation_id
+    );
+    assert_eq!(
+        payload["plan"]["right_input_relation_id"],
+        scores.relation_schema.relation_id
+    );
+
+    let restored = restore_standing_runtime(checkpoint).unwrap();
+    assert_join_page(restored.as_ref(), 1, &[("alice", 100, 1), ("bob", 50, 1)]);
 }
 
 #[test]
@@ -11171,8 +13815,400 @@ fn standing_identity_with_view(sql: &str, view_id: &str) -> StandingProgramIdent
     }
 }
 
+fn native_inner_join_aggregate_graph() -> NativeOperatorGraph {
+    let mut graph = NativeOperatorGraph::new();
+    graph
+        .add_operator(NativeBinaryJoinOperator::new("join", |left, _right| {
+            Ok(left.clone())
+        }))
+        .unwrap();
+    graph
+        .add_operator(NativeAggregateOperator::new(
+            "aggregate",
+            AggregateValueMode::Integer,
+            false,
+        ))
+        .unwrap();
+    graph.add_edge(NativeOperatorEdgeV1 {
+        from_node_id: "join".to_string(),
+        to_node_id: "aggregate".to_string(),
+        to_port_id: "input".to_string(),
+    });
+    graph
+}
+
+fn native_left_join_aggregate_graph() -> NativeOperatorGraph {
+    let mut graph = NativeOperatorGraph::new();
+    graph
+        .add_operator(NativeLeftJoinOperator::new(
+            "join",
+            |left, _right| Ok(left.clone()),
+            |left| Ok(left.clone()),
+        ))
+        .unwrap();
+    graph
+        .add_operator(NativeAggregateOperator::new(
+            "aggregate",
+            AggregateValueMode::Integer,
+            false,
+        ))
+        .unwrap();
+    graph.add_edge(NativeOperatorEdgeV1 {
+        from_node_id: "join".to_string(),
+        to_node_id: "aggregate".to_string(),
+        to_port_id: "input".to_string(),
+    });
+    graph
+}
+
+fn native_join_input(
+    catalog: &VelorixRelationCatalogV1,
+    key_column_id: &str,
+    value_column_id: &str,
+    batches: &[RecordBatch],
+) -> DeltaBatch {
+    arrow_record_batches_to_key_value_delta_batch(
+        catalog,
+        &catalog.relation_schema.relation_id,
+        &catalog.relation_schema.relation_version,
+        catalog.schema_fingerprint.as_str(),
+        &[key_column_id.to_string()],
+        value_column_id,
+        batches,
+    )
+    .unwrap()
+}
+
+fn join_relation_input(
+    catalog: &VelorixRelationCatalogV1,
+    start_offset_inclusive: u64,
+    end_offset_exclusive: u64,
+    batches: Vec<RecordBatch>,
+) -> RelationInputBatch {
+    RelationInputBatch {
+        relation_id: catalog.relation_schema.relation_id.clone(),
+        relation_version: catalog.relation_schema.relation_version.clone(),
+        stream_id: "specialization-equivalence".to_string(),
+        partition_id: 0,
+        schema_fingerprint: catalog.schema_fingerprint.to_string(),
+        start_offset_inclusive,
+        end_offset_exclusive,
+        event_time_watermark: None,
+        batches,
+    }
+}
+
+fn apply_native_join_epoch(
+    graph: &mut NativeOperatorGraph,
+    epoch: u64,
+    left: DeltaBatch,
+    right: DeltaBatch,
+) -> DeltaBatch {
+    graph
+        .apply_epoch(
+            epoch,
+            vec![
+                NativeOperatorInputV1 {
+                    node_id: "join".to_string(),
+                    port_id: "left".to_string(),
+                    batch: left,
+                },
+                NativeOperatorInputV1 {
+                    node_id: "join".to_string(),
+                    port_id: "right".to_string(),
+                    batch: right,
+                },
+            ],
+        )
+        .unwrap()
+        .remove("aggregate")
+        .unwrap()
+}
+
+fn canonical_delta(batch: &DeltaBatch) -> DeltaBatch {
+    DeltaBatch::from_records(batch.net_rows().unwrap())
+}
+
+fn assert_join_runtime_epoch_equivalent(
+    selected: &mut Box<dyn StandingProgramRuntime + Send>,
+    reference: &mut Box<dyn StandingProgramRuntime + Send>,
+    logical_epoch: u64,
+    input_changes: Vec<RelationInputBatch>,
+) {
+    let selected_commit = selected
+        .apply_changes(
+            logical_epoch,
+            EpochIdempotencyKey::new(format!("selected-reference-{logical_epoch}")).unwrap(),
+            input_changes.clone(),
+        )
+        .unwrap();
+    let reference_commit = reference
+        .apply_changes(
+            logical_epoch,
+            EpochIdempotencyKey::new(format!("selected-reference-{logical_epoch}")).unwrap(),
+            input_changes,
+        )
+        .unwrap();
+    assert_eq!(
+        selected_commit.input_frontiers,
+        reference_commit.input_frontiers
+    );
+    assert_eq!(
+        selected_commit.input_event_time_frontiers,
+        reference_commit.input_event_time_frontiers
+    );
+    assert_eq!(selected_commit.output_deltas.len(), 1);
+    assert_eq!(reference_commit.output_deltas.len(), 1);
+    assert!(specialization_delta_difference(
+        &selected_commit.output_deltas[0].delta,
+        &reference_commit.output_deltas[0].delta,
+    )
+    .is_none());
+}
+
+fn assert_join_checkpoint_canonical_equivalent(
+    selected: &velorix_core::standing_program::RuntimeCheckpoint,
+    reference: &velorix_core::standing_program::RuntimeCheckpoint,
+) {
+    assert_eq!(selected.logical_epoch, reference.logical_epoch);
+    assert_eq!(selected.input_frontiers, reference.input_frontiers);
+    assert_eq!(
+        selected.input_event_time_frontiers,
+        reference.input_event_time_frontiers
+    );
+    assert_eq!(selected.output_frontiers, reference.output_frontiers);
+    let selected_payload: Value =
+        serde_json::from_str(&selected.state_payload.as_ref().unwrap().payload).unwrap();
+    let reference_payload: Value =
+        serde_json::from_str(&reference.state_payload.as_ref().unwrap().payload).unwrap();
+    assert_eq!(
+        selected_payload.get("published_output"),
+        reference_payload.get("published_output")
+    );
+    assert_eq!(
+        selected_payload.get("applied_epochs"),
+        reference_payload.get("applied_epochs")
+    );
+}
+
+fn canonical_key_multiplicity(batch: &DeltaBatch) -> DeltaBatch {
+    DeltaBatch::from_records(batch.net_rows().unwrap().into_iter().map(|row| {
+        DeltaRecord::new(
+            row.key.clone(),
+            DeltaValue::from_json(row.key.as_json().clone()),
+            row.weight,
+        )
+    }))
+}
+
+fn specialization_delta_difference(
+    specialized: &DeltaBatch,
+    generic: &DeltaBatch,
+) -> Option<(DeltaBatch, DeltaBatch)> {
+    let specialized = canonical_delta(specialized);
+    let generic = canonical_delta(generic);
+    (specialized != generic).then_some((specialized, generic))
+}
+
+fn native_checkpoint_state(
+    checkpoint: &NativeOperatorGraphCheckpointV1,
+    node_id: &str,
+) -> NativeOperatorStateV1 {
+    checkpoint
+        .operators
+        .iter()
+        .find(|operator| operator.node_id == node_id)
+        .unwrap()
+        .state
+        .clone()
+}
+
+fn runtime_join_checkpoint_state(
+    runtime: &(dyn StandingProgramRuntime + Send),
+) -> (
+    u64,
+    DeltaBatch,
+    DeltaBatch,
+    DeltaBatch,
+    DeltaBatch,
+    DeltaBatch,
+) {
+    let checkpoint = runtime.checkpoint().unwrap();
+    let payload: Value = serde_json::from_str(
+        &checkpoint
+            .state_payload
+            .as_ref()
+            .expect("join checkpoint payload")
+            .payload,
+    )
+    .unwrap();
+    (
+        checkpoint.logical_epoch,
+        serde_json::from_value(payload["left_state"].clone()).unwrap(),
+        serde_json::from_value(payload["right_state"].clone()).unwrap(),
+        serde_json::from_value(payload["engine"]["state"].clone()).unwrap(),
+        serde_json::from_value(payload["filtered_aggregate_state"].clone()).unwrap(),
+        serde_json::from_value(payload["published_output"].clone()).unwrap(),
+    )
+}
+
+fn assert_inner_join_specialization_state_equivalent(
+    runtime: &(dyn StandingProgramRuntime + Send),
+    graph: &NativeOperatorGraph,
+) {
+    let runtime_state = runtime_join_checkpoint_state(runtime);
+    let graph_checkpoint = graph.checkpoint().unwrap();
+    assert_eq!(runtime_state.0, graph_checkpoint.logical_epoch);
+    let NativeOperatorStateV1::Binary {
+        left_state,
+        right_state,
+    } = native_checkpoint_state(&graph_checkpoint, "join")
+    else {
+        panic!("join must have binary state");
+    };
+    let NativeOperatorStateV1::Unary { state: aggregate } =
+        native_checkpoint_state(&graph_checkpoint, "aggregate")
+    else {
+        panic!("aggregate must have unary state");
+    };
+    assert_eq!(
+        canonical_delta(&runtime_state.1),
+        canonical_delta(&left_state)
+    );
+    assert_eq!(
+        canonical_key_multiplicity(&runtime_state.2),
+        canonical_key_multiplicity(&right_state)
+    );
+    assert_eq!(
+        canonical_delta(&runtime_state.3),
+        canonical_delta(&aggregate)
+    );
+    assert_eq!(
+        canonical_delta(&runtime_state.5),
+        canonical_delta(&aggregate)
+    );
+}
+
+fn assert_left_join_specialization_state_equivalent(
+    runtime: &(dyn StandingProgramRuntime + Send),
+    graph: &NativeOperatorGraph,
+) {
+    let runtime_state = runtime_join_checkpoint_state(runtime);
+    let graph_checkpoint = graph.checkpoint().unwrap();
+    assert_eq!(runtime_state.0, graph_checkpoint.logical_epoch);
+    let NativeOperatorStateV1::Unary { state: aggregate } =
+        native_checkpoint_state(&graph_checkpoint, "aggregate")
+    else {
+        panic!("aggregate must have unary state");
+    };
+    // The narrow specialization deliberately omits generic join-side state.
+    // Its canonical logical state is the left-only aggregate and published bag.
+    assert_eq!(
+        canonical_delta(&runtime_state.4),
+        canonical_delta(&aggregate)
+    );
+    assert_eq!(
+        canonical_delta(&runtime_state.5),
+        canonical_delta(&aggregate)
+    );
+}
+
+fn assert_general_join_specialization_state_equivalent(
+    runtime: &(dyn StandingProgramRuntime + Send),
+    graph: &JoinSpecializationComparisonGraph,
+) {
+    let runtime_state = runtime_join_checkpoint_state(runtime);
+    let graph_checkpoint = graph.checkpoint().unwrap();
+    assert_eq!(runtime_state.0, graph_checkpoint.logical_epoch);
+    let NativeOperatorStateV1::Unary { state: aggregate } =
+        native_checkpoint_state(&graph_checkpoint, "aggregate")
+    else {
+        panic!("aggregate must have unary state");
+    };
+    let NativeOperatorStateV1::Binary {
+        left_state: publisher_full,
+        right_state: publisher_visible,
+    } = native_checkpoint_state(&graph_checkpoint, "publish")
+    else {
+        panic!("publisher must have binary state");
+    };
+    let runtime_aggregate = if runtime_state.4.records().is_empty() {
+        &runtime_state.3
+    } else {
+        &runtime_state.4
+    };
+    assert_eq!(
+        canonical_delta(runtime_aggregate),
+        canonical_delta(&aggregate)
+    );
+    assert_eq!(
+        canonical_delta(runtime_aggregate),
+        canonical_delta(&publisher_full)
+    );
+    assert_eq!(
+        canonical_delta(&runtime_state.5),
+        canonical_delta(&publisher_visible)
+    );
+}
+
 fn assert_join_page(
     runtime: &(dyn velorix_core::standing_program::StandingProgramRuntime + Send),
+    epoch: u64,
+    expected: &[(&str, i64, i64)],
+) {
+    assert_join_page_for_view(runtime, "scores_by_account", epoch, expected);
+}
+
+fn assert_nullable_join_page(
+    runtime: &(dyn velorix_core::standing_program::StandingProgramRuntime + Send),
+    epoch: u64,
+    expected: &[(&str, Option<i64>, i64)],
+) {
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "scores_by_account".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(epoch),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let account_ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let sums = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let counts = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+
+    assert_eq!(batch.num_rows(), expected.len());
+    for (index, (account_id, sum, count)) in expected.iter().enumerate() {
+        assert_eq!(account_ids.value(index), *account_id);
+        match sum {
+            Some(sum) => assert_eq!(sums.value(index), *sum),
+            None => assert!(sums.is_null(index)),
+        }
+        assert_eq!(counts.value(index), *count);
+    }
+}
+
+fn assert_join_page_for_view(
+    runtime: &(dyn velorix_core::standing_program::StandingProgramRuntime + Send),
+    view_id: &str,
     epoch: u64,
     expected: &[(&str, i64, i64)],
 ) {
@@ -11181,7 +14217,7 @@ fn assert_join_page(
             ScopedViewId {
                 tenant_id: "tenant-a".to_string(),
                 program_id: "program-purchases".to_string(),
-                view_id: "scores_by_account".to_string(),
+                view_id: view_id.to_string(),
             },
             SnapshotPageRequest {
                 committed_epoch: Some(epoch),
@@ -11211,6 +14247,50 @@ fn assert_join_page(
     assert_eq!(batch.num_rows(), expected.len());
     for (index, (account_id, sum, count)) in expected.iter().enumerate() {
         assert_eq!(account_ids.value(index), *account_id);
+        assert_eq!(sums.value(index), *sum);
+        assert_eq!(counts.value(index), *count);
+    }
+}
+
+fn assert_int_join_page_for_view(
+    runtime: &(dyn velorix_core::standing_program::StandingProgramRuntime + Send),
+    view_id: &str,
+    epoch: u64,
+    expected: &[(i64, i64, i64)],
+) {
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: view_id.to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(epoch),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let keys = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let sums = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let counts = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(batch.num_rows(), expected.len());
+    for (index, (key, sum, count)) in expected.iter().enumerate() {
+        assert_eq!(keys.value(index), *key);
         assert_eq!(sums.value(index), *sum);
         assert_eq!(counts.value(index), *count);
     }
@@ -11624,6 +14704,104 @@ fn assert_join_right_stats_page(
         assert_eq!(minimums.value(index), *minimum);
         assert_eq!(maximums.value(index), *maximum);
         assert_eq!(averages.value(index), *average);
+    }
+}
+
+fn assert_left_join_right_sum_page(
+    runtime: &(dyn velorix_core::standing_program::StandingProgramRuntime + Send),
+    epoch: u64,
+    expected: &[(&str, i64, Option<i64>, i64)],
+) {
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "left_join_right_sum".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(epoch),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let keys = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let sums = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let limit_sums = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let counts = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(batch.num_rows(), expected.len());
+    for (index, (key, sum, limit_sum, count)) in expected.iter().enumerate() {
+        assert_eq!(keys.value(index), *key);
+        assert_eq!(sums.value(index), *sum);
+        assert_eq!(
+            (!limit_sums.is_null(index)).then(|| limit_sums.value(index)),
+            *limit_sum
+        );
+        assert_eq!(counts.value(index), *count);
+    }
+}
+
+fn assert_left_join_empty_right_stats_page(
+    runtime: &(dyn velorix_core::standing_program::StandingProgramRuntime + Send),
+    epoch: u64,
+    expected_keys: &[&str],
+) {
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "scores_by_account_limits".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(epoch),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let keys = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let count_limits = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let distinct_limits = batch
+        .column(4)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(batch.num_rows(), expected_keys.len());
+    for (row, expected_key) in expected_keys.iter().enumerate() {
+        assert_eq!(keys.value(row), *expected_key);
+        assert_eq!(count_limits.value(row), 0);
+        assert_eq!(distinct_limits.value(row), 0);
+        for column in 5..=8 {
+            assert!(batch.column(column).is_null(row));
+        }
     }
 }
 
@@ -12321,6 +15499,96 @@ fn generic_adapter_catalog(mut catalog: VelorixRelationCatalogV1) -> VelorixRela
     catalog
 }
 
+fn composite_join_catalogs() -> (VelorixRelationCatalogV1, VelorixRelationCatalogV1) {
+    let add_tenant_key = |mut catalog: VelorixRelationCatalogV1| {
+        let weight_index = catalog
+            .relation_schema
+            .columns
+            .iter()
+            .position(|column| column.column_id == catalog.relation_schema.weight_column_id)
+            .unwrap();
+        catalog.relation_schema.columns.insert(
+            weight_index,
+            RelationColumnV1 {
+                column_id: "tenant_id".into(),
+                name: "tenant_id".into(),
+                logical_type: VelorixLogicalTypeV1::Utf8,
+                physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+                nullable: false,
+                ordinal: 0,
+                semantic_role: RelationSemanticRoleV1::PrimaryKey,
+            },
+        );
+        for (ordinal, column) in catalog.relation_schema.columns.iter_mut().enumerate() {
+            column.ordinal = ordinal as u32;
+        }
+        catalog
+            .relation_schema
+            .primary_key_column_ids
+            .insert(0, "tenant_id".into());
+        let fingerprint = SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema)
+            .expect("composite join catalog should fingerprint");
+        catalog.schema_fingerprint = fingerprint.clone();
+        catalog.incremental_relation.schema_fingerprint = fingerprint;
+        generic_adapter_catalog(catalog)
+    };
+    let scores = add_tenant_key(scores_catalog());
+    let mut accounts = add_tenant_key(accounts_catalog());
+    let tenant = accounts
+        .relation_schema
+        .columns
+        .iter_mut()
+        .find(|column| column.column_id == "tenant_id")
+        .unwrap();
+    tenant.column_id = "account_tenant_id".into();
+    tenant.name = "account_tenant_id".into();
+    accounts.relation_schema.primary_key_column_ids =
+        vec!["account_id".into(), "account_tenant_id".into()];
+    let fingerprint = SchemaFingerprintV1::for_relation_schema(&accounts.relation_schema)
+        .expect("renamed composite join catalog should fingerprint");
+    accounts.schema_fingerprint = fingerprint.clone();
+    accounts.incremental_relation.schema_fingerprint = fingerprint;
+    (scores, accounts)
+}
+
+fn three_input_composite_join_catalogs() -> [VelorixRelationCatalogV1; 3] {
+    let (scores, accounts) = composite_join_catalogs();
+    let mut profiles = accounts.clone();
+    profiles.relation_schema.relation_id = "profiles".into();
+    profiles.relation_schema.relation_name = "profiles".into();
+    profiles.datafusion_registration.name = "profiles".into();
+    profiles.incremental_relation.relation_id = "profiles".into();
+    let fingerprint = SchemaFingerprintV1::for_relation_schema(&profiles.relation_schema)
+        .expect("profile composite catalog should fingerprint");
+    profiles.schema_fingerprint = fingerprint.clone();
+    profiles.incremental_relation.schema_fingerprint = fingerprint;
+    [scores, accounts, profiles]
+}
+
+fn scores_with_category_catalog() -> VelorixRelationCatalogV1 {
+    let mut catalog = scores_catalog();
+    catalog.relation_schema.columns.insert(
+        2,
+        RelationColumnV1 {
+            column_id: "category".to_string(),
+            name: "category".to_string(),
+            logical_type: VelorixLogicalTypeV1::Utf8,
+            physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+            nullable: true,
+            ordinal: 2,
+            semantic_role: RelationSemanticRoleV1::Metadata,
+        },
+    );
+    for (ordinal, column) in catalog.relation_schema.columns.iter_mut().enumerate() {
+        column.ordinal = ordinal as u32;
+    }
+    let schema_fingerprint =
+        SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema).unwrap();
+    catalog.schema_fingerprint = schema_fingerprint.clone();
+    catalog.incremental_relation.schema_fingerprint = schema_fingerprint;
+    generic_adapter_catalog(catalog)
+}
+
 fn scores_with_adjustment_catalog() -> VelorixRelationCatalogV1 {
     let mut catalog = scores_catalog();
     catalog.relation_schema.columns.insert(
@@ -12750,6 +16018,183 @@ fn purchases_output_schema() -> RelationSchema {
             },
         ],
         primary_key: vec!["user_id".to_string()],
+    }
+}
+
+fn composite_bucket_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "scores_by_user_bucket".to_string(),
+        relation_name: "scores_by_user_bucket".to_string(),
+        relation_version: "2026-08-10.v1".to_string(),
+        schema_fingerprint:
+            "sha256:2000000000000000000000000000000000000000000000000000000000000002".to_string(),
+        columns: vec![
+            ColumnSchema {
+                name: "user_id".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "bucket".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "sum".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "count".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["user_id".to_string(), "bucket".to_string()],
+    }
+}
+
+fn composite_join_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "scores_by_tenant".into(),
+        relation_name: "scores_by_tenant".into(),
+        relation_version: "2026-08-10.v1".into(),
+        schema_fingerprint:
+            "sha256:6000000000000000000000000000000000000000000000000000000000000006".into(),
+        columns: vec![
+            ColumnSchema {
+                name: "tenant_id".into(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "sum".into(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "count".into(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["tenant_id".into()],
+    }
+}
+
+fn three_input_join_count_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "three_input_counts".into(),
+        relation_name: "three_input_counts".into(),
+        relation_version: "2026-08-10.v1".into(),
+        schema_fingerprint:
+            "sha256:00000000000000000000000000000000000000000000000000000000000000c5".into(),
+        columns: vec![
+            ColumnSchema {
+                name: "tenant_id".into(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "user_id".into(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "count".into(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["tenant_id".into(), "user_id".into()],
+    }
+}
+
+fn non_primary_join_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "scores_by_bucket".into(),
+        relation_name: "scores_by_bucket".into(),
+        relation_version: "2026-08-10.v1".into(),
+        schema_fingerprint:
+            "sha256:7000000000000000000000000000000000000000000000000000000000000007".into(),
+        columns: vec![
+            ColumnSchema {
+                name: "bucket".into(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "sum".into(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "count".into(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["bucket".into()],
+    }
+}
+
+fn global_count_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "score_count".to_string(),
+        relation_name: "score_count".to_string(),
+        relation_version: "2026-08-10.v1".to_string(),
+        schema_fingerprint:
+            "sha256:5000000000000000000000000000000000000000000000000000000000000005".to_string(),
+        columns: vec![ColumnSchema {
+            name: "count".to_string(),
+            data_type: SqlDataType::Int64,
+            nullable: false,
+        }],
+        primary_key: Vec::new(),
+    }
+}
+
+fn assert_global_count_batch(batch: &RecordBatch, expected: i64) {
+    assert_eq!(batch.num_columns(), 1);
+    assert_eq!(batch.num_rows(), 1);
+    let count = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(count.value(0), expected);
+}
+
+fn composite_category_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "scores_by_user_category".to_string(),
+        relation_name: "scores_by_user_category".to_string(),
+        relation_version: "2026-08-10.v1".to_string(),
+        schema_fingerprint:
+            "sha256:3000000000000000000000000000000000000000000000000000000000000003".to_string(),
+        columns: vec![
+            ColumnSchema {
+                name: "user_id".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "category".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "sum".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "count".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["user_id".to_string(), "category".to_string()],
     }
 }
 
@@ -13686,6 +17131,39 @@ fn join_right_stats_output_schema() -> RelationSchema {
     }
 }
 
+fn left_join_right_sum_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "left_join_right_sum".to_string(),
+        relation_name: "left_join_right_sum".to_string(),
+        relation_version: "v1".to_string(),
+        schema_fingerprint:
+            "sha256:0000000000000000000000000000000000000000000000000000000000000022".to_string(),
+        columns: vec![
+            ColumnSchema {
+                name: "account_id".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "sum".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "limit_sum".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "count".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["account_id".to_string()],
+    }
+}
+
 fn join_decimal_avg_output_schema() -> RelationSchema {
     RelationSchema {
         relation_id: "scores_by_account_decimal_avg".to_string(),
@@ -13806,54 +17284,12 @@ fn join_stats_logical_plan(
     accounts: &VelorixRelationCatalogV1,
     output_schema: &RelationSchema,
 ) -> VelorixLogicalViewPlanV1 {
-    let base_sql = "select a.account_id, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.user_id = a.account_id group by a.account_id";
-    let mut logical_plan = lower_supported_join_view_sql_to_logical_plan(
-        base_sql,
+    lower_supported_join_view_sql_to_logical_plan(
+        sql,
         &[scores.clone(), accounts.clone()],
-        &join_output_schema(),
+        output_schema,
     )
-    .unwrap();
-    let aggregate_outputs = join_stats_aggregate_outputs();
-    logical_plan.view_sql = sql.to_string();
-    logical_plan.output_relation.relation_id = output_schema.relation_id.clone();
-    logical_plan.output_relation.relation_name = output_schema.relation_name.clone();
-    logical_plan.output_relation.relation_version = output_schema.relation_version.clone();
-    logical_plan.output_relation.schema_fingerprint = output_schema.schema_fingerprint.clone();
-    for node in &mut logical_plan.nodes {
-        match node {
-            VelorixLogicalViewPlanNodeV1::Aggregate { accumulators, .. } => {
-                *accumulators = aggregate_outputs
-                    .iter()
-                    .map(|output| LogicalPlanAggregateAccumulatorV1 {
-                        function: output.function,
-                        input: output.input_column_id.as_ref().map(|column_id| {
-                            LogicalPlanColumnRef {
-                                relation_id: scores.relation_schema.relation_id.clone(),
-                                column_id: column_id.clone(),
-                            }
-                        }),
-                        output_column_id: output.output_column_id.clone(),
-                    })
-                    .collect();
-            }
-            VelorixLogicalViewPlanNodeV1::Output { relation, .. } => {
-                relation.relation_id = output_schema.relation_id.clone();
-                relation.relation_name = output_schema.relation_name.clone();
-                relation.relation_version = output_schema.relation_version.clone();
-                relation.schema_fingerprint = output_schema.schema_fingerprint.clone();
-            }
-            _ => {}
-        }
-    }
-    let VelorixLogicalViewExecutionV1::TwoInputJoinSumCount { plan } = &mut logical_plan.execution
-    else {
-        panic!("base plan should be a join execution");
-    };
-    plan.output_key_column_id = "account_id".to_string();
-    plan.aggregate_outputs = aggregate_outputs;
-    logical_plan.plan_hash = None;
-    logical_plan.plan_hash = Some(logical_view_plan_hash(&logical_plan).unwrap());
-    logical_plan
+    .unwrap()
 }
 
 fn row_number_logical_plan(
@@ -13861,126 +17297,17 @@ fn row_number_logical_plan(
     catalog: &VelorixRelationCatalogV1,
     output_schema: &RelationSchema,
 ) -> VelorixLogicalViewPlanV1 {
-    let input_relation = LogicalPlanRelationRef {
-        relation_id: catalog.relation_schema.relation_id.clone(),
-        relation_name: catalog.relation_schema.relation_name.clone(),
-        relation_version: catalog.relation_schema.relation_version.clone(),
-        schema_fingerprint: catalog.schema_fingerprint.to_string(),
-    };
-    let output_relation = LogicalPlanRelationRef {
-        relation_id: output_schema.relation_id.clone(),
-        relation_name: output_schema.relation_name.clone(),
-        relation_version: output_schema.relation_version.clone(),
-        schema_fingerprint: output_schema.schema_fingerprint.clone(),
-    };
-    let column = |column_id: &str| LogicalPlanColumnRef {
-        relation_id: catalog.relation_schema.relation_id.clone(),
-        column_id: column_id.to_string(),
-    };
-    let plan = SupportedAnalyticRowNumberPlan {
-        input_relation_id: catalog.relation_schema.relation_id.clone(),
-        key_column_id: "user_id".to_string(),
-        output_key_column_id: "user_id".to_string(),
-        function: SupportedAnalyticWindowFunction::RowNumber,
-        partition_column_id: "score".to_string(),
-        order_column_id: "score".to_string(),
-        order_descending: true,
-        output_row_number_column_id: "rank".to_string(),
-        predicate_expr: Some(RowPredicateExpr::Atom {
-            predicate: RowPredicate {
-                column_id: "score".to_string(),
-                op: PredicateOp::Gt,
-                literal: json!(0),
-            },
-        }),
-        rank_limit: None,
-    };
-    let mut logical_plan = VelorixLogicalViewPlanV1 {
-        plan_version: LOGICAL_VIEW_PLAN_VERSION_V1,
-        plan_hash: None,
-        view_sql: sql.to_string(),
-        capability_version: LOGICAL_VIEW_PLAN_CAPABILITY_VERSION_V1.to_string(),
-        input_relations: vec![input_relation.clone()],
-        output_relation: output_relation.clone(),
-        nodes: vec![
-            VelorixLogicalViewPlanNodeV1::RelationScan {
-                node_id: "scan_input".to_string(),
-                relation: input_relation,
-            },
-            VelorixLogicalViewPlanNodeV1::Filter {
-                node_id: "filter_row_number_input".to_string(),
-                input: "scan_input".to_string(),
-                predicate: velorix_core::view_plan::LogicalPlanPredicateV1 {
-                    column: column("score"),
-                    op: PredicateOp::Gt,
-                    literal: json!(0),
-                },
-            },
-            VelorixLogicalViewPlanNodeV1::RowNumber {
-                node_id: "rank_materialized_output".to_string(),
-                input: "filter_row_number_input".to_string(),
-                partition_column: column("score"),
-                order_column: column("score"),
-                descending: true,
-                rank_limit: None,
-            },
-            VelorixLogicalViewPlanNodeV1::Output {
-                node_id: "output_materialized_view".to_string(),
-                input: "rank_materialized_output".to_string(),
-                relation: output_relation,
-            },
-        ],
-        state_requirements: vec![LogicalPlanStateRequirementV1 {
-            node_id: "rank_materialized_output".to_string(),
-            state_kind: LogicalPlanStateKindV1::RowNumber,
-            key_columns: vec![column("user_id")],
-            codec_version: LOGICAL_VIEW_STATE_CODEC_VERSION_V1.to_string(),
-        }],
-        output_codec_version: LOGICAL_VIEW_OUTPUT_CODEC_VERSION_V1.to_string(),
-        execution: VelorixLogicalViewExecutionV1::AnalyticRowNumber { plan },
-    };
+    let admitted_sql = "select user_id, row_number() over (partition by score order by score desc, user_id asc) as rank from scores where score > 0";
+    let mut logical_plan = lower_supported_analytic_row_number_sql_to_logical_plan(
+        admitted_sql,
+        catalog,
+        output_schema,
+    )
+    .unwrap();
+    logical_plan.view_sql = sql.to_string();
+    logical_plan.plan_hash = None;
     logical_plan.plan_hash = Some(logical_view_plan_hash(&logical_plan).unwrap());
     logical_plan
-}
-
-fn join_stats_aggregate_outputs() -> Vec<SupportedAggregateOutput> {
-    vec![
-        SupportedAggregateOutput {
-            function: LogicalPlanAggregateFunctionV1::Sum,
-            input_column_id: Some("score".to_string()),
-            input_relation_side: Some(SupportedAggregateInputRelationSide::Left),
-            input_expression: None,
-            output_column_id: "sum".to_string(),
-        },
-        SupportedAggregateOutput {
-            function: LogicalPlanAggregateFunctionV1::Count,
-            input_column_id: None,
-            input_relation_side: None,
-            input_expression: None,
-            output_column_id: "count".to_string(),
-        },
-        SupportedAggregateOutput {
-            function: LogicalPlanAggregateFunctionV1::Min,
-            input_column_id: Some("score".to_string()),
-            input_relation_side: Some(SupportedAggregateInputRelationSide::Left),
-            input_expression: None,
-            output_column_id: "min_score".to_string(),
-        },
-        SupportedAggregateOutput {
-            function: LogicalPlanAggregateFunctionV1::Max,
-            input_column_id: Some("score".to_string()),
-            input_relation_side: Some(SupportedAggregateInputRelationSide::Left),
-            input_expression: None,
-            output_column_id: "max_score".to_string(),
-        },
-        SupportedAggregateOutput {
-            function: LogicalPlanAggregateFunctionV1::Avg,
-            input_column_id: Some("score".to_string()),
-            input_relation_side: Some(SupportedAggregateInputRelationSide::Left),
-            input_expression: None,
-            output_column_id: "avg_score".to_string(),
-        },
-    ]
 }
 
 fn device_status_batch(rows: &[(&str, bool, i64, i64)]) -> RecordBatch {
@@ -14180,6 +17507,124 @@ fn scores_batch() -> RecordBatch {
             Arc::new(StringArray::from(vec!["alice", "bob", "alice"])) as _,
             Arc::new(Int64Array::from(vec![10, 5, 7])) as _,
             Arc::new(Int64Array::from(vec![1, 1, 1])) as _,
+        ],
+    )
+    .unwrap()
+}
+
+fn relation_input(
+    catalog: &VelorixRelationCatalogV1,
+    stream_id: &str,
+    start_offset_inclusive: u64,
+    end_offset_exclusive: u64,
+    batch: RecordBatch,
+) -> RelationInputBatch {
+    RelationInputBatch {
+        relation_id: catalog.relation_schema.relation_id.clone(),
+        relation_version: catalog.relation_schema.relation_version.clone(),
+        stream_id: stream_id.into(),
+        partition_id: 0,
+        schema_fingerprint: catalog.schema_fingerprint.to_string(),
+        start_offset_inclusive,
+        end_offset_exclusive,
+        event_time_watermark: None,
+        batches: vec![batch],
+    }
+}
+
+fn composite_scores_rows_batch(rows: &[(&str, i64, &str, i64)]) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("score", DataType::Int64, false),
+            Field::new("tenant_id", DataType::Utf8, false),
+            Field::new("delta", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(Int64Array::from(
+                rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.2).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(Int64Array::from(
+                rows.iter().map(|row| row.3).collect::<Vec<_>>(),
+            )) as _,
+        ],
+    )
+    .unwrap()
+}
+
+fn composite_accounts_rows_batch(rows: &[(&str, i64, &str, &str, i64)]) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("account_id", DataType::Utf8, false),
+            Field::new("limit", DataType::Int64, false),
+            Field::new("tier", DataType::Utf8, false),
+            Field::new("account_tenant_id", DataType::Utf8, false),
+            Field::new("delta", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(Int64Array::from(
+                rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.2).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.3).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(Int64Array::from(
+                rows.iter().map(|row| row.4).collect::<Vec<_>>(),
+            )) as _,
+        ],
+    )
+    .unwrap()
+}
+
+fn scores_with_category_batch() -> RecordBatch {
+    scores_with_category_rows_batch(&[
+        ("u1", 5, Some("a"), 1),
+        ("u1", 7, Some("a"), 1),
+        ("u1", 15, None, 1),
+    ])
+}
+
+fn scores_with_category_rows_batch(rows: &[(&str, i64, Option<&str>, i64)]) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("score", DataType::Int64, false),
+            Field::new("category", DataType::Utf8, true),
+            Field::new("delta", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|(user_id, _, _, _)| *user_id)
+                    .collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(Int64Array::from(
+                rows.iter()
+                    .map(|(_, score, _, _)| *score)
+                    .collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|(_, _, category, _)| *category)
+                    .collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(Int64Array::from(
+                rows.iter()
+                    .map(|(_, _, _, delta)| *delta)
+                    .collect::<Vec<_>>(),
+            )) as _,
         ],
     )
     .unwrap()

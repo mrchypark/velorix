@@ -7,6 +7,12 @@ service VelorixMeta {
   rpc StoreRelationCatalog(StoreRelationCatalogRequest) returns (StoreRelationCatalogResponse);
   rpc ReadRelationCatalog(ReadRelationCatalogRequest) returns (ReadRelationCatalogResponse);
   rpc ReserveIngestRange(ReserveIngestRangeRequest) returns (ReserveIngestRangeResponse);
+  rpc CommitIngestRange(ReserveIngestRangeRequest) returns (CommitIngestRangeResponse);
+  rpc CaptureIngestSourceCut(CaptureIngestSourceCutRequest) returns (CaptureIngestSourceCutResponse);
+  rpc BeginViewBootstrap(BeginViewBootstrapRequest) returns (BeginViewBootstrapResponse);
+  rpc ReadViewBootstrap(ReadViewBootstrapRequest) returns (ReadViewBootstrapResponse);
+  rpc FixViewBootstrapActivationCut(FixViewBootstrapActivationCutRequest) returns (FixViewBootstrapActivationCutResponse);
+  rpc PromoteViewBootstrap(PromoteViewBootstrapRequest) returns (PromoteViewBootstrapResponse);
   rpc AcquireStandingRuntimeOwner(AcquireStandingRuntimeOwnerRequest) returns (AcquireStandingRuntimeOwnerResponse);
   rpc ReadStandingRuntimeOwner(ReadStandingRuntimeOwnerRequest) returns (ReadStandingRuntimeOwnerResponse);
   rpc PublishStandingRuntimeCheckpoint(PublishStandingRuntimeCheckpointRequest) returns (PublishStandingRuntimeCheckpointResponse);
@@ -78,6 +84,56 @@ message ReserveIngestRangeResponse {
   string outcome = 1;
 }
 
+message CommitIngestRangeResponse {
+  string outcome = 1;
+}
+
+message CaptureIngestSourceCutRequest {
+  bytes request_json = 1;
+}
+
+message CaptureIngestSourceCutResponse {
+  bytes source_cut_json = 1;
+}
+
+message BeginViewBootstrapRequest {
+  bytes request_json = 1;
+}
+
+message BeginViewBootstrapResponse {
+  string outcome = 1;
+  bytes control_json = 2;
+}
+
+message ReadViewBootstrapRequest {
+  string tenant_id = 1;
+  string program_id = 2;
+  string view_id = 3;
+}
+
+message ReadViewBootstrapResponse {
+  bool found = 1;
+  bytes control_json = 2;
+}
+
+message FixViewBootstrapActivationCutRequest {
+  bytes request_json = 1;
+}
+
+message FixViewBootstrapActivationCutResponse {
+  string outcome = 1;
+  bytes control_json = 2;
+}
+
+message PromoteViewBootstrapRequest {
+  bytes request_json = 1;
+}
+
+message PromoteViewBootstrapResponse {
+  string outcome = 1;
+  bytes control_json = 2;
+}
+
 message StandingRuntimeCheckpointPointer {
   string tenant_id = 1;
   string program_id = 2;
@@ -87,6 +143,12 @@ message StandingRuntimeCheckpointPointer {
   string content_hash = 6;
   repeated string output_manifest_refs = 7;
   string manifest_hash = 8;
+  uint64 bootstrap_generation = 9;
+  string plan_hash = 10;
+  string coverage_hash = 11;
+  bytes input_coverage_json = 12;
+  string previous_checkpoint_key = 13;
+  string previous_manifest_hash = 14;
 }
 
 message StandingRuntimeOwnerClaim {

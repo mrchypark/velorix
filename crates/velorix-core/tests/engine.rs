@@ -15,6 +15,14 @@ fn input_delta(account: &str, amount: i64, weight: i64) -> DeltaRecord {
     )
 }
 
+fn keyed_input_delta(key: serde_json::Value, amount: i64, weight: i64) -> DeltaRecord {
+    DeltaRecord::new(
+        DeltaKey::from_json(key),
+        DeltaValue::from_json(json!(amount)),
+        weight,
+    )
+}
+
 fn decimal_input_delta(account: &str, amount: &str, weight: i64) -> DeltaRecord {
     DeltaRecord::new(
         DeltaKey::from_json(json!(account)),
@@ -119,6 +127,60 @@ fn keyed_aggregate_kernel_checkpoint_plus_replay_matches_uninterrupted_run() {
     restored.push_changes(2, &replay_input).unwrap();
 
     assert_eq!(net_state(&restored), net_state(&uninterrupted));
+}
+
+#[test]
+fn keyed_aggregate_kernel_restores_composite_null_group_state_from_wire_checkpoint() {
+    let nullable_group = json!({ "region": "north", "category": null });
+    let hardware_group = json!({ "region": "north", "category": "hardware" });
+    let south_group = json!({ "region": "south", "category": null });
+    let checkpoint_input = batch([
+        keyed_input_delta(nullable_group.clone(), 10, 1),
+        keyed_input_delta(nullable_group.clone(), 5, 1),
+        keyed_input_delta(hardware_group.clone(), 7, 1),
+    ]);
+    let replay_input = batch([
+        keyed_input_delta(nullable_group.clone(), 5, -1),
+        keyed_input_delta(south_group.clone(), 3, 1),
+    ]);
+
+    let mut uninterrupted = KeyedAggregateKernel::new();
+    uninterrupted.push_changes(1, &checkpoint_input).unwrap();
+    uninterrupted.push_changes(2, &replay_input).unwrap();
+
+    let mut checkpointed = KeyedAggregateKernel::new();
+    checkpointed.push_changes(1, &checkpoint_input).unwrap();
+    let encoded = serde_json::to_vec(&checkpointed.checkpoint_state().to_payload()).unwrap();
+    assert!(
+        String::from_utf8_lossy(&encoded).contains("\"category\":null"),
+        "wire checkpoint must preserve a NULL composite-key component"
+    );
+    let decoded = serde_json::from_slice::<EngineCheckpointPayload>(&encoded).unwrap();
+    let mut restored = KeyedAggregateKernel::from_checkpoint(decoded.into_checkpoint()).unwrap();
+    restored.push_changes(2, &replay_input).unwrap();
+
+    assert_eq!(restored.logical_epoch(), 2);
+    assert_eq!(net_state(&restored), net_state(&uninterrupted));
+    assert_eq!(
+        net_state(&restored),
+        vec![
+            DeltaRecord::new(
+                DeltaKey::from_json(json!({ "category": "hardware", "region": "north" })),
+                DeltaValue::from_json(json!({ "sum": 7, "count": 1 })),
+                1,
+            ),
+            DeltaRecord::new(
+                DeltaKey::from_json(json!({ "category": null, "region": "north" })),
+                DeltaValue::from_json(json!({ "sum": 10, "count": 1 })),
+                1,
+            ),
+            DeltaRecord::new(
+                DeltaKey::from_json(json!({ "category": null, "region": "south" })),
+                DeltaValue::from_json(json!({ "sum": 3, "count": 1 })),
+                1,
+            ),
+        ]
+    );
 }
 
 #[test]

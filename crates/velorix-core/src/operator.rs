@@ -107,6 +107,18 @@ where
     pub fn right_state(&self) -> DeltaBatch {
         self.right.batch()
     }
+
+    pub fn restore_state(
+        &mut self,
+        left: &DeltaBatch,
+        right: &DeltaBatch,
+    ) -> Result<(), OperatorError> {
+        let restored_left = SideState::default().applied(left)?;
+        let restored_right = SideState::default().applied(right)?;
+        self.left = restored_left;
+        self.right = restored_right;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

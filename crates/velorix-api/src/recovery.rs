@@ -195,7 +195,8 @@ pub(super) async fn replay_committed_ingest_into_standing_runtime_limited(
                         descriptor.end_offset_exclusive,
                     )],
                     owner,
-                ),
+                )
+                .with_published_relation(published_relation_binding_for_active_view(active)?),
                 None,
             )
             .await
@@ -237,7 +238,8 @@ pub(super) async fn replay_committed_ingest_into_standing_runtime_limited(
             &active.spec.view_id,
             &apply_result.checkpoint,
             &apply_result.output_deltas,
-            StandingRuntimeCheckpointPersistContext::new(None, coalesced_replay_checkpoints, owner),
+            StandingRuntimeCheckpointPersistContext::new(None, coalesced_replay_checkpoints, owner)
+                .with_published_relation(published_relation_binding_for_active_view(active)?),
             None,
         )
         .await

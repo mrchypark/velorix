@@ -80,6 +80,8 @@ impl SingleKeySumCountRuntime {
         validate_plan_matches_catalog(&plan, &catalog)?;
         let value_mode = aggregate_value_mode_for_plan(&catalog, &plan)?;
         let track_extrema = plan_tracks_extrema(&plan);
+        let filtered_aggregate_state = DeltaBatch::default();
+        let published_output = publish_aggregate_state(&filtered_aggregate_state, &plan)?;
         Ok(Self {
             identity,
             catalog,
@@ -92,8 +94,8 @@ impl SingleKeySumCountRuntime {
                 value_mode,
                 track_extrema,
             ),
-            published_output: DeltaBatch::default(),
-            filtered_aggregate_state: DeltaBatch::default(),
+            published_output,
+            filtered_aggregate_state,
             input_frontiers: Vec::new(),
             input_event_time_frontiers: Vec::new(),
             applied_epochs: BTreeMap::new(),
@@ -233,8 +235,10 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
                     &self.input_schema,
                     "generic_input_relation",
                 )?;
-                let delta = single_key_input_delta_batch(&self.catalog, &self.plan, &input)?;
+                let delta = aggregate_group_input_delta_batch(&self.catalog, &self.plan, &input)?;
                 let delta = filter_delta_batch_for_plan(&delta, &self.plan, &self.catalog)?;
+                let delta =
+                    rekey_delta_batch_for_aggregate_group(&delta, &self.catalog, &self.plan)?;
                 combined = combined.combine(&delta);
                 advance_input_frontier(&mut input_frontiers, &input)?;
                 advance_input_event_time_frontier(&mut input_event_time_frontiers, &input)?;
@@ -246,8 +250,9 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
                 &self.catalog,
             )?;
             let aggregate_outputs = supported_view_plan_aggregate_outputs(&self.plan);
+            let published_state = publish_aggregate_state(&next_state, &self.plan)?;
             let visible_output = filter_output_delta_for_having(
-                &next_state,
+                &published_state,
                 self.plan.having.as_ref(),
                 self.plan.having_expr.as_ref(),
                 &self.output_schema,
@@ -417,6 +422,8 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
             }),
             output_manifest_refs: Vec::new(),
             owner_epoch: None,
+            input_coverage: None,
+            causal_cut: None,
         })
     }
 
@@ -467,7 +474,10 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
         )
         .map_err(|_| invalid_checkpoint())?;
         let published_output = payload.published_output;
-        let filtered_aggregate_state = if payload.filtered_aggregate_state.records().is_empty() {
+        let filtered_aggregate_state = if single_key_plan_uses_runtime_aggregate_state(&plan)
+            && !supported_view_plan_is_singleton(&plan)
+            && payload.filtered_aggregate_state.records().is_empty()
+        {
             published_output.clone()
         } else {
             payload.filtered_aggregate_state

@@ -21,6 +21,7 @@ tokio = { workspace = true }
 velorix-k8s = { path = "../velorix-k8s" }
 velorix-meta = { path = "../velorix-meta" }
 velorix-control = { path = "../velorix-control" }
+velorix-core = { path = "../velorix-core" }
 velorix-runtime = { path = "../velorix-runtime" }
 
 [dev-dependencies]

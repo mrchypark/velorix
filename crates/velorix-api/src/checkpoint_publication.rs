@@ -8,6 +8,10 @@ pub(super) async fn persist_standing_runtime_checkpoint(
     context: StandingRuntimeCheckpointPersistContext,
     mut timer: Option<&mut IngestTimer>,
 ) -> Result<StandingRuntimeCheckpointWriteSummary, ApiError> {
+    let checkpoint =
+        standing_runtime_checkpoint_with_authoritative_input_coverage(state, view_id, checkpoint)
+            .await?;
+    let checkpoint = &checkpoint;
     if !checkpoint.identity.view_ids.iter().any(|id| id == view_id) {
         return Err(ApiError::bad_request(format!(
             "standing runtime checkpoint identity does not include view `{view_id}`"
@@ -21,17 +25,47 @@ pub(super) async fn persist_standing_runtime_checkpoint(
         &checkpoint.state_root.content_hash,
     )
     .map_err(ApiError::bad_request)?;
-    let previous_record = match context.previous_record {
+    let StandingRuntimeCheckpointPersistContext {
+        previous_record,
+        replay_checkpoints_to_merge,
+        owner,
+        published_relation,
+        direct_view_inputs,
+    } = context;
+    let previous_record = match previous_record {
         Some(record) => Some(record),
         None => {
             read_latest_standing_runtime_checkpoint(state, &checkpoint.identity, view_id).await?
         }
     };
+    let checkpoint = standing_runtime_checkpoint_with_prior_input_coverage(
+        checkpoint,
+        previous_record.as_ref(),
+        published_relation.as_ref(),
+    )?;
+    let resolved_view_cursors = resolve_authoritative_direct_view_inputs(
+        state,
+        &checkpoint.identity.tenant_id,
+        &direct_view_inputs,
+    )
+    .await?;
+    let checkpoint = standing_runtime_checkpoint_with_causal_cut(
+        &checkpoint,
+        &resolved_view_cursors,
+        published_relation.as_ref(),
+    )?;
+    let checkpoint = &checkpoint;
     let expected_previous = previous_record
         .as_ref()
         .map(standing_runtime_checkpoint_pointer_from_record);
     let output_delta_publications =
-        standing_runtime_output_delta_records_for_checkpoint(checkpoint, view_id, output_deltas)?;
+        standing_runtime_output_delta_records_for_checkpoint_with_binding(
+            checkpoint,
+            view_id,
+            output_deltas,
+            &checkpoint_key,
+            published_relation.as_ref(),
+        )?;
     let mut write_summary = StandingRuntimeCheckpointWriteSummary {
         output_delta_writes: output_delta_publications.len(),
         state_payload_writes: 1,
@@ -39,6 +73,7 @@ pub(super) async fn persist_standing_runtime_checkpoint(
         checkpoint_pointer_writes: usize::from(state.meta_store.is_some()),
         latest_cache_writes: 1,
         compaction_scheduled: 0,
+        output_refs: Vec::new(),
     };
     for publication in &output_delta_publications {
         persist_standing_runtime_output_delta(
@@ -61,11 +96,7 @@ pub(super) async fn persist_standing_runtime_checkpoint(
     let checkpoint_for_record = standing_runtime_checkpoint_with_durable_publication_refs(
         checkpoint,
         None,
-        output_delta_publications
-            .iter()
-            .map(|publication| &publication.delta_key)
-            .collect::<Vec<_>>()
-            .as_slice(),
+        &output_delta_publications,
         &state_payload_key,
     );
     let duplicate_checkpoint = expected_previous.as_ref().is_some_and(|pointer| {
@@ -73,7 +104,12 @@ pub(super) async fn persist_standing_runtime_checkpoint(
             && pointer.logical_epoch == checkpoint.logical_epoch
             && pointer.content_hash == checkpoint.state_root.content_hash
             && pointer.output_manifest_refs == checkpoint_for_record.output_manifest_refs
+            && pointer.input_coverage == checkpoint_for_record.input_coverage
+            && previous_record.as_ref().is_some_and(|record| {
+                record.checkpoint.causal_cut == checkpoint_for_record.causal_cut
+            })
     });
+    write_summary.output_refs = checkpoint_for_record.output_manifest_refs.clone();
     let previous_checkpoint = if duplicate_checkpoint {
         previous_record
             .as_ref()
@@ -89,7 +125,7 @@ pub(super) async fn persist_standing_runtime_checkpoint(
     .map_err(ApiError::bad_request)?;
     let replay_checkpoints = merged_standing_runtime_replay_checkpoints(
         previous_record.as_ref(),
-        context.replay_checkpoints_to_merge,
+        replay_checkpoints_to_merge,
     );
     let record = StandingRuntimeCheckpointRecord {
         schema_version: 1,
@@ -103,16 +139,7 @@ pub(super) async fn persist_standing_runtime_checkpoint(
     };
     let bytes =
         serde_json::to_vec(&record).map_err(|source| ApiError::internal(source.to_string()))?;
-    let candidate = standing_runtime_checkpoint_pointer_from_key(
-        &checkpoint_key,
-        &checkpoint.identity.tenant_id,
-        &checkpoint.identity.program_id,
-        view_id,
-        checkpoint.logical_epoch,
-        &checkpoint.state_root.content_hash,
-        stable_bytes_hash(&bytes),
-        record.checkpoint.output_manifest_refs.clone(),
-    )?;
+    let candidate = standing_runtime_checkpoint_pointer_from_record(&record);
     let checkpoint_path = ObjectPath::from(checkpoint_key.as_str());
     let result = state
         .store
@@ -148,13 +175,8 @@ pub(super) async fn persist_standing_runtime_checkpoint(
     if state.meta_store.is_some() {
         validate_checkpoint_pointer_object_exists_for_meta_rehydration(state, &candidate).await?;
     }
-    publish_standing_runtime_checkpoint_pointer(
-        state,
-        expected_previous,
-        candidate.clone(),
-        context.owner,
-    )
-    .await?;
+    publish_standing_runtime_checkpoint_pointer(state, expected_previous, candidate.clone(), owner)
+        .await?;
     if let Some(timer) = timer.as_mut() {
         timer.mark("checkpoint_pointer");
     }
@@ -189,6 +211,369 @@ pub(super) async fn persist_standing_runtime_checkpoint(
     Ok(write_summary)
 }
 
+fn standing_runtime_checkpoint_with_prior_input_coverage(
+    checkpoint: &RuntimeCheckpoint,
+    previous_record: Option<&StandingRuntimeCheckpointRecord>,
+    published_relation: Option<&PublishedRelationBindingV1>,
+) -> Result<RuntimeCheckpoint, ApiError> {
+    if checkpoint.input_coverage.is_some() || published_relation.is_none() {
+        return Ok(checkpoint.clone());
+    }
+    let previous_coverage = previous_record
+        .and_then(|record| record.checkpoint.input_coverage.as_ref())
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "published relation output commit requires checkpoint input coverage",
+            )
+        })?;
+    let binding = published_relation.expect("checked above");
+    if previous_coverage.view_generation != binding.producer_view_generation
+        || previous_coverage.plan_hash != binding.producer_plan_hash
+    {
+        return Err(ApiError::bad_request(
+            "published relation prior checkpoint generation or plan mismatch",
+        ));
+    }
+    let mut coverage = previous_coverage.clone();
+    for relation in &mut coverage.relations {
+        for partition in &mut relation.partitions {
+            if let Some(frontier) = checkpoint.input_frontiers.iter().find(|frontier| {
+                frontier.relation_id == relation.relation_id
+                    && frontier.relation_version == relation.relation_version
+                    && frontier.stream_id == partition.stream_id
+                    && frontier.partition_id == partition.partition_id
+            }) {
+                if frontier.committed_offset_exclusive < partition.processed_offset_exclusive {
+                    return Err(ApiError::bad_request(
+                        "published relation checkpoint input coverage regressed",
+                    ));
+                }
+                partition.processed_offset_exclusive = frontier.committed_offset_exclusive;
+            }
+        }
+    }
+    let mut checkpoint = checkpoint.clone();
+    checkpoint.input_coverage = Some(
+        coverage
+            .canonicalized()
+            .map_err(|error| ApiError::bad_request(error.to_string()))?,
+    );
+    Ok(checkpoint)
+}
+
+fn standing_runtime_checkpoint_with_causal_cut(
+    checkpoint: &RuntimeCheckpoint,
+    direct_view_cursors: &[ResolvedCausalViewCursorV1],
+    published_relation: Option<&PublishedRelationBindingV1>,
+) -> Result<RuntimeCheckpoint, ApiError> {
+    if published_relation.is_none() {
+        return Ok(checkpoint.clone());
+    }
+    let coverage = checkpoint.input_coverage.as_ref().ok_or_else(|| {
+        ApiError::bad_request("published relation output commit requires checkpoint input coverage")
+    })?;
+    if direct_view_cursors.iter().any(|resolved| {
+        resolved.authoritative_head_checkpoint_key.is_empty()
+            || !is_sha256_identity(&resolved.authoritative_head_manifest_hash)
+    }) {
+        return Err(ApiError::bad_request(
+            "resolved view cursor is missing its authoritative head commitment",
+        ));
+    }
+    let causal_cut = CausalCutV1::from_input_coverage(
+        coverage,
+        direct_view_cursors
+            .iter()
+            .map(|resolved| resolved.cursor.clone())
+            .collect(),
+    )
+    .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    if checkpoint
+        .causal_cut
+        .as_ref()
+        .is_some_and(|existing| existing != &causal_cut)
+    {
+        return Err(ApiError::bad_request(
+            "published relation checkpoint causal cut mismatch",
+        ));
+    }
+    let mut checkpoint = checkpoint.clone();
+    checkpoint.causal_cut = Some(causal_cut);
+    Ok(checkpoint)
+}
+
+async fn resolve_authoritative_direct_view_inputs(
+    state: &ApiState,
+    tenant_id: &str,
+    direct_view_inputs: &[StandingRuntimeDirectViewInputV1],
+) -> Result<Vec<ResolvedCausalViewCursorV1>, ApiError> {
+    let mut resolved = Vec::with_capacity(direct_view_inputs.len());
+    for input in direct_view_inputs {
+        let cursor = resolve_authoritative_view_cursor(
+            state,
+            tenant_id,
+            &input.published_relation,
+            &input.cursor,
+        )
+        .await?;
+        resolved.push(cursor);
+    }
+    Ok(resolved)
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ResolvedCausalViewCursorV1 {
+    cursor: CausalViewCursorV1,
+    authoritative_head_checkpoint_key: String,
+    authoritative_head_manifest_hash: String,
+}
+
+pub(super) async fn resolve_authoritative_view_cursor(
+    state: &ApiState,
+    tenant_id: &str,
+    binding: &PublishedRelationBindingV1,
+    cursor: &CausalViewCursorV1,
+) -> Result<ResolvedCausalViewCursorV1, ApiError> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        resolve_authoritative_view_cursor_within_budget(state, tenant_id, binding, cursor),
+    )
+    .await
+    .map_err(|_| {
+        ApiError::service_unavailable("authoritative view cursor resolution deadline exceeded")
+    })?
+}
+
+async fn resolve_authoritative_view_cursor_within_budget(
+    state: &ApiState,
+    tenant_id: &str,
+    binding: &PublishedRelationBindingV1,
+    cursor: &CausalViewCursorV1,
+) -> Result<ResolvedCausalViewCursorV1, ApiError> {
+    validate_published_relation_binding_v1(binding).map_err(ApiError::bad_request)?;
+    cursor
+        .validate()
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    if cursor.producer_tenant_id != tenant_id
+        || cursor.producer_program_id != binding.producer_view_id
+        || cursor.producer_view_id != binding.producer_view_id
+        || cursor.producer_generation != binding.producer_view_generation
+        || cursor.output_stream != binding.output_stream_id
+    {
+        return Err(ApiError::bad_request(format!(
+            "view cursor binding mismatch on edge `{}`",
+            cursor.input_edge
+        )));
+    }
+    let meta_store = state.meta_store.as_ref().ok_or_else(|| {
+        ApiError::service_unavailable(
+            "authoritative metadata is required to resolve a direct view cursor",
+        )
+    })?;
+    let producer_view_id = &cursor.producer_view_id;
+    let producer_program_id = &cursor.producer_program_id;
+    let mut pointer = meta_store
+        .read_standing_runtime_checkpoint(tenant_id, producer_program_id, producer_view_id)
+        .await
+        .map_err(meta_error_to_api)?
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "view cursor edge `{}` has no authoritative producer checkpoint",
+                cursor.input_edge
+            ))
+        })?;
+    let authoritative_head_checkpoint_key = pointer.checkpoint_key.clone();
+    let authoritative_head_manifest_hash = pointer.manifest_hash.clone();
+
+    #[cfg(not(test))]
+    const MAX_LINEAGE_HOPS: usize = 4_096;
+    #[cfg(test)]
+    const MAX_LINEAGE_HOPS: usize = 8;
+    const MAX_OUTPUT_REFS_PER_CHECKPOINT: usize = 64;
+    let mut lineage_hops = 0usize;
+    loop {
+        lineage_hops += 1;
+        if lineage_hops > MAX_LINEAGE_HOPS {
+            return Err(ApiError::bad_request(format!(
+                "view cursor edge `{}` exceeds the authoritative checkpoint lineage budget",
+                cursor.input_edge
+            )));
+        }
+        if pointer.output_manifest_refs.len() > MAX_OUTPUT_REFS_PER_CHECKPOINT {
+            return Err(ApiError::bad_request(format!(
+                "view cursor edge `{}` exceeds the authoritative checkpoint output-ref budget",
+                cursor.input_edge
+            )));
+        }
+        if pointer.logical_epoch < cursor.output_epoch {
+            return Err(ApiError::bad_request(format!(
+                "view cursor edge `{}` is ahead of the authoritative producer frontier",
+                cursor.input_edge
+            )));
+        }
+        let record = read_standing_runtime_checkpoint_record_from_pointer_for_scope(
+            state,
+            tenant_id,
+            producer_program_id,
+            producer_view_id,
+            &pointer,
+        )
+        .await?;
+        if record.checkpoint.logical_epoch == cursor.output_epoch {
+            validate_authoritative_view_cursor_commit(state, binding, cursor, &record).await?;
+            return Ok(ResolvedCausalViewCursorV1 {
+                cursor: cursor.clone(),
+                authoritative_head_checkpoint_key,
+                authoritative_head_manifest_hash,
+            });
+        }
+        let previous = record.previous_checkpoint.ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "view cursor edge `{}` references a producer epoch missing from the authoritative checkpoint lineage",
+                cursor.input_edge
+            ))
+        })?;
+        if previous.logical_epoch >= pointer.logical_epoch
+            || previous.logical_epoch < cursor.output_epoch
+        {
+            return Err(ApiError::bad_request(format!(
+                "view cursor edge `{}` has a non-contiguous authoritative checkpoint lineage",
+                cursor.input_edge
+            )));
+        }
+        pointer = previous;
+    }
+}
+
+async fn validate_authoritative_view_cursor_commit(
+    state: &ApiState,
+    binding: &PublishedRelationBindingV1,
+    cursor: &CausalViewCursorV1,
+    record: &StandingRuntimeCheckpointRecord,
+) -> Result<(), ApiError> {
+    let commit_refs = record
+        .checkpoint
+        .output_manifest_refs
+        .iter()
+        .filter(|output_ref| output_ref.starts_with(STANDING_RUNTIME_OUTPUT_COMMIT_REF_PREFIX))
+        .collect::<Vec<_>>();
+    if commit_refs.len() != 1 {
+        return Err(ApiError::bad_request(format!(
+            "view cursor edge `{}` requires exactly one authoritative producer commit",
+            cursor.input_edge
+        )));
+    }
+    let (_key, delta_record) =
+        read_standing_runtime_output_delta_record(state, commit_refs[0], &binding.producer_view_id)
+            .await?;
+    let commit = delta_record.producer_commit.as_ref().ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "view cursor edge `{}` points to a legacy output delta",
+            cursor.input_edge
+        ))
+    })?;
+    if record.checkpoint.logical_epoch != cursor.output_epoch
+        || delta_record.logical_epoch != cursor.output_epoch
+        || delta_record.schema_fingerprint != binding.relation.schema_fingerprint
+        || commit.producer_view_generation != binding.producer_view_generation
+        || commit.producer_view_generation != cursor.producer_generation
+        || commit.producer_plan_hash != binding.producer_plan_hash
+        || commit.output_stream_id != binding.output_stream_id
+        || commit.output_stream_id != cursor.output_stream
+        || commit.output_schema_hash != binding.output_schema_hash
+        || commit.key_descriptor_hash != binding.key_descriptor_hash
+        || commit.delta_codec_identity != binding.delta_codec_identity
+        || commit.frontier_kind != binding.frontier_kind
+        || commit.producer_commit_digest != cursor.commit_digest
+    {
+        return Err(ApiError::bad_request(format!(
+            "view cursor edge `{}` does not match its authoritative producer commit",
+            cursor.input_edge
+        )));
+    }
+    Ok(())
+}
+
+async fn standing_runtime_checkpoint_with_authoritative_input_coverage(
+    state: &ApiState,
+    view_id: &str,
+    checkpoint: &RuntimeCheckpoint,
+) -> Result<RuntimeCheckpoint, ApiError> {
+    let Some(meta_store) = state.view_bootstrap_meta_store.as_ref() else {
+        return Ok(checkpoint.clone());
+    };
+    let Some(control) = meta_store
+        .read_view_bootstrap(
+            &checkpoint.identity.tenant_id,
+            &checkpoint.identity.program_id,
+            view_id,
+        )
+        .await
+        .map_err(meta_error_to_api)?
+    else {
+        return Ok(checkpoint.clone());
+    };
+    let coverage_cut = meta_store
+        .capture_ingest_source_cut(CaptureIngestSourceCutRequest {
+            relations: control
+                .bootstrap_cut
+                .relations
+                .iter()
+                .map(|relation| relation.relation.clone())
+                .collect(),
+        })
+        .await
+        .map_err(meta_error_to_api)?;
+    let relations = coverage_cut
+        .relations
+        .iter()
+        .map(|relation_cut| {
+            let partitions = relation_cut
+                .partitions
+                .iter()
+                .map(|partition_cut| RuntimeCheckpointPartitionCoverageV1 {
+                    stream_id: partition_cut.stream_id.clone(),
+                    stream_generation: partition_cut.stream_generation,
+                    partition_id: partition_cut.partition_id,
+                    partition_generation: partition_cut.partition_generation,
+                    covered_from_offset_inclusive: partition_cut.base_offset_inclusive,
+                    processed_offset_exclusive: checkpoint
+                        .input_frontiers
+                        .iter()
+                        .find(|frontier| {
+                            frontier.relation_id == relation_cut.relation.relation_id
+                                && frontier.relation_version
+                                    == relation_cut.relation.relation_version
+                                && frontier.stream_id == partition_cut.stream_id
+                                && frontier.partition_id == partition_cut.partition_id
+                        })
+                        .map(|frontier| frontier.committed_offset_exclusive)
+                        .unwrap_or(partition_cut.base_offset_inclusive),
+                })
+                .collect();
+            RuntimeCheckpointRelationCoverageV1 {
+                relation_id: relation_cut.relation.relation_id.clone(),
+                relation_version: relation_cut.relation.relation_version.clone(),
+                relation_generation: relation_cut.relation.relation_generation,
+                schema_fingerprint: relation_cut.relation.schema_fingerprint.clone(),
+                partitions,
+            }
+        })
+        .collect();
+    let coverage = RuntimeCheckpointInputCoverageV1 {
+        schema_version: RUNTIME_CHECKPOINT_INPUT_COVERAGE_SCHEMA_VERSION_V1,
+        view_generation: control.bootstrap_generation,
+        plan_hash: control.plan_hash,
+        input_catalog_epoch: coverage_cut.input_catalog_epoch,
+        relations,
+    }
+    .canonicalized()
+    .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let mut checkpoint = checkpoint.clone();
+    checkpoint.input_coverage = Some(coverage);
+    Ok(checkpoint)
+}
+
 pub(super) fn standing_runtime_checkpoint_with_publication_output_refs(
     checkpoint: &RuntimeCheckpoint,
     output_manifest_key: Option<&ObjectKey>,
@@ -216,14 +601,31 @@ pub(super) fn standing_runtime_checkpoint_with_publication_output_refs(
 pub(super) fn standing_runtime_checkpoint_with_durable_publication_refs(
     checkpoint: &RuntimeCheckpoint,
     output_manifest_key: Option<&ObjectKey>,
-    output_delta_keys: &[&ObjectKey],
+    output_delta_publications: &[StandingRuntimeDeltaPublication],
     state_payload_key: &ObjectKey,
 ) -> RuntimeCheckpoint {
+    let output_delta_keys = output_delta_publications
+        .iter()
+        .map(|publication| &publication.delta_key)
+        .collect::<Vec<_>>();
     let mut checkpoint = standing_runtime_checkpoint_with_publication_output_refs(
         checkpoint,
         output_manifest_key,
-        output_delta_keys,
+        &output_delta_keys,
     );
+    for (output_ref, publication) in checkpoint
+        .output_manifest_refs
+        .iter_mut()
+        .filter(|output_ref| output_ref.starts_with(STANDING_RUNTIME_OUTPUT_DELTA_REF_PREFIX))
+        .zip(output_delta_publications)
+    {
+        if publication.delta_record.producer_commit.is_some() {
+            *output_ref = format!(
+                "{STANDING_RUNTIME_OUTPUT_COMMIT_REF_PREFIX}{}",
+                publication.delta_key.as_str()
+            );
+        }
+    }
     checkpoint.state_root.object_key = state_payload_key.as_str().to_string();
     checkpoint.state_payload = None;
     checkpoint
@@ -519,11 +921,41 @@ pub(super) async fn put_standing_runtime_output_manifest(
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn standing_runtime_output_delta_records_for_checkpoint(
     checkpoint: &RuntimeCheckpoint,
     view_id: &str,
     output_deltas: &[ViewOutputDelta],
 ) -> Result<Vec<StandingRuntimeDeltaPublication>, ApiError> {
+    let checkpoint_key = ObjectKey::standing_runtime_checkpoint(
+        &checkpoint.identity.tenant_id,
+        &checkpoint.identity.program_id,
+        view_id,
+        checkpoint.logical_epoch,
+        &checkpoint.state_root.content_hash,
+    )
+    .map_err(ApiError::bad_request)?;
+    standing_runtime_output_delta_records_for_checkpoint_with_binding(
+        checkpoint,
+        view_id,
+        output_deltas,
+        &checkpoint_key,
+        None,
+    )
+}
+
+pub(super) fn standing_runtime_output_delta_records_for_checkpoint_with_binding(
+    checkpoint: &RuntimeCheckpoint,
+    view_id: &str,
+    output_deltas: &[ViewOutputDelta],
+    checkpoint_key: &ObjectKey,
+    published_relation: Option<&PublishedRelationBindingV1>,
+) -> Result<Vec<StandingRuntimeDeltaPublication>, ApiError> {
+    if published_relation.is_some() && output_deltas.len() != 1 {
+        return Err(ApiError::bad_request(format!(
+            "published relation `{view_id}` requires exactly one output commit per logical epoch, including empty deltas"
+        )));
+    }
     let mut publications = Vec::new();
     for output_delta in output_deltas {
         if output_delta.view_id != view_id {
@@ -531,7 +963,11 @@ pub(super) fn standing_runtime_output_delta_records_for_checkpoint(
                 "standing runtime output delta identity does not match view `{view_id}`"
             )));
         }
-        let output_delta_value = serde_json::to_value(&output_delta.delta)
+        let consolidated_delta =
+            DeltaBatch::from_records(output_delta.delta.net_rows().map_err(|_| {
+                ApiError::bad_request("standing runtime output delta is malformed")
+            })?);
+        let output_delta_value = serde_json::to_value(&consolidated_delta)
             .map_err(|source| ApiError::internal(source.to_string()))?;
         let delta_bytes = serde_json::to_vec(&output_delta_value)
             .map_err(|source| ApiError::internal(source.to_string()))?;
@@ -544,14 +980,28 @@ pub(super) fn standing_runtime_output_delta_records_for_checkpoint(
             &delta_content_hash,
         )
         .map_err(ApiError::bad_request)?;
-        let delta_row_count = output_delta
-            .delta
+        let delta_row_count = consolidated_delta
             .net_rows()
             .map_err(|_| ApiError::bad_request("standing runtime output delta is malformed"))?
             .len();
+        let producer_commit = published_relation
+            .map(|binding| {
+                standing_runtime_producer_commit_v1(
+                    checkpoint,
+                    checkpoint_key,
+                    output_delta,
+                    binding,
+                    &delta_content_hash,
+                )
+            })
+            .transpose()?;
         let delta_record = StandingRuntimeOutputDeltaRecord {
-            schema_version: 1,
-            record_kind: "standing_runtime_output_delta_v1".to_string(),
+            schema_version: if producer_commit.is_some() { 2 } else { 1 },
+            record_kind: if producer_commit.is_some() {
+                "standing_runtime_output_commit_v1".to_string()
+            } else {
+                "standing_runtime_output_delta_v1".to_string()
+            },
             tenant_id: checkpoint.identity.tenant_id.clone(),
             program_id: checkpoint.identity.program_id.clone(),
             view_id: view_id.to_string(),
@@ -560,8 +1010,13 @@ pub(super) fn standing_runtime_output_delta_records_for_checkpoint(
             delta_content_hash,
             delta_encoding: "velorix-delta-batch-json-v1".to_string(),
             delta_row_count,
-            source_kind: "standing_runtime_epoch_output_delta".to_string(),
+            source_kind: if producer_commit.is_some() {
+                "standing_runtime_epoch_output_commit".to_string()
+            } else {
+                "standing_runtime_epoch_output_delta".to_string()
+            },
             output_delta: output_delta_value,
+            producer_commit,
         };
         validate_standing_runtime_output_delta_record(&delta_key, &delta_record)?;
         publications.push(StandingRuntimeDeltaPublication {
@@ -570,6 +1025,104 @@ pub(super) fn standing_runtime_output_delta_records_for_checkpoint(
         });
     }
     Ok(publications)
+}
+
+#[derive(Serialize)]
+struct StandingRuntimeProducerCommitDigestInputV1<'a> {
+    schema_version: u32,
+    tenant_id: &'a str,
+    program_id: &'a str,
+    view_id: &'a str,
+    logical_epoch: u64,
+    producer_view_generation: u64,
+    producer_plan_hash: &'a str,
+    output_stream_id: &'a str,
+    output_schema_hash: &'a str,
+    key_descriptor_hash: &'a str,
+    delta_codec_identity: &'a str,
+    frontier_kind: &'a str,
+    schema_fingerprint: &'a str,
+    delta_content_hash: &'a str,
+    checkpoint_key: &'a str,
+    checkpoint_content_hash: &'a str,
+    causal_cut_digest: &'a str,
+}
+
+fn standing_runtime_producer_commit_v1(
+    checkpoint: &RuntimeCheckpoint,
+    checkpoint_key: &ObjectKey,
+    output_delta: &ViewOutputDelta,
+    binding: &PublishedRelationBindingV1,
+    delta_content_hash: &str,
+) -> Result<StandingRuntimeProducerCommitV1, ApiError> {
+    validate_published_relation_binding_v1(binding).map_err(ApiError::bad_request)?;
+    let coverage = checkpoint.input_coverage.as_ref().ok_or_else(|| {
+        ApiError::bad_request("published relation output commit requires checkpoint input coverage")
+    })?;
+    if binding.schema_version != PUBLISHED_RELATION_BINDING_SCHEMA_VERSION_V1
+        || binding.producer_view_id != output_delta.view_id
+        || binding.relation.schema_fingerprint != output_delta.schema_fingerprint
+        || binding.producer_view_generation != coverage.view_generation
+        || binding.producer_plan_hash != coverage.plan_hash
+        || checkpoint_key.as_str()
+            != ObjectKey::standing_runtime_checkpoint(
+                &checkpoint.identity.tenant_id,
+                &checkpoint.identity.program_id,
+                &output_delta.view_id,
+                checkpoint.logical_epoch,
+                &checkpoint.state_root.content_hash,
+            )
+            .map_err(ApiError::bad_request)?
+            .as_str()
+    {
+        return Err(ApiError::bad_request(format!(
+            "published relation output commit identity mismatch for `{}`",
+            output_delta.view_id
+        )));
+    }
+    let causal_cut_digest = checkpoint
+        .causal_cut
+        .as_ref()
+        .ok_or_else(|| {
+            ApiError::bad_request("published relation output commit requires a causal cut")
+        })?
+        .stable_digest()
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let digest_input = StandingRuntimeProducerCommitDigestInputV1 {
+        schema_version: 1,
+        tenant_id: &checkpoint.identity.tenant_id,
+        program_id: &checkpoint.identity.program_id,
+        view_id: &output_delta.view_id,
+        logical_epoch: checkpoint.logical_epoch,
+        producer_view_generation: binding.producer_view_generation,
+        producer_plan_hash: &binding.producer_plan_hash,
+        output_stream_id: &binding.output_stream_id,
+        output_schema_hash: &binding.output_schema_hash,
+        key_descriptor_hash: &binding.key_descriptor_hash,
+        delta_codec_identity: &binding.delta_codec_identity,
+        frontier_kind: &binding.frontier_kind,
+        schema_fingerprint: &output_delta.schema_fingerprint,
+        delta_content_hash,
+        checkpoint_key: checkpoint_key.as_str(),
+        checkpoint_content_hash: &checkpoint.state_root.content_hash,
+        causal_cut_digest: &causal_cut_digest,
+    };
+    let digest_bytes = serde_json::to_vec(&digest_input)
+        .map_err(|source| ApiError::internal(source.to_string()))?;
+    Ok(StandingRuntimeProducerCommitV1 {
+        schema_version: 1,
+        producer_view_generation: binding.producer_view_generation,
+        producer_plan_hash: binding.producer_plan_hash.clone(),
+        output_stream_id: binding.output_stream_id.clone(),
+        output_schema_hash: binding.output_schema_hash.clone(),
+        key_descriptor_hash: binding.key_descriptor_hash.clone(),
+        delta_codec_identity: binding.delta_codec_identity.clone(),
+        frontier_kind: binding.frontier_kind.clone(),
+        checkpoint_key: checkpoint_key.as_str().to_string(),
+        checkpoint_content_hash: checkpoint.state_root.content_hash.clone(),
+        causal_cut_digest,
+        producer_commit_digest: stable_bytes_hash(&digest_bytes),
+    })
 }
 
 pub(super) async fn persist_standing_runtime_output_delta(
@@ -761,6 +1314,18 @@ pub(super) async fn validate_checkpoint_pointer_object_exists_for_meta_rehydrati
         || record.checkpoint.logical_epoch != pointer.logical_epoch
         || record.checkpoint.state_root.content_hash != pointer.content_hash
         || record.checkpoint_key != pointer.checkpoint_key
+        || pointer.previous_checkpoint_key
+            != record
+                .previous_checkpoint
+                .as_ref()
+                .map(|previous| previous.checkpoint_key.clone())
+                .unwrap_or_default()
+        || pointer.previous_manifest_hash
+            != record
+                .previous_checkpoint
+                .as_ref()
+                .map(|previous| previous.manifest_hash.clone())
+                .unwrap_or_default()
     {
         return Err(ApiError::bad_request(format!(
             "standing runtime checkpoint pointer/body mismatch for `{}/{}/{}`",
@@ -789,6 +1354,8 @@ pub(super) fn standing_runtime_checkpoint_pointer_from_record(
     } else {
         record.manifest_hash.clone()
     };
+    let (bootstrap_generation, plan_hash, coverage_hash, input_coverage) =
+        standing_runtime_checkpoint_coverage_commitment(&record.checkpoint);
     StandingRuntimeCheckpointPointer {
         tenant_id: record.checkpoint.identity.tenant_id.clone(),
         program_id: record.checkpoint.identity.program_id.clone(),
@@ -798,7 +1365,40 @@ pub(super) fn standing_runtime_checkpoint_pointer_from_record(
         content_hash: record.checkpoint.state_root.content_hash.clone(),
         manifest_hash,
         output_manifest_refs: record.checkpoint.output_manifest_refs.clone(),
+        bootstrap_generation,
+        plan_hash,
+        coverage_hash,
+        input_coverage,
+        previous_checkpoint_key: record
+            .previous_checkpoint
+            .as_ref()
+            .map(|pointer| pointer.checkpoint_key.clone())
+            .unwrap_or_default(),
+        previous_manifest_hash: record
+            .previous_checkpoint
+            .as_ref()
+            .map(|pointer| pointer.manifest_hash.clone())
+            .unwrap_or_default(),
     }
+}
+
+fn standing_runtime_checkpoint_coverage_commitment(
+    checkpoint: &RuntimeCheckpoint,
+) -> (
+    u64,
+    String,
+    String,
+    Option<RuntimeCheckpointInputCoverageV1>,
+) {
+    let Some(coverage) = checkpoint.input_coverage.clone() else {
+        return (0, String::new(), String::new(), None);
+    };
+    (
+        coverage.view_generation,
+        coverage.plan_hash.clone(),
+        coverage.stable_hash().unwrap_or_default(),
+        Some(coverage),
+    )
 }
 
 pub(super) fn standing_runtime_replay_plan_from_record_ref(
@@ -808,42 +1408,6 @@ pub(super) fn standing_runtime_replay_plan_from_record_ref(
         replay_checkpoints: record.replay_checkpoints.clone(),
         input_frontiers: record.checkpoint.input_frontiers.clone(),
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn standing_runtime_checkpoint_pointer_from_key(
-    checkpoint_key: &ObjectKey,
-    tenant_id: &str,
-    program_id: &str,
-    view_id: &str,
-    logical_epoch: u64,
-    content_hash: &str,
-    manifest_hash: String,
-    output_manifest_refs: Vec<String>,
-) -> Result<StandingRuntimeCheckpointPointer, ApiError> {
-    let pointer = StandingRuntimeCheckpointPointer {
-        tenant_id: tenant_id.to_string(),
-        program_id: program_id.to_string(),
-        view_id: view_id.to_string(),
-        checkpoint_key: checkpoint_key.as_str().to_string(),
-        logical_epoch,
-        content_hash: content_hash.to_string(),
-        manifest_hash,
-        output_manifest_refs,
-    };
-    let (_, parts) = ObjectKey::parse_standing_runtime_checkpoint(pointer.checkpoint_key.clone())
-        .map_err(ApiError::bad_request)?;
-    if parts.tenant_id != pointer.tenant_id
-        || parts.program_id != pointer.program_id
-        || parts.view_id != pointer.view_id
-        || parts.logical_epoch != pointer.logical_epoch
-        || parts.content_hash != pointer.content_hash
-    {
-        return Err(ApiError::bad_request(format!(
-            "standing runtime checkpoint pointer key/body mismatch for `{tenant_id}/{program_id}/{view_id}`"
-        )));
-    }
-    Ok(pointer)
 }
 
 pub(super) async fn read_latest_standing_runtime_checkpoint(
@@ -951,6 +1515,8 @@ pub(super) async fn read_latest_standing_runtime_checkpoint(
             identity.tenant_id, identity.program_id
         )));
     }
+    let (bootstrap_generation, plan_hash, coverage_hash, input_coverage) =
+        standing_runtime_checkpoint_coverage_commitment(&record.checkpoint);
     let pointer = StandingRuntimeCheckpointPointer {
         tenant_id: checkpoint_key_parts.tenant_id,
         program_id: checkpoint_key_parts.program_id,
@@ -960,6 +1526,20 @@ pub(super) async fn read_latest_standing_runtime_checkpoint(
         content_hash: checkpoint_key_parts.content_hash,
         manifest_hash: stable_bytes_hash(&bytes),
         output_manifest_refs: record.checkpoint.output_manifest_refs.clone(),
+        bootstrap_generation,
+        plan_hash,
+        coverage_hash,
+        input_coverage,
+        previous_checkpoint_key: record
+            .previous_checkpoint
+            .as_ref()
+            .map(|previous| previous.checkpoint_key.clone())
+            .unwrap_or_default(),
+        previous_manifest_hash: record
+            .previous_checkpoint
+            .as_ref()
+            .map(|previous| previous.manifest_hash.clone())
+            .unwrap_or_default(),
     };
     validate_standing_runtime_checkpoint_output_refs(&record, &pointer)?;
     hydrate_standing_runtime_checkpoint_state_payload(state, &mut record).await?;
@@ -1000,6 +1580,38 @@ pub(super) async fn read_standing_runtime_checkpoint_record_from_pointer(
     view_id: &str,
     pointer: &StandingRuntimeCheckpointPointer,
 ) -> Result<StandingRuntimeCheckpointRecord, ApiError> {
+    let record = read_standing_runtime_checkpoint_record_from_pointer_for_scope(
+        state,
+        &identity.tenant_id,
+        &identity.program_id,
+        view_id,
+        pointer,
+    )
+    .await?;
+    if record.checkpoint.identity != *identity {
+        return Err(ApiError::bad_request(format!(
+            "standing runtime checkpoint record identity mismatch for `{}/{}/{view_id}`",
+            identity.tenant_id, identity.program_id
+        )));
+    }
+    Ok(record)
+}
+
+async fn read_standing_runtime_checkpoint_record_from_pointer_for_scope(
+    state: &ApiState,
+    tenant_id: &str,
+    program_id: &str,
+    view_id: &str,
+    pointer: &StandingRuntimeCheckpointPointer,
+) -> Result<StandingRuntimeCheckpointRecord, ApiError> {
+    if pointer.tenant_id != tenant_id
+        || pointer.program_id != program_id
+        || pointer.view_id != view_id
+    {
+        return Err(ApiError::bad_request(format!(
+            "standing runtime checkpoint pointer scope mismatch for `{tenant_id}/{program_id}/{view_id}`"
+        )));
+    }
     let bytes = state
         .store
         .get(&ObjectPath::from(pointer.checkpoint_key.clone()))
@@ -1008,6 +1620,12 @@ pub(super) async fn read_standing_runtime_checkpoint_record_from_pointer(
         .bytes()
         .await
         .map_err(ApiError::internal)?;
+    const MAX_CHECKPOINT_RECORD_BYTES: usize = 16 * 1024 * 1024;
+    if bytes.len() > MAX_CHECKPOINT_RECORD_BYTES {
+        return Err(ApiError::bad_request(format!(
+            "standing runtime checkpoint exceeds the record-size budget for `{tenant_id}/{program_id}/{view_id}`"
+        )));
+    }
     let actual_manifest_hash = stable_bytes_hash(&bytes);
     if actual_manifest_hash != pointer.manifest_hash {
         return Err(ApiError::bad_request(format!(
@@ -1020,8 +1638,24 @@ pub(super) async fn read_standing_runtime_checkpoint_record_from_pointer(
     if record.checkpoint_key.is_empty() {
         record.checkpoint_key = pointer.checkpoint_key.clone();
     }
-    validate_standing_runtime_checkpoint_record(identity, view_id, pointer, &record)?;
+    let identity = record.checkpoint.identity.clone();
+    if identity.tenant_id != tenant_id
+        || identity.program_id != program_id
+        || !identity
+            .view_ids
+            .iter()
+            .any(|candidate| candidate == view_id)
+    {
+        return Err(ApiError::bad_request(format!(
+            "standing runtime checkpoint record scope mismatch for `{tenant_id}/{program_id}/{view_id}`"
+        )));
+    }
+    validate_standing_runtime_checkpoint_record(&identity, view_id, pointer, &record)?;
     hydrate_standing_runtime_checkpoint_state_payload(state, &mut record).await?;
+    record
+        .checkpoint
+        .validate_identity(&identity)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
     validate_standing_runtime_checkpoint_output_manifest_records(state, &record).await?;
     validate_standing_runtime_checkpoint_replay_frontiers(&record)?;
     Ok(record)
@@ -1033,6 +1667,8 @@ pub(super) fn validate_standing_runtime_checkpoint_record(
     pointer: &StandingRuntimeCheckpointPointer,
     record: &StandingRuntimeCheckpointRecord,
 ) -> Result<(), ApiError> {
+    let (bootstrap_generation, plan_hash, coverage_hash, input_coverage) =
+        standing_runtime_checkpoint_coverage_commitment(&record.checkpoint);
     if record.schema_version != 1
         || record.record_kind != "standing_runtime_checkpoint_v1"
         || record.view_id != view_id
@@ -1050,6 +1686,22 @@ pub(super) fn validate_standing_runtime_checkpoint_record(
         || pointer.logical_epoch != record.checkpoint.logical_epoch
         || pointer.content_hash != record.checkpoint.state_root.content_hash
         || pointer.manifest_hash != record.manifest_hash
+        || pointer.bootstrap_generation != bootstrap_generation
+        || pointer.plan_hash != plan_hash
+        || pointer.coverage_hash != coverage_hash
+        || pointer.input_coverage != input_coverage
+        || pointer.previous_checkpoint_key
+            != record
+                .previous_checkpoint
+                .as_ref()
+                .map(|previous| previous.checkpoint_key.clone())
+                .unwrap_or_default()
+        || pointer.previous_manifest_hash
+            != record
+                .previous_checkpoint
+                .as_ref()
+                .map(|previous| previous.manifest_hash.clone())
+                .unwrap_or_default()
         || (!pointer.output_manifest_refs.is_empty()
             && pointer.output_manifest_refs != record.checkpoint.output_manifest_refs)
     {
@@ -1167,8 +1819,9 @@ pub(super) fn validate_standing_runtime_checkpoint_output_refs(
                     pointer.tenant_id, pointer.program_id, pointer.view_id
                 )));
             }
-        } else if let Some(output_delta_key) =
-            output_ref.strip_prefix(STANDING_RUNTIME_OUTPUT_DELTA_REF_PREFIX)
+        } else if let Some(output_delta_key) = output_ref
+            .strip_prefix(STANDING_RUNTIME_OUTPUT_DELTA_REF_PREFIX)
+            .or_else(|| output_ref.strip_prefix(STANDING_RUNTIME_OUTPUT_COMMIT_REF_PREFIX))
         {
             let (parsed_key, parts) =
                 ObjectKey::parse_standing_runtime_output_delta(output_delta_key.to_string())
@@ -1199,9 +1852,13 @@ pub(super) async fn validate_standing_runtime_checkpoint_output_manifest_records
     record: &StandingRuntimeCheckpointRecord,
 ) -> Result<(), ApiError> {
     for output_ref in &record.checkpoint.output_manifest_refs {
-        if output_ref
-            .strip_prefix(STANDING_RUNTIME_OUTPUT_DELTA_REF_PREFIX)
-            .is_some()
+        let is_commit_ref = output_ref
+            .strip_prefix(STANDING_RUNTIME_OUTPUT_COMMIT_REF_PREFIX)
+            .is_some();
+        if is_commit_ref
+            || output_ref
+                .strip_prefix(STANDING_RUNTIME_OUTPUT_DELTA_REF_PREFIX)
+                .is_some()
         {
             let (_key, delta) =
                 read_standing_runtime_output_delta_record(state, output_ref, &record.view_id)
@@ -1217,6 +1874,38 @@ pub(super) async fn validate_standing_runtime_checkpoint_output_manifest_records
                     record.checkpoint.identity.program_id,
                     record.view_id
                 )));
+            }
+            if is_commit_ref {
+                let commit = delta.producer_commit.as_ref().ok_or_else(|| {
+                    ApiError::bad_request(format!(
+                        "standing runtime output commit ref points to a legacy delta for `{}/{}/{}`",
+                        record.checkpoint.identity.tenant_id,
+                        record.checkpoint.identity.program_id,
+                        record.view_id
+                    ))
+                })?;
+                let causal_cut_digest = record
+                    .checkpoint
+                    .causal_cut
+                    .as_ref()
+                    .ok_or_else(|| {
+                        ApiError::bad_request(
+                            "standing runtime output commit checkpoint is missing causal cut",
+                        )
+                    })?
+                    .stable_digest()
+                    .map_err(|error| ApiError::bad_request(error.to_string()))?;
+                if commit.checkpoint_key != record.checkpoint_key
+                    || commit.checkpoint_content_hash != record.checkpoint.state_root.content_hash
+                    || commit.causal_cut_digest != causal_cut_digest
+                {
+                    return Err(ApiError::bad_request(format!(
+                        "standing runtime output commit body/checkpoint binding mismatch for `{}/{}/{}`",
+                        record.checkpoint.identity.tenant_id,
+                        record.checkpoint.identity.program_id,
+                        record.view_id
+                    )));
+                }
             }
             continue;
         }
@@ -1341,6 +2030,7 @@ pub(super) async fn read_standing_runtime_output_delta_record(
 ) -> Result<(ObjectKey, StandingRuntimeOutputDeltaRecord), ApiError> {
     let output_delta_key = output_ref
         .strip_prefix(STANDING_RUNTIME_OUTPUT_DELTA_REF_PREFIX)
+        .or_else(|| output_ref.strip_prefix(STANDING_RUNTIME_OUTPUT_COMMIT_REF_PREFIX))
         .ok_or_else(|| {
             ApiError::bad_request(format!(
                 "unsupported standing runtime checkpoint output delta ref for view `{view_id}`"
@@ -1441,14 +2131,20 @@ pub(super) fn validate_standing_runtime_output_delta_record(
     key: &ObjectKey,
     record: &StandingRuntimeOutputDeltaRecord,
 ) -> Result<(), ApiError> {
-    if record.schema_version != 1 || record.record_kind != "standing_runtime_output_delta_v1" {
+    let is_legacy_delta =
+        record.schema_version == 1 && record.record_kind == "standing_runtime_output_delta_v1";
+    let is_producer_commit = record.schema_version == 2
+        && record.record_kind == "standing_runtime_output_commit_v1"
+        && record.producer_commit.is_some();
+    if !is_legacy_delta && !is_producer_commit {
         return Err(ApiError::bad_request(format!(
             "standing runtime output delta record identity mismatch for `{}/{}/{}`",
             record.tenant_id, record.program_id, record.view_id
         )));
     }
     if record.delta_encoding != "velorix-delta-batch-json-v1"
-        || record.source_kind != "standing_runtime_epoch_output_delta"
+        || (is_legacy_delta && record.source_kind != "standing_runtime_epoch_output_delta")
+        || (is_producer_commit && record.source_kind != "standing_runtime_epoch_output_commit")
         || record.schema_fingerprint.is_empty()
     {
         return Err(ApiError::bad_request(format!(
@@ -1480,7 +2176,80 @@ pub(super) fn validate_standing_runtime_output_delta_record(
             record.tenant_id, record.program_id, record.view_id
         )));
     }
+    if is_legacy_delta && record.producer_commit.is_some() {
+        return Err(ApiError::bad_request(format!(
+            "legacy standing runtime output delta carries a producer commit for `{}/{}/{}`",
+            record.tenant_id, record.program_id, record.view_id
+        )));
+    }
+    if let Some(commit) = &record.producer_commit {
+        validate_standing_runtime_producer_commit_v1(record, commit)?;
+    }
     Ok(())
+}
+
+fn validate_standing_runtime_producer_commit_v1(
+    record: &StandingRuntimeOutputDeltaRecord,
+    commit: &StandingRuntimeProducerCommitV1,
+) -> Result<(), ApiError> {
+    let (_, checkpoint_parts) =
+        ObjectKey::parse_standing_runtime_checkpoint(commit.checkpoint_key.clone())
+            .map_err(ApiError::bad_request)?;
+    let expected_stream_prefix = format!(
+        "view/{}/generation/{}/output/",
+        record.view_id, commit.producer_view_generation
+    );
+    let digest_input = StandingRuntimeProducerCommitDigestInputV1 {
+        schema_version: commit.schema_version,
+        tenant_id: &record.tenant_id,
+        program_id: &record.program_id,
+        view_id: &record.view_id,
+        logical_epoch: record.logical_epoch,
+        producer_view_generation: commit.producer_view_generation,
+        producer_plan_hash: &commit.producer_plan_hash,
+        output_stream_id: &commit.output_stream_id,
+        output_schema_hash: &commit.output_schema_hash,
+        key_descriptor_hash: &commit.key_descriptor_hash,
+        delta_codec_identity: &commit.delta_codec_identity,
+        frontier_kind: &commit.frontier_kind,
+        schema_fingerprint: &record.schema_fingerprint,
+        delta_content_hash: &record.delta_content_hash,
+        checkpoint_key: &commit.checkpoint_key,
+        checkpoint_content_hash: &commit.checkpoint_content_hash,
+        causal_cut_digest: &commit.causal_cut_digest,
+    };
+    let digest_bytes = serde_json::to_vec(&digest_input)
+        .map_err(|source| ApiError::internal(source.to_string()))?;
+    let actual_commit_digest = stable_bytes_hash(&digest_bytes);
+    if commit.schema_version != 1
+        || commit.producer_view_generation == 0
+        || commit.producer_plan_hash.trim().is_empty()
+        || !commit.output_stream_id.starts_with(&expected_stream_prefix)
+        || commit.delta_codec_identity != "velorix-published-relation-delta-v1"
+        || commit.frontier_kind != "producer_commit_epoch"
+        || checkpoint_parts.tenant_id != record.tenant_id
+        || checkpoint_parts.program_id != record.program_id
+        || checkpoint_parts.view_id != record.view_id
+        || checkpoint_parts.logical_epoch != record.logical_epoch
+        || checkpoint_parts.content_hash != commit.checkpoint_content_hash
+        || commit.producer_commit_digest != actual_commit_digest
+        || !is_sha256_identity(&commit.output_schema_hash)
+        || !is_sha256_identity(&commit.key_descriptor_hash)
+        || !is_sha256_identity(&commit.causal_cut_digest)
+        || !is_sha256_identity(&commit.producer_commit_digest)
+    {
+        return Err(ApiError::bad_request(format!(
+            "standing runtime producer commit mismatch for `{}/{}/{}`",
+            record.tenant_id, record.program_id, record.view_id
+        )));
+    }
+    Ok(())
+}
+
+fn is_sha256_identity(value: &str) -> bool {
+    value
+        .strip_prefix("sha256:")
+        .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
 pub(super) fn validate_standing_runtime_state_payload_record(

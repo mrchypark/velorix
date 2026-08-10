@@ -1540,6 +1540,14 @@ mod tests {
             &content_hash,
         )
         .unwrap();
+        let same_state_next_epoch = ObjectKey::standing_runtime_checkpoint(
+            "tenant-a",
+            "program-a",
+            "scores-by-user",
+            43,
+            &content_hash,
+        )
+        .unwrap();
         let latest = ObjectKey::standing_runtime_latest_checkpoint(
             "tenant-a",
             "program-a",
@@ -1552,6 +1560,7 @@ mod tests {
             "v1/standing-runtime-checkpoints/tenant-a/program-a/scores-by-user/epochs/00000000000000000042/sha256/dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd.checkpoint.json"
         );
         assert_eq!(checkpoint, restarted);
+        assert_ne!(checkpoint, same_state_next_epoch);
         assert_eq!(ObjectKey::parse(checkpoint.as_str()).unwrap(), checkpoint);
         let (_, parts) = ObjectKey::parse_standing_runtime_checkpoint(checkpoint.as_str()).unwrap();
         assert_eq!(parts.tenant_id, "tenant-a");

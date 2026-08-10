@@ -9,7 +9,7 @@ pub(super) async fn create_view(
     let spec = view_spec_from_request(&state, &request, &catalogs)?;
     validate_materialized_runtime_spec_admission(&spec)?;
     state.validate_standing_runtime_fencing_or_evict().await?;
-    let runtime_binding = materialized_view_runtime_binding_for_spec(&catalogs, &spec)?;
+    let mut runtime_binding = materialized_view_runtime_binding_for_spec(&catalogs, &spec)?;
     validate_public_runtime_plan_admission(
         &state,
         runtime_binding.logical_plan.as_ref().ok_or_else(|| {
@@ -36,6 +36,12 @@ pub(super) async fn create_view(
         &spec.output_relations,
     )?;
     let execution_mode = MaterializedViewExecutionMode::StandingRuntime;
+    let bootstrap = begin_authoritative_view_bootstrap(&state, &spec, &runtime_binding).await?;
+    runtime_binding.published_relations = published_relation_bindings_for_spec(
+        &spec,
+        &runtime_binding,
+        bootstrap.bootstrap_generation,
+    )?;
     let requires_backfill = standing_runtime_create_requires_backfill(&state, &spec).await?;
     let lifecycle = lifecycle_for_create_view_execution(&execution_mode, requires_backfill);
     let outcome = if let Some(runtime) = pending_runtime {
@@ -81,6 +87,56 @@ pub(super) async fn create_view(
             state.experimental_advanced_view_features,
         )?),
     ))
+}
+
+async fn begin_authoritative_view_bootstrap(
+    state: &ApiState,
+    spec: &StandingViewSpec,
+    runtime: &MaterializedViewRuntimeBinding,
+) -> Result<ViewBootstrapControlV1, ApiError> {
+    let meta_store = state.view_bootstrap_meta_store.as_ref().ok_or_else(|| {
+        ApiError::service_unavailable(
+            "materialized view admission requires authoritative bootstrap metadata",
+        )
+    })?;
+    let plan_hash = runtime
+        .logical_plan
+        .as_ref()
+        .and_then(|plan| plan.plan_hash.clone())
+        .ok_or_else(|| {
+            ApiError::bad_request("materialized view logical plan is missing plan_hash")
+        })?;
+    let view_spec_json =
+        serde_json::to_vec(spec).map_err(|error| ApiError::internal(error.to_string()))?;
+    let request = BeginViewBootstrapRequest {
+        tenant_id: runtime.standing_program_identity.tenant_id.clone(),
+        program_id: runtime.standing_program_identity.program_id.clone(),
+        view_id: spec.view_id.clone(),
+        plan_hash,
+        view_spec_json,
+        relations: spec
+            .input_relations
+            .iter()
+            .map(|relation| IngestSourceRelationIdentityV1 {
+                relation_id: relation.relation_id.clone(),
+                relation_version: relation.relation_version.clone(),
+                relation_generation: INGEST_SOURCE_IDENTITY_GENERATION_V1,
+                schema_fingerprint: relation.schema_fingerprint.clone(),
+            })
+            .collect(),
+    };
+    match meta_store
+        .begin_view_bootstrap(request)
+        .await
+        .map_err(meta_error_to_api)?
+    {
+        BeginViewBootstrapOutcome::Created(control)
+        | BeginViewBootstrapOutcome::Duplicate(control) => Ok(control),
+        BeginViewBootstrapOutcome::Conflict => Err(ApiError::conflict(format!(
+            "authoritative view bootstrap conflict for `{}`",
+            spec.view_id
+        ))),
+    }
 }
 
 pub(super) fn validate_public_view_feature_admission(
@@ -139,6 +195,8 @@ pub(super) fn validate_public_runtime_plan_admission(
         VelorixLogicalViewExecutionV1::TwoInputJoinSumCount { plan } => {
             validate_public_top_k_limit(plan.top_k.as_ref())
         }
+        VelorixLogicalViewExecutionV1::ThreeInputInnerJoinCount { .. } => Ok(()),
+        VelorixLogicalViewExecutionV1::TwoInputSemiAntiJoinProject { .. } => Ok(()),
     }
 }
 
@@ -217,7 +275,51 @@ pub(super) fn materialized_view_runtime_binding_for_spec(
         runtime_version: "builtin-v1".to_string(),
         standing_program_identity: identity,
         logical_plan: Some(logical_plan),
+        published_relations: Vec::new(),
     })
+}
+
+pub(super) fn published_relation_bindings_for_spec(
+    spec: &StandingViewSpec,
+    runtime: &MaterializedViewRuntimeBinding,
+    producer_view_generation: u64,
+) -> Result<Vec<velorix_core::view_contract::PublishedRelationBindingV1>, ApiError> {
+    let plan_hash = runtime
+        .logical_plan
+        .as_ref()
+        .and_then(|plan| plan.plan_hash.as_deref())
+        .ok_or_else(|| {
+            ApiError::bad_request("materialized view logical plan is missing plan_hash")
+        })?;
+    spec.output_relations
+        .iter()
+        .map(|relation| {
+            published_relation_binding_v1(
+                &spec.view_id,
+                producer_view_generation,
+                plan_hash,
+                relation,
+            )
+            .map_err(ApiError::bad_request)
+        })
+        .collect()
+}
+
+pub(super) fn published_relation_binding_for_active_view(
+    active: &ActiveMaterializedView,
+) -> Result<Option<PublishedRelationBindingV1>, ApiError> {
+    let Some(runtime) = active.runtime.as_ref() else {
+        return Ok(None);
+    };
+    match runtime.published_relations.as_slice() {
+        [] => Ok(None),
+        [binding] => Ok(Some(binding.clone())),
+        bindings => Err(ApiError::internal(format!(
+            "active standing view `{}` has {} published relation bindings; exactly one is supported",
+            active.spec.view_id,
+            bindings.len()
+        ))),
+    }
 }
 
 pub(super) fn only_output_relation_for_runtime_binding(
@@ -271,7 +373,11 @@ pub(super) fn standing_program_identity_from_materialized_view_runtime(
             name: MATERIALIZED_VIEW_RUNTIME_NAME.to_string(),
             version: "builtin-v1".to_string(),
         }],
-        runtime_capabilities: vec!["materialized_view_runtime".to_string()],
+        runtime_capabilities: vec![
+            "materialized_view_runtime".to_string(),
+            INCREMENTAL_KEY_SEMANTICS_VERSION_V1.to_string(),
+            INCREMENTAL_BAG_SEMANTICS_VERSION_V1.to_string(),
+        ],
         runtime_compatibility: "velorix-materialized-view-runtime-v1".to_string(),
         checkpoint_codec_identity: "velorix-materialized-view-state-v1".to_string(),
         native_code_policy: NativeCodePolicy::DisabledNoExternalDependencies,

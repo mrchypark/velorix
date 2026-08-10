@@ -5,8 +5,8 @@ use tempfile::TempDir;
 use velorix_core::{
     standing_program::{BuiltinRuntimeIdentity, NativeCodePolicy, StandingProgramIdentity},
     view_contract::{
-        view_spec_hash, ColumnSchema, RelationSchema, SqlDataType, SqlDialect, SqlSourceKind,
-        StandingViewShape, StandingViewSpec, ViewContractError,
+        published_relation_binding_v1, view_spec_hash, ColumnSchema, RelationSchema, SqlDataType,
+        SqlDialect, SqlSourceKind, StandingViewShape, StandingViewSpec, ViewContractError,
     },
 };
 use velorix_storage::{
@@ -111,6 +111,13 @@ fn runtime_binding(spec: &StandingViewSpec) -> MaterializedViewRuntimeBinding {
         runtime_version: "builtin-v1".to_string(),
         standing_program_identity: standing_program_identity(&spec.view_id),
         logical_plan: None,
+        published_relations: vec![published_relation_binding_v1(
+            &spec.view_id,
+            1,
+            "velorix-logical-view-plan-sha256-v1:test",
+            &spec.output_relations[0],
+        )
+        .unwrap()],
     }
 }
 

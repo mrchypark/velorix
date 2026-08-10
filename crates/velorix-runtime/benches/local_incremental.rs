@@ -9,6 +9,8 @@ use std::{
 };
 
 mod materialized_output_workloads;
+mod scale_group_key_workloads;
+mod scale_join_key_workloads;
 
 use arrow::{
     array::{ArrayRef, Int64Array, StringArray},
@@ -316,6 +318,8 @@ async fn run() -> BenchResult<()> {
             CHECKPOINT_VERSION,
         )
         .await?;
+    let scale_group_key_workloads = scale_group_key_workloads::run()?;
+    let scale_join_key_workloads = scale_join_key_workloads::run()?;
 
     let records_per_second = total_records as f64 / materialized_view_apply_elapsed.as_secs_f64();
     let object_requests = metered_store.snapshot();
@@ -390,6 +394,22 @@ async fn run() -> BenchResult<()> {
                 ),
             ];
             workload_metrics.extend(materialized_output_workloads);
+            workload_metrics.extend(scale_group_key_workloads.into_iter().map(|measurement| {
+                workload_metric(
+                    &measurement.name,
+                    &measurement.samples,
+                    empty_object_requests(),
+                    0,
+                )
+            }));
+            workload_metrics.extend(scale_join_key_workloads.into_iter().map(|measurement| {
+                workload_metric(
+                    &measurement.name,
+                    &measurement.samples,
+                    empty_object_requests(),
+                    0,
+                )
+            }));
             workload_metrics
         },
     };

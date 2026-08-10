@@ -71,6 +71,29 @@ pub struct VelorixRelationCatalogV1 {
 }
 
 impl VelorixRelationCatalogV1 {
+    pub fn from_relation_schema(
+        relation_schema: VelorixRelationSchemaV1,
+        adapter_id: String,
+    ) -> Result<Self, RelationSchemaError> {
+        let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema)?;
+        let catalog = Self {
+            schema_version: RELATION_SCHEMA_VERSION_V1,
+            datafusion_registration: DataFusionRegistrationV1 {
+                name: relation_schema.relation_name.clone(),
+                mode: DataFusionRegistrationModeV1::Table,
+            },
+            incremental_relation: IncrementalRelationBindingV1 {
+                relation_id: relation_schema.relation_id.clone(),
+                schema_fingerprint: schema_fingerprint.clone(),
+            },
+            incremental_adapter: IncrementalAdapterBindingV1 { adapter_id },
+            relation_schema,
+            schema_fingerprint,
+        };
+        catalog.validate_ingest_adapter_scope()?;
+        Ok(catalog)
+    }
+
     pub fn validate(&self) -> Result<(), RelationSchemaError> {
         if self.schema_version != RELATION_SCHEMA_VERSION_V1 {
             return Err(RelationSchemaError::UnsupportedSchemaVersion {
@@ -207,24 +230,10 @@ pub fn orders_sum_count_relation_catalog() -> Result<VelorixRelationCatalogV1, R
         allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
         event_time_column_id: None,
     };
-    let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema)?;
-
-    Ok(VelorixRelationCatalogV1 {
-        schema_version: RELATION_SCHEMA_VERSION_V1,
+    VelorixRelationCatalogV1::from_relation_schema(
         relation_schema,
-        schema_fingerprint: schema_fingerprint.clone(),
-        datafusion_registration: DataFusionRegistrationV1 {
-            name: "orders".to_string(),
-            mode: DataFusionRegistrationModeV1::Table,
-        },
-        incremental_relation: IncrementalRelationBindingV1 {
-            relation_id: ORDERS_SUM_COUNT_RELATION_ID.to_string(),
-            schema_fingerprint,
-        },
-        incremental_adapter: IncrementalAdapterBindingV1 {
-            adapter_id: ORDERS_SUM_COUNT_ADAPTER_ID.to_string(),
-        },
-    })
+        ORDERS_SUM_COUNT_ADAPTER_ID.to_string(),
+    )
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1679,7 +1688,7 @@ impl IncrementalKeyColumn<'_> {
                     });
                 }
 
-                Ok(json!(value))
+                Ok(json!(if value == 0.0 { 0.0 } else { value }))
             }
             Self::Float64(column) => {
                 let value = column.value(row);
@@ -1689,7 +1698,7 @@ impl IncrementalKeyColumn<'_> {
                     });
                 }
 
-                Ok(json!(value))
+                Ok(json!(if value == 0.0 { 0.0 } else { value }))
             }
             Self::Decimal128(column, precision, scale) => Ok(json!(decimal128_string(
                 column.value(row),

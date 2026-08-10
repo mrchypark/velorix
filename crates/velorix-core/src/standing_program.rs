@@ -205,6 +205,228 @@ pub struct RuntimeCheckpoint {
     pub state_payload: Option<RuntimeCheckpointStatePayload>,
     pub output_manifest_refs: Vec<String>,
     pub owner_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_coverage: Option<RuntimeCheckpointInputCoverageV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub causal_cut: Option<CausalCutV1>,
+}
+
+pub const RUNTIME_CHECKPOINT_INPUT_COVERAGE_SCHEMA_VERSION_V1: u32 = 1;
+pub const CAUSAL_CUT_SCHEMA_VERSION_V1: u32 = 1;
+const CAUSAL_CUT_DIGEST_DOMAIN_V1: &str = "velorix-causal-cut-v1";
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeCheckpointInputCoverageV1 {
+    pub schema_version: u32,
+    pub view_generation: u64,
+    pub plan_hash: String,
+    pub input_catalog_epoch: u64,
+    pub relations: Vec<RuntimeCheckpointRelationCoverageV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeCheckpointRelationCoverageV1 {
+    pub relation_id: String,
+    pub relation_version: String,
+    pub relation_generation: u64,
+    pub schema_fingerprint: String,
+    pub partitions: Vec<RuntimeCheckpointPartitionCoverageV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeCheckpointPartitionCoverageV1 {
+    pub stream_id: String,
+    pub stream_generation: u64,
+    pub partition_id: u32,
+    pub partition_generation: u64,
+    pub covered_from_offset_inclusive: u64,
+    pub processed_offset_exclusive: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CausalCutV1 {
+    pub schema_version: u32,
+    pub direct_source_catalog_epoch: u64,
+    pub direct_source_frontiers: Vec<RuntimeCheckpointRelationCoverageV1>,
+    pub direct_view_cursors: Vec<CausalViewCursorV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CausalViewCursorV1 {
+    pub input_edge: String,
+    pub producer_tenant_id: String,
+    pub producer_program_id: String,
+    pub producer_view_id: String,
+    pub producer_generation: u64,
+    pub output_stream: String,
+    pub output_epoch: LogicalEpoch,
+    pub commit_digest: String,
+}
+
+impl CausalViewCursorV1 {
+    pub fn validate(&self) -> Result<(), StandingProgramRuntimeError> {
+        require_non_empty("causal_cut.input_edge", &self.input_edge)?;
+        require_non_empty("causal_cut.producer_tenant_id", &self.producer_tenant_id)?;
+        require_non_empty("causal_cut.producer_program_id", &self.producer_program_id)?;
+        require_non_empty("causal_cut.producer_view_id", &self.producer_view_id)?;
+        require_non_empty("causal_cut.output_stream", &self.output_stream)?;
+        require_sha256("causal_cut.commit_digest", &self.commit_digest)?;
+        if self.producer_generation == 0 {
+            return Err(invalid_causal_cut());
+        }
+        Ok(())
+    }
+}
+
+impl CausalCutV1 {
+    pub fn from_input_coverage(
+        coverage: &RuntimeCheckpointInputCoverageV1,
+        direct_view_cursors: Vec<CausalViewCursorV1>,
+    ) -> Result<Self, StandingProgramRuntimeError> {
+        let coverage = coverage.clone().canonicalized()?;
+        Self {
+            schema_version: CAUSAL_CUT_SCHEMA_VERSION_V1,
+            direct_source_catalog_epoch: coverage.input_catalog_epoch,
+            direct_source_frontiers: coverage.relations,
+            direct_view_cursors,
+        }
+        .canonicalized()
+    }
+
+    pub fn canonicalized(mut self) -> Result<Self, StandingProgramRuntimeError> {
+        if self.schema_version != CAUSAL_CUT_SCHEMA_VERSION_V1
+            || (self.direct_source_frontiers.is_empty() && self.direct_view_cursors.is_empty())
+        {
+            return Err(invalid_causal_cut());
+        }
+        let source_coverage = RuntimeCheckpointInputCoverageV1 {
+            schema_version: RUNTIME_CHECKPOINT_INPUT_COVERAGE_SCHEMA_VERSION_V1,
+            view_generation: 1,
+            plan_hash: "causal-cut-source-validation".to_string(),
+            input_catalog_epoch: self.direct_source_catalog_epoch,
+            relations: self.direct_source_frontiers,
+        }
+        .canonicalized()?;
+        self.direct_source_frontiers = source_coverage.relations;
+        self.direct_view_cursors.sort();
+        let mut previous_edge = None;
+        for cursor in &self.direct_view_cursors {
+            cursor.validate()?;
+            if previous_edge == Some(cursor.input_edge.as_str()) {
+                return Err(invalid_causal_cut());
+            }
+            previous_edge = Some(cursor.input_edge.as_str());
+        }
+        Ok(self)
+    }
+
+    pub fn stable_digest(&self) -> Result<String, StandingProgramRuntimeError> {
+        #[derive(Serialize)]
+        struct DigestEnvelope<'a> {
+            domain: &'static str,
+            causal_cut: &'a CausalCutV1,
+        }
+
+        let canonical = self.clone().canonicalized()?;
+        let bytes = serde_json::to_vec(&DigestEnvelope {
+            domain: CAUSAL_CUT_DIGEST_DOMAIN_V1,
+            causal_cut: &canonical,
+        })
+        .map_err(|_| invalid_causal_cut())?;
+        Ok(sha256_hex(&bytes))
+    }
+}
+
+impl RuntimeCheckpointInputCoverageV1 {
+    pub fn canonicalized(mut self) -> Result<Self, StandingProgramRuntimeError> {
+        if self.schema_version != RUNTIME_CHECKPOINT_INPUT_COVERAGE_SCHEMA_VERSION_V1
+            || self.view_generation == 0
+        {
+            return Err(invalid_input_coverage());
+        }
+        require_non_empty("input_coverage.plan_hash", &self.plan_hash)?;
+        self.relations.sort_by(|left, right| {
+            (
+                &left.relation_id,
+                &left.relation_version,
+                left.relation_generation,
+            )
+                .cmp(&(
+                    &right.relation_id,
+                    &right.relation_version,
+                    right.relation_generation,
+                ))
+        });
+        let mut previous_relation = None;
+        for relation in &mut self.relations {
+            require_non_empty("input_coverage.relation_id", &relation.relation_id)?;
+            require_non_empty(
+                "input_coverage.relation_version",
+                &relation.relation_version,
+            )?;
+            require_non_empty(
+                "input_coverage.schema_fingerprint",
+                &relation.schema_fingerprint,
+            )?;
+            if relation.relation_generation == 0 {
+                return Err(invalid_input_coverage());
+            }
+            relation.partitions.sort();
+            let mut previous_partition = None;
+            for partition in &relation.partitions {
+                require_non_empty("input_coverage.stream_id", &partition.stream_id)?;
+                if partition.stream_generation == 0 || partition.partition_generation == 0 {
+                    return Err(invalid_input_coverage());
+                }
+                if partition.covered_from_offset_inclusive > partition.processed_offset_exclusive {
+                    return Err(invalid_input_coverage());
+                }
+                let identity = (
+                    partition.stream_id.as_str(),
+                    partition.stream_generation,
+                    partition.partition_id,
+                    partition.partition_generation,
+                );
+                if previous_partition == Some(identity) {
+                    return Err(invalid_input_coverage());
+                }
+                previous_partition = Some(identity);
+            }
+            let identity = (
+                relation.relation_id.as_str(),
+                relation.relation_version.as_str(),
+                relation.relation_generation,
+            );
+            if previous_relation == Some(identity) {
+                return Err(invalid_input_coverage());
+            }
+            previous_relation = Some(identity);
+        }
+        Ok(self)
+    }
+
+    pub fn stable_hash(&self) -> Result<String, StandingProgramRuntimeError> {
+        let canonical = self.clone().canonicalized()?;
+        let bytes = serde_json::to_vec(&canonical).map_err(|_| invalid_input_coverage())?;
+        Ok(sha256_hex(&bytes))
+    }
+}
+
+fn invalid_input_coverage() -> StandingProgramRuntimeError {
+    StandingProgramRuntimeError::InvalidProgramIdentity {
+        field: "input_coverage",
+    }
+}
+
+fn invalid_causal_cut() -> StandingProgramRuntimeError {
+    StandingProgramRuntimeError::InvalidProgramIdentity {
+        field: "causal_cut",
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -248,6 +470,22 @@ impl RuntimeCheckpoint {
         }
         require_non_empty("state_root.object_key", &self.state_root.object_key)?;
         require_sha256("state_root.content_hash", &self.state_root.content_hash)?;
+        if let Some(coverage) = &self.input_coverage {
+            coverage.stable_hash()?;
+        }
+        if let Some(causal_cut) = &self.causal_cut {
+            let canonical_cut = causal_cut.clone().canonicalized()?;
+            causal_cut.stable_digest()?;
+            if let Some(coverage) = &self.input_coverage {
+                let expected = CausalCutV1::from_input_coverage(
+                    coverage,
+                    canonical_cut.direct_view_cursors.clone(),
+                )?;
+                if canonical_cut != expected {
+                    return Err(invalid_causal_cut());
+                }
+            }
+        }
         Ok(())
     }
 }

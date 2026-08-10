@@ -9,6 +9,9 @@ use crate::relation::{
 };
 
 pub const SPEC_HASH_PREFIX: &str = "velorix-view-spec-sha256-v1";
+pub const PUBLISHED_RELATION_BINDING_SCHEMA_VERSION_V1: u32 = 1;
+pub const PUBLISHED_RELATION_DELTA_CODEC_V1: &str = "velorix-published-relation-delta-v1";
+pub const PUBLISHED_RELATION_FRONTIER_KIND_V1: &str = "producer_commit_epoch";
 pub const MAX_RELATION_COLUMNS: usize = 1024;
 pub const MAX_SQL_TYPE_NESTING_DEPTH: usize = 16;
 pub const MAX_SQL_TYPE_NODES: usize = 4096;
@@ -59,6 +62,25 @@ pub struct RelationSchema {
     pub schema_fingerprint: String,
     pub columns: Vec<ColumnSchema>,
     pub primary_key: Vec<String>,
+}
+
+/// Immutable identity for consuming a materialized output as a typed relation.
+///
+/// The public relation schema never contains a physical delta-weight column. The
+/// internal delta codec named here carries signed bag weights separately.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishedRelationBindingV1 {
+    pub schema_version: u32,
+    pub producer_view_id: String,
+    pub producer_view_generation: u64,
+    pub producer_plan_hash: String,
+    pub relation: RelationSchema,
+    pub output_schema_hash: String,
+    pub key_descriptor_hash: String,
+    pub output_stream_id: String,
+    pub delta_codec_identity: String,
+    pub frontier_kind: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -226,6 +248,109 @@ pub fn view_spec_hash(spec: &StandingViewSpec) -> Result<String, ViewContractErr
     Ok(format!("{SPEC_HASH_PREFIX}:{hex}"))
 }
 
+pub fn published_relation_binding_v1(
+    producer_view_id: &str,
+    producer_view_generation: u64,
+    producer_plan_hash: &str,
+    relation: &RelationSchema,
+) -> Result<PublishedRelationBindingV1, ViewContractError> {
+    require_non_empty("published_relation.producer_view_id", producer_view_id)?;
+    require_non_empty("published_relation.producer_plan_hash", producer_plan_hash)?;
+    if producer_view_generation == 0 {
+        return Err(ViewContractError::InvalidField {
+            field: "published_relation.producer_view_generation",
+        });
+    }
+    validate_relation_schema(relation)?;
+    let output_schema_hash = stable_serialized_hash(relation, "published relation output schema")?;
+    let key_descriptor_hash =
+        stable_serialized_hash(&relation.primary_key, "published relation key descriptor")?;
+    let binding = PublishedRelationBindingV1 {
+        schema_version: PUBLISHED_RELATION_BINDING_SCHEMA_VERSION_V1,
+        producer_view_id: producer_view_id.to_string(),
+        producer_view_generation,
+        producer_plan_hash: producer_plan_hash.to_string(),
+        relation: relation.clone(),
+        output_schema_hash,
+        key_descriptor_hash,
+        output_stream_id: format!(
+            "view/{producer_view_id}/generation/{producer_view_generation}/output/{}",
+            relation.relation_id
+        ),
+        delta_codec_identity: PUBLISHED_RELATION_DELTA_CODEC_V1.to_string(),
+        frontier_kind: PUBLISHED_RELATION_FRONTIER_KIND_V1.to_string(),
+    };
+    validate_published_relation_binding_v1(&binding)?;
+    Ok(binding)
+}
+
+pub fn validate_published_relation_binding_v1(
+    binding: &PublishedRelationBindingV1,
+) -> Result<(), ViewContractError> {
+    if binding.schema_version != PUBLISHED_RELATION_BINDING_SCHEMA_VERSION_V1
+        || binding.producer_view_generation == 0
+    {
+        return Err(ViewContractError::InvalidField {
+            field: "published_relation",
+        });
+    }
+    require_non_empty(
+        "published_relation.producer_view_id",
+        &binding.producer_view_id,
+    )?;
+    require_non_empty(
+        "published_relation.producer_plan_hash",
+        &binding.producer_plan_hash,
+    )?;
+    validate_relation_schema(&binding.relation)?;
+    let expected_schema_hash =
+        stable_serialized_hash(&binding.relation, "published relation output schema")?;
+    let expected_key_hash = stable_serialized_hash(
+        &binding.relation.primary_key,
+        "published relation key descriptor",
+    )?;
+    let expected_stream_id = format!(
+        "view/{}/generation/{}/output/{}",
+        binding.producer_view_id, binding.producer_view_generation, binding.relation.relation_id
+    );
+    if binding.output_schema_hash != expected_schema_hash {
+        return Err(ViewContractError::InvalidField {
+            field: "published_relation.output_schema_hash",
+        });
+    }
+    if binding.key_descriptor_hash != expected_key_hash {
+        return Err(ViewContractError::InvalidField {
+            field: "published_relation.key_descriptor_hash",
+        });
+    }
+    if binding.output_stream_id != expected_stream_id {
+        return Err(ViewContractError::InvalidField {
+            field: "published_relation.output_stream_id",
+        });
+    }
+    if binding.delta_codec_identity != PUBLISHED_RELATION_DELTA_CODEC_V1 {
+        return Err(ViewContractError::InvalidField {
+            field: "published_relation.delta_codec_identity",
+        });
+    }
+    if binding.frontier_kind != PUBLISHED_RELATION_FRONTIER_KIND_V1 {
+        return Err(ViewContractError::InvalidField {
+            field: "published_relation.frontier_kind",
+        });
+    }
+    Ok(())
+}
+
+fn stable_serialized_hash<T: Serialize>(
+    value: &T,
+    description: &str,
+) -> Result<String, ViewContractError> {
+    let bytes = serde_json::to_vec(value).map_err(|source| ViewContractError::Serialization {
+        reason: format!("could not serialize {description}: {source}"),
+    })?;
+    Ok(stable_bytes_hash(&bytes))
+}
+
 pub fn stable_bytes_hash(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -256,11 +381,6 @@ fn validate_relation_schema(schema: &RelationSchema) -> Result<(), ViewContractE
     validate_schema_fingerprint(&schema.schema_fingerprint)?;
     if schema.columns.is_empty() || schema.columns.len() > MAX_RELATION_COLUMNS {
         return Err(ViewContractError::InvalidField { field: "columns" });
-    }
-    if schema.primary_key.is_empty() {
-        return Err(ViewContractError::InvalidField {
-            field: "primary_key",
-        });
     }
     let mut column_names = BTreeSet::new();
     for column in &schema.columns {
@@ -568,5 +688,60 @@ mod tests {
         let hex = hash.strip_prefix("velorix-view-spec-sha256-v1:").unwrap();
         assert_eq!(hex.len(), 64);
         assert!(hex.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn published_relation_binding_fences_schema_key_generation_and_frontier() {
+        let relation = RelationSchema {
+            relation_id: "orders_by_region".to_string(),
+            relation_name: "orders_by_region".to_string(),
+            relation_version: "v1".to_string(),
+            schema_fingerprint: format!("sha256:{}", "2".repeat(64)),
+            columns: vec![ColumnSchema {
+                name: "region".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            }],
+            primary_key: vec!["region".to_string()],
+        };
+
+        let binding = published_relation_binding_v1(
+            "orders_by_region",
+            7,
+            "velorix-logical-view-plan-sha256-v1:plan",
+            &relation,
+        )
+        .unwrap();
+
+        assert_eq!(binding.relation, relation);
+        assert_eq!(binding.producer_view_generation, 7);
+        assert_eq!(
+            binding.output_stream_id,
+            "view/orders_by_region/generation/7/output/orders_by_region"
+        );
+        assert_eq!(
+            binding.delta_codec_identity,
+            PUBLISHED_RELATION_DELTA_CODEC_V1
+        );
+        assert_eq!(binding.frontier_kind, PUBLISHED_RELATION_FRONTIER_KIND_V1);
+        validate_published_relation_binding_v1(&binding).unwrap();
+
+        let mut stale_key = binding.clone();
+        stale_key.key_descriptor_hash = format!("sha256:{}", "0".repeat(64));
+        assert_eq!(
+            validate_published_relation_binding_v1(&stale_key),
+            Err(ViewContractError::InvalidField {
+                field: "published_relation.key_descriptor_hash"
+            })
+        );
+
+        let mut wrong_generation_stream = binding;
+        wrong_generation_stream.producer_view_generation += 1;
+        assert_eq!(
+            validate_published_relation_binding_v1(&wrong_generation_stream),
+            Err(ViewContractError::InvalidField {
+                field: "published_relation.output_stream_id"
+            })
+        );
     }
 }
