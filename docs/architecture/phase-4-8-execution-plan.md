@@ -671,3 +671,7 @@ cargo fmt --all --check
 | 2026-08-11 | 4 | Step 0.4: Bootstrap + retention/GC | DeltaRetentionStateV1 | Complete |
 | 2026-08-11 | 4 | Step 0.5: Mandatory causal validation | CausalCutV1 validation | Complete |
 | 2026-08-11 | 4 | Step 0.6: Fan-in scheduling + backpressure | ConsumerLagQuotaV1 | Complete |
+| 2026-08-11 | 5 | Event-Time Semantics documentation | supported-sql.md | Complete |
+| 2026-08-11 | 6 | Type Inventory V1 documentation | type-inventory-v1.md | Complete |
+| 2026-08-11 | 7 | Query Rewrite Design V1 documentation | query-rewrite-design-v1.md | Complete |
+| 2026-08-11 | 8 | Advanced Capabilities Design V1 documentation | advanced-capabilities-design-v1.md | Complete |
