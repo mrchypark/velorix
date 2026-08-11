@@ -39,8 +39,8 @@ pub use source_cut::{
     INGEST_SOURCE_IDENTITY_GENERATION_V1,
 };
 pub use view_bootstrap::{
-    BeginViewBootstrapOutcome, BeginViewBootstrapRequest, DependencyGraphEdgeV1,
-    DependencyGraphV1, FixViewBootstrapActivationCutOutcome, FixViewBootstrapActivationCutRequest,
+    BeginViewBootstrapOutcome, BeginViewBootstrapRequest, DependencyGraphEdgeV1, DependencyGraphV1,
+    FixViewBootstrapActivationCutOutcome, FixViewBootstrapActivationCutRequest,
     PromoteViewBootstrapOutcome, PromoteViewBootstrapRequest, PublishDependencyGraphOutcome,
     ViewBootstrapControlV1, ViewBootstrapLifecycleV1, INITIAL_VIEW_BOOTSTRAP_GENERATION,
     VIEW_BOOTSTRAP_CONTROL_SCHEMA_VERSION_V1,

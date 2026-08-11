@@ -244,8 +244,9 @@ impl StandingProgramRuntime for ThreeInputInnerJoinCountRuntime {
         &mut self,
         logical_epoch: LogicalEpoch,
         idempotency_key: EpochIdempotencyKey,
-        input_changes: Vec<RelationInputBatch>,
+        input_changes: Vec<StandingInputChangeV1>,
     ) -> Result<EpochCommit, StandingProgramRuntimeError> {
+        let input_changes = source_input_batches(input_changes)?;
         let idempotency_key_text = idempotency_key.as_str().to_string();
         if let Some(applied_epoch) = self.applied_epochs.get(&idempotency_key_text) {
             if *applied_epoch == logical_epoch {

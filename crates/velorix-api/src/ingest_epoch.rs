@@ -1787,7 +1787,7 @@ pub(super) async fn apply_standing_runtime_changes_and_checkpoint_many(
         let logical_epoch =
             next_standing_runtime_logical_epoch(runtime.as_ref(), lower_bound_epoch)?;
         let before = runtime.checkpoint().map_err(ApiError::bad_request)?;
-        let commit = match runtime.apply_changes(logical_epoch, idempotency_key, input_batches) {
+        let commit = match runtime.apply_changes(logical_epoch, idempotency_key, input_batches.into_iter().map(StandingInputChangeV1::Source).collect()) {
             Ok(commit) => commit,
             Err(error) => {
                 *runtime = velorix_runtime::materialized_view_runtime::restore_standing_runtime(

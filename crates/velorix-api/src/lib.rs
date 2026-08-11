@@ -100,9 +100,9 @@ use velorix_core::{
         InputEventTimeWatermark, MaterializedViewPage, NativeCodePolicy, RelationFrontier,
         RelationInputBatch, RuntimeCheckpoint, RuntimeCheckpointInputCoverageV1,
         RuntimeCheckpointPartitionCoverageV1, RuntimeCheckpointRelationCoverageV1,
-        RuntimeCheckpointStatePayload, ScopedViewId, SnapshotPageRequest, StandingProgramIdentity,
-        StandingProgramRuntime, StandingProgramRuntimeError, ViewOutputDelta,
-        RUNTIME_CHECKPOINT_INPUT_COVERAGE_SCHEMA_VERSION_V1,
+        RuntimeCheckpointStatePayload, ScopedViewId, SnapshotPageRequest, StandingInputChangeV1,
+        StandingProgramIdentity, StandingProgramRuntime, StandingProgramRuntimeError,
+        ViewOutputDelta, RUNTIME_CHECKPOINT_INPUT_COVERAGE_SCHEMA_VERSION_V1,
     },
     view_contract::{
         catalog_input_relation_schema, published_relation_binding_v1, stable_bytes_hash,

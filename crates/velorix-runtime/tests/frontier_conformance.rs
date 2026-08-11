@@ -17,7 +17,8 @@ use velorix_core::{
     },
     standing_program::{
         BuiltinRuntimeIdentity, EpochIdempotencyKey, NativeCodePolicy, RelationInputBatch,
-        ScopedViewId, SnapshotPageRequest, StandingProgramIdentity, StandingProgramRuntime,
+        ScopedViewId, SnapshotPageRequest, StandingInputChangeV1, StandingProgramIdentity,
+        StandingProgramRuntime,
     },
     view_contract::{
         catalog_input_relation_schema, stable_bytes_hash, ColumnSchema, RelationSchema, SqlDataType,
@@ -218,8 +219,8 @@ fn input(
     start: u64,
     end: u64,
     rows: &[(&str, i64, i64)],
-) -> RelationInputBatch {
-    RelationInputBatch {
+) -> StandingInputChangeV1 {
+    StandingInputChangeV1::Source(RelationInputBatch {
         relation_id: catalog.relation_schema.relation_id.clone(),
         relation_version: catalog.relation_schema.relation_version.clone(),
         stream_id: "scores-stream".to_string(),
@@ -247,7 +248,7 @@ fn input(
             ],
         )
         .unwrap()],
-    }
+    })
 }
 
 fn scores_catalog() -> VelorixRelationCatalogV1 {

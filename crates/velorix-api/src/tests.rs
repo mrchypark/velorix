@@ -16149,7 +16149,7 @@ impl StandingProgramRuntime for FailingApplyRuntime {
         &mut self,
         _logical_epoch: u64,
         _idempotency_key: EpochIdempotencyKey,
-        _input_changes: Vec<RelationInputBatch>,
+        _input_changes: Vec<StandingInputChangeV1>,
     ) -> Result<velorix_core::standing_program::EpochCommit, StandingProgramRuntimeError> {
         Err(self.error())
     }
@@ -17033,7 +17033,8 @@ async fn scenario_list_views_empty_then_create() {
 async fn rest_tumble_window_admitted_through_public_api_without_experimental_flag() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     // Use test_public_api_state_with_store which does NOT set experimental flag
-    let state = test_public_api_state_with_store(store, "api-test-tumble-public-owner", false).await;
+    let state =
+        test_public_api_state_with_store(store, "api-test-tumble-public-owner", false).await;
     let router = app(state);
 
     // Register a relation with event_time column using the same helper as other TUMBLE tests

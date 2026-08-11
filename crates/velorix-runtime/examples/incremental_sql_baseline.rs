@@ -26,7 +26,8 @@ use velorix_core::{
     },
     standing_program::{
         BuiltinRuntimeIdentity, EpochIdempotencyKey, NativeCodePolicy, RelationInputBatch,
-        ScopedViewId, SnapshotPageRequest, StandingProgramIdentity, StandingProgramRuntime,
+        ScopedViewId, SnapshotPageRequest, StandingInputChangeV1, StandingProgramIdentity,
+        StandingProgramRuntime,
     },
     view_contract::{
         catalog_input_relation_schema, stable_bytes_hash, ColumnSchema, RelationSchema, SqlDataType,
@@ -320,7 +321,7 @@ fn relation_input_batches(
     catalogs: &[VelorixRelationCatalogV1],
     changes: &[Change],
     offsets: &mut BTreeMap<String, u64>,
-) -> Result<Vec<RelationInputBatch>, DynError> {
+) -> Result<Vec<StandingInputChangeV1>, DynError> {
     let mut batches = Vec::new();
     for catalog in catalogs {
         let relation_id = &catalog.relation_schema.relation_id;
@@ -346,7 +347,7 @@ fn relation_input_batches(
         let start = *offsets.get(relation_id).unwrap_or(&0);
         let end = start + relation_changes.len() as u64;
         offsets.insert(relation_id.clone(), end);
-        batches.push(RelationInputBatch {
+        batches.push(StandingInputChangeV1::Source(RelationInputBatch {
             relation_id: relation_id.clone(),
             relation_version: catalog.relation_schema.relation_version.clone(),
             stream_id: format!("{relation_id}-corpus-stream"),
@@ -356,7 +357,7 @@ fn relation_input_batches(
             end_offset_exclusive: end,
             event_time_watermark: None,
             batches: vec![catalog_batch(catalog, &rows, true)?],
-        });
+        }));
     }
     Ok(batches)
 }

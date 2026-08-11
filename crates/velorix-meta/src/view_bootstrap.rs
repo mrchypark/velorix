@@ -96,20 +96,26 @@ impl DependencyGraphV1 {
 
     /// Checks if adding the given edges would create a cycle.
     /// Returns Ok(()) if acyclic, Err(cycle_path) if cyclic.
-    pub fn validate_acyclicity(&self, new_edges: &[DependencyGraphEdgeV1]) -> Result<(), Vec<String>> {
+    pub fn validate_acyclicity(
+        &self,
+        new_edges: &[DependencyGraphEdgeV1],
+    ) -> Result<(), Vec<String>> {
         // Build adjacency list: producer_view_id -> set of consumer_view_ids
-        let mut graph: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        let mut graph: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
 
         // Add existing edges
         for edge in &self.edges {
-            graph.entry(edge.producer_view_id.clone())
+            graph
+                .entry(edge.producer_view_id.clone())
                 .or_default()
                 .push(edge.consumer_input_port.clone());
         }
 
         // Add new edges
         for edge in new_edges {
-            graph.entry(edge.producer_view_id.clone())
+            graph
+                .entry(edge.producer_view_id.clone())
                 .or_default()
                 .push(edge.consumer_input_port.clone());
         }
@@ -120,7 +126,8 @@ impl DependencyGraphV1 {
 
         for node in graph.keys() {
             if !visited.contains(node) {
-                if let Some(cycle) = dfs_cycle_detection(node, &graph, &mut visited, &mut rec_stack) {
+                if let Some(cycle) = dfs_cycle_detection(node, &graph, &mut visited, &mut rec_stack)
+                {
                     return Err(cycle);
                 }
             }
@@ -511,7 +518,7 @@ impl Default for TenantSchedulingConfigV1 {
             lag_quota: ConsumerLagQuotaV1 {
                 max_lag_epochs: 1000,
                 max_lag_bytes: 1024 * 1024 * 1024, // 1GB
-                max_lag_ms: 3600 * 1000, // 1 hour
+                max_lag_ms: 3600 * 1000,           // 1 hour
                 exceeded_action: LagExceededAction::FailClosed,
             },
             graph_limits: GraphSizeLimitsV1::default(),

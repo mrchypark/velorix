@@ -398,7 +398,9 @@ impl CausalCutV1 {
         }
 
         // For dependency-capable checkpoints, cursors must match edges exactly
-        let cursor_edges: Vec<&str> = self.direct_view_cursors.iter()
+        let cursor_edges: Vec<&str> = self
+            .direct_view_cursors
+            .iter()
             .map(|c| c.input_edge.as_str())
             .collect();
 
@@ -435,7 +437,8 @@ impl CausalCutV1 {
 
     /// Returns the set of edge IDs that have cursors.
     pub fn cursor_edge_ids(&self) -> Vec<String> {
-        self.direct_view_cursors.iter()
+        self.direct_view_cursors
+            .iter()
             .map(|c| c.input_edge.clone())
             .collect()
     }
@@ -651,7 +654,7 @@ pub trait StandingProgramRuntime {
         &mut self,
         logical_epoch: LogicalEpoch,
         idempotency_key: EpochIdempotencyKey,
-        input_changes: Vec<RelationInputBatch>,
+        input_changes: Vec<StandingInputChangeV1>,
     ) -> Result<EpochCommit, StandingProgramRuntimeError>;
 
     fn materialized_view_page(

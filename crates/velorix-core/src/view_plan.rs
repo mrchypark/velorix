@@ -12699,7 +12699,9 @@ fn supported_filter_project_bound_projection_expr(
                 return Ok(SupportedProjectionExpr::LeastInt64 { exprs });
             }
             // String expression functions
-            if function_name_eq(&function.name, "length") || function_name_eq(&function.name, "char_length") {
+            if function_name_eq(&function.name, "length")
+                || function_name_eq(&function.name, "char_length")
+            {
                 let [FunctionArg::Unnamed(FunctionArgExpr::Expr(argument))] =
                     arguments.args.as_slice()
                 else {
@@ -12733,18 +12735,23 @@ fn supported_filter_project_bound_projection_expr(
                     .collect::<Result<Vec<_>, _>>()?;
                 return Ok(SupportedProjectionExpr::ConcatUtf8 { exprs });
             }
-            if function_name_eq(&function.name, "substring") || function_name_eq(&function.name, "substr") {
+            if function_name_eq(&function.name, "substring")
+                || function_name_eq(&function.name, "substr")
+            {
                 if arguments.args.len() < 2 || arguments.args.len() > 3 {
                     return unsupported("SUBSTRING requires 2 or 3 arguments");
                 }
-                let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr_arg)) = &arguments.args[0] else {
+                let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr_arg)) = &arguments.args[0]
+                else {
                     return unsupported("SUBSTRING first argument must be an expression");
                 };
-                let FunctionArg::Unnamed(FunctionArgExpr::Expr(start_arg)) = &arguments.args[1] else {
+                let FunctionArg::Unnamed(FunctionArgExpr::Expr(start_arg)) = &arguments.args[1]
+                else {
                     return unsupported("SUBSTRING start must be an expression");
                 };
                 let length_arg = if arguments.args.len() == 3 {
-                    let FunctionArg::Unnamed(FunctionArgExpr::Expr(len_arg)) = &arguments.args[2] else {
+                    let FunctionArg::Unnamed(FunctionArgExpr::Expr(len_arg)) = &arguments.args[2]
+                    else {
                         return unsupported("SUBSTRING length must be an expression");
                     };
                     Some(Box::new(supported_filter_project_bound_projection_expr(
@@ -12905,7 +12912,9 @@ fn supported_filter_project_bound_string_projection_expr(
                     "string projection function DISTINCT arguments and clauses are not supported",
                 );
             }
-            if function_name_eq(&function.name, "length") || function_name_eq(&function.name, "char_length") {
+            if function_name_eq(&function.name, "length")
+                || function_name_eq(&function.name, "char_length")
+            {
                 let [FunctionArg::Unnamed(FunctionArgExpr::Expr(argument))] =
                     arguments.args.as_slice()
                 else {
@@ -12941,18 +12950,23 @@ fn supported_filter_project_bound_string_projection_expr(
                     .collect::<Result<Vec<_>, _>>()?;
                 return Ok(SupportedProjectionExpr::ConcatUtf8 { exprs });
             }
-            if function_name_eq(&function.name, "substring") || function_name_eq(&function.name, "substr") {
+            if function_name_eq(&function.name, "substring")
+                || function_name_eq(&function.name, "substr")
+            {
                 if arguments.args.len() < 2 || arguments.args.len() > 3 {
                     return unsupported("SUBSTRING requires 2 or 3 arguments");
                 }
-                let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr_arg)) = &arguments.args[0] else {
+                let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr_arg)) = &arguments.args[0]
+                else {
                     return unsupported("SUBSTRING first argument must be an expression");
                 };
-                let FunctionArg::Unnamed(FunctionArgExpr::Expr(start_arg)) = &arguments.args[1] else {
+                let FunctionArg::Unnamed(FunctionArgExpr::Expr(start_arg)) = &arguments.args[1]
+                else {
                     return unsupported("SUBSTRING start must be an expression");
                 };
                 let length_arg = if arguments.args.len() == 3 {
-                    let FunctionArg::Unnamed(FunctionArgExpr::Expr(len_arg)) = &arguments.args[2] else {
+                    let FunctionArg::Unnamed(FunctionArgExpr::Expr(len_arg)) = &arguments.args[2]
+                    else {
                         return unsupported("SUBSTRING length must be an expression");
                     };
                     Some(Box::new(supported_filter_project_bound_projection_expr(
@@ -13034,16 +13048,14 @@ fn supported_filter_project_bound_string_projection_expr(
                 length,
             })
         }
-        Expr::Trim { expr, .. } => {
-            Ok(SupportedProjectionExpr::TrimUtf8 {
-                expr: Box::new(supported_filter_project_bound_string_projection_expr(
-                    expr,
-                    catalog,
-                    relation_alias,
-                    source_projection,
-                )?),
-            })
-        }
+        Expr::Trim { expr, .. } => Ok(SupportedProjectionExpr::TrimUtf8 {
+            expr: Box::new(supported_filter_project_bound_string_projection_expr(
+                expr,
+                catalog,
+                relation_alias,
+                source_projection,
+            )?),
+        }),
         _ => unsupported("string projection expression is not supported"),
     }
 }
@@ -13380,11 +13392,17 @@ fn first_supported_projection_expr_column_id(expr: &SupportedProjectionExpr) -> 
         SupportedProjectionExpr::ConcatUtf8 { exprs } => exprs
             .iter()
             .find_map(first_supported_projection_expr_column_id),
-        SupportedProjectionExpr::SubstringUtf8 { expr, start, length } => {
-            first_supported_projection_expr_column_id(expr)
-                .or_else(|| first_supported_projection_expr_column_id(start))
-                .or_else(|| length.as_ref().and_then(|l| first_supported_projection_expr_column_id(l)))
-        }
+        SupportedProjectionExpr::SubstringUtf8 {
+            expr,
+            start,
+            length,
+        } => first_supported_projection_expr_column_id(expr)
+            .or_else(|| first_supported_projection_expr_column_id(start))
+            .or_else(|| {
+                length
+                    .as_ref()
+                    .and_then(|l| first_supported_projection_expr_column_id(l))
+            }),
         SupportedProjectionExpr::TrimUtf8 { expr } => {
             first_supported_projection_expr_column_id(expr)
         }
@@ -13451,7 +13469,11 @@ fn collect_supported_projection_expr_column_ids(
                 collect_supported_projection_expr_column_ids(expr, columns);
             }
         }
-        SupportedProjectionExpr::SubstringUtf8 { expr, start, length } => {
+        SupportedProjectionExpr::SubstringUtf8 {
+            expr,
+            start,
+            length,
+        } => {
             collect_supported_projection_expr_column_ids(expr, columns);
             collect_supported_projection_expr_column_ids(start, columns);
             if let Some(l) = length {

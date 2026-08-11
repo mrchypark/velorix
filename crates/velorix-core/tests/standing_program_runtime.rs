@@ -13,8 +13,9 @@ use velorix_core::{
         EpochIdempotencyKey, NativeCodePolicy, RelationFrontier, RelationInputBatch,
         RuntimeCheckpoint, RuntimeCheckpointInputCoverageV1, RuntimeCheckpointPartitionCoverageV1,
         RuntimeCheckpointRelationCoverageV1, ScopedViewId, SnapshotPageRequest,
-        StandingProgramIdentity, StandingProgramRuntime, StandingProgramRuntimeError, ViewFrontier,
-        ViewOutputBatch, ViewOutputDelta, RUNTIME_CHECKPOINT_INPUT_COVERAGE_SCHEMA_VERSION_V1,
+        StandingInputChangeV1, StandingProgramIdentity, StandingProgramRuntime,
+        StandingProgramRuntimeError, ViewFrontier, ViewOutputBatch, ViewOutputDelta,
+        RUNTIME_CHECKPOINT_INPUT_COVERAGE_SCHEMA_VERSION_V1,
     },
     view_contract::{ColumnSchema, RelationSchema, SqlDataType},
 };
@@ -358,8 +359,15 @@ impl StandingProgramRuntime for FakeStandingProgramRuntime {
         &mut self,
         logical_epoch: LogicalEpoch,
         idempotency_key: EpochIdempotencyKey,
-        input_changes: Vec<RelationInputBatch>,
+        input_changes: Vec<StandingInputChangeV1>,
     ) -> Result<EpochCommit, StandingProgramRuntimeError> {
+        let input_changes: Vec<RelationInputBatch> = input_changes
+            .into_iter()
+            .filter_map(|change| match change {
+                StandingInputChangeV1::Source(batch) => Some(batch),
+                StandingInputChangeV1::View(_) => None,
+            })
+            .collect();
         self.identity.validate()?;
         if logical_epoch <= self.epoch {
             return Err(StandingProgramRuntimeError::NonMonotonicLogicalEpoch {
@@ -457,7 +465,7 @@ fn standing_program_runtime_applies_relation_scoped_epoch_and_emits_view_scoped_
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![RelationInputBatch {
+            vec![StandingInputChangeV1::Source(RelationInputBatch {
                 relation_id: "orders".to_string(),
                 relation_version: "2026-05-05.v1".to_string(),
                 stream_id: "test-stream".to_string(),
@@ -467,7 +475,7 @@ fn standing_program_runtime_applies_relation_scoped_epoch_and_emits_view_scoped_
                 end_offset_exclusive: 1,
                 event_time_watermark: None,
                 batches: vec![sample_batch()],
-            }],
+            })],
         )
         .unwrap();
 

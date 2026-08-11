@@ -35,9 +35,9 @@ use velorix_core::{
     standing_program::{
         DurableStateRoot, EpochCommit, EpochIdempotencyKey, InputEventTimeFrontier,
         MaterializedViewPage, RelationFrontier, RelationInputBatch, RuntimeCheckpoint,
-        RuntimeCheckpointStatePayload, ScopedViewId, SnapshotPageRequest, StandingProgramIdentity,
-        StandingProgramRuntime, StandingProgramRuntimeError, ViewFrontier, ViewOutputBatch,
-        ViewOutputDelta,
+        RuntimeCheckpointStatePayload, ScopedViewId, SnapshotPageRequest, StandingInputChangeV1,
+        StandingProgramIdentity, StandingProgramRuntime, StandingProgramRuntimeError, ViewFrontier,
+        ViewOutputBatch, ViewOutputDelta,
     },
     view_contract::{
         catalog_input_relation_schema, stable_bytes_hash, RelationSchema, SqlDataType,
@@ -392,6 +392,26 @@ fn looks_like_default_sum_count_output(output_schema: &RelationSchema) -> bool {
         output_schema.columns.as_slice(),
         [_, sum, count] if sum.name == "sum" && count.name == "count"
     )
+}
+
+/// Extract source-only input batches from a mixed standing input change list.
+///
+/// View inputs are rejected with a clear error. Runtimes that support
+/// view-on-view dependencies implement their own view-input dispatch.
+pub(super) fn source_input_batches(
+    input_changes: Vec<StandingInputChangeV1>,
+) -> Result<Vec<RelationInputBatch>, StandingProgramRuntimeError> {
+    input_changes
+        .into_iter()
+        .map(|change| match change {
+            StandingInputChangeV1::Source(batch) => Ok(batch),
+            StandingInputChangeV1::View(_) => {
+                Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                    field: "view delta input is not supported by this runtime",
+                })
+            }
+        })
+        .collect()
 }
 
 fn looks_like_tumbling_window_output(
@@ -2860,7 +2880,11 @@ fn validate_filter_project_projection_expr(
             }
             Ok(())
         }
-        SupportedProjectionExpr::SubstringUtf8 { expr, start, length } => {
+        SupportedProjectionExpr::SubstringUtf8 {
+            expr,
+            start,
+            length,
+        } => {
             validate_filter_project_projection_expr(catalog, expr)?;
             validate_filter_project_projection_expr(catalog, start)?;
             if let Some(l) = length {
@@ -4811,7 +4835,11 @@ fn collect_projection_expr_column_ids(expr: &SupportedProjectionExpr, columns: &
                 collect_projection_expr_column_ids(expr, columns);
             }
         }
-        SupportedProjectionExpr::SubstringUtf8 { expr, start, length } => {
+        SupportedProjectionExpr::SubstringUtf8 {
+            expr,
+            start,
+            length,
+        } => {
             collect_projection_expr_column_ids(expr, columns);
             collect_projection_expr_column_ids(start, columns);
             if let Some(l) = length {
@@ -5167,7 +5195,11 @@ fn evaluate_string_projection_expr(
             }
             Ok(result)
         }
-        SupportedProjectionExpr::SubstringUtf8 { expr, start, length } => {
+        SupportedProjectionExpr::SubstringUtf8 {
+            expr,
+            start,
+            length,
+        } => {
             let s = evaluate_string_projection_expr(expr, input, catalog)?;
             let start_val = evaluate_projection_expr(start, input, catalog)? as usize;
             let len = match length {
