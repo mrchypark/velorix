@@ -12705,14 +12705,12 @@ fn supported_filter_project_bound_projection_expr(
                 else {
                     return unsupported("LENGTH/CHAR_LENGTH requires one expression argument");
                 };
-                return Ok(SupportedProjectionExpr::LengthUtf8 {
-                    expr: Box::new(supported_filter_project_bound_projection_expr(
-                        argument,
-                        catalog,
-                        relation_alias,
-                        source_projection,
-                    )?),
-                });
+                return supported_filter_project_bound_string_projection_expr(
+                    argument,
+                    catalog,
+                    relation_alias,
+                    source_projection,
+                );
             }
             if function_name_eq(&function.name, "concat") {
                 if arguments.args.len() < 2 {
@@ -12725,7 +12723,7 @@ fn supported_filter_project_bound_projection_expr(
                         let FunctionArg::Unnamed(FunctionArgExpr::Expr(argument)) = argument else {
                             return unsupported("CONCAT only supports expression arguments");
                         };
-                        supported_filter_project_bound_projection_expr(
+                        supported_filter_project_bound_string_projection_expr(
                             argument,
                             catalog,
                             relation_alias,
@@ -12759,7 +12757,7 @@ fn supported_filter_project_bound_projection_expr(
                     None
                 };
                 return Ok(SupportedProjectionExpr::SubstringUtf8 {
-                    expr: Box::new(supported_filter_project_bound_projection_expr(
+                    expr: Box::new(supported_filter_project_bound_string_projection_expr(
                         expr_arg,
                         catalog,
                         relation_alias,
@@ -12780,14 +12778,12 @@ fn supported_filter_project_bound_projection_expr(
                 else {
                     return unsupported("TRIM requires one expression argument");
                 };
-                return Ok(SupportedProjectionExpr::TrimUtf8 {
-                    expr: Box::new(supported_filter_project_bound_projection_expr(
-                        argument,
-                        catalog,
-                        relation_alias,
-                        source_projection,
-                    )?),
-                });
+                return supported_filter_project_bound_string_projection_expr(
+                    argument,
+                    catalog,
+                    relation_alias,
+                    source_projection,
+                );
             }
             unsupported("computed projection function is not supported")
         }
@@ -12843,7 +12839,212 @@ fn supported_filter_project_bound_projection_expr(
             }
             Ok(expression)
         }
+        Expr::Substring { .. } | Expr::Trim { .. } => {
+            // SUBSTRING and TRIM parse to their own Expr variants (not Expr::Function).
+            // Route them through the string projection parser.
+            supported_filter_project_bound_string_projection_expr(
+                expr,
+                catalog,
+                relation_alias,
+                source_projection,
+            )
+        }
         _ => unsupported("computed projection expression is not supported"),
+    }
+}
+
+/// Parse a string projection expression from SQL.
+///
+/// This function is similar to `supported_filter_project_bound_projection_expr`
+/// but handles string columns instead of Int64 columns.
+fn supported_filter_project_bound_string_projection_expr(
+    expr: &Expr,
+    catalog: &VelorixRelationCatalogV1,
+    relation_alias: Option<&str>,
+    source_projection: Option<&SourceProjection>,
+) -> Result<SupportedProjectionExpr, ViewPlanError> {
+    match expr {
+        Expr::Nested(inner) => supported_filter_project_bound_string_projection_expr(
+            inner,
+            catalog,
+            relation_alias,
+            source_projection,
+        ),
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+            let Some(column) =
+                expression_filter_project_column(expr, catalog, relation_alias, source_projection)
+            else {
+                return unsupported("computed projection column is not registered");
+            };
+            validate_filter_project_string_expr_column(catalog, column)?;
+            Ok(SupportedProjectionExpr::Column {
+                column_id: column.column_id.clone(),
+            })
+        }
+        Expr::Value(value) => {
+            // String literals
+            if let SqlValue::SingleQuotedString(s) = &value.value {
+                Ok(SupportedProjectionExpr::LiteralUtf8 { value: s.clone() })
+            } else {
+                unsupported("string expression requires string literal")
+            }
+        }
+        Expr::Function(function) => {
+            if !matches!(function.parameters, FunctionArguments::None)
+                || function.filter.is_some()
+                || function.over.is_some()
+                || !function.within_group.is_empty()
+            {
+                return unsupported("string projection function is not supported");
+            }
+            let FunctionArguments::List(arguments) = &function.args else {
+                return unsupported("string projection function requires an argument list");
+            };
+            if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() {
+                return unsupported(
+                    "string projection function DISTINCT arguments and clauses are not supported",
+                );
+            }
+            if function_name_eq(&function.name, "length") || function_name_eq(&function.name, "char_length") {
+                let [FunctionArg::Unnamed(FunctionArgExpr::Expr(argument))] =
+                    arguments.args.as_slice()
+                else {
+                    return unsupported("LENGTH/CHAR_LENGTH requires one expression argument");
+                };
+                return Ok(SupportedProjectionExpr::LengthUtf8 {
+                    expr: Box::new(supported_filter_project_bound_string_projection_expr(
+                        argument,
+                        catalog,
+                        relation_alias,
+                        source_projection,
+                    )?),
+                });
+            }
+            if function_name_eq(&function.name, "concat") {
+                if arguments.args.len() < 2 {
+                    return unsupported("CONCAT requires at least two arguments");
+                }
+                let exprs = arguments
+                    .args
+                    .iter()
+                    .map(|argument| {
+                        let FunctionArg::Unnamed(FunctionArgExpr::Expr(argument)) = argument else {
+                            return unsupported("CONCAT only supports expression arguments");
+                        };
+                        supported_filter_project_bound_string_projection_expr(
+                            argument,
+                            catalog,
+                            relation_alias,
+                            source_projection,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                return Ok(SupportedProjectionExpr::ConcatUtf8 { exprs });
+            }
+            if function_name_eq(&function.name, "substring") || function_name_eq(&function.name, "substr") {
+                if arguments.args.len() < 2 || arguments.args.len() > 3 {
+                    return unsupported("SUBSTRING requires 2 or 3 arguments");
+                }
+                let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr_arg)) = &arguments.args[0] else {
+                    return unsupported("SUBSTRING first argument must be an expression");
+                };
+                let FunctionArg::Unnamed(FunctionArgExpr::Expr(start_arg)) = &arguments.args[1] else {
+                    return unsupported("SUBSTRING start must be an expression");
+                };
+                let length_arg = if arguments.args.len() == 3 {
+                    let FunctionArg::Unnamed(FunctionArgExpr::Expr(len_arg)) = &arguments.args[2] else {
+                        return unsupported("SUBSTRING length must be an expression");
+                    };
+                    Some(Box::new(supported_filter_project_bound_projection_expr(
+                        len_arg,
+                        catalog,
+                        relation_alias,
+                        source_projection,
+                    )?))
+                } else {
+                    None
+                };
+                return Ok(SupportedProjectionExpr::SubstringUtf8 {
+                    expr: Box::new(supported_filter_project_bound_string_projection_expr(
+                        expr_arg,
+                        catalog,
+                        relation_alias,
+                        source_projection,
+                    )?),
+                    start: Box::new(supported_filter_project_bound_projection_expr(
+                        start_arg,
+                        catalog,
+                        relation_alias,
+                        source_projection,
+                    )?),
+                    length: length_arg,
+                });
+            }
+            if function_name_eq(&function.name, "trim") {
+                let [FunctionArg::Unnamed(FunctionArgExpr::Expr(argument))] =
+                    arguments.args.as_slice()
+                else {
+                    return unsupported("TRIM requires one expression argument");
+                };
+                return Ok(SupportedProjectionExpr::TrimUtf8 {
+                    expr: Box::new(supported_filter_project_bound_string_projection_expr(
+                        argument,
+                        catalog,
+                        relation_alias,
+                        source_projection,
+                    )?),
+                });
+            }
+            unsupported("string projection function is not supported")
+        }
+        Expr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            let start = if let Some(from) = substring_from {
+                Box::new(supported_filter_project_bound_projection_expr(
+                    from,
+                    catalog,
+                    relation_alias,
+                    source_projection,
+                )?)
+            } else {
+                Box::new(SupportedProjectionExpr::LiteralInt64 { value: 1 })
+            };
+            let length = if let Some(f) = substring_for {
+                Some(Box::new(supported_filter_project_bound_projection_expr(
+                    f,
+                    catalog,
+                    relation_alias,
+                    source_projection,
+                )?))
+            } else {
+                None
+            };
+            Ok(SupportedProjectionExpr::SubstringUtf8 {
+                expr: Box::new(supported_filter_project_bound_string_projection_expr(
+                    expr,
+                    catalog,
+                    relation_alias,
+                    source_projection,
+                )?),
+                start,
+                length,
+            })
+        }
+        Expr::Trim { expr, .. } => {
+            Ok(SupportedProjectionExpr::TrimUtf8 {
+                expr: Box::new(supported_filter_project_bound_string_projection_expr(
+                    expr,
+                    catalog,
+                    relation_alias,
+                    source_projection,
+                )?),
+            })
+        }
+        _ => unsupported("string projection expression is not supported"),
     }
 }
 
@@ -13128,6 +13329,19 @@ fn validate_filter_project_int64_expr_column(
     }
     if column.nullable || !matches!(column.physical_arrow_type, ArrowPhysicalTypeV1::Int64) {
         return unsupported("computed filter/project expressions require non-null Int64 columns");
+    }
+    Ok(())
+}
+
+fn validate_filter_project_string_expr_column(
+    catalog: &VelorixRelationCatalogV1,
+    column: &RelationColumnV1,
+) -> Result<(), ViewPlanError> {
+    if column.column_id == catalog.relation_schema.weight_column_id {
+        return unsupported("computed filter/project expressions must not reference weight");
+    }
+    if !matches!(column.physical_arrow_type, ArrowPhysicalTypeV1::Utf8) {
+        return unsupported("computed filter/project string expressions require Utf8 columns");
     }
     Ok(())
 }

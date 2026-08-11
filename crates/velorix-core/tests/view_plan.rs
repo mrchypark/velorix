@@ -11037,3 +11037,184 @@ fn device_status_catalog() -> VelorixRelationCatalogV1 {
         },
     }
 }
+
+// ============================================================================
+// Phase 6: String Expression Tests
+// ============================================================================
+
+#[test]
+fn string_length_ascii_semantics_are_stable() {
+    let catalogs = vec![string_test_catalog()];
+    let output = string_test_output_schema();
+    let result = lower_supported_sql_to_logical_plan(
+        "select user_id, length(name) as name_length from string_test",
+        &catalogs,
+        &output,
+    );
+    let plan = result.unwrap();
+    match &plan.execution {
+        VelorixLogicalViewExecutionV1::FilterProject { plan } => {
+            assert_eq!(plan.value_columns.len(), 1);
+            let value_col = &plan.value_columns[0];
+            assert_eq!(value_col.output_column_id, "name_length");
+            assert!(value_col.expression.is_some());
+        }
+        _ => panic!("expected FilterProject plan"),
+    }
+}
+
+#[test]
+fn string_concat_basic_concatenation() {
+    let catalogs = vec![string_test_catalog()];
+    let output = string_test_output_schema();
+    let result = lower_supported_sql_to_logical_plan(
+        "select user_id, concat(name, '_suffix') as concatenated from string_test",
+        &catalogs,
+        &output,
+    );
+    let plan = result.unwrap();
+    match &plan.execution {
+        VelorixLogicalViewExecutionV1::FilterProject { plan } => {
+            assert_eq!(plan.value_columns.len(), 1);
+            let value_col = &plan.value_columns[0];
+            assert_eq!(value_col.output_column_id, "concatenated");
+            assert!(value_col.expression.is_some());
+        }
+        _ => panic!("expected FilterProject plan"),
+    }
+}
+
+#[test]
+fn string_substring_extracts_correct_range() {
+    let catalogs = vec![string_test_catalog()];
+    let output = string_test_output_schema();
+    let result = lower_supported_sql_to_logical_plan(
+        "select user_id, substring(name, 1, 3) as sub from string_test",
+        &catalogs,
+        &output,
+    );
+    let plan = result.unwrap();
+    match &plan.execution {
+        VelorixLogicalViewExecutionV1::FilterProject { plan } => {
+            assert_eq!(plan.value_columns.len(), 1);
+            let value_col = &plan.value_columns[0];
+            assert_eq!(value_col.output_column_id, "sub");
+            assert!(value_col.expression.is_some());
+        }
+        _ => panic!("expected FilterProject plan"),
+    }
+}
+
+#[test]
+fn string_trim_removes_whitespace() {
+    let catalogs = vec![string_test_catalog()];
+    let output = string_test_output_schema();
+    let result = lower_supported_sql_to_logical_plan(
+        "select user_id, trim(name) as trimmed from string_test",
+        &catalogs,
+        &output,
+    );
+    let plan = result.unwrap();
+    match &plan.execution {
+        VelorixLogicalViewExecutionV1::FilterProject { plan } => {
+            assert_eq!(plan.value_columns.len(), 1);
+            let value_col = &plan.value_columns[0];
+            assert_eq!(value_col.output_column_id, "trimmed");
+            assert!(value_col.expression.is_some());
+        }
+        _ => panic!("expected FilterProject plan"),
+    }
+}
+
+#[test]
+fn string_expression_rejection_of_invalid_types() {
+    let catalogs = vec![string_test_catalog()];
+    let output = string_test_output_schema();
+    let result = lower_supported_sql_to_logical_plan(
+        "select user_id, length(name) as len, count(*) as cnt from string_test group by user_id",
+        &catalogs,
+        &output,
+    );
+    let _ = result;
+}
+
+fn string_test_catalog() -> VelorixRelationCatalogV1 {
+    let relation_schema = VelorixRelationSchemaV1 {
+        relation_id: "string_test".to_string(),
+        relation_name: "string_test".to_string(),
+        relation_version: "2026-05-24.v1".to_string(),
+        columns: vec![
+            RelationColumnV1 {
+                column_id: "user_id".to_string(),
+                name: "user_id".to_string(),
+                logical_type: VelorixLogicalTypeV1::Utf8,
+                physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+                nullable: false,
+                ordinal: 0,
+                semantic_role: RelationSemanticRoleV1::PrimaryKey,
+            },
+            RelationColumnV1 {
+                column_id: "name".to_string(),
+                name: "name".to_string(),
+                logical_type: VelorixLogicalTypeV1::Utf8,
+                physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+                nullable: false,
+                ordinal: 1,
+                semantic_role: RelationSemanticRoleV1::Value,
+            },
+            RelationColumnV1 {
+                column_id: "delta".to_string(),
+                name: "delta".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 2,
+                semantic_role: RelationSemanticRoleV1::Weight,
+            },
+        ],
+        primary_key_column_ids: vec!["user_id".to_string()],
+        weight_column_id: "delta".to_string(),
+        allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+        event_time_column_id: None,
+    };
+    let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
+
+    VelorixRelationCatalogV1 {
+        schema_version: RELATION_SCHEMA_VERSION_V1,
+        relation_schema,
+        schema_fingerprint: schema_fingerprint.clone(),
+        datafusion_registration: DataFusionRegistrationV1 {
+            name: "string_test".to_string(),
+            mode: DataFusionRegistrationModeV1::Table,
+        },
+        incremental_relation: IncrementalRelationBindingV1 {
+            relation_id: "string_test".to_string(),
+            schema_fingerprint,
+        },
+        incremental_adapter: IncrementalAdapterBindingV1 {
+            adapter_id: CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.to_string(),
+        },
+    }
+}
+
+fn string_test_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "string_test_output".to_string(),
+        relation_name: "string_test_output".to_string(),
+        relation_version: "v1".to_string(),
+        schema_fingerprint: "sha256:string-test-output".to_string(),
+        columns: vec![
+            ColumnSchema {
+                name: "user_id".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "output_value".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: true,
+            },
+        ],
+        primary_key: vec!["user_id".to_string()],
+    }
+}
