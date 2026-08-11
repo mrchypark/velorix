@@ -128,6 +128,12 @@ pub struct LogicalPlanRelationRef {
 pub struct PlannerRelationInput {
     /// The relation schema the planner resolves SQL against.
     pub relation: RelationSchema,
+    /// The catalog schema fingerprint this input binds to.
+    pub schema_fingerprint: String,
+    /// The weight column id, if this input is a physical source with one.
+    pub weight_column_id: Option<String>,
+    /// The declared event-time column id, if this input has one.
+    pub event_time_column_id: Option<String>,
     /// How this input's changes are encoded at runtime.
     pub change_encoding: PlannerChangeEncoding,
 }
@@ -153,9 +159,30 @@ impl PlannerRelationInput {
             }
         })?;
         Ok(Self {
+            schema_fingerprint: catalog.schema_fingerprint.to_string(),
+            weight_column_id: Some(catalog.relation_schema.weight_column_id.clone()),
+            event_time_column_id: catalog.relation_schema.event_time_column_id.clone(),
             relation,
             change_encoding: PlannerChangeEncoding::PhysicalSource,
         })
+    }
+
+    /// Builds a planner input from a published view output binding.
+    pub fn from_published_binding(
+        relation: RelationSchema,
+        delta_codec_identity: String,
+        frontier_kind: String,
+    ) -> Self {
+        Self {
+            schema_fingerprint: relation.schema_fingerprint.clone(),
+            weight_column_id: None,
+            event_time_column_id: None,
+            relation,
+            change_encoding: PlannerChangeEncoding::PublishedDelta {
+                delta_codec_identity,
+                frontier_kind,
+            },
+        }
     }
 }
 
