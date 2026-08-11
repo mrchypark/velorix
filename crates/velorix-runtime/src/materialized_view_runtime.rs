@@ -1462,13 +1462,54 @@ fn rekey_delta_batch_for_aggregate_group(
     catalog: &VelorixRelationCatalogV1,
     plan: &SupportedViewPlan,
 ) -> Result<DeltaBatch, StandingProgramRuntimeError> {
+    if plan.aggregate_output_identity.is_none() {
+        return Ok(delta.clone());
+    }
     let primary_key = catalog_primary_key_column(catalog)?.column_id.clone();
-    rekey_delta_batch_for_aggregate_group_with_primary_key(
-        delta,
-        &primary_key,
-        plan,
-        &catalog_input_relation_schema(catalog).map_err(|_| invalid_runtime_state())?,
-    )
+    let group_keys = supported_view_plan_group_keys(plan);
+    let mut records = Vec::with_capacity(delta.records().len());
+    for record in delta.records() {
+        let mut input = record
+            .value
+            .as_json()
+            .as_object()
+            .cloned()
+            .ok_or_else(invalid_runtime_state)?;
+        input.insert(primary_key.clone(), record.key.as_json().clone());
+        let values = group_keys
+            .iter()
+            .map(|key| {
+                let value = if let Some(column_id) = &key.input_column_id {
+                    input
+                        .get(column_id)
+                        .cloned()
+                        .ok_or_else(invalid_runtime_state)?
+                } else if let Some(expression) = &key.expression {
+                    Value::Number(JsonNumber::from(evaluate_projection_expr(
+                        expression, &input, catalog,
+                    )?))
+                } else {
+                    return Err(invalid_runtime_state());
+                };
+                Ok((key.output_column_id.clone(), value))
+            })
+            .collect::<Result<Vec<_>, StandingProgramRuntimeError>>()?;
+        let key = if supported_view_plan_is_singleton(plan) {
+            singleton_aggregate_key("state")
+        } else if let [(_, value)] = values.as_slice() {
+            value.clone()
+        } else {
+            DeltaValue::from_json(Value::Object(values.into_iter().collect()))
+                .as_json()
+                .clone()
+        };
+        records.push(DeltaRecord::new(
+            DeltaKey::from_json(key),
+            record.value.clone(),
+            record.weight,
+        ));
+    }
+    Ok(DeltaBatch::from_records(records))
 }
 
 fn singleton_aggregate_key(domain: &str) -> Value {

@@ -250,7 +250,6 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
         idempotency_key: EpochIdempotencyKey,
         input_changes: Vec<StandingInputChangeV1>,
     ) -> Result<EpochCommit, StandingProgramRuntimeError> {
-        let input_changes = source_input_batches(input_changes)?;
         let idempotency_key_text = idempotency_key.as_str().to_string();
         if let Some(applied_epoch) = self.applied_epochs.get(&idempotency_key_text) {
             if *applied_epoch == logical_epoch {
@@ -277,19 +276,36 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
             let mut combined = DeltaBatch::default();
             let mut input_frontiers = self.input_frontiers.clone();
             let mut input_event_time_frontiers = self.input_event_time_frontiers.clone();
-            for input in input_changes {
-                validate_input_matches_schema(
-                    &input,
-                    &self.input_schema,
-                    "generic_input_relation",
-                )?;
-                let catalog = self.input.catalog()?;
-                let delta = aggregate_group_input_delta_batch(catalog, &self.plan, &input)?;
-                let delta = filter_delta_batch_for_plan(&delta, &self.plan, catalog)?;
-                let delta = rekey_delta_batch_for_aggregate_group(&delta, catalog, &self.plan)?;
-                combined = combined.combine(&delta);
-                advance_input_frontier(&mut input_frontiers, &input)?;
-                advance_input_event_time_frontier(&mut input_event_time_frontiers, &input)?;
+            for change in input_changes {
+                match change {
+                    StandingInputChangeV1::Source(input) => {
+                        validate_input_matches_schema(
+                            &input,
+                            &self.input_schema,
+                            "generic_input_relation",
+                        )?;
+                        let catalog = self.input.catalog()?;
+                        let delta = aggregate_group_input_delta_batch(catalog, &self.plan, &input)?;
+                        let delta = filter_delta_batch_for_plan(&delta, &self.plan, catalog)?;
+                        let delta =
+                            rekey_delta_batch_for_aggregate_group(&delta, catalog, &self.plan)?;
+                        combined = combined.combine(&delta);
+                        advance_input_frontier(&mut input_frontiers, &input)?;
+                        advance_input_event_time_frontier(&mut input_event_time_frontiers, &input)?;
+                    }
+                    StandingInputChangeV1::View(input) => {
+                        input.validate()?;
+                        let primary_key = self.input.primary_key_column_id()?;
+                        let delta = rekey_delta_batch_for_aggregate_group_with_primary_key(
+                            &input.delta,
+                            primary_key,
+                            &self.plan,
+                            &self.input_schema,
+                        )?;
+                        combined = combined.combine(&delta);
+                        self.view_input_cursors.push(input.producer_cursor);
+                    }
+                }
             }
             let (next_state, _) = apply_filtered_single_key_aggregate_delta(
                 &self.filtered_aggregate_state,
@@ -355,7 +371,7 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
             logical_epoch,
             &self.input_frontiers,
             &self.input_event_time_frontiers,
-            input_changes,
+            source_input_batches(input_changes)?,
         )?;
         let output_delta = filter_output_delta_for_having(
             &executor_commit.output_delta,
