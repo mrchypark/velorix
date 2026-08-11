@@ -1400,15 +1400,15 @@ fn aggregate_group_input_delta_batch(
     })
 }
 
-fn rekey_delta_batch_for_aggregate_group(
+fn rekey_delta_batch_for_aggregate_group_with_primary_key(
     delta: &DeltaBatch,
-    catalog: &VelorixRelationCatalogV1,
+    primary_key: &str,
     plan: &SupportedViewPlan,
+    input_schema: &RelationSchema,
 ) -> Result<DeltaBatch, StandingProgramRuntimeError> {
     if plan.aggregate_output_identity.is_none() {
         return Ok(delta.clone());
     }
-    let primary_key = catalog_primary_key_column(catalog)?.column_id.clone();
     let group_keys = supported_view_plan_group_keys(plan);
     let mut records = Vec::with_capacity(delta.records().len());
     for record in delta.records() {
@@ -1418,7 +1418,7 @@ fn rekey_delta_batch_for_aggregate_group(
             .as_object()
             .cloned()
             .ok_or_else(invalid_runtime_state)?;
-        input.insert(primary_key.clone(), record.key.as_json().clone());
+        input.insert(primary_key.to_string(), record.key.as_json().clone());
         let values = group_keys
             .iter()
             .map(|key| {
@@ -1428,8 +1428,10 @@ fn rekey_delta_batch_for_aggregate_group(
                         .cloned()
                         .ok_or_else(invalid_runtime_state)?
                 } else if let Some(expression) = &key.expression {
-                    Value::Number(JsonNumber::from(evaluate_projection_expr(
-                        expression, &input, catalog,
+                    Value::Number(JsonNumber::from(evaluate_projection_expr_for_schema(
+                        expression,
+                        &input,
+                        input_schema,
                     )?))
                 } else {
                     return Err(invalid_runtime_state());
@@ -1453,6 +1455,20 @@ fn rekey_delta_batch_for_aggregate_group(
         ));
     }
     Ok(DeltaBatch::from_records(records))
+}
+
+fn rekey_delta_batch_for_aggregate_group(
+    delta: &DeltaBatch,
+    catalog: &VelorixRelationCatalogV1,
+    plan: &SupportedViewPlan,
+) -> Result<DeltaBatch, StandingProgramRuntimeError> {
+    let primary_key = catalog_primary_key_column(catalog)?.column_id.clone();
+    rekey_delta_batch_for_aggregate_group_with_primary_key(
+        delta,
+        &primary_key,
+        plan,
+        &catalog_input_relation_schema(catalog).map_err(|_| invalid_runtime_state())?,
+    )
 }
 
 fn singleton_aggregate_key(domain: &str) -> Value {
@@ -5159,6 +5175,29 @@ fn evaluate_projection_expr(
                 field: "string_expression_in_int64_context",
             })
         }
+    }
+}
+
+/// Evaluate a projection expression against a published-view input schema.
+///
+/// This is the catalog-free analog of `evaluate_projection_expr` used by the
+/// published-view aggregate path. The narrow Phase 4 slice forbids computed
+/// group keys, so only direct columns and Int64 literals are reachable; any
+/// wider expression fails closed.
+fn evaluate_projection_expr_for_schema(
+    expr: &SupportedProjectionExpr,
+    input: &Map<String, Value>,
+    _input_schema: &RelationSchema,
+) -> Result<i64, StandingProgramRuntimeError> {
+    match expr {
+        SupportedProjectionExpr::Column { column_id } => input
+            .get(column_id.as_str())
+            .and_then(Value::as_i64)
+            .ok_or_else(invalid_runtime_state),
+        SupportedProjectionExpr::LiteralInt64 { value } => Ok(*value),
+        _ => Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+            field: "published_view_projection_expression_not_supported",
+        }),
     }
 }
 
