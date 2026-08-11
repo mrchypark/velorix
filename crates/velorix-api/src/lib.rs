@@ -1696,6 +1696,24 @@ pub struct CreateViewRequest {
 pub struct InputRelationRef {
     pub relation_id: String,
     pub relation_version: String,
+    /// Explicit input kind. Defaults to `Source`.
+    ///
+    /// A `View` input resolves against an active view's published output,
+    /// never against a physical relation catalog. Admission rejects a `View`
+    /// input when view-on-view is disabled.
+    #[serde(default)]
+    pub input_kind: InputRelationKind,
+}
+
+/// Explicit kind for a view input relation reference.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputRelationKind {
+    /// A registered physical ingest source.
+    #[default]
+    Source,
+    /// An upstream materialized view output.
+    View,
 }
 
 fn default_sql_source_kind() -> SqlSourceKind {

@@ -143,6 +143,19 @@ pub(super) fn validate_public_view_feature_admission(
     state: &ApiState,
     request: &CreateViewRequest,
 ) -> Result<(), ApiError> {
+    // View-on-view inputs are gated by a separate flag so enabling them does
+    // not disable unrelated experimental SQL shape restrictions.
+    if request
+        .input_relation_refs
+        .iter()
+        .any(|input| input.input_kind == InputRelationKind::View)
+    {
+        if !state.experimental_view_on_view {
+            return Err(ApiError::bad_request(
+                "view-on-view inputs are experimental and disabled for the public 1.0 API",
+            ));
+        }
+    }
     if state.experimental_advanced_view_features {
         return Ok(());
     }
