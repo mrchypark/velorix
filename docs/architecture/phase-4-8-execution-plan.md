@@ -680,3 +680,7 @@ cargo fmt --all --check
 | 2026-08-11 | 6 | String expression parsing | view_plan.rs | Complete |
 | 2026-08-11 | 6 | String expression evaluation | materialized_view_runtime.rs | Complete |
 | 2026-08-11 | 6 | String expression tests | 5 view_plan tests | Complete |
+| 2026-08-11 | 4 | Slice: apply_changes accepts StandingInputChangeV1 | Trait + 8 runtimes + call sites | Complete |
+| 2026-08-11 | 4 | Slice: resolve_view_input_relation_v1 helper | view_contract.rs | Complete |
+| 2026-08-11 | 4 | Slice: PublishedViewCommitV1 durable commit identity | standing_program.rs | Complete |
+| 2026-08-11 | 4 | Slice: with_direct_view_inputs + edge binding | ingest_epoch.rs | Complete |
