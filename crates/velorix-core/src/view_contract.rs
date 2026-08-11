@@ -28,6 +28,43 @@ pub enum BoundInputV1 {
     View(ViewDependencyEdgeBindingV1),
 }
 
+/// A view admission input resolved to a concrete authority domain.
+///
+/// Admission resolves each requested input to either a physical source
+/// (with its registered catalog) or a published view output (with its
+/// producer binding and admitted dependency edge). The input kind is
+/// explicit: the resolver must NOT fall back between source and view based
+/// on relation ID/version availability, because a physical source and a
+/// published view output can share the same relation identity.
+#[derive(Clone, Debug)]
+pub enum ResolvedAdmissionInput {
+    /// Input from a registered physical ingest source.
+    Source {
+        catalog: VelorixRelationCatalogV1,
+        relation: RelationSchema,
+        binding: SourceInputBindingV1,
+    },
+    /// Input from an upstream materialized view output.
+    View {
+        relation: RelationSchema,
+        /// The producer's published binding, used only for admission-time
+        /// verification. Persist `edge`, not this full object.
+        published: PublishedRelationBindingV1,
+        /// The immutable dependency edge this input is bound to.
+        edge: ViewDependencyEdgeBindingV1,
+    },
+}
+
+impl ResolvedAdmissionInput {
+    /// Returns the relation schema the consumer planner resolves against.
+    pub fn relation(&self) -> &RelationSchema {
+        match self {
+            ResolvedAdmissionInput::Source { relation, .. }
+            | ResolvedAdmissionInput::View { relation, .. } => relation,
+        }
+    }
+}
+
 /// Binding for a physical source relation input.
 ///
 /// Wraps the existing source relation identity fields used throughout
