@@ -353,6 +353,22 @@ pub trait StandingProgramRuntimeFactory: Send + Sync + 'static {
         self.create_with_catalogs_and_spec(identity, catalogs, spec, input_schemas, output_schemas)
     }
 
+    /// Create a runtime bound to a published view output input.
+    ///
+    /// Default implementation fails closed: only factories that explicitly
+    /// support view-on-view inputs override this.
+    fn create_with_published_binding_plan_and_spec(
+        &self,
+        _identity: &StandingProgramIdentity,
+        _binding: &PublishedRelationBindingV1,
+        _logical_plan: &VelorixLogicalViewPlanV1,
+        _spec: &StandingViewSpec,
+        _input_schemas: &[RelationSchema],
+        _output_schemas: &[RelationSchema],
+    ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
+        Err("standing runtime factory does not support published-view inputs".to_string())
+    }
+
     fn restore(
         &self,
         checkpoint: RuntimeCheckpoint,
@@ -709,6 +725,24 @@ impl StandingProgramRuntimeFactory for MaterializedViewRuntimeFactory {
         velorix_runtime::materialized_view_runtime::create_standing_runtime_with_logical_plan_and_catalogs(
             identity,
             catalogs,
+            logical_plan.clone(),
+            input_schemas,
+            output_schemas,
+        )
+    }
+
+    fn create_with_published_binding_plan_and_spec(
+        &self,
+        identity: &StandingProgramIdentity,
+        binding: &PublishedRelationBindingV1,
+        logical_plan: &VelorixLogicalViewPlanV1,
+        _spec: &StandingViewSpec,
+        input_schemas: &[RelationSchema],
+        output_schemas: &[RelationSchema],
+    ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
+        velorix_runtime::materialized_view_runtime::create_standing_runtime_with_logical_plan_and_published_binding(
+            identity,
+            binding,
             logical_plan.clone(),
             input_schemas,
             output_schemas,
