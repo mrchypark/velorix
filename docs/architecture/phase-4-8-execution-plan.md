@@ -676,4 +676,6 @@ cargo fmt --all --check
 | 2026-08-11 | 7 | Query Rewrite Design V1 documentation | query-rewrite-design-v1.md | Complete |
 | 2026-08-11 | 8 | Advanced Capabilities Design V1 documentation | advanced-capabilities-design-v1.md | Complete |
 | 2026-08-11 | 5 | Single-input TUMBLE public admission | Public API test | Complete |
-| 2026-08-11 | 6 | String expression types added | SupportedProjectionExpr variants | In progress |
+| 2026-08-11 | 6 | String expression types added | SupportedProjectionExpr variants | Complete |
+| 2026-08-11 | 6 | String expression parsing | view_plan.rs | Complete |
+| 2026-08-11 | 6 | String expression evaluation | materialized_view_runtime.rs | Complete |
