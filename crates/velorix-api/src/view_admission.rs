@@ -147,8 +147,9 @@ pub(super) fn validate_public_view_feature_admission(
         return Ok(());
     }
     let sql = request.sql.to_ascii_lowercase();
-    if contains_sql_function_call(&sql, "tumble")
-        || contains_sql_function_call(&sql, "hop")
+
+    // Always blocked: HOP, SESSION, ranking functions
+    if contains_sql_function_call(&sql, "hop")
         || contains_sql_function_call(&sql, "session")
         || contains_sql_function_call(&sql, "row_number")
         || contains_sql_function_call(&sql, "rank")
@@ -159,6 +160,10 @@ pub(super) fn validate_public_view_feature_admission(
             "advanced view SQL is experimental and disabled for the public 1.0 API",
         ));
     }
+
+    // TUMBLE is allowed for single-relation views (Phase 5 public admission)
+    // HOP, SESSION remain blocked until their retention/recovery contracts are proven
+
     Ok(())
 }
 
@@ -177,11 +182,16 @@ pub(super) fn validate_public_runtime_plan_admission(
         )));
     }
     match &plan.execution {
-        VelorixLogicalViewExecutionV1::AnalyticRowNumber { .. }
-        | VelorixLogicalViewExecutionV1::TumblingEventTimeAggregate { .. } => {
+        VelorixLogicalViewExecutionV1::AnalyticRowNumber { .. } => {
+            // Ranking remains experimental
             Err(ApiError::bad_request(
-                "advanced view execution is experimental and disabled for the public 1.0 API",
+                "analytic ranking is experimental and disabled for the public 1.0 API",
             ))
+        }
+        VelorixLogicalViewExecutionV1::TumblingEventTimeAggregate { .. } => {
+            // TUMBLE with single input is now public (Phase 5)
+            // HOP/SESSION still blocked by SQL-level validation
+            Ok(())
         }
         VelorixLogicalViewExecutionV1::SingleKeySumCount { plan } => {
             validate_public_top_k_limit(plan.top_k.as_ref())

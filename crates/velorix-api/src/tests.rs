@@ -17028,3 +17028,105 @@ async fn scenario_list_views_empty_then_create() {
     assert_eq!(views.len(), 1, "expected 1 view after creation");
     assert_eq!(views[0]["view_id"], "test_view");
 }
+
+#[tokio::test]
+async fn rest_tumble_window_admitted_through_public_api_without_experimental_flag() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    // Use test_public_api_state_with_store which does NOT set experimental flag
+    let state = test_public_api_state_with_store(store, "api-test-tumble-public-owner", false).await;
+    let router = app(state);
+
+    // Register a relation with event_time column using the same helper as other TUMBLE tests
+    let relation_response = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations",
+        json!({
+            "catalog": test_purchases_event_time_catalog(),
+            "default_orders_sum_count": false
+        }),
+    )
+    .await;
+    assert_eq!(relation_response.0, StatusCode::CREATED);
+
+    // Create a TUMBLE view WITHOUT experimental flag
+    let view_response = call_json(
+        &router,
+        Method::POST,
+        "/v1/views",
+        json!({
+            "view_id": "tumble_purchases",
+            "sql": "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end",
+            "input_relation_id": "purchases",
+            "input_relation_version": "2026-05-24.v1",
+            "source_kind": "standing_view"
+        }),
+    )
+    .await;
+    assert_eq!(
+        view_response.0,
+        StatusCode::CREATED,
+        "TUMBLE should be admitted through public API without experimental flag: {:?}",
+        view_response.1
+    );
+
+    // HOP should still be blocked
+    let hop_response = call_json(
+        &router,
+        Method::POST,
+        "/v1/views",
+        json!({
+            "view_id": "hop_purchases",
+            "sql": "select user_id, window_start, window_end, sum(amount) as total_amount from hop(purchases, event_time, interval '60 seconds', interval '30 seconds') group by user_id, window_start, window_end",
+            "input_relation_id": "purchases",
+            "input_relation_version": "2026-05-24.v1",
+            "source_kind": "standing_view"
+        }),
+    )
+    .await;
+    assert_eq!(
+        hop_response.0,
+        StatusCode::BAD_REQUEST,
+        "HOP should be blocked without experimental flag"
+    );
+
+    // SESSION should still be blocked
+    let session_response = call_json(
+        &router,
+        Method::POST,
+        "/v1/views",
+        json!({
+            "view_id": "session_purchases",
+            "sql": "select user_id, window_start, window_end, sum(amount) as total_amount from session(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end",
+            "input_relation_id": "purchases",
+            "input_relation_version": "2026-05-24.v1",
+            "source_kind": "standing_view"
+        }),
+    )
+    .await;
+    assert_eq!(
+        session_response.0,
+        StatusCode::BAD_REQUEST,
+        "SESSION should be blocked without experimental flag"
+    );
+
+    // ROW_NUMBER should still be blocked
+    let rank_response = call_json(
+        &router,
+        Method::POST,
+        "/v1/views",
+        json!({
+            "view_id": "rank_purchases",
+            "sql": "select user_id, amount, row_number() over (partition by user_id order by amount desc) as rank from purchases",
+            "input_relation_id": "purchases",
+            "input_relation_version": "2026-05-24.v1",
+            "source_kind": "standing_view"
+        }),
+    )
+    .await;
+    assert_eq!(
+        rank_response.0,
+        StatusCode::BAD_REQUEST,
+        "ROW_NUMBER should be blocked without experimental flag"
+    );
+}
