@@ -179,6 +179,73 @@ pub struct ViewOutputDelta {
     pub delta: DeltaBatch,
 }
 
+/// Durable identity of a producer's published output commit.
+///
+/// Written after the output delta object, state payload, and immutable
+/// checkpoint record are durably stored, and referenced by consumer view
+/// cursors (`CausalViewCursorV1`) through `commit_digest`.
+///
+/// The `commit_digest` is the domain-separated SHA-256 of this canonical
+/// record. It is NOT the checkpoint state root hash, because that value does
+/// not bind the output delta ref, producer identity, and authority chain that
+/// a consumer must verify before applying a view delta.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishedViewCommitV1 {
+    pub schema_version: u32,
+    pub producer_tenant_id: String,
+    pub producer_program_id: String,
+    pub producer_view_id: String,
+    pub producer_generation: u64,
+    pub producer_plan_hash: String,
+    pub output_stream_id: String,
+    pub output_epoch: LogicalEpoch,
+    pub output_schema_hash: String,
+    pub key_descriptor_hash: String,
+    pub delta_codec_identity: String,
+    /// Reference to the durable checkpoint record covering this commit.
+    pub checkpoint_ref: String,
+    /// Domain-separated digest of the durable checkpoint record.
+    pub checkpoint_record_digest: String,
+    /// Reference to the durable output delta object.
+    pub output_delta_ref: String,
+    /// Producer's idempotency key for this epoch.
+    pub idempotency_key: String,
+}
+
+pub const PUBLISHED_VIEW_COMMIT_SCHEMA_VERSION_V1: u32 = 1;
+pub const PUBLISHED_VIEW_COMMIT_DIGEST_DOMAIN: &str = "velorix-published-view-commit-sha256-v1";
+
+impl PublishedViewCommitV1 {
+    /// Canonical domain-separated digest of this commit record.
+    ///
+    /// Consumers verify `commit_digest == cursor.commit_digest` after walking
+    /// the authoritative pointer -> checkpoint -> commit chain.
+    pub fn commit_digest(&self) -> Result<String, StandingProgramRuntimeError> {
+        let bytes = serde_json::to_vec(self).map_err(|_| invalid_commit_record())?;
+        let mut hasher = Sha256::new();
+        hasher.update(PUBLISHED_VIEW_COMMIT_DIGEST_DOMAIN.as_bytes());
+        hasher.update(bytes);
+        Ok(format!("sha256:{:x}", hasher.finalize()))
+    }
+
+    /// Builds the `CausalViewCursorV1` a consumer uses to reference this commit.
+    pub fn to_cursor(&self, input_edge: &str) -> CausalViewCursorV1 {
+        CausalViewCursorV1 {
+            input_edge: input_edge.to_string(),
+            producer_tenant_id: self.producer_tenant_id.clone(),
+            producer_program_id: self.producer_program_id.clone(),
+            producer_view_id: self.producer_view_id.clone(),
+            producer_generation: self.producer_generation,
+            output_stream: self.output_stream_id.clone(),
+            output_epoch: self.output_epoch,
+            commit_digest: self
+                .commit_digest()
+                .unwrap_or_else(|_| format!("sha256:{}", "0".repeat(64))),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct EpochCommit {
     pub logical_epoch: LogicalEpoch,
@@ -544,6 +611,12 @@ fn invalid_input_coverage() -> StandingProgramRuntimeError {
 fn invalid_causal_cut() -> StandingProgramRuntimeError {
     StandingProgramRuntimeError::InvalidProgramIdentity {
         field: "causal_cut",
+    }
+}
+
+fn invalid_commit_record() -> StandingProgramRuntimeError {
+    StandingProgramRuntimeError::InvalidProgramIdentity {
+        field: "published_view_commit",
     }
 }
 

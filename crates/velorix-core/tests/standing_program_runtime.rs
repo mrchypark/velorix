@@ -10,11 +10,12 @@ use velorix_core::{
     engine::LogicalEpoch,
     standing_program::{
         BuiltinRuntimeIdentity, CausalCutV1, CausalViewCursorV1, DurableStateRoot, EpochCommit,
-        EpochIdempotencyKey, NativeCodePolicy, RelationFrontier, RelationInputBatch,
-        RuntimeCheckpoint, RuntimeCheckpointInputCoverageV1, RuntimeCheckpointPartitionCoverageV1,
-        RuntimeCheckpointRelationCoverageV1, ScopedViewId, SnapshotPageRequest,
-        StandingInputChangeV1, StandingProgramIdentity, StandingProgramRuntime,
-        StandingProgramRuntimeError, ViewFrontier, ViewOutputBatch, ViewOutputDelta,
+        EpochIdempotencyKey, NativeCodePolicy, PublishedViewCommitV1, RelationFrontier,
+        RelationInputBatch, RuntimeCheckpoint, RuntimeCheckpointInputCoverageV1,
+        RuntimeCheckpointPartitionCoverageV1, RuntimeCheckpointRelationCoverageV1, ScopedViewId,
+        SnapshotPageRequest, StandingInputChangeV1, StandingProgramIdentity,
+        StandingProgramRuntime, StandingProgramRuntimeError, ViewFrontier, ViewOutputBatch,
+        ViewOutputDelta, PUBLISHED_VIEW_COMMIT_SCHEMA_VERSION_V1,
         RUNTIME_CHECKPOINT_INPUT_COVERAGE_SCHEMA_VERSION_V1,
     },
     view_contract::{ColumnSchema, RelationSchema, SqlDataType},
@@ -532,4 +533,50 @@ fn orders_output_schema() -> RelationSchema {
         ],
         primary_key: vec!["region".to_string()],
     }
+}
+
+#[test]
+fn published_view_commit_digest_is_domain_separated_and_stable() {
+    let commit = PublishedViewCommitV1 {
+        schema_version: PUBLISHED_VIEW_COMMIT_SCHEMA_VERSION_V1,
+        producer_tenant_id: "tenant-a".to_string(),
+        producer_program_id: "program-a".to_string(),
+        producer_view_id: "orders_by_region".to_string(),
+        producer_generation: 7,
+        producer_plan_hash: "velorix-logical-view-plan-sha256-v1:plan".to_string(),
+        output_stream_id: "view/orders_by_region/generation/7/output/orders_by_region".to_string(),
+        output_epoch: 3,
+        output_schema_hash: format!("sha256:{}", "2".repeat(64)),
+        key_descriptor_hash: format!("sha256:{}", "1".repeat(64)),
+        delta_codec_identity: "velorix-published-relation-delta-v1".to_string(),
+        checkpoint_ref: "checkpoint-ref".to_string(),
+        checkpoint_record_digest: format!("sha256:{}", "4".repeat(64)),
+        output_delta_ref: "output-delta-ref".to_string(),
+        idempotency_key: "epoch-3".to_string(),
+    };
+
+    // Digest is deterministic and domain-separated.
+    let digest1 = commit.commit_digest().unwrap();
+    let digest2 = commit.commit_digest().unwrap();
+    assert_eq!(digest1, digest2);
+    assert!(digest1.starts_with("sha256:"));
+    assert_eq!(digest1.len(), "sha256:".len() + 64);
+
+    // Changing any field changes the digest.
+    let mut tampered = commit.clone();
+    tampered.output_delta_ref = "tampered-ref".to_string();
+    assert_ne!(digest1, tampered.commit_digest().unwrap());
+
+    // Digest is NOT the checkpoint record digest.
+    assert_ne!(digest1, commit.checkpoint_record_digest);
+
+    // to_cursor binds the commit identity into a CausalViewCursorV1.
+    let cursor = commit.to_cursor("edge-1");
+    assert_eq!(cursor.input_edge, "edge-1");
+    assert_eq!(cursor.producer_view_id, "orders_by_region");
+    assert_eq!(cursor.producer_generation, 7);
+    assert_eq!(cursor.output_epoch, 3);
+    assert_eq!(cursor.output_stream, commit.output_stream_id);
+    assert_eq!(cursor.commit_digest, digest1);
+    cursor.validate().unwrap();
 }
