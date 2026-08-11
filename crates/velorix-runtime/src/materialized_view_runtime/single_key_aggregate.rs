@@ -1,9 +1,54 @@
 use super::*;
 
+/// Input binding for a single-key sum/count runtime.
+///
+/// The input kind is explicit so a missing catalog for a Source binding fails
+/// recovery, while a PublishedView binding legitimately has no physical catalog.
+/// Do NOT model this as `catalog: Option<_>` because that cannot distinguish a
+/// broken Source checkpoint from a valid published-view input.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SingleKeyRuntimeInputV1 {
+    /// A registered physical ingest source.
+    Source { catalog: VelorixRelationCatalogV1 },
+    /// An upstream published view output delivered as signed delta batches.
+    PublishedView {
+        binding: PublishedRelationBindingV1,
+        primary_key_column_id: String,
+    },
+}
+
+impl SingleKeyRuntimeInputV1 {
+    /// The single primary key column id for this input.
+    pub fn primary_key_column_id(&self) -> Result<&str, StandingProgramRuntimeError> {
+        match self {
+            SingleKeyRuntimeInputV1::Source { catalog } => {
+                catalog_primary_key_column(catalog).map(|column| column.column_id.as_str())
+            }
+            SingleKeyRuntimeInputV1::PublishedView {
+                primary_key_column_id,
+                ..
+            } => Ok(primary_key_column_id.as_str()),
+        }
+    }
+
+    /// The physical catalog for a Source input.
+    pub fn catalog(&self) -> Result<&VelorixRelationCatalogV1, StandingProgramRuntimeError> {
+        match self {
+            SingleKeyRuntimeInputV1::Source { catalog } => Ok(catalog),
+            SingleKeyRuntimeInputV1::PublishedView { .. } => {
+                Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                    field: "single_key_published_view_input_has_no_catalog",
+                })
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SingleKeySumCountRuntime {
     identity: StandingProgramIdentity,
-    catalog: VelorixRelationCatalogV1,
+    input: SingleKeyRuntimeInputV1,
     input_schema: RelationSchema,
     output_schema: RelationSchema,
     view_sql: String,
@@ -14,6 +59,7 @@ pub struct SingleKeySumCountRuntime {
     filtered_aggregate_state: DeltaBatch,
     input_frontiers: Vec<RelationFrontier>,
     input_event_time_frontiers: Vec<InputEventTimeFrontier>,
+    view_input_cursors: Vec<CausalViewCursorV1>,
     applied_epochs: BTreeMap<String, LogicalEpoch>,
 }
 
@@ -84,7 +130,7 @@ impl SingleKeySumCountRuntime {
         let published_output = publish_aggregate_state(&filtered_aggregate_state, &plan)?;
         Ok(Self {
             identity,
-            catalog,
+            input: SingleKeyRuntimeInputV1::Source { catalog },
             input_schema,
             output_schema,
             view_sql,
@@ -98,6 +144,7 @@ impl SingleKeySumCountRuntime {
             filtered_aggregate_state,
             input_frontiers: Vec::new(),
             input_event_time_frontiers: Vec::new(),
+            view_input_cursors: Vec::new(),
             applied_epochs: BTreeMap::new(),
         })
     }
@@ -130,7 +177,7 @@ impl SingleKeySumCountRuntime {
     fn checkpoint_payload(&self) -> Result<String, StandingProgramRuntimeError> {
         let payload = GenericCheckpointPayload {
             schema_version: CHECKPOINT_PAYLOAD_SCHEMA_VERSION,
-            catalog: self.catalog.clone(),
+            input: self.input.clone(),
             input_schema: self.input_schema.clone(),
             output_schema: self.output_schema.clone(),
             view_sql: self.view_sql.clone(),
@@ -171,7 +218,7 @@ impl SingleKeySumCountRuntime {
             return Err(invalid_checkpoint());
         }
         validate_supported_schemas(
-            &payload.catalog,
+            payload.input.catalog()?,
             &payload.input_schema,
             &payload.output_schema,
             &payload.plan,
@@ -236,10 +283,10 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
                     &self.input_schema,
                     "generic_input_relation",
                 )?;
-                let delta = aggregate_group_input_delta_batch(&self.catalog, &self.plan, &input)?;
-                let delta = filter_delta_batch_for_plan(&delta, &self.plan, &self.catalog)?;
-                let delta =
-                    rekey_delta_batch_for_aggregate_group(&delta, &self.catalog, &self.plan)?;
+                let catalog = self.input.catalog()?;
+                let delta = aggregate_group_input_delta_batch(catalog, &self.plan, &input)?;
+                let delta = filter_delta_batch_for_plan(&delta, &self.plan, catalog)?;
+                let delta = rekey_delta_batch_for_aggregate_group(&delta, catalog, &self.plan)?;
                 combined = combined.combine(&delta);
                 advance_input_frontier(&mut input_frontiers, &input)?;
                 advance_input_event_time_frontier(&mut input_event_time_frontiers, &input)?;
@@ -248,7 +295,7 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
                 &self.filtered_aggregate_state,
                 &combined,
                 &self.plan,
-                &self.catalog,
+                self.input.catalog()?,
             )?;
             let aggregate_outputs = supported_view_plan_aggregate_outputs(&self.plan);
             let published_state = publish_aggregate_state(&next_state, &self.plan)?;
@@ -297,8 +344,9 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
                 }],
             });
         }
+        let catalog = self.input.catalog()?;
         let mut executor = LogicalPlanExecutor::SingleKeyAggregate {
-            catalog: &self.catalog,
+            catalog,
             input_schema: &self.input_schema,
             plan: &self.plan,
             engine: &mut self.engine,
@@ -444,24 +492,25 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
         }
         validate_input_event_time_frontiers_for_catalogs(
             &checkpoint,
-            std::slice::from_ref(&payload.catalog),
+            std::slice::from_ref(payload.input.catalog()?),
         )?;
         let view_sql = payload.view_sql;
         validate_view_sql_hash(&checkpoint.identity, view_sql.as_str())?;
         let plan = payload.plan;
-        let compiled = validate_supported_view_sql(view_sql.as_str(), &payload.catalog)
+        let compiled_catalog = payload.input.catalog()?;
+        let compiled = validate_supported_view_sql(view_sql.as_str(), compiled_catalog)
             .map_err(|_| invalid_checkpoint())?;
         if compiled != plan {
             return Err(invalid_checkpoint());
         }
-        validate_plan_matches_catalog(&plan, &payload.catalog)?;
-        let value_mode = aggregate_value_mode_for_plan(&payload.catalog, &plan)?;
+        validate_plan_matches_catalog(&plan, compiled_catalog)?;
+        let value_mode = aggregate_value_mode_for_plan(compiled_catalog, &plan)?;
         let track_extrema = plan_tracks_extrema(&plan);
         let logical_plan = payload.logical_plan;
         validate_logical_view_plan(&logical_plan).map_err(|_| invalid_checkpoint())?;
         let compiled_logical_plan = lower_supported_view_sql_to_logical_plan(
             view_sql.as_str(),
-            &payload.catalog,
+            compiled_catalog,
             &payload.output_schema,
         )
         .map_err(|_| invalid_checkpoint())?;
@@ -493,7 +542,7 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
         retain_recent_applied_epochs(&mut applied_epochs);
         Ok(Self {
             identity: checkpoint.identity,
-            catalog: payload.catalog,
+            input: payload.input,
             input_schema: payload.input_schema,
             output_schema: payload.output_schema,
             view_sql,
@@ -504,6 +553,7 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
             filtered_aggregate_state,
             input_frontiers: checkpoint.input_frontiers,
             input_event_time_frontiers: checkpoint.input_event_time_frontiers,
+            view_input_cursors: Vec::new(),
             applied_epochs,
         })
     }

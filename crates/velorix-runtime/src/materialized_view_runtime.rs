@@ -33,15 +33,15 @@ use velorix_core::{
         VelorixRelationCatalogV1,
     },
     standing_program::{
-        DurableStateRoot, EpochCommit, EpochIdempotencyKey, InputEventTimeFrontier,
-        MaterializedViewPage, RelationFrontier, RelationInputBatch, RuntimeCheckpoint,
-        RuntimeCheckpointStatePayload, ScopedViewId, SnapshotPageRequest, StandingInputChangeV1,
-        StandingProgramIdentity, StandingProgramRuntime, StandingProgramRuntimeError, ViewFrontier,
-        ViewOutputBatch, ViewOutputDelta,
+        CausalViewCursorV1, DurableStateRoot, EpochCommit, EpochIdempotencyKey,
+        InputEventTimeFrontier, MaterializedViewPage, RelationFrontier, RelationInputBatch,
+        RuntimeCheckpoint, RuntimeCheckpointStatePayload, ScopedViewId, SnapshotPageRequest,
+        StandingInputChangeV1, StandingProgramIdentity, StandingProgramRuntime,
+        StandingProgramRuntimeError, ViewFrontier, ViewOutputBatch, ViewOutputDelta,
     },
     view_contract::{
-        catalog_input_relation_schema, stable_bytes_hash, RelationSchema, SqlDataType,
-        SqlStructField,
+        catalog_input_relation_schema, stable_bytes_hash, PublishedRelationBindingV1,
+        RelationSchema, SqlDataType, SqlStructField,
     },
     view_plan::{
         lower_supported_analytic_row_number_sql_to_logical_plan,
@@ -95,7 +95,7 @@ pub use event_time_window::TumblingEventTimeAggregateRuntime;
 pub use filter_project::FilterProjectRuntime;
 pub use latest_by_key::LatestByKeyRuntime;
 pub use semi_anti_join::TwoInputSemiAntiJoinRuntime;
-pub use single_key_aggregate::SingleKeySumCountRuntime;
+pub use single_key_aggregate::{SingleKeyRuntimeInputV1, SingleKeySumCountRuntime};
 pub use three_input_join::ThreeInputInnerJoinCountRuntime;
 pub use two_input_join::TwoInputJoinRuntime;
 
@@ -476,7 +476,7 @@ pub fn restore_standing_runtime(
 #[serde(deny_unknown_fields)]
 struct GenericCheckpointPayload {
     schema_version: u32,
-    catalog: VelorixRelationCatalogV1,
+    input: SingleKeyRuntimeInputV1,
     input_schema: RelationSchema,
     output_schema: RelationSchema,
     view_sql: String,
