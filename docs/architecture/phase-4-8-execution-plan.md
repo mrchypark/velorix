@@ -722,3 +722,6 @@ cargo fmt --all --check
 | 2026-08-11 | 4 | Slice: ResolvedAdmissionInput enum | view_contract.rs | Complete |
 | 2026-08-11 | 4 | Slice: resolve_view_inputs_for_request | view_admission.rs | Complete |
 | 2026-08-11 | 4 | Slice: create_view wires resolver | view_admission.rs | Complete |
+| 2026-08-11 | 4 | Slice: lower_published_single_key_sum_count_sql | view_plan.rs | Complete |
+| 2026-08-11 | 4 | Slice: validate_supported_view_sql_with_input | view_plan.rs | Complete |
+| 2026-08-11 | 4 | Slice: published-view admission tests | 3 view_plan tests | Complete |
