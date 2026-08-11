@@ -105,10 +105,12 @@ use velorix_core::{
         ViewOutputDelta, RUNTIME_CHECKPOINT_INPUT_COVERAGE_SCHEMA_VERSION_V1,
     },
     view_contract::{
-        catalog_input_relation_schema, published_relation_binding_v1, stable_bytes_hash,
+        catalog_input_relation_schema, published_relation_binding_v1,
+        resolve_view_input_relation_v1, stable_bytes_hash,
         validate_materialized_standing_view_spec, validate_published_relation_binding_v1,
-        view_spec_hash, ColumnSchema, PublishedRelationBindingV1, RelationSchema, SqlDataType,
-        SqlDialect, SqlSourceKind, SqlStructField, StandingViewShape, StandingViewSpec,
+        view_spec_hash, ColumnSchema, PublishedRelationBindingV1, RelationSchema,
+        ResolvedAdmissionInput, SourceInputBindingV1, SqlDataType, SqlDialect, SqlSourceKind,
+        SqlStructField, StandingViewShape, StandingViewSpec, ViewDependencyEdgeBindingV1,
         PUBLISHED_RELATION_BINDING_SCHEMA_VERSION_V1,
     },
     view_plan::{

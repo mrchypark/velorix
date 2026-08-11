@@ -356,6 +356,163 @@ pub(super) fn only_output_relation_for_runtime_binding(
     Ok(output_schema)
 }
 
+/// Resolve a create-view request's input references into explicit source/view
+/// admission inputs.
+///
+/// Each `InputRelationRef` carries an explicit `input_kind`. `Source` inputs
+/// resolve against the physical relation catalog. `View` inputs resolve against
+/// an active view's published output and produce an immutable dependency edge.
+///
+/// The first slice requires exactly one input and forbids mixing source and
+/// view inputs, per the Phase 4 vertical-slice contract.
+pub(super) async fn resolve_view_inputs_for_request(
+    state: &ApiState,
+    request: &CreateViewRequest,
+) -> Result<Vec<ResolvedAdmissionInput>, ApiError> {
+    let refs = if !request.input_relation_refs.is_empty() {
+        &request.input_relation_refs
+    } else if !request.input_relation_id.trim().is_empty()
+        || !request.input_relation_version.trim().is_empty()
+    {
+        return read_single_source_input_for_request(state, request).await;
+    } else {
+        return Err(ApiError::bad_request(
+            "view requires either input_relation_refs or input_relation_id/input_relation_version",
+        ));
+    };
+
+    let mut resolved = Vec::with_capacity(refs.len());
+    let mut seen = BTreeSet::new();
+    for input in refs {
+        if input.relation_id.trim().is_empty() || input.relation_version.trim().is_empty() {
+            return Err(ApiError::bad_request(
+                "input_relation_refs must include non-empty relation_id and relation_version",
+            ));
+        }
+        if !seen.insert((input.relation_id.as_str(), input.relation_version.as_str())) {
+            return Err(ApiError::bad_request(format!(
+                "duplicate input_relation_refs entry for relation `{}` version `{}`",
+                input.relation_id, input.relation_version
+            )));
+        }
+        match input.input_kind {
+            InputRelationKind::Source => {
+                let catalog =
+                    read_relation_catalog(state, &input.relation_id, &input.relation_version)
+                        .await?;
+                let relation =
+                    catalog_input_relation_schema(&catalog).map_err(ApiError::bad_request)?;
+                resolved.push(ResolvedAdmissionInput::Source {
+                    binding: SourceInputBindingV1 {
+                        relation_id: input.relation_id.clone(),
+                        relation_version: input.relation_version.clone(),
+                        relation_generation: INGEST_SOURCE_IDENTITY_GENERATION_V1,
+                        schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                    },
+                    relation,
+                    catalog,
+                });
+            }
+            InputRelationKind::View => {
+                let resolved_view = resolve_single_view_input(state, input).await?;
+                resolved.push(resolved_view);
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+async fn read_single_source_input_for_request(
+    state: &ApiState,
+    request: &CreateViewRequest,
+) -> Result<Vec<ResolvedAdmissionInput>, ApiError> {
+    let catalog = read_relation_catalog(
+        state,
+        &request.input_relation_id,
+        &request.input_relation_version,
+    )
+    .await?;
+    let relation = catalog_input_relation_schema(&catalog).map_err(ApiError::bad_request)?;
+    Ok(vec![ResolvedAdmissionInput::Source {
+        binding: SourceInputBindingV1 {
+            relation_id: request.input_relation_id.clone(),
+            relation_version: request.input_relation_version.clone(),
+            relation_generation: INGEST_SOURCE_IDENTITY_GENERATION_V1,
+            schema_fingerprint: catalog.schema_fingerprint.to_string(),
+        },
+        relation,
+        catalog,
+    }])
+}
+
+/// Resolve a single `View` input reference against an active producer view.
+async fn resolve_single_view_input(
+    state: &ApiState,
+    input: &InputRelationRef,
+) -> Result<ResolvedAdmissionInput, ApiError> {
+    let active_views = state
+        .view_registry()?
+        .list_active()
+        .await
+        .map_err(materialized_view_registry_error_to_api)?;
+    let producer = active_views
+        .iter()
+        .find(|active| {
+            active.spec.view_id == input.relation_id
+                && active.spec.output_relations.iter().any(|output| {
+                    output.relation_id == input.relation_id
+                        && output.relation_version == input.relation_version
+                })
+        })
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "view input `{}` version `{}` does not match an active view output",
+                input.relation_id, input.relation_version
+            ))
+        })?;
+    if !standing_runtime_can_accept_incremental_ingest(producer) {
+        return Err(ApiError::bad_request(format!(
+            "view input producer `{}` is not in an active lifecycle",
+            input.relation_id
+        )));
+    }
+    let published = published_relation_binding_for_active_view(producer)?.ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "view input producer `{}` has no published output binding",
+            input.relation_id
+        ))
+    })?;
+    validate_published_relation_binding_v1(&published).map_err(ApiError::bad_request)?;
+    let identity = active_standing_runtime_identity(producer).ok_or_else(|| {
+        ApiError::internal(format!(
+            "active view `{}` has no standing runtime identity",
+            input.relation_id
+        ))
+    })?;
+    let relation = published.relation.clone();
+    let edge = ViewDependencyEdgeBindingV1 {
+        input_edge_id: format!("{}->{}", input.relation_id, input.relation_version),
+        graph_revision: 0,
+        producer_tenant_id: identity.tenant_id.clone(),
+        producer_program_id: identity.program_id.clone(),
+        producer_view_id: published.producer_view_id.clone(),
+        producer_generation: published.producer_view_generation,
+        producer_plan_hash: published.producer_plan_hash.clone(),
+        output_schema_hash: published.output_schema_hash.clone(),
+        key_descriptor_hash: published.key_descriptor_hash.clone(),
+        output_stream_id: published.output_stream_id.clone(),
+        delta_codec_identity: published.delta_codec_identity.clone(),
+        frontier_kind: published.frontier_kind.clone(),
+    };
+    resolve_view_input_relation_v1(&edge, &identity.tenant_id, &identity.program_id, &published)
+        .map_err(ApiError::bad_request)?;
+    Ok(ResolvedAdmissionInput::View {
+        relation,
+        published,
+        edge,
+    })
+}
+
 pub(super) fn lower_materialized_view_runtime_sql_to_logical_plan(
     sql: &str,
     catalogs: &[VelorixRelationCatalogV1],
