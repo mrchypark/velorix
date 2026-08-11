@@ -1545,12 +1545,13 @@ pub(super) async fn apply_standing_runtime_prepared_ingests(
                 !prepared_batch_is_covered_by_replay_plan(&replay_plan, prepared)
             });
         }
-        let input_batches = uncovered_prepared_batches
+        let input_changes = uncovered_prepared_batches
             .iter()
             .copied()
             .map(relation_input_batch_from_prepared_ingest)
+            .map(StandingInputChangeV1::Source)
             .collect::<Vec<_>>();
-        if input_batches.is_empty() {
+        if input_changes.is_empty() {
             continue;
         }
         let runtime = state
@@ -1578,7 +1579,7 @@ pub(super) async fn apply_standing_runtime_prepared_ingests(
             Arc::clone(&runtime),
             lower_bound_epoch,
             idempotency_key,
-            input_batches,
+            input_changes,
             StandingRuntimeBudgetLimits::from_state(state),
         )
         .await;
@@ -1765,7 +1766,7 @@ pub(super) async fn apply_standing_runtime_changes_and_checkpoint(
         runtime,
         lower_bound_epoch,
         idempotency_key,
-        vec![input_batch],
+        vec![StandingInputChangeV1::Source(input_batch)],
         budget_limits,
     )
     .await
@@ -1790,7 +1791,7 @@ pub(super) async fn apply_standing_runtime_changes_and_checkpoint_many(
     runtime: SharedStandingRuntime,
     lower_bound_epoch: u64,
     idempotency_key: EpochIdempotencyKey,
-    input_batches: Vec<RelationInputBatch>,
+    input_changes: Vec<StandingInputChangeV1>,
     budget_limits: StandingRuntimeBudgetLimits,
 ) -> Result<StandingRuntimeApplyResult, ApiError> {
     tokio::task::spawn_blocking(move || {
@@ -1800,7 +1801,7 @@ pub(super) async fn apply_standing_runtime_changes_and_checkpoint_many(
         let logical_epoch =
             next_standing_runtime_logical_epoch(runtime.as_ref(), lower_bound_epoch)?;
         let before = runtime.checkpoint().map_err(ApiError::bad_request)?;
-        let commit = match runtime.apply_changes(logical_epoch, idempotency_key, input_batches.into_iter().map(StandingInputChangeV1::Source).collect()) {
+        let commit = match runtime.apply_changes(logical_epoch, idempotency_key, input_changes) {
             Ok(commit) => commit,
             Err(error) => {
                 *runtime = velorix_runtime::materialized_view_runtime::restore_standing_runtime(

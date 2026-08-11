@@ -71,7 +71,7 @@ pub(super) async fn replay_committed_ingest_into_standing_runtime_limited(
 
     let mut outcome = StandingRuntimeBackfillReplayOutcome::default();
     let coalesce_replay = range.is_none() && scope.is_none();
-    let mut coalesced_input_batches = Vec::new();
+    let mut coalesced_input_batches: Vec<StandingInputChangeV1> = Vec::new();
     let mut coalesced_replay_checkpoints = Vec::new();
     let mut coalesced_idempotency_parts = Vec::new();
     let mut coalesced_lower_bound_epoch = 0_u64;
@@ -152,7 +152,7 @@ pub(super) async fn replay_committed_ingest_into_standing_runtime_limited(
                 descriptor.partition_id,
                 descriptor.end_offset_exclusive,
             ));
-            coalesced_input_batches.push(input_batch);
+            coalesced_input_batches.push(StandingInputChangeV1::Source(input_batch));
         } else {
             let owner = state
                 .acquire_standing_runtime_owner(identity, &active.spec.view_id)
