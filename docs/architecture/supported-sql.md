@@ -107,6 +107,67 @@ Enabling the flag does not turn parser acceptance into support. These shapes
 still go through the same typed logical-plan admission and runtime capability
 checks.
 
+## Event-Time Semantics
+
+When experimental window SQL is enabled, the following event-time semantics
+apply to TUMBLE, HOP, and SESSION windows.
+
+### Event-Time Extraction
+
+- The event-time column must be declared in the relation schema with
+  `event_time_column_id`.
+- Supported types: Int64 (nanoseconds since epoch), Date32, TimestampNanosecond.
+- Event-time values must be monotonically non-decreasing within each source
+  partition after watermark assignment.
+
+### Per-Partition Watermarks
+
+- Each source partition maintains a watermark: the latest event-time observed
+  minus an optional lateness allowance.
+- Watermarks advance monotonically per partition.
+- Window closure is determined by the minimum watermark across all partitions
+  of a relation.
+
+### Window Closure Rules
+
+- **TUMBLE**: Window closes when `window_end <= min(watermark)`. Rows with
+  event-time in a closed window are discarded.
+- **HOP**: Window closes when `window_end <= min(watermark)`. Overlapping
+  windows are closed independently.
+- **SESSION**: Window closes when `gap > session_gap` and `window_end <=
+  min(watermark)`. Windows may merge if new rows arrive within the gap.
+
+### Allowed Lateness and Late-Row Handling
+
+- Default policy: **reject** rows arriving after window closure.
+- Late rows return an error to the ingest caller.
+- No configurable lateness allowance in the current implementation.
+- Future extensions may support configurable lateness with explicit
+  evidence tracking.
+
+### State Boundedness
+
+- Window operators use `StateBoundednessV1::WatermarkBounded` with the
+  event-time column and allowed lateness.
+- State growth is bounded by the number of active windows multiplied by
+  the number of distinct group keys per window.
+- No explicit retention contract beyond watermark-bounded state.
+
+### Multi-Input Watermark Combination
+
+- For joins involving windowed relations, the minimum watermark across
+  all inputs determines window closure.
+- Idle partitions are handled by tracking the last observed watermark.
+- No explicit idle-partition timeout in the current implementation.
+
+### Recovery Behavior
+
+- Window state is checkpointed per partition with the watermark frontier.
+- On restart, windows are reconstructed from checkpointed state.
+- Late rows after restart are rejected based on the restored watermark.
+- Deterministic replay: same input epochs produce identical window
+  assignments and output deltas.
+
 ## Query-time SQL is a separate surface
 
 After a view has materialized its published output snapshot, a caller may provide
