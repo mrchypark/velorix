@@ -5134,6 +5134,74 @@ fn evaluate_projection_expr(
     }
 }
 
+/// Evaluate a string projection expression.
+///
+/// Returns the string result of evaluating the expression against the input record.
+fn evaluate_string_projection_expr(
+    expr: &SupportedProjectionExpr,
+    input: &Map<String, Value>,
+    catalog: &VelorixRelationCatalogV1,
+) -> Result<String, StandingProgramRuntimeError> {
+    match expr {
+        SupportedProjectionExpr::Column { column_id } => input
+            .get(column_id.as_str())
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .or_else(|| {
+                // Try as Int64 and convert to string
+                input
+                    .get(column_id.as_str())
+                    .and_then(|v| v.as_i64().map(|n| n.to_string()))
+            })
+            .ok_or_else(invalid_runtime_state),
+        SupportedProjectionExpr::LiteralUtf8 { value } => Ok(value.clone()),
+        SupportedProjectionExpr::LengthUtf8 { expr } => {
+            let s = evaluate_string_projection_expr(expr, input, catalog)?;
+            // LENGTH returns byte count (UTF-8)
+            Ok(s.len().to_string())
+        }
+        SupportedProjectionExpr::ConcatUtf8 { exprs } => {
+            let mut result = String::new();
+            for expr in exprs {
+                let s = evaluate_string_projection_expr(expr, input, catalog)?;
+                result.push_str(&s);
+            }
+            Ok(result)
+        }
+        SupportedProjectionExpr::SubstringUtf8 { expr, start, length } => {
+            let s = evaluate_string_projection_expr(expr, input, catalog)?;
+            let start_val = evaluate_projection_expr(start, input, catalog)? as usize;
+            let len = match length {
+                Some(l) => Some(evaluate_projection_expr(l, input, catalog)? as usize),
+                None => None,
+            };
+            // SQL SUBSTRING is 1-indexed
+            let start_idx = if start_val > 0 { start_val - 1 } else { 0 };
+            let chars: Vec<char> = s.chars().collect();
+            let result: String = match len {
+                Some(l) => chars.iter().skip(start_idx).take(l).collect(),
+                None => chars.iter().skip(start_idx).collect(),
+            };
+            Ok(result)
+        }
+        SupportedProjectionExpr::TrimUtf8 { expr } => {
+            let s = evaluate_string_projection_expr(expr, input, catalog)?;
+            Ok(s.trim().to_string())
+        }
+        // Int64 expressions cannot be used in string context
+        SupportedProjectionExpr::LiteralInt64 { value } => Ok(value.to_string()),
+        SupportedProjectionExpr::BinaryInt64 { .. }
+        | SupportedProjectionExpr::AbsInt64 { .. }
+        | SupportedProjectionExpr::GreatestInt64 { .. }
+        | SupportedProjectionExpr::LeastInt64 { .. }
+        | SupportedProjectionExpr::CoalesceInt64 { .. }
+        | SupportedProjectionExpr::CaseInt64 { .. } => {
+            Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "int64_expression_in_string_context",
+            })
+        }
+    }
+}
+
 fn scalar_int64_comparison_matches_input(
     left: &SupportedProjectionExpr,
     comparison_op: PredicateOp,

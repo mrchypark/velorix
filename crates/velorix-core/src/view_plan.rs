@@ -12698,6 +12698,97 @@ fn supported_filter_project_bound_projection_expr(
                 }
                 return Ok(SupportedProjectionExpr::LeastInt64 { exprs });
             }
+            // String expression functions
+            if function_name_eq(&function.name, "length") || function_name_eq(&function.name, "char_length") {
+                let [FunctionArg::Unnamed(FunctionArgExpr::Expr(argument))] =
+                    arguments.args.as_slice()
+                else {
+                    return unsupported("LENGTH/CHAR_LENGTH requires one expression argument");
+                };
+                return Ok(SupportedProjectionExpr::LengthUtf8 {
+                    expr: Box::new(supported_filter_project_bound_projection_expr(
+                        argument,
+                        catalog,
+                        relation_alias,
+                        source_projection,
+                    )?),
+                });
+            }
+            if function_name_eq(&function.name, "concat") {
+                if arguments.args.len() < 2 {
+                    return unsupported("CONCAT requires at least two arguments");
+                }
+                let exprs = arguments
+                    .args
+                    .iter()
+                    .map(|argument| {
+                        let FunctionArg::Unnamed(FunctionArgExpr::Expr(argument)) = argument else {
+                            return unsupported("CONCAT only supports expression arguments");
+                        };
+                        supported_filter_project_bound_projection_expr(
+                            argument,
+                            catalog,
+                            relation_alias,
+                            source_projection,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                return Ok(SupportedProjectionExpr::ConcatUtf8 { exprs });
+            }
+            if function_name_eq(&function.name, "substring") || function_name_eq(&function.name, "substr") {
+                if arguments.args.len() < 2 || arguments.args.len() > 3 {
+                    return unsupported("SUBSTRING requires 2 or 3 arguments");
+                }
+                let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr_arg)) = &arguments.args[0] else {
+                    return unsupported("SUBSTRING first argument must be an expression");
+                };
+                let FunctionArg::Unnamed(FunctionArgExpr::Expr(start_arg)) = &arguments.args[1] else {
+                    return unsupported("SUBSTRING start must be an expression");
+                };
+                let length_arg = if arguments.args.len() == 3 {
+                    let FunctionArg::Unnamed(FunctionArgExpr::Expr(len_arg)) = &arguments.args[2] else {
+                        return unsupported("SUBSTRING length must be an expression");
+                    };
+                    Some(Box::new(supported_filter_project_bound_projection_expr(
+                        len_arg,
+                        catalog,
+                        relation_alias,
+                        source_projection,
+                    )?))
+                } else {
+                    None
+                };
+                return Ok(SupportedProjectionExpr::SubstringUtf8 {
+                    expr: Box::new(supported_filter_project_bound_projection_expr(
+                        expr_arg,
+                        catalog,
+                        relation_alias,
+                        source_projection,
+                    )?),
+                    start: Box::new(supported_filter_project_bound_projection_expr(
+                        start_arg,
+                        catalog,
+                        relation_alias,
+                        source_projection,
+                    )?),
+                    length: length_arg,
+                });
+            }
+            if function_name_eq(&function.name, "trim") {
+                let [FunctionArg::Unnamed(FunctionArgExpr::Expr(argument))] =
+                    arguments.args.as_slice()
+                else {
+                    return unsupported("TRIM requires one expression argument");
+                };
+                return Ok(SupportedProjectionExpr::TrimUtf8 {
+                    expr: Box::new(supported_filter_project_bound_projection_expr(
+                        argument,
+                        catalog,
+                        relation_alias,
+                        source_projection,
+                    )?),
+                });
+            }
             unsupported("computed projection function is not supported")
         }
         Expr::Case {
