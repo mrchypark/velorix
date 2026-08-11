@@ -36,7 +36,7 @@ use crate::{
         ArrowPhysicalTypeV1, RelationColumnV1, RelationSchemaError,
         SupportedIncrementalAdapterSpec, VelorixRelationCatalogV1,
     },
-    view_contract::{stable_bytes_hash, RelationSchema},
+    view_contract::{catalog_input_relation_schema, stable_bytes_hash, RelationSchema},
 };
 
 pub const LOGICAL_VIEW_PLAN_VERSION_V1: u32 = 1;
@@ -114,6 +114,49 @@ pub struct LogicalPlanRelationRef {
     pub relation_name: String,
     pub relation_version: String,
     pub schema_fingerprint: String,
+}
+
+/// Schema-only relation input used by the SQL planner.
+///
+/// The planner only needs the relation schema (columns, key, types) to resolve
+/// SQL names and expressions. Physical source catalogs carry extra ingestion
+/// contract fields (weight column, incremental adapter) that do not apply to
+/// published view outputs. `PlannerRelationInput` decouples those concerns so a
+/// consumer view can plan against a producer's `PublishedRelationBindingV1`
+/// without fabricating a physical `VelorixRelationCatalogV1`.
+#[derive(Clone, Debug)]
+pub struct PlannerRelationInput {
+    /// The relation schema the planner resolves SQL against.
+    pub relation: RelationSchema,
+    /// How this input's changes are encoded at runtime.
+    pub change_encoding: PlannerChangeEncoding,
+}
+
+/// How an input's signed changes are delivered to the runtime.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PlannerChangeEncoding {
+    /// A registered physical ingest source.
+    PhysicalSource,
+    /// A published view output delivered as a signed delta batch.
+    PublishedDelta {
+        delta_codec_identity: String,
+        frontier_kind: String,
+    },
+}
+
+impl PlannerRelationInput {
+    /// Builds a planner input from a physical source catalog.
+    pub fn from_source_catalog(catalog: &VelorixRelationCatalogV1) -> Result<Self, ViewPlanError> {
+        let relation = catalog_input_relation_schema(catalog).map_err(|error| {
+            ViewPlanError::UnsupportedShape {
+                reason: format!("relation catalog does not yield an input schema: {error}"),
+            }
+        })?;
+        Ok(Self {
+            relation,
+            change_encoding: PlannerChangeEncoding::PhysicalSource,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
