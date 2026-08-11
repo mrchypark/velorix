@@ -664,4 +664,10 @@ cargo fmt --all --check
 | 2026-08-10 | 7 | PK Correlated EXISTS/NOT EXISTS | View plan tests | Complete |
 | 2026-08-10 | 8 | Ranking functions (ROW_NUMBER, RANK) | Runtime tests | Experimental |
 | 2026-08-11 | 4 | Oracle Pro design review | GPT-5.6 Sol Pro review | Review complete |
-| 2026-08-11 | 4 | P0 foundational contracts identified | 8 P0 + 2 P1 issues | In progress |
+| 2026-08-11 | 4 | P0 foundational contracts identified | 8 P0 + 2 P1 issues | Complete |
+| 2026-08-11 | 4 | Step 0.1: Graph mutation CAS + tagged input | Core types + MetaStore trait | Complete |
+| 2026-08-11 | 4 | Step 0.2: Dependency edge binding | Program identity update | Complete |
+| 2026-08-11 | 4 | Step 0.3: Typed view-delta input API | StandingInputChangeV1 | Complete |
+| 2026-08-11 | 4 | Step 0.4: Bootstrap + retention/GC | DeltaRetentionStateV1 | Complete |
+| 2026-08-11 | 4 | Step 0.5: Mandatory causal validation | CausalCutV1 validation | Complete |
+| 2026-08-11 | 4 | Step 0.6: Fan-in scheduling + backpressure | ConsumerLagQuotaV1 | Complete |
