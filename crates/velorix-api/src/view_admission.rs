@@ -342,6 +342,62 @@ pub(super) fn materialized_view_runtime_binding_for_spec(
     })
 }
 
+/// Build a runtime binding for a published-view input consumer.
+///
+/// The input has no physical catalog. The output schema is inferred from the
+/// SQL projection, the plan is lowered through the published single-key
+/// sum/count lowerer, and the input catalog hash binds the verified producer
+/// relation schema fingerprint.
+pub(super) fn materialized_view_runtime_binding_for_published_spec(
+    view_id: &str,
+    sql: &str,
+    relation: &RelationSchema,
+    binding: &PublishedRelationBindingV1,
+    codec: &str,
+    frontier: &str,
+) -> Result<MaterializedViewRuntimeBinding, ApiError> {
+    let planner_input = PlannerRelationInput::from_published_binding(
+        relation.clone(),
+        codec.to_string(),
+        frontier.to_string(),
+    );
+    let output_schema = infer_single_key_sum_count_output_schema(sql, &planner_input, view_id)
+        .map_err(ApiError::bad_request)?;
+    let logical_plan = lower_published_single_key_sum_count_sql(
+        sql,
+        &planner_input,
+        &output_schema,
+        codec,
+        frontier,
+    )
+    .map_err(ApiError::bad_request)?;
+    let spec = StandingViewSpec {
+        view_id: view_id.to_string(),
+        sql: sql.to_string(),
+        dialect: SqlDialect::VelorixSql,
+        source_kind: SqlSourceKind::StandingView,
+        input_relations: vec![relation.clone()],
+        output_relations: vec![output_schema],
+        shape: StandingViewShape {
+            is_materialized: true,
+            multi_input: false,
+            multi_output: false,
+        },
+    };
+    let identity = standing_program_identity_from_materialized_view_runtime(&[], &spec)?;
+    let mut binding_result = MaterializedViewRuntimeBinding {
+        runtime_kind: MATERIALIZED_VIEW_RUNTIME_NAME.to_string(),
+        runtime_version: "builtin-v1".to_string(),
+        standing_program_identity: identity,
+        logical_plan: Some(logical_plan),
+        published_relations: Vec::new(),
+    };
+    let _ = binding;
+    binding_result.standing_program_identity.input_catalog_hash =
+        relation.schema_fingerprint.clone();
+    Ok(binding_result)
+}
+
 pub(super) fn published_relation_bindings_for_spec(
     spec: &StandingViewSpec,
     runtime: &MaterializedViewRuntimeBinding,

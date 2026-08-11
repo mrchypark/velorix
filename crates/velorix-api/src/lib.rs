@@ -114,6 +114,7 @@ use velorix_core::{
         PUBLISHED_RELATION_BINDING_SCHEMA_VERSION_V1,
     },
     view_plan::{
+        infer_single_key_sum_count_output_schema, lower_published_single_key_sum_count_sql,
         lower_supported_analytic_row_number_sql_to_logical_plan,
         lower_supported_sql_to_logical_plan, supported_join_view_plan_aggregate_outputs,
         supported_join_view_plan_is_self_join, supported_join_view_plan_is_singleton,
@@ -123,7 +124,7 @@ use velorix_core::{
         validate_supported_latest_by_key_sql, validate_supported_semi_anti_join_sql,
         validate_supported_three_input_inner_join_count_sql,
         validate_supported_tumbling_window_sql, LogicalPlanAggregateFunctionV1,
-        SupportedAggregateInputRelationSide, SupportedAggregateOutput,
+        PlannerRelationInput, SupportedAggregateInputRelationSide, SupportedAggregateOutput,
         SupportedAnalyticRowNumberPlan, SupportedFilterProjectPlan, SupportedJoinViewPlan,
         SupportedLatestByKeyPlan, SupportedProjectionExpr, SupportedThreeInputInnerJoinCountPlanV1,
         SupportedTumblingWindowPlan, SupportedViewPlan, VelorixLogicalViewExecutionV1,
