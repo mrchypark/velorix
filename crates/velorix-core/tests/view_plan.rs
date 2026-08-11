@@ -14,6 +14,7 @@ use velorix_core::{
     view_contract::{ColumnSchema, RelationSchema, SqlDataType},
     view_plan::{
         logical_view_plan_hash, lower_join_chain_to_binary_dag,
+        lower_published_single_key_sum_count_sql,
         lower_supported_filter_project_sql_to_logical_plan,
         lower_supported_join_view_sql_to_logical_plan,
         lower_supported_latest_by_key_sql_to_logical_plan, lower_supported_sql_to_logical_plan,
@@ -26,15 +27,16 @@ use velorix_core::{
         validate_supported_view_sql, AggregateOutputPredicateExpr, JoinPredicateExpr,
         LogicalPlanAggregateFunctionV1, LogicalPlanBinaryJoinStepV1, LogicalPlanColumnRef,
         LogicalPlanCompositeJoinEqualityV1, LogicalPlanJoinKeyPairV1,
-        LogicalPlanLatestByKeyFunctionV1, LogicalPlanStateKindV1, PredicateOp, RowPredicateExpr,
-        SupportedAggregateInputRelationSide, SupportedAggregateOutputIdentity,
-        SupportedAnalyticWindowFunction, SupportedCompositeJoinEqualityV1,
-        SupportedEventTimeWindowKind, SupportedJoinKeyDomainV1, SupportedJoinKeyPairV1,
-        SupportedJoinKind, SupportedProjectionExpr, VelorixLogicalViewExecutionV1,
-        VelorixLogicalViewPlanNodeV1, VelorixLogicalViewPlanV1, ViewPlanError,
-        COMPOSITE_PK_POSITIONAL_JSON_ARRAY_JOIN_KEY_CODEC_V1, INCREMENTAL_BAG_SEMANTICS_VERSION_V1,
-        INCREMENTAL_KEY_SEMANTICS_VERSION_V1, LEFT_JOIN_INPUT_INSTANCE_ID_V1,
-        LOGICAL_VIEW_PLAN_HASH_PREFIX, LOGICAL_VIEW_PLAN_VERSION_V1, LOGICAL_VIEW_PLAN_VERSION_V2,
+        LogicalPlanLatestByKeyFunctionV1, LogicalPlanStateKindV1, PlannerRelationInput,
+        PredicateOp, RowPredicateExpr, SupportedAggregateInputRelationSide,
+        SupportedAggregateOutputIdentity, SupportedAnalyticWindowFunction,
+        SupportedCompositeJoinEqualityV1, SupportedEventTimeWindowKind, SupportedJoinKeyDomainV1,
+        SupportedJoinKeyPairV1, SupportedJoinKind, SupportedProjectionExpr,
+        VelorixLogicalViewExecutionV1, VelorixLogicalViewPlanNodeV1, VelorixLogicalViewPlanV1,
+        ViewPlanError, COMPOSITE_PK_POSITIONAL_JSON_ARRAY_JOIN_KEY_CODEC_V1,
+        INCREMENTAL_BAG_SEMANTICS_VERSION_V1, INCREMENTAL_KEY_SEMANTICS_VERSION_V1,
+        LEFT_JOIN_INPUT_INSTANCE_ID_V1, LOGICAL_VIEW_PLAN_HASH_PREFIX,
+        LOGICAL_VIEW_PLAN_VERSION_V1, LOGICAL_VIEW_PLAN_VERSION_V2,
         NON_PRIMARY_NON_NULL_SCALAR_JOIN_KEY_CODEC_V1, RIGHT_JOIN_INPUT_INSTANCE_ID_V1,
         SELF_JOIN_ATOMIC_FANOUT_PROTOCOL_V1, THREE_INPUT_LEGACY_SQL_ENCOUNTER_JOIN_ORDER_V1,
         THREE_INPUT_ROOT_FIXED_RIGHT_RELATION_ID_JOIN_ORDER_V1,
@@ -11216,5 +11218,148 @@ fn string_test_output_schema() -> RelationSchema {
             },
         ],
         primary_key: vec!["user_id".to_string()],
+    }
+}
+
+// ============================================================================
+// Phase 4: Published-View Single-Key Sum/Count Admission
+// ============================================================================
+
+#[test]
+fn published_single_key_sum_count_lowers_to_single_key_plan() {
+    let input = PlannerRelationInput::from_published_binding(
+        published_regions_relation(),
+        "velorix-published-relation-delta-v1".to_string(),
+        "producer_commit_epoch".to_string(),
+    );
+    let output = RelationSchema {
+        relation_id: "regions_total".to_string(),
+        relation_name: "regions_total".to_string(),
+        relation_version: "v1".to_string(),
+        schema_fingerprint: format!("sha256:{}", "9".repeat(64)),
+        columns: vec![
+            ColumnSchema {
+                name: "region".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "total".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "count".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["region".to_string()],
+    };
+    let plan = lower_published_single_key_sum_count_sql(
+        "select region, sum(amount) as total, count(*) as count from regions_by_region group by region",
+        &input,
+        &output,
+        "velorix-published-relation-delta-v1",
+        "producer_commit_epoch",
+    )
+    .unwrap();
+    assert!(matches!(
+        plan.execution,
+        VelorixLogicalViewExecutionV1::SingleKeySumCount { .. }
+    ));
+}
+
+#[test]
+fn published_single_key_sum_count_rejects_mismatched_codec() {
+    let input = PlannerRelationInput::from_published_binding(
+        published_regions_relation(),
+        "velorix-published-relation-delta-v1".to_string(),
+        "producer_commit_epoch".to_string(),
+    );
+    let output = RelationSchema {
+        relation_id: "regions_total".to_string(),
+        relation_name: "regions_total".to_string(),
+        relation_version: "v1".to_string(),
+        schema_fingerprint: format!("sha256:{}", "9".repeat(64)),
+        columns: vec![
+            ColumnSchema {
+                name: "region".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "total".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["region".to_string()],
+    };
+    // Stale generation codec must be rejected before planning.
+    let result = lower_published_single_key_sum_count_sql(
+        "select region, sum(amount) as total from regions_by_region group by region",
+        &input,
+        &output,
+        "stale-codec",
+        "producer_commit_epoch",
+    );
+    assert!(matches!(
+        result,
+        Err(ViewPlanError::UnsupportedShape { .. })
+    ));
+}
+
+#[test]
+fn published_single_key_sum_count_rejects_window_sql() {
+    let input = PlannerRelationInput::from_published_binding(
+        published_regions_relation(),
+        "velorix-published-relation-delta-v1".to_string(),
+        "producer_commit_epoch".to_string(),
+    );
+    let output = RelationSchema {
+        relation_id: "regions_total".to_string(),
+        relation_name: "regions_total".to_string(),
+        relation_version: "v1".to_string(),
+        schema_fingerprint: format!("sha256:{}", "9".repeat(64)),
+        columns: vec![ColumnSchema {
+            name: "region".to_string(),
+            data_type: SqlDataType::Utf8,
+            nullable: false,
+        }],
+        primary_key: vec!["region".to_string()],
+    };
+    let result = lower_published_single_key_sum_count_sql(
+        "select region, row_number() over (partition by region order by region) as rn from regions_by_region",
+        &input,
+        &output,
+        "velorix-published-relation-delta-v1",
+        "producer_commit_epoch",
+    );
+    assert!(matches!(
+        result,
+        Err(ViewPlanError::UnsupportedShape { .. })
+    ));
+}
+
+fn published_regions_relation() -> RelationSchema {
+    RelationSchema {
+        relation_id: "regions_by_region".to_string(),
+        relation_name: "regions_by_region".to_string(),
+        relation_version: "v1".to_string(),
+        schema_fingerprint: format!("sha256:{}", "7".repeat(64)),
+        columns: vec![
+            ColumnSchema {
+                name: "region".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "amount".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["region".to_string()],
     }
 }

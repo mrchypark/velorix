@@ -36,7 +36,9 @@ use crate::{
         ArrowPhysicalTypeV1, RelationColumnV1, RelationSchemaError,
         SupportedIncrementalAdapterSpec, VelorixRelationCatalogV1,
     },
-    view_contract::{catalog_input_relation_schema, stable_bytes_hash, RelationSchema},
+    view_contract::{
+        catalog_input_relation_schema, stable_bytes_hash, ColumnSchema, RelationSchema,
+    },
 };
 
 pub const LOGICAL_VIEW_PLAN_VERSION_V1: u32 = 1;
@@ -3890,6 +3892,12 @@ fn single_key_sum_count_logical_plan_from_input(
         group_keys: group_keys.clone(),
         accumulators,
     });
+    let mut current_node = aggregate_node.clone();
+    nodes.push(VelorixLogicalViewPlanNodeV1::Output {
+        node_id: "output_materialized_view".to_string(),
+        input: current_node,
+        relation: output_relation.clone(),
+    });
     Ok(VelorixLogicalViewPlanV1 {
         plan_version: LOGICAL_VIEW_PLAN_VERSION_V2,
         plan_hash: None,
@@ -3917,15 +3925,210 @@ fn single_key_sum_count_logical_plan_from_input(
 /// relation input.
 ///
 /// This is the catalog-free core of `validate_supported_view_sql`. It does not
-/// perform physical catalog or adapter validation. The first Phase 4 slice wires
-/// only the supported single-key sum/count family; any other shape fails closed.
+/// perform physical catalog or adapter validation. The first Phase 4 slice
+/// admits only the narrow direct-PK single-key sum/count family:
+///
+/// - exactly one published delta input
+/// - direct single primary-key grouping
+/// - `SUM(non-null Int64 column)` and/or `COUNT(*)` / `COUNT(column)`
+/// - no Top-K, window, CTE/derived input, DISTINCT, HAVING, aggregate FILTER,
+///   or computed group key
+///
+/// Any other shape fails closed; there is no family fallback.
 fn validate_supported_view_sql_with_input(
     sql: &str,
-    _input: &PlannerRelationInput,
+    input: &PlannerRelationInput,
     _registration_name: Option<&str>,
 ) -> Result<SupportedViewPlan, ViewPlanError> {
-    let _ = sql;
-    unsupported("published view single-key sum/count planning is not yet wired")
+    if input.weight_column_id.is_some() {
+        return unsupported("published view input must not carry a physical weight column");
+    }
+    if input.event_time_column_id.is_some() {
+        return unsupported("published view input must not carry a physical event-time column");
+    }
+    let [key_column_id] = input.relation.primary_key.as_slice() else {
+        return unsupported("published view SQL requires exactly one primary key column");
+    };
+    let key_column_id = key_column_id.as_str();
+    let query = parse_single_query(sql)?;
+    if query.limit_clause.is_some() || query.fetch.is_some() {
+        return unsupported("published view aggregate Top-K is not supported in this slice");
+    }
+    let select = match query.body.as_ref() {
+        sqlparser::ast::SetExpr::Select(select) => select.as_ref(),
+        _ => return unsupported("published view SQL requires a plain SELECT"),
+    };
+    if select.distinct.is_some() {
+        return unsupported("published view aggregate DISTINCT is not supported in this slice");
+    }
+    if select.having.is_some() {
+        return unsupported("published view aggregate HAVING is not supported in this slice");
+    }
+    let (group_exprs, modifiers) = match &select.group_by {
+        GroupByExpr::All(modifiers) => (Vec::new(), modifiers),
+        GroupByExpr::Expressions(exprs, modifiers) => (exprs.clone(), modifiers),
+    };
+    if !modifiers.is_empty() {
+        return unsupported("published view GROUP BY modifiers are not supported");
+    }
+    if group_exprs.len() != 1 {
+        return unsupported("published view SQL requires exactly one group key");
+    }
+    let group_expr = &group_exprs[0];
+    if let Some(column) = expression_catalog_column_against_relation(group_expr, input) {
+        if column.name != key_column_id {
+            return unsupported("published view group key must be the single primary key column");
+        }
+    } else {
+        return unsupported("published view group key must reference the primary key column");
+    }
+
+    let mut aggregate_outputs = Vec::new();
+    let mut sum_value_column_id: Option<String> = None;
+    let mut seen = BTreeSet::new();
+    for item in select.projection.iter().skip(1) {
+        let (expr, alias) = match item {
+            SelectItem::UnnamedExpr(expr) => (expr, None),
+            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.as_str())),
+            _ => {
+                return unsupported(
+                    "published view aggregate projections must be scalar expressions",
+                )
+            }
+        };
+        let Expr::Function(function) = expr else {
+            return unsupported("published view aggregate projections must be aggregate functions");
+        };
+        let FunctionArguments::List(arguments) = &function.args else {
+            return unsupported("published view aggregate functions require an argument list");
+        };
+        let function_name = single_object_name_identifier(&function.name).ok_or_else(|| {
+            ViewPlanError::UnsupportedShape {
+                reason: "published view aggregate function name is not recognized".to_string(),
+            }
+        })?;
+        let upper = function_name.to_ascii_uppercase();
+        let alias = alias.unwrap_or(function_name.as_str());
+        if !seen.insert(alias.to_string()) {
+            return unsupported("published view aggregate output aliases must be unique");
+        }
+        match upper.as_str() {
+            "SUM" => {
+                if arguments.args.len() != 1 {
+                    return unsupported("SUM requires exactly one argument");
+                }
+                let FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr)) = &arguments.args[0]
+                else {
+                    return unsupported("SUM argument must be a scalar expression");
+                };
+                let Some(column) = expression_catalog_column_against_relation(arg_expr, input)
+                else {
+                    return unsupported("SUM argument must reference a registered column");
+                };
+                if column.name == key_column_id {
+                    return unsupported("SUM of the group key column is not supported");
+                }
+                sum_value_column_id = Some(column.name.clone());
+                aggregate_outputs.push(SupportedAggregateOutput {
+                    function: LogicalPlanAggregateFunctionV1::Sum,
+                    output_column_id: alias.to_string(),
+                    input_column_id: Some(column.name.clone()),
+                    input_relation_side: None,
+                    input_expression: None,
+                });
+            }
+            "COUNT" => match arguments.args.as_slice() {
+                [] | [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)] => {
+                    aggregate_outputs.push(SupportedAggregateOutput {
+                        function: LogicalPlanAggregateFunctionV1::Count,
+                        output_column_id: alias.to_string(),
+                        input_column_id: None,
+                        input_relation_side: None,
+                        input_expression: None,
+                    });
+                }
+                [FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr))] => {
+                    if let Expr::Value(v) = arg_expr {
+                        if let SqlValue::Number(n, _) = &v.value {
+                            if n == "1" {
+                                aggregate_outputs.push(SupportedAggregateOutput {
+                                    function: LogicalPlanAggregateFunctionV1::Count,
+                                    output_column_id: alias.to_string(),
+                                    input_column_id: None,
+                                    input_relation_side: None,
+                                    input_expression: None,
+                                });
+                                continue;
+                            }
+                        }
+                    }
+                    if let Some(column) =
+                        expression_catalog_column_against_relation(arg_expr, input)
+                    {
+                        aggregate_outputs.push(SupportedAggregateOutput {
+                            function: LogicalPlanAggregateFunctionV1::Count,
+                            output_column_id: alias.to_string(),
+                            input_column_id: Some(column.name.clone()),
+                            input_relation_side: None,
+                            input_expression: None,
+                        });
+                    } else {
+                        return unsupported("COUNT argument must reference a registered column");
+                    }
+                }
+                _ => return unsupported("COUNT supports zero or one argument in this slice"),
+            },
+            _ => {
+                return unsupported(
+                    "published view aggregate only supports SUM and COUNT in this slice",
+                );
+            }
+        }
+    }
+    if aggregate_outputs.is_empty() {
+        return unsupported("published view SQL requires at least one aggregate projection");
+    }
+
+    Ok(SupportedViewPlan {
+        input_relation_id: input.relation.relation_id.clone(),
+        group_key_column_id: key_column_id.to_string(),
+        aggregate_output_identity: Some(SupportedAggregateOutputIdentity::GroupKey {
+            group_keys: vec![SupportedGroupKey {
+                output_column_id: key_column_id.to_string(),
+                input_column_id: Some(key_column_id.to_string()),
+                expression: None,
+            }],
+        }),
+        output_key_column_id: key_column_id.to_string(),
+        sum_value_column_id: sum_value_column_id.unwrap_or_else(|| key_column_id.to_string()),
+        aggregate_outputs,
+        predicate: None,
+        predicate_expr: None,
+        aggregate_filter_exprs: BTreeMap::new(),
+        having: None,
+        having_expr: None,
+        top_k: None,
+    })
+}
+
+/// Resolve a column reference in a published-view relation schema.
+///
+/// Returns the matching `ColumnSchema` when the expression is an unqualified or
+/// alias-qualified identifier resolving to a column of the published relation.
+fn expression_catalog_column_against_relation<'a>(
+    expr: &'a Expr,
+    input: &'a PlannerRelationInput,
+) -> Option<&'a ColumnSchema> {
+    let column_name = match expr {
+        Expr::Identifier(ident) => ident.value.as_str(),
+        Expr::CompoundIdentifier(idents) if idents.len() == 2 => idents[1].value.as_str(),
+        _ => return None,
+    };
+    input
+        .relation
+        .columns
+        .iter()
+        .find(|column| column.name == column_name)
 }
 
 fn three_input_inner_join_count_logical_plan(
