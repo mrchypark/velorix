@@ -17288,3 +17288,187 @@ async fn rest_view_on_view_input_fails_closed_without_flag_and_planner_integrati
         "unexpected error message: {response:?}"
     );
 }
+
+#[tokio::test]
+async fn rest_two_level_sum_count_chain_admits_producer_and_consumer() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let state = test_public_api_state_with_store(store, "api-test-two-level-chain", false)
+        .await
+        .with_experimental_view_on_view(true);
+    let router = app(state);
+
+    let relation_response = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations",
+        json!({
+            "catalog": test_scores_catalog(),
+            "default_orders_sum_count": false
+        }),
+    )
+    .await;
+    assert_eq!(relation_response.0, StatusCode::CREATED);
+
+    // Producer: single-key sum/count over the physical source.
+    let producer_response = call_json(
+        &router,
+        Method::POST,
+        "/v1/views",
+        json!({
+            "view_id": "scores_by_user",
+            "sql": "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id",
+            "input_relation_id": "scores",
+            "input_relation_version": "2026-05-24.v1",
+            "source_kind": "standing_view"
+        }),
+    )
+    .await;
+    assert_eq!(
+        producer_response.0,
+        StatusCode::CREATED,
+        "producer view must admit: {producer_response:?}"
+    );
+
+    // Consumer: single-key sum/count over the producer's published output.
+    let consumer_response = call_json(
+        &router,
+        Method::POST,
+        "/v1/views",
+        json!({
+            "view_id": "total_by_user",
+            "sql": "select user_id, sum(sum) as total, count(*) as count from scores_by_user group by user_id",
+            "input_relation_refs": [{
+                "relation_id": "scores_by_user",
+                "relation_version": "v1",
+                "input_kind": "view"
+            }],
+            "source_kind": "standing_view"
+        }),
+    )
+    .await;
+    assert_eq!(
+        consumer_response.0,
+        StatusCode::CREATED,
+        "consumer view must admit against the published producer output: {consumer_response:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "delta propagation routing is not yet implemented; producer output deltas are not routed to consumers as StandingInputChangeV1::View"]
+async fn rest_two_level_sum_count_chain_propagates_delta_through_ingest() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let state = test_public_api_state_with_store(store, "api-test-two-level-delta", false)
+        .await
+        .with_experimental_view_on_view(true);
+    let router = app(state.clone());
+
+    let relation_response = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations",
+        json!({
+            "catalog": test_scores_catalog(),
+            "default_orders_sum_count": false
+        }),
+    )
+    .await;
+    assert_eq!(relation_response.0, StatusCode::CREATED);
+
+    let producer_response = call_json(
+        &router,
+        Method::POST,
+        "/v1/views",
+        json!({
+            "view_id": "scores_by_user",
+            "sql": "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id",
+            "input_relation_id": "scores",
+            "input_relation_version": "2026-05-24.v1",
+            "source_kind": "standing_view"
+        }),
+    )
+    .await;
+    assert_eq!(producer_response.0, StatusCode::CREATED);
+
+    let consumer_response = call_json(
+        &router,
+        Method::POST,
+        "/v1/views",
+        json!({
+            "view_id": "total_by_user",
+            "sql": "select user_id, sum(sum) as total, count(*) as count from scores_by_user group by user_id",
+            "input_relation_refs": [{
+                "relation_id": "scores_by_user",
+                "relation_version": "v1",
+                "input_kind": "view"
+            }],
+            "source_kind": "standing_view"
+        }),
+    )
+    .await;
+    assert_eq!(consumer_response.0, StatusCode::CREATED);
+
+    // Ingest one positive-score row. The producer emits a +1 delta; the
+    // consumer must route that delta as a view input and publish its own
+    // aggregate output.
+    let ingest_response = call_json(
+        &router,
+        Method::POST,
+        "/v1/ingest",
+        json!({
+            "relation_id": "scores",
+            "relation_version": "2026-05-24.v1",
+            "stream_id": "two-level-chain-stream",
+            "partition_id": 0,
+            "start_offset_inclusive": 0,
+            "rows": [
+                {"user_id": "alice", "score": 10, "delta": 1}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(ingest_response.0, StatusCode::CREATED);
+
+    let consumer = state
+        .view_registry()
+        .unwrap()
+        .read_active("total_by_user")
+        .await
+        .unwrap();
+    let consumer_identity = active_standing_runtime_identity(&consumer).unwrap();
+    let consumer_checkpoint =
+        read_latest_standing_runtime_checkpoint(&state, consumer_identity, "total_by_user")
+            .await
+            .unwrap();
+    assert!(
+        consumer_checkpoint.is_some(),
+        "consumer view must have a checkpoint after the source ingest propagates through the chain"
+    );
+
+    let consumer_runtime = state
+        .standing_runtime(consumer_identity, "total_by_user")
+        .unwrap()
+        .expect("consumer standing runtime must be available");
+    let runtime = consumer_runtime.lock().unwrap();
+    let page = runtime
+        .materialized_view_page(
+            velorix_core::standing_program::ScopedViewId {
+                tenant_id: consumer_identity.tenant_id.clone(),
+                program_id: consumer_identity.program_id.clone(),
+                view_id: "total_by_user".to_string(),
+            },
+            velorix_core::standing_program::SnapshotPageRequest::default(),
+        )
+        .unwrap();
+    assert_eq!(page.batches.len(), 1);
+    let batch = &page.batches[0];
+    let rows = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.name().to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        rows.contains(&"total".to_string()),
+        "consumer output must contain the total column: {rows:?}"
+    );
+}
