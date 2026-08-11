@@ -679,3 +679,4 @@ cargo fmt --all --check
 | 2026-08-11 | 6 | String expression types added | SupportedProjectionExpr variants | Complete |
 | 2026-08-11 | 6 | String expression parsing | view_plan.rs | Complete |
 | 2026-08-11 | 6 | String expression evaluation | materialized_view_runtime.rs | Complete |
+| 2026-08-11 | 6 | String expression tests | 5 view_plan tests | Complete |
