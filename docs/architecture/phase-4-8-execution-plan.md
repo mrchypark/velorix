@@ -378,34 +378,135 @@ Each Phase 8 item requires before implementation:
 
 ---
 
-## Execution Order
+## Execution Order (Revised after Oracle Pro Review 2026-08-11)
 
-### Step 1: Phase 4 Completion (View Dependencies)
+Oracle Pro review identified P0 issues that require foundational changes before
+Phase 4 can proceed. The original execution order was insufficient because it
+treated dependency graph validation and delta propagation as simple function
+additions, ignoring TOCTOU races, trust boundary violations, and missing
+retention contracts.
 
-1. **Dependency graph validation during admission**
-   - File: `crates/velorix-api/src/view_admission.rs`
-   - Action: Add `validate_acyclic_dependency_graph()` function
-   - Evidence: `view_dependency_graph_rejects_cycles_at_admission`
+### Step 0: Phase 4 Foundational Contracts (P0 Blockers)
 
-2. **Delta propagation runtime path**
-   - File: `crates/velorix-control/src/general_circuit_runtime.rs`
-   - Action: Add `propagate_view_delta_to_consumers()` function
-   - Evidence: `view_delta_propagation_forwards_signed_deltas_without_snapshot`
+These must be completed before any Phase 4 feature work.
 
-3. **Frontier chaining across dependency chain**
-   - File: `crates/velorix-core/src/standing_program.rs`
-   - Action: Add `chain_frontiers_across_dependencies()` function
-   - Evidence: `dependency_chain_frontier_propagation_is_deterministic`
+#### 0.1 Authoritative Graph Mutation CAS + Tagged Input Binding
 
-4. **Multi-level chain checkpoint/restore**
-   - File: `crates/velorix-control/src/general_circuit_runtime.rs`
-   - Action: Extend checkpoint to include dependency chain state
-   - Evidence: `three_level_dependency_chain_survives_restart`
+- **File**: `crates/velorix-meta/src/view_bootstrap.rs`
+- **Action**: Add `DependencyGraphV1` with `graph_revision: u64` in metadata authority.
+  - `resolve_and_register_view_dependencies()`: single CAS transaction that
+    reads current revision → builds candidate graph → validates acyclicity →
+    creates immutable edge records → publishes revision+1
+  - Each edge stores: `tenant_id`, `graph_revision`, `input_edge_id`,
+    producer tenant/program/view/generation, plan hash, schema/key/stream/codec
+- **File**: `crates/velorix-core/src/view_contract.rs`
+- **Action**: Add `BoundInputV1` tagged enum:
+  ```rust
+  enum BoundInputV1 {
+      Source(SourceInputBindingV1),
+      View(ViewDependencyEdgeBindingV1),
+  }
+  ```
+- **File**: `crates/velorix-api/src/view_admission.rs`
+- **Action**: Replace flat catalog resolution with tagged binding resolution.
+  Unresolved, ambiguous, or origin-mismatched inputs fail closed.
+- **Evidence**: `dependency_graph_cas_rejects_concurrent_cycle_creation`,
+  `admission_rejects_stale_producer_after_generation_replacement`
 
-5. **Exit gate test**
+#### 0.2 Dependency Edge Binding in Program Identity
+
+- **File**: `crates/velorix-core/src/standing_program.rs`
+- **Action**: Add `DependencyEdgeBindingV1` struct and `dependency_binding_digest`
+  to `StandingProgramIdentity`. Tenant from authenticated request scope (not
+  "default"). Output stream and object key namespaced by tenant/program/generation.
+- **File**: `crates/velorix-core/src/view_contract.rs`
+- **Action**: Add `graph_revision` and `dependency_binding_digest` to
+  `PublishedRelationBindingV1`.
+- **Evidence**: `different_producer_generations_yield_different_program_identities`,
+  `producer_replacement_requires_explicit_consumer_migration`
+
+#### 0.3 Typed View-Delta Input API
+
+- **File**: `crates/velorix-core/src/standing_program.rs`
+- **Action**: Replace source-only input with tagged enum:
+  ```rust
+  enum StandingInputChangeV1 {
+      Source(RelationInputBatch),
+      View(ViewInputDeltaV1),
+  }
+  struct ViewInputDeltaV1 {
+      edge_binding_digest: String,
+      producer_cursor: CausalViewCursorV1,
+      commit_ref: String,
+      delta: DeltaBatch,
+  }
+  ```
+- **File**: `crates/velorix-core/src/standing_program.rs`
+- **Action**: `StandingProgramRuntime::apply_changes()` accepts `Vec<StandingInputChangeV1>`.
+  View deltas are NOT converted to source offsets. Empty-delta commits advance cursors.
+- **Evidence**: `view_delta_preserves_signed_bag_weights_across_chain`,
+  `empty_delta_commit_advances_cursor_without_row_change`,
+  `tampered_edge_digest_rejects_before_state_mutation`
+
+#### 0.4 View Bootstrap + Retention/GC Protocol
+
+- **File**: `crates/velorix-meta/src/view_bootstrap.rs`
+- **Action**: Extend `BeginViewBootstrapRequest` with `view_base: Option<ViewBootstrapBaseV1>`
+  that captures authoritative producer checkpoint P, base snapshot ref, generation/edge
+  binding, and retention pin. Tail replay from P+1.
+- **File**: `crates/velorix-meta/src/view_bootstrap.rs`
+- **Action**: Add `DeltaRetentionProtocol` with:
+  - Per-edge durable consumed epoch (from consumer checkpoint pointer CAS)
+  - GC low watermark = min(active edge cursors)
+  - Edge tombstone grace period + failed consumer transition
+- **File**: `crates/velorix-api/src/ingest_epoch.rs`
+- **Action**: GC only retained deltas above low watermark. Retention budget excess
+  triggers consumer failure (not silent drop or snapshot fallback).
+- **Evidence**: `producer_gc_preserves_deltas_for_slow_consumer`,
+  `edge_deletion_requires_consumer_unrecoverable_transition`,
+  `retention_budget_excess_fails_closed_without_snapshot_fallback`
+
+#### 0.5 Dependency Checkpoint Mandatory Causal Validation
+
+- **File**: `crates/velorix-core/src/standing_program.rs`
+- **Action**: For dependency-capable plans, `causal_cut` is mandatory in checkpoint.
+  Validate: cursor set == admitted edge set exactly; each cursor passes full
+  authority chain (pointer → checkpoint → commit → digest). Legacy source-only
+  checkpoints use separate schema/version path.
+- **File**: `crates/velorix-api/src/checkpoint_publication.rs`
+- **Action**: Recovery coordinator loads committed graph revision, validates all
+  view checkpoints and dependency edges, confirms each causal parent via authority
+  chain, restores runtime state individually, catch-up replay in topological order.
+  No global atomic snapshot; causal parent set is the consistency unit.
+- **Evidence**: `checkpoint_without_causal_cut_rejects_for_dependency_plan`,
+  `orphan_cursor_rejects_authority_chain_validation`,
+  `three_level_chain_survives_fresh_process_restore`
+
+#### 0.6 Fan-in Scheduling + Backpressure
+
+- **File**: `crates/velorix-api/src/ingest_epoch.rs`
+- **Action**: Producer writes immutable commit once; consumers pull independently.
+  Notification is non-authoritative wake-up only. Each consumer apply produces
+  `(previous pointer, edge set, consumed commits, CausalCutV1 digest)` for
+  idempotent CAS. Bounded worker concurrency per tenant.
+- **File**: `crates/velorix-meta/src/view_bootstrap.rs`
+- **Action**: Consumer lag quota; exceeded → explicit degraded/failed state with
+  backpressure (not silent drop).
+- **Evidence**: `fan_in_idempotent_across_all_delivery_orders`,
+  `notification_loss_does_not_affect_correctness`,
+  `consumer_lag_quota_exceeds_fails_closed`
+
+### Step 1: Phase 4 Feature Implementation (after Step 0)
+
+1. **Three-level exit gate test**
    - File: `crates/velorix-api/src/tests.rs`
    - Action: Add `rest_three_level_filter_aggregate_topk_chain_exact`
-   - Evidence: Test passes across insert, retract, restart, replay
+   - Evidence: Test passes across insert, retract, restart, replay with signed deltas
+
+2. **Fan-in/fan-out/depth benchmark**
+   - File: `crates/velorix-runtime/benches/`
+   - Action: Add dependency chain benchmarks with fault injection
+   - Evidence: `dependency_chain_benchmark_latency_does_not_scale_with_fan_out`
 
 ### Step 2: Phase 5 Completion (Event-Time Semantics)
 
@@ -562,3 +663,5 @@ cargo fmt --all --check
 | 2026-08-10 | 6 | Int64 expressions | View plan tests | Complete |
 | 2026-08-10 | 7 | PK Correlated EXISTS/NOT EXISTS | View plan tests | Complete |
 | 2026-08-10 | 8 | Ranking functions (ROW_NUMBER, RANK) | Runtime tests | Experimental |
+| 2026-08-11 | 4 | Oracle Pro design review | GPT-5.6 Sol Pro review | Review complete |
+| 2026-08-11 | 4 | P0 foundational contracts identified | 8 P0 + 2 P1 issues | In progress |

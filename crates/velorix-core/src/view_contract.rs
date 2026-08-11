@@ -12,6 +12,78 @@ pub const SPEC_HASH_PREFIX: &str = "velorix-view-spec-sha256-v1";
 pub const PUBLISHED_RELATION_BINDING_SCHEMA_VERSION_V1: u32 = 1;
 pub const PUBLISHED_RELATION_DELTA_CODEC_V1: &str = "velorix-published-relation-delta-v1";
 pub const PUBLISHED_RELATION_FRONTIER_KIND_V1: &str = "producer_commit_epoch";
+/// Tagged input binding for view admission.
+///
+/// Distinguishes between physical source relations and upstream materialized
+/// view outputs. This is critical for:
+/// - Trust boundary enforcement (source vs. view inputs)
+/// - Graph mutation CAS (view edges require cycle detection)
+/// - Checkpoint identity (dependency binding digest)
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BoundInputV1 {
+    /// Input from a physical ingest source relation.
+    Source(SourceInputBindingV1),
+    /// Input from an upstream materialized view output.
+    View(ViewDependencyEdgeBindingV1),
+}
+
+/// Binding for a physical source relation input.
+///
+/// Wraps the existing source relation identity fields used throughout
+/// the ingest pipeline.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceInputBindingV1 {
+    pub relation_id: String,
+    pub relation_version: String,
+    pub relation_generation: u64,
+    pub schema_fingerprint: String,
+}
+
+/// Binding for a view-to-view dependency edge.
+///
+/// Contains all information needed to:
+/// - Resolve the producer view's published output
+/// - Validate schema/key/codec consistency
+/// - Track the dependency in the graph revision
+/// - Verify the authority chain during checkpoint/restore
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewDependencyEdgeBindingV1 {
+    /// Unique identifier for this edge within the dependency graph.
+    pub input_edge_id: String,
+    /// Graph revision under which this edge was admitted.
+    pub graph_revision: u64,
+    /// Producer view's tenant ID.
+    pub producer_tenant_id: String,
+    /// Producer view's program ID.
+    pub producer_program_id: String,
+    /// Producer view's view ID.
+    pub producer_view_id: String,
+    /// Producer view's generation at admission time.
+    pub producer_generation: u64,
+    /// Producer view's logical plan hash.
+    pub producer_plan_hash: String,
+    /// Output schema hash from the producer's PublishedRelationBindingV1.
+    pub output_schema_hash: String,
+    /// Key descriptor hash from the producer's PublishedRelationBindingV1.
+    pub key_descriptor_hash: String,
+    /// Output stream ID from the producer's PublishedRelationBindingV1.
+    pub output_stream_id: String,
+    /// Delta codec identity from the producer's PublishedRelationBindingV1.
+    pub delta_codec_identity: String,
+    /// Frontier kind from the producer's PublishedRelationBindingV1.
+    pub frontier_kind: String,
+}
+
+/// Canonical hash of a dependency edge binding set.
+///
+/// Computed over the sorted set of `ViewDependencyEdgeBindingV1` entries,
+/// ensuring that any change to the dependency graph produces a different
+/// program identity.
+pub const DEPENDENCY_BINDING_DIGEST_PREFIX: &str = "velorix-dependency-binding-sha256-v1";
+
 pub const MAX_RELATION_COLUMNS: usize = 1024;
 pub const MAX_SQL_TYPE_NESTING_DEPTH: usize = 16;
 pub const MAX_SQL_TYPE_NODES: usize = 4096;
@@ -81,6 +153,12 @@ pub struct PublishedRelationBindingV1 {
     pub output_stream_id: String,
     pub delta_codec_identity: String,
     pub frontier_kind: String,
+    /// Graph revision under which this binding was admitted.
+    /// 0 for direct source inputs (no dependency graph).
+    pub graph_revision: u64,
+    /// Canonical digest of the dependency edge binding set.
+    /// Empty for direct source inputs.
+    pub dependency_binding_digest: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -279,6 +357,8 @@ pub fn published_relation_binding_v1(
         ),
         delta_codec_identity: PUBLISHED_RELATION_DELTA_CODEC_V1.to_string(),
         frontier_kind: PUBLISHED_RELATION_FRONTIER_KIND_V1.to_string(),
+        graph_revision: 0,
+        dependency_binding_digest: String::new(),
     };
     validate_published_relation_binding_v1(&binding)?;
     Ok(binding)

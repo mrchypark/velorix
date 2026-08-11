@@ -8,6 +8,164 @@ use crate::{
 
 pub const VIEW_BOOTSTRAP_CONTROL_SCHEMA_VERSION_V1: u32 = 1;
 pub const INITIAL_VIEW_BOOTSTRAP_GENERATION: u64 = 1;
+pub const DEPENDENCY_GRAPH_SCHEMA_VERSION_V1: u32 = 1;
+
+/// Tenant-scoped dependency graph with monotonically increasing revision.
+///
+/// Each mutation (view admission, deletion, edge change) increments the revision
+/// via a CAS transaction. This prevents TOCTOU races and ensures that concurrent
+/// admissions cannot create cycles.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DependencyGraphV1 {
+    pub schema_version: u32,
+    pub tenant_id: String,
+    pub graph_revision: u64,
+    pub edges: Vec<DependencyGraphEdgeV1>,
+}
+
+/// An immutable edge in the dependency graph.
+///
+/// Created during view admission under a specific graph revision.
+/// Each edge captures the full producer identity at admission time.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DependencyGraphEdgeV1 {
+    /// Unique identifier for this edge within the graph.
+    pub input_edge_id: String,
+    /// Graph revision when this edge was created.
+    pub graph_revision: u64,
+    /// Consumer view's input port identifier.
+    pub consumer_input_port: String,
+    /// Producer view's tenant ID.
+    pub producer_tenant_id: String,
+    /// Producer view's program ID.
+    pub producer_program_id: String,
+    /// Producer view's view ID.
+    pub producer_view_id: String,
+    /// Producer view's generation at admission time.
+    pub producer_generation: u64,
+    /// Producer view's logical plan hash.
+    pub producer_plan_hash: String,
+    /// Output schema hash from the producer's PublishedRelationBindingV1.
+    pub output_schema_hash: String,
+    /// Key descriptor hash from the producer's PublishedRelationBindingV1.
+    pub key_descriptor_hash: String,
+    /// Output stream ID from the producer's PublishedRelationBindingV1.
+    pub output_stream_id: String,
+    /// Delta codec identity from the producer's PublishedRelationBindingV1.
+    pub delta_codec_identity: String,
+    /// Frontier kind from the producer's PublishedRelationBindingV1.
+    pub frontier_kind: String,
+    /// Timestamp when this edge was created.
+    pub created_at_ms: u64,
+}
+
+/// Outcome of a dependency graph CAS operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PublishDependencyGraphOutcome {
+    /// Graph was successfully published with new revision.
+    Published(DependencyGraphV1),
+    /// CAS conflict: expected revision didn't match current.
+    Conflict {
+        current_revision: u64,
+        expected_revision: u64,
+    },
+}
+
+impl DependencyGraphV1 {
+    /// Creates a new empty dependency graph for a tenant.
+    pub fn new(tenant_id: String) -> Self {
+        Self {
+            schema_version: DEPENDENCY_GRAPH_SCHEMA_VERSION_V1,
+            tenant_id,
+            graph_revision: 0,
+            edges: Vec::new(),
+        }
+    }
+
+    /// Returns the current graph revision.
+    pub fn revision(&self) -> u64 {
+        self.graph_revision
+    }
+
+    /// Returns all edges in the graph.
+    pub fn edges(&self) -> &[DependencyGraphEdgeV1] {
+        &self.edges
+    }
+
+    /// Checks if adding the given edges would create a cycle.
+    /// Returns Ok(()) if acyclic, Err(cycle_path) if cyclic.
+    pub fn validate_acyclicity(&self, new_edges: &[DependencyGraphEdgeV1]) -> Result<(), Vec<String>> {
+        // Build adjacency list: producer_view_id -> set of consumer_view_ids
+        let mut graph: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+
+        // Add existing edges
+        for edge in &self.edges {
+            graph.entry(edge.producer_view_id.clone())
+                .or_default()
+                .push(edge.consumer_input_port.clone());
+        }
+
+        // Add new edges
+        for edge in new_edges {
+            graph.entry(edge.producer_view_id.clone())
+                .or_default()
+                .push(edge.consumer_input_port.clone());
+        }
+
+        // DFS cycle detection
+        let mut visited = std::collections::HashSet::new();
+        let mut rec_stack = std::collections::HashSet::new();
+
+        for node in graph.keys() {
+            if !visited.contains(node) {
+                if let Some(cycle) = dfs_cycle_detection(node, &graph, &mut visited, &mut rec_stack) {
+                    return Err(cycle);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Creates a new revision with the given edges added.
+    pub fn with_edges_added(&self, new_edges: Vec<DependencyGraphEdgeV1>) -> Self {
+        let mut graph = self.clone();
+        graph.edges.extend(new_edges);
+        graph.graph_revision += 1;
+        graph
+    }
+}
+
+/// DFS-based cycle detection.
+/// Returns Some(cycle_path) if a cycle is found, None otherwise.
+fn dfs_cycle_detection(
+    node: &str,
+    graph: &std::collections::HashMap<String, Vec<String>>,
+    visited: &mut std::collections::HashSet<String>,
+    rec_stack: &mut std::collections::HashSet<String>,
+) -> Option<Vec<String>> {
+    visited.insert(node.to_string());
+    rec_stack.insert(node.to_string());
+
+    if let Some(neighbors) = graph.get(node) {
+        for neighbor in neighbors {
+            if !visited.contains(neighbor) {
+                if let Some(cycle) = dfs_cycle_detection(neighbor, graph, visited, rec_stack) {
+                    let mut result = vec![node.to_string()];
+                    result.extend(cycle);
+                    return Some(result);
+                }
+            } else if rec_stack.contains(neighbor) {
+                return Some(vec![node.to_string(), neighbor.to_string()]);
+            }
+        }
+    }
+
+    rec_stack.remove(node);
+    None
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]

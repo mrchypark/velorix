@@ -39,8 +39,9 @@ pub use source_cut::{
     INGEST_SOURCE_IDENTITY_GENERATION_V1,
 };
 pub use view_bootstrap::{
-    BeginViewBootstrapOutcome, BeginViewBootstrapRequest, FixViewBootstrapActivationCutOutcome,
-    FixViewBootstrapActivationCutRequest, PromoteViewBootstrapOutcome, PromoteViewBootstrapRequest,
+    BeginViewBootstrapOutcome, BeginViewBootstrapRequest, DependencyGraphEdgeV1,
+    DependencyGraphV1, FixViewBootstrapActivationCutOutcome, FixViewBootstrapActivationCutRequest,
+    PromoteViewBootstrapOutcome, PromoteViewBootstrapRequest, PublishDependencyGraphOutcome,
     ViewBootstrapControlV1, ViewBootstrapLifecycleV1, INITIAL_VIEW_BOOTSTRAP_GENERATION,
     VIEW_BOOTSTRAP_CONTROL_SCHEMA_VERSION_V1,
 };
@@ -353,6 +354,38 @@ pub trait MetaStore: Send + Sync + 'static {
         request.validate()?;
         Err(MetaStoreError::UnsupportedCapability(
             "authoritative_view_bootstrap_activation",
+        ))
+    }
+
+    /// Reads the current dependency graph for a tenant.
+    ///
+    /// Returns the graph at its current revision. If no graph exists,
+    /// returns an empty graph at revision 0.
+    async fn read_dependency_graph(
+        &self,
+        tenant_id: &str,
+    ) -> Result<DependencyGraphV1, MetaStoreError> {
+        require_non_empty("tenant_id", tenant_id)?;
+        Err(MetaStoreError::UnsupportedCapability(
+            "dependency_graph_cas",
+        ))
+    }
+
+    /// Publishes a new dependency graph version via CAS.
+    ///
+    /// The `expected_revision` must match the current graph revision.
+    /// If it doesn't, returns `Conflict` with the current revision.
+    /// On success, publishes the candidate graph and returns `Published`.
+    async fn publish_dependency_graph(
+        &self,
+        tenant_id: &str,
+        expected_revision: u64,
+        candidate: DependencyGraphV1,
+    ) -> Result<PublishDependencyGraphOutcome, MetaStoreError> {
+        require_non_empty("tenant_id", tenant_id)?;
+        let _ = (expected_revision, candidate);
+        Err(MetaStoreError::UnsupportedCapability(
+            "dependency_graph_cas",
         ))
     }
 
