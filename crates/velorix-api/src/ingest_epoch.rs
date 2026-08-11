@@ -1,4 +1,5 @@
 use super::*;
+use velorix_core::view_contract::ViewDependencyEdgeBindingV1;
 
 #[derive(Clone)]
 pub(super) struct PreparedIngestBatch {
@@ -53,7 +54,11 @@ pub(super) struct StandingRuntimeCheckpointPersistContext {
 
 #[derive(Clone, Debug)]
 pub(super) struct StandingRuntimeDirectViewInputV1 {
+    /// The exact admitted dependency edge this input was bound to.
+    pub(super) edge: ViewDependencyEdgeBindingV1,
+    /// The producer's published relation binding at admission time.
     pub(super) published_relation: PublishedRelationBindingV1,
+    /// The producer commit cursor consumed by this apply.
     pub(super) cursor: CausalViewCursorV1,
 }
 
@@ -77,6 +82,14 @@ impl StandingRuntimeCheckpointPersistContext {
         published_relation: Option<PublishedRelationBindingV1>,
     ) -> Self {
         self.published_relation = published_relation;
+        self
+    }
+
+    pub(super) fn with_direct_view_inputs(
+        mut self,
+        direct_view_inputs: Vec<StandingRuntimeDirectViewInputV1>,
+    ) -> Self {
+        self.direct_view_inputs = direct_view_inputs;
         self
     }
 }

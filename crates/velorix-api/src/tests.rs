@@ -18,6 +18,7 @@ use velorix_core::{
     standing_program::{
         DurableStateRoot, RelationFrontier, RuntimeCheckpointStatePayload, ViewFrontier,
     },
+    view_contract::ViewDependencyEdgeBindingV1,
 };
 
 fn template_result_schema() -> RelationSchema {
@@ -918,6 +919,20 @@ async fn mixed_source_view_causal_cut_survives_authoritative_restart() {
         StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), Some(owner.clone()))
             .with_published_relation(Some(published_relation.clone()));
     first_context.direct_view_inputs = vec![StandingRuntimeDirectViewInputV1 {
+        edge: ViewDependencyEdgeBindingV1 {
+            input_edge_id: "upstream_orders->purchases_by_user".to_string(),
+            graph_revision: 0,
+            producer_tenant_id: first_cursor.producer_tenant_id.clone(),
+            producer_program_id: first_cursor.producer_program_id.clone(),
+            producer_view_id: first_cursor.producer_view_id.clone(),
+            producer_generation: first_cursor.producer_generation,
+            producer_plan_hash: producer_binding.producer_plan_hash.clone(),
+            output_schema_hash: producer_binding.output_schema_hash.clone(),
+            key_descriptor_hash: producer_binding.key_descriptor_hash.clone(),
+            output_stream_id: producer_binding.output_stream_id.clone(),
+            delta_codec_identity: producer_binding.delta_codec_identity.clone(),
+            frontier_kind: producer_binding.frontier_kind.clone(),
+        },
         published_relation: producer_binding.clone(),
         cursor: first_cursor,
     }];
@@ -939,6 +954,20 @@ async fn mixed_source_view_causal_cut_survives_authoritative_restart() {
         StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), Some(owner))
             .with_published_relation(Some(published_relation));
     next_context.direct_view_inputs = vec![StandingRuntimeDirectViewInputV1 {
+        edge: ViewDependencyEdgeBindingV1 {
+            input_edge_id: "upstream_orders->purchases_by_user".to_string(),
+            graph_revision: 0,
+            producer_tenant_id: advanced_cursor.producer_tenant_id.clone(),
+            producer_program_id: advanced_cursor.producer_program_id.clone(),
+            producer_view_id: advanced_cursor.producer_view_id.clone(),
+            producer_generation: advanced_cursor.producer_generation,
+            producer_plan_hash: producer_binding.producer_plan_hash.clone(),
+            output_schema_hash: producer_binding.output_schema_hash.clone(),
+            key_descriptor_hash: producer_binding.key_descriptor_hash.clone(),
+            output_stream_id: producer_binding.output_stream_id.clone(),
+            delta_codec_identity: producer_binding.delta_codec_identity.clone(),
+            frontier_kind: producer_binding.frontier_kind.clone(),
+        },
         published_relation: producer_binding,
         cursor: advanced_cursor.clone(),
     }];
