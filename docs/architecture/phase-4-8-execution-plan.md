@@ -756,3 +756,6 @@ cargo fmt --all --check
 | 2026-08-11 | 4 | Slice: lower_published_single_key_sum_count_sql | view_plan.rs | Complete |
 | 2026-08-11 | 4 | Slice: validate_supported_view_sql_with_input | view_plan.rs | Complete |
 | 2026-08-11 | 4 | Slice: published-view admission tests | 3 view_plan tests | Complete |
+| 2026-08-11 | 4 | Slice: SingleKeyRuntimeInputV1 tagged enum | single_key_aggregate.rs | Complete |
+| 2026-08-11 | 4 | Slice: apply_changes Source/View dispatch | single_key_aggregate.rs | Complete |
+| 2026-08-11 | 4 | Slice: view delta binding validation | validate_view_input_matches_binding | Complete |
