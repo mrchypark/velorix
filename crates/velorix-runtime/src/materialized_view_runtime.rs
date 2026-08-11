@@ -37,7 +37,8 @@ use velorix_core::{
         InputEventTimeFrontier, MaterializedViewPage, RelationFrontier, RelationInputBatch,
         RuntimeCheckpoint, RuntimeCheckpointStatePayload, ScopedViewId, SnapshotPageRequest,
         StandingInputChangeV1, StandingProgramIdentity, StandingProgramRuntime,
-        StandingProgramRuntimeError, ViewFrontier, ViewOutputBatch, ViewOutputDelta,
+        StandingProgramRuntimeError, ViewFrontier, ViewInputDeltaV1, ViewOutputBatch,
+        ViewOutputDelta,
     },
     view_contract::{
         catalog_input_relation_schema, stable_bytes_hash, PublishedRelationBindingV1,

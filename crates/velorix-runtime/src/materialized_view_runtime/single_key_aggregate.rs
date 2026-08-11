@@ -64,6 +64,50 @@ pub struct SingleKeySumCountRuntime {
 }
 
 impl SingleKeySumCountRuntime {
+    /// Validate a view delta input against the admitted published binding.
+    ///
+    /// Rejects deltas from a different producer view, generation, output
+    /// stream, or schema before any state mutation. Cursor monotonicity across
+    /// epochs is checked by the controller; here we bind the input to the
+    /// admitted producer identity.
+    fn validate_view_input_matches_binding(
+        &self,
+        input: &ViewInputDeltaV1,
+    ) -> Result<(), StandingProgramRuntimeError> {
+        let SingleKeyRuntimeInputV1::PublishedView {
+            binding,
+            primary_key_column_id,
+        } = &self.input
+        else {
+            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "single_key_view_input_on_source_runtime",
+            });
+        };
+        let cursor = &input.producer_cursor;
+        if cursor.producer_view_id != binding.producer_view_id {
+            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "single_key_view_input_producer_view_id",
+            });
+        }
+        if cursor.producer_generation != binding.producer_view_generation {
+            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "single_key_view_input_producer_generation",
+            });
+        }
+        if cursor.output_stream != binding.output_stream_id {
+            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "single_key_view_input_output_stream",
+            });
+        }
+        if binding.relation.schema_fingerprint != self.input_schema.schema_fingerprint {
+            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "single_key_view_input_schema_fingerprint",
+            });
+        }
+        let _ = primary_key_column_id;
+        Ok(())
+    }
+
     pub fn new_with_plan(
         identity: StandingProgramIdentity,
         catalog: VelorixRelationCatalogV1,
@@ -295,6 +339,7 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
                     }
                     StandingInputChangeV1::View(input) => {
                         input.validate()?;
+                        self.validate_view_input_matches_binding(&input)?;
                         let primary_key = self.input.primary_key_column_id()?;
                         let delta = rekey_delta_batch_for_aggregate_group_with_primary_key(
                             &input.delta,
