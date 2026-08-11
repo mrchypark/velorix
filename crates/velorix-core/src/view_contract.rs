@@ -255,6 +255,8 @@ pub enum ViewContractError {
     InvalidField { field: &'static str },
     #[error("relation schema mismatch: {field}")]
     RelationSchemaMismatch { field: &'static str },
+    #[error("dependency edge binding mismatch: {field}")]
+    DependencyEdgeMismatch { field: &'static str },
     #[error("could not serialize canonical view contract: {reason}")]
     Serialization { reason: String },
 }
@@ -419,6 +421,79 @@ pub fn validate_published_relation_binding_v1(
         });
     }
     Ok(())
+}
+
+/// Resolve a consumer view input relation from the producer's published binding.
+///
+/// This is the authoritative source for a consumer view input schema. It verifies
+/// every identity field of the admitted dependency edge against the producer's
+/// `PublishedRelationBindingV1` with exact matching, so a stale generation,
+/// cross-tenant producer, changed key descriptor, or mismatched stream/codec is
+/// rejected before the consumer planner/runtime can bind to it.
+///
+/// On success, returns `published.relation` which the consumer must use as its
+/// input schema. The consumer must NOT re-resolve the schema from a live catalog
+/// or producer runtime later.
+pub fn resolve_view_input_relation_v1(
+    edge: &ViewDependencyEdgeBindingV1,
+    producer_tenant_id: &str,
+    producer_program_id: &str,
+    published: &PublishedRelationBindingV1,
+) -> Result<RelationSchema, ViewContractError> {
+    validate_published_relation_binding_v1(published)?;
+
+    if edge.producer_tenant_id != producer_tenant_id {
+        return Err(ViewContractError::DependencyEdgeMismatch {
+            field: "producer_tenant_id",
+        });
+    }
+    if edge.producer_program_id != producer_program_id {
+        return Err(ViewContractError::DependencyEdgeMismatch {
+            field: "producer_program_id",
+        });
+    }
+    if edge.producer_view_id != published.producer_view_id {
+        return Err(ViewContractError::DependencyEdgeMismatch {
+            field: "producer_view_id",
+        });
+    }
+    if edge.producer_generation != published.producer_view_generation {
+        return Err(ViewContractError::DependencyEdgeMismatch {
+            field: "producer_generation",
+        });
+    }
+    if edge.producer_plan_hash != published.producer_plan_hash {
+        return Err(ViewContractError::DependencyEdgeMismatch {
+            field: "producer_plan_hash",
+        });
+    }
+    if edge.output_schema_hash != published.output_schema_hash {
+        return Err(ViewContractError::DependencyEdgeMismatch {
+            field: "output_schema_hash",
+        });
+    }
+    if edge.key_descriptor_hash != published.key_descriptor_hash {
+        return Err(ViewContractError::DependencyEdgeMismatch {
+            field: "key_descriptor_hash",
+        });
+    }
+    if edge.output_stream_id != published.output_stream_id {
+        return Err(ViewContractError::DependencyEdgeMismatch {
+            field: "output_stream_id",
+        });
+    }
+    if edge.delta_codec_identity != published.delta_codec_identity {
+        return Err(ViewContractError::DependencyEdgeMismatch {
+            field: "delta_codec_identity",
+        });
+    }
+    if edge.frontier_kind != published.frontier_kind {
+        return Err(ViewContractError::DependencyEdgeMismatch {
+            field: "frontier_kind",
+        });
+    }
+
+    Ok(published.relation.clone())
 }
 
 fn stable_serialized_hash<T: Serialize>(
@@ -821,6 +896,95 @@ mod tests {
             validate_published_relation_binding_v1(&wrong_generation_stream),
             Err(ViewContractError::InvalidField {
                 field: "published_relation.output_stream_id"
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_view_input_relation_matches_edge_to_published_binding() {
+        let relation = RelationSchema {
+            relation_id: "orders_by_region".to_string(),
+            relation_name: "orders_by_region".to_string(),
+            relation_version: "v1".to_string(),
+            schema_fingerprint: format!("sha256:{}", "2".repeat(64)),
+            columns: vec![ColumnSchema {
+                name: "region".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            }],
+            primary_key: vec!["region".to_string()],
+        };
+        let published = published_relation_binding_v1(
+            "orders_by_region",
+            7,
+            "velorix-logical-view-plan-sha256-v1:plan",
+            &relation,
+        )
+        .unwrap();
+
+        let edge = ViewDependencyEdgeBindingV1 {
+            input_edge_id: "edge-1".to_string(),
+            graph_revision: 4,
+            producer_tenant_id: "tenant-a".to_string(),
+            producer_program_id: "program-a".to_string(),
+            producer_view_id: published.producer_view_id.clone(),
+            producer_generation: published.producer_view_generation,
+            producer_plan_hash: published.producer_plan_hash.clone(),
+            output_schema_hash: published.output_schema_hash.clone(),
+            key_descriptor_hash: published.key_descriptor_hash.clone(),
+            output_stream_id: published.output_stream_id.clone(),
+            delta_codec_identity: published.delta_codec_identity.clone(),
+            frontier_kind: published.frontier_kind.clone(),
+        };
+
+        // Exact match resolves to the published relation schema.
+        let resolved =
+            resolve_view_input_relation_v1(&edge, "tenant-a", "program-a", &published).unwrap();
+        assert_eq!(resolved, relation);
+
+        // Cross-tenant producer is rejected.
+        assert_eq!(
+            resolve_view_input_relation_v1(&edge, "tenant-b", "program-a", &published),
+            Err(ViewContractError::DependencyEdgeMismatch {
+                field: "producer_tenant_id"
+            })
+        );
+
+        // Cross-program producer is rejected.
+        assert_eq!(
+            resolve_view_input_relation_v1(&edge, "tenant-a", "program-b", &published),
+            Err(ViewContractError::DependencyEdgeMismatch {
+                field: "producer_program_id"
+            })
+        );
+
+        // Stale producer generation is rejected before schema binding.
+        let mut stale_edge = edge.clone();
+        stale_edge.producer_generation = published.producer_view_generation + 1;
+        assert_eq!(
+            resolve_view_input_relation_v1(&stale_edge, "tenant-a", "program-a", &published),
+            Err(ViewContractError::DependencyEdgeMismatch {
+                field: "producer_generation"
+            })
+        );
+
+        // Changed key descriptor is rejected.
+        let mut changed_key = edge.clone();
+        changed_key.key_descriptor_hash = format!("sha256:{}", "0".repeat(64));
+        assert_eq!(
+            resolve_view_input_relation_v1(&changed_key, "tenant-a", "program-a", &published),
+            Err(ViewContractError::DependencyEdgeMismatch {
+                field: "key_descriptor_hash"
+            })
+        );
+
+        // Mismatched output stream is rejected.
+        let mut changed_stream = edge;
+        changed_stream.output_stream_id = "view/other/generation/1/output/other".to_string();
+        assert_eq!(
+            resolve_view_input_relation_v1(&changed_stream, "tenant-a", "program-a", &published),
+            Err(ViewContractError::DependencyEdgeMismatch {
+                field: "output_stream_id"
             })
         );
     }
