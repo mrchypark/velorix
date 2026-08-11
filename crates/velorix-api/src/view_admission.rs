@@ -6,16 +6,27 @@ pub(super) async fn create_view(
 ) -> Result<(StatusCode, Json<ViewResponse>), ApiError> {
     validate_public_view_feature_admission(&state, &request)?;
     let resolved_inputs = resolve_view_inputs_for_request(&state, &request).await?;
+    if let [ResolvedAdmissionInput::View {
+        relation,
+        published,
+        edge,
+    }] = resolved_inputs.as_slice()
+    {
+        return create_view_with_published_input(
+            &state,
+            &request,
+            relation.clone(),
+            published.clone(),
+            edge.clone(),
+        )
+        .await;
+    }
     if resolved_inputs
         .iter()
         .any(|input| matches!(input, ResolvedAdmissionInput::View { .. }))
     {
-        // The planner integration for view-produced inputs is the next slice of
-        // Phase 4. Until lower_supported_sql_to_logical_plan_with_inputs exists,
-        // a view input fails closed here instead of fabricating a physical
-        // catalog or silently mixing input authority domains.
         return Err(ApiError::bad_request(
-            "view-on-view admission requires the Phase 4 planner integration which is not yet complete",
+            "view-on-view admission currently supports exactly one view input and no mixed source inputs",
         ));
     }
     let catalogs = resolved_inputs
@@ -115,6 +126,128 @@ pub(super) async fn create_view(
         RegisterMaterializedViewOutcome::Duplicate => (StatusCode::OK, "duplicate"),
     };
 
+    Ok((
+        status,
+        Json(view_response(
+            &spec,
+            spec_hash,
+            execution_mode,
+            lifecycle,
+            Some(api_metadata),
+            Some(outcome_text),
+            state.experimental_advanced_view_features,
+        )?),
+    ))
+}
+
+/// Admit a view whose input is an upstream published view output.
+///
+/// This is the Phase 4 view-on-view admission path. Exactly one published-view
+/// input is resolved; the consumer output schema is inferred from the SQL
+/// projection, the plan is lowered through the published single-key sum/count
+/// lowerer, and the runtime is bound to the producer's `PublishedRelationBindingV1`.
+async fn create_view_with_published_input(
+    state: &ApiState,
+    request: &CreateViewRequest,
+    relation: RelationSchema,
+    published: PublishedRelationBindingV1,
+    edge: ViewDependencyEdgeBindingV1,
+) -> Result<(StatusCode, Json<ViewResponse>), ApiError> {
+    let planner_input = PlannerRelationInput::from_published_binding(
+        relation.clone(),
+        edge.delta_codec_identity.clone(),
+        edge.frontier_kind.clone(),
+    );
+    let output_schema =
+        infer_single_key_sum_count_output_schema(&request.sql, &planner_input, &request.view_id)
+            .map_err(ApiError::bad_request)?;
+    let mut runtime_binding = materialized_view_runtime_binding_for_published_spec(
+        &request.view_id,
+        &request.sql,
+        &relation,
+        &published,
+        &edge.delta_codec_identity,
+        &edge.frontier_kind,
+    )?;
+    let spec = StandingViewSpec {
+        view_id: request.view_id.clone(),
+        sql: request.sql.clone(),
+        dialect: SqlDialect::VelorixSql,
+        source_kind: SqlSourceKind::StandingView,
+        input_relations: vec![relation.clone()],
+        output_relations: vec![output_schema],
+        shape: StandingViewShape {
+            is_materialized: true,
+            multi_input: false,
+            multi_output: false,
+        },
+    };
+    validate_materialized_runtime_spec_admission(&spec)?;
+    state.validate_standing_runtime_fencing_or_evict().await?;
+    validate_public_runtime_plan_admission(
+        state,
+        runtime_binding.logical_plan.as_ref().ok_or_else(|| {
+            ApiError::bad_request("materialized view runtime binding is missing a logical plan")
+        })?,
+    )?;
+    let spec_hash = view_spec_hash(&spec).map_err(ApiError::bad_request)?;
+    let api_metadata = api_metadata_from_create_view_request(request);
+    validate_view_api_metadata(&api_metadata)?;
+    validate_query_policy_reference(state, &api_metadata).await?;
+    validate_view_api_output_binding(&spec.view_id, &api_metadata, &spec.output_relations)?;
+    validate_standing_runtime_create_api_metadata(
+        &spec.view_id,
+        &api_metadata,
+        &spec.output_relations,
+    )
+    .await?;
+    let pending_runtime = build_standing_runtime_for_published_binding(
+        state,
+        &spec,
+        &runtime_binding,
+        &published,
+        &spec.input_relations,
+        &spec.output_relations,
+    )?;
+    let execution_mode = MaterializedViewExecutionMode::StandingRuntime;
+    let bootstrap = begin_authoritative_view_bootstrap(state, &spec, &runtime_binding).await?;
+    runtime_binding.published_relations = published_relation_bindings_for_spec(
+        &spec,
+        &runtime_binding,
+        bootstrap.bootstrap_generation,
+    )?;
+    let requires_backfill = standing_runtime_create_requires_backfill(state, &spec).await?;
+    let lifecycle = lifecycle_for_create_view_execution(&execution_mode, requires_backfill);
+    let outcome = if let Some(runtime) = pending_runtime {
+        let operation_lock =
+            state.standing_runtime_operation_lock(runtime.program_identity(), &spec.view_id)?;
+        let _operation_guard = operation_lock.lock().await;
+        let outcome = register_materialized_view_execution(
+            state,
+            &spec,
+            Some(api_metadata.clone()),
+            runtime_binding.clone(),
+            Some(lifecycle.clone()),
+        )
+        .await?;
+        if view_query_availability(&lifecycle) {
+            insert_standing_runtime(state, &spec.view_id, runtime)?;
+        }
+        outcome
+    } else {
+        register_materialized_view_execution(
+            state,
+            &spec,
+            Some(api_metadata.clone()),
+            runtime_binding.clone(),
+            Some(lifecycle.clone()),
+        )
+        .await?
+    };
+    let (status, outcome_text) = match outcome {
+        RegisterMaterializedViewOutcome::Created => (StatusCode::CREATED, "created"),
+        RegisterMaterializedViewOutcome::Duplicate => (StatusCode::OK, "duplicate"),
+    };
     Ok((
         status,
         Json(view_response(
@@ -749,6 +882,58 @@ pub(super) fn build_standing_runtime_for_runtime_binding(
         .create_with_catalogs_plan_and_spec(
             identity,
             catalogs,
+            logical_plan,
+            spec,
+            expected_input_schemas,
+            expected_output_schemas,
+        )
+        .map_err(ApiError::internal)?;
+    if runtime.program_identity() != identity {
+        return Err(ApiError::bad_request(
+            StandingProgramRuntimeError::ProgramIdentityMismatch {
+                expected_program_id: identity.program_id.clone(),
+                actual_program_id: runtime.program_identity().program_id.clone(),
+            },
+        ));
+    }
+    validate_runtime_schemas(
+        runtime.as_ref(),
+        expected_input_schemas,
+        expected_output_schemas,
+    )?;
+    Ok(Some(runtime))
+}
+
+/// Build a standing runtime bound to a published view output input.
+///
+/// Uses the published-binding factory seam. The input schema comes from the
+/// persisted producer relation, not a physical catalog.
+pub(super) fn build_standing_runtime_for_published_binding(
+    state: &ApiState,
+    spec: &StandingViewSpec,
+    runtime_binding: &MaterializedViewRuntimeBinding,
+    binding: &PublishedRelationBindingV1,
+    expected_input_schemas: &[RelationSchema],
+    expected_output_schemas: &[RelationSchema],
+) -> Result<Option<Box<dyn StandingProgramRuntime + Send>>, ApiError> {
+    let identity = &runtime_binding.standing_program_identity;
+    if state.standing_runtime(identity, &spec.view_id)?.is_some() {
+        return Ok(None);
+    }
+    let Some(factory) = state.standing_runtime_factory(&runtime_binding.runtime_kind)? else {
+        return Err(ApiError::bad_request(format!(
+            "standing runtime factory is not registered for runtime `{}`",
+            runtime_binding.runtime_kind
+        )));
+    };
+    let logical_plan = runtime_binding
+        .logical_plan
+        .as_ref()
+        .ok_or_else(|| ApiError::bad_request("standing runtime binding is missing logical plan"))?;
+    let runtime = factory
+        .create_with_published_binding_plan_and_spec(
+            identity,
+            binding,
             logical_plan,
             spec,
             expected_input_schemas,
