@@ -307,6 +307,39 @@ pub fn create_standing_runtime_with_logical_plan_and_catalogs(
     }
 }
 
+/// Create a single-key sum/count runtime bound to a published view output.
+///
+/// This is the Phase 4 view-on-view factory seam. It binds the runtime to a
+/// `PublishedRelationBindingV1` instead of a physical catalog, and the input
+/// schema comes from the persisted producer relation.
+pub fn create_standing_runtime_with_logical_plan_and_published_binding(
+    identity: &StandingProgramIdentity,
+    binding: &PublishedRelationBindingV1,
+    logical_plan: VelorixLogicalViewPlanV1,
+    input_schemas: &[RelationSchema],
+    output_schemas: &[RelationSchema],
+) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
+    let output_schema =
+        only_schema(output_schemas, "output_schemas").map_err(|error| error.to_string())?;
+    let sql = logical_plan.view_sql.clone();
+    match &logical_plan.execution {
+        VelorixLogicalViewExecutionV1::SingleKeySumCount { plan } => {
+            SingleKeySumCountRuntime::new_with_logical_plan_for_published_view(
+                identity.clone(),
+                binding.clone(),
+                only_schema(input_schemas, "input_schemas").map_err(|error| error.to_string())?,
+                output_schema.clone(),
+                sql,
+                plan.clone(),
+                logical_plan,
+            )
+            .map(|runtime| Box::new(runtime) as Box<dyn StandingProgramRuntime + Send>)
+            .map_err(|error| error.to_string())
+        }
+        _ => Err("published-view runtime currently supports only single-key sum/count".to_string()),
+    }
+}
+
 /// Differential-test backend that binds an already admitted join DAG to the
 /// generic native operator graph. It is intentionally not selected by the
 /// public runtime factory or any SQL/API/configuration surface.
