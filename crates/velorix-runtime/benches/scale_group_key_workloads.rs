@@ -365,5 +365,7 @@ fn identity(workload: &ScaleWorkload) -> StandingProgramIdentity {
         runtime_compatibility: "velorix-materialized-view-runtime-v1".to_string(),
         checkpoint_codec_identity: "velorix-standing-program-checkpoint-v1".to_string(),
         native_code_policy: NativeCodePolicy::DisabledNoExternalDependencies,
+        dependency_binding_digest: String::new(),
+        authenticated_tenant_id: "default".to_string(),
     }
 }

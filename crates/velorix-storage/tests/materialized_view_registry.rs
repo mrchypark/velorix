@@ -153,6 +153,8 @@ fn standing_program_identity(view_id: &str) -> StandingProgramIdentity {
         runtime_compatibility: "velorix-materialized-runtime-v1".to_string(),
         checkpoint_codec_identity: "velorix-materialized-view-state-v1".to_string(),
         native_code_policy: NativeCodePolicy::DisabledNoExternalDependencies,
+        dependency_binding_digest: String::new(),
+        authenticated_tenant_id: "default".to_string(),
     }
 }
 

@@ -15763,6 +15763,8 @@ fn test_runtime_checkpoint(output_manifest_refs: Vec<String>) -> RuntimeCheckpoi
             runtime_compatibility: "velorix-materialized-view-runtime-v1".to_string(),
             checkpoint_codec_identity: "velorix-standing-program-checkpoint-v1".to_string(),
             native_code_policy: NativeCodePolicy::DisabledNoExternalDependencies,
+            dependency_binding_digest: String::new(),
+            authenticated_tenant_id: "default".to_string(),
         },
         logical_epoch: 7,
         input_frontiers: vec![RelationFrontier {

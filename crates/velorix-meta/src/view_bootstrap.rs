@@ -167,6 +167,113 @@ fn dfs_cycle_detection(
     None
 }
 
+/// Base snapshot for bootstrapping a consumer view from an existing producer.
+///
+/// When a consumer view is created while a producer already has data,
+/// this captures the authoritative producer checkpoint P so the consumer
+/// can start from P's materialized bag and replay from P+1.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewBootstrapBaseV1 {
+    /// Authoritative producer checkpoint pointer at bootstrap time.
+    pub producer_checkpoint: StandingRuntimeCheckpointPointer,
+    /// Producer's generation at bootstrap time.
+    pub producer_generation: u64,
+    /// Producer's plan hash at bootstrap time.
+    pub producer_plan_hash: String,
+    /// Reference to the base snapshot object in object store.
+    pub base_snapshot_ref: String,
+    /// Retention pin: this bootstrap requires retaining producer deltas
+    /// from producer_generation onward until consumer catches up.
+    pub retention_pin: DeltaRetentionPinV1,
+}
+
+/// Retention pin that prevents producer deltas from being garbage collected.
+///
+/// Each active consumer edge creates a pin. The pin is released only when:
+/// 1. The consumer is explicitly marked as unrecoverable/failed, OR
+/// 2. The consumer's checkpoint has advanced past the pinned epoch.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeltaRetentionPinV1 {
+    /// Consumer's tenant ID.
+    pub consumer_tenant_id: String,
+    /// Consumer's program ID.
+    pub consumer_program_id: String,
+    /// Consumer's view ID.
+    pub consumer_view_id: String,
+    /// Consumer's generation at pin creation time.
+    pub consumer_generation: u64,
+    /// Producer's view ID being retained.
+    pub producer_view_id: String,
+    /// Producer's generation at pin creation time.
+    pub producer_generation: u64,
+    /// Minimum producer epoch that must be retained.
+    /// Consumer's checkpoint cursor at pin creation time.
+    pub min_retained_epoch: u64,
+    /// Timestamp when this pin was created.
+    pub created_at_ms: u64,
+    /// Optional expiration timestamp (for bounded retention).
+    pub expires_at_ms: Option<u64>,
+}
+
+/// Delta retention protocol state for a tenant.
+///
+/// Tracks all active retention pins and computes the GC low watermark
+/// for each producer.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeltaRetentionStateV1 {
+    pub schema_version: u32,
+    pub tenant_id: String,
+    /// Active retention pins indexed by (consumer_view_id, producer_view_id).
+    pub pins: Vec<DeltaRetentionPinV1>,
+}
+
+impl DeltaRetentionStateV1 {
+    /// Creates a new empty retention state.
+    pub fn new(tenant_id: String) -> Self {
+        Self {
+            schema_version: 1,
+            tenant_id,
+            pins: Vec::new(),
+        }
+    }
+
+    /// Adds a retention pin.
+    pub fn add_pin(&mut self, pin: DeltaRetentionPinV1) {
+        // Remove any existing pin for this consumer-producer pair
+        self.pins.retain(|p| {
+            !(p.consumer_view_id == pin.consumer_view_id
+                && p.producer_view_id == pin.producer_view_id)
+        });
+        self.pins.push(pin);
+    }
+
+    /// Removes a retention pin for a consumer view.
+    pub fn remove_pins_for_consumer(&mut self, consumer_view_id: &str) {
+        self.pins.retain(|p| p.consumer_view_id != consumer_view_id);
+    }
+
+    /// Computes the GC low watermark for a producer view.
+    /// Returns None if there are no active pins (nothing to retain).
+    pub fn gc_low_watermark(&self, producer_view_id: &str) -> Option<u64> {
+        self.pins
+            .iter()
+            .filter(|p| p.producer_view_id == producer_view_id)
+            .map(|p| p.min_retained_epoch)
+            .min()
+    }
+
+    /// Checks if a producer epoch can be garbage collected.
+    pub fn can_gc_epoch(&self, producer_view_id: &str, epoch: u64) -> bool {
+        match self.gc_low_watermark(producer_view_id) {
+            Some(watermark) => epoch < watermark,
+            None => true, // No pins, can GC anything
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub enum ViewBootstrapLifecycleV1 {

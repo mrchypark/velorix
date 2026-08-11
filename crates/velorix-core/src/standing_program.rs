@@ -23,6 +23,15 @@ pub struct StandingProgramIdentity {
     pub runtime_compatibility: String,
     pub checkpoint_codec_identity: String,
     pub native_code_policy: NativeCodePolicy,
+    /// Canonical digest of the dependency edge binding set.
+    /// Empty for views with no view-to-view dependencies.
+    /// Computed over sorted ViewDependencyEdgeBindingV1 entries.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub dependency_binding_digest: String,
+    /// Tenant from authenticated request scope (not "default").
+    /// Used for cross-tenant isolation in dependency graphs.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub authenticated_tenant_id: String,
 }
 
 impl StandingProgramIdentity {
@@ -115,6 +124,45 @@ pub struct RelationInputBatch {
     pub end_offset_exclusive: u64,
     pub event_time_watermark: Option<InputEventTimeWatermark>,
     pub batches: Vec<RecordBatch>,
+}
+
+/// Tagged input for the StandingProgramRuntime.
+///
+/// Distinguishes between physical source batches and upstream materialized
+/// view deltas. View deltas preserve signed bag weights and are NOT converted
+/// to source offsets.
+#[derive(Clone, Debug)]
+pub enum StandingInputChangeV1 {
+    /// Input from a physical ingest source.
+    Source(RelationInputBatch),
+    /// Input from an upstream materialized view output.
+    View(ViewInputDeltaV1),
+}
+
+/// A signed delta batch from an upstream materialized view.
+///
+/// Contains the edge binding digest, producer cursor, and the actual delta.
+/// The controller must verify the authority chain before passing this to runtime.
+#[derive(Clone, Debug)]
+pub struct ViewInputDeltaV1 {
+    /// Digest of the dependency edge binding this delta came from.
+    pub edge_binding_digest: String,
+    /// Producer cursor at the time of this delta.
+    pub producer_cursor: CausalViewCursorV1,
+    /// Reference to the producer commit object.
+    pub commit_ref: String,
+    /// The signed delta batch from the producer.
+    pub delta: DeltaBatch,
+}
+
+impl ViewInputDeltaV1 {
+    /// Validates the view input delta structure.
+    pub fn validate(&self) -> Result<(), StandingProgramRuntimeError> {
+        require_non_empty("edge_binding_digest", &self.edge_binding_digest)?;
+        self.producer_cursor.validate()?;
+        require_non_empty("commit_ref", &self.commit_ref)?;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -323,6 +371,73 @@ impl CausalCutV1 {
             previous_edge = Some(cursor.input_edge.as_str());
         }
         Ok(self)
+    }
+
+    /// Validates that the cursor set exactly matches the admitted edge set.
+    ///
+    /// For dependency-capable checkpoints, this ensures:
+    /// 1. Every admitted edge has a corresponding cursor
+    /// 2. No extra cursors exist beyond the admitted edges
+    /// 3. Each cursor passes full authority chain validation
+    ///
+    /// `admitted_edge_ids` is the set of input_edge_id values from the
+    /// admitted dependency graph edges. For source-only checkpoints, pass
+    /// an empty set.
+    pub fn validate_cursors_match_edges(
+        &self,
+        admitted_edge_ids: &[String],
+    ) -> Result<(), StandingProgramRuntimeError> {
+        // For source-only checkpoints, cursors must be empty
+        if admitted_edge_ids.is_empty() {
+            if !self.direct_view_cursors.is_empty() {
+                return Err(StandingProgramRuntimeError::InvalidCausalCut {
+                    reason: "source-only checkpoint has view cursors".to_string(),
+                });
+            }
+            return Ok(());
+        }
+
+        // For dependency-capable checkpoints, cursors must match edges exactly
+        let cursor_edges: Vec<&str> = self.direct_view_cursors.iter()
+            .map(|c| c.input_edge.as_str())
+            .collect();
+
+        // Check every admitted edge has a cursor
+        for edge_id in admitted_edge_ids {
+            if !cursor_edges.contains(&edge_id.as_str()) {
+                return Err(StandingProgramRuntimeError::InvalidCausalCut {
+                    reason: format!("missing cursor for admitted edge: {}", edge_id),
+                });
+            }
+        }
+
+        // Check no extra cursors exist
+        for cursor in &self.direct_view_cursors {
+            if !admitted_edge_ids.contains(&cursor.input_edge) {
+                return Err(StandingProgramRuntimeError::InvalidCausalCut {
+                    reason: format!("extra cursor for non-admitted edge: {}", cursor.input_edge),
+                });
+            }
+        }
+
+        // Validate each cursor
+        for cursor in &self.direct_view_cursors {
+            cursor.validate()?;
+        }
+
+        Ok(())
+    }
+
+    /// Checks if this causal cut has any view dependencies.
+    pub fn has_view_dependencies(&self) -> bool {
+        !self.direct_view_cursors.is_empty()
+    }
+
+    /// Returns the set of edge IDs that have cursors.
+    pub fn cursor_edge_ids(&self) -> Vec<String> {
+        self.direct_view_cursors.iter()
+            .map(|c| c.input_edge.clone())
+            .collect()
     }
 
     pub fn stable_digest(&self) -> Result<String, StandingProgramRuntimeError> {
@@ -597,6 +712,8 @@ pub enum StandingProgramRuntimeError {
     UnknownView { view_id: String },
     #[error("external standing runtime error: {reason}")]
     ExternalRuntime { reason: String },
+    #[error("invalid causal cut: {reason}")]
+    InvalidCausalCut { reason: String },
 }
 
 fn require_non_empty(field: &'static str, value: &str) -> Result<(), StandingProgramRuntimeError> {
