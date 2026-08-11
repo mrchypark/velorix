@@ -684,3 +684,10 @@ cargo fmt --all --check
 | 2026-08-11 | 4 | Slice: resolve_view_input_relation_v1 helper | view_contract.rs | Complete |
 | 2026-08-11 | 4 | Slice: PublishedViewCommitV1 durable commit identity | standing_program.rs | Complete |
 | 2026-08-11 | 4 | Slice: with_direct_view_inputs + edge binding | ingest_epoch.rs | Complete |
+| 2026-08-11 | 4 | Slice: apply_many accepts StandingInputChangeV1 | ingest_epoch.rs + recovery.rs | Complete |
+| 2026-08-11 | 4 | Slice: experimental_view_on_view flag | ApiState | Complete |
+| 2026-08-11 | 4 | Slice: InputRelationKind + admission gate | lib.rs + view_admission.rs | Complete |
+| 2026-08-11 | 4 | Slice: PlannerRelationInput types | view_plan.rs | Complete |
+| 2026-08-11 | 4 | Slice: ResolvedAdmissionInput enum | view_contract.rs | Complete |
+| 2026-08-11 | 4 | Slice: resolve_view_inputs_for_request | view_admission.rs | Complete |
+| 2026-08-11 | 4 | Slice: create_view wires resolver | view_admission.rs | Complete |
