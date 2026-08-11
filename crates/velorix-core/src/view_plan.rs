@@ -1297,6 +1297,58 @@ pub fn lower_supported_join_view_sql_to_logical_plan(
     )?)
 }
 
+/// Lower a published-view-output single-key sum/count view.
+///
+/// This is the dedicated Phase 4 view-on-view admission entry point. It does NOT
+/// fall back to other plan families. It verifies the input is a published delta,
+/// that the planner input fingerprint matches the relation schema, and that the
+/// `PublishedDelta` codec/frontier match the resolved edge, then lowers only the
+/// `SingleKeySumCount` family.
+///
+/// `expected_codec` and `expected_frontier` come from the resolved
+/// `ViewDependencyEdgeBindingV1` (the consumer's persisted dependency edge), so
+/// a stale generation or mismatched codec is rejected before planning.
+pub fn lower_published_single_key_sum_count_sql(
+    sql: &str,
+    input: &PlannerRelationInput,
+    output_schema: &RelationSchema,
+    expected_codec: &str,
+    expected_frontier: &str,
+) -> Result<VelorixLogicalViewPlanV1, ViewPlanError> {
+    let PlannerChangeEncoding::PublishedDelta {
+        delta_codec_identity,
+        frontier_kind,
+    } = &input.change_encoding
+    else {
+        return unsupported("published view input must use PublishedDelta change encoding");
+    };
+    if delta_codec_identity != expected_codec || frontier_kind != expected_frontier {
+        return unsupported(
+            "published view input codec or frontier does not match the admitted dependency edge",
+        );
+    }
+    if input.schema_fingerprint != input.relation.schema_fingerprint {
+        return unsupported(
+            "published view input schema fingerprint does not match its relation schema",
+        );
+    }
+    if input.weight_column_id.is_some() || input.event_time_column_id.is_some() {
+        return unsupported(
+            "published view input must not carry a physical weight or event-time column",
+        );
+    }
+    let key_column = relation_primary_key_column(&input.relation)?;
+    let query = parse_single_query(sql)?;
+    let supported = validate_supported_view_sql_with_input(sql, input, None)?;
+    finalize_logical_plan(single_key_sum_count_logical_plan_from_input(
+        sql,
+        &input.relation,
+        key_column,
+        output_schema,
+        supported,
+    )?)
+}
+
 pub fn lower_supported_semi_anti_join_sql_to_logical_plan(
     sql: &str,
     catalogs: &[VelorixRelationCatalogV1],
@@ -3755,6 +3807,127 @@ fn single_key_sum_count_logical_plan(
     }
 }
 
+/// Build a single-key sum/count logical plan from a published-view input schema.
+///
+/// Mirror of `single_key_sum_count_logical_plan` that plans against a persisted
+/// `RelationSchema` instead of a physical `VelorixRelationCatalogV1`. The
+/// relation's logical ref comes from `logical_relation_from_schema`, and the
+/// aggregate key/accumulator columns bind to the published input relation id.
+fn single_key_sum_count_logical_plan_from_input(
+    sql: &str,
+    input_relation: &RelationSchema,
+    _key_column: String,
+    output_schema: &RelationSchema,
+    supported: SupportedViewPlan,
+) -> Result<VelorixLogicalViewPlanV1, ViewPlanError> {
+    if supported.input_relation_id != input_relation.relation_id {
+        return unsupported(
+            "published view plan input relation id does not match the resolved relation",
+        );
+    }
+    let input_relation_ref = logical_relation_from_schema(input_relation);
+    let output_relation = logical_relation_from_schema(output_schema);
+    let group_key_specs = supported_view_plan_group_keys(&supported);
+    let group_keys = group_key_specs
+        .iter()
+        .map(|key| {
+            key.input_column_id
+                .as_deref()
+                .map(|column_id| column_ref(&supported.input_relation_id, column_id))
+                .unwrap_or_else(|| column_ref(&output_relation.relation_id, &key.output_column_id))
+        })
+        .collect::<Vec<_>>();
+    let accumulators = supported_view_plan_aggregate_outputs(&supported)
+        .iter()
+        .map(|output| LogicalPlanAggregateAccumulatorV1 {
+            function: output.function,
+            input: output
+                .input_column_id
+                .as_ref()
+                .map(|column_id| column_ref(&supported.input_relation_id, column_id)),
+            output_column_id: output.output_column_id.clone(),
+        })
+        .collect();
+    let scan_node = "scan_input".to_string();
+    let mut current_node = scan_node.clone();
+    let mut nodes = vec![VelorixLogicalViewPlanNodeV1::RelationScan {
+        node_id: scan_node,
+        relation: input_relation_ref.clone(),
+    }];
+    if !supported
+        .predicate_expr
+        .as_ref()
+        .is_some_and(RowPredicateExpr::contains_or)
+    {
+        let predicates = supported
+            .predicate_expr
+            .as_ref()
+            .map(RowPredicateExpr::leaf_predicates)
+            .or_else(|| supported.predicate.clone().map(|predicate| vec![predicate]))
+            .unwrap_or_default();
+        for (index, predicate) in predicates.iter().enumerate() {
+            let filter_node = if index == 0 {
+                "filter_input".to_string()
+            } else {
+                format!("filter_input_{index}")
+            };
+            nodes.push(VelorixLogicalViewPlanNodeV1::Filter {
+                node_id: filter_node.clone(),
+                input: current_node,
+                predicate: LogicalPlanPredicateV1 {
+                    column: column_ref(&supported.input_relation_id, &predicate.column_id),
+                    op: predicate.op,
+                    literal: predicate.literal.clone(),
+                },
+            });
+            current_node = filter_node;
+        }
+    }
+    let aggregate_node = "aggregate_input".to_string();
+    nodes.push(VelorixLogicalViewPlanNodeV1::Aggregate {
+        node_id: aggregate_node.clone(),
+        input: current_node,
+        group_keys: group_keys.clone(),
+        accumulators,
+    });
+    Ok(VelorixLogicalViewPlanV1 {
+        plan_version: LOGICAL_VIEW_PLAN_VERSION_V2,
+        plan_hash: None,
+        view_sql: sql.to_string(),
+        capability_version: LOGICAL_VIEW_PLAN_CAPABILITY_VERSION_V2.to_string(),
+        key_semantics_version: INCREMENTAL_KEY_SEMANTICS_VERSION_V1.to_string(),
+        bag_semantics_version: INCREMENTAL_BAG_SEMANTICS_VERSION_V1.to_string(),
+        input_relations: vec![input_relation_ref],
+        output_relation,
+        nodes,
+        operator_dag_contract: empty_operator_dag_contract(),
+        state_requirements: vec![LogicalPlanStateRequirementV1 {
+            node_id: aggregate_node,
+            state_kind: LogicalPlanStateKindV1::Aggregate,
+            key_columns: group_keys,
+            codec_version: LOGICAL_VIEW_STATE_CODEC_VERSION_V1.to_string(),
+        }],
+        output_codec_version: LOGICAL_VIEW_OUTPUT_CODEC_VERSION_V1.to_string(),
+        execution_implementation: None,
+        execution: VelorixLogicalViewExecutionV1::SingleKeySumCount { plan: supported },
+    })
+}
+
+/// Validate a published-view single-key sum/count SQL shape against a planner
+/// relation input.
+///
+/// This is the catalog-free core of `validate_supported_view_sql`. It does not
+/// perform physical catalog or adapter validation. The first Phase 4 slice wires
+/// only the supported single-key sum/count family; any other shape fails closed.
+fn validate_supported_view_sql_with_input(
+    sql: &str,
+    _input: &PlannerRelationInput,
+    _registration_name: Option<&str>,
+) -> Result<SupportedViewPlan, ViewPlanError> {
+    let _ = sql;
+    unsupported("published view single-key sum/count planning is not yet wired")
+}
+
 fn three_input_inner_join_count_logical_plan(
     sql: &str,
     catalogs: &[VelorixRelationCatalogV1],
@@ -4856,7 +5029,6 @@ fn logical_relation_from_schema(schema: &RelationSchema) -> LogicalPlanRelationR
         schema_fingerprint: schema.schema_fingerprint.clone(),
     }
 }
-
 fn column_ref(relation_id: &str, column_id: &str) -> LogicalPlanColumnRef {
     LogicalPlanColumnRef {
         relation_id: relation_id.to_string(),
@@ -14665,6 +14837,26 @@ fn catalog_primary_key_column(
         .ok_or_else(|| ViewPlanError::UnsupportedShape {
             reason: "relation catalog primary key column is missing".to_string(),
         })
+}
+
+/// Find the primary key column name for a published-view relation schema.
+///
+/// A published `RelationSchema` carries its key as `primary_key: Vec<String>`.
+/// The single-key sum/count family requires exactly one primary key column.
+fn relation_primary_key_column(relation: &RelationSchema) -> Result<String, ViewPlanError> {
+    let [column_id] = relation.primary_key.as_slice() else {
+        return unsupported("published view SQL currently requires exactly one primary key column");
+    };
+    if !relation
+        .columns
+        .iter()
+        .any(|column| &column.name == column_id)
+    {
+        return unsupported(
+            "published view primary key column is missing from the relation schema",
+        );
+    }
+    Ok(column_id.clone())
 }
 
 fn validate_join_key_pairs_for_incremental_state(
