@@ -498,6 +498,37 @@ These must be completed before any Phase 4 feature work.
 
 ### Step 1: Phase 4 Feature Implementation (after Step 0)
 
+Oracle planner-integration review (2026-08-11) decided the exact seam:
+
+- **Do NOT** add a generic `lower_supported_sql_to_logical_plan_with_inputs`
+  dispatcher. Reusing the fallback chain would let out-of-slice families be
+  admitted accidentally.
+- **Add** `lower_published_single_key_sum_count_sql(sql, input, output)` which:
+  1. verifies `PlannerChangeEncoding::PublishedDelta`
+  2. verifies `input.schema_fingerprint == input.relation.schema_fingerprint`
+  3. verifies edge codec/frontier matches `change_encoding`
+  4. calls only the `SingleKeySumCount` validator
+  5. fails immediately, no fallback
+- **Split** `validate_supported_view_sql` into
+  `validate_supported_view_sql_with_input(sql, input, registration_name)`.
+  Existing source lowerer validates catalog/adapter first then calls the core;
+  published-view lowerer calls it with `registration_name: None`.
+- **weight_column_id: None** means "no reserved weight column", not "reject any
+  column named weight". Use `is_weight_column(input, id)`. A published output's
+  real `"weight"` data column is a normal column.
+- **event_time_column_id: None** means window SQL is fail-closed. The
+  view-input dispatcher never calls window families.
+- **Runtime factory**: add
+  `create_standing_runtime_with_logical_plan_and_input_schemas(plan, input_schemas)`;
+  keep the catalogs-based fn as a wrapper. View path passes the persisted
+  producer relation from `resolve_view_input_relation_v1` — never re-reads a
+  catalog and never builds a synthetic catalog.
+- **First admitted family**: `SingleKeySumCount` (not FilterProject) so signed
+  producer retraction is verified against stateful aggregate state. Slice shape:
+  exactly 1 `PublishedDelta` input, direct single PK key, `SUM(non-null Int64)`
+  and/or `COUNT(*)`; exclude Top-K, window, CTE/derived, DISTINCT, HAVING,
+  aggregate FILTER, computed group key. Failure rejects, no family fallback.
+
 1. **Three-level exit gate test**
    - File: `crates/velorix-api/src/tests.rs`
    - Action: Add `rest_three_level_filter_aggregate_topk_chain_exact`
