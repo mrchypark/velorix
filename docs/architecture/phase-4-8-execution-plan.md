@@ -529,6 +529,37 @@ Oracle planner-integration review (2026-08-11) decided the exact seam:
   and/or `COUNT(*)`; exclude Top-K, window, CTE/derived, DISTINCT, HAVING,
   aggregate FILTER, computed group key. Failure rejects, no family fallback.
 
+Oracle runtime-execution review (2026-08-11) decided the input-boundary shape:
+
+- **Do NOT make `catalog: Option<_>`.** A missing catalog for a Source binding
+  must fail recovery, while a PublishedView binding legitimately has no catalog.
+  Store an explicit tagged enum on the runtime:
+  ```rust
+  enum SingleKeyRuntimeInputV1 {
+      Source { catalog: VelorixRelationCatalogV1 },
+      PublishedView { binding: PublishedRelationBindingV1, primary_key_column_id: String },
+  }
+  ```
+- **Remove `source_input_batches` from `apply_changes`.** Dispatch the original
+  `StandingInputChangeV1` after idempotency checking:
+  - `Source` → `validate_input_matches_schema` + `aggregate_group_input_delta_batch`
+  - `View` → `validate_view_input_matches_binding` + use `input.delta` directly
+  - both → `filter` → `rekey` → `combine` → aggregate apply
+- **Never call `aggregate_group_input_delta_batch` for View inputs** (already a
+  DeltaBatch). Do not fabricate a catalog. `weight_column_id` is irrelevant for
+  View inputs; `DeltaRecord.weight` is the signed multiplicity.
+- **View validation** must check admitted producer/view identity, relation
+  id/version, schema fingerprint, expected change encoding, and cursor
+  continuity before any state mutation.
+- **Narrow slice guard**: single PK, published `DeltaBatch.key` is that PK,
+  direct column GROUP BY, non-null aggregate inputs, direct SUM/COUNT, no
+  predicate/aggregate-FILTER/expression (or RelationSchema-based evaluator).
+  Reject anything wider at runtime construction.
+- **`GenericCheckpointPayload`** stores mandatory `catalog`; replace with
+  `SingleKeyRuntimeInputV1` and migrate legacy catalog payloads to the `Source`
+  variant. View cursors persist in the same checkpoint, never masquerading as
+  Source `RelationFrontier`s.
+
 1. **Three-level exit gate test**
    - File: `crates/velorix-api/src/tests.rs`
    - Action: Add `rest_three_level_filter_aggregate_topk_chain_exact`
