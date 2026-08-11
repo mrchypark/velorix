@@ -5721,6 +5721,7 @@ fn projection_expression_output_type(
         }
         SupportedProjectionExpr::LiteralInt64 { .. }
         | SupportedProjectionExpr::CoalesceInt64 { .. } => Ok((SqlDataType::Int64, false)),
+        SupportedProjectionExpr::LiteralUtf8 { .. } => Ok((SqlDataType::Utf8, false)),
         SupportedProjectionExpr::BinaryInt64 { left, right, .. } => {
             let (_, left_nullable) = projection_expression_output_type(catalog, left)?;
             let (_, right_nullable) = projection_expression_output_type(catalog, right)?;
@@ -5747,6 +5748,10 @@ fn projection_expression_output_type(
             let (_, else_nullable) = projection_expression_output_type(catalog, else_expr)?;
             Ok((SqlDataType::Int64, then_nullable || else_nullable))
         }
+        SupportedProjectionExpr::LengthUtf8 { .. } => Ok((SqlDataType::Int64, false)),
+        SupportedProjectionExpr::ConcatUtf8 { .. } => Ok((SqlDataType::Utf8, false)),
+        SupportedProjectionExpr::SubstringUtf8 { .. } => Ok((SqlDataType::Utf8, false)),
+        SupportedProjectionExpr::TrimUtf8 { .. } => Ok((SqlDataType::Utf8, false)),
     }
 }
 

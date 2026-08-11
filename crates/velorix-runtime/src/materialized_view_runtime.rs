@@ -2827,6 +2827,7 @@ fn validate_filter_project_projection_expr(
             validate_filter_project_int64_projection_column(catalog, column_id)
         }
         SupportedProjectionExpr::LiteralInt64 { .. } => Ok(()),
+        SupportedProjectionExpr::LiteralUtf8 { .. } => Ok(()),
         SupportedProjectionExpr::BinaryInt64 { left, right, .. } => {
             validate_filter_project_projection_expr(catalog, left)?;
             validate_filter_project_projection_expr(catalog, right)
@@ -2849,6 +2850,26 @@ fn validate_filter_project_projection_expr(
             validate_filter_project_case_predicate_expr(catalog, predicate)?;
             validate_filter_project_projection_expr(catalog, then_expr)?;
             validate_filter_project_projection_expr(catalog, else_expr)
+        }
+        SupportedProjectionExpr::LengthUtf8 { expr } => {
+            validate_filter_project_projection_expr(catalog, expr)
+        }
+        SupportedProjectionExpr::ConcatUtf8 { exprs } => {
+            for expr in exprs {
+                validate_filter_project_projection_expr(catalog, expr)?;
+            }
+            Ok(())
+        }
+        SupportedProjectionExpr::SubstringUtf8 { expr, start, length } => {
+            validate_filter_project_projection_expr(catalog, expr)?;
+            validate_filter_project_projection_expr(catalog, start)?;
+            if let Some(l) = length {
+                validate_filter_project_projection_expr(catalog, l)?;
+            }
+            Ok(())
+        }
+        SupportedProjectionExpr::TrimUtf8 { expr } => {
+            validate_filter_project_projection_expr(catalog, expr)
         }
     }
 }
@@ -4750,6 +4771,7 @@ fn collect_projection_expr_column_ids(expr: &SupportedProjectionExpr, columns: &
             }
         }
         SupportedProjectionExpr::LiteralInt64 { .. } => {}
+        SupportedProjectionExpr::LiteralUtf8 { .. } => {}
         SupportedProjectionExpr::BinaryInt64 { left, right, .. } => {
             collect_projection_expr_column_ids(left, columns);
             collect_projection_expr_column_ids(right, columns);
@@ -4780,6 +4802,24 @@ fn collect_projection_expr_column_ids(expr: &SupportedProjectionExpr, columns: &
             }
             collect_projection_expr_column_ids(then_expr, columns);
             collect_projection_expr_column_ids(else_expr, columns);
+        }
+        SupportedProjectionExpr::LengthUtf8 { expr } => {
+            collect_projection_expr_column_ids(expr, columns);
+        }
+        SupportedProjectionExpr::ConcatUtf8 { exprs } => {
+            for expr in exprs {
+                collect_projection_expr_column_ids(expr, columns);
+            }
+        }
+        SupportedProjectionExpr::SubstringUtf8 { expr, start, length } => {
+            collect_projection_expr_column_ids(expr, columns);
+            collect_projection_expr_column_ids(start, columns);
+            if let Some(l) = length {
+                collect_projection_expr_column_ids(l, columns);
+            }
+        }
+        SupportedProjectionExpr::TrimUtf8 { expr } => {
+            collect_projection_expr_column_ids(expr, columns);
         }
     }
 }
@@ -5018,6 +5058,12 @@ fn evaluate_projection_expr(
             .and_then(Value::as_i64)
             .ok_or_else(invalid_runtime_state),
         SupportedProjectionExpr::LiteralInt64 { value } => Ok(*value),
+        SupportedProjectionExpr::LiteralUtf8 { .. } => {
+            // String literals cannot be used in Int64 context
+            Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "string_literal_in_int64_context",
+            })
+        }
         SupportedProjectionExpr::BinaryInt64 { op, left, right } => {
             let left = evaluate_projection_expr(left, input, catalog)?;
             let right = evaluate_projection_expr(right, input, catalog)?;
@@ -5075,6 +5121,15 @@ fn evaluate_projection_expr(
             } else {
                 evaluate_projection_expr(else_expr, input, catalog)
             }
+        }
+        // String expressions cannot be used in Int64 context
+        SupportedProjectionExpr::LengthUtf8 { .. }
+        | SupportedProjectionExpr::ConcatUtf8 { .. }
+        | SupportedProjectionExpr::SubstringUtf8 { .. }
+        | SupportedProjectionExpr::TrimUtf8 { .. } => {
+            Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "string_expression_in_int64_context",
+            })
         }
     }
 }

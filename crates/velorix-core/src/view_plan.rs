@@ -517,6 +517,9 @@ pub enum SupportedProjectionExpr {
     LiteralInt64 {
         value: i64,
     },
+    LiteralUtf8 {
+        value: String,
+    },
     BinaryInt64 {
         op: SupportedProjectionBinaryOp,
         left: Box<SupportedProjectionExpr>,
@@ -539,6 +542,21 @@ pub enum SupportedProjectionExpr {
         predicate: RowPredicateExpr,
         then_expr: Box<SupportedProjectionExpr>,
         else_expr: Box<SupportedProjectionExpr>,
+    },
+    // String expressions
+    LengthUtf8 {
+        expr: Box<SupportedProjectionExpr>,
+    },
+    ConcatUtf8 {
+        exprs: Vec<SupportedProjectionExpr>,
+    },
+    SubstringUtf8 {
+        expr: Box<SupportedProjectionExpr>,
+        start: Box<SupportedProjectionExpr>,
+        length: Option<Box<SupportedProjectionExpr>>,
+    },
+    TrimUtf8 {
+        expr: Box<SupportedProjectionExpr>,
     },
 }
 
@@ -13027,6 +13045,7 @@ fn first_supported_projection_expr_column_id(expr: &SupportedProjectionExpr) -> 
     match expr {
         SupportedProjectionExpr::Column { column_id } => Some(column_id.clone()),
         SupportedProjectionExpr::LiteralInt64 { .. } => None,
+        SupportedProjectionExpr::LiteralUtf8 { .. } => None,
         SupportedProjectionExpr::BinaryInt64 { left, right, .. } => {
             first_supported_projection_expr_column_id(left)
                 .or_else(|| first_supported_projection_expr_column_id(right))
@@ -13050,6 +13069,20 @@ fn first_supported_projection_expr_column_id(expr: &SupportedProjectionExpr) -> 
             .next()
             .or_else(|| first_supported_projection_expr_column_id(then_expr))
             .or_else(|| first_supported_projection_expr_column_id(else_expr)),
+        SupportedProjectionExpr::LengthUtf8 { expr } => {
+            first_supported_projection_expr_column_id(expr)
+        }
+        SupportedProjectionExpr::ConcatUtf8 { exprs } => exprs
+            .iter()
+            .find_map(first_supported_projection_expr_column_id),
+        SupportedProjectionExpr::SubstringUtf8 { expr, start, length } => {
+            first_supported_projection_expr_column_id(expr)
+                .or_else(|| first_supported_projection_expr_column_id(start))
+                .or_else(|| length.as_ref().and_then(|l| first_supported_projection_expr_column_id(l)))
+        }
+        SupportedProjectionExpr::TrimUtf8 { expr } => {
+            first_supported_projection_expr_column_id(expr)
+        }
     }
 }
 
@@ -13070,6 +13103,7 @@ fn collect_supported_projection_expr_column_ids(
             }
         }
         SupportedProjectionExpr::LiteralInt64 { .. } => {}
+        SupportedProjectionExpr::LiteralUtf8 { .. } => {}
         SupportedProjectionExpr::BinaryInt64 { left, right, .. } => {
             collect_supported_projection_expr_column_ids(left, columns);
             collect_supported_projection_expr_column_ids(right, columns);
@@ -13103,6 +13137,24 @@ fn collect_supported_projection_expr_column_ids(
             }
             collect_supported_projection_expr_column_ids(then_expr, columns);
             collect_supported_projection_expr_column_ids(else_expr, columns);
+        }
+        SupportedProjectionExpr::LengthUtf8 { expr } => {
+            collect_supported_projection_expr_column_ids(expr, columns);
+        }
+        SupportedProjectionExpr::ConcatUtf8 { exprs } => {
+            for expr in exprs {
+                collect_supported_projection_expr_column_ids(expr, columns);
+            }
+        }
+        SupportedProjectionExpr::SubstringUtf8 { expr, start, length } => {
+            collect_supported_projection_expr_column_ids(expr, columns);
+            collect_supported_projection_expr_column_ids(start, columns);
+            if let Some(l) = length {
+                collect_supported_projection_expr_column_ids(l, columns);
+            }
+        }
+        SupportedProjectionExpr::TrimUtf8 { expr } => {
+            collect_supported_projection_expr_column_ids(expr, columns);
         }
     }
 }
