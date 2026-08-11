@@ -5633,39 +5633,26 @@ fn standing_runtime_can_accept_incremental_ingest(active: &ActiveMaterializedVie
 }
 
 fn view_spec_from_request(
-    state: &ApiState,
     request: &CreateViewRequest,
-    catalogs: &[VelorixRelationCatalogV1],
+    inputs: &[ResolvedAdmissionInput],
+    output_schema: &RelationSchema,
 ) -> Result<StandingViewSpec, ApiError> {
-    let input_relations = catalogs
+    let input_relations = inputs
         .iter()
-        .map(|catalog| catalog_input_relation_schema(catalog).map_err(ApiError::bad_request))
-        .collect::<Result<Vec<_>, _>>()?;
-    let input = input_relations
-        .first()
-        .ok_or_else(|| ApiError::bad_request("view has no input relation"))?;
+        .map(resolved_input_relation_schema)
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    if input_relations.is_empty() {
+        return Err(ApiError::bad_request("view has no input relation"));
+    }
     validate_create_view_sql_source_contract(request)?;
     let source_kind = resolved_sql_source_kind_for_create_view(request);
-    let output_relations = if source_kind == SqlSourceKind::StandingView {
-        state
-            .materialized_runtime_output_schemas_for_view_request(
-                request.view_id.as_str(),
-                request.sql.as_str(),
-                catalogs,
-                input.schema_fingerprint.as_str(),
-            )?
-            .ok_or_else(|| {
-                ApiError::bad_request(format!(
-                    "unsupported view SQL for materialized runtime `{}`",
-                    request.view_id
-                ))
-            })
-    } else {
+    if source_kind != SqlSourceKind::StandingView {
         return Err(ApiError::bad_request(
             "CREATE VIEW SQL requires a supported materialized view runtime; runtime fallback is disabled",
         ));
-    }?;
-    let multi_output = output_relations.len() > 1;
+    }
+    let output_relations = vec![output_schema.clone()];
+    let multi_output = false;
     Ok(StandingViewSpec {
         view_id: request.view_id.clone(),
         sql: request.sql.clone(),
@@ -5675,10 +5662,26 @@ fn view_spec_from_request(
         output_relations,
         shape: StandingViewShape {
             is_materialized: true,
-            multi_input: catalogs.len() > 1,
+            multi_input: inputs.len() > 1,
             multi_output,
         },
     })
+}
+
+/// Select the relation schema for a resolved admission input.
+///
+/// Source inputs derive the schema from their physical catalog; View inputs
+/// use the verified producer `PublishedRelationBindingV1.relation` directly.
+/// A physical catalog is never fabricated for a view input.
+fn resolved_input_relation_schema(
+    input: &ResolvedAdmissionInput,
+) -> Result<RelationSchema, ApiError> {
+    match input {
+        ResolvedAdmissionInput::Source { catalog, .. } => {
+            catalog_input_relation_schema(catalog).map_err(ApiError::bad_request)
+        }
+        ResolvedAdmissionInput::View { relation, .. } => Ok(relation.clone()),
+    }
 }
 
 fn validate_create_view_sql_source_contract(request: &CreateViewRequest) -> Result<(), ApiError> {

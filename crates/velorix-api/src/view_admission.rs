@@ -19,13 +19,34 @@ pub(super) async fn create_view(
         ));
     }
     let catalogs = resolved_inputs
-        .into_iter()
+        .iter()
         .map(|input| match input {
-            ResolvedAdmissionInput::Source { catalog, .. } => Ok(catalog),
+            ResolvedAdmissionInput::Source { catalog, .. } => Ok(catalog.clone()),
             ResolvedAdmissionInput::View { .. } => unreachable!("view inputs rejected above"),
         })
         .collect::<Result<Vec<_>, ApiError>>()?;
-    let spec = view_spec_from_request(&state, &request, &catalogs)?;
+    let input_schema = catalogs
+        .first()
+        .map(|catalog| catalog_input_relation_schema(catalog).map_err(ApiError::bad_request))
+        .transpose()?
+        .ok_or_else(|| ApiError::bad_request("view has no input relation"))?;
+    let output_schema = state
+        .materialized_runtime_output_schemas_for_view_request(
+            request.view_id.as_str(),
+            request.sql.as_str(),
+            &catalogs,
+            input_schema.schema_fingerprint.as_str(),
+        )?
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "unsupported view SQL for materialized runtime `{}`",
+                request.view_id
+            ))
+        })?
+        .into_iter()
+        .next()
+        .ok_or_else(|| ApiError::bad_request("materialized runtime produced no output schema"))?;
+    let spec = view_spec_from_request(&request, &resolved_inputs, &output_schema)?;
     validate_materialized_runtime_spec_admission(&spec)?;
     state.validate_standing_runtime_fencing_or_evict().await?;
     let mut runtime_binding = materialized_view_runtime_binding_for_spec(&catalogs, &spec)?;
