@@ -17211,3 +17211,80 @@ async fn rest_tumble_window_admitted_through_public_api_without_experimental_fla
         "ROW_NUMBER should be blocked without experimental flag"
     );
 }
+
+#[tokio::test]
+async fn rest_view_on_view_input_fails_closed_without_flag_and_planner_integration() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let state = test_public_api_state_with_store(store, "api-test-view-on-view-owner", false).await;
+    let router = app(state);
+
+    let view_request = CreateViewRequest {
+        view_id: "consumer_view".to_string(),
+        url_path: None,
+        output_relation_id: None,
+        input_relation_id: String::new(),
+        input_relation_version: String::new(),
+        input_relation_refs: vec![InputRelationRef {
+            relation_id: "producer_view".to_string(),
+            relation_version: "v1".to_string(),
+            input_kind: InputRelationKind::View,
+        }],
+        input_relations: Vec::new(),
+        sql: "select region, sum(sum) as total from producer_view group by region".to_string(),
+        source_kind: SqlSourceKind::StandingView,
+        output_relation_ids: Vec::new(),
+        sql_template: None,
+        description: None,
+        request: Vec::new(),
+        response_schema: None,
+        response_formats: vec!["json".to_string()],
+        query_policy_id: None,
+    };
+
+    // Without the experimental flag, view inputs are rejected before any
+    // producer lookup.
+    let response = call_json(
+        &router,
+        Method::POST,
+        "/v1/views",
+        json!(view_request.clone()),
+    )
+    .await;
+    assert_eq!(
+        response.0,
+        StatusCode::BAD_REQUEST,
+        "view-on-view input must be rejected without the experimental flag: {response:?}"
+    );
+    assert!(
+        response.1["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("view-on-view inputs are experimental"),
+        "unexpected error message: {response:?}"
+    );
+
+    // With the flag enabled but no matching producer view, the view input
+    // fails closed against the active view registry instead of falling back
+    // to a physical source catalog lookup.
+    let state = test_public_api_state_with_store(
+        Arc::new(InMemory::new()),
+        "api-test-view-on-view-owner-2",
+        false,
+    )
+    .await
+    .with_experimental_view_on_view(true);
+    let router = app(state);
+    let response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+    assert_eq!(
+        response.0,
+        StatusCode::BAD_REQUEST,
+        "view-on-view input must fail closed without a matching producer view: {response:?}"
+    );
+    assert!(
+        response.1["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("does not match an active view output"),
+        "unexpected error message: {response:?}"
+    );
+}

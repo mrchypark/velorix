@@ -5,7 +5,26 @@ pub(super) async fn create_view(
     Json(request): Json<CreateViewRequest>,
 ) -> Result<(StatusCode, Json<ViewResponse>), ApiError> {
     validate_public_view_feature_admission(&state, &request)?;
-    let catalogs = read_relation_catalogs_for_view_request(&state, &request).await?;
+    let resolved_inputs = resolve_view_inputs_for_request(&state, &request).await?;
+    if resolved_inputs
+        .iter()
+        .any(|input| matches!(input, ResolvedAdmissionInput::View { .. }))
+    {
+        // The planner integration for view-produced inputs is the next slice of
+        // Phase 4. Until lower_supported_sql_to_logical_plan_with_inputs exists,
+        // a view input fails closed here instead of fabricating a physical
+        // catalog or silently mixing input authority domains.
+        return Err(ApiError::bad_request(
+            "view-on-view admission requires the Phase 4 planner integration which is not yet complete",
+        ));
+    }
+    let catalogs = resolved_inputs
+        .into_iter()
+        .map(|input| match input {
+            ResolvedAdmissionInput::Source { catalog, .. } => Ok(catalog),
+            ResolvedAdmissionInput::View { .. } => unreachable!("view inputs rejected above"),
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
     let spec = view_spec_from_request(&state, &request, &catalogs)?;
     validate_materialized_runtime_spec_admission(&spec)?;
     state.validate_standing_runtime_fencing_or_evict().await?;
