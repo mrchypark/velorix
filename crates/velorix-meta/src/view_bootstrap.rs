@@ -417,6 +417,168 @@ impl PromoteViewBootstrapRequest {
     }
 }
 
+/// Consumer lag quota configuration for a tenant.
+///
+/// Prevents slow consumers from consuming unbounded resources.
+/// When lag exceeds the quota, the consumer is transitioned to
+/// a degraded/failed state with backpressure.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsumerLagQuotaV1 {
+    /// Maximum number of epochs a consumer can lag behind.
+    pub max_lag_epochs: u64,
+    /// Maximum bytes of retained deltas a consumer can accumulate.
+    pub max_lag_bytes: u64,
+    /// Maximum time (ms) a consumer can be behind.
+    pub max_lag_ms: u64,
+    /// Action when quota is exceeded.
+    pub exceeded_action: LagExceededAction,
+}
+
+/// Action to take when consumer lag quota is exceeded.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LagExceededAction {
+    /// Transition consumer to failed state (fail closed).
+    FailClosed,
+    /// Apply backpressure to producer (slow down production).
+    Backpressure,
+    /// Log warning but continue (not recommended for production).
+    WarnOnly,
+}
+
+/// Graph size limits for a tenant.
+///
+/// Prevents unbounded graph growth and ensures bounded scheduling latency.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraphSizeLimitsV1 {
+    /// Maximum number of nodes (views) in the dependency graph.
+    pub max_nodes: u32,
+    /// Maximum number of edges in the dependency graph.
+    pub max_edges: u32,
+    /// Maximum fan-in (number of producers per consumer).
+    pub max_fan_in: u32,
+    /// Maximum fan-out (number of consumers per producer).
+    pub max_fan_out: u32,
+    /// Maximum chain depth (longest path in the DAG).
+    pub max_chain_depth: u32,
+}
+
+impl Default for GraphSizeLimitsV1 {
+    fn default() -> Self {
+        Self {
+            max_nodes: 1024,
+            max_edges: 4096,
+            max_fan_in: 16,
+            max_fan_out: 256,
+            max_chain_depth: 32,
+        }
+    }
+}
+
+/// Tenant-wide scheduling and backpressure configuration.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TenantSchedulingConfigV1 {
+    pub schema_version: u32,
+    pub tenant_id: String,
+    pub lag_quota: ConsumerLagQuotaV1,
+    pub graph_limits: GraphSizeLimitsV1,
+    /// Maximum concurrent workers for this tenant.
+    pub max_worker_concurrency: u32,
+    /// Notification coalescing policy.
+    pub notification_coalescing: NotificationCoalescingPolicy,
+}
+
+/// Policy for coalescing notifications to consumers.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationCoalescingPolicy {
+    /// Send notification for every producer commit (no coalescing).
+    EveryCommit,
+    /// Coalesce to latest available epoch per edge.
+    LatestPerEdge,
+    /// Coalesce to latest epoch across all edges.
+    LatestGlobal,
+}
+
+impl Default for TenantSchedulingConfigV1 {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            tenant_id: String::new(),
+            lag_quota: ConsumerLagQuotaV1 {
+                max_lag_epochs: 1000,
+                max_lag_bytes: 1024 * 1024 * 1024, // 1GB
+                max_lag_ms: 3600 * 1000, // 1 hour
+                exceeded_action: LagExceededAction::FailClosed,
+            },
+            graph_limits: GraphSizeLimitsV1::default(),
+            max_worker_concurrency: 8,
+            notification_coalescing: NotificationCoalescingPolicy::LatestPerEdge,
+        }
+    }
+}
+
+/// Scheduling state for a consumer view.
+///
+/// Tracks the consumer's progress and backpressure status.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsumerSchedulingStateV1 {
+    /// Consumer's view ID.
+    pub consumer_view_id: String,
+    /// Current consumer status.
+    pub status: ConsumerStatus,
+    /// Current lag in epochs (producer_latest - consumer_latest).
+    pub lag_epochs: u64,
+    /// Current lag in bytes.
+    pub lag_bytes: u64,
+    /// Current lag in milliseconds.
+    pub lag_ms: u64,
+    /// Timestamp of last successful apply.
+    pub last_apply_ms: Option<u64>,
+    /// Number of consecutive apply failures.
+    pub consecutive_failures: u32,
+}
+
+/// Consumer view status.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsumerStatus {
+    /// Consumer is processing normally.
+    Active,
+    /// Consumer is lagging but within quota.
+    Lagging,
+    /// Consumer has exceeded lag quota and is under backpressure.
+    Backpressured,
+    /// Consumer has failed and needs manual intervention.
+    Failed { reason: String },
+}
+
+impl ConsumerSchedulingStateV1 {
+    /// Creates a new active consumer state.
+    pub fn new(consumer_view_id: String) -> Self {
+        Self {
+            consumer_view_id,
+            status: ConsumerStatus::Active,
+            lag_epochs: 0,
+            lag_bytes: 0,
+            lag_ms: 0,
+            last_apply_ms: None,
+            consecutive_failures: 0,
+        }
+    }
+
+    /// Checks if the consumer exceeds the lag quota.
+    pub fn exceeds_lag_quota(&self, quota: &ConsumerLagQuotaV1) -> bool {
+        self.lag_epochs > quota.max_lag_epochs
+            || self.lag_bytes > quota.max_lag_bytes
+            || self.lag_ms > quota.max_lag_ms
+    }
+}
+
 fn validate_activation_scope(
     tenant_id: &str,
     program_id: &str,
