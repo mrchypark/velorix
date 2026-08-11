@@ -179,6 +179,7 @@ pub struct ApiState {
     max_standing_runtime_state_payload_bytes: usize,
     output_compaction_interval_epochs: u64,
     experimental_advanced_view_features: bool,
+    experimental_view_on_view: bool,
     background_tasks: Arc<Mutex<BackgroundTaskStatus>>,
     background_compactions: Arc<Mutex<BTreeSet<String>>>,
     standing_runtimes: Arc<StandingRuntimeRegistry>,
@@ -775,6 +776,7 @@ impl ApiState {
                 DEFAULT_MAX_STANDING_RUNTIME_STATE_PAYLOAD_BYTES,
             output_compaction_interval_epochs: 0,
             experimental_advanced_view_features: false,
+            experimental_view_on_view: false,
             background_tasks: Arc::new(Mutex::new(BackgroundTaskStatus::default())),
             background_compactions: Arc::new(Mutex::new(BTreeSet::new())),
             standing_runtimes: Arc::new(StandingRuntimeRegistry::default()),
@@ -865,6 +867,12 @@ impl ApiState {
     #[cfg(test)]
     pub fn with_experimental_advanced_view_features(mut self, enabled: bool) -> Self {
         self.experimental_advanced_view_features = enabled;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_experimental_view_on_view(mut self, enabled: bool) -> Self {
+        self.experimental_view_on_view = enabled;
         self
     }
 
