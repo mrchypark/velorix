@@ -37,7 +37,7 @@ use crate::{
         SupportedIncrementalAdapterSpec, VelorixRelationCatalogV1,
     },
     view_contract::{
-        catalog_input_relation_schema, stable_bytes_hash, ColumnSchema, RelationSchema,
+        catalog_input_relation_schema, stable_bytes_hash, ColumnSchema, RelationSchema, SqlDataType,
     },
 };
 
@@ -1349,6 +1349,91 @@ pub fn lower_published_single_key_sum_count_sql(
         output_schema,
         supported,
     )?)
+}
+
+/// Infer the output schema of a published single-key sum/count view from its
+/// SQL projection.
+///
+/// This is the catalog-free analog of the catalog-backed output-schema
+/// inference used by `output_schemas_for_view_request`. It reads the projection
+/// and group key from SQL and the published input schema, so create_view can
+/// derive the consumer output schema before lowering. The resulting schema must
+/// be reused identically for the plan, `ViewSpec`, published binding, runtime
+/// factory, and create response.
+pub fn infer_single_key_sum_count_output_schema(
+    sql: &str,
+    input: &PlannerRelationInput,
+    view_id: &str,
+) -> Result<RelationSchema, ViewPlanError> {
+    let [key_column_id] = input.relation.primary_key.as_slice() else {
+        return unsupported("published view SQL requires exactly one primary key column");
+    };
+    let key_column = input
+        .relation
+        .columns
+        .iter()
+        .find(|column| &column.name == key_column_id)
+        .ok_or_else(|| ViewPlanError::UnsupportedShape {
+            reason: "published view primary key column is missing".to_string(),
+        })?;
+    let query = parse_single_query(sql)?;
+    let select = match query.body.as_ref() {
+        sqlparser::ast::SetExpr::Select(select) => select.as_ref(),
+        _ => return unsupported("published view SQL requires a plain SELECT"),
+    };
+    let mut columns = vec![ColumnSchema {
+        name: key_column.name.clone(),
+        data_type: key_column.data_type.clone(),
+        nullable: false,
+    }];
+    let mut primary_key = vec![key_column.name.clone()];
+    for item in select.projection.iter().skip(1) {
+        let (expr, alias) = match item {
+            SelectItem::UnnamedExpr(expr) => (expr, None),
+            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.as_str())),
+            _ => {
+                return unsupported(
+                    "published view aggregate projections must be scalar expressions",
+                )
+            }
+        };
+        let Expr::Function(function) = expr else {
+            return unsupported("published view aggregate projections must be aggregate functions");
+        };
+        let function_name = single_object_name_identifier(&function.name).ok_or_else(|| {
+            ViewPlanError::UnsupportedShape {
+                reason: "published view aggregate function name is not recognized".to_string(),
+            }
+        })?;
+        let output_name = alias.unwrap_or(function_name.as_str()).to_string();
+        let upper = function_name.to_ascii_uppercase();
+        let data_type = match upper.as_str() {
+            "SUM" => SqlDataType::Int64,
+            "COUNT" => SqlDataType::Int64,
+            _ => {
+                return unsupported(
+                    "published view aggregate only supports SUM and COUNT in this slice",
+                );
+            }
+        };
+        columns.push(ColumnSchema {
+            name: output_name,
+            data_type,
+            nullable: false,
+        });
+    }
+    if columns.len() == 1 {
+        return unsupported("published view SQL requires at least one aggregate projection");
+    }
+    let relation = RelationSchema {
+        relation_id: format!("{view_id}_output"),
+        relation_name: format!("{view_id}_output"),
+        relation_version: "v1".to_string(),
+        schema_fingerprint: format!("sha256:{}", "0".repeat(64)),
+        columns,
+        primary_key,
+    };
+    Ok(relation)
 }
 
 pub fn lower_supported_semi_anti_join_sql_to_logical_plan(
