@@ -560,6 +560,27 @@ Oracle runtime-execution review (2026-08-11) decided the input-boundary shape:
   variant. View cursors persist in the same checkpoint, never masquerading as
   Source `RelationFrontier`s.
 
+Oracle create_view output-schema review (2026-08-11) decided:
+
+- **Use option 1**: a planner-owned common inference helper
+  `infer_single_key_sum_count_output_schema(sql, input: &PlannerRelationInput,
+  output) -> RelationSchema` that derives group-key, SUM, COUNT output
+  column ids/names/types, SQL projection order and aliases, and schema
+  fingerprint. It must NOT be published-view-specific; extract the existing
+  catalog-based single-key inference so both paths share one function.
+- **Do NOT use client-provided output schema as authority** (option 2). The
+  server must infer it anyway to validate. **Do NOT introduce
+  plan-returns-schema (option 3)** in this slice.
+- The single inferred `output_schema` instance must be reused identically for
+  the logical plan, `ViewSpec`, `PublishedRelationBindingV1`, runtime factory,
+  and create response.
+- **`view_spec_from_request` takes `&[ResolvedAdmissionInput]`** (slice), and
+  `resolved_input_relation_schema(input)` picks `catalog_input_relation_schema`
+  for Source and the verified `PublishedRelationBindingV1.relation` for View.
+  Never fabricate a `VelorixRelationCatalogV1` or fill missing physical fields.
+- Slice boundary: exactly one resolved view input and supported single-key
+  SUM/COUNT; other view-input SQL families stay fail-closed.
+
 1. **Three-level exit gate test**
    - File: `crates/velorix-api/src/tests.rs`
    - Action: Add `rest_three_level_filter_aggregate_topk_chain_exact`
