@@ -7899,6 +7899,34 @@ fn aggregate_value_mode_for_column_id(
     }
 }
 
+/// Aggregate value mode for a published-view input schema column.
+///
+/// The published path has no physical catalog, so the value mode is derived
+/// from the persisted `RelationSchema` column's `SqlDataType`. Only Int64 and
+/// Decimal128 (the aggregate-key-capable types) are admitted; anything else
+/// fails closed.
+fn aggregate_value_mode_for_published_schema(
+    input_schema: &RelationSchema,
+    column_id: &str,
+) -> Result<AggregateValueMode, StandingProgramRuntimeError> {
+    let column = input_schema
+        .columns
+        .iter()
+        .find(|column| column.name == column_id)
+        .ok_or_else(|| StandingProgramRuntimeError::InvalidProgramIdentity {
+            field: "published_view.value_column",
+        })?;
+    match column.data_type {
+        SqlDataType::Int64 => Ok(AggregateValueMode::Integer),
+        SqlDataType::Decimal { precision, scale } => {
+            Ok(AggregateValueMode::Decimal128 { precision, scale })
+        }
+        _ => Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+            field: "published_view.value_column",
+        }),
+    }
+}
+
 fn aggregate_sum_sql_type_for_column_id(
     catalog: &VelorixRelationCatalogV1,
     column_id: &str,

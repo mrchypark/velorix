@@ -128,6 +128,64 @@ impl SingleKeySumCountRuntime {
         )
     }
 
+    /// Create a runtime bound to a published view output input.
+    ///
+    /// This path has no physical catalog. The plan is re-validated through the
+    /// published single-key sum/count lowerer, and the aggregate value mode is
+    /// derived from the persisted input schema instead of a catalog.
+    pub fn new_with_logical_plan_for_published_view(
+        identity: StandingProgramIdentity,
+        binding: PublishedRelationBindingV1,
+        input_schema: RelationSchema,
+        output_schema: RelationSchema,
+        view_sql: String,
+        plan: SupportedViewPlan,
+        logical_plan: VelorixLogicalViewPlanV1,
+    ) -> Result<Self, StandingProgramRuntimeError> {
+        identity.validate()?;
+        validate_builtin_runtime_identity(&identity)?;
+        validate_view_sql_hash(&identity, view_sql.as_str())?;
+        validate_logical_view_plan(&logical_plan).map_err(|_| {
+            StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "logical_view_plan",
+            }
+        })?;
+        if binding.relation.schema_fingerprint != input_schema.schema_fingerprint {
+            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "published_view_input_schema",
+            });
+        }
+        let primary_key_column_id = plan.group_key_column_id.clone();
+        let input = SingleKeyRuntimeInputV1::PublishedView {
+            binding,
+            primary_key_column_id,
+        };
+        let value_mode =
+            aggregate_value_mode_for_published_schema(&input_schema, &plan.sum_value_column_id)?;
+        let track_extrema = plan_tracks_extrema(&plan);
+        let filtered_aggregate_state = DeltaBatch::default();
+        let published_output = publish_aggregate_state(&filtered_aggregate_state, &plan)?;
+        Ok(Self {
+            identity,
+            input,
+            input_schema,
+            output_schema,
+            view_sql,
+            plan,
+            logical_plan,
+            engine: KeyedAggregateKernel::with_aggregate_value_mode_and_extrema(
+                value_mode,
+                track_extrema,
+            ),
+            published_output,
+            filtered_aggregate_state,
+            input_frontiers: Vec::new(),
+            input_event_time_frontiers: Vec::new(),
+            view_input_cursors: Vec::new(),
+            applied_epochs: BTreeMap::new(),
+        })
+    }
+
     pub fn new_with_logical_plan(
         identity: StandingProgramIdentity,
         catalog: VelorixRelationCatalogV1,
