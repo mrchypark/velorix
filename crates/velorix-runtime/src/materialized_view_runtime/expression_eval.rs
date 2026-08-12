@@ -467,21 +467,12 @@ fn civil_from_days(days: i64) -> Result<(i64, i64, i64), ExpressionEvaluationErr
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = mp + if mp < 10 { 3 } else { -9 };
     let year = year + if month <= 2 { 1 } else { 0 };
-    if year < 1 || year > 9999 {
+    if !(1..=9999).contains(&year) {
         return Err(ExpressionEvaluationError::Failed(format!(
             "timestamp year {year} is outside the supported 1..=9999 range"
         )));
     }
     Ok((year, month, day))
-}
-
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let year = year - if month <= 2 { 1 } else { 0 };
-    let era = year.div_euclid(400);
-    let yoe = year.rem_euclid(400);
-    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
 }
 
 fn date_trunc(

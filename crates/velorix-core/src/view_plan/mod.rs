@@ -15555,7 +15555,7 @@ fn typed_expr_node_from_expr(
                 let FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr)) = argument else {
                     return unsupported("typed functions only accept expression arguments");
                 };
-                let Some(node) = typed_expr_node_from_expr(&arg_expr, catalog, relation_alias)?
+                let Some(node) = typed_expr_node_from_expr(arg_expr, catalog, relation_alias)?
                 else {
                     return unsupported(
                         "typed function arguments must be columns, literals, or typed functions",
@@ -15579,7 +15579,6 @@ fn typed_expr_node_from_expr(
             // surface owns on the right side (timestamp/date arithmetic).
             // Everything else is either a float-typed arithmetic pair or
             // legacy Int64 arithmetic.
-            let mut arg_nodes: Vec<TypedExprNodeV1> = Vec::new();
             let mut interval_left = None;
             let mut interval_right = None;
             for (index, arg_expr) in [&**left, &**right].into_iter().enumerate() {
@@ -15686,7 +15685,7 @@ fn typed_expr_node_from_expr(
                     "EXTRACT argument must be a column, literal, or typed function",
                 );
             };
-            let result_type = typed_call_result_type(function, &[node.clone()])?;
+            let result_type = typed_call_result_type(function, std::slice::from_ref(&node))?;
             Ok(Some(TypedExprNodeV1 {
                 result_type,
                 nullable: node.nullable,

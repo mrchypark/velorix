@@ -72,7 +72,7 @@ use velorix_core::{
         SupportedProjectionBinaryOp, SupportedProjectionExpr, SupportedSemiAntiJoinKindV1,
         SupportedSemiAntiJoinProjectPlanV1, SupportedThreeInputInnerJoinCountPlanV1,
         SupportedTopKPlan, SupportedTumblingWindowPlan, SupportedViewPlan, TypedExprKindV1,
-        TypedExprNodeV1, TypedExprProgramV1, TypedProjectionColumn, VelorixLogicalViewExecutionV1,
+        TypedExprNodeV1, TypedExprProgramV1, VelorixLogicalViewExecutionV1,
         VelorixLogicalViewPlanV1, COMPOSITE_PK_POSITIONAL_JSON_ARRAY_JOIN_KEY_CODEC_V1,
         LEFT_JOIN_INPUT_INSTANCE_ID_V1, RIGHT_JOIN_INPUT_INSTANCE_ID_V1,
         THREE_INPUT_LEGACY_SQL_ENCOUNTER_JOIN_ORDER_V1,
@@ -5229,7 +5229,7 @@ fn typed_result_sql_data_type(
         RuntimeScalarTypeV1::Int64 => SqlDataType::Int64,
         RuntimeScalarTypeV1::Float64 => SqlDataType::Float64,
         RuntimeScalarTypeV1::Decimal128 { precision, scale } => SqlDataType::Decimal {
-            precision: u8::try_from(precision).map_err(|_| invalid_runtime_state())?,
+            precision,
             scale: u8::try_from(scale.max(0)).map_err(|_| invalid_runtime_state())?,
         },
         RuntimeScalarTypeV1::Utf8 => SqlDataType::Utf8,
