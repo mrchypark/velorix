@@ -11297,7 +11297,7 @@ fn runtime_materializes_two_relation_join_projected_aliases() {
                 },
             ],
         )
-        .unwrap();
+        .unwrap_or_else(|error| panic!("[SCALAR-APPLY1] {error}"));
 
     let page = runtime
         .materialized_view_page(
@@ -19838,4 +19838,186 @@ fn decimal_events_batch(rows: &[(&str, i64, i64)]) -> RecordBatch {
         ],
     )
     .unwrap()
+}
+
+#[test]
+fn scalar_aggregate_filter_materializes_and_restores() {
+    let scores = scores_catalog();
+    let accounts = accounts_catalog();
+    let catalogs = vec![scores.clone(), accounts.clone()];
+    let input_schemas = catalogs
+        .iter()
+        .map(|catalog| catalog_input_relation_schema(catalog).unwrap())
+        .collect::<Vec<_>>();
+    let output = scores_projection_output_schema();
+    let sql = "select s.user_id, s.score from scores s where s.score > (select avg(a.limit) from accounts a)";
+    let identity = standing_identity_with_view(sql, "positive_scores");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &catalogs,
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("epoch-1").unwrap(),
+            vec![
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
+                    relation_id: scores.relation_schema.relation_id.clone(),
+                    relation_version: scores.relation_schema.relation_version.clone(),
+                    stream_id: "scores-stream".to_string(),
+                    partition_id: 0,
+                    schema_fingerprint: scores.schema_fingerprint.to_string(),
+                    start_offset_inclusive: 0,
+                    end_offset_exclusive: 3,
+                    event_time_watermark: None,
+                    batches: vec![scores_rows_batch(&[
+                        ("alice", 10, 1),
+                        ("bob", 20, 1),
+                        ("carol", 30, 1),
+                    ])],
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
+                    relation_id: accounts.relation_schema.relation_id.clone(),
+                    relation_version: accounts.relation_schema.relation_version.clone(),
+                    stream_id: "accounts-stream".to_string(),
+                    partition_id: 0,
+                    schema_fingerprint: accounts.schema_fingerprint.to_string(),
+                    start_offset_inclusive: 0,
+                    end_offset_exclusive: 2,
+                    event_time_watermark: None,
+                    batches: vec![accounts_rows_batch(&[
+                        ("a1", 10, "gold", 1),
+                        ("a2", 30, "silver", 1),
+                    ])],
+                },
+            ],
+        )
+        .unwrap();
+
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "positive_scores".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(1),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let user_ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mut users = (0..batch.num_rows())
+        .map(|index| user_ids.value(index).to_string())
+        .collect::<Vec<_>>();
+    users.sort();
+    // avg(limit) = 20; score > 20 -> carol only.
+    assert_eq!(users, vec!["carol".to_string()]);
+
+    // Scalar changes to 40: bob and carol now pass.
+    runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("epoch-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: accounts.relation_schema.relation_id.clone(),
+                relation_version: accounts.relation_schema.relation_version.clone(),
+                stream_id: "accounts-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: accounts.schema_fingerprint.to_string(),
+                start_offset_inclusive: 2,
+                end_offset_exclusive: 3,
+                event_time_watermark: None,
+                batches: vec![accounts_rows_batch(&[("a3", 80, "gold", 1)])],
+            }],
+        )
+        .unwrap();
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "positive_scores".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(2),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let user_ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mut users = (0..batch.num_rows())
+        .map(|index| user_ids.value(index).to_string())
+        .collect::<Vec<_>>();
+    users.sort();
+    // avg now 40; no score exceeds 40.
+    assert!(users.is_empty(), "no score exceeds avg 40: {users:?}");
+
+    // Restart: checkpoint then restore, verify state and continued updates.
+    let checkpoint = runtime.checkpoint().unwrap();
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    restored
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("epoch-3").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: scores.relation_schema.relation_id.clone(),
+                relation_version: scores.relation_schema.relation_version.clone(),
+                stream_id: "scores-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: scores.schema_fingerprint.to_string(),
+                start_offset_inclusive: 3,
+                end_offset_exclusive: 4,
+                event_time_watermark: None,
+                batches: vec![scores_rows_batch(&[("dave", 50, 1)])],
+            }],
+        )
+        .unwrap();
+    let page = restored
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "positive_scores".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(3),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let user_ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mut users = (0..batch.num_rows())
+        .map(|index| user_ids.value(index).to_string())
+        .collect::<Vec<_>>();
+    users.sort();
+    assert_eq!(users, vec!["dave".to_string()]);
 }

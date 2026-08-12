@@ -438,7 +438,8 @@ pub(super) fn validate_public_runtime_plan_admission(
             ))
         }
         VelorixLogicalViewExecutionV1::AnalyticRowNumber { .. }
-        | VelorixLogicalViewExecutionV1::TumblingEventTimeAggregate { .. } => Ok(()),
+        | VelorixLogicalViewExecutionV1::TumblingEventTimeAggregate { .. }
+        | VelorixLogicalViewExecutionV1::ScalarAggregateFilter { .. } => Ok(()),
         VelorixLogicalViewExecutionV1::SingleKeySumCount { plan } => {
             validate_public_top_k_limit(plan.top_k.as_ref())
         }

@@ -472,6 +472,50 @@ pub enum VelorixLogicalViewExecutionV1 {
     TumblingEventTimeAggregate {
         plan: SupportedTumblingWindowPlan,
     },
+    /// Phase 7.2: `WHERE outer_col <op> (SELECT <agg>(col) FROM inner)`
+    /// for an uncorrelated scalar aggregate subquery over the second
+    /// relation. The scalar is recomputed per epoch from the inner
+    /// aggregate state and the outer predicate is evaluated against it;
+    /// when the scalar changes the full outer bag is re-evaluated.
+    ScalarAggregateFilter {
+        plan: Box<SupportedScalarAggregateFilterPlanV1>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupportedScalarAggregateFilterPlanV1 {
+    pub schema_version: u32,
+    pub outer_input_relation_id: String,
+    pub scalar_input_relation_id: String,
+    pub outer_key_column_id: String,
+    /// The scalar aggregate over the inner relation (no GROUP BY).
+    pub scalar_aggregate: SupportedAggregateOutput,
+    /// The outer comparison: outer column op scalar-slot.
+    pub outer_comparison_column_id: String,
+    pub comparison_op: ScalarSubqueryComparisonOp,
+    /// Public output projection over the outer relation.
+    pub projection: SupportedFilterProjectPlan,
+    pub resource_contract: ScalarAggregateResourceContractV1,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScalarSubqueryComparisonOp {
+    Eq,
+    NotEq,
+    Gt,
+    GtEq,
+    Lt,
+    LtEq,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScalarAggregateResourceContractV1 {
+    pub max_outer_rows: u64,
+    pub max_recomputed_rows_per_epoch: u64,
+    pub max_output_delta_rows: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1290,17 +1334,31 @@ pub fn lower_supported_sql_to_logical_plan(
             }
             Err(error) => Err(error),
         },
-        [_, _] => match lower_supported_semi_anti_join_sql_to_logical_plan(
-            sql,
-            catalogs,
-            output_schema,
-        ) {
-            Ok(plan) => Ok(plan),
-            Err(ViewPlanError::UnsupportedShape { .. }) => {
-                lower_supported_join_view_sql_to_logical_plan(sql, catalogs, output_schema)
+        [_, _] => {
+            match lower_supported_scalar_aggregate_filter_sql_to_logical_plan(
+                sql,
+                catalogs,
+                output_schema,
+            ) {
+                Ok(plan) => Ok(plan),
+                Err(ViewPlanError::UnsupportedShape { .. }) => {
+                    match lower_supported_semi_anti_join_sql_to_logical_plan(
+                        sql,
+                        catalogs,
+                        output_schema,
+                    ) {
+                        Ok(plan) => Ok(plan),
+                        Err(ViewPlanError::UnsupportedShape { .. }) => {
+                            lower_supported_join_view_sql_to_logical_plan(
+                                sql, catalogs, output_schema,
+                            )
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                Err(error) => Err(error),
             }
-            Err(error) => Err(error),
-        },
+        }
         [_, _, _] => {
             lower_supported_three_input_inner_join_count_sql_to_logical_plan(
                 sql,
@@ -3006,6 +3064,9 @@ fn derive_execution_implementation(
             SupportedSemiAntiJoinKindV1::Semi => "velorix-native-semi-join-project-dag-v1",
             SupportedSemiAntiJoinKindV1::Anti => "velorix-native-anti-join-project-dag-v1",
         },
+        VelorixLogicalViewExecutionV1::ScalarAggregateFilter { .. } => {
+            "velorix-scalar-aggregate-filter-specialization-v1"
+        }
     };
     let physical_bytes = serde_json::to_vec(&(
         &plan.nodes,
@@ -16244,4 +16305,325 @@ fn decorrelated_in_subquery_select(
         format_clause: None,
         pipe_operators: Vec::new(),
     })))
+}
+
+/// Phase 7.2: validates `WHERE outer_col <op> (SELECT <agg>(col) FROM inner)`
+/// for an uncorrelated scalar aggregate subquery over the second relation.
+/// MVP scope: exactly one comparison forming the whole outer WHERE, a
+/// direct outer column probe, one global aggregate (SUM/COUNT/MIN/MAX/AVG,
+/// or COUNT(*)) over the inner relation with no filters, and a
+/// filter/project outer projection.
+pub fn validate_supported_scalar_aggregate_filter_sql(
+    sql: &str,
+    catalogs: &[VelorixRelationCatalogV1],
+) -> Result<SupportedScalarAggregateFilterPlanV1, ViewPlanError> {
+    let [outer_catalog, scalar_catalog] = catalogs else {
+        return unsupported("scalar aggregate filter SQL requires exactly two input relations");
+    };
+    for catalog in catalogs {
+        catalog.validate()?;
+        let adapter = crate::relation::supported_incremental_adapter_spec(
+            &catalog.incremental_adapter.adapter_id,
+        )
+        .ok_or(RelationSchemaError::InvalidRelationSchema {
+            field: "incremental_adapter.adapter_id",
+        })?;
+        if !matches!(
+            adapter,
+            SupportedIncrementalAdapterSpec::ScalarSumCount
+                | SupportedIncrementalAdapterSpec::Generic
+        ) {
+            return unsupported("scalar aggregate filter SQL requires scalar or generic inputs");
+        }
+    }
+    let query = parse_single_query(sql)?;
+    validate_query_level_clauses(&query, false)?;
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return unsupported("scalar aggregate filter requires a single SELECT");
+    };
+    validate_plain_select_clauses(select)?;
+    if select.distinct.is_some() || !group_by_is_empty(&select.group_by) || select.having.is_some()
+    {
+        return unsupported("scalar aggregate filter does not support DISTINCT or GROUP BY");
+    }
+    let [outer_from] = select.from.as_slice() else {
+        return unsupported("scalar aggregate filter outer query requires one relation");
+    };
+    if !outer_from.joins.is_empty() {
+        return unsupported("scalar aggregate filter outer query must not contain a JOIN");
+    }
+    let outer_table = registered_table_ref(&outer_from.relation, "outer")?;
+    if outer_table.name != outer_catalog.relation_schema.relation_id {
+        return unsupported(
+            "scalar aggregate filter outer query must reference the first registered relation",
+        );
+    }
+    let outer_alias = Some(outer_table.alias.as_str());
+    let Some(Expr::BinaryOp { left, op, right }) = select.selection.as_ref() else {
+        return unsupported(
+            "scalar aggregate filter requires one comparison predicate over a scalar subquery",
+        );
+    };
+    let comparison_op = match op {
+        BinaryOperator::Eq => ScalarSubqueryComparisonOp::Eq,
+        BinaryOperator::NotEq => ScalarSubqueryComparisonOp::NotEq,
+        BinaryOperator::Gt => ScalarSubqueryComparisonOp::Gt,
+        BinaryOperator::GtEq => ScalarSubqueryComparisonOp::GtEq,
+        BinaryOperator::Lt => ScalarSubqueryComparisonOp::Lt,
+        BinaryOperator::LtEq => ScalarSubqueryComparisonOp::LtEq,
+        _ => return unsupported("scalar aggregate filter comparison operator is not supported"),
+    };
+    let outer_ref = qualified_column_ref(left)?;
+    let outer_column = qualified_ref_catalog_column(&outer_ref, outer_catalog)?;
+    if outer_column.column_id == outer_catalog.relation_schema.weight_column_id {
+        return unsupported("scalar aggregate filter must not compare the weight column");
+    }
+    let Expr::Subquery(scalar_subquery) = right.as_ref() else {
+        return unsupported("scalar aggregate filter requires a scalar subquery on the right side");
+    };
+    validate_query_level_clauses(scalar_subquery, false)?;
+    let SetExpr::Select(inner_select) = scalar_subquery.body.as_ref() else {
+        return unsupported("scalar subquery requires a single SELECT");
+    };
+    validate_plain_select_clauses(inner_select)?;
+    if inner_select.distinct.is_some()
+        || !group_by_is_empty(&inner_select.group_by)
+        || inner_select.having.is_some()
+        || inner_select.selection.is_some()
+    {
+        return unsupported(
+            "scalar subquery does not support DISTINCT, GROUP BY, HAVING, WHERE, or LIMIT",
+        );
+    }
+    let [inner_from] = inner_select.from.as_slice() else {
+        return unsupported("scalar subquery requires one relation");
+    };
+    let inner_table = registered_table_ref(&inner_from.relation, "inner")?;
+    if inner_table.name != scalar_catalog.relation_schema.relation_id {
+        return unsupported("scalar subquery must reference the second registered relation");
+    }
+    let inner_alias = Some(inner_table.alias.as_str());
+    let [SelectItem::UnnamedExpr(Expr::Function(Function { name, args, .. }))] =
+        inner_select.projection.as_slice()
+    else {
+        return unsupported("scalar subquery must project exactly one aggregate call");
+    };
+    let function_name = name.to_string();
+    let scalar_aggregate = scalar_subquery_aggregate_output(
+        function_name.as_str(),
+        args,
+        scalar_catalog,
+        inner_alias,
+    )?;
+    let key_column = catalog_primary_key_column(outer_catalog)?;
+    let projection = validate_filter_project_projection(
+        &select.clone(),
+        outer_catalog,
+        key_column,
+        outer_alias,
+        None,
+    )?;
+    if projection.value_columns.is_empty() {
+        return unsupported(
+            "scalar aggregate filter materialized output requires at least one value column",
+        );
+    }
+    Ok(SupportedScalarAggregateFilterPlanV1 {
+        schema_version: 1,
+        outer_input_relation_id: outer_catalog.relation_schema.relation_id.clone(),
+        scalar_input_relation_id: scalar_catalog.relation_schema.relation_id.clone(),
+        outer_key_column_id: key_column.column_id.clone(),
+        scalar_aggregate,
+        outer_comparison_column_id: outer_column.column_id.clone(),
+        comparison_op,
+        projection: SupportedFilterProjectPlan {
+            typed_value_columns: Vec::new(),
+            input_relation_id: outer_catalog.relation_schema.relation_id.clone(),
+            key_column_id: key_column.column_id.clone(),
+            output_key_column_id: projection.output_key_column_id,
+            output_key_input_column_id: projection.output_key_input_column_id,
+            value_columns: projection
+                .value_columns
+                .into_iter()
+                .map(|column| SupportedProjectionColumn {
+                    input_column_id: column.input_column_id,
+                    output_column_id: column.output_column_id,
+                    expression: column.expression,
+                })
+                .collect(),
+            predicate_expr: None,
+            top_k: None,
+        },
+        resource_contract: ScalarAggregateResourceContractV1 {
+            max_outer_rows: 1_000_000,
+            max_recomputed_rows_per_epoch: 1_000_000,
+            max_output_delta_rows: 1_000_000,
+        },
+    })
+}
+
+fn scalar_subquery_aggregate_output(
+    function_name: &str,
+    args: &FunctionArguments,
+    catalog: &VelorixRelationCatalogV1,
+    _inner_alias: Option<&str>,
+) -> Result<SupportedAggregateOutput, ViewPlanError> {
+    let FunctionArguments::List(argument_list) = args else {
+        return unsupported("scalar subquery aggregate requires a normal argument list");
+    };
+    let aggregate = match function_name.to_ascii_lowercase().as_str() {
+        "count" if argument_list.args.is_empty() => SupportedAggregateOutput {
+            function: LogicalPlanAggregateFunctionV1::Count,
+            input_column_id: None,
+            input_relation_side: None,
+            input_expression: None,
+            output_column_id: "count".to_string(),
+        },
+        "count" => {
+            let [FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))] = argument_list.args.as_slice()
+            else {
+                return unsupported("COUNT requires one column argument");
+            };
+            let inner_ref = qualified_column_ref(expr)?;
+            let column = qualified_ref_catalog_column(&inner_ref, catalog)?;
+            SupportedAggregateOutput {
+                function: LogicalPlanAggregateFunctionV1::Count,
+                input_column_id: Some(column.column_id.clone()),
+                input_relation_side: None,
+                input_expression: None,
+                output_column_id: "count".to_string(),
+            }
+        }
+        name @ ("sum" | "min" | "max" | "avg") => {
+            let [FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))] = argument_list.args.as_slice()
+            else {
+                return unsupported(format!("{name} requires one column argument"));
+            };
+            let inner_ref = qualified_column_ref(expr)?;
+            let column = qualified_ref_catalog_column(&inner_ref, catalog)?;
+            let function = match name {
+                "sum" => LogicalPlanAggregateFunctionV1::Sum,
+                "min" => LogicalPlanAggregateFunctionV1::Min,
+                "max" => LogicalPlanAggregateFunctionV1::Max,
+                "avg" => LogicalPlanAggregateFunctionV1::Avg,
+                _ => unreachable!(),
+            };
+            match function {
+                LogicalPlanAggregateFunctionV1::Sum | LogicalPlanAggregateFunctionV1::Avg => {
+                    validate_numeric_sum_column(catalog, column)?;
+                }
+                _ => {}
+            }
+            SupportedAggregateOutput {
+                function,
+                input_column_id: Some(column.column_id.clone()),
+                input_relation_side: None,
+                input_expression: None,
+                output_column_id: name.to_string(),
+            }
+        }
+        other => {
+            return unsupported(format!(
+                "scalar subquery aggregate `{other}` is not supported"
+            ))
+        }
+    };
+    Ok(aggregate)
+}
+
+pub fn lower_supported_scalar_aggregate_filter_sql_to_logical_plan(
+    sql: &str,
+    catalogs: &[VelorixRelationCatalogV1],
+    output_schema: &RelationSchema,
+) -> Result<VelorixLogicalViewPlanV1, ViewPlanError> {
+    let supported = validate_supported_scalar_aggregate_filter_sql(sql, catalogs)?;
+    finalize_logical_plan(scalar_aggregate_filter_logical_plan(
+        sql,
+        catalogs,
+        output_schema,
+        supported,
+    )?)
+}
+
+fn scalar_aggregate_filter_logical_plan(
+    sql: &str,
+    catalogs: &[VelorixRelationCatalogV1],
+    output_schema: &RelationSchema,
+    supported: SupportedScalarAggregateFilterPlanV1,
+) -> Result<VelorixLogicalViewPlanV1, ViewPlanError> {
+    let outer_catalog =
+        catalog_for_relation_in_slice(catalogs, &supported.outer_input_relation_id)?;
+    let output_relation = logical_relation_from_schema(output_schema);
+    let outer_scan = logical_relation_from_catalog(outer_catalog);
+    let outer_key = column_ref(
+        &supported.outer_input_relation_id,
+        &supported.outer_key_column_id,
+    );
+    let outer_comparison = column_ref(
+        &supported.outer_input_relation_id,
+        &supported.outer_comparison_column_id,
+    );
+    let filter_node_id = "scalar_aggregate_filter".to_string();
+    let project_node_id = "scalar_aggregate_project".to_string();
+    let nodes = vec![
+        VelorixLogicalViewPlanNodeV1::RelationScan {
+            node_id: "outer_relation_scan".to_string(),
+            relation: outer_scan,
+        },
+        VelorixLogicalViewPlanNodeV1::Filter {
+            node_id: filter_node_id.clone(),
+            input: "outer_relation_scan".to_string(),
+            predicate: LogicalPlanPredicateV1 {
+                column: outer_comparison,
+                op: PredicateOp::Gt,
+                literal: JsonValue::Null,
+            },
+        },
+        VelorixLogicalViewPlanNodeV1::Project {
+            node_id: project_node_id.clone(),
+            input: filter_node_id,
+            columns: vec![
+                outer_key,
+                column_ref(&supported.outer_input_relation_id, "score"),
+            ],
+            computed_columns: Vec::new(),
+        },
+        VelorixLogicalViewPlanNodeV1::Output {
+            node_id: "output_materialized_view".to_string(),
+            input: project_node_id,
+            relation: output_relation.clone(),
+        },
+    ];
+    let mut plan = VelorixLogicalViewPlanV1 {
+        plan_version: LOGICAL_VIEW_PLAN_VERSION_V2,
+        plan_hash: None,
+        view_sql: sql.to_string(),
+        capability_version: LOGICAL_VIEW_PLAN_CAPABILITY_VERSION_V2.to_string(),
+        key_semantics_version: INCREMENTAL_KEY_SEMANTICS_VERSION_V1.to_string(),
+        bag_semantics_version: INCREMENTAL_BAG_SEMANTICS_VERSION_V1.to_string(),
+        input_relations: catalogs.iter().map(logical_relation_from_catalog).collect(),
+        output_relation,
+        nodes,
+        operator_dag_contract: empty_operator_dag_contract(),
+        state_requirements: Vec::new(),
+        output_codec_version: LOGICAL_VIEW_OUTPUT_CODEC_VERSION_V1.to_string(),
+        execution_implementation: None,
+        execution: VelorixLogicalViewExecutionV1::ScalarAggregateFilter {
+            plan: Box::new(supported),
+        },
+    };
+    plan.execution_implementation = Some(derive_execution_implementation(&plan)?);
+    Ok(plan)
+}
+
+fn catalog_for_relation_in_slice<'a>(
+    catalogs: &'a [VelorixRelationCatalogV1],
+    relation_id: &str,
+) -> Result<&'a VelorixRelationCatalogV1, ViewPlanError> {
+    catalogs
+        .iter()
+        .find(|catalog| catalog.relation_schema.relation_id == relation_id)
+        .ok_or_else(|| ViewPlanError::UnsupportedShape {
+            reason: "scalar aggregate filter input catalog is missing".to_string(),
+        })
 }

@@ -4,6 +4,7 @@ use std::{
 };
 
 use crate::materialized_view_runtime::expression_eval::{evaluate_typed_expr, RuntimeScalarValue};
+pub(crate) use crate::materialized_view_runtime::scalar_aggregate_filter::ScalarAggregateFilterRuntime as ScalarAggregateFilterRuntimeAlias;
 use arrow::{
     array::{Array, BooleanArray, Date32Array, Int64Array, StringArray, TimestampNanosecondArray},
     record_batch::RecordBatch,
@@ -61,21 +62,23 @@ use velorix_core::{
         supported_view_plan_is_singleton, validate_logical_view_plan,
         validate_supported_analytic_row_number_sql, validate_supported_filter_project_sql,
         validate_supported_join_view_sql, validate_supported_latest_by_key_sql,
-        validate_supported_semi_anti_join_sql, validate_supported_tumbling_window_sql_with_policy,
-        validate_supported_view_sql, AggregateOutputPredicate, AggregateOutputPredicateExpr,
-        JoinPredicateExpr, JoinRowPredicate, LateRowPolicy, LogicalPlanAggregateFunctionV1,
+        validate_supported_scalar_aggregate_filter_sql, validate_supported_semi_anti_join_sql,
+        validate_supported_tumbling_window_sql_with_policy, validate_supported_view_sql,
+        AggregateOutputPredicate, AggregateOutputPredicateExpr, JoinPredicateExpr,
+        JoinRowPredicate, LateRowPolicy, LogicalPlanAggregateFunctionV1,
         LogicalPlanExecutionImplementationV1, LogicalPlanLatestByKeyFunctionV1, PredicateOp,
-        RowPredicate, RowPredicateExpr, SupportedAggregateInputRelationSide,
-        SupportedAggregateOutput, SupportedAnalyticRowNumberPlan, SupportedAnalyticWindowFunction,
+        RowPredicate, RowPredicateExpr, ScalarAggregateResourceContractV1,
+        ScalarSubqueryComparisonOp, SupportedAggregateInputRelationSide, SupportedAggregateOutput,
+        SupportedAnalyticRowNumberPlan, SupportedAnalyticWindowFunction,
         SupportedEventTimeWindowKind, SupportedFilterProjectPlan, SupportedJoinKeyDomainV1,
         SupportedJoinKind, SupportedJoinViewPlan, SupportedLatestByKeyPlan,
-        SupportedProjectionBinaryOp, SupportedProjectionExpr, SupportedSemiAntiJoinKindV1,
-        SupportedSemiAntiJoinProjectPlanV1, SupportedThreeInputInnerJoinCountPlanV1,
-        SupportedTopKPlan, SupportedTumblingWindowPlan, SupportedViewPlan, TypedExprKindV1,
-        TypedExprNodeV1, TypedExprProgramV1, VelorixLogicalViewExecutionV1,
-        VelorixLogicalViewPlanV1, COMPOSITE_PK_POSITIONAL_JSON_ARRAY_JOIN_KEY_CODEC_V1,
-        LEFT_JOIN_INPUT_INSTANCE_ID_V1, RIGHT_JOIN_INPUT_INSTANCE_ID_V1,
-        THREE_INPUT_LEGACY_SQL_ENCOUNTER_JOIN_ORDER_V1,
+        SupportedProjectionBinaryOp, SupportedProjectionExpr, SupportedScalarAggregateFilterPlanV1,
+        SupportedSemiAntiJoinKindV1, SupportedSemiAntiJoinProjectPlanV1,
+        SupportedThreeInputInnerJoinCountPlanV1, SupportedTopKPlan, SupportedTumblingWindowPlan,
+        SupportedViewPlan, TypedExprKindV1, TypedExprNodeV1, TypedExprProgramV1,
+        VelorixLogicalViewExecutionV1, VelorixLogicalViewPlanV1,
+        COMPOSITE_PK_POSITIONAL_JSON_ARRAY_JOIN_KEY_CODEC_V1, LEFT_JOIN_INPUT_INSTANCE_ID_V1,
+        RIGHT_JOIN_INPUT_INSTANCE_ID_V1, THREE_INPUT_LEGACY_SQL_ENCOUNTER_JOIN_ORDER_V1,
         THREE_INPUT_ROOT_FIXED_RIGHT_RELATION_ID_JOIN_ORDER_V1,
     },
 };
@@ -89,6 +92,7 @@ pub mod expression_eval;
 mod filter_project;
 mod latest_by_key;
 mod output;
+mod scalar_aggregate_filter;
 mod semi_anti_join;
 mod single_key_aggregate;
 mod three_input_join;
@@ -289,6 +293,19 @@ pub fn create_standing_runtime_with_logical_plan_and_catalogs(
             .map(|runtime| Box::new(runtime) as Box<dyn StandingProgramRuntime + Send>)
             .map_err(|error| error.to_string())
         }
+        VelorixLogicalViewExecutionV1::ScalarAggregateFilter { plan } => {
+            ScalarAggregateFilterRuntimeAlias::new_with_logical_plan(
+                identity.clone(),
+                catalogs.to_vec(),
+                input_schemas.to_vec(),
+                output_schema.clone(),
+                logical_plan.view_sql.clone(),
+                *plan.clone(),
+                logical_plan,
+            )
+            .map(|runtime| Box::new(runtime) as Box<dyn StandingProgramRuntime + Send>)
+            .map_err(|error| error.to_string())
+        }
         VelorixLogicalViewExecutionV1::TumblingEventTimeAggregate { plan } => {
             let [catalog] = catalogs else {
                 return Err(
@@ -418,6 +435,11 @@ pub fn restore_standing_runtime(
     }
     if checkpoint_has_tumbling_window_payload(&checkpoint) {
         return TumblingEventTimeAggregateRuntime::restore(checkpoint)
+            .map(|runtime| Box::new(runtime) as Box<dyn StandingProgramRuntime + Send>)
+            .map_err(|error| error.to_string());
+    }
+    if checkpoint_has_scalar_aggregate_filter_payload(&checkpoint) {
+        return ScalarAggregateFilterRuntimeAlias::restore(checkpoint)
             .map(|runtime| Box::new(runtime) as Box<dyn StandingProgramRuntime + Send>)
             .map_err(|error| error.to_string());
     }
@@ -8746,6 +8768,18 @@ fn checkpoint_has_filter_project_payload(checkpoint: &RuntimeCheckpoint) -> bool
         })
         .as_deref()
         == Some(FILTER_PROJECT_RUNTIME_KIND)
+}
+
+fn checkpoint_has_scalar_aggregate_filter_payload(checkpoint: &RuntimeCheckpoint) -> bool {
+    matches!(
+        checkpoint
+            .state_payload
+            .as_ref()
+            .and_then(|payload| serde_json::from_str::<serde_json::Value>(&payload.payload).ok())
+            .and_then(|value| value.get("runtime_kind").cloned())
+            .and_then(|value| value.as_str().map(str::to_string)),
+        Some(kind) if kind == crate::materialized_view_runtime::scalar_aggregate_filter::SCALAR_AGGREGATE_FILTER_RUNTIME_KIND
+    )
 }
 
 fn checkpoint_has_tumbling_window_payload(checkpoint: &RuntimeCheckpoint) -> bool {
