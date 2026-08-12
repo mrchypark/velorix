@@ -336,11 +336,17 @@ test matrix for the unimplemented string/temporal/float expressions.
 - [ ] **Normalize derived tables with complex expressions**
 - [ ] **Validate CTE dependency ordering**
 
-**Current state**: Partially complete. Identity/filter/project CTEs plus
-Phase 7.4: correlated EXISTS/NOT EXISTS on identical non-null scalar columns
-(non-PK equality) admitted and materialized exactly with restart. Remaining:
-complex CTE normalization with aggregation, uncorrelated scalar subquery
-lowering, IN/NOT IN subquery decorrelation, query equivalence harness.
+**Current state**: **COMPLETE (2026-08-12).** 7.1 aggregate CTE inline
+(outer filters merge into inner WHERE/HAVING with slot-based aggregate
+rewrites, mixed OR / raw-column shapes fail closed); 7.2 uncorrelated
+scalar aggregate subqueries through the dedicated ScalarAggregateFilter
+execution family (atomic epoch application, per-value aggregate multiset,
+full re-evaluation on scalar change, resource contract, NULL=UNKNOWN
+semantics, restart restore); 7.3 IN/NOT IN subquery decorrelation to the
+semi/anti join family (WHERE-only context, nullable IN admitted, nullable
+NOT IN fail-closed until null-aware anti-join exists); 7.4 non-PK
+correlated EXISTS/NOT EXISTS. Remaining: 7.5 query equivalence harness
+(framework design documented; gated).
 
 ### 7.2 Uncorrelated Scalar Subqueries
 
