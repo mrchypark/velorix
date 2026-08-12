@@ -19533,3 +19533,208 @@ fn runtime_materializes_string_temporal_float_typed_projections_and_restores() {
         ]
     );
 }
+
+#[test]
+fn runtime_materializes_decimal_group_key_aggregate_and_restores() {
+    let catalog = decimal_key_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = decimal_key_output_schema();
+    let sql = "select k, sum(amount) as total from decimal_events group by k";
+    let identity = standing_identity_with_view(sql, "decimal_events_by_key");
+
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap_or_else(|error| panic!("[DEC-ERR] {error}"));
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("epoch-1").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "decimal-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 3,
+                event_time_watermark: None,
+                batches: vec![decimal_events_batch(&[
+                    ("1.25", 10, 1),
+                    ("2.50", 7, 1),
+                    ("1.25", -3, 1),
+                ])],
+            }],
+        )
+        .unwrap();
+
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "decimal_events_by_key".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(1),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let keys = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .unwrap();
+    let totals = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let mut rows = (0..batch.num_rows())
+        .map(|index| (keys.value(index), totals.value(index)))
+        .collect::<Vec<_>>();
+    rows.sort();
+    assert_eq!(rows, vec![(125_i128, 7_i64), (250_i128, 7_i64)]);
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("epoch-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "decimal-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 3,
+                end_offset_exclusive: 4,
+                event_time_watermark: None,
+                batches: vec![decimal_events_batch(&[("1.25", 5, 1)])],
+            }],
+        )
+        .unwrap();
+    let page = restored
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "decimal_events_by_key".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(2),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let keys = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .unwrap();
+    let totals = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let mut rows = (0..batch.num_rows())
+        .map(|index| (keys.value(index), totals.value(index)))
+        .collect::<Vec<_>>();
+    rows.sort();
+    assert_eq!(rows, vec![(125_i128, 12_i64), (250_i128, 7_i64)]);
+}
+
+fn decimal_key_catalog() -> VelorixRelationCatalogV1 {
+    let mut catalog = purchases_catalog_without_value_role();
+    catalog.relation_schema.relation_id = "decimal_events".to_string();
+    catalog.relation_schema.relation_name = "decimal_events".to_string();
+    let key = catalog
+        .relation_schema
+        .columns
+        .iter_mut()
+        .find(|column| column.column_id == "user_id")
+        .unwrap();
+    key.name = "k".to_string();
+    key.column_id = "k".to_string();
+    key.logical_type = VelorixLogicalTypeV1::Decimal {
+        precision: 10,
+        scale: 2,
+    };
+    key.physical_arrow_type = ArrowPhysicalTypeV1::Decimal128 {
+        precision: 10,
+        scale: 2,
+    };
+    catalog.relation_schema.primary_key_column_ids = vec!["k".to_string()];
+    catalog.relation_schema.event_time_column_id = None;
+    catalog.incremental_relation.relation_id = "decimal_events".to_string();
+
+    let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema)
+        .expect("decimal key schema should fingerprint");
+    catalog.schema_fingerprint = schema_fingerprint.clone();
+    catalog.incremental_relation.schema_fingerprint = schema_fingerprint;
+    catalog
+}
+
+fn decimal_key_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "decimal_events_by_key".to_string(),
+        relation_name: "decimal_events_by_key".to_string(),
+        relation_version: "2026-05-24.v1".to_string(),
+        schema_fingerprint: "decimal-key-v1".to_string(),
+        columns: vec![
+            ColumnSchema {
+                name: "k".to_string(),
+                data_type: SqlDataType::Decimal {
+                    precision: 10,
+                    scale: 2,
+                },
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "total".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["k".to_string()],
+    }
+}
+
+fn decimal_events_batch(rows: &[(&str, i64, i64)]) -> RecordBatch {
+    let keys = Decimal128Array::from_iter_values(
+        rows.iter()
+            .map(|(key, _, _)| key.replace('.', "").parse::<i128>().unwrap()),
+    )
+    .with_precision_and_scale(10, 2)
+    .unwrap();
+    RecordBatch::try_new(
+        Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("k", arrow::datatypes::DataType::Decimal128(10, 2), false),
+            arrow::datatypes::Field::new("amount", arrow::datatypes::DataType::Int64, false),
+            arrow::datatypes::Field::new("delta", arrow::datatypes::DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(keys) as _,
+            Arc::new(Int64Array::from(
+                rows.iter().map(|(_, v, _)| *v).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(Int64Array::from(
+                rows.iter().map(|(_, _, w)| *w).collect::<Vec<_>>(),
+            )) as _,
+        ],
+    )
+    .unwrap()
+}

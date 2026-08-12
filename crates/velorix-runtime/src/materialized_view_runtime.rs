@@ -1390,9 +1390,11 @@ fn single_key_input_delta_batch(
             &value_column_ids,
             &input.batches,
         )
-        .map_err(|_| StandingProgramRuntimeError::InvalidProgramIdentity {
-            field: "generic_input_batch",
-        });
+        .map_err(
+            |_error| StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "generic_input_batch",
+            },
+        );
     }
     if let Some(count_column_id) = single_key_count_distinct_input_column(plan) {
         return arrow_record_batches_to_key_value_delta_batch_skipping_null_values(
@@ -1472,9 +1474,11 @@ fn single_key_input_delta_batch(
         &plan.sum_value_column_id,
         &input.batches,
     )
-    .map_err(|_| StandingProgramRuntimeError::InvalidProgramIdentity {
-        field: "generic_input_batch",
-    })
+    .map_err(
+        |_error| StandingProgramRuntimeError::InvalidProgramIdentity {
+            field: "generic_input_batch",
+        },
+    )
 }
 
 fn aggregate_group_input_delta_batch(
