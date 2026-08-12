@@ -5740,6 +5740,42 @@ pub fn validate_supported_semi_anti_join_sql(
         return unsupported("semi/anti join V1 requires two distinct registered relations");
     }
 
+    // Phase 7.3: `WHERE x IN (SELECT y FROM r)` is decorrelated into the
+    // correlated EXISTS form `WHERE EXISTS (SELECT y FROM r WHERE r.y = x)`
+    // and reuses the semi/anti join machinery. Only the WHERE-only boolean
+    // context is admitted; IN inside SELECT/CASE/OR fails closed.
+    let mut in_form = false;
+    let mut in_negated = false;
+    let select = if let Some(Expr::InSubquery {
+        expr,
+        subquery,
+        negated,
+    }) = select.selection.as_ref()
+    {
+        if !matches!(
+            expr.as_ref(),
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_)
+        ) {
+            return unsupported(
+                "IN-subquery decorrelation requires a direct column probe expression",
+            );
+        }
+        let Some(inner_select) = decorrelated_in_subquery_select(expr, subquery)? else {
+            return unsupported(
+                "IN-subquery decorrelation requires a single-column subquery over one registered relation",
+            );
+        };
+        in_form = true;
+        in_negated = *negated;
+        let mut rewritten = (*select).clone();
+        rewritten.selection = Some(Expr::Exists {
+            subquery: inner_select,
+            negated: *negated,
+        });
+        rewritten
+    } else {
+        (*select).clone()
+    };
     let Some(Expr::Exists { subquery, negated }) = select.selection.as_ref() else {
         return unsupported(
             "semi/anti join V1 requires one correlated EXISTS or NOT EXISTS predicate",
@@ -5751,7 +5787,17 @@ pub fn validate_supported_semi_anti_join_sql(
     if inner.distinct.is_some() || !group_by_is_empty(&inner.group_by) {
         return unsupported("EXISTS/NOT EXISTS V1 subquery does not support DISTINCT or GROUP BY");
     }
-    if !matches!(
+    if in_form {
+        if !matches!(
+            inner.projection.as_slice(),
+            [SelectItem::UnnamedExpr(Expr::Identifier(_))
+                | SelectItem::UnnamedExpr(Expr::CompoundIdentifier(_))]
+        ) {
+            return unsupported(
+                "IN-subquery decorrelation requires exactly one inner column projection",
+            );
+        }
+    } else if !matches!(
         inner.projection.as_slice(),
         [SelectItem::UnnamedExpr(Expr::Value(value))]
             if !matches!(value.value, SqlValue::Null)
@@ -5787,9 +5833,12 @@ pub fn validate_supported_semi_anti_join_sql(
         orient_join_refs(left_ref, right_ref, &outer_table.alias, &inner_table.alias)?;
     let left_key = qualified_ref_catalog_column(&outer_ref, left_catalog)?;
     let right_key = qualified_ref_catalog_column(&inner_ref, right_catalog)?;
-    if left_key.nullable
-        || right_key.nullable
-        || !supported_scalar_join_key_atom(&left_key.physical_arrow_type)
+    if in_negated && (left_key.nullable || right_key.nullable) {
+        return unsupported(
+            "EXISTS/NOT EXISTS and NOT IN correlation must equate identical non-null scalar columns; nullable NOT IN is rejected until null-aware anti-join semantics exist",
+        );
+    }
+    if !supported_scalar_join_key_atom(&left_key.physical_arrow_type)
         || !supported_scalar_join_key_atom(&right_key.physical_arrow_type)
         || left_key.physical_arrow_type != right_key.physical_arrow_type
         || left_key.logical_type != right_key.logical_type
@@ -5801,7 +5850,7 @@ pub fn validate_supported_semi_anti_join_sql(
 
     let left_pk = catalog_primary_key_column(left_catalog)?;
     let projection = validate_filter_project_projection(
-        select,
+        &select,
         left_catalog,
         left_pk,
         Some(&outer_table.alias),
@@ -16130,4 +16179,69 @@ fn combine_and_exprs(left: Option<&Expr>, right: Option<Expr>) -> Option<Expr> {
             right: Box::new(right),
         }),
     }
+}
+
+/// Builds the decorrelated EXISTS subquery for `WHERE x IN (SELECT y FROM r)`:
+/// `EXISTS (SELECT y FROM r WHERE r.y = x)`. Returns `None` for unsupported
+/// subquery shapes (multi-column projections, joins, DISTINCT/GROUP BY,
+/// inner selections, set operations).
+fn decorrelated_in_subquery_select(
+    probe: &Expr,
+    subquery: &Query,
+) -> Result<Option<Box<Query>>, ViewPlanError> {
+    validate_query_level_clauses(subquery, false)?;
+    let SetExpr::Select(inner_select) = subquery.body.as_ref() else {
+        return Ok(None);
+    };
+    if inner_select.distinct.is_some() || !group_by_is_empty(&inner_select.group_by) {
+        return Ok(None);
+    }
+    let [SelectItem::UnnamedExpr(projected)] = inner_select.projection.as_slice() else {
+        return Ok(None);
+    };
+    let inner_column = match projected {
+        Expr::Identifier(inner_column) => inner_column.clone(),
+        Expr::CompoundIdentifier(parts) => match parts.last() {
+            Some(inner_column) => inner_column.clone(),
+            None => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    let [inner_from] = inner_select.from.as_slice() else {
+        return Ok(None);
+    };
+    if !inner_from.joins.is_empty() || inner_select.selection.is_some() {
+        return Ok(None);
+    }
+    let inner_alias = match &inner_from.relation {
+        TableFactor::Table { name, alias, .. } => alias
+            .as_ref()
+            .map(|alias| alias.name.value.clone())
+            .unwrap_or_else(|| name.to_string()),
+        _ => String::new(),
+    };
+    if inner_alias.is_empty() {
+        return Ok(None);
+    }
+    let inner_ref = Expr::CompoundIdentifier(vec![Ident::new(inner_alias), inner_column.clone()]);
+    let equality = Expr::BinaryOp {
+        left: Box::new(inner_ref),
+        op: BinaryOperator::Eq,
+        right: Box::new(probe.clone()),
+    };
+    let mut synthesized = (*inner_select).clone();
+    synthesized.projection = vec![SelectItem::UnnamedExpr(Expr::Identifier(inner_column))];
+    synthesized.selection = Some(equality);
+    Ok(Some(Box::new(Query {
+        with: None,
+        body: Box::new(SetExpr::Select(synthesized)),
+        order_by: None,
+        limit_clause: None,
+        fetch: None,
+        locks: Vec::new(),
+        for_clause: None,
+        settings: None,
+        format_clause: None,
+        pipe_operators: Vec::new(),
+    })))
 }

@@ -31,11 +31,12 @@ use velorix_core::{
         SupportedAggregateInputRelationSide, SupportedAggregateOutputIdentity,
         SupportedAnalyticWindowFunction, SupportedCompositeJoinEqualityV1,
         SupportedEventTimeWindowKind, SupportedJoinKeyDomainV1, SupportedJoinKeyPairV1,
-        SupportedJoinKind, SupportedProjectionExpr, VelorixLogicalViewExecutionV1,
-        VelorixLogicalViewPlanNodeV1, VelorixLogicalViewPlanV1, ViewPlanError,
-        COMPOSITE_PK_POSITIONAL_JSON_ARRAY_JOIN_KEY_CODEC_V1, INCREMENTAL_BAG_SEMANTICS_VERSION_V1,
-        INCREMENTAL_KEY_SEMANTICS_VERSION_V1, LEFT_JOIN_INPUT_INSTANCE_ID_V1,
-        LOGICAL_VIEW_PLAN_HASH_PREFIX, LOGICAL_VIEW_PLAN_VERSION_V1, LOGICAL_VIEW_PLAN_VERSION_V2,
+        SupportedJoinKind, SupportedProjectionExpr, SupportedSemiAntiJoinKindV1,
+        VelorixLogicalViewExecutionV1, VelorixLogicalViewPlanNodeV1, VelorixLogicalViewPlanV1,
+        ViewPlanError, COMPOSITE_PK_POSITIONAL_JSON_ARRAY_JOIN_KEY_CODEC_V1,
+        INCREMENTAL_BAG_SEMANTICS_VERSION_V1, INCREMENTAL_KEY_SEMANTICS_VERSION_V1,
+        LEFT_JOIN_INPUT_INSTANCE_ID_V1, LOGICAL_VIEW_PLAN_HASH_PREFIX,
+        LOGICAL_VIEW_PLAN_VERSION_V1, LOGICAL_VIEW_PLAN_VERSION_V2,
         NON_PRIMARY_NON_NULL_SCALAR_JOIN_KEY_CODEC_V1, RIGHT_JOIN_INPUT_INSTANCE_ID_V1,
         SELF_JOIN_ATOMIC_FANOUT_PROTOCOL_V1, THREE_INPUT_LEGACY_SQL_ENCOUNTER_JOIN_ORDER_V1,
         THREE_INPUT_ROOT_FIXED_RIGHT_RELATION_ID_JOIN_ORDER_V1,
@@ -1701,19 +1702,28 @@ fn nullable_in_and_not_in_forms_fail_closed() {
         SchemaFingerprintV1::for_relation_schema(&nullable_accounts.relation_schema).unwrap();
     nullable_accounts.schema_fingerprint = fingerprint.clone();
     nullable_accounts.incremental_relation.schema_fingerprint = fingerprint;
-    for sql in [
+    // Phase 7.3: nullable IN is admitted (NULL probe never matches in the
+    // semi-join), while nullable NOT IN stays fail-closed until null-aware
+    // anti-join semantics exist.
+    let in_plan = lower_supported_sql_to_logical_plan(
         "select s.user_id, s.score from scores s where s.score in (select a.limit from accounts a)",
-        "select s.user_id, s.score from scores s where s.score not in (select a.limit from accounts a)",
-    ] {
-        assert!(matches!(
-            lower_supported_sql_to_logical_plan(
-                sql,
-                &[catalog.clone(), nullable_accounts.clone()],
-                &output_schema,
-            ),
-            Err(ViewPlanError::UnsupportedShape { .. })
-        ));
-    }
+        &[catalog.clone(), nullable_accounts.clone()],
+        &output_schema,
+    )
+    .expect("nullable IN must decorrelate to a semi-join");
+    let VelorixLogicalViewExecutionV1::TwoInputSemiAntiJoinProject { plan } = &in_plan.execution
+    else {
+        panic!("expected semi-join plan for nullable IN");
+    };
+    assert_eq!(plan.join_kind, SupportedSemiAntiJoinKindV1::Semi);
+    assert!(matches!(
+        lower_supported_sql_to_logical_plan(
+            "select s.user_id, s.score from scores s where s.score not in (select a.limit from accounts a)",
+            &[catalog.clone(), nullable_accounts.clone()],
+            &output_schema,
+        ),
+        Err(ViewPlanError::UnsupportedShape { .. })
+    ));
 }
 
 #[test]
@@ -11106,5 +11116,57 @@ fn aggregate_cte_with_outer_filter_inlines_to_plain_aggregate_plan() {
     assert!(
         lower_supported_sql_to_logical_plan(sql, std::slice::from_ref(&catalog), &output).is_err(),
         "raw non-key column projection must fail closed"
+    );
+}
+
+#[test]
+fn in_subquery_decorrelates_to_semi_anti_join() {
+    let catalogs = vec![scores_catalog(), accounts_catalog()];
+    let output = scores_projection_output_schema();
+    // IN on the primary key lowers to a semi-join.
+    let lowered = lower_supported_sql_to_logical_plan(
+        "select s.user_id, s.score from scores s where s.user_id in (select a.account_id from accounts a)",
+        &catalogs,
+        &output,
+    )
+    .expect("IN subquery must decorrelate to semi-join");
+    let VelorixLogicalViewExecutionV1::TwoInputSemiAntiJoinProject { plan } = &lowered.execution
+    else {
+        panic!("expected semi/anti join plan for IN");
+    };
+    assert_eq!(plan.join_kind, SupportedSemiAntiJoinKindV1::Semi);
+    assert_eq!(plan.left_join_key_column_id, "user_id");
+    assert_eq!(plan.right_join_key_column_id, "account_id");
+
+    // NOT IN on non-null columns lowers to an anti-join.
+    let lowered = lower_supported_sql_to_logical_plan(
+        "select s.user_id, s.score from scores s where s.user_id not in (select a.account_id from accounts a)",
+        &catalogs,
+        &output,
+    )
+    .expect("NOT IN on non-null columns must decorrelate to anti-join");
+    let VelorixLogicalViewExecutionV1::TwoInputSemiAntiJoinProject { plan } = &lowered.execution
+    else {
+        panic!("expected semi/anti join plan for NOT IN");
+    };
+    assert_eq!(plan.join_kind, SupportedSemiAntiJoinKindV1::Anti);
+
+    // Non-column probe expressions are rejected.
+    assert!(
+        lower_supported_sql_to_logical_plan(
+            "select s.user_id, s.score from scores s where s.score + 1 in (select a.limit from accounts a)",
+            &catalogs,
+            &output,
+        )
+        .is_err()
+    );
+    // Inner WHERE / multi-column projections are rejected.
+    assert!(
+        lower_supported_sql_to_logical_plan(
+            "select s.user_id, s.score from scores s where s.user_id in (select a.account_id from accounts a where a.limit > 0)",
+            &catalogs,
+            &output,
+        )
+        .is_err()
     );
 }
