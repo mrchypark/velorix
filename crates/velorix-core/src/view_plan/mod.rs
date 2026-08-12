@@ -5797,11 +5797,7 @@ pub fn validate_supported_semi_anti_join_sql(
         orient_join_refs(left_ref, right_ref, &outer_table.alias, &inner_table.alias)?;
     let left_key = qualified_ref_catalog_column(&outer_ref, left_catalog)?;
     let right_key = qualified_ref_catalog_column(&inner_ref, right_catalog)?;
-    let left_pk = catalog_primary_key_column(left_catalog)?;
-    let right_pk = catalog_primary_key_column(right_catalog)?;
-    if left_key.column_id != left_pk.column_id
-        || right_key.column_id != right_pk.column_id
-        || left_key.nullable
+    if left_key.nullable
         || right_key.nullable
         || !supported_scalar_join_key_atom(&left_key.physical_arrow_type)
         || !supported_scalar_join_key_atom(&right_key.physical_arrow_type)
@@ -5809,10 +5805,11 @@ pub fn validate_supported_semi_anti_join_sql(
         || left_key.logical_type != right_key.logical_type
     {
         return unsupported(
-            "EXISTS/NOT EXISTS V1 correlation must equate identical non-null scalar primary keys",
+            "EXISTS/NOT EXISTS correlation must equate identical non-null scalar columns",
         );
     }
 
+    let left_pk = catalog_primary_key_column(left_catalog)?;
     let projection = validate_filter_project_projection(
         select,
         left_catalog,
@@ -5841,7 +5838,12 @@ pub fn validate_supported_semi_anti_join_sql(
             input_relation_id: left_catalog.relation_schema.relation_id.clone(),
             key_column_id: left_pk.column_id.clone(),
             output_key_column_id: projection.output_key_column_id,
-            output_key_input_column_id: projection.output_key_input_column_id,
+            // Phase 7.4: when the correlation key is not the left primary
+            // key, the projected output key must be derived from the left
+            // PK value carried by the left delta.
+            output_key_input_column_id: projection.output_key_input_column_id.or_else(|| {
+                (left_key.column_id != left_pk.column_id).then(|| left_pk.column_id.clone())
+            }),
             value_columns: projection
                 .value_columns
                 .into_iter()

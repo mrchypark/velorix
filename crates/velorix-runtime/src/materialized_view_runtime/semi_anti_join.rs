@@ -148,7 +148,9 @@ impl TwoInputSemiAntiJoinRuntime {
     pub fn restore(checkpoint: RuntimeCheckpoint) -> Result<Self, StandingProgramRuntimeError> {
         checkpoint.validate_identity(&checkpoint.identity)?;
         let Some(state_payload) = &checkpoint.state_payload else {
-            return Err(invalid_checkpoint());
+            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: Box::leak(format!("semi_cp_1").into_boxed_str()),
+            });
         };
         if state_payload.codec_identity != checkpoint.checkpoint_codec_identity {
             return Err(StandingProgramRuntimeError::CheckpointCodecMismatch {
@@ -169,14 +171,18 @@ impl TwoInputSemiAntiJoinRuntime {
                     || !checkpoint.identity.view_ids.contains(&frontier.view_id)
             })
         {
-            return Err(invalid_checkpoint());
+            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: Box::leak(format!("semi_cp_2").into_boxed_str()),
+            });
         }
         validate_view_sql_hash(&checkpoint.identity, &payload.logical_plan.view_sql)?;
         validate_logical_view_plan(&payload.logical_plan).map_err(|_| invalid_checkpoint())?;
         let VelorixLogicalViewExecutionV1::TwoInputSemiAntiJoinProject { plan } =
             payload.logical_plan.execution.clone()
         else {
-            return Err(invalid_checkpoint());
+            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: Box::leak(format!("semi_cp_3").into_boxed_str()),
+            });
         };
         validate_semi_anti_join_runtime_contract(
             &payload.catalogs,
@@ -198,6 +204,11 @@ impl TwoInputSemiAntiJoinRuntime {
         validate_input_event_time_frontiers_for_catalogs(&checkpoint, &payload.catalogs)?;
         validate_published_output(&payload.published_output)?;
         let expected_output = expected_semi_anti_output(&payload.graph, plan.join_kind)?;
+        let expected_output = project_filter_project_delta_batch(
+            &expected_output,
+            &plan.projection,
+            catalog_for_relation_id(&payload.catalogs, &plan.left_input_relation_id)?,
+        )?;
         if expected_output != payload.published_output {
             return Err(invalid_checkpoint());
         }
@@ -218,7 +229,9 @@ impl TwoInputSemiAntiJoinRuntime {
             || (checkpoint.logical_epoch > 0
                 && applied_epochs.values().max().copied() != Some(checkpoint.logical_epoch))
         {
-            return Err(invalid_checkpoint());
+            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: Box::leak(format!("semi_cp_5").into_boxed_str()),
+            });
         }
         Ok(Self {
             identity: checkpoint.identity,
@@ -307,7 +320,16 @@ impl StandingProgramRuntime for TwoInputSemiAntiJoinRuntime {
                 advance_input_event_time_frontier(&mut next_event_time_frontiers, input)?;
                 let catalog = catalog_for_relation_id(&self.catalogs, &input.relation_id)?;
                 let (port_id, delta) = if input.relation_id == self.plan.left_input_relation_id {
-                    let columns = filter_project_input_column_ids(&self.plan.projection);
+                    let mut columns = filter_project_input_column_ids(&self.plan.projection);
+                    // The projected output key is carried as a value column
+                    // when it differs from the join key (non-PK
+                    // correlations).
+                    let projection_key = self.plan.projection.key_column_id.clone();
+                    if projection_key != self.plan.left_join_key_column_id
+                        && !columns.iter().any(|column| column == &projection_key)
+                    {
+                        columns.push(projection_key);
+                    }
                     let delta =
                         if let Some(empty_delta) = published_input_empty_delta(input, catalog)? {
                             empty_delta
@@ -327,14 +349,7 @@ impl StandingProgramRuntime for TwoInputSemiAntiJoinRuntime {
                                 }
                             })?
                         };
-                    (
-                        "left",
-                        project_filter_project_delta_batch(
-                            &delta,
-                            &self.plan.projection,
-                            self.left_catalog()?,
-                        )?,
-                    )
+                    ("left", delta)
                 } else if input.relation_id == self.plan.right_input_relation_id {
                     let value_columns = catalog
                         .relation_schema
@@ -383,6 +398,14 @@ impl StandingProgramRuntime for TwoInputSemiAntiJoinRuntime {
                 .map_err(|_| invalid_runtime_state())?
                 .remove(SEMI_ANTI_JOIN_NODE_ID)
                 .unwrap_or_default();
+            // The graph emits matched left rows keyed by the join key; the
+            // projection derives the public output key and values. For
+            // primary-key correlations the join key equals the output key.
+            let output_delta = project_filter_project_delta_batch(
+                &output_delta,
+                &self.plan.projection,
+                self.left_catalog()?,
+            )?;
             let next_published =
                 apply_published_output_delta(&self.published_output, &output_delta)?;
             let batch =
@@ -503,7 +526,8 @@ fn validate_semi_anti_join_runtime_contract(
     let right_catalog = catalog_for_relation_id(catalogs, &plan.right_input_relation_id)?;
     if left_catalog.relation_schema.relation_id == right_catalog.relation_schema.relation_id
         || plan.projection.input_relation_id != plan.left_input_relation_id
-        || plan.projection.key_column_id != plan.left_join_key_column_id
+        || catalog_column(left_catalog, &plan.projection.key_column_id).is_err()
+        || catalog_column(left_catalog, &plan.left_join_key_column_id).is_err()
     {
         return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
             field: "semi_anti_join_contract",

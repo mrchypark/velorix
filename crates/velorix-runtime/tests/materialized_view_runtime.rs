@@ -19535,6 +19535,142 @@ fn runtime_materializes_string_temporal_float_typed_projections_and_restores() {
 }
 
 #[test]
+fn public_exists_on_non_primary_key_materializes_and_restores() {
+    let scores = scores_catalog();
+    let accounts = accounts_catalog();
+    let catalogs = vec![scores.clone(), accounts.clone()];
+    let input_schemas = catalogs
+        .iter()
+        .map(|catalog| catalog_input_relation_schema(catalog).unwrap())
+        .collect::<Vec<_>>();
+    let output = scores_projection_output_schema();
+    // Phase 7.4: correlation on identical non-null scalar columns (score =
+    // limit), not only the primary key.
+    let sql = "select s.user_id, s.score from scores s where exists (select 1 from accounts a where a.limit = s.score)";
+    let identity = standing_identity_with_view(sql, "positive_scores");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &catalogs,
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("epoch-1").unwrap(),
+            vec![
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
+                    relation_id: scores.relation_schema.relation_id.clone(),
+                    relation_version: scores.relation_schema.relation_version.clone(),
+                    stream_id: "scores-stream".to_string(),
+                    partition_id: 0,
+                    schema_fingerprint: scores.schema_fingerprint.to_string(),
+                    start_offset_inclusive: 0,
+                    end_offset_exclusive: 3,
+                    event_time_watermark: None,
+                    batches: vec![scores_rows_batch(&[
+                        ("alice", 10, 1),
+                        ("bob", 20, 1),
+                        ("carol", 30, 1),
+                    ])],
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
+                    relation_id: accounts.relation_schema.relation_id.clone(),
+                    relation_version: accounts.relation_schema.relation_version.clone(),
+                    stream_id: "accounts-stream".to_string(),
+                    partition_id: 0,
+                    schema_fingerprint: accounts.schema_fingerprint.to_string(),
+                    start_offset_inclusive: 0,
+                    end_offset_exclusive: 2,
+                    event_time_watermark: None,
+                    batches: vec![accounts_rows_batch(&[
+                        ("a1", 10, "gold", 1),
+                        ("a2", 40, "silver", 1),
+                    ])],
+                },
+            ],
+        )
+        .unwrap();
+
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "positive_scores".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(1),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap_or_else(|error| panic!("[PAGE-ERR] {error}"));
+    let batch = &page.batches[0];
+    let user_ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mut users = (0..batch.num_rows())
+        .map(|index| user_ids.value(index).to_string())
+        .collect::<Vec<_>>();
+    users.sort();
+    assert_eq!(users, vec!["alice".to_string()]);
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("epoch-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: accounts.relation_schema.relation_id.clone(),
+                relation_version: accounts.relation_schema.relation_version.clone(),
+                stream_id: "accounts-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: accounts.schema_fingerprint.to_string(),
+                start_offset_inclusive: 2,
+                end_offset_exclusive: 3,
+                event_time_watermark: None,
+                batches: vec![accounts_rows_batch(&[("a3", 20, "gold", 1)])],
+            }],
+        )
+        .unwrap();
+    let page = restored
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "positive_scores".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(2),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let user_ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mut users = (0..batch.num_rows())
+        .map(|index| user_ids.value(index).to_string())
+        .collect::<Vec<_>>();
+    users.sort();
+    assert_eq!(users, vec!["alice".to_string(), "bob".to_string()]);
+}
+
+#[test]
 fn runtime_materializes_decimal_group_key_aggregate_and_restores() {
     let catalog = decimal_key_catalog();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();

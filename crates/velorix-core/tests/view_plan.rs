@@ -76,16 +76,37 @@ fn correlated_exists_and_not_exists_lower_to_generic_semi_anti_join_nodes() {
 }
 
 #[test]
-fn correlated_exists_v1_fails_closed_outside_complete_non_null_pk_equality() {
+fn correlated_exists_v1_fails_closed_outside_identical_non_null_scalar_equality() {
     let catalogs = vec![scores_catalog(), accounts_catalog()];
     let output = scores_projection_output_schema();
-    for sql in [
+    // Residual predicates on the correlated subquery are not supported yet.
+    assert!(lower_supported_sql_to_logical_plan(
         "select s.user_id, s.score from scores s where exists (select 1 from accounts a where a.account_id = s.user_id and a.limit > 0)",
-        "select s.user_id, s.score from scores s where exists (select 1 from accounts a where a.limit = s.score)",
+        &catalogs,
+        &output,
+    )
+    .is_err());
+    // Projecting a column (not a literal) from the subquery is rejected.
+    assert!(lower_supported_sql_to_logical_plan(
         "select s.user_id, s.score from scores s where exists (select a.limit from accounts a where a.account_id = s.user_id)",
-    ] {
-        assert!(lower_supported_sql_to_logical_plan(sql, &catalogs, &output).is_err());
-    }
+        &catalogs,
+        &output,
+    )
+    .is_err());
+    // Phase 7.4: non-primary-key equality on identical non-null scalar
+    // columns is now admitted and lowers to a semi-join.
+    let lowered = lower_supported_sql_to_logical_plan(
+        "select s.user_id, s.score from scores s where exists (select 1 from accounts a where a.limit = s.score)",
+        &catalogs,
+        &output,
+    )
+    .expect("non-PK correlation must lower");
+    let VelorixLogicalViewExecutionV1::TwoInputSemiAntiJoinProject { plan } = &lowered.execution
+    else {
+        panic!("expected semi/anti join plan");
+    };
+    assert_eq!(plan.left_join_key_column_id, "score");
+    assert_eq!(plan.right_join_key_column_id, "limit");
 }
 
 #[test]

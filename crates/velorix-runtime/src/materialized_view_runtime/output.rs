@@ -45,7 +45,9 @@ pub(super) fn materialized_delta_to_record_batch(
     let mut aggregate_values = vec![Vec::new(); aggregate_outputs.len()];
     for row in rows {
         if row.weight != 1 {
-            return Err(invalid_runtime_state());
+            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: Box::leak(format!("generic_page_weight:{}", row.weight).into_boxed_str()),
+            });
         }
         let value = row
             .value
@@ -166,7 +168,9 @@ pub(super) fn materialized_tumbling_delta_to_record_batch(
     let mut aggregate_values = vec![Vec::new(); aggregate_columns.len()];
     for row in rows {
         if row.weight != 1 {
-            return Err(invalid_runtime_state());
+            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: Box::leak(format!("generic_page_weight:{}", row.weight).into_boxed_str()),
+            });
         }
         let key_values = row
             .key
@@ -280,7 +284,9 @@ pub(super) fn materialized_generic_delta_to_record_batch(
     let mut column_values = vec![Vec::new(); value_columns.len()];
     for row in rows {
         if row.weight != 1 {
-            return Err(invalid_runtime_state());
+            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: Box::leak(format!("generic_page_weight:{}", row.weight).into_boxed_str()),
+            });
         }
         keys.push(row.key.as_json().clone());
         if !value_columns.is_empty() {
