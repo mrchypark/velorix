@@ -1381,7 +1381,6 @@ pub fn lower_published_single_key_sum_count_sql(
         );
     }
     let key_column = relation_primary_key_column(&input.relation)?;
-    let query = parse_single_query(sql)?;
     let supported = validate_supported_view_sql_with_input(sql, input, None)?;
     finalize_logical_plan(single_key_sum_count_logical_plan_from_input(
         sql,
@@ -1427,7 +1426,7 @@ pub fn infer_single_key_sum_count_output_schema(
         data_type: key_column.data_type.clone(),
         nullable: false,
     }];
-    let mut primary_key = vec![key_column.name.clone()];
+    let primary_key = vec![key_column.name.clone()];
     for item in select.projection.iter().skip(1) {
         let (expr, alias) = match item {
             SelectItem::UnnamedExpr(expr) => (expr, None),
@@ -4059,7 +4058,7 @@ fn single_key_sum_count_logical_plan_from_input(
         group_keys: group_keys.clone(),
         accumulators,
     });
-    let mut current_node = aggregate_node.clone();
+    let current_node = aggregate_node.clone();
     nodes.push(VelorixLogicalViewPlanNodeV1::Output {
         node_id: "output_materialized_view".to_string(),
         input: current_node,
@@ -13413,11 +13412,9 @@ fn supported_filter_project_bound_projection_expr(
             }
             Ok(expression)
         }
-        Expr::Substring { .. } | Expr::Trim { .. } => {
-            return unsupported(
-                "string expressions are supported through typed projections; the legacy Int64 expression surface does not admit string functions",
-            );
-        }
+        Expr::Substring { .. } | Expr::Trim { .. } => unsupported(
+            "string expressions are supported through typed projections; the legacy Int64 expression surface does not admit string functions",
+        ),
         _ => unsupported("computed projection expression is not supported"),
     }
 }
@@ -13703,19 +13700,6 @@ fn validate_filter_project_int64_expr_column(
     }
     if column.nullable || !matches!(column.physical_arrow_type, ArrowPhysicalTypeV1::Int64) {
         return unsupported("computed filter/project expressions require non-null Int64 columns");
-    }
-    Ok(())
-}
-
-fn validate_filter_project_string_expr_column(
-    catalog: &VelorixRelationCatalogV1,
-    column: &RelationColumnV1,
-) -> Result<(), ViewPlanError> {
-    if column.column_id == catalog.relation_schema.weight_column_id {
-        return unsupported("computed filter/project expressions must not reference weight");
-    }
-    if !matches!(column.physical_arrow_type, ArrowPhysicalTypeV1::Utf8) {
-        return unsupported("computed filter/project string expressions require Utf8 columns");
     }
     Ok(())
 }
