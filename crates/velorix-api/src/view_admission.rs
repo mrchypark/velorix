@@ -341,38 +341,72 @@ async fn begin_authoritative_view_bootstrap(
     }
 }
 
+/// Per-capability SQL feature admission mode (Phase 5 gate split). Capabilities
+/// that are a stable public contract use `Enabled`; capabilities that still
+/// need design artifacts stay `Experimental` and reject on the public path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum FeatureAdmissionModeV1 {
+    Enabled,
+    Experimental,
+}
+
+/// Public view feature policy. The legacy single boolean maps to
+/// `{event_time_windows: Enabled, analytic_windows: Enabled}` when set, and to
+/// the Phase 5 public defaults (event-time enabled, analytic experimental)
+/// when unset.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PublicViewFeaturePolicyV1 {
+    pub event_time_windows: FeatureAdmissionModeV1,
+    pub analytic_windows: FeatureAdmissionModeV1,
+}
+
+impl Default for PublicViewFeaturePolicyV1 {
+    fn default() -> Self {
+        Self {
+            event_time_windows: FeatureAdmissionModeV1::Enabled,
+            analytic_windows: FeatureAdmissionModeV1::Experimental,
+        }
+    }
+}
+
+impl From<bool> for PublicViewFeaturePolicyV1 {
+    fn from(experimental: bool) -> Self {
+        if experimental {
+            Self {
+                event_time_windows: FeatureAdmissionModeV1::Enabled,
+                analytic_windows: FeatureAdmissionModeV1::Enabled,
+            }
+        } else {
+            Self::default()
+        }
+    }
+}
+
 pub(super) fn validate_public_view_feature_admission(
     state: &ApiState,
     request: &CreateViewRequest,
 ) -> Result<(), ApiError> {
-    // View-on-view inputs are gated by a separate flag so enabling them does
-    // not disable unrelated experimental SQL shape restrictions.
-    if request
-        .input_relation_refs
-        .iter()
-        .any(|input| input.input_kind == InputRelationKind::View)
-    {
-        if !state.experimental_view_on_view {
-            return Err(ApiError::bad_request(
-                "view-on-view inputs are experimental and disabled for the public 1.0 API",
-            ));
-        }
-    }
-    if state.experimental_advanced_view_features {
-        return Ok(());
-    }
+    let policy = state.public_view_feature_policy;
     let sql = request.sql.to_ascii_lowercase();
-
-    // Always blocked: HOP, SESSION, ranking functions
-    if contains_sql_function_call(&sql, "hop")
-        || contains_sql_function_call(&sql, "session")
-        || contains_sql_function_call(&sql, "row_number")
-        || contains_sql_function_call(&sql, "rank")
-        || contains_sql_function_call(&sql, "dense_rank")
-        || contains_sql_keyword(&sql, "over")
+    let event_time_enabled = policy.event_time_windows == FeatureAdmissionModeV1::Enabled;
+    let analytic_enabled = policy.analytic_windows == FeatureAdmissionModeV1::Enabled;
+    if !event_time_enabled
+        && (contains_sql_function_call(&sql, "tumble")
+            || contains_sql_function_call(&sql, "hop")
+            || contains_sql_function_call(&sql, "session"))
     {
         return Err(ApiError::bad_request(
-            "advanced view SQL is experimental and disabled for the public 1.0 API",
+            "event-time window SQL is experimental and disabled for the public 1.0 API",
+        ));
+    }
+    if !analytic_enabled
+        && (contains_sql_function_call(&sql, "row_number")
+            || contains_sql_function_call(&sql, "rank")
+            || contains_sql_function_call(&sql, "dense_rank")
+            || contains_sql_keyword(&sql, "over"))
+    {
+        return Err(ApiError::bad_request(
+            "analytic window SQL is experimental and disabled for the public 1.0 API",
         ));
     }
 
@@ -386,9 +420,9 @@ pub(super) fn validate_public_runtime_plan_admission(
     state: &ApiState,
     plan: &VelorixLogicalViewPlanV1,
 ) -> Result<(), ApiError> {
-    if state.experimental_advanced_view_features {
-        return Ok(());
-    }
+    let policy = state.public_view_feature_policy;
+    let event_time_enabled = policy.event_time_windows == FeatureAdmissionModeV1::Enabled;
+    let analytic_enabled = policy.analytic_windows == FeatureAdmissionModeV1::Enabled;
     if plan.input_relations.len() > PUBLIC_1_0_MAX_JOIN_INPUT_RELATIONS {
         return Err(ApiError::bad_request(format!(
             "materialized view uses {} input relations; public 1.0 supports at most {}",
@@ -397,17 +431,18 @@ pub(super) fn validate_public_runtime_plan_admission(
         )));
     }
     match &plan.execution {
-        VelorixLogicalViewExecutionV1::AnalyticRowNumber { .. } => {
-            // Ranking remains experimental
+        VelorixLogicalViewExecutionV1::AnalyticRowNumber { .. } if !analytic_enabled => {
             Err(ApiError::bad_request(
-                "analytic ranking is experimental and disabled for the public 1.0 API",
+                "analytic window execution is experimental and disabled for the public 1.0 API",
             ))
         }
-        VelorixLogicalViewExecutionV1::TumblingEventTimeAggregate { .. } => {
-            // TUMBLE with single input is now public (Phase 5)
-            // HOP/SESSION still blocked by SQL-level validation
-            Ok(())
+        VelorixLogicalViewExecutionV1::TumblingEventTimeAggregate { .. } if !event_time_enabled => {
+            Err(ApiError::bad_request(
+                "event-time window execution is experimental and disabled for the public 1.0 API",
+            ))
         }
+        VelorixLogicalViewExecutionV1::AnalyticRowNumber { .. }
+        | VelorixLogicalViewExecutionV1::TumblingEventTimeAggregate { .. } => Ok(()),
         VelorixLogicalViewExecutionV1::SingleKeySumCount { plan } => {
             validate_public_top_k_limit(plan.top_k.as_ref())
         }

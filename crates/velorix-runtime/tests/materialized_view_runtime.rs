@@ -18944,3 +18944,400 @@ fn late_row_policy_default_strict_reject_fails_closed_on_late_row() {
     );
     assert_window_page(runtime.as_ref(), 1, &[("alice", 0, 60_000_000_000, 10, 1)]);
 }
+
+#[test]
+fn session_window_retraction_splits_merged_session_exactly_and_survives_restart() {
+    let catalog = purchases_event_time_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = purchases_window_output_schema();
+    let sql = "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from purchases group by user_id, session(interval '10 seconds')";
+    let identity = standing_identity_with_view(sql, "purchases_by_user_minute");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    let watermark = |w: i64| InputEventTimeWatermark {
+        stream_id: "purchases-stream".to_string(),
+        partition_id: 0,
+        event_time_column_id: "event_time".to_string(),
+        max_observed_event_time_ns: w,
+        watermark_ns: w,
+    };
+    // Epoch 1: 30s, 40s, 50s with a 10s gap merge into one session [30,50];
+    // watermark 20s keeps every row on-time and nothing finalizes yet
+    // (50 + 10 > 20).
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("epoch-1").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 3,
+                event_time_watermark: Some(watermark(20_000_000_000)),
+                batches: vec![purchases_event_time_batch(&[
+                    ("alice", 10, 30_000_000_000, 1),
+                    ("alice", 5, 40_000_000_000, 1),
+                    ("alice", 9, 50_000_000_000, 1),
+                ])],
+            }],
+        )
+        .unwrap();
+    assert_window_page(runtime.as_ref(), 1, &[]);
+
+    // Epoch 2: retracting the bridge event (40s) must split the merged
+    // session into [30] and [50] while nothing is published yet.
+    runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("epoch-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 3,
+                end_offset_exclusive: 4,
+                event_time_watermark: Some(watermark(20_000_000_000)),
+                batches: vec![purchases_event_time_batch(&[(
+                    "alice",
+                    5,
+                    40_000_000_000,
+                    -1,
+                )])],
+            }],
+        )
+        .unwrap();
+    assert_window_page(runtime.as_ref(), 2, &[]);
+
+    // Epoch 3: watermark 60s finalizes both split sessions exactly once.
+    runtime
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("epoch-3").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 4,
+                end_offset_exclusive: 5,
+                event_time_watermark: Some(watermark(60_000_000_000)),
+                batches: vec![],
+            }],
+        )
+        .unwrap();
+    assert_window_page(
+        runtime.as_ref(),
+        3,
+        &[
+            ("alice", 30_000_000_000, 30_000_000_000, 10, 1),
+            ("alice", 50_000_000_000, 50_000_000_000, 9, 1),
+        ],
+    );
+
+    // Restart equivalence: the same suffix after a checkpoint yields the
+    // identical split output.
+    let checkpoint = runtime.checkpoint().unwrap();
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    restored
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("epoch-3").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 4,
+                end_offset_exclusive: 5,
+                event_time_watermark: Some(watermark(60_000_000_000)),
+                batches: vec![],
+            }],
+        )
+        .unwrap();
+    assert_window_page(
+        restored.as_ref(),
+        3,
+        &[
+            ("alice", 30_000_000_000, 30_000_000_000, 10, 1),
+            ("alice", 50_000_000_000, 50_000_000_000, 9, 1),
+        ],
+    );
+}
+
+#[test]
+fn tumbling_window_retraction_before_closure_is_exact_and_after_closure_fails_closed() {
+    let catalog = purchases_event_time_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = purchases_window_output_schema();
+    let sql = "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end";
+    let identity = standing_identity_with_view(sql, "purchases_by_user_minute");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    // Epoch 1: rows at 30s and 35s, watermark 20s (all on-time), the
+    // [0,60) window is not closed yet.
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("epoch-1").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 2,
+                event_time_watermark: Some(InputEventTimeWatermark {
+                    stream_id: "purchases-stream".to_string(),
+                    partition_id: 0,
+                    event_time_column_id: "event_time".to_string(),
+                    max_observed_event_time_ns: 20_000_000_000,
+                    watermark_ns: 20_000_000_000,
+                }),
+                batches: vec![purchases_event_time_batch(&[
+                    ("alice", 10, 30_000_000_000, 1),
+                    ("alice", 7, 35_000_000_000, 1),
+                ])],
+            }],
+        )
+        .unwrap();
+    assert_window_page(runtime.as_ref(), 1, &[]);
+
+    // Epoch 2: retract the 30s row before closure; the window keeps 35s only.
+    runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("epoch-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 2,
+                end_offset_exclusive: 3,
+                event_time_watermark: Some(InputEventTimeWatermark {
+                    stream_id: "purchases-stream".to_string(),
+                    partition_id: 0,
+                    event_time_column_id: "event_time".to_string(),
+                    max_observed_event_time_ns: 20_000_000_000,
+                    watermark_ns: 20_000_000_000,
+                }),
+                batches: vec![purchases_event_time_batch(&[(
+                    "alice",
+                    10,
+                    30_000_000_000,
+                    -1,
+                )])],
+            }],
+        )
+        .unwrap();
+    assert_window_page(runtime.as_ref(), 2, &[]);
+
+    // Epoch 3: the window closes exactly once with the surviving row.
+    runtime
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("epoch-3").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 3,
+                end_offset_exclusive: 4,
+                event_time_watermark: Some(InputEventTimeWatermark {
+                    stream_id: "purchases-stream".to_string(),
+                    partition_id: 0,
+                    event_time_column_id: "event_time".to_string(),
+                    max_observed_event_time_ns: 60_000_000_000,
+                    watermark_ns: 60_000_000_000,
+                }),
+                batches: vec![],
+            }],
+        )
+        .unwrap();
+    assert_window_page(runtime.as_ref(), 3, &[("alice", 0, 60_000_000_000, 7, 1)]);
+
+    // A retraction of a finalized-window row is late and the strict default
+    // fails the epoch closed.
+    let error = runtime
+        .apply_changes(
+            4,
+            EpochIdempotencyKey::new("epoch-4").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 4,
+                end_offset_exclusive: 5,
+                event_time_watermark: Some(InputEventTimeWatermark {
+                    stream_id: "purchases-stream".to_string(),
+                    partition_id: 0,
+                    event_time_column_id: "event_time".to_string(),
+                    max_observed_event_time_ns: 60_000_000_000,
+                    watermark_ns: 60_000_000_000,
+                }),
+                batches: vec![purchases_event_time_batch(&[(
+                    "alice",
+                    -7,
+                    35_000_000_000,
+                    -1,
+                )])],
+            }],
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("tumbling_event_time_input_batch"),
+        "post-finalization retraction must fail closed under strict policy: {error}"
+    );
+}
+
+#[test]
+fn hopping_window_retraction_updates_all_fanout_windows_exactly() {
+    let catalog = purchases_event_time_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = purchases_window_output_schema();
+    let sql = "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from hop(purchases, event_time, interval '5 seconds', interval '10 seconds') group by user_id, window_start, window_end";
+    let identity = standing_identity_with_view(sql, "purchases_by_user_minute");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    // Epoch 1: 10s and 12s rows (watermark 10s keeps both on-time); each
+    // lands in the [5,15) and [10,20) windows; nothing is closed yet
+    // (window ends 15/20 > frontier 10).
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("epoch-1").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 2,
+                event_time_watermark: Some(InputEventTimeWatermark {
+                    stream_id: "purchases-stream".to_string(),
+                    partition_id: 0,
+                    event_time_column_id: "event_time".to_string(),
+                    max_observed_event_time_ns: 10_000_000_000,
+                    watermark_ns: 10_000_000_000,
+                }),
+                batches: vec![purchases_event_time_batch(&[
+                    ("alice", 5, 10_000_000_000, 1),
+                    ("alice", 3, 12_000_000_000, 1),
+                ])],
+            }],
+        )
+        .unwrap();
+    assert_window_page(runtime.as_ref(), 1, &[]);
+
+    // Epoch 2: retract the 10s row; both fanout windows must drop it.
+    runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("epoch-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 2,
+                end_offset_exclusive: 3,
+                event_time_watermark: Some(InputEventTimeWatermark {
+                    stream_id: "purchases-stream".to_string(),
+                    partition_id: 0,
+                    event_time_column_id: "event_time".to_string(),
+                    max_observed_event_time_ns: 10_000_000_000,
+                    watermark_ns: 10_000_000_000,
+                }),
+                batches: vec![purchases_event_time_batch(&[(
+                    "alice",
+                    5,
+                    10_000_000_000,
+                    -1,
+                )])],
+            }],
+        )
+        .unwrap();
+
+    // Epoch 3: watermark 20s finalizes [5,15) and [10,20) with only the
+    // 12s row surviving in both.
+    runtime
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("epoch-3").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 3,
+                end_offset_exclusive: 4,
+                event_time_watermark: Some(InputEventTimeWatermark {
+                    stream_id: "purchases-stream".to_string(),
+                    partition_id: 0,
+                    event_time_column_id: "event_time".to_string(),
+                    max_observed_event_time_ns: 20_000_000_000,
+                    watermark_ns: 20_000_000_000,
+                }),
+                batches: vec![],
+            }],
+        )
+        .unwrap();
+    assert_window_page(
+        runtime.as_ref(),
+        3,
+        &[
+            ("alice", 10_000_000_000, 20_000_000_000, 3, 1),
+            ("alice", 5_000_000_000, 15_000_000_000, 3, 1),
+        ],
+    );
+}

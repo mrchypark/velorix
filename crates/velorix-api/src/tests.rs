@@ -16382,19 +16382,21 @@ async fn public_1_0_rejects_experimental_view_surfaces_by_default() {
     .await;
     assert_eq!(relation_response.0, StatusCode::CREATED);
 
+    // Phase 5 gate split: event-time window SQL is now a public 1.0
+    // capability; analytic window SQL stays experimental. The view id is
+    // deliberately neutral so the assertion cannot pass via the echoed id.
     for sql in [
-            "select user_id, window_start, window_end, sum(score) as sum, count(*) as count from scores group by user_id, tumble(interval '60 seconds')",
-            "select user_id, window_start, window_end, sum(score) as sum, count(*) as count from scores group by user_id, hop (interval '60 seconds', interval '5 seconds')",
-            "select user_id, window_start, window_end, sum(score) as sum, count(*) as count from scores group by user_id, session(interval '60 seconds')",
             "select user_id, row_number() over (partition by user_id order by score desc, user_id asc) as rank from scores",
             "select user_id, sum(score)\nover (partition by user_id) as total from scores",
+            "select user_id, rank() over (order by score) as ranking from scores",
+            "select user_id, dense_rank() over (order by score) as ranking from scores",
         ] {
             let view_response = call_json(
                 &router,
                 Method::POST,
                 "/v1/views",
                 json!({
-                    "view_id": "experimental_view",
+                    "view_id": "analytic_view",
                     "input_relation_id": "scores",
                     "input_relation_version": "2026-05-24.v1",
                     "sql": sql
@@ -16405,7 +16407,8 @@ async fn public_1_0_rejects_experimental_view_surfaces_by_default() {
             assert!(view_response.1["error"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("experimental"));
+                .contains("analytic window SQL is experimental"),
+            "{view_response:?}");
         }
 
     for body in [
@@ -16641,6 +16644,55 @@ fn test_purchases_event_time_catalog() -> VelorixRelationCatalogV1 {
     catalog.schema_fingerprint = schema_fingerprint.clone();
     catalog.incremental_relation.schema_fingerprint = schema_fingerprint;
     catalog
+}
+
+#[tokio::test]
+async fn public_1_0_admits_event_time_window_sql_by_default() {
+    let state = test_public_api_state_with_store(
+        Arc::new(InMemory::new()),
+        "api-test-public-1-0-event-time",
+        false,
+    )
+    .await;
+    let router = app(state);
+
+    let relation_response = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations",
+        json!({
+            "catalog": test_purchases_event_time_catalog(),
+            "default_orders_sum_count": false
+        }),
+    )
+    .await;
+    assert_eq!(relation_response.0, StatusCode::CREATED);
+
+    for sql in [
+            "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end",
+            "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from hop(purchases, event_time, interval '5 seconds', interval '60 seconds') group by user_id, window_start, window_end",
+            "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from session(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end",
+        ] {
+            let view_id = match sql {
+                sql if sql.contains("tumble") => "tumbling_view",
+                sql if sql.contains("hop(") => "hopping_view",
+                _ => "session_view",
+            };
+            let view_response = call_json(
+                &router,
+                Method::POST,
+                "/v1/views",
+                json!({
+                    "view_id": view_id,
+                    "input_relation_id": "purchases",
+                    "input_relation_version": "2026-05-24.v1",
+                    "sql": sql,
+                    "source_kind": "standing_view"
+                }),
+            )
+            .await;
+            assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+        }
 }
 
 #[tokio::test]

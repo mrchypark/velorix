@@ -84,28 +84,106 @@ empty-set NULL state is represented by the runtime and public schema.
 ## Experimental-gated materialized views
 
 The runtime has implementations and API integration coverage for the following
-families, but `POST /v1/views` rejects them by default with "advanced view SQL
-is experimental and disabled for the public 1.0 API". They require the server
-configuration that enables `experimental_advanced_view_features`:
+families. `POST /v1/views` admits **event-time windows by default** (public 1.0,
+see "Event-Time Semantics" below); analytic ranking stays gated and rejects by
+default with "analytic window SQL is experimental and disabled for the public
+1.0 API". Analytic ranking requires the server configuration that enables
+`experimental_advanced_view_features`:
 
-| Family | Narrow admitted scope |
-| --- | --- |
-| Event-time aggregate windows | `TUMBLE`, `HOP`, and `SESSION` over one relation, with the same supported aggregate/filter/HAVING/Top-K concepts where their window validator permits them. Intervals and event-time columns are validated; this is not arbitrary window SQL. |
-| Analytic ranking | `ROW_NUMBER`, `RANK`, and `DENSE_RANK` with the required single partition column, sortable non-null order column, deterministic primary-key ascending tie-breaker, and optional bounded rank filter (`QUALIFY` or the supported wrapper form). |
+| Family | Narrow admitted scope | Default |
+| --- | --- | --- |
+| Event-time aggregate windows | `TUMBLE`, `HOP`, and `SESSION` over one relation, with the same supported aggregate/filter/HAVING/Top-K concepts where their window validator permits them. Intervals and event-time columns are validated; this is not arbitrary window SQL. | **Admitted** (public 1.0) |
+| Analytic ranking | `ROW_NUMBER`, `RANK`, and `DENSE_RANK` with the required single partition column, sortable non-null order column, deterministic primary-key ascending tie-breaker, and optional bounded rank filter (`QUALIFY` or the supported wrapper form). | Experimental |
 
-The window aggregate table-function forms admitted by the experimental plan
-are `TUMBLE`, `HOP`, and `SESSION`. Their event-time argument must resolve to
-the catalog's declared event-time column and their intervals must be positive,
-supported interval literals. Ranking admits one relation, no grouping or set
-operation, one non-null partition column, one non-null sortable order column,
-and the primary key as an ascending deterministic tie-breaker. A rank bound is
-`rank = 1` or `rank <= positive_integer` in the supported `QUALIFY` or wrapper
-shape; arbitrary window frames, named windows, and other rank predicates are
-rejected.
+The window aggregate table-function forms admitted are `TUMBLE`, `HOP`, and
+`SESSION`. Their event-time argument must resolve to the catalog's declared
+event-time column and their intervals must be positive, supported interval
+literals. Ranking admits one relation, no grouping or set operation, one
+non-null partition column, one non-null sortable order column, and the primary
+key as an ascending deterministic tie-breaker. A rank bound is `rank = 1` or
+`rank <= positive_integer` in the supported `QUALIFY` or wrapper shape;
+arbitrary window frames, named windows, and other rank predicates are rejected.
 
-Enabling the flag does not turn parser acceptance into support. These shapes
-still go through the same typed logical-plan admission and runtime capability
-checks.
+These shapes still go through the same typed logical-plan admission and runtime
+capability checks; enabling the flag does not turn parser acceptance into
+support.
+
+## Event-Time Semantics (public 1.0 contract)
+
+Event-time window SQL (`TUMBLE`, `HOP`, `SESSION`) is a public 1.0 capability.
+The following time behavior is the stable product contract.
+
+### Event-time extraction
+
+- The window's event-time argument must resolve to the catalog's declared
+  event-time column (`event_time_column_id`).
+- Supported physical types: `Int64` (nanoseconds since epoch), `Date32`,
+  `TimestampNanosecond` without timezone. Timezone-bearing timestamps are
+  rejected at admission.
+- Every input batch must carry an explicit `event_time_watermark`
+  (`stream_id`, `partition_id`, `event_time_column_id`,
+  `max_observed_event_time_ns`, `watermark_ns`). A batch without a watermark
+  is rejected.
+
+### Per-partition watermark behavior
+
+- Watermarks are tracked per `(relation, stream, partition, column)`.
+- A watermark may never regress: `watermark_ns` and
+  `max_observed_event_time_ns` are monotonic per partition; a regression
+  fails the whole epoch closed.
+- There is **no implicit idle** policy: a partition without input never
+  advances by wall clock, and a partition that has never emitted a watermark
+  pins the effective watermark to `None` (nothing finalizes).
+
+### Watermark combination (multi-input)
+
+- The effective operator watermark is the **minimum over every active
+  partition of every input**: `W_effective = min(partitions)`. No input can
+  finalize windows while another input is behind.
+
+### Window closure rules
+
+- A window becomes **final** only when its end passes the *finalization
+  frontier* `F = W - A`, where `W` is the effective watermark and `A` is the
+  configured late-row allowance (zero for `strict_reject` and
+  `drop_with_evidence`).
+- TUMBLE/HOP: `window_end <= F` closes the window.
+- SESSION: `window_end + session_gap <= F` closes the window.
+- Only closed windows are published; there is **no provisional emission** —
+  a window is never published and later corrected. With allowance 0 the
+  frontier equals the watermark exactly.
+
+### Late-row handling
+
+- A row is late when `event_time < W` (current partition watermark).
+- `LateRowPolicy` (default `strict_reject`):
+  - `strict_reject` (default): a late row fails the whole epoch closed.
+  - `drop_with_evidence`: late rows are dropped and a durable evidence
+    counter (`late_rows_dropped`) is persisted in the checkpoint.
+  - `admit_within_allowance { allowance_ns }`: rows with
+    `event_time >= W - allowance_ns` are admitted; rows older than the
+    finalization frontier are dropped with evidence. Finalization is
+    deferred to `F = W - allowance_ns`, so admitted late rows can still
+    update their window before it publishes.
+- The policy is part of the admitted plan and the checkpoint payload;
+  retractions and restart replay identical decisions.
+
+### State boundedness and retention
+
+- Window state is watermark-bounded: closed windows are not published
+  incrementally, and the published output is recomputed from closed state
+  each epoch.
+- `StateRetentionContractV1` bounds retained open-window state
+  (`max_open_windows`, `closed_window_retention_ns`,
+  `late_row_evidence_retention_ns`). State growth beyond the contract fails
+  the epoch closed; state is never silently evicted.
+
+### Determinism
+
+- For in-order, out-of-order (within allowance), late (per policy), restart,
+  and replay cases the outcomes are deterministic: the same signed input
+  sequence produces the same published deltas, window state, watermark
+  state, late-row evidence, and program identity.
 
 ## Event-Time Semantics
 
