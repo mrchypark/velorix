@@ -225,6 +225,34 @@ pub enum StateBoundednessV1 {
     Unbounded,
 }
 
+/// Explicit state retention contract for watermark-bounded operators. The
+/// contract bounds state growth without silently changing SQL semantics:
+/// windows fully closed before `closed_window_retention_ns` may be evicted
+/// from operator state, and `late_row_evidence_retention_ns` bounds how long
+/// dropped-late-row evidence is kept for observability.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateRetentionContractV1 {
+    /// Retention window for closed window state, in nanoseconds.
+    pub closed_window_retention_ns: u64,
+    /// Retention window for late-row handling evidence, in nanoseconds.
+    pub late_row_evidence_retention_ns: u64,
+    /// Hard cap on retained open window groups; admission rejects plans that
+    /// could exceed it only when the operator can prove the bound.
+    pub max_open_windows: u64,
+}
+
+impl StateRetentionContractV1 {
+    pub fn validate(&self) -> Result<(), OperatorContractError> {
+        if self.max_open_windows == 0 {
+            return Err(OperatorContractError::Invalid(
+                "state retention contract max_open_windows must be non-zero".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CheckpointCodecIdentityV1 {

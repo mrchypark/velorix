@@ -51,6 +51,7 @@ use velorix_core::{
         lower_supported_semi_anti_join_sql_to_logical_plan, lower_supported_sql_to_logical_plan,
         lower_supported_three_input_inner_join_count_sql_to_logical_plan_with_policy,
         lower_supported_tumbling_window_sql_to_logical_plan,
+        lower_supported_tumbling_window_sql_to_logical_plan_with_policy,
         lower_supported_view_sql_to_logical_plan, supported_join_key_codec_id,
         supported_join_view_plan_aggregate_outputs, supported_join_view_plan_is_self_join,
         supported_join_view_plan_is_singleton, supported_join_view_plan_key_pairs,
@@ -60,12 +61,14 @@ use velorix_core::{
         validate_supported_analytic_row_number_sql, validate_supported_filter_project_sql,
         validate_supported_join_view_sql, validate_supported_latest_by_key_sql,
         validate_supported_semi_anti_join_sql, validate_supported_tumbling_window_sql,
+        validate_supported_tumbling_window_sql_with_policy,
         validate_supported_view_sql, AggregateOutputPredicate, AggregateOutputPredicateExpr,
         JoinPredicateExpr, JoinRowPredicate, LogicalPlanAggregateFunctionV1,
         LogicalPlanExecutionImplementationV1, LogicalPlanLatestByKeyFunctionV1, PredicateOp,
         RowPredicate, RowPredicateExpr, SupportedAggregateInputRelationSide,
         SupportedAggregateOutput, SupportedAnalyticRowNumberPlan, SupportedAnalyticWindowFunction,
         SupportedEventTimeWindowKind, SupportedFilterProjectPlan, SupportedJoinKeyDomainV1,
+        LateRowPolicy,
         SupportedJoinKind, SupportedJoinViewPlan, SupportedLatestByKeyPlan,
         SupportedProjectionBinaryOp, SupportedProjectionExpr, SupportedSemiAntiJoinKindV1,
         SupportedSemiAntiJoinProjectPlanV1, SupportedThreeInputInnerJoinCountPlanV1,
@@ -640,6 +643,14 @@ struct TumblingWindowState {
     rows: BTreeMap<String, TumblingWindowStateRow>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     session_events: BTreeMap<String, SessionWindowEvent>,
+    /// Monotonic evidence counter of rows dropped by the configured
+    /// late-row policy. Persisted so restart reports identical evidence.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    late_rows_dropped: u64,
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -6712,10 +6723,34 @@ fn apply_tumbling_input(
                 &event_time_column.physical_arrow_type,
                 row_index,
             )?;
-            if current_watermark.is_some_and(|watermark| event_time_ns < watermark) {
-                return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
-                    field: "tumbling_event_time_input_batch",
-                });
+            let is_late = current_watermark.is_some_and(|watermark| event_time_ns < watermark);
+            if is_late {
+                match plan.late_row_policy {
+                    None | Some(LateRowPolicy::Reject) => {
+                        return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                            field: "tumbling_event_time_input_batch",
+                        });
+                    }
+                    Some(LateRowPolicy::DropWithEvidence) => {
+                        state.late_rows_dropped = state
+                            .late_rows_dropped
+                            .checked_add(1)
+                            .ok_or_else(|| invalid_runtime_state())?;
+                        continue;
+                    }
+                    Some(LateRowPolicy::AdmitWithinAllowance { allowance_ns }) => {
+                        let admissible_until = current_watermark
+                            .map(|watermark| watermark.saturating_sub(allowance_ns))
+                            .unwrap_or(i64::MAX);
+                        if event_time_ns < admissible_until {
+                            state.late_rows_dropped = state
+                                .late_rows_dropped
+                                .checked_add(1)
+                                .ok_or_else(|| invalid_runtime_state())?;
+                            continue;
+                        }
+                    }
+                }
             }
             let group_key =
                 batch_key_value(batch, key_index, &key_column.physical_arrow_type, row_index)?;

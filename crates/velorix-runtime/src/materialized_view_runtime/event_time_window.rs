@@ -35,7 +35,11 @@ impl TumblingEventTimeAggregateRuntime {
             }
         })?;
         validate_tumbling_supported_schemas(&catalog, &input_schema, &output_schema, &plan)?;
-        let compiled_plan = validate_supported_tumbling_window_sql(view_sql.as_str(), &catalog)
+        let compiled_plan = validate_supported_tumbling_window_sql_with_policy(
+            view_sql.as_str(),
+            &catalog,
+            plan.late_row_policy,
+        )
             .map_err(|_| StandingProgramRuntimeError::InvalidProgramIdentity {
                 field: "tumbling_window_view_plan",
             })?;
@@ -44,10 +48,11 @@ impl TumblingEventTimeAggregateRuntime {
                 field: "tumbling_window_view_plan",
             });
         }
-        let compiled_logical_plan = lower_supported_tumbling_window_sql_to_logical_plan(
+        let compiled_logical_plan = lower_supported_tumbling_window_sql_to_logical_plan_with_policy(
             view_sql.as_str(),
             &catalog,
             &output_schema,
+            plan.late_row_policy,
         )
         .map_err(|_| StandingProgramRuntimeError::InvalidProgramIdentity {
             field: "logical_tumbling_window_view_plan",
@@ -349,16 +354,21 @@ impl StandingProgramRuntime for TumblingEventTimeAggregateRuntime {
         )?;
         validate_view_sql_hash(&checkpoint.identity, payload.view_sql.as_str())?;
         let compiled_plan =
-            validate_supported_tumbling_window_sql(payload.view_sql.as_str(), &payload.catalog)
+            validate_supported_tumbling_window_sql_with_policy(
+                payload.view_sql.as_str(),
+                &payload.catalog,
+                payload.plan.late_row_policy,
+            )
                 .map_err(|_| invalid_checkpoint())?;
         if compiled_plan != payload.plan {
             return Err(invalid_checkpoint());
         }
         validate_logical_view_plan(&payload.logical_plan).map_err(|_| invalid_checkpoint())?;
-        let compiled_logical_plan = lower_supported_tumbling_window_sql_to_logical_plan(
+        let compiled_logical_plan = lower_supported_tumbling_window_sql_to_logical_plan_with_policy(
             payload.view_sql.as_str(),
             &payload.catalog,
             &payload.output_schema,
+            payload.plan.late_row_policy,
         )
         .map_err(|_| invalid_checkpoint())?;
         if compiled_logical_plan != payload.logical_plan {

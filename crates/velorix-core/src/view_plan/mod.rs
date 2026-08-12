@@ -29,8 +29,8 @@ use crate::{
         OperatorKindIdentityV1, OutputPortContractV1, OutputPortRefV1, PortColumnV1,
         ProcessingFrontierGuaranteeV1, ProcessingFrontierRequirementV1, ProgressGuaranteeV1,
         ProgressRequirementV1, RowSchemaV1, StateBoundednessV1, StateContractV1,
-        UniquenessGuaranteeV1, WatermarkGuaranteeV1, WatermarkRequirementV1,
-        OPERATOR_DAG_CONTRACT_VERSION_V1,
+        StateRetentionContractV1, UniquenessGuaranteeV1, WatermarkGuaranteeV1,
+        WatermarkRequirementV1, OPERATOR_DAG_CONTRACT_VERSION_V1,
     },
     relation::{
         ArrowPhysicalTypeV1, RelationColumnV1, RelationSchemaError,
@@ -731,6 +731,42 @@ pub enum LogicalPlanLatestByKeyFunctionV1 {
     ArgMin,
 }
 
+/// Public late-row handling policy for event-time windows. The policy is
+/// part of the admitted plan and the checkpoint payload, so retractions and
+/// restart replay the same decisions deterministically.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LateRowPolicy {
+    /// Reject the whole input batch when any row is late (event time below
+    /// the current watermark). The admission fails closed with a clear error.
+    #[default]
+    Reject,
+    /// Drop late rows and record evidence (count per epoch) instead of
+    /// failing. The view output is exact for everything admitted.
+    DropWithEvidence,
+    /// Admit rows whose event time is at least `allowance_ns` behind the
+    /// watermark, up to a configured bound. Rows beyond the bound are
+    /// dropped with evidence.
+    AdmitWithinAllowance {
+        /// Maximum allowed lateness in nanoseconds.
+        allowance_ns: i64,
+    },
+}
+
+impl LateRowPolicy {
+    pub fn validate(&self) -> Result<(), ViewPlanError> {
+        if let LateRowPolicy::AdmitWithinAllowance { allowance_ns } = self {
+            if *allowance_ns < 0 {
+                return Err(ViewPlanError::UnsupportedShape {
+                    reason: "late-row allowance must be non-negative".to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SupportedTumblingWindowPlan {
@@ -758,6 +794,10 @@ pub struct SupportedTumblingWindowPlan {
     pub top_k: Option<SupportedTopKPlan>,
     pub window_start_output_column_id: String,
     pub window_end_output_column_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub late_row_policy: Option<LateRowPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_contract: Option<StateRetentionContractV1>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -1879,6 +1919,25 @@ pub fn lower_supported_tumbling_window_sql_to_logical_plan(
     ))
 }
 
+/// Lowering variant with an explicit late-row policy. The policy becomes part
+/// of the admitted plan (and therefore the checkpoint payload), so retractions
+/// and restart replay identical decisions. `None` means the default
+/// `LateRowPolicy::Reject`.
+pub fn lower_supported_tumbling_window_sql_to_logical_plan_with_policy(
+    sql: &str,
+    catalog: &VelorixRelationCatalogV1,
+    output_schema: &RelationSchema,
+    late_row_policy: Option<LateRowPolicy>,
+) -> Result<VelorixLogicalViewPlanV1, ViewPlanError> {
+    let supported = validate_supported_tumbling_window_sql_with_policy(sql, catalog, late_row_policy)?;
+    finalize_logical_plan(tumbling_window_logical_plan(
+        sql,
+        catalog,
+        output_schema,
+        supported,
+    ))
+}
+
 pub fn lower_supported_filter_project_sql_to_logical_plan(
     sql: &str,
     catalog: &VelorixRelationCatalogV1,
@@ -2225,7 +2284,25 @@ pub fn validate_supported_tumbling_window_sql(
         top_k,
         window_start_output_column_id: projection.window_start_output_column_id,
         window_end_output_column_id: projection.window_end_output_column_id,
+        late_row_policy: None,
+        retention_contract: None,
     })
+}
+
+/// Validates window SQL and attaches an explicit late-row policy to the
+/// compiled plan. The base validator keeps returning `None` so existing
+/// callers are byte-stable.
+pub fn validate_supported_tumbling_window_sql_with_policy(
+    sql: &str,
+    catalog: &VelorixRelationCatalogV1,
+    late_row_policy: Option<LateRowPolicy>,
+) -> Result<SupportedTumblingWindowPlan, ViewPlanError> {
+    if let Some(policy) = &late_row_policy {
+        policy.validate()?;
+    }
+    let mut plan = validate_supported_tumbling_window_sql(sql, catalog)?;
+    plan.late_row_policy = late_row_policy;
+    Ok(plan)
 }
 
 pub fn validate_supported_filter_project_sql(
