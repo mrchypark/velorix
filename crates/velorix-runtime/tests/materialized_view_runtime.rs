@@ -40,6 +40,7 @@ use velorix_core::{
         lower_supported_filter_project_sql_to_logical_plan,
         lower_supported_join_view_sql_to_logical_plan,
         lower_supported_three_input_inner_join_count_sql_to_logical_plan_with_policy,
+        lower_supported_tumbling_window_sql_to_logical_plan_with_policy, LateRowPolicy,
         LogicalPlanAggregateFunctionV1, RowPredicateExpr, SupportedAggregateOutput,
         SupportedProjectionExpr, VelorixLogicalViewExecutionV1, VelorixLogicalViewPlanV1,
         COMPOSITE_PK_POSITIONAL_JSON_ARRAY_JOIN_KEY_CODEC_V1,
@@ -47,7 +48,7 @@ use velorix_core::{
     },
 };
 use velorix_runtime::materialized_view_runtime::{
-    bind_join_execution_v1,
+    advance_input_event_time_frontier, bind_join_execution_v1, combine_multi_input_watermarks,
     create_common_dag_reference_standing_runtime_with_logical_plan_and_catalogs,
     create_standing_runtime, create_standing_runtime_with_logical_plan_and_catalogs,
     create_standing_runtime_with_sql_and_catalogs, materialized_delta_to_page,
@@ -18536,4 +18537,410 @@ fn score_append_batch(user_id: &str, score: i64) -> RecordBatch {
         ],
     )
     .unwrap()
+}
+
+#[test]
+fn late_row_policy_drop_with_evidence_drops_late_rows_and_persists_evidence() {
+    let catalog = purchases_event_time_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = purchases_window_output_schema();
+    let sql = "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end";
+    let logical_plan = lower_supported_tumbling_window_sql_to_logical_plan_with_policy(
+        sql,
+        &catalog,
+        &output_schema,
+        Some(LateRowPolicy::DropWithEvidence),
+    )
+    .unwrap();
+    let identity = standing_identity_with_view(sql, "purchases_by_user_minute");
+    let mut runtime = create_standing_runtime_with_logical_plan_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        logical_plan,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    // Epoch 1 establishes the watermark frontier (no lateness possible on the
+    // very first batch of a partition).
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("epoch-1").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 2,
+                event_time_watermark: Some(InputEventTimeWatermark {
+                    stream_id: "purchases-stream".to_string(),
+                    partition_id: 0,
+                    event_time_column_id: "event_time".to_string(),
+                    max_observed_event_time_ns: 60_000_000_000,
+                    watermark_ns: 60_000_000_000,
+                }),
+                batches: vec![purchases_event_time_batch(&[
+                    ("alice", 10, 10_000_000_000, 1),
+                    ("bob", 45, 45_000_000_000, 1),
+                ])],
+            }],
+        )
+        .unwrap();
+    assert_window_page(
+        runtime.as_ref(),
+        1,
+        &[
+            ("alice", 0, 60_000_000_000, 10, 1),
+            ("bob", 0, 60_000_000_000, 45, 1),
+        ],
+    );
+
+    // Epoch 2: carol@20s is late (20 < 60 vs the established frontier) and
+    // must be dropped with evidence instead of failing.
+    runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("epoch-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 2,
+                end_offset_exclusive: 4,
+                event_time_watermark: Some(InputEventTimeWatermark {
+                    stream_id: "purchases-stream".to_string(),
+                    partition_id: 0,
+                    event_time_column_id: "event_time".to_string(),
+                    max_observed_event_time_ns: 60_000_000_000,
+                    watermark_ns: 60_000_000_000,
+                }),
+                batches: vec![purchases_event_time_batch(&[(
+                    "carol",
+                    99,
+                    20_000_000_000,
+                    1,
+                )])],
+            }],
+        )
+        .unwrap();
+
+    assert_window_page(
+        runtime.as_ref(),
+        2,
+        &[
+            ("alice", 0, 60_000_000_000, 10, 1),
+            ("bob", 0, 60_000_000_000, 45, 1),
+        ],
+    );
+
+    // Evidence is part of the durable checkpoint payload.
+    let checkpoint = runtime.checkpoint().unwrap();
+    let payload: serde_json::Value =
+        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+    assert_eq!(payload["state"]["late_rows_dropped"], 1);
+
+    // Restart replays the same evidence and stays exact.
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    // A late row after restart is still dropped with evidence (counter
+    // accumulates deterministically across the checkpoint boundary).
+    restored
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("epoch-3").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 4,
+                end_offset_exclusive: 5,
+                event_time_watermark: Some(InputEventTimeWatermark {
+                    stream_id: "purchases-stream".to_string(),
+                    partition_id: 0,
+                    event_time_column_id: "event_time".to_string(),
+                    max_observed_event_time_ns: 60_000_000_000,
+                    watermark_ns: 60_000_000_000,
+                }),
+                batches: vec![purchases_event_time_batch(&[(
+                    "dave",
+                    99,
+                    30_000_000_000,
+                    1,
+                )])],
+            }],
+        )
+        .unwrap();
+    assert_window_page(
+        restored.as_ref(),
+        3,
+        &[
+            ("alice", 0, 60_000_000_000, 10, 1),
+            ("bob", 0, 60_000_000_000, 45, 1),
+        ],
+    );
+    let checkpoint = restored.checkpoint().unwrap();
+    let payload: serde_json::Value =
+        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+    assert_eq!(payload["state"]["late_rows_dropped"], 2);
+}
+
+#[test]
+fn late_row_policy_admit_within_allowance_defers_finalization_until_frontier() {
+    let catalog = purchases_event_time_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = purchases_window_output_schema();
+    let sql = "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end";
+    let logical_plan = lower_supported_tumbling_window_sql_to_logical_plan_with_policy(
+        sql,
+        &catalog,
+        &output_schema,
+        Some(LateRowPolicy::AdmitWithinAllowance {
+            allowance_ns: 10_000_000_000,
+        }),
+    )
+    .unwrap();
+    let identity = standing_identity_with_view(sql, "purchases_by_user_minute");
+    let mut runtime = create_standing_runtime_with_logical_plan_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        logical_plan,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    // Watermark 60s, allowance 10s -> finalization frontier 50s. bob@55s is
+    // late relative to the watermark but still within allowance, so it is
+    // admitted; the [0,60) window ends at 60 > 50, so it must NOT be
+    // published yet (deferred finalization).
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("epoch-1").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 3,
+                event_time_watermark: Some(InputEventTimeWatermark {
+                    stream_id: "purchases-stream".to_string(),
+                    partition_id: 0,
+                    event_time_column_id: "event_time".to_string(),
+                    max_observed_event_time_ns: 60_000_000_000,
+                    watermark_ns: 60_000_000_000,
+                }),
+                batches: vec![purchases_event_time_batch(&[
+                    ("alice", 10, 10_000_000_000, 1),
+                    ("bob", 55, 55_000_000_000, 1),
+                ])],
+            }],
+        )
+        .unwrap();
+    assert_window_page(runtime.as_ref(), 1, &[]);
+
+    // Watermark advances to 70s -> frontier 60s; the [0,60) window is now
+    // final and publishes exactly once with both admitted rows.
+    runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("epoch-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 3,
+                end_offset_exclusive: 4,
+                event_time_watermark: Some(InputEventTimeWatermark {
+                    stream_id: "purchases-stream".to_string(),
+                    partition_id: 0,
+                    event_time_column_id: "event_time".to_string(),
+                    max_observed_event_time_ns: 70_000_000_000,
+                    watermark_ns: 70_000_000_000,
+                }),
+                batches: vec![purchases_event_time_batch(&[(
+                    "alice",
+                    7,
+                    70_000_000_000,
+                    1,
+                )])],
+            }],
+        )
+        .unwrap();
+    assert_window_page(
+        runtime.as_ref(),
+        2,
+        &[
+            ("alice", 0, 60_000_000_000, 10, 1),
+            ("bob", 0, 60_000_000_000, 55, 1),
+        ],
+    );
+}
+
+#[test]
+fn multi_input_watermark_combination_is_min_across_partitions_and_rejects_regression() {
+    use velorix_core::standing_program::InputEventTimeFrontier;
+
+    let frontiers = vec![
+        InputEventTimeFrontier {
+            relation_id: "a".to_string(),
+            relation_version: "v1".to_string(),
+            schema_fingerprint: "fp".to_string(),
+            stream_id: "s".to_string(),
+            partition_id: 0,
+            event_time_column_id: "event_time".to_string(),
+            max_observed_event_time_ns: 100,
+            watermark_ns: 90,
+        },
+        InputEventTimeFrontier {
+            relation_id: "a".to_string(),
+            relation_version: "v1".to_string(),
+            schema_fingerprint: "fp".to_string(),
+            stream_id: "s".to_string(),
+            partition_id: 1,
+            event_time_column_id: "event_time".to_string(),
+            max_observed_event_time_ns: 60,
+            watermark_ns: 50,
+        },
+        InputEventTimeFrontier {
+            relation_id: "b".to_string(),
+            relation_version: "v1".to_string(),
+            schema_fingerprint: "fp".to_string(),
+            stream_id: "t".to_string(),
+            partition_id: 0,
+            event_time_column_id: "event_time".to_string(),
+            max_observed_event_time_ns: 200,
+            watermark_ns: 180,
+        },
+    ];
+    // Effective operator watermark = min over all active partitions of all
+    // inputs; no input can finalize windows while another is behind.
+    assert_eq!(combine_multi_input_watermarks(&frontiers), Some(50));
+    assert_eq!(combine_multi_input_watermarks(&[]), None);
+
+    // A regressing watermark must fail the epoch closed.
+    let mut state = frontiers.clone();
+    let regression = [RelationInputBatch {
+        encoding: RelationInputEncodingV1::SourceRelationV1,
+        relation_id: "a".to_string(),
+        relation_version: "v1".to_string(),
+        stream_id: "s".to_string(),
+        partition_id: 1,
+        schema_fingerprint: "fp".to_string(),
+        start_offset_inclusive: 0,
+        end_offset_exclusive: 1,
+        event_time_watermark: Some(InputEventTimeWatermark {
+            stream_id: "s".to_string(),
+            partition_id: 1,
+            event_time_column_id: "event_time".to_string(),
+            max_observed_event_time_ns: 55,
+            watermark_ns: 45,
+        }),
+        batches: vec![],
+    }];
+    let error = advance_input_event_time_frontier(&mut state, &regression[0]).unwrap_err();
+    assert!(
+        error.to_string().contains("input_event_time_watermark"),
+        "watermark regression must fail closed: {error}"
+    );
+}
+
+#[test]
+fn late_row_policy_default_strict_reject_fails_closed_on_late_row() {
+    let catalog = purchases_event_time_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = purchases_window_output_schema();
+    let sql = "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end";
+    // No policy on the plan: the legacy strict contract must be preserved.
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &standing_identity_with_view(sql, "purchases_by_user_minute"),
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("epoch-1").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 1,
+                event_time_watermark: Some(InputEventTimeWatermark {
+                    stream_id: "purchases-stream".to_string(),
+                    partition_id: 0,
+                    event_time_column_id: "event_time".to_string(),
+                    max_observed_event_time_ns: 60_000_000_000,
+                    watermark_ns: 60_000_000_000,
+                }),
+                batches: vec![purchases_event_time_batch(&[(
+                    "alice",
+                    10,
+                    10_000_000_000,
+                    1,
+                )])],
+            }],
+        )
+        .unwrap();
+
+    let error = runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("epoch-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 1,
+                end_offset_exclusive: 2,
+                event_time_watermark: Some(InputEventTimeWatermark {
+                    stream_id: "purchases-stream".to_string(),
+                    partition_id: 0,
+                    event_time_column_id: "event_time".to_string(),
+                    max_observed_event_time_ns: 60_000_000_000,
+                    watermark_ns: 60_000_000_000,
+                }),
+                batches: vec![purchases_event_time_batch(&[(
+                    "carol",
+                    99,
+                    20_000_000_000,
+                    1,
+                )])],
+            }],
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("tumbling_event_time_input_batch"),
+        "strict default must fail closed on late rows: {error}"
+    );
+    assert_window_page(runtime.as_ref(), 1, &[("alice", 0, 60_000_000_000, 10, 1)]);
 }

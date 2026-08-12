@@ -309,7 +309,7 @@ impl StandingProgramRuntime for TwoInputSemiAntiJoinRuntime {
                 let (port_id, delta) = if input.relation_id == self.plan.left_input_relation_id {
                     let columns = filter_project_input_column_ids(&self.plan.projection);
                     let delta =
-                        if let Some(empty_delta) = published_input_empty_delta(&input, catalog)? {
+                        if let Some(empty_delta) = published_input_empty_delta(input, catalog)? {
                             empty_delta
                         } else {
                             arrow_record_batches_to_key_multi_value_delta_batch(
@@ -347,7 +347,7 @@ impl StandingProgramRuntime for TwoInputSemiAntiJoinRuntime {
                         .map(|column| column.column_id.clone())
                         .collect::<Vec<_>>();
                     let delta =
-                        if let Some(empty_delta) = published_input_empty_delta(&input, catalog)? {
+                        if let Some(empty_delta) = published_input_empty_delta(input, catalog)? {
                             empty_delta
                         } else {
                             arrow_record_batches_to_key_multi_value_delta_batch(
@@ -524,20 +524,18 @@ fn validate_semi_anti_join_runtime_contract(
     })?;
     if &expected_right != right_input
         || logical_plan.input_relations.len() != 2
-        || !logical_plan
-            .nodes
-            .iter()
-            .any(|node| match (plan.join_kind, node) {
+        || !logical_plan.nodes.iter().any(|node| {
+            matches!(
+                (plan.join_kind, node),
                 (
                     SupportedSemiAntiJoinKindV1::Semi,
                     velorix_core::view_plan::VelorixLogicalViewPlanNodeV1::SemiEquiJoin { .. },
-                )
-                | (
+                ) | (
                     SupportedSemiAntiJoinKindV1::Anti,
                     velorix_core::view_plan::VelorixLogicalViewPlanNodeV1::AntiEquiJoin { .. },
-                ) => true,
-                _ => false,
-            })
+                )
+            )
+        })
     {
         return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
             field: "semi_anti_join_contract",

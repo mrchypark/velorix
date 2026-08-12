@@ -158,6 +158,7 @@ pub struct RelationInputBatch {
 }
 
 impl RelationInputBatch {
+    #[allow(clippy::too_many_arguments)]
     pub fn source_relation(
         relation_id: String,
         relation_version: String,

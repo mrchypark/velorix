@@ -117,7 +117,7 @@ fn validate(workload: &ScaleWorkload) -> BenchResult<()> {
         && !workload.sql.trim().is_empty()
         && workload.total_rows > 0
         && workload.batch_rows > 0
-        && workload.total_rows % workload.batch_rows == 0
+        && workload.total_rows.is_multiple_of(workload.batch_rows)
         && workload.distinct_groups > 1
         && workload.distinct_groups <= workload.total_rows
         && match workload.distribution {

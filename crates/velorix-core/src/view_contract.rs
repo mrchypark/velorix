@@ -1,9 +1,3 @@
-use std::collections::BTreeSet;
-
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use thiserror::Error;
-
 use crate::relation::{
     ArrowPhysicalTypeV1, DataFusionRegistrationModeV1, DataFusionRegistrationV1,
     IncrementalAdapterBindingV1, IncrementalRelationBindingV1, RelationColumnV1,
@@ -12,7 +6,10 @@ use crate::relation::{
     VelorixRelationSourceV1, CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID, RELATION_SCHEMA_VERSION_V1,
 };
 use crate::standing_program::CausalViewCursorV1;
-
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
+use thiserror::Error;
 pub const SPEC_HASH_PREFIX: &str = "velorix-view-spec-sha256-v1";
 pub const PUBLISHED_RELATION_BINDING_SCHEMA_VERSION_V1: u32 = 1;
 pub const PUBLISHED_RELATION_DELTA_CODEC_V1: &str = "velorix-published-relation-delta-v1";
@@ -27,7 +24,6 @@ pub const MAX_SQL_TYPE_NODES: usize = 4096;
 pub const MAX_SQL_STRUCT_FIELDS: usize = 256;
 pub const MAX_SQL_STRUCT_FIELD_NAME_BYTES: usize = 128;
 pub const MAX_SQL_TIMEZONE_BYTES: usize = 128;
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StandingViewSpec {
@@ -39,21 +35,18 @@ pub struct StandingViewSpec {
     pub output_relations: Vec<RelationSchema>,
     pub shape: StandingViewShape,
 }
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "snake_case")]
 pub enum SqlDialect {
     VelorixSql,
 }
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "snake_case")]
 pub enum SqlSourceKind {
     StandingView,
 }
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StandingViewShape {
@@ -61,7 +54,6 @@ pub struct StandingViewShape {
     pub multi_input: bool,
     pub multi_output: bool,
 }
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelationSchema {
@@ -72,7 +64,6 @@ pub struct RelationSchema {
     pub columns: Vec<ColumnSchema>,
     pub primary_key: Vec<String>,
 }
-
 /// Immutable identity for consuming a materialized output as a typed relation.
 ///
 /// The public relation schema never contains a physical delta-weight column. The
@@ -97,7 +88,6 @@ pub struct PublishedRelationBindingV1 {
     /// Empty for direct source inputs.
     pub dependency_binding_digest: String,
 }
-
 /// Durable description of one input edge of a materialized view: either a
 /// direct source relation or the published output of a producer view.
 ///
@@ -107,6 +97,7 @@ pub struct PublishedRelationBindingV1 {
 /// Arrow encoding instead.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[allow(clippy::large_enum_variant)]
 pub enum StandingInputBindingV1 {
     Source {
         relation: RelationSchema,
@@ -121,7 +112,6 @@ pub enum StandingInputBindingV1 {
         bootstrap_cursor: CausalViewCursorV1,
     },
 }
-
 /// Durable view-on-view dependency edge, persisted alongside the consumer's
 /// active view record. Direction is consumer -> producer.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -145,7 +135,6 @@ pub struct ViewDependencyEdgeV1 {
     pub delta_codec_identity: String,
     pub frontier_kind: String,
 }
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ColumnSchema {
@@ -153,7 +142,6 @@ pub struct ColumnSchema {
     pub data_type: SqlDataType,
     pub nullable: bool,
 }
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -204,7 +192,6 @@ pub enum SqlDataType {
     Json,
     Geometry,
 }
-
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "snake_case")]
@@ -223,7 +210,6 @@ pub enum SqlIntervalUnit {
     Year,
     YearToMonth,
 }
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SqlStructField {
@@ -231,7 +217,6 @@ pub struct SqlStructField {
     pub data_type: SqlDataType,
     pub nullable: bool,
 }
-
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum ViewContractError {
     #[error("missing view contract field: {field}")]
@@ -245,7 +230,6 @@ pub enum ViewContractError {
     #[error("could not serialize canonical view contract: {reason}")]
     Serialization { reason: String },
 }
-
 pub fn validate_materialized_standing_view_spec(
     spec: &StandingViewSpec,
 ) -> Result<(), ViewContractError> {
@@ -277,7 +261,6 @@ pub fn validate_materialized_standing_view_spec(
     }
     Ok(())
 }
-
 pub fn catalog_input_relation_schema(
     catalog: &VelorixRelationCatalogV1,
 ) -> Result<RelationSchema, ViewContractError> {
@@ -305,7 +288,6 @@ pub fn catalog_input_relation_schema(
         primary_key: catalog_primary_key_columns(catalog)?,
     })
 }
-
 pub fn view_spec_hash(spec: &StandingViewSpec) -> Result<String, ViewContractError> {
     validate_materialized_standing_view_spec(spec)?;
     let canonical_json =
@@ -321,7 +303,6 @@ pub fn view_spec_hash(spec: &StandingViewSpec) -> Result<String, ViewContractErr
             })?;
     Ok(format!("{SPEC_HASH_PREFIX}:{hex}"))
 }
-
 pub fn published_relation_binding_v1(
     producer_view_id: &str,
     producer_view_generation: u64,
@@ -359,7 +340,6 @@ pub fn published_relation_binding_v1(
     validate_published_relation_binding_v1(&binding)?;
     Ok(binding)
 }
-
 pub fn validate_published_relation_binding_v1(
     binding: &PublishedRelationBindingV1,
 ) -> Result<(), ViewContractError> {
@@ -416,80 +396,6 @@ pub fn validate_published_relation_binding_v1(
     }
     Ok(())
 }
-
-/// Resolve a consumer view input relation from the producer's published binding.
-///
-/// This is the authoritative source for a consumer view input schema. It verifies
-/// every identity field of the admitted dependency edge against the producer's
-/// `PublishedRelationBindingV1` with exact matching, so a stale generation,
-/// cross-tenant producer, changed key descriptor, or mismatched stream/codec is
-/// rejected before the consumer planner/runtime can bind to it.
-///
-/// On success, returns `published.relation` which the consumer must use as its
-/// input schema. The consumer must NOT re-resolve the schema from a live catalog
-/// or producer runtime later.
-pub fn resolve_view_input_relation_v1(
-    edge: &ViewDependencyEdgeBindingV1,
-    producer_tenant_id: &str,
-    producer_program_id: &str,
-    published: &PublishedRelationBindingV1,
-) -> Result<RelationSchema, ViewContractError> {
-    validate_published_relation_binding_v1(published)?;
-
-    if edge.producer_tenant_id != producer_tenant_id {
-        return Err(ViewContractError::DependencyEdgeMismatch {
-            field: "producer_tenant_id",
-        });
-    }
-    if edge.producer_program_id != producer_program_id {
-        return Err(ViewContractError::DependencyEdgeMismatch {
-            field: "producer_program_id",
-        });
-    }
-    if edge.producer_view_id != published.producer_view_id {
-        return Err(ViewContractError::DependencyEdgeMismatch {
-            field: "producer_view_id",
-        });
-    }
-    if edge.producer_generation != published.producer_view_generation {
-        return Err(ViewContractError::DependencyEdgeMismatch {
-            field: "producer_generation",
-        });
-    }
-    if edge.producer_plan_hash != published.producer_plan_hash {
-        return Err(ViewContractError::DependencyEdgeMismatch {
-            field: "producer_plan_hash",
-        });
-    }
-    if edge.output_schema_hash != published.output_schema_hash {
-        return Err(ViewContractError::DependencyEdgeMismatch {
-            field: "output_schema_hash",
-        });
-    }
-    if edge.key_descriptor_hash != published.key_descriptor_hash {
-        return Err(ViewContractError::DependencyEdgeMismatch {
-            field: "key_descriptor_hash",
-        });
-    }
-    if edge.output_stream_id != published.output_stream_id {
-        return Err(ViewContractError::DependencyEdgeMismatch {
-            field: "output_stream_id",
-        });
-    }
-    if edge.delta_codec_identity != published.delta_codec_identity {
-        return Err(ViewContractError::DependencyEdgeMismatch {
-            field: "delta_codec_identity",
-        });
-    }
-    if edge.frontier_kind != published.frontier_kind {
-        return Err(ViewContractError::DependencyEdgeMismatch {
-            field: "frontier_kind",
-        });
-    }
-
-    Ok(published.relation.clone())
-}
-
 fn stable_serialized_hash<T: Serialize>(
     value: &T,
     description: &str,
@@ -499,13 +405,11 @@ fn stable_serialized_hash<T: Serialize>(
     })?;
     Ok(stable_bytes_hash(&bytes))
 }
-
 pub fn stable_bytes_hash(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("sha256:{:x}", hasher.finalize())
 }
-
 /// Synthesizes the runtime planning descriptor for a published-view-output
 /// input relation. The descriptor mirrors the producer's signed binding: the
 /// public columns in binding order plus exactly one private Int64 weight
@@ -529,8 +433,8 @@ pub fn catalog_from_published_relation_binding(
     let mut columns = Vec::with_capacity(binding.relation.columns.len() + 1);
     let primary_key = binding.relation.primary_key.iter().collect::<BTreeSet<_>>();
     for (ordinal, column) in binding.relation.columns.iter().enumerate() {
-        let (logical_type, physical_arrow_type) = published_column_type(&column.data_type)
-            .ok_or_else(|| ViewContractError::InvalidField {
+        let (logical_type, physical_arrow_type) =
+            published_column_type(&column.data_type).ok_or(ViewContractError::InvalidField {
                 field: "published_relation.column.data_type",
             })?;
         let semantic_role = if primary_key.contains(&column.name) {
@@ -612,7 +516,6 @@ pub fn catalog_from_published_relation_binding(
         })?;
     Ok(catalog)
 }
-
 fn published_column_type(
     data_type: &SqlDataType,
 ) -> Option<(VelorixLogicalTypeV1, ArrowPhysicalTypeV1)> {
@@ -672,7 +575,6 @@ fn published_column_type(
         | SqlDataType::Map { .. } => None,
     }
 }
-
 impl StandingInputBindingV1 {
     pub fn validate(&self) -> Result<(), ViewContractError> {
         match self {
@@ -750,7 +652,6 @@ impl StandingInputBindingV1 {
             }
         }
     }
-
     /// Canonical identity hash over the full binding: producer scope,
     /// generation, plan hash, output stream, schema hash, key hash, codec,
     /// and frontier kind. View inputs must never be identified by the public
@@ -813,7 +714,6 @@ impl StandingInputBindingV1 {
         }
     }
 }
-
 /// Canonical domain-separated edge id for a view-on-view dependency edge.
 pub fn view_dependency_edge_id(
     producer_tenant_id: &str,
@@ -860,7 +760,7 @@ pub fn view_dependency_edge_id(
         })?;
     Ok(stable_bytes_hash(&bytes))
 }
-
+#[allow(clippy::too_many_arguments)]
 pub fn view_dependency_edge_from_binding(
     tenant_id: &str,
     consumer_program_id: &str,
@@ -894,7 +794,6 @@ pub fn view_dependency_edge_from_binding(
     validate_view_dependency_edge(&edge)?;
     Ok(edge)
 }
-
 pub fn validate_view_dependency_edge(edge: &ViewDependencyEdgeV1) -> Result<(), ViewContractError> {
     if edge.schema_version != VIEW_DEPENDENCY_EDGE_SCHEMA_VERSION_V1
         || edge.consumer_generation == 0
@@ -947,7 +846,6 @@ pub fn validate_view_dependency_edge(edge: &ViewDependencyEdgeV1) -> Result<(), 
     }
     Ok(())
 }
-
 /// Validates that the dependency edges form an acyclic graph and returns the
 /// producer-first topological ordering of consumer view ids.
 ///
@@ -1019,7 +917,6 @@ pub fn validate_view_dependency_graph(
     }
     Ok(order)
 }
-
 fn validate_relation_schemas(schemas: &[RelationSchema]) -> Result<(), ViewContractError> {
     if schemas.len() > MAX_RELATION_COLUMNS {
         return Err(ViewContractError::InvalidField {
@@ -1036,7 +933,6 @@ fn validate_relation_schemas(schemas: &[RelationSchema]) -> Result<(), ViewContr
     }
     Ok(())
 }
-
 fn validate_relation_schema(schema: &RelationSchema) -> Result<(), ViewContractError> {
     require_non_empty("relation_id", &schema.relation_id)?;
     require_non_empty("relation_name", &schema.relation_name)?;
@@ -1065,7 +961,6 @@ fn validate_relation_schema(schema: &RelationSchema) -> Result<(), ViewContractE
     }
     Ok(())
 }
-
 fn catalog_column_schema(column: &RelationColumnV1) -> Result<ColumnSchema, ViewContractError> {
     Ok(ColumnSchema {
         name: column.name.clone(),
@@ -1073,7 +968,6 @@ fn catalog_column_schema(column: &RelationColumnV1) -> Result<ColumnSchema, View
         nullable: column.nullable,
     })
 }
-
 fn catalog_primary_key_columns(
     catalog: &VelorixRelationCatalogV1,
 ) -> Result<Vec<String>, ViewContractError> {
@@ -1097,7 +991,6 @@ fn catalog_primary_key_columns(
         })
         .collect()
 }
-
 fn sql_data_type_for_logical_type(
     logical_type: &VelorixLogicalTypeV1,
 ) -> Result<SqlDataType, ViewContractError> {
@@ -1152,12 +1045,10 @@ fn sql_data_type_for_logical_type(
         }),
     }
 }
-
 fn validate_sql_data_type(data_type: &SqlDataType) -> Result<(), ViewContractError> {
     let mut node_count = 0;
     validate_sql_data_type_with_limits(data_type, 0, &mut node_count)
 }
-
 fn validate_sql_data_type_with_limits(
     data_type: &SqlDataType,
     depth: usize,
@@ -1252,7 +1143,6 @@ fn validate_sql_data_type_with_limits(
     }
     Ok(())
 }
-
 fn validate_schema_fingerprint(value: &str) -> Result<(), ViewContractError> {
     let Some(hex) = value.strip_prefix("sha256:") else {
         return Err(ViewContractError::InvalidField {
@@ -1266,7 +1156,6 @@ fn validate_schema_fingerprint(value: &str) -> Result<(), ViewContractError> {
     }
     Ok(())
 }
-
 fn catalog_relation_error(error: RelationSchemaError) -> ViewContractError {
     match error {
         RelationSchemaError::UnsupportedSchemaVersion { .. } => ViewContractError::InvalidField {
@@ -1283,18 +1172,15 @@ fn catalog_relation_error(error: RelationSchemaError) -> ViewContractError {
         }
     }
 }
-
 fn require_non_empty(field: &'static str, value: &str) -> Result<(), ViewContractError> {
     if value.trim().is_empty() {
         return Err(ViewContractError::MissingField { field });
     }
     Ok(())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn view_spec_hash_uses_path_safe_namespaced_hex() {
         let spec = StandingViewSpec {
@@ -1346,13 +1232,11 @@ mod tests {
                 multi_output: false,
             },
         };
-
         let hash = view_spec_hash(&spec).unwrap();
         let hex = hash.strip_prefix("velorix-view-spec-sha256-v1:").unwrap();
         assert_eq!(hex.len(), 64);
         assert!(hex.bytes().all(|byte| byte.is_ascii_hexdigit()));
     }
-
     #[test]
     fn published_relation_binding_fences_schema_key_generation_and_frontier() {
         let relation = RelationSchema {
@@ -1367,7 +1251,6 @@ mod tests {
             }],
             primary_key: vec!["region".to_string()],
         };
-
         let binding = published_relation_binding_v1(
             "orders_by_region",
             7,
@@ -1375,7 +1258,6 @@ mod tests {
             &relation,
         )
         .unwrap();
-
         assert_eq!(binding.relation, relation);
         assert_eq!(binding.producer_view_generation, 7);
         assert_eq!(
@@ -1388,7 +1270,6 @@ mod tests {
         );
         assert_eq!(binding.frontier_kind, PUBLISHED_RELATION_FRONTIER_KIND_V1);
         validate_published_relation_binding_v1(&binding).unwrap();
-
         let mut stale_key = binding.clone();
         stale_key.key_descriptor_hash = format!("sha256:{}", "0".repeat(64));
         assert_eq!(
@@ -1397,7 +1278,6 @@ mod tests {
                 field: "published_relation.key_descriptor_hash"
             })
         );
-
         let mut wrong_generation_stream = binding;
         wrong_generation_stream.producer_view_generation += 1;
         assert_eq!(
@@ -1407,7 +1287,6 @@ mod tests {
             })
         );
     }
-
     fn sample_binding() -> PublishedRelationBindingV1 {
         published_relation_binding_v1(
             "filtered_orders",
@@ -1435,7 +1314,6 @@ mod tests {
         )
         .unwrap()
     }
-
     fn sample_cursor() -> CausalViewCursorV1 {
         CausalViewCursorV1 {
             input_edge: view_dependency_edge_id("default", "filtered_orders", &sample_binding())
@@ -1449,7 +1327,6 @@ mod tests {
             commit_digest: format!("sha256:{}", "a".repeat(64)),
         }
     }
-
     #[test]
     fn published_view_input_binding_validation_is_generation_fenced() {
         let binding = sample_binding();
@@ -1463,7 +1340,6 @@ mod tests {
             bootstrap_cursor: sample_cursor(),
         };
         input.validate().unwrap();
-
         let mut stale = input.clone();
         if let StandingInputBindingV1::PublishedView {
             published_relation, ..
@@ -1472,7 +1348,6 @@ mod tests {
             published_relation.producer_view_generation += 1;
         }
         assert!(stale.validate().is_err());
-
         let mut wrong_cursor = input.clone();
         if let StandingInputBindingV1::PublishedView {
             bootstrap_cursor, ..
@@ -1486,8 +1361,8 @@ mod tests {
                 field: "input_binding.published_view.bootstrap_cursor"
             })
         );
-
         // The cursor must be bound to the same producer scope as the binding.
+        #[allow(clippy::type_complexity)]
         let scope_mutations: [(&str, fn(&mut CausalViewCursorV1)); 6] = [
             ("edge", |cursor: &mut CausalViewCursorV1| {
                 cursor.input_edge.push_str("-other")
@@ -1524,7 +1399,6 @@ mod tests {
                 "cursor {field} mismatch must fail validation"
             );
         }
-
         let source = StandingInputBindingV1::Source {
             relation: RelationSchema {
                 relation_id: "orders".to_string(),
@@ -1542,7 +1416,6 @@ mod tests {
         };
         source.validate().unwrap();
     }
-
     #[test]
     fn published_view_input_binding_hash_fences_generation_plan_schema_and_codec() {
         let binding = sample_binding();
@@ -1556,7 +1429,6 @@ mod tests {
             bootstrap_cursor: sample_cursor(),
         };
         let base = input.input_catalog_hash().unwrap();
-
         let mut generation = input.clone();
         if let StandingInputBindingV1::PublishedView {
             published_relation, ..
@@ -1565,7 +1437,6 @@ mod tests {
             published_relation.producer_view_generation += 1;
         }
         assert_ne!(generation.input_catalog_hash().unwrap(), base);
-
         let mut plan = input.clone();
         if let StandingInputBindingV1::PublishedView {
             published_relation, ..
@@ -1575,7 +1446,6 @@ mod tests {
                 "velorix-logical-view-plan-sha256-v1:other".to_string();
         }
         assert_ne!(plan.input_catalog_hash().unwrap(), base);
-
         let mut schema = input.clone();
         if let StandingInputBindingV1::PublishedView {
             published_relation, ..
@@ -1584,7 +1454,6 @@ mod tests {
             published_relation.relation.schema_fingerprint = format!("sha256:{}", "9".repeat(64));
         }
         assert_ne!(schema.input_catalog_hash().unwrap(), base);
-
         let mut codec = input.clone();
         if let StandingInputBindingV1::PublishedView {
             published_relation, ..
@@ -1593,7 +1462,6 @@ mod tests {
             published_relation.delta_codec_identity = "other-codec".to_string();
         }
         assert_ne!(codec.input_catalog_hash().unwrap(), base);
-
         let source = StandingInputBindingV1::Source {
             relation: RelationSchema {
                 relation_id: "orders".to_string(),
@@ -1614,7 +1482,6 @@ mod tests {
             format!("sha256:{}", "3".repeat(64))
         );
     }
-
     fn edge(consumer: &str, producer: &str) -> ViewDependencyEdgeV1 {
         ViewDependencyEdgeV1 {
             schema_version: VIEW_DEPENDENCY_EDGE_SCHEMA_VERSION_V1,
@@ -1636,7 +1503,6 @@ mod tests {
             frontier_kind: PUBLISHED_RELATION_FRONTIER_KIND_V1.to_string(),
         }
     }
-
     #[test]
     fn view_dependency_edge_id_is_deterministic_and_domain_separated() {
         let binding = sample_binding();
@@ -1656,7 +1522,6 @@ mod tests {
             view_dependency_edge_id("other-tenant", "filtered_orders", &binding).unwrap();
         assert_ne!(first, other_tenant);
     }
-
     #[test]
     fn view_dependency_graph_rejects_self_two_node_and_three_node_cycles() {
         let self_cycle = vec![edge("a", "a")];
@@ -1667,7 +1532,6 @@ mod tests {
                 ..
             })
         ));
-
         let two_cycle = vec![edge("a", "b"), edge("b", "a")];
         assert_eq!(
             validate_view_dependency_graph(&two_cycle),
@@ -1675,7 +1539,6 @@ mod tests {
                 field: "dependency_cycle"
             })
         );
-
         let three_cycle = vec![edge("a", "b"), edge("b", "c"), edge("c", "a")];
         assert_eq!(
             validate_view_dependency_graph(&three_cycle),
@@ -1684,7 +1547,6 @@ mod tests {
             })
         );
     }
-
     #[test]
     fn view_dependency_graph_produces_producer_first_topological_order() {
         let edges = vec![
@@ -1701,7 +1563,6 @@ mod tests {
             orders_pos < filtered_pos && filtered_pos < aggregate_pos && aggregate_pos < topk_pos
         );
     }
-
     #[test]
     fn published_relation_descriptor_catalog_round_trips_public_schema_with_signed_weight_column() {
         let binding = sample_binding();
@@ -1734,7 +1595,6 @@ mod tests {
         assert_eq!(weight_column.logical_type, VelorixLogicalTypeV1::Int64);
         assert!(!weight_column.nullable);
     }
-
     #[test]
     fn published_relation_descriptor_catalog_rejects_reserved_weight_column_in_public_schema() {
         let mut binding = sample_binding();
@@ -1745,7 +1605,6 @@ mod tests {
         });
         assert!(catalog_from_published_relation_binding(&binding).is_err());
     }
-
     #[test]
     fn published_relation_descriptor_catalog_rejects_unsupported_column_types() {
         let mut binding = sample_binding();

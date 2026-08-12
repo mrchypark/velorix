@@ -3,6 +3,7 @@ use super::*;
 /// One resolved input edge of a view admission: either a direct source
 /// relation catalog or the published output of an active producer view.
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub(super) enum ResolvedAdmissionInputV1 {
     Source {
         catalog: VelorixRelationCatalogV1,

@@ -82,6 +82,7 @@ impl TwoInputJoinRuntime {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_with_execution_mode(
         identity: StandingProgramIdentity,
         catalogs: Vec<VelorixRelationCatalogV1>,

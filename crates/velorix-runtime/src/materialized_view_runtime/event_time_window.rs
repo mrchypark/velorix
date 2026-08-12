@@ -40,23 +40,24 @@ impl TumblingEventTimeAggregateRuntime {
             &catalog,
             plan.late_row_policy,
         )
-            .map_err(|_| StandingProgramRuntimeError::InvalidProgramIdentity {
-                field: "tumbling_window_view_plan",
-            })?;
+        .map_err(|_| StandingProgramRuntimeError::InvalidProgramIdentity {
+            field: "tumbling_window_view_plan",
+        })?;
         if compiled_plan != plan {
             return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
                 field: "tumbling_window_view_plan",
             });
         }
-        let compiled_logical_plan = lower_supported_tumbling_window_sql_to_logical_plan_with_policy(
-            view_sql.as_str(),
-            &catalog,
-            &output_schema,
-            plan.late_row_policy,
-        )
-        .map_err(|_| StandingProgramRuntimeError::InvalidProgramIdentity {
-            field: "logical_tumbling_window_view_plan",
-        })?;
+        let compiled_logical_plan =
+            lower_supported_tumbling_window_sql_to_logical_plan_with_policy(
+                view_sql.as_str(),
+                &catalog,
+                &output_schema,
+                plan.late_row_policy,
+            )
+            .map_err(|_| StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "logical_tumbling_window_view_plan",
+            })?;
         if compiled_logical_plan != logical_plan {
             return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
                 field: "logical_tumbling_window_view_plan",
@@ -232,11 +233,17 @@ impl StandingProgramRuntime for TumblingEventTimeAggregateRuntime {
             advance_input_event_time_frontier(&mut next_event_time_frontiers, &input)?;
         }
         let previous_output = self.published_output.clone();
-        let full_output = self.state.closed_delta(
-            &self.plan,
-            &self.output_schema,
+        // Finalization frontier: windows become final only once their end
+        // passes the watermark minus the allowed lateness. With the default
+        // StrictReject (allowance 0) this is exactly the watermark, so the
+        // behavior is byte-identical to the legacy contract.
+        let effective_watermark = finalization_frontier(
+            self.plan.late_row_policy,
             min_event_time_watermark(&next_event_time_frontiers),
-        )?;
+        );
+        let full_output =
+            self.state
+                .closed_delta(&self.plan, &self.output_schema, effective_watermark)?;
         self.published_output = apply_top_k_to_published_output(
             full_output,
             self.plan.top_k.as_ref(),
@@ -353,24 +360,24 @@ impl StandingProgramRuntime for TumblingEventTimeAggregateRuntime {
             std::slice::from_ref(&payload.catalog),
         )?;
         validate_view_sql_hash(&checkpoint.identity, payload.view_sql.as_str())?;
-        let compiled_plan =
-            validate_supported_tumbling_window_sql_with_policy(
-                payload.view_sql.as_str(),
-                &payload.catalog,
-                payload.plan.late_row_policy,
-            )
-                .map_err(|_| invalid_checkpoint())?;
+        let compiled_plan = validate_supported_tumbling_window_sql_with_policy(
+            payload.view_sql.as_str(),
+            &payload.catalog,
+            payload.plan.late_row_policy,
+        )
+        .map_err(|_| invalid_checkpoint())?;
         if compiled_plan != payload.plan {
             return Err(invalid_checkpoint());
         }
         validate_logical_view_plan(&payload.logical_plan).map_err(|_| invalid_checkpoint())?;
-        let compiled_logical_plan = lower_supported_tumbling_window_sql_to_logical_plan_with_policy(
-            payload.view_sql.as_str(),
-            &payload.catalog,
-            &payload.output_schema,
-            payload.plan.late_row_policy,
-        )
-        .map_err(|_| invalid_checkpoint())?;
+        let compiled_logical_plan =
+            lower_supported_tumbling_window_sql_to_logical_plan_with_policy(
+                payload.view_sql.as_str(),
+                &payload.catalog,
+                &payload.output_schema,
+                payload.plan.late_row_policy,
+            )
+            .map_err(|_| invalid_checkpoint())?;
         if compiled_logical_plan != payload.logical_plan {
             return Err(invalid_checkpoint());
         }

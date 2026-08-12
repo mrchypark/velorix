@@ -50,7 +50,6 @@ use velorix_core::{
         lower_supported_latest_by_key_sql_to_logical_plan,
         lower_supported_semi_anti_join_sql_to_logical_plan, lower_supported_sql_to_logical_plan,
         lower_supported_three_input_inner_join_count_sql_to_logical_plan_with_policy,
-        lower_supported_tumbling_window_sql_to_logical_plan,
         lower_supported_tumbling_window_sql_to_logical_plan_with_policy,
         lower_supported_view_sql_to_logical_plan, supported_join_key_codec_id,
         supported_join_view_plan_aggregate_outputs, supported_join_view_plan_is_self_join,
@@ -60,15 +59,13 @@ use velorix_core::{
         supported_view_plan_is_singleton, validate_logical_view_plan,
         validate_supported_analytic_row_number_sql, validate_supported_filter_project_sql,
         validate_supported_join_view_sql, validate_supported_latest_by_key_sql,
-        validate_supported_semi_anti_join_sql, validate_supported_tumbling_window_sql,
-        validate_supported_tumbling_window_sql_with_policy,
+        validate_supported_semi_anti_join_sql, validate_supported_tumbling_window_sql_with_policy,
         validate_supported_view_sql, AggregateOutputPredicate, AggregateOutputPredicateExpr,
-        JoinPredicateExpr, JoinRowPredicate, LogicalPlanAggregateFunctionV1,
+        JoinPredicateExpr, JoinRowPredicate, LateRowPolicy, LogicalPlanAggregateFunctionV1,
         LogicalPlanExecutionImplementationV1, LogicalPlanLatestByKeyFunctionV1, PredicateOp,
         RowPredicate, RowPredicateExpr, SupportedAggregateInputRelationSide,
         SupportedAggregateOutput, SupportedAnalyticRowNumberPlan, SupportedAnalyticWindowFunction,
         SupportedEventTimeWindowKind, SupportedFilterProjectPlan, SupportedJoinKeyDomainV1,
-        LateRowPolicy,
         SupportedJoinKind, SupportedJoinViewPlan, SupportedLatestByKeyPlan,
         SupportedProjectionBinaryOp, SupportedProjectionExpr, SupportedSemiAntiJoinKindV1,
         SupportedSemiAntiJoinProjectPlanV1, SupportedThreeInputInnerJoinCountPlanV1,
@@ -1890,7 +1887,7 @@ fn advance_input_frontier(
     Ok(())
 }
 
-fn advance_input_event_time_frontier(
+pub fn advance_input_event_time_frontier(
     frontiers: &mut Vec<InputEventTimeFrontier>,
     input: &RelationInputBatch,
 ) -> Result<(), StandingProgramRuntimeError> {
@@ -6735,7 +6732,7 @@ fn apply_tumbling_input(
                         state.late_rows_dropped = state
                             .late_rows_dropped
                             .checked_add(1)
-                            .ok_or_else(|| invalid_runtime_state())?;
+                            .ok_or_else(invalid_runtime_state)?;
                         continue;
                     }
                     Some(LateRowPolicy::AdmitWithinAllowance { allowance_ns }) => {
@@ -6746,7 +6743,7 @@ fn apply_tumbling_input(
                             state.late_rows_dropped = state
                                 .late_rows_dropped
                                 .checked_add(1)
-                                .ok_or_else(|| invalid_runtime_state())?;
+                                .ok_or_else(invalid_runtime_state)?;
                             continue;
                         }
                     }
@@ -7212,6 +7209,30 @@ fn current_partition_watermark(
 
 fn min_event_time_watermark(frontiers: &[InputEventTimeFrontier]) -> Option<i64> {
     frontiers.iter().map(|frontier| frontier.watermark_ns).min()
+}
+
+/// Multi-input watermark combination (Phase 5.2 contract): the effective
+/// operator watermark is the minimum over every active partition of every
+/// input, so no input can finalize windows while another input is still
+/// behind. Idle partitions never advance implicitly (no wall-clock idle
+/// policy); a partition without a watermark keeps the effective watermark at
+/// its last value, and a new partition without any watermark yet pins the
+/// combination to `None` (nothing finalizes).
+pub fn combine_multi_input_watermarks(frontiers: &[InputEventTimeFrontier]) -> Option<i64> {
+    min_event_time_watermark(frontiers)
+}
+
+/// Finalization frontier for the configured late-row policy: `F = W - A`.
+/// `None` policy (legacy default) means `A = 0`, so `F = W` exactly.
+pub fn finalization_frontier(
+    late_row_policy: Option<LateRowPolicy>,
+    watermark: Option<i64>,
+) -> Option<i64> {
+    let allowance = match late_row_policy {
+        Some(LateRowPolicy::AdmitWithinAllowance { allowance_ns }) => allowance_ns,
+        _ => 0,
+    };
+    watermark.map(|watermark| watermark.saturating_sub(allowance))
 }
 
 fn batch_column_index(
@@ -8426,10 +8447,10 @@ fn strip_filter_project_hidden_order_value(
     output: DeltaBatch,
     plan: &SupportedFilterProjectPlan,
 ) -> Result<DeltaBatch, StandingProgramRuntimeError> {
-    if !plan
+    if plan
         .top_k
         .as_ref()
-        .is_some_and(|top_k| top_k.order_input_column_id.is_some())
+        .is_none_or(|top_k| top_k.order_input_column_id.is_none())
     {
         return Ok(output);
     }

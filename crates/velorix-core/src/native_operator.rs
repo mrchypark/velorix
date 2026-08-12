@@ -1373,6 +1373,7 @@ where
     }
 }
 
+#[allow(clippy::type_complexity)]
 pub struct NativeTopKOperator {
     node_id: String,
     offset: usize,

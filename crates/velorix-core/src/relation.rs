@@ -79,19 +79,15 @@ pub struct VelorixRelationCatalogV1 {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(Default)]
 pub enum VelorixRelationSourceV1 {
+    #[default]
     SourceRelation,
     PublishedViewOutput {
         producer_view_id: String,
         producer_view_generation: u64,
         output_stream_id: String,
     },
-}
-
-impl Default for VelorixRelationSourceV1 {
-    fn default() -> Self {
-        VelorixRelationSourceV1::SourceRelation
-    }
 }
 
 impl VelorixRelationCatalogV1 {

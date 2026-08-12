@@ -766,7 +766,6 @@ impl LateRowPolicy {
     }
 }
 
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SupportedTumblingWindowPlan {
@@ -1929,7 +1928,8 @@ pub fn lower_supported_tumbling_window_sql_to_logical_plan_with_policy(
     output_schema: &RelationSchema,
     late_row_policy: Option<LateRowPolicy>,
 ) -> Result<VelorixLogicalViewPlanV1, ViewPlanError> {
-    let supported = validate_supported_tumbling_window_sql_with_policy(sql, catalog, late_row_policy)?;
+    let supported =
+        validate_supported_tumbling_window_sql_with_policy(sql, catalog, late_row_policy)?;
     finalize_logical_plan(tumbling_window_logical_plan(
         sql,
         catalog,
@@ -3531,10 +3531,10 @@ fn derive_node_output(
         }
         _ => Vec::new(),
     };
-    let uniqueness = if matches!(node, VelorixLogicalViewPlanNodeV1::Aggregate { group_keys, .. } if group_keys.is_empty())
-    {
-        UniquenessGuaranteeV1::Singleton
-    } else if matches!(
+    let uniqueness = if matches!(
+        node,
+        VelorixLogicalViewPlanNodeV1::Aggregate { group_keys, .. } if group_keys.is_empty()
+    ) || (matches!(
         node,
         VelorixLogicalViewPlanNodeV1::Filter { .. }
             | VelorixLogicalViewPlanNodeV1::Project { .. }
@@ -3542,7 +3542,7 @@ fn derive_node_output(
             | VelorixLogicalViewPlanNodeV1::Output { .. }
     ) && upstream
         .first()
-        .is_some_and(|output| output.uniqueness == UniquenessGuaranteeV1::Singleton)
+        .is_some_and(|output| output.uniqueness == UniquenessGuaranteeV1::Singleton))
     {
         UniquenessGuaranteeV1::Singleton
     } else if candidate_keys.is_empty() {
@@ -7526,6 +7526,7 @@ fn validate_join_group_by_key(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn join_projection_key<'a>(
     item: &SelectItem,
     join_kind: SupportedJoinKind,
@@ -7609,6 +7610,7 @@ fn join_key_coalesce_expr(
         && column_identifier_eq(right_key, &right_reference.column)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn join_aggregate_input_relation_id<'a>(
     supported: &'a SupportedJoinViewPlan,
     output: &SupportedAggregateOutput,
@@ -7639,6 +7641,7 @@ struct JoinCountArgument {
     relation_side: SupportedAggregateInputRelationSide,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_join_projection<'a>(
     select: &Select,
     join_kind: SupportedJoinKind,

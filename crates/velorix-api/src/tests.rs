@@ -8180,7 +8180,7 @@ async fn rest_ingest_optimization_modes_report_timings_and_materialize_correctly
         .store
         .put(
             &Path::from(convergence_key.as_str()),
-            bytes::Bytes::from(convergence_bytes).into(),
+            convergence_bytes.into(),
         )
         .await
         .unwrap();

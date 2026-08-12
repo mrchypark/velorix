@@ -1258,13 +1258,13 @@ fn validate_critique_release_evidence_kind_specific_fields(
                 );
             }
         }
-        "hiqlite_total_voter_loss_restore_drill" | "hiqlite_no_pvc_three_voter_backup_restore" => {
-            if require_json_u64(path, artifact, "/voter_count")? != 3 {
-                bail!(
-                    "{} Hiqlite restore drill requires voter_count=3",
-                    path.display()
-                );
-            }
+        "hiqlite_total_voter_loss_restore_drill" | "hiqlite_no_pvc_three_voter_backup_restore"
+            if require_json_u64(path, artifact, "/voter_count")? != 3 =>
+        {
+            bail!(
+                "{} Hiqlite restore drill requires voter_count=3",
+                path.display()
+            );
         }
         "query_output_isolation"
             if require_json_str(path, artifact, "/query_authority")?
