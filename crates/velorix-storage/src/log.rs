@@ -1206,7 +1206,17 @@ impl RangeAdmissionIndexTransitionRecordV1 {
         let expired = state
             .indexed_expired_admission_keys
             .contains(&self.admitted.admission_record_key);
+        // A transition's own admission record may already be materialized in
+        // the object store (reservation materializes evidence before the batch
+        // append commits). Replaying that transition on top of its own record
+        // is legitimate, not a self-overlap; only overlaps with a DIFFERENT
+        // active reservation are corrupt.
+        let self_materialized = state
+            .active_admissions
+            .iter()
+            .any(|active| active.admission_record_key == self.admitted.admission_record_key);
         if !expired
+            && !self_materialized
             && !matches!(
                 admission_conflict(&state.active_admissions, &self.admitted)?,
                 AdmissionReservationOutcome::Admitted
@@ -1218,8 +1228,14 @@ impl RangeAdmissionIndexTransitionRecordV1 {
             });
         }
 
-        state.indexed_admissions.push(self.admitted.clone());
-        sort_admission_records(&mut state.indexed_admissions);
+        if !state
+            .indexed_admissions
+            .iter()
+            .any(|indexed| indexed.admission_record_key == self.admitted.admission_record_key)
+        {
+            state.indexed_admissions.push(self.admitted.clone());
+            sort_admission_records(&mut state.indexed_admissions);
+        }
         let next_digest = range_admission_index_state_digest(
             &self.stream_id,
             self.partition_id,
@@ -1231,7 +1247,7 @@ impl RangeAdmissionIndexTransitionRecordV1 {
                 reason: format!("next_state_digest does not match computed digest `{next_digest}`"),
             });
         }
-        if !expired {
+        if !expired && !self_materialized {
             state.active_admissions.push(self.admitted.clone());
             sort_admission_records(&mut state.active_admissions);
         }
