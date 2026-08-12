@@ -1,54 +1,9 @@
 use super::*;
 
-/// Input binding for a single-key sum/count runtime.
-///
-/// The input kind is explicit so a missing catalog for a Source binding fails
-/// recovery, while a PublishedView binding legitimately has no physical catalog.
-/// Do NOT model this as `catalog: Option<_>` because that cannot distinguish a
-/// broken Source checkpoint from a valid published-view input.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum SingleKeyRuntimeInputV1 {
-    /// A registered physical ingest source.
-    Source { catalog: VelorixRelationCatalogV1 },
-    /// An upstream published view output delivered as signed delta batches.
-    PublishedView {
-        binding: PublishedRelationBindingV1,
-        primary_key_column_id: String,
-    },
-}
-
-impl SingleKeyRuntimeInputV1 {
-    /// The single primary key column id for this input.
-    pub fn primary_key_column_id(&self) -> Result<&str, StandingProgramRuntimeError> {
-        match self {
-            SingleKeyRuntimeInputV1::Source { catalog } => {
-                catalog_primary_key_column(catalog).map(|column| column.column_id.as_str())
-            }
-            SingleKeyRuntimeInputV1::PublishedView {
-                primary_key_column_id,
-                ..
-            } => Ok(primary_key_column_id.as_str()),
-        }
-    }
-
-    /// The physical catalog for a Source input.
-    pub fn catalog(&self) -> Result<&VelorixRelationCatalogV1, StandingProgramRuntimeError> {
-        match self {
-            SingleKeyRuntimeInputV1::Source { catalog } => Ok(catalog),
-            SingleKeyRuntimeInputV1::PublishedView { .. } => {
-                Err(StandingProgramRuntimeError::InvalidProgramIdentity {
-                    field: "single_key_published_view_input_has_no_catalog",
-                })
-            }
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct SingleKeySumCountRuntime {
     identity: StandingProgramIdentity,
-    input: SingleKeyRuntimeInputV1,
+    catalog: VelorixRelationCatalogV1,
     input_schema: RelationSchema,
     output_schema: RelationSchema,
     view_sql: String,
@@ -59,55 +14,10 @@ pub struct SingleKeySumCountRuntime {
     filtered_aggregate_state: DeltaBatch,
     input_frontiers: Vec<RelationFrontier>,
     input_event_time_frontiers: Vec<InputEventTimeFrontier>,
-    view_input_cursors: Vec<CausalViewCursorV1>,
     applied_epochs: BTreeMap<String, LogicalEpoch>,
 }
 
 impl SingleKeySumCountRuntime {
-    /// Validate a view delta input against the admitted published binding.
-    ///
-    /// Rejects deltas from a different producer view, generation, output
-    /// stream, or schema before any state mutation. Cursor monotonicity across
-    /// epochs is checked by the controller; here we bind the input to the
-    /// admitted producer identity.
-    fn validate_view_input_matches_binding(
-        &self,
-        input: &ViewInputDeltaV1,
-    ) -> Result<(), StandingProgramRuntimeError> {
-        let SingleKeyRuntimeInputV1::PublishedView {
-            binding,
-            primary_key_column_id,
-        } = &self.input
-        else {
-            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
-                field: "single_key_view_input_on_source_runtime",
-            });
-        };
-        let cursor = &input.producer_cursor;
-        if cursor.producer_view_id != binding.producer_view_id {
-            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
-                field: "single_key_view_input_producer_view_id",
-            });
-        }
-        if cursor.producer_generation != binding.producer_view_generation {
-            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
-                field: "single_key_view_input_producer_generation",
-            });
-        }
-        if cursor.output_stream != binding.output_stream_id {
-            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
-                field: "single_key_view_input_output_stream",
-            });
-        }
-        if binding.relation.schema_fingerprint != self.input_schema.schema_fingerprint {
-            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
-                field: "single_key_view_input_schema_fingerprint",
-            });
-        }
-        let _ = primary_key_column_id;
-        Ok(())
-    }
-
     pub fn new_with_plan(
         identity: StandingProgramIdentity,
         catalog: VelorixRelationCatalogV1,
@@ -126,64 +36,6 @@ impl SingleKeySumCountRuntime {
             plan,
             logical_plan,
         )
-    }
-
-    /// Create a runtime bound to a published view output input.
-    ///
-    /// This path has no physical catalog. The plan is re-validated through the
-    /// published single-key sum/count lowerer, and the aggregate value mode is
-    /// derived from the persisted input schema instead of a catalog.
-    pub fn new_with_logical_plan_for_published_view(
-        identity: StandingProgramIdentity,
-        binding: PublishedRelationBindingV1,
-        input_schema: RelationSchema,
-        output_schema: RelationSchema,
-        view_sql: String,
-        plan: SupportedViewPlan,
-        logical_plan: VelorixLogicalViewPlanV1,
-    ) -> Result<Self, StandingProgramRuntimeError> {
-        identity.validate()?;
-        validate_builtin_runtime_identity(&identity)?;
-        validate_view_sql_hash(&identity, view_sql.as_str())?;
-        validate_logical_view_plan(&logical_plan).map_err(|_| {
-            StandingProgramRuntimeError::InvalidProgramIdentity {
-                field: "logical_view_plan",
-            }
-        })?;
-        if binding.relation.schema_fingerprint != input_schema.schema_fingerprint {
-            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
-                field: "published_view_input_schema",
-            });
-        }
-        let primary_key_column_id = plan.group_key_column_id.clone();
-        let input = SingleKeyRuntimeInputV1::PublishedView {
-            binding,
-            primary_key_column_id,
-        };
-        let value_mode =
-            aggregate_value_mode_for_published_schema(&input_schema, &plan.sum_value_column_id)?;
-        let track_extrema = plan_tracks_extrema(&plan);
-        let filtered_aggregate_state = DeltaBatch::default();
-        let published_output = publish_aggregate_state(&filtered_aggregate_state, &plan)?;
-        Ok(Self {
-            identity,
-            input,
-            input_schema,
-            output_schema,
-            view_sql,
-            plan,
-            logical_plan,
-            engine: KeyedAggregateKernel::with_aggregate_value_mode_and_extrema(
-                value_mode,
-                track_extrema,
-            ),
-            published_output,
-            filtered_aggregate_state,
-            input_frontiers: Vec::new(),
-            input_event_time_frontiers: Vec::new(),
-            view_input_cursors: Vec::new(),
-            applied_epochs: BTreeMap::new(),
-        })
     }
 
     pub fn new_with_logical_plan(
@@ -232,7 +84,7 @@ impl SingleKeySumCountRuntime {
         let published_output = publish_aggregate_state(&filtered_aggregate_state, &plan)?;
         Ok(Self {
             identity,
-            input: SingleKeyRuntimeInputV1::Source { catalog },
+            catalog,
             input_schema,
             output_schema,
             view_sql,
@@ -246,7 +98,6 @@ impl SingleKeySumCountRuntime {
             filtered_aggregate_state,
             input_frontiers: Vec::new(),
             input_event_time_frontiers: Vec::new(),
-            view_input_cursors: Vec::new(),
             applied_epochs: BTreeMap::new(),
         })
     }
@@ -279,7 +130,7 @@ impl SingleKeySumCountRuntime {
     fn checkpoint_payload(&self) -> Result<String, StandingProgramRuntimeError> {
         let payload = GenericCheckpointPayload {
             schema_version: CHECKPOINT_PAYLOAD_SCHEMA_VERSION,
-            input: self.input.clone(),
+            catalog: self.catalog.clone(),
             input_schema: self.input_schema.clone(),
             output_schema: self.output_schema.clone(),
             view_sql: self.view_sql.clone(),
@@ -320,7 +171,7 @@ impl SingleKeySumCountRuntime {
             return Err(invalid_checkpoint());
         }
         validate_supported_schemas(
-            payload.input.catalog()?,
+            &payload.catalog,
             &payload.input_schema,
             &payload.output_schema,
             &payload.plan,
@@ -350,7 +201,7 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
         &mut self,
         logical_epoch: LogicalEpoch,
         idempotency_key: EpochIdempotencyKey,
-        input_changes: Vec<StandingInputChangeV1>,
+        input_changes: Vec<RelationInputBatch>,
     ) -> Result<EpochCommit, StandingProgramRuntimeError> {
         let idempotency_key_text = idempotency_key.as_str().to_string();
         if let Some(applied_epoch) = self.applied_epochs.get(&idempotency_key_text) {
@@ -378,43 +229,25 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
             let mut combined = DeltaBatch::default();
             let mut input_frontiers = self.input_frontiers.clone();
             let mut input_event_time_frontiers = self.input_event_time_frontiers.clone();
-            for change in input_changes {
-                match change {
-                    StandingInputChangeV1::Source(input) => {
-                        validate_input_matches_schema(
-                            &input,
-                            &self.input_schema,
-                            "generic_input_relation",
-                        )?;
-                        let catalog = self.input.catalog()?;
-                        let delta = aggregate_group_input_delta_batch(catalog, &self.plan, &input)?;
-                        let delta = filter_delta_batch_for_plan(&delta, &self.plan, catalog)?;
-                        let delta =
-                            rekey_delta_batch_for_aggregate_group(&delta, catalog, &self.plan)?;
-                        combined = combined.combine(&delta);
-                        advance_input_frontier(&mut input_frontiers, &input)?;
-                        advance_input_event_time_frontier(&mut input_event_time_frontiers, &input)?;
-                    }
-                    StandingInputChangeV1::View(input) => {
-                        input.validate()?;
-                        self.validate_view_input_matches_binding(&input)?;
-                        let primary_key = self.input.primary_key_column_id()?;
-                        let delta = rekey_delta_batch_for_aggregate_group_with_primary_key(
-                            &input.delta,
-                            primary_key,
-                            &self.plan,
-                            &self.input_schema,
-                        )?;
-                        combined = combined.combine(&delta);
-                        self.view_input_cursors.push(input.producer_cursor);
-                    }
-                }
+            for input in input_changes {
+                validate_input_matches_schema(
+                    &input,
+                    &self.input_schema,
+                    "generic_input_relation",
+                )?;
+                let delta = aggregate_group_input_delta_batch(&self.catalog, &self.plan, &input)?;
+                let delta = filter_delta_batch_for_plan(&delta, &self.plan, &self.catalog)?;
+                let delta =
+                    rekey_delta_batch_for_aggregate_group(&delta, &self.catalog, &self.plan)?;
+                combined = combined.combine(&delta);
+                advance_input_frontier(&mut input_frontiers, &input)?;
+                advance_input_event_time_frontier(&mut input_event_time_frontiers, &input)?;
             }
             let (next_state, _) = apply_filtered_single_key_aggregate_delta(
                 &self.filtered_aggregate_state,
                 &combined,
                 &self.plan,
-                self.input.catalog()?,
+                &self.catalog,
             )?;
             let aggregate_outputs = supported_view_plan_aggregate_outputs(&self.plan);
             let published_state = publish_aggregate_state(&next_state, &self.plan)?;
@@ -465,9 +298,8 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
                 }],
             });
         }
-        let catalog = self.input.catalog()?;
         let mut executor = LogicalPlanExecutor::SingleKeyAggregate {
-            catalog,
+            catalog: &self.catalog,
             input_schema: &self.input_schema,
             plan: &self.plan,
             engine: &mut self.engine,
@@ -476,7 +308,7 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
             logical_epoch,
             &self.input_frontiers,
             &self.input_event_time_frontiers,
-            source_input_batches(input_changes)?,
+            input_changes,
         )?;
         let aggregate_outputs = supported_view_plan_aggregate_outputs(&self.plan);
         let output_delta = filter_output_delta_for_having(
@@ -615,25 +447,24 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
         }
         validate_input_event_time_frontiers_for_catalogs(
             &checkpoint,
-            std::slice::from_ref(payload.input.catalog()?),
+            std::slice::from_ref(&payload.catalog),
         )?;
         let view_sql = payload.view_sql;
         validate_view_sql_hash(&checkpoint.identity, view_sql.as_str())?;
         let plan = payload.plan;
-        let compiled_catalog = payload.input.catalog()?;
-        let compiled = validate_supported_view_sql(view_sql.as_str(), compiled_catalog)
+        let compiled = validate_supported_view_sql(view_sql.as_str(), &payload.catalog)
             .map_err(|_| invalid_checkpoint())?;
         if compiled != plan {
             return Err(invalid_checkpoint());
         }
-        validate_plan_matches_catalog(&plan, compiled_catalog)?;
-        let value_mode = aggregate_value_mode_for_plan(compiled_catalog, &plan)?;
+        validate_plan_matches_catalog(&plan, &payload.catalog)?;
+        let value_mode = aggregate_value_mode_for_plan(&payload.catalog, &plan)?;
         let track_extrema = plan_tracks_extrema(&plan);
         let logical_plan = payload.logical_plan;
         validate_logical_view_plan(&logical_plan).map_err(|_| invalid_checkpoint())?;
         let compiled_logical_plan = lower_supported_view_sql_to_logical_plan(
             view_sql.as_str(),
-            compiled_catalog,
+            &payload.catalog,
             &payload.output_schema,
         )
         .map_err(|_| invalid_checkpoint())?;
@@ -665,7 +496,7 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
         retain_recent_applied_epochs(&mut applied_epochs);
         Ok(Self {
             identity: checkpoint.identity,
-            input: payload.input,
+            catalog: payload.catalog,
             input_schema: payload.input_schema,
             output_schema: payload.output_schema,
             view_sql,
@@ -676,7 +507,6 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
             filtered_aggregate_state,
             input_frontiers: checkpoint.input_frontiers,
             input_event_time_frontiers: checkpoint.input_event_time_frontiers,
-            view_input_cursors: Vec::new(),
             applied_epochs,
         })
     }

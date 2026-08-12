@@ -116,7 +116,6 @@ use velorix_core::{
         PUBLISHED_RELATION_BINDING_SCHEMA_VERSION_V1,
     },
     view_plan::{
-        infer_single_key_sum_count_output_schema, lower_published_single_key_sum_count_sql,
         lower_supported_analytic_row_number_sql_to_logical_plan,
         lower_supported_sql_to_logical_plan, supported_join_view_plan_aggregate_outputs,
         supported_join_view_plan_is_self_join, supported_join_view_plan_is_singleton,
@@ -126,7 +125,7 @@ use velorix_core::{
         validate_supported_latest_by_key_sql, validate_supported_semi_anti_join_sql,
         validate_supported_three_input_inner_join_count_sql,
         validate_supported_tumbling_window_sql, LogicalPlanAggregateFunctionV1,
-        PlannerRelationInput, SupportedAggregateInputRelationSide, SupportedAggregateOutput,
+        SupportedAggregateInputRelationSide, SupportedAggregateOutput,
         SupportedAnalyticRowNumberPlan, SupportedFilterProjectPlan, SupportedJoinViewPlan,
         SupportedLatestByKeyPlan, SupportedProjectionExpr, SupportedThreeInputInnerJoinCountPlanV1,
         SupportedTumblingWindowPlan, SupportedViewPlan, VelorixLogicalViewExecutionV1,
@@ -361,22 +360,6 @@ pub trait StandingProgramRuntimeFactory: Send + Sync + 'static {
     ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
         let _ = logical_plan;
         self.create_with_catalogs_and_spec(identity, catalogs, spec, input_schemas, output_schemas)
-    }
-
-    /// Create a runtime bound to a published view output input.
-    ///
-    /// Default implementation fails closed: only factories that explicitly
-    /// support view-on-view inputs override this.
-    fn create_with_published_binding_plan_and_spec(
-        &self,
-        _identity: &StandingProgramIdentity,
-        _binding: &PublishedRelationBindingV1,
-        _logical_plan: &VelorixLogicalViewPlanV1,
-        _spec: &StandingViewSpec,
-        _input_schemas: &[RelationSchema],
-        _output_schemas: &[RelationSchema],
-    ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
-        Err("standing runtime factory does not support published-view inputs".to_string())
     }
 
     fn restore(
@@ -741,24 +724,6 @@ impl StandingProgramRuntimeFactory for MaterializedViewRuntimeFactory {
         )
     }
 
-    fn create_with_published_binding_plan_and_spec(
-        &self,
-        identity: &StandingProgramIdentity,
-        binding: &PublishedRelationBindingV1,
-        logical_plan: &VelorixLogicalViewPlanV1,
-        _spec: &StandingViewSpec,
-        input_schemas: &[RelationSchema],
-        output_schemas: &[RelationSchema],
-    ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
-        velorix_runtime::materialized_view_runtime::create_standing_runtime_with_logical_plan_and_published_binding(
-            identity,
-            binding,
-            logical_plan.clone(),
-            input_schemas,
-            output_schemas,
-        )
-    }
-
     fn restore(
         &self,
         checkpoint: RuntimeCheckpoint,
@@ -915,12 +880,6 @@ impl ApiState {
     pub fn with_experimental_advanced_view_features(mut self, enabled: bool) -> Self {
         self.experimental_advanced_view_features = enabled;
         self.public_view_feature_policy = PublicViewFeaturePolicyV1::from(enabled);
-        self
-    }
-
-    #[cfg(test)]
-    pub fn with_experimental_view_on_view(mut self, enabled: bool) -> Self {
-        self.experimental_view_on_view = enabled;
         self
     }
 
@@ -1749,24 +1708,6 @@ pub struct CreateViewRequest {
 pub struct InputRelationRef {
     pub relation_id: String,
     pub relation_version: String,
-    /// Explicit input kind. Defaults to `Source`.
-    ///
-    /// A `View` input resolves against an active view's published output,
-    /// never against a physical relation catalog. Admission rejects a `View`
-    /// input when view-on-view is disabled.
-    #[serde(default)]
-    pub input_kind: InputRelationKind,
-}
-
-/// Explicit kind for a view input relation reference.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InputRelationKind {
-    /// A registered physical ingest source.
-    #[default]
-    Source,
-    /// An upstream materialized view output.
-    View,
 }
 
 fn default_sql_source_kind() -> SqlSourceKind {
@@ -5661,26 +5602,39 @@ fn standing_runtime_can_accept_incremental_ingest(active: &ActiveMaterializedVie
 }
 
 fn view_spec_from_request(
+    state: &ApiState,
     request: &CreateViewRequest,
-    inputs: &[ResolvedAdmissionInput],
-    output_schema: &RelationSchema,
+    catalogs: &[VelorixRelationCatalogV1],
 ) -> Result<StandingViewSpec, ApiError> {
-    let input_relations = inputs
+    let input_relations = catalogs
         .iter()
-        .map(resolved_input_relation_schema)
-        .collect::<Result<Vec<_>, ApiError>>()?;
-    if input_relations.is_empty() {
-        return Err(ApiError::bad_request("view has no input relation"));
-    }
+        .map(|catalog| catalog_input_relation_schema(catalog).map_err(ApiError::bad_request))
+        .collect::<Result<Vec<_>, _>>()?;
+    let input = input_relations
+        .first()
+        .ok_or_else(|| ApiError::bad_request("view has no input relation"))?;
     validate_create_view_sql_source_contract(request)?;
     let source_kind = resolved_sql_source_kind_for_create_view(request);
-    if source_kind != SqlSourceKind::StandingView {
+    let output_relations = if source_kind == SqlSourceKind::StandingView {
+        state
+            .materialized_runtime_output_schemas_for_view_request(
+                request.view_id.as_str(),
+                request.sql.as_str(),
+                catalogs,
+                input.schema_fingerprint.as_str(),
+            )?
+            .ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "unsupported view SQL for materialized runtime `{}`",
+                    request.view_id
+                ))
+            })
+    } else {
         return Err(ApiError::bad_request(
             "CREATE VIEW SQL requires a supported materialized view runtime; runtime fallback is disabled",
         ));
-    }
-    let output_relations = vec![output_schema.clone()];
-    let multi_output = false;
+    }?;
+    let multi_output = output_relations.len() > 1;
     Ok(StandingViewSpec {
         view_id: request.view_id.clone(),
         sql: request.sql.clone(),
@@ -5690,26 +5644,10 @@ fn view_spec_from_request(
         output_relations,
         shape: StandingViewShape {
             is_materialized: true,
-            multi_input: inputs.len() > 1,
+            multi_input: catalogs.len() > 1,
             multi_output,
         },
     })
-}
-
-/// Select the relation schema for a resolved admission input.
-///
-/// Source inputs derive the schema from their physical catalog; View inputs
-/// use the verified producer `PublishedRelationBindingV1.relation` directly.
-/// A physical catalog is never fabricated for a view input.
-fn resolved_input_relation_schema(
-    input: &ResolvedAdmissionInput,
-) -> Result<RelationSchema, ApiError> {
-    match input {
-        ResolvedAdmissionInput::Source { catalog, .. } => {
-            catalog_input_relation_schema(catalog).map_err(ApiError::bad_request)
-        }
-        ResolvedAdmissionInput::View { relation, .. } => Ok(relation.clone()),
-    }
 }
 
 fn validate_create_view_sql_source_contract(request: &CreateViewRequest) -> Result<(), ApiError> {
@@ -5814,7 +5752,6 @@ fn projection_expression_output_type(
         }
         SupportedProjectionExpr::LiteralInt64 { .. }
         | SupportedProjectionExpr::CoalesceInt64 { .. } => Ok((SqlDataType::Int64, false)),
-        SupportedProjectionExpr::LiteralUtf8 { .. } => Ok((SqlDataType::Utf8, false)),
         SupportedProjectionExpr::BinaryInt64 { left, right, .. } => {
             let (_, left_nullable) = projection_expression_output_type(catalog, left)?;
             let (_, right_nullable) = projection_expression_output_type(catalog, right)?;
@@ -5841,10 +5778,6 @@ fn projection_expression_output_type(
             let (_, else_nullable) = projection_expression_output_type(catalog, else_expr)?;
             Ok((SqlDataType::Int64, then_nullable || else_nullable))
         }
-        SupportedProjectionExpr::LengthUtf8 { .. } => Ok((SqlDataType::Int64, false)),
-        SupportedProjectionExpr::ConcatUtf8 { .. } => Ok((SqlDataType::Utf8, false)),
-        SupportedProjectionExpr::SubstringUtf8 { .. } => Ok((SqlDataType::Utf8, false)),
-        SupportedProjectionExpr::TrimUtf8 { .. } => Ok((SqlDataType::Utf8, false)),
     }
 }
 

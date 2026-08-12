@@ -257,7 +257,7 @@ fn runtime_materializes_global_count_empty_input_and_final_retract_across_restor
                     ("bob", 5, 1),
                     ("alice", 7, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
     assert_global_count_batch(&inserted.output_batches[0].batches[0], 3);
@@ -291,7 +291,7 @@ fn runtime_materializes_global_count_empty_input_and_final_retract_across_restor
                     ("bob", 5, -1),
                     ("alice", 7, -1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
     assert_global_count_batch(&deleted.output_batches[0].batches[0], 0);
@@ -328,7 +328,7 @@ fn runtime_materializes_composite_computed_group_keys() {
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![scores_with_category_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -393,7 +393,7 @@ fn runtime_materializes_registered_composite_group_keys_with_null() {
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![scores_with_category_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -442,7 +442,7 @@ fn runtime_materializes_registered_composite_group_keys_with_null() {
                 end_offset_exclusive: 4,
                 event_time_watermark: None,
                 batches: vec![scores_with_category_rows_batch(&[("u1", 15, None, -1)])],
-            })],
+            }],
         )
         .unwrap();
     let batch = &retracted.output_batches[0].batches[0];
@@ -501,7 +501,7 @@ fn runtime_materializes_sum_count_for_relation_without_value_semantic_role() {
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -576,11 +576,7 @@ fn runtime_repeated_epoch_is_idempotent_before_and_after_restore() {
     };
     let key = EpochIdempotencyKey::new("repeated-epoch").unwrap();
     runtime
-        .apply_changes(
-            1,
-            key.clone(),
-            vec![StandingInputChangeV1::Source(input.clone())],
-        )
+        .apply_changes(1, key.clone(), vec![input.clone()])
         .unwrap();
     let checkpoint = runtime.checkpoint().unwrap();
     let page = runtime
@@ -599,11 +595,7 @@ fn runtime_repeated_epoch_is_idempotent_before_and_after_restore() {
         .unwrap();
 
     let duplicate = runtime
-        .apply_changes(
-            1,
-            key.clone(),
-            vec![StandingInputChangeV1::Source(input.clone())],
-        )
+        .apply_changes(1, key.clone(), vec![input.clone()])
         .unwrap();
     assert!(duplicate.output_deltas.is_empty());
     assert_eq!(runtime.checkpoint().unwrap(), checkpoint);
@@ -627,9 +619,7 @@ fn runtime_repeated_epoch_is_idempotent_before_and_after_restore() {
     );
 
     let mut restored = restore_standing_runtime(checkpoint.clone()).unwrap();
-    let restored_duplicate = restored
-        .apply_changes(1, key, vec![StandingInputChangeV1::Source(input)])
-        .unwrap();
+    let restored_duplicate = restored.apply_changes(1, key, vec![input]).unwrap();
     assert!(restored_duplicate.output_deltas.is_empty());
     assert_eq!(restored.checkpoint().unwrap(), checkpoint);
 }
@@ -850,7 +840,7 @@ fn runtime_materializes_sum_arithmetic_expression() {
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -926,7 +916,7 @@ fn runtime_materializes_cast_int64_aggregate_expression() {
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -1026,7 +1016,7 @@ fn runtime_materializes_nested_double_colon_cast_int64_aggregate_expression() {
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -1126,7 +1116,7 @@ fn runtime_materializes_try_and_safe_cast_int64_aggregate_expressions() {
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -1230,7 +1220,7 @@ fn runtime_materializes_abs_int64_aggregate_expression() {
                     ("bob", 5, 1),
                     ("alice", -7, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -1339,7 +1329,7 @@ fn runtime_materializes_greatest_least_int64_aggregate_expressions() {
                     ("alice", 17, 1),
                     ("bob", 5, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -1451,7 +1441,7 @@ fn runtime_materializes_coalesce_nullable_int64_aggregate_expression() {
                     ("alice", Some(7), 1),
                     ("bob", None, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -1556,7 +1546,7 @@ fn runtime_materializes_is_not_distinct_from_null_predicate() {
                     ("bob", None, 1),
                     ("carol", Some(3), 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -1661,7 +1651,7 @@ fn runtime_materializes_is_distinct_from_predicate() {
                     ("bob", None, 1),
                     ("carol", Some(0), 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -1766,7 +1756,7 @@ fn runtime_materializes_case_when_distinct_from_null_predicates() {
                     ("alice", Some(7), 1),
                     ("bob", None, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -1871,7 +1861,7 @@ fn runtime_materializes_case_when_is_null_predicates() {
                     ("alice", Some(7), 1),
                     ("bob", None, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -1971,7 +1961,7 @@ fn runtime_materializes_case_when_int64_aggregate_expression() {
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -2076,7 +2066,7 @@ fn runtime_materializes_case_when_between_and_in_predicates() {
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -2183,7 +2173,7 @@ fn runtime_materializes_if_int64_aggregate_expression() {
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -2283,7 +2273,7 @@ fn runtime_materializes_multi_branch_case_when_int64_aggregate_expression() {
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -2383,7 +2373,7 @@ fn runtime_materializes_simple_case_when_int64_aggregate_expression() {
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -2459,7 +2449,7 @@ fn runtime_materializes_count_only_aggregate_and_restores_state() {
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -2494,7 +2484,7 @@ fn runtime_materializes_count_only_aggregate_and_restores_state() {
                     ],
                 )
                 .unwrap()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -2532,7 +2522,7 @@ fn runtime_materializes_filter_project_view_and_restores_state() {
                 end_offset_exclusive: 2,
                 event_time_watermark: None,
                 batches: vec![scores_rows_batch(&[("alice", 10, 1), ("bob", -3, 1)])],
-            })],
+            }],
         )
         .unwrap();
     assert_projected_scores_page(runtime.as_ref(), 1, &[("alice", 10)]);
@@ -2553,7 +2543,7 @@ fn runtime_materializes_filter_project_view_and_restores_state() {
                 end_offset_exclusive: 4,
                 event_time_watermark: None,
                 batches: vec![scores_rows_batch(&[("alice", 10, -1), ("carol", 7, 1)])],
-            })],
+            }],
         )
         .unwrap();
     assert_projected_scores_page(restored.as_ref(), 2, &[("carol", 7)]);
@@ -2846,7 +2836,7 @@ fn runtime_materializes_plain_select_distinct_filter_project_when_primary_key_is
                 end_offset_exclusive: 2,
                 event_time_watermark: None,
                 batches: vec![scores_rows_batch(&[("alice", 10, 1), ("bob", -3, 1)])],
-            })],
+            }],
         )
         .unwrap();
     assert_projected_scores_page(runtime.as_ref(), 1, &[("alice", 10)]);
@@ -2867,7 +2857,7 @@ fn runtime_materializes_plain_select_distinct_filter_project_when_primary_key_is
                 end_offset_exclusive: 4,
                 event_time_watermark: None,
                 batches: vec![scores_rows_batch(&[("alice", 10, -1), ("carol", 7, 1)])],
-            })],
+            }],
         )
         .unwrap();
     assert_projected_scores_page(restored.as_ref(), 2, &[("carol", 7)]);
@@ -2933,7 +2923,7 @@ fn runtime_materializes_plain_select_distinct_filter_project_by_projected_output
                     ("bob", 10, 1),
                     ("carol", 7, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
     assert_projected_distinct_scores_page(runtime.as_ref(), 1, &[10, 7]);
@@ -2954,7 +2944,7 @@ fn runtime_materializes_plain_select_distinct_filter_project_by_projected_output
                 end_offset_exclusive: 4,
                 event_time_watermark: None,
                 batches: vec![scores_rows_batch(&[("alice", 10, -1)])],
-            })],
+            }],
         )
         .unwrap();
     assert_projected_distinct_scores_page(restored.as_ref(), 2, &[10, 7]);
@@ -2974,7 +2964,7 @@ fn runtime_materializes_plain_select_distinct_filter_project_by_projected_output
                 end_offset_exclusive: 5,
                 event_time_watermark: None,
                 batches: vec![scores_rows_batch(&[("bob", 10, -1)])],
-            })],
+            }],
         )
         .unwrap();
     assert_projected_distinct_scores_page(restored.as_ref(), 3, &[7]);
@@ -3018,7 +3008,7 @@ fn runtime_materializes_row_number_and_restores_rerank_state() {
                     ("bob", 10, 1),
                     ("carol", -1, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
     assert_row_number_delta(
@@ -3042,7 +3032,7 @@ fn runtime_materializes_row_number_and_restores_rerank_state() {
                 end_offset_exclusive: 4,
                 event_time_watermark: None,
                 batches: vec![scores_rows_batch(&[("aaron", 10, 1)])],
-            })],
+            }],
         )
         .unwrap();
     assert_row_number_delta(
@@ -3077,7 +3067,7 @@ fn runtime_materializes_row_number_and_restores_rerank_state() {
                 end_offset_exclusive: 5,
                 event_time_watermark: None,
                 batches: vec![scores_rows_batch(&[("aaron", 10, -1)])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -3123,7 +3113,7 @@ fn runtime_materializes_rank_with_sql_order_ties() {
                     ("carol", 5, 1, 1),
                     ("dana", 7, 2, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -3182,7 +3172,7 @@ fn runtime_materializes_dense_rank_with_sql_order_ties() {
                     ("carol", 5, 1, 1),
                     ("dana", 7, 2, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -3240,7 +3230,7 @@ fn runtime_materializes_wrapped_row_number_top_n() {
                     ("bob", 10, 1),
                     ("carol", 10, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
     assert_row_number_delta(
@@ -3264,7 +3254,7 @@ fn runtime_materializes_wrapped_row_number_top_n() {
                 end_offset_exclusive: 4,
                 event_time_watermark: None,
                 batches: vec![scores_rows_batch(&[("alice", 10, -1)])],
-            })],
+            }],
         )
         .unwrap();
     assert_row_number_delta(
@@ -3319,7 +3309,7 @@ fn runtime_materializes_wrapped_row_number_top_one_and_promotes_after_delete() {
                     ("dana", 5, 1),
                     ("erin", 5, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
     assert_row_number_delta(
@@ -3343,7 +3333,7 @@ fn runtime_materializes_wrapped_row_number_top_one_and_promotes_after_delete() {
                 end_offset_exclusive: 6,
                 event_time_watermark: None,
                 batches: vec![scores_rows_batch(&[("alice", 10, -1)])],
-            })],
+            }],
         )
         .unwrap();
     assert_row_number_delta(
@@ -3392,7 +3382,7 @@ fn runtime_materializes_row_number_with_source_and_outer_predicates_before_ranki
                     ("bob", 10, 1),
                     ("carol", 10, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -3433,7 +3423,7 @@ fn runtime_restore_rejects_row_number_checkpoint_when_state_mismatches_published
                 end_offset_exclusive: 2,
                 event_time_watermark: None,
                 batches: vec![scores_rows_batch(&[("alice", 10, 1), ("bob", 10, 1)])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -3573,7 +3563,7 @@ fn runtime_materializes_row_number_with_precise_large_int64_ordering() {
                     ("alice", 9_007_199_254_740_992, 1, 1),
                     ("bob", 9_007_199_254_740_993, 1, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -3615,7 +3605,7 @@ fn runtime_materializes_filter_project_union_distinct_overlapping_branch_rows_on
                     ("bob", -3, 1),
                     ("carol", 7, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
     assert_projected_scores_page(runtime.as_ref(), 1, &[("alice", 10), ("carol", 7)]);
@@ -3636,7 +3626,7 @@ fn runtime_materializes_filter_project_union_distinct_overlapping_branch_rows_on
                 end_offset_exclusive: 5,
                 event_time_watermark: None,
                 batches: vec![scores_rows_batch(&[("carol", 7, -1), ("dave", 12, 1)])],
-            })],
+            }],
         )
         .unwrap();
     assert_projected_scores_page(restored.as_ref(), 2, &[("alice", 10), ("dave", 12)]);
@@ -3677,7 +3667,7 @@ fn runtime_materializes_filter_project_intersect_distinct_overlapping_branch_row
                     ("bob", -3, 1),
                     ("carol", 7, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
     assert_projected_scores_page(runtime.as_ref(), 1, &[("alice", 10)]);
@@ -3721,7 +3711,7 @@ fn runtime_materializes_filter_project_except_distinct_left_minus_right_and_rest
                     ("bob", -3, 1),
                     ("carol", 7, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
     assert_projected_scores_page(runtime.as_ref(), 1, &[("carol", 7)]);
@@ -3742,7 +3732,7 @@ fn runtime_materializes_filter_project_except_distinct_left_minus_right_and_rest
                 end_offset_exclusive: 5,
                 event_time_watermark: None,
                 batches: vec![scores_rows_batch(&[("dave", 12, 1), ("erin", 6, 1)])],
-            })],
+            }],
         )
         .unwrap();
     assert_projected_scores_page(restored.as_ref(), 2, &[("carol", 7), ("erin", 6)]);
@@ -3783,7 +3773,7 @@ fn runtime_materializes_filter_project_with_scalar_expression_predicate() {
                     ("bob", 9, 1),
                     ("carol", 11, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
     assert_projected_scores_page(runtime.as_ref(), 1, &[("alice", 10), ("carol", 11)]);
@@ -3804,7 +3794,7 @@ fn runtime_materializes_filter_project_with_scalar_expression_predicate() {
                 end_offset_exclusive: 5,
                 event_time_watermark: None,
                 batches: vec![scores_rows_batch(&[("alice", 10, -1), ("dave", 12, 1)])],
-            })],
+            }],
         )
         .unwrap();
     assert_projected_scores_page(restored.as_ref(), 2, &[("carol", 11), ("dave", 12)]);
@@ -3845,7 +3835,7 @@ fn runtime_materializes_filter_project_with_expression_vs_expression_predicate()
                     ("bob", 9, 10, 1),
                     ("carol", 12, 11, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
     assert_projected_scores_page(runtime.as_ref(), 1, &[("alice", 10), ("carol", 12)]);
@@ -3869,7 +3859,7 @@ fn runtime_materializes_filter_project_with_expression_vs_expression_predicate()
                     ("alice", 10, 10, -1),
                     ("dave", 11, 9, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
     assert_projected_scores_page(restored.as_ref(), 2, &[("carol", 12), ("dave", 11)]);
@@ -3910,7 +3900,7 @@ fn runtime_materializes_filter_project_with_unprojected_predicate_column() {
                     ("bob", 12, 0, 1),
                     ("carol", 7, 2, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
     assert_projected_scores_page(runtime.as_ref(), 1, &[("alice", 10), ("carol", 7)]);
@@ -3934,7 +3924,7 @@ fn runtime_materializes_filter_project_with_unprojected_predicate_column() {
                     ("alice", 10, 1, -1),
                     ("dave", 11, 3, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
     assert_projected_scores_page(restored.as_ref(), 2, &[("carol", 7), ("dave", 11)]);
@@ -3975,7 +3965,7 @@ fn runtime_materializes_single_key_aggregates_over_multiple_raw_int64_input_colu
                     ("alice", 7, -2, 1),
                     ("bob", 5, 8, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
     assert_scores_multi_input_stats_page(
@@ -4002,7 +3992,7 @@ fn runtime_materializes_single_key_aggregates_over_multiple_raw_int64_input_colu
                     ("alice", 10, 3, -1),
                     ("bob", 2, -4, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
     assert_scores_multi_input_stats_page(
@@ -4061,7 +4051,7 @@ fn runtime_materializes_multi_input_count_distinct_by_selected_value_across_rest
                     ("alice", 5, Some(5), 1),
                     ("alice", 2, None, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
     assert_sum_count_page(
@@ -4092,7 +4082,7 @@ fn runtime_materializes_multi_input_count_distinct_by_selected_value_across_rest
                     Some(3),
                     -1,
                 )])],
-            })],
+            }],
         )
         .unwrap();
     assert_sum_count_page(
@@ -4122,7 +4112,7 @@ fn runtime_materializes_multi_input_count_distinct_by_selected_value_across_rest
                     Some(3),
                     -1,
                 )])],
-            })],
+            }],
         )
         .unwrap();
     assert_sum_count_page(
@@ -4168,7 +4158,7 @@ fn runtime_materializes_filter_project_order_by_limit_top_k_and_restores_full_st
                     ("bob", 8, 1),
                     ("carol", 6, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
     assert_projected_scores_page(runtime.as_ref(), 1, &[("alice", 10), ("bob", 8)]);
@@ -4189,7 +4179,7 @@ fn runtime_materializes_filter_project_order_by_limit_top_k_and_restores_full_st
                 end_offset_exclusive: 4,
                 event_time_watermark: None,
                 batches: vec![scores_rows_batch(&[("alice", 10, -1)])],
-            })],
+            }],
         )
         .unwrap();
     assert_projected_scores_page(restored.as_ref(), 2, &[("bob", 8), ("carol", 6)]);
@@ -4231,7 +4221,7 @@ fn runtime_materializes_filter_project_order_by_limit_offset_top_k() {
                     ("carol", 6, 1),
                     ("dave", 4, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
     assert_projected_scores_page(runtime.as_ref(), 1, &[("bob", 8), ("carol", 6)]);
@@ -4251,7 +4241,7 @@ fn runtime_materializes_filter_project_order_by_limit_offset_top_k() {
                 end_offset_exclusive: 5,
                 event_time_watermark: None,
                 batches: vec![scores_rows_batch(&[("erin", 12, 1)])],
-            })],
+            }],
         )
         .unwrap();
     assert_projected_scores_page(runtime.as_ref(), 2, &[("alice", 10), ("bob", 8)]);
@@ -4293,7 +4283,7 @@ fn runtime_materializes_filter_project_order_by_fetch_first_top_k() {
                     ("carol", 8, 1),
                     ("dave", -1, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -4335,7 +4325,7 @@ fn runtime_materializes_filter_project_hidden_input_order_by_top_k() {
                     ("bob", 8, 1),
                     ("carol", 6, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
     assert_projected_user_ids_page(runtime.as_ref(), 1, &["alice", "bob"]);
@@ -4356,7 +4346,7 @@ fn runtime_materializes_filter_project_hidden_input_order_by_top_k() {
                 end_offset_exclusive: 4,
                 event_time_watermark: None,
                 batches: vec![scores_rows_batch(&[("alice", 10, -1)])],
-            })],
+            }],
         )
         .unwrap();
     assert_projected_user_ids_page(restored.as_ref(), 2, &["bob", "carol"]);
@@ -4397,7 +4387,7 @@ fn runtime_materializes_filter_project_cte_source_filters() {
                     ("bob", 8, 1),
                     ("carol", -2, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -4439,7 +4429,7 @@ fn runtime_materializes_filter_project_derived_table_source_filters() {
                     ("bob", 8, 1),
                     ("carol", -2, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -4481,7 +4471,7 @@ fn runtime_materializes_filter_project_nullable_value_and_restores_state() {
                     ("alice", Some(10), 1),
                     ("bob", None, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
     assert_projected_nullable_scores_page(
@@ -4530,7 +4520,7 @@ fn runtime_materializes_computed_filter_project_view() {
                 end_offset_exclusive: 2,
                 event_time_watermark: None,
                 batches: vec![scores_rows_batch(&[("alice", 10, 1), ("bob", -3, 1)])],
-            })],
+            }],
         )
         .unwrap();
     assert_projected_scores_page(runtime.as_ref(), 1, &[("alice", -4)]);
@@ -4550,7 +4540,7 @@ fn runtime_materializes_computed_filter_project_view() {
                 end_offset_exclusive: 4,
                 event_time_watermark: None,
                 batches: vec![scores_rows_batch(&[("alice", 10, -1), ("carol", 7, 1)])],
-            })],
+            }],
         )
         .unwrap();
     assert_projected_scores_page(runtime.as_ref(), 2, &[("carol", -3)]);
@@ -4590,7 +4580,7 @@ fn runtime_materializes_filter_project_case_over_bool_predicate() {
                     ("device-a", true, 100, 1),
                     ("device-b", false, 101, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -4678,7 +4668,7 @@ fn runtime_materializes_count_distinct_aggregate_and_restores_state() {
                     ("alice", 7, 1),
                     ("bob", 5, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -4701,7 +4691,7 @@ fn runtime_materializes_count_distinct_aggregate_and_restores_state() {
                 end_offset_exclusive: 5,
                 event_time_watermark: None,
                 batches: vec![purchases_rows_batch(&[("alice", 7, -1)])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -4739,7 +4729,7 @@ fn runtime_materializes_non_null_column_count_aggregate() {
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -4777,7 +4767,7 @@ fn runtime_materializes_nullable_column_count_aggregate() {
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![purchases_nullable_amount_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -4815,7 +4805,7 @@ fn runtime_materializes_mixed_nullable_column_count_aggregate() {
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![purchases_nullable_amount_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -4858,7 +4848,7 @@ fn runtime_materializes_identity_cte_single_relation_aggregate() {
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -4901,7 +4891,7 @@ fn runtime_materializes_cte_source_filter_single_relation_aggregate() {
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -4944,7 +4934,7 @@ fn runtime_materializes_derived_table_source_filter_single_relation_aggregate() 
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -4991,7 +4981,7 @@ fn runtime_materializes_cte_source_and_outer_where_filters() {
                     ("bob", 7, 1),
                     ("alice", 4, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -5035,7 +5025,7 @@ fn runtime_commit_publishes_materialized_output_batch_after_ingest() {
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -5103,7 +5093,7 @@ fn runtime_commit_publishes_signed_output_delta_for_changed_keys_only() {
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -5122,7 +5112,7 @@ fn runtime_commit_publishes_signed_output_delta_for_changed_keys_only() {
                 end_offset_exclusive: 4,
                 event_time_watermark: None,
                 batches: vec![purchases_rows_batch(&[("alice", 3, 1)])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -5181,7 +5171,7 @@ fn runtime_materializes_filtered_single_relation_aggregate_view() {
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -5258,7 +5248,7 @@ fn runtime_materializes_single_relation_aggregate_with_scalar_expression_predica
                     ("alice", 8, 1),
                     ("bob", 20, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
     assert_sum_count_page(
@@ -5283,7 +5273,7 @@ fn runtime_materializes_single_relation_aggregate_with_scalar_expression_predica
                 end_offset_exclusive: 5,
                 event_time_watermark: None,
                 batches: vec![scores_rows_batch(&[("alice", 10, -1), ("carol", 11, 1)])],
-            })],
+            }],
         )
         .unwrap();
     assert_sum_count_page(
@@ -5330,7 +5320,7 @@ fn runtime_materializes_single_relation_aggregate_with_between_predicates() {
                     ("alice", 7, 1),
                     ("carol", 21, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -5368,7 +5358,7 @@ fn runtime_materializes_single_relation_aggregate_with_matching_filters() {
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -5411,7 +5401,7 @@ fn runtime_materializes_single_relation_aggregate_with_mixed_filters() {
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -5437,7 +5427,7 @@ fn runtime_materializes_single_relation_aggregate_with_mixed_filters() {
                 end_offset_exclusive: 4,
                 event_time_watermark: None,
                 batches: vec![purchases_rows_batch(&[("alice", 10, -1)])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -5493,7 +5483,7 @@ fn runtime_materializes_single_relation_filtered_count_distinct_with_mixed_filte
                     ("alice", 7, 1),
                     ("bob", 5, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -5551,7 +5541,7 @@ fn runtime_materializes_single_relation_mixed_min_max_avg_filters() {
                     ("bob", -1, 1),
                     ("bob", 20, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -5600,7 +5590,7 @@ fn runtime_materializes_single_relation_mixed_filter_having_top_k() {
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -5626,7 +5616,7 @@ fn runtime_materializes_single_relation_mixed_filter_having_top_k() {
                 end_offset_exclusive: 4,
                 event_time_watermark: None,
                 batches: vec![purchases_rows_batch(&[("bob", 20, 1)])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -5667,7 +5657,7 @@ fn runtime_materializes_single_relation_aggregate_with_different_filters() {
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -5710,7 +5700,7 @@ fn runtime_materializes_single_relation_aggregate_having_view() {
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -5823,7 +5813,7 @@ fn runtime_materializes_single_relation_having_count_distinct_function_view() {
                     ("bob", 5, 1),
                     ("bob", 5, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -5896,7 +5886,7 @@ fn runtime_rejects_non_contiguous_input_offsets_without_advancing_frontier() {
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -5922,7 +5912,7 @@ fn runtime_rejects_non_contiguous_input_offsets_without_advancing_frontier() {
                 end_offset_exclusive: 6,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap_err();
 
@@ -5949,7 +5939,7 @@ fn runtime_rejects_non_contiguous_input_offsets_without_advancing_frontier() {
                 end_offset_exclusive: 5,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -5968,7 +5958,7 @@ fn runtime_rejects_non_contiguous_input_offsets_without_advancing_frontier() {
                 end_offset_exclusive: 7,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap_err();
 
@@ -6023,7 +6013,7 @@ fn runtime_tracks_input_frontiers_by_relation_stream_and_partition() {
                     end_offset_exclusive: 1,
                     event_time_watermark: None,
                     batches: vec![purchases_batch()],
-                })],
+                }],
             )
             .unwrap();
     }
@@ -6074,7 +6064,7 @@ fn runtime_accepts_sparse_first_offset_for_new_stream_frontier() {
                 end_offset_exclusive: 43,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -6123,7 +6113,7 @@ fn runtime_checkpoints_event_time_frontiers_by_source_partition() {
                     watermark_ns: 1_700_000_000_000_000_000,
                 }),
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -6148,7 +6138,7 @@ fn runtime_checkpoints_event_time_frontiers_by_source_partition() {
                     watermark_ns: 1_700_000_000_000_000_200,
                 }),
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -6215,7 +6205,7 @@ fn runtime_rejects_non_monotonic_event_time_watermark_for_source_partition() {
                     watermark_ns: 200,
                 }),
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -6240,7 +6230,7 @@ fn runtime_rejects_non_monotonic_event_time_watermark_for_source_partition() {
                     watermark_ns: 199,
                 }),
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap_err();
 
@@ -6290,7 +6280,7 @@ fn runtime_restore_rejects_malformed_event_time_frontier_even_when_payload_match
                     watermark_ns: 200,
                 }),
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -6366,7 +6356,7 @@ fn runtime_materializes_avg_projection_aliases_for_relation_without_value_semant
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -6453,7 +6443,7 @@ fn runtime_materializes_single_key_order_by_limit_top_k_and_restores_state() {
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
     assert_top_purchase_user(runtime.as_ref(), 1, "alice", 17, 2);
@@ -6473,7 +6463,7 @@ fn runtime_materializes_single_key_order_by_limit_top_k_and_restores_state() {
                 end_offset_exclusive: 4,
                 event_time_watermark: None,
                 batches: vec![purchases_rows_batch(&[("bob", 20, 1)])],
-            })],
+            }],
         )
         .unwrap();
     assert_top_purchase_user(runtime.as_ref(), 2, "bob", 25, 2);
@@ -6514,7 +6504,7 @@ fn runtime_materializes_single_key_order_by_limit_offset_top_k() {
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
     assert_top_purchase_user(runtime.as_ref(), 1, "bob", 5, 1);
@@ -6534,7 +6524,7 @@ fn runtime_materializes_single_key_order_by_limit_offset_top_k() {
                 end_offset_exclusive: 4,
                 event_time_watermark: None,
                 batches: vec![purchases_rows_batch(&[("bob", 20, 1)])],
-            })],
+            }],
         )
         .unwrap();
     assert_top_purchase_user(runtime.as_ref(), 2, "alice", 17, 2);
@@ -6576,7 +6566,7 @@ fn runtime_materializes_single_key_order_by_function_top_k() {
                     ("bob", 5, 1),
                     ("carol", 20, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -6655,7 +6645,7 @@ fn runtime_materializes_single_key_order_by_metric_then_key_top_k() {
                     ("alice", 0, 1),
                     ("carol", 9, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -6727,7 +6717,7 @@ fn runtime_materializes_decimal_avg_as_float64_output() {
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![purchases_decimal_amount_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -6797,7 +6787,7 @@ fn runtime_materializes_avg_arithmetic_expression() {
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -6866,7 +6856,7 @@ fn runtime_materializes_filtered_projected_aggregate_view() {
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -7052,7 +7042,7 @@ fn runtime_materializes_min_max_and_recomputes_after_extreme_delete() {
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
     runtime
@@ -7070,7 +7060,7 @@ fn runtime_materializes_min_max_and_recomputes_after_extreme_delete() {
                 end_offset_exclusive: 4,
                 event_time_watermark: None,
                 batches: vec![purchase_delete_batch("alice", 10)],
-            })],
+            }],
         )
         .unwrap();
 
@@ -7148,7 +7138,7 @@ fn runtime_materializes_min_max_arithmetic_expression() {
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -7224,7 +7214,7 @@ fn runtime_restores_min_max_multiset_checkpoint_before_extreme_delete() {
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -7245,7 +7235,7 @@ fn runtime_restores_min_max_multiset_checkpoint_before_extreme_delete() {
                 end_offset_exclusive: 4,
                 event_time_watermark: None,
                 batches: vec![purchase_delete_batch("alice", 10)],
-            })],
+            }],
         )
         .unwrap();
 
@@ -7318,7 +7308,7 @@ fn runtime_restored_query_reads_published_output_not_engine_state() {
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -7407,7 +7397,7 @@ fn runtime_restore_without_admitted_plan_metadata_fails_closed() {
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -7474,7 +7464,7 @@ fn runtime_materializes_two_relation_join_and_restores_epoch_consistent_state() 
                     end_offset_exclusive: 2,
                     event_time_watermark: None,
                     batches: vec![accounts_alice_bob_batch()],
-                }),
+                },
             ],
         )
         .unwrap();
@@ -7525,7 +7515,7 @@ fn runtime_materializes_two_relation_join_and_restores_epoch_consistent_state() 
                 end_offset_exclusive: 5,
                 event_time_watermark: None,
                 batches: vec![score_append_batch("alice", 3)],
-            })],
+            }],
         )
         .unwrap();
 
@@ -8802,9 +8792,7 @@ fn general_aggregate_join_specialization_matches_native_dag_state_and_restart() 
             first_inputs.clone(),
         )
         .unwrap();
-    let generic = uninterrupted_graph
-        .apply_epoch(1, source_batches_from_changes(first_inputs))
-        .unwrap();
+    let generic = uninterrupted_graph.apply_epoch(1, first_inputs).unwrap();
     assert!(
         specialization_delta_difference(&specialized.output_deltas[0].delta, &generic).is_none()
     );
@@ -8846,12 +8834,8 @@ fn general_aggregate_join_specialization_matches_native_dag_state_and_restart() 
             tail.clone(),
         )
         .unwrap();
-    let generic_live = uninterrupted_graph
-        .apply_epoch(2, source_batches_from_changes(tail.clone()))
-        .unwrap();
-    let generic_restored = restored_graph
-        .apply_epoch(2, source_batches_from_changes(tail))
-        .unwrap();
+    let generic_live = uninterrupted_graph.apply_epoch(2, tail.clone()).unwrap();
+    let generic_restored = restored_graph.apply_epoch(2, tail).unwrap();
     for delta in [
         &restored.output_deltas[0].delta,
         &generic_live,
@@ -8939,9 +8923,7 @@ fn general_aggregate_join_comparison_covers_filters_and_expression_inputs() {
                 inputs.clone(),
             )
             .unwrap();
-        let generic = comparison
-            .apply_epoch(1, source_batches_from_changes(inputs))
-            .unwrap();
+        let generic = comparison.apply_epoch(1, inputs).unwrap();
         assert!(
             specialization_delta_difference(&specialized.output_deltas[0].delta, &generic,)
                 .is_none()
@@ -8966,9 +8948,7 @@ fn general_aggregate_join_comparison_covers_filters_and_expression_inputs() {
                 tail.clone(),
             )
             .unwrap();
-        let generic = comparison
-            .apply_epoch(2, source_batches_from_changes(tail))
-            .unwrap();
+        let generic = comparison.apply_epoch(2, tail).unwrap();
         assert!(
             specialization_delta_difference(&specialized.output_deltas[0].delta, &generic,)
                 .is_none()
@@ -9030,7 +9010,7 @@ fn runtime_materializes_left_join_left_only_aggregates_for_unmatched_left_rows()
                     end_offset_exclusive: 2,
                     event_time_watermark: None,
                     batches: vec![accounts_alice_bob_batch()],
-                }),
+                },
             ],
         )
         .unwrap();
@@ -9065,7 +9045,7 @@ fn runtime_materializes_left_join_left_only_aggregates_for_unmatched_left_rows()
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![accounts_rows_batch(&[("charlie", 100, "gold", 1)])],
-            })],
+            }],
         )
         .unwrap();
     assert_join_stats_page(
@@ -9093,7 +9073,7 @@ fn runtime_materializes_left_join_left_only_aggregates_for_unmatched_left_rows()
                 end_offset_exclusive: 4,
                 event_time_watermark: None,
                 batches: vec![accounts_rows_batch(&[("charlie", 100, "gold", -1)])],
-            })],
+            }],
         )
         .unwrap();
     assert_join_stats_page(
@@ -9650,7 +9630,7 @@ fn runtime_materializes_right_join_by_swapping_to_left_join_state() {
                     end_offset_exclusive: 2,
                     event_time_watermark: None,
                     batches: vec![accounts_alice_bob_batch()],
-                }),
+                },
             ],
         )
         .unwrap();
@@ -9727,7 +9707,7 @@ fn runtime_materializes_left_join_with_left_only_aggregate_filter_for_unmatched_
                     end_offset_exclusive: 2,
                     event_time_watermark: None,
                     batches: vec![accounts_alice_bob_batch()],
-                }),
+                },
             ],
         )
         .unwrap();
@@ -9791,7 +9771,7 @@ fn runtime_materializes_two_relation_join_with_generic_adapter_catalogs() {
                     end_offset_exclusive: 2,
                     event_time_watermark: None,
                     batches: vec![accounts_alice_bob_batch()],
-                }),
+                },
             ],
         )
         .unwrap();
@@ -9927,7 +9907,7 @@ fn apply_join_expression_fixture(
                     end_offset_exclusive: 2,
                     event_time_watermark: None,
                     batches: vec![accounts_alice_bob_batch()],
-                }),
+                },
             ],
         )
         .unwrap();
@@ -9986,7 +9966,7 @@ fn runtime_materializes_two_relation_join_count_only_and_restores_state() {
                     end_offset_exclusive: 2,
                     event_time_watermark: None,
                     batches: vec![accounts_alice_bob_batch()],
-                }),
+                },
             ],
         )
         .unwrap();
@@ -10010,7 +9990,7 @@ fn runtime_materializes_two_relation_join_count_only_and_restores_state() {
                 end_offset_exclusive: 5,
                 event_time_watermark: None,
                 batches: vec![score_append_batch("alice", 3)],
-            })],
+            }],
         )
         .unwrap();
 
@@ -10070,7 +10050,7 @@ fn runtime_materializes_two_relation_join_count_distinct_only_and_restores_state
                     end_offset_exclusive: 2,
                     event_time_watermark: None,
                     batches: vec![accounts_alice_bob_batch()],
-                }),
+                },
             ],
         )
         .unwrap();
@@ -10094,7 +10074,7 @@ fn runtime_materializes_two_relation_join_count_distinct_only_and_restores_state
                 end_offset_exclusive: 5,
                 event_time_watermark: None,
                 batches: vec![score_append_batch("bob", 20)],
-            })],
+            }],
         )
         .unwrap();
 
@@ -10153,7 +10133,7 @@ fn runtime_materializes_two_relation_join_grouped_by_left_key_projection() {
                     end_offset_exclusive: 2,
                     event_time_watermark: None,
                     batches: vec![accounts_alice_bob_batch()],
-                }),
+                },
             ],
         )
         .unwrap();
@@ -10177,7 +10157,7 @@ fn runtime_materializes_two_relation_join_grouped_by_left_key_projection() {
                 end_offset_exclusive: 4,
                 event_time_watermark: None,
                 batches: vec![score_append_batch("alice", 3)],
-            })],
+            }],
         )
         .unwrap();
 
@@ -10238,7 +10218,7 @@ fn runtime_materializes_two_relation_join_stats_and_restores_incremental_state()
                     end_offset_exclusive: 2,
                     event_time_watermark: None,
                     batches: vec![accounts_alice_bob_batch()],
-                }),
+                },
             ],
         )
         .unwrap();
@@ -10270,7 +10250,7 @@ fn runtime_materializes_two_relation_join_stats_and_restores_incremental_state()
                     ("alice", 13, 1),
                     ("bob", 20, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -10339,7 +10319,7 @@ fn runtime_materializes_two_relation_join_right_side_stats_and_restores_state() 
                     end_offset_exclusive: 2,
                     event_time_watermark: None,
                     batches: vec![accounts_alice_bob_batch()],
-                }),
+                },
             ],
         )
         .unwrap();
@@ -10373,7 +10353,7 @@ fn runtime_materializes_two_relation_join_right_side_stats_and_restores_state() 
                     ("alice", 100, "gold", -1),
                     ("alice", 80, "gold", 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -10448,7 +10428,7 @@ fn runtime_materializes_two_relation_join_decimal_avg_as_float64_output() {
                         ("alice", 1000, "gold", 1),
                         ("bob", 505, "gold", 1),
                     ])],
-                }),
+                },
             ],
         )
         .unwrap();
@@ -10521,7 +10501,7 @@ fn runtime_materializes_two_relation_join_nullable_right_value_count() {
                         ("alice", None, "gold", 1),
                         ("bob", Some(50), "gold", 1),
                     ])],
-                }),
+                },
             ],
         )
         .unwrap();
@@ -10552,7 +10532,7 @@ fn runtime_materializes_two_relation_join_nullable_right_value_count() {
                     ("alice", None, "gold", -1),
                     ("alice", Some(80), "gold", 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -10624,7 +10604,7 @@ fn runtime_materializes_two_relation_join_multiple_right_aggregate_input_columns
                         ("alice", 100, 1000, "gold", 1),
                         ("bob", 50, 500, "gold", 1),
                     ])],
-                }),
+                },
             ],
         )
         .unwrap();
@@ -10658,7 +10638,7 @@ fn runtime_materializes_two_relation_join_multiple_right_aggregate_input_columns
                     ("alice", 100, 1000, "gold", -1),
                     ("alice", 80, 800, "gold", 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -10730,7 +10710,7 @@ fn runtime_materializes_two_relation_join_right_aggregate_having_order_by_top_k(
                     end_offset_exclusive: 2,
                     event_time_watermark: None,
                     batches: vec![accounts_alice_bob_batch()],
-                }),
+                },
             ],
         )
         .unwrap();
@@ -10790,7 +10770,7 @@ fn runtime_restores_legacy_join_checkpoint_without_aggregate_input_relation_side
                     end_offset_exclusive: 2,
                     event_time_watermark: None,
                     batches: vec![accounts_alice_bob_batch()],
-                }),
+                },
             ],
         )
         .unwrap();
@@ -10863,7 +10843,7 @@ fn runtime_rejects_join_checkpoint_without_published_output() {
                     end_offset_exclusive: 2,
                     event_time_watermark: None,
                     batches: vec![accounts_alice_bob_batch()],
-                }),
+                },
             ],
         )
         .unwrap();
@@ -10939,7 +10919,7 @@ fn runtime_materializes_two_relation_join_using_primary_key() {
                     end_offset_exclusive: 2,
                     event_time_watermark: None,
                     batches: vec![accounts_using_user_id_batch()],
-                }),
+                },
             ],
         )
         .unwrap();
@@ -10995,7 +10975,7 @@ fn runtime_materializes_two_relation_join_order_by_limit_top_k_and_restores_stat
                     end_offset_exclusive: 3,
                     event_time_watermark: None,
                     batches: vec![accounts_batch()],
-                }),
+                },
             ],
         )
         .unwrap();
@@ -11016,7 +10996,7 @@ fn runtime_materializes_two_relation_join_order_by_limit_top_k_and_restores_stat
                 end_offset_exclusive: 4,
                 event_time_watermark: None,
                 batches: vec![score_append_batch("bob", 20)],
-            })],
+            }],
         )
         .unwrap();
     assert_join_page(runtime.as_ref(), 2, &[("bob", 25, 2)]);
@@ -11073,7 +11053,7 @@ fn runtime_materializes_two_relation_join_order_by_sum_function_top_k() {
                     end_offset_exclusive: 3,
                     event_time_watermark: None,
                     batches: vec![accounts_batch()],
-                }),
+                },
             ],
         )
         .unwrap();
@@ -11094,7 +11074,7 @@ fn runtime_materializes_two_relation_join_order_by_sum_function_top_k() {
                 end_offset_exclusive: 4,
                 event_time_watermark: None,
                 batches: vec![score_append_batch("bob", 20)],
-            })],
+            }],
         )
         .unwrap();
     assert_join_page(runtime.as_ref(), 2, &[("bob", 25, 2)]);
@@ -11148,7 +11128,7 @@ fn runtime_materializes_two_relation_join_order_by_count_star_function_top_k() {
                     end_offset_exclusive: 3,
                     event_time_watermark: None,
                     batches: vec![accounts_batch()],
-                }),
+                },
             ],
         )
         .unwrap();
@@ -11203,7 +11183,7 @@ fn runtime_materializes_two_relation_join_order_by_count_distinct_function_top_k
                     end_offset_exclusive: 3,
                     event_time_watermark: None,
                     batches: vec![accounts_batch()],
-                }),
+                },
             ],
         )
         .unwrap();
@@ -11258,7 +11238,7 @@ fn runtime_materializes_two_relation_join_having_view() {
                     end_offset_exclusive: 2,
                     event_time_watermark: None,
                     batches: vec![accounts_batch()],
-                }),
+                },
             ],
         )
         .unwrap();
@@ -11314,7 +11294,7 @@ fn runtime_materializes_two_relation_join_projected_aliases() {
                     end_offset_exclusive: 2,
                     event_time_watermark: None,
                     batches: vec![accounts_batch()],
-                }),
+                },
             ],
         )
         .unwrap();
@@ -11383,7 +11363,7 @@ fn runtime_materializes_two_relation_join_shared_aggregate_filter() {
                     end_offset_exclusive: 3,
                     event_time_watermark: None,
                     batches: vec![accounts_batch()],
-                }),
+                },
             ],
         )
         .unwrap();
@@ -11404,7 +11384,7 @@ fn runtime_materializes_two_relation_join_shared_aggregate_filter() {
                 end_offset_exclusive: 4,
                 event_time_watermark: None,
                 batches: vec![score_append_batch("bob", 20)],
-            })],
+            }],
         )
         .unwrap();
     assert_join_page(runtime.as_ref(), 2, &[("alice", 17, 2), ("bob", 20, 1)]);
@@ -11461,7 +11441,7 @@ fn runtime_materializes_two_relation_join_mixed_aggregate_filters() {
                     end_offset_exclusive: 3,
                     event_time_watermark: None,
                     batches: vec![accounts_batch()],
-                }),
+                },
             ],
         )
         .unwrap();
@@ -11482,7 +11462,7 @@ fn runtime_materializes_two_relation_join_mixed_aggregate_filters() {
                 end_offset_exclusive: 4,
                 event_time_watermark: None,
                 batches: vec![score_append_batch("bob", 20)],
-            })],
+            }],
         )
         .unwrap();
     assert_join_page(runtime.as_ref(), 2, &[("alice", 17, 2), ("bob", 20, 2)]);
@@ -11544,7 +11524,7 @@ fn runtime_materializes_two_relation_join_filtered_count_distinct() {
                     end_offset_exclusive: 3,
                     event_time_watermark: None,
                     batches: vec![accounts_batch()],
-                }),
+                },
             ],
         )
         .unwrap();
@@ -11607,7 +11587,7 @@ fn runtime_materializes_two_relation_join_having_count_distinct_function() {
                     end_offset_exclusive: 3,
                     event_time_watermark: None,
                     batches: vec![accounts_batch()],
-                }),
+                },
             ],
         )
         .unwrap();
@@ -11628,7 +11608,7 @@ fn runtime_materializes_two_relation_join_having_count_distinct_function() {
                 end_offset_exclusive: 5,
                 event_time_watermark: None,
                 batches: vec![scores_rows_batch(&[("bob", 20, 1)])],
-            })],
+            }],
         )
         .unwrap();
     assert_join_page(runtime.as_ref(), 2, &[("alice", 27, 2), ("bob", 25, 2)]);
@@ -11682,7 +11662,7 @@ fn runtime_materializes_two_relation_join_count_distinct_skips_null_left_values(
                     end_offset_exclusive: 3,
                     event_time_watermark: None,
                     batches: vec![accounts_batch()],
-                }),
+                },
             ],
         )
         .unwrap();
@@ -11737,7 +11717,7 @@ fn runtime_materializes_two_relation_join_nullable_left_value_count() {
                     end_offset_exclusive: 3,
                     event_time_watermark: None,
                     batches: vec![accounts_batch()],
-                }),
+                },
             ],
         )
         .unwrap();
@@ -11806,7 +11786,7 @@ fn runtime_materializes_two_relation_join_with_left_where_filter() {
                     end_offset_exclusive: 3,
                     event_time_watermark: None,
                     batches: vec![accounts_batch()],
-                }),
+                },
             ],
         )
         .unwrap();
@@ -11846,7 +11826,7 @@ fn runtime_materializes_two_relation_join_with_left_where_filter() {
                     end_offset_exclusive: 4,
                     event_time_watermark: None,
                     batches: vec![accounts_rows_batch(&[("charlie", 100, "gold", 1)])],
-                }),
+                },
             ],
         )
         .unwrap();
@@ -11880,7 +11860,7 @@ fn runtime_materializes_two_relation_join_with_left_where_filter() {
                     end_offset_exclusive: 5,
                     event_time_watermark: None,
                     batches: vec![accounts_rows_batch(&[("charlie", 100, "gold", -1)])],
-                }),
+                },
             ],
         )
         .unwrap();
@@ -11947,7 +11927,7 @@ fn runtime_materializes_two_relation_join_with_cte_source_filter() {
                     end_offset_exclusive: 3,
                     event_time_watermark: None,
                     batches: vec![accounts_batch()],
-                }),
+                },
             ],
         )
         .unwrap();
@@ -12015,7 +11995,7 @@ fn runtime_materializes_two_relation_join_with_right_cte_source_filter() {
                     end_offset_exclusive: 3,
                     event_time_watermark: None,
                     batches: vec![accounts_batch()],
-                }),
+                },
             ],
         )
         .unwrap();
@@ -12083,7 +12063,7 @@ fn runtime_materializes_two_relation_join_with_two_cte_source_filters() {
                     end_offset_exclusive: 3,
                     event_time_watermark: None,
                     batches: vec![accounts_batch()],
-                }),
+                },
             ],
         )
         .unwrap();
@@ -12151,7 +12131,7 @@ fn runtime_materializes_two_relation_join_with_two_derived_table_source_filters(
                     end_offset_exclusive: 3,
                     event_time_watermark: None,
                     batches: vec![accounts_batch()],
-                }),
+                },
             ],
         )
         .unwrap();
@@ -12207,7 +12187,7 @@ fn runtime_materializes_two_relation_join_with_cross_relation_or_where_filter() 
                     end_offset_exclusive: 3,
                     event_time_watermark: None,
                     batches: vec![accounts_batch()],
-                }),
+                },
             ],
         )
         .unwrap();
@@ -12250,7 +12230,7 @@ fn runtime_materializes_latest_bool_by_key_and_restores_state() {
                     ("device-a", false, 110, 1),
                     ("device-b", true, 90, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -12280,7 +12260,7 @@ fn runtime_materializes_latest_bool_by_key_and_restores_state() {
                     ("device-a", true, 105, 1),
                     ("device-b", false, 120, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -12325,7 +12305,7 @@ fn runtime_rejects_latest_by_key_checkpoint_without_published_output() {
                     ("device-a", true, 100, 1),
                     ("device-b", true, 90, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -12379,7 +12359,7 @@ fn runtime_materializes_earliest_bool_by_key_with_arg_min() {
                     ("device-b", false, 80, 1),
                     ("device-b", true, 70, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -12407,7 +12387,7 @@ fn runtime_materializes_earliest_bool_by_key_with_arg_min() {
                     ("device-a", false, 90, 1),
                     ("device-b", false, 120, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -12454,7 +12434,7 @@ fn runtime_materializes_latest_by_key_with_arg_max_filter_predicate() {
                     ("device-b", false, 120, 1),
                     ("device-b", true, 90, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -12502,7 +12482,7 @@ fn runtime_materializes_latest_by_key_with_where_and_arg_max_filter_predicates()
                     ("device-c", false, 120, 1),
                     ("device-c", true, 80, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -12544,7 +12524,7 @@ fn runtime_materializes_latest_by_key_cte_source_filters() {
                     ("device-a", false, 110, 1),
                     ("device-b", true, 90, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -12586,7 +12566,7 @@ fn runtime_materializes_latest_by_key_derived_table_source_filters() {
                     ("device-a", false, 110, 1),
                     ("device-b", true, 90, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -12627,7 +12607,7 @@ fn runtime_materializes_latest_by_key_order_by_limit_top_k_and_restores_state() 
                     ("device-a", true, 100, 1),
                     ("device-b", false, 110, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -12650,7 +12630,7 @@ fn runtime_materializes_latest_by_key_order_by_limit_top_k_and_restores_state() 
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
                 batches: vec![device_status_batch(&[("device-c", true, 120, 1)])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -12692,7 +12672,7 @@ fn runtime_materializes_latest_by_key_order_by_limit_offset_top_k() {
                     ("device-b", false, 110, 1),
                     ("device-c", true, 120, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
     assert_latest_status_page(runtime.as_ref(), 1, &[("device-b", false)]);
@@ -12712,7 +12692,7 @@ fn runtime_materializes_latest_by_key_order_by_limit_offset_top_k() {
                 end_offset_exclusive: 4,
                 event_time_watermark: None,
                 batches: vec![device_status_batch(&[("device-d", false, 130, 1)])],
-            })],
+            }],
         )
         .unwrap();
     assert_latest_status_page(runtime.as_ref(), 2, &[("device-c", true)]);
@@ -12752,7 +12732,7 @@ fn runtime_materializes_latest_by_key_order_by_arg_max_function_top_k() {
                     ("device-a", false, 100, 1),
                     ("device-b", true, 110, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -12801,7 +12781,7 @@ fn runtime_materializes_tumbling_event_time_windows_and_restores_state() {
                     ("bob", -50, 35_000_000_000, 1),
                     ("alice", 7, 70_000_000_000, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -12835,7 +12815,7 @@ fn runtime_materializes_tumbling_event_time_windows_and_restores_state() {
                     80_000_000_000,
                     1,
                 )])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -12892,7 +12872,7 @@ fn runtime_materializes_tumbling_event_time_aggregate_with_matching_filters() {
                     ("alice", 7, 70_000_000_000, 1),
                     ("bob", 11, 80_000_000_000, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -12949,7 +12929,7 @@ fn runtime_materializes_tumbling_event_time_aggregate_with_mixed_filters() {
                     ("alice", 7, 70_000_000_000, 1),
                     ("bob", 11, 80_000_000_000, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -13020,7 +13000,7 @@ fn runtime_materializes_tumbling_event_time_filtered_count_distinct_with_mixed_f
                     ("alice", 7, 70_000_000_000, 1),
                     ("bob", 11, 80_000_000_000, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -13090,7 +13070,7 @@ fn runtime_materializes_tumbling_event_time_nullable_column_count() {
                     ("bob", None, 30_000_000_000, 1),
                     ("alice", Some(7), 70_000_000_000, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -13156,7 +13136,7 @@ fn runtime_materializes_tumbling_event_time_filtered_nullable_column_count() {
                     ("bob", None, 30_000_000_000, 1),
                     ("alice", Some(7), 70_000_000_000, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -13212,7 +13192,7 @@ fn runtime_materializes_tumbling_event_time_mixed_filter_having_top_k() {
                     ("alice", 7, 70_000_000_000, 1),
                     ("bob", 11, 80_000_000_000, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -13272,7 +13252,7 @@ fn runtime_materializes_tumbling_event_time_aggregate_with_different_filters() {
                     ("alice", 7, 70_000_000_000, 1),
                     ("bob", 11, 80_000_000_000, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -13329,7 +13309,7 @@ fn runtime_materializes_subsecond_tumbling_event_time_windows() {
                     ("bob", 5, 300_000_000, 1),
                     ("alice", 4, 700_000_000, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -13385,7 +13365,7 @@ fn runtime_materializes_tumbling_event_time_order_by_limit_top_k_and_restores_st
                     ("bob", 5, 30_000_000_000, 1),
                     ("alice", 7, 70_000_000_000, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -13419,7 +13399,7 @@ fn runtime_materializes_tumbling_event_time_order_by_limit_top_k_and_restores_st
                     80_000_000_000,
                     1,
                 )])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -13472,7 +13452,7 @@ fn runtime_materializes_tumbling_event_time_order_by_limit_offset_top_k() {
                     ("carol", 10, 30_000_000_000, 1),
                     ("dave", 5, 40_000_000_000, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -13527,7 +13507,7 @@ fn runtime_materializes_tumbling_event_time_order_by_sum_function_top_k() {
                     ("bob", 12, 30_000_000_000, 1),
                     ("alice", 50, 70_000_000_000, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -13576,7 +13556,7 @@ fn runtime_materializes_tumbling_event_time_count_distinct_and_restores_state() 
                     ("alice", 7, 30_000_000_000, 1),
                     ("bob", 5, 30_000_000_000, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -13641,7 +13621,7 @@ fn runtime_materializes_hopping_event_time_windows() {
                     ("alice", 10, 10_000_000_000, 1),
                     ("alice", 7, 40_000_000_000, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -13697,7 +13677,7 @@ fn runtime_materializes_hopping_event_time_advanced_aggregates_having_top_k() {
                     ("alice", 14, 20_000_000_000, 1),
                     ("alice", 10, 40_000_000_000, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -13749,7 +13729,7 @@ fn runtime_materializes_session_event_time_windows() {
                     ("alice", 7, 25_000_000_000, 1),
                     ("alice", 11, 80_000_000_000, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -13808,7 +13788,7 @@ fn runtime_materializes_session_event_time_advanced_aggregates_after_bridge_retr
                     ("carol", 12, 20_000_000_000, 1),
                     ("bob", 50, 10_000_000_000, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -13869,7 +13849,7 @@ fn runtime_rejects_missing_session_event_retract_without_mutating_state() {
                     10_000_000_000,
                     -1,
                 )])],
-            })],
+            }],
         )
         .unwrap_err();
 
@@ -13903,7 +13883,7 @@ fn runtime_rejects_missing_session_event_retract_without_mutating_state() {
                     10_000_000_000,
                     1,
                 )])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -13955,7 +13935,7 @@ fn runtime_materializes_tumbling_event_time_cte_source_filters() {
                     ("bob", 8, 20_000_000_000, 1),
                     ("alice", 4, 30_000_000_000, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -14003,7 +13983,7 @@ fn runtime_materializes_tumbling_event_time_derived_table_source_filters() {
                     ("bob", 8, 20_000_000_000, 1),
                     ("alice", 4, 30_000_000_000, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -14052,7 +14032,7 @@ fn runtime_materializes_tumbling_event_time_min_max_avg_and_restores_state() {
                     ("bob", 5, 30_000_000_000, 1),
                     ("alice", 7, 70_000_000_000, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -14091,7 +14071,7 @@ fn runtime_materializes_tumbling_event_time_min_max_avg_and_restores_state() {
                     ("alice", 9, 80_000_000_000, 1),
                     ("bob", 11, 90_000_000_000, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -14147,7 +14127,7 @@ fn runtime_materializes_tumbling_min_max_arithmetic_expression() {
                     ("alice", 10, 10_000_000_000, 1),
                     ("alice", 7, 20_000_000_000, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -14198,7 +14178,7 @@ fn runtime_materializes_tumbling_avg_arithmetic_expression() {
                     ("alice", 10, 10_000_000_000, 1),
                     ("alice", 7, 20_000_000_000, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -14249,7 +14229,7 @@ fn runtime_materializes_tumbling_sum_arithmetic_expression() {
                     ("alice", 10, 10_000_000_000, 1),
                     ("alice", 7, 20_000_000_000, 1),
                 ])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -14298,7 +14278,7 @@ fn runtime_rejects_late_rows_for_already_closed_tumbling_window() {
                     10_000_000_000,
                     1,
                 )])],
-            })],
+            }],
         )
         .unwrap();
 
@@ -14323,7 +14303,7 @@ fn runtime_rejects_late_rows_for_already_closed_tumbling_window() {
                     watermark_ns: 60_000_000_000,
                 }),
                 batches: vec![purchases_event_time_batch(&[("bob", 9, 30_000_000_000, 1)])],
-            })],
+            }],
         )
         .unwrap_err();
 
@@ -14356,8 +14336,6 @@ fn standing_identity_with_view(sql: &str, view_id: &str) -> StandingProgramIdent
         runtime_compatibility: "velorix-materialized-view-runtime-v1".to_string(),
         checkpoint_codec_identity: "velorix-standing-program-checkpoint-v1".to_string(),
         native_code_policy: NativeCodePolicy::DisabledNoExternalDependencies,
-        dependency_binding_digest: String::new(),
-        authenticated_tenant_id: "default".to_string(),
     }
 }
 
@@ -14442,7 +14420,7 @@ fn join_relation_input(
         end_offset_exclusive,
         event_time_watermark: None,
         batches,
-    })
+    }
 }
 
 fn apply_native_join_epoch(
@@ -14476,24 +14454,11 @@ fn canonical_delta(batch: &DeltaBatch) -> DeltaBatch {
     DeltaBatch::from_records(batch.net_rows().unwrap())
 }
 
-/// Extract source-only batches from a standing input change list.
-///
-/// Used by internal executor helpers that still accept `Vec<RelationInputBatch>`.
-fn source_batches_from_changes(changes: Vec<StandingInputChangeV1>) -> Vec<RelationInputBatch> {
-    changes
-        .into_iter()
-        .filter_map(|change| match change {
-            StandingInputChangeV1::Source(batch) => Some(batch),
-            StandingInputChangeV1::View(_) => None,
-        })
-        .collect()
-}
-
 fn assert_join_runtime_epoch_equivalent(
     selected: &mut Box<dyn StandingProgramRuntime + Send>,
     reference: &mut Box<dyn StandingProgramRuntime + Send>,
     logical_epoch: u64,
-    input_changes: Vec<StandingInputChangeV1>,
+    input_changes: Vec<RelationInputBatch>,
 ) {
     let selected_commit = selected
         .apply_changes(
@@ -18151,7 +18116,7 @@ fn relation_input(
         end_offset_exclusive,
         event_time_watermark: None,
         batches: vec![batch],
-    })
+    }
 }
 
 fn composite_scores_rows_batch(rows: &[(&str, i64, &str, i64)]) -> RecordBatch {

@@ -23,15 +23,6 @@ pub struct StandingProgramIdentity {
     pub runtime_compatibility: String,
     pub checkpoint_codec_identity: String,
     pub native_code_policy: NativeCodePolicy,
-    /// Canonical digest of the dependency edge binding set.
-    /// Empty for views with no view-to-view dependencies.
-    /// Computed over sorted ViewDependencyEdgeBindingV1 entries.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub dependency_binding_digest: String,
-    /// Tenant from authenticated request scope (not "default").
-    /// Used for cross-tenant isolation in dependency graphs.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub authenticated_tenant_id: String,
 }
 
 impl StandingProgramIdentity {
@@ -197,73 +188,6 @@ pub struct ViewOutputDelta {
     pub view_id: String,
     pub schema_fingerprint: String,
     pub delta: DeltaBatch,
-}
-
-/// Durable identity of a producer's published output commit.
-///
-/// Written after the output delta object, state payload, and immutable
-/// checkpoint record are durably stored, and referenced by consumer view
-/// cursors (`CausalViewCursorV1`) through `commit_digest`.
-///
-/// The `commit_digest` is the domain-separated SHA-256 of this canonical
-/// record. It is NOT the checkpoint state root hash, because that value does
-/// not bind the output delta ref, producer identity, and authority chain that
-/// a consumer must verify before applying a view delta.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct PublishedViewCommitV1 {
-    pub schema_version: u32,
-    pub producer_tenant_id: String,
-    pub producer_program_id: String,
-    pub producer_view_id: String,
-    pub producer_generation: u64,
-    pub producer_plan_hash: String,
-    pub output_stream_id: String,
-    pub output_epoch: LogicalEpoch,
-    pub output_schema_hash: String,
-    pub key_descriptor_hash: String,
-    pub delta_codec_identity: String,
-    /// Reference to the durable checkpoint record covering this commit.
-    pub checkpoint_ref: String,
-    /// Domain-separated digest of the durable checkpoint record.
-    pub checkpoint_record_digest: String,
-    /// Reference to the durable output delta object.
-    pub output_delta_ref: String,
-    /// Producer's idempotency key for this epoch.
-    pub idempotency_key: String,
-}
-
-pub const PUBLISHED_VIEW_COMMIT_SCHEMA_VERSION_V1: u32 = 1;
-pub const PUBLISHED_VIEW_COMMIT_DIGEST_DOMAIN: &str = "velorix-published-view-commit-sha256-v1";
-
-impl PublishedViewCommitV1 {
-    /// Canonical domain-separated digest of this commit record.
-    ///
-    /// Consumers verify `commit_digest == cursor.commit_digest` after walking
-    /// the authoritative pointer -> checkpoint -> commit chain.
-    pub fn commit_digest(&self) -> Result<String, StandingProgramRuntimeError> {
-        let bytes = serde_json::to_vec(self).map_err(|_| invalid_commit_record())?;
-        let mut hasher = Sha256::new();
-        hasher.update(PUBLISHED_VIEW_COMMIT_DIGEST_DOMAIN.as_bytes());
-        hasher.update(bytes);
-        Ok(format!("sha256:{:x}", hasher.finalize()))
-    }
-
-    /// Builds the `CausalViewCursorV1` a consumer uses to reference this commit.
-    pub fn to_cursor(&self, input_edge: &str) -> CausalViewCursorV1 {
-        CausalViewCursorV1 {
-            input_edge: input_edge.to_string(),
-            producer_tenant_id: self.producer_tenant_id.clone(),
-            producer_program_id: self.producer_program_id.clone(),
-            producer_view_id: self.producer_view_id.clone(),
-            producer_generation: self.producer_generation,
-            output_stream: self.output_stream_id.clone(),
-            output_epoch: self.output_epoch,
-            commit_digest: self
-                .commit_digest()
-                .unwrap_or_else(|_| format!("sha256:{}", "0".repeat(64))),
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -460,76 +384,6 @@ impl CausalCutV1 {
         Ok(self)
     }
 
-    /// Validates that the cursor set exactly matches the admitted edge set.
-    ///
-    /// For dependency-capable checkpoints, this ensures:
-    /// 1. Every admitted edge has a corresponding cursor
-    /// 2. No extra cursors exist beyond the admitted edges
-    /// 3. Each cursor passes full authority chain validation
-    ///
-    /// `admitted_edge_ids` is the set of input_edge_id values from the
-    /// admitted dependency graph edges. For source-only checkpoints, pass
-    /// an empty set.
-    pub fn validate_cursors_match_edges(
-        &self,
-        admitted_edge_ids: &[String],
-    ) -> Result<(), StandingProgramRuntimeError> {
-        // For source-only checkpoints, cursors must be empty
-        if admitted_edge_ids.is_empty() {
-            if !self.direct_view_cursors.is_empty() {
-                return Err(StandingProgramRuntimeError::InvalidCausalCut {
-                    reason: "source-only checkpoint has view cursors".to_string(),
-                });
-            }
-            return Ok(());
-        }
-
-        // For dependency-capable checkpoints, cursors must match edges exactly
-        let cursor_edges: Vec<&str> = self
-            .direct_view_cursors
-            .iter()
-            .map(|c| c.input_edge.as_str())
-            .collect();
-
-        // Check every admitted edge has a cursor
-        for edge_id in admitted_edge_ids {
-            if !cursor_edges.contains(&edge_id.as_str()) {
-                return Err(StandingProgramRuntimeError::InvalidCausalCut {
-                    reason: format!("missing cursor for admitted edge: {}", edge_id),
-                });
-            }
-        }
-
-        // Check no extra cursors exist
-        for cursor in &self.direct_view_cursors {
-            if !admitted_edge_ids.contains(&cursor.input_edge) {
-                return Err(StandingProgramRuntimeError::InvalidCausalCut {
-                    reason: format!("extra cursor for non-admitted edge: {}", cursor.input_edge),
-                });
-            }
-        }
-
-        // Validate each cursor
-        for cursor in &self.direct_view_cursors {
-            cursor.validate()?;
-        }
-
-        Ok(())
-    }
-
-    /// Checks if this causal cut has any view dependencies.
-    pub fn has_view_dependencies(&self) -> bool {
-        !self.direct_view_cursors.is_empty()
-    }
-
-    /// Returns the set of edge IDs that have cursors.
-    pub fn cursor_edge_ids(&self) -> Vec<String> {
-        self.direct_view_cursors
-            .iter()
-            .map(|c| c.input_edge.clone())
-            .collect()
-    }
-
     pub fn stable_digest(&self) -> Result<String, StandingProgramRuntimeError> {
         #[derive(Serialize)]
         struct DigestEnvelope<'a> {
@@ -631,12 +485,6 @@ fn invalid_input_coverage() -> StandingProgramRuntimeError {
 fn invalid_causal_cut() -> StandingProgramRuntimeError {
     StandingProgramRuntimeError::InvalidProgramIdentity {
         field: "causal_cut",
-    }
-}
-
-fn invalid_commit_record() -> StandingProgramRuntimeError {
-    StandingProgramRuntimeError::InvalidProgramIdentity {
-        field: "published_view_commit",
     }
 }
 
@@ -747,7 +595,7 @@ pub trait StandingProgramRuntime {
         &mut self,
         logical_epoch: LogicalEpoch,
         idempotency_key: EpochIdempotencyKey,
-        input_changes: Vec<StandingInputChangeV1>,
+        input_changes: Vec<RelationInputBatch>,
     ) -> Result<EpochCommit, StandingProgramRuntimeError>;
 
     fn materialized_view_page(
@@ -808,8 +656,6 @@ pub enum StandingProgramRuntimeError {
     UnknownView { view_id: String },
     #[error("external standing runtime error: {reason}")]
     ExternalRuntime { reason: String },
-    #[error("invalid causal cut: {reason}")]
-    InvalidCausalCut { reason: String },
 }
 
 fn require_non_empty(field: &'static str, value: &str) -> Result<(), StandingProgramRuntimeError> {

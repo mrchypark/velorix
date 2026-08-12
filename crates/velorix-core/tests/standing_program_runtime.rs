@@ -37,8 +37,6 @@ fn valid_identity() -> StandingProgramIdentity {
         runtime_compatibility: "velorix-native-materialized-runtime-v1".to_string(),
         checkpoint_codec_identity: "velorix-standing-program-checkpoint-v1".to_string(),
         native_code_policy: NativeCodePolicy::DisabledNoExternalDependencies,
-        dependency_binding_digest: String::new(),
-        authenticated_tenant_id: "default".to_string(),
     }
 }
 
@@ -359,15 +357,8 @@ impl StandingProgramRuntime for FakeStandingProgramRuntime {
         &mut self,
         logical_epoch: LogicalEpoch,
         idempotency_key: EpochIdempotencyKey,
-        input_changes: Vec<StandingInputChangeV1>,
+        input_changes: Vec<RelationInputBatch>,
     ) -> Result<EpochCommit, StandingProgramRuntimeError> {
-        let input_changes: Vec<RelationInputBatch> = input_changes
-            .into_iter()
-            .filter_map(|change| match change {
-                StandingInputChangeV1::Source(batch) => Some(batch),
-                StandingInputChangeV1::View(_) => None,
-            })
-            .collect();
         self.identity.validate()?;
         if logical_epoch <= self.epoch {
             return Err(StandingProgramRuntimeError::NonMonotonicLogicalEpoch {
@@ -476,7 +467,7 @@ fn standing_program_runtime_applies_relation_scoped_epoch_and_emits_view_scoped_
                 end_offset_exclusive: 1,
                 event_time_watermark: None,
                 batches: vec![sample_batch()],
-            })],
+            }],
         )
         .unwrap();
 
@@ -533,50 +524,4 @@ fn orders_output_schema() -> RelationSchema {
         ],
         primary_key: vec!["region".to_string()],
     }
-}
-
-#[test]
-fn published_view_commit_digest_is_domain_separated_and_stable() {
-    let commit = PublishedViewCommitV1 {
-        schema_version: PUBLISHED_VIEW_COMMIT_SCHEMA_VERSION_V1,
-        producer_tenant_id: "tenant-a".to_string(),
-        producer_program_id: "program-a".to_string(),
-        producer_view_id: "orders_by_region".to_string(),
-        producer_generation: 7,
-        producer_plan_hash: "velorix-logical-view-plan-sha256-v1:plan".to_string(),
-        output_stream_id: "view/orders_by_region/generation/7/output/orders_by_region".to_string(),
-        output_epoch: 3,
-        output_schema_hash: format!("sha256:{}", "2".repeat(64)),
-        key_descriptor_hash: format!("sha256:{}", "1".repeat(64)),
-        delta_codec_identity: "velorix-published-relation-delta-v1".to_string(),
-        checkpoint_ref: "checkpoint-ref".to_string(),
-        checkpoint_record_digest: format!("sha256:{}", "4".repeat(64)),
-        output_delta_ref: "output-delta-ref".to_string(),
-        idempotency_key: "epoch-3".to_string(),
-    };
-
-    // Digest is deterministic and domain-separated.
-    let digest1 = commit.commit_digest().unwrap();
-    let digest2 = commit.commit_digest().unwrap();
-    assert_eq!(digest1, digest2);
-    assert!(digest1.starts_with("sha256:"));
-    assert_eq!(digest1.len(), "sha256:".len() + 64);
-
-    // Changing any field changes the digest.
-    let mut tampered = commit.clone();
-    tampered.output_delta_ref = "tampered-ref".to_string();
-    assert_ne!(digest1, tampered.commit_digest().unwrap());
-
-    // Digest is NOT the checkpoint record digest.
-    assert_ne!(digest1, commit.checkpoint_record_digest);
-
-    // to_cursor binds the commit identity into a CausalViewCursorV1.
-    let cursor = commit.to_cursor("edge-1");
-    assert_eq!(cursor.input_edge, "edge-1");
-    assert_eq!(cursor.producer_view_id, "orders_by_region");
-    assert_eq!(cursor.producer_generation, 7);
-    assert_eq!(cursor.output_epoch, 3);
-    assert_eq!(cursor.output_stream, commit.output_stream_id);
-    assert_eq!(cursor.commit_digest, digest1);
-    cursor.validate().unwrap();
 }

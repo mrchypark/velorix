@@ -99,7 +99,7 @@ pub use event_time_window::TumblingEventTimeAggregateRuntime;
 pub use filter_project::FilterProjectRuntime;
 pub use latest_by_key::LatestByKeyRuntime;
 pub use semi_anti_join::TwoInputSemiAntiJoinRuntime;
-pub use single_key_aggregate::{SingleKeyRuntimeInputV1, SingleKeySumCountRuntime};
+pub use single_key_aggregate::SingleKeySumCountRuntime;
 pub use three_input_join::ThreeInputInnerJoinCountRuntime;
 pub use two_input_join::TwoInputJoinRuntime;
 
@@ -310,39 +310,6 @@ pub fn create_standing_runtime_with_logical_plan_and_catalogs(
     }
 }
 
-/// Create a single-key sum/count runtime bound to a published view output.
-///
-/// This is the Phase 4 view-on-view factory seam. It binds the runtime to a
-/// `PublishedRelationBindingV1` instead of a physical catalog, and the input
-/// schema comes from the persisted producer relation.
-pub fn create_standing_runtime_with_logical_plan_and_published_binding(
-    identity: &StandingProgramIdentity,
-    binding: &PublishedRelationBindingV1,
-    logical_plan: VelorixLogicalViewPlanV1,
-    input_schemas: &[RelationSchema],
-    output_schemas: &[RelationSchema],
-) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
-    let output_schema =
-        only_schema(output_schemas, "output_schemas").map_err(|error| error.to_string())?;
-    let sql = logical_plan.view_sql.clone();
-    match &logical_plan.execution {
-        VelorixLogicalViewExecutionV1::SingleKeySumCount { plan } => {
-            SingleKeySumCountRuntime::new_with_logical_plan_for_published_view(
-                identity.clone(),
-                binding.clone(),
-                only_schema(input_schemas, "input_schemas").map_err(|error| error.to_string())?,
-                output_schema.clone(),
-                sql,
-                plan.clone(),
-                logical_plan,
-            )
-            .map(|runtime| Box::new(runtime) as Box<dyn StandingProgramRuntime + Send>)
-            .map_err(|error| error.to_string())
-        }
-        _ => Err("published-view runtime currently supports only single-key sum/count".to_string()),
-    }
-}
-
 /// Differential-test backend that binds an already admitted join DAG to the
 /// generic native operator graph. It is intentionally not selected by the
 /// public runtime factory or any SQL/API/configuration surface.
@@ -431,26 +398,6 @@ fn looks_like_default_sum_count_output(output_schema: &RelationSchema) -> bool {
     )
 }
 
-/// Extract source-only input batches from a mixed standing input change list.
-///
-/// View inputs are rejected with a clear error. Runtimes that support
-/// view-on-view dependencies implement their own view-input dispatch.
-pub(super) fn source_input_batches(
-    input_changes: Vec<StandingInputChangeV1>,
-) -> Result<Vec<RelationInputBatch>, StandingProgramRuntimeError> {
-    input_changes
-        .into_iter()
-        .map(|change| match change {
-            StandingInputChangeV1::Source(batch) => Ok(batch),
-            StandingInputChangeV1::View(_) => {
-                Err(StandingProgramRuntimeError::InvalidProgramIdentity {
-                    field: "view delta input is not supported by this runtime",
-                })
-            }
-        })
-        .collect()
-}
-
 fn looks_like_tumbling_window_output(
     output_schema: &RelationSchema,
     aggregate_outputs: Option<&[SupportedAggregateOutput]>,
@@ -513,7 +460,7 @@ pub fn restore_standing_runtime(
 #[serde(deny_unknown_fields)]
 struct GenericCheckpointPayload {
     schema_version: u32,
-    input: SingleKeyRuntimeInputV1,
+    catalog: VelorixRelationCatalogV1,
     input_schema: RelationSchema,
     output_schema: RelationSchema,
     view_sql: String,
@@ -1521,63 +1468,6 @@ fn aggregate_group_input_delta_batch(
     .map_err(|_| StandingProgramRuntimeError::InvalidProgramIdentity {
         field: "aggregate_group_input_batch",
     })
-}
-
-fn rekey_delta_batch_for_aggregate_group_with_primary_key(
-    delta: &DeltaBatch,
-    primary_key: &str,
-    plan: &SupportedViewPlan,
-    input_schema: &RelationSchema,
-) -> Result<DeltaBatch, StandingProgramRuntimeError> {
-    if plan.aggregate_output_identity.is_none() {
-        return Ok(delta.clone());
-    }
-    let group_keys = supported_view_plan_group_keys(plan);
-    let mut records = Vec::with_capacity(delta.records().len());
-    for record in delta.records() {
-        let mut input = record
-            .value
-            .as_json()
-            .as_object()
-            .cloned()
-            .ok_or_else(invalid_runtime_state)?;
-        input.insert(primary_key.to_string(), record.key.as_json().clone());
-        let values = group_keys
-            .iter()
-            .map(|key| {
-                let value = if let Some(column_id) = &key.input_column_id {
-                    input
-                        .get(column_id)
-                        .cloned()
-                        .ok_or_else(invalid_runtime_state)?
-                } else if let Some(expression) = &key.expression {
-                    Value::Number(JsonNumber::from(evaluate_projection_expr_for_schema(
-                        expression,
-                        &input,
-                        input_schema,
-                    )?))
-                } else {
-                    return Err(invalid_runtime_state());
-                };
-                Ok((key.output_column_id.clone(), value))
-            })
-            .collect::<Result<Vec<_>, StandingProgramRuntimeError>>()?;
-        let key = if supported_view_plan_is_singleton(plan) {
-            singleton_aggregate_key("state")
-        } else if let [(_, value)] = values.as_slice() {
-            value.clone()
-        } else {
-            DeltaValue::from_json(Value::Object(values.into_iter().collect()))
-                .as_json()
-                .clone()
-        };
-        records.push(DeltaRecord::new(
-            DeltaKey::from_json(key),
-            record.value.clone(),
-            record.weight,
-        ));
-    }
-    Ok(DeltaBatch::from_records(records))
 }
 
 fn rekey_delta_batch_for_aggregate_group(
@@ -3058,7 +2948,6 @@ fn validate_filter_project_projection_expr(
             validate_filter_project_int64_projection_column(catalog, column_id)
         }
         SupportedProjectionExpr::LiteralInt64 { .. } => Ok(()),
-        SupportedProjectionExpr::LiteralUtf8 { .. } => Ok(()),
         SupportedProjectionExpr::BinaryInt64 { left, right, .. } => {
             validate_filter_project_projection_expr(catalog, left)?;
             validate_filter_project_projection_expr(catalog, right)
@@ -3081,30 +2970,6 @@ fn validate_filter_project_projection_expr(
             validate_filter_project_case_predicate_expr(catalog, predicate)?;
             validate_filter_project_projection_expr(catalog, then_expr)?;
             validate_filter_project_projection_expr(catalog, else_expr)
-        }
-        SupportedProjectionExpr::LengthUtf8 { expr } => {
-            validate_filter_project_projection_expr(catalog, expr)
-        }
-        SupportedProjectionExpr::ConcatUtf8 { exprs } => {
-            for expr in exprs {
-                validate_filter_project_projection_expr(catalog, expr)?;
-            }
-            Ok(())
-        }
-        SupportedProjectionExpr::SubstringUtf8 {
-            expr,
-            start,
-            length,
-        } => {
-            validate_filter_project_projection_expr(catalog, expr)?;
-            validate_filter_project_projection_expr(catalog, start)?;
-            if let Some(l) = length {
-                validate_filter_project_projection_expr(catalog, l)?;
-            }
-            Ok(())
-        }
-        SupportedProjectionExpr::TrimUtf8 { expr } => {
-            validate_filter_project_projection_expr(catalog, expr)
         }
     }
 }
@@ -5011,7 +4876,6 @@ fn collect_projection_expr_column_ids(expr: &SupportedProjectionExpr, columns: &
             }
         }
         SupportedProjectionExpr::LiteralInt64 { .. } => {}
-        SupportedProjectionExpr::LiteralUtf8 { .. } => {}
         SupportedProjectionExpr::BinaryInt64 { left, right, .. } => {
             collect_projection_expr_column_ids(left, columns);
             collect_projection_expr_column_ids(right, columns);
@@ -5042,28 +4906,6 @@ fn collect_projection_expr_column_ids(expr: &SupportedProjectionExpr, columns: &
             }
             collect_projection_expr_column_ids(then_expr, columns);
             collect_projection_expr_column_ids(else_expr, columns);
-        }
-        SupportedProjectionExpr::LengthUtf8 { expr } => {
-            collect_projection_expr_column_ids(expr, columns);
-        }
-        SupportedProjectionExpr::ConcatUtf8 { exprs } => {
-            for expr in exprs {
-                collect_projection_expr_column_ids(expr, columns);
-            }
-        }
-        SupportedProjectionExpr::SubstringUtf8 {
-            expr,
-            start,
-            length,
-        } => {
-            collect_projection_expr_column_ids(expr, columns);
-            collect_projection_expr_column_ids(start, columns);
-            if let Some(l) = length {
-                collect_projection_expr_column_ids(l, columns);
-            }
-        }
-        SupportedProjectionExpr::TrimUtf8 { expr } => {
-            collect_projection_expr_column_ids(expr, columns);
         }
     }
 }
@@ -5447,12 +5289,6 @@ fn evaluate_projection_expr(
             .and_then(Value::as_i64)
             .ok_or_else(invalid_runtime_state),
         SupportedProjectionExpr::LiteralInt64 { value } => Ok(*value),
-        SupportedProjectionExpr::LiteralUtf8 { .. } => {
-            // String literals cannot be used in Int64 context
-            Err(StandingProgramRuntimeError::InvalidProgramIdentity {
-                field: "string_literal_in_int64_context",
-            })
-        }
         SupportedProjectionExpr::BinaryInt64 { op, left, right } => {
             let left = evaluate_projection_expr(left, input, catalog)?;
             let right = evaluate_projection_expr(right, input, catalog)?;
@@ -5510,110 +5346,6 @@ fn evaluate_projection_expr(
             } else {
                 evaluate_projection_expr(else_expr, input, catalog)
             }
-        }
-        // String expressions cannot be used in Int64 context
-        SupportedProjectionExpr::LengthUtf8 { .. }
-        | SupportedProjectionExpr::ConcatUtf8 { .. }
-        | SupportedProjectionExpr::SubstringUtf8 { .. }
-        | SupportedProjectionExpr::TrimUtf8 { .. } => {
-            Err(StandingProgramRuntimeError::InvalidProgramIdentity {
-                field: "string_expression_in_int64_context",
-            })
-        }
-    }
-}
-
-/// Evaluate a projection expression against a published-view input schema.
-///
-/// This is the catalog-free analog of `evaluate_projection_expr` used by the
-/// published-view aggregate path. The narrow Phase 4 slice forbids computed
-/// group keys, so only direct columns and Int64 literals are reachable; any
-/// wider expression fails closed.
-fn evaluate_projection_expr_for_schema(
-    expr: &SupportedProjectionExpr,
-    input: &Map<String, Value>,
-    _input_schema: &RelationSchema,
-) -> Result<i64, StandingProgramRuntimeError> {
-    match expr {
-        SupportedProjectionExpr::Column { column_id } => input
-            .get(column_id.as_str())
-            .and_then(Value::as_i64)
-            .ok_or_else(invalid_runtime_state),
-        SupportedProjectionExpr::LiteralInt64 { value } => Ok(*value),
-        _ => Err(StandingProgramRuntimeError::InvalidProgramIdentity {
-            field: "published_view_projection_expression_not_supported",
-        }),
-    }
-}
-
-/// Evaluate a string projection expression.
-///
-/// Returns the string result of evaluating the expression against the input record.
-fn evaluate_string_projection_expr(
-    expr: &SupportedProjectionExpr,
-    input: &Map<String, Value>,
-    catalog: &VelorixRelationCatalogV1,
-) -> Result<String, StandingProgramRuntimeError> {
-    match expr {
-        SupportedProjectionExpr::Column { column_id } => input
-            .get(column_id.as_str())
-            .and_then(|v| v.as_str().map(|s| s.to_string()))
-            .or_else(|| {
-                // Try as Int64 and convert to string
-                input
-                    .get(column_id.as_str())
-                    .and_then(|v| v.as_i64().map(|n| n.to_string()))
-            })
-            .ok_or_else(invalid_runtime_state),
-        SupportedProjectionExpr::LiteralUtf8 { value } => Ok(value.clone()),
-        SupportedProjectionExpr::LengthUtf8 { expr } => {
-            let s = evaluate_string_projection_expr(expr, input, catalog)?;
-            // LENGTH returns byte count (UTF-8)
-            Ok(s.len().to_string())
-        }
-        SupportedProjectionExpr::ConcatUtf8 { exprs } => {
-            let mut result = String::new();
-            for expr in exprs {
-                let s = evaluate_string_projection_expr(expr, input, catalog)?;
-                result.push_str(&s);
-            }
-            Ok(result)
-        }
-        SupportedProjectionExpr::SubstringUtf8 {
-            expr,
-            start,
-            length,
-        } => {
-            let s = evaluate_string_projection_expr(expr, input, catalog)?;
-            let start_val = evaluate_projection_expr(start, input, catalog)? as usize;
-            let len = match length {
-                Some(l) => Some(evaluate_projection_expr(l, input, catalog)? as usize),
-                None => None,
-            };
-            // SQL SUBSTRING is 1-indexed
-            let start_idx = if start_val > 0 { start_val - 1 } else { 0 };
-            let chars: Vec<char> = s.chars().collect();
-            let result: String = match len {
-                Some(l) => chars.iter().skip(start_idx).take(l).collect(),
-                None => chars.iter().skip(start_idx).collect(),
-            };
-            Ok(result)
-        }
-        SupportedProjectionExpr::TrimUtf8 { expr } => {
-            let s = evaluate_string_projection_expr(expr, input, catalog)?;
-            Ok(s.trim().to_string())
-        }
-        // Int64 expressions cannot be used in string context
-        SupportedProjectionExpr::LiteralInt64 { value } => Ok(value.to_string()),
-        SupportedProjectionExpr::BinaryInt64 { .. }
-        | SupportedProjectionExpr::AbsInt64 { .. }
-        | SupportedProjectionExpr::GreatestInt64 { .. }
-        | SupportedProjectionExpr::LeastInt64 { .. }
-        | SupportedProjectionExpr::CoalesceInt64 { .. }
-        | SupportedProjectionExpr::CaseInt64 { .. } => {
-            Err(StandingProgramRuntimeError::InvalidProgramIdentity {
-                field: "int64_expression_in_string_context",
-            })
         }
     }
 }
@@ -8246,34 +7978,6 @@ fn aggregate_value_mode_for_column_id(
         }
         _ => Err(StandingProgramRuntimeError::InvalidProgramIdentity {
             field: "catalog.value_column",
-        }),
-    }
-}
-
-/// Aggregate value mode for a published-view input schema column.
-///
-/// The published path has no physical catalog, so the value mode is derived
-/// from the persisted `RelationSchema` column's `SqlDataType`. Only Int64 and
-/// Decimal128 (the aggregate-key-capable types) are admitted; anything else
-/// fails closed.
-fn aggregate_value_mode_for_published_schema(
-    input_schema: &RelationSchema,
-    column_id: &str,
-) -> Result<AggregateValueMode, StandingProgramRuntimeError> {
-    let column = input_schema
-        .columns
-        .iter()
-        .find(|column| column.name == column_id)
-        .ok_or_else(|| StandingProgramRuntimeError::InvalidProgramIdentity {
-            field: "published_view.value_column",
-        })?;
-    match column.data_type {
-        SqlDataType::Int64 => Ok(AggregateValueMode::Integer),
-        SqlDataType::Decimal { precision, scale } => {
-            Ok(AggregateValueMode::Decimal128 { precision, scale })
-        }
-        _ => Err(StandingProgramRuntimeError::InvalidProgramIdentity {
-            field: "published_view.value_column",
         }),
     }
 }

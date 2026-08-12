@@ -321,7 +321,7 @@ fn relation_input_batches(
     catalogs: &[VelorixRelationCatalogV1],
     changes: &[Change],
     offsets: &mut BTreeMap<String, u64>,
-) -> Result<Vec<StandingInputChangeV1>, DynError> {
+) -> Result<Vec<RelationInputBatch>, DynError> {
     let mut batches = Vec::new();
     for catalog in catalogs {
         let relation_id = &catalog.relation_schema.relation_id;
@@ -358,7 +358,7 @@ fn relation_input_batches(
             end_offset_exclusive: end,
             event_time_watermark: None,
             batches: vec![catalog_batch(catalog, &rows, true)?],
-        }));
+        });
     }
     Ok(batches)
 }
@@ -906,8 +906,6 @@ fn standing_identity(workload: &str, sql: &str) -> StandingProgramIdentity {
         runtime_compatibility: "velorix-materialized-view-runtime-v1".to_string(),
         checkpoint_codec_identity: "velorix-standing-program-checkpoint-v1".to_string(),
         native_code_policy: NativeCodePolicy::DisabledNoExternalDependencies,
-        dependency_binding_digest: String::new(),
-        authenticated_tenant_id: "default".to_string(),
     }
 }
 

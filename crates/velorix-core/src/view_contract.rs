@@ -81,12 +81,6 @@ pub struct PublishedRelationBindingV1 {
     pub output_stream_id: String,
     pub delta_codec_identity: String,
     pub frontier_kind: String,
-    /// Graph revision under which this binding was admitted.
-    /// 0 for direct source inputs (no dependency graph).
-    pub graph_revision: u64,
-    /// Canonical digest of the dependency edge binding set.
-    /// Empty for direct source inputs.
-    pub dependency_binding_digest: String,
 }
 /// Durable description of one input edge of a materialized view: either a
 /// direct source relation or the published output of a producer view.
@@ -225,8 +219,6 @@ pub enum ViewContractError {
     InvalidField { field: &'static str },
     #[error("relation schema mismatch: {field}")]
     RelationSchemaMismatch { field: &'static str },
-    #[error("dependency edge binding mismatch: {field}")]
-    DependencyEdgeMismatch { field: &'static str },
     #[error("could not serialize canonical view contract: {reason}")]
     Serialization { reason: String },
 }
@@ -334,8 +326,6 @@ pub fn published_relation_binding_v1(
         ),
         delta_codec_identity: PUBLISHED_RELATION_DELTA_CODEC_V1.to_string(),
         frontier_kind: PUBLISHED_RELATION_FRONTIER_KIND_V1.to_string(),
-        graph_revision: 0,
-        dependency_binding_digest: String::new(),
     };
     validate_published_relation_binding_v1(&binding)?;
     Ok(binding)

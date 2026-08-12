@@ -357,38 +357,6 @@ pub trait MetaStore: Send + Sync + 'static {
         ))
     }
 
-    /// Reads the current dependency graph for a tenant.
-    ///
-    /// Returns the graph at its current revision. If no graph exists,
-    /// returns an empty graph at revision 0.
-    async fn read_dependency_graph(
-        &self,
-        tenant_id: &str,
-    ) -> Result<DependencyGraphV1, MetaStoreError> {
-        require_non_empty("tenant_id", tenant_id)?;
-        Err(MetaStoreError::UnsupportedCapability(
-            "dependency_graph_cas",
-        ))
-    }
-
-    /// Publishes a new dependency graph version via CAS.
-    ///
-    /// The `expected_revision` must match the current graph revision.
-    /// If it doesn't, returns `Conflict` with the current revision.
-    /// On success, publishes the candidate graph and returns `Published`.
-    async fn publish_dependency_graph(
-        &self,
-        tenant_id: &str,
-        expected_revision: u64,
-        candidate: DependencyGraphV1,
-    ) -> Result<PublishDependencyGraphOutcome, MetaStoreError> {
-        require_non_empty("tenant_id", tenant_id)?;
-        let _ = (expected_revision, candidate);
-        Err(MetaStoreError::UnsupportedCapability(
-            "dependency_graph_cas",
-        ))
-    }
-
     async fn acquire_standing_runtime_owner(
         &self,
         request: AcquireStandingRuntimeOwnerRequest,

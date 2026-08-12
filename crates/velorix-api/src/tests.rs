@@ -18,7 +18,6 @@ use velorix_core::{
     standing_program::{
         DurableStateRoot, RelationFrontier, RuntimeCheckpointStatePayload, ViewFrontier,
     },
-    view_contract::ViewDependencyEdgeBindingV1,
 };
 
 fn template_result_schema() -> RelationSchema {
@@ -919,20 +918,6 @@ async fn mixed_source_view_causal_cut_survives_authoritative_restart() {
         StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), Some(owner.clone()))
             .with_published_relation(Some(published_relation.clone()));
     first_context.direct_view_inputs = vec![StandingRuntimeDirectViewInputV1 {
-        edge: ViewDependencyEdgeBindingV1 {
-            input_edge_id: "upstream_orders->purchases_by_user".to_string(),
-            graph_revision: 0,
-            producer_tenant_id: first_cursor.producer_tenant_id.clone(),
-            producer_program_id: first_cursor.producer_program_id.clone(),
-            producer_view_id: first_cursor.producer_view_id.clone(),
-            producer_generation: first_cursor.producer_generation,
-            producer_plan_hash: producer_binding.producer_plan_hash.clone(),
-            output_schema_hash: producer_binding.output_schema_hash.clone(),
-            key_descriptor_hash: producer_binding.key_descriptor_hash.clone(),
-            output_stream_id: producer_binding.output_stream_id.clone(),
-            delta_codec_identity: producer_binding.delta_codec_identity.clone(),
-            frontier_kind: producer_binding.frontier_kind.clone(),
-        },
         published_relation: producer_binding.clone(),
         cursor: first_cursor,
     }];
@@ -954,20 +939,6 @@ async fn mixed_source_view_causal_cut_survives_authoritative_restart() {
         StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), Some(owner))
             .with_published_relation(Some(published_relation));
     next_context.direct_view_inputs = vec![StandingRuntimeDirectViewInputV1 {
-        edge: ViewDependencyEdgeBindingV1 {
-            input_edge_id: "upstream_orders->purchases_by_user".to_string(),
-            graph_revision: 0,
-            producer_tenant_id: advanced_cursor.producer_tenant_id.clone(),
-            producer_program_id: advanced_cursor.producer_program_id.clone(),
-            producer_view_id: advanced_cursor.producer_view_id.clone(),
-            producer_generation: advanced_cursor.producer_generation,
-            producer_plan_hash: producer_binding.producer_plan_hash.clone(),
-            output_schema_hash: producer_binding.output_schema_hash.clone(),
-            key_descriptor_hash: producer_binding.key_descriptor_hash.clone(),
-            output_stream_id: producer_binding.output_stream_id.clone(),
-            delta_codec_identity: producer_binding.delta_codec_identity.clone(),
-            frontier_kind: producer_binding.frontier_kind.clone(),
-        },
         published_relation: producer_binding,
         cursor: advanced_cursor.clone(),
     }];
@@ -5955,13 +5926,11 @@ async fn rest_unsupported_join_sql_admission_fails_closed_without_creating_view(
                     InputRelationRef {
                         relation_id: "scores".to_string(),
                         relation_version: "2026-05-24.v1".to_string(),
-                        input_kind: InputRelationKind::Source,
-},
+                    },
                     InputRelationRef {
                         relation_id: "accounts".to_string(),
                         relation_version: "2026-05-24.v1".to_string(),
-                        input_kind: InputRelationKind::Source,
-},
+                    },
                 ],
                 input_relations: Vec::new(),
                 sql: sql.to_string(),
@@ -6025,18 +5994,15 @@ async fn rest_unsupported_three_table_join_admission_fails_closed_without_active
                 InputRelationRef {
                     relation_id: "scores".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
                 InputRelationRef {
                     relation_id: "accounts".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
                 InputRelationRef {
                     relation_id: "device_status".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
             ],
             input_relations: Vec::new(),
             sql: "select a.account_id, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.user_id = a.account_id join device_status d on d.device_id = s.user_id group by a.account_id".to_string(),
@@ -6116,35 +6082,29 @@ async fn rest_sql_admission_corpus_fails_closed_without_metadata_or_runtime_bind
     let scores = vec![InputRelationRef {
         relation_id: "scores".to_string(),
         relation_version: "2026-05-24.v1".to_string(),
-        input_kind: InputRelationKind::Source,
     }];
     let scores_accounts = vec![
         InputRelationRef {
             relation_id: "scores".to_string(),
             relation_version: "2026-05-24.v1".to_string(),
-            input_kind: InputRelationKind::Source,
         },
         InputRelationRef {
             relation_id: "accounts".to_string(),
             relation_version: "2026-05-24.v1".to_string(),
-            input_kind: InputRelationKind::Source,
         },
     ];
     let scores_accounts_devices = vec![
         InputRelationRef {
             relation_id: "scores".to_string(),
             relation_version: "2026-05-24.v1".to_string(),
-            input_kind: InputRelationKind::Source,
         },
         InputRelationRef {
             relation_id: "accounts".to_string(),
             relation_version: "2026-05-24.v1".to_string(),
-            input_kind: InputRelationKind::Source,
         },
         InputRelationRef {
             relation_id: "device_status".to_string(),
             relation_version: "2026-05-24.v1".to_string(),
-            input_kind: InputRelationKind::Source,
         },
     ];
 
@@ -12650,12 +12610,10 @@ async fn rest_exists_and_not_exists_views_survive_restart_and_match_transitions(
                 InputRelationRef {
                     relation_id: "scores".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
                 },
                 InputRelationRef {
                     relation_id: "accounts".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
                 },
             ],
             input_relations: Vec::new(),
@@ -12814,13 +12772,11 @@ async fn rest_two_relation_join_view_materialized_output_survives_api_restart() 
                 InputRelationRef {
                     relation_id: "scores".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
                 InputRelationRef {
                     relation_id: "accounts".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
             ],
             input_relations: Vec::new(),
             sql: "select a.account_id, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.user_id = a.account_id group by a.account_id".to_string(),
@@ -13830,13 +13786,11 @@ async fn rest_two_relation_join_count_only_view_materialized_output_survives_api
                 InputRelationRef {
                     relation_id: "scores".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
                 InputRelationRef {
                     relation_id: "accounts".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
             ],
             input_relations: Vec::new(),
             sql: "select a.account_id, count(*) as count from scores s join accounts a on s.user_id = a.account_id group by a.account_id".to_string(),
@@ -13962,13 +13916,11 @@ async fn rest_left_join_left_group_key_view_materializes_unmatched_left_rows() {
                 InputRelationRef {
                     relation_id: "scores".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
                 InputRelationRef {
                     relation_id: "accounts".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
             ],
             input_relations: Vec::new(),
             sql: "select s.user_id as user, sum(s.score) as sum, count(*) as count from scores s left join accounts a on s.user_id = a.account_id group by s.user_id".to_string(),
@@ -14070,13 +14022,11 @@ async fn rest_right_join_swaps_operands_and_materializes_unmatched_right_rows() 
                 InputRelationRef {
                     relation_id: "scores".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
                 InputRelationRef {
                     relation_id: "accounts".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
             ],
             input_relations: Vec::new(),
             sql: "select a.account_id, sum(a.limit) as sum, count(*) as count from scores s right join accounts a on s.user_id = a.account_id group by a.account_id".to_string(),
@@ -14171,13 +14121,11 @@ async fn rest_two_relation_join_min_max_avg_view_materializes_outputs() {
                 InputRelationRef {
                     relation_id: "scores".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
                 InputRelationRef {
                     relation_id: "accounts".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
             ],
             input_relations: Vec::new(),
             sql: "select a.account_id, sum(s.score) as sum, count(*) as count, min(s.score) as min_score, max(s.score) as max_score, avg(s.score) as avg_score from scores s join accounts a on s.user_id = a.account_id group by a.account_id".to_string(),
@@ -14280,13 +14228,11 @@ async fn rest_two_relation_join_right_min_max_avg_view_materializes_outputs() {
                 InputRelationRef {
                     relation_id: "scores".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
                 InputRelationRef {
                     relation_id: "accounts".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
             ],
             input_relations: Vec::new(),
             sql: "select a.account_id, sum(s.score) as sum, count(*) as count, count(a.limit) as count_limit, count(distinct a.limit) as distinct_limits, min(a.limit) as min_limit, max(a.limit) as max_limit, avg(a.limit) as avg_limit from scores s join accounts a on s.user_id = a.account_id group by a.account_id".to_string(),
@@ -14423,13 +14369,11 @@ async fn rest_late_two_relation_join_having_top_k_reports_materialization_lag_on
                 InputRelationRef {
                     relation_id: "scores".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
                 InputRelationRef {
                     relation_id: "accounts".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
             ],
             input_relations: Vec::new(),
             sql: "select a.account_id, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.user_id = a.account_id group by a.account_id having sum(s.score) >= 5 order by sum desc limit 1".to_string(),
@@ -14533,13 +14477,11 @@ async fn rest_two_relation_join_order_by_limit_top_k_view_materializes_outputs()
                 InputRelationRef {
                     relation_id: "scores".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
                 InputRelationRef {
                     relation_id: "accounts".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
             ],
             input_relations: Vec::new(),
             sql: "select a.account_id, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.user_id = a.account_id group by a.account_id order by sum desc limit 1".to_string(),
@@ -14663,13 +14605,11 @@ async fn rest_two_relation_join_having_view_materializes_outputs() {
                 InputRelationRef {
                     relation_id: "scores".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
                 InputRelationRef {
                     relation_id: "accounts".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
             ],
             input_relations: Vec::new(),
             sql: "select a.account_id, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.user_id = a.account_id group by a.account_id having sum(s.score) > 10 or count(*) = 1".to_string(),
@@ -14772,13 +14712,11 @@ async fn rest_two_relation_join_mixed_aggregate_filter_view_materializes_outputs
                 InputRelationRef {
                     relation_id: "scores".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
                 InputRelationRef {
                     relation_id: "accounts".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
             ],
             input_relations: Vec::new(),
             sql: "select a.account_id, sum(s.score) filter (where s.score > 5) as sum, count(*) filter (where s.score > 0) as count from scores s join accounts a on s.user_id = a.account_id group by a.account_id".to_string(),
@@ -14881,13 +14819,11 @@ async fn rest_two_relation_join_filtered_count_distinct_view_materializes_output
                 InputRelationRef {
                     relation_id: "scores".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
                 InputRelationRef {
                     relation_id: "accounts".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
             ],
             input_relations: Vec::new(),
             sql: "select a.account_id, sum(s.score) filter (where s.score > 5) as sum, count(distinct s.score) filter (where s.score > 0) as distinct_scores from scores s join accounts a on s.user_id = a.account_id group by a.account_id".to_string(),
@@ -14994,13 +14930,11 @@ async fn rest_two_relation_join_nullable_left_value_count_view_materializes_outp
                 InputRelationRef {
                     relation_id: "scores".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
                 InputRelationRef {
                     relation_id: "accounts".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
             ],
             input_relations: Vec::new(),
             sql: "select a.account_id, sum(s.score) as sum, count(s.score) as count from scores s join accounts a on s.user_id = a.account_id group by a.account_id".to_string(),
@@ -15101,13 +15035,11 @@ async fn rest_two_relation_join_count_distinct_view_materializes_outputs() {
                 InputRelationRef {
                     relation_id: "scores".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
                 InputRelationRef {
                     relation_id: "accounts".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
             ],
             input_relations: Vec::new(),
             sql: "select a.account_id, sum(s.score) as sum, count(distinct s.score) as distinct_scores from scores s join accounts a on s.user_id = a.account_id group by a.account_id".to_string(),
@@ -15227,13 +15159,11 @@ async fn rest_two_relation_join_alias_view_materializes_outputs() {
                 InputRelationRef {
                     relation_id: "scores".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
                 InputRelationRef {
                     relation_id: "accounts".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
             ],
             input_relations: Vec::new(),
             sql: "select a.account_id as account, sum(s.score) as total_score, count(1) as score_events from scores s join accounts a on s.user_id = a.account_id group by a.account_id having total_score > 10 and count(1) > 1".to_string(),
@@ -15329,13 +15259,11 @@ async fn rest_two_relation_join_where_view_materializes_outputs() {
                 InputRelationRef {
                     relation_id: "scores".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
                 InputRelationRef {
                     relation_id: "accounts".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
             ],
             input_relations: Vec::new(),
             sql: "select a.account_id, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.user_id = a.account_id where (s.score > 0 or s.score = -3) and s.score < 100 and a.limit > 60 and a.tier = 'gold' group by a.account_id".to_string(),
@@ -15435,13 +15363,11 @@ async fn rest_two_relation_join_cte_source_filter_view_materializes_outputs() {
                 InputRelationRef {
                     relation_id: "scores".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
                 InputRelationRef {
                     relation_id: "accounts".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
             ],
             input_relations: Vec::new(),
             sql: "with positive_scores as (select * from scores where score > 0) select a.account_id, sum(s.score) as sum, count(*) as count from positive_scores s join accounts a on s.user_id = a.account_id where a.limit > 60 group by a.account_id".to_string(),
@@ -15540,13 +15466,11 @@ async fn rest_two_relation_join_right_cte_source_filter_view_materializes_output
                 InputRelationRef {
                     relation_id: "scores".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
                 InputRelationRef {
                     relation_id: "accounts".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
             ],
             input_relations: Vec::new(),
             sql: "with eligible_accounts as (select * from accounts where limit > 60) select a.account_id, sum(s.score) as sum, count(*) as count from scores s join eligible_accounts a on s.user_id = a.account_id where s.score > 0 group by a.account_id".to_string(),
@@ -15644,13 +15568,11 @@ async fn rest_two_relation_join_two_cte_source_filter_view_materializes_outputs(
                 InputRelationRef {
                     relation_id: "scores".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
                 InputRelationRef {
                     relation_id: "accounts".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
             ],
             input_relations: Vec::new(),
             sql: "with positive_scores as (select * from scores where score > 0), eligible_accounts as (select * from accounts where limit > 60) select a.account_id, sum(s.score) as sum, count(*) as count from positive_scores s join eligible_accounts a on s.user_id = a.account_id group by a.account_id".to_string(),
@@ -15752,13 +15674,11 @@ async fn rest_two_relation_join_derived_table_source_filter_view_materializes_ou
                 InputRelationRef {
                     relation_id: "scores".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
                 InputRelationRef {
                     relation_id: "accounts".to_string(),
                     relation_version: "2026-05-24.v1".to_string(),
-                    input_kind: InputRelationKind::Source,
-},
+                },
             ],
             input_relations: Vec::new(),
             sql: "select a.account_id, sum(s.score) as sum, count(*) as count from (select * from scores where score > 0) s join (select * from accounts where limit > 60) a on s.user_id = a.account_id group by a.account_id".to_string(),
@@ -15884,8 +15804,6 @@ fn test_runtime_checkpoint(output_manifest_refs: Vec<String>) -> RuntimeCheckpoi
             runtime_compatibility: "velorix-materialized-view-runtime-v1".to_string(),
             checkpoint_codec_identity: "velorix-standing-program-checkpoint-v1".to_string(),
             native_code_policy: NativeCodePolicy::DisabledNoExternalDependencies,
-            dependency_binding_digest: String::new(),
-            authenticated_tenant_id: "default".to_string(),
         },
         logical_epoch: 7,
         input_frontiers: vec![RelationFrontier {
@@ -16272,7 +16190,7 @@ impl StandingProgramRuntime for FailingApplyRuntime {
         &mut self,
         _logical_epoch: u64,
         _idempotency_key: EpochIdempotencyKey,
-        _input_changes: Vec<StandingInputChangeV1>,
+        _input_changes: Vec<RelationInputBatch>,
     ) -> Result<velorix_core::standing_program::EpochCommit, StandingProgramRuntimeError> {
         Err(self.error())
     }
