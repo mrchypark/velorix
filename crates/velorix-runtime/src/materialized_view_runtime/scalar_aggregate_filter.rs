@@ -166,12 +166,12 @@ impl ScalarAggregateFilterRuntime {
                 }
                 Value::from(self.scalar_state.avg_sums as f64 / self.scalar_state.avg_counts as f64)
             }
-            LogicalPlanAggregateFunctionV1::Min | LogicalPlanAggregateFunctionV1::Max => {
-                let Some(entry) = self.scalar_state.values.values().next() else {
-                    return None;
-                };
-                entry.value.clone()
-            }
+            LogicalPlanAggregateFunctionV1::Min | LogicalPlanAggregateFunctionV1::Max => self
+                .scalar_state
+                .values
+                .values()
+                .next()
+                .map(|entry| entry.value.clone())?,
             LogicalPlanAggregateFunctionV1::CountDistinct => {
                 Value::Number(JsonNumber::from(self.scalar_state.values.len() as i64))
             }
@@ -828,7 +828,7 @@ pub(super) fn catalog_for_relation_id<'a>(
     catalogs
         .iter()
         .find(|catalog| catalog.relation_schema.relation_id == relation_id)
-        .ok_or_else(|| StandingProgramRuntimeError::InvalidProgramIdentity {
+        .ok_or(StandingProgramRuntimeError::InvalidProgramIdentity {
             field: "scalar_aggregate_filter_catalog",
         })
 }
