@@ -510,6 +510,35 @@ fn output_column_value_array(
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         ))),
+        SqlDataType::Date => Ok(Arc::new(Date32Array::from(
+            values
+                .iter()
+                .map(|value| {
+                    if value.is_null() {
+                        return Ok(None);
+                    }
+                    value
+                        .as_i64()
+                        .and_then(|value| i32::try_from(value).ok())
+                        .map(Some)
+                        .ok_or_else(invalid_runtime_state)
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        ))),
+        SqlDataType::Timestamp { timezone } => Ok(Arc::new(
+            TimestampNanosecondArray::from(
+                values
+                    .iter()
+                    .map(|value| {
+                        if value.is_null() {
+                            return Ok(None);
+                        }
+                        value.as_i64().map(Some).ok_or_else(invalid_runtime_state)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+            .with_timezone_opt(timezone.clone()),
+        )),
         SqlDataType::Decimal { precision, scale } => Ok(Arc::new(
             Decimal128Array::from(
                 values

@@ -17079,6 +17079,63 @@ fn assert_scores_multi_input_stats_page(
     }
 }
 
+fn typed_expressions_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "typed_projection_view".to_string(),
+        relation_name: "typed_projection_view".to_string(),
+        relation_version: "2026-05-24.v1".to_string(),
+        schema_fingerprint: "typed-projection-v1".to_string(),
+        columns: vec![
+            ColumnSchema {
+                name: "user_id".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "user_upper".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "user_tag".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "event_year".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "hour_trunc".to_string(),
+                data_type: SqlDataType::Timestamp { timezone: None },
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "plus_hour".to_string(),
+                data_type: SqlDataType::Timestamp { timezone: None },
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "amount_f64".to_string(),
+                data_type: SqlDataType::Float64,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "amount_abs".to_string(),
+                data_type: SqlDataType::Float64,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "amount_round".to_string(),
+                data_type: SqlDataType::Float64,
+                nullable: true,
+            },
+        ],
+        primary_key: vec!["user_id".to_string()],
+    }
+}
+
 fn scores_projection_output_schema() -> RelationSchema {
     RelationSchema {
         relation_id: "positive_scores".to_string(),
@@ -19339,5 +19396,140 @@ fn hopping_window_retraction_updates_all_fanout_windows_exactly() {
             ("alice", 10_000_000_000, 20_000_000_000, 3, 1),
             ("alice", 5_000_000_000, 15_000_000_000, 3, 1),
         ],
+    );
+}
+
+#[test]
+fn runtime_materializes_string_temporal_float_typed_projections_and_restores() {
+    let catalog = purchases_event_time_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = typed_expressions_output_schema();
+    let sql = "select user_id, upper(user_id) as user_upper, concat(user_id, '-x') as user_tag, extract(year from event_time) as event_year, date_trunc('hour', event_time) as hour_trunc, event_time + interval '1 hour' as plus_hour, amount * 1.0 as amount_f64, abs(amount * 1.0) as amount_abs, round(amount * 1.5) as amount_round from purchases";
+    let identity = standing_identity_with_view(sql, "typed_projection_view");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("epoch-1").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 2,
+                event_time_watermark: None,
+                batches: vec![purchases_event_time_batch(&[
+                    ("alice", 10, 1_735_689_600_000_000_000, 1),
+                    ("bob", 4, 1_735_689_600_000_000_000, 1),
+                ])],
+            }],
+        )
+        .unwrap();
+
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "typed_projection_view".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(1),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let user_upper = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .unwrap();
+    let user_tag = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .unwrap();
+    assert_eq!(user_upper.value(0), "ALICE");
+    assert_eq!(user_tag.value(0), "alice-x");
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("epoch-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 2,
+                end_offset_exclusive: 3,
+                event_time_watermark: None,
+                batches: vec![purchases_event_time_batch(&[(
+                    "carol",
+                    7,
+                    1_735_689_600_000_000_000,
+                    1,
+                )])],
+            }],
+        )
+        .unwrap();
+    let page = restored
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "typed_projection_view".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(2),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let user_upper = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .unwrap();
+    let user_tag = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .unwrap();
+    let mut values = (0..batch.num_rows())
+        .map(|index| {
+            (
+                user_upper.value(index).to_string(),
+                user_tag.value(index).to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    values.sort();
+    assert_eq!(
+        values,
+        vec![
+            ("ALICE".to_string(), "alice-x".to_string()),
+            ("BOB".to_string(), "bob-x".to_string()),
+            ("CAROL".to_string(), "carol-x".to_string()),
+        ]
     );
 }

@@ -3,12 +3,14 @@ use std::{
     collections::{BTreeMap, BTreeSet},
 };
 
+use crate::materialized_view_runtime::expression_eval::{evaluate_typed_expr, RuntimeScalarValue};
 use arrow::{
     array::{Array, BooleanArray, Date32Array, Int64Array, StringArray, TimestampNanosecondArray},
     record_batch::RecordBatch,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number as JsonNumber, Value};
+use velorix_core::view_plan::RuntimeScalarTypeV1;
 use velorix_core::{
     delta::{DeltaBatch, DeltaKey, DeltaRecord, DeltaValue},
     engine::{
@@ -69,10 +71,11 @@ use velorix_core::{
         SupportedJoinKind, SupportedJoinViewPlan, SupportedLatestByKeyPlan,
         SupportedProjectionBinaryOp, SupportedProjectionExpr, SupportedSemiAntiJoinKindV1,
         SupportedSemiAntiJoinProjectPlanV1, SupportedThreeInputInnerJoinCountPlanV1,
-        SupportedTopKPlan, SupportedTumblingWindowPlan, SupportedViewPlan,
-        VelorixLogicalViewExecutionV1, VelorixLogicalViewPlanV1,
-        COMPOSITE_PK_POSITIONAL_JSON_ARRAY_JOIN_KEY_CODEC_V1, LEFT_JOIN_INPUT_INSTANCE_ID_V1,
-        RIGHT_JOIN_INPUT_INSTANCE_ID_V1, THREE_INPUT_LEGACY_SQL_ENCOUNTER_JOIN_ORDER_V1,
+        SupportedTopKPlan, SupportedTumblingWindowPlan, SupportedViewPlan, TypedExprKindV1,
+        TypedExprNodeV1, TypedExprProgramV1, TypedProjectionColumn, VelorixLogicalViewExecutionV1,
+        VelorixLogicalViewPlanV1, COMPOSITE_PK_POSITIONAL_JSON_ARRAY_JOIN_KEY_CODEC_V1,
+        LEFT_JOIN_INPUT_INSTANCE_ID_V1, RIGHT_JOIN_INPUT_INSTANCE_ID_V1,
+        THREE_INPUT_LEGACY_SQL_ENCOUNTER_JOIN_ORDER_V1,
         THREE_INPUT_ROOT_FIXED_RIGHT_RELATION_ID_JOIN_ORDER_V1,
     },
 };
@@ -82,6 +85,7 @@ pub use crate::runtime_contract::MATERIALIZED_VIEW_RUNTIME_NAME as CRATE_NAME;
 mod analytic_row_number;
 mod checkpoint_common;
 mod event_time_window;
+pub mod expression_eval;
 mod filter_project;
 mod latest_by_key;
 mod output;
@@ -2945,7 +2949,7 @@ fn validate_filter_project_supported_schemas(
         || output_key_input_column.nullable
         || key.data_type != sql_type_from_catalog_column(output_key_input_column)?
         || key.nullable
-        || value_columns.len() != plan.value_columns.len()
+        || value_columns.len() != plan.value_columns.len() + plan.typed_value_columns.len()
     {
         return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
             field: "filter_project_output_schema",
@@ -2978,6 +2982,31 @@ fn validate_filter_project_supported_schemas(
             }
             sql_type_from_catalog_column(input_column)?
         };
+        if output_column.data_type != expected_type {
+            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "filter_project_output_schema",
+            });
+        }
+    }
+    for (output_column, typed_column) in value_columns
+        .iter()
+        .skip(plan.value_columns.len())
+        .zip(plan.typed_value_columns.iter())
+    {
+        if output_column.name != typed_column.output_column_id
+            || !output_names.insert(output_column.name.clone())
+        {
+            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "filter_project_output_schema",
+            });
+        }
+        let program = &typed_column.program;
+        program
+            .validate()
+            .map_err(|_| StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "filter_project_typed_expression",
+            })?;
+        let expected_type = typed_result_sql_data_type(program)?;
         if output_column.data_type != expected_type {
             return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
                 field: "filter_project_output_schema",
@@ -4760,6 +4789,11 @@ fn filter_project_input_column_ids(plan: &SupportedFilterProjectPlan) -> Vec<Str
             push_filter_project_input_column(&mut columns, plan, column_id);
         }
     }
+    for typed_column in &plan.typed_value_columns {
+        for column_id in typed_expr_column_ids(&typed_column.program) {
+            push_filter_project_input_column(&mut columns, plan, column_id);
+        }
+    }
     if let Some(order_input_column_id) = plan
         .top_k
         .as_ref()
@@ -5116,6 +5150,46 @@ fn project_filter_project_delta_batch(
             };
             output.insert(column.output_column_id.clone(), value);
         }
+        let key_object = record.key.as_json();
+        for column in &plan.typed_value_columns {
+            let accessor = |column_id: &str| {
+                let single_pk = catalog.relation_schema.primary_key_column_ids.as_slice();
+                let value = input.get(column_id).cloned().or_else(|| {
+                    if key_object.is_object() {
+                        key_object.get(column_id).cloned()
+                    } else if single_pk.len() == 1 && single_pk[0] == column_id {
+                        Some(key_object.clone())
+                    } else {
+                        None
+                    }
+                });
+                value.and_then(|value| {
+                    let is_event_time = catalog
+                        .relation_schema
+                        .event_time_column_id
+                        .as_ref()
+                        .is_some_and(|column| column == column_id);
+                    let mut scalar = typed_json_value_to_scalar(
+                        value,
+                        catalog_column_by_id(catalog, column_id)
+                            .ok()
+                            .map(|column| &column.physical_arrow_type),
+                    );
+                    if is_event_time {
+                        if let Some(RuntimeScalarValue::Int64(ns)) = scalar {
+                            scalar = Some(RuntimeScalarValue::TimestampNanosecond(ns));
+                        }
+                    }
+                    scalar
+                })
+            };
+            let value = evaluate_typed_expr(&column.program, &accessor)
+                .map_err(|_| invalid_runtime_state())?;
+            output.insert(
+                column.output_column_id.clone(),
+                typed_scalar_value_to_json(value)?,
+            );
+        }
         if let Some(order_input_column_id) = plan
             .top_k
             .as_ref()
@@ -5145,6 +5219,111 @@ fn project_filter_project_delta_batch(
         ));
     }
     Ok(DeltaBatch::from_records(records))
+}
+
+fn typed_result_sql_data_type(
+    program: &TypedExprProgramV1,
+) -> Result<SqlDataType, StandingProgramRuntimeError> {
+    let data_type = match program.root.result_type {
+        RuntimeScalarTypeV1::Boolean => SqlDataType::Bool,
+        RuntimeScalarTypeV1::Int64 => SqlDataType::Int64,
+        RuntimeScalarTypeV1::Float64 => SqlDataType::Float64,
+        RuntimeScalarTypeV1::Decimal128 { precision, scale } => SqlDataType::Decimal {
+            precision: u8::try_from(precision).map_err(|_| invalid_runtime_state())?,
+            scale: u8::try_from(scale.max(0)).map_err(|_| invalid_runtime_state())?,
+        },
+        RuntimeScalarTypeV1::Utf8 => SqlDataType::Utf8,
+        RuntimeScalarTypeV1::Date32 => SqlDataType::Date,
+        RuntimeScalarTypeV1::TimestampNanosecond => SqlDataType::Timestamp { timezone: None },
+    };
+    Ok(data_type)
+}
+
+/// Collects the input column ids referenced by a typed expression program.
+fn typed_expr_column_ids(program: &TypedExprProgramV1) -> Vec<String> {
+    let mut columns = Vec::new();
+    collect_typed_node_column_ids(&program.root, &mut columns);
+    columns
+}
+
+fn collect_typed_node_column_ids(node: &TypedExprNodeV1, columns: &mut Vec<String>) {
+    match &node.kind {
+        TypedExprKindV1::Column { column_id } => {
+            if !columns.iter().any(|candidate| candidate == column_id) {
+                columns.push(column_id.clone());
+            }
+        }
+        TypedExprKindV1::Literal { .. } => {}
+        TypedExprKindV1::Call { args, .. } => {
+            for arg in args {
+                collect_typed_node_column_ids(arg, columns);
+            }
+        }
+    }
+}
+
+fn typed_json_value_to_scalar(
+    value: Value,
+    physical_type: Option<&ArrowPhysicalTypeV1>,
+) -> Option<RuntimeScalarValue> {
+    if value.is_null() {
+        let data_type = match physical_type {
+            Some(ArrowPhysicalTypeV1::Boolean) => RuntimeScalarTypeV1::Boolean,
+            Some(ArrowPhysicalTypeV1::Float64) => RuntimeScalarTypeV1::Float64,
+            Some(ArrowPhysicalTypeV1::Decimal128 { .. }) => RuntimeScalarTypeV1::Decimal128 {
+                precision: 38,
+                scale: 0,
+            },
+            Some(ArrowPhysicalTypeV1::Utf8) => RuntimeScalarTypeV1::Utf8,
+            Some(ArrowPhysicalTypeV1::Date32) => RuntimeScalarTypeV1::Date32,
+            Some(ArrowPhysicalTypeV1::TimestampNanosecond { .. }) => {
+                RuntimeScalarTypeV1::TimestampNanosecond
+            }
+            _ => RuntimeScalarTypeV1::Int64,
+        };
+        return Some(RuntimeScalarValue::Null(data_type));
+    }
+    let scalar = match physical_type {
+        Some(ArrowPhysicalTypeV1::Boolean) => value.as_bool().map(RuntimeScalarValue::Boolean),
+        Some(ArrowPhysicalTypeV1::Float64) => value.as_f64().map(RuntimeScalarValue::Float64),
+        Some(ArrowPhysicalTypeV1::Decimal128 { .. }) => value
+            .as_str()
+            .and_then(|text| text.parse::<i128>().ok())
+            .map(|unscaled| RuntimeScalarValue::Decimal128 { unscaled, scale: 0 }),
+        Some(ArrowPhysicalTypeV1::Utf8) => value
+            .as_str()
+            .map(|text| RuntimeScalarValue::Utf8(text.to_string())),
+        Some(ArrowPhysicalTypeV1::Date32) => value
+            .as_i64()
+            .and_then(|days| i32::try_from(days).ok())
+            .map(RuntimeScalarValue::Date32),
+        Some(ArrowPhysicalTypeV1::TimestampNanosecond { .. }) => {
+            value.as_i64().map(RuntimeScalarValue::TimestampNanosecond)
+        }
+        _ => value.as_i64().map(RuntimeScalarValue::Int64),
+    };
+    scalar
+}
+
+fn typed_scalar_value_to_json(
+    value: RuntimeScalarValue,
+) -> Result<Value, StandingProgramRuntimeError> {
+    let json = match value {
+        RuntimeScalarValue::Null(_) => Value::Null,
+        RuntimeScalarValue::Boolean(value) => Value::Bool(value),
+        RuntimeScalarValue::Int64(value) => Value::Number(JsonNumber::from(value)),
+        RuntimeScalarValue::Float64(value) => {
+            if !value.is_finite() {
+                return Err(invalid_runtime_state());
+            }
+            serde_json::to_value(value).map_err(|_| invalid_runtime_state())?
+        }
+        RuntimeScalarValue::Decimal128 { unscaled, .. } => Value::String(unscaled.to_string()),
+        RuntimeScalarValue::Utf8(value) => Value::String(value),
+        RuntimeScalarValue::Date32(value) => Value::Number(JsonNumber::from(value)),
+        RuntimeScalarValue::TimestampNanosecond(value) => Value::Number(JsonNumber::from(value)),
+    };
+    Ok(json)
 }
 
 fn analytic_row_number_input_column_ids(plan: &SupportedAnalyticRowNumberPlan) -> Vec<String> {

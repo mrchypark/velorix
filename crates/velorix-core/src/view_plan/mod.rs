@@ -10,11 +10,11 @@ use serde_json::{Number as JsonNumber, Value as JsonValue};
 use sqlparser::{
     ast::{
         BinaryOperator, CastKind, DataType, DateTimeField, Distinct, DuplicateTreatment, Expr,
-        Fetch, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr,
-        Ident, JoinConstraint, JoinOperator, LimitClause, ObjectName, OrderByExpr, OrderByKind,
-        Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, SetOperator,
-        SetQuantifier, Statement as SqlStatement, TableAlias, TableFactor, TableSampleKind,
-        UnaryOperator, Value as SqlValue, WindowType,
+        Fetch, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments,
+        GroupByExpr, Ident, JoinConstraint, JoinOperator, LimitClause, ObjectName, OrderByExpr,
+        OrderByKind, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr,
+        SetOperator, SetQuantifier, Statement as SqlStatement, TableAlias, TableFactor,
+        TableSampleKind, UnaryOperator, Value as SqlValue, ValueWithSpan, WindowType,
     },
     dialect::GenericDialect,
     parser::{Parser, ParserError},
@@ -39,6 +39,14 @@ use crate::{
     view_contract::{
         catalog_input_relation_schema, stable_bytes_hash, ColumnSchema, RelationSchema, SqlDataType,
     },
+};
+
+mod typed_expr;
+
+pub use typed_expr::{
+    validate_typed_expr_node, BuiltinScalarFunctionV1, CanonicalI128V1, RuntimeScalarTypeV1,
+    ScalarLiteralV1, TypedExprError, TypedExprKindV1, TypedExprNodeV1, TypedExprProgramV1,
+    TYPED_EXPR_PROGRAM_SCHEMA_VERSION_V1,
 };
 
 pub const LOGICAL_VIEW_PLAN_VERSION_V1: u32 = 1;
@@ -652,10 +660,22 @@ pub struct SupportedFilterProjectPlan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_key_input_column_id: Option<String>,
     pub value_columns: Vec<SupportedProjectionColumn>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub typed_value_columns: Vec<TypedProjectionColumn>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub predicate_expr: Option<RowPredicateExpr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_k: Option<SupportedTopKPlan>,
+}
+
+/// A value column produced by a typed expression program (Phase 6 string,
+/// temporal, and float families). Kept separate from the legacy Int64-only
+/// `SupportedProjectionExpr` so persisted V1 plans stay byte-stable.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TypedProjectionColumn {
+    pub output_column_id: String,
+    pub program: TypedExprProgramV1,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2366,6 +2386,7 @@ pub fn validate_supported_filter_project_sql(
     let top_k =
         validate_filter_project_top_k(&query, &projection, catalog, key_column, relation_alias)?;
     if projection.value_columns.is_empty()
+        && projection.typed_value_columns.is_empty()
         && projection.output_key_input_column_id.is_none()
         && top_k.is_none()
     {
@@ -2403,6 +2424,7 @@ pub fn validate_supported_filter_project_sql(
                 expression: column.expression,
             })
             .collect(),
+        typed_value_columns: projection.typed_value_columns,
         predicate_expr,
         top_k,
     })
@@ -2564,6 +2586,7 @@ fn validate_filter_project_set_operand(
                 expression: column.expression,
             })
             .collect(),
+        typed_value_columns: Vec::new(),
         predicate_expr,
         top_k: None,
     })
@@ -5814,6 +5837,7 @@ pub fn validate_supported_semi_anti_join_sql(
         left_join_key_column_id: left_key.column_id.clone(),
         right_join_key_column_id: right_key.column_id.clone(),
         projection: SupportedFilterProjectPlan {
+            typed_value_columns: Vec::new(),
             input_relation_id: left_catalog.relation_schema.relation_id.clone(),
             key_column_id: left_pk.column_id.clone(),
             output_key_column_id: projection.output_key_column_id,
@@ -12645,6 +12669,7 @@ struct ValidatedFilterProjectProjection {
     output_key_column_id: String,
     output_key_input_column_id: Option<String>,
     value_columns: Vec<ValidatedProjectionColumn>,
+    typed_value_columns: Vec<TypedProjectionColumn>,
 }
 
 struct ValidatedProjectionColumn {
@@ -12965,6 +12990,7 @@ fn validate_filter_project_projection(
             output_key_column_id: key_column.name.clone(),
             output_key_input_column_id: None,
             value_columns,
+            typed_value_columns: Vec::new(),
         });
     }
     let [key, values @ ..] = select.projection.as_slice() else {
@@ -13022,6 +13048,7 @@ fn validate_filter_project_projection(
     };
     let mut output_ids = BTreeSet::from([output_key_column_id.clone()]);
     let mut value_columns = Vec::with_capacity(values.len());
+    let mut typed_value_columns = Vec::new();
     for item in values {
         let (expr, alias) = match item {
             SelectItem::UnnamedExpr(expr) => (expr, None),
@@ -13047,15 +13074,37 @@ fn validate_filter_project_projection(
             let Some(alias) = alias else {
                 return unsupported("computed filter/project projections require an alias");
             };
-            let expression =
-                supported_filter_project_projection_expr(expr, catalog, relation_alias)?;
-            let input_column_id =
+            let Some(typed_column) =
+                supported_filter_project_typed_projection(expr, catalog, relation_alias)?
+            else {
+                let expression =
+                    supported_filter_project_projection_expr(expr, catalog, relation_alias)?;
+                let input_column_id =
                     first_supported_projection_expr_column_id(&expression).ok_or_else(|| {
                         ViewPlanError::UnsupportedShape {
                             reason: "computed filter/project projections must reference at least one registered column".to_string(),
                         }
                     })?;
-            (input_column_id, Some(expression), alias)
+                let output_column_id = alias.to_string();
+                if !output_ids.insert(output_column_id.clone()) {
+                    return unsupported("filter/project output column ids must be unique");
+                }
+                value_columns.push(ValidatedProjectionColumn {
+                    input_column_id,
+                    output_column_id,
+                    expression: Some(expression),
+                });
+                continue;
+            };
+            let output_column_id = alias.to_string();
+            if !output_ids.insert(output_column_id.clone()) {
+                return unsupported("filter/project output column ids must be unique");
+            }
+            typed_value_columns.push(TypedProjectionColumn {
+                output_column_id,
+                program: typed_column,
+            });
+            continue;
         };
         let output_column_id = alias.unwrap_or(default_name).to_string();
         if !output_ids.insert(output_column_id.clone()) {
@@ -13071,6 +13120,7 @@ fn validate_filter_project_projection(
         output_key_column_id,
         output_key_input_column_id,
         value_columns,
+        typed_value_columns,
     })
 }
 
@@ -15422,4 +15472,576 @@ fn unsupported<T>(reason: impl Into<String>) -> Result<T, ViewPlanError> {
     Err(ViewPlanError::UnsupportedShape {
         reason: reason.into(),
     })
+}
+
+/// Parses a computed filter/project projection into the typed expression IR
+/// (Phase 6 string/temporal/float families). Returns `None` for expressions
+/// that belong to the legacy Int64-only `SupportedProjectionExpr` surface and
+/// `Err` for typed-family expressions that fail type checking.
+fn supported_filter_project_typed_projection(
+    expr: &Expr,
+    catalog: &VelorixRelationCatalogV1,
+    relation_alias: Option<&str>,
+) -> Result<Option<TypedExprProgramV1>, ViewPlanError> {
+    let root = match typed_expr_node_from_expr(expr, catalog, relation_alias)? {
+        Some(node) => node,
+        None => return Ok(None),
+    };
+    let program = TypedExprProgramV1 {
+        encoding_version: TYPED_EXPR_PROGRAM_SCHEMA_VERSION_V1,
+        root,
+    };
+    program
+        .validate()
+        .map_err(|error| ViewPlanError::UnsupportedShape {
+            reason: format!("typed projection is invalid: {error}"),
+        })?;
+    Ok(Some(program))
+}
+
+fn typed_expr_node_from_expr(
+    expr: &Expr,
+    catalog: &VelorixRelationCatalogV1,
+    relation_alias: Option<&str>,
+) -> Result<Option<TypedExprNodeV1>, ViewPlanError> {
+    match expr {
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+            let Some(column) =
+                expression_filter_project_column(expr, catalog, relation_alias, None)
+            else {
+                return unsupported("typed projections must reference registered relation columns");
+            };
+            let result_type = typed_scalar_type_for_column(column)?;
+            // The public contract binds event-time columns as Int64
+            // nanoseconds; typed temporal functions consume them as
+            // timestamps.
+            let result_type = if catalog
+                .relation_schema
+                .event_time_column_id
+                .as_ref()
+                .is_some_and(|event_time_column_id| event_time_column_id == &column.column_id)
+            {
+                RuntimeScalarTypeV1::TimestampNanosecond
+            } else {
+                result_type
+            };
+            Ok(Some(TypedExprNodeV1 {
+                result_type,
+                nullable: column.nullable,
+                kind: TypedExprKindV1::Column {
+                    column_id: column.column_id.clone(),
+                },
+            }))
+        }
+        Expr::Value(value) => typed_literal_node(value),
+        Expr::Function(Function {
+            name: function_name,
+            args,
+            ..
+        }) => {
+            let name = function_name.to_string();
+            if !is_typed_function_name(&name) {
+                return Ok(None);
+            }
+            let function =
+                typed_function_for_name(&name).ok_or_else(|| ViewPlanError::UnsupportedShape {
+                    reason: format!("unsupported typed function `{name}`"),
+                })?;
+            let FunctionArguments::List(argument_list) = args else {
+                return unsupported("typed functions require a normal argument list");
+            };
+            let mut arg_nodes = Vec::new();
+            for argument in &argument_list.args {
+                let FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr)) = argument else {
+                    return unsupported("typed functions only accept expression arguments");
+                };
+                let Some(node) = typed_expr_node_from_expr(&arg_expr, catalog, relation_alias)?
+                else {
+                    return unsupported(
+                        "typed function arguments must be columns, literals, or typed functions",
+                    );
+                };
+                arg_nodes.push(node);
+            }
+            let function = typed_function_with_field(name.as_str(), function, &arg_nodes)?;
+            let result_type = typed_call_result_type(function, &arg_nodes)?;
+            Ok(Some(TypedExprNodeV1 {
+                result_type,
+                nullable: arg_nodes.iter().any(|node| node.nullable),
+                kind: TypedExprKindV1::Call {
+                    function,
+                    args: arg_nodes,
+                },
+            }))
+        }
+        Expr::BinaryOp { left, op, right } => {
+            // Interval literals are the only binary operand forms the typed
+            // surface owns on the right side (timestamp/date arithmetic).
+            // Everything else is either a float-typed arithmetic pair or
+            // legacy Int64 arithmetic.
+            let mut arg_nodes: Vec<TypedExprNodeV1> = Vec::new();
+            let mut interval_left = None;
+            let mut interval_right = None;
+            for (index, arg_expr) in [&**left, &**right].into_iter().enumerate() {
+                if let Expr::Interval(interval) = arg_expr {
+                    let Some(Some(ns)) = typed_interval_nanoseconds(interval) else {
+                        return unsupported(
+                            "typed arithmetic intervals must have a fixed duration",
+                        );
+                    };
+                    let node = TypedExprNodeV1 {
+                        result_type: RuntimeScalarTypeV1::Int64,
+                        nullable: false,
+                        kind: TypedExprKindV1::Literal {
+                            value: ScalarLiteralV1::Int64(ns),
+                        },
+                    };
+                    if index == 0 {
+                        interval_left = Some(node);
+                    } else {
+                        interval_right = Some(node);
+                    }
+                    continue;
+                }
+                let Some(node) = typed_expr_node_from_expr(arg_expr, catalog, relation_alias)?
+                else {
+                    return Ok(None);
+                };
+                if index == 0 {
+                    interval_left = Some(node);
+                } else {
+                    interval_right = Some(node);
+                }
+            }
+            let left_node = interval_left.ok_or_else(|| ViewPlanError::UnsupportedShape {
+                reason: "typed binary expressions require a left operand".to_string(),
+            })?;
+            let right_node = interval_right.ok_or_else(|| ViewPlanError::UnsupportedShape {
+                reason: "typed binary expressions require a right operand".to_string(),
+            })?;
+            let function = if matches!(right_node.kind, TypedExprKindV1::Literal { .. })
+                && left_node.result_type == RuntimeScalarTypeV1::TimestampNanosecond
+                && right_node.result_type == RuntimeScalarTypeV1::Int64
+            {
+                match op {
+                    BinaryOperator::Plus => BuiltinScalarFunctionV1::TimestampAddNanoseconds,
+                    BinaryOperator::Minus => BuiltinScalarFunctionV1::TimestampSubtractNanoseconds,
+                    _ => return Ok(None),
+                }
+            } else if left_node.result_type == RuntimeScalarTypeV1::Date32
+                && right_node.result_type == RuntimeScalarTypeV1::Int64
+                && op == &BinaryOperator::Plus
+            {
+                BuiltinScalarFunctionV1::DateAddDays
+            } else if (left_node.result_type == RuntimeScalarTypeV1::Float64
+                || left_node.result_type == RuntimeScalarTypeV1::Int64)
+                && (right_node.result_type == RuntimeScalarTypeV1::Float64
+                    || right_node.result_type == RuntimeScalarTypeV1::Int64)
+                && (left_node.result_type == RuntimeScalarTypeV1::Float64
+                    || right_node.result_type == RuntimeScalarTypeV1::Float64)
+            {
+                match op {
+                    BinaryOperator::Plus => BuiltinScalarFunctionV1::AddFloat64,
+                    BinaryOperator::Minus => BuiltinScalarFunctionV1::SubtractFloat64,
+                    BinaryOperator::Multiply => BuiltinScalarFunctionV1::MultiplyFloat64,
+                    BinaryOperator::Divide => BuiltinScalarFunctionV1::DivideFloat64,
+                    _ => return Ok(None),
+                }
+            } else {
+                return Ok(None);
+            };
+            let arg_nodes = vec![left_node, right_node];
+            let result_type = typed_call_result_type(function, &arg_nodes)?;
+            Ok(Some(TypedExprNodeV1 {
+                result_type,
+                nullable: arg_nodes.iter().any(|node| node.nullable),
+                kind: TypedExprKindV1::Call {
+                    function,
+                    args: arg_nodes,
+                },
+            }))
+        }
+        Expr::Extract { field, expr, .. } => {
+            let function = match field {
+                DateTimeField::Year | DateTimeField::Years => BuiltinScalarFunctionV1::ExtractYear,
+                DateTimeField::Month | DateTimeField::Months => {
+                    BuiltinScalarFunctionV1::ExtractMonth
+                }
+                DateTimeField::Day | DateTimeField::Days => BuiltinScalarFunctionV1::ExtractDay,
+                DateTimeField::Hour | DateTimeField::Hours => BuiltinScalarFunctionV1::ExtractHour,
+                DateTimeField::Minute | DateTimeField::Minutes => {
+                    BuiltinScalarFunctionV1::ExtractMinute
+                }
+                DateTimeField::Second | DateTimeField::Seconds => {
+                    BuiltinScalarFunctionV1::ExtractSecond
+                }
+                _ => {
+                    return unsupported(format!(
+                        "EXTRACT field `{field}` is not supported by the typed runtime"
+                    ))
+                }
+            };
+            let Some(node) = typed_expr_node_from_expr(expr, catalog, relation_alias)? else {
+                return unsupported(
+                    "EXTRACT argument must be a column, literal, or typed function",
+                );
+            };
+            let result_type = typed_call_result_type(function, &[node.clone()])?;
+            Ok(Some(TypedExprNodeV1 {
+                result_type,
+                nullable: node.nullable,
+                kind: TypedExprKindV1::Call {
+                    function,
+                    args: vec![node],
+                },
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn typed_literal_node(value: &ValueWithSpan) -> Result<Option<TypedExprNodeV1>, ViewPlanError> {
+    let node = match &value.value {
+        SqlValue::SingleQuotedString(text) => TypedExprNodeV1 {
+            result_type: RuntimeScalarTypeV1::Utf8,
+            nullable: false,
+            kind: TypedExprKindV1::Literal {
+                value: ScalarLiteralV1::Utf8 {
+                    value: text.clone(),
+                },
+            },
+        },
+        SqlValue::Number(text, _) => {
+            if text.contains('.') || text.contains('e') || text.contains('E') {
+                let number = text
+                    .parse::<f64>()
+                    .map_err(|_| ViewPlanError::UnsupportedShape {
+                        reason: "typed float literal is not a valid number".to_string(),
+                    })?;
+                TypedExprNodeV1 {
+                    result_type: RuntimeScalarTypeV1::Float64,
+                    nullable: false,
+                    kind: TypedExprKindV1::Literal {
+                        value: ScalarLiteralV1::Float64 {
+                            canonical_bits: number.to_bits(),
+                        },
+                    },
+                }
+            } else {
+                let number = text
+                    .parse::<i64>()
+                    .map_err(|_| ViewPlanError::UnsupportedShape {
+                        reason: "typed integer literal is not a valid number".to_string(),
+                    })?;
+                TypedExprNodeV1 {
+                    result_type: RuntimeScalarTypeV1::Int64,
+                    nullable: false,
+                    kind: TypedExprKindV1::Literal {
+                        value: ScalarLiteralV1::Int64(number),
+                    },
+                }
+            }
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(node))
+}
+
+fn typed_scalar_type_for_column(
+    column: &RelationColumnV1,
+) -> Result<RuntimeScalarTypeV1, ViewPlanError> {
+    match &column.physical_arrow_type {
+        ArrowPhysicalTypeV1::Boolean => Ok(RuntimeScalarTypeV1::Boolean),
+        ArrowPhysicalTypeV1::Int64 => Ok(RuntimeScalarTypeV1::Int64),
+        ArrowPhysicalTypeV1::Float64 => Ok(RuntimeScalarTypeV1::Float64),
+        ArrowPhysicalTypeV1::Utf8 => Ok(RuntimeScalarTypeV1::Utf8),
+        ArrowPhysicalTypeV1::Date32 => Ok(RuntimeScalarTypeV1::Date32),
+        ArrowPhysicalTypeV1::TimestampNanosecond { .. } => {
+            Ok(RuntimeScalarTypeV1::TimestampNanosecond)
+        }
+        other => unsupported(format!(
+            "typed projections do not support input physical type {other:?}"
+        )),
+    }
+}
+
+fn is_typed_function_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "concat"
+            | "substring"
+            | "substr"
+            | "upper"
+            | "ucase"
+            | "lower"
+            | "lcase"
+            | "trim"
+            | "btrim"
+            | "ltrim"
+            | "rtrim"
+            | "length"
+            | "char_length"
+            | "character_length"
+            | "extract"
+            | "date_trunc"
+            | "abs"
+            | "ceil"
+            | "ceiling"
+            | "floor"
+            | "round"
+            | "greatest"
+            | "least"
+    )
+}
+
+fn typed_function_for_name(name: &str) -> Option<BuiltinScalarFunctionV1> {
+    match name.to_ascii_lowercase().as_str() {
+        "concat" => Some(BuiltinScalarFunctionV1::Concat),
+        "substring" | "substr" => Some(BuiltinScalarFunctionV1::Substring),
+        "upper" | "ucase" => Some(BuiltinScalarFunctionV1::Upper),
+        "lower" | "lcase" => Some(BuiltinScalarFunctionV1::Lower),
+        "trim" | "btrim" | "ltrim" | "rtrim" => Some(BuiltinScalarFunctionV1::Trim),
+        "length" | "char_length" | "character_length" => Some(BuiltinScalarFunctionV1::Length),
+        "extract" => Some(BuiltinScalarFunctionV1::ExtractYear),
+        "date_trunc" => Some(BuiltinScalarFunctionV1::DateTruncDay),
+        "abs" => Some(BuiltinScalarFunctionV1::AbsFloat64),
+        "ceil" | "ceiling" => Some(BuiltinScalarFunctionV1::CeilFloat64),
+        "floor" => Some(BuiltinScalarFunctionV1::FloorFloat64),
+        "round" => Some(BuiltinScalarFunctionV1::RoundFloat64),
+        "greatest" => Some(BuiltinScalarFunctionV1::GreatestFloat64),
+        "least" => Some(BuiltinScalarFunctionV1::LeastFloat64),
+        _ => None,
+    }
+}
+
+fn typed_call_result_type(
+    function: BuiltinScalarFunctionV1,
+    args: &[TypedExprNodeV1],
+) -> Result<RuntimeScalarTypeV1, ViewPlanError> {
+    match function {
+        BuiltinScalarFunctionV1::Concat
+        | BuiltinScalarFunctionV1::Substring
+        | BuiltinScalarFunctionV1::Upper
+        | BuiltinScalarFunctionV1::Lower
+        | BuiltinScalarFunctionV1::Trim => {
+            if !args
+                .first()
+                .is_some_and(|arg| arg.result_type == RuntimeScalarTypeV1::Utf8)
+            {
+                return unsupported(format!("{function:?} requires a utf8 first argument"));
+            }
+            Ok(RuntimeScalarTypeV1::Utf8)
+        }
+        BuiltinScalarFunctionV1::Length => {
+            if !args
+                .first()
+                .is_some_and(|arg| arg.result_type == RuntimeScalarTypeV1::Utf8)
+            {
+                return unsupported("LENGTH requires a utf8 argument");
+            }
+            Ok(RuntimeScalarTypeV1::Int64)
+        }
+        BuiltinScalarFunctionV1::ExtractYear
+        | BuiltinScalarFunctionV1::ExtractMonth
+        | BuiltinScalarFunctionV1::ExtractDay
+        | BuiltinScalarFunctionV1::ExtractHour
+        | BuiltinScalarFunctionV1::ExtractMinute
+        | BuiltinScalarFunctionV1::ExtractSecond
+        | BuiltinScalarFunctionV1::DateTruncDay
+        | BuiltinScalarFunctionV1::DateTruncHour
+        | BuiltinScalarFunctionV1::DateTruncMinute
+        | BuiltinScalarFunctionV1::DateTruncSecond => {
+            // The timestamp expression is either the only argument
+            // (`EXTRACT(field FROM ts)` AST form) or the second argument
+            // (`extract('field', ts)` function form with a leading literal).
+            if !args
+                .iter()
+                .any(|arg| arg.result_type == RuntimeScalarTypeV1::TimestampNanosecond)
+            {
+                return unsupported(format!(
+                    "{function:?} requires a timestamp_nanosecond argument"
+                ));
+            }
+            match function {
+                BuiltinScalarFunctionV1::ExtractYear
+                | BuiltinScalarFunctionV1::ExtractMonth
+                | BuiltinScalarFunctionV1::ExtractDay
+                | BuiltinScalarFunctionV1::ExtractHour
+                | BuiltinScalarFunctionV1::ExtractMinute
+                | BuiltinScalarFunctionV1::ExtractSecond => Ok(RuntimeScalarTypeV1::Int64),
+                _ => Ok(RuntimeScalarTypeV1::TimestampNanosecond),
+            }
+        }
+        BuiltinScalarFunctionV1::TimestampAddNanoseconds
+        | BuiltinScalarFunctionV1::TimestampSubtractNanoseconds => {
+            if !args
+                .first()
+                .is_some_and(|arg| arg.result_type == RuntimeScalarTypeV1::TimestampNanosecond)
+                || !args
+                    .get(1)
+                    .is_some_and(|arg| arg.result_type == RuntimeScalarTypeV1::Int64)
+            {
+                return unsupported(
+                    "timestamp arithmetic requires (timestamp_nanosecond, int64 nanoseconds)",
+                );
+            }
+            Ok(RuntimeScalarTypeV1::TimestampNanosecond)
+        }
+        BuiltinScalarFunctionV1::DateAddDays => {
+            if !args
+                .first()
+                .is_some_and(|arg| arg.result_type == RuntimeScalarTypeV1::Date32)
+                || !args
+                    .get(1)
+                    .is_some_and(|arg| arg.result_type == RuntimeScalarTypeV1::Int64)
+            {
+                return unsupported("DATE + days requires (date32, int64 days)");
+            }
+            Ok(RuntimeScalarTypeV1::Date32)
+        }
+        BuiltinScalarFunctionV1::AbsFloat64
+        | BuiltinScalarFunctionV1::CeilFloat64
+        | BuiltinScalarFunctionV1::FloorFloat64
+        | BuiltinScalarFunctionV1::RoundFloat64 => {
+            if !args
+                .first()
+                .is_some_and(|arg| arg.result_type == RuntimeScalarTypeV1::Float64)
+            {
+                return unsupported(format!("{function:?} requires a float64 argument"));
+            }
+            Ok(RuntimeScalarTypeV1::Float64)
+        }
+        BuiltinScalarFunctionV1::GreatestFloat64 | BuiltinScalarFunctionV1::LeastFloat64 => {
+            if !args
+                .iter()
+                .all(|arg| arg.result_type == RuntimeScalarTypeV1::Float64)
+            {
+                return unsupported(format!("{function:?} requires float64 arguments"));
+            }
+            Ok(RuntimeScalarTypeV1::Float64)
+        }
+        BuiltinScalarFunctionV1::AddFloat64
+        | BuiltinScalarFunctionV1::SubtractFloat64
+        | BuiltinScalarFunctionV1::MultiplyFloat64
+        | BuiltinScalarFunctionV1::DivideFloat64 => {
+            if !args.iter().all(|arg| {
+                arg.result_type == RuntimeScalarTypeV1::Float64
+                    || arg.result_type == RuntimeScalarTypeV1::Int64
+            }) {
+                return unsupported(format!(
+                    "{function:?} requires float64 arguments (int64 is coerced exactly)"
+                ));
+            }
+            Ok(RuntimeScalarTypeV1::Float64)
+        }
+    }
+}
+
+/// Converts a sqlparser interval with a fixed-duration leading field into
+/// nanoseconds. Returns `None` for calendar units (month/year) and for
+/// non-literal interval values.
+fn typed_interval_nanoseconds(interval: &sqlparser::ast::Interval) -> Option<Option<i64>> {
+    use sqlparser::ast::DateTimeField;
+    let (text, field) = match &*interval.value {
+        Expr::Value(ValueWithSpan {
+            value: SqlValue::SingleQuotedString(text),
+            ..
+        }) => {
+            // `INTERVAL '1 hour'` carries the unit inside the string when no
+            // leading field is present; `INTERVAL '1' HOUR` uses the field.
+            let parts = text.split_whitespace().collect::<Vec<_>>();
+            let field = match (parts.as_slice(), interval.leading_field.as_ref()) {
+                ([number, unit, ..], None) => {
+                    let unit: &str = unit;
+                    let parsed_unit = match unit.to_ascii_lowercase().as_str() {
+                        "nanosecond" | "nanoseconds" => DateTimeField::Nanosecond,
+                        "microsecond" | "microseconds" => DateTimeField::Microsecond,
+                        "millisecond" | "milliseconds" => DateTimeField::Millisecond,
+                        "second" | "seconds" => DateTimeField::Second,
+                        "minute" | "minutes" => DateTimeField::Minute,
+                        "hour" | "hours" => DateTimeField::Hour,
+                        "day" | "days" => DateTimeField::Day,
+                        _ => return None,
+                    };
+                    (*number, parsed_unit)
+                }
+                ([number, ..], Some(field)) => (*number, field.clone()),
+                ([number], None) => (*number, DateTimeField::Second),
+                _ => return None,
+            };
+            let number = field.0.parse::<i64>().ok()?;
+            (number, field.1)
+        }
+        Expr::Value(ValueWithSpan {
+            value: SqlValue::Number(text, _),
+            ..
+        }) => (
+            text.parse::<i64>().ok()?,
+            interval
+                .leading_field
+                .as_ref()
+                .cloned()
+                .unwrap_or(DateTimeField::Second),
+        ),
+        _ => return None,
+    };
+    let value = text;
+    let multiplier = match &field {
+        DateTimeField::Nanosecond => Some(1),
+        DateTimeField::Microsecond => Some(1_000),
+        DateTimeField::Millisecond => Some(1_000_000),
+        DateTimeField::Second | DateTimeField::Seconds => Some(1_000_000_000),
+        DateTimeField::Minute | DateTimeField::Minutes => Some(60_000_000_000),
+        DateTimeField::Hour | DateTimeField::Hours => Some(3_600_000_000_000),
+        DateTimeField::Day | DateTimeField::Days => Some(86_400_000_000_000),
+        _ => None,
+    }?;
+    Some(Some(value.checked_mul(multiplier)?))
+}
+
+fn typed_function_with_field(
+    name: &str,
+    function: BuiltinScalarFunctionV1,
+    args: &[TypedExprNodeV1],
+) -> Result<BuiltinScalarFunctionV1, ViewPlanError> {
+    let name = name.to_ascii_lowercase();
+    if name == "extract" {
+        let field = match args.first().map(|arg| &arg.kind) {
+            Some(TypedExprKindV1::Literal {
+                value: ScalarLiteralV1::Utf8 { value: field },
+            }) => field.to_ascii_lowercase(),
+            _ => {
+                return unsupported("EXTRACT requires a string field literal as its first argument")
+            }
+        };
+        return match field.as_str() {
+            "year" => Ok(BuiltinScalarFunctionV1::ExtractYear),
+            "month" => Ok(BuiltinScalarFunctionV1::ExtractMonth),
+            "day" => Ok(BuiltinScalarFunctionV1::ExtractDay),
+            "hour" => Ok(BuiltinScalarFunctionV1::ExtractHour),
+            "minute" => Ok(BuiltinScalarFunctionV1::ExtractMinute),
+            "second" => Ok(BuiltinScalarFunctionV1::ExtractSecond),
+            _ => unsupported(format!("EXTRACT field `{field}` is not supported")),
+        };
+    }
+    if name == "date_trunc" {
+        let unit = match args.first().map(|arg| &arg.kind) {
+            Some(TypedExprKindV1::Literal {
+                value: ScalarLiteralV1::Utf8 { value: unit },
+            }) => unit.to_ascii_lowercase(),
+            _ => {
+                return unsupported(
+                    "DATE_TRUNC requires a string unit literal as its first argument",
+                )
+            }
+        };
+        return match unit.as_str() {
+            "day" => Ok(BuiltinScalarFunctionV1::DateTruncDay),
+            "hour" => Ok(BuiltinScalarFunctionV1::DateTruncHour),
+            "minute" => Ok(BuiltinScalarFunctionV1::DateTruncMinute),
+            "second" => Ok(BuiltinScalarFunctionV1::DateTruncSecond),
+            _ => unsupported(format!("DATE_TRUNC unit `{unit}` is not supported")),
+        };
+    }
+    Ok(function)
 }
