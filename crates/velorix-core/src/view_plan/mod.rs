@@ -2016,6 +2016,15 @@ pub fn validate_supported_view_sql(
     }
     let key_column = catalog_primary_key_column(catalog)?;
     let query = parse_single_query(sql)?;
+    // Phase 7.1: an aggregate CTE followed by an identity/filter projection
+    // over the CTE is inlined into a plain aggregate query (the outer
+    // WHERE merges into the inner WHERE/HAVING). The runtime and the stored
+    // plan still see the original SQL text, so identity hashing is stable.
+    let query = if let Some(merged) = inline_aggregate_cte(query.clone(), catalog)? {
+        Box::new(merged)
+    } else {
+        query
+    };
     let (select, cte_source) =
         supported_plain_select_allow_identity_cte_and_top_k(&query, catalog)?;
 
@@ -15685,4 +15694,440 @@ fn typed_function_with_field(
         };
     }
     Ok(function)
+}
+
+/// Phase 7.1: inlines a single aggregate CTE into the outer query.
+///
+/// Pattern:
+/// ```sql
+/// WITH x AS (SELECT k, sum(v) AS total FROM t GROUP BY k)
+/// SELECT k, total FROM x WHERE <pred>
+/// ```
+/// The outer query must be a single-relation SELECT over the CTE alias
+/// whose projections reference only the CTE group key and aggregate output
+/// columns. Outer WHERE conjuncts on the group key merge into the inner
+/// WHERE; conjuncts on aggregate outputs merge into the inner HAVING (with
+/// the output reference rebuilt as the aggregate call). Anything else fails
+/// closed through the existing identity-CTE path. Returns `None` when the
+/// pattern does not match (the caller keeps the existing validation).
+fn inline_aggregate_cte(
+    query: Box<Query>,
+    catalog: &VelorixRelationCatalogV1,
+) -> Result<Option<Query>, ViewPlanError> {
+    let Some(with) = &query.with else {
+        return Ok(None);
+    };
+    let [cte] = with.cte_tables.as_slice() else {
+        return Ok(None);
+    };
+    if !cte.alias.columns.is_empty() || cte.from.is_some() || cte.materialized.is_some() {
+        return Ok(None);
+    }
+    let SetExpr::Select(cte_select) = cte.query.body.as_ref() else {
+        return Ok(None);
+    };
+    let has_group_by = matches!(
+        &cte_select.group_by,
+        GroupByExpr::Expressions(expressions, modifiers)
+            if !expressions.is_empty() && modifiers.is_empty()
+    );
+    if !has_group_by {
+        return Ok(None);
+    }
+    let SetExpr::Select(outer_select) = &*query.body else {
+        return Ok(None);
+    };
+    if outer_select.distinct.is_some() || outer_select.from.len() != 1 {
+        return Ok(None);
+    }
+    let cte_alias = cte.alias.name.value.as_str();
+    let [outer_from] = outer_select.from.as_slice() else {
+        return Ok(None);
+    };
+    let TableFactor::Table { name, alias, .. } = &outer_from.relation else {
+        return Ok(None);
+    };
+    let from_alias = alias.as_ref().map(|alias| alias.name.value.as_str());
+    let from_name = name.to_string();
+    let from_is_cte = from_alias == Some(cte_alias)
+        || (from_alias.is_none() && from_name.eq_ignore_ascii_case(cte_alias));
+    if !from_is_cte || !outer_from.joins.is_empty() {
+        return Ok(None);
+    }
+
+    // The CTE itself must be a supported single-key aggregate query.
+    let cte_query = Query {
+        with: None,
+        body: Box::new(SetExpr::Select((*cte_select).clone())),
+        order_by: None,
+        limit_clause: None,
+        fetch: None,
+        locks: Vec::new(),
+        for_clause: None,
+        settings: None,
+        format_clause: None,
+        pipe_operators: Vec::new(),
+    };
+    let cte_plan = validate_supported_view_sql(&cte_query.to_string(), catalog)?;
+    if cte_plan.aggregate_outputs.is_empty() {
+        return Ok(None);
+    }
+    let key_output_name = if cte_plan.output_key_column_id.is_empty() {
+        catalog_column_by_id(catalog, &cte_plan.group_key_column_id)
+            .ok()
+            .map(|column| column.name.clone())
+    } else {
+        Some(cte_plan.output_key_column_id.clone())
+    };
+    let Some(key_output_name) = key_output_name else {
+        return Ok(None);
+    };
+    let base_key_name = catalog_primary_key_column(catalog)?.name.clone();
+    // CTE output name -> rebuilt inner expression.
+    let mut output_exprs: BTreeMap<String, Expr> = BTreeMap::new();
+    output_exprs.insert(
+        key_output_name.clone(),
+        Expr::Identifier(Ident::new(base_key_name.as_str())),
+    );
+    for aggregate in &cte_plan.aggregate_outputs {
+        let Some(call) = rebuilt_aggregate_call(aggregate, catalog)? else {
+            return Ok(None);
+        };
+        output_exprs.insert(aggregate.output_column_id.clone(), call);
+    }
+
+    // Outer projection: every item must reference a CTE output column.
+    let mut merged_projection = Vec::with_capacity(outer_select.projection.len());
+    for item in &outer_select.projection {
+        let (expr, alias) = match item {
+            SelectItem::UnnamedExpr(expr) => (expr, None),
+            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.as_str())),
+            _ => return Ok(None),
+        };
+        let column_name = cte_output_column_reference(expr, cte_alias, from_alias);
+        let Some(column_name) = column_name else {
+            return Ok(None);
+        };
+        let Some(inner) = output_exprs.get(&column_name) else {
+            return Ok(None);
+        };
+        if let Some(alias) = alias {
+            if alias != column_name {
+                // Renaming an aggregate CTE output is only safe when the
+                // name still matches the canonical output id; keep the
+                // alias only for the group key.
+                if !column_name.eq_ignore_ascii_case(key_output_name.as_str()) {
+                    return Ok(None);
+                }
+            }
+            merged_projection.push(SelectItem::ExprWithAlias {
+                expr: inner.clone(),
+                alias: Ident::new(alias),
+            });
+        } else {
+            merged_projection.push(SelectItem::UnnamedExpr(inner.clone()));
+        }
+    }
+
+    // Outer WHERE: classify conjuncts by the CTE output columns they touch.
+    let mut key_filters = Vec::new();
+    let mut having_filters = Vec::new();
+    if let Some(selection) = &outer_select.selection {
+        for conjunct in split_and_conjuncts(selection) {
+            let referenced = cte_output_references(&conjunct, cte_alias, from_alias);
+            if referenced.is_empty() {
+                return Ok(None);
+            }
+            let mut uses_key = false;
+            let mut uses_aggregate = false;
+            for name in &referenced {
+                if *name == key_output_name {
+                    uses_key = true;
+                } else if output_exprs.contains_key(name) {
+                    uses_aggregate = true;
+                } else {
+                    return Ok(None);
+                }
+            }
+            if uses_key && uses_aggregate {
+                return Ok(None);
+            }
+            if uses_key {
+                key_filters.push(rewrite_cte_references(
+                    conjunct.clone(),
+                    cte_alias,
+                    from_alias,
+                    &output_exprs,
+                )?);
+            } else {
+                having_filters.push(rewrite_cte_references(
+                    conjunct.clone(),
+                    cte_alias,
+                    from_alias,
+                    &output_exprs,
+                )?);
+            }
+        }
+    }
+
+    let mut merged = (*cte_select).clone();
+    merged.projection = merged_projection;
+    merged.selection = combine_and_exprs(
+        cte_select.selection.as_ref(),
+        combine_and_exprs_opt(&key_filters),
+    );
+    merged.having = combine_and_exprs(
+        cte_select.having.as_ref(),
+        combine_and_exprs_opt(&having_filters),
+    );
+    merged.distinct = None;
+    let merged_query = Query {
+        with: None,
+        body: Box::new(SetExpr::Select(merged)),
+        order_by: None,
+        limit_clause: None,
+        fetch: None,
+        locks: Vec::new(),
+        for_clause: None,
+        settings: None,
+        format_clause: None,
+        pipe_operators: Vec::new(),
+    };
+    // The merged query must itself be a supported aggregate query; any
+    // mismatch fails closed here rather than in the runtime.
+    validate_supported_view_sql(&merged_query.to_string(), catalog)?;
+    Ok(Some(merged_query))
+}
+
+/// Rebuilds the SQL aggregate call for a validated aggregate output so an
+/// outer HAVING/projection reference can be replaced by the inner call.
+fn rebuilt_aggregate_call(
+    aggregate: &SupportedAggregateOutput,
+    catalog: &VelorixRelationCatalogV1,
+) -> Result<Option<Expr>, ViewPlanError> {
+    if aggregate.input_expression.is_some() {
+        return Ok(None);
+    }
+    let input_name = match &aggregate.input_column_id {
+        Some(column_id) => Some(catalog_column_by_id(catalog, column_id)?.name.clone()),
+        None => None,
+    };
+    let function_name = match aggregate.function {
+        LogicalPlanAggregateFunctionV1::Sum => "sum",
+        LogicalPlanAggregateFunctionV1::Count => "count",
+        LogicalPlanAggregateFunctionV1::CountDistinct => "count",
+        LogicalPlanAggregateFunctionV1::Min => "min",
+        LogicalPlanAggregateFunctionV1::Max => "max",
+        LogicalPlanAggregateFunctionV1::Avg => "avg",
+    };
+    let mut arguments = FunctionArguments::List(FunctionArgumentList {
+        duplicate_treatment: if aggregate.function == LogicalPlanAggregateFunctionV1::CountDistinct
+        {
+            Some(DuplicateTreatment::Distinct)
+        } else {
+            None
+        },
+        args: Vec::new(),
+        clauses: Vec::new(),
+    });
+    match (&aggregate.function, input_name) {
+        (LogicalPlanAggregateFunctionV1::Count, None) => {
+            if let FunctionArguments::List(list) = &mut arguments {
+                list.args
+                    .push(FunctionArg::Unnamed(FunctionArgExpr::Wildcard));
+            }
+        }
+        (_, Some(input_name)) => {
+            if let FunctionArguments::List(list) = &mut arguments {
+                list.args.push(FunctionArg::Unnamed(FunctionArgExpr::Expr(
+                    Expr::Identifier(Ident::new(input_name)),
+                )));
+            }
+        }
+        _ => return Ok(None),
+    }
+    Ok(Some(Expr::Function(Function {
+        name: ObjectName(vec![sqlparser::ast::ObjectNamePart::Identifier(
+            Ident::new(function_name),
+        )]),
+        args: arguments,
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: Vec::new(),
+        parameters: FunctionArguments::None,
+        uses_odbc_syntax: false,
+    })))
+}
+
+/// Returns the CTE output column name referenced by a simple column
+/// expression, if it is a (possibly CTE-qualified) reference.
+fn cte_output_column_reference(
+    expr: &Expr,
+    cte_alias: &str,
+    from_alias: Option<&str>,
+) -> Option<String> {
+    match expr {
+        Expr::Identifier(ident) => Some(ident.value.clone()),
+        Expr::CompoundIdentifier(parts) => {
+            let [qualifier, name] = parts.as_slice() else {
+                return None;
+            };
+            let qualifier_matches = from_alias
+                .map(|alias| identifier_eq(alias, qualifier.value.as_str()))
+                .unwrap_or_else(|| identifier_eq(cte_alias, qualifier.value.as_str()));
+            qualifier_matches.then(|| name.value.clone())
+        }
+        _ => None,
+    }
+}
+
+/// Collects the CTE output column names referenced anywhere in an
+/// expression.
+fn cte_output_references(
+    expr: &Expr,
+    cte_alias: &str,
+    from_alias: Option<&str>,
+) -> BTreeSet<String> {
+    let mut references = BTreeSet::new();
+    collect_cte_references(expr, cte_alias, from_alias, &mut references);
+    references
+}
+
+fn collect_cte_references(
+    expr: &Expr,
+    cte_alias: &str,
+    from_alias: Option<&str>,
+    references: &mut BTreeSet<String>,
+) {
+    match expr {
+        Expr::Identifier(ident) => {
+            references.insert(ident.value.clone());
+        }
+        Expr::CompoundIdentifier(parts) => {
+            if let [qualifier, name] = parts.as_slice() {
+                let qualifier_matches = from_alias
+                    .map(|alias| identifier_eq(alias, qualifier.value.as_str()))
+                    .unwrap_or_else(|| identifier_eq(cte_alias, qualifier.value.as_str()));
+                if qualifier_matches {
+                    references.insert(name.value.clone());
+                }
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_cte_references(left, cte_alias, from_alias, references);
+            collect_cte_references(right, cte_alias, from_alias, references);
+        }
+        Expr::Nested(inner) => collect_cte_references(inner, cte_alias, from_alias, references),
+        Expr::UnaryOp { expr, .. } => {
+            collect_cte_references(expr, cte_alias, from_alias, references)
+        }
+        Expr::Value(_) => {}
+        _ => {}
+    }
+}
+
+/// Rewrites CTE output column references to the rebuilt inner expressions.
+fn rewrite_cte_references(
+    expr: Expr,
+    cte_alias: &str,
+    from_alias: Option<&str>,
+    output_exprs: &BTreeMap<String, Expr>,
+) -> Result<Expr, ViewPlanError> {
+    match expr {
+        Expr::Identifier(ident) => {
+            if let Some(inner) = output_exprs.get(&ident.value) {
+                Ok(inner.clone())
+            } else {
+                Ok(Expr::Identifier(ident))
+            }
+        }
+        Expr::CompoundIdentifier(parts) => {
+            if let [qualifier, name] = parts.as_slice() {
+                let qualifier_matches = from_alias
+                    .map(|alias| identifier_eq(alias, qualifier.value.as_str()))
+                    .unwrap_or_else(|| identifier_eq(cte_alias, qualifier.value.as_str()));
+                if qualifier_matches {
+                    if let Some(inner) = output_exprs.get(&name.value) {
+                        return Ok(inner.clone());
+                    }
+                }
+            }
+            Ok(Expr::CompoundIdentifier(parts))
+        }
+        Expr::BinaryOp { left, op, right } => Ok(Expr::BinaryOp {
+            left: Box::new(rewrite_cte_references(
+                *left,
+                cte_alias,
+                from_alias,
+                output_exprs,
+            )?),
+            op,
+            right: Box::new(rewrite_cte_references(
+                *right,
+                cte_alias,
+                from_alias,
+                output_exprs,
+            )?),
+        }),
+        Expr::Nested(inner) => Ok(Expr::Nested(Box::new(rewrite_cte_references(
+            *inner,
+            cte_alias,
+            from_alias,
+            output_exprs,
+        )?))),
+        Expr::UnaryOp { op, expr } => Ok(Expr::UnaryOp {
+            op,
+            expr: Box::new(rewrite_cte_references(
+                *expr,
+                cte_alias,
+                from_alias,
+                output_exprs,
+            )?),
+        }),
+        other => Ok(other),
+    }
+}
+
+fn split_and_conjuncts(expr: &Expr) -> Vec<Expr> {
+    match expr {
+        Expr::BinaryOp {
+            op: BinaryOperator::And,
+            left,
+            right,
+        } => {
+            let mut conjuncts = split_and_conjuncts(left);
+            conjuncts.extend(split_and_conjuncts(right));
+            conjuncts
+        }
+        other => vec![other.clone()],
+    }
+}
+
+fn combine_and_exprs_opt(exprs: &[Expr]) -> Option<Expr> {
+    match exprs {
+        [] => None,
+        [single] => Some(single.clone()),
+        [head, tail @ ..] => Some(
+            tail.iter()
+                .fold(head.clone(), |acc, conjunct| Expr::BinaryOp {
+                    left: Box::new(acc),
+                    op: BinaryOperator::And,
+                    right: Box::new(conjunct.clone()),
+                }),
+        ),
+    }
+}
+
+fn combine_and_exprs(left: Option<&Expr>, right: Option<Expr>) -> Option<Expr> {
+    match (left, right) {
+        (None, None) => None,
+        (Some(left), None) => Some(left.clone()),
+        (None, Some(right)) => Some(right),
+        (Some(left), Some(right)) => Some(Expr::BinaryOp {
+            left: Box::new(left.clone()),
+            op: BinaryOperator::And,
+            right: Box::new(right),
+        }),
+    }
 }

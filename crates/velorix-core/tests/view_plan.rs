@@ -11063,3 +11063,48 @@ fn device_status_catalog() -> VelorixRelationCatalogV1 {
         },
     }
 }
+
+#[test]
+fn aggregate_cte_with_outer_filter_inlines_to_plain_aggregate_plan() {
+    let catalog = scores_catalog();
+    let output = scores_projected_stats_output_schema();
+    // Outer filter on the aggregate output merges into HAVING.
+    let sql = "with x as (select user_id, sum(score) as total from scores group by user_id) select user_id, total from x where total > 10";
+    let plan = lower_supported_sql_to_logical_plan(sql, std::slice::from_ref(&catalog), &output)
+        .expect("aggregate CTE with output filter must inline");
+    let VelorixLogicalViewExecutionV1::SingleKeySumCount { plan } = &plan.execution else {
+        panic!("expected aggregate plan");
+    };
+    assert!(
+        plan.having_expr.is_some(),
+        "aggregate filter must become HAVING"
+    );
+    assert!(plan.predicate_expr.is_none(), "no inner WHERE expected");
+
+    // Outer filter on the group key merges into the inner WHERE.
+    let sql = "with x as (select user_id, sum(score) as total from scores group by user_id) select user_id, total from x where user_id = 'alice'";
+    let plan = lower_supported_sql_to_logical_plan(sql, std::slice::from_ref(&catalog), &output)
+        .expect("aggregate CTE with key filter must inline");
+    let VelorixLogicalViewExecutionV1::SingleKeySumCount { plan } = &plan.execution else {
+        panic!("expected aggregate plan");
+    };
+    assert!(
+        plan.predicate_expr.is_some(),
+        "key filter must become inner WHERE"
+    );
+    assert!(plan.having_expr.is_none(), "no HAVING expected");
+
+    // Mixed key OR aggregate filter cannot be split: fail closed.
+    let sql = "with x as (select user_id, sum(score) as total from scores group by user_id) select user_id, total from x where user_id = 'alice' or total > 10";
+    assert!(
+        lower_supported_sql_to_logical_plan(sql, std::slice::from_ref(&catalog), &output).is_err(),
+        "mixed OR filter must fail closed"
+    );
+
+    // A raw non-key, non-aggregate CTE column cannot be projected.
+    let sql = "with x as (select user_id, score, sum(score) as total from scores group by user_id) select user_id, total from x";
+    assert!(
+        lower_supported_sql_to_logical_plan(sql, std::slice::from_ref(&catalog), &output).is_err(),
+        "raw non-key column projection must fail closed"
+    );
+}
