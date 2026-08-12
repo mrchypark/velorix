@@ -446,6 +446,11 @@ pub(super) async fn materialize_prepared_ingest_epoch_for_ack_mode(
             )
             .await?;
             timer.mark("materialize");
+            // Producer checkpoints are durable now; pull every pending
+            // producer commit into dependent consumer views before the
+            // materialized acknowledgement returns.
+            drain_published_view_dependencies(state).await?;
+            timer.mark("materialize_view_dependencies");
             Ok(materialization_response("completed", summary))
         }
     }
@@ -1689,6 +1694,7 @@ pub(super) fn relation_input_batch_from_prepared_ingest(
     prepared: &PreparedIngestBatch,
 ) -> RelationInputBatch {
     RelationInputBatch {
+        encoding: RelationInputEncodingV1::SourceRelationV1,
         relation_id: prepared.request.relation_id.clone(),
         relation_version: prepared.request.relation_version.clone(),
         stream_id: prepared.request.stream_id.clone(),

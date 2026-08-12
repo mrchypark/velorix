@@ -48,7 +48,7 @@ use velorix_control::{
     meta_admin::{
         validate_bearer_token, AcquireStandingRuntimeOwnerOutcome,
         AcquireStandingRuntimeOwnerRequest, BeginViewBootstrapOutcome, BeginViewBootstrapRequest,
-        CaptureIngestSourceCutRequest, CommitIngestRangeOutcome,
+        BeginViewDependencyEdgeV1, CaptureIngestSourceCutRequest, CommitIngestRangeOutcome,
         FixViewBootstrapActivationCutOutcome, FixViewBootstrapActivationCutRequest, GrpcMetaStore,
         IngestRangeReservation, IngestSourceRelationIdentityV1, MetaStore, MetaStoreError,
         PromoteViewBootstrapOutcome, PromoteViewBootstrapRequest,
@@ -92,25 +92,27 @@ use velorix_core::{
         DataFusionRegistrationModeV1, DataFusionRegistrationV1, DictionaryKeyTypeV1,
         IncrementalAdapterBindingV1, IncrementalRelationBindingV1, RelationColumnV1,
         RelationOperationV1, RelationSemanticRoleV1, SchemaFingerprintV1, VelorixLogicalTypeV1,
-        VelorixRelationCatalogV1, VelorixRelationSchemaV1,
+        VelorixRelationCatalogV1, VelorixRelationSchemaV1, VelorixRelationSourceV1,
         CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID, RELATION_SCHEMA_VERSION_V1,
     },
     standing_program::{
         BuiltinRuntimeIdentity, CausalCutV1, CausalViewCursorV1, EpochIdempotencyKey,
         InputEventTimeWatermark, MaterializedViewPage, NativeCodePolicy, RelationFrontier,
-        RelationInputBatch, RuntimeCheckpoint, RuntimeCheckpointInputCoverageV1,
-        RuntimeCheckpointPartitionCoverageV1, RuntimeCheckpointRelationCoverageV1,
-        RuntimeCheckpointStatePayload, ScopedViewId, SnapshotPageRequest, StandingInputChangeV1,
-        StandingProgramIdentity, StandingProgramRuntime, StandingProgramRuntimeError,
-        ViewOutputDelta, RUNTIME_CHECKPOINT_INPUT_COVERAGE_SCHEMA_VERSION_V1,
+        RelationInputBatch, RelationInputEncodingV1, RuntimeCheckpoint,
+        RuntimeCheckpointInputCoverageV1, RuntimeCheckpointPartitionCoverageV1,
+        RuntimeCheckpointRelationCoverageV1, RuntimeCheckpointStatePayload, ScopedViewId,
+        SnapshotPageRequest, StandingProgramIdentity, StandingProgramRuntime,
+        StandingProgramRuntimeError, ViewOutputDelta,
+        RUNTIME_CHECKPOINT_INPUT_COVERAGE_SCHEMA_VERSION_V1,
     },
     view_contract::{
-        catalog_input_relation_schema, published_relation_binding_v1,
-        resolve_view_input_relation_v1, stable_bytes_hash,
-        validate_materialized_standing_view_spec, validate_published_relation_binding_v1,
-        view_spec_hash, ColumnSchema, PublishedRelationBindingV1, RelationSchema,
-        ResolvedAdmissionInput, SourceInputBindingV1, SqlDataType, SqlDialect, SqlSourceKind,
-        SqlStructField, StandingViewShape, StandingViewSpec, ViewDependencyEdgeBindingV1,
+        catalog_from_published_relation_binding, catalog_input_relation_schema,
+        published_relation_binding_v1, stable_bytes_hash, validate_materialized_standing_view_spec,
+        validate_published_relation_binding_v1, validate_view_dependency_graph,
+        view_dependency_edge_from_binding, view_dependency_edge_id, view_spec_hash, ColumnSchema,
+        PublishedRelationBindingV1, RelationSchema, SqlDataType, SqlDialect, SqlSourceKind,
+        SqlStructField, StandingInputBindingV1, StandingViewShape, StandingViewSpec,
+        ViewDependencyEdgeV1, PUBLISHED_DELTA_WEIGHT_FIELD_V1,
         PUBLISHED_RELATION_BINDING_SCHEMA_VERSION_V1,
     },
     view_plan::{
@@ -149,6 +151,7 @@ mod openapi;
 mod query_serving;
 mod recovery;
 mod view_admission;
+mod view_dependencies;
 
 use checkpoint_publication::*;
 use ingest_epoch::*;
@@ -156,6 +159,7 @@ use openapi::openapi_json;
 use query_serving::*;
 use recovery::*;
 use view_admission::*;
+use view_dependencies::*;
 
 const PUBLIC_1_0_MAX_JOIN_INPUT_RELATIONS: usize = 3;
 const PUBLIC_1_0_MAX_TOP_K_LIMIT: usize = 1_000;
@@ -188,6 +192,11 @@ pub struct ApiState {
     standing_runtimes: Arc<StandingRuntimeRegistry>,
     standing_runtime_factories: Arc<StandingRuntimeFactoryRegistry>,
     query_runtimes: Arc<Mutex<HashMap<String, ProductionQueryRuntime>>>,
+    /// Serializes view-on-view dependency admissions in-process so concurrent
+    /// creates cannot both pass the acyclic check on the same snapshot. The
+    /// authoritative meta-store graph revision CAS extends this fence across
+    /// processes.
+    view_dependency_graph_mutex: Arc<AsyncMutex<()>>,
 }
 
 type SharedStandingRuntime = Arc<Mutex<Box<dyn StandingProgramRuntime + Send>>>;
@@ -403,7 +412,7 @@ struct StandingRuntimeCheckpointRecord {
     manifest_hash: String,
 }
 
-fn standing_runtime_checkpoint_record_from_slice(
+pub(crate) fn standing_runtime_checkpoint_record_from_slice(
     bytes: &[u8],
 ) -> Result<StandingRuntimeCheckpointRecord, serde_json::Error> {
     let mut value: Value = serde_json::from_slice(bytes)?;
@@ -819,6 +828,7 @@ impl ApiState {
             standing_runtimes: Arc::new(StandingRuntimeRegistry::default()),
             standing_runtime_factories: Arc::new(StandingRuntimeFactoryRegistry::default()),
             query_runtimes: Arc::new(Mutex::new(HashMap::new())),
+            view_dependency_graph_mutex: Arc::new(AsyncMutex::new(())),
         };
         state.register_standing_program_runtime_factory(
             MATERIALIZED_VIEW_RUNTIME_NAME,
@@ -1243,6 +1253,10 @@ impl ApiState {
             }
         }
 
+        // After restoring runtimes, pull pending producer commits into
+        // dependent consumer views so the chain is caught up.
+        drain_published_view_dependencies(self).await?;
+
         Ok(restored)
     }
 
@@ -1451,6 +1465,7 @@ fn default_scores_relation_catalog() -> Result<VelorixRelationCatalogV1, ApiErro
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema)
         .map_err(ApiError::bad_request)?;
     Ok(VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
         schema_version: RELATION_SCHEMA_VERSION_V1,
         relation_schema,
         schema_fingerprint: schema_fingerprint.clone(),
@@ -2207,6 +2222,17 @@ async fn create_relation_catalog(
     state: ApiState,
     catalog: VelorixRelationCatalogV1,
 ) -> Result<(StatusCode, Json<RelationResponse>), ApiError> {
+    // Internal published-view-output descriptors are created by the view
+    // runtime from validated producer bindings; a user-supplied catalog must
+    // never claim that source kind on the public admission path.
+    if matches!(
+        catalog.relation_source,
+        VelorixRelationSourceV1::PublishedViewOutput { .. }
+    ) {
+        return Err(ApiError::bad_request(
+            "relation catalog admission rejected: `PublishedViewOutput` is an internal source kind reserved for materialized view outputs and cannot be registered through the public relation API",
+        ));
+    }
     let outcome = if let Some(meta_store) = &state.meta_store {
         let outcome = meta_store
             .store_relation_catalog(catalog.clone())

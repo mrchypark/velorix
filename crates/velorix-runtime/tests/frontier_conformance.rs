@@ -12,12 +12,12 @@ use velorix_core::{
         ArrowPhysicalTypeV1, DataFusionRegistrationModeV1, DataFusionRegistrationV1,
         IncrementalAdapterBindingV1, IncrementalRelationBindingV1, RelationColumnV1,
         RelationOperationV1, RelationSemanticRoleV1, SchemaFingerprintV1, VelorixLogicalTypeV1,
-        VelorixRelationCatalogV1, VelorixRelationSchemaV1,
+        VelorixRelationCatalogV1, VelorixRelationSchemaV1, VelorixRelationSourceV1,
         CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID, RELATION_SCHEMA_VERSION_V1,
     },
     standing_program::{
         BuiltinRuntimeIdentity, EpochIdempotencyKey, NativeCodePolicy, RelationInputBatch,
-        ScopedViewId, SnapshotPageRequest, StandingInputChangeV1, StandingProgramIdentity,
+        RelationInputEncodingV1, ScopedViewId, SnapshotPageRequest, StandingProgramIdentity,
         StandingProgramRuntime,
     },
     view_contract::{
@@ -219,8 +219,9 @@ fn input(
     start: u64,
     end: u64,
     rows: &[(&str, i64, i64)],
-) -> StandingInputChangeV1 {
-    StandingInputChangeV1::Source(RelationInputBatch {
+) -> RelationInputBatch {
+    RelationInputBatch {
+        encoding: RelationInputEncodingV1::SourceRelationV1,
         relation_id: catalog.relation_schema.relation_id.clone(),
         relation_version: catalog.relation_schema.relation_version.clone(),
         stream_id: "scores-stream".to_string(),
@@ -292,6 +293,7 @@ fn scores_catalog() -> VelorixRelationCatalogV1 {
     };
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
     VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
         schema_version: RELATION_SCHEMA_VERSION_V1,
         relation_schema,
         schema_fingerprint: schema_fingerprint.clone(),

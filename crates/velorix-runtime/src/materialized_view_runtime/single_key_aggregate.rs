@@ -418,6 +418,8 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
             )?;
             let aggregate_outputs = supported_view_plan_aggregate_outputs(&self.plan);
             let published_state = publish_aggregate_state(&next_state, &self.plan)?;
+            let published_state =
+                project_aggregate_delta_outputs(published_state, &aggregate_outputs)?;
             let visible_output = filter_output_delta_for_having(
                 &published_state,
                 self.plan.having.as_ref(),
@@ -476,16 +478,17 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
             &self.input_event_time_frontiers,
             source_input_batches(input_changes)?,
         )?;
+        let aggregate_outputs = supported_view_plan_aggregate_outputs(&self.plan);
         let output_delta = filter_output_delta_for_having(
             &executor_commit.output_delta,
             self.plan.having.as_ref(),
             self.plan.having_expr.as_ref(),
             &self.output_schema,
-            Some(&supported_view_plan_aggregate_outputs(&self.plan)),
+            Some(&aggregate_outputs),
         )?;
+        let output_delta = project_aggregate_delta_outputs(output_delta, &aggregate_outputs)?;
         let output_delta = if self.plan.top_k.is_some() {
             let previous_output = self.published_output.clone();
-            let aggregate_outputs = supported_view_plan_aggregate_outputs(&self.plan);
             let full_output = filter_output_delta_for_having(
                 &self.engine.materialized_state(),
                 self.plan.having.as_ref(),
@@ -493,6 +496,7 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
                 &self.output_schema,
                 Some(&aggregate_outputs),
             )?;
+            let full_output = project_aggregate_delta_outputs(full_output, &aggregate_outputs)?;
             self.published_output = apply_top_k_to_published_output(
                 full_output,
                 self.plan.top_k.as_ref(),

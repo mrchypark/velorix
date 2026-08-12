@@ -761,6 +761,8 @@ fn view_bootstrap_request(
         plan_hash: "sha256:plan".to_string(),
         view_spec_json: br#"{"view_id":"orders-view"}"#.to_vec(),
         relations: source_cut_request(catalog).relations,
+        view_inputs: Vec::new(),
+        expected_graph_revision: 0,
     }
 }
 

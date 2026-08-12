@@ -8,7 +8,8 @@ use velorix_core::{
         ArrowPhysicalTypeV1, DataFusionRegistrationModeV1, DataFusionRegistrationV1,
         IncrementalAdapterBindingV1, IncrementalRelationBindingV1, RelationColumnV1,
         RelationOperationV1, RelationSemanticRoleV1, SchemaFingerprintV1, VelorixLogicalTypeV1,
-        VelorixRelationCatalogV1, VelorixRelationSchemaV1, CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID,
+        VelorixRelationCatalogV1, VelorixRelationSchemaV1, VelorixRelationSourceV1,
+        CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID,
         CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID, RELATION_SCHEMA_VERSION_V1,
     },
     view_contract::{ColumnSchema, RelationSchema, SqlDataType},
@@ -10522,6 +10523,7 @@ fn scores_catalog() -> VelorixRelationCatalogV1 {
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
 
     VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
         schema_version: RELATION_SCHEMA_VERSION_V1,
         relation_schema,
         schema_fingerprint: schema_fingerprint.clone(),
@@ -10628,6 +10630,7 @@ fn purchases_catalog_without_value_role() -> VelorixRelationCatalogV1 {
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
 
     VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
         schema_version: RELATION_SCHEMA_VERSION_V1,
         relation_schema,
         schema_fingerprint: schema_fingerprint.clone(),
@@ -10721,6 +10724,7 @@ fn accounts_catalog() -> VelorixRelationCatalogV1 {
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
 
     VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
         schema_version: RELATION_SCHEMA_VERSION_V1,
         relation_schema,
         schema_fingerprint: schema_fingerprint.clone(),
@@ -11023,6 +11027,7 @@ fn device_status_catalog() -> VelorixRelationCatalogV1 {
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
 
     VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
         schema_version: RELATION_SCHEMA_VERSION_V1,
         relation_schema,
         schema_fingerprint: schema_fingerprint.clone(),

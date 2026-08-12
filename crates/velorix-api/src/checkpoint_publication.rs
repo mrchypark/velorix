@@ -365,23 +365,39 @@ async fn resolve_authoritative_view_cursor_within_budget(
             cursor.input_edge
         )));
     }
-    let meta_store = state.meta_store.as_ref().ok_or_else(|| {
-        ApiError::service_unavailable(
-            "authoritative metadata is required to resolve a direct view cursor",
-        )
-    })?;
     let producer_view_id = &cursor.producer_view_id;
     let producer_program_id = &cursor.producer_program_id;
-    let mut pointer = meta_store
-        .read_standing_runtime_checkpoint(tenant_id, producer_program_id, producer_view_id)
-        .await
-        .map_err(meta_error_to_api)?
-        .ok_or_else(|| {
-            ApiError::bad_request(format!(
-                "view cursor edge `{}` has no authoritative producer checkpoint",
-                cursor.input_edge
-            ))
-        })?;
+    let mut pointer = match &state.meta_store {
+        Some(meta_store) => meta_store
+            .read_standing_runtime_checkpoint(tenant_id, producer_program_id, producer_view_id)
+            .await
+            .map_err(meta_error_to_api)?
+            .ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "view cursor edge `{}` has no authoritative producer checkpoint",
+                    cursor.input_edge
+                ))
+            })?,
+        None => {
+            let latest_key = ObjectKey::standing_runtime_latest_checkpoint(
+                tenant_id,
+                producer_program_id,
+                producer_view_id,
+            )
+            .map_err(ApiError::bad_request)?;
+            let bytes = state
+                .store
+                .get(&ObjectPath::from(latest_key.as_str()))
+                .await
+                .map_err(ApiError::internal)?
+                .bytes()
+                .await
+                .map_err(ApiError::internal)?;
+            let record = standing_runtime_checkpoint_record_from_slice(&bytes)
+                .map_err(|source| ApiError::bad_request(source.to_string()))?;
+            standing_runtime_checkpoint_pointer_from_record(&record)
+        }
+    };
     let authoritative_head_checkpoint_key = pointer.checkpoint_key.clone();
     let authoritative_head_manifest_hash = pointer.manifest_hash.clone();
 
@@ -445,7 +461,7 @@ async fn resolve_authoritative_view_cursor_within_budget(
     }
 }
 
-async fn validate_authoritative_view_cursor_commit(
+pub(super) async fn validate_authoritative_view_cursor_commit(
     state: &ApiState,
     binding: &PublishedRelationBindingV1,
     cursor: &CausalViewCursorV1,
@@ -1597,7 +1613,7 @@ pub(super) async fn read_standing_runtime_checkpoint_record_from_pointer(
     Ok(record)
 }
 
-async fn read_standing_runtime_checkpoint_record_from_pointer_for_scope(
+pub(super) async fn read_standing_runtime_checkpoint_record_from_pointer_for_scope(
     state: &ApiState,
     tenant_id: &str,
     program_id: &str,

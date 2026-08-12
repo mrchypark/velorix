@@ -508,18 +508,22 @@ fn three_input_join_delta(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let value_column_id = key_column_ids.first().ok_or_else(invalid_runtime_state)?;
-    let delta = arrow_record_batches_to_key_value_delta_batch(
-        catalog,
-        &input.relation_id,
-        &input.relation_version,
-        &input.schema_fingerprint,
-        &key_column_ids,
-        value_column_id,
-        &input.batches,
-    )
-    .map_err(|_| StandingProgramRuntimeError::InvalidProgramIdentity {
-        field: "three_input_join_input_batch",
-    })?;
+    let delta = if let Some(empty_delta) = published_input_empty_delta(input, catalog)? {
+        empty_delta
+    } else {
+        arrow_record_batches_to_key_value_delta_batch(
+            catalog,
+            &input.relation_id,
+            &input.relation_version,
+            &input.schema_fingerprint,
+            &key_column_ids,
+            value_column_id,
+            &input.batches,
+        )
+        .map_err(|_| StandingProgramRuntimeError::InvalidProgramIdentity {
+            field: "three_input_join_input_batch",
+        })?
+    };
     normalize_composite_join_keys(delta, &key_column_ids)
 }
 

@@ -631,7 +631,7 @@ pub(super) async fn run_active_view_backfill_step(
     })
 }
 
-async fn activate_authoritative_view_bootstrap(
+pub(super) async fn activate_authoritative_view_bootstrap(
     state: &ApiState,
     identity: &StandingProgramIdentity,
     view_id: &str,

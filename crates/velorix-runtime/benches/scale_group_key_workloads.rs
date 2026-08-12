@@ -14,7 +14,8 @@ use velorix_core::{
     },
     standing_program::{
         BuiltinRuntimeIdentity, EpochIdempotencyKey, NativeCodePolicy, RelationInputBatch,
-        ScopedViewId, SnapshotPageRequest, StandingProgramIdentity, StandingProgramRuntime,
+        RelationInputEncodingV1, ScopedViewId, SnapshotPageRequest, StandingProgramIdentity,
+        StandingProgramRuntime,
     },
     view_contract::{
         catalog_input_relation_schema, stable_bytes_hash, ColumnSchema, RelationSchema, SqlDataType,
@@ -89,6 +90,7 @@ fn run_workload(workload: &ScaleWorkload) -> BenchResult<ScaleWorkloadMeasuremen
             epoch as u64 + 1,
             EpochIdempotencyKey::new(format!("{}-epoch-{}", workload.id, epoch + 1))?,
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: workload.id.clone(),

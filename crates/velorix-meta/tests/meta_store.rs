@@ -1134,6 +1134,8 @@ fn orders_view_bootstrap_request() -> BeginViewBootstrapRequest {
         plan_hash: "sha256:plan".to_string(),
         view_spec_json: br#"{"view_id":"orders-view"}"#.to_vec(),
         relations: orders_source_cut_request().relations,
+        view_inputs: Vec::new(),
+        expected_graph_revision: 0,
     }
 }
 
@@ -1275,4 +1277,142 @@ fn owner_request(owner_id: &str, ttl_ms: u64) -> AcquireStandingRuntimeOwnerRequ
         owner_id: owner_id.to_string(),
         ttl_ms,
     }
+}
+
+fn view_input_edge(edge_id: &str) -> velorix_meta::BeginViewDependencyEdgeV1 {
+    velorix_meta::BeginViewDependencyEdgeV1 {
+        edge_id: edge_id.to_string(),
+        producer_program_id: "producer".to_string(),
+        producer_view_id: "producer".to_string(),
+        producer_generation: 1,
+        producer_plan_hash: "sha256:producer-plan".to_string(),
+        input_relation_id: "producer-output".to_string(),
+        input_relation_version: "v1".to_string(),
+        output_stream_id: "producer-output/v1".to_string(),
+        output_schema_hash: "sha256:output-schema".to_string(),
+        key_descriptor_hash: "sha256:key-descriptor".to_string(),
+        delta_codec_identity: "velorix-published-delta-v1".to_string(),
+        frontier_kind: "producer_commit_epoch".to_string(),
+        bootstrap_cursor: velorix_core::standing_program::CausalViewCursorV1 {
+            input_edge: edge_id.to_string(),
+            producer_tenant_id: "default".to_string(),
+            producer_program_id: "producer".to_string(),
+            producer_view_id: "producer".to_string(),
+            producer_generation: 1,
+            output_stream: "producer-output/v1".to_string(),
+            output_epoch: 3,
+            commit_digest:
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+        },
+    }
+}
+
+#[tokio::test]
+async fn view_dependency_graph_revision_cas_fences_only_view_input_admissions() {
+    let store = InMemoryMetaStore::default();
+
+    // Source-only admissions do not consume the graph revision and never
+    // bump it: they create isolated nodes with no dependency edges.
+    let source_only = orders_view_bootstrap_request();
+    assert!(matches!(
+        store
+            .begin_view_bootstrap(source_only.clone())
+            .await
+            .unwrap(),
+        BeginViewBootstrapOutcome::Created(_)
+    ));
+    assert_eq!(
+        store
+            .read_view_dependency_graph_revision("default")
+            .await
+            .unwrap(),
+        0
+    );
+    let mut stale = orders_view_bootstrap_request();
+    stale.program_id = "second-source-view".to_string();
+    stale.view_id = "second-source-view".to_string();
+    assert!(matches!(
+        store.begin_view_bootstrap(stale).await.unwrap(),
+        BeginViewBootstrapOutcome::Created(_)
+    ));
+    assert_eq!(
+        store
+            .read_view_dependency_graph_revision("default")
+            .await
+            .unwrap(),
+        0
+    );
+
+    // A view-input admission CAS-checks the expected revision and bumps it.
+    let mut consumer = orders_view_bootstrap_request();
+    consumer.program_id = "consumer-a".to_string();
+    consumer.view_id = "consumer-a".to_string();
+    consumer.view_inputs = vec![view_input_edge("edge-a")];
+    assert!(matches!(
+        store.begin_view_bootstrap(consumer.clone()).await.unwrap(),
+        BeginViewBootstrapOutcome::Created(_)
+    ));
+    assert_eq!(
+        store
+            .read_view_dependency_graph_revision("default")
+            .await
+            .unwrap(),
+        1
+    );
+
+    // A concurrent admission that validated against the stale snapshot must
+    // fail closed with Conflict instead of silently passing the gate.
+    let mut racing = orders_view_bootstrap_request();
+    racing.program_id = "consumer-b".to_string();
+    racing.view_id = "consumer-b".to_string();
+    racing.view_inputs = vec![view_input_edge("edge-b")];
+    assert_eq!(
+        store.begin_view_bootstrap(racing.clone()).await.unwrap(),
+        BeginViewBootstrapOutcome::Conflict
+    );
+
+    // Re-validating against the current revision succeeds and advances it.
+    racing.expected_graph_revision = 1;
+    assert!(matches!(
+        store.begin_view_bootstrap(racing).await.unwrap(),
+        BeginViewBootstrapOutcome::Created(_)
+    ));
+    assert_eq!(
+        store
+            .read_view_dependency_graph_revision("default")
+            .await
+            .unwrap(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn arc_dyn_meta_store_forwarding_reads_live_graph_revision() {
+    // Regression probe for the silent-Ok(0) Arc forwarding bug: the API holds
+    // Arc<dyn MetaStore> and must observe the live revision, never a default.
+    let store: Arc<dyn MetaStore> = Arc::new(InMemoryMetaStore::default());
+    assert_eq!(
+        store
+            .read_view_dependency_graph_revision("default")
+            .await
+            .unwrap(),
+        0
+    );
+    let mut consumer = orders_view_bootstrap_request();
+    consumer.program_id = "consumer-a".to_string();
+    consumer.view_id = "consumer-a".to_string();
+    consumer.view_inputs = vec![view_input_edge("edge-a")];
+    assert!(matches!(
+        store.begin_view_bootstrap(consumer).await.unwrap(),
+        BeginViewBootstrapOutcome::Created(_)
+    ));
+    assert_eq!(
+        store
+            .read_view_dependency_graph_revision("default")
+            .await
+            .unwrap(),
+        1,
+        "Arc<dyn MetaStore> must forward read_view_dependency_graph_revision to the inner store"
+    );
 }

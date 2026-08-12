@@ -10,12 +10,11 @@ use velorix_core::{
     engine::LogicalEpoch,
     standing_program::{
         BuiltinRuntimeIdentity, CausalCutV1, CausalViewCursorV1, DurableStateRoot, EpochCommit,
-        EpochIdempotencyKey, NativeCodePolicy, PublishedViewCommitV1, RelationFrontier,
-        RelationInputBatch, RuntimeCheckpoint, RuntimeCheckpointInputCoverageV1,
+        EpochIdempotencyKey, NativeCodePolicy, RelationFrontier, RelationInputBatch,
+        RelationInputEncodingV1, RuntimeCheckpoint, RuntimeCheckpointInputCoverageV1,
         RuntimeCheckpointPartitionCoverageV1, RuntimeCheckpointRelationCoverageV1, ScopedViewId,
-        SnapshotPageRequest, StandingInputChangeV1, StandingProgramIdentity,
-        StandingProgramRuntime, StandingProgramRuntimeError, ViewFrontier, ViewOutputBatch,
-        ViewOutputDelta, PUBLISHED_VIEW_COMMIT_SCHEMA_VERSION_V1,
+        SnapshotPageRequest, StandingProgramIdentity, StandingProgramRuntime,
+        StandingProgramRuntimeError, ViewFrontier, ViewOutputBatch, ViewOutputDelta,
         RUNTIME_CHECKPOINT_INPUT_COVERAGE_SCHEMA_VERSION_V1,
     },
     view_contract::{ColumnSchema, RelationSchema, SqlDataType},
@@ -466,7 +465,8 @@ fn standing_program_runtime_applies_relation_scoped_epoch_and_emits_view_scoped_
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: "orders".to_string(),
                 relation_version: "2026-05-05.v1".to_string(),
                 stream_id: "test-stream".to_string(),

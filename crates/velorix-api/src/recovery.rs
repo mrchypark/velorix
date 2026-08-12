@@ -124,6 +124,7 @@ pub(super) async fn replay_committed_ingest_into_standing_runtime_limited(
             continue;
         }
         let input_batch = RelationInputBatch {
+            encoding: RelationInputEncodingV1::SourceRelationV1,
             relation_id: header.relation_id.clone(),
             relation_version: header.relation_version.clone(),
             stream_id: descriptor.stream_id.clone(),
@@ -411,62 +412,6 @@ pub(super) async fn read_relation_catalog(
         .read(relation_id, relation_version)
         .await
         .map_err(ApiError::bad_request)
-}
-
-pub(super) async fn read_relation_catalogs_for_view_request(
-    state: &ApiState,
-    request: &CreateViewRequest,
-) -> Result<Vec<VelorixRelationCatalogV1>, ApiError> {
-    let has_single_ref = !request.input_relation_id.trim().is_empty()
-        || !request.input_relation_version.trim().is_empty();
-    if !request.input_relation_refs.is_empty() {
-        if !request.input_relations.is_empty() || has_single_ref {
-            return Err(ApiError::bad_request(
-                "view must use only one input relation selector: input_relation_id/input_relation_version, input_relation_refs, or input_relations",
-            ));
-        }
-        let mut catalogs = Vec::with_capacity(request.input_relation_refs.len());
-        let mut seen = BTreeSet::new();
-        for input in &request.input_relation_refs {
-            if input.relation_id.trim().is_empty() || input.relation_version.trim().is_empty() {
-                return Err(ApiError::bad_request(
-                    "input_relation_refs must include non-empty relation_id and relation_version",
-                ));
-            }
-            if !seen.insert((input.relation_id.as_str(), input.relation_version.as_str())) {
-                return Err(ApiError::bad_request(format!(
-                    "duplicate input_relation_refs entry for relation `{}` version `{}`",
-                    input.relation_id, input.relation_version
-                )));
-            }
-            catalogs.push(
-                read_relation_catalog(state, &input.relation_id, &input.relation_version).await?,
-            );
-        }
-        return Ok(catalogs);
-    }
-    if !request.input_relations.is_empty() {
-        if has_single_ref {
-            return Err(ApiError::bad_request(
-                "view must use only one input relation selector: input_relation_id/input_relation_version, input_relation_refs, or input_relations",
-            ));
-        }
-        return read_relation_catalogs_for_input_schemas(state, &request.input_relations).await;
-    }
-    if request.input_relation_id.trim().is_empty()
-        || request.input_relation_version.trim().is_empty()
-    {
-        return Err(ApiError::bad_request(
-            "view requires either input_relation_id/input_relation_version or input_relations",
-        ));
-    }
-    read_relation_catalog(
-        state,
-        &request.input_relation_id,
-        &request.input_relation_version,
-    )
-    .await
-    .map(|catalog| vec![catalog])
 }
 
 pub(super) async fn read_relation_catalogs_for_input_schemas(

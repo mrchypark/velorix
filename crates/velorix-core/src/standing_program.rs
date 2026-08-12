@@ -113,6 +113,36 @@ impl EpochIdempotencyKey {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RelationInputEncodingV1 {
+    /// Direct source-relation ingest rows carrying the source catalog weight
+    /// column (usually +1 per row).
+    SourceRelationV1,
+    /// Signed bag delta published by a producer view. The Arrow batches carry
+    /// the producer's public output columns followed by exactly one private
+    /// `Int64` weight column; one Arrow row per delta record, weights may be
+    /// negative or have absolute value greater than one.
+    PublishedRelationDeltaV1 {
+        delta_codec_identity: String,
+        output_schema_hash: String,
+        weight_field_name: String,
+        weight_field_index: usize,
+    },
+}
+
+impl RelationInputEncodingV1 {
+    pub fn is_source(&self) -> bool {
+        matches!(self, RelationInputEncodingV1::SourceRelationV1)
+    }
+
+    pub fn is_published_delta(&self) -> bool {
+        matches!(
+            self,
+            RelationInputEncodingV1::PublishedRelationDeltaV1 { .. }
+        )
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RelationInputBatch {
     pub relation_id: String,
@@ -123,45 +153,34 @@ pub struct RelationInputBatch {
     pub start_offset_inclusive: u64,
     pub end_offset_exclusive: u64,
     pub event_time_watermark: Option<InputEventTimeWatermark>,
+    pub encoding: RelationInputEncodingV1,
     pub batches: Vec<RecordBatch>,
 }
 
-/// Tagged input for the StandingProgramRuntime.
-///
-/// Distinguishes between physical source batches and upstream materialized
-/// view deltas. View deltas preserve signed bag weights and are NOT converted
-/// to source offsets.
-#[derive(Clone, Debug)]
-pub enum StandingInputChangeV1 {
-    /// Input from a physical ingest source.
-    Source(RelationInputBatch),
-    /// Input from an upstream materialized view output.
-    View(ViewInputDeltaV1),
-}
-
-/// A signed delta batch from an upstream materialized view.
-///
-/// Contains the edge binding digest, producer cursor, and the actual delta.
-/// The controller must verify the authority chain before passing this to runtime.
-#[derive(Clone, Debug)]
-pub struct ViewInputDeltaV1 {
-    /// Digest of the dependency edge binding this delta came from.
-    pub edge_binding_digest: String,
-    /// Producer cursor at the time of this delta.
-    pub producer_cursor: CausalViewCursorV1,
-    /// Reference to the producer commit object.
-    pub commit_ref: String,
-    /// The signed delta batch from the producer.
-    pub delta: DeltaBatch,
-}
-
-impl ViewInputDeltaV1 {
-    /// Validates the view input delta structure.
-    pub fn validate(&self) -> Result<(), StandingProgramRuntimeError> {
-        require_non_empty("edge_binding_digest", &self.edge_binding_digest)?;
-        self.producer_cursor.validate()?;
-        require_non_empty("commit_ref", &self.commit_ref)?;
-        Ok(())
+impl RelationInputBatch {
+    pub fn source_relation(
+        relation_id: String,
+        relation_version: String,
+        stream_id: String,
+        partition_id: u32,
+        schema_fingerprint: String,
+        start_offset_inclusive: u64,
+        end_offset_exclusive: u64,
+        event_time_watermark: Option<InputEventTimeWatermark>,
+        batches: Vec<RecordBatch>,
+    ) -> Self {
+        Self {
+            relation_id,
+            relation_version,
+            stream_id,
+            partition_id,
+            schema_fingerprint,
+            start_offset_inclusive,
+            end_offset_exclusive,
+            event_time_watermark,
+            encoding: RelationInputEncodingV1::SourceRelationV1,
+            batches,
+        }
     }
 }
 

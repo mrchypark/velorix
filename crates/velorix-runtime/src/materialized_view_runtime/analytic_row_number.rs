@@ -224,18 +224,25 @@ impl StandingProgramRuntime for AnalyticRowNumberRuntime {
         let value_column_ids = analytic_row_number_input_column_ids(&self.plan);
         for input in input_changes {
             validate_input_matches_schema(&input, &self.input_schema, "analytic_row_number_input")?;
-            let delta = arrow_record_batches_to_key_multi_value_delta_batch(
-                &self.catalog,
-                &input.relation_id,
-                &input.relation_version,
-                &input.schema_fingerprint,
-                std::slice::from_ref(&self.plan.key_column_id),
-                &value_column_ids,
-                &input.batches,
-            )
-            .map_err(|_| StandingProgramRuntimeError::InvalidProgramIdentity {
-                field: "analytic_row_number_input_batch",
-            })?;
+            let delta =
+                if let Some(empty_delta) = published_input_empty_delta(&input, &self.catalog)? {
+                    empty_delta
+                } else {
+                    arrow_record_batches_to_key_multi_value_delta_batch(
+                        &self.catalog,
+                        &input.relation_id,
+                        &input.relation_version,
+                        &input.schema_fingerprint,
+                        std::slice::from_ref(&self.plan.key_column_id),
+                        &value_column_ids,
+                        &input.batches,
+                    )
+                    .map_err(|_| {
+                        StandingProgramRuntimeError::InvalidProgramIdentity {
+                            field: "analytic_row_number_input_batch",
+                        }
+                    })?
+                };
             let delta =
                 filter_delta_batch_for_analytic_row_number_plan(&delta, &self.plan, &self.catalog)?;
             self.state

@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use velorix_core::standing_program::CausalViewCursorV1;
+
 use crate::{
     require_non_empty, CaptureIngestSourceCutRequest, IngestSourceCutV1,
     IngestSourceRelationIdentityV1, MetaStoreError, StandingRuntimeCheckpointPointer,
@@ -288,6 +290,29 @@ pub enum ViewBootstrapLifecycleV1 {
     Active,
 }
 
+/// A view-on-view dependency edge declared at consumer admission. The full
+/// durable edge (including the bootstrap cursor) is persisted on the
+/// consumer's active view record; this compact identity is recorded with the
+/// bootstrap control so the authoritative metadata knows the view consumes
+/// producer output rather than direct source ingest.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BeginViewDependencyEdgeV1 {
+    pub edge_id: String,
+    pub producer_program_id: String,
+    pub producer_view_id: String,
+    pub producer_generation: u64,
+    pub producer_plan_hash: String,
+    pub input_relation_id: String,
+    pub input_relation_version: String,
+    pub output_stream_id: String,
+    pub output_schema_hash: String,
+    pub key_descriptor_hash: String,
+    pub delta_codec_identity: String,
+    pub frontier_kind: String,
+    pub bootstrap_cursor: CausalViewCursorV1,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BeginViewBootstrapRequest {
@@ -297,6 +322,14 @@ pub struct BeginViewBootstrapRequest {
     pub plan_hash: String,
     pub view_spec_json: Vec<u8>,
     pub relations: Vec<IngestSourceRelationIdentityV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub view_inputs: Vec<BeginViewDependencyEdgeV1>,
+    /// Graph revision the admission observed; the authoritative store bumps
+    /// the tenant graph revision atomically with the bootstrap record and
+    /// rejects the request with Conflict when the revision moved. Zero skips
+    /// the gate (views without published-view inputs do not touch the graph).
+    #[serde(default)]
+    pub expected_graph_revision: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -315,6 +348,8 @@ pub struct ViewBootstrapControlV1 {
     pub activation_cut: Option<IngestSourceCutV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_checkpoint: Option<StandingRuntimeCheckpointPointer>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub view_inputs: Vec<BeginViewDependencyEdgeV1>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -372,13 +407,51 @@ impl BeginViewBootstrapRequest {
                 field: "view_spec_json",
             });
         }
-        if self.relations.is_empty() {
+        if self.relations.is_empty() && self.view_inputs.is_empty() {
             return Err(MetaStoreError::EmptyField { field: "relations" });
         }
         CaptureIngestSourceCutRequest {
             relations: self.relations.clone(),
         }
-        .validate()
+        .validate()?;
+        let mut seen_edges = std::collections::BTreeSet::new();
+        for edge in &self.view_inputs {
+            require_non_empty("view_inputs.edge_id", &edge.edge_id)?;
+            require_non_empty("view_inputs.producer_program_id", &edge.producer_program_id)?;
+            require_non_empty("view_inputs.producer_view_id", &edge.producer_view_id)?;
+            require_non_empty("view_inputs.producer_plan_hash", &edge.producer_plan_hash)?;
+            require_non_empty("view_inputs.input_relation_id", &edge.input_relation_id)?;
+            require_non_empty(
+                "view_inputs.input_relation_version",
+                &edge.input_relation_version,
+            )?;
+            require_non_empty("view_inputs.output_stream_id", &edge.output_stream_id)?;
+            require_non_empty("view_inputs.output_schema_hash", &edge.output_schema_hash)?;
+            require_non_empty("view_inputs.key_descriptor_hash", &edge.key_descriptor_hash)?;
+            require_non_empty(
+                "view_inputs.delta_codec_identity",
+                &edge.delta_codec_identity,
+            )?;
+            require_non_empty("view_inputs.frontier_kind", &edge.frontier_kind)?;
+            if edge.producer_generation == 0 {
+                return Err(MetaStoreError::IntegerOutOfRange {
+                    field: "view_inputs.producer_generation",
+                    value: edge.producer_generation,
+                });
+            }
+            edge.bootstrap_cursor
+                .validate()
+                .map_err(|_| MetaStoreError::EmptyField {
+                    field: "view_inputs.bootstrap_cursor",
+                })?;
+            if !seen_edges.insert(edge.edge_id.as_str()) {
+                return Err(MetaStoreError::DuplicateSourceCutRelation {
+                    relation_id: edge.edge_id.clone(),
+                    relation_version: String::new(),
+                });
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn matches(&self, control: &ViewBootstrapControlV1) -> bool {
@@ -394,6 +467,7 @@ impl BeginViewBootstrapRequest {
                     .iter()
                     .map(|cut| cut.relation.clone())
                     .collect::<Vec<_>>()
+            && self.view_inputs == control.view_inputs
     }
 }
 
@@ -622,6 +696,7 @@ pub(crate) fn bootstrap_control(
         bootstrap_cut,
         activation_cut: None,
         active_checkpoint: None,
+        view_inputs: request.view_inputs,
     }
 }
 

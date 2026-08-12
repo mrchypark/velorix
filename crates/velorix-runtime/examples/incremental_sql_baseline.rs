@@ -21,12 +21,12 @@ use velorix_core::{
         ArrowPhysicalTypeV1, DataFusionRegistrationModeV1, DataFusionRegistrationV1,
         IncrementalAdapterBindingV1, IncrementalRelationBindingV1, RelationColumnV1,
         RelationOperationV1, RelationSemanticRoleV1, SchemaFingerprintV1, VelorixLogicalTypeV1,
-        VelorixRelationCatalogV1, VelorixRelationSchemaV1, CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID,
-        RELATION_SCHEMA_VERSION_V1,
+        VelorixRelationCatalogV1, VelorixRelationSchemaV1, VelorixRelationSourceV1,
+        CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID, RELATION_SCHEMA_VERSION_V1,
     },
     standing_program::{
         BuiltinRuntimeIdentity, EpochIdempotencyKey, NativeCodePolicy, RelationInputBatch,
-        ScopedViewId, SnapshotPageRequest, StandingInputChangeV1, StandingProgramIdentity,
+        RelationInputEncodingV1, ScopedViewId, SnapshotPageRequest, StandingProgramIdentity,
         StandingProgramRuntime,
     },
     view_contract::{
@@ -347,7 +347,8 @@ fn relation_input_batches(
         let start = *offsets.get(relation_id).unwrap_or(&0);
         let end = start + relation_changes.len() as u64;
         offsets.insert(relation_id.clone(), end);
-        batches.push(StandingInputChangeV1::Source(RelationInputBatch {
+        batches.push(RelationInputBatch {
+            encoding: RelationInputEncodingV1::SourceRelationV1,
             relation_id: relation_id.clone(),
             relation_version: catalog.relation_schema.relation_version.clone(),
             stream_id: format!("{relation_id}-corpus-stream"),
@@ -789,6 +790,7 @@ fn relation_catalog(
     };
     let fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema)?;
     Ok(VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
         schema_version: RELATION_SCHEMA_VERSION_V1,
         relation_schema,
         schema_fingerprint: fingerprint.clone(),

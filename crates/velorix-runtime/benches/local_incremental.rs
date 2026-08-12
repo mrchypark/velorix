@@ -34,8 +34,8 @@ use velorix_core::{
     },
     standing_program::{
         BuiltinRuntimeIdentity, EpochIdempotencyKey, NativeCodePolicy, RelationInputBatch,
-        RuntimeCheckpoint, ScopedViewId, SnapshotPageRequest, StandingProgramIdentity,
-        StandingProgramRuntime,
+        RelationInputEncodingV1, RuntimeCheckpoint, ScopedViewId, SnapshotPageRequest,
+        StandingProgramIdentity, StandingProgramRuntime,
     },
     view_contract::{
         catalog_input_relation_schema, stable_bytes_hash, ColumnSchema, RelationSchema, SqlDataType,
@@ -685,6 +685,7 @@ fn relation_input_batch(
     batch: RecordBatch,
 ) -> RelationInputBatch {
     RelationInputBatch {
+        encoding: RelationInputEncodingV1::SourceRelationV1,
         relation_id: catalog.relation_schema.relation_id.clone(),
         relation_version: catalog.relation_schema.relation_version.clone(),
         stream_id: STREAM_ID.to_string(),

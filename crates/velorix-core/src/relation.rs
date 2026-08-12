@@ -68,6 +68,30 @@ pub struct VelorixRelationCatalogV1 {
     pub datafusion_registration: DataFusionRegistrationV1,
     pub incremental_relation: IncrementalRelationBindingV1,
     pub incremental_adapter: IncrementalAdapterBindingV1,
+    /// Provenance of this catalog. Source catalogs are registered relations
+    /// backed by the ingest log. Published-view-output catalogs are runtime
+    /// planning descriptors derived from a producer's immutable
+    /// `PublishedRelationBindingV1`; they are never registered in the relation
+    /// registry and must never be targets of external ingest.
+    #[serde(default)]
+    pub relation_source: VelorixRelationSourceV1,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum VelorixRelationSourceV1 {
+    SourceRelation,
+    PublishedViewOutput {
+        producer_view_id: String,
+        producer_view_generation: u64,
+        output_stream_id: String,
+    },
+}
+
+impl Default for VelorixRelationSourceV1 {
+    fn default() -> Self {
+        VelorixRelationSourceV1::SourceRelation
+    }
 }
 
 impl VelorixRelationCatalogV1 {
@@ -89,6 +113,7 @@ impl VelorixRelationCatalogV1 {
             incremental_adapter: IncrementalAdapterBindingV1 { adapter_id },
             relation_schema,
             schema_fingerprint,
+            relation_source: VelorixRelationSourceV1::SourceRelation,
         };
         catalog.validate_ingest_adapter_scope()?;
         Ok(catalog)
@@ -103,7 +128,14 @@ impl VelorixRelationCatalogV1 {
 
         let computed = SchemaFingerprintV1::for_relation_schema(&self.relation_schema)?;
         self.schema_fingerprint.validate("schema_fingerprint")?;
-        if self.schema_fingerprint != computed {
+        if matches!(
+            self.relation_source,
+            VelorixRelationSourceV1::SourceRelation
+        ) && self.schema_fingerprint != computed
+        {
+            // Published-view-output descriptors carry the producer's signed
+            // output schema fingerprint, which is computed over the public
+            // output relation (not over the internal descriptor schema).
             return Err(RelationSchemaError::SchemaFingerprintMismatch { field: "catalog" });
         }
 

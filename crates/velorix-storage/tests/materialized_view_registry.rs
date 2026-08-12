@@ -107,6 +107,7 @@ fn artifact_binding(spec: &StandingViewSpec) -> MaterializedViewArtifactBinding 
 
 fn runtime_binding(spec: &StandingViewSpec) -> MaterializedViewRuntimeBinding {
     MaterializedViewRuntimeBinding {
+        input_bindings: Vec::new(),
         runtime_kind: "velorix_materialized_view_runtime".to_string(),
         runtime_version: "builtin-v1".to_string(),
         standing_program_identity: standing_program_identity(&spec.view_id),

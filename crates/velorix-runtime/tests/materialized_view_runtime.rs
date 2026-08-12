@@ -20,17 +20,20 @@ use velorix_core::{
         DataFusionRegistrationModeV1, DataFusionRegistrationV1, IncrementalAdapterBindingV1,
         IncrementalRelationBindingV1, RelationColumnV1, RelationOperationV1,
         RelationSemanticRoleV1, SchemaFingerprintV1, VelorixLogicalTypeV1,
-        VelorixRelationCatalogV1, VelorixRelationSchemaV1, CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID,
+        VelorixRelationCatalogV1, VelorixRelationSchemaV1, VelorixRelationSourceV1,
+        CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID,
         CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID, RELATION_SCHEMA_VERSION_V1,
     },
     standing_program::{
         BuiltinRuntimeIdentity, EpochIdempotencyKey, InputEventTimeWatermark, NativeCodePolicy,
-        RelationFrontier, RelationInputBatch, ScopedViewId, SnapshotPageRequest,
-        StandingInputChangeV1, StandingProgramIdentity, StandingProgramRuntime,
+        RelationFrontier, RelationInputBatch, RelationInputEncodingV1, ScopedViewId,
+        SnapshotPageRequest, StandingProgramIdentity, StandingProgramRuntime,
         StandingProgramRuntimeError,
     },
     view_contract::{
-        catalog_input_relation_schema, stable_bytes_hash, ColumnSchema, RelationSchema, SqlDataType,
+        catalog_from_published_relation_binding, catalog_input_relation_schema,
+        published_relation_binding_v1, stable_bytes_hash, ColumnSchema, RelationSchema,
+        SqlDataType, PUBLISHED_DELTA_WEIGHT_FIELD_V1, PUBLISHED_RELATION_DELTA_CODEC_V1,
     },
     view_plan::{
         logical_view_plan_hash, lower_supported_analytic_row_number_sql_to_logical_plan,
@@ -238,7 +241,8 @@ fn runtime_materializes_global_count_empty_input_and_final_retract_across_restor
         .apply_changes(
             1,
             EpochIdempotencyKey::new("global-count-epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "global-count-stream".to_string(),
@@ -271,7 +275,8 @@ fn runtime_materializes_global_count_empty_input_and_final_retract_across_restor
         .apply_changes(
             2,
             EpochIdempotencyKey::new("global-count-epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "global-count-stream".to_string(),
@@ -311,7 +316,8 @@ fn runtime_materializes_composite_computed_group_keys() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("composite-group-epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "composite-group-stream".to_string(),
@@ -375,7 +381,8 @@ fn runtime_materializes_registered_composite_group_keys_with_null() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("registered-composite-group-epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "registered-composite-group-stream".to_string(),
@@ -423,7 +430,8 @@ fn runtime_materializes_registered_composite_group_keys_with_null() {
         .apply_changes(
             2,
             EpochIdempotencyKey::new("registered-composite-group-epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "registered-composite-group-stream".to_string(),
@@ -481,7 +489,8 @@ fn runtime_materializes_sum_count_for_relation_without_value_semantic_role() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -553,6 +562,7 @@ fn runtime_repeated_epoch_is_idempotent_before_and_after_restore() {
     )
     .unwrap();
     let input = RelationInputBatch {
+        encoding: RelationInputEncodingV1::SourceRelationV1,
         relation_id: catalog.relation_schema.relation_id.clone(),
         relation_version: catalog.relation_schema.relation_version.clone(),
         stream_id: "idempotent-stream".to_string(),
@@ -632,18 +642,17 @@ fn runtime_same_epoch_input_permutations_have_identical_state_output_and_restore
         "select user_id, sum(amount) as sum, count(*) as count from purchases group by user_id";
     let identity = standing_identity(sql);
     let inputs = [(0, "alice", 10), (1, "bob", 5), (2, "alice", 7)].map(
-        |(partition_id, user_id, amount)| {
-            StandingInputChangeV1::Source(RelationInputBatch {
-                relation_id: catalog.relation_schema.relation_id.clone(),
-                relation_version: catalog.relation_schema.relation_version.clone(),
-                stream_id: "permutation-stream".to_string(),
-                partition_id,
-                schema_fingerprint: catalog.schema_fingerprint.to_string(),
-                start_offset_inclusive: 0,
-                end_offset_exclusive: 1,
-                event_time_watermark: None,
-                batches: vec![purchases_rows_batch(&[(user_id, amount, 1)])],
-            })
+        |(partition_id, user_id, amount)| RelationInputBatch {
+            encoding: RelationInputEncodingV1::SourceRelationV1,
+            relation_id: catalog.relation_schema.relation_id.clone(),
+            relation_version: catalog.relation_schema.relation_version.clone(),
+            stream_id: "permutation-stream".to_string(),
+            partition_id,
+            schema_fingerprint: catalog.schema_fingerprint.to_string(),
+            start_offset_inclusive: 0,
+            end_offset_exclusive: 1,
+            event_time_watermark: None,
+            batches: vec![purchases_rows_batch(&[(user_id, amount, 1)])],
         },
     );
     let mut baseline = None;
@@ -829,7 +838,8 @@ fn runtime_materializes_sum_arithmetic_expression() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -904,7 +914,8 @@ fn runtime_materializes_cast_int64_aggregate_expression() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -1003,7 +1014,8 @@ fn runtime_materializes_nested_double_colon_cast_int64_aggregate_expression() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -1102,7 +1114,8 @@ fn runtime_materializes_try_and_safe_cast_int64_aggregate_expressions() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -1201,7 +1214,8 @@ fn runtime_materializes_abs_int64_aggregate_expression() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -1309,7 +1323,8 @@ fn runtime_materializes_greatest_least_int64_aggregate_expressions() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -1419,7 +1434,8 @@ fn runtime_materializes_coalesce_nullable_int64_aggregate_expression() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -1523,7 +1539,8 @@ fn runtime_materializes_is_not_distinct_from_null_predicate() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -1627,7 +1644,8 @@ fn runtime_materializes_is_distinct_from_predicate() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -1731,7 +1749,8 @@ fn runtime_materializes_case_when_distinct_from_null_predicates() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -1835,7 +1854,8 @@ fn runtime_materializes_case_when_is_null_predicates() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -1939,7 +1959,8 @@ fn runtime_materializes_case_when_int64_aggregate_expression() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -2043,7 +2064,8 @@ fn runtime_materializes_case_when_between_and_in_predicates() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -2149,7 +2171,8 @@ fn runtime_materializes_if_int64_aggregate_expression() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -2248,7 +2271,8 @@ fn runtime_materializes_multi_branch_case_when_int64_aggregate_expression() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -2347,7 +2371,8 @@ fn runtime_materializes_simple_case_when_int64_aggregate_expression() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -2422,7 +2447,8 @@ fn runtime_materializes_count_only_aggregate_and_restores_state() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -2444,7 +2470,8 @@ fn runtime_materializes_count_only_aggregate_and_restores_state() {
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -2493,7 +2520,8 @@ fn runtime_materializes_filter_project_view_and_restores_state() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -2513,7 +2541,8 @@ fn runtime_materializes_filter_project_view_and_restores_state() {
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -2527,6 +2556,262 @@ fn runtime_materializes_filter_project_view_and_restores_state() {
         )
         .unwrap();
     assert_projected_scores_page(restored.as_ref(), 2, &[("carol", 7)]);
+}
+
+#[test]
+fn runtime_materializes_filter_project_view_from_published_relation_delta_input() {
+    let binding = published_relation_binding_v1(
+        "filtered_scores",
+        7,
+        "velorix-logical-view-plan-sha256-v1:plan",
+        &filtered_scores_published_relation(),
+    )
+    .unwrap();
+    let catalog = catalog_from_published_relation_binding(&binding).unwrap();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    assert_eq!(input_schema, binding.relation);
+    let output_schema = filtered_scores_projection_output_schema();
+    let sql = "select user_id, score from filtered_scores where score > 0 order by score desc";
+    let identity = standing_identity_with_view(sql, "positive_scores");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    let published_encoding = RelationInputEncodingV1::PublishedRelationDeltaV1 {
+        delta_codec_identity: PUBLISHED_RELATION_DELTA_CODEC_V1.to_string(),
+        output_schema_hash: binding.output_schema_hash.clone(),
+        weight_field_name: PUBLISHED_DELTA_WEIGHT_FIELD_V1.to_string(),
+        weight_field_index: binding.relation.columns.len(),
+    };
+    let input_batch = |start: u64, end: u64, rows: &[(&str, i64, i64)]| RelationInputBatch {
+        encoding: published_encoding.clone(),
+        relation_id: binding.relation.relation_id.clone(),
+        relation_version: binding.relation.relation_version.clone(),
+        stream_id: binding.output_stream_id.clone(),
+        partition_id: 0,
+        schema_fingerprint: binding.relation.schema_fingerprint.clone(),
+        start_offset_inclusive: start,
+        end_offset_exclusive: end,
+        event_time_watermark: None,
+        batches: vec![filtered_scores_published_batch(rows)],
+    };
+
+    runtime
+        .apply_changes(
+            10,
+            EpochIdempotencyKey::new("published-epoch-10").unwrap(),
+            vec![input_batch(0, 10, &[("alice", 10, 1), ("carol", 3, 1)])],
+        )
+        .unwrap();
+    assert_projected_scores_page(runtime.as_ref(), 10, &[("alice", 10), ("carol", 3)]);
+
+    runtime
+        .apply_changes(
+            25,
+            EpochIdempotencyKey::new("published-epoch-25").unwrap(),
+            vec![input_batch(
+                10,
+                25,
+                &[
+                    ("alice", 10, -1),
+                    ("bob", -4, 1),
+                    ("carol", 3, -1),
+                    ("dave", 8, 1),
+                ],
+            )],
+        )
+        .unwrap();
+    assert_projected_scores_page(runtime.as_ref(), 25, &[("dave", 8)]);
+
+    let mut restored = restore_standing_runtime(runtime.checkpoint().unwrap()).unwrap();
+    restored
+        .apply_changes(
+            100,
+            EpochIdempotencyKey::new("published-epoch-100").unwrap(),
+            vec![RelationInputBatch {
+                encoding: published_encoding,
+                relation_id: binding.relation.relation_id.clone(),
+                relation_version: binding.relation.relation_version.clone(),
+                stream_id: binding.output_stream_id.clone(),
+                partition_id: 0,
+                schema_fingerprint: binding.relation.schema_fingerprint.clone(),
+                start_offset_inclusive: 25,
+                end_offset_exclusive: 100,
+                event_time_watermark: None,
+                batches: vec![filtered_scores_published_empty_batch()],
+            }],
+        )
+        .unwrap();
+    assert_projected_scores_page(restored.as_ref(), 100, &[("dave", 8)]);
+}
+
+#[test]
+fn runtime_rejects_published_relation_delta_input_with_wrong_codec_or_weight_layout() {
+    let binding = published_relation_binding_v1(
+        "filtered_scores",
+        7,
+        "velorix-logical-view-plan-sha256-v1:plan",
+        &filtered_scores_published_relation(),
+    )
+    .unwrap();
+    let catalog = catalog_from_published_relation_binding(&binding).unwrap();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = filtered_scores_projection_output_schema();
+    let sql = "select user_id, score from filtered_scores where score > 0";
+    let identity = standing_identity_with_view(sql, "positive_scores");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    let wrong_codec = RelationInputEncodingV1::PublishedRelationDeltaV1 {
+        delta_codec_identity: "not-the-published-codec".to_string(),
+        output_schema_hash: binding.output_schema_hash.clone(),
+        weight_field_name: PUBLISHED_DELTA_WEIGHT_FIELD_V1.to_string(),
+        weight_field_index: binding.relation.columns.len(),
+    };
+    let result = runtime.apply_changes(
+        1,
+        EpochIdempotencyKey::new("published-epoch-1").unwrap(),
+        vec![RelationInputBatch {
+            encoding: wrong_codec,
+            relation_id: binding.relation.relation_id.clone(),
+            relation_version: binding.relation.relation_version.clone(),
+            stream_id: binding.output_stream_id.clone(),
+            partition_id: 0,
+            schema_fingerprint: binding.relation.schema_fingerprint.clone(),
+            start_offset_inclusive: 0,
+            end_offset_exclusive: 1,
+            event_time_watermark: None,
+            batches: vec![filtered_scores_published_batch(&[("alice", 10, 1)])],
+        }],
+    );
+    assert!(matches!(
+        result,
+        Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+            field: "published_input.delta_codec_identity"
+        })
+    ));
+
+    let wrong_weight_index = RelationInputEncodingV1::PublishedRelationDeltaV1 {
+        delta_codec_identity: PUBLISHED_RELATION_DELTA_CODEC_V1.to_string(),
+        output_schema_hash: binding.output_schema_hash.clone(),
+        weight_field_name: PUBLISHED_DELTA_WEIGHT_FIELD_V1.to_string(),
+        weight_field_index: 0,
+    };
+    let result = runtime.apply_changes(
+        1,
+        EpochIdempotencyKey::new("published-epoch-1").unwrap(),
+        vec![RelationInputBatch {
+            encoding: wrong_weight_index,
+            relation_id: binding.relation.relation_id.clone(),
+            relation_version: binding.relation.relation_version.clone(),
+            stream_id: binding.output_stream_id.clone(),
+            partition_id: 0,
+            schema_fingerprint: binding.relation.schema_fingerprint.clone(),
+            start_offset_inclusive: 0,
+            end_offset_exclusive: 1,
+            event_time_watermark: None,
+            batches: vec![filtered_scores_published_batch(&[("alice", 10, 1)])],
+        }],
+    );
+    assert!(matches!(
+        result,
+        Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+            field: "published_input.weight_field_index"
+        })
+    ));
+}
+
+fn filtered_scores_published_relation() -> RelationSchema {
+    RelationSchema {
+        relation_id: "filtered_scores".to_string(),
+        relation_name: "filtered_scores".to_string(),
+        relation_version: "v1".to_string(),
+        schema_fingerprint: format!("sha256:{}", "2".repeat(64)),
+        columns: vec![
+            ColumnSchema {
+                name: "user_id".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "score".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["user_id".to_string()],
+    }
+}
+
+fn filtered_scores_projection_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "positive_scores".to_string(),
+        relation_name: "positive_scores".to_string(),
+        relation_version: "v1".to_string(),
+        schema_fingerprint: format!("sha256:{}", "3".repeat(64)),
+        columns: vec![
+            ColumnSchema {
+                name: "user_id".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "score".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["user_id".to_string()],
+    }
+}
+
+fn filtered_scores_published_batch(rows: &[(&str, i64, i64)]) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("score", DataType::Int64, false),
+            Field::new(PUBLISHED_DELTA_WEIGHT_FIELD_V1, DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|row| row.2).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap()
+}
+
+fn filtered_scores_published_empty_batch() -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("score", DataType::Int64, false),
+            Field::new(PUBLISHED_DELTA_WEIGHT_FIELD_V1, DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+            Arc::new(Int64Array::from(Vec::<i64>::new())),
+            Arc::new(Int64Array::from(Vec::<i64>::new())),
+        ],
+    )
+    .unwrap()
 }
 
 #[test]
@@ -2549,7 +2834,8 @@ fn runtime_materializes_plain_select_distinct_filter_project_when_primary_key_is
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -2569,7 +2855,8 @@ fn runtime_materializes_plain_select_distinct_filter_project_when_primary_key_is
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -2630,7 +2917,8 @@ fn runtime_materializes_plain_select_distinct_filter_project_by_projected_output
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -2654,7 +2942,8 @@ fn runtime_materializes_plain_select_distinct_filter_project_by_projected_output
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -2673,7 +2962,8 @@ fn runtime_materializes_plain_select_distinct_filter_project_by_projected_output
         .apply_changes(
             3,
             EpochIdempotencyKey::new("epoch-3").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -2712,7 +3002,8 @@ fn runtime_materializes_row_number_and_restores_rerank_state() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -2739,7 +3030,8 @@ fn runtime_materializes_row_number_and_restores_rerank_state() {
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -2773,7 +3065,8 @@ fn runtime_materializes_row_number_and_restores_rerank_state() {
         .apply_changes(
             3,
             EpochIdempotencyKey::new("epoch-3").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -2813,7 +3106,8 @@ fn runtime_materializes_rank_with_sql_order_ties() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -2871,7 +3165,8 @@ fn runtime_materializes_dense_rank_with_sql_order_ties() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -2929,7 +3224,8 @@ fn runtime_materializes_wrapped_row_number_top_n() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -2956,7 +3252,8 @@ fn runtime_materializes_wrapped_row_number_top_n() {
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -3004,7 +3301,8 @@ fn runtime_materializes_wrapped_row_number_top_one_and_promotes_after_delete() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -3033,7 +3331,8 @@ fn runtime_materializes_wrapped_row_number_top_one_and_promotes_after_delete() {
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -3076,7 +3375,8 @@ fn runtime_materializes_row_number_with_source_and_outer_predicates_before_ranki
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -3121,7 +3421,8 @@ fn runtime_restore_rejects_row_number_checkpoint_when_state_mismatches_published
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -3257,7 +3558,8 @@ fn runtime_materializes_row_number_with_precise_large_int64_ordering() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -3297,7 +3599,8 @@ fn runtime_materializes_filter_project_union_distinct_overlapping_branch_rows_on
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -3321,7 +3624,8 @@ fn runtime_materializes_filter_project_union_distinct_overlapping_branch_rows_on
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -3357,7 +3661,8 @@ fn runtime_materializes_filter_project_intersect_distinct_overlapping_branch_row
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -3400,7 +3705,8 @@ fn runtime_materializes_filter_project_except_distinct_left_minus_right_and_rest
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -3424,7 +3730,8 @@ fn runtime_materializes_filter_project_except_distinct_left_minus_right_and_rest
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -3460,7 +3767,8 @@ fn runtime_materializes_filter_project_with_scalar_expression_predicate() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -3484,7 +3792,8 @@ fn runtime_materializes_filter_project_with_scalar_expression_predicate() {
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -3520,7 +3829,8 @@ fn runtime_materializes_filter_project_with_expression_vs_expression_predicate()
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -3544,7 +3854,8 @@ fn runtime_materializes_filter_project_with_expression_vs_expression_predicate()
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -3583,7 +3894,8 @@ fn runtime_materializes_filter_project_with_unprojected_predicate_column() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -3607,7 +3919,8 @@ fn runtime_materializes_filter_project_with_unprojected_predicate_column() {
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -3646,7 +3959,8 @@ fn runtime_materializes_single_key_aggregates_over_multiple_raw_int64_input_colu
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -3673,7 +3987,8 @@ fn runtime_materializes_single_key_aggregates_over_multiple_raw_int64_input_colu
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -3729,7 +4044,8 @@ fn runtime_materializes_multi_input_count_distinct_by_selected_value_across_rest
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -3759,7 +4075,8 @@ fn runtime_materializes_multi_input_count_distinct_by_selected_value_across_rest
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -3788,7 +4105,8 @@ fn runtime_materializes_multi_input_count_distinct_by_selected_value_across_rest
         .apply_changes(
             3,
             EpochIdempotencyKey::new("epoch-3").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -3834,7 +4152,8 @@ fn runtime_materializes_filter_project_order_by_limit_top_k_and_restores_full_st
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -3858,7 +4177,8 @@ fn runtime_materializes_filter_project_order_by_limit_top_k_and_restores_full_st
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -3894,7 +4214,8 @@ fn runtime_materializes_filter_project_order_by_limit_offset_top_k() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -3918,7 +4239,8 @@ fn runtime_materializes_filter_project_order_by_limit_offset_top_k() {
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -3954,7 +4276,8 @@ fn runtime_materializes_filter_project_order_by_fetch_first_top_k() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -3996,7 +4319,8 @@ fn runtime_materializes_filter_project_hidden_input_order_by_top_k() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -4020,7 +4344,8 @@ fn runtime_materializes_filter_project_hidden_input_order_by_top_k() {
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -4056,7 +4381,8 @@ fn runtime_materializes_filter_project_cte_source_filters() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -4097,7 +4423,8 @@ fn runtime_materializes_filter_project_derived_table_source_filters() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -4139,7 +4466,8 @@ fn runtime_materializes_filter_project_nullable_value_and_restores_state() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -4190,7 +4518,8 @@ fn runtime_materializes_computed_filter_project_view() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -4209,7 +4538,8 @@ fn runtime_materializes_computed_filter_project_view() {
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -4245,7 +4575,8 @@ fn runtime_materializes_filter_project_case_over_bool_predicate() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "device-status-stream".to_string(),
@@ -4330,7 +4661,8 @@ fn runtime_materializes_count_distinct_aggregate_and_restores_state() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -4357,7 +4689,8 @@ fn runtime_materializes_count_distinct_aggregate_and_restores_state() {
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -4394,7 +4727,8 @@ fn runtime_materializes_non_null_column_count_aggregate() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -4431,7 +4765,8 @@ fn runtime_materializes_nullable_column_count_aggregate() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -4468,7 +4803,8 @@ fn runtime_materializes_mixed_nullable_column_count_aggregate() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -4510,7 +4846,8 @@ fn runtime_materializes_identity_cte_single_relation_aggregate() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -4552,7 +4889,8 @@ fn runtime_materializes_cte_source_filter_single_relation_aggregate() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -4594,7 +4932,8 @@ fn runtime_materializes_derived_table_source_filter_single_relation_aggregate() 
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -4636,7 +4975,8 @@ fn runtime_materializes_cte_source_and_outer_where_filters() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -4683,7 +5023,8 @@ fn runtime_commit_publishes_materialized_output_batch_after_ingest() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -4750,7 +5091,8 @@ fn runtime_commit_publishes_signed_output_delta_for_changed_keys_only() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -4768,7 +5110,8 @@ fn runtime_commit_publishes_signed_output_delta_for_changed_keys_only() {
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -4826,7 +5169,8 @@ fn runtime_materializes_filtered_single_relation_aggregate_view() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -4898,7 +5242,8 @@ fn runtime_materializes_single_relation_aggregate_with_scalar_expression_predica
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -4926,7 +5271,8 @@ fn runtime_materializes_single_relation_aggregate_with_scalar_expression_predica
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -4967,7 +5313,8 @@ fn runtime_materializes_single_relation_aggregate_with_between_predicates() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -5009,7 +5356,8 @@ fn runtime_materializes_single_relation_aggregate_with_matching_filters() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -5051,7 +5399,8 @@ fn runtime_materializes_single_relation_aggregate_with_mixed_filters() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -5076,7 +5425,8 @@ fn runtime_materializes_single_relation_aggregate_with_mixed_filters() {
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -5126,7 +5476,8 @@ fn runtime_materializes_single_relation_filtered_count_distinct_with_mixed_filte
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -5181,7 +5532,8 @@ fn runtime_materializes_single_relation_mixed_min_max_avg_filters() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -5236,7 +5588,8 @@ fn runtime_materializes_single_relation_mixed_filter_having_top_k() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -5261,7 +5614,8 @@ fn runtime_materializes_single_relation_mixed_filter_having_top_k() {
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -5301,7 +5655,8 @@ fn runtime_materializes_single_relation_aggregate_with_different_filters() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -5343,7 +5698,8 @@ fn runtime_materializes_single_relation_aggregate_having_view() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -5449,7 +5805,8 @@ fn runtime_materializes_single_relation_having_count_distinct_function_view() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -5527,7 +5884,8 @@ fn runtime_rejects_non_contiguous_input_offsets_without_advancing_frontier() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -5552,7 +5910,8 @@ fn runtime_rejects_non_contiguous_input_offsets_without_advancing_frontier() {
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -5578,7 +5937,8 @@ fn runtime_rejects_non_contiguous_input_offsets_without_advancing_frontier() {
         .apply_changes(
             3,
             EpochIdempotencyKey::new("epoch-3").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -5596,7 +5956,8 @@ fn runtime_rejects_non_contiguous_input_offsets_without_advancing_frontier() {
         .apply_changes(
             4,
             EpochIdempotencyKey::new("epoch-4").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -5650,7 +6011,8 @@ fn runtime_tracks_input_frontiers_by_relation_stream_and_partition() {
             .apply_changes(
                 epoch,
                 EpochIdempotencyKey::new(format!("epoch-{epoch}")).unwrap(),
-                vec![StandingInputChangeV1::Source(RelationInputBatch {
+                vec![RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: catalog.relation_schema.relation_id.clone(),
                     relation_version: catalog.relation_schema.relation_version.clone(),
                     stream_id: stream_id.to_string(),
@@ -5700,7 +6062,8 @@ fn runtime_accepts_sparse_first_offset_for_new_stream_frontier() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "sparse-stream".to_string(),
@@ -5742,7 +6105,8 @@ fn runtime_checkpoints_event_time_frontiers_by_source_partition() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -5766,7 +6130,8 @@ fn runtime_checkpoints_event_time_frontiers_by_source_partition() {
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -5832,7 +6197,8 @@ fn runtime_rejects_non_monotonic_event_time_watermark_for_source_partition() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -5856,7 +6222,8 @@ fn runtime_rejects_non_monotonic_event_time_watermark_for_source_partition() {
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -5905,7 +6272,8 @@ fn runtime_restore_rejects_malformed_event_time_frontier_even_when_payload_match
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -5986,7 +6354,8 @@ fn runtime_materializes_avg_projection_aliases_for_relation_without_value_semant
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -6072,7 +6441,8 @@ fn runtime_materializes_single_key_order_by_limit_top_k_and_restores_state() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -6091,7 +6461,8 @@ fn runtime_materializes_single_key_order_by_limit_top_k_and_restores_state() {
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -6131,7 +6502,8 @@ fn runtime_materializes_single_key_order_by_limit_offset_top_k() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -6150,7 +6522,8 @@ fn runtime_materializes_single_key_order_by_limit_offset_top_k() {
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -6186,7 +6559,8 @@ fn runtime_materializes_single_key_order_by_function_top_k() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-top-k-stream".to_string(),
@@ -6263,7 +6637,8 @@ fn runtime_materializes_single_key_order_by_metric_then_key_top_k() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-top-k-stream".to_string(),
@@ -6340,7 +6715,8 @@ fn runtime_materializes_decimal_avg_as_float64_output() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -6409,7 +6785,8 @@ fn runtime_materializes_avg_arithmetic_expression() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -6477,7 +6854,8 @@ fn runtime_materializes_filtered_projected_aggregate_view() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -6662,7 +7040,8 @@ fn runtime_materializes_min_max_and_recomputes_after_extreme_delete() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -6679,7 +7058,8 @@ fn runtime_materializes_min_max_and_recomputes_after_extreme_delete() {
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -6756,7 +7136,8 @@ fn runtime_materializes_min_max_arithmetic_expression() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -6831,7 +7212,8 @@ fn runtime_restores_min_max_multiset_checkpoint_before_extreme_delete() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -6851,7 +7233,8 @@ fn runtime_restores_min_max_multiset_checkpoint_before_extreme_delete() {
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -6923,7 +7306,8 @@ fn runtime_restored_query_reads_published_output_not_engine_state() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -7011,7 +7395,8 @@ fn runtime_restore_without_admitted_plan_metadata_fails_closed() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -7060,7 +7445,8 @@ fn runtime_materializes_two_relation_join_and_restores_epoch_consistent_state() 
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
-                StandingInputChangeV1::Source(RelationInputBatch {
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -7075,8 +7461,9 @@ fn runtime_materializes_two_relation_join_and_restores_epoch_consistent_state() 
                         ("alice", 7, 1),
                         ("charlie", 30, 1),
                     ])],
-                }),
-                StandingInputChangeV1::Source(RelationInputBatch {
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -7126,7 +7513,8 @@ fn runtime_materializes_two_relation_join_and_restores_epoch_consistent_state() 
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: scores.relation_schema.relation_id.clone(),
                 relation_version: scores.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -8613,7 +9001,8 @@ fn runtime_materializes_left_join_left_only_aggregates_for_unmatched_left_rows()
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
-                StandingInputChangeV1::Source(RelationInputBatch {
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -8628,8 +9017,9 @@ fn runtime_materializes_left_join_left_only_aggregates_for_unmatched_left_rows()
                         ("alice", 7, 1),
                         ("charlie", 30, 1),
                     ])],
-                }),
-                StandingInputChangeV1::Source(RelationInputBatch {
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -8663,7 +9053,8 @@ fn runtime_materializes_left_join_left_only_aggregates_for_unmatched_left_rows()
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: accounts.relation_schema.relation_id.clone(),
                 relation_version: accounts.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -8690,7 +9081,8 @@ fn runtime_materializes_left_join_left_only_aggregates_for_unmatched_left_rows()
         .apply_changes(
             3,
             EpochIdempotencyKey::new("epoch-3").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: accounts.relation_schema.relation_id.clone(),
                 relation_version: accounts.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -9234,7 +9626,8 @@ fn runtime_materializes_right_join_by_swapping_to_left_join_state() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
-                StandingInputChangeV1::Source(RelationInputBatch {
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -9244,8 +9637,9 @@ fn runtime_materializes_right_join_by_swapping_to_left_join_state() {
                     end_offset_exclusive: 1,
                     event_time_watermark: None,
                     batches: vec![scores_rows_batch(&[("alice", 10, 1)])],
-                }),
-                StandingInputChangeV1::Source(RelationInputBatch {
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -9303,7 +9697,8 @@ fn runtime_materializes_left_join_with_left_only_aggregate_filter_for_unmatched_
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
-                StandingInputChangeV1::Source(RelationInputBatch {
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -9319,8 +9714,9 @@ fn runtime_materializes_left_join_with_left_only_aggregate_filter_for_unmatched_
                         ("charlie", 30, 1),
                         ("charlie", -1, 1),
                     ])],
-                }),
-                StandingInputChangeV1::Source(RelationInputBatch {
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -9367,7 +9763,8 @@ fn runtime_materializes_two_relation_join_with_generic_adapter_catalogs() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
-                StandingInputChangeV1::Source(RelationInputBatch {
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -9381,8 +9778,9 @@ fn runtime_materializes_two_relation_join_with_generic_adapter_catalogs() {
                         ("bob", 5, 1),
                         ("alice", 7, 1),
                     ])],
-                }),
-                StandingInputChangeV1::Source(RelationInputBatch {
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -9501,7 +9899,8 @@ fn apply_join_expression_fixture(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
-                StandingInputChangeV1::Source(RelationInputBatch {
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -9515,8 +9914,9 @@ fn apply_join_expression_fixture(
                         ("bob", 5, 1),
                         ("alice", 7, 1),
                     ])],
-                }),
-                StandingInputChangeV1::Source(RelationInputBatch {
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -9557,7 +9957,8 @@ fn runtime_materializes_two_relation_join_count_only_and_restores_state() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
-                StandingInputChangeV1::Source(RelationInputBatch {
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -9572,8 +9973,9 @@ fn runtime_materializes_two_relation_join_count_only_and_restores_state() {
                         ("alice", 7, 1),
                         ("charlie", 30, 1),
                     ])],
-                }),
-                StandingInputChangeV1::Source(RelationInputBatch {
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -9596,7 +9998,8 @@ fn runtime_materializes_two_relation_join_count_only_and_restores_state() {
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: scores.relation_schema.relation_id.clone(),
                 relation_version: scores.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -9638,7 +10041,8 @@ fn runtime_materializes_two_relation_join_count_distinct_only_and_restores_state
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
-                StandingInputChangeV1::Source(RelationInputBatch {
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -9653,8 +10057,9 @@ fn runtime_materializes_two_relation_join_count_distinct_only_and_restores_state
                         ("alice", 7, 1),
                         ("bob", 5, 1),
                     ])],
-                }),
-                StandingInputChangeV1::Source(RelationInputBatch {
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -9677,7 +10082,8 @@ fn runtime_materializes_two_relation_join_count_distinct_only_and_restores_state
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: scores.relation_schema.relation_id.clone(),
                 relation_version: scores.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -9719,7 +10125,8 @@ fn runtime_materializes_two_relation_join_grouped_by_left_key_projection() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
-                StandingInputChangeV1::Source(RelationInputBatch {
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -9733,8 +10140,9 @@ fn runtime_materializes_two_relation_join_grouped_by_left_key_projection() {
                         ("bob", 5, 1),
                         ("alice", 7, 1),
                     ])],
-                }),
-                StandingInputChangeV1::Source(RelationInputBatch {
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -9757,7 +10165,8 @@ fn runtime_materializes_two_relation_join_grouped_by_left_key_projection() {
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: scores.relation_schema.relation_id.clone(),
                 relation_version: scores.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -9800,7 +10209,8 @@ fn runtime_materializes_two_relation_join_stats_and_restores_incremental_state()
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
-                StandingInputChangeV1::Source(RelationInputBatch {
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -9815,8 +10225,9 @@ fn runtime_materializes_two_relation_join_stats_and_restores_incremental_state()
                         ("alice", 7, 1),
                         ("charlie", 30, 1),
                     ])],
-                }),
-                StandingInputChangeV1::Source(RelationInputBatch {
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -9843,7 +10254,8 @@ fn runtime_materializes_two_relation_join_stats_and_restores_incremental_state()
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: scores.relation_schema.relation_id.clone(),
                 relation_version: scores.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -9899,7 +10311,8 @@ fn runtime_materializes_two_relation_join_right_side_stats_and_restores_state() 
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
-                StandingInputChangeV1::Source(RelationInputBatch {
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -9913,8 +10326,9 @@ fn runtime_materializes_two_relation_join_right_side_stats_and_restores_state() 
                         ("bob", 5, 1),
                         ("alice", 7, 1),
                     ])],
-                }),
-                StandingInputChangeV1::Source(RelationInputBatch {
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -9944,7 +10358,8 @@ fn runtime_materializes_two_relation_join_right_side_stats_and_restores_state() 
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: accounts.relation_schema.relation_id.clone(),
                 relation_version: accounts.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -10002,7 +10417,8 @@ fn runtime_materializes_two_relation_join_decimal_avg_as_float64_output() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
-                StandingInputChangeV1::Source(RelationInputBatch {
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -10016,8 +10432,9 @@ fn runtime_materializes_two_relation_join_decimal_avg_as_float64_output() {
                         ("bob", 5, 1),
                         ("alice", 7, 1),
                     ])],
-                }),
-                StandingInputChangeV1::Source(RelationInputBatch {
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -10073,7 +10490,8 @@ fn runtime_materializes_two_relation_join_nullable_right_value_count() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
-                StandingInputChangeV1::Source(RelationInputBatch {
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -10087,8 +10505,9 @@ fn runtime_materializes_two_relation_join_nullable_right_value_count() {
                         ("bob", 5, 1),
                         ("alice", 7, 1),
                     ])],
-                }),
-                StandingInputChangeV1::Source(RelationInputBatch {
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -10118,7 +10537,8 @@ fn runtime_materializes_two_relation_join_nullable_right_value_count() {
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: accounts.relation_schema.relation_id.clone(),
                 relation_version: accounts.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -10173,7 +10593,8 @@ fn runtime_materializes_two_relation_join_multiple_right_aggregate_input_columns
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
-                StandingInputChangeV1::Source(RelationInputBatch {
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -10187,8 +10608,9 @@ fn runtime_materializes_two_relation_join_multiple_right_aggregate_input_columns
                         ("bob", 5, 1),
                         ("alice", 7, 1),
                     ])],
-                }),
-                StandingInputChangeV1::Source(RelationInputBatch {
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -10221,7 +10643,8 @@ fn runtime_materializes_two_relation_join_multiple_right_aggregate_input_columns
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: accounts.relation_schema.relation_id.clone(),
                 relation_version: accounts.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -10279,7 +10702,8 @@ fn runtime_materializes_two_relation_join_right_aggregate_having_order_by_top_k(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
-                StandingInputChangeV1::Source(RelationInputBatch {
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -10293,8 +10717,9 @@ fn runtime_materializes_two_relation_join_right_aggregate_having_order_by_top_k(
                         ("bob", 5, 1),
                         ("alice", 7, 1),
                     ])],
-                }),
-                StandingInputChangeV1::Source(RelationInputBatch {
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -10341,7 +10766,8 @@ fn runtime_restores_legacy_join_checkpoint_without_aggregate_input_relation_side
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
-                StandingInputChangeV1::Source(RelationInputBatch {
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -10351,8 +10777,9 @@ fn runtime_restores_legacy_join_checkpoint_without_aggregate_input_relation_side
                     end_offset_exclusive: 2,
                     event_time_watermark: None,
                     batches: vec![scores_rows_batch(&[("alice", 10, 1), ("bob", 5, 1)])],
-                }),
-                StandingInputChangeV1::Source(RelationInputBatch {
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -10412,7 +10839,8 @@ fn runtime_rejects_join_checkpoint_without_published_output() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
-                StandingInputChangeV1::Source(RelationInputBatch {
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -10422,8 +10850,9 @@ fn runtime_rejects_join_checkpoint_without_published_output() {
                     end_offset_exclusive: 2,
                     event_time_watermark: None,
                     batches: vec![scores_rows_batch(&[("alice", 10, 1), ("bob", 5, 1)])],
-                }),
-                StandingInputChangeV1::Source(RelationInputBatch {
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -10486,7 +10915,8 @@ fn runtime_materializes_two_relation_join_using_primary_key() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
-                StandingInputChangeV1::Source(RelationInputBatch {
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -10496,8 +10926,9 @@ fn runtime_materializes_two_relation_join_using_primary_key() {
                     end_offset_exclusive: 3,
                     event_time_watermark: None,
                     batches: vec![scores_batch()],
-                }),
-                StandingInputChangeV1::Source(RelationInputBatch {
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -10540,7 +10971,8 @@ fn runtime_materializes_two_relation_join_order_by_limit_top_k_and_restores_stat
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
-                StandingInputChangeV1::Source(RelationInputBatch {
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -10550,8 +10982,9 @@ fn runtime_materializes_two_relation_join_order_by_limit_top_k_and_restores_stat
                     end_offset_exclusive: 3,
                     event_time_watermark: None,
                     batches: vec![scores_batch()],
-                }),
-                StandingInputChangeV1::Source(RelationInputBatch {
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -10571,7 +11004,8 @@ fn runtime_materializes_two_relation_join_order_by_limit_top_k_and_restores_stat
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: scores.relation_schema.relation_id.clone(),
                 relation_version: scores.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -10615,7 +11049,8 @@ fn runtime_materializes_two_relation_join_order_by_sum_function_top_k() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
-                StandingInputChangeV1::Source(RelationInputBatch {
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -10625,8 +11060,9 @@ fn runtime_materializes_two_relation_join_order_by_sum_function_top_k() {
                     end_offset_exclusive: 3,
                     event_time_watermark: None,
                     batches: vec![scores_batch()],
-                }),
-                StandingInputChangeV1::Source(RelationInputBatch {
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -10646,7 +11082,8 @@ fn runtime_materializes_two_relation_join_order_by_sum_function_top_k() {
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: scores.relation_schema.relation_id.clone(),
                 relation_version: scores.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -10687,7 +11124,8 @@ fn runtime_materializes_two_relation_join_order_by_count_star_function_top_k() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
-                StandingInputChangeV1::Source(RelationInputBatch {
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -10697,8 +11135,9 @@ fn runtime_materializes_two_relation_join_order_by_count_star_function_top_k() {
                     end_offset_exclusive: 3,
                     event_time_watermark: None,
                     batches: vec![scores_batch()],
-                }),
-                StandingInputChangeV1::Source(RelationInputBatch {
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -10740,7 +11179,8 @@ fn runtime_materializes_two_relation_join_order_by_count_distinct_function_top_k
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
-                StandingInputChangeV1::Source(RelationInputBatch {
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -10750,8 +11190,9 @@ fn runtime_materializes_two_relation_join_order_by_count_distinct_function_top_k
                     end_offset_exclusive: 3,
                     event_time_watermark: None,
                     batches: vec![scores_batch()],
-                }),
-                StandingInputChangeV1::Source(RelationInputBatch {
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -10793,7 +11234,8 @@ fn runtime_materializes_two_relation_join_having_view() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
-                StandingInputChangeV1::Source(RelationInputBatch {
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -10803,8 +11245,9 @@ fn runtime_materializes_two_relation_join_having_view() {
                     end_offset_exclusive: 3,
                     event_time_watermark: None,
                     batches: vec![scores_batch()],
-                }),
-                StandingInputChangeV1::Source(RelationInputBatch {
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -10847,7 +11290,8 @@ fn runtime_materializes_two_relation_join_projected_aliases() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
-                StandingInputChangeV1::Source(RelationInputBatch {
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -10857,8 +11301,9 @@ fn runtime_materializes_two_relation_join_projected_aliases() {
                     end_offset_exclusive: 3,
                     event_time_watermark: None,
                     batches: vec![scores_batch()],
-                }),
-                StandingInputChangeV1::Source(RelationInputBatch {
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -10914,7 +11359,8 @@ fn runtime_materializes_two_relation_join_shared_aggregate_filter() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
-                StandingInputChangeV1::Source(RelationInputBatch {
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -10924,8 +11370,9 @@ fn runtime_materializes_two_relation_join_shared_aggregate_filter() {
                     end_offset_exclusive: 3,
                     event_time_watermark: None,
                     batches: vec![scores_batch()],
-                }),
-                StandingInputChangeV1::Source(RelationInputBatch {
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -10945,7 +11392,8 @@ fn runtime_materializes_two_relation_join_shared_aggregate_filter() {
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: scores.relation_schema.relation_id.clone(),
                 relation_version: scores.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -10989,7 +11437,8 @@ fn runtime_materializes_two_relation_join_mixed_aggregate_filters() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
-                StandingInputChangeV1::Source(RelationInputBatch {
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -10999,8 +11448,9 @@ fn runtime_materializes_two_relation_join_mixed_aggregate_filters() {
                     end_offset_exclusive: 3,
                     event_time_watermark: None,
                     batches: vec![scores_batch()],
-                }),
-                StandingInputChangeV1::Source(RelationInputBatch {
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -11020,7 +11470,8 @@ fn runtime_materializes_two_relation_join_mixed_aggregate_filters() {
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: scores.relation_schema.relation_id.clone(),
                 relation_version: scores.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -11064,7 +11515,8 @@ fn runtime_materializes_two_relation_join_filtered_count_distinct() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
-                StandingInputChangeV1::Source(RelationInputBatch {
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -11079,8 +11531,9 @@ fn runtime_materializes_two_relation_join_filtered_count_distinct() {
                         ("alice", 7, 1),
                         ("bob", 5, 1),
                     ])],
-                }),
-                StandingInputChangeV1::Source(RelationInputBatch {
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -11125,7 +11578,8 @@ fn runtime_materializes_two_relation_join_having_count_distinct_function() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
-                StandingInputChangeV1::Source(RelationInputBatch {
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -11140,8 +11594,9 @@ fn runtime_materializes_two_relation_join_having_count_distinct_function() {
                         ("alice", 7, 1),
                         ("bob", 5, 1),
                     ])],
-                }),
-                StandingInputChangeV1::Source(RelationInputBatch {
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -11161,7 +11616,8 @@ fn runtime_materializes_two_relation_join_having_count_distinct_function() {
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: scores.relation_schema.relation_id.clone(),
                 relation_version: scores.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -11202,7 +11658,8 @@ fn runtime_materializes_two_relation_join_count_distinct_skips_null_left_values(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
-                StandingInputChangeV1::Source(RelationInputBatch {
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -11212,8 +11669,9 @@ fn runtime_materializes_two_relation_join_count_distinct_skips_null_left_values(
                     end_offset_exclusive: 4,
                     event_time_watermark: None,
                     batches: vec![scores_nullable_batch()],
-                }),
-                StandingInputChangeV1::Source(RelationInputBatch {
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -11255,7 +11713,8 @@ fn runtime_materializes_two_relation_join_nullable_left_value_count() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
-                StandingInputChangeV1::Source(RelationInputBatch {
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -11265,8 +11724,9 @@ fn runtime_materializes_two_relation_join_nullable_left_value_count() {
                     end_offset_exclusive: 4,
                     event_time_watermark: None,
                     batches: vec![scores_nullable_batch()],
-                }),
-                StandingInputChangeV1::Source(RelationInputBatch {
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -11308,7 +11768,8 @@ fn runtime_materializes_two_relation_join_with_left_where_filter() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
-                StandingInputChangeV1::Source(RelationInputBatch {
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -11332,8 +11793,9 @@ fn runtime_materializes_two_relation_join_with_left_where_filter() {
                         ],
                     )
                     .unwrap()],
-                }),
-                StandingInputChangeV1::Source(RelationInputBatch {
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -11356,7 +11818,8 @@ fn runtime_materializes_two_relation_join_with_left_where_filter() {
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![
-                StandingInputChangeV1::Source(RelationInputBatch {
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -11370,8 +11833,9 @@ fn runtime_materializes_two_relation_join_with_left_where_filter() {
                         ("alice", 200, 1), // fails `score < 100`
                         ("alice", -3, -1), // retracts a passing row
                     ])],
-                }),
-                StandingInputChangeV1::Source(RelationInputBatch {
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -11392,7 +11856,8 @@ fn runtime_materializes_two_relation_join_with_left_where_filter() {
             3,
             EpochIdempotencyKey::new("epoch-3").unwrap(),
             vec![
-                StandingInputChangeV1::Source(RelationInputBatch {
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -11402,8 +11867,9 @@ fn runtime_materializes_two_relation_join_with_left_where_filter() {
                     end_offset_exclusive: 10,
                     event_time_watermark: None,
                     batches: vec![scores_rows_batch(&[("alice", 20, -1)])],
-                }),
-                StandingInputChangeV1::Source(RelationInputBatch {
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -11445,7 +11911,8 @@ fn runtime_materializes_two_relation_join_with_cte_source_filter() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
-                StandingInputChangeV1::Source(RelationInputBatch {
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -11467,8 +11934,9 @@ fn runtime_materializes_two_relation_join_with_cte_source_filter() {
                         ],
                     )
                     .unwrap()],
-                }),
-                StandingInputChangeV1::Source(RelationInputBatch {
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -11511,7 +11979,8 @@ fn runtime_materializes_two_relation_join_with_right_cte_source_filter() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
-                StandingInputChangeV1::Source(RelationInputBatch {
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -11533,8 +12002,9 @@ fn runtime_materializes_two_relation_join_with_right_cte_source_filter() {
                         ],
                     )
                     .unwrap()],
-                }),
-                StandingInputChangeV1::Source(RelationInputBatch {
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -11577,7 +12047,8 @@ fn runtime_materializes_two_relation_join_with_two_cte_source_filters() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
-                StandingInputChangeV1::Source(RelationInputBatch {
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -11599,8 +12070,9 @@ fn runtime_materializes_two_relation_join_with_two_cte_source_filters() {
                         ],
                     )
                     .unwrap()],
-                }),
-                StandingInputChangeV1::Source(RelationInputBatch {
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -11643,7 +12115,8 @@ fn runtime_materializes_two_relation_join_with_two_derived_table_source_filters(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
-                StandingInputChangeV1::Source(RelationInputBatch {
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -11665,8 +12138,9 @@ fn runtime_materializes_two_relation_join_with_two_derived_table_source_filters(
                         ],
                     )
                     .unwrap()],
-                }),
-                StandingInputChangeV1::Source(RelationInputBatch {
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -11709,7 +12183,8 @@ fn runtime_materializes_two_relation_join_with_cross_relation_or_where_filter() 
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
-                StandingInputChangeV1::Source(RelationInputBatch {
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -11719,8 +12194,9 @@ fn runtime_materializes_two_relation_join_with_cross_relation_or_where_filter() 
                     end_offset_exclusive: 3,
                     event_time_watermark: None,
                     batches: vec![scores_batch()],
-                }),
-                StandingInputChangeV1::Source(RelationInputBatch {
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -11758,7 +12234,8 @@ fn runtime_materializes_latest_bool_by_key_and_restores_state() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -11788,7 +12265,8 @@ fn runtime_materializes_latest_bool_by_key_and_restores_state() {
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -11832,7 +12310,8 @@ fn runtime_rejects_latest_by_key_checkpoint_without_published_output() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -11883,7 +12362,8 @@ fn runtime_materializes_earliest_bool_by_key_with_arg_min() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -11912,7 +12392,8 @@ fn runtime_materializes_earliest_bool_by_key_with_arg_min() {
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -11956,7 +12437,8 @@ fn runtime_materializes_latest_by_key_with_arg_max_filter_predicate() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -12002,7 +12484,8 @@ fn runtime_materializes_latest_by_key_with_where_and_arg_max_filter_predicates()
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -12045,7 +12528,8 @@ fn runtime_materializes_latest_by_key_cte_source_filters() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -12086,7 +12570,8 @@ fn runtime_materializes_latest_by_key_derived_table_source_filters() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -12127,7 +12612,8 @@ fn runtime_materializes_latest_by_key_order_by_limit_top_k_and_restores_state() 
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -12152,7 +12638,8 @@ fn runtime_materializes_latest_by_key_order_by_limit_top_k_and_restores_state() 
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -12189,7 +12676,8 @@ fn runtime_materializes_latest_by_key_order_by_limit_offset_top_k() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -12212,7 +12700,8 @@ fn runtime_materializes_latest_by_key_order_by_limit_offset_top_k() {
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -12248,7 +12737,8 @@ fn runtime_materializes_latest_by_key_order_by_arg_max_function_top_k() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -12288,7 +12778,8 @@ fn runtime_materializes_tumbling_event_time_windows_and_restores_state() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -12321,7 +12812,8 @@ fn runtime_materializes_tumbling_event_time_windows_and_restores_state() {
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -12377,7 +12869,8 @@ fn runtime_materializes_tumbling_event_time_aggregate_with_matching_filters() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -12433,7 +12926,8 @@ fn runtime_materializes_tumbling_event_time_aggregate_with_mixed_filters() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -12502,7 +12996,8 @@ fn runtime_materializes_tumbling_event_time_filtered_count_distinct_with_mixed_f
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -12572,7 +13067,8 @@ fn runtime_materializes_tumbling_event_time_nullable_column_count() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -12637,7 +13133,8 @@ fn runtime_materializes_tumbling_event_time_filtered_nullable_column_count() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -12692,7 +13189,8 @@ fn runtime_materializes_tumbling_event_time_mixed_filter_having_top_k() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -12751,7 +13249,8 @@ fn runtime_materializes_tumbling_event_time_aggregate_with_different_filters() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -12808,7 +13307,8 @@ fn runtime_materializes_subsecond_tumbling_event_time_windows() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -12863,7 +13363,8 @@ fn runtime_materializes_tumbling_event_time_order_by_limit_top_k_and_restores_st
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -12895,7 +13396,8 @@ fn runtime_materializes_tumbling_event_time_order_by_limit_top_k_and_restores_st
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -12947,7 +13449,8 @@ fn runtime_materializes_tumbling_event_time_order_by_limit_offset_top_k() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -13002,7 +13505,8 @@ fn runtime_materializes_tumbling_event_time_order_by_sum_function_top_k() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -13049,7 +13553,8 @@ fn runtime_materializes_tumbling_event_time_count_distinct_and_restores_state() 
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -13115,7 +13620,8 @@ fn runtime_materializes_hopping_event_time_windows() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -13169,7 +13675,8 @@ fn runtime_materializes_hopping_event_time_advanced_aggregates_having_top_k() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -13220,7 +13727,8 @@ fn runtime_materializes_session_event_time_windows() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -13274,7 +13782,8 @@ fn runtime_materializes_session_event_time_advanced_aggregates_after_bridge_retr
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -13337,7 +13846,8 @@ fn runtime_rejects_missing_session_event_retract_without_mutating_state() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -13370,7 +13880,8 @@ fn runtime_rejects_missing_session_event_retract_without_mutating_state() {
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -13422,7 +13933,8 @@ fn runtime_materializes_tumbling_event_time_cte_source_filters() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -13469,7 +13981,8 @@ fn runtime_materializes_tumbling_event_time_derived_table_source_filters() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -13516,7 +14029,8 @@ fn runtime_materializes_tumbling_event_time_min_max_avg_and_restores_state() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -13556,7 +14070,8 @@ fn runtime_materializes_tumbling_event_time_min_max_avg_and_restores_state() {
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -13611,7 +14126,8 @@ fn runtime_materializes_tumbling_min_max_arithmetic_expression() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -13661,7 +14177,8 @@ fn runtime_materializes_tumbling_avg_arithmetic_expression() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -13711,7 +14228,8 @@ fn runtime_materializes_tumbling_sum_arithmetic_expression() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -13757,7 +14275,8 @@ fn runtime_rejects_late_rows_for_already_closed_tumbling_window() {
         .apply_changes(
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -13786,7 +14305,8 @@ fn runtime_rejects_late_rows_for_already_closed_tumbling_window() {
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
-            vec![StandingInputChangeV1::Source(RelationInputBatch {
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -13909,8 +14429,9 @@ fn join_relation_input(
     start_offset_inclusive: u64,
     end_offset_exclusive: u64,
     batches: Vec<RecordBatch>,
-) -> StandingInputChangeV1 {
-    StandingInputChangeV1::Source(RelationInputBatch {
+) -> RelationInputBatch {
+    RelationInputBatch {
+        encoding: RelationInputEncodingV1::SourceRelationV1,
         relation_id: catalog.relation_schema.relation_id.clone(),
         relation_version: catalog.relation_schema.relation_version.clone(),
         stream_id: "specialization-equivalence".to_string(),
@@ -15515,6 +16036,7 @@ fn scores_catalog() -> VelorixRelationCatalogV1 {
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
 
     VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
         schema_version: RELATION_SCHEMA_VERSION_V1,
         relation_schema,
         schema_fingerprint: schema_fingerprint.clone(),
@@ -15718,6 +16240,7 @@ fn accounts_catalog() -> VelorixRelationCatalogV1 {
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
 
     VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
         schema_version: RELATION_SCHEMA_VERSION_V1,
         relation_schema,
         schema_fingerprint: schema_fingerprint.clone(),
@@ -15865,6 +16388,7 @@ fn device_status_catalog() -> VelorixRelationCatalogV1 {
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
 
     VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
         schema_version: RELATION_SCHEMA_VERSION_V1,
         relation_schema,
         schema_fingerprint: schema_fingerprint.clone(),
@@ -15924,6 +16448,7 @@ fn purchases_catalog_without_value_role() -> VelorixRelationCatalogV1 {
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
 
     VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
         schema_version: RELATION_SCHEMA_VERSION_V1,
         relation_schema,
         schema_fingerprint: schema_fingerprint.clone(),
@@ -17556,8 +18081,9 @@ fn relation_input(
     start_offset_inclusive: u64,
     end_offset_exclusive: u64,
     batch: RecordBatch,
-) -> StandingInputChangeV1 {
-    StandingInputChangeV1::Source(RelationInputBatch {
+) -> RelationInputBatch {
+    RelationInputBatch {
+        encoding: RelationInputEncodingV1::SourceRelationV1,
         relation_id: catalog.relation_schema.relation_id.clone(),
         relation_version: catalog.relation_schema.relation_version.clone(),
         stream_id: stream_id.into(),

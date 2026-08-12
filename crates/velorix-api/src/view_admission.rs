@@ -5,62 +5,19 @@ pub(super) async fn create_view(
     Json(request): Json<CreateViewRequest>,
 ) -> Result<(StatusCode, Json<ViewResponse>), ApiError> {
     validate_public_view_feature_admission(&state, &request)?;
-    let resolved_inputs = resolve_view_inputs_for_request(&state, &request).await?;
-    if let [ResolvedAdmissionInput::View {
-        relation,
-        published,
-        edge,
-    }] = resolved_inputs.as_slice()
-    {
-        return create_view_with_published_input(
-            &state,
-            &request,
-            relation.clone(),
-            published.clone(),
-            edge.clone(),
-        )
-        .await;
-    }
-    if resolved_inputs
-        .iter()
-        .any(|input| matches!(input, ResolvedAdmissionInput::View { .. }))
-    {
-        return Err(ApiError::bad_request(
-            "view-on-view admission currently supports exactly one view input and no mixed source inputs",
-        ));
-    }
+    let resolved_inputs = resolve_standing_inputs_for_view_request(&state, &request).await?;
+    validate_resolved_input_scope(&resolved_inputs)?;
     let catalogs = resolved_inputs
         .iter()
-        .map(|input| match input {
-            ResolvedAdmissionInput::Source { catalog, .. } => Ok(catalog.clone()),
-            ResolvedAdmissionInput::View { .. } => unreachable!("view inputs rejected above"),
-        })
+        .map(|input| input.catalog())
         .collect::<Result<Vec<_>, ApiError>>()?;
-    let input_schema = catalogs
-        .first()
-        .map(|catalog| catalog_input_relation_schema(catalog).map_err(ApiError::bad_request))
-        .transpose()?
-        .ok_or_else(|| ApiError::bad_request("view has no input relation"))?;
-    let output_schema = state
-        .materialized_runtime_output_schemas_for_view_request(
-            request.view_id.as_str(),
-            request.sql.as_str(),
-            &catalogs,
-            input_schema.schema_fingerprint.as_str(),
-        )?
-        .ok_or_else(|| {
-            ApiError::bad_request(format!(
-                "unsupported view SQL for materialized runtime `{}`",
-                request.view_id
-            ))
-        })?
-        .into_iter()
-        .next()
-        .ok_or_else(|| ApiError::bad_request("materialized runtime produced no output schema"))?;
-    let spec = view_spec_from_request(&request, &resolved_inputs, &output_schema)?;
+    let spec = view_spec_from_request(&state, &request, &catalogs)?;
     validate_materialized_runtime_spec_admission(&spec)?;
     state.validate_standing_runtime_fencing_or_evict().await?;
-    let mut runtime_binding = materialized_view_runtime_binding_for_spec(&catalogs, &spec)?;
+    let input_bindings =
+        input_bindings_for_resolved_inputs(&state, "default", &resolved_inputs).await?;
+    let mut runtime_binding =
+        materialized_view_runtime_binding_for_spec(&catalogs, &spec, &input_bindings)?;
     validate_public_runtime_plan_admission(
         &state,
         runtime_binding.logical_plan.as_ref().ok_or_else(|| {
@@ -78,6 +35,21 @@ pub(super) async fn create_view(
         &spec.output_relations,
     )
     .await?;
+    // Serialize view-on-view admissions in-process so concurrent creates
+    // cannot both pass the acyclic check against the same graph snapshot; the
+    // authoritative meta-store graph revision CAS extends the fence across
+    // processes.
+    let _graph_guard = state.view_dependency_graph_mutex.lock().await;
+    let candidate_edges = dependency_edges_from_input_bindings(
+        &runtime_binding.standing_program_identity.tenant_id,
+        &runtime_binding.standing_program_identity.program_id,
+        &spec.view_id,
+        &input_bindings,
+    )?;
+    let existing_edges = view_dependency_edges_from_active_views(&state).await?;
+    for candidate in &candidate_edges {
+        validate_view_dependency_graph_with_candidate(&existing_edges, candidate)?;
+    }
     let pending_runtime = build_standing_runtime_for_runtime_binding(
         &state,
         &spec,
@@ -87,12 +59,15 @@ pub(super) async fn create_view(
         &spec.output_relations,
     )?;
     let execution_mode = MaterializedViewExecutionMode::StandingRuntime;
-    let bootstrap = begin_authoritative_view_bootstrap(&state, &spec, &runtime_binding).await?;
+    let bootstrap =
+        begin_authoritative_view_bootstrap(&state, &spec, &runtime_binding, &input_bindings)
+            .await?;
     runtime_binding.published_relations = published_relation_bindings_for_spec(
         &spec,
         &runtime_binding,
         bootstrap.bootstrap_generation,
     )?;
+    runtime_binding.input_bindings = input_bindings;
     let requires_backfill = standing_runtime_create_requires_backfill(&state, &spec).await?;
     let lifecycle = lifecycle_for_create_view_execution(&execution_mode, requires_backfill);
     let outcome = if let Some(runtime) = pending_runtime {
@@ -121,6 +96,15 @@ pub(super) async fn create_view(
         )
         .await?
     };
+    if view_has_published_view_inputs(&runtime_binding) {
+        bootstrap_consumer_view_after_registration(
+            &state,
+            &spec,
+            &runtime_binding,
+            &resolved_inputs,
+        )
+        .await?;
+    }
     let (status, outcome_text) = match outcome {
         RegisterMaterializedViewOutcome::Created => (StatusCode::CREATED, "created"),
         RegisterMaterializedViewOutcome::Duplicate => (StatusCode::OK, "duplicate"),
@@ -140,132 +124,135 @@ pub(super) async fn create_view(
     ))
 }
 
-/// Admit a view whose input is an upstream published view output.
-///
-/// This is the Phase 4 view-on-view admission path. Exactly one published-view
-/// input is resolved; the consumer output schema is inferred from the SQL
-/// projection, the plan is lowered through the published single-key sum/count
-/// lowerer, and the runtime is bound to the producer's `PublishedRelationBindingV1`.
-async fn create_view_with_published_input(
+fn view_has_published_view_inputs(runtime: &MaterializedViewRuntimeBinding) -> bool {
+    runtime
+        .input_bindings
+        .iter()
+        .any(|binding| matches!(binding, StandingInputBindingV1::PublishedView { .. }))
+}
+
+async fn bootstrap_consumer_view_after_registration(
     state: &ApiState,
-    request: &CreateViewRequest,
-    relation: RelationSchema,
-    published: PublishedRelationBindingV1,
-    edge: ViewDependencyEdgeBindingV1,
-) -> Result<(StatusCode, Json<ViewResponse>), ApiError> {
-    let planner_input = PlannerRelationInput::from_published_binding(
-        relation.clone(),
-        edge.delta_codec_identity.clone(),
-        edge.frontier_kind.clone(),
-    );
-    let output_schema =
-        infer_single_key_sum_count_output_schema(&request.sql, &planner_input, &request.view_id)
-            .map_err(ApiError::bad_request)?;
-    let mut runtime_binding = materialized_view_runtime_binding_for_published_spec(
-        &request.view_id,
-        &request.sql,
-        &relation,
-        &published,
-        &edge.delta_codec_identity,
-        &edge.frontier_kind,
-    )?;
-    let spec = StandingViewSpec {
-        view_id: request.view_id.clone(),
-        sql: request.sql.clone(),
-        dialect: SqlDialect::VelorixSql,
-        source_kind: SqlSourceKind::StandingView,
-        input_relations: vec![relation.clone()],
-        output_relations: vec![output_schema],
-        shape: StandingViewShape {
-            is_materialized: true,
-            multi_input: false,
-            multi_output: false,
-        },
+    spec: &StandingViewSpec,
+    runtime: &MaterializedViewRuntimeBinding,
+    resolved_inputs: &[ResolvedAdmissionInputV1],
+) -> Result<(), ApiError> {
+    let active = state
+        .view_registry()?
+        .read_active(&spec.view_id)
+        .await
+        .map_err(materialized_view_registry_error_to_api)?;
+    let Some(identity) = active_standing_runtime_identity(&active) else {
+        return Err(ApiError::bad_request(format!(
+            "consumer view `{}` has no standing runtime identity",
+            spec.view_id
+        )));
     };
-    validate_materialized_runtime_spec_admission(&spec)?;
-    state.validate_standing_runtime_fencing_or_evict().await?;
-    validate_public_runtime_plan_admission(
-        state,
-        runtime_binding.logical_plan.as_ref().ok_or_else(|| {
-            ApiError::bad_request("materialized view runtime binding is missing a logical plan")
-        })?,
-    )?;
-    let spec_hash = view_spec_hash(&spec).map_err(ApiError::bad_request)?;
-    let api_metadata = api_metadata_from_create_view_request(request);
-    validate_view_api_metadata(&api_metadata)?;
-    validate_query_policy_reference(state, &api_metadata).await?;
-    validate_view_api_output_binding(&spec.view_id, &api_metadata, &spec.output_relations)?;
-    validate_standing_runtime_create_api_metadata(
-        &spec.view_id,
-        &api_metadata,
-        &spec.output_relations,
-    )
-    .await?;
-    let pending_runtime = build_standing_runtime_for_published_binding(
-        state,
-        &spec,
-        &runtime_binding,
-        &published,
-        &spec.input_relations,
-        &spec.output_relations,
-    )?;
-    let execution_mode = MaterializedViewExecutionMode::StandingRuntime;
-    let bootstrap = begin_authoritative_view_bootstrap(state, &spec, &runtime_binding).await?;
-    runtime_binding.published_relations = published_relation_bindings_for_spec(
-        &spec,
-        &runtime_binding,
-        bootstrap.bootstrap_generation,
-    )?;
-    let requires_backfill = standing_runtime_create_requires_backfill(state, &spec).await?;
-    let lifecycle = lifecycle_for_create_view_execution(&execution_mode, requires_backfill);
-    let outcome = if let Some(runtime) = pending_runtime {
-        let operation_lock =
-            state.standing_runtime_operation_lock(runtime.program_identity(), &spec.view_id)?;
-        let _operation_guard = operation_lock.lock().await;
-        let outcome = register_materialized_view_execution(
-            state,
-            &spec,
-            Some(api_metadata.clone()),
-            runtime_binding.clone(),
-            Some(lifecycle.clone()),
+    for resolved in resolved_inputs {
+        let ResolvedAdmissionInputV1::PublishedView { binding, .. } = resolved else {
+            continue;
+        };
+        let binding = binding.clone();
+        let input_binding = runtime
+            .input_bindings
+            .iter()
+            .find_map(|candidate| match candidate {
+                StandingInputBindingV1::PublishedView {
+                    edge_id,
+                    producer_tenant_id,
+                    producer_program_id,
+                    published_relation,
+                    bootstrap_cursor,
+                    ..
+                } if published_relation == &binding => Some((
+                    edge_id,
+                    producer_tenant_id,
+                    producer_program_id,
+                    published_relation,
+                    bootstrap_cursor,
+                )),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "consumer view `{}` is missing its persisted published-view input binding",
+                    spec.view_id
+                ))
+            })?;
+        let (
+            edge_id,
+            producer_tenant_id,
+            producer_program_id,
+            published_relation,
+            bootstrap_cursor,
+        ) = input_binding;
+        let edge = view_dependency_edge_from_binding(
+            producer_tenant_id,
+            &identity.program_id,
+            &spec.view_id,
+            1,
+            &published_relation.relation.relation_id,
+            &published_relation.relation.relation_version,
+            producer_program_id,
+            published_relation,
         )
-        .await?;
-        if view_query_availability(&lifecycle) {
-            insert_standing_runtime(state, &spec.view_id, runtime)?;
+        .map_err(ApiError::bad_request)?;
+        if &edge.edge_id != edge_id {
+            return Err(ApiError::bad_request(format!(
+                "consumer view `{}` dependency edge mismatch",
+                spec.view_id
+            )));
         }
-        outcome
-    } else {
-        register_materialized_view_execution(
-            state,
-            &spec,
-            Some(api_metadata.clone()),
-            runtime_binding.clone(),
-            Some(lifecycle.clone()),
+        // Duplicate CREATE requests must resume, not reapply: if the consumer
+        // already has a checkpoint with this edge's cursor, the baseline was
+        // applied and only catch-up is needed. A checkpoint without the edge
+        // cursor is corrupt and fails closed.
+        let latest =
+            read_latest_standing_runtime_checkpoint(state, identity, &spec.view_id).await?;
+        let baseline_pending = match &latest {
+            Some(record) => match consumer_edge_cursor(record, edge_id)? {
+                Some(_) => false,
+                None => {
+                    return Err(ApiError::bad_request(format!(
+                        "consumer view `{}` has a checkpoint without the dependency cursor for edge `{edge_id}`",
+                        spec.view_id
+                    )));
+                }
+            },
+            None => true,
+        };
+        if baseline_pending {
+            bootstrap_consumer_from_published_snapshot(
+                state,
+                &active,
+                &ConsumerViewDependencyInputV1 {
+                    edge,
+                    binding: published_relation.clone(),
+                    bootstrap_cursor: bootstrap_cursor.clone(),
+                },
+            )
+            .await?;
+        }
+    }
+    drain_published_view_dependencies(state).await?;
+    activate_authoritative_view_bootstrap(state, identity, &spec.view_id).await?;
+    state
+        .view_registry()?
+        .update_standing_runtime_lifecycle(
+            &spec.view_id,
+            &active.spec_hash,
+            MaterializedViewLifecycleStatus::standing_runtime(),
         )
-        .await?
-    };
-    let (status, outcome_text) = match outcome {
-        RegisterMaterializedViewOutcome::Created => (StatusCode::CREATED, "created"),
-        RegisterMaterializedViewOutcome::Duplicate => (StatusCode::OK, "duplicate"),
-    };
-    Ok((
-        status,
-        Json(view_response(
-            &spec,
-            spec_hash,
-            execution_mode,
-            lifecycle,
-            Some(api_metadata),
-            Some(outcome_text),
-            state.experimental_advanced_view_features,
-        )?),
-    ))
+        .await
+        .map_err(materialized_view_registry_error_to_api)?;
+    Ok(())
 }
 
 async fn begin_authoritative_view_bootstrap(
     state: &ApiState,
     spec: &StandingViewSpec,
     runtime: &MaterializedViewRuntimeBinding,
+    input_bindings: &[StandingInputBindingV1],
 ) -> Result<ViewBootstrapControlV1, ApiError> {
     let meta_store = state.view_bootstrap_meta_store.as_ref().ok_or_else(|| {
         ApiError::service_unavailable(
@@ -281,6 +268,41 @@ async fn begin_authoritative_view_bootstrap(
         })?;
     let view_spec_json =
         serde_json::to_vec(spec).map_err(|error| ApiError::internal(error.to_string()))?;
+    let view_inputs = input_bindings
+        .iter()
+        .filter_map(|binding| match binding {
+            StandingInputBindingV1::PublishedView {
+                edge_id,
+                producer_program_id,
+                published_relation,
+                bootstrap_cursor,
+                ..
+            } => Some(BeginViewDependencyEdgeV1 {
+                edge_id: edge_id.clone(),
+                producer_program_id: producer_program_id.clone(),
+                producer_view_id: published_relation.producer_view_id.clone(),
+                producer_generation: published_relation.producer_view_generation,
+                producer_plan_hash: published_relation.producer_plan_hash.clone(),
+                input_relation_id: published_relation.relation.relation_id.clone(),
+                input_relation_version: published_relation.relation.relation_version.clone(),
+                output_stream_id: published_relation.output_stream_id.clone(),
+                output_schema_hash: published_relation.output_schema_hash.clone(),
+                key_descriptor_hash: published_relation.key_descriptor_hash.clone(),
+                delta_codec_identity: published_relation.delta_codec_identity.clone(),
+                frontier_kind: published_relation.frontier_kind.clone(),
+                bootstrap_cursor: bootstrap_cursor.clone(),
+            }),
+            StandingInputBindingV1::Source { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    let expected_graph_revision = if view_inputs.is_empty() {
+        0
+    } else {
+        meta_store
+            .read_view_dependency_graph_revision(&runtime.standing_program_identity.tenant_id)
+            .await
+            .map_err(meta_error_to_api)?
+    };
     let request = BeginViewBootstrapRequest {
         tenant_id: runtime.standing_program_identity.tenant_id.clone(),
         program_id: runtime.standing_program_identity.program_id.clone(),
@@ -290,6 +312,11 @@ async fn begin_authoritative_view_bootstrap(
         relations: spec
             .input_relations
             .iter()
+            .filter(|relation| {
+                !view_inputs
+                    .iter()
+                    .any(|edge| edge.input_relation_id == relation.relation_id)
+            })
             .map(|relation| IngestSourceRelationIdentityV1 {
                 relation_id: relation.relation_id.clone(),
                 relation_version: relation.relation_version.clone(),
@@ -297,6 +324,8 @@ async fn begin_authoritative_view_bootstrap(
                 schema_fingerprint: relation.schema_fingerprint.clone(),
             })
             .collect(),
+        view_inputs,
+        expected_graph_revision,
     };
     match meta_store
         .begin_view_bootstrap(request)
@@ -306,7 +335,7 @@ async fn begin_authoritative_view_bootstrap(
         BeginViewBootstrapOutcome::Created(control)
         | BeginViewBootstrapOutcome::Duplicate(control) => Ok(control),
         BeginViewBootstrapOutcome::Conflict => Err(ApiError::conflict(format!(
-            "authoritative view bootstrap conflict for `{}`",
+            "authoritative view bootstrap conflict for `{}` (expected graph revision {expected_graph_revision})",
             spec.view_id
         ))),
     }
@@ -458,8 +487,10 @@ pub(super) async fn register_materialized_view_execution(
 pub(super) fn materialized_view_runtime_binding_for_spec(
     catalogs: &[VelorixRelationCatalogV1],
     spec: &StandingViewSpec,
+    input_bindings: &[StandingInputBindingV1],
 ) -> Result<MaterializedViewRuntimeBinding, ApiError> {
-    let identity = standing_program_identity_from_materialized_view_runtime(catalogs, spec)?;
+    let identity =
+        standing_program_identity_from_materialized_view_runtime(catalogs, spec, input_bindings)?;
     let output_schema = only_output_relation_for_runtime_binding(spec)?;
     let logical_plan = lower_materialized_view_runtime_sql_to_logical_plan(
         spec.sql.as_str(),
@@ -472,6 +503,7 @@ pub(super) fn materialized_view_runtime_binding_for_spec(
         standing_program_identity: identity,
         logical_plan: Some(logical_plan),
         published_relations: Vec::new(),
+        input_bindings: input_bindings.to_vec(),
     })
 }
 
@@ -760,12 +792,26 @@ pub(super) fn lower_materialized_view_runtime_sql_to_logical_plan(
 pub(super) fn standing_program_identity_from_materialized_view_runtime(
     catalogs: &[VelorixRelationCatalogV1],
     spec: &StandingViewSpec,
+    input_bindings: &[StandingInputBindingV1],
 ) -> Result<StandingProgramIdentity, ApiError> {
     let input_schema_bytes = serde_json::to_vec(&spec.input_relations)
         .map_err(|source| ApiError::internal(source.to_string()))?;
     let output_schema_bytes = serde_json::to_vec(&spec.output_relations)
         .map_err(|source| ApiError::internal(source.to_string()))?;
-    let input_catalog_hash = if catalogs.len() == 1 {
+    let input_catalog_hash = if input_bindings
+        .iter()
+        .any(|binding| matches!(binding, StandingInputBindingV1::PublishedView { .. }))
+    {
+        // View-on-view inputs are fenced by the full producer binding: a
+        // generation, plan, schema, key, codec, or frontier change must
+        // produce a different program identity and fail closed on restore.
+        let mut binding_hashes = input_bindings
+            .iter()
+            .map(|binding| binding.input_catalog_hash().map_err(ApiError::bad_request))
+            .collect::<Result<Vec<_>, ApiError>>()?;
+        binding_hashes.sort();
+        stable_bytes_hash(binding_hashes.join("\u{1f}").as_bytes())
+    } else if catalogs.len() == 1 {
         catalogs[0].schema_fingerprint.as_str().to_string()
     } else {
         stable_bytes_hash(&input_schema_bytes)
@@ -983,7 +1029,11 @@ pub(super) async fn restore_or_build_standing_runtime_for_runtime_binding(
         .logical_plan
         .as_ref()
         .ok_or_else(|| ApiError::bad_request("standing runtime binding is missing logical plan"))?;
-    let catalogs = read_relation_catalogs_for_input_schemas(state, expected_input_schemas).await?;
+    let catalogs = if runtime_binding.input_bindings.is_empty() {
+        read_relation_catalogs_for_input_schemas(state, expected_input_schemas).await?
+    } else {
+        catalogs_for_input_bindings(state, runtime_binding).await?
+    };
 
     let (runtime, replay_plan) = if let Some(record) =
         read_latest_standing_runtime_checkpoint(state, identity, &spec.view_id).await?
@@ -1014,6 +1064,18 @@ pub(super) async fn restore_or_build_standing_runtime_for_runtime_binding(
                 .map_err(ApiError::internal)?,
                 replay_plan,
             )
+        } else if runtime_binding
+            .input_bindings
+            .iter()
+            .any(|binding| matches!(binding, StandingInputBindingV1::PublishedView { .. }))
+        {
+            // A published-input consumer checkpoint without its state payload
+            // cannot be rebuilt from an empty runtime: history would silently
+            // be skipped while the causal cut says otherwise. Fail closed.
+            return Err(ApiError::bad_request(format!(
+                "consumer view `{}` checkpoint is missing its state payload; rebuild the view explicitly before serving queries",
+                spec.view_id
+            )));
         } else {
             let factory = Arc::clone(&factory);
             let identity = identity.clone();
@@ -1078,6 +1140,40 @@ pub(super) async fn restore_or_build_standing_runtime_for_runtime_binding(
         expected_output_schemas,
     )?;
     Ok(Some((runtime, replay_plan)))
+}
+
+/// Resolves the runtime catalogs for a view's persisted input bindings:
+/// registered source relations or published-view-output descriptors derived
+/// from the producer's immutable binding.
+pub(super) async fn catalogs_for_input_bindings(
+    state: &ApiState,
+    runtime_binding: &MaterializedViewRuntimeBinding,
+) -> Result<Vec<VelorixRelationCatalogV1>, ApiError> {
+    let mut catalogs = Vec::with_capacity(runtime_binding.input_bindings.len());
+    for binding in &runtime_binding.input_bindings {
+        match binding {
+            StandingInputBindingV1::Source { relation, .. } => {
+                catalogs.push(
+                    read_relation_catalog(state, &relation.relation_id, &relation.relation_version)
+                        .await?,
+                );
+            }
+            StandingInputBindingV1::PublishedView {
+                published_relation, ..
+            } => {
+                catalogs.push(
+                    catalog_from_published_relation_binding(published_relation)
+                        .map_err(ApiError::bad_request)?,
+                );
+            }
+        }
+    }
+    if catalogs.is_empty() {
+        return Err(ApiError::bad_request(
+            "standing runtime binding has no resolvable input catalogs",
+        ));
+    }
+    Ok(catalogs)
 }
 
 pub(super) fn validate_runtime_schemas(

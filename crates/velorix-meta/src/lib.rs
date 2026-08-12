@@ -39,10 +39,10 @@ pub use source_cut::{
     INGEST_SOURCE_IDENTITY_GENERATION_V1,
 };
 pub use view_bootstrap::{
-    BeginViewBootstrapOutcome, BeginViewBootstrapRequest, DependencyGraphEdgeV1, DependencyGraphV1,
+    BeginViewBootstrapOutcome, BeginViewBootstrapRequest, BeginViewDependencyEdgeV1,
     FixViewBootstrapActivationCutOutcome, FixViewBootstrapActivationCutRequest,
-    PromoteViewBootstrapOutcome, PromoteViewBootstrapRequest, PublishDependencyGraphOutcome,
-    ViewBootstrapControlV1, ViewBootstrapLifecycleV1, INITIAL_VIEW_BOOTSTRAP_GENERATION,
+    PromoteViewBootstrapOutcome, PromoteViewBootstrapRequest, ViewBootstrapControlV1,
+    ViewBootstrapLifecycleV1, INITIAL_VIEW_BOOTSTRAP_GENERATION,
     VIEW_BOOTSTRAP_CONTROL_SCHEMA_VERSION_V1,
 };
 
@@ -412,6 +412,17 @@ pub trait MetaStore: Send + Sync + 'static {
         program_id: &str,
         view_id: &str,
     ) -> Result<Option<StandingRuntimeCheckpointPointer>, MetaStoreError>;
+
+    /// Current view-on-view dependency graph revision for a tenant.
+    ///
+    /// Required: a default `Ok(0)` here silently turns every missing
+    /// forwarding override into a "no graph tracking" claim, which corrupts
+    /// the admission-time revision CAS for view-on-view chains. Every concrete
+    /// store and every forwarding wrapper must implement this explicitly.
+    async fn read_view_dependency_graph_revision(
+        &self,
+        tenant_id: &str,
+    ) -> Result<u64, MetaStoreError>;
 }
 
 #[async_trait]
@@ -493,6 +504,15 @@ where
             .await
     }
 
+    async fn read_view_dependency_graph_revision(
+        &self,
+        tenant_id: &str,
+    ) -> Result<u64, MetaStoreError> {
+        (**self)
+            .read_view_dependency_graph_revision(tenant_id)
+            .await
+    }
+
     async fn acquire_standing_runtime_owner(
         &self,
         request: AcquireStandingRuntimeOwnerRequest,
@@ -542,6 +562,7 @@ struct InMemoryMetaState {
     committed_ingest_batch_keys: BTreeSet<String>,
     ingest_catalog_epoch: u64,
     view_bootstraps: HashMap<(String, String, String), ViewBootstrapControlV1>,
+    view_dependency_graph_revisions: HashMap<String, u64>,
     standing_runtime_owners: HashMap<(String, String, String), StandingRuntimeOwnerClaim>,
     standing_runtime_checkpoints:
         HashMap<(String, String, String), StandingRuntimeCheckpointPointer>,
@@ -712,6 +733,22 @@ impl MetaStore for InMemoryMetaStore {
                 Ok(BeginViewBootstrapOutcome::Conflict)
             };
         }
+        // View-on-view admissions bump the tenant graph revision atomically
+        // with the bootstrap record; a stale expected revision means another
+        // admission moved the graph after this request's cycle check.
+        if !request.view_inputs.is_empty() {
+            let revision = guard
+                .view_dependency_graph_revisions
+                .get(&request.tenant_id)
+                .copied()
+                .unwrap_or(0);
+            if revision != request.expected_graph_revision {
+                return Ok(BeginViewBootstrapOutcome::Conflict);
+            }
+            guard
+                .view_dependency_graph_revisions
+                .insert(request.tenant_id.clone(), revision + 1);
+        }
         let cut_request = CaptureIngestSourceCutRequest {
             relations: request.relations.clone(),
         };
@@ -724,6 +761,21 @@ impl MetaStore for InMemoryMetaStore {
         let control = view_bootstrap::bootstrap_control(request, cut);
         guard.view_bootstraps.insert(key, control.clone());
         Ok(BeginViewBootstrapOutcome::Created(control))
+    }
+
+    async fn read_view_dependency_graph_revision(
+        &self,
+        tenant_id: &str,
+    ) -> Result<u64, MetaStoreError> {
+        require_non_empty("tenant_id", tenant_id)?;
+        Ok(self
+            .inner
+            .read()
+            .await
+            .view_dependency_graph_revisions
+            .get(tenant_id)
+            .copied()
+            .unwrap_or(0))
     }
 
     async fn read_view_bootstrap(
@@ -1172,6 +1224,16 @@ impl MetaStore for OssMetaStore {
         validate_standing_runtime_scope(tenant_id, program_id, view_id)?;
         Err(MetaStoreError::UnsupportedCapability(
             "linearizable_standing_runtime_checkpoint_publish",
+        ))
+    }
+
+    async fn read_view_dependency_graph_revision(
+        &self,
+        tenant_id: &str,
+    ) -> Result<u64, MetaStoreError> {
+        require_non_empty("tenant_id", tenant_id)?;
+        Err(MetaStoreError::UnsupportedCapability(
+            "authoritative_view_bootstrap",
         ))
     }
 }
@@ -2030,6 +2092,22 @@ where
             },
         ))
     }
+
+    async fn read_view_dependency_graph_revision(
+        &self,
+        request: Request<proto::ReadViewDependencyGraphRevisionRequest>,
+    ) -> Result<Response<proto::ReadViewDependencyGraphRevisionResponse>, Status> {
+        self.authorize(&request)?;
+        let request = request.into_inner();
+        let revision = self
+            .store
+            .read_view_dependency_graph_revision(&request.tenant_id)
+            .await
+            .map_err(meta_status)?;
+        Ok(Response::new(
+            proto::ReadViewDependencyGraphRevisionResponse { revision },
+        ))
+    }
 }
 
 fn store_relation_catalog_outcome(outcome: &StoreRelationCatalogOutcome) -> &'static str {
@@ -2474,6 +2552,38 @@ impl HiqliteMetaStore {
             .map_err(hiqlite_error)?;
         self.client
             .execute(
+                "CREATE TABLE IF NOT EXISTS velorix_view_bootstrap_view_inputs (
+                    tenant_id TEXT NOT NULL,
+                    program_id TEXT NOT NULL,
+                    view_id TEXT NOT NULL,
+                    bootstrap_generation INTEGER NOT NULL,
+                    edge_ordinal INTEGER NOT NULL,
+                    edge_json TEXT NOT NULL,
+                    PRIMARY KEY (
+                        tenant_id,
+                        program_id,
+                        view_id,
+                        bootstrap_generation,
+                        edge_ordinal
+                    )
+                )",
+                vec![],
+            )
+            .await
+            .map_err(hiqlite_error)?;
+        self.client
+            .execute(
+                "CREATE TABLE IF NOT EXISTS velorix_view_dependency_graph_heads (
+                    tenant_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    PRIMARY KEY (tenant_id)
+                )",
+                vec![],
+            )
+            .await
+            .map_err(hiqlite_error)?;
+        self.client
+            .execute(
                 "CREATE TABLE IF NOT EXISTS velorix_view_bootstrap_reservations (
                     tenant_id TEXT NOT NULL,
                     program_id TEXT NOT NULL,
@@ -2789,6 +2899,33 @@ impl HiqliteMetaStore {
                 schema_fingerprint: input.schema_fingerprint,
             })
             .collect::<Vec<_>>();
+        let view_input_rows = self
+            .client
+            .query_consistent_map::<ViewBootstrapViewInputRow, _>(
+                "SELECT edge_json
+                FROM velorix_view_bootstrap_view_inputs
+                WHERE tenant_id = $1 AND program_id = $2 AND view_id = $3
+                  AND bootstrap_generation = $4
+                ORDER BY edge_ordinal",
+                vec![
+                    hiqlite::Param::from(tenant_id.to_string()),
+                    hiqlite::Param::from(program_id.to_string()),
+                    hiqlite::Param::from(view_id.to_string()),
+                    hiqlite::Param::from(control.bootstrap_generation),
+                ],
+            )
+            .await
+            .map_err(hiqlite_error)?;
+        let view_inputs = view_input_rows
+            .into_iter()
+            .map(|row| {
+                serde_json::from_slice(&row.edge_json).map_err(|error| {
+                    MetaStoreError::Serialization(format!(
+                        "could not deserialize view bootstrap view input: {error}"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let snapshots = self
             .client
             .query_consistent_map::<SourceCutReservationRow, _>(
@@ -2850,6 +2987,7 @@ impl HiqliteMetaStore {
             bootstrap_cut,
             activation_cut,
             active_checkpoint,
+            view_inputs,
         }))
     }
 }
@@ -3239,6 +3377,34 @@ impl MetaStore for HiqliteMetaStore {
                 ],
             ));
         }
+        for (ordinal, edge) in request.view_inputs.iter().enumerate() {
+            let ordinal = i64::try_from(ordinal).map_err(|_| {
+                MetaStoreError::Serialization(
+                    "view bootstrap view-input ordinal exceeds i64".to_string(),
+                )
+            })?;
+            let edge_json = serde_json::to_vec(edge).map_err(|error| {
+                MetaStoreError::Serialization(format!(
+                    "could not serialize view bootstrap view input: {error}"
+                ))
+            })?;
+            statements.push((
+                "INSERT INTO velorix_view_bootstrap_view_inputs (
+                    tenant_id, program_id, view_id, bootstrap_generation,
+                    edge_ordinal, edge_json
+                )
+                SELECT $1, $2, $3, $4, $5, $6
+                WHERE changes() = 1",
+                vec![
+                    hiqlite::Param::from(request.tenant_id.clone()),
+                    hiqlite::Param::from(request.program_id.clone()),
+                    hiqlite::Param::from(request.view_id.clone()),
+                    hiqlite::Param::from(generation),
+                    hiqlite::Param::from(ordinal),
+                    hiqlite::Param::from(edge_json),
+                ],
+            ));
+        }
         statements.push((
             "INSERT INTO velorix_view_bootstrap_reservations (
                 tenant_id, program_id, view_id, bootstrap_generation,
@@ -3275,6 +3441,27 @@ impl MetaStore for HiqliteMetaStore {
                 hiqlite::Param::from(generation),
             ],
         ));
+        if !request.view_inputs.is_empty() {
+            let expected_revision =
+                i64::try_from(request.expected_graph_revision).map_err(|_| {
+                    MetaStoreError::Serialization("expected graph revision exceeds i64".to_string())
+                })?;
+            statements.push((
+                "INSERT OR IGNORE INTO velorix_view_dependency_graph_heads
+                    (tenant_id, revision)
+                 VALUES ($1, 1)",
+                vec![hiqlite::Param::from(request.tenant_id.clone())],
+            ));
+            statements.push((
+                "UPDATE velorix_view_dependency_graph_heads
+                 SET revision = revision + 1
+                 WHERE tenant_id = $1 AND revision = $2",
+                vec![
+                    hiqlite::Param::from(request.tenant_id.clone()),
+                    hiqlite::Param::from(expected_revision),
+                ],
+            ));
+        }
         let results = self
             .with_schema_repair(|| {
                 let statements = statements.clone();
@@ -3282,6 +3469,17 @@ impl MetaStore for HiqliteMetaStore {
             })
             .await?;
         let created = hiqlite_txn_changed_rows(results, 0)? == 1;
+        if !request.view_inputs.is_empty() {
+            // The graph gate succeeds when exactly one of {INSERT OR IGNORE,
+            // revision CAS UPDATE} changed a row: first admission inserts the
+            // head, later admissions bump it from the expected revision. A
+            // stale expected revision changes nothing and fails the gate.
+            let inserted_head = hiqlite_txn_changed_rows(results, statements.len() - 2)?;
+            let bumped_revision = hiqlite_txn_changed_rows(results, statements.len() - 1)?;
+            if inserted_head + bumped_revision != 1 {
+                return Ok(BeginViewBootstrapOutcome::Conflict);
+            }
+        }
         let control = self
             .read_view_bootstrap_record(&request.tenant_id, &request.program_id, &request.view_id)
             .await?
@@ -3981,6 +4179,46 @@ impl MetaStore for HiqliteMetaStore {
             .map(StandingRuntimeCheckpointPointerRow::into_pointer)
             .transpose()
     }
+
+    async fn read_view_dependency_graph_revision(
+        &self,
+        tenant_id: &str,
+    ) -> Result<u64, MetaStoreError> {
+        require_non_empty("tenant_id", tenant_id)?;
+        let rows = self
+            .with_schema_repair(|| async {
+                self.client
+                    .query_consistent_map::<GraphHeadRow, _>(
+                        "SELECT revision FROM velorix_view_dependency_graph_heads
+                         WHERE tenant_id = $1",
+                        vec![hiqlite::Param::from(tenant_id.to_string())],
+                    )
+                    .await
+                    .map_err(hiqlite_error)
+            })
+            .await?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(0);
+        };
+        let revision = i64::try_from(row.revision)
+            .map_err(|_| MetaStoreError::Serialization("graph revision is negative".to_string()))?;
+        u64::try_from(revision)
+            .map_err(|_| MetaStoreError::Serialization("graph revision is negative".to_string()))
+    }
+}
+
+#[cfg(feature = "hiqlite-backend")]
+struct GraphHeadRow {
+    revision: i64,
+}
+
+#[cfg(feature = "hiqlite-backend")]
+impl From<&mut hiqlite::Row<'_>> for GraphHeadRow {
+    fn from(row: &mut hiqlite::Row<'_>) -> Self {
+        Self {
+            revision: row.get("revision"),
+        }
+    }
 }
 
 #[cfg(feature = "hiqlite-backend")]
@@ -4274,6 +4512,20 @@ impl From<&mut hiqlite::Row<'_>> for ViewBootstrapInputRow {
             relation_id: row.get("relation_id"),
             relation_version: row.get("relation_version"),
             schema_fingerprint: row.get("schema_fingerprint"),
+        }
+    }
+}
+
+#[cfg(feature = "hiqlite-backend")]
+struct ViewBootstrapViewInputRow {
+    edge_json: Vec<u8>,
+}
+
+#[cfg(feature = "hiqlite-backend")]
+impl From<&mut hiqlite::Row<'_>> for ViewBootstrapViewInputRow {
+    fn from(row: &mut hiqlite::Row<'_>) -> Self {
+        Self {
+            edge_json: row.get("edge_json"),
         }
     }
 }
@@ -4777,6 +5029,26 @@ impl MetaStore for GrpcMetaStore {
         Ok(Some(standing_runtime_checkpoint_pointer_from_proto(
             pointer,
         )?))
+    }
+
+    async fn read_view_dependency_graph_revision(
+        &self,
+        tenant_id: &str,
+    ) -> Result<u64, MetaStoreError> {
+        require_non_empty("tenant_id", tenant_id)?;
+        let response = self
+            .client
+            .lock()
+            .await
+            .read_view_dependency_graph_revision(self.request(
+                proto::ReadViewDependencyGraphRevisionRequest {
+                    tenant_id: tenant_id.to_string(),
+                },
+            ))
+            .await
+            .map_err(|error| MetaStoreError::Remote(error.to_string()))?
+            .into_inner();
+        Ok(response.revision)
     }
 }
 

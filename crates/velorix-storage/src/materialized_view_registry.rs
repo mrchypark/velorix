@@ -11,7 +11,8 @@ use velorix_core::{
     standing_program::StandingProgramIdentity,
     view_contract::{
         validate_materialized_standing_view_spec, validate_published_relation_binding_v1,
-        view_spec_hash, PublishedRelationBindingV1, StandingViewSpec, ViewContractError,
+        view_spec_hash, PublishedRelationBindingV1, StandingInputBindingV1, StandingViewSpec,
+        ViewContractError,
     },
     view_plan::VelorixLogicalViewPlanV1,
 };
@@ -169,6 +170,10 @@ pub struct MaterializedViewRuntimeBinding {
     pub logical_plan: Option<VelorixLogicalViewPlanV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub published_relations: Vec<PublishedRelationBindingV1>,
+    /// Durable input-edge bindings: direct source relations and published-view
+    /// outputs, each fenced to the producer generation captured at admission.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_bindings: Vec<StandingInputBindingV1>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -881,6 +886,31 @@ impl MaterializedViewRegistry {
                             field: "published_relation.producer_binding",
                         },
                     ));
+                }
+            }
+            for binding in &runtime.input_bindings {
+                binding
+                    .validate()
+                    .map_err(MaterializedViewRegistryError::Validation)?;
+                if let StandingInputBindingV1::PublishedView {
+                    edge_id,
+                    published_relation,
+                    ..
+                } = binding
+                {
+                    let expected_edge_id = velorix_core::view_contract::view_dependency_edge_id(
+                        &runtime.standing_program_identity.tenant_id,
+                        &published_relation.producer_view_id,
+                        published_relation,
+                    )
+                    .map_err(MaterializedViewRegistryError::Validation)?;
+                    if expected_edge_id != *edge_id {
+                        return Err(MaterializedViewRegistryError::Validation(
+                            ViewContractError::InvalidField {
+                                field: "input_binding.published_view.edge_id",
+                            },
+                        ));
+                    }
                 }
             }
         }

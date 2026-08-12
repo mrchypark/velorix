@@ -308,20 +308,25 @@ impl StandingProgramRuntime for TwoInputSemiAntiJoinRuntime {
                 let catalog = catalog_for_relation_id(&self.catalogs, &input.relation_id)?;
                 let (port_id, delta) = if input.relation_id == self.plan.left_input_relation_id {
                     let columns = filter_project_input_column_ids(&self.plan.projection);
-                    let delta = arrow_record_batches_to_key_multi_value_delta_batch(
-                        catalog,
-                        &input.relation_id,
-                        &input.relation_version,
-                        &input.schema_fingerprint,
-                        std::slice::from_ref(&self.plan.left_join_key_column_id),
-                        &columns,
-                        &input.batches,
-                    )
-                    .map_err(|_| {
-                        StandingProgramRuntimeError::InvalidProgramIdentity {
-                            field: "semi_anti_join_left_input_batch",
-                        }
-                    })?;
+                    let delta =
+                        if let Some(empty_delta) = published_input_empty_delta(&input, catalog)? {
+                            empty_delta
+                        } else {
+                            arrow_record_batches_to_key_multi_value_delta_batch(
+                                catalog,
+                                &input.relation_id,
+                                &input.relation_version,
+                                &input.schema_fingerprint,
+                                std::slice::from_ref(&self.plan.left_join_key_column_id),
+                                &columns,
+                                &input.batches,
+                            )
+                            .map_err(|_| {
+                                StandingProgramRuntimeError::InvalidProgramIdentity {
+                                    field: "semi_anti_join_left_input_batch",
+                                }
+                            })?
+                        };
                     (
                         "left",
                         project_filter_project_delta_batch(
@@ -341,20 +346,25 @@ impl StandingProgramRuntime for TwoInputSemiAntiJoinRuntime {
                         })
                         .map(|column| column.column_id.clone())
                         .collect::<Vec<_>>();
-                    let delta = arrow_record_batches_to_key_multi_value_delta_batch(
-                        catalog,
-                        &input.relation_id,
-                        &input.relation_version,
-                        &input.schema_fingerprint,
-                        std::slice::from_ref(&self.plan.right_join_key_column_id),
-                        &value_columns,
-                        &input.batches,
-                    )
-                    .map_err(|_| {
-                        StandingProgramRuntimeError::InvalidProgramIdentity {
-                            field: "semi_anti_join_right_input_batch",
-                        }
-                    })?;
+                    let delta =
+                        if let Some(empty_delta) = published_input_empty_delta(&input, catalog)? {
+                            empty_delta
+                        } else {
+                            arrow_record_batches_to_key_multi_value_delta_batch(
+                                catalog,
+                                &input.relation_id,
+                                &input.relation_version,
+                                &input.schema_fingerprint,
+                                std::slice::from_ref(&self.plan.right_join_key_column_id),
+                                &value_columns,
+                                &input.batches,
+                            )
+                            .map_err(|_| {
+                                StandingProgramRuntimeError::InvalidProgramIdentity {
+                                    field: "semi_anti_join_right_input_batch",
+                                }
+                            })?
+                        };
                     ("right", delta)
                 } else {
                     return Err(StandingProgramRuntimeError::InvalidProgramIdentity {

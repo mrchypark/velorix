@@ -14,7 +14,8 @@ use velorix_core::{
     },
     standing_program::{
         BuiltinRuntimeIdentity, EpochIdempotencyKey, NativeCodePolicy, RelationInputBatch,
-        ScopedViewId, SnapshotPageRequest, StandingProgramIdentity, StandingProgramRuntime,
+        RelationInputEncodingV1, ScopedViewId, SnapshotPageRequest, StandingProgramIdentity,
+        StandingProgramRuntime,
     },
     view_contract::{
         catalog_input_relation_schema, stable_bytes_hash, ColumnSchema, RelationSchema, SqlDataType,
@@ -368,6 +369,7 @@ fn relation_input(
     keys: &[i64],
 ) -> BenchResult<RelationInputBatch> {
     Ok(RelationInputBatch {
+        encoding: RelationInputEncodingV1::SourceRelationV1,
         relation_id: catalog.relation_schema.relation_id.clone(),
         relation_version: catalog.relation_schema.relation_version.clone(),
         stream_id: format!("{workload_id}-{}", catalog.relation_schema.relation_id),
@@ -545,6 +547,7 @@ fn outer_relation_input(
     rows: &[(i64, i64, i64)],
 ) -> BenchResult<RelationInputBatch> {
     Ok(RelationInputBatch {
+        encoding: RelationInputEncodingV1::SourceRelationV1,
         relation_id: catalog.relation_schema.relation_id.clone(),
         relation_version: catalog.relation_schema.relation_version.clone(),
         stream_id: format!("{workload_id}-{}", catalog.relation_schema.relation_id),

@@ -5,122 +5,22 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::relation::{
-    RelationColumnV1, RelationSchemaError, VelorixLogicalTypeV1, VelorixRelationCatalogV1,
+    ArrowPhysicalTypeV1, DataFusionRegistrationModeV1, DataFusionRegistrationV1,
+    IncrementalAdapterBindingV1, IncrementalRelationBindingV1, RelationColumnV1,
+    RelationOperationV1, RelationSchemaError, RelationSemanticRoleV1, SchemaFingerprintV1,
+    VelorixLogicalTypeV1, VelorixRelationCatalogV1, VelorixRelationSchemaV1,
+    VelorixRelationSourceV1, CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID, RELATION_SCHEMA_VERSION_V1,
 };
+use crate::standing_program::CausalViewCursorV1;
 
 pub const SPEC_HASH_PREFIX: &str = "velorix-view-spec-sha256-v1";
 pub const PUBLISHED_RELATION_BINDING_SCHEMA_VERSION_V1: u32 = 1;
 pub const PUBLISHED_RELATION_DELTA_CODEC_V1: &str = "velorix-published-relation-delta-v1";
 pub const PUBLISHED_RELATION_FRONTIER_KIND_V1: &str = "producer_commit_epoch";
-/// Tagged input binding for view admission.
-///
-/// Distinguishes between physical source relations and upstream materialized
-/// view outputs. This is critical for:
-/// - Trust boundary enforcement (source vs. view inputs)
-/// - Graph mutation CAS (view edges require cycle detection)
-/// - Checkpoint identity (dependency binding digest)
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum BoundInputV1 {
-    /// Input from a physical ingest source relation.
-    Source(SourceInputBindingV1),
-    /// Input from an upstream materialized view output.
-    View(ViewDependencyEdgeBindingV1),
-}
-
-/// A view admission input resolved to a concrete authority domain.
-///
-/// Admission resolves each requested input to either a physical source
-/// (with its registered catalog) or a published view output (with its
-/// producer binding and admitted dependency edge). The input kind is
-/// explicit: the resolver must NOT fall back between source and view based
-/// on relation ID/version availability, because a physical source and a
-/// published view output can share the same relation identity.
-#[derive(Clone, Debug)]
-pub enum ResolvedAdmissionInput {
-    /// Input from a registered physical ingest source.
-    Source {
-        catalog: VelorixRelationCatalogV1,
-        relation: RelationSchema,
-        binding: SourceInputBindingV1,
-    },
-    /// Input from an upstream materialized view output.
-    View {
-        relation: RelationSchema,
-        /// The producer's published binding, used only for admission-time
-        /// verification. Persist `edge`, not this full object.
-        published: PublishedRelationBindingV1,
-        /// The immutable dependency edge this input is bound to.
-        edge: ViewDependencyEdgeBindingV1,
-    },
-}
-
-impl ResolvedAdmissionInput {
-    /// Returns the relation schema the consumer planner resolves against.
-    pub fn relation(&self) -> &RelationSchema {
-        match self {
-            ResolvedAdmissionInput::Source { relation, .. }
-            | ResolvedAdmissionInput::View { relation, .. } => relation,
-        }
-    }
-}
-
-/// Binding for a physical source relation input.
-///
-/// Wraps the existing source relation identity fields used throughout
-/// the ingest pipeline.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SourceInputBindingV1 {
-    pub relation_id: String,
-    pub relation_version: String,
-    pub relation_generation: u64,
-    pub schema_fingerprint: String,
-}
-
-/// Binding for a view-to-view dependency edge.
-///
-/// Contains all information needed to:
-/// - Resolve the producer view's published output
-/// - Validate schema/key/codec consistency
-/// - Track the dependency in the graph revision
-/// - Verify the authority chain during checkpoint/restore
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ViewDependencyEdgeBindingV1 {
-    /// Unique identifier for this edge within the dependency graph.
-    pub input_edge_id: String,
-    /// Graph revision under which this edge was admitted.
-    pub graph_revision: u64,
-    /// Producer view's tenant ID.
-    pub producer_tenant_id: String,
-    /// Producer view's program ID.
-    pub producer_program_id: String,
-    /// Producer view's view ID.
-    pub producer_view_id: String,
-    /// Producer view's generation at admission time.
-    pub producer_generation: u64,
-    /// Producer view's logical plan hash.
-    pub producer_plan_hash: String,
-    /// Output schema hash from the producer's PublishedRelationBindingV1.
-    pub output_schema_hash: String,
-    /// Key descriptor hash from the producer's PublishedRelationBindingV1.
-    pub key_descriptor_hash: String,
-    /// Output stream ID from the producer's PublishedRelationBindingV1.
-    pub output_stream_id: String,
-    /// Delta codec identity from the producer's PublishedRelationBindingV1.
-    pub delta_codec_identity: String,
-    /// Frontier kind from the producer's PublishedRelationBindingV1.
-    pub frontier_kind: String,
-}
-
-/// Canonical hash of a dependency edge binding set.
-///
-/// Computed over the sorted set of `ViewDependencyEdgeBindingV1` entries,
-/// ensuring that any change to the dependency graph produces a different
-/// program identity.
-pub const DEPENDENCY_BINDING_DIGEST_PREFIX: &str = "velorix-dependency-binding-sha256-v1";
-
+pub const PUBLISHED_DELTA_WEIGHT_FIELD_V1: &str = "__velorix_internal_weight_v1";
+pub const STANDING_INPUT_BINDING_SCHEMA_VERSION_V1: u32 = 1;
+pub const VIEW_DEPENDENCY_EDGE_SCHEMA_VERSION_V1: u32 = 1;
+pub const VIEW_DEPENDENCY_EDGE_ID_DOMAIN_V1: &str = "velorix-view-dependency-edge-v1";
 pub const MAX_RELATION_COLUMNS: usize = 1024;
 pub const MAX_SQL_TYPE_NESTING_DEPTH: usize = 16;
 pub const MAX_SQL_TYPE_NODES: usize = 4096;
@@ -196,6 +96,54 @@ pub struct PublishedRelationBindingV1 {
     /// Canonical digest of the dependency edge binding set.
     /// Empty for direct source inputs.
     pub dependency_binding_digest: String,
+}
+
+/// Durable description of one input edge of a materialized view: either a
+/// direct source relation or the published output of a producer view.
+///
+/// A view input is bound to an immutable producer generation at admission
+/// time. The public relation schema never contains a physical delta-weight
+/// column; signed bag weights travel through the internal published-delta
+/// Arrow encoding instead.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum StandingInputBindingV1 {
+    Source {
+        relation: RelationSchema,
+        relation_generation: u64,
+    },
+    PublishedView {
+        edge_id: String,
+        producer_tenant_id: String,
+        producer_program_id: String,
+        published_relation: PublishedRelationBindingV1,
+        graph_revision: u64,
+        bootstrap_cursor: CausalViewCursorV1,
+    },
+}
+
+/// Durable view-on-view dependency edge, persisted alongside the consumer's
+/// active view record. Direction is consumer -> producer.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewDependencyEdgeV1 {
+    pub schema_version: u32,
+    pub edge_id: String,
+    pub tenant_id: String,
+    pub consumer_program_id: String,
+    pub consumer_view_id: String,
+    pub consumer_generation: u64,
+    pub input_relation_id: String,
+    pub input_relation_version: String,
+    pub producer_program_id: String,
+    pub producer_view_id: String,
+    pub producer_generation: u64,
+    pub producer_plan_hash: String,
+    pub output_stream_id: String,
+    pub output_schema_hash: String,
+    pub key_descriptor_hash: String,
+    pub delta_codec_identity: String,
+    pub frontier_kind: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -343,6 +291,15 @@ pub fn catalog_input_relation_schema(
             .relation_schema
             .columns
             .iter()
+            .filter(|column| {
+                // The internal weight column of a published-view-output
+                // descriptor is an encoding artifact, not part of the public
+                // relation schema.
+                !(matches!(
+                    catalog.relation_source,
+                    VelorixRelationSourceV1::PublishedViewOutput { .. }
+                ) && column.column_id == catalog.relation_schema.weight_column_id)
+            })
             .map(catalog_column_schema)
             .collect::<Result<Vec<_>, _>>()?,
         primary_key: catalog_primary_key_columns(catalog)?,
@@ -547,6 +504,520 @@ pub fn stable_bytes_hash(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("sha256:{:x}", hasher.finalize())
+}
+
+/// Synthesizes the runtime planning descriptor for a published-view-output
+/// input relation. The descriptor mirrors the producer's signed binding: the
+/// public columns in binding order plus exactly one private Int64 weight
+/// column carrying signed bag weights. The declared schema fingerprint is the
+/// producer's signed output fingerprint, not a recomputation over the
+/// descriptor schema.
+///
+/// The descriptor is a runtime-only artifact: it is never registered in the
+/// relation registry and must never be a target of external ingest.
+pub fn catalog_from_published_relation_binding(
+    binding: &PublishedRelationBindingV1,
+) -> Result<VelorixRelationCatalogV1, ViewContractError> {
+    validate_published_relation_binding_v1(binding)?;
+    for column in &binding.relation.columns {
+        if column.name == PUBLISHED_DELTA_WEIGHT_FIELD_V1 {
+            return Err(ViewContractError::InvalidField {
+                field: "published_relation.column.name",
+            });
+        }
+    }
+    let mut columns = Vec::with_capacity(binding.relation.columns.len() + 1);
+    let primary_key = binding.relation.primary_key.iter().collect::<BTreeSet<_>>();
+    for (ordinal, column) in binding.relation.columns.iter().enumerate() {
+        let (logical_type, physical_arrow_type) = published_column_type(&column.data_type)
+            .ok_or_else(|| ViewContractError::InvalidField {
+                field: "published_relation.column.data_type",
+            })?;
+        let semantic_role = if primary_key.contains(&column.name) {
+            RelationSemanticRoleV1::PrimaryKey
+        } else {
+            RelationSemanticRoleV1::Value
+        };
+        columns.push(RelationColumnV1 {
+            column_id: column.name.clone(),
+            name: column.name.clone(),
+            logical_type,
+            physical_arrow_type,
+            nullable: column.nullable,
+            ordinal: u32::try_from(ordinal).map_err(|_| ViewContractError::InvalidField {
+                field: "published_relation.column.ordinal",
+            })?,
+            semantic_role,
+        });
+    }
+    columns.push(RelationColumnV1 {
+        column_id: PUBLISHED_DELTA_WEIGHT_FIELD_V1.to_string(),
+        name: PUBLISHED_DELTA_WEIGHT_FIELD_V1.to_string(),
+        logical_type: VelorixLogicalTypeV1::Int64,
+        physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+        nullable: false,
+        ordinal: u32::try_from(binding.relation.columns.len()).map_err(|_| {
+            ViewContractError::InvalidField {
+                field: "published_relation.weight_column.ordinal",
+            }
+        })?,
+        semantic_role: RelationSemanticRoleV1::Weight,
+    });
+    let relation_schema = VelorixRelationSchemaV1 {
+        relation_id: binding.relation.relation_id.clone(),
+        relation_name: binding.relation.relation_name.clone(),
+        relation_version: binding.relation.relation_version.clone(),
+        columns,
+        primary_key_column_ids: binding.relation.primary_key.clone(),
+        weight_column_id: PUBLISHED_DELTA_WEIGHT_FIELD_V1.to_string(),
+        allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+        event_time_column_id: None,
+    };
+    relation_schema
+        .validate()
+        .map_err(|_| ViewContractError::InvalidField {
+            field: "published_relation.catalog_schema",
+        })?;
+    let schema_fingerprint = SchemaFingerprintV1::new(binding.relation.schema_fingerprint.clone());
+    schema_fingerprint
+        .validate("published_relation.schema_fingerprint")
+        .map_err(|_| ViewContractError::InvalidField {
+            field: "published_relation.schema_fingerprint",
+        })?;
+    let catalog = VelorixRelationCatalogV1 {
+        schema_version: RELATION_SCHEMA_VERSION_V1,
+        relation_schema,
+        schema_fingerprint: schema_fingerprint.clone(),
+        datafusion_registration: DataFusionRegistrationV1 {
+            name: binding.relation.relation_name.clone(),
+            mode: DataFusionRegistrationModeV1::Table,
+        },
+        incremental_relation: IncrementalRelationBindingV1 {
+            relation_id: binding.relation.relation_id.clone(),
+            schema_fingerprint: schema_fingerprint.clone(),
+        },
+        incremental_adapter: IncrementalAdapterBindingV1 {
+            adapter_id: CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.to_string(),
+        },
+        relation_source: VelorixRelationSourceV1::PublishedViewOutput {
+            producer_view_id: binding.producer_view_id.clone(),
+            producer_view_generation: binding.producer_view_generation,
+            output_stream_id: binding.output_stream_id.clone(),
+        },
+    };
+    catalog
+        .validate_ingest_adapter_scope()
+        .map_err(|_| ViewContractError::InvalidField {
+            field: "published_relation.catalog_adapter",
+        })?;
+    Ok(catalog)
+}
+
+fn published_column_type(
+    data_type: &SqlDataType,
+) -> Option<(VelorixLogicalTypeV1, ArrowPhysicalTypeV1)> {
+    match data_type {
+        SqlDataType::Bool => Some((VelorixLogicalTypeV1::Bool, ArrowPhysicalTypeV1::Boolean)),
+        SqlDataType::Int8 => Some((VelorixLogicalTypeV1::Int8, ArrowPhysicalTypeV1::Int8)),
+        SqlDataType::Int16 => Some((VelorixLogicalTypeV1::Int16, ArrowPhysicalTypeV1::Int16)),
+        SqlDataType::Int32 => Some((VelorixLogicalTypeV1::Int32, ArrowPhysicalTypeV1::Int32)),
+        SqlDataType::Int64 => Some((VelorixLogicalTypeV1::Int64, ArrowPhysicalTypeV1::Int64)),
+        SqlDataType::UInt8 => Some((VelorixLogicalTypeV1::UInt8, ArrowPhysicalTypeV1::UInt8)),
+        SqlDataType::UInt16 => Some((VelorixLogicalTypeV1::UInt16, ArrowPhysicalTypeV1::UInt16)),
+        SqlDataType::UInt32 => Some((VelorixLogicalTypeV1::UInt32, ArrowPhysicalTypeV1::UInt32)),
+        SqlDataType::UInt64 => Some((VelorixLogicalTypeV1::UInt64, ArrowPhysicalTypeV1::UInt64)),
+        SqlDataType::Float32 => Some((VelorixLogicalTypeV1::Float32, ArrowPhysicalTypeV1::Float32)),
+        SqlDataType::Float64 => Some((VelorixLogicalTypeV1::Float64, ArrowPhysicalTypeV1::Float64)),
+        SqlDataType::Decimal { precision, scale } => Some((
+            VelorixLogicalTypeV1::Decimal {
+                precision: *precision,
+                scale: *scale,
+            },
+            ArrowPhysicalTypeV1::Decimal128 {
+                precision: *precision,
+                scale: *scale,
+            },
+        )),
+        SqlDataType::Char { length } => Some((
+            VelorixLogicalTypeV1::Char { length: *length },
+            ArrowPhysicalTypeV1::Utf8,
+        )),
+        SqlDataType::Utf8 | SqlDataType::Uuid | SqlDataType::Json | SqlDataType::Geometry => {
+            Some((VelorixLogicalTypeV1::Utf8, ArrowPhysicalTypeV1::Utf8))
+        }
+        SqlDataType::Binary { length } => Some((
+            VelorixLogicalTypeV1::Binary { length: *length },
+            ArrowPhysicalTypeV1::Binary,
+        )),
+        SqlDataType::Varbinary => {
+            Some((VelorixLogicalTypeV1::Varbinary, ArrowPhysicalTypeV1::Binary))
+        }
+        SqlDataType::Date => Some((VelorixLogicalTypeV1::Date, ArrowPhysicalTypeV1::Date32)),
+        SqlDataType::Time => Some((
+            VelorixLogicalTypeV1::Time,
+            ArrowPhysicalTypeV1::Time64Nanosecond,
+        )),
+        SqlDataType::Timestamp { timezone } => Some((
+            VelorixLogicalTypeV1::Timestamp {
+                timezone: timezone.clone(),
+            },
+            ArrowPhysicalTypeV1::TimestampNanosecond {
+                timezone: timezone.clone(),
+            },
+        )),
+        SqlDataType::Interval { .. }
+        | SqlDataType::Null
+        | SqlDataType::Array { .. }
+        | SqlDataType::Struct { .. }
+        | SqlDataType::Map { .. } => None,
+    }
+}
+
+impl StandingInputBindingV1 {
+    pub fn validate(&self) -> Result<(), ViewContractError> {
+        match self {
+            StandingInputBindingV1::Source {
+                relation,
+                relation_generation,
+            } => {
+                validate_relation_schema(relation)?;
+                if *relation_generation == 0 {
+                    return Err(ViewContractError::InvalidField {
+                        field: "input_binding.source.relation_generation",
+                    });
+                }
+                Ok(())
+            }
+            StandingInputBindingV1::PublishedView {
+                edge_id,
+                producer_tenant_id,
+                producer_program_id,
+                published_relation,
+                graph_revision,
+                bootstrap_cursor,
+            } => {
+                require_non_empty("input_binding.published_view.edge_id", edge_id)?;
+                require_non_empty(
+                    "input_binding.published_view.producer_tenant_id",
+                    producer_tenant_id,
+                )?;
+                require_non_empty(
+                    "input_binding.published_view.producer_program_id",
+                    producer_program_id,
+                )?;
+                validate_published_relation_binding_v1(published_relation)?;
+                if *graph_revision == 0 {
+                    return Err(ViewContractError::InvalidField {
+                        field: "input_binding.published_view.graph_revision",
+                    });
+                }
+                // The bootstrap cursor must be bound to the same producer
+                // scope as the binding: edge, tenant, program, view,
+                // generation, and output stream. A format-valid cursor that
+                // points at a different producer would let a consumer read
+                // the wrong commit lineage.
+                if bootstrap_cursor.input_edge != *edge_id
+                    || bootstrap_cursor.producer_tenant_id != *producer_tenant_id
+                    || bootstrap_cursor.producer_program_id != *producer_program_id
+                    || bootstrap_cursor.producer_view_id != published_relation.producer_view_id
+                    || bootstrap_cursor.producer_generation
+                        != published_relation.producer_view_generation
+                    || bootstrap_cursor.output_stream != published_relation.output_stream_id
+                {
+                    return Err(ViewContractError::InvalidField {
+                        field: "input_binding.published_view.bootstrap_cursor",
+                    });
+                }
+                bootstrap_cursor
+                    .validate()
+                    .map_err(|_| ViewContractError::InvalidField {
+                        field: "input_binding.published_view.bootstrap_cursor",
+                    })?;
+                let expected_edge_id = view_dependency_edge_id(
+                    producer_tenant_id,
+                    producer_program_id,
+                    published_relation,
+                )
+                .map_err(|_| ViewContractError::InvalidField {
+                    field: "input_binding.published_view.edge_id",
+                })?;
+                if expected_edge_id != *edge_id {
+                    return Err(ViewContractError::InvalidField {
+                        field: "input_binding.published_view.edge_id",
+                    });
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Canonical identity hash over the full binding: producer scope,
+    /// generation, plan hash, output stream, schema hash, key hash, codec,
+    /// and frontier kind. View inputs must never be identified by the public
+    /// schema fingerprint alone.
+    pub fn input_catalog_hash(&self) -> Result<String, ViewContractError> {
+        match self {
+            StandingInputBindingV1::Source { relation, .. } => {
+                require_non_empty(
+                    "input_binding.schema_fingerprint",
+                    &relation.schema_fingerprint,
+                )?;
+                Ok(relation.schema_fingerprint.clone())
+            }
+            StandingInputBindingV1::PublishedView {
+                producer_tenant_id,
+                producer_program_id,
+                published_relation: binding,
+                ..
+            } => {
+                #[derive(Serialize)]
+                struct BindingIdentity<'a> {
+                    domain: &'static str,
+                    kind: &'static str,
+                    schema_version: u32,
+                    producer_tenant_id: &'a str,
+                    producer_program_id: &'a str,
+                    producer_view_id: &'a str,
+                    producer_view_generation: u64,
+                    producer_plan_hash: &'a str,
+                    output_stream_id: &'a str,
+                    output_schema_hash: &'a str,
+                    key_descriptor_hash: &'a str,
+                    delta_codec_identity: &'a str,
+                    frontier_kind: &'a str,
+                    schema_fingerprint: &'a str,
+                }
+                let identity = BindingIdentity {
+                    domain: "velorix-standing-input-binding-v1",
+                    kind: "published_view",
+                    schema_version: STANDING_INPUT_BINDING_SCHEMA_VERSION_V1,
+                    producer_tenant_id,
+                    producer_program_id,
+                    producer_view_id: &binding.producer_view_id,
+                    producer_view_generation: binding.producer_view_generation,
+                    producer_plan_hash: &binding.producer_plan_hash,
+                    output_stream_id: &binding.output_stream_id,
+                    output_schema_hash: &binding.output_schema_hash,
+                    key_descriptor_hash: &binding.key_descriptor_hash,
+                    delta_codec_identity: &binding.delta_codec_identity,
+                    frontier_kind: &binding.frontier_kind,
+                    schema_fingerprint: &binding.relation.schema_fingerprint,
+                };
+                let bytes = serde_json::to_vec(&identity).map_err(|source| {
+                    ViewContractError::Serialization {
+                        reason: format!("could not serialize input binding identity: {source}"),
+                    }
+                })?;
+                Ok(stable_bytes_hash(&bytes))
+            }
+        }
+    }
+}
+
+/// Canonical domain-separated edge id for a view-on-view dependency edge.
+pub fn view_dependency_edge_id(
+    producer_tenant_id: &str,
+    producer_program_id: &str,
+    binding: &PublishedRelationBindingV1,
+) -> Result<String, ViewContractError> {
+    require_non_empty("edge.producer_tenant_id", producer_tenant_id)?;
+    require_non_empty("edge.producer_program_id", producer_program_id)?;
+    validate_published_relation_binding_v1(binding)?;
+    #[derive(Serialize)]
+    struct EdgeIdentity<'a> {
+        domain: &'static str,
+        schema_version: u32,
+        producer_tenant_id: &'a str,
+        producer_program_id: &'a str,
+        producer_view_id: &'a str,
+        producer_generation: u64,
+        producer_plan_hash: &'a str,
+        output_stream_id: &'a str,
+        output_schema_hash: &'a str,
+        key_descriptor_hash: &'a str,
+        delta_codec_identity: &'a str,
+        frontier_kind: &'a str,
+        schema_fingerprint: &'a str,
+    }
+    let identity = EdgeIdentity {
+        domain: VIEW_DEPENDENCY_EDGE_ID_DOMAIN_V1,
+        schema_version: VIEW_DEPENDENCY_EDGE_SCHEMA_VERSION_V1,
+        producer_tenant_id,
+        producer_program_id,
+        producer_view_id: &binding.producer_view_id,
+        producer_generation: binding.producer_view_generation,
+        producer_plan_hash: &binding.producer_plan_hash,
+        output_stream_id: &binding.output_stream_id,
+        output_schema_hash: &binding.output_schema_hash,
+        key_descriptor_hash: &binding.key_descriptor_hash,
+        delta_codec_identity: &binding.delta_codec_identity,
+        frontier_kind: &binding.frontier_kind,
+        schema_fingerprint: &binding.relation.schema_fingerprint,
+    };
+    let bytes =
+        serde_json::to_vec(&identity).map_err(|source| ViewContractError::Serialization {
+            reason: format!("could not serialize view dependency edge identity: {source}"),
+        })?;
+    Ok(stable_bytes_hash(&bytes))
+}
+
+pub fn view_dependency_edge_from_binding(
+    tenant_id: &str,
+    consumer_program_id: &str,
+    consumer_view_id: &str,
+    consumer_generation: u64,
+    input_relation_id: &str,
+    input_relation_version: &str,
+    producer_program_id: &str,
+    binding: &PublishedRelationBindingV1,
+) -> Result<ViewDependencyEdgeV1, ViewContractError> {
+    let edge_id = view_dependency_edge_id(tenant_id, producer_program_id, binding)?;
+    let edge = ViewDependencyEdgeV1 {
+        schema_version: VIEW_DEPENDENCY_EDGE_SCHEMA_VERSION_V1,
+        edge_id,
+        tenant_id: tenant_id.to_string(),
+        consumer_program_id: consumer_program_id.to_string(),
+        consumer_view_id: consumer_view_id.to_string(),
+        consumer_generation,
+        input_relation_id: input_relation_id.to_string(),
+        input_relation_version: input_relation_version.to_string(),
+        producer_program_id: producer_program_id.to_string(),
+        producer_view_id: binding.producer_view_id.clone(),
+        producer_generation: binding.producer_view_generation,
+        producer_plan_hash: binding.producer_plan_hash.clone(),
+        output_stream_id: binding.output_stream_id.clone(),
+        output_schema_hash: binding.output_schema_hash.clone(),
+        key_descriptor_hash: binding.key_descriptor_hash.clone(),
+        delta_codec_identity: binding.delta_codec_identity.clone(),
+        frontier_kind: binding.frontier_kind.clone(),
+    };
+    validate_view_dependency_edge(&edge)?;
+    Ok(edge)
+}
+
+pub fn validate_view_dependency_edge(edge: &ViewDependencyEdgeV1) -> Result<(), ViewContractError> {
+    if edge.schema_version != VIEW_DEPENDENCY_EDGE_SCHEMA_VERSION_V1
+        || edge.consumer_generation == 0
+    {
+        return Err(ViewContractError::InvalidField {
+            field: "dependency_edge",
+        });
+    }
+    require_non_empty("dependency_edge.edge_id", &edge.edge_id)?;
+    require_non_empty("dependency_edge.tenant_id", &edge.tenant_id)?;
+    require_non_empty(
+        "dependency_edge.consumer_program_id",
+        &edge.consumer_program_id,
+    )?;
+    require_non_empty("dependency_edge.consumer_view_id", &edge.consumer_view_id)?;
+    require_non_empty("dependency_edge.input_relation_id", &edge.input_relation_id)?;
+    require_non_empty(
+        "dependency_edge.input_relation_version",
+        &edge.input_relation_version,
+    )?;
+    require_non_empty(
+        "dependency_edge.producer_program_id",
+        &edge.producer_program_id,
+    )?;
+    require_non_empty("dependency_edge.producer_view_id", &edge.producer_view_id)?;
+    require_non_empty(
+        "dependency_edge.producer_plan_hash",
+        &edge.producer_plan_hash,
+    )?;
+    require_non_empty("dependency_edge.output_stream_id", &edge.output_stream_id)?;
+    require_non_empty(
+        "dependency_edge.output_schema_hash",
+        &edge.output_schema_hash,
+    )?;
+    require_non_empty(
+        "dependency_edge.key_descriptor_hash",
+        &edge.key_descriptor_hash,
+    )?;
+    require_non_empty(
+        "dependency_edge.delta_codec_identity",
+        &edge.delta_codec_identity,
+    )?;
+    require_non_empty("dependency_edge.frontier_kind", &edge.frontier_kind)?;
+    if edge.producer_view_id == edge.consumer_view_id
+        && edge.producer_program_id == edge.consumer_program_id
+    {
+        return Err(ViewContractError::InvalidField {
+            field: "dependency_edge.self_cycle",
+        });
+    }
+    Ok(())
+}
+
+/// Validates that the dependency edges form an acyclic graph and returns the
+/// producer-first topological ordering of consumer view ids.
+///
+/// Each edge points consumer -> producer. A cycle exists when following
+/// producer links from a consumer reaches the consumer again (or itself).
+pub fn validate_view_dependency_graph(
+    edges: &[ViewDependencyEdgeV1],
+) -> Result<Vec<String>, ViewContractError> {
+    for edge in edges {
+        validate_view_dependency_edge(edge)?;
+    }
+    let mut edges_by_consumer: std::collections::BTreeMap<&str, Vec<&ViewDependencyEdgeV1>> =
+        std::collections::BTreeMap::new();
+    for edge in edges {
+        edges_by_consumer
+            .entry(edge.consumer_view_id.as_str())
+            .or_default()
+            .push(edge);
+    }
+    let mut visited: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut on_stack: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut order: Vec<String> = Vec::new();
+    let mut stack: Vec<&str> = edges
+        .iter()
+        .map(|edge| edge.consumer_view_id.as_str())
+        .chain(edges.iter().map(|edge| edge.producer_view_id.as_str()))
+        .collect();
+    stack.sort_unstable();
+    stack.dedup();
+    fn visit<'a>(
+        view_id: &'a str,
+        edges_by_consumer: &std::collections::BTreeMap<&'a str, Vec<&'a ViewDependencyEdgeV1>>,
+        visited: &mut std::collections::BTreeSet<String>,
+        on_stack: &mut std::collections::BTreeSet<String>,
+        order: &mut Vec<String>,
+    ) -> Result<(), ViewContractError> {
+        if on_stack.contains(view_id) {
+            return Err(ViewContractError::InvalidField {
+                field: "dependency_cycle",
+            });
+        }
+        if !visited.insert(view_id.to_string()) {
+            return Ok(());
+        }
+        on_stack.insert(view_id.to_string());
+        if let Some(producers) = edges_by_consumer.get(view_id) {
+            for edge in producers {
+                visit(
+                    edge.producer_view_id.as_str(),
+                    edges_by_consumer,
+                    visited,
+                    on_stack,
+                    order,
+                )?;
+            }
+        }
+        on_stack.remove(view_id);
+        order.push(view_id.to_string());
+        Ok(())
+    }
+    for view_id in stack {
+        visit(
+            view_id,
+            &edges_by_consumer,
+            &mut visited,
+            &mut on_stack,
+            &mut order,
+        )?;
+    }
+    Ok(order)
 }
 
 fn validate_relation_schemas(schemas: &[RelationSchema]) -> Result<(), ViewContractError> {
@@ -937,92 +1408,352 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolve_view_input_relation_matches_edge_to_published_binding() {
-        let relation = RelationSchema {
-            relation_id: "orders_by_region".to_string(),
-            relation_name: "orders_by_region".to_string(),
-            relation_version: "v1".to_string(),
-            schema_fingerprint: format!("sha256:{}", "2".repeat(64)),
-            columns: vec![ColumnSchema {
-                name: "region".to_string(),
-                data_type: SqlDataType::Utf8,
-                nullable: false,
-            }],
-            primary_key: vec!["region".to_string()],
-        };
-        let published = published_relation_binding_v1(
-            "orders_by_region",
+    fn sample_binding() -> PublishedRelationBindingV1 {
+        published_relation_binding_v1(
+            "filtered_orders",
             7,
             "velorix-logical-view-plan-sha256-v1:plan",
-            &relation,
+            &RelationSchema {
+                relation_id: "filtered_orders".to_string(),
+                relation_name: "filtered_orders".to_string(),
+                relation_version: "v1".to_string(),
+                schema_fingerprint: format!("sha256:{}", "2".repeat(64)),
+                columns: vec![
+                    ColumnSchema {
+                        name: "region".to_string(),
+                        data_type: SqlDataType::Utf8,
+                        nullable: false,
+                    },
+                    ColumnSchema {
+                        name: "total_amount".to_string(),
+                        data_type: SqlDataType::Int64,
+                        nullable: false,
+                    },
+                ],
+                primary_key: vec!["region".to_string()],
+            },
         )
-        .unwrap();
+        .unwrap()
+    }
 
-        let edge = ViewDependencyEdgeBindingV1 {
-            input_edge_id: "edge-1".to_string(),
-            graph_revision: 4,
-            producer_tenant_id: "tenant-a".to_string(),
-            producer_program_id: "program-a".to_string(),
-            producer_view_id: published.producer_view_id.clone(),
-            producer_generation: published.producer_view_generation,
-            producer_plan_hash: published.producer_plan_hash.clone(),
-            output_schema_hash: published.output_schema_hash.clone(),
-            key_descriptor_hash: published.key_descriptor_hash.clone(),
-            output_stream_id: published.output_stream_id.clone(),
-            delta_codec_identity: published.delta_codec_identity.clone(),
-            frontier_kind: published.frontier_kind.clone(),
+    fn sample_cursor() -> CausalViewCursorV1 {
+        CausalViewCursorV1 {
+            input_edge: view_dependency_edge_id("default", "filtered_orders", &sample_binding())
+                .unwrap(),
+            producer_tenant_id: "default".to_string(),
+            producer_program_id: "filtered_orders".to_string(),
+            producer_view_id: "filtered_orders".to_string(),
+            producer_generation: 7,
+            output_stream: "view/filtered_orders/generation/7/output/filtered_orders".to_string(),
+            output_epoch: 41,
+            commit_digest: format!("sha256:{}", "a".repeat(64)),
+        }
+    }
+
+    #[test]
+    fn published_view_input_binding_validation_is_generation_fenced() {
+        let binding = sample_binding();
+        let edge_id = view_dependency_edge_id("default", "filtered_orders", &binding).unwrap();
+        let input = StandingInputBindingV1::PublishedView {
+            edge_id: edge_id.clone(),
+            producer_tenant_id: "default".to_string(),
+            producer_program_id: "filtered_orders".to_string(),
+            published_relation: binding,
+            graph_revision: 3,
+            bootstrap_cursor: sample_cursor(),
         };
+        input.validate().unwrap();
 
-        // Exact match resolves to the published relation schema.
-        let resolved =
-            resolve_view_input_relation_v1(&edge, "tenant-a", "program-a", &published).unwrap();
-        assert_eq!(resolved, relation);
+        let mut stale = input.clone();
+        if let StandingInputBindingV1::PublishedView {
+            published_relation, ..
+        } = &mut stale
+        {
+            published_relation.producer_view_generation += 1;
+        }
+        assert!(stale.validate().is_err());
 
-        // Cross-tenant producer is rejected.
+        let mut wrong_cursor = input.clone();
+        if let StandingInputBindingV1::PublishedView {
+            bootstrap_cursor, ..
+        } = &mut wrong_cursor
+        {
+            bootstrap_cursor.commit_digest = "not-a-sha256".to_string();
+        }
         assert_eq!(
-            resolve_view_input_relation_v1(&edge, "tenant-b", "program-a", &published),
-            Err(ViewContractError::DependencyEdgeMismatch {
-                field: "producer_tenant_id"
+            wrong_cursor.validate(),
+            Err(ViewContractError::InvalidField {
+                field: "input_binding.published_view.bootstrap_cursor"
             })
         );
 
-        // Cross-program producer is rejected.
+        // The cursor must be bound to the same producer scope as the binding.
+        let scope_mutations: [(&str, fn(&mut CausalViewCursorV1)); 6] = [
+            ("edge", |cursor: &mut CausalViewCursorV1| {
+                cursor.input_edge.push_str("-other")
+            }),
+            ("tenant", |cursor: &mut CausalViewCursorV1| {
+                cursor.producer_tenant_id.push_str("-other")
+            }),
+            ("program", |cursor: &mut CausalViewCursorV1| {
+                cursor.producer_program_id.push_str("-other")
+            }),
+            ("view", |cursor: &mut CausalViewCursorV1| {
+                cursor.producer_view_id.push_str("-other")
+            }),
+            ("generation", |cursor: &mut CausalViewCursorV1| {
+                cursor.producer_generation += 1
+            }),
+            ("stream", |cursor: &mut CausalViewCursorV1| {
+                cursor.output_stream.push_str("-other")
+            }),
+        ];
+        for (field, mutate) in scope_mutations {
+            let mut scope_mismatch = input.clone();
+            if let StandingInputBindingV1::PublishedView {
+                bootstrap_cursor, ..
+            } = &mut scope_mismatch
+            {
+                mutate(bootstrap_cursor);
+            }
+            assert_eq!(
+                scope_mismatch.validate(),
+                Err(ViewContractError::InvalidField {
+                    field: "input_binding.published_view.bootstrap_cursor"
+                }),
+                "cursor {field} mismatch must fail validation"
+            );
+        }
+
+        let source = StandingInputBindingV1::Source {
+            relation: RelationSchema {
+                relation_id: "orders".to_string(),
+                relation_name: "orders".to_string(),
+                relation_version: "v1".to_string(),
+                schema_fingerprint: format!("sha256:{}", "3".repeat(64)),
+                columns: vec![ColumnSchema {
+                    name: "region".to_string(),
+                    data_type: SqlDataType::Utf8,
+                    nullable: false,
+                }],
+                primary_key: vec!["region".to_string()],
+            },
+            relation_generation: 2,
+        };
+        source.validate().unwrap();
+    }
+
+    #[test]
+    fn published_view_input_binding_hash_fences_generation_plan_schema_and_codec() {
+        let binding = sample_binding();
+        let edge_id = view_dependency_edge_id("default", "filtered_orders", &binding).unwrap();
+        let input = StandingInputBindingV1::PublishedView {
+            edge_id,
+            producer_tenant_id: "default".to_string(),
+            producer_program_id: "filtered_orders".to_string(),
+            published_relation: binding,
+            graph_revision: 3,
+            bootstrap_cursor: sample_cursor(),
+        };
+        let base = input.input_catalog_hash().unwrap();
+
+        let mut generation = input.clone();
+        if let StandingInputBindingV1::PublishedView {
+            published_relation, ..
+        } = &mut generation
+        {
+            published_relation.producer_view_generation += 1;
+        }
+        assert_ne!(generation.input_catalog_hash().unwrap(), base);
+
+        let mut plan = input.clone();
+        if let StandingInputBindingV1::PublishedView {
+            published_relation, ..
+        } = &mut plan
+        {
+            published_relation.producer_plan_hash =
+                "velorix-logical-view-plan-sha256-v1:other".to_string();
+        }
+        assert_ne!(plan.input_catalog_hash().unwrap(), base);
+
+        let mut schema = input.clone();
+        if let StandingInputBindingV1::PublishedView {
+            published_relation, ..
+        } = &mut schema
+        {
+            published_relation.relation.schema_fingerprint = format!("sha256:{}", "9".repeat(64));
+        }
+        assert_ne!(schema.input_catalog_hash().unwrap(), base);
+
+        let mut codec = input.clone();
+        if let StandingInputBindingV1::PublishedView {
+            published_relation, ..
+        } = &mut codec
+        {
+            published_relation.delta_codec_identity = "other-codec".to_string();
+        }
+        assert_ne!(codec.input_catalog_hash().unwrap(), base);
+
+        let source = StandingInputBindingV1::Source {
+            relation: RelationSchema {
+                relation_id: "orders".to_string(),
+                relation_name: "orders".to_string(),
+                relation_version: "v1".to_string(),
+                schema_fingerprint: format!("sha256:{}", "3".repeat(64)),
+                columns: vec![ColumnSchema {
+                    name: "region".to_string(),
+                    data_type: SqlDataType::Utf8,
+                    nullable: false,
+                }],
+                primary_key: vec!["region".to_string()],
+            },
+            relation_generation: 2,
+        };
         assert_eq!(
-            resolve_view_input_relation_v1(&edge, "tenant-a", "program-b", &published),
-            Err(ViewContractError::DependencyEdgeMismatch {
-                field: "producer_program_id"
+            source.input_catalog_hash().unwrap(),
+            format!("sha256:{}", "3".repeat(64))
+        );
+    }
+
+    fn edge(consumer: &str, producer: &str) -> ViewDependencyEdgeV1 {
+        ViewDependencyEdgeV1 {
+            schema_version: VIEW_DEPENDENCY_EDGE_SCHEMA_VERSION_V1,
+            edge_id: format!("edge-{consumer}-{producer}"),
+            tenant_id: "default".to_string(),
+            consumer_program_id: consumer.to_string(),
+            consumer_view_id: consumer.to_string(),
+            consumer_generation: 1,
+            input_relation_id: producer.to_string(),
+            input_relation_version: "v1".to_string(),
+            producer_program_id: producer.to_string(),
+            producer_view_id: producer.to_string(),
+            producer_generation: 1,
+            producer_plan_hash: format!("sha256:{}", "1".repeat(64)),
+            output_stream_id: format!("view/{producer}/generation/1/output/{producer}"),
+            output_schema_hash: format!("sha256:{}", "2".repeat(64)),
+            key_descriptor_hash: format!("sha256:{}", "3".repeat(64)),
+            delta_codec_identity: PUBLISHED_RELATION_DELTA_CODEC_V1.to_string(),
+            frontier_kind: PUBLISHED_RELATION_FRONTIER_KIND_V1.to_string(),
+        }
+    }
+
+    #[test]
+    fn view_dependency_edge_id_is_deterministic_and_domain_separated() {
+        let binding = sample_binding();
+        let first = view_dependency_edge_id("default", "filtered_orders", &binding).unwrap();
+        let second = view_dependency_edge_id("default", "filtered_orders", &binding).unwrap();
+        assert_eq!(first, second);
+        assert!(first.starts_with("sha256:"));
+        let other_plan = {
+            let mut binding = binding.clone();
+            binding.producer_plan_hash = "velorix-logical-view-plan-sha256-v1:other".to_string();
+            binding
+        };
+        let other_plan_id =
+            view_dependency_edge_id("default", "filtered_orders", &other_plan).unwrap();
+        assert_ne!(first, other_plan_id);
+        let other_tenant =
+            view_dependency_edge_id("other-tenant", "filtered_orders", &binding).unwrap();
+        assert_ne!(first, other_tenant);
+    }
+
+    #[test]
+    fn view_dependency_graph_rejects_self_two_node_and_three_node_cycles() {
+        let self_cycle = vec![edge("a", "a")];
+        assert!(matches!(
+            validate_view_dependency_graph(&self_cycle),
+            Err(ViewContractError::InvalidField {
+                field: "dependency_cycle" | "dependency_edge.self_cycle",
+                ..
+            })
+        ));
+
+        let two_cycle = vec![edge("a", "b"), edge("b", "a")];
+        assert_eq!(
+            validate_view_dependency_graph(&two_cycle),
+            Err(ViewContractError::InvalidField {
+                field: "dependency_cycle"
             })
         );
 
-        // Stale producer generation is rejected before schema binding.
-        let mut stale_edge = edge.clone();
-        stale_edge.producer_generation = published.producer_view_generation + 1;
+        let three_cycle = vec![edge("a", "b"), edge("b", "c"), edge("c", "a")];
         assert_eq!(
-            resolve_view_input_relation_v1(&stale_edge, "tenant-a", "program-a", &published),
-            Err(ViewContractError::DependencyEdgeMismatch {
-                field: "producer_generation"
+            validate_view_dependency_graph(&three_cycle),
+            Err(ViewContractError::InvalidField {
+                field: "dependency_cycle"
             })
         );
+    }
 
-        // Changed key descriptor is rejected.
-        let mut changed_key = edge.clone();
-        changed_key.key_descriptor_hash = format!("sha256:{}", "0".repeat(64));
-        assert_eq!(
-            resolve_view_input_relation_v1(&changed_key, "tenant-a", "program-a", &published),
-            Err(ViewContractError::DependencyEdgeMismatch {
-                field: "key_descriptor_hash"
-            })
+    #[test]
+    fn view_dependency_graph_produces_producer_first_topological_order() {
+        let edges = vec![
+            edge("topk", "aggregate"),
+            edge("aggregate", "filtered"),
+            edge("filtered", "orders"),
+        ];
+        let order = validate_view_dependency_graph(&edges).unwrap();
+        let orders_pos = order.iter().position(|id| id == "orders").unwrap();
+        let filtered_pos = order.iter().position(|id| id == "filtered").unwrap();
+        let aggregate_pos = order.iter().position(|id| id == "aggregate").unwrap();
+        let topk_pos = order.iter().position(|id| id == "topk").unwrap();
+        assert!(
+            orders_pos < filtered_pos && filtered_pos < aggregate_pos && aggregate_pos < topk_pos
         );
+    }
 
-        // Mismatched output stream is rejected.
-        let mut changed_stream = edge;
-        changed_stream.output_stream_id = "view/other/generation/1/output/other".to_string();
+    #[test]
+    fn published_relation_descriptor_catalog_round_trips_public_schema_with_signed_weight_column() {
+        let binding = sample_binding();
+        let catalog = catalog_from_published_relation_binding(&binding).unwrap();
+        catalog.validate().unwrap();
+        assert!(matches!(
+            catalog.relation_source,
+            VelorixRelationSourceV1::PublishedViewOutput { .. }
+        ));
         assert_eq!(
-            resolve_view_input_relation_v1(&changed_stream, "tenant-a", "program-a", &published),
-            Err(ViewContractError::DependencyEdgeMismatch {
-                field: "output_stream_id"
-            })
+            catalog.schema_fingerprint.as_str(),
+            binding.relation.schema_fingerprint
         );
+        assert_eq!(
+            catalog.relation_schema.weight_column_id,
+            PUBLISHED_DELTA_WEIGHT_FIELD_V1
+        );
+        let public = catalog_input_relation_schema(&catalog).unwrap();
+        assert_eq!(public, binding.relation);
+        let weight_column = catalog
+            .relation_schema
+            .columns
+            .iter()
+            .find(|column| column.column_id == PUBLISHED_DELTA_WEIGHT_FIELD_V1)
+            .unwrap();
+        assert_eq!(
+            weight_column.ordinal as usize,
+            binding.relation.columns.len()
+        );
+        assert_eq!(weight_column.logical_type, VelorixLogicalTypeV1::Int64);
+        assert!(!weight_column.nullable);
+    }
+
+    #[test]
+    fn published_relation_descriptor_catalog_rejects_reserved_weight_column_in_public_schema() {
+        let mut binding = sample_binding();
+        binding.relation.columns.push(ColumnSchema {
+            name: PUBLISHED_DELTA_WEIGHT_FIELD_V1.to_string(),
+            data_type: SqlDataType::Int64,
+            nullable: false,
+        });
+        assert!(catalog_from_published_relation_binding(&binding).is_err());
+    }
+
+    #[test]
+    fn published_relation_descriptor_catalog_rejects_unsupported_column_types() {
+        let mut binding = sample_binding();
+        binding.relation.columns.push(ColumnSchema {
+            name: "payload".to_string(),
+            data_type: SqlDataType::Null,
+            nullable: true,
+        });
+        assert!(catalog_from_published_relation_binding(&binding).is_err());
     }
 }

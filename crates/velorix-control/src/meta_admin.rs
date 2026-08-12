@@ -2,8 +2,8 @@
 
 pub use velorix_meta::{
     validate_bearer_token, AcquireStandingRuntimeOwnerOutcome, AcquireStandingRuntimeOwnerRequest,
-    BeginViewBootstrapOutcome, BeginViewBootstrapRequest, CaptureIngestSourceCutRequest,
-    CommitIngestRangeOutcome, FixViewBootstrapActivationCutOutcome,
+    BeginViewBootstrapOutcome, BeginViewBootstrapRequest, BeginViewDependencyEdgeV1,
+    CaptureIngestSourceCutRequest, CommitIngestRangeOutcome, FixViewBootstrapActivationCutOutcome,
     FixViewBootstrapActivationCutRequest, GrpcMetaStore, InMemoryMetaStore, IngestRangeReservation,
     IngestSourceCutV1, IngestSourceRelationIdentityV1, MetaStore, MetaStoreError,
     PromoteViewBootstrapOutcome, PromoteViewBootstrapRequest,

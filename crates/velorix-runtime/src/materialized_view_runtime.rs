@@ -28,21 +28,20 @@ use velorix_core::{
         arrow_record_batches_to_key_multi_value_delta_batch,
         arrow_record_batches_to_key_nullable_value_delta_batch,
         arrow_record_batches_to_key_value_delta_batch,
-        arrow_record_batches_to_key_value_delta_batch_skipping_null_values, ArrowPhysicalTypeV1,
-        KeyLatestByDeltaBatchInput, RelationColumnV1, RelationSemanticRoleV1,
-        VelorixRelationCatalogV1,
+        arrow_record_batches_to_key_value_delta_batch_skipping_null_values,
+        validate_record_batch_matches_catalog, ArrowPhysicalTypeV1, KeyLatestByDeltaBatchInput,
+        RelationColumnV1, RelationSemanticRoleV1, VelorixRelationCatalogV1,
     },
     standing_program::{
-        CausalViewCursorV1, DurableStateRoot, EpochCommit, EpochIdempotencyKey,
-        InputEventTimeFrontier, MaterializedViewPage, RelationFrontier, RelationInputBatch,
+        DurableStateRoot, EpochCommit, EpochIdempotencyKey, InputEventTimeFrontier,
+        MaterializedViewPage, RelationFrontier, RelationInputBatch, RelationInputEncodingV1,
         RuntimeCheckpoint, RuntimeCheckpointStatePayload, ScopedViewId, SnapshotPageRequest,
-        StandingInputChangeV1, StandingProgramIdentity, StandingProgramRuntime,
-        StandingProgramRuntimeError, ViewFrontier, ViewInputDeltaV1, ViewOutputBatch,
-        ViewOutputDelta,
+        StandingProgramIdentity, StandingProgramRuntime, StandingProgramRuntimeError, ViewFrontier,
+        ViewOutputBatch, ViewOutputDelta,
     },
     view_contract::{
-        catalog_input_relation_schema, stable_bytes_hash, PublishedRelationBindingV1,
-        RelationSchema, SqlDataType, SqlStructField,
+        catalog_input_relation_schema, stable_bytes_hash, RelationSchema, SqlDataType,
+        SqlStructField, PUBLISHED_RELATION_DELTA_CODEC_V1,
     },
     view_plan::{
         lower_supported_analytic_row_number_sql_to_logical_plan,
@@ -883,23 +882,28 @@ impl LogicalPlanExecutor<'_> {
                     advance_input_event_time_frontier(&mut input_event_time_frontiers, input)?;
                 }
                 for input in input_changes {
-                    let delta = arrow_record_batches_to_key_latest_by_delta_batch(
-                        KeyLatestByDeltaBatchInput {
-                            catalog,
-                            relation_id: &input.relation_id,
-                            relation_version: &input.relation_version,
-                            schema_fingerprint: &input.schema_fingerprint,
-                            key_column_id: &plan.key_column_id,
-                            value_column_id: &plan.value_column_id,
-                            ordering_column_id: &plan.ordering_column_id,
-                            batches: &input.batches,
-                        },
-                    )
-                    .map_err(|_| {
-                        StandingProgramRuntimeError::InvalidProgramIdentity {
-                            field: "latest_by_key_input_batch",
-                        }
-                    })?;
+                    let delta =
+                        if let Some(empty_delta) = published_input_empty_delta(&input, catalog)? {
+                            empty_delta
+                        } else {
+                            arrow_record_batches_to_key_latest_by_delta_batch(
+                                KeyLatestByDeltaBatchInput {
+                                    catalog,
+                                    relation_id: &input.relation_id,
+                                    relation_version: &input.relation_version,
+                                    schema_fingerprint: &input.schema_fingerprint,
+                                    key_column_id: &plan.key_column_id,
+                                    value_column_id: &plan.value_column_id,
+                                    ordering_column_id: &plan.ordering_column_id,
+                                    batches: &input.batches,
+                                },
+                            )
+                            .map_err(|_| {
+                                StandingProgramRuntimeError::InvalidProgramIdentity {
+                                    field: "latest_by_key_input_batch",
+                                }
+                            })?
+                        };
                     let delta = filter_delta_batch_for_latest_plan(&delta, plan, catalog)?;
                     combined = combined.combine(&delta);
                 }
@@ -1293,11 +1297,77 @@ fn validate_input_matches_schema(
     Ok(())
 }
 
+/// Validates the published-delta input encoding against the runtime catalog
+/// descriptor and returns `Some(empty)` when the published input carries no
+/// rows (empty producer commits must still advance the consumer frontier).
+///
+/// Source inputs and non-empty published inputs return `Ok(None)` and proceed
+/// through the ordinary arrow-to-delta conversion, whose descriptor schema is
+/// layout-compatible with published batches (public columns in binding order
+/// plus exactly one private Int64 weight column).
+fn published_input_empty_delta(
+    input: &RelationInputBatch,
+    catalog: &VelorixRelationCatalogV1,
+) -> Result<Option<DeltaBatch>, StandingProgramRuntimeError> {
+    let RelationInputEncodingV1::PublishedRelationDeltaV1 {
+        delta_codec_identity,
+        weight_field_name,
+        weight_field_index,
+        ..
+    } = &input.encoding
+    else {
+        return Ok(None);
+    };
+    if delta_codec_identity != PUBLISHED_RELATION_DELTA_CODEC_V1 {
+        return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+            field: "published_input.delta_codec_identity",
+        });
+    }
+    if weight_field_name.as_str() != catalog.relation_schema.weight_column_id {
+        return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+            field: "published_input.weight_field_name",
+        });
+    }
+    let expected_weight_index = catalog.relation_schema.columns.len().checked_sub(1).ok_or(
+        StandingProgramRuntimeError::InvalidProgramIdentity {
+            field: "published_input.weight_field_index",
+        },
+    )?;
+    if *weight_field_index != expected_weight_index {
+        return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+            field: "published_input.weight_field_index",
+        });
+    }
+    for batch in &input.batches {
+        validate_record_batch_matches_catalog(catalog, batch).map_err(|_| {
+            StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "published_input.batch_schema",
+            }
+        })?;
+        let weight_field = batch.schema().field(*weight_field_index).clone();
+        if weight_field.name() != weight_field_name
+            || weight_field.data_type() != &arrow::datatypes::DataType::Int64
+            || weight_field.is_nullable()
+        {
+            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "published_input.weight_field",
+            });
+        }
+    }
+    if input.batches.iter().all(|batch| batch.num_rows() == 0) {
+        return Ok(Some(DeltaBatch::default()));
+    }
+    Ok(None)
+}
+
 fn single_key_input_delta_batch(
     catalog: &VelorixRelationCatalogV1,
     plan: &SupportedViewPlan,
     input: &RelationInputBatch,
 ) -> Result<DeltaBatch, StandingProgramRuntimeError> {
+    if let Some(empty_delta) = published_input_empty_delta(input, catalog)? {
+        return Ok(empty_delta);
+    }
     if let Some(value_column_ids) = single_key_multi_input_column_ids(plan) {
         return arrow_record_batches_to_key_multi_value_delta_batch(
             catalog,
@@ -1400,6 +1470,9 @@ fn aggregate_group_input_delta_batch(
     plan: &SupportedViewPlan,
     input: &RelationInputBatch,
 ) -> Result<DeltaBatch, StandingProgramRuntimeError> {
+    if let Some(empty_delta) = published_input_empty_delta(input, catalog)? {
+        return Ok(empty_delta);
+    }
     if plan.aggregate_output_identity.is_none() {
         return single_key_input_delta_batch(catalog, plan, input);
     }
@@ -1591,6 +1664,9 @@ fn join_right_input_delta_batch(
     plan: &SupportedJoinViewPlan,
     input: &RelationInputBatch,
 ) -> Result<DeltaBatch, StandingProgramRuntimeError> {
+    if let Some(empty_delta) = published_input_empty_delta(input, catalog)? {
+        return Ok(empty_delta);
+    }
     let (_, right_join_key_column_ids) = join_key_column_ids(plan)?;
     let right_value_column_ids = supported_join_view_plan_right_value_column_ids(plan);
     if right_value_column_ids.is_empty() {
@@ -1646,6 +1722,9 @@ fn join_left_input_delta_batch(
     plan: &SupportedJoinViewPlan,
     input: &RelationInputBatch,
 ) -> Result<DeltaBatch, StandingProgramRuntimeError> {
+    if let Some(empty_delta) = published_input_empty_delta(input, catalog)? {
+        return Ok(empty_delta);
+    }
     let (left_join_key_column_ids, _) = join_key_column_ids(plan)?;
     if join_plan_preserves_nullable_left_values(catalog, plan)? {
         let delta = arrow_record_batches_to_key_nullable_value_delta_batch(
@@ -8544,6 +8623,40 @@ fn project_aggregate_value(
                 .ok_or_else(invalid_runtime_state)
         }
     }
+}
+
+/// Projects aggregate delta records onto their published output columns:
+/// engine-canonical keys (`sum`, `count`, `min`, `max`, `values`) are
+/// rewritten to the plan's `output_column_id` names, so the published
+/// contract exactly matches the public output schema. Without this, an
+/// aliased aggregate (e.g. `sum(score) as total`) would publish `{sum, count}`
+/// keys that a consumer cannot map to its input columns.
+pub(crate) fn project_aggregate_delta_outputs(
+    delta: DeltaBatch,
+    aggregate_outputs: &[SupportedAggregateOutput],
+) -> Result<DeltaBatch, StandingProgramRuntimeError> {
+    let rows = delta.net_rows().map_err(|_| invalid_runtime_state())?;
+    let mut records = Vec::with_capacity(rows.len());
+    for row in rows {
+        let value = row
+            .value
+            .as_json()
+            .as_object()
+            .ok_or_else(invalid_runtime_state)?;
+        let mut projected = Map::new();
+        for aggregate in aggregate_outputs {
+            projected.insert(
+                aggregate.output_column_id.clone(),
+                project_aggregate_value(value, aggregate)?,
+            );
+        }
+        records.push(DeltaRecord::new(
+            row.key,
+            DeltaValue::from_json(Value::Object(projected)),
+            row.weight,
+        ));
+    }
+    Ok(DeltaBatch::from_records(records))
 }
 
 fn project_filtered_avg_value(value: &Value) -> Result<Option<Value>, StandingProgramRuntimeError> {

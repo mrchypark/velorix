@@ -17,6 +17,15 @@ service VelorixMeta {
   rpc ReadStandingRuntimeOwner(ReadStandingRuntimeOwnerRequest) returns (ReadStandingRuntimeOwnerResponse);
   rpc PublishStandingRuntimeCheckpoint(PublishStandingRuntimeCheckpointRequest) returns (PublishStandingRuntimeCheckpointResponse);
   rpc ReadStandingRuntimeCheckpoint(ReadStandingRuntimeCheckpointRequest) returns (ReadStandingRuntimeCheckpointResponse);
+  rpc ReadViewDependencyGraphRevision(ReadViewDependencyGraphRevisionRequest) returns (ReadViewDependencyGraphRevisionResponse);
+}
+
+message ReadViewDependencyGraphRevisionRequest {
+  string tenant_id = 1;
+}
+
+message ReadViewDependencyGraphRevisionResponse {
+  uint64 revision = 1;
 }
 
 message ReadMetaStoreCapabilitiesRequest {}

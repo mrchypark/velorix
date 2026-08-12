@@ -1102,15 +1102,17 @@ async fn authoritative_view_cursor_resolution_fails_closed_at_every_trust_bounda
         false,
     )
     .await;
-    let error = resolve_authoritative_view_cursor(
+    // Without a meta store the resolver falls back to the object-store latest
+    // checkpoint cache; the cursor is still validated against the durable
+    // producer commit records.
+    resolve_authoritative_view_cursor(
         &state_without_meta,
         &producer_checkpoint.identity.tenant_id,
         &producer_binding,
         &cursor,
     )
     .await
-    .unwrap_err();
-    assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+    .unwrap();
 
     let state_without_pointer = test_api_state_with_store(
         Arc::clone(&store),
@@ -2592,6 +2594,44 @@ async fn relation_catalog_read_falls_back_to_object_store_when_meta_is_empty_aft
 }
 
 #[tokio::test]
+async fn view_admission_does_not_resurrect_stale_object_store_catalog_when_meta_is_authoritative() {
+    // The recovery read path may fall back to the object-store registry when
+    // the meta store is empty, but view admission must treat the meta store
+    // as the authoritative source namespace: a stale registry copy of a
+    // catalog the meta store never registered is a missing dependency, not
+    // a resolvable source.
+    let state = test_api_state().await;
+    let catalog = test_scores_catalog();
+    materialize_relation_catalog_to_object_store(&state, &catalog)
+        .await
+        .unwrap();
+    let state = state.with_meta_store(Arc::new(InMemoryMetaStore::default()));
+    let router = app(state);
+
+    let rejected = call_json(
+        &router,
+        Method::POST,
+        "/v1/views",
+        json!({
+            "view_id": "stale_source_consumer",
+            "sql": "select user_id, score from scores where score > 0",
+            "input_relation_id": "scores",
+            "input_relation_version": "2026-05-24.v1",
+            "source_kind": "standing_view"
+        }),
+    )
+    .await;
+    assert_eq!(rejected.0, StatusCode::BAD_REQUEST, "{rejected:?}");
+    assert!(
+        rejected.1["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not a registered relation"),
+        "{rejected:?}"
+    );
+}
+
+#[tokio::test]
 async fn standing_runtime_checkpoint_read_ignores_object_store_when_meta_pointer_is_empty_after_recovery(
 ) {
     let state = test_api_state().await;
@@ -3180,7 +3220,8 @@ fn materialized_runtime_binding_persists_admitted_logical_plan() {
     };
 
     let binding =
-        materialized_view_runtime_binding_for_spec(std::slice::from_ref(&catalog), &spec).unwrap();
+        materialized_view_runtime_binding_for_spec(std::slice::from_ref(&catalog), &spec, &[])
+            .unwrap();
     let logical_plan = binding.logical_plan.unwrap();
 
     assert_eq!(logical_plan.view_sql, spec.sql);
@@ -3193,7 +3234,7 @@ fn materialized_runtime_binding_persists_admitted_logical_plan() {
         catalog.schema_fingerprint.to_string()
     );
 
-    let identity = standing_program_identity_from_materialized_view_runtime(&[catalog], &spec)
+    let identity = standing_program_identity_from_materialized_view_runtime(&[catalog], &spec, &[])
         .expect("standing program identity should bind admitted semantics");
     assert!(identity
         .runtime_capabilities
@@ -15917,6 +15958,7 @@ async fn standing_runtime_state_quota_rejection_rolls_back_before_publication() 
     let identity = standing_program_identity_from_materialized_view_runtime(
         std::slice::from_ref(&catalog),
         &spec,
+        &[],
     )
     .unwrap();
     let logical_plan =
@@ -15933,6 +15975,7 @@ async fn standing_runtime_state_quota_rejection_rolls_back_before_publication() 
     let runtime: SharedStandingRuntime = Arc::new(Mutex::new(runtime));
     let before = runtime.lock().unwrap().checkpoint().unwrap();
     let input = RelationInputBatch {
+        encoding: RelationInputEncodingV1::SourceRelationV1,
         relation_id: catalog.relation_schema.relation_id.clone(),
         relation_version: catalog.relation_schema.relation_version.clone(),
         stream_id: "quota-test".to_string(),
@@ -16493,6 +16536,7 @@ fn test_purchases_catalog() -> VelorixRelationCatalogV1 {
         .expect("test relation schema should fingerprint");
 
     VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
         schema_version: RELATION_SCHEMA_VERSION_V1,
         relation_schema,
         schema_fingerprint: schema_fingerprint.clone(),
@@ -16599,6 +16643,36 @@ fn test_purchases_event_time_catalog() -> VelorixRelationCatalogV1 {
     catalog
 }
 
+#[tokio::test]
+async fn rest_relation_admission_rejects_internal_published_view_output_source_kind() {
+    let state = test_api_state().await;
+    let router = app(state);
+    let mut catalog = test_scores_catalog();
+    catalog.relation_source = VelorixRelationSourceV1::PublishedViewOutput {
+        producer_view_id: "producer".to_string(),
+        producer_view_generation: 1,
+        output_stream_id: "producer/v1".to_string(),
+    };
+    let rejected = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations",
+        json!({
+            "catalog": catalog,
+            "default_orders_sum_count": false
+        }),
+    )
+    .await;
+    assert_eq!(rejected.0, StatusCode::BAD_REQUEST, "{rejected:?}");
+    assert!(
+        rejected.1["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("PublishedViewOutput"),
+        "{rejected:?}"
+    );
+}
+
 fn test_scores_catalog() -> VelorixRelationCatalogV1 {
     let relation_schema = VelorixRelationSchemaV1 {
         relation_id: "scores".to_string(),
@@ -16641,6 +16715,7 @@ fn test_scores_catalog() -> VelorixRelationCatalogV1 {
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema)
         .expect("scores catalog should fingerprint");
     VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
         schema_version: RELATION_SCHEMA_VERSION_V1,
         relation_schema,
         schema_fingerprint: schema_fingerprint.clone(),
@@ -16725,6 +16800,7 @@ fn test_accounts_catalog() -> VelorixRelationCatalogV1 {
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema)
         .expect("accounts catalog should fingerprint");
     VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
         schema_version: RELATION_SCHEMA_VERSION_V1,
         relation_schema,
         schema_fingerprint: schema_fingerprint.clone(),
@@ -16855,6 +16931,7 @@ fn test_device_status_catalog() -> VelorixRelationCatalogV1 {
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema)
         .expect("device status catalog should fingerprint");
     VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
         schema_version: RELATION_SCHEMA_VERSION_V1,
         relation_schema,
         schema_fingerprint: schema_fingerprint.clone(),
@@ -17110,314 +17187,520 @@ async fn scenario_list_views_empty_then_create() {
 }
 
 #[tokio::test]
-async fn rest_tumble_window_admitted_through_public_api_without_experimental_flag() {
+async fn rest_three_level_filter_aggregate_topk_chain_exact() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    // Use test_public_api_state_with_store which does NOT set experimental flag
-    let state =
-        test_public_api_state_with_store(store, "api-test-tumble-public-owner", false).await;
+    let state = test_api_state_with_store(store.clone(), "api-test-chain-owner-a", false).await;
     let router = app(state);
 
-    // Register a relation with event_time column using the same helper as other TUMBLE tests
     let relation_response = call_json(
         &router,
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_purchases_event_time_catalog(),
+            "catalog": test_scores_catalog(),
             "default_orders_sum_count": false
         }),
     )
     .await;
     assert_eq!(relation_response.0, StatusCode::CREATED);
 
-    // Create a TUMBLE view WITHOUT experimental flag
-    let view_response = call_json(
-        &router,
-        Method::POST,
-        "/v1/views",
-        json!({
-            "view_id": "tumble_purchases",
-            "sql": "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end",
-            "input_relation_id": "purchases",
-            "input_relation_version": "2026-05-24.v1",
-            "source_kind": "standing_view"
-        }),
-    )
-    .await;
-    assert_eq!(
-        view_response.0,
-        StatusCode::CREATED,
-        "TUMBLE should be admitted through public API without experimental flag: {:?}",
-        view_response.1
-    );
-
-    // HOP should still be blocked
-    let hop_response = call_json(
-        &router,
-        Method::POST,
-        "/v1/views",
-        json!({
-            "view_id": "hop_purchases",
-            "sql": "select user_id, window_start, window_end, sum(amount) as total_amount from hop(purchases, event_time, interval '60 seconds', interval '30 seconds') group by user_id, window_start, window_end",
-            "input_relation_id": "purchases",
-            "input_relation_version": "2026-05-24.v1",
-            "source_kind": "standing_view"
-        }),
-    )
-    .await;
-    assert_eq!(
-        hop_response.0,
-        StatusCode::BAD_REQUEST,
-        "HOP should be blocked without experimental flag"
-    );
-
-    // SESSION should still be blocked
-    let session_response = call_json(
-        &router,
-        Method::POST,
-        "/v1/views",
-        json!({
-            "view_id": "session_purchases",
-            "sql": "select user_id, window_start, window_end, sum(amount) as total_amount from session(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end",
-            "input_relation_id": "purchases",
-            "input_relation_version": "2026-05-24.v1",
-            "source_kind": "standing_view"
-        }),
-    )
-    .await;
-    assert_eq!(
-        session_response.0,
-        StatusCode::BAD_REQUEST,
-        "SESSION should be blocked without experimental flag"
-    );
-
-    // ROW_NUMBER should still be blocked
-    let rank_response = call_json(
-        &router,
-        Method::POST,
-        "/v1/views",
-        json!({
-            "view_id": "rank_purchases",
-            "sql": "select user_id, amount, row_number() over (partition by user_id order by amount desc) as rank from purchases",
-            "input_relation_id": "purchases",
-            "input_relation_version": "2026-05-24.v1",
-            "source_kind": "standing_view"
-        }),
-    )
-    .await;
-    assert_eq!(
-        rank_response.0,
-        StatusCode::BAD_REQUEST,
-        "ROW_NUMBER should be blocked without experimental flag"
-    );
-}
-
-#[tokio::test]
-async fn rest_view_on_view_input_fails_closed_without_flag_and_planner_integration() {
-    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let state = test_public_api_state_with_store(store, "api-test-view-on-view-owner", false).await;
-    let router = app(state);
-
-    let view_request = CreateViewRequest {
-        view_id: "consumer_view".to_string(),
-        url_path: None,
+    let filter_view = CreateViewRequest {
+        view_id: "filtered_scores".to_string(),
+        url_path: Some("/scores/filtered".to_string()),
         output_relation_id: None,
-        input_relation_id: String::new(),
-        input_relation_version: String::new(),
-        input_relation_refs: vec![InputRelationRef {
-            relation_id: "producer_view".to_string(),
-            relation_version: "v1".to_string(),
-            input_kind: InputRelationKind::View,
-        }],
+        input_relation_id: "scores".to_string(),
+        input_relation_version: "2026-05-24.v1".to_string(),
+        input_relation_refs: Vec::new(),
         input_relations: Vec::new(),
-        sql: "select region, sum(sum) as total from producer_view group by region".to_string(),
+        sql: "select user_id, score from scores where score > 0".to_string(),
         source_kind: SqlSourceKind::StandingView,
         output_relation_ids: Vec::new(),
         sql_template: None,
-        description: None,
+        description: Some("positive scores filter".to_string()),
         request: Vec::new(),
         response_schema: None,
         response_formats: vec!["json".to_string()],
         query_policy_id: None,
     };
+    let view_response = call_json(&router, Method::POST, "/v1/views", json!(filter_view)).await;
+    assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
 
-    // Without the experimental flag, view inputs are rejected before any
-    // producer lookup.
-    let response = call_json(
-        &router,
-        Method::POST,
-        "/v1/views",
-        json!(view_request.clone()),
-    )
-    .await;
-    assert_eq!(
-        response.0,
-        StatusCode::BAD_REQUEST,
-        "view-on-view input must be rejected without the experimental flag: {response:?}"
-    );
-    assert!(
-        response.1["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("view-on-view inputs are experimental"),
-        "unexpected error message: {response:?}"
-    );
-
-    // With the flag enabled but no matching producer view, the view input
-    // fails closed against the active view registry instead of falling back
-    // to a physical source catalog lookup.
-    let state = test_public_api_state_with_store(
-        Arc::new(InMemory::new()),
-        "api-test-view-on-view-owner-2",
-        false,
-    )
-    .await
-    .with_experimental_view_on_view(true);
-    let router = app(state);
-    let response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
-    assert_eq!(
-        response.0,
-        StatusCode::BAD_REQUEST,
-        "view-on-view input must fail closed without a matching producer view: {response:?}"
-    );
-    assert!(
-        response.1["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("does not match an active view output"),
-        "unexpected error message: {response:?}"
-    );
-}
-
-#[tokio::test]
-async fn rest_two_level_sum_count_chain_admits_producer_and_consumer() {
-    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let state = test_public_api_state_with_store(store, "api-test-two-level-chain", false)
-        .await
-        .with_experimental_view_on_view(true);
-    let router = app(state);
-
-    let relation_response = call_json(
-        &router,
-        Method::POST,
-        "/v1/relations",
-        json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
-        }),
-    )
-    .await;
-    assert_eq!(relation_response.0, StatusCode::CREATED);
-
-    // Producer: single-key sum/count over the physical source.
-    let producer_response = call_json(
-        &router,
-        Method::POST,
-        "/v1/views",
-        json!({
-            "view_id": "scores_by_user",
-            "sql": "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id",
-            "input_relation_id": "scores",
-            "input_relation_version": "2026-05-24.v1",
-            "source_kind": "standing_view"
-        }),
-    )
-    .await;
-    assert_eq!(
-        producer_response.0,
-        StatusCode::CREATED,
-        "producer view must admit: {producer_response:?}"
-    );
-
-    // Consumer: single-key sum/count over the producer's published output.
-    let consumer_response = call_json(
-        &router,
-        Method::POST,
-        "/v1/views",
-        json!({
-            "view_id": "total_by_user",
-            "sql": "select user_id, sum(sum) as total, count(*) as count from scores_by_user group by user_id",
-            "input_relation_refs": [{
-                "relation_id": "scores_by_user",
-                "relation_version": "v1",
-                "input_kind": "view"
-            }],
-            "source_kind": "standing_view"
-        }),
-    )
-    .await;
-    assert_eq!(
-        consumer_response.0,
-        StatusCode::CREATED,
-        "consumer view must admit against the published producer output: {consumer_response:?}"
-    );
-}
-
-#[tokio::test]
-#[ignore = "delta propagation routing is not yet implemented; producer output deltas are not routed to consumers as StandingInputChangeV1::View"]
-async fn rest_two_level_sum_count_chain_propagates_delta_through_ingest() {
-    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let state = test_public_api_state_with_store(store, "api-test-two-level-delta", false)
-        .await
-        .with_experimental_view_on_view(true);
-    let router = app(state.clone());
-
-    let relation_response = call_json(
-        &router,
-        Method::POST,
-        "/v1/relations",
-        json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
-        }),
-    )
-    .await;
-    assert_eq!(relation_response.0, StatusCode::CREATED);
-
-    let producer_response = call_json(
-        &router,
-        Method::POST,
-        "/v1/views",
-        json!({
-            "view_id": "scores_by_user",
-            "sql": "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id",
-            "input_relation_id": "scores",
-            "input_relation_version": "2026-05-24.v1",
-            "source_kind": "standing_view"
-        }),
-    )
-    .await;
-    assert_eq!(producer_response.0, StatusCode::CREATED);
-
-    let consumer_response = call_json(
-        &router,
-        Method::POST,
-        "/v1/views",
-        json!({
-            "view_id": "total_by_user",
-            "sql": "select user_id, sum(sum) as total, count(*) as count from scores_by_user group by user_id",
-            "input_relation_refs": [{
-                "relation_id": "scores_by_user",
-                "relation_version": "v1",
-                "input_kind": "view"
-            }],
-            "source_kind": "standing_view"
-        }),
-    )
-    .await;
-    assert_eq!(consumer_response.0, StatusCode::CREATED);
-
-    // Ingest one positive-score row. The producer emits a +1 delta; the
-    // consumer must route that delta as a view input and publish its own
-    // aggregate output.
-    let ingest_response = call_json(
+    let ingest_one = call_json(
         &router,
         Method::POST,
         "/v1/ingest",
         json!({
             "relation_id": "scores",
             "relation_version": "2026-05-24.v1",
-            "stream_id": "two-level-chain-stream",
+            "stream_id": "scores-chain-stream",
+            "partition_id": 0,
+            "start_offset_inclusive": 0,
+            "rows": [
+                {"user_id": "alice", "score": 10, "delta": 1},
+                {"user_id": "alice", "score": 7, "delta": 1},
+                {"user_id": "bob", "score": 5, "delta": 1},
+                {"user_id": "carol", "score": -3, "delta": 1}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(ingest_one.0, StatusCode::CREATED, "{ingest_one:?}");
+
+    let filter_query = call_json(
+        &router,
+        Method::POST,
+        "/v1/views/filtered_scores/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(filter_query.0, StatusCode::OK, "{filter_query:?}");
+    assert_eq!(
+        filter_query.1["rows"],
+        json!([
+            {"user_id": "alice", "score": 10},
+            {"user_id": "alice", "score": 7},
+            {"user_id": "bob", "score": 5}
+        ])
+    );
+
+    let aggregate_view = CreateViewRequest {
+        view_id: "score_totals".to_string(),
+        url_path: Some("/scores/totals".to_string()),
+        output_relation_id: None,
+        input_relation_id: "filtered_scores".to_string(),
+        input_relation_version: "v1".to_string(),
+        input_relation_refs: Vec::new(),
+        input_relations: Vec::new(),
+        sql: "select user_id, sum(score) as total from filtered_scores group by user_id"
+            .to_string(),
+        source_kind: SqlSourceKind::StandingView,
+        output_relation_ids: Vec::new(),
+        sql_template: None,
+        description: Some("score totals over filtered scores".to_string()),
+        request: Vec::new(),
+        response_schema: None,
+        response_formats: vec!["json".to_string()],
+        query_policy_id: None,
+    };
+    let view_response = call_json(&router, Method::POST, "/v1/views", json!(aggregate_view)).await;
+    assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+    assert_eq!(view_response.1["query_enabled"], true, "{view_response:?}");
+
+    let totals_query = call_json(
+        &router,
+        Method::POST,
+        "/v1/views/score_totals/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(totals_query.0, StatusCode::OK, "{totals_query:?}");
+    assert_eq!(
+        totals_query.1["rows"],
+        json!([
+            {"user_id": "alice", "total": 17},
+            {"user_id": "bob", "total": 5}
+        ])
+    );
+
+    let topk_view = CreateViewRequest {
+        view_id: "top_scores".to_string(),
+        url_path: Some("/scores/top".to_string()),
+        output_relation_id: None,
+        input_relation_id: "score_totals".to_string(),
+        input_relation_version: "v1".to_string(),
+        input_relation_refs: Vec::new(),
+        input_relations: Vec::new(),
+        sql: "select user_id, total from score_totals order by total desc limit 2".to_string(),
+        source_kind: SqlSourceKind::StandingView,
+        output_relation_ids: Vec::new(),
+        sql_template: None,
+        description: Some("top two score totals".to_string()),
+        request: Vec::new(),
+        response_schema: None,
+        response_formats: vec!["json".to_string()],
+        query_policy_id: None,
+    };
+    let view_response = call_json(&router, Method::POST, "/v1/views", json!(topk_view)).await;
+    assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+    assert_eq!(view_response.1["query_enabled"], true, "{view_response:?}");
+
+    let top_query = call_json(
+        &router,
+        Method::POST,
+        "/v1/views/top_scores/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(top_query.0, StatusCode::OK, "{top_query:?}");
+    assert_eq!(
+        top_query.1["rows"],
+        json!([
+            {"user_id": "alice", "total": 17},
+            {"user_id": "bob", "total": 5}
+        ])
+    );
+
+    let ingest_two = call_json(
+        &router,
+        Method::POST,
+        "/v1/ingest",
+        json!({
+            "relation_id": "scores",
+            "relation_version": "2026-05-24.v1",
+            "stream_id": "scores-chain-stream",
+            "partition_id": 0,
+            "start_offset_inclusive": 4,
+            "rows": [
+                {"user_id": "alice", "score": 10, "delta": -1},
+                {"user_id": "carol", "score": 8, "delta": 1},
+                {"user_id": "dave", "score": 3, "delta": 1}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(ingest_two.0, StatusCode::CREATED, "{ingest_two:?}");
+
+    let filter_query = call_json(
+        &router,
+        Method::POST,
+        "/v1/views/filtered_scores/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(filter_query.0, StatusCode::OK, "{filter_query:?}");
+    assert_eq!(
+        filter_query.1["rows"],
+        json!([
+            {"user_id": "alice", "score": 7},
+            {"user_id": "bob", "score": 5},
+            {"user_id": "carol", "score": 8},
+            {"user_id": "dave", "score": 3}
+        ])
+    );
+
+    let totals_query = call_json(
+        &router,
+        Method::POST,
+        "/v1/views/score_totals/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(totals_query.0, StatusCode::OK, "{totals_query:?}");
+    assert_eq!(
+        totals_query.1["rows"],
+        json!([
+            {"user_id": "alice", "total": 7},
+            {"user_id": "bob", "total": 5},
+            {"user_id": "carol", "total": 8},
+            {"user_id": "dave", "total": 3}
+        ])
+    );
+
+    let top_query = call_json(
+        &router,
+        Method::POST,
+        "/v1/views/top_scores/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(top_query.0, StatusCode::OK, "{top_query:?}");
+    assert_eq!(
+        top_query.1["rows"],
+        json!([
+            {"user_id": "alice", "total": 7},
+            {"user_id": "carol", "total": 8}
+        ])
+    );
+    let top_sql_query = call_json(
+        &router,
+        Method::GET,
+        "/v1/views/top_scores/query?sql=select%20user_id%2C%20total%20from%20top_scores%20order%20by%20total%20desc",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(top_sql_query.0, StatusCode::OK, "{top_sql_query:?}");
+    assert_eq!(
+        top_sql_query.1["rows"],
+        json!([
+            {"user_id": "carol", "total": 8},
+            {"user_id": "alice", "total": 7}
+        ])
+    );
+
+    // Crash window: append a committed ingest that is never applied before the
+    // restart; restart restore must replay it and the drain must propagate it
+    // through the whole chain.
+    append_admitted_ingest_without_runtime_apply(
+        store.clone(),
+        IngestRowsRequest {
+            relation_id: "scores".to_string(),
+            relation_version: "2026-05-24.v1".to_string(),
+            stream_id: "scores-chain-stream".to_string(),
+            partition_id: 0,
+            start_offset_inclusive: 7,
+            event_time_watermark: None,
+            rows: vec![
+                json!({"user_id": "bob", "score": 5, "delta": -1}),
+                json!({"user_id": "dave", "score": 3, "delta": -1}),
+                json!({"user_id": "alice", "score": 7, "delta": -1}),
+                json!({"user_id": "alice", "score": 6, "delta": 1}),
+            ],
+        },
+    )
+    .await;
+
+    let restarted_state =
+        test_api_state_with_store(store.clone(), "api-test-chain-owner-b", true).await;
+    let restored = restarted_state
+        .restore_standing_program_runtimes_from_active_views()
+        .await
+        .unwrap();
+    assert_eq!(restored, 3, "expected all three chain views restored");
+    let restarted_app = app(restarted_state);
+
+    let filter_query = call_json(
+        &restarted_app,
+        Method::POST,
+        "/v1/views/filtered_scores/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(filter_query.0, StatusCode::OK, "{filter_query:?}");
+    assert_eq!(
+        filter_query.1["rows"],
+        json!([
+            {"user_id": "alice", "score": 6},
+            {"user_id": "carol", "score": 8}
+        ])
+    );
+
+    let totals_query = call_json(
+        &restarted_app,
+        Method::POST,
+        "/v1/views/score_totals/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(totals_query.0, StatusCode::OK, "{totals_query:?}");
+    assert_eq!(
+        totals_query.1["rows"],
+        json!([
+            {"user_id": "alice", "total": 6},
+            {"user_id": "carol", "total": 8}
+        ])
+    );
+
+    let top_query = call_json(
+        &restarted_app,
+        Method::POST,
+        "/v1/views/top_scores/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(top_query.0, StatusCode::OK, "{top_query:?}");
+    assert_eq!(
+        top_query.1["rows"],
+        json!([
+            {"user_id": "alice", "total": 6},
+            {"user_id": "carol", "total": 8}
+        ])
+    );
+
+    // Live ingest after restart flows through the restored chain.
+    let ingest_three = call_json(
+        &restarted_app,
+        Method::POST,
+        "/v1/ingest",
+        json!({
+            "relation_id": "scores",
+            "relation_version": "2026-05-24.v1",
+            "stream_id": "scores-chain-stream",
+            "partition_id": 0,
+            "start_offset_inclusive": 11,
+            "rows": [
+                {"user_id": "eve", "score": 12, "delta": 1}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(ingest_three.0, StatusCode::CREATED, "{ingest_three:?}");
+
+    let top_query = call_json(
+        &restarted_app,
+        Method::POST,
+        "/v1/views/top_scores/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(top_query.0, StatusCode::OK, "{top_query:?}");
+    assert_eq!(
+        top_query.1["rows"],
+        json!([
+            {"user_id": "carol", "total": 8},
+            {"user_id": "eve", "total": 12}
+        ])
+    );
+}
+
+#[tokio::test]
+async fn view_on_view_admission_rejects_cycles_missing_producers_and_ambiguity() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let state = test_api_state_with_store(store, "api-test-chain-reject", false).await;
+    let router = app(state);
+
+    let relation_response = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations",
+        json!({
+            "catalog": test_scores_catalog(),
+            "default_orders_sum_count": false
+        }),
+    )
+    .await;
+    assert_eq!(relation_response.0, StatusCode::CREATED);
+
+    // Missing producer: no view publishes `ghost_output`.
+    let missing = call_json(
+        &router,
+        Method::POST,
+        "/v1/views",
+        json!({
+            "view_id": "ghost_consumer",
+            "sql": "select user_id, score from ghost_output where score > 0",
+            "input_relation_id": "ghost_output",
+            "input_relation_version": "v1",
+            "source_kind": "standing_view"
+        }),
+    )
+    .await;
+    assert_eq!(missing.0, StatusCode::BAD_REQUEST, "{missing:?}");
+    assert!(
+        missing.1["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not a registered relation"),
+        "{missing:?}"
+    );
+
+    // Producer without any published checkpoint cannot be consumed.
+    let no_checkpoint_producer = call_json(
+        &router,
+        Method::POST,
+        "/v1/views",
+        json!({
+            "view_id": "never_materialized",
+            "sql": "select user_id, score from scores where score > 0",
+            "input_relation_id": "scores",
+            "input_relation_version": "2026-05-24.v1",
+            "source_kind": "standing_view"
+        }),
+    )
+    .await;
+    assert_eq!(
+        no_checkpoint_producer.0,
+        StatusCode::CREATED,
+        "{no_checkpoint_producer:?}"
+    );
+
+    let premature_consumer = call_json(
+        &router,
+        Method::POST,
+        "/v1/views",
+        json!({
+            "view_id": "premature_consumer",
+            "sql": "select user_id, score from never_materialized",
+            "input_relation_id": "never_materialized",
+            "input_relation_version": "v1",
+            "source_kind": "standing_view"
+        }),
+    )
+    .await;
+    assert_eq!(
+        premature_consumer.0,
+        StatusCode::BAD_REQUEST,
+        "{premature_consumer:?}"
+    );
+    assert!(
+        premature_consumer.1["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no authoritative published checkpoint"),
+        "{premature_consumer:?}"
+    );
+
+    // Ambiguity: a physical relation with the same id as a published view
+    // output makes the consumer input unresolvable.
+    let mut competing_catalog = test_scores_catalog();
+    competing_catalog.relation_schema.relation_id = "never_materialized".to_string();
+    competing_catalog.relation_schema.relation_name = "never_materialized".to_string();
+    competing_catalog.relation_schema.relation_version = "v1".to_string();
+    competing_catalog.schema_fingerprint =
+        SchemaFingerprintV1::for_relation_schema(&competing_catalog.relation_schema).unwrap();
+    competing_catalog.incremental_relation.relation_id = "never_materialized".to_string();
+    competing_catalog.incremental_relation.schema_fingerprint =
+        competing_catalog.schema_fingerprint.clone();
+    let competing = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations",
+        json!({
+            "catalog": competing_catalog,
+            "default_orders_sum_count": false
+        }),
+    )
+    .await;
+    assert_eq!(competing.0, StatusCode::CREATED, "{competing:?}");
+
+    let ambiguous = call_json(
+        &router,
+        Method::POST,
+        "/v1/views",
+        json!({
+            "view_id": "ambiguous_consumer",
+            "sql": "select user_id, score from never_materialized",
+            "input_relation_id": "never_materialized",
+            "input_relation_version": "v1",
+            "source_kind": "standing_view"
+        }),
+    )
+    .await;
+    assert_eq!(ambiguous.0, StatusCode::BAD_REQUEST, "{ambiguous:?}");
+    assert!(
+        ambiguous.1["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ambiguous"),
+        "{ambiguous:?}"
+    );
+}
+
+#[tokio::test]
+async fn view_on_view_chain_rejects_cycles_at_admission() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let state = test_api_state_with_store(store, "api-test-chain-cycle", false).await;
+    let router = app(state);
+
+    let relation_response = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations",
+        json!({
+            "catalog": test_scores_catalog(),
+            "default_orders_sum_count": false
+        }),
+    )
+    .await;
+    assert_eq!(relation_response.0, StatusCode::CREATED);
+
+    let ingest = call_json(
+        &router,
+        Method::POST,
+        "/v1/ingest",
+        json!({
+            "relation_id": "scores",
+            "relation_version": "2026-05-24.v1",
+            "stream_id": "scores-cycle-stream",
             "partition_id": 0,
             "start_offset_inclusive": 0,
             "rows": [
@@ -17426,49 +17709,95 @@ async fn rest_two_level_sum_count_chain_propagates_delta_through_ingest() {
         }),
     )
     .await;
-    assert_eq!(ingest_response.0, StatusCode::CREATED);
+    assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
 
-    let consumer = state
-        .view_registry()
-        .unwrap()
-        .read_active("total_by_user")
-        .await
-        .unwrap();
-    let consumer_identity = active_standing_runtime_identity(&consumer).unwrap();
-    let consumer_checkpoint =
-        read_latest_standing_runtime_checkpoint(&state, consumer_identity, "total_by_user")
-            .await
-            .unwrap();
-    assert!(
-        consumer_checkpoint.is_some(),
-        "consumer view must have a checkpoint after the source ingest propagates through the chain"
-    );
+    let view_a = call_json(
+        &router,
+        Method::POST,
+        "/v1/views",
+        json!({
+            "view_id": "view_a",
+            "sql": "select user_id, score from scores where score > 0",
+            "input_relation_id": "scores",
+            "input_relation_version": "2026-05-24.v1",
+            "source_kind": "standing_view"
+        }),
+    )
+    .await;
+    assert_eq!(view_a.0, StatusCode::CREATED, "{view_a:?}");
 
-    let consumer_runtime = state
-        .standing_runtime(consumer_identity, "total_by_user")
-        .unwrap()
-        .expect("consumer standing runtime must be available");
-    let runtime = consumer_runtime.lock().unwrap();
-    let page = runtime
-        .materialized_view_page(
-            velorix_core::standing_program::ScopedViewId {
-                tenant_id: consumer_identity.tenant_id.clone(),
-                program_id: consumer_identity.program_id.clone(),
-                view_id: "total_by_user".to_string(),
-            },
-            velorix_core::standing_program::SnapshotPageRequest::default(),
-        )
-        .unwrap();
-    assert_eq!(page.batches.len(), 1);
-    let batch = &page.batches[0];
-    let rows = batch
-        .schema()
-        .fields()
-        .iter()
-        .map(|field| field.name().to_string())
-        .collect::<Vec<_>>();
+    // view_a requires backfill (source data exists); its published output is
+    // only consumable once it is active with an authoritative checkpoint.
+    let backfill = call_json(
+        &router,
+        Method::POST,
+        "/v1/views/view_a/backfill",
+        json!({}),
+    )
+    .await;
+    assert_eq!(backfill.0, StatusCode::OK, "{backfill:?}");
+
+    let view_b = call_json(
+        &router,
+        Method::POST,
+        "/v1/views",
+        json!({
+            "view_id": "view_b",
+            "sql": "select user_id, score from view_a where score > 0",
+            "input_relation_id": "view_a",
+            "input_relation_version": "v1",
+            "source_kind": "standing_view"
+        }),
+    )
+    .await;
+    assert_eq!(view_b.0, StatusCode::CREATED, "{view_b:?}");
+
+    // Extending the chain with another layer is valid: view_a_again -> view_b
+    // -> view_a -> scores stays acyclic.
+    let view_a_again = call_json(
+        &router,
+        Method::POST,
+        "/v1/views",
+        json!({
+            "view_id": "view_a_again",
+            "sql": "select user_id, score from view_b where score > 0",
+            "input_relation_id": "view_b",
+            "input_relation_version": "v1",
+            "source_kind": "standing_view"
+        }),
+    )
+    .await;
+    assert_eq!(view_a_again.0, StatusCode::CREATED, "{view_a_again:?}");
+    assert_eq!(view_a_again.1["query_enabled"], true, "{view_a_again:?}");
+
+    let query = call_json(
+        &router,
+        Method::POST,
+        "/v1/views/view_a_again/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(query.0, StatusCode::OK, "{query:?}");
+    assert_eq!(query.1["rows"], json!([{"user_id": "alice", "score": 10}]));
+
+    // A self-referencing view cannot be admitted: the input resolves neither
+    // to a registered relation nor to an existing published view output, so
+    // admission fails closed before any graph edge is created.
+    let self_cycle = call_json(
+        &router,
+        Method::POST,
+        "/v1/views",
+        json!({
+            "view_id": "self_cycle_view",
+            "sql": "select user_id, score from self_cycle_view where score > 0",
+            "input_relation_id": "self_cycle_view",
+            "input_relation_version": "v1",
+            "source_kind": "standing_view"
+        }),
+    )
+    .await;
     assert!(
-        rows.contains(&"total".to_string()),
-        "consumer output must contain the total column: {rows:?}"
+        self_cycle.0.is_client_error(),
+        "self-referencing view admission must fail closed: {self_cycle:?}"
     );
 }

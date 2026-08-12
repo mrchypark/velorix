@@ -12,7 +12,7 @@ use velorix_core::relation::{
     ArrowPhysicalTypeV1, DataFusionRegistrationModeV1, DataFusionRegistrationV1,
     IncrementalAdapterBindingV1, IncrementalRelationBindingV1, RelationColumnV1,
     RelationOperationV1, RelationSemanticRoleV1, SchemaFingerprintV1, VelorixLogicalTypeV1,
-    VelorixRelationCatalogV1, VelorixRelationSchemaV1,
+    VelorixRelationCatalogV1, VelorixRelationSchemaV1, VelorixRelationSourceV1,
     CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID, RELATION_SCHEMA_VERSION_V1,
 };
 use velorix_meta::{
@@ -704,6 +704,7 @@ fn smoke_relation_catalog(probe_id: &str) -> anyhow::Result<VelorixRelationCatal
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema)?;
 
     Ok(VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
         schema_version: RELATION_SCHEMA_VERSION_V1,
         relation_schema,
         schema_fingerprint: schema_fingerprint.clone(),
