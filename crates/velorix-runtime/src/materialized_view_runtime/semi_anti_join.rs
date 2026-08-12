@@ -149,7 +149,7 @@ impl TwoInputSemiAntiJoinRuntime {
         checkpoint.validate_identity(&checkpoint.identity)?;
         let Some(state_payload) = &checkpoint.state_payload else {
             return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
-                field: Box::leak(format!("semi_cp_1").into_boxed_str()),
+                field: "semi_anti_join_checkpoint",
             });
         };
         if state_payload.codec_identity != checkpoint.checkpoint_codec_identity {
@@ -172,7 +172,7 @@ impl TwoInputSemiAntiJoinRuntime {
             })
         {
             return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
-                field: Box::leak(format!("semi_cp_2").into_boxed_str()),
+                field: "semi_anti_join_checkpoint",
             });
         }
         validate_view_sql_hash(&checkpoint.identity, &payload.logical_plan.view_sql)?;
@@ -181,7 +181,7 @@ impl TwoInputSemiAntiJoinRuntime {
             payload.logical_plan.execution.clone()
         else {
             return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
-                field: Box::leak(format!("semi_cp_3").into_boxed_str()),
+                field: "semi_anti_join_checkpoint",
             });
         };
         validate_semi_anti_join_runtime_contract(
@@ -230,7 +230,7 @@ impl TwoInputSemiAntiJoinRuntime {
                 && applied_epochs.values().max().copied() != Some(checkpoint.logical_epoch))
         {
             return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
-                field: Box::leak(format!("semi_cp_5").into_boxed_str()),
+                field: "semi_anti_join_checkpoint",
             });
         }
         Ok(Self {
