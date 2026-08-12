@@ -225,12 +225,14 @@ Comprehensive retraction verification not complete.
 - [ ] **Update supported-sql.md with window families**
 - [ ] **Add window-specific admission tests**
 
-**Current state**: Windows (TUMBLE/HOP/SESSION) implemented but gated behind
-`experimental_advanced_view_features`; public admission rejects window SQL.
-Verified runtime coverage: `tumbling_window_*`, `hopping_and_session_window_views_*`
-API tests; `TumblingEventTimeAggregate` execution variant in view_plan tests.
-Remaining: public contract documentation, multi-input watermark combination,
-configurable late-row policy, state retention contract, gate removal.
+**Current state**: **COMPLETE (2026-08-12).** Windows are public 1.0
+(`PublicViewFeaturePolicyV1` splits the gate; event-time enabled by default,
+analytic gated). Public contract documented in supported-sql.md (extraction,
+per-partition watermark, min-over-inputs combination, finalization frontier
+F = W - allowance, late-row policies, retention, determinism). LateRowPolicy
+(strict/drop-with-evidence/admit-within-allowance) with durable evidence
+counter; StateRetentionContractV1; retraction verification matrix (TUMBLE
+pre/post closure, HOP fanout, SESSION merge-split + restart).
 
 ## Phase 6: Types and Deterministic Expressions
 
@@ -334,9 +336,11 @@ test matrix for the unimplemented string/temporal/float expressions.
 - [ ] **Normalize derived tables with complex expressions**
 - [ ] **Validate CTE dependency ordering**
 
-**Current state**: Identity CTEs and simple filter/project CTEs supported;
-CTE dependency ordering validated; recursive CTEs rejected. Complex CTEs with
-aggregation/join rejected.
+**Current state**: Partially complete. Identity/filter/project CTEs plus
+Phase 7.4: correlated EXISTS/NOT EXISTS on identical non-null scalar columns
+(non-PK equality) admitted and materialized exactly with restart. Remaining:
+complex CTE normalization with aggregation, uncorrelated scalar subquery
+lowering, IN/NOT IN subquery decorrelation, query equivalence harness.
 
 ### 7.2 Uncorrelated Scalar Subqueries
 
