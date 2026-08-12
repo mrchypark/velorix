@@ -374,8 +374,12 @@ Current implementation evidence:
   references re-enter the runtime path.
 
 Verification commands for this internal experimental-only evidence. These
-commands do not make window SQL part of the public 1.0 contract; the product
-API admission path rejects window SQL.
+commands do not make analytic ranking SQL part of the public 1.0 contract;
+the product API admission path rejects it. Event-time window SQL
+(TUMBLE/HOP/SESSION) is part of the public 1.0 contract (see the Event-Time
+Semantics section of supported-sql.md and `PublicViewFeaturePolicyV1`);
+late rows default to strict rejection, and window closure is governed by
+the finalization frontier F = W - allowance.
 
 ```bash
 cargo test -p velorix-api --lib

@@ -62,6 +62,9 @@ deployment_files = [
 deployment_scan_excludes = {
     "scripts/check-no-external-runtime-artifacts.sh",
     "scripts/check-vind-product-contract.sh",
+    # External-comparison baseline tooling (Feldera/DBSP reference runs) is
+    # not a product runtime path and is scanned separately.
+    "scripts/run-feldera-community-baseline.sh",
 }
 forbidden_runtime_terms = [
     "feldera",
