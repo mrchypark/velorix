@@ -6,7 +6,7 @@
 use std::{error::Error, sync::Arc, time::Duration, time::Instant};
 
 use arrow::{
-    array::{Array, ArrayRef, Int64Array, StringArray},
+    array::{ArrayRef, Int64Array, StringArray},
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
@@ -18,8 +18,7 @@ use velorix_core::{
     },
     standing_program::{
         BuiltinRuntimeIdentity, EpochIdempotencyKey, NativeCodePolicy, RelationInputBatch,
-        RelationInputEncodingV1, ScopedViewId, SnapshotPageRequest, StandingProgramIdentity,
-        StandingProgramRuntime,
+        RelationInputEncodingV1, StandingProgramIdentity,
     },
     view_contract::{
         catalog_input_relation_schema, stable_bytes_hash, ColumnSchema, RelationSchema, SqlDataType,
@@ -85,7 +84,7 @@ fn interval_join_workload() -> BenchResult<Phase8WorkloadMeasurement> {
         primary_key: vec!["ride_id".to_string()],
     };
     let identity = standing_identity(INTERVAL_JOIN_SQL, "interval_matches");
-    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+    let runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
         &catalogs,
         INTERVAL_JOIN_SQL,
@@ -181,7 +180,7 @@ fn recursive_fixpoint_workload() -> BenchResult<Phase8WorkloadMeasurement> {
         primary_key: vec!["src".to_string(), "dst".to_string()],
     };
     let identity = standing_identity(RECURSIVE_FIXPOINT_SQL, "reachability");
-    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+    let runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
         std::slice::from_ref(&edges),
         RECURSIVE_FIXPOINT_SQL,
