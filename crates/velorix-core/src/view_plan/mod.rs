@@ -17227,7 +17227,8 @@ pub fn validate_supported_interval_join_sql(
         })?;
         if !matches!(
             adapter,
-            SupportedIncrementalAdapterSpec::ScalarSumCount | SupportedIncrementalAdapterSpec::Generic
+            SupportedIncrementalAdapterSpec::ScalarSumCount
+                | SupportedIncrementalAdapterSpec::Generic
         ) {
             return unsupported("interval join SQL requires scalar or generic inputs");
         }
@@ -17284,8 +17285,12 @@ pub fn validate_supported_interval_join_sql(
         }
         let left_ref = qualified_column_ref(left.as_ref())?;
         let right_ref = qualified_column_ref(right.as_ref())?;
-        let (left_side, right_side) =
-            orient_join_refs(left_ref, right_ref, left_table.alias.as_str(), right_table.alias.as_str())?;
+        let (left_side, right_side) = orient_join_refs(
+            left_ref,
+            right_ref,
+            left_table.alias.as_str(),
+            right_table.alias.as_str(),
+        )?;
         let left_column = qualified_ref_catalog_column(&left_side, left_catalog)?;
         let right_column = qualified_ref_catalog_column(&right_side, right_catalog)?;
         if left_column.column_id == right_catalog.relation_schema.weight_column_id
@@ -17370,7 +17375,8 @@ pub fn lower_supported_interval_join_sql_to_logical_plan(
     let supported = validate_supported_interval_join_sql(sql, catalogs)?;
     let output_relation = logical_relation_from_schema(output_schema);
     let left_catalog = catalog_for_relation_in_slice(catalogs, &supported.left_input_relation_id)?;
-    let right_catalog = catalog_for_relation_in_slice(catalogs, &supported.right_input_relation_id)?;
+    let right_catalog =
+        catalog_for_relation_in_slice(catalogs, &supported.right_input_relation_id)?;
     finalize_logical_plan(VelorixLogicalViewPlanV1 {
         plan_version: LOGICAL_VIEW_PLAN_VERSION_V2,
         plan_hash: None,
@@ -17378,10 +17384,7 @@ pub fn lower_supported_interval_join_sql_to_logical_plan(
         capability_version: LOGICAL_VIEW_PLAN_CAPABILITY_VERSION_V2.to_string(),
         key_semantics_version: INCREMENTAL_KEY_SEMANTICS_VERSION_V1.to_string(),
         bag_semantics_version: INCREMENTAL_BAG_SEMANTICS_VERSION_V1.to_string(),
-        input_relations: catalogs
-            .iter()
-            .map(logical_relation_from_catalog)
-            .collect(),
+        input_relations: catalogs.iter().map(logical_relation_from_catalog).collect(),
         output_relation: output_relation.clone(),
         nodes: vec![
             VelorixLogicalViewPlanNodeV1::RelationScan {
@@ -17396,7 +17399,10 @@ pub fn lower_supported_interval_join_sql_to_logical_plan(
                 node_id: "interval_join".to_string(),
                 left: "interval_left_scan".to_string(),
                 right: "interval_right_scan".to_string(),
-                left_key: column_ref(&supported.left_input_relation_id, &supported.left_key_column_id),
+                left_key: column_ref(
+                    &supported.left_input_relation_id,
+                    &supported.left_key_column_id,
+                ),
                 right_key: column_ref(
                     &supported.right_input_relation_id,
                     &supported.right_key_column_id,

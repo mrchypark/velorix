@@ -20569,12 +20569,7 @@ fn frame_output_schema() -> RelationSchema {
 }
 
 fn interval_join_rides_catalog() -> VelorixRelationCatalogV1 {
-    interval_side_catalog(
-        "rides",
-        "ride_id",
-        "booking_start",
-        "booking_end_time",
-    )
+    interval_side_catalog("rides", "ride_id", "booking_start", "booking_end_time")
 }
 
 fn interval_join_vehicles_catalog() -> VelorixRelationCatalogV1 {
@@ -20854,19 +20849,11 @@ fn interval_join_materializes_overlap_retraction_and_restart() {
             ],
         )
         .unwrap();
-    assert_interval_join_page(
-        runtime.as_ref(),
-        3,
-        &[("r1", 10, 20), ("r2", 5, 12)],
-    );
+    assert_interval_join_page(runtime.as_ref(), 3, &[("r1", 10, 20), ("r2", 5, 12)]);
 
     let checkpoint = runtime.checkpoint().unwrap();
     let mut restored = restore_standing_runtime(checkpoint).unwrap();
-    assert_interval_join_page(
-        restored.as_ref(),
-        3,
-        &[("r1", 10, 20), ("r2", 5, 12)],
-    );
+    assert_interval_join_page(restored.as_ref(), 3, &[("r1", 10, 20), ("r2", 5, 12)]);
     restored
         .apply_changes(
             4,
@@ -20880,9 +20867,5 @@ fn interval_join_materializes_overlap_retraction_and_restart() {
             )],
         )
         .unwrap();
-    assert_interval_join_page(
-        restored.as_ref(),
-        4,
-        &[("r1", 10, 20), ("r2", 5, 12)],
-    );
+    assert_interval_join_page(restored.as_ref(), 4, &[("r1", 10, 20), ("r2", 5, 12)]);
 }

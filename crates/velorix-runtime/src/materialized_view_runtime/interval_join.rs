@@ -63,9 +63,11 @@ impl IntervalJoinRuntime {
             }
         })?;
         validate_interval_join_contract(&catalogs, &input_schemas, &output_schema, &plan)?;
-        let compiled = validate_supported_interval_join_sql(view_sql.as_str(), &catalogs)
-            .map_err(|_| StandingProgramRuntimeError::InvalidProgramIdentity {
-                field: "interval_join_plan",
+        let compiled =
+            validate_supported_interval_join_sql(view_sql.as_str(), &catalogs).map_err(|_| {
+                StandingProgramRuntimeError::InvalidProgramIdentity {
+                    field: "interval_join_plan",
+                }
             })?;
         if compiled != plan {
             return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
@@ -135,15 +137,13 @@ impl IntervalJoinRuntime {
         record: &DeltaRecord,
     ) -> Result<(), StandingProgramRuntimeError> {
         let key = canonical_json(record.key.as_json());
-        let entry = intervals
-            .entry(key.clone())
-            .or_insert_with(|| IntervalRow {
-                key: record.key.as_json().clone(),
-                start_ns: 0,
-                end_ns: 0,
-                values: BTreeMap::new(),
-                weight: 0,
-            });
+        let entry = intervals.entry(key.clone()).or_insert_with(|| IntervalRow {
+            key: record.key.as_json().clone(),
+            start_ns: 0,
+            end_ns: 0,
+            values: BTreeMap::new(),
+            weight: 0,
+        });
         entry.weight = entry
             .weight
             .checked_add(record.weight)
@@ -247,7 +247,10 @@ impl StandingProgramRuntime for IntervalJoinRuntime {
     }
 
     fn input_schemas(&self) -> Vec<RelationSchema> {
-        vec![self.left_input_schema.clone(), self.right_input_schema.clone()]
+        vec![
+            self.left_input_schema.clone(),
+            self.right_input_schema.clone(),
+        ]
     }
 
     fn output_schemas(&self) -> Vec<RelationSchema> {
@@ -313,31 +316,30 @@ impl StandingProgramRuntime for IntervalJoinRuntime {
             columns
         };
         for input in &input_changes {
-            let (side, schema, catalog, start_column, end_column, intervals) = if input.relation_id
-                == self.plan.left_input_relation_id
-            {
-                (
-                    "left",
-                    &self.left_input_schema,
-                    &self.left_catalog,
-                    self.plan.left_start_column_id.as_str(),
-                    self.plan.left_end_column_id.as_str(),
-                    &mut self.left_intervals,
-                )
-            } else if input.relation_id == self.plan.right_input_relation_id {
-                (
-                    "right",
-                    &self.right_input_schema,
-                    &self.right_catalog,
-                    self.plan.right_start_column_id.as_str(),
-                    self.plan.right_end_column_id.as_str(),
-                    &mut self.right_intervals,
-                )
-            } else {
-                return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
-                    field: "interval_join_input_relation",
-                });
-            };
+            let (side, schema, catalog, start_column, end_column, intervals) =
+                if input.relation_id == self.plan.left_input_relation_id {
+                    (
+                        "left",
+                        &self.left_input_schema,
+                        &self.left_catalog,
+                        self.plan.left_start_column_id.as_str(),
+                        self.plan.left_end_column_id.as_str(),
+                        &mut self.left_intervals,
+                    )
+                } else if input.relation_id == self.plan.right_input_relation_id {
+                    (
+                        "right",
+                        &self.right_input_schema,
+                        &self.right_catalog,
+                        self.plan.right_start_column_id.as_str(),
+                        self.plan.right_end_column_id.as_str(),
+                        &mut self.right_intervals,
+                    )
+                } else {
+                    return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                        field: "interval_join_input_relation",
+                    });
+                };
             validate_input_matches_schema(input, schema, "interval_join_input")?;
             let delta = if let Some(empty_delta) = published_input_empty_delta(input, catalog)? {
                 empty_delta
@@ -367,8 +369,10 @@ impl StandingProgramRuntime for IntervalJoinRuntime {
                     &columns.into_iter().collect::<Vec<_>>(),
                     &input.batches,
                 )
-                .map_err(|_| StandingProgramRuntimeError::InvalidProgramIdentity {
-                    field: "interval_join_input_batch",
+                .map_err(|_| {
+                    StandingProgramRuntimeError::InvalidProgramIdentity {
+                        field: "interval_join_input_batch",
+                    }
                 })?
             };
             for record in delta.net_rows().map_err(|_| invalid_runtime_state())? {
@@ -518,7 +522,10 @@ impl StandingProgramRuntime for IntervalJoinRuntime {
         }
         validate_interval_join_contract(
             &[payload.left_catalog.clone(), payload.right_catalog.clone()],
-            &[payload.left_input_schema.clone(), payload.right_input_schema.clone()],
+            &[
+                payload.left_input_schema.clone(),
+                payload.right_input_schema.clone(),
+            ],
             &payload.output_schema,
             &payload.plan,
         )?;
