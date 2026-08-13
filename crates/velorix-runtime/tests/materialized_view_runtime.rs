@@ -29,9 +29,9 @@ use velorix_core::{
     },
     standing_program::{
         BuiltinRuntimeIdentity, EpochIdempotencyKey, InputEventTimeWatermark, NativeCodePolicy,
-        RelationFrontier, RelationInputBatch, RelationInputEncodingV1, ScopedViewId,
-        SnapshotPageRequest, StandingProgramIdentity, StandingProgramRuntime,
-        StandingProgramRuntimeError,
+        RelationFrontier, RelationInputBatch, RelationInputEncodingV1, RuntimeCheckpoint,
+        ScopedViewId, SnapshotPageRequest, StandingProgramIdentity, StandingProgramRuntime,
+        StandingProgramRuntimeError, ViewOutputDelta,
     },
     view_contract::{
         catalog_from_published_relation_binding, catalog_input_relation_schema,
@@ -41,7 +41,7 @@ use velorix_core::{
     view_plan::{
         logical_view_plan_hash, lower_supported_analytic_row_number_sql_to_logical_plan,
         lower_supported_filter_project_sql_to_logical_plan,
-        lower_supported_join_view_sql_to_logical_plan,
+        lower_supported_join_view_sql_to_logical_plan, lower_supported_sql_to_logical_plan,
         lower_supported_three_input_inner_join_count_sql_to_logical_plan_with_policy,
         lower_supported_tumbling_window_sql_to_logical_plan_with_policy, LateRowPolicy,
         LogicalPlanAggregateFunctionV1, RowPredicateExpr, SupportedAggregateOutput,
@@ -21181,4 +21181,281 @@ fn assert_typed_family_matrix_page(
     expected.sort();
     actual.sort();
     assert_eq!(actual, expected);
+}
+
+fn normalized_plan_equality(
+    left: &VelorixLogicalViewPlanV1,
+    right: &VelorixLogicalViewPlanV1,
+) -> bool {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    left.view_sql.clear();
+    right.view_sql.clear();
+    left.plan_hash = None;
+    right.plan_hash = None;
+    left == right
+}
+
+fn assert_equivalent_lowering(
+    left_sql: &str,
+    right_sql: &str,
+    catalogs: &[VelorixRelationCatalogV1],
+    output: &RelationSchema,
+    label: &str,
+) {
+    let left = lower_supported_sql_to_logical_plan(left_sql, catalogs, output).unwrap();
+    let right = lower_supported_sql_to_logical_plan(right_sql, catalogs, output).unwrap();
+    assert!(
+        normalized_plan_equality(&left, &right),
+        "{label}: rewrites must lower to identical normalized logical plans"
+    );
+}
+
+fn checkpoint_payload_normalized(checkpoint: &RuntimeCheckpoint) -> Value {
+    let payload = checkpoint.state_payload.as_ref().unwrap().payload.clone();
+    let mut payload: Value = serde_json::from_str(&payload).unwrap();
+    if let Some(plan) = payload
+        .get_mut("logical_plan")
+        .and_then(Value::as_object_mut)
+    {
+        plan.insert("view_sql".to_string(), Value::Null);
+        plan.insert("plan_hash".to_string(), Value::Null);
+    }
+    payload
+}
+
+fn delta_commits_canonical(deltas: &[ViewOutputDelta]) -> String {
+    deltas
+        .iter()
+        .map(|delta| {
+            format!(
+                "{}|{}|{}",
+                delta.view_id,
+                delta.schema_fingerprint,
+                serde_json::to_string(&delta.delta).unwrap()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+fn assert_identical_materialized_rows(
+    left: &(dyn StandingProgramRuntime + Send),
+    right: &(dyn StandingProgramRuntime + Send),
+    view_id: &str,
+    epoch: u64,
+) {
+    let left_page = left
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".into(),
+                program_id: "program-purchases".into(),
+                view_id: view_id.into(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(epoch),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let right_page = right
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".into(),
+                program_id: "program-purchases".into(),
+                view_id: view_id.into(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(epoch),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(left_page.batches[0], right_page.batches[0]);
+}
+
+fn equivalence_corpus_epochs(
+    scores: &VelorixRelationCatalogV1,
+    accounts: &VelorixRelationCatalogV1,
+) -> Vec<Vec<RelationInputBatch>> {
+    vec![
+        vec![
+            relation_input(
+                scores,
+                "eq-scores",
+                0,
+                2,
+                scores_rows_batch(&[("alice", 10, 1), ("bob", 5, 1)]),
+            ),
+            relation_input(
+                accounts,
+                "eq-accounts",
+                0,
+                1,
+                accounts_rows_batch(&[("a10", 10, "gold", 1)]),
+            ),
+        ],
+        vec![relation_input(
+            accounts,
+            "eq-accounts",
+            1,
+            2,
+            accounts_rows_batch(&[("a5", 5, "silver", 1), ("a10", 10, "gold", -1)]),
+        )],
+        vec![
+            relation_input(
+                scores,
+                "eq-scores",
+                2,
+                3,
+                scores_rows_batch(&[("carol", 5, 1), ("carol", 5, -1)]),
+            ),
+            relation_input(
+                accounts,
+                "eq-accounts",
+                2,
+                3,
+                accounts_rows_batch(&[("a5", 5, "silver", -1)]),
+            ),
+        ],
+        vec![relation_input(
+            scores,
+            "eq-scores",
+            3,
+            4,
+            scores_rows_batch(&[("bob", 5, -1)]),
+        )],
+    ]
+}
+
+#[test]
+fn query_equivalence_harness_proves_identical_plans_deltas_and_checkpoints() {
+    let scores = scores_catalog();
+    let accounts = accounts_catalog();
+    let catalogs = vec![scores.clone(), accounts.clone()];
+    let input_schemas = catalogs
+        .iter()
+        .map(|catalog| catalog_input_relation_schema(catalog).unwrap())
+        .collect::<Vec<_>>();
+    let output = scores_projection_output_schema();
+
+    // Tier 1: rewrites must lower to identical normalized logical plans.
+    let in_list = "select user_id, score from scores where score in (1, 2)";
+    let or_chain = "select user_id, score from scores where score = 1 or score = 2";
+    assert_equivalent_lowering(
+        in_list,
+        or_chain,
+        std::slice::from_ref(&scores),
+        &output,
+        "IN-list vs OR-chain",
+    );
+
+    let cte_sql = "with c as (select * from scores where score > 0) select user_id, score from c";
+    let inline_sql = "select user_id, score from scores where score > 0";
+    assert_equivalent_lowering(
+        cte_sql,
+        inline_sql,
+        std::slice::from_ref(&scores),
+        &output,
+        "CTE-inlined vs inline",
+    );
+
+    let in_subquery =
+        "select s.user_id, s.score from scores s where s.score in (select a.limit from accounts a)";
+    let exists_subquery = "select s.user_id, s.score from scores s where exists (select 1 from accounts a where a.limit = s.score)";
+    assert_equivalent_lowering(
+        in_subquery,
+        exists_subquery,
+        &catalogs,
+        &output,
+        "IN-subquery vs EXISTS-subquery",
+    );
+
+    // Tier 2: dual-runtime execution equivalence across an adversarial
+    // corpus (inserts, retractions, net-zero batches, side switches).
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &standing_identity_with_view(in_subquery, "positive_scores"),
+        &catalogs,
+        in_subquery,
+        &input_schemas,
+        std::slice::from_ref(&output),
+    )
+    .unwrap();
+    let mut reference = create_standing_runtime_with_sql_and_catalogs(
+        &standing_identity_with_view(exists_subquery, "positive_scores"),
+        &catalogs,
+        exists_subquery,
+        &input_schemas,
+        std::slice::from_ref(&output),
+    )
+    .unwrap();
+
+    let corpus = equivalence_corpus_epochs(&scores, &accounts);
+    for (epoch, batches) in corpus.iter().enumerate() {
+        let epoch = (epoch + 1) as u64;
+        let left_commit = runtime
+            .apply_changes(
+                epoch,
+                EpochIdempotencyKey::new(format!("eq-epoch-{epoch}")).unwrap(),
+                batches.clone(),
+            )
+            .unwrap();
+        let right_commit = reference
+            .apply_changes(
+                epoch,
+                EpochIdempotencyKey::new(format!("eq-epoch-{epoch}")).unwrap(),
+                batches.clone(),
+            )
+            .unwrap();
+        assert_eq!(
+            delta_commits_canonical(&left_commit.output_deltas),
+            delta_commits_canonical(&right_commit.output_deltas)
+        );
+        assert_identical_materialized_rows(
+            runtime.as_ref(),
+            reference.as_ref(),
+            "positive_scores",
+            epoch,
+        );
+    }
+
+    let left_checkpoint = runtime.checkpoint().unwrap();
+    let right_checkpoint = reference.checkpoint().unwrap();
+    assert_eq!(
+        checkpoint_payload_normalized(&left_checkpoint),
+        checkpoint_payload_normalized(&right_checkpoint),
+        "rewritten and reference runtimes must reach identical checkpoint state"
+    );
+
+    // Crash-window equivalence: restart the reference and verify the
+    // remaining epochs stay identical.
+    let mut restarted = restore_standing_runtime(right_checkpoint).unwrap();
+    let restarted_epochs = vec![relation_input(
+        &scores,
+        "eq-scores",
+        4,
+        5,
+        scores_rows_batch(&[("dave", 1, 1)]),
+    )];
+    let left_commit = runtime
+        .apply_changes(
+            5,
+            EpochIdempotencyKey::new("eq-epoch-5").unwrap(),
+            restarted_epochs.clone(),
+        )
+        .unwrap();
+    let right_commit = restarted
+        .apply_changes(
+            5,
+            EpochIdempotencyKey::new("eq-epoch-5").unwrap(),
+            restarted_epochs,
+        )
+        .unwrap();
+    assert_eq!(
+        delta_commits_canonical(&left_commit.output_deltas),
+        delta_commits_canonical(&right_commit.output_deltas)
+    );
+    assert_identical_materialized_rows(runtime.as_ref(), restarted.as_ref(), "positive_scores", 5);
 }

@@ -295,56 +295,79 @@ Not supported as group key or join key.
 
 ### 6.3 String Expressions
 
-- [ ] **Add CONCAT expression**
-- [ ] **Add SUBSTRING expression**
-- [ ] **Add UPPER/LOWER expressions**
-- [ ] **Add TRIM expression**
-- [ ] **Add LENGTH/CHAR_LENGTH expressions**
+- [x] **Add CONCAT expression**
+- [x] **Add SUBSTRING expression**
+- [x] **Add UPPER/LOWER expressions**
+- [x] **Add TRIM expression**
+- [x] **Add LENGTH/CHAR_LENGTH expressions**
 - [x] **Add string comparison predicates** (LIKE/NOT LIKE, Eq/NotEq, IS NULL on
       Utf8 columns implemented in `PredicateOp`)
 
-**Current state**: No string scalar expressions implemented.
-String literals supported in predicates.
+**Current state**: Complete. CONCAT/SUBSTRING/SUBSTR/UPPER/LOWER/TRIM/
+LENGTH/CHAR_LENGTH admitted through the typed projection surface
+(`TypedExprKindV1::Call` + `BuiltinScalarFunctionV1`), including the AST
+forms `SUBSTRING(x FROM n FOR m)` and `TRIM(chars FROM x)`. Strict null
+propagation; LENGTH counts Unicode scalar values. Evidence:
+`runtime_materializes_string_temporal_float_typed_projections_and_restores`
+and the Phase 6.6 type-family matrix.
 
 ### 6.4 Temporal Expressions
 
-- [ ] **Add EXTRACT expression (year, month, day, etc.)**
-- [ ] **Add DATE_TRUNC expression**
-- [ ] **Add AGE expression**
-- [ ] **Add date/time arithmetic (date + interval)**
+- [x] **Add EXTRACT expression (year, month, day, etc.)**
+- [x] **Add DATE_TRUNC expression**
+- [ ] **Add AGE expression** (deferred: requires month-length arithmetic; see
+      phase-4-8-execution-plan contract boundaries)
+- [x] **Add date/time arithmetic (date + interval)**
 - [x] **Add temporal comparison predicates** (event-time columns bound as Int64
       nanoseconds/Date32/TimestampNanosecond are comparable in predicates and
       window SQL)
 
-**Current state**: No temporal expressions implemented.
-Event-time column bound as Int64 nanoseconds.
+**Current state**: Complete for the supported UTC-Gregorian surface:
+EXTRACT year/month/day/hour/minute/second, DATE_TRUNC day/hour/minute/second,
+timestamp +/- fixed-duration interval (nanoseconds), DATE + integer days
+(DateAddDays). Event-time Int64 columns are coerced to TimestampNanosecond in
+the typed surface. Evidence: `type_family_test_matrix_covers_null_overflow_boundary_restart`.
 
 ### 6.5 Float and Numeric Expressions
 
-- [ ] **Add checked arithmetic for Float32/Float64**
-- [ ] **Define NaN, infinity, and zero-division handling rules**
-- [ ] **Add ABS, CEIL, FLOOR, ROUND expressions**
-- [ ] **Add GREATEST/LEAST for Float types** (Float64 pass-through in
+- [x] **Add checked arithmetic for Float32/Float64**
+- [x] **Define NaN, infinity, and zero-division handling rules**
+- [x] **Add ABS, CEIL, FLOOR, ROUND expressions**
+- [x] **Add GREATEST/LEAST for Float types** (Float64 pass-through in
       filter/project; computed expressions Int64-only)
 
-**Current state**: Int64 arithmetic only.
-GREATEST/LEAST implemented for Int64 only.
+**Current state**: Complete. Finite-only Float64 arithmetic with
+NaN/Infinity inputs and results failing closed, -0.0 canonicalization,
+division by zero rejected, Int64-to-Float64 promotion for |value| < 2^53,
+ABS/CEIL/FLOOR/ROUND (half-away-from-zero) and variadic
+GREATEST/LEAST (nulls skipped). CEIL/FLOOR admitted in both the dedicated
+AST forms and function forms. Evidence: `type_family_test_matrix_covers_null_overflow_boundary_restart`.
 
 ### 6.6 Type-Specific Tests
 
-- [ ] **Add null handling tests per type family**
-- [ ] **Add overflow and boundary tests per type family**
-- [ ] **Add restart and recovery tests per type family**
-- [ ] **Add type coercion tests**
+- [x] **Add null handling tests per type family**
+- [x] **Add overflow and boundary tests per type family**
+- [x] **Add restart and recovery tests per type family**
+- [x] **Add type coercion tests**
 
-**Current state**: Int64 null/overflow tests exist; Decimal128/Utf8/Float64
-value-path coverage exists in view_plan and runtime tests. No expression-family
-test matrix for the unimplemented string/temporal/float expressions.
+**Current state**: Complete. The Phase 6.6 matrix
+(`type_family_test_matrix_covers_null_overflow_boundary_restart`) exercises
+the string family (lower, substring AST + substr function forms, trim with
+characters, length), temporal family (extract month/hour/second, date_trunc
+day/minute, timestamp - interval), float family (ceil/floor/round,
+greatest/least), null propagation through float arithmetic and unary
+functions, and checkpoint/restart continuation.
 
 ### 6.7 Exit Gate
 
-- [ ] Each newly admitted type has exact SQL, Arrow, delta, checkpoint, and query
+- [x] Each newly admitted type has exact SQL, Arrow, delta, checkpoint, and query
   representations with no lossy implicit conversion.
+
+**Evidence**: Typed IR types (`RuntimeScalarTypeV1`) are persisted in the
+program hash and checkpoint payloads; Float64 literals store canonical bits;
+Decimal128 literals store unscaled i128 with explicit precision/scale; the
+only documented promotion is Int64 -> Float64 for |value| < 2^53 inside the
+float expression family (`float_operand`).
 
 ---
 
@@ -406,13 +429,20 @@ Two-relation only.
 
 ### 7.5 Rewritten Query Verification
 
-- [ ] **Build test framework for query equivalence verification**
-- [ ] **Verify identical plan semantics across rewrites**
-- [ ] **Verify identical output deltas across rewrites**
-- [ ] **Verify identical checkpoint state across rewrites**
+- [x] **Build test framework for query equivalence verification**
+- [x] **Verify identical plan semantics across rewrites**
+- [x] **Verify identical output deltas across rewrites**
+- [x] **Verify identical checkpoint state across rewrites**
 
-**Current state**: No equivalence verification framework.
-Manual testing only.
+**Current state**: Complete. Two-tier harness
+(`query_equivalence_harness_proves_identical_plans_deltas_and_checkpoints`):
+Tier 1 asserts normalized logical-plan equality (view_sql/plan_hash
+excluded) for IN-list vs OR-chain, CTE-inlined vs inline, and IN-subquery vs
+EXISTS-subquery rewrites; Tier 2 drives a rewritten and a reference runtime
+through an adversarial corpus (inserts, retractions, net-zero batches, side
+switches) asserting equal output deltas and equal materialized pages per
+epoch, then equal normalized checkpoint state, then continues after restart
+of one runtime and re-verifies delta and page equality.
 
 ### 7.6 Exit Gate
 
