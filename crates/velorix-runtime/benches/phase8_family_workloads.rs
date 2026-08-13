@@ -94,8 +94,6 @@ fn interval_join_workload() -> BenchResult<Phase8WorkloadMeasurement> {
             "vehicle_id".to_string(),
         ],
     };
-    let identity = standing_identity(INTERVAL_JOIN_SQL, "interval_matches");
-
     const SIDE_ROWS: u64 = 2_000;
     const SAMPLES: u32 = 2;
     let mut samples = Vec::new();
