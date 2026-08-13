@@ -66,7 +66,7 @@ use velorix_core::{
         validate_supported_latest_by_key_sql, validate_supported_recursive_cte_sql,
         validate_supported_scalar_aggregate_filter_sql, validate_supported_semi_anti_join_sql,
         validate_supported_tumbling_window_sql_with_policy, validate_supported_view_sql,
-        AggregateOutputPredicate, AggregateOutputPredicateExpr, CrossJoinProjectionItemV1,
+        AggregateOutputPredicate, AggregateOutputPredicateExpr,
         CrossJoinSideV1, JoinPredicateExpr, JoinRowPredicate, LateRowPolicy,
         LogicalPlanAggregateFunctionV1, LogicalPlanExecutionImplementationV1,
         LogicalPlanLatestByKeyFunctionV1, PredicateOp, RecursiveBasePredicateV1,
