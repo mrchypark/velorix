@@ -63,18 +63,19 @@ use velorix_core::{
         validate_supported_analytic_row_number_sql, validate_supported_analytic_window_frame_sql,
         validate_supported_filter_project_sql, validate_supported_interval_join_sql,
         validate_supported_join_view_sql, validate_supported_latest_by_key_sql,
-        validate_supported_scalar_aggregate_filter_sql, validate_supported_semi_anti_join_sql,
-        validate_supported_tumbling_window_sql_with_policy, validate_supported_view_sql,
-        AggregateOutputPredicate, AggregateOutputPredicateExpr, JoinPredicateExpr,
-        JoinRowPredicate, LateRowPolicy, LogicalPlanAggregateFunctionV1,
+        validate_supported_recursive_cte_sql, validate_supported_scalar_aggregate_filter_sql,
+        validate_supported_semi_anti_join_sql, validate_supported_tumbling_window_sql_with_policy,
+        validate_supported_view_sql, AggregateOutputPredicate, AggregateOutputPredicateExpr,
+        JoinPredicateExpr, JoinRowPredicate, LateRowPolicy, LogicalPlanAggregateFunctionV1,
         LogicalPlanExecutionImplementationV1, LogicalPlanLatestByKeyFunctionV1, PredicateOp,
-        RowPredicate, RowPredicateExpr, ScalarSubqueryComparisonOp,
-        SupportedAggregateInputRelationSide, SupportedAggregateOutput,
+        RecursiveBasePredicateV1, RecursiveProjectionItemV1, RowPredicate, RowPredicateExpr,
+        ScalarSubqueryComparisonOp, SupportedAggregateInputRelationSide, SupportedAggregateOutput,
         SupportedAnalyticRowNumberPlan, SupportedAnalyticWindowFramePlanV1,
         SupportedAnalyticWindowFunction, SupportedEventTimeWindowKind, SupportedFilterProjectPlan,
         SupportedIntervalJoinPlanV1, SupportedJoinKeyDomainV1, SupportedJoinKind,
         SupportedJoinViewPlan, SupportedLatestByKeyPlan, SupportedProjectionBinaryOp,
-        SupportedProjectionExpr, SupportedScalarAggregateFilterPlanV1, SupportedSemiAntiJoinKindV1,
+        SupportedProjectionExpr, SupportedRecursiveFixpointPlanV1,
+        SupportedScalarAggregateFilterPlanV1, SupportedSemiAntiJoinKindV1,
         SupportedSemiAntiJoinProjectPlanV1, SupportedThreeInputInnerJoinCountPlanV1,
         SupportedTopKPlan, SupportedTumblingWindowPlan, SupportedViewPlan, TypedExprKindV1,
         TypedExprNodeV1, TypedExprProgramV1, VelorixLogicalViewExecutionV1,
@@ -96,6 +97,7 @@ mod filter_project;
 mod interval_join;
 mod latest_by_key;
 mod output;
+mod recursive_fixpoint;
 mod scalar_aggregate_filter;
 mod semi_anti_join;
 mod single_key_aggregate;
@@ -107,6 +109,7 @@ pub use event_time_window::TumblingEventTimeAggregateRuntime;
 pub use filter_project::FilterProjectRuntime;
 pub use interval_join::IntervalJoinRuntime;
 pub use latest_by_key::LatestByKeyRuntime;
+pub use recursive_fixpoint::RecursiveFixpointRuntime;
 pub use semi_anti_join::TwoInputSemiAntiJoinRuntime;
 pub use single_key_aggregate::SingleKeySumCountRuntime;
 pub use three_input_join::ThreeInputInnerJoinCountRuntime;
@@ -342,6 +345,25 @@ pub fn create_standing_runtime_with_logical_plan_and_catalogs(
             .map(|runtime| Box::new(runtime) as Box<dyn StandingProgramRuntime + Send>)
             .map_err(|error| error.to_string())
         }
+        VelorixLogicalViewExecutionV1::RecursiveFixpointV1 { plan } => {
+            let [catalog] = catalogs else {
+                return Err(
+                    "recursive fixpoint runtime requires exactly one relation catalog"
+                        .to_string(),
+                );
+            };
+            RecursiveFixpointRuntime::new_with_logical_plan(
+                identity.clone(),
+                catalog.clone(),
+                only_schema(input_schemas, "input_schemas").map_err(|error| error.to_string())?,
+                output_schema.clone(),
+                sql,
+                *plan.clone(),
+                logical_plan,
+            )
+            .map(|runtime| Box::new(runtime) as Box<dyn StandingProgramRuntime + Send>)
+            .map_err(|error| error.to_string())
+        }
         VelorixLogicalViewExecutionV1::TumblingEventTimeAggregate { plan } => {
             let [catalog] = catalogs else {
                 return Err(
@@ -516,6 +538,11 @@ pub fn restore_standing_runtime(
     }
     if checkpoint_has_interval_join_payload(&checkpoint) {
         return IntervalJoinRuntime::restore(checkpoint)
+            .map(|runtime| Box::new(runtime) as Box<dyn StandingProgramRuntime + Send>)
+            .map_err(|error| error.to_string());
+    }
+    if checkpoint_has_recursive_fixpoint_payload(&checkpoint) {
+        return RecursiveFixpointRuntime::restore(checkpoint)
             .map(|runtime| Box::new(runtime) as Box<dyn StandingProgramRuntime + Send>)
             .map_err(|error| error.to_string());
     }
@@ -8838,6 +8865,21 @@ fn checkpoint_has_three_input_join_payload(checkpoint: &RuntimeCheckpoint) -> bo
         })
         .as_deref()
         == Some(three_input_join::THREE_INPUT_JOIN_RUNTIME_KIND)
+}
+
+fn checkpoint_has_recursive_fixpoint_payload(checkpoint: &RuntimeCheckpoint) -> bool {
+    checkpoint
+        .state_payload
+        .as_ref()
+        .and_then(|payload| serde_json::from_str::<Value>(&payload.payload).ok())
+        .and_then(|payload| {
+            payload
+                .get("runtime_kind")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .as_deref()
+        == Some(recursive_fixpoint::RECURSIVE_FIXPOINT_RUNTIME_KIND)
 }
 
 fn checkpoint_has_interval_join_payload(checkpoint: &RuntimeCheckpoint) -> bool {

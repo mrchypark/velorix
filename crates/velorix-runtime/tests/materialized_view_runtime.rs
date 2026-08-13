@@ -21459,3 +21459,316 @@ fn query_equivalence_harness_proves_identical_plans_deltas_and_checkpoints() {
     );
     assert_identical_materialized_rows(runtime.as_ref(), restarted.as_ref(), "positive_scores", 5);
 }
+
+fn edges_catalog() -> VelorixRelationCatalogV1 {
+    let relation_schema = VelorixRelationSchemaV1 {
+        relation_id: "edges".to_string(),
+        relation_name: "edges".to_string(),
+        relation_version: "2026-08-13.v1".to_string(),
+        columns: vec![
+            RelationColumnV1 {
+                column_id: "edge_id".to_string(),
+                name: "edge_id".to_string(),
+                logical_type: VelorixLogicalTypeV1::Utf8,
+                physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+                nullable: false,
+                ordinal: 0,
+                semantic_role: RelationSemanticRoleV1::PrimaryKey,
+            },
+            RelationColumnV1 {
+                column_id: "src".to_string(),
+                name: "src".to_string(),
+                logical_type: VelorixLogicalTypeV1::Utf8,
+                physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+                nullable: false,
+                ordinal: 1,
+                semantic_role: RelationSemanticRoleV1::Value,
+            },
+            RelationColumnV1 {
+                column_id: "dst".to_string(),
+                name: "dst".to_string(),
+                logical_type: VelorixLogicalTypeV1::Utf8,
+                physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+                nullable: false,
+                ordinal: 2,
+                semantic_role: RelationSemanticRoleV1::Value,
+            },
+            RelationColumnV1 {
+                column_id: "delta".to_string(),
+                name: "delta".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 3,
+                semantic_role: RelationSemanticRoleV1::Weight,
+            },
+        ],
+        primary_key_column_ids: vec!["edge_id".to_string()],
+        weight_column_id: "delta".to_string(),
+        allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+        event_time_column_id: None,
+    };
+    let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
+    VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
+        schema_version: RELATION_SCHEMA_VERSION_V1,
+        relation_schema,
+        schema_fingerprint: schema_fingerprint.clone(),
+        datafusion_registration: DataFusionRegistrationV1 {
+            name: "edges".to_string(),
+            mode: DataFusionRegistrationModeV1::Table,
+        },
+        incremental_relation: IncrementalRelationBindingV1 {
+            relation_id: "edges".to_string(),
+            schema_fingerprint,
+        },
+        incremental_adapter: IncrementalAdapterBindingV1 {
+            adapter_id: CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.to_string(),
+        },
+    }
+}
+
+fn edges_rows_batch(rows: &[(&str, &str, &str, i64)]) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("edge_id", DataType::Utf8, false),
+            Field::new("src", DataType::Utf8, false),
+            Field::new("dst", DataType::Utf8, false),
+            Field::new("delta", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.2).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(Int64Array::from(
+                rows.iter().map(|row| row.3).collect::<Vec<_>>(),
+            )) as _,
+        ],
+    )
+    .unwrap()
+}
+
+fn recursive_reachability_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "reachability".to_string(),
+        relation_name: "reachability".to_string(),
+        relation_version: "2026-08-13.v1".to_string(),
+        schema_fingerprint: "recursive-reach-v1".to_string(),
+        columns: vec![
+            ColumnSchema {
+                name: "src".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "dst".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["src".to_string(), "dst".to_string()],
+    }
+}
+
+fn assert_reachability_page(
+    runtime: &(dyn StandingProgramRuntime + Send),
+    epoch: u64,
+    expected: &[(&str, &str)],
+) {
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".into(),
+                program_id: "program-purchases".into(),
+                view_id: "reachability".into(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(epoch),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let srcs = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let dsts = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mut actual = (0..batch.num_rows())
+        .map(|index| (srcs.value(index), dsts.value(index)))
+        .collect::<Vec<_>>();
+    let mut expected = expected.to_vec();
+    actual.sort();
+    expected.sort();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn recursive_cte_materializes_closure_exactly_across_retract_restart_and_fail_closed() {
+    let edges = edges_catalog();
+    let input_schema = catalog_input_relation_schema(&edges).unwrap();
+    let output_schema = recursive_reachability_output_schema();
+    let sql = "with recursive reach as (select src, dst from edges union distinct select r.src, e.dst from reach r join edges e on r.dst = e.src) select src, dst from reach";
+    let identity = standing_identity_with_view(sql, "reachability");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&edges),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("reach-epoch-1").unwrap(),
+            vec![relation_input(
+                &edges,
+                "reach-edges",
+                0,
+                3,
+                edges_rows_batch(&[
+                    ("e1", "a", "b", 1),
+                    ("e2", "b", "c", 1),
+                    ("e3", "c", "d", 1),
+                ]),
+            )],
+        )
+        .unwrap();
+    assert_reachability_page(
+        runtime.as_ref(),
+        1,
+        &[
+            ("a", "b"),
+            ("b", "c"),
+            ("c", "d"),
+            ("a", "c"),
+            ("b", "d"),
+            ("a", "d"),
+        ],
+    );
+
+    runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("reach-epoch-2").unwrap(),
+            vec![relation_input(
+                &edges,
+                "reach-edges",
+                3,
+                4,
+                edges_rows_batch(&[("e2", "b", "c", -1)]),
+            )],
+        )
+        .unwrap();
+    assert_reachability_page(runtime.as_ref(), 2, &[("a", "b"), ("c", "d")]);
+
+    runtime
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("reach-epoch-3").unwrap(),
+            vec![relation_input(
+                &edges,
+                "reach-edges",
+                4,
+                5,
+                edges_rows_batch(&[("e2", "b", "c", 1)]),
+            )],
+        )
+        .unwrap();
+    assert_reachability_page(
+        runtime.as_ref(),
+        3,
+        &[
+            ("a", "b"),
+            ("b", "c"),
+            ("c", "d"),
+            ("a", "c"),
+            ("b", "d"),
+            ("a", "d"),
+        ],
+    );
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    assert_reachability_page(
+        restored.as_ref(),
+        3,
+        &[
+            ("a", "b"),
+            ("b", "c"),
+            ("c", "d"),
+            ("a", "c"),
+            ("b", "d"),
+            ("a", "d"),
+        ],
+    );
+    restored
+        .apply_changes(
+            4,
+            EpochIdempotencyKey::new("reach-epoch-4").unwrap(),
+            vec![relation_input(
+                &edges,
+                "reach-edges",
+                5,
+                6,
+                edges_rows_batch(&[("e4", "d", "e", 1)]),
+            )],
+        )
+        .unwrap();
+    assert_reachability_page(
+        restored.as_ref(),
+        4,
+        &[
+            ("a", "b"),
+            ("b", "c"),
+            ("c", "d"),
+            ("a", "c"),
+            ("b", "d"),
+            ("a", "d"),
+            ("d", "e"),
+            ("c", "e"),
+            ("b", "e"),
+            ("a", "e"),
+        ],
+    );
+
+    for (sql, fragment) in [
+        (
+            "with recursive reach as (select src, dst from edges union all select r.src, e.dst from reach r join edges e on r.dst = e.src) select src, dst from reach",
+            "UNION ALL",
+        ),
+        (
+            "with recursive reach as (select src, count(*) from edges group by src union distinct select r.src, count(*) from reach r join edges e on r.dst = e.src group by r.src) select src, count from reach",
+            "anchor projections",
+        ),
+        (
+            "with recursive reach as (select src, dst from edges union distinct select r2.src, e.dst from reach r2 join reach r1 on r1.dst = r2.src join edges e on r2.dst = e.src) select src, dst from reach",
+            "exactly one JOIN",
+        ),
+    ] {
+        let error = lower_supported_sql_to_logical_plan(
+            sql,
+            std::slice::from_ref(&edges),
+            &output_schema,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains(fragment),
+            "expected fail-closed for {fragment}, got: {error}"
+        );
+    }
+}
