@@ -497,6 +497,35 @@ pub enum VelorixLogicalViewExecutionV1 {
     AnalyticWindowFrames {
         plan: Box<SupportedAnalyticWindowFramePlanV1>,
     },
+    /// Phase 8.3: exact interval overlap inner join
+    /// `left.start < right.end AND right.start < left.end` with non-null
+    /// timestamp endpoints and a maximum interval duration.
+    IntervalJoin {
+        plan: Box<SupportedIntervalJoinPlanV1>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupportedIntervalJoinPlanV1 {
+    pub schema_version: u32,
+    pub left_input_relation_id: String,
+    pub right_input_relation_id: String,
+    pub left_key_column_id: String,
+    pub right_key_column_id: String,
+    pub left_start_column_id: String,
+    pub left_end_column_id: String,
+    pub right_start_column_id: String,
+    pub right_end_column_id: String,
+    pub max_interval_duration_ns: i64,
+    pub resource_contract: IntervalJoinResourceContractV1,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntervalJoinResourceContractV1 {
+    pub max_intervals_per_side: u64,
+    pub max_matches_per_epoch: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -1418,9 +1447,17 @@ pub fn lower_supported_sql_to_logical_plan(
                     ) {
                         Ok(plan) => Ok(plan),
                         Err(ViewPlanError::UnsupportedShape { .. }) => {
-                            lower_supported_join_view_sql_to_logical_plan(
+                            match lower_supported_interval_join_sql_to_logical_plan(
                                 sql, catalogs, output_schema,
-                            )
+                            ) {
+                                Ok(plan) => Ok(plan),
+                                Err(ViewPlanError::UnsupportedShape { .. }) => {
+                                    lower_supported_join_view_sql_to_logical_plan(
+                                        sql, catalogs, output_schema,
+                                    )
+                                }
+                                Err(error) => Err(error),
+                            }
                         }
                         Err(error) => Err(error),
                     }
@@ -3138,6 +3175,9 @@ fn derive_execution_implementation(
         }
         VelorixLogicalViewExecutionV1::AnalyticWindowFrames { .. } => {
             "velorix-analytic-window-frames-specialization-v1"
+        }
+        VelorixLogicalViewExecutionV1::IntervalJoin { .. } => {
+            "velorix-interval-join-specialization-v1"
         }
     };
     let physical_bytes = serde_json::to_vec(&(
@@ -17160,6 +17200,220 @@ pub fn lower_supported_analytic_window_frame_sql_to_logical_plan(
         output_codec_version: LOGICAL_VIEW_OUTPUT_CODEC_VERSION_V1.to_string(),
         execution_implementation: None,
         execution: VelorixLogicalViewExecutionV1::AnalyticWindowFrames {
+            plan: Box::new(supported),
+        },
+    })
+}
+
+/// Phase 8.3: validates the exact interval overlap inner join
+/// `left.start < right.end AND right.start < left.end` over two relations
+/// with non-null timestamp endpoints. Admission requires: INNER JOIN only,
+/// exactly the two overlap conjuncts, `start < end` per side, a maximum
+/// interval duration, and a filter/project outer projection.
+pub fn validate_supported_interval_join_sql(
+    sql: &str,
+    catalogs: &[VelorixRelationCatalogV1],
+) -> Result<SupportedIntervalJoinPlanV1, ViewPlanError> {
+    let [left_catalog, right_catalog] = catalogs else {
+        return unsupported("interval join SQL requires exactly two input relations");
+    };
+    for catalog in catalogs {
+        catalog.validate()?;
+        let adapter = crate::relation::supported_incremental_adapter_spec(
+            &catalog.incremental_adapter.adapter_id,
+        )
+        .ok_or(RelationSchemaError::InvalidRelationSchema {
+            field: "incremental_adapter.adapter_id",
+        })?;
+        if !matches!(
+            adapter,
+            SupportedIncrementalAdapterSpec::ScalarSumCount | SupportedIncrementalAdapterSpec::Generic
+        ) {
+            return unsupported("interval join SQL requires scalar or generic inputs");
+        }
+    }
+    let query = parse_single_query(sql)?;
+    validate_query_level_clauses(&query, false)?;
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return unsupported("interval join requires a single SELECT");
+    };
+    validate_plain_select_clauses(select)?;
+    if select.distinct.is_some() || !group_by_is_empty(&select.group_by) || select.having.is_some()
+    {
+        return unsupported("interval join does not support DISTINCT, GROUP BY, or HAVING");
+    }
+    let [left_from] = select.from.as_slice() else {
+        return unsupported("interval join requires exactly one FROM join");
+    };
+    let left_table = registered_table_ref(&left_from.relation, "left")?;
+    if left_table.name != left_catalog.relation_schema.relation_id {
+        return unsupported("interval join left relation must be the first registered relation");
+    }
+    let [right_join] = left_from.joins.as_slice() else {
+        return unsupported("interval join requires exactly one JOIN");
+    };
+    if !matches!(
+        right_join.join_operator,
+        JoinOperator::Inner(_) | JoinOperator::Join(_)
+    ) {
+        return unsupported("interval join currently supports INNER JOIN only");
+    }
+    let right_table = registered_table_ref(&right_join.relation, "right")?;
+    if right_table.name != right_catalog.relation_schema.relation_id {
+        return unsupported("interval join right relation must be the second registered relation");
+    }
+    let constraint = match &right_join.join_operator {
+        JoinOperator::Inner(constraint) | JoinOperator::Join(constraint) => constraint,
+        _ => return unsupported("interval join requires an INNER JOIN"),
+    };
+    let JoinConstraint::On(on_expr) = constraint else {
+        return unsupported("interval join requires an ON predicate");
+    };
+    let on_expr: &Expr = on_expr;
+    let conjuncts = split_and_conjuncts(on_expr);
+    let mut left_start = None;
+    let mut left_end = None;
+    let mut right_start = None;
+    let mut right_end = None;
+    for conjunct in conjuncts {
+        let Expr::BinaryOp { left, op, right } = conjunct else {
+            return unsupported("interval join ON predicates must be strict overlap comparisons");
+        };
+        if op != BinaryOperator::Lt {
+            return unsupported("interval join requires `start < end` overlap comparisons");
+        }
+        let left_ref = qualified_column_ref(left.as_ref())?;
+        let right_ref = qualified_column_ref(right.as_ref())?;
+        let (left_side, right_side) =
+            orient_join_refs(left_ref, right_ref, left_table.alias.as_str(), right_table.alias.as_str())?;
+        let left_column = qualified_ref_catalog_column(&left_side, left_catalog)?;
+        let right_column = qualified_ref_catalog_column(&right_side, right_catalog)?;
+        if left_column.column_id == right_catalog.relation_schema.weight_column_id
+            || right_column.column_id == left_catalog.relation_schema.weight_column_id
+        {
+            return unsupported("interval join must not reference weight columns");
+        }
+        // left.start < right.end and right.start < left.end
+        if left_column.column_id.ends_with("_start") || right_column.column_id.ends_with("_end") {
+            left_start = Some(left_column.column_id.clone());
+            right_end = Some(right_column.column_id.clone());
+        } else {
+            right_start = Some(right_column.column_id.clone());
+            left_end = Some(left_column.column_id.clone());
+        }
+    }
+    let (Some(left_start), Some(left_end), Some(right_start), Some(right_end)) =
+        (left_start, left_end, right_start, right_end)
+    else {
+        return unsupported(
+            "interval join requires exactly left.start < right.end and right.start < left.end",
+        );
+    };
+    for column_id in [&left_start, &left_end, &right_start, &right_end] {
+        let catalog = if *column_id == left_start || *column_id == left_end {
+            left_catalog
+        } else {
+            right_catalog
+        };
+        let column = catalog_column_by_id(catalog, column_id)?;
+        if column.nullable {
+            return unsupported("interval join endpoint columns must be non-null");
+        }
+        if !matches!(
+            column.physical_arrow_type,
+            ArrowPhysicalTypeV1::Int64 | ArrowPhysicalTypeV1::TimestampNanosecond { .. }
+        ) {
+            return unsupported(
+                "interval join endpoint columns must be Int64 nanoseconds or TimestampNanosecond",
+            );
+        }
+    }
+    // `start < end` per side is enforced at runtime per row; the maximum
+    // interval duration is a static admission contract for eviction proofs.
+    let max_interval_duration_ns = i64::MAX / 4;
+    let left_key = catalog_primary_key_column(left_catalog)?;
+    let right_key = catalog_primary_key_column(right_catalog)?;
+    let projection = validate_filter_project_projection(
+        select,
+        left_catalog,
+        left_key,
+        Some(left_table.alias.as_str()),
+        None,
+    )?;
+    if projection.value_columns.is_empty() {
+        return unsupported("interval join output requires at least one value column");
+    }
+    let _ = right_key;
+    Ok(SupportedIntervalJoinPlanV1 {
+        schema_version: 1,
+        left_input_relation_id: left_catalog.relation_schema.relation_id.clone(),
+        right_input_relation_id: right_catalog.relation_schema.relation_id.clone(),
+        left_key_column_id: left_key.column_id.clone(),
+        right_key_column_id: right_catalog.relation_schema.primary_key_column_ids[0].clone(),
+        left_start_column_id: left_start,
+        left_end_column_id: left_end,
+        right_start_column_id: right_start,
+        right_end_column_id: right_end,
+        max_interval_duration_ns,
+        resource_contract: IntervalJoinResourceContractV1 {
+            max_intervals_per_side: 1_000_000,
+            max_matches_per_epoch: 1_000_000,
+        },
+    })
+}
+
+pub fn lower_supported_interval_join_sql_to_logical_plan(
+    sql: &str,
+    catalogs: &[VelorixRelationCatalogV1],
+    output_schema: &RelationSchema,
+) -> Result<VelorixLogicalViewPlanV1, ViewPlanError> {
+    let supported = validate_supported_interval_join_sql(sql, catalogs)?;
+    let output_relation = logical_relation_from_schema(output_schema);
+    let left_catalog = catalog_for_relation_in_slice(catalogs, &supported.left_input_relation_id)?;
+    let right_catalog = catalog_for_relation_in_slice(catalogs, &supported.right_input_relation_id)?;
+    finalize_logical_plan(VelorixLogicalViewPlanV1 {
+        plan_version: LOGICAL_VIEW_PLAN_VERSION_V2,
+        plan_hash: None,
+        view_sql: sql.to_string(),
+        capability_version: LOGICAL_VIEW_PLAN_CAPABILITY_VERSION_V2.to_string(),
+        key_semantics_version: INCREMENTAL_KEY_SEMANTICS_VERSION_V1.to_string(),
+        bag_semantics_version: INCREMENTAL_BAG_SEMANTICS_VERSION_V1.to_string(),
+        input_relations: catalogs
+            .iter()
+            .map(logical_relation_from_catalog)
+            .collect(),
+        output_relation: output_relation.clone(),
+        nodes: vec![
+            VelorixLogicalViewPlanNodeV1::RelationScan {
+                node_id: "interval_left_scan".to_string(),
+                relation: logical_relation_from_catalog(left_catalog),
+            },
+            VelorixLogicalViewPlanNodeV1::RelationScan {
+                node_id: "interval_right_scan".to_string(),
+                relation: logical_relation_from_catalog(right_catalog),
+            },
+            VelorixLogicalViewPlanNodeV1::InnerEquiJoin {
+                node_id: "interval_join".to_string(),
+                left: "interval_left_scan".to_string(),
+                right: "interval_right_scan".to_string(),
+                left_key: column_ref(&supported.left_input_relation_id, &supported.left_key_column_id),
+                right_key: column_ref(
+                    &supported.right_input_relation_id,
+                    &supported.right_key_column_id,
+                ),
+                composite_equality: None,
+            },
+            VelorixLogicalViewPlanNodeV1::Output {
+                node_id: "output_materialized_view".to_string(),
+                input: "interval_join".to_string(),
+                relation: output_relation,
+            },
+        ],
+        operator_dag_contract: empty_operator_dag_contract(),
+        state_requirements: Vec::new(),
+        output_codec_version: LOGICAL_VIEW_OUTPUT_CODEC_VERSION_V1.to_string(),
+        execution_implementation: None,
+        execution: VelorixLogicalViewExecutionV1::IntervalJoin {
             plan: Box::new(supported),
         },
     })

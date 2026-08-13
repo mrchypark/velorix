@@ -20567,3 +20567,322 @@ fn frame_output_schema() -> RelationSchema {
         primary_key: vec!["user_id".to_string()],
     }
 }
+
+fn interval_join_rides_catalog() -> VelorixRelationCatalogV1 {
+    interval_side_catalog(
+        "rides",
+        "ride_id",
+        "booking_start",
+        "booking_end_time",
+    )
+}
+
+fn interval_join_vehicles_catalog() -> VelorixRelationCatalogV1 {
+    interval_side_catalog(
+        "vehicles",
+        "vehicle_id",
+        "capacity_start_time",
+        "capacity_end",
+    )
+}
+
+fn interval_side_catalog(
+    relation_id: &str,
+    key_column_id: &str,
+    start_column_id: &str,
+    end_column_id: &str,
+) -> VelorixRelationCatalogV1 {
+    let relation_schema = VelorixRelationSchemaV1 {
+        relation_id: relation_id.to_string(),
+        relation_name: relation_id.to_string(),
+        relation_version: "2026-08-13.v1".to_string(),
+        columns: vec![
+            RelationColumnV1 {
+                column_id: key_column_id.to_string(),
+                name: key_column_id.to_string(),
+                logical_type: VelorixLogicalTypeV1::Utf8,
+                physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+                nullable: false,
+                ordinal: 0,
+                semantic_role: RelationSemanticRoleV1::PrimaryKey,
+            },
+            RelationColumnV1 {
+                column_id: start_column_id.to_string(),
+                name: start_column_id.to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 1,
+                semantic_role: RelationSemanticRoleV1::Value,
+            },
+            RelationColumnV1 {
+                column_id: end_column_id.to_string(),
+                name: end_column_id.to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 2,
+                semantic_role: RelationSemanticRoleV1::Value,
+            },
+            RelationColumnV1 {
+                column_id: "delta".to_string(),
+                name: "delta".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 3,
+                semantic_role: RelationSemanticRoleV1::Weight,
+            },
+        ],
+        primary_key_column_ids: vec![key_column_id.to_string()],
+        weight_column_id: "delta".to_string(),
+        allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+        event_time_column_id: None,
+    };
+    let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
+    VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
+        schema_version: RELATION_SCHEMA_VERSION_V1,
+        relation_schema,
+        schema_fingerprint: schema_fingerprint.clone(),
+        datafusion_registration: DataFusionRegistrationV1 {
+            name: relation_id.to_string(),
+            mode: DataFusionRegistrationModeV1::Table,
+        },
+        incremental_relation: IncrementalRelationBindingV1 {
+            relation_id: relation_id.to_string(),
+            schema_fingerprint,
+        },
+        incremental_adapter: IncrementalAdapterBindingV1 {
+            adapter_id: CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.to_string(),
+        },
+    }
+}
+
+fn interval_rides_rows_batch(rows: &[(&str, i64, i64, i64)]) -> RecordBatch {
+    interval_side_rows_batch(rows, "ride_id", "booking_start", "booking_end_time")
+}
+
+fn interval_vehicles_rows_batch(rows: &[(&str, i64, i64, i64)]) -> RecordBatch {
+    interval_side_rows_batch(rows, "vehicle_id", "capacity_start_time", "capacity_end")
+}
+
+fn interval_side_rows_batch(
+    rows: &[(&str, i64, i64, i64)],
+    key_column: &str,
+    start_column: &str,
+    end_column: &str,
+) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new(key_column, DataType::Utf8, false),
+            Field::new(start_column, DataType::Int64, false),
+            Field::new(end_column, DataType::Int64, false),
+            Field::new("delta", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(Int64Array::from(
+                rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(Int64Array::from(
+                rows.iter().map(|row| row.2).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(Int64Array::from(
+                rows.iter().map(|row| row.3).collect::<Vec<_>>(),
+            )) as _,
+        ],
+    )
+    .unwrap()
+}
+
+fn interval_join_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "interval_matches".to_string(),
+        relation_name: "interval_matches".to_string(),
+        relation_version: "2026-08-13.v1".to_string(),
+        schema_fingerprint: "interval-v1".to_string(),
+        columns: vec![
+            ColumnSchema {
+                name: "ride_id".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "booking_start".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "booking_end_time".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["ride_id".to_string()],
+    }
+}
+
+fn assert_interval_join_page(
+    runtime: &(dyn StandingProgramRuntime + Send),
+    epoch: u64,
+    expected: &[(&str, i64, i64)],
+) {
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".into(),
+                program_id: "program-purchases".into(),
+                view_id: "interval_matches".into(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(epoch),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let ride_ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let starts = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let ends = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let actual = (0..batch.num_rows())
+        .map(|index| {
+            (
+                ride_ids.value(index),
+                starts.value(index),
+                ends.value(index),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn interval_join_materializes_overlap_retraction_and_restart() {
+    let rides = interval_join_rides_catalog();
+    let vehicles = interval_join_vehicles_catalog();
+    let catalogs = vec![rides.clone(), vehicles.clone()];
+    let input_schemas = catalogs
+        .iter()
+        .map(|catalog| catalog_input_relation_schema(catalog).unwrap())
+        .collect::<Vec<_>>();
+    let output_schema = interval_join_output_schema();
+    let sql = "select r.ride_id, r.booking_start, r.booking_end_time from rides r join vehicles v on r.booking_start < v.capacity_end and v.capacity_start_time < r.booking_end_time";
+    let identity = standing_identity_with_view(sql, "interval_matches");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &catalogs,
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("interval-epoch-1").unwrap(),
+            vec![
+                relation_input(
+                    &rides,
+                    "interval-rides",
+                    0,
+                    1,
+                    interval_rides_rows_batch(&[("r1", 10, 20, 1)]),
+                ),
+                relation_input(
+                    &vehicles,
+                    "interval-vehicles",
+                    0,
+                    2,
+                    interval_vehicles_rows_batch(&[("v1", 15, 25, 1), ("v2", 30, 40, 1)]),
+                ),
+            ],
+        )
+        .unwrap();
+    assert_interval_join_page(runtime.as_ref(), 1, &[("r1", 10, 20)]);
+
+    runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("interval-epoch-2").unwrap(),
+            vec![relation_input(
+                &vehicles,
+                "interval-vehicles",
+                2,
+                3,
+                interval_vehicles_rows_batch(&[("v1", 15, 25, -1)]),
+            )],
+        )
+        .unwrap();
+    assert_interval_join_page(runtime.as_ref(), 2, &[]);
+
+    runtime
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("interval-epoch-3").unwrap(),
+            vec![
+                relation_input(
+                    &rides,
+                    "interval-rides",
+                    1,
+                    2,
+                    interval_rides_rows_batch(&[("r2", 5, 12, 1)]),
+                ),
+                relation_input(
+                    &vehicles,
+                    "interval-vehicles",
+                    3,
+                    4,
+                    interval_vehicles_rows_batch(&[("v1", 8, 25, 1)]),
+                ),
+            ],
+        )
+        .unwrap();
+    assert_interval_join_page(
+        runtime.as_ref(),
+        3,
+        &[("r1", 10, 20), ("r2", 5, 12)],
+    );
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    assert_interval_join_page(
+        restored.as_ref(),
+        3,
+        &[("r1", 10, 20), ("r2", 5, 12)],
+    );
+    restored
+        .apply_changes(
+            4,
+            EpochIdempotencyKey::new("interval-epoch-4").unwrap(),
+            vec![relation_input(
+                &rides,
+                "interval-rides",
+                2,
+                3,
+                interval_rides_rows_batch(&[("r1", 10, 20, 1)]),
+            )],
+        )
+        .unwrap();
+    assert_interval_join_page(
+        restored.as_ref(),
+        4,
+        &[("r1", 10, 20), ("r2", 5, 12)],
+    );
+}

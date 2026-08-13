@@ -61,7 +61,8 @@ use velorix_core::{
         supported_view_plan_aggregate_outputs, supported_view_plan_group_keys,
         supported_view_plan_is_singleton, validate_logical_view_plan,
         validate_supported_analytic_row_number_sql, validate_supported_analytic_window_frame_sql,
-        validate_supported_filter_project_sql, validate_supported_join_view_sql,
+        validate_supported_filter_project_sql, validate_supported_interval_join_sql,
+        validate_supported_join_view_sql,
         validate_supported_latest_by_key_sql, validate_supported_scalar_aggregate_filter_sql,
         validate_supported_semi_anti_join_sql, validate_supported_tumbling_window_sql_with_policy,
         validate_supported_view_sql, AggregateOutputPredicate, AggregateOutputPredicateExpr,
@@ -72,8 +73,8 @@ use velorix_core::{
         SupportedAnalyticRowNumberPlan, SupportedAnalyticWindowFramePlanV1,
         SupportedAnalyticWindowFunction, SupportedEventTimeWindowKind, SupportedFilterProjectPlan,
         SupportedJoinKeyDomainV1, SupportedJoinKind, SupportedJoinViewPlan,
-        SupportedLatestByKeyPlan, SupportedProjectionBinaryOp, SupportedProjectionExpr,
-        SupportedScalarAggregateFilterPlanV1, SupportedSemiAntiJoinKindV1,
+        SupportedIntervalJoinPlanV1, SupportedLatestByKeyPlan, SupportedProjectionBinaryOp,
+        SupportedProjectionExpr, SupportedScalarAggregateFilterPlanV1, SupportedSemiAntiJoinKindV1,
         SupportedSemiAntiJoinProjectPlanV1, SupportedThreeInputInnerJoinCountPlanV1,
         SupportedTopKPlan, SupportedTumblingWindowPlan, SupportedViewPlan, TypedExprKindV1,
         TypedExprNodeV1, TypedExprProgramV1, VelorixLogicalViewExecutionV1,
@@ -92,6 +93,7 @@ mod checkpoint_common;
 mod event_time_window;
 pub mod expression_eval;
 mod filter_project;
+mod interval_join;
 mod latest_by_key;
 mod output;
 mod scalar_aggregate_filter;
@@ -103,6 +105,7 @@ mod two_input_join;
 pub use analytic_row_number::AnalyticRowNumberRuntime;
 pub use event_time_window::TumblingEventTimeAggregateRuntime;
 pub use filter_project::FilterProjectRuntime;
+pub use interval_join::IntervalJoinRuntime;
 pub use latest_by_key::LatestByKeyRuntime;
 pub use semi_anti_join::TwoInputSemiAntiJoinRuntime;
 pub use single_key_aggregate::SingleKeySumCountRuntime;
@@ -326,6 +329,19 @@ pub fn create_standing_runtime_with_logical_plan_and_catalogs(
             .map(|runtime| Box::new(runtime) as Box<dyn StandingProgramRuntime + Send>)
             .map_err(|error| error.to_string())
         }
+        VelorixLogicalViewExecutionV1::IntervalJoin { plan } => {
+            IntervalJoinRuntime::new_with_logical_plan(
+                identity.clone(),
+                catalogs.to_vec(),
+                input_schemas.to_vec(),
+                output_schema.clone(),
+                sql,
+                *plan.clone(),
+                logical_plan,
+            )
+            .map(|runtime| Box::new(runtime) as Box<dyn StandingProgramRuntime + Send>)
+            .map_err(|error| error.to_string())
+        }
         VelorixLogicalViewExecutionV1::TumblingEventTimeAggregate { plan } => {
             let [catalog] = catalogs else {
                 return Err(
@@ -495,6 +511,11 @@ pub fn restore_standing_runtime(
     }
     if checkpoint_has_semi_anti_join_payload(&checkpoint) {
         return TwoInputSemiAntiJoinRuntime::restore(checkpoint)
+            .map(|runtime| Box::new(runtime) as Box<dyn StandingProgramRuntime + Send>)
+            .map_err(|error| error.to_string());
+    }
+    if checkpoint_has_interval_join_payload(&checkpoint) {
+        return IntervalJoinRuntime::restore(checkpoint)
             .map(|runtime| Box::new(runtime) as Box<dyn StandingProgramRuntime + Send>)
             .map_err(|error| error.to_string());
     }
@@ -8817,6 +8838,21 @@ fn checkpoint_has_three_input_join_payload(checkpoint: &RuntimeCheckpoint) -> bo
         })
         .as_deref()
         == Some(three_input_join::THREE_INPUT_JOIN_RUNTIME_KIND)
+}
+
+fn checkpoint_has_interval_join_payload(checkpoint: &RuntimeCheckpoint) -> bool {
+    checkpoint
+        .state_payload
+        .as_ref()
+        .and_then(|payload| serde_json::from_str::<Value>(&payload.payload).ok())
+        .and_then(|payload| {
+            payload
+                .get("runtime_kind")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .as_deref()
+        == Some(interval_join::INTERVAL_JOIN_RUNTIME_KIND)
 }
 
 fn checkpoint_has_semi_anti_join_payload(checkpoint: &RuntimeCheckpoint) -> bool {

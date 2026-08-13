@@ -455,6 +455,7 @@ pub(super) fn validate_public_runtime_plan_admission(
         }
         VelorixLogicalViewExecutionV1::ThreeInputInnerJoinCount { .. } => Ok(()),
         VelorixLogicalViewExecutionV1::TwoInputSemiAntiJoinProject { .. } => Ok(()),
+        VelorixLogicalViewExecutionV1::IntervalJoin { .. } => Ok(()),
     }
 }
 

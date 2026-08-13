@@ -567,7 +567,7 @@ fn validate_semi_anti_join_runtime_contract(
     Ok(())
 }
 
-fn catalog_for_relation_id<'a>(
+pub(super) fn catalog_for_relation_id<'a>(
     catalogs: &'a [VelorixRelationCatalogV1],
     relation_id: &str,
 ) -> Result<&'a VelorixRelationCatalogV1, StandingProgramRuntimeError> {
