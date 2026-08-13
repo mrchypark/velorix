@@ -6129,6 +6129,10 @@ fn join_aggregate_output_type(
     aggregate: &SupportedAggregateOutput,
 ) -> Result<SqlDataType, ApiError> {
     match aggregate.function {
+        LogicalPlanAggregateFunctionV1::PercentileDisc { .. }
+        | LogicalPlanAggregateFunctionV1::PercentileCont { .. } => Err(ApiError::bad_request(
+            "percentile aggregates are not supported in join views yet",
+        )),
         LogicalPlanAggregateFunctionV1::Count | LogicalPlanAggregateFunctionV1::CountDistinct => {
             if aggregate.input_column_id.is_some() {
                 let _ = join_value_aggregate_column(
@@ -6319,6 +6323,8 @@ fn single_key_aggregate_output_type(
         LogicalPlanAggregateFunctionV1::Count | LogicalPlanAggregateFunctionV1::CountDistinct => {
             Ok(SqlDataType::Int64)
         }
+        LogicalPlanAggregateFunctionV1::PercentileDisc { .. } => Ok(SqlDataType::Int64),
+        LogicalPlanAggregateFunctionV1::PercentileCont { .. } => Ok(SqlDataType::Float64),
         LogicalPlanAggregateFunctionV1::Avg => {
             let column_id = aggregate
                 .input_column_id

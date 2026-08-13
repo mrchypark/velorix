@@ -20181,3 +20181,236 @@ fn scalar_aggregate_filter_materializes_and_restores() {
     users.sort();
     assert_eq!(users, vec!["dave".to_string()]);
 }
+
+#[test]
+fn percentile_aggregates_are_exact_across_retract_and_restart() {
+    let catalog = scores_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = percentile_output_schema();
+    let sql = "select user_id, percentile_disc(score, 0.5) as median_disc, percentile_cont(score, 0.25) as q1_cont, median(score) as median from scores group by user_id";
+    let identity = standing_identity_with_view(sql, "percentile_view");
+    let lowered_debug = velorix_core::view_plan::lower_supported_sql_to_logical_plan(
+        sql,
+        std::slice::from_ref(&catalog),
+        &output_schema,
+    )
+    .unwrap();
+    if let velorix_core::view_plan::VelorixLogicalViewExecutionV1::SingleKeySumCount { plan } =
+        &lowered_debug.execution
+    {
+        eprintln!(
+            "[P-PLAN] outputs={:?}",
+            velorix_core::view_plan::supported_view_plan_aggregate_outputs(plan)
+                .iter()
+                .map(|o| (format!("{:?}", o.function), o.output_column_id.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap_or_else(|error| panic!("[P-CREATE] {error}"));
+
+    // alice scores: 10, 20, 30 -> disc(0.5)=20, cont(0.25)=15, median(0.5 cont)=20
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("epoch-1").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "scores-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 3,
+                event_time_watermark: None,
+                batches: vec![scores_rows_batch(&[
+                    ("alice", 10, 1),
+                    ("alice", 20, 1),
+                    ("alice", 30, 1),
+                ])],
+            }],
+        )
+        .unwrap_or_else(|error| panic!("[P-APPLY] {error}"));
+
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "percentile_view".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(1),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let median_disc = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let q1_cont = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let median = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(median_disc.value(0), 20);
+    assert!((q1_cont.value(0) - 15.0).abs() < 1e-9);
+    assert!((median.value(0) - 20.0).abs() < 1e-9);
+
+    // Retract 30: scores 10, 20 -> disc(0.5)=20, cont(0.25)=12.5, median=15
+    runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("epoch-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "scores-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 3,
+                end_offset_exclusive: 4,
+                event_time_watermark: None,
+                batches: vec![scores_rows_batch(&[("alice", 30, -1)])],
+            }],
+        )
+        .unwrap();
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "percentile_view".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(2),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let median_disc = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let q1_cont = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let median = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!(median_disc.value(0), 10);
+    assert!((q1_cont.value(0) - 12.5).abs() < 1e-9);
+    assert!((median.value(0) - 15.0).abs() < 1e-9);
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    restored
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("epoch-3").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "scores-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 4,
+                end_offset_exclusive: 5,
+                event_time_watermark: None,
+                batches: vec![scores_rows_batch(&[("alice", 40, 1)])],
+            }],
+        )
+        .unwrap();
+    let page = restored
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "percentile_view".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(3),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let median_disc = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let q1_cont = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let median = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    // scores 10,20,40: disc(0.5)=20, cont(0.25)=15 (position 0.25*(3-1)), median=20
+    assert_eq!(median_disc.value(0), 20);
+    assert!((q1_cont.value(0) - 15.0).abs() < 1e-9);
+    assert!((median.value(0) - 20.0).abs() < 1e-9);
+}
+
+fn percentile_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "percentile_view".to_string(),
+        relation_name: "percentile_view".to_string(),
+        relation_version: "2026-05-24.v1".to_string(),
+        schema_fingerprint: "percentile-v1".to_string(),
+        columns: vec![
+            ColumnSchema {
+                name: "user_id".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "median_disc".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "q1_cont".to_string(),
+                data_type: SqlDataType::Float64,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "median".to_string(),
+                data_type: SqlDataType::Float64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["user_id".to_string()],
+    }
+}

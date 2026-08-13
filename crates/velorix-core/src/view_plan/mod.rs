@@ -82,7 +82,7 @@ pub const EXECUTION_IMPLEMENTATION_CONTRACT_VERSION_V2: u32 = 2;
 pub const CHECKPOINT_MANIFEST_VERSION_V1: u32 = 1;
 pub const OUTPUT_PUBLICATION_PROTOCOL_VERSION_V1: &str = "velorix-durable-output-publication-v1";
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct VelorixLogicalViewPlanV1 {
     pub plan_version: u32,
@@ -197,7 +197,7 @@ impl PlannerRelationInput {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum VelorixLogicalViewPlanNodeV1 {
     RelationScan {
@@ -407,7 +407,7 @@ pub struct LogicalPlanPredicateV1 {
     pub literal: JsonValue,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LogicalPlanAggregateAccumulatorV1 {
     pub function: LogicalPlanAggregateFunctionV1,
@@ -415,7 +415,7 @@ pub struct LogicalPlanAggregateAccumulatorV1 {
     pub output_column_id: String,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LogicalPlanAggregateFunctionV1 {
     Sum,
@@ -424,6 +424,16 @@ pub enum LogicalPlanAggregateFunctionV1 {
     Min,
     Max,
     Avg,
+    /// Phase 8.2: exact discrete percentile. `percentile` is a
+    /// compile-time literal in [0, 1]; the result is an input value at the
+    /// discrete rank, exact across retractions and restart.
+    PercentileDisc {
+        percentile: f64,
+    },
+    /// Phase 8.2: exact continuous percentile (linear interpolation).
+    PercentileCont {
+        percentile: f64,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -446,7 +456,7 @@ pub enum LogicalPlanStateKindV1 {
     RowNumber,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum VelorixLogicalViewExecutionV1 {
     SingleKeySumCount {
@@ -483,7 +493,7 @@ pub enum VelorixLogicalViewExecutionV1 {
     },
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SupportedScalarAggregateFilterPlanV1 {
     pub schema_version: u32,
@@ -519,7 +529,7 @@ pub struct ScalarAggregateResourceContractV1 {
     pub max_output_delta_rows: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SupportedViewPlan {
     pub input_relation_id: String,
@@ -605,7 +615,7 @@ fn usize_is_zero(value: &usize) -> bool {
     *value == 0
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SupportedAggregateOutput {
     pub function: LogicalPlanAggregateFunctionV1,
@@ -712,7 +722,7 @@ pub enum SupportedSemiAntiJoinKindV1 {
     Anti,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SupportedSemiAntiJoinProjectPlanV1 {
     pub schema_version: u32,
@@ -813,7 +823,7 @@ impl LateRowPolicy {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SupportedTumblingWindowPlan {
     pub input_relation_id: String,
@@ -880,7 +890,7 @@ pub fn supported_view_plan_aggregate_outputs(
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SupportedJoinViewPlan {
     pub left_input_relation_id: String,
@@ -11674,7 +11684,9 @@ fn validate_raw_int64_multi_input_aggregates(
             | LogicalPlanAggregateFunctionV1::Max
             | LogicalPlanAggregateFunctionV1::Avg
             | LogicalPlanAggregateFunctionV1::Count
-            | LogicalPlanAggregateFunctionV1::CountDistinct => {}
+            | LogicalPlanAggregateFunctionV1::CountDistinct
+            | LogicalPlanAggregateFunctionV1::PercentileDisc { .. }
+            | LogicalPlanAggregateFunctionV1::PercentileCont { .. } => {}
         }
         let Some(input_column_id) = output.input_column_id.as_deref() else {
             continue;
@@ -14297,6 +14309,116 @@ fn select_item_aggregate<'a>(
                 filter_expr: filter_expr.clone(),
             })
         }
+        "median" => {
+            if arguments.duplicate_treatment.is_some() {
+                return unsupported("DISTINCT MEDIAN is not supported");
+            }
+            let [FunctionArg::Unnamed(FunctionArgExpr::Expr(argument))] = arguments.args.as_slice()
+            else {
+                return unsupported("MEDIAN requires one column argument");
+            };
+            let column = match source_projection {
+                Some(projection) => source_projection_expression_column(
+                    argument,
+                    catalog,
+                    relation_alias,
+                    projection,
+                ),
+                None => expression_column(argument, catalog, relation_alias),
+            }
+            .ok_or_else(|| ViewPlanError::UnsupportedShape {
+                reason: "MEDIAN requires a direct column argument".to_string(),
+            })?;
+            let input_expression: Option<SupportedProjectionExpr> = None;
+            if input_expression.is_some() {
+                return unsupported("MEDIAN does not support computed input expressions");
+            }
+            if !matches!(
+                column.physical_arrow_type,
+                ArrowPhysicalTypeV1::Int64 | ArrowPhysicalTypeV1::Decimal128 { .. }
+            ) {
+                return unsupported("MEDIAN currently supports Int64 or Decimal128 input columns");
+            }
+            Ok(ParsedAggregateProjection {
+                output: SupportedAggregateOutput {
+                    function: LogicalPlanAggregateFunctionV1::PercentileCont { percentile: 0.5 },
+                    input_column_id: Some(column.column_id.clone()),
+                    input_relation_side: None,
+                    input_expression: None,
+                    output_column_id,
+                },
+                input_column: Some(column),
+                count_input_column: None,
+                filter_expr: filter_expr.clone(),
+            })
+        }
+        name @ ("percentile_disc" | "percentile_cont") => {
+            if arguments.duplicate_treatment.is_some() {
+                return unsupported("DISTINCT percentile arguments are not supported");
+            }
+            let [FunctionArg::Unnamed(FunctionArgExpr::Expr(argument)), FunctionArg::Unnamed(FunctionArgExpr::Expr(percentile_expr))] =
+                arguments.args.as_slice()
+            else {
+                return unsupported(format!(
+                    "{name} requires exactly (column, percentile) arguments"
+                ));
+            };
+            let percentile = match percentile_expr {
+                Expr::Value(ValueWithSpan {
+                    value: SqlValue::Number(text, _),
+                    ..
+                }) => text.parse::<f64>().ok(),
+                _ => None,
+            };
+            let Some(percentile) = percentile else {
+                return unsupported(format!("{name} percentile must be a numeric literal"));
+            };
+            if !(0.0..=1.0).contains(&percentile) {
+                return unsupported(format!("{name} percentile must be in [0, 1]"));
+            }
+            let column = match source_projection {
+                Some(projection) => source_projection_expression_column(
+                    argument,
+                    catalog,
+                    relation_alias,
+                    projection,
+                ),
+                None => expression_column(argument, catalog, relation_alias),
+            }
+            .ok_or_else(|| ViewPlanError::UnsupportedShape {
+                reason: format!("{name} requires a direct column argument"),
+            })?;
+            let input_expression: Option<SupportedProjectionExpr> = None;
+            if input_expression.is_some() {
+                return unsupported(format!(
+                    "{name} does not support computed input expressions"
+                ));
+            }
+            if !matches!(
+                column.physical_arrow_type,
+                ArrowPhysicalTypeV1::Int64 | ArrowPhysicalTypeV1::Decimal128 { .. }
+            ) {
+                return unsupported(format!(
+                    "{name} currently supports Int64 or Decimal128 input columns"
+                ));
+            }
+            Ok(ParsedAggregateProjection {
+                output: SupportedAggregateOutput {
+                    function: if name == "percentile_disc" {
+                        LogicalPlanAggregateFunctionV1::PercentileDisc { percentile }
+                    } else {
+                        LogicalPlanAggregateFunctionV1::PercentileCont { percentile }
+                    },
+                    input_column_id: Some(column.column_id.clone()),
+                    input_relation_side: None,
+                    input_expression: None,
+                    output_column_id,
+                },
+                input_column: Some(column),
+                count_input_column: None,
+                filter_expr: filter_expr.clone(),
+            })
+        }
         "count" => {
             let is_distinct = matches!(
                 arguments.duplicate_treatment,
@@ -14405,6 +14527,17 @@ fn validate_join_value_aggregate_select_item<'a>(
         LogicalPlanAggregateFunctionV1::Sum
         | LogicalPlanAggregateFunctionV1::Min
         | LogicalPlanAggregateFunctionV1::Max => validate_numeric_sum_column(catalog, column)?,
+        LogicalPlanAggregateFunctionV1::PercentileDisc { .. }
+        | LogicalPlanAggregateFunctionV1::PercentileCont { .. } => {
+            if !matches!(
+                column.physical_arrow_type,
+                ArrowPhysicalTypeV1::Int64 | ArrowPhysicalTypeV1::Decimal128 { .. }
+            ) {
+                return unsupported(
+                    "percentile aggregates currently support Int64 or Decimal128 input columns",
+                );
+            }
+        }
         LogicalPlanAggregateFunctionV1::Count | LogicalPlanAggregateFunctionV1::CountDistinct => {
             unreachable!("validated value aggregate function")
         }
@@ -16067,6 +16200,8 @@ fn rebuilt_aggregate_call(
         LogicalPlanAggregateFunctionV1::CountDistinct => "count",
         LogicalPlanAggregateFunctionV1::Min => "min",
         LogicalPlanAggregateFunctionV1::Max => "max",
+        LogicalPlanAggregateFunctionV1::PercentileDisc { .. } => "percentile_disc",
+        LogicalPlanAggregateFunctionV1::PercentileCont { .. } => "percentile_cont",
         LogicalPlanAggregateFunctionV1::Avg => "avg",
     };
     let mut arguments = FunctionArguments::List(FunctionArgumentList {

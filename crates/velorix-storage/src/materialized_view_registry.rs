@@ -107,7 +107,7 @@ impl MaterializedViewLifecycleStatus {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ActiveMaterializedViewRecord {
     pub schema_version: u16,
@@ -135,7 +135,7 @@ struct ActiveMaterializedViewRecordInput<'a> {
     lifecycle: Option<MaterializedViewLifecycleStatus>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ActiveMaterializedView {
     pub spec_hash: String,
     pub spec: StandingViewSpec,
@@ -160,7 +160,7 @@ pub struct MaterializedViewArtifactBinding {
     pub standing_program_identity: Option<StandingProgramIdentity>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MaterializedViewRuntimeBinding {
     pub runtime_kind: String,

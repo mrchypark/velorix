@@ -149,20 +149,20 @@ impl ScalarAggregateFilterRuntime {
 
     /// Current scalar value of the inner aggregate (NULL when the inner bag
     /// is empty for MIN/MAX/SUM/AVG, 0 for COUNT).
-    fn current_scalar(&self) -> Option<Value> {
+    fn current_scalar(&self) -> Result<Option<Value>, StandingProgramRuntimeError> {
         let scalar = match self.plan.scalar_aggregate.function {
             LogicalPlanAggregateFunctionV1::Count => {
                 Value::Number(JsonNumber::from(self.scalar_state.count))
             }
             LogicalPlanAggregateFunctionV1::Sum => {
                 if self.scalar_state.count == 0 {
-                    return None;
+                    return Ok(None);
                 }
                 Value::Number(JsonNumber::from(self.scalar_state.sum))
             }
             LogicalPlanAggregateFunctionV1::Avg => {
                 if self.scalar_state.avg_counts == 0 {
-                    return None;
+                    return Ok(None);
                 }
                 Value::from(self.scalar_state.avg_sums as f64 / self.scalar_state.avg_counts as f64)
             }
@@ -171,12 +171,19 @@ impl ScalarAggregateFilterRuntime {
                 .values
                 .values()
                 .next()
-                .map(|entry| entry.value.clone())?,
+                .map(|entry| entry.value.clone())
+                .unwrap_or(Value::Null),
             LogicalPlanAggregateFunctionV1::CountDistinct => {
                 Value::Number(JsonNumber::from(self.scalar_state.values.len() as i64))
             }
+            LogicalPlanAggregateFunctionV1::PercentileDisc { .. }
+            | LogicalPlanAggregateFunctionV1::PercentileCont { .. } => {
+                return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                    field: "scalar_aggregate_filter_percentile_not_supported",
+                })
+            }
         };
-        Some(scalar)
+        Ok(Some(scalar))
     }
 
     fn evaluate_comparison(&self, outer_value: &Value, scalar: &Value) -> bool {
@@ -255,7 +262,7 @@ impl StandingProgramRuntime for ScalarAggregateFilterRuntime {
         let mut next_event_time_frontiers = self.input_event_time_frontiers.clone();
         // Phase 7.2 contract: both inputs are applied atomically before the
         // end-of-epoch scalar and output are computed.
-        let scalar_before = self.current_scalar();
+        let scalar_before = self.current_scalar()?;
         for input in &input_changes {
             if input.relation_id == self.plan.outer_input_relation_id {
                 self.apply_outer_input(input)?;
@@ -269,7 +276,7 @@ impl StandingProgramRuntime for ScalarAggregateFilterRuntime {
             advance_input_frontier(&mut next_frontiers, input)?;
             advance_input_event_time_frontier(&mut next_event_time_frontiers, input)?;
         }
-        let scalar_after = self.current_scalar();
+        let scalar_after = self.current_scalar()?;
         let scalar_changed = scalar_before != scalar_after;
         let next_output = if scalar_changed {
             self.recompute_all_outputs()?
@@ -728,6 +735,12 @@ impl ScalarAggregateFilterRuntime {
                         self.scalar_state.values.remove(&key);
                     }
                 }
+                LogicalPlanAggregateFunctionV1::PercentileDisc { .. }
+                | LogicalPlanAggregateFunctionV1::PercentileCont { .. } => {
+                    return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                        field: "scalar_aggregate_filter_percentile_not_supported",
+                    })
+                }
             }
         }
         // MIN/MAX: canonical key order over the multiset keys gives the
@@ -737,7 +750,7 @@ impl ScalarAggregateFilterRuntime {
     }
 
     fn recompute_all_outputs(&self) -> Result<DeltaBatch, StandingProgramRuntimeError> {
-        let scalar = self.current_scalar();
+        let scalar = self.current_scalar()?;
         let mut records = Vec::new();
         let comparison_column = &self.plan.outer_comparison_column_id;
         for row in self.outer_rows.values() {

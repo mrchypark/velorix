@@ -3718,7 +3718,14 @@ fn single_key_plan_uses_runtime_aggregate_state(plan: &SupportedViewPlan) -> boo
         || !plan.aggregate_filter_exprs.is_empty()
         || supported_view_plan_aggregate_outputs(plan)
             .iter()
-            .any(|output| output.input_expression.is_some())
+            .any(|output| {
+                output.input_expression.is_some()
+                    || matches!(
+                        output.function,
+                        LogicalPlanAggregateFunctionV1::PercentileDisc { .. }
+                            | LogicalPlanAggregateFunctionV1::PercentileCont { .. }
+                    )
+            })
 }
 
 fn join_plan_uses_runtime_aggregate_state(plan: &SupportedJoinViewPlan) -> bool {
@@ -3961,7 +3968,10 @@ fn apply_filtered_single_key_aggregate_delta(
                         value: input_value,
                     }
                 }
-                LogicalPlanAggregateFunctionV1::Min | LogicalPlanAggregateFunctionV1::Max => {
+                LogicalPlanAggregateFunctionV1::Min
+                | LogicalPlanAggregateFunctionV1::Max
+                | LogicalPlanAggregateFunctionV1::PercentileDisc { .. }
+                | LogicalPlanAggregateFunctionV1::PercentileCont { .. } => {
                     FilteredAggregateUpdate::Multiset {
                         aggregate: aggregate.clone(),
                         value: Value::Number(JsonNumber::from(aggregate_input_i64_value(
@@ -4111,6 +4121,13 @@ fn apply_filtered_join_aggregate_delta(
             }
             let input_value = join_aggregate_input_value(aggregate, plan, catalogs, record)?;
             let update = match aggregate.function {
+                LogicalPlanAggregateFunctionV1::PercentileDisc { .. }
+                | LogicalPlanAggregateFunctionV1::PercentileCont { .. } => {
+                    FilteredAggregateUpdate::Multiset {
+                        aggregate: aggregate.clone(),
+                        value: input_value.clone(),
+                    }
+                }
                 LogicalPlanAggregateFunctionV1::Sum if input_value.is_null() => continue,
                 LogicalPlanAggregateFunctionV1::Sum => FilteredAggregateUpdate::AddI64 {
                     aggregate: aggregate.clone(),
@@ -4303,9 +4320,10 @@ fn zeroed_filtered_aggregate_record(
         let initial = match aggregate.function {
             LogicalPlanAggregateFunctionV1::CountDistinct => Value::Array(Vec::new()),
             LogicalPlanAggregateFunctionV1::Avg => zeroed_filtered_avg_value(),
-            LogicalPlanAggregateFunctionV1::Min | LogicalPlanAggregateFunctionV1::Max => {
-                Value::Array(Vec::new())
-            }
+            LogicalPlanAggregateFunctionV1::Min
+            | LogicalPlanAggregateFunctionV1::Max
+            | LogicalPlanAggregateFunctionV1::PercentileDisc { .. }
+            | LogicalPlanAggregateFunctionV1::PercentileCont { .. } => Value::Array(Vec::new()),
             _ => Value::Number(JsonNumber::from(0)),
         };
         value.insert(aggregate.output_column_id.clone(), initial);
@@ -4355,7 +4373,10 @@ fn filtered_aggregate_record_is_live(
                     return Ok(true);
                 }
             }
-            LogicalPlanAggregateFunctionV1::Min | LogicalPlanAggregateFunctionV1::Max => {
+            LogicalPlanAggregateFunctionV1::Min
+            | LogicalPlanAggregateFunctionV1::Max
+            | LogicalPlanAggregateFunctionV1::PercentileDisc { .. }
+            | LogicalPlanAggregateFunctionV1::PercentileCont { .. } => {
                 if value
                     .get(&aggregate.output_column_id)
                     .and_then(Value::as_array)
@@ -6587,6 +6608,26 @@ fn tumbling_project_aggregate_value(
                 .map(Value::Number)
                 .unwrap_or(Value::Null)
         }
+        LogicalPlanAggregateFunctionV1::PercentileDisc { percentile }
+        | LogicalPlanAggregateFunctionV1::PercentileCont { percentile } => {
+            let multiset = row
+                .extrema_values
+                .get(&aggregate.output_column_id)
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .map(|(value, weight)| {
+                    let mut entry = serde_json::Map::new();
+                    entry.insert("value".to_string(), Value::Number(JsonNumber::from(*value)));
+                    entry.insert(
+                        "weight".to_string(),
+                        Value::Number(JsonNumber::from(*weight)),
+                    );
+                    Value::Object(entry)
+                })
+                .collect::<Vec<_>>();
+            percentile_value(&multiset, percentile, aggregate.function).unwrap_or(Value::Null)
+        }
         LogicalPlanAggregateFunctionV1::Min => row
             .extrema_values
             .get(&aggregate.output_column_id)
@@ -7039,7 +7080,10 @@ fn apply_window_row_update(
                     .checked_add(weight)
                     .ok_or_else(invalid_runtime_state)?;
             }
-            LogicalPlanAggregateFunctionV1::Min | LogicalPlanAggregateFunctionV1::Max => {
+            LogicalPlanAggregateFunctionV1::Min
+            | LogicalPlanAggregateFunctionV1::Max
+            | LogicalPlanAggregateFunctionV1::PercentileDisc { .. }
+            | LogicalPlanAggregateFunctionV1::PercentileCont { .. } => {
                 let Some(amount) = window_aggregate_input_amount(
                     aggregate,
                     plan.sum_value_column_id.as_str(),
@@ -8070,6 +8114,8 @@ fn aggregate_output_sql_type(
             };
             aggregate_sum_sql_type_for_column_id(catalog, column_id)
         }
+        LogicalPlanAggregateFunctionV1::PercentileDisc { .. } => Ok(SqlDataType::Int64),
+        LogicalPlanAggregateFunctionV1::PercentileCont { .. } => Ok(SqlDataType::Float64),
     }
 }
 
@@ -8531,6 +8577,24 @@ fn project_aggregate_value(
             .or_else(|| value.get("count"))
             .cloned()
             .ok_or_else(invalid_runtime_state),
+        LogicalPlanAggregateFunctionV1::PercentileDisc { percentile }
+        | LogicalPlanAggregateFunctionV1::PercentileCont { percentile } => {
+            // Idempotent projection: a multiset array is ranked, while an
+            // already-projected scalar (e.g. when HAVING re-projects the
+            // published output) passes through unchanged.
+            match value.get(aggregate.output_column_id.as_str()) {
+                Some(Value::Array(multiset)) => {
+                    percentile_value(multiset, percentile, aggregate.function)
+                }
+                Some(projected) => Ok(projected.clone()),
+                None => value
+                    .get("median_disc")
+                    .or_else(|| value.get("q1_cont"))
+                    .or_else(|| value.get("median"))
+                    .cloned()
+                    .ok_or_else(invalid_runtime_state),
+            }
+        }
         LogicalPlanAggregateFunctionV1::CountDistinct => {
             if let Some(values) = value
                 .get(aggregate.output_column_id.as_str())
@@ -8857,5 +8921,74 @@ fn canonical_json(value: &Value) -> String {
                 .collect::<Vec<_>>();
             format!("{{{}}}", items.join(","))
         }
+    }
+}
+
+/// Phase 8.2: exact percentile selection over the sorted value multiset.
+/// `percentile_disc` returns the input value at the discrete rank
+/// `ceil(p * N)`; `percentile_cont` linearly interpolates between the two
+/// values bracketing `p * (N - 1)` and returns a Float64. Both are exact
+/// for the admitted multiset; retractions adjust multiplicities only.
+fn percentile_value(
+    values: &[Value],
+    percentile: f64,
+    function: LogicalPlanAggregateFunctionV1,
+) -> Result<Value, StandingProgramRuntimeError> {
+    let mut entries = Vec::with_capacity(values.len());
+    for entry in values {
+        let entry = entry.as_object().ok_or_else(invalid_runtime_state)?;
+        let weight = entry
+            .get("weight")
+            .and_then(Value::as_i64)
+            .ok_or_else(invalid_runtime_state)?;
+        if weight <= 0 {
+            continue;
+        }
+        let candidate = entry
+            .get("value")
+            .and_then(Value::as_i64)
+            .ok_or_else(invalid_runtime_state)?;
+        entries.push((candidate, weight));
+    }
+    entries.sort_by_key(|(value, _)| *value);
+    let total: i64 = entries.iter().map(|(_, weight)| weight).sum();
+    if total <= 0 {
+        return Ok(Value::Null);
+    }
+    match function {
+        LogicalPlanAggregateFunctionV1::PercentileDisc { .. } => {
+            let rank = (percentile * total as f64).ceil().max(1.0) as i64;
+            let mut remaining = rank;
+            for (value, weight) in entries {
+                remaining -= weight;
+                if remaining <= 0 {
+                    return Ok(Value::Number(JsonNumber::from(value)));
+                }
+            }
+            Err(invalid_runtime_state())
+        }
+        LogicalPlanAggregateFunctionV1::PercentileCont { .. } => {
+            let position = percentile * (total - 1) as f64;
+            let lower_rank = position.floor() as i64;
+            let upper_rank = position.ceil() as i64;
+            let value_at = |rank: i64| -> Result<i64, StandingProgramRuntimeError> {
+                let mut remaining = rank + 1;
+                for (value, weight) in &entries {
+                    remaining -= *weight;
+                    if remaining <= 0 {
+                        return Ok(*value);
+                    }
+                }
+                Err(invalid_runtime_state())
+            };
+            let lower = value_at(lower_rank)?;
+            let upper = value_at(upper_rank)?;
+            let fraction = position - lower_rank as f64;
+            let interpolated = lower as f64 + (upper - lower) as f64 * fraction;
+            Ok(JsonNumber::from_f64(interpolated)
+                .map(Value::Number)
+                .unwrap_or(Value::Null))
+        }
+        _ => Err(invalid_runtime_state()),
     }
 }
