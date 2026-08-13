@@ -568,7 +568,6 @@ fn edge_catalog() -> VelorixRelationCatalogV1 {
     }
 }
 
-
 fn edge_id_src_dst_batch(ids: &[String], srcs: &[String], dsts: &[String]) -> RecordBatch {
     RecordBatch::try_new(
         Arc::new(Schema::new(vec![
