@@ -44,7 +44,8 @@ use crate::{
 mod typed_expr;
 
 pub use typed_expr::{
-    validate_typed_expr_node, BuiltinScalarFunctionV1, CanonicalI128V1, RuntimeScalarTypeV1,
+    builtin_udf_identity_for_name, builtin_udf_spec, validate_typed_expr_node,
+    BuiltinScalarFunctionV1, BuiltinUdfIdentityV1, CanonicalI128V1, RuntimeScalarTypeV1,
     ScalarLiteralV1, TypedExprError, TypedExprKindV1, TypedExprNodeV1, TypedExprProgramV1,
     TYPED_EXPR_PROGRAM_SCHEMA_VERSION_V1,
 };
@@ -15301,6 +15302,44 @@ fn typed_expr_node_from_expr(
             ..
         }) => {
             let name = function_name.to_string();
+            // Phase 8.4: compiled-in UDF names always route to the typed
+            // surface with their pinned identity.
+            if let Some(identity) = builtin_udf_identity_for_name(name.as_str()) {
+                let FunctionArguments::List(argument_list) = args else {
+                    return unsupported("builtin UDFs require a normal argument list");
+                };
+                let mut arg_nodes = Vec::new();
+                for argument in &argument_list.args {
+                    let FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr)) = argument else {
+                        return unsupported("builtin UDFs only accept expression arguments");
+                    };
+                    let Some(node) = typed_expr_node_from_expr(arg_expr, catalog, relation_alias)?
+                    else {
+                        return unsupported(
+                            "builtin UDF arguments must be columns, literals, or typed functions",
+                        );
+                    };
+                    arg_nodes.push(node);
+                }
+                let Some((arity, _, result_type)) = builtin_udf_spec(&identity) else {
+                    return unsupported(format!("builtin UDF `{name}` has no type specification"));
+                };
+                if arg_nodes.len() != arity {
+                    return unsupported(format!(
+                        "builtin UDF `{name}` expects {arity} arguments, got {}",
+                        arg_nodes.len()
+                    ));
+                }
+                let nullable = arg_nodes.iter().any(|node| node.nullable);
+                return Ok(Some(TypedExprNodeV1 {
+                    result_type,
+                    nullable,
+                    kind: TypedExprKindV1::UdfCall {
+                        identity,
+                        args: arg_nodes,
+                    },
+                }));
+            }
             if !is_typed_function_name(&name) {
                 return Ok(None);
             }

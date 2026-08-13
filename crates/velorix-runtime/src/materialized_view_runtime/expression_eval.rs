@@ -80,6 +80,13 @@ pub fn evaluate_node(
             }
             evaluate_call(*function, &values)
         }
+        TypedExprKindV1::UdfCall { identity, args } => {
+            let mut values = Vec::with_capacity(args.len());
+            for arg in args {
+                values.push(evaluate_node(arg, get_column)?);
+            }
+            evaluate_udf(identity, &values)
+        }
     }
 }
 
@@ -603,4 +610,81 @@ pub fn interval_nanoseconds(millis: i64, seconds: i64, minutes: i64, hours: i64,
         .and_then(|value| value.checked_add(seconds * 1_000_000_000))
         .and_then(|value| value.checked_add(millis * 1_000_000))
         .unwrap_or(i64::MAX)
+}
+
+/// Compiled-in UDF implementations (Phase 8.4). The identity must be
+/// resolved against the registry before evaluation; an unknown identity or
+/// a semantic version / digest mismatch fails closed.
+pub fn evaluate_udf(
+    identity: &velorix_core::view_plan::BuiltinUdfIdentityV1,
+    args: &[RuntimeScalarValue],
+) -> Result<RuntimeScalarValue, ExpressionEvaluationError> {
+    let registered = velorix_core::view_plan::builtin_udf_identity_for_name(&identity.name)
+        .ok_or_else(|| {
+            ExpressionEvaluationError::Failed(format!(
+                "builtin UDF `{}` is not in the compiled registry",
+                identity.name
+            ))
+        })?;
+    if registered != *identity {
+        return Err(ExpressionEvaluationError::Failed(format!(
+            "builtin UDF identity mismatch for `{}`: expected version {} digest {}",
+            identity.name, registered.semantic_version, registered.implementation_digest
+        )));
+    }
+    match identity.name.as_str() {
+        "vx_strlen" => {
+            let value = match &args[0] {
+                RuntimeScalarValue::Utf8(value) => value,
+                RuntimeScalarValue::Null(_) => {
+                    return Ok(RuntimeScalarValue::Null(RuntimeScalarTypeV1::Int64))
+                }
+                other => {
+                    return Err(ExpressionEvaluationError::Failed(format!(
+                        "vx_strlen requires utf8, got {:?}",
+                        other.data_type()
+                    )))
+                }
+            };
+            Ok(RuntimeScalarValue::Int64(value.chars().count() as i64))
+        }
+        "vx_sign" => {
+            let value = match &args[0] {
+                RuntimeScalarValue::Int64(value) => *value,
+                RuntimeScalarValue::Null(_) => {
+                    return Ok(RuntimeScalarValue::Null(RuntimeScalarTypeV1::Int64))
+                }
+                other => {
+                    return Err(ExpressionEvaluationError::Failed(format!(
+                        "vx_sign requires int64, got {:?}",
+                        other.data_type()
+                    )))
+                }
+            };
+            Ok(RuntimeScalarValue::Int64(value.signum()))
+        }
+        "vx_clamp" => {
+            let mut values = Vec::with_capacity(args.len());
+            for arg in args {
+                match arg {
+                    RuntimeScalarValue::Int64(value) => values.push(*value),
+                    RuntimeScalarValue::Null(_) => {
+                        return Ok(RuntimeScalarValue::Null(RuntimeScalarTypeV1::Int64))
+                    }
+                    other => {
+                        return Err(ExpressionEvaluationError::Failed(format!(
+                            "vx_clamp requires int64, got {:?}",
+                            other.data_type()
+                        )))
+                    }
+                }
+            }
+            Ok(RuntimeScalarValue::Int64(
+                values[0].clamp(values[1], values[2]),
+            ))
+        }
+        other => Err(ExpressionEvaluationError::Failed(format!(
+            "builtin UDF `{other}` has no compiled implementation"
+        ))),
+    }
 }

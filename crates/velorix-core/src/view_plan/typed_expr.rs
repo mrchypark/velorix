@@ -60,6 +60,36 @@ pub enum TypedExprKindV1 {
         function: BuiltinScalarFunctionV1,
         args: Vec<TypedExprNodeV1>,
     },
+    /// Phase 8.4: deterministic built-in UDF invocation. The identity
+    /// (namespace/name/version/implementation digest) is resolved against
+    /// the compiled registry at admission and restore; unknown or
+    /// mismatched identities fail closed.
+    UdfCall {
+        identity: BuiltinUdfIdentityV1,
+        args: Vec<TypedExprNodeV1>,
+    },
+}
+
+/// Identity of a compiled-in deterministic scalar UDF. The
+/// `implementation_digest` is computed over the function definition at
+/// build time and is part of the program identity, so a behavior change
+/// invalidates stored checkpoints instead of silently changing replay.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuiltinUdfIdentityV1 {
+    pub namespace: String,
+    pub name: String,
+    pub semantic_version: u32,
+    pub implementation_digest: String,
+}
+
+impl BuiltinUdfIdentityV1 {
+    pub fn canonical_key(&self) -> String {
+        format!(
+            "{}/{}@v{}:{}",
+            self.namespace, self.name, self.semantic_version, self.implementation_digest
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -194,8 +224,100 @@ pub fn validate_typed_expr_node(node: &TypedExprNodeV1) -> Result<(), TypedExprE
                 validate_typed_expr_node(arg)?;
             }
         }
+        TypedExprKindV1::UdfCall { identity, args } => {
+            let Some((arity, argument_types, result_type)) = builtin_udf_spec(identity) else {
+                return Err(TypedExprError::Invalid(format!(
+                    "unknown builtin UDF identity `{}`",
+                    identity.canonical_key()
+                )));
+            };
+            if args.len() != arity {
+                return Err(TypedExprError::Invalid(format!(
+                    "builtin UDF `{}` expects {arity} arguments, got {}",
+                    identity.name,
+                    args.len()
+                )));
+            }
+            for (argument, expected) in args.iter().zip(argument_types.iter()) {
+                if argument.result_type != *expected {
+                    return Err(TypedExprError::Invalid(format!(
+                        "builtin UDF `{}` argument type mismatch: expected {:?}, got {:?}",
+                        identity.name, expected, argument.result_type
+                    )));
+                }
+            }
+            if node.result_type != result_type {
+                return Err(TypedExprError::Invalid(format!(
+                    "builtin UDF `{}` result type mismatch",
+                    identity.name
+                )));
+            }
+            for arg in args {
+                validate_typed_expr_node(arg)?;
+            }
+        }
     }
     Ok(())
+}
+
+/// Compiled-in deterministic UDF registry (Phase 8.4). Each entry maps the
+/// SQL name to a pinned identity whose implementation digest is computed
+/// over the canonical definition below. New UDFs are appended only.
+pub fn builtin_udf_identity_for_name(name: &str) -> Option<BuiltinUdfIdentityV1> {
+    let name = name.to_ascii_lowercase();
+    let (name, semantic_version, definition) = match name.as_str() {
+        "vx_strlen" => (
+            "vx_strlen",
+            1,
+            "fn vx_strlen(s: Utf8) -> Int64 { s.chars().count() as i64 }",
+        ),
+        "vx_sign" => ("vx_sign", 1, "fn vx_sign(v: Int64) -> Int64 { v.signum() }"),
+        "vx_clamp" => (
+            "vx_clamp",
+            1,
+            "fn vx_clamp(v: Int64, lo: Int64, hi: Int64) -> Int64 { v.clamp(lo, hi) }",
+        ),
+        _ => return None,
+    };
+    Some(BuiltinUdfIdentityV1 {
+        namespace: "velorix".to_string(),
+        name: name.to_string(),
+        semantic_version,
+        implementation_digest: stable_bytes_hash(definition.as_bytes()),
+    })
+}
+
+/// Type specification for a compiled UDF identity: (arity, argument types,
+/// result type). `None` means the identity is not in the compiled registry.
+pub fn builtin_udf_spec(
+    identity: &BuiltinUdfIdentityV1,
+) -> Option<(usize, Vec<RuntimeScalarTypeV1>, RuntimeScalarTypeV1)> {
+    let registered = builtin_udf_identity_for_name(&identity.name)?;
+    if registered != *identity {
+        return None;
+    }
+    match identity.name.as_str() {
+        "vx_strlen" => Some((
+            1,
+            vec![RuntimeScalarTypeV1::Utf8],
+            RuntimeScalarTypeV1::Int64,
+        )),
+        "vx_sign" => Some((
+            1,
+            vec![RuntimeScalarTypeV1::Int64],
+            RuntimeScalarTypeV1::Int64,
+        )),
+        "vx_clamp" => Some((
+            3,
+            vec![
+                RuntimeScalarTypeV1::Int64,
+                RuntimeScalarTypeV1::Int64,
+                RuntimeScalarTypeV1::Int64,
+            ],
+            RuntimeScalarTypeV1::Int64,
+        )),
+        _ => None,
+    }
 }
 
 fn validate_literal_type(

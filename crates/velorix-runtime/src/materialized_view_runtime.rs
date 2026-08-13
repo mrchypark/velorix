@@ -5127,6 +5127,11 @@ fn collect_typed_node_column_ids(node: &TypedExprNodeV1, columns: &mut Vec<Strin
                 collect_typed_node_column_ids(arg, columns);
             }
         }
+        TypedExprKindV1::UdfCall { args, .. } => {
+            for arg in args {
+                collect_typed_node_column_ids(arg, columns);
+            }
+        }
     }
 }
 

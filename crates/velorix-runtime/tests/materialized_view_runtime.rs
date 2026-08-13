@@ -19636,6 +19636,166 @@ fn public_exists_on_non_primary_key_materializes_and_restores() {
 }
 
 #[test]
+fn builtin_udf_typed_projection_materializes_and_restores() {
+    let catalog = purchases_catalog_without_value_role();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = udf_output_schema();
+    let sql = "select user_id, vx_strlen(user_id) as name_len, vx_sign(amount) as sign_of_amount, vx_clamp(amount, 0, 8) as clamped from purchases";
+    let identity = standing_identity_with_view(sql, "udf_projection_view");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("epoch-1").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "purchases-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 3,
+                event_time_watermark: None,
+                batches: vec![purchases_rows_batch(&[
+                    ("alice", 10, 1),
+                    ("bob", -4, 1),
+                    ("carol", 20, 1),
+                ])],
+            }],
+        )
+        .unwrap();
+
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "udf_projection_view".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(1),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let name_len = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let sign = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let clamped = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let mut rows = (0..batch.num_rows())
+        .map(|index| {
+            (
+                name_len.value(index),
+                sign.value(index),
+                clamped.value(index),
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort();
+    assert_eq!(rows, vec![(3, -1, 0), (5, 1, 8), (5, 1, 8)]);
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("epoch-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "purchases-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 3,
+                end_offset_exclusive: 4,
+                event_time_watermark: None,
+                batches: vec![purchases_rows_batch(&[("dave", 6, 1)])],
+            }],
+        )
+        .unwrap();
+    let page = restored
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "udf_projection_view".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(2),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let name_len = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let mut lens = (0..batch.num_rows())
+        .map(|index| name_len.value(index))
+        .collect::<Vec<_>>();
+    lens.sort();
+    assert_eq!(lens, vec![3, 4, 5, 5]);
+}
+
+fn udf_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "udf_projection_view".to_string(),
+        relation_name: "udf_projection_view".to_string(),
+        relation_version: "2026-05-24.v1".to_string(),
+        schema_fingerprint: "udf-v1".to_string(),
+        columns: vec![
+            ColumnSchema {
+                name: "user_id".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "name_len".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "sign_of_amount".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "clamped".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: true,
+            },
+        ],
+        primary_key: vec!["user_id".to_string()],
+    }
+}
+
+#[test]
 fn runtime_materializes_decimal_group_key_aggregate_and_restores() {
     let catalog = decimal_key_catalog();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
