@@ -9,12 +9,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Number as JsonNumber, Value as JsonValue};
 use sqlparser::{
     ast::{
-        BinaryOperator, CastKind, DataType, DateTimeField, Distinct, DuplicateTreatment, Expr,
-        Fetch, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments,
-        GroupByExpr, Ident, JoinConstraint, JoinOperator, LimitClause, ObjectName, OrderByExpr,
-        OrderByKind, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr,
-        SetOperator, SetQuantifier, Statement as SqlStatement, TableAlias, TableFactor,
-        TableSampleKind, UnaryOperator, Value as SqlValue, ValueWithSpan, WindowType,
+        BinaryOperator, CastKind, CeilFloorKind, DataType, DateTimeField, Distinct,
+        DuplicateTreatment, Expr, Fetch, Function, FunctionArg, FunctionArgExpr,
+        FunctionArgumentList, FunctionArguments, GroupByExpr, Ident, JoinConstraint, JoinOperator,
+        LimitClause, ObjectName, OrderByExpr, OrderByKind, Query, Select, SelectItem,
+        SelectItemQualifiedWildcardKind, SetExpr, SetOperator, SetQuantifier,
+        Statement as SqlStatement, TableAlias, TableFactor, TableSampleKind, TrimWhereField,
+        UnaryOperator, Value as SqlValue, ValueWithSpan, WindowType,
     },
     dialect::GenericDialect,
     parser::{Parser, ParserError},
@@ -15729,8 +15730,135 @@ fn typed_expr_node_from_expr(
                 },
             }))
         }
+        Expr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            let mut arg_nodes = Vec::new();
+            for arg_expr in std::iter::once(&**expr)
+                .chain(substring_from.iter().map(|arg| &**arg))
+                .chain(substring_for.iter().map(|arg| &**arg))
+            {
+                let Some(node) = typed_expr_node_from_expr(arg_expr, catalog, relation_alias)?
+                else {
+                    return unsupported(
+                        "SUBSTRING arguments must be columns, literals, or typed functions",
+                    );
+                };
+                arg_nodes.push(node);
+            }
+            if arg_nodes.len() < 2 {
+                return unsupported("SUBSTRING requires a start position");
+            }
+            for arg in arg_nodes.iter().skip(1) {
+                if arg.result_type != RuntimeScalarTypeV1::Int64 {
+                    return unsupported("SUBSTRING start/length must be Int64");
+                }
+            }
+            let function = BuiltinScalarFunctionV1::Substring;
+            let result_type = typed_call_result_type(function, &arg_nodes)?;
+            Ok(Some(TypedExprNodeV1 {
+                result_type,
+                nullable: arg_nodes.iter().any(|node| node.nullable),
+                kind: TypedExprKindV1::Call {
+                    function,
+                    args: arg_nodes,
+                },
+            }))
+        }
+        Expr::Trim {
+            trim_where,
+            trim_what,
+            expr,
+            trim_characters,
+        } => {
+            if matches!(
+                trim_where,
+                Some(TrimWhereField::Leading) | Some(TrimWhereField::Trailing)
+            ) {
+                return unsupported(
+                    "TRIM with LEADING/TRAILING is not supported; use TRIM(x) or TRIM(chars FROM x)",
+                );
+            }
+            if trim_characters
+                .as_ref()
+                .is_some_and(|characters| !characters.is_empty())
+            {
+                return unsupported("TRIM comma-separated characters are not supported");
+            }
+            let mut arg_nodes = Vec::new();
+            for arg_expr in std::iter::once(&**expr).chain(trim_what.iter().map(|arg| &**arg)) {
+                let Some(node) = typed_expr_node_from_expr(arg_expr, catalog, relation_alias)?
+                else {
+                    return unsupported(
+                        "TRIM arguments must be columns, literals, or typed functions",
+                    );
+                };
+                arg_nodes.push(node);
+            }
+            for arg in arg_nodes.iter().skip(1) {
+                if arg.result_type != RuntimeScalarTypeV1::Utf8 {
+                    return unsupported("TRIM characters must be Utf8");
+                }
+            }
+            let function = BuiltinScalarFunctionV1::Trim;
+            let result_type = typed_call_result_type(function, &arg_nodes)?;
+            Ok(Some(TypedExprNodeV1 {
+                result_type,
+                nullable: arg_nodes.iter().any(|node| node.nullable),
+                kind: TypedExprKindV1::Call {
+                    function,
+                    args: arg_nodes,
+                },
+            }))
+        }
+        Expr::Ceil { expr, field } => {
+            typed_ceil_floor_call(expr, field, true, catalog, relation_alias)
+        }
+        Expr::Floor { expr, field } => {
+            typed_ceil_floor_call(expr, field, false, catalog, relation_alias)
+        }
         _ => Ok(None),
     }
+}
+
+fn typed_ceil_floor_call(
+    expr: &Expr,
+    field: &CeilFloorKind,
+    is_ceil: bool,
+    catalog: &VelorixRelationCatalogV1,
+    relation_alias: Option<&str>,
+) -> Result<Option<TypedExprNodeV1>, ViewPlanError> {
+    if !matches!(
+        field,
+        CeilFloorKind::DateTimeField(DateTimeField::NoDateTime)
+    ) {
+        return unsupported("CEIL/FLOOR with a TO field or scale argument is not supported");
+    }
+    let Some(node) = typed_expr_node_from_expr(expr, catalog, relation_alias)? else {
+        return unsupported("CEIL/FLOOR arguments must be columns, literals, or typed functions");
+    };
+    if node.result_type != RuntimeScalarTypeV1::Float64
+        && node.result_type != RuntimeScalarTypeV1::Int64
+    {
+        return unsupported("CEIL/FLOOR require a float64 or int64 argument");
+    }
+    let function = if is_ceil {
+        BuiltinScalarFunctionV1::CeilFloat64
+    } else {
+        BuiltinScalarFunctionV1::FloorFloat64
+    };
+    let result_type = typed_call_result_type(function, std::slice::from_ref(&node))?;
+    Ok(Some(TypedExprNodeV1 {
+        result_type,
+        nullable: node.nullable,
+        kind: TypedExprKindV1::Call {
+            function,
+            args: vec![node],
+        },
+    }))
 }
 
 fn typed_literal_node(value: &ValueWithSpan) -> Result<Option<TypedExprNodeV1>, ViewPlanError> {

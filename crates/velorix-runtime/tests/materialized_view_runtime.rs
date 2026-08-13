@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use arrow::{
-    array::{Array, BooleanArray, Decimal128Array, Float64Array, Int64Array, StringArray},
+    array::{
+        Array, BooleanArray, Decimal128Array, Float64Array, Int64Array, StringArray,
+        TimestampNanosecondArray,
+    },
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
@@ -20868,4 +20871,314 @@ fn interval_join_materializes_overlap_retraction_and_restart() {
         )
         .unwrap();
     assert_interval_join_page(restored.as_ref(), 4, &[("r1", 10, 20), ("r2", 5, 12)]);
+}
+
+fn typed_family_matrix_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "typed_family_matrix".to_string(),
+        relation_name: "typed_family_matrix".to_string(),
+        relation_version: "2026-08-13.v1".to_string(),
+        schema_fingerprint: "typed-family-matrix-v1".to_string(),
+        columns: vec![
+            ColumnSchema {
+                name: "user_id".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "user_lower".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "user_sub_ast".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "user_sub_fn".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "user_trim".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "user_len".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "event_month".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "event_hour".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "event_second".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "day_trunc".to_string(),
+                data_type: SqlDataType::Timestamp { timezone: None },
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "minute_trunc".to_string(),
+                data_type: SqlDataType::Timestamp { timezone: None },
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "minus_half_hour".to_string(),
+                data_type: SqlDataType::Timestamp { timezone: None },
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "amount_ceil".to_string(),
+                data_type: SqlDataType::Float64,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "amount_floor".to_string(),
+                data_type: SqlDataType::Float64,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "amount_greatest".to_string(),
+                data_type: SqlDataType::Float64,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "amount_least".to_string(),
+                data_type: SqlDataType::Float64,
+                nullable: true,
+            },
+        ],
+        primary_key: vec!["user_id".to_string()],
+    }
+}
+
+#[test]
+fn type_family_test_matrix_covers_null_overflow_boundary_restart() {
+    let catalog = purchases_event_time_catalog_with_nullable_amount();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = typed_family_matrix_output_schema();
+    let sql = "select user_id, lower(user_id) as user_lower, substring(user_id from 1 for 3) as user_sub_ast, substr(user_id, 2, 3) as user_sub_fn, trim('x' from user_id) as user_trim, length(user_id) as user_len, extract(month from event_time) as event_month, extract(hour from event_time) as event_hour, extract(second from event_time) as event_second, date_trunc('day', event_time) as day_trunc, date_trunc('minute', event_time) as minute_trunc, event_time - interval '30 minutes' as minus_half_hour, ceil(amount * 1.5) as amount_ceil, floor(amount * 1.5) as amount_floor, greatest(amount * 1.0, amount * 1.5) as amount_greatest, least(amount * 1.0, amount * 1.5) as amount_least from purchases";
+    let identity = standing_identity_with_view(sql, "typed_family_matrix");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("matrix-epoch-1").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "matrix-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 2,
+                event_time_watermark: None,
+                batches: vec![purchases_event_time_nullable_amount_batch(&[
+                    ("alice", Some(10), 1_735_689_600_000_000_000, 1),
+                    ("bob", Some(4), 1_735_689_600_000_000_000, 1),
+                ])],
+            }],
+        )
+        .unwrap();
+    assert_typed_family_matrix_page(runtime.as_ref(), 1, &[alice_matrix_row(), bob_matrix_row()]);
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("matrix-epoch-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "matrix-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 2,
+                end_offset_exclusive: 4,
+                event_time_watermark: None,
+                batches: vec![purchases_event_time_nullable_amount_batch(&[
+                    ("carol", Some(7), 1_735_689_600_000_000_000, 1),
+                    ("nullam", None, 1_735_689_600_000_000_000, 1),
+                ])],
+            }],
+        )
+        .unwrap();
+    assert_typed_family_matrix_page(
+        restored.as_ref(),
+        2,
+        &[
+            alice_matrix_row(),
+            bob_matrix_row(),
+            carol_matrix_row(),
+            null_amount_matrix_row(),
+        ],
+    );
+}
+
+fn alice_matrix_row() -> Vec<String> {
+    vec![
+        "alice".to_string(),
+        "alice".to_string(),
+        "ali".to_string(),
+        "lic".to_string(),
+        "alice".to_string(),
+        "5".to_string(),
+        "1".to_string(),
+        "0".to_string(),
+        "0".to_string(),
+        "1735689600000000000".to_string(),
+        "1735689600000000000".to_string(),
+        "1735687800000000000".to_string(),
+        "15".to_string(),
+        "15".to_string(),
+        "15".to_string(),
+        "10".to_string(),
+    ]
+}
+
+fn bob_matrix_row() -> Vec<String> {
+    vec![
+        "bob".to_string(),
+        "bob".to_string(),
+        "bob".to_string(),
+        "ob".to_string(),
+        "bob".to_string(),
+        "3".to_string(),
+        "1".to_string(),
+        "0".to_string(),
+        "0".to_string(),
+        "1735689600000000000".to_string(),
+        "1735689600000000000".to_string(),
+        "1735687800000000000".to_string(),
+        "6".to_string(),
+        "6".to_string(),
+        "6".to_string(),
+        "4".to_string(),
+    ]
+}
+
+fn carol_matrix_row() -> Vec<String> {
+    vec![
+        "carol".to_string(),
+        "carol".to_string(),
+        "car".to_string(),
+        "aro".to_string(),
+        "carol".to_string(),
+        "5".to_string(),
+        "1".to_string(),
+        "0".to_string(),
+        "0".to_string(),
+        "1735689600000000000".to_string(),
+        "1735689600000000000".to_string(),
+        "1735687800000000000".to_string(),
+        "11".to_string(),
+        "10".to_string(),
+        "10.5".to_string(),
+        "7".to_string(),
+    ]
+}
+
+fn null_amount_matrix_row() -> Vec<String> {
+    vec![
+        "nullam".to_string(),
+        "nullam".to_string(),
+        "nul".to_string(),
+        "ull".to_string(),
+        "nullam".to_string(),
+        "6".to_string(),
+        "1".to_string(),
+        "0".to_string(),
+        "0".to_string(),
+        "1735689600000000000".to_string(),
+        "1735689600000000000".to_string(),
+        "1735687800000000000".to_string(),
+        "NULL".to_string(),
+        "NULL".to_string(),
+        "NULL".to_string(),
+        "NULL".to_string(),
+    ]
+}
+
+fn assert_typed_family_matrix_page(
+    runtime: &(dyn StandingProgramRuntime + Send),
+    epoch: u64,
+    expected_rows: &[Vec<String>],
+) {
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".into(),
+                program_id: "program-purchases".into(),
+                view_id: "typed_family_matrix".into(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(epoch),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let mut expected = expected_rows.to_vec();
+    let mut actual = Vec::new();
+    for index in 0..batch.num_rows() {
+        let mut row = Vec::new();
+        for column in 0..batch.num_columns() {
+            let column_value = batch.column(column);
+            if let Some(array) = column_value.as_any().downcast_ref::<StringArray>() {
+                row.push(array.value(index).to_string());
+            } else if let Some(array) = column_value.as_any().downcast_ref::<Int64Array>() {
+                if array.is_null(index) {
+                    row.push("NULL".to_string());
+                } else {
+                    row.push(array.value(index).to_string());
+                }
+            } else if let Some(array) = column_value.as_any().downcast_ref::<Float64Array>() {
+                if array.is_null(index) {
+                    row.push("NULL".to_string());
+                } else {
+                    row.push(array.value(index).to_string());
+                }
+            } else if let Some(array) = column_value
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+            {
+                if array.is_null(index) {
+                    row.push("NULL".to_string());
+                } else {
+                    row.push(array.value(index).to_string());
+                }
+            } else {
+                panic!("unexpected column type in typed family matrix page");
+            }
+        }
+        actual.push(row);
+    }
+    expected.sort();
+    actual.sort();
+    assert_eq!(actual, expected);
 }

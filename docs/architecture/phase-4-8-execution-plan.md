@@ -169,54 +169,73 @@ stable product contract.
 
 ### 5.1 Event-Time Semantics Documentation
 
-- [ ] **Document event-time extraction semantics**
-- [ ] **Document per-partition watermark behavior**
-- [ ] **Document window closure rules**
-- [ ] **Document allowed lateness and late-row handling**
-- [ ] **Publish as part of supported-sql.md**
+- [x] **Document event-time extraction semantics**
+- [x] **Document per-partition watermark behavior**
+- [x] **Document window closure rules**
+- [x] **Document allowed lateness and late-row handling**
+- [x] **Publish as part of supported-sql.md**
 
-**Current state**: Experimental implementation exists.
-No public documentation of time semantics.
+**Current state**: Complete. The "Event-Time Semantics (public 1.0
+contract)" section of docs/architecture/supported-sql.md documents
+extraction (`event_time_watermark` required on every input batch),
+per-partition watermark behavior (monotonic `watermark_ns`, idle
+partitions pin the effective watermark to `None`), window closure
+(finalization frontier F = W - allowance), allowed lateness
+(`LateRowPolicy` strict/drop-with-evidence/admit-within-allowance), and
+the deterministic outcomes matrix for in-order, out-of-order, late,
+restart, and replay cases.
 
 ### 5.2 Multi-Input Watermark Combination
 
-- [ ] **Define watermark combination strategy for multi-input windows**
-- [ ] **Handle idle-partition behavior explicitly**
-- [ ] **Implement watermark advance logic for join-with-window scenarios**
-- [ ] **Validate watermark monotonicity across inputs**
+- [x] **Define watermark combination strategy for multi-input windows**
+- [x] **Handle idle-partition behavior explicitly**
+- [x] **Implement watermark advance logic for join-with-window scenarios**
+- [x] **Validate watermark monotonicity across inputs**
 
-**Current state**: Single-input watermark propagation implemented.
-Multi-input combination not implemented.
+**Current state**: Complete. `combine_multi_input_watermarks`
+(materialized_view_runtime.rs) takes the minimum over active partitions;
+non-monotonic watermarks fail closed. Evidence:
+`multi_input_watermark_combination_is_min_across_partitions_and_rejects_regression`,
+`runtime_rejects_non_monotonic_event_time_watermark_for_source_partition`.
 
 ### 5.3 Late-Row Handling Policy
 
-- [ ] **Decide policy: reject, drop with evidence, or admit within allowance**
-- [ ] **Make policy explicit and configurable**
-- [ ] **Persist late-row handling state for recovery**
-- [ ] **Add late-row workload to benchmark corpus**
+- [x] **Decide policy: reject, drop with evidence, or admit within allowance**
+- [x] **Make policy explicit and configurable**
+- [x] **Persist late-row handling state for recovery**
+- [x] **Add late-row workload to benchmark corpus**
 
-**Current state**: Strict late-data policy (reject late rows).
-No configurable policy or evidence tracking.
+**Current state**: Complete. `LateRowPolicy` (strict_reject default,
+drop_with_evidence, admit_within_allowance) is persisted in the plan and
+checkpoint; dropped-late-row evidence counters are durable. Evidence:
+`late_row_policy_default_strict_reject_fails_closed_on_late_row`,
+`late_row_policy_drop_with_evidence_drops_late_rows_and_persists_evidence`,
+`late_row_policy_admit_within_allowance_defers_finalization_until_frontier`,
+`runtime_rejects_late_rows_for_already_closed_tumbling_window`.
 
 ### 5.4 State Boundedness and Retention
 
-- [ ] **Define explicit retention contract for watermark-bounded state**
-- [ ] **Bound state growth without silently changing SQL semantics**
-- [ ] **Persist retention policy in operator contract**
-- [ ] **Add state boundedness tests for window operators**
+- [x] **Define explicit retention contract for watermark-bounded state**
+- [x] **Bound state growth without silently changing SQL semantics**
+- [x] **Persist retention policy in operator contract**
+- [x] **Add state boundedness tests for window operators**
 
-**Current state**: `StateBoundednessV1::WatermarkBounded` exists.
-No explicit retention contract or state growth bounds.
+**Current state**: Complete. `StateRetentionContractV1`
+(operator_contract.rs) bounds retained open-window state and is persisted
+in `SupportedTumblingWindowPlan`; closed windows are not published again
+and their state is released. Retraction-after-closure fails closed.
 
 ### 5.5 Window Retraction Verification
 
-- [ ] **Verify TUMBLE retraction before and after window closure**
-- [ ] **Verify HOP retraction for sliding windows**
-- [ ] **Verify SESSION merge and bridge retraction**
-- [ ] **Verify recovery behavior for closed windows**
+- [x] **Verify TUMBLE retraction before and after window closure**
+- [x] **Verify HOP retraction for sliding windows**
+- [x] **Verify SESSION merge and bridge retraction**
+- [x] **Verify recovery behavior for closed windows**
 
-**Current state**: Basic window closure tests exist.
-Comprehensive retraction verification not complete.
+**Current state**: Complete. Evidence:
+`tumbling_window_retraction_before_closure_is_exact_and_after_closure_fails_closed`,
+`hopping_window_retraction_updates_all_fanout_windows_exactly`,
+`session_window_retraction_splits_merged_session_exactly_and_survives_restart`.
 
 ### 5.6 Experimental Gate Removal
 
@@ -238,8 +257,12 @@ pre/post closure, HOP fanout, SESSION merge-split + restart).
 
 ### 5.7 Exit Gate
 
-- [ ] TUMBLE, HOP, and SESSION have documented deterministic outcomes for
+- [x] TUMBLE, HOP, and SESSION have documented deterministic outcomes for
   in-order, out-of-order, late, restart, and replay cases.
+
+**Evidence**: supported-sql.md "Event-Time Semantics" determinism matrix
+plus the retraction/restart tests in 5.5 and
+`runtime_materializes_tumbling_event_time_windows_and_restores_state`.
 
 ---
 
