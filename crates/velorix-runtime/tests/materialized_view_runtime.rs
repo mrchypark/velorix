@@ -21772,3 +21772,229 @@ fn recursive_cte_materializes_closure_exactly_across_retract_restart_and_fail_cl
         );
     }
 }
+
+fn cross_join_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "pair_matches".to_string(),
+        relation_name: "pair_matches".to_string(),
+        relation_version: "2026-08-13.v1".to_string(),
+        schema_fingerprint: "cross-join-v1".to_string(),
+        columns: vec![
+            ColumnSchema {
+                name: "user_id".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "account_id".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "score".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "tier".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+        ],
+        primary_key: vec![
+            "user_id".to_string(),
+            "account_id".to_string(),
+            "score".to_string(),
+            "tier".to_string(),
+        ],
+    }
+}
+
+fn assert_cross_join_page(
+    runtime: &(dyn StandingProgramRuntime + Send),
+    epoch: u64,
+    expected: &[(&str, &str, i64, &str)],
+) {
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".into(),
+                program_id: "program-purchases".into(),
+                view_id: "pair_matches".into(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(epoch),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let users = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let accounts = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let scores = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let tiers = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mut actual = (0..batch.num_rows())
+        .map(|index| {
+            (
+                users.value(index),
+                accounts.value(index),
+                scores.value(index),
+                tiers.value(index),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut expected = expected.to_vec();
+    actual.sort();
+    expected.sort();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn cross_join_materializes_all_pairs_exactly_across_retract_and_restart() {
+    let scores = scores_catalog();
+    let accounts = accounts_catalog();
+    let catalogs = vec![scores.clone(), accounts.clone()];
+    let input_schemas = catalogs
+        .iter()
+        .map(|catalog| catalog_input_relation_schema(catalog).unwrap())
+        .collect::<Vec<_>>();
+    let output_schema = cross_join_output_schema();
+    let sql = "select s.user_id, a.account_id, s.score, a.tier from scores s cross join accounts a";
+    let identity = standing_identity_with_view(sql, "pair_matches");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &catalogs,
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("cross-epoch-1").unwrap(),
+            vec![
+                relation_input(
+                    &scores,
+                    "cross-scores",
+                    0,
+                    2,
+                    scores_rows_batch(&[("alice", 10, 1), ("bob", 5, 1)]),
+                ),
+                relation_input(
+                    &accounts,
+                    "cross-accounts",
+                    0,
+                    1,
+                    accounts_rows_batch(&[("a1", 100, "gold", 1)]),
+                ),
+            ],
+        )
+        .unwrap();
+    assert_cross_join_page(
+        runtime.as_ref(),
+        1,
+        &[("alice", "a1", 10, "gold"), ("bob", "a1", 5, "gold")],
+    );
+
+    runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("cross-epoch-2").unwrap(),
+            vec![relation_input(
+                &accounts,
+                "cross-accounts",
+                1,
+                2,
+                accounts_rows_batch(&[("a2", 50, "silver", 1)]),
+            )],
+        )
+        .unwrap();
+    assert_cross_join_page(
+        runtime.as_ref(),
+        2,
+        &[
+            ("alice", "a1", 10, "gold"),
+            ("bob", "a1", 5, "gold"),
+            ("alice", "a2", 10, "silver"),
+            ("bob", "a2", 5, "silver"),
+        ],
+    );
+
+    runtime
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("cross-epoch-3").unwrap(),
+            vec![relation_input(
+                &scores,
+                "cross-scores",
+                2,
+                3,
+                scores_rows_batch(&[("bob", 5, -1)]),
+            )],
+        )
+        .unwrap();
+    assert_cross_join_page(
+        runtime.as_ref(),
+        3,
+        &[("alice", "a1", 10, "gold"), ("alice", "a2", 10, "silver")],
+    );
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    assert_cross_join_page(
+        restored.as_ref(),
+        3,
+        &[("alice", "a1", 10, "gold"), ("alice", "a2", 10, "silver")],
+    );
+    restored
+        .apply_changes(
+            4,
+            EpochIdempotencyKey::new("cross-epoch-4").unwrap(),
+            vec![relation_input(
+                &accounts,
+                "cross-accounts",
+                2,
+                3,
+                accounts_rows_batch(&[("a1", 100, "gold", -1)]),
+            )],
+        )
+        .unwrap();
+    assert_cross_join_page(restored.as_ref(), 4, &[("alice", "a2", 10, "silver")]);
+
+    for sql in [
+        "select s.user_id, a.account_id from scores s cross join accounts a on s.user_id = a.account_id",
+        "select s.user_id, a.account_id, s.score from scores s cross join accounts a where s.score > 5",
+        "select s.user_id, s.score from scores s cross join accounts a",
+        "select s.user_id, a.account_id, s.score, count(*) from scores s cross join accounts a group by s.user_id, a.account_id, s.score",
+    ] {
+        let error = lower_supported_sql_to_logical_plan(
+            sql,
+            &catalogs,
+            &cross_join_output_schema(),
+        )
+        .unwrap_err();
+        assert!(
+            !error.to_string().contains("admitted"),
+            "expected fail-closed for {sql}, got: {error}"
+        );
+    }
+}

@@ -61,20 +61,22 @@ use velorix_core::{
         supported_view_plan_aggregate_outputs, supported_view_plan_group_keys,
         supported_view_plan_is_singleton, validate_logical_view_plan,
         validate_supported_analytic_row_number_sql, validate_supported_analytic_window_frame_sql,
-        validate_supported_filter_project_sql, validate_supported_interval_join_sql,
-        validate_supported_join_view_sql, validate_supported_latest_by_key_sql,
-        validate_supported_recursive_cte_sql, validate_supported_scalar_aggregate_filter_sql,
-        validate_supported_semi_anti_join_sql, validate_supported_tumbling_window_sql_with_policy,
-        validate_supported_view_sql, AggregateOutputPredicate, AggregateOutputPredicateExpr,
-        JoinPredicateExpr, JoinRowPredicate, LateRowPolicy, LogicalPlanAggregateFunctionV1,
-        LogicalPlanExecutionImplementationV1, LogicalPlanLatestByKeyFunctionV1, PredicateOp,
-        RecursiveBasePredicateV1, RecursiveProjectionItemV1, RowPredicate, RowPredicateExpr,
-        ScalarSubqueryComparisonOp, SupportedAggregateInputRelationSide, SupportedAggregateOutput,
+        validate_supported_cross_join_sql, validate_supported_filter_project_sql,
+        validate_supported_interval_join_sql, validate_supported_join_view_sql,
+        validate_supported_latest_by_key_sql, validate_supported_recursive_cte_sql,
+        validate_supported_scalar_aggregate_filter_sql, validate_supported_semi_anti_join_sql,
+        validate_supported_tumbling_window_sql_with_policy, validate_supported_view_sql,
+        AggregateOutputPredicate, AggregateOutputPredicateExpr, CrossJoinProjectionItemV1,
+        CrossJoinSideV1, JoinPredicateExpr, JoinRowPredicate, LateRowPolicy,
+        LogicalPlanAggregateFunctionV1, LogicalPlanExecutionImplementationV1,
+        LogicalPlanLatestByKeyFunctionV1, PredicateOp, RecursiveBasePredicateV1,
+        RecursiveProjectionItemV1, RowPredicate, RowPredicateExpr, ScalarSubqueryComparisonOp,
+        SupportedAggregateInputRelationSide, SupportedAggregateOutput,
         SupportedAnalyticRowNumberPlan, SupportedAnalyticWindowFramePlanV1,
-        SupportedAnalyticWindowFunction, SupportedEventTimeWindowKind, SupportedFilterProjectPlan,
-        SupportedIntervalJoinPlanV1, SupportedJoinKeyDomainV1, SupportedJoinKind,
-        SupportedJoinViewPlan, SupportedLatestByKeyPlan, SupportedProjectionBinaryOp,
-        SupportedProjectionExpr, SupportedRecursiveFixpointPlanV1,
+        SupportedAnalyticWindowFunction, SupportedCrossJoinPlanV1, SupportedEventTimeWindowKind,
+        SupportedFilterProjectPlan, SupportedIntervalJoinPlanV1, SupportedJoinKeyDomainV1,
+        SupportedJoinKind, SupportedJoinViewPlan, SupportedLatestByKeyPlan,
+        SupportedProjectionBinaryOp, SupportedProjectionExpr, SupportedRecursiveFixpointPlanV1,
         SupportedScalarAggregateFilterPlanV1, SupportedSemiAntiJoinKindV1,
         SupportedSemiAntiJoinProjectPlanV1, SupportedThreeInputInnerJoinCountPlanV1,
         SupportedTopKPlan, SupportedTumblingWindowPlan, SupportedViewPlan, TypedExprKindV1,
@@ -91,6 +93,7 @@ pub use crate::runtime_contract::MATERIALIZED_VIEW_RUNTIME_NAME as CRATE_NAME;
 mod analytic_row_number;
 pub mod analytic_window_frame;
 mod checkpoint_common;
+mod cross_join;
 mod event_time_window;
 pub mod expression_eval;
 mod filter_project;
@@ -105,6 +108,7 @@ mod three_input_join;
 mod two_input_join;
 
 pub use analytic_row_number::AnalyticRowNumberRuntime;
+pub use cross_join::CrossJoinRuntime;
 pub use event_time_window::TumblingEventTimeAggregateRuntime;
 pub use filter_project::FilterProjectRuntime;
 pub use interval_join::IntervalJoinRuntime;
@@ -345,6 +349,19 @@ pub fn create_standing_runtime_with_logical_plan_and_catalogs(
             .map(|runtime| Box::new(runtime) as Box<dyn StandingProgramRuntime + Send>)
             .map_err(|error| error.to_string())
         }
+        VelorixLogicalViewExecutionV1::CrossJoin { plan } => {
+            CrossJoinRuntime::new_with_logical_plan(
+                identity.clone(),
+                catalogs.to_vec(),
+                input_schemas.to_vec(),
+                output_schema.clone(),
+                sql,
+                *plan.clone(),
+                logical_plan,
+            )
+            .map(|runtime| Box::new(runtime) as Box<dyn StandingProgramRuntime + Send>)
+            .map_err(|error| error.to_string())
+        }
         VelorixLogicalViewExecutionV1::RecursiveFixpointV1 { plan } => {
             let [catalog] = catalogs else {
                 return Err(
@@ -543,6 +560,11 @@ pub fn restore_standing_runtime(
     }
     if checkpoint_has_recursive_fixpoint_payload(&checkpoint) {
         return RecursiveFixpointRuntime::restore(checkpoint)
+            .map(|runtime| Box::new(runtime) as Box<dyn StandingProgramRuntime + Send>)
+            .map_err(|error| error.to_string());
+    }
+    if checkpoint_has_cross_join_payload(&checkpoint) {
+        return CrossJoinRuntime::restore(checkpoint)
             .map(|runtime| Box::new(runtime) as Box<dyn StandingProgramRuntime + Send>)
             .map_err(|error| error.to_string());
     }
@@ -8865,6 +8887,21 @@ fn checkpoint_has_three_input_join_payload(checkpoint: &RuntimeCheckpoint) -> bo
         })
         .as_deref()
         == Some(three_input_join::THREE_INPUT_JOIN_RUNTIME_KIND)
+}
+
+fn checkpoint_has_cross_join_payload(checkpoint: &RuntimeCheckpoint) -> bool {
+    checkpoint
+        .state_payload
+        .as_ref()
+        .and_then(|payload| serde_json::from_str::<Value>(&payload.payload).ok())
+        .and_then(|payload| {
+            payload
+                .get("runtime_kind")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .as_deref()
+        == Some(cross_join::CROSS_JOIN_RUNTIME_KIND)
 }
 
 fn checkpoint_has_recursive_fixpoint_payload(checkpoint: &RuntimeCheckpoint) -> bool {

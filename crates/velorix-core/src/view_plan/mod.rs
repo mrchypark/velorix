@@ -510,6 +510,12 @@ pub enum VelorixLogicalViewExecutionV1 {
     RecursiveFixpointV1 {
         plan: Box<SupportedRecursiveFixpointPlanV1>,
     },
+    /// Phase 8.3: exact CROSS JOIN over two registered relations. The
+    /// output is the full projected row per left/right pair; every epoch
+    /// recomputes the pair set and diffs (exact retractions).
+    CrossJoin {
+        plan: Box<SupportedCrossJoinPlanV1>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -1470,9 +1476,17 @@ pub fn lower_supported_sql_to_logical_plan(
                             ) {
                                 Ok(plan) => Ok(plan),
                                 Err(ViewPlanError::UnsupportedShape { .. }) => {
-                                    lower_supported_join_view_sql_to_logical_plan(
+                                    match lower_supported_cross_join_sql_to_logical_plan(
                                         sql, catalogs, output_schema,
-                                    )
+                                    ) {
+                                        Ok(plan) => Ok(plan),
+                                        Err(ViewPlanError::UnsupportedShape { .. }) => {
+                                            lower_supported_join_view_sql_to_logical_plan(
+                                                sql, catalogs, output_schema,
+                                            )
+                                        }
+                                        Err(error) => Err(error),
+                                    }
                                 }
                                 Err(error) => Err(error),
                             }
@@ -3200,6 +3214,7 @@ fn derive_execution_implementation(
         VelorixLogicalViewExecutionV1::RecursiveFixpointV1 { .. } => {
             "velorix-recursive-fixpoint-specialization-v1"
         }
+        VelorixLogicalViewExecutionV1::CrossJoin { .. } => "velorix-cross-join-specialization-v1",
     };
     let physical_bytes = serde_json::to_vec(&(
         &plan.nodes,
@@ -18070,6 +18085,220 @@ pub fn lower_supported_recursive_cte_sql_to_logical_plan(
         output_codec_version: LOGICAL_VIEW_OUTPUT_CODEC_VERSION_V1.to_string(),
         execution_implementation: None,
         execution: VelorixLogicalViewExecutionV1::RecursiveFixpointV1 {
+            plan: Box::new(supported),
+        },
+    })
+}
+
+/// Phase 8.3: CROSS JOIN plan. The output is the full projected row per
+/// left/right pair, keyed by itself; the projection must include both
+/// primary keys so output rows are unique per pair (bag semantics).
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupportedCrossJoinPlanV1 {
+    pub schema_version: u32,
+    pub left_input_relation_id: String,
+    pub right_input_relation_id: String,
+    pub projection: Vec<CrossJoinProjectionItemV1>,
+    pub resource_contract: CrossJoinResourceContractV1,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CrossJoinProjectionItemV1 {
+    pub side: CrossJoinSideV1,
+    pub column_id: String,
+    pub output_name: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CrossJoinSideV1 {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CrossJoinResourceContractV1 {
+    pub max_rows_per_side: u64,
+    pub max_pairs_per_epoch: u64,
+}
+
+/// Phase 8.3: validates `SELECT ... FROM left CROSS JOIN right` over two
+/// registered relations. Admission requires a bare CROSS JOIN (no ON/USING),
+/// a plain projection of direct columns that includes both primary keys,
+/// and no WHERE, GROUP BY, DISTINCT, or aggregates. State and per-epoch
+/// output are bounded by `CrossJoinResourceContractV1`.
+pub fn validate_supported_cross_join_sql(
+    sql: &str,
+    catalogs: &[VelorixRelationCatalogV1],
+) -> Result<SupportedCrossJoinPlanV1, ViewPlanError> {
+    let [left_catalog, right_catalog] = catalogs else {
+        return unsupported("cross join SQL requires exactly two input relations");
+    };
+    for catalog in catalogs {
+        catalog.validate()?;
+        let adapter = crate::relation::supported_incremental_adapter_spec(
+            &catalog.incremental_adapter.adapter_id,
+        )
+        .ok_or(RelationSchemaError::InvalidRelationSchema {
+            field: "incremental_adapter.adapter_id",
+        })?;
+        if !matches!(
+            adapter,
+            SupportedIncrementalAdapterSpec::ScalarSumCount
+                | SupportedIncrementalAdapterSpec::Generic
+        ) {
+            return unsupported("cross join SQL requires scalar or generic inputs");
+        }
+    }
+    let query = parse_single_query(sql)?;
+    validate_query_level_clauses(&query, false)?;
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return unsupported("cross join requires a single SELECT");
+    };
+    validate_plain_select_clauses(select)?;
+    let [left_from] = select.from.as_slice() else {
+        return unsupported("cross join requires exactly one FROM join");
+    };
+    let left_table = registered_table_ref(&left_from.relation, "left")?;
+    if left_table.name != left_catalog.relation_schema.relation_id {
+        return unsupported("cross join left relation must be the first registered relation");
+    }
+    let [right_join] = left_from.joins.as_slice() else {
+        return unsupported("cross join requires exactly one JOIN");
+    };
+    if !matches!(
+        right_join.join_operator,
+        JoinOperator::CrossJoin(JoinConstraint::None)
+    ) {
+        return unsupported("cross join requires a bare CROSS JOIN without ON or USING");
+    }
+    let right_table = registered_table_ref(&right_join.relation, "right")?;
+    if right_table.name != right_catalog.relation_schema.relation_id {
+        return unsupported("cross join right relation must be the second registered relation");
+    }
+    if select.selection.is_some() {
+        return unsupported("cross join WHERE clauses are not supported yet");
+    }
+    let left_key = catalog_primary_key_column(left_catalog)?;
+    let right_key = catalog_primary_key_column(right_catalog)?;
+    let mut projection = Vec::new();
+    let mut output_names = BTreeSet::new();
+    let mut has_left_key = false;
+    let mut has_right_key = false;
+    for item in &select.projection {
+        let (expr, alias) = match item {
+            SelectItem::UnnamedExpr(expr) => (expr, None),
+            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.as_str())),
+            _ => return unsupported("cross join projections must be direct columns"),
+        };
+        let reference = qualified_column_ref(expr)?;
+        let (side, catalog, alias_hint) =
+            if identifier_eq(reference.qualifier.as_str(), left_table.alias.as_str()) {
+                (
+                    CrossJoinSideV1::Left,
+                    left_catalog,
+                    left_table.alias.as_str(),
+                )
+            } else if identifier_eq(reference.qualifier.as_str(), right_table.alias.as_str()) {
+                (
+                    CrossJoinSideV1::Right,
+                    right_catalog,
+                    right_table.alias.as_str(),
+                )
+            } else {
+                return unsupported(
+                    "cross join projections must reference one of the two joined table aliases",
+                );
+            };
+        let column = qualified_ref_catalog_column(&reference, catalog)?;
+        let output_name = alias.unwrap_or(column.name.as_str()).to_string();
+        if !output_names.insert(output_name.clone()) {
+            return unsupported("cross join output column names must be unique");
+        }
+        if column.column_id == catalog.relation_schema.weight_column_id {
+            return unsupported("cross join projections must not reference weight columns");
+        }
+        if side == CrossJoinSideV1::Left && column.column_id == left_key.column_id {
+            has_left_key = true;
+        }
+        if side == CrossJoinSideV1::Right && column.column_id == right_key.column_id {
+            has_right_key = true;
+        }
+        let _ = alias_hint;
+        projection.push(CrossJoinProjectionItemV1 {
+            side,
+            column_id: column.column_id.clone(),
+            output_name,
+        });
+    }
+    if !has_left_key || !has_right_key {
+        return unsupported(
+            "cross join output must include both the left and right primary key columns",
+        );
+    }
+    Ok(SupportedCrossJoinPlanV1 {
+        schema_version: 1,
+        left_input_relation_id: left_catalog.relation_schema.relation_id.clone(),
+        right_input_relation_id: right_catalog.relation_schema.relation_id.clone(),
+        projection,
+        resource_contract: CrossJoinResourceContractV1 {
+            max_rows_per_side: 1_000_000,
+            max_pairs_per_epoch: 1_000_000,
+        },
+    })
+}
+
+/// Phase 8.3: lowers an admitted CROSS JOIN to a logical view plan.
+pub fn lower_supported_cross_join_sql_to_logical_plan(
+    sql: &str,
+    catalogs: &[VelorixRelationCatalogV1],
+    output_schema: &RelationSchema,
+) -> Result<VelorixLogicalViewPlanV1, ViewPlanError> {
+    let supported = validate_supported_cross_join_sql(sql, catalogs)?;
+    let output_relation = logical_relation_from_schema(output_schema);
+    let left_catalog = catalog_for_relation_in_slice(catalogs, &supported.left_input_relation_id)?;
+    let right_catalog =
+        catalog_for_relation_in_slice(catalogs, &supported.right_input_relation_id)?;
+    finalize_logical_plan(VelorixLogicalViewPlanV1 {
+        plan_version: LOGICAL_VIEW_PLAN_VERSION_V2,
+        plan_hash: None,
+        view_sql: sql.to_string(),
+        capability_version: LOGICAL_VIEW_PLAN_CAPABILITY_VERSION_V2.to_string(),
+        key_semantics_version: INCREMENTAL_KEY_SEMANTICS_VERSION_V1.to_string(),
+        bag_semantics_version: INCREMENTAL_BAG_SEMANTICS_VERSION_V1.to_string(),
+        input_relations: catalogs.iter().map(logical_relation_from_catalog).collect(),
+        output_relation: output_relation.clone(),
+        nodes: vec![
+            VelorixLogicalViewPlanNodeV1::RelationScan {
+                node_id: "cross_left_scan".to_string(),
+                relation: logical_relation_from_catalog(left_catalog),
+            },
+            VelorixLogicalViewPlanNodeV1::RelationScan {
+                node_id: "cross_right_scan".to_string(),
+                relation: logical_relation_from_catalog(right_catalog),
+            },
+            VelorixLogicalViewPlanNodeV1::InnerEquiJoin {
+                node_id: "cross_join".to_string(),
+                left: "cross_left_scan".to_string(),
+                right: "cross_right_scan".to_string(),
+                left_key: column_ref(&supported.left_input_relation_id, "cross_key_left"),
+                right_key: column_ref(&supported.right_input_relation_id, "cross_key_right"),
+                composite_equality: None,
+            },
+            VelorixLogicalViewPlanNodeV1::Output {
+                node_id: "output_materialized_view".to_string(),
+                input: "cross_join".to_string(),
+                relation: output_relation,
+            },
+        ],
+        operator_dag_contract: empty_operator_dag_contract(),
+        state_requirements: Vec::new(),
+        output_codec_version: LOGICAL_VIEW_OUTPUT_CODEC_VERSION_V1.to_string(),
+        execution_implementation: None,
+        execution: VelorixLogicalViewExecutionV1::CrossJoin {
             plan: Box::new(supported),
         },
     })
