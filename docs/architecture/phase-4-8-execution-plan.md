@@ -788,6 +788,7 @@ cargo fmt --all --check
 | 2026-08-13 | 8 | CROSS JOIN runtime | `cross_join_materializes_all_pairs_exactly_across_retract_and_restart` | Complete |
 | 2026-08-13 | 8 | Recursive CTE positive fixpoint runtime | `recursive_cte_materializes_closure_exactly_across_retract_restart_and_fail_closed` | Complete |
 | 2026-08-13 | 8 | PR smoke benchmark workloads for phase-8 families | `interval_join_epoch_apply`/`recursive_fixpoint_epoch_apply`/`cross_join_epoch_apply` | Complete |
+| 2026-08-13 | 6-8 | Multi-perspective review hardening (3 parallel reviewers, 30+ findings) | epoch atomicity (clone-and-swap), composite interval output keys, Generic-adapter weight gate, admission holes closed (weight columns, ON column/type checks, predicate types, DISTINCT/GROUP BY, aliases, TRIM BOTH, CEIL Int64), bench cardinality gates, matrix discriminators | Complete |
 
 ## Design-Goal Evidence Mapping (AGENTS.md)
 
