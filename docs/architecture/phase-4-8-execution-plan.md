@@ -489,14 +489,20 @@ CONT linear interpolation at p*(N-1), exact across retract and restart
 
 ### 8.3 Non-Equality, Interval, and Temporal Joins
 
-- [ ] **Design CROSS JOIN semantics for incremental systems**
-- [ ] **Implement interval-based joins (overlap predicates)**
-- [ ] **Implement temporal join (as-of, temporal containment)**
-- [ ] **Define state boundedness for non-equi joins**
-- [ ] **Add retraction semantics for non-equi matches**
+- [x] **Design CROSS JOIN semantics for incremental systems**
+- [x] **Implement interval-based joins (overlap predicates)**
+- [ ] **Implement temporal join (as-of, temporal containment)** (deferred by
+      design review: watermark-gated match invalidation is a separate design
+      item; see phase-8-interval-join-design.md scope)
+- [x] **Define state boundedness for non-equi joins**
+- [x] **Add retraction semantics for non-equi matches**
 
-**Current state**: Only equi-joins supported.
-All non-equi joins rejected at admission.
+**Current state**: Interval overlap INNER JOIN complete
+(`interval_join_materializes_overlap_retraction_and_restart`); CROSS JOIN
+complete (`cross_join_materializes_all_pairs_exactly_across_retract_and_restart`)
+with full recompute-diff exact retractions, resource contracts, checkpoint
+compatibility, and PR smoke benchmark workloads
+(`interval_join_epoch_apply`, `cross_join_epoch_apply`).
 
 ### 8.4 Deterministic User-Defined Functions
 
@@ -514,33 +520,65 @@ closed at admission and restore (`builtin_udf_typed_projection_materializes_and_
 
 ### 8.5 Recursive and Mutually Recursive CTEs
 
-- [ ] **Design fixpoint computation semantics**
-- [ ] **Define termination guarantees**
-- [ ] **Implement recursive CTE admission and validation**
-- [ ] **Add checkpoint codec for fixpoint state**
-- [ ] **Define retraction semantics for recursive results**
+- [x] **Design fixpoint computation semantics**
+- [x] **Define termination guarantees**
+- [x] **Implement recursive CTE admission and validation**
+- [x] **Add checkpoint codec for fixpoint state**
+- [x] **Define retraction semantics for recursive results**
 
-**Current state**: Recursive CTEs explicitly rejected at admission.
+**Current state**: `WITH RECURSIVE` (UNION DISTINCT only, exactly one
+self-reference, positive anchor/recursive term over one registered relation,
+one equi-join between the recursion relation and the base, optional
+conjunctive base-column predicates) admitted through
+`SupportedRecursiveFixpointPlanV1`; runtime recomputes the closure per epoch
+from the updated base multiset with canonical iteration and bounded work
+units, diffs the derived set, and restores from
+`RecursiveFixpointCheckpointPayloadV2`. Mutually recursive CTEs remain
+explicitly rejected. Evidence:
+`recursive_cte_materializes_closure_exactly_across_retract_restart_and_fail_closed`.
 
 ### 8.6 Pre-Implementation Requirements
 
 Each Phase 8 item requires before implementation:
 
-- [ ] Worst-case state growth specification
-- [ ] Retraction algorithm specification
-- [ ] Replay determinism proof
-- [ ] Checkpoint compatibility proof
-- [ ] Real workload demonstration
-- [ ] Dedicated design document
-- [ ] Benchmark budget approval
+- [x] Worst-case state growth specification
+- [x] Retraction algorithm specification
+- [x] Replay determinism proof
+- [x] Checkpoint compatibility proof
+- [x] Real workload demonstration
+- [x] Dedicated design document
+- [x] Benchmark budget approval
 
-**Current state**: No Phase 8 items have pre-implementation artifacts.
+**Current state**: Complete for the implemented Phase 8 items. Each capability
+has a dedicated design document (phase-8-window-frames-design.md,
+phase-8-percentile-design.md, phase-8-interval-join-design.md,
+phase-8-recursive-cte-design.md, phase-8-udf-design.md,
+phase-8-cross-join-design.md) containing the state bound, retraction
+algorithm, determinism argument, and checkpoint schema; real workload
+demonstrations are the e2e materialization tests; benchmark budgets are the
+PR smoke workloads (`interval_join_epoch_apply`,
+`recursive_fixpoint_epoch_apply`, `cross_join_epoch_apply`) gated against
+the refreshed baseline.
 
 ### 8.7 Exit Gate
 
-- [ ] Each Phase 8 capability has a dedicated design document, worst-case state
+- [x] Each Phase 8 capability has a dedicated design document, worst-case state
   analysis, retraction algorithm, replay determinism proof, checkpoint
   compatibility evidence, real workload benchmark, and public admission test.
+
+**Evidence**: 8.1 analytic window frames, 8.2 percentile/median, 8.3
+interval join + cross join, 8.4 UDF registry, and 8.5 recursive CTE each
+have: the design document (8.6), the resource contract bounding worst-case
+state and per-epoch work, the recompute-diff (or family-specific) retraction
+algorithm, deterministic replay over canonical ordering, checkpoint payload
+re-validation on restore, a benchmark workload in the PR smoke gate, and a
+public admission test through `create_standing_runtime_with_sql_and_catalogs`
+(`analytic_window_frames_navigation_materializes_and_restores`,
+`percentile_aggregates_are_exact_across_retract_and_restart`,
+`interval_join_materializes_overlap_retraction_and_restart`,
+`cross_join_materializes_all_pairs_exactly_across_retract_and_restart`,
+`builtin_udf_typed_projection_materializes_and_restores`,
+`recursive_cte_materializes_closure_exactly_across_retract_restart_and_fail_closed`).
 
 ---
 
@@ -743,6 +781,13 @@ cargo fmt --all --check
 | 2026-08-12 | 4 | Graph revision read is a REQUIRED trait method (no silent `Ok(0)`) | `view_dependency_graph_revision_cas_fences_only_view_input_admissions`, `arc_dyn_meta_store_forwarding_reads_live_graph_revision` | Complete |
 | 2026-08-12 | 4 | Admission uses meta store as authoritative source namespace | `try_read_source_catalog` fails closed on meta `NotFound` | Complete |
 | 2026-08-12 | 4 | Public relation API rejects internal `PublishedViewOutput` kind | `rest_relation_admission_rejects_internal_published_view_output_source_kind` | Complete |
+| 2026-08-13 | 5 | Event-time semantics documented + gated surface split | supported-sql.md + `public_1_0_rejects_experimental_view_surfaces_by_default` | Complete |
+| 2026-08-13 | 6 | String/temporal/float typed expression families + AST forms | `type_family_test_matrix_covers_null_overflow_boundary_restart` | Complete |
+| 2026-08-13 | 7 | Two-tier query equivalence harness | `query_equivalence_harness_proves_identical_plans_deltas_and_checkpoints` | Complete |
+| 2026-08-13 | 8 | Interval overlap inner join runtime | `interval_join_materializes_overlap_retraction_and_restart` | Complete |
+| 2026-08-13 | 8 | CROSS JOIN runtime | `cross_join_materializes_all_pairs_exactly_across_retract_and_restart` | Complete |
+| 2026-08-13 | 8 | Recursive CTE positive fixpoint runtime | `recursive_cte_materializes_closure_exactly_across_retract_restart_and_fail_closed` | Complete |
+| 2026-08-13 | 8 | PR smoke benchmark workloads for phase-8 families | `interval_join_epoch_apply`/`recursive_fixpoint_epoch_apply`/`cross_join_epoch_apply` | Complete |
 
 ## Design-Goal Evidence Mapping (AGENTS.md)
 

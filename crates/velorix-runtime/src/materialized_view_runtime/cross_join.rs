@@ -10,8 +10,8 @@
 
 use super::*;
 use crate::materialized_view_runtime::{
-    semi_anti_join::catalog_for_relation_id, validate_supported_cross_join_sql,
-    CrossJoinSideV1, SupportedCrossJoinPlanV1,
+    semi_anti_join::catalog_for_relation_id, validate_supported_cross_join_sql, CrossJoinSideV1,
+    SupportedCrossJoinPlanV1,
 };
 
 pub struct CrossJoinRuntime {
