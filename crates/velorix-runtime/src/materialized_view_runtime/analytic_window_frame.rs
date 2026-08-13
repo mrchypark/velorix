@@ -49,7 +49,7 @@ impl AnalyticWindowFrameRuntime {
         identity.validate()?;
         validate_builtin_runtime_identity(&identity)?;
         validate_view_sql_hash(&identity, view_sql.as_str())?;
-        validate_logical_view_plan(&logical_plan).map_err(|error| {
+        validate_logical_view_plan(&logical_plan).map_err(|_| {
             StandingProgramRuntimeError::InvalidProgramIdentity {
                 field: "logical_analytic_window_frame_plan",
             }

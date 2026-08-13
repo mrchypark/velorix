@@ -48,7 +48,6 @@ use velorix_core::{
     },
     view_plan::{
         lower_supported_analytic_row_number_sql_to_logical_plan,
-        lower_supported_analytic_window_frame_sql_to_logical_plan,
         lower_supported_filter_project_sql_to_logical_plan,
         lower_supported_join_view_sql_to_logical_plan,
         lower_supported_latest_by_key_sql_to_logical_plan,
