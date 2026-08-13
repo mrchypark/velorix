@@ -491,6 +491,54 @@ pub enum VelorixLogicalViewExecutionV1 {
     ScalarAggregateFilter {
         plan: Box<SupportedScalarAggregateFilterPlanV1>,
     },
+    /// Phase 8.1: bounded ROWS window frames with navigation functions
+    /// (LAG/LEAD/FIRST_VALUE/LAST_VALUE/NTH_VALUE). Exact-only; the frame
+    /// is `ROWS BETWEEN k PRECEDING AND k FOLLOWING` with constant k.
+    AnalyticWindowFrames {
+        plan: Box<SupportedAnalyticWindowFramePlanV1>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupportedAnalyticWindowFramePlanV1 {
+    pub schema_version: u32,
+    pub input_relation_id: String,
+    pub key_column_id: String,
+    pub output_key_column_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_key_input_column_id: Option<String>,
+    pub partition_column_id: String,
+    pub order_column_id: String,
+    pub order_descending: bool,
+    /// Constant ROWS frame bound (rows before and after the current row).
+    pub frame_preceding: u64,
+    pub frame_following: u64,
+    pub function: WindowNavigationFunctionV1,
+    pub output_column_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WindowNavigationFunctionV1 {
+    Lag {
+        value_column_id: String,
+        offset: u64,
+    },
+    Lead {
+        value_column_id: String,
+        offset: u64,
+    },
+    FirstValue {
+        value_column_id: String,
+    },
+    LastValue {
+        value_column_id: String,
+    },
+    NthValue {
+        value_column_id: String,
+        n: u64,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -1325,11 +1373,21 @@ pub fn lower_supported_sql_to_logical_plan(
                                 ) {
                                     Ok(plan) => Ok(plan),
                                     Err(ViewPlanError::UnsupportedShape { .. }) => {
-                                        lower_supported_filter_project_sql_to_logical_plan(
+                                        match lower_supported_analytic_window_frame_sql_to_logical_plan(
                                             sql,
                                             catalog,
                                             output_schema,
-                                        )
+                                        ) {
+                                            Ok(plan) => Ok(plan),
+                                            Err(ViewPlanError::UnsupportedShape { .. }) => {
+                                                lower_supported_filter_project_sql_to_logical_plan(
+                                                    sql,
+                                                    catalog,
+                                                    output_schema,
+                                                )
+                                            }
+                                            Err(error) => Err(error),
+                                        }
                                     }
                                     Err(error) => Err(error),
                                 }
@@ -3077,6 +3135,9 @@ fn derive_execution_implementation(
         },
         VelorixLogicalViewExecutionV1::ScalarAggregateFilter { .. } => {
             "velorix-scalar-aggregate-filter-specialization-v1"
+        }
+        VelorixLogicalViewExecutionV1::AnalyticWindowFrames { .. } => {
+            "velorix-analytic-window-frames-specialization-v1"
         }
     };
     let physical_bytes = serde_json::to_vec(&(
@@ -16800,4 +16861,306 @@ fn catalog_for_relation_in_slice<'a>(
         .ok_or_else(|| ViewPlanError::UnsupportedShape {
             reason: "scalar aggregate filter input catalog is missing".to_string(),
         })
+}
+
+/// Phase 8.1: validates bounded ROWS window frames with navigation
+/// functions: `LAG/LEAD(expr, k)`, `FIRST_VALUE(expr)`, `LAST_VALUE(expr)`,
+/// `NTH_VALUE(expr, n)` OVER (PARTITION BY col ORDER BY col ROWS BETWEEN
+/// k PRECEDING AND k FOLLOWING). One partition column, one non-null
+/// sortable order column, constant bounded frame; RANGE/GROUPS/UNBOUNDED/
+/// EXCLUDE/named windows fail closed.
+pub fn validate_supported_analytic_window_frame_sql(
+    sql: &str,
+    catalog: &VelorixRelationCatalogV1,
+) -> Result<SupportedAnalyticWindowFramePlanV1, ViewPlanError> {
+    catalog.validate()?;
+    let adapter = crate::relation::supported_incremental_adapter_spec(
+        &catalog.incremental_adapter.adapter_id,
+    )
+    .ok_or(RelationSchemaError::InvalidRelationSchema {
+        field: "incremental_adapter.adapter_id",
+    })?;
+    if !matches!(
+        adapter,
+        SupportedIncrementalAdapterSpec::ScalarSumCount | SupportedIncrementalAdapterSpec::Generic
+    ) {
+        return unsupported("window frame SQL currently supports scalar or generic inputs");
+    }
+    let key_column = catalog_primary_key_column(catalog)?;
+    let query = parse_single_query(sql)?;
+    validate_query_level_clauses(&query, false)?;
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return unsupported("window frame requires a single SELECT");
+    };
+    validate_plain_select_clauses_allow_qualify(select)?;
+    if select.distinct.is_some() || !group_by_is_empty(&select.group_by) || select.having.is_some()
+    {
+        return unsupported("window frame does not support DISTINCT, GROUP BY, or HAVING");
+    }
+    let [from] = select.from.as_slice() else {
+        return unsupported("window frame requires one relation");
+    };
+    if !from.joins.is_empty() {
+        return unsupported("window frame must not contain a JOIN");
+    }
+    let table = registered_table_ref(&from.relation, "frame")?;
+    if table.name != catalog.relation_schema.relation_id {
+        return unsupported("window frame must reference the registered relation");
+    }
+    let relation_alias = Some(table.alias.as_str());
+    let [key_item, frame_item] = select.projection.as_slice() else {
+        return unsupported("window frame requires the primary key and exactly one window column");
+    };
+    let (output_key_column_id, output_key_input_column_id) =
+        if select_item_references_bound_column(key_item, catalog, key_column, relation_alias, None)
+        {
+            (
+                select_item_alias_or_source_default(
+                    key_item,
+                    key_column.name.as_str(),
+                    relation_alias,
+                    None,
+                )?,
+                None,
+            )
+        } else {
+            return unsupported("first window frame projection must be the primary key column");
+        };
+    let (window_expr, output_column_id) = match frame_item {
+        SelectItem::UnnamedExpr(expr) => (expr, None),
+        SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.as_str())),
+        _ => return unsupported("window frame projection must be a window function"),
+    };
+    let Expr::Function(function) = window_expr else {
+        return unsupported("window frame projection must be a window function");
+    };
+    let function_name = function.name.to_string();
+    let Some(WindowType::WindowSpec(window)) = function.over.as_ref() else {
+        return unsupported("window frame requires an inline OVER window specification");
+    };
+    if window.window_name.is_some() {
+        return unsupported("named windows are not supported");
+    }
+    let [partition_expr] = window.partition_by.as_slice() else {
+        return unsupported("window frame requires exactly one PARTITION BY column");
+    };
+    let Some(partition_column) = expression_catalog_column(partition_expr, catalog, relation_alias)
+    else {
+        return unsupported("PARTITION BY must reference a registered relation column");
+    };
+    validate_row_number_partition_column(catalog, partition_column)?;
+    let [order] = window.order_by.as_slice() else {
+        return unsupported("window frame requires exactly one ORDER BY column");
+    };
+    let Some(order_column) = expression_catalog_column(&order.expr, catalog, relation_alias) else {
+        return unsupported("ORDER BY must reference a registered relation column");
+    };
+    if order_column.nullable {
+        return unsupported("window frame ORDER BY column must be non-nullable");
+    }
+    validate_latest_ordering_column(catalog, order_column)?;
+    if order.with_fill.is_some() || order.options.nulls_first.is_some() {
+        return unsupported("window frame ORDER BY NULLS/WITH FILL is not supported");
+    }
+    let (frame_preceding, frame_following) = match &window.window_frame {
+        None => (0, 0),
+        Some(frame) => {
+            if frame.units != sqlparser::ast::WindowFrameUnits::Rows {
+                return unsupported("window frame supports only ROWS units");
+            }
+            let bound = |bound: &sqlparser::ast::WindowFrameBound| -> Result<u64, ViewPlanError> {
+                match bound {
+                    sqlparser::ast::WindowFrameBound::Preceding(Some(expr)) => {
+                        const_frame_bound(expr, "PRECEDING")
+                    }
+                    sqlparser::ast::WindowFrameBound::Following(Some(expr)) => {
+                        const_frame_bound(expr, "FOLLOWING")
+                    }
+                    sqlparser::ast::WindowFrameBound::CurrentRow => Ok(0),
+                    _ => unsupported("window frame bounds must be bounded constants"),
+                }
+            };
+            let end = frame
+                .end_bound
+                .as_ref()
+                .map(bound)
+                .transpose()?
+                .unwrap_or(0);
+            (bound(&frame.start_bound)?, end)
+        }
+    };
+    let FunctionArguments::List(argument_list) = &function.args else {
+        return unsupported("window frame function requires a normal argument list");
+    };
+    let function_spec = parse_window_navigation_function(
+        function_name.as_str(),
+        &argument_list.args,
+        catalog,
+        relation_alias,
+    )?;
+    let output_column_id = output_column_id.unwrap_or(function_name.as_str());
+    Ok(SupportedAnalyticWindowFramePlanV1 {
+        schema_version: 1,
+        input_relation_id: catalog.relation_schema.relation_id.clone(),
+        key_column_id: key_column.column_id.clone(),
+        output_key_column_id: output_key_column_id.clone(),
+        output_key_input_column_id,
+        partition_column_id: partition_column.column_id.clone(),
+        order_column_id: order_column.column_id.clone(),
+        order_descending: order.options.asc == Some(false),
+        frame_preceding,
+        frame_following,
+        function: function_spec,
+        output_column_id: output_column_id.to_string(),
+    })
+}
+
+fn const_frame_bound(expr: &Expr, label: &str) -> Result<u64, ViewPlanError> {
+    let Expr::Value(ValueWithSpan {
+        value: SqlValue::Number(text, _),
+        ..
+    }) = expr
+    else {
+        return unsupported(format!("window frame {label} bound must be a constant"));
+    };
+    text.parse::<u64>()
+        .map_err(|_| ViewPlanError::UnsupportedShape {
+            reason: format!("window frame {label} bound must be a non-negative constant"),
+        })
+}
+
+fn parse_window_navigation_function(
+    name: &str,
+    args: &[FunctionArg],
+    catalog: &VelorixRelationCatalogV1,
+    relation_alias: Option<&str>,
+) -> Result<WindowNavigationFunctionV1, ViewPlanError> {
+    fn column_arg(arg: &FunctionArg) -> Result<&Expr, ViewPlanError> {
+        let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) = arg else {
+            return unsupported("window frame value argument must be an expression");
+        };
+        Ok(expr)
+    }
+    let const_arg = |arg: &FunctionArg| -> Result<u64, ViewPlanError> {
+        let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) = arg else {
+            return unsupported("window frame offset argument must be a constant");
+        };
+        const_frame_bound(expr, "offset")
+    };
+    match name.to_ascii_lowercase().as_str() {
+        "lag" | "lead" => {
+            let [value_arg, offset_arg] = args else {
+                return unsupported(format!("{name} requires (value_column, constant_offset)"));
+            };
+            let column = catalog_column_from_expr(column_arg(value_arg)?, catalog, relation_alias)?;
+            let offset = const_arg(offset_arg)?;
+            if offset == 0 {
+                return unsupported(format!("{name} offset must be positive"));
+            }
+            Ok(if name.eq_ignore_ascii_case("lag") {
+                WindowNavigationFunctionV1::Lag {
+                    value_column_id: column.column_id.clone(),
+                    offset,
+                }
+            } else {
+                WindowNavigationFunctionV1::Lead {
+                    value_column_id: column.column_id.clone(),
+                    offset,
+                }
+            })
+        }
+        "first_value" | "last_value" => {
+            let [value_arg] = args else {
+                return unsupported(format!("{name} requires exactly one value column"));
+            };
+            let column = catalog_column_from_expr(column_arg(value_arg)?, catalog, relation_alias)?;
+            Ok(if name.eq_ignore_ascii_case("first_value") {
+                WindowNavigationFunctionV1::FirstValue {
+                    value_column_id: column.column_id.clone(),
+                }
+            } else {
+                WindowNavigationFunctionV1::LastValue {
+                    value_column_id: column.column_id.clone(),
+                }
+            })
+        }
+        "nth_value" => {
+            let [value_arg, n_arg] = args else {
+                return unsupported("nth_value requires (value_column, constant_n)");
+            };
+            let column = catalog_column_from_expr(column_arg(value_arg)?, catalog, relation_alias)?;
+            let n = const_arg(n_arg)?;
+            if n == 0 {
+                return unsupported("nth_value n must be positive");
+            }
+            Ok(WindowNavigationFunctionV1::NthValue {
+                value_column_id: column.column_id.clone(),
+                n,
+            })
+        }
+        other => unsupported(format!(
+            "window navigation function `{other}` is not supported"
+        )),
+    }
+}
+
+fn catalog_column_from_expr<'a>(
+    expr: &Expr,
+    catalog: &'a VelorixRelationCatalogV1,
+    relation_alias: Option<&str>,
+) -> Result<&'a RelationColumnV1, ViewPlanError> {
+    expression_catalog_column(expr, catalog, relation_alias).ok_or_else(|| {
+        ViewPlanError::UnsupportedShape {
+            reason: "window frame value argument must reference a registered relation column"
+                .to_string(),
+        }
+    })
+}
+
+pub fn lower_supported_analytic_window_frame_sql_to_logical_plan(
+    sql: &str,
+    catalog: &VelorixRelationCatalogV1,
+    output_schema: &RelationSchema,
+) -> Result<VelorixLogicalViewPlanV1, ViewPlanError> {
+    let supported = validate_supported_analytic_window_frame_sql(sql, catalog)?;
+    let input_relation = logical_relation_from_catalog(catalog);
+    let output_relation = logical_relation_from_schema(output_schema);
+    let partition = column_ref(&supported.input_relation_id, &supported.partition_column_id);
+    let order = column_ref(&supported.input_relation_id, &supported.order_column_id);
+    finalize_logical_plan(VelorixLogicalViewPlanV1 {
+        plan_version: LOGICAL_VIEW_PLAN_VERSION_V2,
+        plan_hash: None,
+        view_sql: sql.to_string(),
+        capability_version: LOGICAL_VIEW_PLAN_CAPABILITY_VERSION_V2.to_string(),
+        key_semantics_version: INCREMENTAL_KEY_SEMANTICS_VERSION_V1.to_string(),
+        bag_semantics_version: INCREMENTAL_BAG_SEMANTICS_VERSION_V1.to_string(),
+        input_relations: vec![input_relation],
+        output_relation: output_relation.clone(),
+        nodes: vec![
+            VelorixLogicalViewPlanNodeV1::RelationScan {
+                node_id: "frame_scan".to_string(),
+                relation: logical_relation_from_catalog(catalog),
+            },
+            VelorixLogicalViewPlanNodeV1::RowNumber {
+                node_id: "frame_partition".to_string(),
+                input: "frame_scan".to_string(),
+                partition_column: partition,
+                order_column: order,
+                descending: supported.order_descending,
+                rank_limit: None,
+            },
+            VelorixLogicalViewPlanNodeV1::Output {
+                node_id: "output_materialized_view".to_string(),
+                input: "frame_partition".to_string(),
+                relation: output_relation,
+            },
+        ],
+        operator_dag_contract: empty_operator_dag_contract(),
+        state_requirements: Vec::new(),
+        output_codec_version: LOGICAL_VIEW_OUTPUT_CODEC_VERSION_V1.to_string(),
+        execution_implementation: None,
+        execution: VelorixLogicalViewExecutionV1::AnalyticWindowFrames {
+            plan: Box::new(supported),
+        },
+    })
 }

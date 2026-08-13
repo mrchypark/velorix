@@ -20414,3 +20414,156 @@ fn percentile_output_schema() -> RelationSchema {
         primary_key: vec!["user_id".to_string()],
     }
 }
+
+#[test]
+fn analytic_window_frames_navigation_materializes_and_restores() {
+    let catalog = scores_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = frame_output_schema();
+    // Partition by score: alice(10) and bob(10) share a partition, carol(-1)
+    // is its own partition. Per-partition order = score then PK.
+    let sql = "select user_id, lag(score, 1) over (partition by score order by score rows between 1 preceding and current row) as prev_score from scores";
+    let identity = standing_identity_with_view(sql, "frame_view");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("epoch-1").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "scores-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 3,
+                event_time_watermark: None,
+                batches: vec![scores_rows_batch(&[
+                    ("alice", 10, 1),
+                    ("bob", 10, 1),
+                    ("carol", -1, 1),
+                ])],
+            }],
+        )
+        .unwrap();
+
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "frame_view".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(1),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let user_ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let prev = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let mut rows = (0..batch.num_rows())
+        .map(|index| (user_ids.value(index).to_string(), prev.value(index)))
+        .collect::<Vec<_>>();
+    rows.sort();
+    // Partition {10}: alice first (lag None -> row dropped), bob lag=10.
+    // Partition {-1}: carol alone (lag None -> dropped).
+    assert_eq!(rows, vec![("bob".to_string(), 10)]);
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("epoch-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "scores-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 3,
+                end_offset_exclusive: 4,
+                event_time_watermark: None,
+                batches: vec![scores_rows_batch(&[("dave", 10, 1)])],
+            }],
+        )
+        .unwrap();
+    let page = restored
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "frame_view".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(2),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let user_ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let prev = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let mut rows = (0..batch.num_rows())
+        .map(|index| (user_ids.value(index).to_string(), prev.value(index)))
+        .collect::<Vec<_>>();
+    rows.sort();
+    // Partition {10}: alice(10), bob(10), dave(10) ordered alice,bob,dave by PK;
+    // lag(1): bob=10, dave=10; alice dropped.
+    assert_eq!(
+        rows,
+        vec![("bob".to_string(), 10), ("dave".to_string(), 10)]
+    );
+}
+
+fn frame_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "frame_view".to_string(),
+        relation_name: "frame_view".to_string(),
+        relation_version: "2026-05-24.v1".to_string(),
+        schema_fingerprint: "frame-v1".to_string(),
+        columns: vec![
+            ColumnSchema {
+                name: "user_id".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "prev_score".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: true,
+            },
+        ],
+        primary_key: vec!["user_id".to_string()],
+    }
+}
