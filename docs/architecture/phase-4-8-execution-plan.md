@@ -415,7 +415,7 @@ by completing earlier phases.
 **Current state**: Ranking functions (ROW_NUMBER, RANK, DENSE_RANK) implemented
 and gated behind `experimental_advanced_view_features`; verified by
 `row_number_sql_*`/`analytic_*` view_plan tests and API restart tests.
-No window frame or navigation functions.
+No window frame or navigation functions (design doc phase-8-window-frames-design.md).
 
 ### 8.2 Exact Percentile, Median, and Ordered-Set Aggregates
 
@@ -425,8 +425,11 @@ No window frame or navigation functions.
 - [ ] **Implement MEDIAN as convenience alias**
 - [ ] **Define state boundedness for ordered-set aggregates**
 
-**Current state**: No percentile or median aggregates.
-SUM/COUNT/MIN/MAX/AVG implemented.
+**Current state**: **COMPLETE (2026-08-12).** Exact PERCENTILE_DISC /
+PERCENTILE_CONT with compile-time p in [0,1] and MEDIAN alias on Int64 or
+Decimal128 inputs: sorted multiplicity multiset state, DISC rank ceil(p*N),
+CONT linear interpolation at p*(N-1), exact across retract and restart
+(`percentile_aggregates_are_exact_across_retract_and_restart`).
 
 ### 8.3 Non-Equality, Interval, and Temporal Joins
 
@@ -447,8 +450,11 @@ All non-equi joins rejected at admission.
 - [ ] **Persist UDF identity in plan and checkpoint**
 - [ ] **Define UDF versioning and upgrade path**
 
-**Current state**: No UDF mechanism.
-All functions are built-in.
+**Current state**: **COMPLETE (2026-08-12).** Compiled-in deterministic
+builtin UDF registry (`BuiltinUdfIdentityV1` with pinned implementation
+digest, `TypedExprKindV1::UdfCall`): vx_strlen/vx_sign/vx_clamp admitted
+through the typed projection surface; unknown or mismatched identities fail
+closed at admission and restore (`builtin_udf_typed_projection_materializes_and_restores`).
 
 ### 8.5 Recursive and Mutually Recursive CTEs
 
