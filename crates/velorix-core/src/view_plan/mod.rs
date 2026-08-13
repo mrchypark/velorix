@@ -531,7 +531,22 @@ pub struct SupportedIntervalJoinPlanV1 {
     pub right_start_column_id: String,
     pub right_end_column_id: String,
     pub max_interval_duration_ns: i64,
+    /// Output row projection over the left relation plus the right key:
+    /// every output row is keyed by its full projected content, so the
+    /// output schema primary key must cover all output columns.
+    pub output_columns: Vec<IntervalJoinOutputColumnV1>,
+    /// Output name of the right key column (part of every output row).
+    pub right_key_output_name: String,
     pub resource_contract: IntervalJoinResourceContractV1,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntervalJoinOutputColumnV1 {
+    /// Left relation column id (or the left key) projected into the output.
+    pub left_column_id: String,
+    /// Output column name (also the DeltaKey object field).
+    pub output_name: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
@@ -1471,12 +1486,12 @@ pub fn lower_supported_sql_to_logical_plan(
                     ) {
                         Ok(plan) => Ok(plan),
                         Err(ViewPlanError::UnsupportedShape { .. }) => {
-                            match lower_supported_interval_join_sql_to_logical_plan(
+                            match lower_supported_cross_join_sql_to_logical_plan(
                                 sql, catalogs, output_schema,
                             ) {
                                 Ok(plan) => Ok(plan),
                                 Err(ViewPlanError::UnsupportedShape { .. }) => {
-                                    match lower_supported_cross_join_sql_to_logical_plan(
+                                    match lower_supported_interval_join_sql_to_logical_plan(
                                         sql, catalogs, output_schema,
                                     ) {
                                         Ok(plan) => Ok(plan),
@@ -15817,6 +15832,9 @@ fn typed_expr_node_from_expr(
                     "TRIM with LEADING/TRAILING is not supported; use TRIM(x) or TRIM(chars FROM x)",
                 );
             }
+            if trim_where.is_some() && trim_what.is_none() {
+                return unsupported("TRIM with BOTH requires a FROM character expression");
+            }
             if trim_characters
                 .as_ref()
                 .is_some_and(|characters| !characters.is_empty())
@@ -15875,10 +15893,8 @@ fn typed_ceil_floor_call(
     let Some(node) = typed_expr_node_from_expr(expr, catalog, relation_alias)? else {
         return unsupported("CEIL/FLOOR arguments must be columns, literals, or typed functions");
     };
-    if node.result_type != RuntimeScalarTypeV1::Float64
-        && node.result_type != RuntimeScalarTypeV1::Int64
-    {
-        return unsupported("CEIL/FLOOR require a float64 or int64 argument");
+    if node.result_type != RuntimeScalarTypeV1::Float64 {
+        return unsupported("CEIL/FLOOR require a float64 argument");
     }
     let function = if is_ceil {
         BuiltinScalarFunctionV1::CeilFloat64
@@ -17388,12 +17404,8 @@ pub fn validate_supported_interval_join_sql(
         .ok_or(RelationSchemaError::InvalidRelationSchema {
             field: "incremental_adapter.adapter_id",
         })?;
-        if !matches!(
-            adapter,
-            SupportedIncrementalAdapterSpec::ScalarSumCount
-                | SupportedIncrementalAdapterSpec::Generic
-        ) {
-            return unsupported("interval join SQL requires scalar or generic inputs");
+        if !matches!(adapter, SupportedIncrementalAdapterSpec::Generic) {
+            return unsupported("interval join SQL requires generic (+-1 weight) inputs; scalar sum/count adapter weights are not supported yet");
         }
     }
     let query = parse_single_query(sql)?;
@@ -17508,21 +17520,36 @@ pub fn validate_supported_interval_join_sql(
         Some(left_table.alias.as_str()),
         None,
     )?;
+    if !projection.typed_value_columns.is_empty() {
+        return unsupported("interval join output must not use typed projections");
+    }
     if projection.value_columns.is_empty() {
         return unsupported("interval join output requires at least one value column");
     }
-    let _ = right_key;
+    let mut output_columns = Vec::new();
+    output_columns.push(IntervalJoinOutputColumnV1 {
+        left_column_id: left_key.column_id.clone(),
+        output_name: projection.output_key_column_id.clone(),
+    });
+    for column in &projection.value_columns {
+        output_columns.push(IntervalJoinOutputColumnV1 {
+            left_column_id: column.input_column_id.clone(),
+            output_name: column.output_column_id.clone(),
+        });
+    }
     Ok(SupportedIntervalJoinPlanV1 {
         schema_version: 1,
         left_input_relation_id: left_catalog.relation_schema.relation_id.clone(),
         right_input_relation_id: right_catalog.relation_schema.relation_id.clone(),
         left_key_column_id: left_key.column_id.clone(),
-        right_key_column_id: right_catalog.relation_schema.primary_key_column_ids[0].clone(),
+        right_key_column_id: right_key.column_id.clone(),
         left_start_column_id: left_start,
         left_end_column_id: left_end,
         right_start_column_id: right_start,
         right_end_column_id: right_end,
         max_interval_duration_ns,
+        output_columns,
+        right_key_output_name: right_key.name.clone(),
         resource_contract: IntervalJoinResourceContractV1 {
             max_intervals_per_side: 1_000_000,
             max_matches_per_epoch: 1_000_000,
@@ -17662,11 +17689,8 @@ pub fn validate_supported_recursive_cte_sql(
     .ok_or(RelationSchemaError::InvalidRelationSchema {
         field: "incremental_adapter.adapter_id",
     })?;
-    if !matches!(
-        adapter,
-        SupportedIncrementalAdapterSpec::ScalarSumCount | SupportedIncrementalAdapterSpec::Generic
-    ) {
-        return unsupported("recursive CTE SQL requires scalar or generic inputs");
+    if !matches!(adapter, SupportedIncrementalAdapterSpec::Generic) {
+        return unsupported("recursive CTE SQL requires generic (+-1 weight) inputs; scalar sum/count adapter weights are not supported yet");
     }
     let query = parse_single_query(sql)?;
     validate_query_level_clauses_with_options(&query, true, false)?;
@@ -17710,6 +17734,12 @@ pub fn validate_supported_recursive_cte_sql(
     };
     validate_plain_select_clauses(anchor_select)?;
     validate_plain_select_clauses(recursive_select)?;
+    if anchor_select.distinct.is_some() || !group_by_is_empty(&anchor_select.group_by) {
+        return unsupported("recursive CTE anchor must not use DISTINCT or GROUP BY");
+    }
+    if recursive_select.distinct.is_some() || !group_by_is_empty(&recursive_select.group_by) {
+        return unsupported("recursive CTE recursive term must not use DISTINCT or GROUP BY");
+    }
 
     // Anchor: single registered base relation, direct column projections.
     let [anchor_from] = anchor_select.from.as_slice() else {
@@ -17741,6 +17771,11 @@ pub fn validate_supported_recursive_cte_sql(
                 "recursive CTE anchor projections must be direct base relation columns",
             );
         };
+        if column.column_id == catalog.relation_schema.weight_column_id {
+            return unsupported(
+                "recursive CTE anchor projections must not reference the weight column",
+            );
+        }
         let name = alias.unwrap_or(column.name.as_str()).to_string();
         if recursion_column_names.contains(&name) {
             return unsupported("recursive CTE column names must be unique");
@@ -17840,6 +17875,31 @@ pub fn validate_supported_recursive_cte_sql(
     if base_join_column.column_id == catalog.relation_schema.weight_column_id {
         return unsupported("recursive term join must not reference the weight column");
     }
+    if !recursion_column_names
+        .iter()
+        .any(|name| identifier_eq(name, recursive_column))
+    {
+        return unsupported(
+            "recursive term ON must reference a recursion relation column from the anchor",
+        );
+    }
+    // Type compatibility: the recursion column's type comes from its anchor
+    // base column; it must match the base join column type so JSON equality
+    // in the fixpoint join is semantically exact.
+    let anchor_index = recursion_column_names
+        .iter()
+        .position(|name| identifier_eq(name, recursive_column))
+        .ok_or_else(|| ViewPlanError::UnsupportedShape {
+            reason: "recursive term ON recursion column is not in the anchor".to_string(),
+        })?;
+    let anchor_base_column = catalog_column_by_id(catalog, &anchor_projection[anchor_index])?;
+    if anchor_base_column.physical_arrow_type != base_join_column.physical_arrow_type
+        || anchor_base_column.nullable != base_join_column.nullable
+    {
+        return unsupported(
+            "recursive term join columns must have identical physical types and nullability",
+        );
+    }
 
     // Recursive term projection: positional names must match the anchor.
     let mut recursive_projection = Vec::new();
@@ -17927,7 +17987,9 @@ pub fn validate_supported_recursive_cte_sql(
     for item in &outer_select.projection {
         let expr = match item {
             SelectItem::UnnamedExpr(expr) => expr,
-            SelectItem::ExprWithAlias { expr, .. } => expr,
+            SelectItem::ExprWithAlias { .. } => {
+                return unsupported("recursive CTE outer projections must not use aliases")
+            }
             _ => return unsupported("recursive CTE outer projections must be direct columns"),
         };
         let column_name = match expr {
@@ -18023,14 +18085,27 @@ fn validate_recursive_base_predicates(
             return unsupported("recursive CTE WHERE comparisons require a literal");
         };
         let literal = match &value.value {
-            SqlValue::Number(text, _) => JsonValue::Number(
-                text.parse::<i64>()
+            SqlValue::Number(text, _) => {
+                let integer = text
+                    .parse::<i64>()
                     .map_err(|_| ViewPlanError::UnsupportedShape {
                         reason: "recursive CTE WHERE literal must be an integer".to_string(),
-                    })?
-                    .into(),
-            ),
-            SqlValue::SingleQuotedString(text) => JsonValue::String(text.clone()),
+                    })?;
+                if !matches!(column.physical_arrow_type, ArrowPhysicalTypeV1::Int64) {
+                    return unsupported(
+                        "recursive CTE WHERE integer literals require an Int64 column",
+                    );
+                }
+                JsonValue::Number(integer.into())
+            }
+            SqlValue::SingleQuotedString(text) => {
+                if !matches!(column.physical_arrow_type, ArrowPhysicalTypeV1::Utf8) {
+                    return unsupported(
+                        "recursive CTE WHERE string literals require a Utf8 column",
+                    );
+                }
+                JsonValue::String(text.clone())
+            }
             _ => return unsupported("recursive CTE WHERE literals must be integers or strings"),
         };
         predicates.push(RecursiveBasePredicateV1 {
@@ -18145,12 +18220,8 @@ pub fn validate_supported_cross_join_sql(
         .ok_or(RelationSchemaError::InvalidRelationSchema {
             field: "incremental_adapter.adapter_id",
         })?;
-        if !matches!(
-            adapter,
-            SupportedIncrementalAdapterSpec::ScalarSumCount
-                | SupportedIncrementalAdapterSpec::Generic
-        ) {
-            return unsupported("cross join SQL requires scalar or generic inputs");
+        if !matches!(adapter, SupportedIncrementalAdapterSpec::Generic) {
+            return unsupported("cross join SQL requires generic (+-1 weight) inputs; scalar sum/count adapter weights are not supported yet");
         }
     }
     let query = parse_single_query(sql)?;
@@ -18159,11 +18230,17 @@ pub fn validate_supported_cross_join_sql(
         return unsupported("cross join requires a single SELECT");
     };
     validate_plain_select_clauses(select)?;
+    if select.distinct.is_some() || !group_by_is_empty(&select.group_by) {
+        return unsupported("cross join does not support DISTINCT or GROUP BY");
+    }
     let [left_from] = select.from.as_slice() else {
         return unsupported("cross join requires exactly one FROM join");
     };
     let left_table = registered_table_ref(&left_from.relation, "left")?;
-    if left_table.name != left_catalog.relation_schema.relation_id {
+    if !identifier_eq(
+        left_table.name.as_str(),
+        left_catalog.relation_schema.relation_id.as_str(),
+    ) {
         return unsupported("cross join left relation must be the first registered relation");
     }
     let [right_join] = left_from.joins.as_slice() else {
@@ -18176,7 +18253,10 @@ pub fn validate_supported_cross_join_sql(
         return unsupported("cross join requires a bare CROSS JOIN without ON or USING");
     }
     let right_table = registered_table_ref(&right_join.relation, "right")?;
-    if right_table.name != right_catalog.relation_schema.relation_id {
+    if !identifier_eq(
+        right_table.name.as_str(),
+        right_catalog.relation_schema.relation_id.as_str(),
+    ) {
         return unsupported("cross join right relation must be the second registered relation");
     }
     if select.selection.is_some() {

@@ -18,7 +18,8 @@ use velorix_core::{
     },
     standing_program::{
         BuiltinRuntimeIdentity, EpochIdempotencyKey, NativeCodePolicy, RelationInputBatch,
-        RelationInputEncodingV1, StandingProgramIdentity,
+        RelationInputEncodingV1, ScopedViewId, SnapshotPageRequest, StandingProgramIdentity,
+        StandingProgramRuntime,
     },
     view_contract::{
         catalog_input_relation_schema, stable_bytes_hash, ColumnSchema, RelationSchema, SqlDataType,
@@ -80,18 +81,20 @@ fn interval_join_workload() -> BenchResult<Phase8WorkloadMeasurement> {
                 data_type: SqlDataType::Int64,
                 nullable: false,
             },
+            ColumnSchema {
+                name: "vehicle_id".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
         ],
-        primary_key: vec!["ride_id".to_string()],
+        primary_key: vec![
+            "ride_id".to_string(),
+            "booking_start".to_string(),
+            "booking_end_time".to_string(),
+            "vehicle_id".to_string(),
+        ],
     };
     let identity = standing_identity(INTERVAL_JOIN_SQL, "interval_matches");
-    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
-        &identity,
-        &catalogs,
-        INTERVAL_JOIN_SQL,
-        &input_schemas,
-        std::slice::from_ref(&output_schema),
-    )
-    .map_err(std::io::Error::other)?;
 
     const SIDE_ROWS: u64 = 2_000;
     const SAMPLES: u32 = 2;
@@ -115,6 +118,15 @@ fn interval_join_workload() -> BenchResult<Phase8WorkloadMeasurement> {
             start + SIDE_ROWS,
         );
         let epoch = sample as u64 + 1;
+        let identity = standing_identity(INTERVAL_JOIN_SQL, "interval_matches");
+        let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+            &identity,
+            &catalogs,
+            INTERVAL_JOIN_SQL,
+            &input_schemas,
+            std::slice::from_ref(&output_schema),
+        )
+        .map_err(std::io::Error::other)?;
         let started = Instant::now();
         runtime.apply_changes(
             epoch,
@@ -146,6 +158,7 @@ fn interval_join_workload() -> BenchResult<Phase8WorkloadMeasurement> {
                 },
             ],
         )?;
+        assert_materialized_row_count(runtime.as_ref(), "interval_matches", epoch, SIDE_ROWS)?;
         samples.push(started.elapsed());
     }
     Ok(Phase8WorkloadMeasurement {
@@ -182,7 +195,8 @@ fn recursive_fixpoint_workload() -> BenchResult<Phase8WorkloadMeasurement> {
     let identity = standing_identity(RECURSIVE_FIXPOINT_SQL, "reachability");
     let _ = &input_schema;
 
-    const EDGE_ROWS: u64 = 2_000;
+    const STAR_ROWS: u64 = 500;
+    const CHAIN_ROWS: u64 = 15;
     const SAMPLES: u32 = 2;
     let mut samples = Vec::new();
     for sample in 0..SAMPLES {
@@ -194,8 +208,24 @@ fn recursive_fixpoint_workload() -> BenchResult<Phase8WorkloadMeasurement> {
             std::slice::from_ref(&output_schema),
         )
         .map_err(std::io::Error::other)?;
-        let start = sample as u64 * EDGE_ROWS;
-        let batch = edge_batch(start, start + EDGE_ROWS);
+        let start = sample as u64 * (STAR_ROWS + CHAIN_ROWS);
+        // Star edges (hub -> every leaf) keep the closure shallow; the
+        // chain (n0->n1->...->n29) exercises multi-iteration fixpoint
+        // propagation within the resource contract.
+        let mut ids = Vec::new();
+        let mut srcs = Vec::new();
+        let mut dsts = Vec::new();
+        for index in 0..STAR_ROWS {
+            ids.push(format!("s{start}-{index}"));
+            srcs.push("hub".to_string());
+            dsts.push(format!("leaf{start}-{index}"));
+        }
+        for index in 0..CHAIN_ROWS {
+            ids.push(format!("c{start}-{index}"));
+            srcs.push(format!("n{start}-{index}"));
+            dsts.push(format!("n{start}-{}", index + 1));
+        }
+        let batch = edge_id_src_dst_batch(&ids, &srcs, &dsts);
         let epoch = sample as u64 + 1;
         let started = Instant::now();
         sample_runtime.apply_changes(
@@ -209,10 +239,17 @@ fn recursive_fixpoint_workload() -> BenchResult<Phase8WorkloadMeasurement> {
                 partition_id: 0,
                 schema_fingerprint: edges.schema_fingerprint.to_string(),
                 start_offset_inclusive: start,
-                end_offset_exclusive: start + EDGE_ROWS,
+                end_offset_exclusive: start + STAR_ROWS + CHAIN_ROWS,
                 event_time_watermark: None,
                 batches: vec![batch],
             }],
+        )?;
+        // Star closure (1000) plus chain closure (30*31/2 = 465).
+        assert_materialized_row_count(
+            sample_runtime.as_ref(),
+            "reachability",
+            epoch,
+            STAR_ROWS + CHAIN_ROWS * (CHAIN_ROWS + 1) / 2,
         )?;
         samples.push(started.elapsed());
     }
@@ -312,6 +349,12 @@ fn cross_join_workload() -> BenchResult<Phase8WorkloadMeasurement> {
                     batches: vec![simple_side_batch(&accounts, start, start + SIDE_ROWS)],
                 },
             ],
+        )?;
+        assert_materialized_row_count(
+            runtime.as_ref(),
+            "pair_matches",
+            epoch,
+            SIDE_ROWS * SIDE_ROWS,
         )?;
         samples.push(started.elapsed());
     }
@@ -527,20 +570,8 @@ fn edge_catalog() -> VelorixRelationCatalogV1 {
     }
 }
 
-fn edge_batch(start: u64, end: u64) -> RecordBatch {
-    let rows = (start..end).collect::<Vec<_>>();
-    let ids = rows
-        .iter()
-        .map(|index| format!("e{index}"))
-        .collect::<Vec<_>>();
-    // Star topology (hub -> every leaf): the closure stays shallow, so the
-    // bench measures anchor + bounded fixpoint work without exceeding the
-    // resource contract.
-    let srcs = rows.iter().map(|_| "hub".to_string()).collect::<Vec<_>>();
-    let dsts = rows
-        .iter()
-        .map(|index| format!("leaf{index}"))
-        .collect::<Vec<_>>();
+
+fn edge_id_src_dst_batch(ids: &[String], srcs: &[String], dsts: &[String]) -> RecordBatch {
     RecordBatch::try_new(
         Arc::new(Schema::new(vec![
             Field::new("edge_id", DataType::Utf8, false),
@@ -549,14 +580,46 @@ fn edge_batch(start: u64, end: u64) -> RecordBatch {
             Field::new("delta", DataType::Int64, false),
         ])),
         vec![
-            Arc::new(StringArray::from(ids)) as ArrayRef,
-            Arc::new(StringArray::from(srcs)) as ArrayRef,
-            Arc::new(StringArray::from(dsts)) as ArrayRef,
-            Arc::new(Int64Array::from(vec![1_i64; rows.len()])) as ArrayRef,
+            Arc::new(StringArray::from(ids.to_vec())) as ArrayRef,
+            Arc::new(StringArray::from(srcs.to_vec())) as ArrayRef,
+            Arc::new(StringArray::from(dsts.to_vec())) as ArrayRef,
+            Arc::new(Int64Array::from(vec![1_i64; ids.len()])) as ArrayRef,
         ],
     )
     .map_err(std::io::Error::other)
     .unwrap()
+}
+
+fn assert_materialized_row_count(
+    runtime: &dyn StandingProgramRuntime,
+    view_id: &str,
+    epoch: u64,
+    expected_rows: u64,
+) -> BenchResult<()> {
+    let page = runtime.materialized_view_page(
+        ScopedViewId {
+            tenant_id: "tenant-a".into(),
+            program_id: "program-phase8-bench".into(),
+            view_id: view_id.into(),
+        },
+        SnapshotPageRequest {
+            committed_epoch: Some(epoch),
+            page_token: None,
+            max_rows: None,
+        },
+    )?;
+    let actual = page
+        .batches
+        .iter()
+        .map(|batch| batch.num_rows() as u64)
+        .sum::<u64>();
+    if actual != expected_rows {
+        return Err(format!(
+            "benchmark output cardinality regression: {view_id} epoch {epoch} expected {expected_rows} rows, got {actual}"
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn simple_side_catalog(

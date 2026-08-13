@@ -20718,15 +20718,25 @@ fn interval_join_output_schema() -> RelationSchema {
                 data_type: SqlDataType::Int64,
                 nullable: false,
             },
+            ColumnSchema {
+                name: "vehicle_id".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
         ],
-        primary_key: vec!["ride_id".to_string()],
+        primary_key: vec![
+            "ride_id".to_string(),
+            "booking_start".to_string(),
+            "booking_end_time".to_string(),
+            "vehicle_id".to_string(),
+        ],
     }
 }
 
 fn assert_interval_join_page(
     runtime: &(dyn StandingProgramRuntime + Send),
     epoch: u64,
-    expected: &[(&str, i64, i64)],
+    expected: &[(&str, i64, i64, &str)],
 ) {
     let page = runtime
         .materialized_view_page(
@@ -20758,15 +20768,24 @@ fn assert_interval_join_page(
         .as_any()
         .downcast_ref::<Int64Array>()
         .unwrap();
-    let actual = (0..batch.num_rows())
+    let vehicles = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mut actual = (0..batch.num_rows())
         .map(|index| {
             (
                 ride_ids.value(index),
                 starts.value(index),
                 ends.value(index),
+                vehicles.value(index),
             )
         })
         .collect::<Vec<_>>();
+    let mut expected = expected.to_vec();
+    actual.sort();
+    expected.sort();
     assert_eq!(actual, expected);
 }
 
@@ -20803,17 +20822,27 @@ fn interval_join_materializes_overlap_retraction_and_restart() {
                     1,
                     interval_rides_rows_batch(&[("r1", 10, 20, 1)]),
                 ),
+                // v2 ends before r1 starts (discriminates the first
+                // conjunct); r1 overlaps both v1 and v4 (multi-match).
                 relation_input(
                     &vehicles,
                     "interval-vehicles",
                     0,
-                    2,
-                    interval_vehicles_rows_batch(&[("v1", 15, 25, 1), ("v2", 30, 40, 1)]),
+                    3,
+                    interval_vehicles_rows_batch(&[
+                        ("v1", 15, 25, 1),
+                        ("v2", 0, 3, 1),
+                        ("v4", 18, 22, 1),
+                    ]),
                 ),
             ],
         )
         .unwrap();
-    assert_interval_join_page(runtime.as_ref(), 1, &[("r1", 10, 20)]);
+    assert_interval_join_page(
+        runtime.as_ref(),
+        1,
+        &[("r1", 10, 20, "v1"), ("r1", 10, 20, "v4")],
+    );
 
     runtime
         .apply_changes(
@@ -20822,13 +20851,13 @@ fn interval_join_materializes_overlap_retraction_and_restart() {
             vec![relation_input(
                 &vehicles,
                 "interval-vehicles",
-                2,
                 3,
+                4,
                 interval_vehicles_rows_batch(&[("v1", 15, 25, -1)]),
             )],
         )
         .unwrap();
-    assert_interval_join_page(runtime.as_ref(), 2, &[]);
+    assert_interval_join_page(runtime.as_ref(), 2, &[("r1", 10, 20, "v4")]);
 
     runtime
         .apply_changes(
@@ -20845,32 +20874,97 @@ fn interval_join_materializes_overlap_retraction_and_restart() {
                 relation_input(
                     &vehicles,
                     "interval-vehicles",
-                    3,
                     4,
-                    interval_vehicles_rows_batch(&[("v1", 8, 25, 1)]),
+                    5,
+                    interval_vehicles_rows_batch(&[("v5", 8, 25, 1)]),
                 ),
             ],
         )
         .unwrap();
-    assert_interval_join_page(runtime.as_ref(), 3, &[("r1", 10, 20), ("r2", 5, 12)]);
+    assert_interval_join_page(
+        runtime.as_ref(),
+        3,
+        &[
+            ("r1", 10, 20, "v4"),
+            ("r1", 10, 20, "v5"),
+            ("r2", 5, 12, "v5"),
+        ],
+    );
 
     let checkpoint = runtime.checkpoint().unwrap();
     let mut restored = restore_standing_runtime(checkpoint).unwrap();
-    assert_interval_join_page(restored.as_ref(), 3, &[("r1", 10, 20), ("r2", 5, 12)]);
+    assert_interval_join_page(
+        restored.as_ref(),
+        3,
+        &[
+            ("r1", 10, 20, "v4"),
+            ("r1", 10, 20, "v5"),
+            ("r2", 5, 12, "v5"),
+        ],
+    );
     restored
         .apply_changes(
             4,
             EpochIdempotencyKey::new("interval-epoch-4").unwrap(),
             vec![relation_input(
+                &vehicles,
+                "interval-vehicles",
+                5,
+                6,
+                interval_vehicles_rows_batch(&[("v5", 8, 25, -1)]),
+            )],
+        )
+        .unwrap();
+    assert_interval_join_page(restored.as_ref(), 4, &[("r1", 10, 20, "v4")]);
+
+    // Failed epochs are atomic: a malformed row rejects the epoch, the
+    // runtime state is untouched, and the same epoch can be retried with
+    // valid data.
+    let bad = relation_input(
+        &rides,
+        "interval-rides",
+        2,
+        3,
+        interval_rides_rows_batch(&[("r3", 30, 20, 1)]),
+    );
+    assert!(runtime
+        .apply_changes(
+            5,
+            EpochIdempotencyKey::new("interval-epoch-5").unwrap(),
+            vec![bad],
+        )
+        .is_err());
+    assert_interval_join_page(
+        runtime.as_ref(),
+        3,
+        &[
+            ("r1", 10, 20, "v4"),
+            ("r1", 10, 20, "v5"),
+            ("r2", 5, 12, "v5"),
+        ],
+    );
+    runtime
+        .apply_changes(
+            5,
+            EpochIdempotencyKey::new("interval-epoch-5").unwrap(),
+            vec![relation_input(
                 &rides,
                 "interval-rides",
                 2,
                 3,
-                interval_rides_rows_batch(&[("r1", 10, 20, 1)]),
+                interval_rides_rows_batch(&[("r3", 30, 40, 1)]),
             )],
         )
         .unwrap();
-    assert_interval_join_page(restored.as_ref(), 4, &[("r1", 10, 20), ("r2", 5, 12)]);
+    assert_interval_join_page(
+        runtime.as_ref(),
+        5,
+        &[
+            ("r1", 10, 20, "v4"),
+            ("r1", 10, 20, "v5"),
+            ("r2", 5, 12, "v5"),
+        ],
+    );
 }
 
 fn typed_family_matrix_output_schema() -> RelationSchema {
@@ -20996,8 +21090,8 @@ fn type_family_test_matrix_covers_null_overflow_boundary_restart() {
                 end_offset_exclusive: 2,
                 event_time_watermark: None,
                 batches: vec![purchases_event_time_nullable_amount_batch(&[
-                    ("alice", Some(10), 1_735_689_600_000_000_000, 1),
-                    ("bob", Some(4), 1_735_689_600_000_000_000, 1),
+                    ("xAvier", Some(10), 1_735_692_777_111_000_000, 1),
+                    ("bob", Some(4), 1_735_692_777_111_000_000, 1),
                 ])],
             }],
         )
@@ -21021,8 +21115,8 @@ fn type_family_test_matrix_covers_null_overflow_boundary_restart() {
                 end_offset_exclusive: 4,
                 event_time_watermark: None,
                 batches: vec![purchases_event_time_nullable_amount_batch(&[
-                    ("carol", Some(7), 1_735_689_600_000_000_000, 1),
-                    ("nullam", None, 1_735_689_600_000_000_000, 1),
+                    ("carol", Some(7), 1_735_692_777_111_000_000, 1),
+                    ("nullam", None, 1_735_692_777_111_000_000, 1),
                 ])],
             }],
         )
@@ -21041,18 +21135,18 @@ fn type_family_test_matrix_covers_null_overflow_boundary_restart() {
 
 fn alice_matrix_row() -> Vec<String> {
     vec![
-        "alice".to_string(),
-        "alice".to_string(),
-        "ali".to_string(),
-        "lic".to_string(),
-        "alice".to_string(),
-        "5".to_string(),
+        "xAvier".to_string(),
+        "xavier".to_string(),
+        "xAv".to_string(),
+        "Avi".to_string(),
+        "Avier".to_string(),
+        "6".to_string(),
         "1".to_string(),
         "0".to_string(),
-        "0".to_string(),
+        "57".to_string(),
         "1735689600000000000".to_string(),
-        "1735689600000000000".to_string(),
-        "1735687800000000000".to_string(),
+        "1735692720000000000".to_string(),
+        "1735690977111000000".to_string(),
         "15".to_string(),
         "15".to_string(),
         "15".to_string(),
@@ -21070,10 +21164,10 @@ fn bob_matrix_row() -> Vec<String> {
         "3".to_string(),
         "1".to_string(),
         "0".to_string(),
-        "0".to_string(),
+        "57".to_string(),
         "1735689600000000000".to_string(),
-        "1735689600000000000".to_string(),
-        "1735687800000000000".to_string(),
+        "1735692720000000000".to_string(),
+        "1735690977111000000".to_string(),
         "6".to_string(),
         "6".to_string(),
         "6".to_string(),
@@ -21091,10 +21185,10 @@ fn carol_matrix_row() -> Vec<String> {
         "5".to_string(),
         "1".to_string(),
         "0".to_string(),
-        "0".to_string(),
+        "57".to_string(),
         "1735689600000000000".to_string(),
-        "1735689600000000000".to_string(),
-        "1735687800000000000".to_string(),
+        "1735692720000000000".to_string(),
+        "1735690977111000000".to_string(),
         "11".to_string(),
         "10".to_string(),
         "10.5".to_string(),
@@ -21112,10 +21206,10 @@ fn null_amount_matrix_row() -> Vec<String> {
         "6".to_string(),
         "1".to_string(),
         "0".to_string(),
-        "0".to_string(),
+        "57".to_string(),
         "1735689600000000000".to_string(),
-        "1735689600000000000".to_string(),
-        "1735687800000000000".to_string(),
+        "1735692720000000000".to_string(),
+        "1735690977111000000".to_string(),
         "NULL".to_string(),
         "NULL".to_string(),
         "NULL".to_string(),
@@ -21753,7 +21847,7 @@ fn recursive_cte_materializes_closure_exactly_across_retract_restart_and_fail_cl
         ),
         (
             "with recursive reach as (select src, count(*) from edges group by src union distinct select r.src, count(*) from reach r join edges e on r.dst = e.src group by r.src) select src, count from reach",
-            "anchor projections",
+            "must not use DISTINCT or GROUP BY",
         ),
         (
             "with recursive reach as (select src, dst from edges union distinct select r2.src, e.dst from reach r2 join reach r1 on r1.dst = r2.src join edges e on r2.dst = e.src) select src, dst from reach",
@@ -21868,8 +21962,8 @@ fn assert_cross_join_page(
 
 #[test]
 fn cross_join_materializes_all_pairs_exactly_across_retract_and_restart() {
-    let scores = scores_catalog();
-    let accounts = accounts_catalog();
+    let scores = generic_adapter_catalog(scores_catalog());
+    let accounts = generic_adapter_catalog(accounts_catalog());
     let catalogs = vec![scores.clone(), accounts.clone()];
     let input_schemas = catalogs
         .iter()
@@ -21996,5 +22090,227 @@ fn cross_join_materializes_all_pairs_exactly_across_retract_and_restart() {
             !error.to_string().contains("admitted"),
             "expected fail-closed for {sql}, got: {error}"
         );
+    }
+}
+
+#[test]
+fn phase8_admission_fails_closed_on_unsafe_shapes() {
+    let edges = edges_catalog();
+    let scores = scores_catalog();
+    let accounts = accounts_catalog();
+    let output = recursive_reachability_output_schema();
+    let interval_output = interval_join_output_schema();
+    let probe_result = lower_supported_sql_to_logical_plan(
+        "select s.user_id, a.account_id, s.score, a.tier from scores s cross join accounts a group by s.user_id, a.account_id, s.score, a.tier",
+        &[generic_adapter_catalog(scores.clone()), generic_adapter_catalog(accounts.clone())],
+        &cross_join_output_schema(),
+    );
+    println!("PROBE chain GROUP BY => {probe_result:?}");
+    for (sql, catalogs, output_schema, fragment) in [
+        (
+            "with recursive reach as (select src, delta from edges union distinct select r.src, e.dst from reach r join edges e on r.dst = e.src) select src, dst from reach",
+            vec![edges.clone()],
+            output.clone(),
+            "weight column",
+        ),
+        (
+            "with recursive reach as (select src, dst from edges union distinct select r.src, e.dst from reach r join edges e on r.dst = e.missing_col) select src, dst from reach",
+            vec![edges.clone()],
+            output.clone(),
+            "not registered",
+        ),
+        (
+            "with recursive reach as (select src, code from codes union distinct select r.src, e.code from reach r join codes e on r.src = e.code) select src, code from reach",
+            vec![mixed_join_type_catalog()],
+            mixed_join_type_output_schema(),
+            "identical physical types",
+        ),
+        (
+            "with recursive reach as (select src, dst from edges where dst > 5 union distinct select r.src, e.dst from reach r join edges e on r.dst = e.src) select src, dst from reach",
+            vec![edges.clone()],
+            output.clone(),
+            "integer literals require an Int64 column",
+        ),
+        (
+            "with recursive reach as (select src, dst from edges union distinct select r.src, e.dst from reach r join edges e on r.dst = e.src) select src as s, dst from reach",
+            vec![edges.clone()],
+            output.clone(),
+            "must not use aliases",
+        ),
+        (
+            "with recursive reach as (select distinct src, dst from edges union distinct select r.src, e.dst from reach r join edges e on r.dst = e.src) select src, dst from reach",
+            vec![edges.clone()],
+            output.clone(),
+            "must not use DISTINCT or GROUP BY",
+        ),
+        (
+            "with recursive reach as (select src, dst from edges union distinct select r.src, e.dst from reach r join edges e on r.dst = e.src) select src, dst from reach",
+            vec![scores.clone()],
+            output.clone(),
+            "requires generic",
+        ),
+        (
+            "select user_id, ceil(score) as c from scores",
+            vec![scores.clone()],
+            scores_projection_output_schema(),
+            "CEIL/FLOOR require a float64 argument",
+        ),
+        (
+            "select s.user_id, a.account_id, s.score, a.tier from scores s cross join accounts a group by s.user_id, a.account_id, s.score, a.tier",
+            vec![generic_adapter_catalog(scores.clone()), generic_adapter_catalog(accounts.clone())],
+            cross_join_output_schema(),
+            "INNER or narrow LEFT/RIGHT JOIN",
+        ),
+    ] {
+        let error = lower_supported_sql_to_logical_plan(sql, &catalogs, &output_schema)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(fragment),
+            "expected `{fragment}` in error for {sql}, got: {error}"
+        );
+    }
+
+    // The interval join output must not silently drop a weight-2 collapse:
+    // one left row overlapping two right rows now yields two distinct rows.
+    let rides = interval_join_rides_catalog();
+    let vehicles = interval_join_vehicles_catalog();
+    let catalogs = vec![rides.clone(), vehicles.clone()];
+    let input_schemas = catalogs
+        .iter()
+        .map(|catalog| catalog_input_relation_schema(catalog).unwrap())
+        .collect::<Vec<_>>();
+    let sql = "select r.ride_id, r.booking_start, r.booking_end_time from rides r join vehicles v on r.booking_start < v.capacity_end and v.capacity_start_time < r.booking_end_time";
+    let identity = standing_identity_with_view(sql, "interval_matches");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &catalogs,
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&interval_output),
+    )
+    .unwrap();
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("multi-match-epoch-1").unwrap(),
+            vec![
+                relation_input(
+                    &rides,
+                    "mm-rides",
+                    0,
+                    1,
+                    interval_rides_rows_batch(&[("r1", 10, 20, 1)]),
+                ),
+                relation_input(
+                    &vehicles,
+                    "mm-vehicles",
+                    0,
+                    2,
+                    interval_vehicles_rows_batch(&[("v1", 15, 25, 1), ("v4", 18, 22, 1)]),
+                ),
+            ],
+        )
+        .unwrap();
+    assert_interval_join_page(
+        runtime.as_ref(),
+        1,
+        &[("r1", 10, 20, "v1"), ("r1", 10, 20, "v4")],
+    );
+    let checkpoint = runtime.checkpoint().unwrap();
+    let restored = restore_standing_runtime(checkpoint).unwrap();
+    assert_interval_join_page(
+        restored.as_ref(),
+        1,
+        &[("r1", 10, 20, "v1"), ("r1", 10, 20, "v4")],
+    );
+}
+
+fn mixed_join_type_catalog() -> VelorixRelationCatalogV1 {
+    let relation_schema = VelorixRelationSchemaV1 {
+        relation_id: "codes".to_string(),
+        relation_name: "codes".to_string(),
+        relation_version: "2026-08-13.v1".to_string(),
+        columns: vec![
+            RelationColumnV1 {
+                column_id: "id".to_string(),
+                name: "id".to_string(),
+                logical_type: VelorixLogicalTypeV1::Utf8,
+                physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+                nullable: false,
+                ordinal: 0,
+                semantic_role: RelationSemanticRoleV1::PrimaryKey,
+            },
+            RelationColumnV1 {
+                column_id: "src".to_string(),
+                name: "src".to_string(),
+                logical_type: VelorixLogicalTypeV1::Utf8,
+                physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+                nullable: false,
+                ordinal: 1,
+                semantic_role: RelationSemanticRoleV1::Value,
+            },
+            RelationColumnV1 {
+                column_id: "code".to_string(),
+                name: "code".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 2,
+                semantic_role: RelationSemanticRoleV1::Value,
+            },
+            RelationColumnV1 {
+                column_id: "delta".to_string(),
+                name: "delta".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 3,
+                semantic_role: RelationSemanticRoleV1::Weight,
+            },
+        ],
+        primary_key_column_ids: vec!["id".to_string()],
+        weight_column_id: "delta".to_string(),
+        allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+        event_time_column_id: None,
+    };
+    let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
+    VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
+        schema_version: RELATION_SCHEMA_VERSION_V1,
+        relation_schema,
+        schema_fingerprint: schema_fingerprint.clone(),
+        datafusion_registration: DataFusionRegistrationV1 {
+            name: "codes".to_string(),
+            mode: DataFusionRegistrationModeV1::Table,
+        },
+        incremental_relation: IncrementalRelationBindingV1 {
+            relation_id: "codes".to_string(),
+            schema_fingerprint,
+        },
+        incremental_adapter: IncrementalAdapterBindingV1 {
+            adapter_id: CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.to_string(),
+        },
+    }
+}
+
+fn mixed_join_type_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "mixed_codes".to_string(),
+        relation_name: "mixed_codes".to_string(),
+        relation_version: "2026-08-13.v1".to_string(),
+        schema_fingerprint: "mixed-codes-v1".to_string(),
+        columns: vec![
+            ColumnSchema {
+                name: "src".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "code".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["src".to_string(), "code".to_string()],
     }
 }

@@ -104,39 +104,6 @@ impl RecursiveFixpointRuntime {
         )
     }
 
-    fn apply_base_delta(&mut self, delta: &DeltaBatch) -> Result<(), StandingProgramRuntimeError> {
-        let mut next = self.base_multiset.clone();
-        for record in delta.net_rows().map_err(|_| invalid_runtime_state())? {
-            let key = canonical_json(record.key.as_json());
-            let entry = next.entry(key.clone()).or_insert_with(|| RecursiveBaseRow {
-                values: BTreeMap::new(),
-                weight: 0,
-            });
-            entry.weight = entry
-                .weight
-                .checked_add(record.weight)
-                .ok_or_else(invalid_runtime_state)?;
-            if entry.weight < 0 {
-                return Err(invalid_runtime_state());
-            }
-            if entry.weight == 0 {
-                next.remove(&key);
-                continue;
-            }
-            let value = record
-                .value
-                .as_json()
-                .as_object()
-                .ok_or_else(invalid_runtime_state)?;
-            entry.values = value
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect();
-        }
-        self.base_multiset = next;
-        Ok(())
-    }
-
     fn anchor_row(
         &self,
         base: &RecursiveBaseRow,
@@ -197,9 +164,12 @@ impl RecursiveFixpointRuntime {
         Ok(Some(Value::Object(row)))
     }
 
-    fn recompute_closure(&self) -> Result<BTreeMap<String, Value>, StandingProgramRuntimeError> {
+    fn recompute_closure_from(
+        &self,
+        base_multiset: &BTreeMap<String, RecursiveBaseRow>,
+    ) -> Result<BTreeMap<String, Value>, StandingProgramRuntimeError> {
         let mut derived: BTreeMap<String, Value> = BTreeMap::new();
-        for base in self.base_multiset.values() {
+        for base in base_multiset.values() {
             if let Some(row) = self.anchor_row(base, &self.plan.anchor_base_predicate)? {
                 derived.insert(canonical_json(&row), row);
             }
@@ -213,7 +183,7 @@ impl RecursiveFixpointRuntime {
         for iteration in 0..self.plan.resource_contract.max_iterations {
             let mut frontier = Vec::new();
             for row in derived.values() {
-                for base in self.base_multiset.values() {
+                for base in base_multiset.values() {
                     if base.weight <= 0 {
                         continue;
                     }
@@ -349,6 +319,10 @@ impl StandingProgramRuntime for RecursiveFixpointRuntime {
 
         let mut next_frontiers = self.input_frontiers.clone();
         let mut next_event_time_frontiers = self.input_event_time_frontiers.clone();
+        // Stage the whole epoch on a cloned base multiset so a failed
+        // closure (resource contract) leaves the runtime state untouched
+        // and the same epoch can be retried exactly once.
+        let mut next_base = self.base_multiset.clone();
         for input in &input_changes {
             if input.relation_id != self.plan.input_relation_id {
                 return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
@@ -376,11 +350,11 @@ impl StandingProgramRuntime for RecursiveFixpointRuntime {
                         }
                     })?
                 };
-            self.apply_base_delta(&delta)?;
+            apply_base_delta_to(&mut next_base, &delta)?;
             advance_input_frontier(&mut next_frontiers, input)?;
             advance_input_event_time_frontier(&mut next_event_time_frontiers, input)?;
         }
-        let next_derived = self.recompute_closure()?;
+        let next_derived = self.recompute_closure_from(&next_base)?;
         let next_output = DeltaBatch::from_records(
             next_derived
                 .values()
@@ -394,6 +368,7 @@ impl StandingProgramRuntime for RecursiveFixpointRuntime {
                 .collect::<Vec<_>>(),
         );
         let output_delta = self.output_delta_for_derived(&next_derived)?;
+        self.base_multiset = next_base;
         self.derived_set = next_derived;
         self.published_output = next_output;
         self.input_frontiers = next_frontiers.clone();
@@ -595,6 +570,42 @@ struct RecursiveFixpointCheckpointPayloadV2 {
 }
 
 pub(super) const RECURSIVE_FIXPOINT_RUNTIME_KIND: &str = "recursive_fixpoint_v2";
+
+fn apply_base_delta_to(
+    base_multiset: &mut BTreeMap<String, RecursiveBaseRow>,
+    delta: &DeltaBatch,
+) -> Result<(), StandingProgramRuntimeError> {
+    for record in delta.net_rows().map_err(|_| invalid_runtime_state())? {
+        let key = canonical_json(record.key.as_json());
+        let entry = base_multiset
+            .entry(key.clone())
+            .or_insert_with(|| RecursiveBaseRow {
+                values: BTreeMap::new(),
+                weight: 0,
+            });
+        entry.weight = entry
+            .weight
+            .checked_add(record.weight)
+            .ok_or_else(invalid_runtime_state)?;
+        if entry.weight < 0 {
+            return Err(invalid_runtime_state());
+        }
+        if entry.weight == 0 {
+            base_multiset.remove(&key);
+            continue;
+        }
+        let value = record
+            .value
+            .as_json()
+            .as_object()
+            .ok_or_else(invalid_runtime_state)?;
+        entry.values = value
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+    }
+    Ok(())
+}
 
 fn validate_recursive_fixpoint_contract(
     catalog: &VelorixRelationCatalogV1,

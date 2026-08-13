@@ -115,18 +115,19 @@ impl IntervalJoinRuntime {
     }
 
     fn materialized_batch(&self) -> Result<RecordBatch, StandingProgramRuntimeError> {
-        materialized_generic_delta_to_record_batch(&self.output_schema, &self.published_output)
+        materialized_delta_to_record_batch(&self.output_schema, &self.published_output, Some(&[]))
     }
 
     fn materialized_page_batch(
         &self,
         page: SnapshotPageRequest,
     ) -> Result<(RecordBatch, Option<String>), StandingProgramRuntimeError> {
-        materialized_generic_delta_page_batch(
+        materialized_delta_page_batch(
             &self.output_schema,
             &self.published_output,
             self.logical_epoch,
             page,
+            Some(&[]),
         )
     }
 
@@ -182,10 +183,14 @@ impl IntervalJoinRuntime {
         Ok(())
     }
 
-    fn recompute_all_matches(&self) -> Result<DeltaBatch, StandingProgramRuntimeError> {
-        if u64::try_from(self.left_intervals.len()).unwrap_or(u64::MAX)
+    fn recompute_all_matches(
+        &self,
+        left: &BTreeMap<String, IntervalRow>,
+        right: &BTreeMap<String, IntervalRow>,
+    ) -> Result<DeltaBatch, StandingProgramRuntimeError> {
+        if u64::try_from(left.len()).unwrap_or(u64::MAX)
             > self.plan.resource_contract.max_intervals_per_side
-            || u64::try_from(self.right_intervals.len()).unwrap_or(u64::MAX)
+            || u64::try_from(right.len()).unwrap_or(u64::MAX)
                 > self.plan.resource_contract.max_intervals_per_side
         {
             return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
@@ -193,24 +198,32 @@ impl IntervalJoinRuntime {
             });
         }
         let mut records = Vec::new();
-        for left in self.left_intervals.values() {
-            for right in self.right_intervals.values() {
-                let overlaps = left.start_ns < right.end_ns && right.start_ns < left.end_ns;
+        for left_row in left.values() {
+            for right_row in right.values() {
+                let overlaps =
+                    left_row.start_ns < right_row.end_ns && right_row.start_ns < left_row.end_ns;
                 if !overlaps {
                     continue;
                 }
+                // Every match is keyed by its full projected row, so the
+                // output schema primary key must cover all output columns
+                // (uniqueness per (left row, right row) pair).
                 let mut output = serde_json::Map::new();
-                for column in &self.plan_value_columns() {
-                    let value = left
+                for column in &self.plan.output_columns {
+                    let value = left_row
                         .values
-                        .get(column)
-                        .cloned()
+                        .get(&column.left_column_id)
                         .ok_or_else(invalid_runtime_state)?;
-                    output.insert(column.clone(), value);
+                    output.insert(column.output_name.clone(), value.clone());
                 }
+                let right_key = right_row
+                    .values
+                    .get(&self.plan.right_key_column_id)
+                    .ok_or_else(invalid_runtime_state)?;
+                output.insert(self.plan.right_key_output_name.clone(), right_key.clone());
                 records.push(DeltaRecord::new(
-                    DeltaKey::from_json(left.key.clone()),
-                    DeltaValue::from_json(Value::Object(output)),
+                    DeltaKey::from_json(Value::Object(output)),
+                    DeltaValue::from_json(Value::Object(serde_json::Map::new())),
                     1,
                 ));
                 if records.len() as u64 > self.plan.resource_contract.max_matches_per_epoch {
@@ -223,21 +236,26 @@ impl IntervalJoinRuntime {
         Ok(DeltaBatch::from_records(records))
     }
 
-    fn plan_value_columns(&self) -> Vec<String> {
-        let key = self.plan.left_key_column_id.clone();
-        let mut columns = self
-            .left_catalog
-            .relation_schema
-            .columns
-            .iter()
-            .map(|column| column.column_id.clone())
-            .filter(|column_id| {
-                *column_id != key
-                    && *column_id != self.left_catalog.relation_schema.weight_column_id
-            })
-            .collect::<Vec<_>>();
-        columns.sort();
-        columns
+    /// Left columns the runtime must carry in state: the output projection
+    /// plus the left endpoints.
+    fn left_state_columns(&self) -> Vec<String> {
+        let mut columns = BTreeSet::new();
+        for column in &self.plan.output_columns {
+            columns.insert(column.left_column_id.clone());
+        }
+        columns.insert(self.plan.left_start_column_id.clone());
+        columns.insert(self.plan.left_end_column_id.clone());
+        columns.into_iter().collect()
+    }
+
+    /// Right columns the runtime must carry in state: the right endpoints
+    /// and the right key.
+    fn right_state_columns(&self) -> Vec<String> {
+        let mut columns = BTreeSet::new();
+        columns.insert(self.plan.right_start_column_id.clone());
+        columns.insert(self.plan.right_end_column_id.clone());
+        columns.insert(self.plan.right_key_column_id.clone());
+        columns.into_iter().collect()
     }
 }
 
@@ -298,23 +316,12 @@ impl StandingProgramRuntime for IntervalJoinRuntime {
 
         let mut next_frontiers = self.input_frontiers.clone();
         let mut next_event_time_frontiers = self.input_event_time_frontiers.clone();
-        let left_value_columns = self.plan_value_columns();
-        let right_value_columns = {
-            let key = self.plan.right_key_column_id.clone();
-            let mut columns = self
-                .right_catalog
-                .relation_schema
-                .columns
-                .iter()
-                .map(|column| column.column_id.clone())
-                .filter(|column_id| {
-                    *column_id != key
-                        && *column_id != self.right_catalog.relation_schema.weight_column_id
-                })
-                .collect::<Vec<_>>();
-            columns.sort();
-            columns
-        };
+        let left_value_columns = self.left_state_columns();
+        let right_value_columns = self.right_state_columns();
+        // Stage both sides in clones so a failed epoch leaves the runtime
+        // state untouched and the same epoch can be retried exactly once.
+        let mut next_left = self.left_intervals.clone();
+        let mut next_right = self.right_intervals.clone();
         for input in &input_changes {
             let (side, schema, catalog, start_column, end_column, intervals) =
                 if input.relation_id == self.plan.left_input_relation_id {
@@ -324,7 +331,7 @@ impl StandingProgramRuntime for IntervalJoinRuntime {
                         &self.left_catalog,
                         self.plan.left_start_column_id.as_str(),
                         self.plan.left_end_column_id.as_str(),
-                        &mut self.left_intervals,
+                        &mut next_left,
                     )
                 } else if input.relation_id == self.plan.right_input_relation_id {
                     (
@@ -333,7 +340,7 @@ impl StandingProgramRuntime for IntervalJoinRuntime {
                         &self.right_catalog,
                         self.plan.right_start_column_id.as_str(),
                         self.plan.right_end_column_id.as_str(),
-                        &mut self.right_intervals,
+                        &mut next_right,
                     )
                 } else {
                     return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
@@ -381,12 +388,14 @@ impl StandingProgramRuntime for IntervalJoinRuntime {
             advance_input_frontier(&mut next_frontiers, input)?;
             advance_input_event_time_frontier(&mut next_event_time_frontiers, input)?;
         }
-        let next_output = self.recompute_all_matches()?;
+        let next_output = self.recompute_all_matches(&next_left, &next_right)?;
         let output_delta = self
             .published_output
             .inverse()
             .map_err(|_| invalid_runtime_state())?
             .combine(&next_output);
+        self.left_intervals = next_left;
+        self.right_intervals = next_right;
         self.published_output = next_output;
         self.input_frontiers = next_frontiers.clone();
         self.input_event_time_frontiers = next_event_time_frontiers.clone();
@@ -620,6 +629,22 @@ fn validate_interval_join_contract(
     catalog_column(right_catalog, &plan.right_key_column_id)?;
     catalog_column(right_catalog, &plan.right_start_column_id)?;
     catalog_column(right_catalog, &plan.right_end_column_id)?;
+    if plan.output_columns.is_empty() {
+        return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+            field: "interval_join_contract",
+        });
+    }
+    let mut output_names = BTreeSet::new();
+    for column in &plan.output_columns {
+        catalog_column(left_catalog, &column.left_column_id)?;
+        if !output_names.insert(column.output_name.clone())
+            || column.output_name == plan.right_key_output_name
+        {
+            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "interval_join_contract",
+            });
+        }
+    }
     let expected_left = catalog_input_relation_schema(left_catalog).map_err(|_| {
         StandingProgramRuntimeError::InvalidProgramIdentity {
             field: "interval_join_left_input_schema",

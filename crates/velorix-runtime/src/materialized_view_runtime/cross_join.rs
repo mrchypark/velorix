@@ -158,10 +158,14 @@ impl CrossJoinRuntime {
         Ok(())
     }
 
-    fn recompute_all_pairs(&self) -> Result<DeltaBatch, StandingProgramRuntimeError> {
-        if u64::try_from(self.left_rows.len()).unwrap_or(u64::MAX)
+    fn recompute_all_pairs(
+        &self,
+        left: &BTreeMap<String, CrossJoinRow>,
+        right: &BTreeMap<String, CrossJoinRow>,
+    ) -> Result<DeltaBatch, StandingProgramRuntimeError> {
+        if u64::try_from(left.len()).unwrap_or(u64::MAX)
             > self.plan.resource_contract.max_rows_per_side
-            || u64::try_from(self.right_rows.len()).unwrap_or(u64::MAX)
+            || u64::try_from(right.len()).unwrap_or(u64::MAX)
                 > self.plan.resource_contract.max_rows_per_side
         {
             return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
@@ -169,16 +173,16 @@ impl CrossJoinRuntime {
             });
         }
         let mut records = Vec::new();
-        for left in self.left_rows.values() {
-            for right in self.right_rows.values() {
+        for left_row in left.values() {
+            for right_row in right.values() {
                 let mut output = serde_json::Map::new();
                 for item in &self.plan.projection {
                     let value = match item.side {
-                        CrossJoinSideV1::Left => left
+                        CrossJoinSideV1::Left => left_row
                             .values
                             .get(&item.column_id)
                             .ok_or_else(invalid_runtime_state)?,
-                        CrossJoinSideV1::Right => right
+                        CrossJoinSideV1::Right => right_row
                             .values
                             .get(&item.column_id)
                             .ok_or_else(invalid_runtime_state)?,
@@ -258,6 +262,10 @@ impl StandingProgramRuntime for CrossJoinRuntime {
 
         let mut next_frontiers = self.input_frontiers.clone();
         let mut next_event_time_frontiers = self.input_event_time_frontiers.clone();
+        // Stage both sides in clones so a failed epoch leaves the runtime
+        // state untouched and the same epoch can be retried exactly once.
+        let mut next_left = self.left_rows.clone();
+        let mut next_right = self.right_rows.clone();
         for input in &input_changes {
             let (side, schema, catalog, rows) =
                 if input.relation_id == self.plan.left_input_relation_id {
@@ -265,14 +273,14 @@ impl StandingProgramRuntime for CrossJoinRuntime {
                         "left",
                         &self.left_input_schema,
                         &self.left_catalog,
-                        &mut self.left_rows,
+                        &mut next_left,
                     )
                 } else if input.relation_id == self.plan.right_input_relation_id {
                     (
                         "right",
                         &self.right_input_schema,
                         &self.right_catalog,
-                        &mut self.right_rows,
+                        &mut next_right,
                     )
                 } else {
                     return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
@@ -319,12 +327,14 @@ impl StandingProgramRuntime for CrossJoinRuntime {
             advance_input_frontier(&mut next_frontiers, input)?;
             advance_input_event_time_frontier(&mut next_event_time_frontiers, input)?;
         }
-        let next_output = self.recompute_all_pairs()?;
+        let next_output = self.recompute_all_pairs(&next_left, &next_right)?;
         let output_delta = self
             .published_output
             .inverse()
             .map_err(|_| invalid_runtime_state())?
             .combine(&next_output);
+        self.left_rows = next_left;
+        self.right_rows = next_right;
         self.published_output = next_output;
         self.input_frontiers = next_frontiers.clone();
         self.input_event_time_frontiers = next_event_time_frontiers.clone();
