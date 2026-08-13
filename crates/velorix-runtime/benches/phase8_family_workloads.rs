@@ -84,7 +84,7 @@ fn interval_join_workload() -> BenchResult<Phase8WorkloadMeasurement> {
         primary_key: vec!["ride_id".to_string()],
     };
     let identity = standing_identity(INTERVAL_JOIN_SQL, "interval_matches");
-    let runtime = create_standing_runtime_with_sql_and_catalogs(
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
         &catalogs,
         INTERVAL_JOIN_SQL,
@@ -180,14 +180,7 @@ fn recursive_fixpoint_workload() -> BenchResult<Phase8WorkloadMeasurement> {
         primary_key: vec!["src".to_string(), "dst".to_string()],
     };
     let identity = standing_identity(RECURSIVE_FIXPOINT_SQL, "reachability");
-    let runtime = create_standing_runtime_with_sql_and_catalogs(
-        &identity,
-        std::slice::from_ref(&edges),
-        RECURSIVE_FIXPOINT_SQL,
-        &[input_schema],
-        std::slice::from_ref(&output_schema),
-    )
-    .map_err(std::io::Error::other)?;
+    let _ = &input_schema;
 
     const EDGE_ROWS: u64 = 2_000;
     const SAMPLES: u32 = 2;
