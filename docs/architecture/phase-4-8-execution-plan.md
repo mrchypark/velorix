@@ -413,9 +413,12 @@ by completing earlier phases.
 - [ ] **Add checkpoint codec for window frame state**
 
 **Current state**: Ranking functions (ROW_NUMBER, RANK, DENSE_RANK) implemented
-and gated behind `experimental_advanced_view_features`; verified by
-`row_number_sql_*`/`analytic_*` view_plan tests and API restart tests.
-No window frame or navigation functions (design doc phase-8-window-frames-design.md).
+and gated behind `experimental_advanced_view_features`. **COMPLETE
+(2026-08-12): bounded ROWS window frames with navigation functions**
+(LAG/LEAD/FIRST_VALUE/LAST_VALUE/NTH_VALUE, constant offsets, ROWS BETWEEN
+k PRECEDING AND k FOLLOWING) through the AnalyticWindowFrames execution
+family; RANGE/GROUPS/UNBOUNDED/EXCLUDE fail closed
+(`analytic_window_frames_navigation_materializes_and_restores`).
 
 ### 8.2 Exact Percentile, Median, and Ordered-Set Aggregates
 
