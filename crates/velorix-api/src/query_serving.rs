@@ -1093,6 +1093,9 @@ pub(super) fn standing_runtime_output_aggregate_outputs_for_checkpoint(
         .map_err(|source| ApiError::bad_request(source.to_string()))?;
     match payload.get("runtime_kind").and_then(Value::as_str) {
         Some("filter_project" | "analytic_row_number" | "latest_by_key") => return Ok(None),
+        Some("interval_join" | "interval_join_v2" | "cross_join_v2" | "recursive_fixpoint_v2") => {
+            return Ok(Some(Vec::new()))
+        }
         Some("two_input_join_sum_count" | "two_input_join_common_dag_reference_v1") => {
             let Some(plan) = payload.get("plan").filter(|plan| !plan.is_null()) else {
                 return Ok(None);

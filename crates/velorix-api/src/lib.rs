@@ -121,16 +121,19 @@ use velorix_core::{
         supported_join_view_plan_is_self_join, supported_join_view_plan_is_singleton,
         supported_view_plan_aggregate_outputs, supported_view_plan_group_keys,
         validate_catalog_backed_sum_count_view_sql, validate_supported_analytic_row_number_sql,
-        validate_supported_filter_project_sql, validate_supported_join_view_sql,
-        validate_supported_latest_by_key_sql, validate_supported_semi_anti_join_sql,
-        validate_supported_three_input_inner_join_count_sql,
-        validate_supported_tumbling_window_sql, LogicalPlanAggregateFunctionV1,
+        validate_supported_cross_join_sql, validate_supported_filter_project_sql,
+        validate_supported_interval_join_sql, validate_supported_join_view_sql,
+        validate_supported_latest_by_key_sql, validate_supported_recursive_cte_sql,
+        validate_supported_semi_anti_join_sql, validate_supported_three_input_inner_join_count_sql,
+        validate_supported_tumbling_window_sql, CrossJoinSideV1, LogicalPlanAggregateFunctionV1,
         SupportedAggregateInputRelationSide, SupportedAggregateOutput,
-        SupportedAnalyticRowNumberPlan, SupportedFilterProjectPlan, SupportedJoinViewPlan,
-        SupportedLatestByKeyPlan, SupportedProjectionExpr, SupportedThreeInputInnerJoinCountPlanV1,
-        SupportedTumblingWindowPlan, SupportedViewPlan, VelorixLogicalViewExecutionV1,
-        VelorixLogicalViewPlanV1, ViewPlanError, INCREMENTAL_BAG_SEMANTICS_VERSION_V1,
-        INCREMENTAL_KEY_SEMANTICS_VERSION_V1, OUTPUT_PUBLICATION_PROTOCOL_VERSION_V1,
+        SupportedAnalyticRowNumberPlan, SupportedCrossJoinPlanV1, SupportedFilterProjectPlan,
+        SupportedIntervalJoinPlanV1, SupportedJoinViewPlan, SupportedLatestByKeyPlan,
+        SupportedProjectionExpr, SupportedRecursiveFixpointPlanV1,
+        SupportedThreeInputInnerJoinCountPlanV1, SupportedTumblingWindowPlan, SupportedViewPlan,
+        VelorixLogicalViewExecutionV1, VelorixLogicalViewPlanV1, ViewPlanError,
+        INCREMENTAL_BAG_SEMANTICS_VERSION_V1, INCREMENTAL_KEY_SEMANTICS_VERSION_V1,
+        OUTPUT_PUBLICATION_PROTOCOL_VERSION_V1,
     },
 };
 use velorix_runtime::{
@@ -612,6 +615,14 @@ impl StandingProgramRuntimeFactory for MaterializedViewRuntimeFactory {
         }
         if matches!(catalogs.len(), 1 | 2) {
             if catalogs.len() == 2 {
+                if let Ok(plan) = validate_supported_interval_join_sql(sql, catalogs) {
+                    return interval_join_output_schema(view_id, catalogs, &plan)
+                        .map(|schema| Some(vec![schema]));
+                }
+                if let Ok(plan) = validate_supported_cross_join_sql(sql, catalogs) {
+                    return cross_join_output_schema(view_id, catalogs, &plan)
+                        .map(|schema| Some(vec![schema]));
+                }
                 if let Ok(plan) = validate_supported_semi_anti_join_sql(sql, catalogs) {
                     let left_catalog = catalogs
                         .iter()
@@ -637,6 +648,10 @@ impl StandingProgramRuntimeFactory for MaterializedViewRuntimeFactory {
         let Some(catalog) = catalogs.first() else {
             return Ok(None);
         };
+        if let Ok(plan) = validate_supported_recursive_cte_sql(sql, catalog) {
+            return recursive_fixpoint_output_schema(view_id, catalog, &plan)
+                .map(|schema| Some(vec![schema]));
+        }
         self.output_schemas_for_view_request(view_id, sql, catalog, input_schema_fingerprint)
     }
 
@@ -6048,6 +6063,151 @@ fn three_input_join_count_output_schema(
         relation_name: view_id.to_string(),
         relation_version: "v1".to_string(),
         schema_fingerprint,
+        columns,
+        primary_key,
+    })
+}
+
+fn interval_join_output_schema(
+    view_id: &str,
+    catalogs: &[VelorixRelationCatalogV1],
+    plan: &SupportedIntervalJoinPlanV1,
+) -> Result<RelationSchema, ApiError> {
+    let left_catalog = catalogs
+        .iter()
+        .find(|catalog| catalog.relation_schema.relation_id == plan.left_input_relation_id)
+        .ok_or_else(|| ApiError::bad_request("interval join left catalog is missing"))?;
+    let right_catalog = catalogs
+        .iter()
+        .find(|catalog| catalog.relation_schema.relation_id == plan.right_input_relation_id)
+        .ok_or_else(|| ApiError::bad_request("interval join right catalog is missing"))?;
+    let mut columns = Vec::new();
+    for column in &plan.output_columns {
+        let input_column = left_catalog
+            .relation_schema
+            .columns
+            .iter()
+            .find(|candidate| candidate.column_id == column.left_column_id)
+            .ok_or_else(|| ApiError::bad_request("interval join output column is missing"))?;
+        columns.push(ColumnSchema {
+            name: column.output_name.clone(),
+            data_type: sql_type_from_catalog_column(input_column)?,
+            nullable: false,
+        });
+    }
+    let right_key = right_catalog
+        .relation_schema
+        .columns
+        .iter()
+        .find(|candidate| candidate.column_id == plan.right_key_column_id)
+        .ok_or_else(|| ApiError::bad_request("interval join right key column is missing"))?;
+    columns.push(ColumnSchema {
+        name: plan.right_key_output_name.clone(),
+        data_type: sql_type_from_catalog_column(right_key)?,
+        nullable: false,
+    });
+    let primary_key = columns
+        .iter()
+        .map(|column| column.name.clone())
+        .collect::<Vec<_>>();
+    Ok(RelationSchema {
+        relation_id: view_id.to_string(),
+        relation_name: view_id.to_string(),
+        relation_version: "2026-08-14.v1".to_string(),
+        schema_fingerprint: materialized_output_schema_fingerprint(
+            view_id,
+            "v1",
+            &columns,
+            &primary_key,
+        )?,
+        columns,
+        primary_key,
+    })
+}
+
+fn cross_join_output_schema(
+    view_id: &str,
+    catalogs: &[VelorixRelationCatalogV1],
+    plan: &SupportedCrossJoinPlanV1,
+) -> Result<RelationSchema, ApiError> {
+    let left_catalog = catalogs
+        .iter()
+        .find(|catalog| catalog.relation_schema.relation_id == plan.left_input_relation_id)
+        .ok_or_else(|| ApiError::bad_request("cross join left catalog is missing"))?;
+    let right_catalog = catalogs
+        .iter()
+        .find(|catalog| catalog.relation_schema.relation_id == plan.right_input_relation_id)
+        .ok_or_else(|| ApiError::bad_request("cross join right catalog is missing"))?;
+    let mut columns = Vec::new();
+    for item in &plan.projection {
+        let catalog = match item.side {
+            CrossJoinSideV1::Left => left_catalog,
+            CrossJoinSideV1::Right => right_catalog,
+        };
+        let input_column = catalog
+            .relation_schema
+            .columns
+            .iter()
+            .find(|candidate| candidate.column_id == item.column_id)
+            .ok_or_else(|| ApiError::bad_request("cross join output column is missing"))?;
+        columns.push(ColumnSchema {
+            name: item.output_name.clone(),
+            data_type: sql_type_from_catalog_column(input_column)?,
+            nullable: false,
+        });
+    }
+    let primary_key = columns
+        .iter()
+        .map(|column| column.name.clone())
+        .collect::<Vec<_>>();
+    Ok(RelationSchema {
+        relation_id: view_id.to_string(),
+        relation_name: view_id.to_string(),
+        relation_version: "2026-08-14.v1".to_string(),
+        schema_fingerprint: materialized_output_schema_fingerprint(
+            view_id,
+            "v1",
+            &columns,
+            &primary_key,
+        )?,
+        columns,
+        primary_key,
+    })
+}
+
+fn recursive_fixpoint_output_schema(
+    view_id: &str,
+    catalog: &VelorixRelationCatalogV1,
+    plan: &SupportedRecursiveFixpointPlanV1,
+) -> Result<RelationSchema, ApiError> {
+    let mut columns = Vec::new();
+    for (index, column_id) in plan.anchor_projection.iter().enumerate() {
+        let input_column = catalog
+            .relation_schema
+            .columns
+            .iter()
+            .find(|candidate| candidate.column_id == *column_id)
+            .ok_or_else(|| ApiError::bad_request("recursive fixpoint output column is missing"))?;
+        columns.push(ColumnSchema {
+            name: plan.recursion_column_names[index].clone(),
+            data_type: sql_type_from_catalog_column(input_column)?,
+            nullable: false,
+        });
+    }
+    let primary_key = columns
+        .iter()
+        .map(|column| column.name.clone())
+        .collect::<Vec<_>>();
+    Ok(RelationSchema {
+        relation_id: view_id.to_string(),
+        relation_name: view_id.to_string(),
+        relation_version: "2026-08-14.v1".to_string(),
+        schema_fingerprint: materialized_output_schema_fingerprint(
+            view_id,
+            "v1",
+            &columns,
+            &primary_key,
+        )?,
         columns,
         primary_key,
     })

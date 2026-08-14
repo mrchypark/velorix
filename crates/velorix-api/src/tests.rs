@@ -16643,6 +16643,189 @@ async fn rest_relation_admission_rejects_internal_published_view_output_source_k
     );
 }
 
+#[tokio::test]
+async fn phase8_families_derive_output_schemas_for_view_requests() {
+    let state = test_public_api_state_with_store(
+        Arc::new(InMemory::new()),
+        "api-test-phase8-output-schemas",
+        false,
+    )
+    .await;
+    let edges = test_edges_catalog_for_e2e();
+    let rides =
+        test_interval_side_catalog_for_e2e("rides", "ride_id", "booking_start", "booking_end_time");
+    let vehicles = test_interval_side_catalog_for_e2e(
+        "vehicles",
+        "vehicle_id",
+        "capacity_start_time",
+        "capacity_end",
+    );
+    let scores = test_scores_catalog();
+    let accounts = test_accounts_catalog();
+    let edges_generic = generic_adapter_catalog(edges);
+    let scores_generic = generic_adapter_catalog(scores);
+    let accounts_generic = generic_adapter_catalog(accounts);
+
+    let recursive = state
+        .materialized_runtime_output_schemas_for_view_request(
+            "reachability",
+            "with recursive reach as (select src, dst from edges union distinct select r.src, e.dst from reach r join edges e on r.dst = e.src) select src, dst from reach",
+            std::slice::from_ref(&edges_generic),
+            edges_generic.schema_fingerprint.as_str(),
+        )
+        .unwrap()
+        .expect("recursive CTE view must derive an output schema");
+    let schema = &recursive[0];
+    assert_eq!(
+        schema.primary_key,
+        vec!["src".to_string(), "dst".to_string()]
+    );
+    assert_eq!(
+        schema
+            .columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.data_type == SqlDataType::Utf8))
+            .collect::<Vec<_>>(),
+        vec![("src", true), ("dst", true)]
+    );
+
+    let interval = state
+        .materialized_runtime_output_schemas_for_view_request(
+            "interval_matches",
+            "select r.ride_id, r.booking_start, r.booking_end_time from rides r join vehicles v on r.booking_start < v.capacity_end and v.capacity_start_time < r.booking_end_time",
+            &[rides, vehicles],
+            "",
+        )
+        .unwrap()
+        .expect("interval join view must derive an output schema");
+    let schema = &interval[0];
+    assert_eq!(
+        schema.primary_key,
+        vec![
+            "ride_id".to_string(),
+            "booking_start".to_string(),
+            "booking_end_time".to_string(),
+            "vehicle_id".to_string()
+        ]
+    );
+
+    let cross = state
+        .materialized_runtime_output_schemas_for_view_request(
+            "pair_matches",
+            "select s.user_id, a.account_id, s.score, a.limit from scores s cross join accounts a",
+            &[scores_generic, accounts_generic],
+            "",
+        )
+        .unwrap()
+        .expect("cross join view must derive an output schema");
+    let schema = &cross[0];
+    assert_eq!(
+        schema.primary_key,
+        vec![
+            "user_id".to_string(),
+            "account_id".to_string(),
+            "score".to_string(),
+            "limit".to_string()
+        ]
+    );
+}
+
+fn generic_adapter_catalog(mut catalog: VelorixRelationCatalogV1) -> VelorixRelationCatalogV1 {
+    catalog.incremental_adapter.adapter_id = CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.to_string();
+    catalog
+}
+
+fn test_edges_catalog_for_e2e() -> VelorixRelationCatalogV1 {
+    generic_adapter_catalog(test_relation_catalog_for_e2e(
+        "edges",
+        &[
+            ("edge_id", VelorixLogicalTypeV1::Utf8, false),
+            ("src", VelorixLogicalTypeV1::Utf8, false),
+            ("dst", VelorixLogicalTypeV1::Utf8, false),
+        ],
+    ))
+}
+
+fn test_interval_side_catalog_for_e2e(
+    relation_id: &str,
+    key_column: &str,
+    start_column: &str,
+    end_column: &str,
+) -> VelorixRelationCatalogV1 {
+    generic_adapter_catalog(test_relation_catalog_for_e2e(
+        relation_id,
+        &[
+            (key_column, VelorixLogicalTypeV1::Utf8, false),
+            (start_column, VelorixLogicalTypeV1::Int64, false),
+            (end_column, VelorixLogicalTypeV1::Int64, false),
+        ],
+    ))
+}
+
+fn test_relation_catalog_for_e2e(
+    relation_id: &str,
+    columns: &[(&str, VelorixLogicalTypeV1, bool)],
+) -> VelorixRelationCatalogV1 {
+    let mut schema_columns = Vec::new();
+    for (index, (column_id, logical_type, nullable)) in columns.iter().enumerate() {
+        let physical_arrow_type = match logical_type {
+            VelorixLogicalTypeV1::Utf8 => ArrowPhysicalTypeV1::Utf8,
+            VelorixLogicalTypeV1::Int64 => ArrowPhysicalTypeV1::Int64,
+            _ => panic!("e2e test catalog supports utf8 and int64 only"),
+        };
+        schema_columns.push(RelationColumnV1 {
+            column_id: column_id.to_string(),
+            name: column_id.to_string(),
+            logical_type: logical_type.clone(),
+            physical_arrow_type,
+            nullable: *nullable,
+            ordinal: index as u32,
+            semantic_role: if index == 0 {
+                RelationSemanticRoleV1::PrimaryKey
+            } else {
+                RelationSemanticRoleV1::Value
+            },
+        });
+    }
+    schema_columns.push(RelationColumnV1 {
+        column_id: "delta".to_string(),
+        name: "delta".to_string(),
+        logical_type: VelorixLogicalTypeV1::Int64,
+        physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+        nullable: false,
+        ordinal: columns.len() as u32,
+        semantic_role: RelationSemanticRoleV1::Weight,
+    });
+    let relation_schema = VelorixRelationSchemaV1 {
+        relation_id: relation_id.to_string(),
+        relation_name: relation_id.to_string(),
+        relation_version: "2026-08-14.v1".to_string(),
+        columns: schema_columns,
+        primary_key_column_ids: vec![columns[0].0.to_string()],
+        weight_column_id: "delta".to_string(),
+        allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+        event_time_column_id: None,
+    };
+    let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
+    VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
+        schema_version: RELATION_SCHEMA_VERSION_V1,
+        relation_schema,
+        schema_fingerprint: schema_fingerprint.clone(),
+        datafusion_registration: DataFusionRegistrationV1 {
+            name: relation_id.to_string(),
+            mode: DataFusionRegistrationModeV1::Table,
+        },
+        incremental_relation: IncrementalRelationBindingV1 {
+            relation_id: relation_id.to_string(),
+            schema_fingerprint,
+        },
+        incremental_adapter: IncrementalAdapterBindingV1 {
+            adapter_id: CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.to_string(),
+        },
+    }
+}
+
 fn test_scores_catalog() -> VelorixRelationCatalogV1 {
     let relation_schema = VelorixRelationSchemaV1 {
         relation_id: "scores".to_string(),
