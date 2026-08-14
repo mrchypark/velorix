@@ -47,18 +47,23 @@ use velorix_control::{
     ingest_writer_runtime::DeployedIngestWriterRuntime,
     meta_admin::{
         validate_bearer_token, AcquireStandingRuntimeOwnerOutcome,
-        AcquireStandingRuntimeOwnerRequest, GrpcMetaStore, IngestRangeReservation, MetaStore,
-        MetaStoreError, PublishStandingRuntimeCheckpointOutcome,
-        PublishStandingRuntimeCheckpointRequest, ReserveIngestRangeOutcome,
-        StandingRuntimeCheckpointPointer, StandingRuntimeFencingCapability,
-        StandingRuntimeOwnerClaim, StandingRuntimeOwnerToken, StoreRelationCatalogOutcome,
-        STANDING_RUNTIME_BACKEND_TIME_SOURCE_RAFT_REPLICATED,
+        AcquireStandingRuntimeOwnerRequest, BeginViewBootstrapOutcome, BeginViewBootstrapRequest,
+        BeginViewDependencyEdgeV1, CaptureIngestSourceCutRequest, CommitIngestRangeOutcome,
+        FixViewBootstrapActivationCutOutcome, FixViewBootstrapActivationCutRequest, GrpcMetaStore,
+        IngestRangeReservation, IngestSourceRelationIdentityV1, MetaStore, MetaStoreError,
+        PromoteViewBootstrapOutcome, PromoteViewBootstrapRequest,
+        PublishStandingRuntimeCheckpointOutcome, PublishStandingRuntimeCheckpointRequest,
+        ReserveIngestRangeOutcome, StandingRuntimeCheckpointPointer,
+        StandingRuntimeFencingCapability, StandingRuntimeOwnerClaim, StandingRuntimeOwnerToken,
+        StoreRelationCatalogOutcome, ViewBootstrapControlV1, ViewBootstrapLifecycleV1,
+        INGEST_SOURCE_IDENTITY_GENERATION_V1, STANDING_RUNTIME_BACKEND_TIME_SOURCE_RAFT_REPLICATED,
         STANDING_RUNTIME_FENCING_CAPABILITY_SCHEMA_VERSION,
         STANDING_RUNTIME_LEASE_AUTHORITY_KIND_HIQLITE_RAFT_SERIALIZED,
         STANDING_RUNTIME_LEASE_AUTHORITY_KIND_RAFT_REPLICATED_TIME,
         STANDING_RUNTIME_LEASE_EXPIRY_SEMANTICS_BACKEND_WALL_CLOCK_TTL,
         STANDING_RUNTIME_LEASE_EXPIRY_SEMANTICS_OPERATION_DRIVEN_LOGICAL,
-        STANDING_RUNTIME_OUTPUT_DELTA_REF_PREFIX, STANDING_RUNTIME_OUTPUT_MANIFEST_REF_PREFIX,
+        STANDING_RUNTIME_OUTPUT_COMMIT_REF_PREFIX, STANDING_RUNTIME_OUTPUT_DELTA_REF_PREFIX,
+        STANDING_RUNTIME_OUTPUT_MANIFEST_REF_PREFIX,
         STANDING_RUNTIME_OWNER_SCOPE_KIND_TENANT_PROGRAM_VIEW,
     },
     operator_authority::{
@@ -87,31 +92,45 @@ use velorix_core::{
         DataFusionRegistrationModeV1, DataFusionRegistrationV1, DictionaryKeyTypeV1,
         IncrementalAdapterBindingV1, IncrementalRelationBindingV1, RelationColumnV1,
         RelationOperationV1, RelationSemanticRoleV1, SchemaFingerprintV1, VelorixLogicalTypeV1,
-        VelorixRelationCatalogV1, VelorixRelationSchemaV1,
+        VelorixRelationCatalogV1, VelorixRelationSchemaV1, VelorixRelationSourceV1,
         CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID, RELATION_SCHEMA_VERSION_V1,
     },
     standing_program::{
-        BuiltinRuntimeIdentity, EpochIdempotencyKey, InputEventTimeWatermark, MaterializedViewPage,
-        NativeCodePolicy, RelationFrontier, RelationInputBatch, RuntimeCheckpoint,
-        RuntimeCheckpointStatePayload, ScopedViewId, SnapshotPageRequest, StandingProgramIdentity,
-        StandingProgramRuntime, StandingProgramRuntimeError, ViewOutputDelta,
+        BuiltinRuntimeIdentity, CausalCutV1, CausalViewCursorV1, EpochIdempotencyKey,
+        InputEventTimeWatermark, MaterializedViewPage, NativeCodePolicy, RelationFrontier,
+        RelationInputBatch, RelationInputEncodingV1, RuntimeCheckpoint,
+        RuntimeCheckpointInputCoverageV1, RuntimeCheckpointPartitionCoverageV1,
+        RuntimeCheckpointRelationCoverageV1, RuntimeCheckpointStatePayload, ScopedViewId,
+        SnapshotPageRequest, StandingProgramIdentity, StandingProgramRuntime,
+        StandingProgramRuntimeError, ViewOutputDelta,
+        RUNTIME_CHECKPOINT_INPUT_COVERAGE_SCHEMA_VERSION_V1,
     },
     view_contract::{
-        catalog_input_relation_schema, stable_bytes_hash, validate_materialized_standing_view_spec,
-        view_spec_hash, ColumnSchema, RelationSchema, SqlDataType, SqlDialect, SqlSourceKind,
-        SqlStructField, StandingViewShape, StandingViewSpec,
+        catalog_from_published_relation_binding, catalog_input_relation_schema,
+        published_relation_binding_v1, stable_bytes_hash, validate_materialized_standing_view_spec,
+        validate_published_relation_binding_v1, validate_view_dependency_graph,
+        view_dependency_edge_from_binding, view_dependency_edge_id, view_spec_hash, ColumnSchema,
+        PublishedRelationBindingV1, RelationSchema, SqlDataType, SqlDialect, SqlSourceKind,
+        SqlStructField, StandingInputBindingV1, StandingViewShape, StandingViewSpec,
+        ViewDependencyEdgeV1, PUBLISHED_DELTA_WEIGHT_FIELD_V1,
+        PUBLISHED_RELATION_BINDING_SCHEMA_VERSION_V1,
     },
     view_plan::{
         lower_supported_analytic_row_number_sql_to_logical_plan,
         lower_supported_sql_to_logical_plan, supported_join_view_plan_aggregate_outputs,
-        supported_view_plan_aggregate_outputs, validate_catalog_backed_sum_count_view_sql,
-        validate_supported_analytic_row_number_sql, validate_supported_filter_project_sql,
-        validate_supported_join_view_sql, validate_supported_latest_by_key_sql,
+        supported_join_view_plan_is_self_join, supported_join_view_plan_is_singleton,
+        supported_view_plan_aggregate_outputs, supported_view_plan_group_keys,
+        validate_catalog_backed_sum_count_view_sql, validate_supported_analytic_row_number_sql,
+        validate_supported_filter_project_sql, validate_supported_join_view_sql,
+        validate_supported_latest_by_key_sql, validate_supported_semi_anti_join_sql,
+        validate_supported_three_input_inner_join_count_sql,
         validate_supported_tumbling_window_sql, LogicalPlanAggregateFunctionV1,
         SupportedAggregateInputRelationSide, SupportedAggregateOutput,
         SupportedAnalyticRowNumberPlan, SupportedFilterProjectPlan, SupportedJoinViewPlan,
-        SupportedLatestByKeyPlan, SupportedTumblingWindowPlan, SupportedViewPlan,
-        VelorixLogicalViewExecutionV1, VelorixLogicalViewPlanV1, ViewPlanError,
+        SupportedLatestByKeyPlan, SupportedProjectionExpr, SupportedThreeInputInnerJoinCountPlanV1,
+        SupportedTumblingWindowPlan, SupportedViewPlan, VelorixLogicalViewExecutionV1,
+        VelorixLogicalViewPlanV1, ViewPlanError, INCREMENTAL_BAG_SEMANTICS_VERSION_V1,
+        INCREMENTAL_KEY_SEMANTICS_VERSION_V1, OUTPUT_PUBLICATION_PROTOCOL_VERSION_V1,
     },
 };
 use velorix_runtime::{
@@ -131,6 +150,7 @@ mod openapi;
 mod query_serving;
 mod recovery;
 mod view_admission;
+mod view_dependencies;
 
 use checkpoint_publication::*;
 use ingest_epoch::*;
@@ -138,8 +158,9 @@ use openapi::openapi_json;
 use query_serving::*;
 use recovery::*;
 use view_admission::*;
+use view_dependencies::*;
 
-const PUBLIC_1_0_MAX_JOIN_INPUT_RELATIONS: usize = 2;
+const PUBLIC_1_0_MAX_JOIN_INPUT_RELATIONS: usize = 3;
 const PUBLIC_1_0_MAX_TOP_K_LIMIT: usize = 1_000;
 const DEFAULT_MAX_STANDING_RUNTIME_OUTPUT_DELTA_RECORDS: usize = 100_000;
 const DEFAULT_MAX_STANDING_RUNTIME_STATE_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
@@ -150,6 +171,7 @@ pub struct ApiState {
     capabilities: Arc<AuthoritativeObjectStoreCapabilitiesV1>,
     ingest_writer: Arc<DeployedIngestWriterRuntime<ObjectStoreAuthorityRef>>,
     meta_store: Option<Arc<dyn MetaStore>>,
+    view_bootstrap_meta_store: Option<Arc<dyn MetaStore>>,
     meta_store_endpoint: Option<String>,
     owner_id: String,
     standing_runtime_owner_ttl_ms: u64,
@@ -163,11 +185,17 @@ pub struct ApiState {
     max_standing_runtime_state_payload_bytes: usize,
     output_compaction_interval_epochs: u64,
     experimental_advanced_view_features: bool,
+    public_view_feature_policy: PublicViewFeaturePolicyV1,
     background_tasks: Arc<Mutex<BackgroundTaskStatus>>,
     background_compactions: Arc<Mutex<BTreeSet<String>>>,
     standing_runtimes: Arc<StandingRuntimeRegistry>,
     standing_runtime_factories: Arc<StandingRuntimeFactoryRegistry>,
     query_runtimes: Arc<Mutex<HashMap<String, ProductionQueryRuntime>>>,
+    /// Serializes view-on-view dependency admissions in-process so concurrent
+    /// creates cannot both pass the acyclic check on the same snapshot. The
+    /// authoritative meta-store graph revision CAS extends this fence across
+    /// processes.
+    view_dependency_graph_mutex: Arc<AsyncMutex<()>>,
 }
 
 type SharedStandingRuntime = Arc<Mutex<Box<dyn StandingProgramRuntime + Send>>>;
@@ -367,7 +395,7 @@ struct StandingRuntimeCheckpointRecord {
     manifest_hash: String,
 }
 
-fn standing_runtime_checkpoint_record_from_slice(
+pub(crate) fn standing_runtime_checkpoint_record_from_slice(
     bytes: &[u8],
 ) -> Result<StandingRuntimeCheckpointRecord, serde_json::Error> {
     let mut value: Value = serde_json::from_slice(bytes)?;
@@ -486,6 +514,25 @@ struct StandingRuntimeOutputDeltaRecord {
     delta_row_count: usize,
     source_kind: String,
     output_delta: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    producer_commit: Option<StandingRuntimeProducerCommitV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StandingRuntimeProducerCommitV1 {
+    schema_version: u32,
+    producer_view_generation: u64,
+    producer_plan_hash: String,
+    output_stream_id: String,
+    output_schema_hash: String,
+    key_descriptor_hash: String,
+    delta_codec_identity: String,
+    frontier_kind: String,
+    checkpoint_key: String,
+    checkpoint_content_hash: String,
+    causal_cut_digest: String,
+    producer_commit_digest: String,
 }
 
 #[derive(Clone, Debug)]
@@ -537,7 +584,7 @@ impl StandingProgramRuntimeFactory for MaterializedViewRuntimeFactory {
             return latest_by_key_output_schema(view_id, catalog, &plan)
                 .map(|schema| Some(vec![schema]));
         };
-        single_key_sum_count_output_schema(view_id, catalog, &plan).map(|schema| Some(vec![schema]))
+        aggregate_output_schema(view_id, catalog, &plan).map(|schema| Some(vec![schema]))
     }
 
     fn output_schemas_for_view_request_with_catalogs(
@@ -547,13 +594,45 @@ impl StandingProgramRuntimeFactory for MaterializedViewRuntimeFactory {
         catalogs: &[VelorixRelationCatalogV1],
         input_schema_fingerprint: &str,
     ) -> Result<Option<Vec<RelationSchema>>, ApiError> {
-        if catalogs.len() == 2 {
-            let Ok(plan) = validate_supported_join_view_sql(sql, catalogs) else {
+        if catalogs.len() == 3 {
+            if let Ok(plan) = validate_supported_three_input_inner_join_count_sql(sql, catalogs) {
+                if catalogs
+                    .iter()
+                    .map(|catalog| &catalog.relation_schema.relation_id)
+                    .ne(plan.ordered_input_relation_ids.iter())
+                {
+                    return Err(ApiError::bad_request(
+                        "three-input JOIN catalogs must follow SQL join order",
+                    ));
+                }
+                return three_input_join_count_output_schema(view_id, catalogs, &plan)
+                    .map(|schema| Some(vec![schema]));
+            }
+            return Ok(None);
+        }
+        if matches!(catalogs.len(), 1 | 2) {
+            if catalogs.len() == 2 {
+                if let Ok(plan) = validate_supported_semi_anti_join_sql(sql, catalogs) {
+                    let left_catalog = catalogs
+                        .iter()
+                        .find(|catalog| {
+                            catalog.relation_schema.relation_id == plan.left_input_relation_id
+                        })
+                        .ok_or_else(|| {
+                            ApiError::bad_request("semi/anti join left catalog is missing")
+                        })?;
+                    return filter_project_output_schema(view_id, left_catalog, &plan.projection)
+                        .map(|schema| Some(vec![schema]));
+                }
+            }
+            if let Ok(plan) = validate_supported_join_view_sql(sql, catalogs) {
+                validate_join_plan_catalog_order(&plan, catalogs)?;
+                return join_sum_count_output_schema(view_id, catalogs, &plan)
+                    .map(|schema| Some(vec![schema]));
+            }
+            if catalogs.len() == 2 {
                 return Ok(None);
-            };
-            validate_join_plan_catalog_order(&plan, catalogs)?;
-            return join_sum_count_output_schema(view_id, catalogs, &plan)
-                .map(|schema| Some(vec![schema]));
+            }
         }
         let Some(catalog) = catalogs.first() else {
             return Ok(None);
@@ -692,6 +771,7 @@ impl ApiState {
             capabilities,
             ingest_writer: Arc::new(ingest_writer),
             meta_store: None,
+            view_bootstrap_meta_store: None,
             meta_store_endpoint: None,
             owner_id,
             standing_runtime_owner_ttl_ms: 30_000,
@@ -707,11 +787,13 @@ impl ApiState {
                 DEFAULT_MAX_STANDING_RUNTIME_STATE_PAYLOAD_BYTES,
             output_compaction_interval_epochs: 0,
             experimental_advanced_view_features: false,
+            public_view_feature_policy: PublicViewFeaturePolicyV1::default(),
             background_tasks: Arc::new(Mutex::new(BackgroundTaskStatus::default())),
             background_compactions: Arc::new(Mutex::new(BTreeSet::new())),
             standing_runtimes: Arc::new(StandingRuntimeRegistry::default()),
             standing_runtime_factories: Arc::new(StandingRuntimeFactoryRegistry::default()),
             query_runtimes: Arc::new(Mutex::new(HashMap::new())),
+            view_dependency_graph_mutex: Arc::new(AsyncMutex::new(())),
         };
         state.register_standing_program_runtime_factory(
             MATERIALIZED_VIEW_RUNTIME_NAME,
@@ -722,7 +804,14 @@ impl ApiState {
     }
 
     pub fn with_meta_store(mut self, meta_store: Arc<dyn MetaStore>) -> Self {
+        self.view_bootstrap_meta_store = Some(Arc::clone(&meta_store));
         self.meta_store = Some(meta_store);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_view_bootstrap_meta_store(mut self, meta_store: Arc<dyn MetaStore>) -> Self {
+        self.view_bootstrap_meta_store = Some(meta_store);
         self
     }
 
@@ -790,6 +879,7 @@ impl ApiState {
     #[cfg(test)]
     pub fn with_experimental_advanced_view_features(mut self, enabled: bool) -> Self {
         self.experimental_advanced_view_features = enabled;
+        self.public_view_feature_policy = PublicViewFeaturePolicyV1::from(enabled);
         self
     }
 
@@ -1123,6 +1213,10 @@ impl ApiState {
             }
         }
 
+        // After restoring runtimes, pull pending producer commits into
+        // dependent consumer views so the chain is caught up.
+        drain_published_view_dependencies(self).await?;
+
         Ok(restored)
     }
 
@@ -1331,6 +1425,7 @@ fn default_scores_relation_catalog() -> Result<VelorixRelationCatalogV1, ApiErro
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema)
         .map_err(ApiError::bad_request)?;
     Ok(VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
         schema_version: RELATION_SCHEMA_VERSION_V1,
         relation_schema,
         schema_fingerprint: schema_fingerprint.clone(),
@@ -2069,6 +2164,17 @@ async fn create_relation_catalog(
     state: ApiState,
     catalog: VelorixRelationCatalogV1,
 ) -> Result<(StatusCode, Json<RelationResponse>), ApiError> {
+    // Internal published-view-output descriptors are created by the view
+    // runtime from validated producer bindings; a user-supplied catalog must
+    // never claim that source kind on the public admission path.
+    if matches!(
+        catalog.relation_source,
+        VelorixRelationSourceV1::PublishedViewOutput { .. }
+    ) {
+        return Err(ApiError::bad_request(
+            "relation catalog admission rejected: `PublishedViewOutput` is an internal source kind reserved for materialized view outputs and cannot be registered through the public relation API",
+        ));
+    }
     let outcome = if let Some(meta_store) = &state.meta_store {
         let outcome = meta_store
             .store_relation_catalog(catalog.clone())
@@ -5567,35 +5673,42 @@ fn validate_create_view_sql_source_contract(request: &CreateViewRequest) -> Resu
     Ok(())
 }
 
-fn single_key_sum_count_output_schema(
+fn aggregate_output_schema(
     view_id: &str,
     catalog: &VelorixRelationCatalogV1,
     plan: &SupportedViewPlan,
 ) -> Result<RelationSchema, ApiError> {
-    let [primary_key_id] = catalog.relation_schema.primary_key_column_ids.as_slice() else {
-        return Err(ApiError::bad_request(
-            "single-key sum/count view requires exactly one primary key column",
-        ));
-    };
-    let key_column = catalog
-        .relation_schema
-        .columns
-        .iter()
-        .find(|column| &column.column_id == primary_key_id)
-        .ok_or_else(|| ApiError::bad_request("primary key column is missing from catalog"))?;
-    let key_type = sql_type_from_catalog_column(key_column)?;
-    let output_key_name = if plan.output_key_column_id.is_empty() {
-        key_column.name.clone()
-    } else {
-        plan.output_key_column_id.clone()
-    };
+    let group_keys = supported_view_plan_group_keys(plan);
     let aggregate_outputs = supported_view_plan_aggregate_outputs(plan);
-    let mut columns = Vec::with_capacity(1 + aggregate_outputs.len());
-    columns.push(ColumnSchema {
-        name: output_key_name.clone(),
-        data_type: key_type,
-        nullable: false,
-    });
+    let mut columns = Vec::with_capacity(group_keys.len() + aggregate_outputs.len());
+    for group_key in &group_keys {
+        let (data_type, nullable) = match (&group_key.input_column_id, &group_key.expression) {
+            (Some(column_id), None) => {
+                let column = catalog
+                    .relation_schema
+                    .columns
+                    .iter()
+                    .find(|column| &column.column_id == column_id)
+                    .ok_or_else(|| {
+                        ApiError::bad_request(format!(
+                            "group key column `{column_id}` is missing from catalog"
+                        ))
+                    })?;
+                (sql_type_from_catalog_column(column)?, column.nullable)
+            }
+            (None, Some(expression)) => projection_expression_output_type(catalog, expression)?,
+            _ => {
+                return Err(ApiError::bad_request(
+                    "group key must bind exactly one input column or expression",
+                ));
+            }
+        };
+        columns.push(ColumnSchema {
+            name: group_key.output_column_id.clone(),
+            data_type,
+            nullable,
+        });
+    }
     for aggregate in &aggregate_outputs {
         columns.push(ColumnSchema {
             name: aggregate.output_column_id.clone(),
@@ -5603,7 +5716,10 @@ fn single_key_sum_count_output_schema(
             nullable: false,
         });
     }
-    let primary_key = vec![output_key_name];
+    let primary_key = group_keys
+        .iter()
+        .map(|group_key| group_key.output_column_id.clone())
+        .collect::<Vec<_>>();
     let schema_fingerprint =
         materialized_output_schema_fingerprint(view_id, "v1", &columns, &primary_key)?;
     Ok(RelationSchema {
@@ -5614,6 +5730,55 @@ fn single_key_sum_count_output_schema(
         columns,
         primary_key,
     })
+}
+
+fn projection_expression_output_type(
+    catalog: &VelorixRelationCatalogV1,
+    expression: &SupportedProjectionExpr,
+) -> Result<(SqlDataType, bool), ApiError> {
+    match expression {
+        SupportedProjectionExpr::Column { column_id } => {
+            let column = catalog
+                .relation_schema
+                .columns
+                .iter()
+                .find(|column| &column.column_id == column_id)
+                .ok_or_else(|| {
+                    ApiError::bad_request(format!(
+                        "group key expression column `{column_id}` is missing from catalog"
+                    ))
+                })?;
+            Ok((sql_type_from_catalog_column(column)?, column.nullable))
+        }
+        SupportedProjectionExpr::LiteralInt64 { .. }
+        | SupportedProjectionExpr::CoalesceInt64 { .. } => Ok((SqlDataType::Int64, false)),
+        SupportedProjectionExpr::BinaryInt64 { left, right, .. } => {
+            let (_, left_nullable) = projection_expression_output_type(catalog, left)?;
+            let (_, right_nullable) = projection_expression_output_type(catalog, right)?;
+            Ok((SqlDataType::Int64, left_nullable || right_nullable))
+        }
+        SupportedProjectionExpr::AbsInt64 { expr } => {
+            let (_, nullable) = projection_expression_output_type(catalog, expr)?;
+            Ok((SqlDataType::Int64, nullable))
+        }
+        SupportedProjectionExpr::GreatestInt64 { exprs }
+        | SupportedProjectionExpr::LeastInt64 { exprs } => {
+            let mut nullable = false;
+            for expr in exprs {
+                nullable |= projection_expression_output_type(catalog, expr)?.1;
+            }
+            Ok((SqlDataType::Int64, nullable))
+        }
+        SupportedProjectionExpr::CaseInt64 {
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            let (_, then_nullable) = projection_expression_output_type(catalog, then_expr)?;
+            let (_, else_nullable) = projection_expression_output_type(catalog, else_expr)?;
+            Ok((SqlDataType::Int64, then_nullable || else_nullable))
+        }
+    }
 }
 
 fn latest_by_key_output_schema(
@@ -5837,38 +6002,106 @@ fn tumbling_window_output_schema(
     })
 }
 
+fn three_input_join_count_output_schema(
+    view_id: &str,
+    catalogs: &[VelorixRelationCatalogV1],
+    plan: &SupportedThreeInputInnerJoinCountPlanV1,
+) -> Result<RelationSchema, ApiError> {
+    let [root, _, _] = catalogs else {
+        return Err(ApiError::bad_request(
+            "three-input JOIN requires exactly three catalogs",
+        ));
+    };
+    if plan.output_key_column_ids.len() != plan.root_primary_key_column_ids.len() {
+        return Err(ApiError::bad_request(
+            "three-input JOIN output key mapping is invalid",
+        ));
+    }
+    let mut columns = plan
+        .root_primary_key_column_ids
+        .iter()
+        .zip(plan.output_key_column_ids.iter())
+        .map(|(column_id, output_name)| {
+            let column = root
+                .relation_schema
+                .columns
+                .iter()
+                .find(|column| &column.column_id == column_id)
+                .ok_or_else(|| ApiError::bad_request("three-input JOIN root PK is missing"))?;
+            Ok(ColumnSchema {
+                name: output_name.clone(),
+                data_type: sql_type_from_catalog_column(column)?,
+                nullable: false,
+            })
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    columns.push(ColumnSchema {
+        name: plan.count_output_column_id.clone(),
+        data_type: SqlDataType::Int64,
+        nullable: false,
+    });
+    let primary_key = plan.output_key_column_ids.clone();
+    let schema_fingerprint =
+        materialized_output_schema_fingerprint(view_id, "v1", &columns, &primary_key)?;
+    Ok(RelationSchema {
+        relation_id: view_id.to_string(),
+        relation_name: view_id.to_string(),
+        relation_version: "v1".to_string(),
+        schema_fingerprint,
+        columns,
+        primary_key,
+    })
+}
+
 fn join_sum_count_output_schema(
     view_id: &str,
     catalogs: &[VelorixRelationCatalogV1],
     plan: &SupportedJoinViewPlan,
 ) -> Result<RelationSchema, ApiError> {
-    let [left_catalog, right_catalog] = catalogs else {
+    let self_join = supported_join_view_plan_is_self_join(plan);
+    if (self_join && catalogs.len() != 1) || (!self_join && catalogs.len() != 2) {
         return Err(ApiError::bad_request(
-            "join sum/count view requires exactly two input relations",
+            "join sum/count view requires one self-joined or two distinct input relations",
         ));
-    };
-    let key_catalog = catalogs
+    }
+    let left_catalog = catalogs
         .iter()
-        .find(|catalog| catalog.relation_schema.relation_id == plan.group_key_relation_id)
-        .ok_or_else(|| ApiError::bad_request("join group key relation is missing from catalog"))?;
-    let key_column = key_catalog
-        .relation_schema
-        .columns
+        .find(|catalog| catalog.relation_schema.relation_id == plan.left_input_relation_id)
+        .ok_or_else(|| ApiError::bad_request("join left relation is missing from catalog"))?;
+    let right_catalog = catalogs
         .iter()
-        .find(|column| column.column_id == plan.group_key_column_id)
-        .ok_or_else(|| ApiError::bad_request("join group key column is missing from catalog"))?;
-    let key_type = sql_type_from_catalog_column(key_column)?;
-    let output_key_name = if plan.output_key_column_id.is_empty() {
-        key_column.name.clone()
-    } else {
-        plan.output_key_column_id.clone()
-    };
+        .find(|catalog| catalog.relation_schema.relation_id == plan.right_input_relation_id)
+        .ok_or_else(|| ApiError::bad_request("join right relation is missing from catalog"))?;
     let aggregate_outputs = supported_join_view_plan_aggregate_outputs(plan);
-    let mut columns = vec![ColumnSchema {
-        name: output_key_name.clone(),
-        data_type: key_type,
-        nullable: false,
-    }];
+    let mut columns = Vec::new();
+    let mut primary_key = Vec::new();
+    if !supported_join_view_plan_is_singleton(plan) {
+        let key_catalog = catalogs
+            .iter()
+            .find(|catalog| catalog.relation_schema.relation_id == plan.group_key_relation_id)
+            .ok_or_else(|| {
+                ApiError::bad_request("join group key relation is missing from catalog")
+            })?;
+        let key_column = key_catalog
+            .relation_schema
+            .columns
+            .iter()
+            .find(|column| column.column_id == plan.group_key_column_id)
+            .ok_or_else(|| {
+                ApiError::bad_request("join group key column is missing from catalog")
+            })?;
+        let output_key_name = if plan.output_key_column_id.is_empty() {
+            key_column.name.clone()
+        } else {
+            plan.output_key_column_id.clone()
+        };
+        columns.push(ColumnSchema {
+            name: output_key_name.clone(),
+            data_type: sql_type_from_catalog_column(key_column)?,
+            nullable: false,
+        });
+        primary_key.push(output_key_name);
+    }
     for aggregate in aggregate_outputs {
         let data_type = join_aggregate_output_type(left_catalog, right_catalog, plan, &aggregate)?;
         columns.push(ColumnSchema {
@@ -5877,7 +6110,6 @@ fn join_sum_count_output_schema(
             nullable: false,
         });
     }
-    let primary_key = vec![output_key_name];
     let schema_fingerprint =
         materialized_output_schema_fingerprint(view_id, "v1", &columns, &primary_key)?;
     Ok(RelationSchema {
@@ -5897,6 +6129,10 @@ fn join_aggregate_output_type(
     aggregate: &SupportedAggregateOutput,
 ) -> Result<SqlDataType, ApiError> {
     match aggregate.function {
+        LogicalPlanAggregateFunctionV1::PercentileDisc { .. }
+        | LogicalPlanAggregateFunctionV1::PercentileCont { .. } => Err(ApiError::bad_request(
+            "percentile aggregates are not supported in join views yet",
+        )),
         LogicalPlanAggregateFunctionV1::Count | LogicalPlanAggregateFunctionV1::CountDistinct => {
             if aggregate.input_column_id.is_some() {
                 let _ = join_value_aggregate_column(
@@ -6011,18 +6247,40 @@ fn validate_join_plan_catalog_order(
     plan: &SupportedJoinViewPlan,
     catalogs: &[VelorixRelationCatalogV1],
 ) -> Result<(), ApiError> {
+    if supported_join_view_plan_is_self_join(plan) {
+        let [catalog] = catalogs else {
+            return Err(ApiError::bad_request(
+                "self-join view requires exactly one physical input relation",
+            ));
+        };
+        return if catalog.relation_schema.relation_id == plan.left_input_relation_id
+            && plan.left_input_relation_id == plan.right_input_relation_id
+        {
+            Ok(())
+        } else {
+            Err(ApiError::bad_request(
+                "input_relations must match the SQL self-JOIN input",
+            ))
+        };
+    }
     let [left, right] = catalogs else {
         return Err(ApiError::bad_request(
             "join sum/count view requires exactly two input relations",
         ));
     };
-    if left.relation_schema.relation_id == plan.left_input_relation_id
-        && right.relation_schema.relation_id == plan.right_input_relation_id
-    {
+    let requested = BTreeSet::from([
+        left.relation_schema.relation_id.as_str(),
+        right.relation_schema.relation_id.as_str(),
+    ]);
+    let planned = BTreeSet::from([
+        plan.left_input_relation_id.as_str(),
+        plan.right_input_relation_id.as_str(),
+    ]);
+    if requested == planned {
         Ok(())
     } else {
         Err(ApiError::bad_request(
-            "input_relations must be ordered to match the SQL JOIN left and right inputs",
+            "input_relations must match the two SQL JOIN inputs",
         ))
     }
 }
@@ -6065,6 +6323,8 @@ fn single_key_aggregate_output_type(
         LogicalPlanAggregateFunctionV1::Count | LogicalPlanAggregateFunctionV1::CountDistinct => {
             Ok(SqlDataType::Int64)
         }
+        LogicalPlanAggregateFunctionV1::PercentileDisc { .. } => Ok(SqlDataType::Int64),
+        LogicalPlanAggregateFunctionV1::PercentileCont { .. } => Ok(SqlDataType::Float64),
         LogicalPlanAggregateFunctionV1::Avg => {
             let column_id = aggregate
                 .input_column_id
@@ -7098,8 +7358,11 @@ fn meta_error_to_api(error: MetaStoreError) -> ApiError {
         | MetaStoreError::TimestampOverflow
         | MetaStoreError::Serialization(_)
         | MetaStoreError::StandingRuntimeCheckpointScopeMismatch
+        | MetaStoreError::DuplicateSourceCutRelation { .. }
+        | MetaStoreError::OverlappingSourceCutRange { .. }
         | MetaStoreError::UnexpectedOutcome(_) => ApiError::bad_request(error),
         MetaStoreError::RelationCatalogConflict { .. }
+        | MetaStoreError::NonMonotonicCheckpointEpoch { .. }
         | MetaStoreError::StandingRuntimeOwnerMismatch => ApiError::conflict(error),
         MetaStoreError::UnsupportedCapability(_) => ApiError::service_unavailable(error),
         MetaStoreError::Remote(_) | MetaStoreError::Oss(_) | MetaStoreError::Hiqlite(_) => {

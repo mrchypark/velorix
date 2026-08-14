@@ -68,9 +68,53 @@ pub struct VelorixRelationCatalogV1 {
     pub datafusion_registration: DataFusionRegistrationV1,
     pub incremental_relation: IncrementalRelationBindingV1,
     pub incremental_adapter: IncrementalAdapterBindingV1,
+    /// Provenance of this catalog. Source catalogs are registered relations
+    /// backed by the ingest log. Published-view-output catalogs are runtime
+    /// planning descriptors derived from a producer's immutable
+    /// `PublishedRelationBindingV1`; they are never registered in the relation
+    /// registry and must never be targets of external ingest.
+    #[serde(default)]
+    pub relation_source: VelorixRelationSourceV1,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(Default)]
+pub enum VelorixRelationSourceV1 {
+    #[default]
+    SourceRelation,
+    PublishedViewOutput {
+        producer_view_id: String,
+        producer_view_generation: u64,
+        output_stream_id: String,
+    },
 }
 
 impl VelorixRelationCatalogV1 {
+    pub fn from_relation_schema(
+        relation_schema: VelorixRelationSchemaV1,
+        adapter_id: String,
+    ) -> Result<Self, RelationSchemaError> {
+        let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema)?;
+        let catalog = Self {
+            schema_version: RELATION_SCHEMA_VERSION_V1,
+            datafusion_registration: DataFusionRegistrationV1 {
+                name: relation_schema.relation_name.clone(),
+                mode: DataFusionRegistrationModeV1::Table,
+            },
+            incremental_relation: IncrementalRelationBindingV1 {
+                relation_id: relation_schema.relation_id.clone(),
+                schema_fingerprint: schema_fingerprint.clone(),
+            },
+            incremental_adapter: IncrementalAdapterBindingV1 { adapter_id },
+            relation_schema,
+            schema_fingerprint,
+            relation_source: VelorixRelationSourceV1::SourceRelation,
+        };
+        catalog.validate_ingest_adapter_scope()?;
+        Ok(catalog)
+    }
+
     pub fn validate(&self) -> Result<(), RelationSchemaError> {
         if self.schema_version != RELATION_SCHEMA_VERSION_V1 {
             return Err(RelationSchemaError::UnsupportedSchemaVersion {
@@ -80,7 +124,14 @@ impl VelorixRelationCatalogV1 {
 
         let computed = SchemaFingerprintV1::for_relation_schema(&self.relation_schema)?;
         self.schema_fingerprint.validate("schema_fingerprint")?;
-        if self.schema_fingerprint != computed {
+        if matches!(
+            self.relation_source,
+            VelorixRelationSourceV1::SourceRelation
+        ) && self.schema_fingerprint != computed
+        {
+            // Published-view-output descriptors carry the producer's signed
+            // output schema fingerprint, which is computed over the public
+            // output relation (not over the internal descriptor schema).
             return Err(RelationSchemaError::SchemaFingerprintMismatch { field: "catalog" });
         }
 
@@ -207,24 +258,10 @@ pub fn orders_sum_count_relation_catalog() -> Result<VelorixRelationCatalogV1, R
         allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
         event_time_column_id: None,
     };
-    let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema)?;
-
-    Ok(VelorixRelationCatalogV1 {
-        schema_version: RELATION_SCHEMA_VERSION_V1,
+    VelorixRelationCatalogV1::from_relation_schema(
         relation_schema,
-        schema_fingerprint: schema_fingerprint.clone(),
-        datafusion_registration: DataFusionRegistrationV1 {
-            name: "orders".to_string(),
-            mode: DataFusionRegistrationModeV1::Table,
-        },
-        incremental_relation: IncrementalRelationBindingV1 {
-            relation_id: ORDERS_SUM_COUNT_RELATION_ID.to_string(),
-            schema_fingerprint,
-        },
-        incremental_adapter: IncrementalAdapterBindingV1 {
-            adapter_id: ORDERS_SUM_COUNT_ADAPTER_ID.to_string(),
-        },
-    })
+        ORDERS_SUM_COUNT_ADAPTER_ID.to_string(),
+    )
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1679,7 +1716,7 @@ impl IncrementalKeyColumn<'_> {
                     });
                 }
 
-                Ok(json!(value))
+                Ok(json!(if value == 0.0 { 0.0 } else { value }))
             }
             Self::Float64(column) => {
                 let value = column.value(row);
@@ -1689,7 +1726,7 @@ impl IncrementalKeyColumn<'_> {
                     });
                 }
 
-                Ok(json!(value))
+                Ok(json!(if value == 0.0 { 0.0 } else { value }))
             }
             Self::Decimal128(column, precision, scale) => Ok(json!(decimal128_string(
                 column.value(row),

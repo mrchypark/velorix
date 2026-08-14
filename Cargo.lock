@@ -6996,6 +6996,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "velorix-control",
+ "velorix-core",
  "velorix-k8s",
  "velorix-meta",
  "velorix-runtime",

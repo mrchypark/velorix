@@ -1,46 +1,476 @@
 use std::sync::Arc;
 
 use arrow::{
-    array::{Array, BooleanArray, Decimal128Array, Float64Array, Int64Array, StringArray},
+    array::{
+        Array, BooleanArray, Decimal128Array, Float64Array, Int64Array, StringArray,
+        TimestampNanosecondArray,
+    },
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
 use serde_json::{json, Value};
 use velorix_core::{
     delta::{DeltaBatch, DeltaKey, DeltaRecord, DeltaValue},
+    native_operator::{
+        NativeAggregateOperator, NativeBinaryJoinOperator, NativeLeftJoinOperator,
+        NativeOperatorEdgeV1, NativeOperatorGraph, NativeOperatorGraphCheckpointV1,
+        NativeOperatorInputV1, NativeOperatorStateV1,
+    },
+    operator::AggregateValueMode,
+    operator_contract::ChangelogModeV1,
     relation::{
-        ArrowPhysicalTypeV1, DataFusionRegistrationModeV1, DataFusionRegistrationV1,
-        IncrementalAdapterBindingV1, IncrementalRelationBindingV1, RelationColumnV1,
-        RelationOperationV1, RelationSemanticRoleV1, SchemaFingerprintV1, VelorixLogicalTypeV1,
-        VelorixRelationCatalogV1, VelorixRelationSchemaV1, CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID,
+        arrow_record_batches_to_key_value_delta_batch, ArrowPhysicalTypeV1,
+        DataFusionRegistrationModeV1, DataFusionRegistrationV1, IncrementalAdapterBindingV1,
+        IncrementalRelationBindingV1, RelationColumnV1, RelationOperationV1,
+        RelationSemanticRoleV1, SchemaFingerprintV1, VelorixLogicalTypeV1,
+        VelorixRelationCatalogV1, VelorixRelationSchemaV1, VelorixRelationSourceV1,
+        CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID,
         CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID, RELATION_SCHEMA_VERSION_V1,
     },
     standing_program::{
         BuiltinRuntimeIdentity, EpochIdempotencyKey, InputEventTimeWatermark, NativeCodePolicy,
-        RelationFrontier, RelationInputBatch, ScopedViewId, SnapshotPageRequest,
-        StandingProgramIdentity, StandingProgramRuntime, StandingProgramRuntimeError,
+        RelationFrontier, RelationInputBatch, RelationInputEncodingV1, RuntimeCheckpoint,
+        ScopedViewId, SnapshotPageRequest, StandingProgramIdentity, StandingProgramRuntime,
+        StandingProgramRuntimeError, ViewOutputDelta,
     },
     view_contract::{
-        catalog_input_relation_schema, stable_bytes_hash, ColumnSchema, RelationSchema, SqlDataType,
+        catalog_from_published_relation_binding, catalog_input_relation_schema,
+        published_relation_binding_v1, stable_bytes_hash, ColumnSchema, RelationSchema,
+        SqlDataType, PUBLISHED_DELTA_WEIGHT_FIELD_V1, PUBLISHED_RELATION_DELTA_CODEC_V1,
     },
     view_plan::{
         logical_view_plan_hash, lower_supported_analytic_row_number_sql_to_logical_plan,
         lower_supported_filter_project_sql_to_logical_plan,
-        lower_supported_join_view_sql_to_logical_plan, LogicalPlanAggregateAccumulatorV1,
-        LogicalPlanAggregateFunctionV1, LogicalPlanColumnRef, LogicalPlanRelationRef,
-        LogicalPlanStateKindV1, LogicalPlanStateRequirementV1, PredicateOp, RowPredicate,
-        RowPredicateExpr, SupportedAggregateInputRelationSide, SupportedAggregateOutput,
-        SupportedAnalyticRowNumberPlan, SupportedAnalyticWindowFunction, SupportedProjectionExpr,
-        VelorixLogicalViewExecutionV1, VelorixLogicalViewPlanNodeV1, VelorixLogicalViewPlanV1,
-        LOGICAL_VIEW_OUTPUT_CODEC_VERSION_V1, LOGICAL_VIEW_PLAN_CAPABILITY_VERSION_V1,
-        LOGICAL_VIEW_PLAN_VERSION_V1, LOGICAL_VIEW_STATE_CODEC_VERSION_V1,
+        lower_supported_join_view_sql_to_logical_plan, lower_supported_sql_to_logical_plan,
+        lower_supported_three_input_inner_join_count_sql_to_logical_plan_with_policy,
+        lower_supported_tumbling_window_sql_to_logical_plan_with_policy, LateRowPolicy,
+        LogicalPlanAggregateFunctionV1, RowPredicateExpr, SupportedAggregateOutput,
+        SupportedProjectionExpr, VelorixLogicalViewExecutionV1, VelorixLogicalViewPlanV1,
+        COMPOSITE_PK_POSITIONAL_JSON_ARRAY_JOIN_KEY_CODEC_V1,
+        THREE_INPUT_LEGACY_SQL_ENCOUNTER_JOIN_ORDER_V1,
     },
 };
 use velorix_runtime::materialized_view_runtime::{
+    advance_input_event_time_frontier, bind_join_execution_v1, combine_multi_input_watermarks,
+    create_common_dag_reference_standing_runtime_with_logical_plan_and_catalogs,
     create_standing_runtime, create_standing_runtime_with_logical_plan_and_catalogs,
     create_standing_runtime_with_sql_and_catalogs, materialized_delta_to_page,
-    restore_standing_runtime, CRATE_NAME,
+    restore_common_dag_reference_standing_runtime, restore_standing_runtime, JoinExecutionModeV1,
+    JoinSpecializationComparisonGraph, TwoInputJoinRuntime, CRATE_NAME,
 };
+
+#[test]
+fn public_exists_and_not_exists_materialize_through_restart_with_duplicate_matches() {
+    for (label, negated) in [("semi", false), ("anti", true)] {
+        let scores = scores_catalog();
+        let accounts = accounts_catalog();
+        let catalogs = vec![scores.clone(), accounts.clone()];
+        let input_schemas = catalogs
+            .iter()
+            .map(|catalog| catalog_input_relation_schema(catalog).unwrap())
+            .collect::<Vec<_>>();
+        let output = scores_projection_output_schema();
+        let sql = format!(
+            "select s.user_id, s.score from scores s where {}exists (select 1 from accounts a where a.account_id = s.user_id)",
+            if negated { "not " } else { "" }
+        );
+        let identity = standing_identity_with_view(&sql, "positive_scores");
+        let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+            &identity,
+            &catalogs,
+            &sql,
+            &input_schemas,
+            std::slice::from_ref(&output),
+        )
+        .unwrap();
+
+        runtime
+            .apply_changes(
+                1,
+                EpochIdempotencyKey::new(format!("{label}-epoch-1")).unwrap(),
+                vec![
+                    relation_input(
+                        &scores,
+                        &format!("{label}-scores"),
+                        0,
+                        2,
+                        scores_rows_batch(&[("alice", 10, 1), ("bob", 5, 1)]),
+                    ),
+                    relation_input(
+                        &accounts,
+                        &format!("{label}-accounts"),
+                        0,
+                        1,
+                        accounts_rows_batch(&[("alice", 100, "gold", 1)]),
+                    ),
+                ],
+            )
+            .unwrap();
+        assert_projected_scores_page(
+            runtime.as_ref(),
+            1,
+            if negated {
+                &[("bob", 5)]
+            } else {
+                &[("alice", 10)]
+            },
+        );
+
+        let checkpoint = runtime.checkpoint().unwrap();
+        let payload = checkpoint.state_payload.as_ref().unwrap().payload.as_str();
+        assert!(payload.contains(if negated {
+            "velorix-native-anti-join-v1"
+        } else {
+            "velorix-native-semi-join-v1"
+        }));
+        let mut restored = restore_standing_runtime(checkpoint).unwrap();
+        restored
+            .apply_changes(
+                2,
+                EpochIdempotencyKey::new(format!("{label}-epoch-2")).unwrap(),
+                vec![relation_input(
+                    &accounts,
+                    &format!("{label}-accounts"),
+                    1,
+                    4,
+                    accounts_rows_batch(&[
+                        ("alice", 100, "gold", -1),
+                        ("bob", 50, "gold", 1),
+                        ("bob", 75, "silver", 1),
+                    ]),
+                )],
+            )
+            .unwrap();
+        assert_projected_scores_page(
+            restored.as_ref(),
+            2,
+            if negated {
+                &[("alice", 10)]
+            } else {
+                &[("bob", 5)]
+            },
+        );
+
+        restored
+            .apply_changes(
+                3,
+                EpochIdempotencyKey::new(format!("{label}-epoch-3")).unwrap(),
+                vec![
+                    relation_input(
+                        &scores,
+                        &format!("{label}-scores"),
+                        2,
+                        4,
+                        scores_rows_batch(&[("alice", 10, -1), ("alice", 12, 1)]),
+                    ),
+                    relation_input(
+                        &accounts,
+                        &format!("{label}-accounts"),
+                        4,
+                        5,
+                        accounts_rows_batch(&[("bob", 50, "gold", -1)]),
+                    ),
+                ],
+            )
+            .unwrap();
+        assert_projected_scores_page(
+            restored.as_ref(),
+            3,
+            if negated {
+                &[("alice", 12)]
+            } else {
+                &[("bob", 5)]
+            },
+        );
+
+        let mut restored = restore_standing_runtime(restored.checkpoint().unwrap()).unwrap();
+        restored
+            .apply_changes(
+                4,
+                EpochIdempotencyKey::new(format!("{label}-epoch-4")).unwrap(),
+                vec![relation_input(
+                    &accounts,
+                    &format!("{label}-accounts"),
+                    5,
+                    6,
+                    accounts_rows_batch(&[("bob", 75, "silver", -1)]),
+                )],
+            )
+            .unwrap();
+        assert_projected_scores_page(
+            restored.as_ref(),
+            4,
+            if negated {
+                &[("alice", 12), ("bob", 5)]
+            } else {
+                &[]
+            },
+        );
+    }
+}
+
+#[test]
+fn runtime_materializes_global_count_empty_input_and_final_retract_across_restore() {
+    let catalog = scores_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = global_count_output_schema();
+    let sql = "select count(*) as count from scores";
+    let identity = standing_identity(sql);
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    let empty = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: identity.tenant_id.clone(),
+                program_id: identity.program_id.clone(),
+                view_id: identity.view_ids[0].clone(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(0),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    assert_global_count_batch(&empty.batches[0], 0);
+
+    let inserted = runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("global-count-epoch-1").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "global-count-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 3,
+                event_time_watermark: None,
+                batches: vec![scores_rows_batch(&[
+                    ("alice", 10, 1),
+                    ("bob", 5, 1),
+                    ("alice", 7, 1),
+                ])],
+            }],
+        )
+        .unwrap();
+    assert_global_count_batch(&inserted.output_batches[0].batches[0], 3);
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    let payload = checkpoint
+        .state_payload
+        .as_ref()
+        .expect("global aggregate checkpoint payload")
+        .payload
+        .as_str();
+    assert!(payload.contains("aggregate_singleton_state"));
+    assert!(payload.contains("aggregate_singleton_publication"));
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    let deleted = restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("global-count-epoch-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "global-count-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 3,
+                end_offset_exclusive: 6,
+                event_time_watermark: None,
+                batches: vec![scores_rows_batch(&[
+                    ("alice", 10, -1),
+                    ("bob", 5, -1),
+                    ("alice", 7, -1),
+                ])],
+            }],
+        )
+        .unwrap();
+    assert_global_count_batch(&deleted.output_batches[0].batches[0], 0);
+}
+
+#[test]
+fn runtime_materializes_composite_computed_group_keys() {
+    let catalog = scores_with_category_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = composite_bucket_output_schema();
+    let sql = "select user_id, score / 10 as bucket, sum(score) as sum, count(*) as count from scores group by user_id, bucket";
+    let identity = standing_identity(sql);
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    let commit = runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("composite-group-epoch-1").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "composite-group-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 3,
+                event_time_watermark: None,
+                batches: vec![scores_with_category_batch()],
+            }],
+        )
+        .unwrap();
+
+    let batch = &commit.output_batches[0].batches[0];
+    assert_eq!(batch.num_rows(), 2);
+    let users = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let buckets = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let sums = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let counts = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(
+        users.iter().collect::<Vec<_>>(),
+        vec![Some("u1"), Some("u1")]
+    );
+    assert_eq!(buckets.values(), &[0, 1]);
+    assert_eq!(sums.values(), &[12, 15]);
+    assert_eq!(counts.values(), &[2, 1]);
+}
+
+#[test]
+fn runtime_materializes_registered_composite_group_keys_with_null() {
+    let catalog = scores_with_category_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = composite_category_output_schema();
+    let sql = "select user_id, category, sum(score) as sum, count(*) as count from scores group by user_id, category";
+    let identity = standing_identity(sql);
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    let commit = runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("registered-composite-group-epoch-1").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "registered-composite-group-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 3,
+                event_time_watermark: None,
+                batches: vec![scores_with_category_batch()],
+            }],
+        )
+        .unwrap();
+
+    let batch = &commit.output_batches[0].batches[0];
+    let categories = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let sums = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let mut rows = (0..batch.num_rows())
+        .map(|index| {
+            (
+                (!categories.is_null(index)).then(|| categories.value(index).to_string()),
+                sums.value(index),
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort();
+    assert_eq!(rows, vec![(None, 15), (Some("a".to_string()), 12)]);
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    assert!(checkpoint
+        .state_payload
+        .as_ref()
+        .unwrap()
+        .payload
+        .contains("\"category\":null"));
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    let retracted = restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("registered-composite-group-epoch-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "registered-composite-group-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 3,
+                end_offset_exclusive: 4,
+                event_time_watermark: None,
+                batches: vec![scores_with_category_rows_batch(&[("u1", 15, None, -1)])],
+            }],
+        )
+        .unwrap();
+    let batch = &retracted.output_batches[0].batches[0];
+    assert_eq!(batch.num_rows(), 1);
+    let categories = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(categories.value(0), "a");
+    let removed_group = retracted.output_deltas[0]
+        .delta
+        .records()
+        .iter()
+        .find(|record| {
+            record.weight == -1
+                && record
+                    .key
+                    .as_json()
+                    .as_object()
+                    .and_then(|key| key.get("category"))
+                    == Some(&Value::Null)
+        });
+    assert!(removed_group.is_some());
+}
 
 #[test]
 fn runtime_materializes_sum_count_for_relation_without_value_semantic_role() {
@@ -64,6 +494,7 @@ fn runtime_materializes_sum_count_for_relation_without_value_semantic_role() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -116,6 +547,173 @@ fn runtime_materializes_sum_count_for_relation_without_value_semantic_role() {
     assert_eq!(user_ids.value(1), "bob");
     assert_eq!(sums.value(1), 5);
     assert_eq!(counts.value(1), 1);
+}
+
+#[test]
+fn runtime_repeated_epoch_is_idempotent_before_and_after_restore() {
+    let catalog = purchases_catalog_without_value_role();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = purchases_output_schema();
+    let sql =
+        "select user_id, sum(amount) as sum, count(*) as count from purchases group by user_id";
+    let identity = standing_identity(sql);
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    let input = RelationInputBatch {
+        encoding: RelationInputEncodingV1::SourceRelationV1,
+        relation_id: catalog.relation_schema.relation_id.clone(),
+        relation_version: catalog.relation_schema.relation_version.clone(),
+        stream_id: "idempotent-stream".to_string(),
+        partition_id: 0,
+        schema_fingerprint: catalog.schema_fingerprint.to_string(),
+        start_offset_inclusive: 0,
+        end_offset_exclusive: 3,
+        event_time_watermark: None,
+        batches: vec![purchases_batch()],
+    };
+    let key = EpochIdempotencyKey::new("repeated-epoch").unwrap();
+    runtime
+        .apply_changes(1, key.clone(), vec![input.clone()])
+        .unwrap();
+    let checkpoint = runtime.checkpoint().unwrap();
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "purchases_by_user".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(1),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+
+    let duplicate = runtime
+        .apply_changes(1, key.clone(), vec![input.clone()])
+        .unwrap();
+    assert!(duplicate.output_deltas.is_empty());
+    assert_eq!(runtime.checkpoint().unwrap(), checkpoint);
+    assert_eq!(
+        runtime
+            .materialized_view_page(
+                ScopedViewId {
+                    tenant_id: "tenant-a".to_string(),
+                    program_id: "program-purchases".to_string(),
+                    view_id: "purchases_by_user".to_string(),
+                },
+                SnapshotPageRequest {
+                    committed_epoch: Some(1),
+                    page_token: None,
+                    max_rows: None,
+                },
+            )
+            .unwrap()
+            .batches,
+        page.batches
+    );
+
+    let mut restored = restore_standing_runtime(checkpoint.clone()).unwrap();
+    let restored_duplicate = restored.apply_changes(1, key, vec![input]).unwrap();
+    assert!(restored_duplicate.output_deltas.is_empty());
+    assert_eq!(restored.checkpoint().unwrap(), checkpoint);
+}
+
+#[test]
+fn runtime_same_epoch_input_permutations_have_identical_state_output_and_restore() {
+    let catalog = purchases_catalog_without_value_role();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = purchases_output_schema();
+    let sql =
+        "select user_id, sum(amount) as sum, count(*) as count from purchases group by user_id";
+    let identity = standing_identity(sql);
+    let inputs = [(0, "alice", 10), (1, "bob", 5), (2, "alice", 7)].map(
+        |(partition_id, user_id, amount)| RelationInputBatch {
+            encoding: RelationInputEncodingV1::SourceRelationV1,
+            relation_id: catalog.relation_schema.relation_id.clone(),
+            relation_version: catalog.relation_schema.relation_version.clone(),
+            stream_id: "permutation-stream".to_string(),
+            partition_id,
+            schema_fingerprint: catalog.schema_fingerprint.to_string(),
+            start_offset_inclusive: 0,
+            end_offset_exclusive: 1,
+            event_time_watermark: None,
+            batches: vec![purchases_rows_batch(&[(user_id, amount, 1)])],
+        },
+    );
+    let mut baseline = None;
+    for order in [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ] {
+        let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+            &identity,
+            std::slice::from_ref(&catalog),
+            sql,
+            std::slice::from_ref(&input_schema),
+            std::slice::from_ref(&output_schema),
+        )
+        .unwrap();
+        runtime
+            .apply_changes(
+                1,
+                EpochIdempotencyKey::new("permuted-epoch").unwrap(),
+                order.iter().map(|index| inputs[*index].clone()).collect(),
+            )
+            .unwrap();
+        let checkpoint = runtime.checkpoint().unwrap();
+        let page = runtime
+            .materialized_view_page(
+                ScopedViewId {
+                    tenant_id: "tenant-a".to_string(),
+                    program_id: "program-purchases".to_string(),
+                    view_id: "purchases_by_user".to_string(),
+                },
+                SnapshotPageRequest {
+                    committed_epoch: Some(1),
+                    page_token: None,
+                    max_rows: None,
+                },
+            )
+            .unwrap();
+        let restored = restore_standing_runtime(checkpoint.clone()).unwrap();
+        let restored_page = restored
+            .materialized_view_page(
+                ScopedViewId {
+                    tenant_id: "tenant-a".to_string(),
+                    program_id: "program-purchases".to_string(),
+                    view_id: "purchases_by_user".to_string(),
+                },
+                SnapshotPageRequest {
+                    committed_epoch: Some(1),
+                    page_token: None,
+                    max_rows: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(restored_page.batches, page.batches);
+        let evidence = (
+            checkpoint.state_root.content_hash,
+            checkpoint.state_payload.unwrap().payload,
+            page.batches,
+        );
+        match &baseline {
+            Some(baseline) => assert_eq!(&evidence, baseline),
+            None => baseline = Some(evidence),
+        }
+    }
 }
 
 #[test]
@@ -235,6 +833,7 @@ fn runtime_materializes_sum_arithmetic_expression() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -310,6 +909,7 @@ fn runtime_materializes_cast_int64_aggregate_expression() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -409,6 +1009,7 @@ fn runtime_materializes_nested_double_colon_cast_int64_aggregate_expression() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -508,6 +1109,7 @@ fn runtime_materializes_try_and_safe_cast_int64_aggregate_expressions() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -607,6 +1209,7 @@ fn runtime_materializes_abs_int64_aggregate_expression() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -715,6 +1318,7 @@ fn runtime_materializes_greatest_least_int64_aggregate_expressions() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -825,6 +1429,7 @@ fn runtime_materializes_coalesce_nullable_int64_aggregate_expression() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -929,6 +1534,7 @@ fn runtime_materializes_is_not_distinct_from_null_predicate() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -1033,6 +1639,7 @@ fn runtime_materializes_is_distinct_from_predicate() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -1137,6 +1744,7 @@ fn runtime_materializes_case_when_distinct_from_null_predicates() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -1241,6 +1849,7 @@ fn runtime_materializes_case_when_is_null_predicates() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -1345,6 +1954,7 @@ fn runtime_materializes_case_when_int64_aggregate_expression() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -1449,6 +2059,7 @@ fn runtime_materializes_case_when_between_and_in_predicates() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -1555,6 +2166,7 @@ fn runtime_materializes_if_int64_aggregate_expression() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -1654,6 +2266,7 @@ fn runtime_materializes_multi_branch_case_when_int64_aggregate_expression() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -1753,6 +2366,7 @@ fn runtime_materializes_simple_case_when_int64_aggregate_expression() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -1828,6 +2442,7 @@ fn runtime_materializes_count_only_aggregate_and_restores_state() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -1850,6 +2465,7 @@ fn runtime_materializes_count_only_aggregate_and_restores_state() {
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -1899,6 +2515,7 @@ fn runtime_materializes_filter_project_view_and_restores_state() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -1919,6 +2536,7 @@ fn runtime_materializes_filter_project_view_and_restores_state() {
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -1932,6 +2550,262 @@ fn runtime_materializes_filter_project_view_and_restores_state() {
         )
         .unwrap();
     assert_projected_scores_page(restored.as_ref(), 2, &[("carol", 7)]);
+}
+
+#[test]
+fn runtime_materializes_filter_project_view_from_published_relation_delta_input() {
+    let binding = published_relation_binding_v1(
+        "filtered_scores",
+        7,
+        "velorix-logical-view-plan-sha256-v1:plan",
+        &filtered_scores_published_relation(),
+    )
+    .unwrap();
+    let catalog = catalog_from_published_relation_binding(&binding).unwrap();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    assert_eq!(input_schema, binding.relation);
+    let output_schema = filtered_scores_projection_output_schema();
+    let sql = "select user_id, score from filtered_scores where score > 0 order by score desc";
+    let identity = standing_identity_with_view(sql, "positive_scores");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    let published_encoding = RelationInputEncodingV1::PublishedRelationDeltaV1 {
+        delta_codec_identity: PUBLISHED_RELATION_DELTA_CODEC_V1.to_string(),
+        output_schema_hash: binding.output_schema_hash.clone(),
+        weight_field_name: PUBLISHED_DELTA_WEIGHT_FIELD_V1.to_string(),
+        weight_field_index: binding.relation.columns.len(),
+    };
+    let input_batch = |start: u64, end: u64, rows: &[(&str, i64, i64)]| RelationInputBatch {
+        encoding: published_encoding.clone(),
+        relation_id: binding.relation.relation_id.clone(),
+        relation_version: binding.relation.relation_version.clone(),
+        stream_id: binding.output_stream_id.clone(),
+        partition_id: 0,
+        schema_fingerprint: binding.relation.schema_fingerprint.clone(),
+        start_offset_inclusive: start,
+        end_offset_exclusive: end,
+        event_time_watermark: None,
+        batches: vec![filtered_scores_published_batch(rows)],
+    };
+
+    runtime
+        .apply_changes(
+            10,
+            EpochIdempotencyKey::new("published-epoch-10").unwrap(),
+            vec![input_batch(0, 10, &[("alice", 10, 1), ("carol", 3, 1)])],
+        )
+        .unwrap();
+    assert_projected_scores_page(runtime.as_ref(), 10, &[("alice", 10), ("carol", 3)]);
+
+    runtime
+        .apply_changes(
+            25,
+            EpochIdempotencyKey::new("published-epoch-25").unwrap(),
+            vec![input_batch(
+                10,
+                25,
+                &[
+                    ("alice", 10, -1),
+                    ("bob", -4, 1),
+                    ("carol", 3, -1),
+                    ("dave", 8, 1),
+                ],
+            )],
+        )
+        .unwrap();
+    assert_projected_scores_page(runtime.as_ref(), 25, &[("dave", 8)]);
+
+    let mut restored = restore_standing_runtime(runtime.checkpoint().unwrap()).unwrap();
+    restored
+        .apply_changes(
+            100,
+            EpochIdempotencyKey::new("published-epoch-100").unwrap(),
+            vec![RelationInputBatch {
+                encoding: published_encoding,
+                relation_id: binding.relation.relation_id.clone(),
+                relation_version: binding.relation.relation_version.clone(),
+                stream_id: binding.output_stream_id.clone(),
+                partition_id: 0,
+                schema_fingerprint: binding.relation.schema_fingerprint.clone(),
+                start_offset_inclusive: 25,
+                end_offset_exclusive: 100,
+                event_time_watermark: None,
+                batches: vec![filtered_scores_published_empty_batch()],
+            }],
+        )
+        .unwrap();
+    assert_projected_scores_page(restored.as_ref(), 100, &[("dave", 8)]);
+}
+
+#[test]
+fn runtime_rejects_published_relation_delta_input_with_wrong_codec_or_weight_layout() {
+    let binding = published_relation_binding_v1(
+        "filtered_scores",
+        7,
+        "velorix-logical-view-plan-sha256-v1:plan",
+        &filtered_scores_published_relation(),
+    )
+    .unwrap();
+    let catalog = catalog_from_published_relation_binding(&binding).unwrap();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = filtered_scores_projection_output_schema();
+    let sql = "select user_id, score from filtered_scores where score > 0";
+    let identity = standing_identity_with_view(sql, "positive_scores");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    let wrong_codec = RelationInputEncodingV1::PublishedRelationDeltaV1 {
+        delta_codec_identity: "not-the-published-codec".to_string(),
+        output_schema_hash: binding.output_schema_hash.clone(),
+        weight_field_name: PUBLISHED_DELTA_WEIGHT_FIELD_V1.to_string(),
+        weight_field_index: binding.relation.columns.len(),
+    };
+    let result = runtime.apply_changes(
+        1,
+        EpochIdempotencyKey::new("published-epoch-1").unwrap(),
+        vec![RelationInputBatch {
+            encoding: wrong_codec,
+            relation_id: binding.relation.relation_id.clone(),
+            relation_version: binding.relation.relation_version.clone(),
+            stream_id: binding.output_stream_id.clone(),
+            partition_id: 0,
+            schema_fingerprint: binding.relation.schema_fingerprint.clone(),
+            start_offset_inclusive: 0,
+            end_offset_exclusive: 1,
+            event_time_watermark: None,
+            batches: vec![filtered_scores_published_batch(&[("alice", 10, 1)])],
+        }],
+    );
+    assert!(matches!(
+        result,
+        Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+            field: "published_input.delta_codec_identity"
+        })
+    ));
+
+    let wrong_weight_index = RelationInputEncodingV1::PublishedRelationDeltaV1 {
+        delta_codec_identity: PUBLISHED_RELATION_DELTA_CODEC_V1.to_string(),
+        output_schema_hash: binding.output_schema_hash.clone(),
+        weight_field_name: PUBLISHED_DELTA_WEIGHT_FIELD_V1.to_string(),
+        weight_field_index: 0,
+    };
+    let result = runtime.apply_changes(
+        1,
+        EpochIdempotencyKey::new("published-epoch-1").unwrap(),
+        vec![RelationInputBatch {
+            encoding: wrong_weight_index,
+            relation_id: binding.relation.relation_id.clone(),
+            relation_version: binding.relation.relation_version.clone(),
+            stream_id: binding.output_stream_id.clone(),
+            partition_id: 0,
+            schema_fingerprint: binding.relation.schema_fingerprint.clone(),
+            start_offset_inclusive: 0,
+            end_offset_exclusive: 1,
+            event_time_watermark: None,
+            batches: vec![filtered_scores_published_batch(&[("alice", 10, 1)])],
+        }],
+    );
+    assert!(matches!(
+        result,
+        Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+            field: "published_input.weight_field_index"
+        })
+    ));
+}
+
+fn filtered_scores_published_relation() -> RelationSchema {
+    RelationSchema {
+        relation_id: "filtered_scores".to_string(),
+        relation_name: "filtered_scores".to_string(),
+        relation_version: "v1".to_string(),
+        schema_fingerprint: format!("sha256:{}", "2".repeat(64)),
+        columns: vec![
+            ColumnSchema {
+                name: "user_id".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "score".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["user_id".to_string()],
+    }
+}
+
+fn filtered_scores_projection_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "positive_scores".to_string(),
+        relation_name: "positive_scores".to_string(),
+        relation_version: "v1".to_string(),
+        schema_fingerprint: format!("sha256:{}", "3".repeat(64)),
+        columns: vec![
+            ColumnSchema {
+                name: "user_id".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "score".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["user_id".to_string()],
+    }
+}
+
+fn filtered_scores_published_batch(rows: &[(&str, i64, i64)]) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("score", DataType::Int64, false),
+            Field::new(PUBLISHED_DELTA_WEIGHT_FIELD_V1, DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|row| row.2).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap()
+}
+
+fn filtered_scores_published_empty_batch() -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("score", DataType::Int64, false),
+            Field::new(PUBLISHED_DELTA_WEIGHT_FIELD_V1, DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+            Arc::new(Int64Array::from(Vec::<i64>::new())),
+            Arc::new(Int64Array::from(Vec::<i64>::new())),
+        ],
+    )
+    .unwrap()
 }
 
 #[test]
@@ -1955,6 +2829,7 @@ fn runtime_materializes_plain_select_distinct_filter_project_when_primary_key_is
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -1975,6 +2850,7 @@ fn runtime_materializes_plain_select_distinct_filter_project_when_primary_key_is
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -2036,6 +2912,7 @@ fn runtime_materializes_plain_select_distinct_filter_project_by_projected_output
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -2060,6 +2937,7 @@ fn runtime_materializes_plain_select_distinct_filter_project_by_projected_output
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -2079,6 +2957,7 @@ fn runtime_materializes_plain_select_distinct_filter_project_by_projected_output
             3,
             EpochIdempotencyKey::new("epoch-3").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -2118,6 +2997,7 @@ fn runtime_materializes_row_number_and_restores_rerank_state() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -2145,6 +3025,7 @@ fn runtime_materializes_row_number_and_restores_rerank_state() {
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -2179,6 +3060,7 @@ fn runtime_materializes_row_number_and_restores_rerank_state() {
             3,
             EpochIdempotencyKey::new("epoch-3").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -2219,6 +3101,7 @@ fn runtime_materializes_rank_with_sql_order_ties() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -2277,6 +3160,7 @@ fn runtime_materializes_dense_rank_with_sql_order_ties() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -2335,6 +3219,7 @@ fn runtime_materializes_wrapped_row_number_top_n() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -2362,6 +3247,7 @@ fn runtime_materializes_wrapped_row_number_top_n() {
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -2410,6 +3296,7 @@ fn runtime_materializes_wrapped_row_number_top_one_and_promotes_after_delete() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -2439,6 +3326,7 @@ fn runtime_materializes_wrapped_row_number_top_one_and_promotes_after_delete() {
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -2482,6 +3370,7 @@ fn runtime_materializes_row_number_with_source_and_outer_predicates_before_ranki
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -2527,6 +3416,7 @@ fn runtime_restore_rejects_row_number_checkpoint_when_state_mismatches_published
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -2582,6 +3472,64 @@ fn runtime_rejects_row_number_logical_plan_that_does_not_match_sql() {
 }
 
 #[test]
+fn runtime_rejects_tampered_operator_contract_before_construction() {
+    let catalog = scores_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = scores_row_number_output_schema();
+    let sql = "select user_id, row_number() over (partition by score order by score desc, user_id asc) as rank from scores where score > 0";
+    let identity = standing_identity_with_view(sql, "scores_ranked");
+    let mut logical_plan =
+        lower_supported_analytic_row_number_sql_to_logical_plan(sql, &catalog, &output_schema)
+            .unwrap();
+    logical_plan.operator_dag_contract.operators[0].outputs[0].changelog =
+        ChangelogModeV1::AppendOnly;
+
+    let error = match create_standing_runtime_with_logical_plan_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        logical_plan,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    ) {
+        Ok(_) => panic!("runtime accepted a tampered operator contract"),
+        Err(error) => error,
+    };
+
+    assert!(error.contains("analytic_row_number_view_plan"));
+}
+
+#[test]
+fn runtime_rejects_tampered_execution_implementation_before_construction() {
+    let catalog = scores_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = scores_row_number_output_schema();
+    let sql = "select user_id, row_number() over (partition by score order by score desc, user_id asc) as rank from scores where score > 0";
+    let identity = standing_identity_with_view(sql, "scores_ranked");
+    let mut logical_plan =
+        lower_supported_analytic_row_number_sql_to_logical_plan(sql, &catalog, &output_schema)
+            .unwrap();
+    logical_plan
+        .execution_implementation
+        .as_mut()
+        .unwrap()
+        .implementation_id = "velorix-generic-dag-v1".to_string();
+    logical_plan.plan_hash = Some(logical_view_plan_hash(&logical_plan).unwrap());
+
+    let error = match create_standing_runtime_with_logical_plan_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        logical_plan,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    ) {
+        Ok(_) => panic!("runtime accepted a tampered execution implementation"),
+        Err(error) => error,
+    };
+
+    assert!(error.contains("analytic_row_number_view_plan"));
+}
+
+#[test]
 fn runtime_materializes_row_number_with_precise_large_int64_ordering() {
     let catalog = scores_with_adjustment_catalog();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
@@ -2605,6 +3553,7 @@ fn runtime_materializes_row_number_with_precise_large_int64_ordering() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -2645,6 +3594,7 @@ fn runtime_materializes_filter_project_union_distinct_overlapping_branch_rows_on
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -2669,6 +3619,7 @@ fn runtime_materializes_filter_project_union_distinct_overlapping_branch_rows_on
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -2705,6 +3656,7 @@ fn runtime_materializes_filter_project_intersect_distinct_overlapping_branch_row
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -2748,6 +3700,7 @@ fn runtime_materializes_filter_project_except_distinct_left_minus_right_and_rest
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -2772,6 +3725,7 @@ fn runtime_materializes_filter_project_except_distinct_left_minus_right_and_rest
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -2808,6 +3762,7 @@ fn runtime_materializes_filter_project_with_scalar_expression_predicate() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -2832,6 +3787,7 @@ fn runtime_materializes_filter_project_with_scalar_expression_predicate() {
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -2868,6 +3824,7 @@ fn runtime_materializes_filter_project_with_expression_vs_expression_predicate()
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -2892,6 +3849,7 @@ fn runtime_materializes_filter_project_with_expression_vs_expression_predicate()
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -2931,6 +3889,7 @@ fn runtime_materializes_filter_project_with_unprojected_predicate_column() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -2955,6 +3914,7 @@ fn runtime_materializes_filter_project_with_unprojected_predicate_column() {
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -2994,6 +3954,7 @@ fn runtime_materializes_single_key_aggregates_over_multiple_raw_int64_input_colu
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -3021,6 +3982,7 @@ fn runtime_materializes_single_key_aggregates_over_multiple_raw_int64_input_colu
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -3077,6 +4039,7 @@ fn runtime_materializes_multi_input_count_distinct_by_selected_value_across_rest
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -3107,6 +4070,7 @@ fn runtime_materializes_multi_input_count_distinct_by_selected_value_across_rest
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -3136,6 +4100,7 @@ fn runtime_materializes_multi_input_count_distinct_by_selected_value_across_rest
             3,
             EpochIdempotencyKey::new("epoch-3").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -3182,6 +4147,7 @@ fn runtime_materializes_filter_project_order_by_limit_top_k_and_restores_full_st
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -3206,6 +4172,7 @@ fn runtime_materializes_filter_project_order_by_limit_top_k_and_restores_full_st
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -3242,6 +4209,7 @@ fn runtime_materializes_filter_project_order_by_limit_offset_top_k() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -3266,6 +4234,7 @@ fn runtime_materializes_filter_project_order_by_limit_offset_top_k() {
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -3302,6 +4271,7 @@ fn runtime_materializes_filter_project_order_by_fetch_first_top_k() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -3344,6 +4314,7 @@ fn runtime_materializes_filter_project_hidden_input_order_by_top_k() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -3368,6 +4339,7 @@ fn runtime_materializes_filter_project_hidden_input_order_by_top_k() {
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -3404,6 +4376,7 @@ fn runtime_materializes_filter_project_cte_source_filters() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -3445,6 +4418,7 @@ fn runtime_materializes_filter_project_derived_table_source_filters() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -3487,6 +4461,7 @@ fn runtime_materializes_filter_project_nullable_value_and_restores_state() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -3538,6 +4513,7 @@ fn runtime_materializes_computed_filter_project_view() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -3557,6 +4533,7 @@ fn runtime_materializes_computed_filter_project_view() {
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -3593,6 +4570,7 @@ fn runtime_materializes_filter_project_case_over_bool_predicate() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "device-status-stream".to_string(),
@@ -3651,7 +4629,10 @@ fn runtime_rejects_filter_project_case_bool_predicate_non_bool_literal() {
         Err(error) => error,
     };
 
-    assert!(error.contains("filter_project_projection_expr"), "{error}");
+    assert!(
+        error.contains("logical_filter_project_view_plan"),
+        "the implementation-bound physical DAG must reject the crafted plan before execution: {error}"
+    );
 }
 
 #[test]
@@ -3675,6 +4656,7 @@ fn runtime_materializes_count_distinct_aggregate_and_restores_state() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -3702,6 +4684,7 @@ fn runtime_materializes_count_distinct_aggregate_and_restores_state() {
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -3739,6 +4722,7 @@ fn runtime_materializes_non_null_column_count_aggregate() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -3776,6 +4760,7 @@ fn runtime_materializes_nullable_column_count_aggregate() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -3813,6 +4798,7 @@ fn runtime_materializes_mixed_nullable_column_count_aggregate() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -3855,6 +4841,7 @@ fn runtime_materializes_identity_cte_single_relation_aggregate() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -3897,6 +4884,7 @@ fn runtime_materializes_cte_source_filter_single_relation_aggregate() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -3939,6 +4927,7 @@ fn runtime_materializes_derived_table_source_filter_single_relation_aggregate() 
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -3981,6 +4970,7 @@ fn runtime_materializes_cte_source_and_outer_where_filters() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -4028,6 +5018,7 @@ fn runtime_commit_publishes_materialized_output_batch_after_ingest() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -4095,6 +5086,7 @@ fn runtime_commit_publishes_signed_output_delta_for_changed_keys_only() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -4113,6 +5105,7 @@ fn runtime_commit_publishes_signed_output_delta_for_changed_keys_only() {
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -4171,6 +5164,7 @@ fn runtime_materializes_filtered_single_relation_aggregate_view() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -4243,6 +5237,7 @@ fn runtime_materializes_single_relation_aggregate_with_scalar_expression_predica
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -4271,6 +5266,7 @@ fn runtime_materializes_single_relation_aggregate_with_scalar_expression_predica
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-stream".to_string(),
@@ -4312,6 +5308,7 @@ fn runtime_materializes_single_relation_aggregate_with_between_predicates() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -4354,6 +5351,7 @@ fn runtime_materializes_single_relation_aggregate_with_matching_filters() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -4396,6 +5394,7 @@ fn runtime_materializes_single_relation_aggregate_with_mixed_filters() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -4421,6 +5420,7 @@ fn runtime_materializes_single_relation_aggregate_with_mixed_filters() {
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -4471,6 +5471,7 @@ fn runtime_materializes_single_relation_filtered_count_distinct_with_mixed_filte
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -4526,6 +5527,7 @@ fn runtime_materializes_single_relation_mixed_min_max_avg_filters() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -4581,6 +5583,7 @@ fn runtime_materializes_single_relation_mixed_filter_having_top_k() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -4606,6 +5609,7 @@ fn runtime_materializes_single_relation_mixed_filter_having_top_k() {
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -4646,6 +5650,7 @@ fn runtime_materializes_single_relation_aggregate_with_different_filters() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -4688,6 +5693,7 @@ fn runtime_materializes_single_relation_aggregate_having_view() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -4794,6 +5800,7 @@ fn runtime_materializes_single_relation_having_count_distinct_function_view() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -4851,7 +5858,7 @@ fn runtime_materializes_single_relation_having_count_distinct_function_view() {
 }
 
 #[test]
-fn runtime_accepts_sparse_forward_offsets_and_rejects_overlapping_offsets() {
+fn runtime_rejects_non_contiguous_input_offsets_without_advancing_frontier() {
     let catalog = purchases_catalog_without_value_role();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
     let output_schema = purchases_output_schema();
@@ -4872,6 +5879,7 @@ fn runtime_accepts_sparse_forward_offsets_and_rejects_overlapping_offsets() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -4890,12 +5898,14 @@ fn runtime_accepts_sparse_forward_offsets_and_rejects_overlapping_offsets() {
         first_commit.input_frontiers[0].committed_offset_exclusive,
         3
     );
+    let checkpoint_before_gap = runtime.checkpoint().unwrap();
 
-    let sparse_commit = runtime
+    let sparse_error = runtime
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -4907,25 +5917,47 @@ fn runtime_accepts_sparse_forward_offsets_and_rejects_overlapping_offsets() {
                 batches: vec![purchases_batch()],
             }],
         )
-        .unwrap();
+        .unwrap_err();
 
-    assert_eq!(sparse_commit.input_frontiers.len(), 1);
-    assert_eq!(
-        sparse_commit.input_frontiers[0].committed_offset_exclusive,
-        6
-    );
+    assert!(matches!(
+        sparse_error,
+        StandingProgramRuntimeError::InvalidProgramIdentity {
+            field: "input_frontier.offset_range"
+        }
+    ));
+    assert_eq!(runtime.checkpoint().unwrap(), checkpoint_before_gap);
 
-    let err = runtime
+    runtime
         .apply_changes(
             3,
             EpochIdempotencyKey::new("epoch-3").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
                 partition_id: 0,
                 schema_fingerprint: catalog.schema_fingerprint.to_string(),
-                start_offset_inclusive: 5,
+                start_offset_inclusive: 3,
+                end_offset_exclusive: 5,
+                event_time_watermark: None,
+                batches: vec![purchases_batch()],
+            }],
+        )
+        .unwrap();
+
+    let err = runtime
+        .apply_changes(
+            4,
+            EpochIdempotencyKey::new("epoch-4").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 4,
                 end_offset_exclusive: 7,
                 event_time_watermark: None,
                 batches: vec![purchases_batch()],
@@ -4941,7 +5973,7 @@ fn runtime_accepts_sparse_forward_offsets_and_rejects_overlapping_offsets() {
         frontier.relation_version,
         catalog.relation_schema.relation_version
     );
-    assert_eq!(frontier.committed_offset_exclusive, 6);
+    assert_eq!(frontier.committed_offset_exclusive, 5);
 
     assert!(matches!(
         err,
@@ -4974,6 +6006,7 @@ fn runtime_tracks_input_frontiers_by_relation_stream_and_partition() {
                 epoch,
                 EpochIdempotencyKey::new(format!("epoch-{epoch}")).unwrap(),
                 vec![RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: catalog.relation_schema.relation_id.clone(),
                     relation_version: catalog.relation_schema.relation_version.clone(),
                     stream_id: stream_id.to_string(),
@@ -5024,6 +6057,7 @@ fn runtime_accepts_sparse_first_offset_for_new_stream_frontier() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "sparse-stream".to_string(),
@@ -5066,6 +6100,7 @@ fn runtime_checkpoints_event_time_frontiers_by_source_partition() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -5090,6 +6125,7 @@ fn runtime_checkpoints_event_time_frontiers_by_source_partition() {
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -5156,6 +6192,7 @@ fn runtime_rejects_non_monotonic_event_time_watermark_for_source_partition() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -5180,6 +6217,7 @@ fn runtime_rejects_non_monotonic_event_time_watermark_for_source_partition() {
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -5229,6 +6267,7 @@ fn runtime_restore_rejects_malformed_event_time_frontier_even_when_payload_match
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -5310,6 +6349,7 @@ fn runtime_materializes_avg_projection_aliases_for_relation_without_value_semant
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -5396,6 +6436,7 @@ fn runtime_materializes_single_key_order_by_limit_top_k_and_restores_state() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -5415,6 +6456,7 @@ fn runtime_materializes_single_key_order_by_limit_top_k_and_restores_state() {
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -5455,6 +6497,7 @@ fn runtime_materializes_single_key_order_by_limit_offset_top_k() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -5474,6 +6517,7 @@ fn runtime_materializes_single_key_order_by_limit_offset_top_k() {
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -5510,6 +6554,7 @@ fn runtime_materializes_single_key_order_by_function_top_k() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-top-k-stream".to_string(),
@@ -5587,6 +6632,7 @@ fn runtime_materializes_single_key_order_by_metric_then_key_top_k() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "scores-top-k-stream".to_string(),
@@ -5664,6 +6710,7 @@ fn runtime_materializes_decimal_avg_as_float64_output() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -5733,6 +6780,7 @@ fn runtime_materializes_avg_arithmetic_expression() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -5801,6 +6849,7 @@ fn runtime_materializes_filtered_projected_aggregate_view() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -5986,6 +7035,7 @@ fn runtime_materializes_min_max_and_recomputes_after_extreme_delete() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -6003,6 +7053,7 @@ fn runtime_materializes_min_max_and_recomputes_after_extreme_delete() {
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -6080,6 +7131,7 @@ fn runtime_materializes_min_max_arithmetic_expression() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -6155,6 +7207,7 @@ fn runtime_restores_min_max_multiset_checkpoint_before_extreme_delete() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -6175,6 +7228,7 @@ fn runtime_restores_min_max_multiset_checkpoint_before_extreme_delete() {
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -6247,6 +7301,7 @@ fn runtime_restored_query_reads_published_output_not_engine_state() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -6335,6 +7390,7 @@ fn runtime_restore_without_admitted_plan_metadata_fails_closed() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -6384,6 +7440,7 @@ fn runtime_materializes_two_relation_join_and_restores_epoch_consistent_state() 
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -6400,6 +7457,7 @@ fn runtime_materializes_two_relation_join_and_restores_epoch_consistent_state() 
                     ])],
                 },
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -6418,24 +7476,27 @@ fn runtime_materializes_two_relation_join_and_restores_epoch_consistent_state() 
 
     let initial_frontiers = vec![
         RelationFrontier {
-            relation_id: scores.relation_schema.relation_id.clone(),
-            relation_version: scores.relation_schema.relation_version.clone(),
-            stream_id: "test-stream".to_string(),
-            partition_id: 0,
-            committed_offset_exclusive: 4,
-        },
-        RelationFrontier {
             relation_id: accounts.relation_schema.relation_id.clone(),
             relation_version: accounts.relation_schema.relation_version.clone(),
             stream_id: "test-stream".to_string(),
             partition_id: 0,
             committed_offset_exclusive: 2,
         },
+        RelationFrontier {
+            relation_id: scores.relation_schema.relation_id.clone(),
+            relation_version: scores.relation_schema.relation_version.clone(),
+            stream_id: "test-stream".to_string(),
+            partition_id: 0,
+            committed_offset_exclusive: 4,
+        },
     ];
     assert_eq!(first_commit.input_frontiers, initial_frontiers);
 
     let checkpoint = runtime.checkpoint().unwrap();
     assert_eq!(checkpoint.input_frontiers, initial_frontiers);
+    let scalar_payload: Value =
+        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+    assert!(scalar_payload.get("join_key_codec_id").is_none());
     let mut restored = restore_standing_runtime(checkpoint).unwrap();
     assert_eq!(
         restored.checkpoint().unwrap().input_frontiers,
@@ -6447,6 +7508,7 @@ fn runtime_materializes_two_relation_join_and_restores_epoch_consistent_state() 
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: scores.relation_schema.relation_id.clone(),
                 relation_version: scores.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -6464,18 +7526,18 @@ fn runtime_materializes_two_relation_join_and_restores_epoch_consistent_state() 
 
     let advanced_frontiers = vec![
         RelationFrontier {
-            relation_id: scores.relation_schema.relation_id.clone(),
-            relation_version: scores.relation_schema.relation_version.clone(),
-            stream_id: "test-stream".to_string(),
-            partition_id: 0,
-            committed_offset_exclusive: 5,
-        },
-        RelationFrontier {
             relation_id: accounts.relation_schema.relation_id.clone(),
             relation_version: accounts.relation_schema.relation_version.clone(),
             stream_id: "test-stream".to_string(),
             partition_id: 0,
             committed_offset_exclusive: 2,
+        },
+        RelationFrontier {
+            relation_id: scores.relation_schema.relation_id.clone(),
+            relation_version: scores.relation_schema.relation_version.clone(),
+            stream_id: "test-stream".to_string(),
+            partition_id: 0,
+            committed_offset_exclusive: 5,
         },
     ];
     assert_eq!(second_commit.input_frontiers, advanced_frontiers);
@@ -6483,6 +7545,1419 @@ fn runtime_materializes_two_relation_join_and_restores_epoch_consistent_state() 
         restored.checkpoint().unwrap().input_frontiers,
         advanced_frontiers
     );
+}
+
+#[test]
+fn runtime_materializes_composite_primary_key_join_across_retract_and_restart() {
+    let (scores, accounts) = composite_join_catalogs();
+    let input_schemas = vec![
+        catalog_input_relation_schema(&scores).unwrap(),
+        catalog_input_relation_schema(&accounts).unwrap(),
+    ];
+    let output_schema = composite_join_output_schema();
+    let sql = "select a.account_tenant_id as tenant_id, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.user_id = a.account_id and s.tenant_id = a.account_tenant_id group by a.account_tenant_id";
+    let identity = standing_identity_with_view(sql, "scores_by_tenant");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &[scores.clone(), accounts.clone()],
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("composite-join-epoch-1").unwrap(),
+            vec![
+                relation_input(
+                    &scores,
+                    "composite-join-scores",
+                    0,
+                    3,
+                    composite_scores_rows_batch(&[
+                        ("alice", 10, "t1", 2),
+                        ("bob", 5, "t1", 1),
+                        ("alice", 7, "t2", 1),
+                    ]),
+                ),
+                relation_input(
+                    &accounts,
+                    "composite-join-accounts",
+                    0,
+                    2,
+                    composite_accounts_rows_batch(&[
+                        ("alice", 100, "gold", "t1", 3),
+                        ("bob", 50, "gold", "t1", 1),
+                    ]),
+                ),
+            ],
+        )
+        .unwrap();
+    assert_join_page_for_view(runtime.as_ref(), "scores_by_tenant", 1, &[("t1", 65, 7)]);
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    let checkpoint_payload: Value =
+        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+    assert_eq!(
+        checkpoint_payload["join_key_codec_id"],
+        "velorix-composite-pk-positional-json-array-join-key-v1"
+    );
+    for replacement in [None, Some("unknown-composite-key-codec-v9")] {
+        let mut tampered = checkpoint.clone();
+        let state_payload = tampered.state_payload.as_mut().unwrap();
+        let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+        match replacement {
+            Some(codec) => {
+                payload["join_key_codec_id"] = Value::String(codec.into());
+            }
+            None => {
+                payload.as_object_mut().unwrap().remove("join_key_codec_id");
+            }
+        }
+        state_payload.payload = serde_json::to_string(&payload).unwrap();
+        tampered.state_root.content_hash = stable_bytes_hash(state_payload.payload.as_bytes());
+        assert!(restore_standing_runtime(tampered).is_err());
+    }
+    let mut tampered_binding = checkpoint.clone();
+    let state_payload = tampered_binding.state_payload.as_mut().unwrap();
+    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    payload["execution_binding"]["implementation"]["join_key_codec_id"] =
+        Value::String("unknown-composite-key-codec-v9".into());
+    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    tampered_binding.state_root.content_hash = stable_bytes_hash(state_payload.payload.as_bytes());
+    assert!(restore_standing_runtime(tampered_binding).is_err());
+
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    assert_join_page_for_view(restored.as_ref(), "scores_by_tenant", 1, &[("t1", 65, 7)]);
+
+    restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("composite-join-epoch-2").unwrap(),
+            vec![
+                relation_input(
+                    &scores,
+                    "composite-join-scores",
+                    3,
+                    4,
+                    composite_scores_rows_batch(&[("alice", 10, "t1", -1)]),
+                ),
+                relation_input(
+                    &accounts,
+                    "composite-join-accounts",
+                    2,
+                    3,
+                    composite_accounts_rows_batch(&[("alice", 100, "gold", "t2", 2)]),
+                ),
+            ],
+        )
+        .unwrap();
+    assert_join_page_for_view(
+        restored.as_ref(),
+        "scores_by_tenant",
+        2,
+        &[("t1", 35, 4), ("t2", 14, 2)],
+    );
+
+    restored
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("composite-join-epoch-3").unwrap(),
+            vec![relation_input(
+                &accounts,
+                "composite-join-accounts",
+                3,
+                4,
+                composite_accounts_rows_batch(&[("alice", 100, "gold", "t1", -3)]),
+            )],
+        )
+        .unwrap();
+    assert_join_page_for_view(
+        restored.as_ref(),
+        "scores_by_tenant",
+        3,
+        &[("t1", 5, 1), ("t2", 14, 2)],
+    );
+}
+
+#[test]
+fn runtime_materializes_three_input_composite_pk_join_through_binary_dag() {
+    let [scores, accounts, profiles] = three_input_composite_join_catalogs();
+    let catalogs = vec![scores.clone(), accounts.clone(), profiles.clone()];
+    let input_schemas = catalogs
+        .iter()
+        .map(|catalog| catalog_input_relation_schema(catalog).unwrap())
+        .collect::<Vec<_>>();
+    let output_schema = three_input_join_count_output_schema();
+    let sql = "select s.tenant_id, s.user_id, count(*) as count from scores s join accounts a on s.tenant_id = a.account_tenant_id and s.user_id = a.account_id join profiles p on s.tenant_id = p.account_tenant_id and s.user_id = p.account_id group by s.tenant_id, s.user_id";
+    let identity = standing_identity_with_view(sql, "three_input_counts");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &catalogs,
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("three-input-epoch-1").unwrap(),
+            vec![
+                relation_input(
+                    &scores,
+                    "three-input-scores",
+                    0,
+                    2,
+                    composite_scores_rows_batch(&[("alice", 10, "t1", 2), ("bob", 5, "t1", 1)]),
+                ),
+                relation_input(
+                    &accounts,
+                    "three-input-accounts",
+                    0,
+                    2,
+                    composite_accounts_rows_batch(&[
+                        ("alice", 100, "gold", "t1", 3),
+                        ("bob", 50, "silver", "t1", 1),
+                    ]),
+                ),
+                relation_input(
+                    &profiles,
+                    "three-input-profiles",
+                    0,
+                    1,
+                    composite_accounts_rows_batch(&[("alice", 0, "active", "t1", 4)]),
+                ),
+            ],
+        )
+        .unwrap();
+    assert_three_input_count_page(runtime.as_ref(), 1, &[("t1", "alice", 24)]);
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    assert_eq!(checkpoint.input_frontiers.len(), 3);
+    let payload: Value =
+        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+    assert_eq!(
+        payload["logical_plan"]["execution_implementation"]["join_key_codec_id"],
+        COMPOSITE_PK_POSITIONAL_JSON_ARRAY_JOIN_KEY_CODEC_V1
+    );
+    assert_eq!(payload["graph"]["operators"].as_array().unwrap().len(), 4);
+
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    assert_three_input_count_page(restored.as_ref(), 1, &[("t1", "alice", 24)]);
+    restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("three-input-epoch-2").unwrap(),
+            vec![relation_input(
+                &scores,
+                "three-input-scores",
+                2,
+                3,
+                composite_scores_rows_batch(&[("alice", 10, "t1", -1)]),
+            )],
+        )
+        .unwrap();
+    assert_three_input_count_page(restored.as_ref(), 2, &[("t1", "alice", 12)]);
+    restored
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("three-input-epoch-3").unwrap(),
+            vec![relation_input(
+                &accounts,
+                "three-input-accounts",
+                2,
+                3,
+                composite_accounts_rows_batch(&[("alice", 100, "gold", "t1", -1)]),
+            )],
+        )
+        .unwrap();
+    assert_three_input_count_page(restored.as_ref(), 3, &[("t1", "alice", 8)]);
+    restored
+        .apply_changes(
+            4,
+            EpochIdempotencyKey::new("three-input-epoch-4").unwrap(),
+            vec![relation_input(
+                &profiles,
+                "three-input-profiles",
+                1,
+                2,
+                composite_accounts_rows_batch(&[("alice", 0, "active", "t1", 1)]),
+            )],
+        )
+        .unwrap();
+    assert_three_input_count_page(restored.as_ref(), 4, &[("t1", "alice", 10)]);
+}
+
+#[test]
+fn three_input_join_order_policy_preserves_results_state_and_legacy_restore() {
+    let [scores, accounts, profiles] = three_input_composite_join_catalogs();
+    let catalogs = vec![scores.clone(), accounts.clone(), profiles.clone()];
+    let input_schemas = catalogs
+        .iter()
+        .map(|catalog| catalog_input_relation_schema(catalog).unwrap())
+        .collect::<Vec<_>>();
+    let output_schema = three_input_join_count_output_schema();
+    let sql = "select s.tenant_id, s.user_id, count(*) as count from scores s join accounts a on s.tenant_id = a.account_tenant_id and s.user_id = a.account_id join profiles p on s.tenant_id = p.account_tenant_id and s.user_id = p.account_id group by s.tenant_id, s.user_id";
+    let reordered_sql = "select s.tenant_id, s.user_id, count(*) as count from scores s join profiles p on s.tenant_id = p.account_tenant_id and s.user_id = p.account_id join accounts a on s.tenant_id = a.account_tenant_id and s.user_id = a.account_id group by s.tenant_id, s.user_id";
+    let changes = || {
+        vec![
+            relation_input(
+                &scores,
+                "join-order-scores",
+                0,
+                2,
+                composite_scores_rows_batch(&[("alice", 10, "t1", 2), ("bob", 5, "t1", 1)]),
+            ),
+            relation_input(
+                &accounts,
+                "join-order-accounts",
+                0,
+                2,
+                composite_accounts_rows_batch(&[
+                    ("alice", 100, "gold", "t1", 3),
+                    ("bob", 50, "silver", "t1", 1),
+                ]),
+            ),
+            relation_input(
+                &profiles,
+                "join-order-profiles",
+                0,
+                1,
+                composite_accounts_rows_batch(&[("alice", 0, "active", "t1", 4)]),
+            ),
+        ]
+    };
+
+    let mut canonical = create_standing_runtime_with_sql_and_catalogs(
+        &standing_identity_with_view(sql, "three_input_counts"),
+        &catalogs,
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    let mut reordered = create_standing_runtime_with_sql_and_catalogs(
+        &standing_identity_with_view(reordered_sql, "three_input_counts"),
+        &catalogs,
+        reordered_sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    canonical
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("join-order-canonical").unwrap(),
+            changes(),
+        )
+        .unwrap();
+    reordered
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("join-order-reordered").unwrap(),
+            changes(),
+        )
+        .unwrap();
+    assert_three_input_count_page(canonical.as_ref(), 1, &[("t1", "alice", 24)]);
+    assert_three_input_count_page(reordered.as_ref(), 1, &[("t1", "alice", 24)]);
+    let canonical_checkpoint = canonical.checkpoint().unwrap();
+    let reordered_checkpoint = reordered.checkpoint().unwrap();
+    let canonical_payload: Value =
+        serde_json::from_str(&canonical_checkpoint.state_payload.as_ref().unwrap().payload)
+            .unwrap();
+    let reordered_payload: Value =
+        serde_json::from_str(&reordered_checkpoint.state_payload.as_ref().unwrap().payload)
+            .unwrap();
+    assert_eq!(canonical_payload["graph"], reordered_payload["graph"]);
+    assert_eq!(
+        canonical_payload["published_output"],
+        reordered_payload["published_output"]
+    );
+    assert_three_input_count_page(
+        restore_standing_runtime(canonical_checkpoint)
+            .unwrap()
+            .as_ref(),
+        1,
+        &[("t1", "alice", 24)],
+    );
+    assert_three_input_count_page(
+        restore_standing_runtime(reordered_checkpoint)
+            .unwrap()
+            .as_ref(),
+        1,
+        &[("t1", "alice", 24)],
+    );
+
+    let legacy_plan = lower_supported_three_input_inner_join_count_sql_to_logical_plan_with_policy(
+        sql,
+        &catalogs,
+        &output_schema,
+        THREE_INPUT_LEGACY_SQL_ENCOUNTER_JOIN_ORDER_V1,
+    )
+    .unwrap();
+    let legacy_identity = standing_identity_with_view(sql, "three_input_counts");
+    let mut legacy = create_standing_runtime_with_logical_plan_and_catalogs(
+        &legacy_identity,
+        &catalogs,
+        legacy_plan,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    legacy
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("join-order-legacy").unwrap(),
+            changes(),
+        )
+        .unwrap();
+    let restored_legacy = restore_standing_runtime(legacy.checkpoint().unwrap()).unwrap();
+    assert_three_input_count_page(restored_legacy.as_ref(), 1, &[("t1", "alice", 24)]);
+}
+
+#[test]
+fn three_input_join_epoch_rolls_back_on_overflow_and_restore_rejects_torn_checkpoint() {
+    let [scores, accounts, profiles] = three_input_composite_join_catalogs();
+    let catalogs = vec![scores.clone(), accounts.clone(), profiles.clone()];
+    let input_schemas = catalogs
+        .iter()
+        .map(|catalog| catalog_input_relation_schema(catalog).unwrap())
+        .collect::<Vec<_>>();
+    let output_schema = three_input_join_count_output_schema();
+    let sql = "select s.tenant_id, s.user_id, count(*) as count from scores s join accounts a on s.tenant_id = a.account_tenant_id and s.user_id = a.account_id join profiles p on s.tenant_id = p.account_tenant_id and s.user_id = p.account_id group by s.tenant_id, s.user_id";
+    let identity = standing_identity_with_view(sql, "three_input_counts");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &catalogs,
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    let empty = runtime.checkpoint().unwrap();
+
+    let overflow = runtime.apply_changes(
+        1,
+        EpochIdempotencyKey::new("three-input-overflow").unwrap(),
+        vec![
+            relation_input(
+                &scores,
+                "three-input-scores",
+                0,
+                1,
+                composite_scores_rows_batch(&[("alice", 10, "t1", i64::MAX)]),
+            ),
+            relation_input(
+                &accounts,
+                "three-input-accounts",
+                0,
+                1,
+                composite_accounts_rows_batch(&[("alice", 100, "gold", "t1", 1)]),
+            ),
+            relation_input(
+                &profiles,
+                "three-input-profiles",
+                0,
+                1,
+                composite_accounts_rows_batch(&[("alice", 0, "active", "t1", 2)]),
+            ),
+        ],
+    );
+    assert!(overflow.is_err());
+    assert_eq!(runtime.checkpoint().unwrap(), empty);
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("three-input-safe").unwrap(),
+            vec![
+                relation_input(
+                    &scores,
+                    "three-input-scores",
+                    0,
+                    1,
+                    composite_scores_rows_batch(&[("alice", 10, "t1", 1)]),
+                ),
+                relation_input(
+                    &accounts,
+                    "three-input-accounts",
+                    0,
+                    1,
+                    composite_accounts_rows_batch(&[("alice", 100, "gold", "t1", 1)]),
+                ),
+                relation_input(
+                    &profiles,
+                    "three-input-profiles",
+                    0,
+                    1,
+                    composite_accounts_rows_batch(&[("alice", 0, "active", "t1", 1)]),
+                ),
+            ],
+        )
+        .unwrap();
+    assert_three_input_count_page(runtime.as_ref(), 1, &[("t1", "alice", 1)]);
+
+    let committed = runtime.checkpoint().unwrap();
+    let gap = runtime.apply_changes(
+        2,
+        EpochIdempotencyKey::new("three-input-gap").unwrap(),
+        vec![relation_input(
+            &profiles,
+            "three-input-profiles",
+            2,
+            3,
+            composite_accounts_rows_batch(&[("alice", 0, "active", "t1", 1)]),
+        )],
+    );
+    assert!(gap.is_err());
+    assert_eq!(runtime.checkpoint().unwrap(), committed);
+
+    let mut torn_output = committed.clone();
+    let state_payload = torn_output.state_payload.as_mut().unwrap();
+    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    payload["published_output"] = json!({"records": []});
+    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    assert!(restore_standing_runtime(torn_output).is_err());
+
+    let mut torn_epoch = committed;
+    let state_payload = torn_epoch.state_payload.as_mut().unwrap();
+    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    payload["graph"]["logical_epoch"] = json!(2);
+    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    assert!(restore_standing_runtime(torn_epoch).is_err());
+
+    let mut unknown_policy = runtime.checkpoint().unwrap();
+    let state_payload = unknown_policy.state_payload.as_mut().unwrap();
+    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    payload["logical_plan"]["execution"]["plan"]["join_order_policy_id"] =
+        json!("unknown-three-input-policy");
+    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    assert!(restore_standing_runtime(unknown_policy).is_err());
+}
+
+fn assert_three_input_count_page(
+    runtime: &(dyn StandingProgramRuntime + Send),
+    epoch: u64,
+    expected: &[(&str, &str, i64)],
+) {
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".into(),
+                program_id: "program-purchases".into(),
+                view_id: "three_input_counts".into(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(epoch),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let tenants = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let users = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let counts = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let actual = (0..batch.num_rows())
+        .map(|index| {
+            (
+                tenants.value(index),
+                users.value(index),
+                counts.value(index),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn runtime_materializes_non_primary_duplicate_join_across_retract_and_restart() {
+    let scores = generic_adapter_catalog(scores_catalog());
+    let accounts = generic_adapter_catalog(accounts_catalog());
+    let input_schemas = vec![
+        catalog_input_relation_schema(&scores).unwrap(),
+        catalog_input_relation_schema(&accounts).unwrap(),
+    ];
+    let output_schema = non_primary_join_output_schema();
+    let sql = "select a.limit as bucket, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.score = a.limit group by a.limit";
+    let identity = standing_identity_with_view(sql, "scores_by_bucket");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &[scores.clone(), accounts.clone()],
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("non-primary-join-epoch-1").unwrap(),
+            vec![
+                relation_input(
+                    &scores,
+                    "non-primary-join-scores",
+                    0,
+                    3,
+                    scores_rows_batch(&[("left-a", 10, 2), ("left-b", 10, 1), ("left-c", 5, 1)]),
+                ),
+                relation_input(
+                    &accounts,
+                    "non-primary-join-accounts",
+                    0,
+                    3,
+                    accounts_rows_batch(&[
+                        ("right-a", 10, "gold", 3),
+                        ("right-b", 10, "silver", 1),
+                        ("right-c", 5, "gold", 1),
+                    ]),
+                ),
+            ],
+        )
+        .unwrap();
+    assert_int_join_page_for_view(
+        runtime.as_ref(),
+        "scores_by_bucket",
+        1,
+        &[(10, 120, 12), (5, 5, 1)],
+    );
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    let payload: Value =
+        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+    assert_eq!(
+        payload["join_key_codec_id"],
+        "velorix-non-primary-non-null-scalar-join-key-v1"
+    );
+    let mut wrong_domain = checkpoint.clone();
+    let state_payload = wrong_domain.state_payload.as_mut().unwrap();
+    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    payload["join_key_codec_id"] =
+        Value::String("velorix-composite-pk-positional-json-array-join-key-v1".into());
+    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    wrong_domain.state_root.content_hash = stable_bytes_hash(state_payload.payload.as_bytes());
+    assert!(restore_standing_runtime(wrong_domain).is_err());
+
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    assert_int_join_page_for_view(
+        restored.as_ref(),
+        "scores_by_bucket",
+        1,
+        &[(10, 120, 12), (5, 5, 1)],
+    );
+    restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("non-primary-join-epoch-2").unwrap(),
+            vec![
+                relation_input(
+                    &scores,
+                    "non-primary-join-scores",
+                    3,
+                    4,
+                    scores_rows_batch(&[("left-a", 10, -1)]),
+                ),
+                relation_input(
+                    &accounts,
+                    "non-primary-join-accounts",
+                    3,
+                    6,
+                    accounts_rows_batch(&[
+                        ("right-a", 10, "gold", -2),
+                        ("right-d", 5, "bronze", 2),
+                    ]),
+                ),
+            ],
+        )
+        .unwrap();
+    assert_int_join_page_for_view(
+        restored.as_ref(),
+        "scores_by_bucket",
+        2,
+        &[(10, 40, 4), (5, 15, 3)],
+    );
+}
+
+#[test]
+fn runtime_materializes_atomic_self_join_fanout_across_retract_and_restart() {
+    let scores = generic_adapter_catalog(scores_catalog());
+    let input_schema = catalog_input_relation_schema(&scores).unwrap();
+    let output_schema = global_count_output_schema();
+    let sql = "select count(*) as count from scores l join scores r on l.score = r.score";
+    let identity = standing_identity_with_view(sql, "score_self_join_count");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&scores),
+        sql,
+        std::slice::from_ref(&input_schema),
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    let empty = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: identity.tenant_id.clone(),
+                program_id: identity.program_id.clone(),
+                view_id: identity.view_ids[0].clone(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(0),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    assert_global_count_batch(&empty.batches[0], 0);
+
+    let before_failed_fanout = runtime.checkpoint().unwrap();
+    assert!(runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("self-join-failed-fanout").unwrap(),
+            vec![relation_input(
+                &scores,
+                "self-join-scores",
+                0,
+                1,
+                scores_rows_batch(&[("overflow", 99, i64::MAX)]),
+            )],
+        )
+        .is_err());
+    let after_failed_fanout = runtime.checkpoint().unwrap();
+    assert_eq!(
+        before_failed_fanout.state_payload,
+        after_failed_fanout.state_payload
+    );
+    assert_eq!(
+        before_failed_fanout.input_frontiers,
+        after_failed_fanout.input_frontiers
+    );
+    assert_eq!(runtime.logical_epoch(), 0);
+
+    let inserted = runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("self-join-epoch-1").unwrap(),
+            vec![relation_input(
+                &scores,
+                "self-join-scores",
+                0,
+                4,
+                scores_rows_batch(&[("left-a", 10, 2), ("left-b", 10, 1), ("left-c", 5, 1)]),
+            )],
+        )
+        .unwrap();
+    assert_global_count_batch(&inserted.output_batches[0].batches[0], 10);
+    assert_eq!(inserted.input_frontiers.len(), 1);
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    let payload: Value =
+        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+    assert_eq!(payload["input_schemas"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        payload["execution_binding"]["implementation"]["input_fanout_protocol_id"],
+        "velorix-self-join-left-then-right-atomic-fanout-v1"
+    );
+    assert!(!payload["left_state"]["records"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(!payload["right_state"]["records"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+
+    let retracted = restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("self-join-epoch-2").unwrap(),
+            vec![relation_input(
+                &scores,
+                "self-join-scores",
+                4,
+                5,
+                scores_rows_batch(&[("left-a", 10, -1)]),
+            )],
+        )
+        .unwrap();
+    assert_global_count_batch(&retracted.output_batches[0].batches[0], 5);
+
+    let emptied = restored
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("self-join-epoch-3").unwrap(),
+            vec![relation_input(
+                &scores,
+                "self-join-scores",
+                5,
+                8,
+                scores_rows_batch(&[("left-a", 10, -1), ("left-b", 10, -1), ("left-c", 5, -1)]),
+            )],
+        )
+        .unwrap();
+    assert_global_count_batch(&emptied.output_batches[0].batches[0], 0);
+}
+
+#[test]
+fn inner_aggregate_join_specialization_matches_native_dag_delta_state_and_restart() {
+    let scores = scores_catalog();
+    let accounts = accounts_catalog();
+    let input_schemas = vec![
+        catalog_input_relation_schema(&scores).unwrap(),
+        catalog_input_relation_schema(&accounts).unwrap(),
+    ];
+    let output_schema = join_output_schema();
+    let sql = "select a.account_id, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.user_id = a.account_id group by a.account_id";
+    let identity = standing_identity_with_view(sql, "scores_by_account");
+    let mut uninterrupted_runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &[scores.clone(), accounts.clone()],
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    let mut uninterrupted_graph = native_inner_join_aggregate_graph();
+
+    let first_scores = scores_rows_batch(&[
+        ("alice", 10, 1),
+        ("alice", 7, 1),
+        ("bob", 5, 1),
+        ("charlie", 30, 1),
+    ]);
+    let first_accounts = accounts_alice_bob_batch();
+    let specialized = uninterrupted_runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("equivalence-inner-1").unwrap(),
+            vec![
+                join_relation_input(&scores, 0, 4, vec![first_scores.clone()]),
+                join_relation_input(&accounts, 0, 2, vec![first_accounts.clone()]),
+            ],
+        )
+        .unwrap();
+    let generic = apply_native_join_epoch(
+        &mut uninterrupted_graph,
+        1,
+        native_join_input(&scores, "user_id", "score", &[first_scores]),
+        native_join_input(&accounts, "account_id", "limit", &[first_accounts]),
+    );
+    assert!(
+        specialization_delta_difference(&specialized.output_deltas[0].delta, &generic).is_none()
+    );
+    assert_inner_join_specialization_state_equivalent(
+        uninterrupted_runtime.as_ref(),
+        &uninterrupted_graph,
+    );
+
+    let mut restored_runtime =
+        restore_standing_runtime(uninterrupted_runtime.checkpoint().unwrap()).unwrap();
+    let graph_checkpoint = uninterrupted_graph.checkpoint().unwrap();
+    let mut restored_graph = native_inner_join_aggregate_graph();
+    restored_graph.restore(&graph_checkpoint).unwrap();
+
+    let changed_scores = scores_rows_batch(&[("alice", 7, -1), ("charlie", 30, -1), ("bob", 2, 1)]);
+    let changed_accounts =
+        accounts_rows_batch(&[("charlie", 90, "silver", 1), ("bob", 50, "gold", -1)]);
+    let runtime_tail = vec![
+        join_relation_input(&scores, 4, 7, vec![changed_scores.clone()]),
+        join_relation_input(&accounts, 2, 4, vec![changed_accounts.clone()]),
+    ];
+    let graph_left = native_join_input(&scores, "user_id", "score", &[changed_scores]);
+    let graph_right = native_join_input(&accounts, "account_id", "limit", &[changed_accounts]);
+    let uninterrupted_specialized = uninterrupted_runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("equivalence-inner-2").unwrap(),
+            runtime_tail.clone(),
+        )
+        .unwrap();
+    let restored_specialized = restored_runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("equivalence-inner-2").unwrap(),
+            runtime_tail,
+        )
+        .unwrap();
+    let uninterrupted_generic = apply_native_join_epoch(
+        &mut uninterrupted_graph,
+        2,
+        graph_left.clone(),
+        graph_right.clone(),
+    );
+    let restored_generic = apply_native_join_epoch(&mut restored_graph, 2, graph_left, graph_right);
+
+    for delta in [
+        &restored_specialized.output_deltas[0].delta,
+        &uninterrupted_generic,
+        &restored_generic,
+    ] {
+        assert!(specialization_delta_difference(
+            &uninterrupted_specialized.output_deltas[0].delta,
+            delta,
+        )
+        .is_none());
+    }
+    assert_eq!(
+        restored_runtime.checkpoint().unwrap(),
+        uninterrupted_runtime.checkpoint().unwrap()
+    );
+    assert_eq!(
+        restored_graph.checkpoint().unwrap(),
+        uninterrupted_graph.checkpoint().unwrap()
+    );
+    assert_inner_join_specialization_state_equivalent(
+        uninterrupted_runtime.as_ref(),
+        &uninterrupted_graph,
+    );
+    assert_inner_join_specialization_state_equivalent(restored_runtime.as_ref(), &restored_graph);
+}
+
+#[test]
+fn narrow_left_join_specialization_matches_native_dag_delta_state_and_restart() {
+    let scores = scores_catalog();
+    let accounts = accounts_catalog();
+    let input_schemas = vec![
+        catalog_input_relation_schema(&scores).unwrap(),
+        catalog_input_relation_schema(&accounts).unwrap(),
+    ];
+    let output_schema = join_output_schema();
+    let sql = "select s.user_id as account_id, sum(s.score) as sum, count(*) as count from scores s left join accounts a on s.user_id = a.account_id group by s.user_id";
+    let identity = standing_identity_with_view(sql, "scores_by_account");
+    let mut uninterrupted_runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &[scores.clone(), accounts.clone()],
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    let mut uninterrupted_graph = native_left_join_aggregate_graph();
+
+    let first_scores = scores_rows_batch(&[
+        ("alice", 10, 1),
+        ("alice", 7, 1),
+        ("bob", 5, 1),
+        ("charlie", 30, 1),
+    ]);
+    let first_accounts = accounts_alice_bob_batch();
+    let specialized = uninterrupted_runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("equivalence-left-1").unwrap(),
+            vec![
+                join_relation_input(&scores, 0, 4, vec![first_scores.clone()]),
+                join_relation_input(&accounts, 0, 2, vec![first_accounts.clone()]),
+            ],
+        )
+        .unwrap();
+    let generic = apply_native_join_epoch(
+        &mut uninterrupted_graph,
+        1,
+        native_join_input(&scores, "user_id", "score", &[first_scores]),
+        native_join_input(&accounts, "account_id", "limit", &[first_accounts]),
+    );
+    assert!(
+        specialization_delta_difference(&specialized.output_deltas[0].delta, &generic).is_none()
+    );
+    assert_left_join_specialization_state_equivalent(
+        uninterrupted_runtime.as_ref(),
+        &uninterrupted_graph,
+    );
+
+    let mut restored_runtime =
+        restore_standing_runtime(uninterrupted_runtime.checkpoint().unwrap()).unwrap();
+    let graph_checkpoint = uninterrupted_graph.checkpoint().unwrap();
+    let mut restored_graph = native_left_join_aggregate_graph();
+    restored_graph.restore(&graph_checkpoint).unwrap();
+
+    let changed_scores = scores_rows_batch(&[
+        ("alice", 7, -1),
+        ("bob", 5, -1),
+        ("bob", 8, 1),
+        ("dora", 4, 1),
+    ]);
+    let changed_accounts =
+        accounts_rows_batch(&[("charlie", 90, "silver", 1), ("alice", 100, "gold", -1)]);
+    let runtime_tail = vec![
+        join_relation_input(&scores, 4, 8, vec![changed_scores.clone()]),
+        join_relation_input(&accounts, 2, 4, vec![changed_accounts.clone()]),
+    ];
+    let graph_left = native_join_input(&scores, "user_id", "score", &[changed_scores]);
+    let graph_right = native_join_input(&accounts, "account_id", "limit", &[changed_accounts]);
+    let uninterrupted_specialized = uninterrupted_runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("equivalence-left-2").unwrap(),
+            runtime_tail.clone(),
+        )
+        .unwrap();
+    let restored_specialized = restored_runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("equivalence-left-2").unwrap(),
+            runtime_tail,
+        )
+        .unwrap();
+    let uninterrupted_generic = apply_native_join_epoch(
+        &mut uninterrupted_graph,
+        2,
+        graph_left.clone(),
+        graph_right.clone(),
+    );
+    let restored_generic = apply_native_join_epoch(&mut restored_graph, 2, graph_left, graph_right);
+
+    for delta in [
+        &restored_specialized.output_deltas[0].delta,
+        &uninterrupted_generic,
+        &restored_generic,
+    ] {
+        assert!(specialization_delta_difference(
+            &uninterrupted_specialized.output_deltas[0].delta,
+            delta,
+        )
+        .is_none());
+    }
+    assert_eq!(
+        restored_runtime.checkpoint().unwrap(),
+        uninterrupted_runtime.checkpoint().unwrap()
+    );
+    assert_eq!(
+        restored_graph.checkpoint().unwrap(),
+        uninterrupted_graph.checkpoint().unwrap()
+    );
+    assert_left_join_specialization_state_equivalent(
+        uninterrupted_runtime.as_ref(),
+        &uninterrupted_graph,
+    );
+    assert_left_join_specialization_state_equivalent(restored_runtime.as_ref(), &restored_graph);
+}
+
+#[test]
+fn specialization_equivalence_harness_detects_a_mutated_delta() {
+    let correct = DeltaBatch::from_records([DeltaRecord::new(
+        DeltaKey::from_json(json!("alice")),
+        DeltaValue::from_json(json!({ "sum": 10, "count": 1 })),
+        1,
+    )]);
+    let mutant = DeltaBatch::from_records([DeltaRecord::new(
+        DeltaKey::from_json(json!("alice")),
+        DeltaValue::from_json(json!({ "sum": 11, "count": 1 })),
+        1,
+    )]);
+    assert!(specialization_delta_difference(&correct, &mutant).is_some());
+}
+
+#[test]
+fn retained_join_specializations_toggle_to_common_dag_with_equivalent_recovery() {
+    let mut full_join_output_schema = join_output_schema();
+    full_join_output_schema.columns[1].nullable = true;
+    let cases = [
+        (
+            "select a.account_id, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.user_id = a.account_id group by a.account_id",
+            join_output_schema(),
+            "scores_by_account",
+        ),
+        (
+            "select s.user_id as account_id, sum(s.score) as sum, count(*) as count from scores s left join accounts a on s.user_id = a.account_id group by s.user_id",
+            join_output_schema(),
+            "scores_by_account_left",
+        ),
+        (
+            "select a.account_id, sum(s.score) as sum, count(*) as count, count(a.limit) as count_limit, count(distinct a.limit) as distinct_limits, sum(a.limit) as limit_sum, min(a.limit) as min_limit, max(a.limit) as max_limit, avg(a.limit) as avg_limit from scores s join accounts a on s.user_id = a.account_id group by a.account_id",
+            join_right_stats_output_schema(),
+            "scores_by_account_limits",
+        ),
+        (
+            "select coalesce(s.user_id, a.account_id) as account_id, sum(s.score) as sum, count(*) as count from scores s full outer join accounts a on s.user_id = a.account_id group by coalesce(s.user_id, a.account_id)",
+            full_join_output_schema,
+            "scores_by_account",
+        ),
+    ];
+
+    for (sql, output_schema, view_id) in cases {
+        let scores = scores_catalog();
+        let accounts = accounts_catalog();
+        let catalogs = vec![scores.clone(), accounts.clone()];
+        let input_schemas = vec![
+            catalog_input_relation_schema(&scores).unwrap(),
+            catalog_input_relation_schema(&accounts).unwrap(),
+        ];
+        let identity = standing_identity_with_view(sql, view_id);
+        let logical_plan =
+            lower_supported_join_view_sql_to_logical_plan(sql, &catalogs, &output_schema).unwrap();
+        let selected_binding =
+            bind_join_execution_v1(&logical_plan, JoinExecutionModeV1::SelectedSpecialization)
+                .unwrap();
+        let reference_binding =
+            bind_join_execution_v1(&logical_plan, JoinExecutionModeV1::CommonDagReference).unwrap();
+        assert_eq!(
+            selected_binding.common_logical_dag_hash,
+            reference_binding.common_logical_dag_hash
+        );
+        assert_ne!(
+            selected_binding.implementation.implementation_id,
+            reference_binding.implementation.implementation_id
+        );
+        assert_ne!(
+            selected_binding.implementation.physical_operator_dag_hash,
+            reference_binding.implementation.physical_operator_dag_hash
+        );
+        assert_eq!(
+            selected_binding.implementation.output_codec_id,
+            reference_binding.implementation.output_codec_id
+        );
+        assert_eq!(
+            selected_binding
+                .implementation
+                .output_publication_protocol_id,
+            reference_binding
+                .implementation
+                .output_publication_protocol_id
+        );
+
+        let mut selected = create_standing_runtime_with_logical_plan_and_catalogs(
+            &identity,
+            &catalogs,
+            logical_plan.clone(),
+            &input_schemas,
+            std::slice::from_ref(&output_schema),
+        )
+        .unwrap();
+        let mut reference =
+            create_common_dag_reference_standing_runtime_with_logical_plan_and_catalogs(
+                &identity,
+                &catalogs,
+                logical_plan,
+                &input_schemas,
+                std::slice::from_ref(&output_schema),
+            )
+            .unwrap();
+
+        let first = vec![
+            join_relation_input(
+                &scores,
+                0,
+                4,
+                vec![scores_rows_batch(&[
+                    ("alice", 10, 1),
+                    ("alice", 7, 1),
+                    ("bob", 5, 1),
+                    ("charlie", 30, 1),
+                ])],
+            ),
+            join_relation_input(&accounts, 0, 2, vec![accounts_alice_bob_batch()]),
+        ];
+        assert_join_runtime_epoch_equivalent(&mut selected, &mut reference, 1, first);
+
+        let changed = vec![
+            join_relation_input(
+                &scores,
+                4,
+                7,
+                vec![scores_rows_batch(&[
+                    ("alice", 7, -1),
+                    ("bob", 5, -1),
+                    ("bob", 8, 1),
+                ])],
+            ),
+            join_relation_input(
+                &accounts,
+                2,
+                5,
+                vec![accounts_rows_batch(&[
+                    ("alice", 100, "gold", -1),
+                    ("alice", 80, "silver", 1),
+                    ("charlie", 90, "silver", 1),
+                ])],
+            ),
+        ];
+        assert_join_runtime_epoch_equivalent(&mut selected, &mut reference, 2, changed);
+
+        let selected_checkpoint = selected.checkpoint().unwrap();
+        let reference_checkpoint = reference.checkpoint().unwrap();
+        assert_join_checkpoint_canonical_equivalent(&selected_checkpoint, &reference_checkpoint);
+        assert!(TwoInputJoinRuntime::restore(reference_checkpoint.clone()).is_err());
+        assert!(
+            restore_common_dag_reference_standing_runtime(selected_checkpoint.clone()).is_err()
+        );
+        let automatically_restored_reference =
+            restore_standing_runtime(reference_checkpoint.clone()).unwrap();
+        assert_join_checkpoint_canonical_equivalent(
+            &selected_checkpoint,
+            &automatically_restored_reference.checkpoint().unwrap(),
+        );
+        drop(selected);
+        drop(reference);
+        let mut selected = restore_standing_runtime(selected_checkpoint).unwrap();
+        let mut reference =
+            restore_common_dag_reference_standing_runtime(reference_checkpoint).unwrap();
+        assert_join_checkpoint_canonical_equivalent(
+            &selected.checkpoint().unwrap(),
+            &reference.checkpoint().unwrap(),
+        );
+
+        let tail = vec![
+            join_relation_input(
+                &scores,
+                7,
+                9,
+                vec![scores_rows_batch(&[("charlie", 30, -1), ("dora", 4, 1)])],
+            ),
+            join_relation_input(
+                &accounts,
+                5,
+                7,
+                vec![accounts_rows_batch(&[
+                    ("charlie", 90, "silver", -1),
+                    ("bob", 50, "gold", -1),
+                ])],
+            ),
+        ];
+        assert_join_runtime_epoch_equivalent(&mut selected, &mut reference, 3, tail);
+        assert_join_checkpoint_canonical_equivalent(
+            &selected.checkpoint().unwrap(),
+            &reference.checkpoint().unwrap(),
+        );
+    }
+}
+
+#[test]
+fn general_aggregate_join_specialization_matches_native_dag_state_and_restart() {
+    let scores = scores_catalog();
+    let accounts = accounts_catalog();
+    let catalogs = vec![scores.clone(), accounts.clone()];
+    let input_schemas = vec![
+        catalog_input_relation_schema(&scores).unwrap(),
+        catalog_input_relation_schema(&accounts).unwrap(),
+    ];
+    let output_schema = join_right_stats_output_schema();
+    let sql = "select a.account_id, sum(s.score) as sum, count(*) as count, count(a.limit) as count_limit, count(distinct a.limit) as distinct_limits, sum(a.limit) as limit_sum, min(a.limit) as min_limit, max(a.limit) as max_limit, avg(a.limit) as avg_limit from scores s join accounts a on s.user_id = a.account_id group by a.account_id";
+    let identity = standing_identity_with_view(sql, "scores_by_account_limits");
+    let logical_plan =
+        lower_supported_join_view_sql_to_logical_plan(sql, &catalogs, &output_schema).unwrap();
+    let VelorixLogicalViewExecutionV1::TwoInputJoinSumCount { plan } = &logical_plan.execution
+    else {
+        panic!("expected join execution");
+    };
+    let supported_plan = plan.as_ref().clone();
+    let mut uninterrupted_runtime = create_standing_runtime_with_logical_plan_and_catalogs(
+        &identity,
+        &catalogs,
+        logical_plan,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    let mut uninterrupted_graph = JoinSpecializationComparisonGraph::new(
+        catalogs.clone(),
+        supported_plan.clone(),
+        output_schema.clone(),
+    )
+    .unwrap();
+
+    let first_inputs = vec![
+        join_relation_input(
+            &scores,
+            0,
+            3,
+            vec![scores_rows_batch(&[
+                ("alice", 10, 1),
+                ("bob", 5, 1),
+                ("alice", 7, 1),
+            ])],
+        ),
+        join_relation_input(&accounts, 0, 2, vec![accounts_alice_bob_batch()]),
+    ];
+    let specialized = uninterrupted_runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("equivalence-general-1").unwrap(),
+            first_inputs.clone(),
+        )
+        .unwrap();
+    let generic = uninterrupted_graph.apply_epoch(1, first_inputs).unwrap();
+    assert!(
+        specialization_delta_difference(&specialized.output_deltas[0].delta, &generic).is_none()
+    );
+    assert_general_join_specialization_state_equivalent(
+        uninterrupted_runtime.as_ref(),
+        &uninterrupted_graph,
+    );
+
+    let mut restored_runtime =
+        restore_standing_runtime(uninterrupted_runtime.checkpoint().unwrap()).unwrap();
+    let graph_checkpoint = uninterrupted_graph.checkpoint().unwrap();
+    let mut restored_graph = JoinSpecializationComparisonGraph::restore(
+        catalogs,
+        supported_plan,
+        output_schema,
+        &graph_checkpoint,
+    )
+    .unwrap();
+    let tail = vec![join_relation_input(
+        &accounts,
+        2,
+        4,
+        vec![accounts_rows_batch(&[
+            ("alice", 100, "gold", -1),
+            ("alice", 80, "gold", 1),
+        ])],
+    )];
+    let live = uninterrupted_runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("equivalence-general-2").unwrap(),
+            tail.clone(),
+        )
+        .unwrap();
+    let restored = restored_runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("equivalence-general-2").unwrap(),
+            tail.clone(),
+        )
+        .unwrap();
+    let generic_live = uninterrupted_graph.apply_epoch(2, tail.clone()).unwrap();
+    let generic_restored = restored_graph.apply_epoch(2, tail).unwrap();
+    for delta in [
+        &restored.output_deltas[0].delta,
+        &generic_live,
+        &generic_restored,
+    ] {
+        assert!(specialization_delta_difference(&live.output_deltas[0].delta, delta).is_none());
+    }
+    assert_eq!(
+        restored_runtime.checkpoint().unwrap(),
+        uninterrupted_runtime.checkpoint().unwrap()
+    );
+    assert_eq!(
+        restored_graph.checkpoint().unwrap(),
+        uninterrupted_graph.checkpoint().unwrap()
+    );
+    assert_general_join_specialization_state_equivalent(
+        uninterrupted_runtime.as_ref(),
+        &uninterrupted_graph,
+    );
+    assert_general_join_specialization_state_equivalent(restored_runtime.as_ref(), &restored_graph);
+}
+
+#[test]
+fn general_aggregate_join_comparison_covers_filters_and_expression_inputs() {
+    let scores = scores_catalog();
+    let accounts = accounts_catalog();
+    let catalogs = vec![scores.clone(), accounts.clone()];
+    let input_schemas = vec![
+        catalog_input_relation_schema(&scores).unwrap(),
+        catalog_input_relation_schema(&accounts).unwrap(),
+    ];
+    let cases = vec![
+        (
+            "select a.account_id, sum(s.score) filter (where s.score > 5) as sum, count(*) filter (where s.score > 0) as count from scores s join accounts a on s.user_id = a.account_id group by a.account_id",
+            join_output_schema(),
+            "scores_by_account",
+        ),
+        (
+            "select a.account_id, sum(s.score + 1) as sum, count(*) as count from scores s join accounts a on s.user_id = a.account_id group by a.account_id",
+            join_output_schema(),
+            "scores_by_account",
+        ),
+        (
+            "select a.account_id, sum(s.score) as sum, sum(a.limit + 1) as adjusted_sum, count(*) as count from scores s join accounts a on s.user_id = a.account_id group by a.account_id",
+            join_adjusted_sum_output_schema(),
+            "scores_by_account_adjusted",
+        ),
+        (
+            "select a.account_id, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.user_id = a.account_id group by a.account_id having sum(s.score) > 5 order by sum desc limit 1",
+            join_output_schema(),
+            "scores_by_account",
+        ),
+    ];
+
+    for (case_index, (sql, output_schema, view_id)) in cases.into_iter().enumerate() {
+        let identity = standing_identity_with_view(sql, view_id);
+        let logical_plan =
+            lower_supported_join_view_sql_to_logical_plan(sql, &catalogs, &output_schema).unwrap();
+        let VelorixLogicalViewExecutionV1::TwoInputJoinSumCount { plan } = &logical_plan.execution
+        else {
+            panic!("expected join execution");
+        };
+        let mut comparison = JoinSpecializationComparisonGraph::new(
+            catalogs.clone(),
+            plan.as_ref().clone(),
+            output_schema.clone(),
+        )
+        .unwrap();
+        let mut runtime = create_standing_runtime_with_logical_plan_and_catalogs(
+            &identity,
+            &catalogs,
+            logical_plan,
+            &input_schemas,
+            std::slice::from_ref(&output_schema),
+        )
+        .unwrap();
+        let inputs = vec![
+            join_relation_input(&scores, 0, 3, vec![scores_batch()]),
+            join_relation_input(&accounts, 0, 2, vec![accounts_alice_bob_batch()]),
+        ];
+        let specialized = runtime
+            .apply_changes(
+                1,
+                EpochIdempotencyKey::new(format!("equivalence-general-case-{case_index}")).unwrap(),
+                inputs.clone(),
+            )
+            .unwrap();
+        let generic = comparison.apply_epoch(1, inputs).unwrap();
+        assert!(
+            specialization_delta_difference(&specialized.output_deltas[0].delta, &generic,)
+                .is_none()
+        );
+        assert_general_join_specialization_state_equivalent(runtime.as_ref(), &comparison);
+
+        let tail = vec![join_relation_input(
+            &scores,
+            3,
+            6,
+            vec![scores_rows_batch(&[
+                ("alice", 10, -1),
+                ("alice", 7, -1),
+                ("bob", 20, 1),
+            ])],
+        )];
+        let specialized = runtime
+            .apply_changes(
+                2,
+                EpochIdempotencyKey::new(format!("equivalence-general-case-{case_index}-tail"))
+                    .unwrap(),
+                tail.clone(),
+            )
+            .unwrap();
+        let generic = comparison.apply_epoch(2, tail).unwrap();
+        assert!(
+            specialization_delta_difference(&specialized.output_deltas[0].delta, &generic,)
+                .is_none()
+        );
+        assert_general_join_specialization_state_equivalent(runtime.as_ref(), &comparison);
+    }
 }
 
 #[test]
@@ -6511,6 +8986,7 @@ fn runtime_materializes_left_join_left_only_aggregates_for_unmatched_left_rows()
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -6527,6 +9003,7 @@ fn runtime_materializes_left_join_left_only_aggregates_for_unmatched_left_rows()
                     ])],
                 },
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -6561,6 +9038,7 @@ fn runtime_materializes_left_join_left_only_aggregates_for_unmatched_left_rows()
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: accounts.relation_schema.relation_id.clone(),
                 relation_version: accounts.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -6588,6 +9066,7 @@ fn runtime_materializes_left_join_left_only_aggregates_for_unmatched_left_rows()
             3,
             EpochIdempotencyKey::new("epoch-3").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: accounts.relation_schema.relation_id.clone(),
                 relation_version: accounts.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -6609,6 +9088,572 @@ fn runtime_materializes_left_join_left_only_aggregates_for_unmatched_left_rows()
             ("charlie", 30, 1, 30, 30, 30.0),
         ],
     );
+}
+
+#[test]
+fn runtime_materializes_full_join_symmetric_transitions_and_restores_state() {
+    let scores = scores_catalog();
+    let accounts = accounts_nullable_limit_catalog();
+    let input_schemas = vec![
+        catalog_input_relation_schema(&scores).unwrap(),
+        catalog_input_relation_schema(&accounts).unwrap(),
+    ];
+    let mut output_schema = join_output_schema();
+    output_schema.columns[1].nullable = true;
+    let sql = "select coalesce(s.user_id, a.account_id) as account_id, sum(s.score) as sum, count(*) as count from scores s full outer join accounts a on s.user_id = a.account_id group by coalesce(s.user_id, a.account_id)";
+    let identity = standing_identity_with_view(sql, "scores_by_account");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &[scores.clone(), accounts.clone()],
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("full-join-epoch-1").unwrap(),
+            vec![
+                join_relation_input(
+                    &scores,
+                    0,
+                    2,
+                    vec![scores_rows_batch(&[("alice", 10, 1), ("charlie", 30, 1)])],
+                ),
+                join_relation_input(
+                    &accounts,
+                    0,
+                    2,
+                    vec![accounts_nullable_limit_rows_batch(&[
+                        ("alice", Some(100), "gold", 1),
+                        ("bob", None, "gold", 1),
+                    ])],
+                ),
+            ],
+        )
+        .unwrap();
+    assert_nullable_join_page(
+        runtime.as_ref(),
+        1,
+        &[
+            ("alice", Some(10), 1),
+            ("bob", None, 1),
+            ("charlie", Some(30), 1),
+        ],
+    );
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    let payload: Value =
+        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+    assert_eq!(payload["plan"]["join_kind"], "full");
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+
+    restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("full-join-epoch-2").unwrap(),
+            vec![
+                join_relation_input(&scores, 2, 3, vec![scores_rows_batch(&[("bob", 5, 1)])]),
+                join_relation_input(
+                    &accounts,
+                    2,
+                    3,
+                    vec![accounts_nullable_limit_rows_batch(&[(
+                        "charlie",
+                        Some(90),
+                        "silver",
+                        1,
+                    )])],
+                ),
+            ],
+        )
+        .unwrap();
+    assert_nullable_join_page(
+        restored.as_ref(),
+        2,
+        &[
+            ("alice", Some(10), 1),
+            ("bob", Some(5), 1),
+            ("charlie", Some(30), 1),
+        ],
+    );
+
+    restored
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("full-join-epoch-3").unwrap(),
+            vec![
+                join_relation_input(&scores, 3, 4, vec![scores_rows_batch(&[("alice", 7, 1)])]),
+                join_relation_input(
+                    &accounts,
+                    3,
+                    4,
+                    vec![accounts_nullable_limit_rows_batch(&[(
+                        "alice",
+                        Some(100),
+                        "gold",
+                        1,
+                    )])],
+                ),
+            ],
+        )
+        .unwrap();
+    assert_nullable_join_page(
+        restored.as_ref(),
+        3,
+        &[
+            ("alice", Some(34), 4),
+            ("bob", Some(5), 1),
+            ("charlie", Some(30), 1),
+        ],
+    );
+
+    let mut restored = restore_standing_runtime(restored.checkpoint().unwrap()).unwrap();
+    for (epoch, start_offset, expected_sum, expected_count) in
+        [(4, 4, Some(17), 2), (5, 5, Some(17), 2)]
+    {
+        restored
+            .apply_changes(
+                epoch,
+                EpochIdempotencyKey::new(format!("full-join-epoch-{epoch}")).unwrap(),
+                vec![join_relation_input(
+                    &accounts,
+                    start_offset,
+                    start_offset + 1,
+                    vec![accounts_nullable_limit_rows_batch(&[(
+                        "alice",
+                        Some(100),
+                        "gold",
+                        -1,
+                    )])],
+                )],
+            )
+            .unwrap();
+        assert_nullable_join_page(
+            restored.as_ref(),
+            epoch,
+            &[
+                ("alice", expected_sum, expected_count),
+                ("bob", Some(5), 1),
+                ("charlie", Some(30), 1),
+            ],
+        );
+    }
+
+    restored
+        .apply_changes(
+            6,
+            EpochIdempotencyKey::new("full-join-epoch-6").unwrap(),
+            vec![join_relation_input(
+                &scores,
+                4,
+                6,
+                vec![scores_rows_batch(&[("alice", 10, -1), ("alice", 7, -1)])],
+            )],
+        )
+        .unwrap();
+    assert_nullable_join_page(
+        restored.as_ref(),
+        6,
+        &[("bob", Some(5), 1), ("charlie", Some(30), 1)],
+    );
+
+    restored
+        .apply_changes(
+            7,
+            EpochIdempotencyKey::new("full-join-epoch-7").unwrap(),
+            vec![
+                join_relation_input(&scores, 6, 7, vec![scores_rows_batch(&[("bob", 5, -1)])]),
+                join_relation_input(
+                    &accounts,
+                    6,
+                    7,
+                    vec![accounts_nullable_limit_rows_batch(&[(
+                        "charlie",
+                        Some(90),
+                        "silver",
+                        -1,
+                    )])],
+                ),
+            ],
+        )
+        .unwrap();
+    assert_nullable_join_page(
+        restored.as_ref(),
+        7,
+        &[("bob", None, 1), ("charlie", Some(30), 1)],
+    );
+
+    restored
+        .apply_changes(
+            8,
+            EpochIdempotencyKey::new("full-join-epoch-8").unwrap(),
+            vec![join_relation_input(
+                &scores,
+                7,
+                9,
+                vec![scores_rows_batch(&[("charlie", 30, -1), ("bob", 30, 1)])],
+            )],
+        )
+        .unwrap();
+    assert_nullable_join_page(restored.as_ref(), 8, &[("bob", Some(30), 1)]);
+}
+
+#[test]
+fn runtime_materializes_left_join_right_aggregate_filter_and_restores_state() {
+    let scores = scores_catalog();
+    let accounts = accounts_catalog();
+    let input_schemas = vec![
+        catalog_input_relation_schema(&scores).unwrap(),
+        catalog_input_relation_schema(&accounts).unwrap(),
+    ];
+    let output_schema = left_join_right_sum_output_schema();
+    let sql = "select s.user_id as account_id, sum(s.score) as sum, sum(a.limit) filter (where a.limit > 60) as limit_sum, count(*) as count from scores s left join accounts a on s.user_id = a.account_id group by s.user_id";
+    let identity = standing_identity_with_view(sql, "left_join_right_sum");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &[scores.clone(), accounts.clone()],
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("epoch-1").unwrap(),
+            vec![
+                join_relation_input(
+                    &scores,
+                    0,
+                    4,
+                    vec![scores_rows_batch(&[
+                        ("alice", 10, 1),
+                        ("alice", 7, 1),
+                        ("bob", 5, 1),
+                        ("charlie", 30, 1),
+                    ])],
+                ),
+                join_relation_input(&accounts, 0, 2, vec![accounts_alice_bob_batch()]),
+            ],
+        )
+        .unwrap();
+
+    assert_left_join_right_sum_page(
+        runtime.as_ref(),
+        1,
+        &[
+            ("alice", 17, Some(200), 2),
+            ("bob", 5, None, 1),
+            ("charlie", 30, None, 1),
+        ],
+    );
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    let mut tampered = checkpoint.clone();
+    let state_payload = tampered.state_payload.as_mut().unwrap();
+    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    payload["plan"]["right_value_column_ids"] = json!(["missing_right_value"]);
+    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    tampered.state_root.content_hash = stable_bytes_hash(state_payload.payload.as_bytes());
+    assert!(restore_standing_runtime(tampered).is_err());
+
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("epoch-2").unwrap(),
+            vec![join_relation_input(
+                &accounts,
+                2,
+                3,
+                vec![accounts_rows_batch(&[("alice", 100, "gold", -1)])],
+            )],
+        )
+        .unwrap();
+    assert_left_join_right_sum_page(
+        restored.as_ref(),
+        2,
+        &[
+            ("alice", 17, None, 2),
+            ("bob", 5, None, 1),
+            ("charlie", 30, None, 1),
+        ],
+    );
+}
+
+#[test]
+fn runtime_materializes_left_join_empty_right_aggregates_as_sql_null() {
+    let scores = scores_catalog();
+    let accounts = accounts_nullable_limit_catalog();
+    let input_schemas = vec![
+        catalog_input_relation_schema(&scores).unwrap(),
+        catalog_input_relation_schema(&accounts).unwrap(),
+    ];
+    let mut output_schema = join_right_stats_output_schema();
+    for index in [1, 5, 6, 7, 8] {
+        output_schema.columns[index].nullable = true;
+    }
+    let sql = "select s.user_id as account_id, sum(s.score) as sum, count(*) as count, count(a.limit) as count_limit, count(distinct a.limit) as distinct_limits, sum(a.limit) as limit_sum, min(a.limit) as min_limit, max(a.limit) as max_limit, avg(a.limit) as avg_limit from scores s left join accounts a on s.user_id = a.account_id group by s.user_id";
+    let identity = standing_identity_with_view(sql, "scores_by_account_limits");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &[scores.clone(), accounts.clone()],
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("epoch-1").unwrap(),
+            vec![
+                join_relation_input(
+                    &scores,
+                    0,
+                    3,
+                    vec![scores_rows_batch(&[
+                        ("alice", 10, 1),
+                        ("alice", 7, 1),
+                        ("bob", 5, 1),
+                    ])],
+                ),
+                join_relation_input(
+                    &accounts,
+                    0,
+                    1,
+                    vec![accounts_nullable_limit_rows_batch(&[(
+                        "alice", None, "gold", 1,
+                    )])],
+                ),
+            ],
+        )
+        .unwrap();
+    assert_left_join_empty_right_stats_page(runtime.as_ref(), 1, &["alice", "bob"]);
+
+    let mut restored = restore_standing_runtime(runtime.checkpoint().unwrap()).unwrap();
+    restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("epoch-2").unwrap(),
+            vec![join_relation_input(
+                &accounts,
+                1,
+                4,
+                vec![accounts_nullable_limit_rows_batch(&[
+                    ("alice", None, "gold", -1),
+                    ("alice", Some(80), "gold", 1),
+                    ("bob", Some(50), "gold", 1),
+                ])],
+            )],
+        )
+        .unwrap();
+    assert_join_right_stats_page(
+        restored.as_ref(),
+        2,
+        &[
+            ("alice", 17, 2, 2, 1, 160, 80, 80, 80.0),
+            ("bob", 5, 1, 1, 1, 50, 50, 50, 50.0),
+        ],
+    );
+}
+
+#[test]
+fn runtime_materializes_left_join_post_join_right_filter() {
+    let scores = scores_catalog();
+    let accounts = accounts_catalog();
+    let input_schemas = vec![
+        catalog_input_relation_schema(&scores).unwrap(),
+        catalog_input_relation_schema(&accounts).unwrap(),
+    ];
+    let mut output_schema = join_output_schema();
+    output_schema.columns[1].nullable = true;
+    let sql = "select s.user_id as account_id, sum(s.score) as sum, count(*) as count from scores s left join accounts a on s.user_id = a.account_id where a.limit > 60 group by s.user_id";
+    let identity = standing_identity_with_view(sql, "scores_by_account");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &[scores.clone(), accounts.clone()],
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("epoch-1").unwrap(),
+            vec![
+                join_relation_input(
+                    &scores,
+                    0,
+                    4,
+                    vec![scores_rows_batch(&[
+                        ("alice", 10, 1),
+                        ("alice", 7, 1),
+                        ("bob", 5, 1),
+                        ("charlie", 30, 1),
+                    ])],
+                ),
+                join_relation_input(&accounts, 0, 2, vec![accounts_alice_bob_batch()]),
+            ],
+        )
+        .unwrap();
+    assert_join_page(runtime.as_ref(), 1, &[("alice", 17, 2)]);
+
+    let mut restored = restore_standing_runtime(runtime.checkpoint().unwrap()).unwrap();
+    restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("epoch-2").unwrap(),
+            vec![join_relation_input(
+                &accounts,
+                2,
+                3,
+                vec![accounts_rows_batch(&[("alice", 100, "gold", -1)])],
+            )],
+        )
+        .unwrap();
+    assert_join_page(restored.as_ref(), 2, &[]);
+}
+
+#[test]
+fn runtime_materializes_null_accepting_left_join_where_after_the_join() {
+    let scores = scores_catalog();
+    let accounts = accounts_catalog();
+    let input_schemas = vec![
+        catalog_input_relation_schema(&scores).unwrap(),
+        catalog_input_relation_schema(&accounts).unwrap(),
+    ];
+    let mut output_schema = join_output_schema();
+    output_schema.columns[1].nullable = true;
+    let sql = "select s.user_id as account_id, sum(s.score) as sum, count(*) as count from scores s left join accounts a on s.user_id = a.account_id where a.limit is null group by s.user_id";
+    let identity = standing_identity_with_view(sql, "scores_by_account");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &[scores.clone(), accounts.clone()],
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("epoch-1").unwrap(),
+            vec![
+                join_relation_input(
+                    &scores,
+                    0,
+                    4,
+                    vec![scores_rows_batch(&[
+                        ("alice", 10, 1),
+                        ("alice", 7, 1),
+                        ("bob", 5, 1),
+                        ("charlie", 30, 1),
+                    ])],
+                ),
+                join_relation_input(&accounts, 0, 2, vec![accounts_alice_bob_batch()]),
+            ],
+        )
+        .unwrap();
+    assert_join_page(runtime.as_ref(), 1, &[("charlie", 30, 1)]);
+
+    let mut restored = restore_standing_runtime(runtime.checkpoint().unwrap()).unwrap();
+    restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("epoch-2").unwrap(),
+            vec![join_relation_input(
+                &accounts,
+                2,
+                3,
+                vec![accounts_rows_batch(&[("alice", 100, "gold", -1)])],
+            )],
+        )
+        .unwrap();
+    assert_join_page(
+        restored.as_ref(),
+        2,
+        &[("alice", 17, 2), ("charlie", 30, 1)],
+    );
+}
+
+#[test]
+fn runtime_materializes_right_join_by_swapping_to_left_join_state() {
+    let scores = scores_catalog();
+    let accounts = accounts_catalog();
+    let input_schemas = vec![
+        catalog_input_relation_schema(&scores).unwrap(),
+        catalog_input_relation_schema(&accounts).unwrap(),
+    ];
+    let output_schema = join_output_schema();
+    let sql = "select a.account_id, sum(a.limit) as sum, count(*) as count from scores s right join accounts a on s.user_id = a.account_id group by a.account_id";
+    let identity = standing_identity_with_view(sql, "scores_by_account");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &[scores.clone(), accounts.clone()],
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("epoch-1").unwrap(),
+            vec![
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
+                    relation_id: scores.relation_schema.relation_id.clone(),
+                    relation_version: scores.relation_schema.relation_version.clone(),
+                    stream_id: "test-stream".to_string(),
+                    partition_id: 0,
+                    schema_fingerprint: scores.schema_fingerprint.to_string(),
+                    start_offset_inclusive: 0,
+                    end_offset_exclusive: 1,
+                    event_time_watermark: None,
+                    batches: vec![scores_rows_batch(&[("alice", 10, 1)])],
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
+                    relation_id: accounts.relation_schema.relation_id.clone(),
+                    relation_version: accounts.relation_schema.relation_version.clone(),
+                    stream_id: "test-stream".to_string(),
+                    partition_id: 0,
+                    schema_fingerprint: accounts.schema_fingerprint.to_string(),
+                    start_offset_inclusive: 0,
+                    end_offset_exclusive: 2,
+                    event_time_watermark: None,
+                    batches: vec![accounts_alice_bob_batch()],
+                },
+            ],
+        )
+        .unwrap();
+    assert_join_page(runtime.as_ref(), 1, &[("alice", 100, 1), ("bob", 50, 1)]);
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    let payload: Value =
+        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+    assert_eq!(payload["plan"]["join_kind"], "left");
+    assert_eq!(
+        payload["plan"]["left_input_relation_id"],
+        accounts.relation_schema.relation_id
+    );
+    assert_eq!(
+        payload["plan"]["right_input_relation_id"],
+        scores.relation_schema.relation_id
+    );
+
+    let restored = restore_standing_runtime(checkpoint).unwrap();
+    assert_join_page(restored.as_ref(), 1, &[("alice", 100, 1), ("bob", 50, 1)]);
 }
 
 #[test]
@@ -6637,6 +9682,7 @@ fn runtime_materializes_left_join_with_left_only_aggregate_filter_for_unmatched_
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -6654,6 +9700,7 @@ fn runtime_materializes_left_join_with_left_only_aggregate_filter_for_unmatched_
                     ])],
                 },
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -6701,6 +9748,7 @@ fn runtime_materializes_two_relation_join_with_generic_adapter_catalogs() {
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -6716,6 +9764,7 @@ fn runtime_materializes_two_relation_join_with_generic_adapter_catalogs() {
                     ])],
                 },
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -6835,6 +9884,7 @@ fn apply_join_expression_fixture(
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -6850,6 +9900,7 @@ fn apply_join_expression_fixture(
                     ])],
                 },
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -6891,6 +9942,7 @@ fn runtime_materializes_two_relation_join_count_only_and_restores_state() {
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -6907,6 +9959,7 @@ fn runtime_materializes_two_relation_join_count_only_and_restores_state() {
                     ])],
                 },
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -6930,6 +9983,7 @@ fn runtime_materializes_two_relation_join_count_only_and_restores_state() {
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: scores.relation_schema.relation_id.clone(),
                 relation_version: scores.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -6972,6 +10026,7 @@ fn runtime_materializes_two_relation_join_count_distinct_only_and_restores_state
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -6988,6 +10043,7 @@ fn runtime_materializes_two_relation_join_count_distinct_only_and_restores_state
                     ])],
                 },
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -7011,6 +10067,7 @@ fn runtime_materializes_two_relation_join_count_distinct_only_and_restores_state
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: scores.relation_schema.relation_id.clone(),
                 relation_version: scores.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -7053,6 +10110,7 @@ fn runtime_materializes_two_relation_join_grouped_by_left_key_projection() {
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -7068,6 +10126,7 @@ fn runtime_materializes_two_relation_join_grouped_by_left_key_projection() {
                     ])],
                 },
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -7091,6 +10150,7 @@ fn runtime_materializes_two_relation_join_grouped_by_left_key_projection() {
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: scores.relation_schema.relation_id.clone(),
                 relation_version: scores.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -7134,6 +10194,7 @@ fn runtime_materializes_two_relation_join_stats_and_restores_incremental_state()
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -7150,6 +10211,7 @@ fn runtime_materializes_two_relation_join_stats_and_restores_incremental_state()
                     ])],
                 },
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -7177,6 +10239,7 @@ fn runtime_materializes_two_relation_join_stats_and_restores_incremental_state()
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: scores.relation_schema.relation_id.clone(),
                 relation_version: scores.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -7233,6 +10296,7 @@ fn runtime_materializes_two_relation_join_right_side_stats_and_restores_state() 
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -7248,6 +10312,7 @@ fn runtime_materializes_two_relation_join_right_side_stats_and_restores_state() 
                     ])],
                 },
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -7278,6 +10343,7 @@ fn runtime_materializes_two_relation_join_right_side_stats_and_restores_state() 
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: accounts.relation_schema.relation_id.clone(),
                 relation_version: accounts.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -7336,6 +10402,7 @@ fn runtime_materializes_two_relation_join_decimal_avg_as_float64_output() {
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -7351,6 +10418,7 @@ fn runtime_materializes_two_relation_join_decimal_avg_as_float64_output() {
                     ])],
                 },
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -7407,6 +10475,7 @@ fn runtime_materializes_two_relation_join_nullable_right_value_count() {
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -7422,6 +10491,7 @@ fn runtime_materializes_two_relation_join_nullable_right_value_count() {
                     ])],
                 },
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -7452,6 +10522,7 @@ fn runtime_materializes_two_relation_join_nullable_right_value_count() {
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: accounts.relation_schema.relation_id.clone(),
                 relation_version: accounts.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -7507,6 +10578,7 @@ fn runtime_materializes_two_relation_join_multiple_right_aggregate_input_columns
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -7522,6 +10594,7 @@ fn runtime_materializes_two_relation_join_multiple_right_aggregate_input_columns
                     ])],
                 },
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -7555,6 +10628,7 @@ fn runtime_materializes_two_relation_join_multiple_right_aggregate_input_columns
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: accounts.relation_schema.relation_id.clone(),
                 relation_version: accounts.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -7613,6 +10687,7 @@ fn runtime_materializes_two_relation_join_right_aggregate_having_order_by_top_k(
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -7628,6 +10703,7 @@ fn runtime_materializes_two_relation_join_right_aggregate_having_order_by_top_k(
                     ])],
                 },
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -7675,6 +10751,7 @@ fn runtime_restores_legacy_join_checkpoint_without_aggregate_input_relation_side
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -7686,6 +10763,7 @@ fn runtime_restores_legacy_join_checkpoint_without_aggregate_input_relation_side
                     batches: vec![scores_rows_batch(&[("alice", 10, 1), ("bob", 5, 1)])],
                 },
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -7746,6 +10824,7 @@ fn runtime_rejects_join_checkpoint_without_published_output() {
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -7757,6 +10836,7 @@ fn runtime_rejects_join_checkpoint_without_published_output() {
                     batches: vec![scores_rows_batch(&[("alice", 10, 1), ("bob", 5, 1)])],
                 },
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -7820,6 +10900,7 @@ fn runtime_materializes_two_relation_join_using_primary_key() {
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -7831,6 +10912,7 @@ fn runtime_materializes_two_relation_join_using_primary_key() {
                     batches: vec![scores_batch()],
                 },
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -7874,6 +10956,7 @@ fn runtime_materializes_two_relation_join_order_by_limit_top_k_and_restores_stat
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -7885,6 +10968,7 @@ fn runtime_materializes_two_relation_join_order_by_limit_top_k_and_restores_stat
                     batches: vec![scores_batch()],
                 },
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -7905,6 +10989,7 @@ fn runtime_materializes_two_relation_join_order_by_limit_top_k_and_restores_stat
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: scores.relation_schema.relation_id.clone(),
                 relation_version: scores.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -7949,6 +11034,7 @@ fn runtime_materializes_two_relation_join_order_by_sum_function_top_k() {
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -7960,6 +11046,7 @@ fn runtime_materializes_two_relation_join_order_by_sum_function_top_k() {
                     batches: vec![scores_batch()],
                 },
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -7980,6 +11067,7 @@ fn runtime_materializes_two_relation_join_order_by_sum_function_top_k() {
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: scores.relation_schema.relation_id.clone(),
                 relation_version: scores.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -8021,6 +11109,7 @@ fn runtime_materializes_two_relation_join_order_by_count_star_function_top_k() {
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -8032,6 +11121,7 @@ fn runtime_materializes_two_relation_join_order_by_count_star_function_top_k() {
                     batches: vec![scores_batch()],
                 },
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -8074,6 +11164,7 @@ fn runtime_materializes_two_relation_join_order_by_count_distinct_function_top_k
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -8085,6 +11176,7 @@ fn runtime_materializes_two_relation_join_order_by_count_distinct_function_top_k
                     batches: vec![scores_batch()],
                 },
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -8127,6 +11219,7 @@ fn runtime_materializes_two_relation_join_having_view() {
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -8138,6 +11231,7 @@ fn runtime_materializes_two_relation_join_having_view() {
                     batches: vec![scores_batch()],
                 },
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -8181,6 +11275,7 @@ fn runtime_materializes_two_relation_join_projected_aliases() {
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -8192,6 +11287,7 @@ fn runtime_materializes_two_relation_join_projected_aliases() {
                     batches: vec![scores_batch()],
                 },
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -8204,7 +11300,7 @@ fn runtime_materializes_two_relation_join_projected_aliases() {
                 },
             ],
         )
-        .unwrap();
+        .unwrap_or_else(|error| panic!("[SCALAR-APPLY1] {error}"));
 
     let page = runtime
         .materialized_view_page(
@@ -8248,6 +11344,7 @@ fn runtime_materializes_two_relation_join_shared_aggregate_filter() {
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -8259,6 +11356,7 @@ fn runtime_materializes_two_relation_join_shared_aggregate_filter() {
                     batches: vec![scores_batch()],
                 },
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -8279,6 +11377,7 @@ fn runtime_materializes_two_relation_join_shared_aggregate_filter() {
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: scores.relation_schema.relation_id.clone(),
                 relation_version: scores.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -8323,6 +11422,7 @@ fn runtime_materializes_two_relation_join_mixed_aggregate_filters() {
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -8334,6 +11434,7 @@ fn runtime_materializes_two_relation_join_mixed_aggregate_filters() {
                     batches: vec![scores_batch()],
                 },
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -8354,6 +11455,7 @@ fn runtime_materializes_two_relation_join_mixed_aggregate_filters() {
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: scores.relation_schema.relation_id.clone(),
                 relation_version: scores.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -8398,6 +11500,7 @@ fn runtime_materializes_two_relation_join_filtered_count_distinct() {
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -8414,6 +11517,7 @@ fn runtime_materializes_two_relation_join_filtered_count_distinct() {
                     ])],
                 },
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -8459,6 +11563,7 @@ fn runtime_materializes_two_relation_join_having_count_distinct_function() {
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -8475,6 +11580,7 @@ fn runtime_materializes_two_relation_join_having_count_distinct_function() {
                     ])],
                 },
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -8495,6 +11601,7 @@ fn runtime_materializes_two_relation_join_having_count_distinct_function() {
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: scores.relation_schema.relation_id.clone(),
                 relation_version: scores.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -8536,6 +11643,7 @@ fn runtime_materializes_two_relation_join_count_distinct_skips_null_left_values(
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -8547,6 +11655,7 @@ fn runtime_materializes_two_relation_join_count_distinct_skips_null_left_values(
                     batches: vec![scores_nullable_batch()],
                 },
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -8589,6 +11698,7 @@ fn runtime_materializes_two_relation_join_nullable_left_value_count() {
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -8600,6 +11710,7 @@ fn runtime_materializes_two_relation_join_nullable_left_value_count() {
                     batches: vec![scores_nullable_batch()],
                 },
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -8642,6 +11753,7 @@ fn runtime_materializes_two_relation_join_with_left_where_filter() {
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -8667,6 +11779,7 @@ fn runtime_materializes_two_relation_join_with_left_where_filter() {
                     .unwrap()],
                 },
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -8690,6 +11803,7 @@ fn runtime_materializes_two_relation_join_with_left_where_filter() {
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -8705,6 +11819,7 @@ fn runtime_materializes_two_relation_join_with_left_where_filter() {
                     ])],
                 },
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -8726,6 +11841,7 @@ fn runtime_materializes_two_relation_join_with_left_where_filter() {
             EpochIdempotencyKey::new("epoch-3").unwrap(),
             vec![
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -8737,6 +11853,7 @@ fn runtime_materializes_two_relation_join_with_left_where_filter() {
                     batches: vec![scores_rows_batch(&[("alice", 20, -1)])],
                 },
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -8779,6 +11896,7 @@ fn runtime_materializes_two_relation_join_with_cte_source_filter() {
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -8802,6 +11920,7 @@ fn runtime_materializes_two_relation_join_with_cte_source_filter() {
                     .unwrap()],
                 },
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -8845,6 +11964,7 @@ fn runtime_materializes_two_relation_join_with_right_cte_source_filter() {
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -8868,6 +11988,7 @@ fn runtime_materializes_two_relation_join_with_right_cte_source_filter() {
                     .unwrap()],
                 },
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -8911,6 +12032,7 @@ fn runtime_materializes_two_relation_join_with_two_cte_source_filters() {
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -8934,6 +12056,7 @@ fn runtime_materializes_two_relation_join_with_two_cte_source_filters() {
                     .unwrap()],
                 },
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -8977,6 +12100,7 @@ fn runtime_materializes_two_relation_join_with_two_derived_table_source_filters(
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -9000,6 +12124,7 @@ fn runtime_materializes_two_relation_join_with_two_derived_table_source_filters(
                     .unwrap()],
                 },
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -9043,6 +12168,7 @@ fn runtime_materializes_two_relation_join_with_cross_relation_or_where_filter() 
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: scores.relation_schema.relation_id.clone(),
                     relation_version: scores.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -9054,6 +12180,7 @@ fn runtime_materializes_two_relation_join_with_cross_relation_or_where_filter() 
                     batches: vec![scores_batch()],
                 },
                 RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
                     relation_id: accounts.relation_schema.relation_id.clone(),
                     relation_version: accounts.relation_schema.relation_version.clone(),
                     stream_id: "test-stream".to_string(),
@@ -9092,6 +12219,7 @@ fn runtime_materializes_latest_bool_by_key_and_restores_state() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -9122,6 +12250,7 @@ fn runtime_materializes_latest_bool_by_key_and_restores_state() {
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -9166,6 +12295,7 @@ fn runtime_rejects_latest_by_key_checkpoint_without_published_output() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -9217,6 +12347,7 @@ fn runtime_materializes_earliest_bool_by_key_with_arg_min() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -9246,6 +12377,7 @@ fn runtime_materializes_earliest_bool_by_key_with_arg_min() {
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -9290,6 +12422,7 @@ fn runtime_materializes_latest_by_key_with_arg_max_filter_predicate() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -9336,6 +12469,7 @@ fn runtime_materializes_latest_by_key_with_where_and_arg_max_filter_predicates()
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -9379,6 +12513,7 @@ fn runtime_materializes_latest_by_key_cte_source_filters() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -9420,6 +12555,7 @@ fn runtime_materializes_latest_by_key_derived_table_source_filters() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -9461,6 +12597,7 @@ fn runtime_materializes_latest_by_key_order_by_limit_top_k_and_restores_state() 
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -9486,6 +12623,7 @@ fn runtime_materializes_latest_by_key_order_by_limit_top_k_and_restores_state() 
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -9523,6 +12661,7 @@ fn runtime_materializes_latest_by_key_order_by_limit_offset_top_k() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -9546,6 +12685,7 @@ fn runtime_materializes_latest_by_key_order_by_limit_offset_top_k() {
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -9582,6 +12722,7 @@ fn runtime_materializes_latest_by_key_order_by_arg_max_function_top_k() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -9622,6 +12763,7 @@ fn runtime_materializes_tumbling_event_time_windows_and_restores_state() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -9655,6 +12797,7 @@ fn runtime_materializes_tumbling_event_time_windows_and_restores_state() {
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -9711,6 +12854,7 @@ fn runtime_materializes_tumbling_event_time_aggregate_with_matching_filters() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -9767,6 +12911,7 @@ fn runtime_materializes_tumbling_event_time_aggregate_with_mixed_filters() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -9836,6 +12981,7 @@ fn runtime_materializes_tumbling_event_time_filtered_count_distinct_with_mixed_f
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -9906,6 +13052,7 @@ fn runtime_materializes_tumbling_event_time_nullable_column_count() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -9971,6 +13118,7 @@ fn runtime_materializes_tumbling_event_time_filtered_nullable_column_count() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -10026,6 +13174,7 @@ fn runtime_materializes_tumbling_event_time_mixed_filter_having_top_k() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -10085,6 +13234,7 @@ fn runtime_materializes_tumbling_event_time_aggregate_with_different_filters() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -10142,6 +13292,7 @@ fn runtime_materializes_subsecond_tumbling_event_time_windows() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -10197,6 +13348,7 @@ fn runtime_materializes_tumbling_event_time_order_by_limit_top_k_and_restores_st
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -10229,6 +13381,7 @@ fn runtime_materializes_tumbling_event_time_order_by_limit_top_k_and_restores_st
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -10281,6 +13434,7 @@ fn runtime_materializes_tumbling_event_time_order_by_limit_offset_top_k() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -10336,6 +13490,7 @@ fn runtime_materializes_tumbling_event_time_order_by_sum_function_top_k() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -10383,6 +13538,7 @@ fn runtime_materializes_tumbling_event_time_count_distinct_and_restores_state() 
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -10449,6 +13605,7 @@ fn runtime_materializes_hopping_event_time_windows() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -10503,6 +13660,7 @@ fn runtime_materializes_hopping_event_time_advanced_aggregates_having_top_k() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -10554,6 +13712,7 @@ fn runtime_materializes_session_event_time_windows() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -10608,6 +13767,7 @@ fn runtime_materializes_session_event_time_advanced_aggregates_after_bridge_retr
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -10671,6 +13831,7 @@ fn runtime_rejects_missing_session_event_retract_without_mutating_state() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -10704,6 +13865,7 @@ fn runtime_rejects_missing_session_event_retract_without_mutating_state() {
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -10756,6 +13918,7 @@ fn runtime_materializes_tumbling_event_time_cte_source_filters() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -10803,6 +13966,7 @@ fn runtime_materializes_tumbling_event_time_derived_table_source_filters() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -10850,6 +14014,7 @@ fn runtime_materializes_tumbling_event_time_min_max_avg_and_restores_state() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -10890,6 +14055,7 @@ fn runtime_materializes_tumbling_event_time_min_max_avg_and_restores_state() {
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -10945,6 +14111,7 @@ fn runtime_materializes_tumbling_min_max_arithmetic_expression() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -10995,6 +14162,7 @@ fn runtime_materializes_tumbling_avg_arithmetic_expression() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -11045,6 +14213,7 @@ fn runtime_materializes_tumbling_sum_arithmetic_expression() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -11091,6 +14260,7 @@ fn runtime_rejects_late_rows_for_already_closed_tumbling_window() {
             1,
             EpochIdempotencyKey::new("epoch-1").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -11120,6 +14290,7 @@ fn runtime_rejects_late_rows_for_already_closed_tumbling_window() {
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
             vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
                 stream_id: "test-stream".to_string(),
@@ -11171,8 +14342,401 @@ fn standing_identity_with_view(sql: &str, view_id: &str) -> StandingProgramIdent
     }
 }
 
+fn native_inner_join_aggregate_graph() -> NativeOperatorGraph {
+    let mut graph = NativeOperatorGraph::new();
+    graph
+        .add_operator(NativeBinaryJoinOperator::new("join", |left, _right| {
+            Ok(left.clone())
+        }))
+        .unwrap();
+    graph
+        .add_operator(NativeAggregateOperator::new(
+            "aggregate",
+            AggregateValueMode::Integer,
+            false,
+        ))
+        .unwrap();
+    graph.add_edge(NativeOperatorEdgeV1 {
+        from_node_id: "join".to_string(),
+        to_node_id: "aggregate".to_string(),
+        to_port_id: "input".to_string(),
+    });
+    graph
+}
+
+fn native_left_join_aggregate_graph() -> NativeOperatorGraph {
+    let mut graph = NativeOperatorGraph::new();
+    graph
+        .add_operator(NativeLeftJoinOperator::new(
+            "join",
+            |left, _right| Ok(left.clone()),
+            |left| Ok(left.clone()),
+        ))
+        .unwrap();
+    graph
+        .add_operator(NativeAggregateOperator::new(
+            "aggregate",
+            AggregateValueMode::Integer,
+            false,
+        ))
+        .unwrap();
+    graph.add_edge(NativeOperatorEdgeV1 {
+        from_node_id: "join".to_string(),
+        to_node_id: "aggregate".to_string(),
+        to_port_id: "input".to_string(),
+    });
+    graph
+}
+
+fn native_join_input(
+    catalog: &VelorixRelationCatalogV1,
+    key_column_id: &str,
+    value_column_id: &str,
+    batches: &[RecordBatch],
+) -> DeltaBatch {
+    arrow_record_batches_to_key_value_delta_batch(
+        catalog,
+        &catalog.relation_schema.relation_id,
+        &catalog.relation_schema.relation_version,
+        catalog.schema_fingerprint.as_str(),
+        &[key_column_id.to_string()],
+        value_column_id,
+        batches,
+    )
+    .unwrap()
+}
+
+fn join_relation_input(
+    catalog: &VelorixRelationCatalogV1,
+    start_offset_inclusive: u64,
+    end_offset_exclusive: u64,
+    batches: Vec<RecordBatch>,
+) -> RelationInputBatch {
+    RelationInputBatch {
+        encoding: RelationInputEncodingV1::SourceRelationV1,
+        relation_id: catalog.relation_schema.relation_id.clone(),
+        relation_version: catalog.relation_schema.relation_version.clone(),
+        stream_id: "specialization-equivalence".to_string(),
+        partition_id: 0,
+        schema_fingerprint: catalog.schema_fingerprint.to_string(),
+        start_offset_inclusive,
+        end_offset_exclusive,
+        event_time_watermark: None,
+        batches,
+    }
+}
+
+fn apply_native_join_epoch(
+    graph: &mut NativeOperatorGraph,
+    epoch: u64,
+    left: DeltaBatch,
+    right: DeltaBatch,
+) -> DeltaBatch {
+    graph
+        .apply_epoch(
+            epoch,
+            vec![
+                NativeOperatorInputV1 {
+                    node_id: "join".to_string(),
+                    port_id: "left".to_string(),
+                    batch: left,
+                },
+                NativeOperatorInputV1 {
+                    node_id: "join".to_string(),
+                    port_id: "right".to_string(),
+                    batch: right,
+                },
+            ],
+        )
+        .unwrap()
+        .remove("aggregate")
+        .unwrap()
+}
+
+fn canonical_delta(batch: &DeltaBatch) -> DeltaBatch {
+    DeltaBatch::from_records(batch.net_rows().unwrap())
+}
+
+fn assert_join_runtime_epoch_equivalent(
+    selected: &mut Box<dyn StandingProgramRuntime + Send>,
+    reference: &mut Box<dyn StandingProgramRuntime + Send>,
+    logical_epoch: u64,
+    input_changes: Vec<RelationInputBatch>,
+) {
+    let selected_commit = selected
+        .apply_changes(
+            logical_epoch,
+            EpochIdempotencyKey::new(format!("selected-reference-{logical_epoch}")).unwrap(),
+            input_changes.clone(),
+        )
+        .unwrap();
+    let reference_commit = reference
+        .apply_changes(
+            logical_epoch,
+            EpochIdempotencyKey::new(format!("selected-reference-{logical_epoch}")).unwrap(),
+            input_changes,
+        )
+        .unwrap();
+    assert_eq!(
+        selected_commit.input_frontiers,
+        reference_commit.input_frontiers
+    );
+    assert_eq!(
+        selected_commit.input_event_time_frontiers,
+        reference_commit.input_event_time_frontiers
+    );
+    assert_eq!(selected_commit.output_deltas.len(), 1);
+    assert_eq!(reference_commit.output_deltas.len(), 1);
+    assert!(specialization_delta_difference(
+        &selected_commit.output_deltas[0].delta,
+        &reference_commit.output_deltas[0].delta,
+    )
+    .is_none());
+}
+
+fn assert_join_checkpoint_canonical_equivalent(
+    selected: &velorix_core::standing_program::RuntimeCheckpoint,
+    reference: &velorix_core::standing_program::RuntimeCheckpoint,
+) {
+    assert_eq!(selected.logical_epoch, reference.logical_epoch);
+    assert_eq!(selected.input_frontiers, reference.input_frontiers);
+    assert_eq!(
+        selected.input_event_time_frontiers,
+        reference.input_event_time_frontiers
+    );
+    assert_eq!(selected.output_frontiers, reference.output_frontiers);
+    let selected_payload: Value =
+        serde_json::from_str(&selected.state_payload.as_ref().unwrap().payload).unwrap();
+    let reference_payload: Value =
+        serde_json::from_str(&reference.state_payload.as_ref().unwrap().payload).unwrap();
+    assert_eq!(
+        selected_payload.get("published_output"),
+        reference_payload.get("published_output")
+    );
+    assert_eq!(
+        selected_payload.get("applied_epochs"),
+        reference_payload.get("applied_epochs")
+    );
+}
+
+fn canonical_key_multiplicity(batch: &DeltaBatch) -> DeltaBatch {
+    DeltaBatch::from_records(batch.net_rows().unwrap().into_iter().map(|row| {
+        DeltaRecord::new(
+            row.key.clone(),
+            DeltaValue::from_json(row.key.as_json().clone()),
+            row.weight,
+        )
+    }))
+}
+
+fn specialization_delta_difference(
+    specialized: &DeltaBatch,
+    generic: &DeltaBatch,
+) -> Option<(DeltaBatch, DeltaBatch)> {
+    let specialized = canonical_delta(specialized);
+    let generic = canonical_delta(generic);
+    (specialized != generic).then_some((specialized, generic))
+}
+
+fn native_checkpoint_state(
+    checkpoint: &NativeOperatorGraphCheckpointV1,
+    node_id: &str,
+) -> NativeOperatorStateV1 {
+    checkpoint
+        .operators
+        .iter()
+        .find(|operator| operator.node_id == node_id)
+        .unwrap()
+        .state
+        .clone()
+}
+
+fn runtime_join_checkpoint_state(
+    runtime: &(dyn StandingProgramRuntime + Send),
+) -> (
+    u64,
+    DeltaBatch,
+    DeltaBatch,
+    DeltaBatch,
+    DeltaBatch,
+    DeltaBatch,
+) {
+    let checkpoint = runtime.checkpoint().unwrap();
+    let payload: Value = serde_json::from_str(
+        &checkpoint
+            .state_payload
+            .as_ref()
+            .expect("join checkpoint payload")
+            .payload,
+    )
+    .unwrap();
+    (
+        checkpoint.logical_epoch,
+        serde_json::from_value(payload["left_state"].clone()).unwrap(),
+        serde_json::from_value(payload["right_state"].clone()).unwrap(),
+        serde_json::from_value(payload["engine"]["state"].clone()).unwrap(),
+        serde_json::from_value(payload["filtered_aggregate_state"].clone()).unwrap(),
+        serde_json::from_value(payload["published_output"].clone()).unwrap(),
+    )
+}
+
+fn assert_inner_join_specialization_state_equivalent(
+    runtime: &(dyn StandingProgramRuntime + Send),
+    graph: &NativeOperatorGraph,
+) {
+    let runtime_state = runtime_join_checkpoint_state(runtime);
+    let graph_checkpoint = graph.checkpoint().unwrap();
+    assert_eq!(runtime_state.0, graph_checkpoint.logical_epoch);
+    let NativeOperatorStateV1::Binary {
+        left_state,
+        right_state,
+    } = native_checkpoint_state(&graph_checkpoint, "join")
+    else {
+        panic!("join must have binary state");
+    };
+    let NativeOperatorStateV1::Unary { state: aggregate } =
+        native_checkpoint_state(&graph_checkpoint, "aggregate")
+    else {
+        panic!("aggregate must have unary state");
+    };
+    assert_eq!(
+        canonical_delta(&runtime_state.1),
+        canonical_delta(&left_state)
+    );
+    assert_eq!(
+        canonical_key_multiplicity(&runtime_state.2),
+        canonical_key_multiplicity(&right_state)
+    );
+    assert_eq!(
+        canonical_delta(&runtime_state.3),
+        canonical_delta(&aggregate)
+    );
+    assert_eq!(
+        canonical_delta(&runtime_state.5),
+        canonical_delta(&aggregate)
+    );
+}
+
+fn assert_left_join_specialization_state_equivalent(
+    runtime: &(dyn StandingProgramRuntime + Send),
+    graph: &NativeOperatorGraph,
+) {
+    let runtime_state = runtime_join_checkpoint_state(runtime);
+    let graph_checkpoint = graph.checkpoint().unwrap();
+    assert_eq!(runtime_state.0, graph_checkpoint.logical_epoch);
+    let NativeOperatorStateV1::Unary { state: aggregate } =
+        native_checkpoint_state(&graph_checkpoint, "aggregate")
+    else {
+        panic!("aggregate must have unary state");
+    };
+    // The narrow specialization deliberately omits generic join-side state.
+    // Its canonical logical state is the left-only aggregate and published bag.
+    assert_eq!(
+        canonical_delta(&runtime_state.4),
+        canonical_delta(&aggregate)
+    );
+    assert_eq!(
+        canonical_delta(&runtime_state.5),
+        canonical_delta(&aggregate)
+    );
+}
+
+fn assert_general_join_specialization_state_equivalent(
+    runtime: &(dyn StandingProgramRuntime + Send),
+    graph: &JoinSpecializationComparisonGraph,
+) {
+    let runtime_state = runtime_join_checkpoint_state(runtime);
+    let graph_checkpoint = graph.checkpoint().unwrap();
+    assert_eq!(runtime_state.0, graph_checkpoint.logical_epoch);
+    let NativeOperatorStateV1::Unary { state: aggregate } =
+        native_checkpoint_state(&graph_checkpoint, "aggregate")
+    else {
+        panic!("aggregate must have unary state");
+    };
+    let NativeOperatorStateV1::Binary {
+        left_state: publisher_full,
+        right_state: publisher_visible,
+    } = native_checkpoint_state(&graph_checkpoint, "publish")
+    else {
+        panic!("publisher must have binary state");
+    };
+    let runtime_aggregate = if runtime_state.4.records().is_empty() {
+        &runtime_state.3
+    } else {
+        &runtime_state.4
+    };
+    assert_eq!(
+        canonical_delta(runtime_aggregate),
+        canonical_delta(&aggregate)
+    );
+    assert_eq!(
+        canonical_delta(runtime_aggregate),
+        canonical_delta(&publisher_full)
+    );
+    assert_eq!(
+        canonical_delta(&runtime_state.5),
+        canonical_delta(&publisher_visible)
+    );
+}
+
 fn assert_join_page(
     runtime: &(dyn velorix_core::standing_program::StandingProgramRuntime + Send),
+    epoch: u64,
+    expected: &[(&str, i64, i64)],
+) {
+    assert_join_page_for_view(runtime, "scores_by_account", epoch, expected);
+}
+
+fn assert_nullable_join_page(
+    runtime: &(dyn velorix_core::standing_program::StandingProgramRuntime + Send),
+    epoch: u64,
+    expected: &[(&str, Option<i64>, i64)],
+) {
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "scores_by_account".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(epoch),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let account_ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let sums = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let counts = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+
+    assert_eq!(batch.num_rows(), expected.len());
+    for (index, (account_id, sum, count)) in expected.iter().enumerate() {
+        assert_eq!(account_ids.value(index), *account_id);
+        match sum {
+            Some(sum) => assert_eq!(sums.value(index), *sum),
+            None => assert!(sums.is_null(index)),
+        }
+        assert_eq!(counts.value(index), *count);
+    }
+}
+
+fn assert_join_page_for_view(
+    runtime: &(dyn velorix_core::standing_program::StandingProgramRuntime + Send),
+    view_id: &str,
     epoch: u64,
     expected: &[(&str, i64, i64)],
 ) {
@@ -11181,7 +14745,7 @@ fn assert_join_page(
             ScopedViewId {
                 tenant_id: "tenant-a".to_string(),
                 program_id: "program-purchases".to_string(),
-                view_id: "scores_by_account".to_string(),
+                view_id: view_id.to_string(),
             },
             SnapshotPageRequest {
                 committed_epoch: Some(epoch),
@@ -11211,6 +14775,50 @@ fn assert_join_page(
     assert_eq!(batch.num_rows(), expected.len());
     for (index, (account_id, sum, count)) in expected.iter().enumerate() {
         assert_eq!(account_ids.value(index), *account_id);
+        assert_eq!(sums.value(index), *sum);
+        assert_eq!(counts.value(index), *count);
+    }
+}
+
+fn assert_int_join_page_for_view(
+    runtime: &(dyn velorix_core::standing_program::StandingProgramRuntime + Send),
+    view_id: &str,
+    epoch: u64,
+    expected: &[(i64, i64, i64)],
+) {
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: view_id.to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(epoch),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let keys = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let sums = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let counts = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(batch.num_rows(), expected.len());
+    for (index, (key, sum, count)) in expected.iter().enumerate() {
+        assert_eq!(keys.value(index), *key);
         assert_eq!(sums.value(index), *sum);
         assert_eq!(counts.value(index), *count);
     }
@@ -11624,6 +15232,104 @@ fn assert_join_right_stats_page(
         assert_eq!(minimums.value(index), *minimum);
         assert_eq!(maximums.value(index), *maximum);
         assert_eq!(averages.value(index), *average);
+    }
+}
+
+fn assert_left_join_right_sum_page(
+    runtime: &(dyn velorix_core::standing_program::StandingProgramRuntime + Send),
+    epoch: u64,
+    expected: &[(&str, i64, Option<i64>, i64)],
+) {
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "left_join_right_sum".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(epoch),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let keys = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let sums = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let limit_sums = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let counts = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(batch.num_rows(), expected.len());
+    for (index, (key, sum, limit_sum, count)) in expected.iter().enumerate() {
+        assert_eq!(keys.value(index), *key);
+        assert_eq!(sums.value(index), *sum);
+        assert_eq!(
+            (!limit_sums.is_null(index)).then(|| limit_sums.value(index)),
+            *limit_sum
+        );
+        assert_eq!(counts.value(index), *count);
+    }
+}
+
+fn assert_left_join_empty_right_stats_page(
+    runtime: &(dyn velorix_core::standing_program::StandingProgramRuntime + Send),
+    epoch: u64,
+    expected_keys: &[&str],
+) {
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "scores_by_account_limits".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(epoch),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let keys = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let count_limits = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let distinct_limits = batch
+        .column(4)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(batch.num_rows(), expected_keys.len());
+    for (row, expected_key) in expected_keys.iter().enumerate() {
+        assert_eq!(keys.value(row), *expected_key);
+        assert_eq!(count_limits.value(row), 0);
+        assert_eq!(distinct_limits.value(row), 0);
+        for column in 5..=8 {
+            assert!(batch.column(column).is_null(row));
+        }
     }
 }
 
@@ -12299,6 +16005,7 @@ fn scores_catalog() -> VelorixRelationCatalogV1 {
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
 
     VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
         schema_version: RELATION_SCHEMA_VERSION_V1,
         relation_schema,
         schema_fingerprint: schema_fingerprint.clone(),
@@ -12319,6 +16026,96 @@ fn scores_catalog() -> VelorixRelationCatalogV1 {
 fn generic_adapter_catalog(mut catalog: VelorixRelationCatalogV1) -> VelorixRelationCatalogV1 {
     catalog.incremental_adapter.adapter_id = CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.to_string();
     catalog
+}
+
+fn composite_join_catalogs() -> (VelorixRelationCatalogV1, VelorixRelationCatalogV1) {
+    let add_tenant_key = |mut catalog: VelorixRelationCatalogV1| {
+        let weight_index = catalog
+            .relation_schema
+            .columns
+            .iter()
+            .position(|column| column.column_id == catalog.relation_schema.weight_column_id)
+            .unwrap();
+        catalog.relation_schema.columns.insert(
+            weight_index,
+            RelationColumnV1 {
+                column_id: "tenant_id".into(),
+                name: "tenant_id".into(),
+                logical_type: VelorixLogicalTypeV1::Utf8,
+                physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+                nullable: false,
+                ordinal: 0,
+                semantic_role: RelationSemanticRoleV1::PrimaryKey,
+            },
+        );
+        for (ordinal, column) in catalog.relation_schema.columns.iter_mut().enumerate() {
+            column.ordinal = ordinal as u32;
+        }
+        catalog
+            .relation_schema
+            .primary_key_column_ids
+            .insert(0, "tenant_id".into());
+        let fingerprint = SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema)
+            .expect("composite join catalog should fingerprint");
+        catalog.schema_fingerprint = fingerprint.clone();
+        catalog.incremental_relation.schema_fingerprint = fingerprint;
+        generic_adapter_catalog(catalog)
+    };
+    let scores = add_tenant_key(scores_catalog());
+    let mut accounts = add_tenant_key(accounts_catalog());
+    let tenant = accounts
+        .relation_schema
+        .columns
+        .iter_mut()
+        .find(|column| column.column_id == "tenant_id")
+        .unwrap();
+    tenant.column_id = "account_tenant_id".into();
+    tenant.name = "account_tenant_id".into();
+    accounts.relation_schema.primary_key_column_ids =
+        vec!["account_id".into(), "account_tenant_id".into()];
+    let fingerprint = SchemaFingerprintV1::for_relation_schema(&accounts.relation_schema)
+        .expect("renamed composite join catalog should fingerprint");
+    accounts.schema_fingerprint = fingerprint.clone();
+    accounts.incremental_relation.schema_fingerprint = fingerprint;
+    (scores, accounts)
+}
+
+fn three_input_composite_join_catalogs() -> [VelorixRelationCatalogV1; 3] {
+    let (scores, accounts) = composite_join_catalogs();
+    let mut profiles = accounts.clone();
+    profiles.relation_schema.relation_id = "profiles".into();
+    profiles.relation_schema.relation_name = "profiles".into();
+    profiles.datafusion_registration.name = "profiles".into();
+    profiles.incremental_relation.relation_id = "profiles".into();
+    let fingerprint = SchemaFingerprintV1::for_relation_schema(&profiles.relation_schema)
+        .expect("profile composite catalog should fingerprint");
+    profiles.schema_fingerprint = fingerprint.clone();
+    profiles.incremental_relation.schema_fingerprint = fingerprint;
+    [scores, accounts, profiles]
+}
+
+fn scores_with_category_catalog() -> VelorixRelationCatalogV1 {
+    let mut catalog = scores_catalog();
+    catalog.relation_schema.columns.insert(
+        2,
+        RelationColumnV1 {
+            column_id: "category".to_string(),
+            name: "category".to_string(),
+            logical_type: VelorixLogicalTypeV1::Utf8,
+            physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+            nullable: true,
+            ordinal: 2,
+            semantic_role: RelationSemanticRoleV1::Metadata,
+        },
+    );
+    for (ordinal, column) in catalog.relation_schema.columns.iter_mut().enumerate() {
+        column.ordinal = ordinal as u32;
+    }
+    let schema_fingerprint =
+        SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema).unwrap();
+    catalog.schema_fingerprint = schema_fingerprint.clone();
+    catalog.incremental_relation.schema_fingerprint = schema_fingerprint;
+    generic_adapter_catalog(catalog)
 }
 
 fn scores_with_adjustment_catalog() -> VelorixRelationCatalogV1 {
@@ -12412,6 +16209,7 @@ fn accounts_catalog() -> VelorixRelationCatalogV1 {
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
 
     VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
         schema_version: RELATION_SCHEMA_VERSION_V1,
         relation_schema,
         schema_fingerprint: schema_fingerprint.clone(),
@@ -12559,6 +16357,7 @@ fn device_status_catalog() -> VelorixRelationCatalogV1 {
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
 
     VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
         schema_version: RELATION_SCHEMA_VERSION_V1,
         relation_schema,
         schema_fingerprint: schema_fingerprint.clone(),
@@ -12618,6 +16417,7 @@ fn purchases_catalog_without_value_role() -> VelorixRelationCatalogV1 {
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
 
     VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
         schema_version: RELATION_SCHEMA_VERSION_V1,
         relation_schema,
         schema_fingerprint: schema_fingerprint.clone(),
@@ -12750,6 +16550,183 @@ fn purchases_output_schema() -> RelationSchema {
             },
         ],
         primary_key: vec!["user_id".to_string()],
+    }
+}
+
+fn composite_bucket_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "scores_by_user_bucket".to_string(),
+        relation_name: "scores_by_user_bucket".to_string(),
+        relation_version: "2026-08-10.v1".to_string(),
+        schema_fingerprint:
+            "sha256:2000000000000000000000000000000000000000000000000000000000000002".to_string(),
+        columns: vec![
+            ColumnSchema {
+                name: "user_id".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "bucket".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "sum".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "count".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["user_id".to_string(), "bucket".to_string()],
+    }
+}
+
+fn composite_join_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "scores_by_tenant".into(),
+        relation_name: "scores_by_tenant".into(),
+        relation_version: "2026-08-10.v1".into(),
+        schema_fingerprint:
+            "sha256:6000000000000000000000000000000000000000000000000000000000000006".into(),
+        columns: vec![
+            ColumnSchema {
+                name: "tenant_id".into(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "sum".into(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "count".into(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["tenant_id".into()],
+    }
+}
+
+fn three_input_join_count_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "three_input_counts".into(),
+        relation_name: "three_input_counts".into(),
+        relation_version: "2026-08-10.v1".into(),
+        schema_fingerprint:
+            "sha256:00000000000000000000000000000000000000000000000000000000000000c5".into(),
+        columns: vec![
+            ColumnSchema {
+                name: "tenant_id".into(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "user_id".into(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "count".into(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["tenant_id".into(), "user_id".into()],
+    }
+}
+
+fn non_primary_join_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "scores_by_bucket".into(),
+        relation_name: "scores_by_bucket".into(),
+        relation_version: "2026-08-10.v1".into(),
+        schema_fingerprint:
+            "sha256:7000000000000000000000000000000000000000000000000000000000000007".into(),
+        columns: vec![
+            ColumnSchema {
+                name: "bucket".into(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "sum".into(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "count".into(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["bucket".into()],
+    }
+}
+
+fn global_count_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "score_count".to_string(),
+        relation_name: "score_count".to_string(),
+        relation_version: "2026-08-10.v1".to_string(),
+        schema_fingerprint:
+            "sha256:5000000000000000000000000000000000000000000000000000000000000005".to_string(),
+        columns: vec![ColumnSchema {
+            name: "count".to_string(),
+            data_type: SqlDataType::Int64,
+            nullable: false,
+        }],
+        primary_key: Vec::new(),
+    }
+}
+
+fn assert_global_count_batch(batch: &RecordBatch, expected: i64) {
+    assert_eq!(batch.num_columns(), 1);
+    assert_eq!(batch.num_rows(), 1);
+    let count = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(count.value(0), expected);
+}
+
+fn composite_category_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "scores_by_user_category".to_string(),
+        relation_name: "scores_by_user_category".to_string(),
+        relation_version: "2026-08-10.v1".to_string(),
+        schema_fingerprint:
+            "sha256:3000000000000000000000000000000000000000000000000000000000000003".to_string(),
+        columns: vec![
+            ColumnSchema {
+                name: "user_id".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "category".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "sum".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "count".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["user_id".to_string(), "category".to_string()],
     }
 }
 
@@ -13067,6 +17044,63 @@ fn assert_scores_multi_input_stats_page(
         assert_eq!(maximums.value(index), *maximum);
         assert_eq!(averages.value(index), *average);
         assert_eq!(counts.value(index), *count);
+    }
+}
+
+fn typed_expressions_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "typed_projection_view".to_string(),
+        relation_name: "typed_projection_view".to_string(),
+        relation_version: "2026-05-24.v1".to_string(),
+        schema_fingerprint: "typed-projection-v1".to_string(),
+        columns: vec![
+            ColumnSchema {
+                name: "user_id".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "user_upper".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "user_tag".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "event_year".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "hour_trunc".to_string(),
+                data_type: SqlDataType::Timestamp { timezone: None },
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "plus_hour".to_string(),
+                data_type: SqlDataType::Timestamp { timezone: None },
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "amount_f64".to_string(),
+                data_type: SqlDataType::Float64,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "amount_abs".to_string(),
+                data_type: SqlDataType::Float64,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "amount_round".to_string(),
+                data_type: SqlDataType::Float64,
+                nullable: true,
+            },
+        ],
+        primary_key: vec!["user_id".to_string()],
     }
 }
 
@@ -13686,6 +17720,39 @@ fn join_right_stats_output_schema() -> RelationSchema {
     }
 }
 
+fn left_join_right_sum_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "left_join_right_sum".to_string(),
+        relation_name: "left_join_right_sum".to_string(),
+        relation_version: "v1".to_string(),
+        schema_fingerprint:
+            "sha256:0000000000000000000000000000000000000000000000000000000000000022".to_string(),
+        columns: vec![
+            ColumnSchema {
+                name: "account_id".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "sum".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "limit_sum".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "count".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["account_id".to_string()],
+    }
+}
+
 fn join_decimal_avg_output_schema() -> RelationSchema {
     RelationSchema {
         relation_id: "scores_by_account_decimal_avg".to_string(),
@@ -13806,54 +17873,12 @@ fn join_stats_logical_plan(
     accounts: &VelorixRelationCatalogV1,
     output_schema: &RelationSchema,
 ) -> VelorixLogicalViewPlanV1 {
-    let base_sql = "select a.account_id, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.user_id = a.account_id group by a.account_id";
-    let mut logical_plan = lower_supported_join_view_sql_to_logical_plan(
-        base_sql,
+    lower_supported_join_view_sql_to_logical_plan(
+        sql,
         &[scores.clone(), accounts.clone()],
-        &join_output_schema(),
+        output_schema,
     )
-    .unwrap();
-    let aggregate_outputs = join_stats_aggregate_outputs();
-    logical_plan.view_sql = sql.to_string();
-    logical_plan.output_relation.relation_id = output_schema.relation_id.clone();
-    logical_plan.output_relation.relation_name = output_schema.relation_name.clone();
-    logical_plan.output_relation.relation_version = output_schema.relation_version.clone();
-    logical_plan.output_relation.schema_fingerprint = output_schema.schema_fingerprint.clone();
-    for node in &mut logical_plan.nodes {
-        match node {
-            VelorixLogicalViewPlanNodeV1::Aggregate { accumulators, .. } => {
-                *accumulators = aggregate_outputs
-                    .iter()
-                    .map(|output| LogicalPlanAggregateAccumulatorV1 {
-                        function: output.function,
-                        input: output.input_column_id.as_ref().map(|column_id| {
-                            LogicalPlanColumnRef {
-                                relation_id: scores.relation_schema.relation_id.clone(),
-                                column_id: column_id.clone(),
-                            }
-                        }),
-                        output_column_id: output.output_column_id.clone(),
-                    })
-                    .collect();
-            }
-            VelorixLogicalViewPlanNodeV1::Output { relation, .. } => {
-                relation.relation_id = output_schema.relation_id.clone();
-                relation.relation_name = output_schema.relation_name.clone();
-                relation.relation_version = output_schema.relation_version.clone();
-                relation.schema_fingerprint = output_schema.schema_fingerprint.clone();
-            }
-            _ => {}
-        }
-    }
-    let VelorixLogicalViewExecutionV1::TwoInputJoinSumCount { plan } = &mut logical_plan.execution
-    else {
-        panic!("base plan should be a join execution");
-    };
-    plan.output_key_column_id = "account_id".to_string();
-    plan.aggregate_outputs = aggregate_outputs;
-    logical_plan.plan_hash = None;
-    logical_plan.plan_hash = Some(logical_view_plan_hash(&logical_plan).unwrap());
-    logical_plan
+    .unwrap()
 }
 
 fn row_number_logical_plan(
@@ -13861,126 +17886,17 @@ fn row_number_logical_plan(
     catalog: &VelorixRelationCatalogV1,
     output_schema: &RelationSchema,
 ) -> VelorixLogicalViewPlanV1 {
-    let input_relation = LogicalPlanRelationRef {
-        relation_id: catalog.relation_schema.relation_id.clone(),
-        relation_name: catalog.relation_schema.relation_name.clone(),
-        relation_version: catalog.relation_schema.relation_version.clone(),
-        schema_fingerprint: catalog.schema_fingerprint.to_string(),
-    };
-    let output_relation = LogicalPlanRelationRef {
-        relation_id: output_schema.relation_id.clone(),
-        relation_name: output_schema.relation_name.clone(),
-        relation_version: output_schema.relation_version.clone(),
-        schema_fingerprint: output_schema.schema_fingerprint.clone(),
-    };
-    let column = |column_id: &str| LogicalPlanColumnRef {
-        relation_id: catalog.relation_schema.relation_id.clone(),
-        column_id: column_id.to_string(),
-    };
-    let plan = SupportedAnalyticRowNumberPlan {
-        input_relation_id: catalog.relation_schema.relation_id.clone(),
-        key_column_id: "user_id".to_string(),
-        output_key_column_id: "user_id".to_string(),
-        function: SupportedAnalyticWindowFunction::RowNumber,
-        partition_column_id: "score".to_string(),
-        order_column_id: "score".to_string(),
-        order_descending: true,
-        output_row_number_column_id: "rank".to_string(),
-        predicate_expr: Some(RowPredicateExpr::Atom {
-            predicate: RowPredicate {
-                column_id: "score".to_string(),
-                op: PredicateOp::Gt,
-                literal: json!(0),
-            },
-        }),
-        rank_limit: None,
-    };
-    let mut logical_plan = VelorixLogicalViewPlanV1 {
-        plan_version: LOGICAL_VIEW_PLAN_VERSION_V1,
-        plan_hash: None,
-        view_sql: sql.to_string(),
-        capability_version: LOGICAL_VIEW_PLAN_CAPABILITY_VERSION_V1.to_string(),
-        input_relations: vec![input_relation.clone()],
-        output_relation: output_relation.clone(),
-        nodes: vec![
-            VelorixLogicalViewPlanNodeV1::RelationScan {
-                node_id: "scan_input".to_string(),
-                relation: input_relation,
-            },
-            VelorixLogicalViewPlanNodeV1::Filter {
-                node_id: "filter_row_number_input".to_string(),
-                input: "scan_input".to_string(),
-                predicate: velorix_core::view_plan::LogicalPlanPredicateV1 {
-                    column: column("score"),
-                    op: PredicateOp::Gt,
-                    literal: json!(0),
-                },
-            },
-            VelorixLogicalViewPlanNodeV1::RowNumber {
-                node_id: "rank_materialized_output".to_string(),
-                input: "filter_row_number_input".to_string(),
-                partition_column: column("score"),
-                order_column: column("score"),
-                descending: true,
-                rank_limit: None,
-            },
-            VelorixLogicalViewPlanNodeV1::Output {
-                node_id: "output_materialized_view".to_string(),
-                input: "rank_materialized_output".to_string(),
-                relation: output_relation,
-            },
-        ],
-        state_requirements: vec![LogicalPlanStateRequirementV1 {
-            node_id: "rank_materialized_output".to_string(),
-            state_kind: LogicalPlanStateKindV1::RowNumber,
-            key_columns: vec![column("user_id")],
-            codec_version: LOGICAL_VIEW_STATE_CODEC_VERSION_V1.to_string(),
-        }],
-        output_codec_version: LOGICAL_VIEW_OUTPUT_CODEC_VERSION_V1.to_string(),
-        execution: VelorixLogicalViewExecutionV1::AnalyticRowNumber { plan },
-    };
+    let admitted_sql = "select user_id, row_number() over (partition by score order by score desc, user_id asc) as rank from scores where score > 0";
+    let mut logical_plan = lower_supported_analytic_row_number_sql_to_logical_plan(
+        admitted_sql,
+        catalog,
+        output_schema,
+    )
+    .unwrap();
+    logical_plan.view_sql = sql.to_string();
+    logical_plan.plan_hash = None;
     logical_plan.plan_hash = Some(logical_view_plan_hash(&logical_plan).unwrap());
     logical_plan
-}
-
-fn join_stats_aggregate_outputs() -> Vec<SupportedAggregateOutput> {
-    vec![
-        SupportedAggregateOutput {
-            function: LogicalPlanAggregateFunctionV1::Sum,
-            input_column_id: Some("score".to_string()),
-            input_relation_side: Some(SupportedAggregateInputRelationSide::Left),
-            input_expression: None,
-            output_column_id: "sum".to_string(),
-        },
-        SupportedAggregateOutput {
-            function: LogicalPlanAggregateFunctionV1::Count,
-            input_column_id: None,
-            input_relation_side: None,
-            input_expression: None,
-            output_column_id: "count".to_string(),
-        },
-        SupportedAggregateOutput {
-            function: LogicalPlanAggregateFunctionV1::Min,
-            input_column_id: Some("score".to_string()),
-            input_relation_side: Some(SupportedAggregateInputRelationSide::Left),
-            input_expression: None,
-            output_column_id: "min_score".to_string(),
-        },
-        SupportedAggregateOutput {
-            function: LogicalPlanAggregateFunctionV1::Max,
-            input_column_id: Some("score".to_string()),
-            input_relation_side: Some(SupportedAggregateInputRelationSide::Left),
-            input_expression: None,
-            output_column_id: "max_score".to_string(),
-        },
-        SupportedAggregateOutput {
-            function: LogicalPlanAggregateFunctionV1::Avg,
-            input_column_id: Some("score".to_string()),
-            input_relation_side: Some(SupportedAggregateInputRelationSide::Left),
-            input_expression: None,
-            output_column_id: "avg_score".to_string(),
-        },
-    ]
 }
 
 fn device_status_batch(rows: &[(&str, bool, i64, i64)]) -> RecordBatch {
@@ -14180,6 +18096,125 @@ fn scores_batch() -> RecordBatch {
             Arc::new(StringArray::from(vec!["alice", "bob", "alice"])) as _,
             Arc::new(Int64Array::from(vec![10, 5, 7])) as _,
             Arc::new(Int64Array::from(vec![1, 1, 1])) as _,
+        ],
+    )
+    .unwrap()
+}
+
+fn relation_input(
+    catalog: &VelorixRelationCatalogV1,
+    stream_id: &str,
+    start_offset_inclusive: u64,
+    end_offset_exclusive: u64,
+    batch: RecordBatch,
+) -> RelationInputBatch {
+    RelationInputBatch {
+        encoding: RelationInputEncodingV1::SourceRelationV1,
+        relation_id: catalog.relation_schema.relation_id.clone(),
+        relation_version: catalog.relation_schema.relation_version.clone(),
+        stream_id: stream_id.into(),
+        partition_id: 0,
+        schema_fingerprint: catalog.schema_fingerprint.to_string(),
+        start_offset_inclusive,
+        end_offset_exclusive,
+        event_time_watermark: None,
+        batches: vec![batch],
+    }
+}
+
+fn composite_scores_rows_batch(rows: &[(&str, i64, &str, i64)]) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("score", DataType::Int64, false),
+            Field::new("tenant_id", DataType::Utf8, false),
+            Field::new("delta", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(Int64Array::from(
+                rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.2).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(Int64Array::from(
+                rows.iter().map(|row| row.3).collect::<Vec<_>>(),
+            )) as _,
+        ],
+    )
+    .unwrap()
+}
+
+fn composite_accounts_rows_batch(rows: &[(&str, i64, &str, &str, i64)]) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("account_id", DataType::Utf8, false),
+            Field::new("limit", DataType::Int64, false),
+            Field::new("tier", DataType::Utf8, false),
+            Field::new("account_tenant_id", DataType::Utf8, false),
+            Field::new("delta", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(Int64Array::from(
+                rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.2).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.3).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(Int64Array::from(
+                rows.iter().map(|row| row.4).collect::<Vec<_>>(),
+            )) as _,
+        ],
+    )
+    .unwrap()
+}
+
+fn scores_with_category_batch() -> RecordBatch {
+    scores_with_category_rows_batch(&[
+        ("u1", 5, Some("a"), 1),
+        ("u1", 7, Some("a"), 1),
+        ("u1", 15, None, 1),
+    ])
+}
+
+fn scores_with_category_rows_batch(rows: &[(&str, i64, Option<&str>, i64)]) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("score", DataType::Int64, false),
+            Field::new("category", DataType::Utf8, true),
+            Field::new("delta", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|(user_id, _, _, _)| *user_id)
+                    .collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(Int64Array::from(
+                rows.iter()
+                    .map(|(_, score, _, _)| *score)
+                    .collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|(_, _, category, _)| *category)
+                    .collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(Int64Array::from(
+                rows.iter()
+                    .map(|(_, _, _, delta)| *delta)
+                    .collect::<Vec<_>>(),
+            )) as _,
         ],
     )
     .unwrap()
@@ -14527,4 +18562,3755 @@ fn score_append_batch(user_id: &str, score: i64) -> RecordBatch {
         ],
     )
     .unwrap()
+}
+
+#[test]
+fn late_row_policy_drop_with_evidence_drops_late_rows_and_persists_evidence() {
+    let catalog = purchases_event_time_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = purchases_window_output_schema();
+    let sql = "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end";
+    let logical_plan = lower_supported_tumbling_window_sql_to_logical_plan_with_policy(
+        sql,
+        &catalog,
+        &output_schema,
+        Some(LateRowPolicy::DropWithEvidence),
+    )
+    .unwrap();
+    let identity = standing_identity_with_view(sql, "purchases_by_user_minute");
+    let mut runtime = create_standing_runtime_with_logical_plan_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        logical_plan,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    // Epoch 1 establishes the watermark frontier (no lateness possible on the
+    // very first batch of a partition).
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("epoch-1").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 2,
+                event_time_watermark: Some(InputEventTimeWatermark {
+                    stream_id: "purchases-stream".to_string(),
+                    partition_id: 0,
+                    event_time_column_id: "event_time".to_string(),
+                    max_observed_event_time_ns: 60_000_000_000,
+                    watermark_ns: 60_000_000_000,
+                }),
+                batches: vec![purchases_event_time_batch(&[
+                    ("alice", 10, 10_000_000_000, 1),
+                    ("bob", 45, 45_000_000_000, 1),
+                ])],
+            }],
+        )
+        .unwrap();
+    assert_window_page(
+        runtime.as_ref(),
+        1,
+        &[
+            ("alice", 0, 60_000_000_000, 10, 1),
+            ("bob", 0, 60_000_000_000, 45, 1),
+        ],
+    );
+
+    // Epoch 2: carol@20s is late (20 < 60 vs the established frontier) and
+    // must be dropped with evidence instead of failing.
+    runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("epoch-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 2,
+                end_offset_exclusive: 4,
+                event_time_watermark: Some(InputEventTimeWatermark {
+                    stream_id: "purchases-stream".to_string(),
+                    partition_id: 0,
+                    event_time_column_id: "event_time".to_string(),
+                    max_observed_event_time_ns: 60_000_000_000,
+                    watermark_ns: 60_000_000_000,
+                }),
+                batches: vec![purchases_event_time_batch(&[(
+                    "carol",
+                    99,
+                    20_000_000_000,
+                    1,
+                )])],
+            }],
+        )
+        .unwrap();
+
+    assert_window_page(
+        runtime.as_ref(),
+        2,
+        &[
+            ("alice", 0, 60_000_000_000, 10, 1),
+            ("bob", 0, 60_000_000_000, 45, 1),
+        ],
+    );
+
+    // Evidence is part of the durable checkpoint payload.
+    let checkpoint = runtime.checkpoint().unwrap();
+    let payload: serde_json::Value =
+        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+    assert_eq!(payload["state"]["late_rows_dropped"], 1);
+
+    // Restart replays the same evidence and stays exact.
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    // A late row after restart is still dropped with evidence (counter
+    // accumulates deterministically across the checkpoint boundary).
+    restored
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("epoch-3").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 4,
+                end_offset_exclusive: 5,
+                event_time_watermark: Some(InputEventTimeWatermark {
+                    stream_id: "purchases-stream".to_string(),
+                    partition_id: 0,
+                    event_time_column_id: "event_time".to_string(),
+                    max_observed_event_time_ns: 60_000_000_000,
+                    watermark_ns: 60_000_000_000,
+                }),
+                batches: vec![purchases_event_time_batch(&[(
+                    "dave",
+                    99,
+                    30_000_000_000,
+                    1,
+                )])],
+            }],
+        )
+        .unwrap();
+    assert_window_page(
+        restored.as_ref(),
+        3,
+        &[
+            ("alice", 0, 60_000_000_000, 10, 1),
+            ("bob", 0, 60_000_000_000, 45, 1),
+        ],
+    );
+    let checkpoint = restored.checkpoint().unwrap();
+    let payload: serde_json::Value =
+        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+    assert_eq!(payload["state"]["late_rows_dropped"], 2);
+}
+
+#[test]
+fn late_row_policy_admit_within_allowance_defers_finalization_until_frontier() {
+    let catalog = purchases_event_time_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = purchases_window_output_schema();
+    let sql = "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end";
+    let logical_plan = lower_supported_tumbling_window_sql_to_logical_plan_with_policy(
+        sql,
+        &catalog,
+        &output_schema,
+        Some(LateRowPolicy::AdmitWithinAllowance {
+            allowance_ns: 10_000_000_000,
+        }),
+    )
+    .unwrap();
+    let identity = standing_identity_with_view(sql, "purchases_by_user_minute");
+    let mut runtime = create_standing_runtime_with_logical_plan_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        logical_plan,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    // Watermark 60s, allowance 10s -> finalization frontier 50s. bob@55s is
+    // late relative to the watermark but still within allowance, so it is
+    // admitted; the [0,60) window ends at 60 > 50, so it must NOT be
+    // published yet (deferred finalization).
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("epoch-1").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 3,
+                event_time_watermark: Some(InputEventTimeWatermark {
+                    stream_id: "purchases-stream".to_string(),
+                    partition_id: 0,
+                    event_time_column_id: "event_time".to_string(),
+                    max_observed_event_time_ns: 60_000_000_000,
+                    watermark_ns: 60_000_000_000,
+                }),
+                batches: vec![purchases_event_time_batch(&[
+                    ("alice", 10, 10_000_000_000, 1),
+                    ("bob", 55, 55_000_000_000, 1),
+                ])],
+            }],
+        )
+        .unwrap();
+    assert_window_page(runtime.as_ref(), 1, &[]);
+
+    // Watermark advances to 70s -> frontier 60s; the [0,60) window is now
+    // final and publishes exactly once with both admitted rows.
+    runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("epoch-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 3,
+                end_offset_exclusive: 4,
+                event_time_watermark: Some(InputEventTimeWatermark {
+                    stream_id: "purchases-stream".to_string(),
+                    partition_id: 0,
+                    event_time_column_id: "event_time".to_string(),
+                    max_observed_event_time_ns: 70_000_000_000,
+                    watermark_ns: 70_000_000_000,
+                }),
+                batches: vec![purchases_event_time_batch(&[(
+                    "alice",
+                    7,
+                    70_000_000_000,
+                    1,
+                )])],
+            }],
+        )
+        .unwrap();
+    assert_window_page(
+        runtime.as_ref(),
+        2,
+        &[
+            ("alice", 0, 60_000_000_000, 10, 1),
+            ("bob", 0, 60_000_000_000, 55, 1),
+        ],
+    );
+}
+
+#[test]
+fn multi_input_watermark_combination_is_min_across_partitions_and_rejects_regression() {
+    use velorix_core::standing_program::InputEventTimeFrontier;
+
+    let frontiers = vec![
+        InputEventTimeFrontier {
+            relation_id: "a".to_string(),
+            relation_version: "v1".to_string(),
+            schema_fingerprint: "fp".to_string(),
+            stream_id: "s".to_string(),
+            partition_id: 0,
+            event_time_column_id: "event_time".to_string(),
+            max_observed_event_time_ns: 100,
+            watermark_ns: 90,
+        },
+        InputEventTimeFrontier {
+            relation_id: "a".to_string(),
+            relation_version: "v1".to_string(),
+            schema_fingerprint: "fp".to_string(),
+            stream_id: "s".to_string(),
+            partition_id: 1,
+            event_time_column_id: "event_time".to_string(),
+            max_observed_event_time_ns: 60,
+            watermark_ns: 50,
+        },
+        InputEventTimeFrontier {
+            relation_id: "b".to_string(),
+            relation_version: "v1".to_string(),
+            schema_fingerprint: "fp".to_string(),
+            stream_id: "t".to_string(),
+            partition_id: 0,
+            event_time_column_id: "event_time".to_string(),
+            max_observed_event_time_ns: 200,
+            watermark_ns: 180,
+        },
+    ];
+    // Effective operator watermark = min over all active partitions of all
+    // inputs; no input can finalize windows while another is behind.
+    assert_eq!(combine_multi_input_watermarks(&frontiers), Some(50));
+    assert_eq!(combine_multi_input_watermarks(&[]), None);
+
+    // A regressing watermark must fail the epoch closed.
+    let mut state = frontiers.clone();
+    let regression = [RelationInputBatch {
+        encoding: RelationInputEncodingV1::SourceRelationV1,
+        relation_id: "a".to_string(),
+        relation_version: "v1".to_string(),
+        stream_id: "s".to_string(),
+        partition_id: 1,
+        schema_fingerprint: "fp".to_string(),
+        start_offset_inclusive: 0,
+        end_offset_exclusive: 1,
+        event_time_watermark: Some(InputEventTimeWatermark {
+            stream_id: "s".to_string(),
+            partition_id: 1,
+            event_time_column_id: "event_time".to_string(),
+            max_observed_event_time_ns: 55,
+            watermark_ns: 45,
+        }),
+        batches: vec![],
+    }];
+    let error = advance_input_event_time_frontier(&mut state, &regression[0]).unwrap_err();
+    assert!(
+        error.to_string().contains("input_event_time_watermark"),
+        "watermark regression must fail closed: {error}"
+    );
+}
+
+#[test]
+fn late_row_policy_default_strict_reject_fails_closed_on_late_row() {
+    let catalog = purchases_event_time_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = purchases_window_output_schema();
+    let sql = "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end";
+    // No policy on the plan: the legacy strict contract must be preserved.
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &standing_identity_with_view(sql, "purchases_by_user_minute"),
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("epoch-1").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 1,
+                event_time_watermark: Some(InputEventTimeWatermark {
+                    stream_id: "purchases-stream".to_string(),
+                    partition_id: 0,
+                    event_time_column_id: "event_time".to_string(),
+                    max_observed_event_time_ns: 60_000_000_000,
+                    watermark_ns: 60_000_000_000,
+                }),
+                batches: vec![purchases_event_time_batch(&[(
+                    "alice",
+                    10,
+                    10_000_000_000,
+                    1,
+                )])],
+            }],
+        )
+        .unwrap();
+
+    let error = runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("epoch-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 1,
+                end_offset_exclusive: 2,
+                event_time_watermark: Some(InputEventTimeWatermark {
+                    stream_id: "purchases-stream".to_string(),
+                    partition_id: 0,
+                    event_time_column_id: "event_time".to_string(),
+                    max_observed_event_time_ns: 60_000_000_000,
+                    watermark_ns: 60_000_000_000,
+                }),
+                batches: vec![purchases_event_time_batch(&[(
+                    "carol",
+                    99,
+                    20_000_000_000,
+                    1,
+                )])],
+            }],
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("tumbling_event_time_input_batch"),
+        "strict default must fail closed on late rows: {error}"
+    );
+    assert_window_page(runtime.as_ref(), 1, &[("alice", 0, 60_000_000_000, 10, 1)]);
+}
+
+#[test]
+fn session_window_retraction_splits_merged_session_exactly_and_survives_restart() {
+    let catalog = purchases_event_time_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = purchases_window_output_schema();
+    let sql = "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from purchases group by user_id, session(interval '10 seconds')";
+    let identity = standing_identity_with_view(sql, "purchases_by_user_minute");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    let watermark = |w: i64| InputEventTimeWatermark {
+        stream_id: "purchases-stream".to_string(),
+        partition_id: 0,
+        event_time_column_id: "event_time".to_string(),
+        max_observed_event_time_ns: w,
+        watermark_ns: w,
+    };
+    // Epoch 1: 30s, 40s, 50s with a 10s gap merge into one session [30,50];
+    // watermark 20s keeps every row on-time and nothing finalizes yet
+    // (50 + 10 > 20).
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("epoch-1").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 3,
+                event_time_watermark: Some(watermark(20_000_000_000)),
+                batches: vec![purchases_event_time_batch(&[
+                    ("alice", 10, 30_000_000_000, 1),
+                    ("alice", 5, 40_000_000_000, 1),
+                    ("alice", 9, 50_000_000_000, 1),
+                ])],
+            }],
+        )
+        .unwrap();
+    assert_window_page(runtime.as_ref(), 1, &[]);
+
+    // Epoch 2: retracting the bridge event (40s) must split the merged
+    // session into [30] and [50] while nothing is published yet.
+    runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("epoch-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 3,
+                end_offset_exclusive: 4,
+                event_time_watermark: Some(watermark(20_000_000_000)),
+                batches: vec![purchases_event_time_batch(&[(
+                    "alice",
+                    5,
+                    40_000_000_000,
+                    -1,
+                )])],
+            }],
+        )
+        .unwrap();
+    assert_window_page(runtime.as_ref(), 2, &[]);
+
+    // Epoch 3: watermark 60s finalizes both split sessions exactly once.
+    runtime
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("epoch-3").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 4,
+                end_offset_exclusive: 5,
+                event_time_watermark: Some(watermark(60_000_000_000)),
+                batches: vec![],
+            }],
+        )
+        .unwrap();
+    assert_window_page(
+        runtime.as_ref(),
+        3,
+        &[
+            ("alice", 30_000_000_000, 30_000_000_000, 10, 1),
+            ("alice", 50_000_000_000, 50_000_000_000, 9, 1),
+        ],
+    );
+
+    // Restart equivalence: the same suffix after a checkpoint yields the
+    // identical split output.
+    let checkpoint = runtime.checkpoint().unwrap();
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    restored
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("epoch-3").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 4,
+                end_offset_exclusive: 5,
+                event_time_watermark: Some(watermark(60_000_000_000)),
+                batches: vec![],
+            }],
+        )
+        .unwrap();
+    assert_window_page(
+        restored.as_ref(),
+        3,
+        &[
+            ("alice", 30_000_000_000, 30_000_000_000, 10, 1),
+            ("alice", 50_000_000_000, 50_000_000_000, 9, 1),
+        ],
+    );
+}
+
+#[test]
+fn tumbling_window_retraction_before_closure_is_exact_and_after_closure_fails_closed() {
+    let catalog = purchases_event_time_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = purchases_window_output_schema();
+    let sql = "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end";
+    let identity = standing_identity_with_view(sql, "purchases_by_user_minute");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    // Epoch 1: rows at 30s and 35s, watermark 20s (all on-time), the
+    // [0,60) window is not closed yet.
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("epoch-1").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 2,
+                event_time_watermark: Some(InputEventTimeWatermark {
+                    stream_id: "purchases-stream".to_string(),
+                    partition_id: 0,
+                    event_time_column_id: "event_time".to_string(),
+                    max_observed_event_time_ns: 20_000_000_000,
+                    watermark_ns: 20_000_000_000,
+                }),
+                batches: vec![purchases_event_time_batch(&[
+                    ("alice", 10, 30_000_000_000, 1),
+                    ("alice", 7, 35_000_000_000, 1),
+                ])],
+            }],
+        )
+        .unwrap();
+    assert_window_page(runtime.as_ref(), 1, &[]);
+
+    // Epoch 2: retract the 30s row before closure; the window keeps 35s only.
+    runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("epoch-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 2,
+                end_offset_exclusive: 3,
+                event_time_watermark: Some(InputEventTimeWatermark {
+                    stream_id: "purchases-stream".to_string(),
+                    partition_id: 0,
+                    event_time_column_id: "event_time".to_string(),
+                    max_observed_event_time_ns: 20_000_000_000,
+                    watermark_ns: 20_000_000_000,
+                }),
+                batches: vec![purchases_event_time_batch(&[(
+                    "alice",
+                    10,
+                    30_000_000_000,
+                    -1,
+                )])],
+            }],
+        )
+        .unwrap();
+    assert_window_page(runtime.as_ref(), 2, &[]);
+
+    // Epoch 3: the window closes exactly once with the surviving row.
+    runtime
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("epoch-3").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 3,
+                end_offset_exclusive: 4,
+                event_time_watermark: Some(InputEventTimeWatermark {
+                    stream_id: "purchases-stream".to_string(),
+                    partition_id: 0,
+                    event_time_column_id: "event_time".to_string(),
+                    max_observed_event_time_ns: 60_000_000_000,
+                    watermark_ns: 60_000_000_000,
+                }),
+                batches: vec![],
+            }],
+        )
+        .unwrap();
+    assert_window_page(runtime.as_ref(), 3, &[("alice", 0, 60_000_000_000, 7, 1)]);
+
+    // A retraction of a finalized-window row is late and the strict default
+    // fails the epoch closed.
+    let error = runtime
+        .apply_changes(
+            4,
+            EpochIdempotencyKey::new("epoch-4").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 4,
+                end_offset_exclusive: 5,
+                event_time_watermark: Some(InputEventTimeWatermark {
+                    stream_id: "purchases-stream".to_string(),
+                    partition_id: 0,
+                    event_time_column_id: "event_time".to_string(),
+                    max_observed_event_time_ns: 60_000_000_000,
+                    watermark_ns: 60_000_000_000,
+                }),
+                batches: vec![purchases_event_time_batch(&[(
+                    "alice",
+                    -7,
+                    35_000_000_000,
+                    -1,
+                )])],
+            }],
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("tumbling_event_time_input_batch"),
+        "post-finalization retraction must fail closed under strict policy: {error}"
+    );
+}
+
+#[test]
+fn hopping_window_retraction_updates_all_fanout_windows_exactly() {
+    let catalog = purchases_event_time_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = purchases_window_output_schema();
+    let sql = "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from hop(purchases, event_time, interval '5 seconds', interval '10 seconds') group by user_id, window_start, window_end";
+    let identity = standing_identity_with_view(sql, "purchases_by_user_minute");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    // Epoch 1: 10s and 12s rows (watermark 10s keeps both on-time); each
+    // lands in the [5,15) and [10,20) windows; nothing is closed yet
+    // (window ends 15/20 > frontier 10).
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("epoch-1").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 2,
+                event_time_watermark: Some(InputEventTimeWatermark {
+                    stream_id: "purchases-stream".to_string(),
+                    partition_id: 0,
+                    event_time_column_id: "event_time".to_string(),
+                    max_observed_event_time_ns: 10_000_000_000,
+                    watermark_ns: 10_000_000_000,
+                }),
+                batches: vec![purchases_event_time_batch(&[
+                    ("alice", 5, 10_000_000_000, 1),
+                    ("alice", 3, 12_000_000_000, 1),
+                ])],
+            }],
+        )
+        .unwrap();
+    assert_window_page(runtime.as_ref(), 1, &[]);
+
+    // Epoch 2: retract the 10s row; both fanout windows must drop it.
+    runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("epoch-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 2,
+                end_offset_exclusive: 3,
+                event_time_watermark: Some(InputEventTimeWatermark {
+                    stream_id: "purchases-stream".to_string(),
+                    partition_id: 0,
+                    event_time_column_id: "event_time".to_string(),
+                    max_observed_event_time_ns: 10_000_000_000,
+                    watermark_ns: 10_000_000_000,
+                }),
+                batches: vec![purchases_event_time_batch(&[(
+                    "alice",
+                    5,
+                    10_000_000_000,
+                    -1,
+                )])],
+            }],
+        )
+        .unwrap();
+
+    // Epoch 3: watermark 20s finalizes [5,15) and [10,20) with only the
+    // 12s row surviving in both.
+    runtime
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("epoch-3").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 3,
+                end_offset_exclusive: 4,
+                event_time_watermark: Some(InputEventTimeWatermark {
+                    stream_id: "purchases-stream".to_string(),
+                    partition_id: 0,
+                    event_time_column_id: "event_time".to_string(),
+                    max_observed_event_time_ns: 20_000_000_000,
+                    watermark_ns: 20_000_000_000,
+                }),
+                batches: vec![],
+            }],
+        )
+        .unwrap();
+    assert_window_page(
+        runtime.as_ref(),
+        3,
+        &[
+            ("alice", 10_000_000_000, 20_000_000_000, 3, 1),
+            ("alice", 5_000_000_000, 15_000_000_000, 3, 1),
+        ],
+    );
+}
+
+#[test]
+fn runtime_materializes_string_temporal_float_typed_projections_and_restores() {
+    let catalog = purchases_event_time_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = typed_expressions_output_schema();
+    let sql = "select user_id, upper(user_id) as user_upper, concat(user_id, '-x') as user_tag, extract(year from event_time) as event_year, date_trunc('hour', event_time) as hour_trunc, event_time + interval '1 hour' as plus_hour, amount * 1.0 as amount_f64, abs(amount * 1.0) as amount_abs, round(amount * 1.5) as amount_round from purchases";
+    let identity = standing_identity_with_view(sql, "typed_projection_view");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("epoch-1").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 2,
+                event_time_watermark: None,
+                batches: vec![purchases_event_time_batch(&[
+                    ("alice", 10, 1_735_689_600_000_000_000, 1),
+                    ("bob", 4, 1_735_689_600_000_000_000, 1),
+                ])],
+            }],
+        )
+        .unwrap();
+
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "typed_projection_view".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(1),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let user_upper = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .unwrap();
+    let user_tag = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .unwrap();
+    assert_eq!(user_upper.value(0), "ALICE");
+    assert_eq!(user_tag.value(0), "alice-x");
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("epoch-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 2,
+                end_offset_exclusive: 3,
+                event_time_watermark: None,
+                batches: vec![purchases_event_time_batch(&[(
+                    "carol",
+                    7,
+                    1_735_689_600_000_000_000,
+                    1,
+                )])],
+            }],
+        )
+        .unwrap();
+    let page = restored
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "typed_projection_view".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(2),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let user_upper = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .unwrap();
+    let user_tag = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .unwrap();
+    let mut values = (0..batch.num_rows())
+        .map(|index| {
+            (
+                user_upper.value(index).to_string(),
+                user_tag.value(index).to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    values.sort();
+    assert_eq!(
+        values,
+        vec![
+            ("ALICE".to_string(), "alice-x".to_string()),
+            ("BOB".to_string(), "bob-x".to_string()),
+            ("CAROL".to_string(), "carol-x".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn public_exists_on_non_primary_key_materializes_and_restores() {
+    let scores = scores_catalog();
+    let accounts = accounts_catalog();
+    let catalogs = vec![scores.clone(), accounts.clone()];
+    let input_schemas = catalogs
+        .iter()
+        .map(|catalog| catalog_input_relation_schema(catalog).unwrap())
+        .collect::<Vec<_>>();
+    let output = scores_projection_output_schema();
+    // Phase 7.4: correlation on identical non-null scalar columns (score =
+    // limit), not only the primary key.
+    let sql = "select s.user_id, s.score from scores s where exists (select 1 from accounts a where a.limit = s.score)";
+    let identity = standing_identity_with_view(sql, "positive_scores");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &catalogs,
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("epoch-1").unwrap(),
+            vec![
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
+                    relation_id: scores.relation_schema.relation_id.clone(),
+                    relation_version: scores.relation_schema.relation_version.clone(),
+                    stream_id: "scores-stream".to_string(),
+                    partition_id: 0,
+                    schema_fingerprint: scores.schema_fingerprint.to_string(),
+                    start_offset_inclusive: 0,
+                    end_offset_exclusive: 3,
+                    event_time_watermark: None,
+                    batches: vec![scores_rows_batch(&[
+                        ("alice", 10, 1),
+                        ("bob", 20, 1),
+                        ("carol", 30, 1),
+                    ])],
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
+                    relation_id: accounts.relation_schema.relation_id.clone(),
+                    relation_version: accounts.relation_schema.relation_version.clone(),
+                    stream_id: "accounts-stream".to_string(),
+                    partition_id: 0,
+                    schema_fingerprint: accounts.schema_fingerprint.to_string(),
+                    start_offset_inclusive: 0,
+                    end_offset_exclusive: 2,
+                    event_time_watermark: None,
+                    batches: vec![accounts_rows_batch(&[
+                        ("a1", 10, "gold", 1),
+                        ("a2", 40, "silver", 1),
+                    ])],
+                },
+            ],
+        )
+        .unwrap();
+
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "positive_scores".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(1),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap_or_else(|error| panic!("[PAGE-ERR] {error}"));
+    let batch = &page.batches[0];
+    let user_ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mut users = (0..batch.num_rows())
+        .map(|index| user_ids.value(index).to_string())
+        .collect::<Vec<_>>();
+    users.sort();
+    assert_eq!(users, vec!["alice".to_string()]);
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("epoch-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: accounts.relation_schema.relation_id.clone(),
+                relation_version: accounts.relation_schema.relation_version.clone(),
+                stream_id: "accounts-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: accounts.schema_fingerprint.to_string(),
+                start_offset_inclusive: 2,
+                end_offset_exclusive: 3,
+                event_time_watermark: None,
+                batches: vec![accounts_rows_batch(&[("a3", 20, "gold", 1)])],
+            }],
+        )
+        .unwrap();
+    let page = restored
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "positive_scores".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(2),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let user_ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mut users = (0..batch.num_rows())
+        .map(|index| user_ids.value(index).to_string())
+        .collect::<Vec<_>>();
+    users.sort();
+    assert_eq!(users, vec!["alice".to_string(), "bob".to_string()]);
+}
+
+#[test]
+fn builtin_udf_typed_projection_materializes_and_restores() {
+    let catalog = purchases_catalog_without_value_role();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = udf_output_schema();
+    let sql = "select user_id, vx_strlen(user_id) as name_len, vx_sign(amount) as sign_of_amount, vx_clamp(amount, 0, 8) as clamped from purchases";
+    let identity = standing_identity_with_view(sql, "udf_projection_view");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("epoch-1").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "purchases-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 3,
+                event_time_watermark: None,
+                batches: vec![purchases_rows_batch(&[
+                    ("alice", 10, 1),
+                    ("bob", -4, 1),
+                    ("carol", 20, 1),
+                ])],
+            }],
+        )
+        .unwrap();
+
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "udf_projection_view".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(1),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let name_len = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let sign = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let clamped = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let mut rows = (0..batch.num_rows())
+        .map(|index| {
+            (
+                name_len.value(index),
+                sign.value(index),
+                clamped.value(index),
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort();
+    assert_eq!(rows, vec![(3, -1, 0), (5, 1, 8), (5, 1, 8)]);
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("epoch-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "purchases-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 3,
+                end_offset_exclusive: 4,
+                event_time_watermark: None,
+                batches: vec![purchases_rows_batch(&[("dave", 6, 1)])],
+            }],
+        )
+        .unwrap();
+    let page = restored
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "udf_projection_view".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(2),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let name_len = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let mut lens = (0..batch.num_rows())
+        .map(|index| name_len.value(index))
+        .collect::<Vec<_>>();
+    lens.sort();
+    assert_eq!(lens, vec![3, 4, 5, 5]);
+}
+
+fn udf_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "udf_projection_view".to_string(),
+        relation_name: "udf_projection_view".to_string(),
+        relation_version: "2026-05-24.v1".to_string(),
+        schema_fingerprint: "udf-v1".to_string(),
+        columns: vec![
+            ColumnSchema {
+                name: "user_id".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "name_len".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "sign_of_amount".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "clamped".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: true,
+            },
+        ],
+        primary_key: vec!["user_id".to_string()],
+    }
+}
+
+#[test]
+fn runtime_materializes_decimal_group_key_aggregate_and_restores() {
+    let catalog = decimal_key_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = decimal_key_output_schema();
+    let sql = "select k, sum(amount) as total from decimal_events group by k";
+    let identity = standing_identity_with_view(sql, "decimal_events_by_key");
+
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap_or_else(|error| panic!("[DEC-ERR] {error}"));
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("epoch-1").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "decimal-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 3,
+                event_time_watermark: None,
+                batches: vec![decimal_events_batch(&[
+                    ("1.25", 10, 1),
+                    ("2.50", 7, 1),
+                    ("1.25", -3, 1),
+                ])],
+            }],
+        )
+        .unwrap();
+
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "decimal_events_by_key".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(1),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let keys = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .unwrap();
+    let totals = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let mut rows = (0..batch.num_rows())
+        .map(|index| (keys.value(index), totals.value(index)))
+        .collect::<Vec<_>>();
+    rows.sort();
+    assert_eq!(rows, vec![(125_i128, 7_i64), (250_i128, 7_i64)]);
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("epoch-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "decimal-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 3,
+                end_offset_exclusive: 4,
+                event_time_watermark: None,
+                batches: vec![decimal_events_batch(&[("1.25", 5, 1)])],
+            }],
+        )
+        .unwrap();
+    let page = restored
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "decimal_events_by_key".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(2),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let keys = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .unwrap();
+    let totals = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let mut rows = (0..batch.num_rows())
+        .map(|index| (keys.value(index), totals.value(index)))
+        .collect::<Vec<_>>();
+    rows.sort();
+    assert_eq!(rows, vec![(125_i128, 12_i64), (250_i128, 7_i64)]);
+}
+
+fn decimal_key_catalog() -> VelorixRelationCatalogV1 {
+    let mut catalog = purchases_catalog_without_value_role();
+    catalog.relation_schema.relation_id = "decimal_events".to_string();
+    catalog.relation_schema.relation_name = "decimal_events".to_string();
+    let key = catalog
+        .relation_schema
+        .columns
+        .iter_mut()
+        .find(|column| column.column_id == "user_id")
+        .unwrap();
+    key.name = "k".to_string();
+    key.column_id = "k".to_string();
+    key.logical_type = VelorixLogicalTypeV1::Decimal {
+        precision: 10,
+        scale: 2,
+    };
+    key.physical_arrow_type = ArrowPhysicalTypeV1::Decimal128 {
+        precision: 10,
+        scale: 2,
+    };
+    catalog.relation_schema.primary_key_column_ids = vec!["k".to_string()];
+    catalog.relation_schema.event_time_column_id = None;
+    catalog.incremental_relation.relation_id = "decimal_events".to_string();
+
+    let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema)
+        .expect("decimal key schema should fingerprint");
+    catalog.schema_fingerprint = schema_fingerprint.clone();
+    catalog.incremental_relation.schema_fingerprint = schema_fingerprint;
+    catalog
+}
+
+fn decimal_key_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "decimal_events_by_key".to_string(),
+        relation_name: "decimal_events_by_key".to_string(),
+        relation_version: "2026-05-24.v1".to_string(),
+        schema_fingerprint: "decimal-key-v1".to_string(),
+        columns: vec![
+            ColumnSchema {
+                name: "k".to_string(),
+                data_type: SqlDataType::Decimal {
+                    precision: 10,
+                    scale: 2,
+                },
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "total".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["k".to_string()],
+    }
+}
+
+fn decimal_events_batch(rows: &[(&str, i64, i64)]) -> RecordBatch {
+    let keys = Decimal128Array::from_iter_values(
+        rows.iter()
+            .map(|(key, _, _)| key.replace('.', "").parse::<i128>().unwrap()),
+    )
+    .with_precision_and_scale(10, 2)
+    .unwrap();
+    RecordBatch::try_new(
+        Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("k", arrow::datatypes::DataType::Decimal128(10, 2), false),
+            arrow::datatypes::Field::new("amount", arrow::datatypes::DataType::Int64, false),
+            arrow::datatypes::Field::new("delta", arrow::datatypes::DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(keys) as _,
+            Arc::new(Int64Array::from(
+                rows.iter().map(|(_, v, _)| *v).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(Int64Array::from(
+                rows.iter().map(|(_, _, w)| *w).collect::<Vec<_>>(),
+            )) as _,
+        ],
+    )
+    .unwrap()
+}
+
+#[test]
+fn scalar_aggregate_filter_materializes_and_restores() {
+    let scores = scores_catalog();
+    let accounts = accounts_catalog();
+    let catalogs = vec![scores.clone(), accounts.clone()];
+    let input_schemas = catalogs
+        .iter()
+        .map(|catalog| catalog_input_relation_schema(catalog).unwrap())
+        .collect::<Vec<_>>();
+    let output = scores_projection_output_schema();
+    let sql = "select s.user_id, s.score from scores s where s.score > (select avg(a.limit) from accounts a)";
+    let identity = standing_identity_with_view(sql, "positive_scores");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &catalogs,
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("epoch-1").unwrap(),
+            vec![
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
+                    relation_id: scores.relation_schema.relation_id.clone(),
+                    relation_version: scores.relation_schema.relation_version.clone(),
+                    stream_id: "scores-stream".to_string(),
+                    partition_id: 0,
+                    schema_fingerprint: scores.schema_fingerprint.to_string(),
+                    start_offset_inclusive: 0,
+                    end_offset_exclusive: 3,
+                    event_time_watermark: None,
+                    batches: vec![scores_rows_batch(&[
+                        ("alice", 10, 1),
+                        ("bob", 20, 1),
+                        ("carol", 30, 1),
+                    ])],
+                },
+                RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
+                    relation_id: accounts.relation_schema.relation_id.clone(),
+                    relation_version: accounts.relation_schema.relation_version.clone(),
+                    stream_id: "accounts-stream".to_string(),
+                    partition_id: 0,
+                    schema_fingerprint: accounts.schema_fingerprint.to_string(),
+                    start_offset_inclusive: 0,
+                    end_offset_exclusive: 2,
+                    event_time_watermark: None,
+                    batches: vec![accounts_rows_batch(&[
+                        ("a1", 10, "gold", 1),
+                        ("a2", 30, "silver", 1),
+                    ])],
+                },
+            ],
+        )
+        .unwrap();
+
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "positive_scores".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(1),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let user_ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mut users = (0..batch.num_rows())
+        .map(|index| user_ids.value(index).to_string())
+        .collect::<Vec<_>>();
+    users.sort();
+    // avg(limit) = 20; score > 20 -> carol only.
+    assert_eq!(users, vec!["carol".to_string()]);
+
+    // Scalar changes to 40: bob and carol now pass.
+    runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("epoch-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: accounts.relation_schema.relation_id.clone(),
+                relation_version: accounts.relation_schema.relation_version.clone(),
+                stream_id: "accounts-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: accounts.schema_fingerprint.to_string(),
+                start_offset_inclusive: 2,
+                end_offset_exclusive: 3,
+                event_time_watermark: None,
+                batches: vec![accounts_rows_batch(&[("a3", 80, "gold", 1)])],
+            }],
+        )
+        .unwrap();
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "positive_scores".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(2),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let user_ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mut users = (0..batch.num_rows())
+        .map(|index| user_ids.value(index).to_string())
+        .collect::<Vec<_>>();
+    users.sort();
+    // avg now 40; no score exceeds 40.
+    assert!(users.is_empty(), "no score exceeds avg 40: {users:?}");
+
+    // Restart: checkpoint then restore, verify state and continued updates.
+    let checkpoint = runtime.checkpoint().unwrap();
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    restored
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("epoch-3").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: scores.relation_schema.relation_id.clone(),
+                relation_version: scores.relation_schema.relation_version.clone(),
+                stream_id: "scores-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: scores.schema_fingerprint.to_string(),
+                start_offset_inclusive: 3,
+                end_offset_exclusive: 4,
+                event_time_watermark: None,
+                batches: vec![scores_rows_batch(&[("dave", 50, 1)])],
+            }],
+        )
+        .unwrap();
+    let page = restored
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "positive_scores".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(3),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let user_ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mut users = (0..batch.num_rows())
+        .map(|index| user_ids.value(index).to_string())
+        .collect::<Vec<_>>();
+    users.sort();
+    assert_eq!(users, vec!["dave".to_string()]);
+}
+
+#[test]
+fn percentile_aggregates_are_exact_across_retract_and_restart() {
+    let catalog = scores_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = percentile_output_schema();
+    let sql = "select user_id, percentile_disc(score, 0.5) as median_disc, percentile_cont(score, 0.25) as q1_cont, median(score) as median from scores group by user_id";
+    let identity = standing_identity_with_view(sql, "percentile_view");
+    let lowered_debug = velorix_core::view_plan::lower_supported_sql_to_logical_plan(
+        sql,
+        std::slice::from_ref(&catalog),
+        &output_schema,
+    )
+    .unwrap();
+    if let velorix_core::view_plan::VelorixLogicalViewExecutionV1::SingleKeySumCount { plan } =
+        &lowered_debug.execution
+    {
+        eprintln!(
+            "[P-PLAN] outputs={:?}",
+            velorix_core::view_plan::supported_view_plan_aggregate_outputs(plan)
+                .iter()
+                .map(|o| (format!("{:?}", o.function), o.output_column_id.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap_or_else(|error| panic!("[P-CREATE] {error}"));
+
+    // alice scores: 10, 20, 30 -> disc(0.5)=20, cont(0.25)=15, median(0.5 cont)=20
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("epoch-1").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "scores-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 3,
+                event_time_watermark: None,
+                batches: vec![scores_rows_batch(&[
+                    ("alice", 10, 1),
+                    ("alice", 20, 1),
+                    ("alice", 30, 1),
+                ])],
+            }],
+        )
+        .unwrap_or_else(|error| panic!("[P-APPLY] {error}"));
+
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "percentile_view".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(1),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let median_disc = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let q1_cont = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let median = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(median_disc.value(0), 20);
+    assert!((q1_cont.value(0) - 15.0).abs() < 1e-9);
+    assert!((median.value(0) - 20.0).abs() < 1e-9);
+
+    // Retract 30: scores 10, 20 -> disc(0.5)=20, cont(0.25)=12.5, median=15
+    runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("epoch-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "scores-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 3,
+                end_offset_exclusive: 4,
+                event_time_watermark: None,
+                batches: vec![scores_rows_batch(&[("alice", 30, -1)])],
+            }],
+        )
+        .unwrap();
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "percentile_view".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(2),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let median_disc = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let q1_cont = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let median = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!(median_disc.value(0), 10);
+    assert!((q1_cont.value(0) - 12.5).abs() < 1e-9);
+    assert!((median.value(0) - 15.0).abs() < 1e-9);
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    restored
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("epoch-3").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "scores-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 4,
+                end_offset_exclusive: 5,
+                event_time_watermark: None,
+                batches: vec![scores_rows_batch(&[("alice", 40, 1)])],
+            }],
+        )
+        .unwrap();
+    let page = restored
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "percentile_view".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(3),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let median_disc = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let q1_cont = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let median = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    // scores 10,20,40: disc(0.5)=20, cont(0.25)=15 (position 0.25*(3-1)), median=20
+    assert_eq!(median_disc.value(0), 20);
+    assert!((q1_cont.value(0) - 15.0).abs() < 1e-9);
+    assert!((median.value(0) - 20.0).abs() < 1e-9);
+}
+
+fn percentile_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "percentile_view".to_string(),
+        relation_name: "percentile_view".to_string(),
+        relation_version: "2026-05-24.v1".to_string(),
+        schema_fingerprint: "percentile-v1".to_string(),
+        columns: vec![
+            ColumnSchema {
+                name: "user_id".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "median_disc".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "q1_cont".to_string(),
+                data_type: SqlDataType::Float64,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "median".to_string(),
+                data_type: SqlDataType::Float64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["user_id".to_string()],
+    }
+}
+
+#[test]
+fn analytic_window_frames_navigation_materializes_and_restores() {
+    let catalog = scores_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = frame_output_schema();
+    // Partition by score: alice(10) and bob(10) share a partition, carol(-1)
+    // is its own partition. Per-partition order = score then PK.
+    let sql = "select user_id, lag(score, 1) over (partition by score order by score rows between 1 preceding and current row) as prev_score from scores";
+    let identity = standing_identity_with_view(sql, "frame_view");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("epoch-1").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "scores-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 3,
+                event_time_watermark: None,
+                batches: vec![scores_rows_batch(&[
+                    ("alice", 10, 1),
+                    ("bob", 10, 1),
+                    ("carol", -1, 1),
+                ])],
+            }],
+        )
+        .unwrap();
+
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "frame_view".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(1),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let user_ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let prev = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let mut rows = (0..batch.num_rows())
+        .map(|index| (user_ids.value(index).to_string(), prev.value(index)))
+        .collect::<Vec<_>>();
+    rows.sort();
+    // Partition {10}: alice first (lag None -> row dropped), bob lag=10.
+    // Partition {-1}: carol alone (lag None -> dropped).
+    assert_eq!(rows, vec![("bob".to_string(), 10)]);
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("epoch-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "scores-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 3,
+                end_offset_exclusive: 4,
+                event_time_watermark: None,
+                batches: vec![scores_rows_batch(&[("dave", 10, 1)])],
+            }],
+        )
+        .unwrap();
+    let page = restored
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "frame_view".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(2),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let user_ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let prev = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let mut rows = (0..batch.num_rows())
+        .map(|index| (user_ids.value(index).to_string(), prev.value(index)))
+        .collect::<Vec<_>>();
+    rows.sort();
+    // Partition {10}: alice(10), bob(10), dave(10) ordered alice,bob,dave by PK;
+    // lag(1): bob=10, dave=10; alice dropped.
+    assert_eq!(
+        rows,
+        vec![("bob".to_string(), 10), ("dave".to_string(), 10)]
+    );
+}
+
+fn frame_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "frame_view".to_string(),
+        relation_name: "frame_view".to_string(),
+        relation_version: "2026-05-24.v1".to_string(),
+        schema_fingerprint: "frame-v1".to_string(),
+        columns: vec![
+            ColumnSchema {
+                name: "user_id".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "prev_score".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: true,
+            },
+        ],
+        primary_key: vec!["user_id".to_string()],
+    }
+}
+
+fn interval_join_rides_catalog() -> VelorixRelationCatalogV1 {
+    interval_side_catalog("rides", "ride_id", "booking_start", "booking_end_time")
+}
+
+fn interval_join_vehicles_catalog() -> VelorixRelationCatalogV1 {
+    interval_side_catalog(
+        "vehicles",
+        "vehicle_id",
+        "capacity_start_time",
+        "capacity_end",
+    )
+}
+
+fn interval_side_catalog(
+    relation_id: &str,
+    key_column_id: &str,
+    start_column_id: &str,
+    end_column_id: &str,
+) -> VelorixRelationCatalogV1 {
+    let relation_schema = VelorixRelationSchemaV1 {
+        relation_id: relation_id.to_string(),
+        relation_name: relation_id.to_string(),
+        relation_version: "2026-08-13.v1".to_string(),
+        columns: vec![
+            RelationColumnV1 {
+                column_id: key_column_id.to_string(),
+                name: key_column_id.to_string(),
+                logical_type: VelorixLogicalTypeV1::Utf8,
+                physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+                nullable: false,
+                ordinal: 0,
+                semantic_role: RelationSemanticRoleV1::PrimaryKey,
+            },
+            RelationColumnV1 {
+                column_id: start_column_id.to_string(),
+                name: start_column_id.to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 1,
+                semantic_role: RelationSemanticRoleV1::Value,
+            },
+            RelationColumnV1 {
+                column_id: end_column_id.to_string(),
+                name: end_column_id.to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 2,
+                semantic_role: RelationSemanticRoleV1::Value,
+            },
+            RelationColumnV1 {
+                column_id: "delta".to_string(),
+                name: "delta".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 3,
+                semantic_role: RelationSemanticRoleV1::Weight,
+            },
+        ],
+        primary_key_column_ids: vec![key_column_id.to_string()],
+        weight_column_id: "delta".to_string(),
+        allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+        event_time_column_id: None,
+    };
+    let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
+    VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
+        schema_version: RELATION_SCHEMA_VERSION_V1,
+        relation_schema,
+        schema_fingerprint: schema_fingerprint.clone(),
+        datafusion_registration: DataFusionRegistrationV1 {
+            name: relation_id.to_string(),
+            mode: DataFusionRegistrationModeV1::Table,
+        },
+        incremental_relation: IncrementalRelationBindingV1 {
+            relation_id: relation_id.to_string(),
+            schema_fingerprint,
+        },
+        incremental_adapter: IncrementalAdapterBindingV1 {
+            adapter_id: CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.to_string(),
+        },
+    }
+}
+
+fn interval_rides_rows_batch(rows: &[(&str, i64, i64, i64)]) -> RecordBatch {
+    interval_side_rows_batch(rows, "ride_id", "booking_start", "booking_end_time")
+}
+
+fn interval_vehicles_rows_batch(rows: &[(&str, i64, i64, i64)]) -> RecordBatch {
+    interval_side_rows_batch(rows, "vehicle_id", "capacity_start_time", "capacity_end")
+}
+
+fn interval_side_rows_batch(
+    rows: &[(&str, i64, i64, i64)],
+    key_column: &str,
+    start_column: &str,
+    end_column: &str,
+) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new(key_column, DataType::Utf8, false),
+            Field::new(start_column, DataType::Int64, false),
+            Field::new(end_column, DataType::Int64, false),
+            Field::new("delta", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(Int64Array::from(
+                rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(Int64Array::from(
+                rows.iter().map(|row| row.2).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(Int64Array::from(
+                rows.iter().map(|row| row.3).collect::<Vec<_>>(),
+            )) as _,
+        ],
+    )
+    .unwrap()
+}
+
+fn interval_join_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "interval_matches".to_string(),
+        relation_name: "interval_matches".to_string(),
+        relation_version: "2026-08-13.v1".to_string(),
+        schema_fingerprint: "interval-v1".to_string(),
+        columns: vec![
+            ColumnSchema {
+                name: "ride_id".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "booking_start".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "booking_end_time".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "vehicle_id".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+        ],
+        primary_key: vec![
+            "ride_id".to_string(),
+            "booking_start".to_string(),
+            "booking_end_time".to_string(),
+            "vehicle_id".to_string(),
+        ],
+    }
+}
+
+fn assert_interval_join_page(
+    runtime: &(dyn StandingProgramRuntime + Send),
+    epoch: u64,
+    expected: &[(&str, i64, i64, &str)],
+) {
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".into(),
+                program_id: "program-purchases".into(),
+                view_id: "interval_matches".into(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(epoch),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let ride_ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let starts = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let ends = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let vehicles = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mut actual = (0..batch.num_rows())
+        .map(|index| {
+            (
+                ride_ids.value(index),
+                starts.value(index),
+                ends.value(index),
+                vehicles.value(index),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut expected = expected.to_vec();
+    actual.sort();
+    expected.sort();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn interval_join_materializes_overlap_retraction_and_restart() {
+    let rides = interval_join_rides_catalog();
+    let vehicles = interval_join_vehicles_catalog();
+    let catalogs = vec![rides.clone(), vehicles.clone()];
+    let input_schemas = catalogs
+        .iter()
+        .map(|catalog| catalog_input_relation_schema(catalog).unwrap())
+        .collect::<Vec<_>>();
+    let output_schema = interval_join_output_schema();
+    let sql = "select r.ride_id, r.booking_start, r.booking_end_time from rides r join vehicles v on r.booking_start < v.capacity_end and v.capacity_start_time < r.booking_end_time";
+    let identity = standing_identity_with_view(sql, "interval_matches");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &catalogs,
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("interval-epoch-1").unwrap(),
+            vec![
+                relation_input(
+                    &rides,
+                    "interval-rides",
+                    0,
+                    1,
+                    interval_rides_rows_batch(&[("r1", 10, 20, 1)]),
+                ),
+                // v2 ends before r1 starts (discriminates the first
+                // conjunct); r1 overlaps both v1 and v4 (multi-match).
+                relation_input(
+                    &vehicles,
+                    "interval-vehicles",
+                    0,
+                    3,
+                    interval_vehicles_rows_batch(&[
+                        ("v1", 15, 25, 1),
+                        ("v2", 0, 3, 1),
+                        ("v4", 18, 22, 1),
+                    ]),
+                ),
+            ],
+        )
+        .unwrap();
+    assert_interval_join_page(
+        runtime.as_ref(),
+        1,
+        &[("r1", 10, 20, "v1"), ("r1", 10, 20, "v4")],
+    );
+
+    runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("interval-epoch-2").unwrap(),
+            vec![relation_input(
+                &vehicles,
+                "interval-vehicles",
+                3,
+                4,
+                interval_vehicles_rows_batch(&[("v1", 15, 25, -1)]),
+            )],
+        )
+        .unwrap();
+    assert_interval_join_page(runtime.as_ref(), 2, &[("r1", 10, 20, "v4")]);
+
+    runtime
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("interval-epoch-3").unwrap(),
+            vec![
+                relation_input(
+                    &rides,
+                    "interval-rides",
+                    1,
+                    2,
+                    interval_rides_rows_batch(&[("r2", 5, 12, 1)]),
+                ),
+                relation_input(
+                    &vehicles,
+                    "interval-vehicles",
+                    4,
+                    5,
+                    interval_vehicles_rows_batch(&[("v5", 8, 25, 1)]),
+                ),
+            ],
+        )
+        .unwrap();
+    assert_interval_join_page(
+        runtime.as_ref(),
+        3,
+        &[
+            ("r1", 10, 20, "v4"),
+            ("r1", 10, 20, "v5"),
+            ("r2", 5, 12, "v5"),
+        ],
+    );
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    assert_interval_join_page(
+        restored.as_ref(),
+        3,
+        &[
+            ("r1", 10, 20, "v4"),
+            ("r1", 10, 20, "v5"),
+            ("r2", 5, 12, "v5"),
+        ],
+    );
+    restored
+        .apply_changes(
+            4,
+            EpochIdempotencyKey::new("interval-epoch-4").unwrap(),
+            vec![relation_input(
+                &vehicles,
+                "interval-vehicles",
+                5,
+                6,
+                interval_vehicles_rows_batch(&[("v5", 8, 25, -1)]),
+            )],
+        )
+        .unwrap();
+    assert_interval_join_page(restored.as_ref(), 4, &[("r1", 10, 20, "v4")]);
+
+    // Failed epochs are atomic: a malformed row rejects the epoch, the
+    // runtime state is untouched, and the same epoch can be retried with
+    // valid data.
+    let bad = relation_input(
+        &rides,
+        "interval-rides",
+        2,
+        3,
+        interval_rides_rows_batch(&[("r3", 30, 20, 1)]),
+    );
+    assert!(runtime
+        .apply_changes(
+            5,
+            EpochIdempotencyKey::new("interval-epoch-5").unwrap(),
+            vec![bad],
+        )
+        .is_err());
+    assert_interval_join_page(
+        runtime.as_ref(),
+        3,
+        &[
+            ("r1", 10, 20, "v4"),
+            ("r1", 10, 20, "v5"),
+            ("r2", 5, 12, "v5"),
+        ],
+    );
+    runtime
+        .apply_changes(
+            5,
+            EpochIdempotencyKey::new("interval-epoch-5").unwrap(),
+            vec![relation_input(
+                &rides,
+                "interval-rides",
+                2,
+                3,
+                interval_rides_rows_batch(&[("r3", 30, 40, 1)]),
+            )],
+        )
+        .unwrap();
+    assert_interval_join_page(
+        runtime.as_ref(),
+        5,
+        &[
+            ("r1", 10, 20, "v4"),
+            ("r1", 10, 20, "v5"),
+            ("r2", 5, 12, "v5"),
+        ],
+    );
+}
+
+fn typed_family_matrix_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "typed_family_matrix".to_string(),
+        relation_name: "typed_family_matrix".to_string(),
+        relation_version: "2026-08-13.v1".to_string(),
+        schema_fingerprint: "typed-family-matrix-v1".to_string(),
+        columns: vec![
+            ColumnSchema {
+                name: "user_id".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "user_lower".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "user_sub_ast".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "user_sub_fn".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "user_trim".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "user_len".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "event_month".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "event_hour".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "event_second".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "day_trunc".to_string(),
+                data_type: SqlDataType::Timestamp { timezone: None },
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "minute_trunc".to_string(),
+                data_type: SqlDataType::Timestamp { timezone: None },
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "minus_half_hour".to_string(),
+                data_type: SqlDataType::Timestamp { timezone: None },
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "amount_ceil".to_string(),
+                data_type: SqlDataType::Float64,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "amount_floor".to_string(),
+                data_type: SqlDataType::Float64,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "amount_greatest".to_string(),
+                data_type: SqlDataType::Float64,
+                nullable: true,
+            },
+            ColumnSchema {
+                name: "amount_least".to_string(),
+                data_type: SqlDataType::Float64,
+                nullable: true,
+            },
+        ],
+        primary_key: vec!["user_id".to_string()],
+    }
+}
+
+#[test]
+fn type_family_test_matrix_covers_null_overflow_boundary_restart() {
+    let catalog = purchases_event_time_catalog_with_nullable_amount();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = typed_family_matrix_output_schema();
+    let sql = "select user_id, lower(user_id) as user_lower, substring(user_id from 1 for 3) as user_sub_ast, substr(user_id, 2, 3) as user_sub_fn, trim('x' from user_id) as user_trim, length(user_id) as user_len, extract(month from event_time) as event_month, extract(hour from event_time) as event_hour, extract(second from event_time) as event_second, date_trunc('day', event_time) as day_trunc, date_trunc('minute', event_time) as minute_trunc, event_time - interval '30 minutes' as minus_half_hour, ceil(amount * 1.5) as amount_ceil, floor(amount * 1.5) as amount_floor, greatest(amount * 1.0, amount * 1.5) as amount_greatest, least(amount * 1.0, amount * 1.5) as amount_least from purchases";
+    let identity = standing_identity_with_view(sql, "typed_family_matrix");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("matrix-epoch-1").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "matrix-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 2,
+                event_time_watermark: None,
+                batches: vec![purchases_event_time_nullable_amount_batch(&[
+                    ("xAvier", Some(10), 1_735_692_777_111_000_000, 1),
+                    ("bob", Some(4), 1_735_692_777_111_000_000, 1),
+                ])],
+            }],
+        )
+        .unwrap();
+    assert_typed_family_matrix_page(runtime.as_ref(), 1, &[alice_matrix_row(), bob_matrix_row()]);
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("matrix-epoch-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "matrix-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 2,
+                end_offset_exclusive: 4,
+                event_time_watermark: None,
+                batches: vec![purchases_event_time_nullable_amount_batch(&[
+                    ("carol", Some(7), 1_735_692_777_111_000_000, 1),
+                    ("nullam", None, 1_735_692_777_111_000_000, 1),
+                ])],
+            }],
+        )
+        .unwrap();
+    assert_typed_family_matrix_page(
+        restored.as_ref(),
+        2,
+        &[
+            alice_matrix_row(),
+            bob_matrix_row(),
+            carol_matrix_row(),
+            null_amount_matrix_row(),
+        ],
+    );
+}
+
+fn alice_matrix_row() -> Vec<String> {
+    vec![
+        "xAvier".to_string(),
+        "xavier".to_string(),
+        "xAv".to_string(),
+        "Avi".to_string(),
+        "Avier".to_string(),
+        "6".to_string(),
+        "1".to_string(),
+        "0".to_string(),
+        "57".to_string(),
+        "1735689600000000000".to_string(),
+        "1735692720000000000".to_string(),
+        "1735690977111000000".to_string(),
+        "15".to_string(),
+        "15".to_string(),
+        "15".to_string(),
+        "10".to_string(),
+    ]
+}
+
+fn bob_matrix_row() -> Vec<String> {
+    vec![
+        "bob".to_string(),
+        "bob".to_string(),
+        "bob".to_string(),
+        "ob".to_string(),
+        "bob".to_string(),
+        "3".to_string(),
+        "1".to_string(),
+        "0".to_string(),
+        "57".to_string(),
+        "1735689600000000000".to_string(),
+        "1735692720000000000".to_string(),
+        "1735690977111000000".to_string(),
+        "6".to_string(),
+        "6".to_string(),
+        "6".to_string(),
+        "4".to_string(),
+    ]
+}
+
+fn carol_matrix_row() -> Vec<String> {
+    vec![
+        "carol".to_string(),
+        "carol".to_string(),
+        "car".to_string(),
+        "aro".to_string(),
+        "carol".to_string(),
+        "5".to_string(),
+        "1".to_string(),
+        "0".to_string(),
+        "57".to_string(),
+        "1735689600000000000".to_string(),
+        "1735692720000000000".to_string(),
+        "1735690977111000000".to_string(),
+        "11".to_string(),
+        "10".to_string(),
+        "10.5".to_string(),
+        "7".to_string(),
+    ]
+}
+
+fn null_amount_matrix_row() -> Vec<String> {
+    vec![
+        "nullam".to_string(),
+        "nullam".to_string(),
+        "nul".to_string(),
+        "ull".to_string(),
+        "nullam".to_string(),
+        "6".to_string(),
+        "1".to_string(),
+        "0".to_string(),
+        "57".to_string(),
+        "1735689600000000000".to_string(),
+        "1735692720000000000".to_string(),
+        "1735690977111000000".to_string(),
+        "NULL".to_string(),
+        "NULL".to_string(),
+        "NULL".to_string(),
+        "NULL".to_string(),
+    ]
+}
+
+fn assert_typed_family_matrix_page(
+    runtime: &(dyn StandingProgramRuntime + Send),
+    epoch: u64,
+    expected_rows: &[Vec<String>],
+) {
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".into(),
+                program_id: "program-purchases".into(),
+                view_id: "typed_family_matrix".into(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(epoch),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let mut expected = expected_rows.to_vec();
+    let mut actual = Vec::new();
+    for index in 0..batch.num_rows() {
+        let mut row = Vec::new();
+        for column in 0..batch.num_columns() {
+            let column_value = batch.column(column);
+            if let Some(array) = column_value.as_any().downcast_ref::<StringArray>() {
+                row.push(array.value(index).to_string());
+            } else if let Some(array) = column_value.as_any().downcast_ref::<Int64Array>() {
+                if array.is_null(index) {
+                    row.push("NULL".to_string());
+                } else {
+                    row.push(array.value(index).to_string());
+                }
+            } else if let Some(array) = column_value.as_any().downcast_ref::<Float64Array>() {
+                if array.is_null(index) {
+                    row.push("NULL".to_string());
+                } else {
+                    row.push(array.value(index).to_string());
+                }
+            } else if let Some(array) = column_value
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+            {
+                if array.is_null(index) {
+                    row.push("NULL".to_string());
+                } else {
+                    row.push(array.value(index).to_string());
+                }
+            } else {
+                panic!("unexpected column type in typed family matrix page");
+            }
+        }
+        actual.push(row);
+    }
+    expected.sort();
+    actual.sort();
+    assert_eq!(actual, expected);
+}
+
+fn normalized_plan_equality(
+    left: &VelorixLogicalViewPlanV1,
+    right: &VelorixLogicalViewPlanV1,
+) -> bool {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    left.view_sql.clear();
+    right.view_sql.clear();
+    left.plan_hash = None;
+    right.plan_hash = None;
+    left == right
+}
+
+fn assert_equivalent_lowering(
+    left_sql: &str,
+    right_sql: &str,
+    catalogs: &[VelorixRelationCatalogV1],
+    output: &RelationSchema,
+    label: &str,
+) {
+    let left = lower_supported_sql_to_logical_plan(left_sql, catalogs, output).unwrap();
+    let right = lower_supported_sql_to_logical_plan(right_sql, catalogs, output).unwrap();
+    assert!(
+        normalized_plan_equality(&left, &right),
+        "{label}: rewrites must lower to identical normalized logical plans"
+    );
+}
+
+fn checkpoint_payload_normalized(checkpoint: &RuntimeCheckpoint) -> Value {
+    let payload = checkpoint.state_payload.as_ref().unwrap().payload.clone();
+    let mut payload: Value = serde_json::from_str(&payload).unwrap();
+    if let Some(plan) = payload
+        .get_mut("logical_plan")
+        .and_then(Value::as_object_mut)
+    {
+        plan.insert("view_sql".to_string(), Value::Null);
+        plan.insert("plan_hash".to_string(), Value::Null);
+    }
+    payload
+}
+
+fn delta_commits_canonical(deltas: &[ViewOutputDelta]) -> String {
+    deltas
+        .iter()
+        .map(|delta| {
+            format!(
+                "{}|{}|{}",
+                delta.view_id,
+                delta.schema_fingerprint,
+                serde_json::to_string(&delta.delta).unwrap()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+fn assert_identical_materialized_rows(
+    left: &(dyn StandingProgramRuntime + Send),
+    right: &(dyn StandingProgramRuntime + Send),
+    view_id: &str,
+    epoch: u64,
+) {
+    let left_page = left
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".into(),
+                program_id: "program-purchases".into(),
+                view_id: view_id.into(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(epoch),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let right_page = right
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".into(),
+                program_id: "program-purchases".into(),
+                view_id: view_id.into(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(epoch),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(left_page.batches[0], right_page.batches[0]);
+}
+
+fn equivalence_corpus_epochs(
+    scores: &VelorixRelationCatalogV1,
+    accounts: &VelorixRelationCatalogV1,
+) -> Vec<Vec<RelationInputBatch>> {
+    vec![
+        vec![
+            relation_input(
+                scores,
+                "eq-scores",
+                0,
+                2,
+                scores_rows_batch(&[("alice", 10, 1), ("bob", 5, 1)]),
+            ),
+            relation_input(
+                accounts,
+                "eq-accounts",
+                0,
+                1,
+                accounts_rows_batch(&[("a10", 10, "gold", 1)]),
+            ),
+        ],
+        vec![relation_input(
+            accounts,
+            "eq-accounts",
+            1,
+            2,
+            accounts_rows_batch(&[("a5", 5, "silver", 1), ("a10", 10, "gold", -1)]),
+        )],
+        vec![
+            relation_input(
+                scores,
+                "eq-scores",
+                2,
+                3,
+                scores_rows_batch(&[("carol", 5, 1), ("carol", 5, -1)]),
+            ),
+            relation_input(
+                accounts,
+                "eq-accounts",
+                2,
+                3,
+                accounts_rows_batch(&[("a5", 5, "silver", -1)]),
+            ),
+        ],
+        vec![relation_input(
+            scores,
+            "eq-scores",
+            3,
+            4,
+            scores_rows_batch(&[("bob", 5, -1)]),
+        )],
+    ]
+}
+
+#[test]
+fn query_equivalence_harness_proves_identical_plans_deltas_and_checkpoints() {
+    let scores = scores_catalog();
+    let accounts = accounts_catalog();
+    let catalogs = vec![scores.clone(), accounts.clone()];
+    let input_schemas = catalogs
+        .iter()
+        .map(|catalog| catalog_input_relation_schema(catalog).unwrap())
+        .collect::<Vec<_>>();
+    let output = scores_projection_output_schema();
+
+    // Tier 1: rewrites must lower to identical normalized logical plans.
+    let in_list = "select user_id, score from scores where score in (1, 2)";
+    let or_chain = "select user_id, score from scores where score = 1 or score = 2";
+    assert_equivalent_lowering(
+        in_list,
+        or_chain,
+        std::slice::from_ref(&scores),
+        &output,
+        "IN-list vs OR-chain",
+    );
+
+    let cte_sql = "with c as (select * from scores where score > 0) select user_id, score from c";
+    let inline_sql = "select user_id, score from scores where score > 0";
+    assert_equivalent_lowering(
+        cte_sql,
+        inline_sql,
+        std::slice::from_ref(&scores),
+        &output,
+        "CTE-inlined vs inline",
+    );
+
+    let in_subquery =
+        "select s.user_id, s.score from scores s where s.score in (select a.limit from accounts a)";
+    let exists_subquery = "select s.user_id, s.score from scores s where exists (select 1 from accounts a where a.limit = s.score)";
+    assert_equivalent_lowering(
+        in_subquery,
+        exists_subquery,
+        &catalogs,
+        &output,
+        "IN-subquery vs EXISTS-subquery",
+    );
+
+    // Tier 2: dual-runtime execution equivalence across an adversarial
+    // corpus (inserts, retractions, net-zero batches, side switches).
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &standing_identity_with_view(in_subquery, "positive_scores"),
+        &catalogs,
+        in_subquery,
+        &input_schemas,
+        std::slice::from_ref(&output),
+    )
+    .unwrap();
+    let mut reference = create_standing_runtime_with_sql_and_catalogs(
+        &standing_identity_with_view(exists_subquery, "positive_scores"),
+        &catalogs,
+        exists_subquery,
+        &input_schemas,
+        std::slice::from_ref(&output),
+    )
+    .unwrap();
+
+    let corpus = equivalence_corpus_epochs(&scores, &accounts);
+    for (epoch, batches) in corpus.iter().enumerate() {
+        let epoch = (epoch + 1) as u64;
+        let left_commit = runtime
+            .apply_changes(
+                epoch,
+                EpochIdempotencyKey::new(format!("eq-epoch-{epoch}")).unwrap(),
+                batches.clone(),
+            )
+            .unwrap();
+        let right_commit = reference
+            .apply_changes(
+                epoch,
+                EpochIdempotencyKey::new(format!("eq-epoch-{epoch}")).unwrap(),
+                batches.clone(),
+            )
+            .unwrap();
+        assert_eq!(
+            delta_commits_canonical(&left_commit.output_deltas),
+            delta_commits_canonical(&right_commit.output_deltas)
+        );
+        assert_identical_materialized_rows(
+            runtime.as_ref(),
+            reference.as_ref(),
+            "positive_scores",
+            epoch,
+        );
+    }
+
+    let left_checkpoint = runtime.checkpoint().unwrap();
+    let right_checkpoint = reference.checkpoint().unwrap();
+    assert_eq!(
+        checkpoint_payload_normalized(&left_checkpoint),
+        checkpoint_payload_normalized(&right_checkpoint),
+        "rewritten and reference runtimes must reach identical checkpoint state"
+    );
+
+    // Crash-window equivalence: restart the reference and verify the
+    // remaining epochs stay identical.
+    let mut restarted = restore_standing_runtime(right_checkpoint).unwrap();
+    let restarted_epochs = vec![relation_input(
+        &scores,
+        "eq-scores",
+        4,
+        5,
+        scores_rows_batch(&[("dave", 1, 1)]),
+    )];
+    let left_commit = runtime
+        .apply_changes(
+            5,
+            EpochIdempotencyKey::new("eq-epoch-5").unwrap(),
+            restarted_epochs.clone(),
+        )
+        .unwrap();
+    let right_commit = restarted
+        .apply_changes(
+            5,
+            EpochIdempotencyKey::new("eq-epoch-5").unwrap(),
+            restarted_epochs,
+        )
+        .unwrap();
+    assert_eq!(
+        delta_commits_canonical(&left_commit.output_deltas),
+        delta_commits_canonical(&right_commit.output_deltas)
+    );
+    assert_identical_materialized_rows(runtime.as_ref(), restarted.as_ref(), "positive_scores", 5);
+}
+
+fn edges_catalog() -> VelorixRelationCatalogV1 {
+    let relation_schema = VelorixRelationSchemaV1 {
+        relation_id: "edges".to_string(),
+        relation_name: "edges".to_string(),
+        relation_version: "2026-08-13.v1".to_string(),
+        columns: vec![
+            RelationColumnV1 {
+                column_id: "edge_id".to_string(),
+                name: "edge_id".to_string(),
+                logical_type: VelorixLogicalTypeV1::Utf8,
+                physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+                nullable: false,
+                ordinal: 0,
+                semantic_role: RelationSemanticRoleV1::PrimaryKey,
+            },
+            RelationColumnV1 {
+                column_id: "src".to_string(),
+                name: "src".to_string(),
+                logical_type: VelorixLogicalTypeV1::Utf8,
+                physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+                nullable: false,
+                ordinal: 1,
+                semantic_role: RelationSemanticRoleV1::Value,
+            },
+            RelationColumnV1 {
+                column_id: "dst".to_string(),
+                name: "dst".to_string(),
+                logical_type: VelorixLogicalTypeV1::Utf8,
+                physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+                nullable: false,
+                ordinal: 2,
+                semantic_role: RelationSemanticRoleV1::Value,
+            },
+            RelationColumnV1 {
+                column_id: "delta".to_string(),
+                name: "delta".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 3,
+                semantic_role: RelationSemanticRoleV1::Weight,
+            },
+        ],
+        primary_key_column_ids: vec!["edge_id".to_string()],
+        weight_column_id: "delta".to_string(),
+        allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+        event_time_column_id: None,
+    };
+    let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
+    VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
+        schema_version: RELATION_SCHEMA_VERSION_V1,
+        relation_schema,
+        schema_fingerprint: schema_fingerprint.clone(),
+        datafusion_registration: DataFusionRegistrationV1 {
+            name: "edges".to_string(),
+            mode: DataFusionRegistrationModeV1::Table,
+        },
+        incremental_relation: IncrementalRelationBindingV1 {
+            relation_id: "edges".to_string(),
+            schema_fingerprint,
+        },
+        incremental_adapter: IncrementalAdapterBindingV1 {
+            adapter_id: CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.to_string(),
+        },
+    }
+}
+
+fn edges_rows_batch(rows: &[(&str, &str, &str, i64)]) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("edge_id", DataType::Utf8, false),
+            Field::new("src", DataType::Utf8, false),
+            Field::new("dst", DataType::Utf8, false),
+            Field::new("delta", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.2).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(Int64Array::from(
+                rows.iter().map(|row| row.3).collect::<Vec<_>>(),
+            )) as _,
+        ],
+    )
+    .unwrap()
+}
+
+fn recursive_reachability_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "reachability".to_string(),
+        relation_name: "reachability".to_string(),
+        relation_version: "2026-08-13.v1".to_string(),
+        schema_fingerprint: "recursive-reach-v1".to_string(),
+        columns: vec![
+            ColumnSchema {
+                name: "src".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "dst".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["src".to_string(), "dst".to_string()],
+    }
+}
+
+fn assert_reachability_page(
+    runtime: &(dyn StandingProgramRuntime + Send),
+    epoch: u64,
+    expected: &[(&str, &str)],
+) {
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".into(),
+                program_id: "program-purchases".into(),
+                view_id: "reachability".into(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(epoch),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let srcs = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let dsts = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mut actual = (0..batch.num_rows())
+        .map(|index| (srcs.value(index), dsts.value(index)))
+        .collect::<Vec<_>>();
+    let mut expected = expected.to_vec();
+    actual.sort();
+    expected.sort();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn recursive_cte_materializes_closure_exactly_across_retract_restart_and_fail_closed() {
+    let edges = edges_catalog();
+    let input_schema = catalog_input_relation_schema(&edges).unwrap();
+    let output_schema = recursive_reachability_output_schema();
+    let sql = "with recursive reach as (select src, dst from edges union distinct select r.src, e.dst from reach r join edges e on r.dst = e.src) select src, dst from reach";
+    let identity = standing_identity_with_view(sql, "reachability");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&edges),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("reach-epoch-1").unwrap(),
+            vec![relation_input(
+                &edges,
+                "reach-edges",
+                0,
+                3,
+                edges_rows_batch(&[
+                    ("e1", "a", "b", 1),
+                    ("e2", "b", "c", 1),
+                    ("e3", "c", "d", 1),
+                ]),
+            )],
+        )
+        .unwrap();
+    assert_reachability_page(
+        runtime.as_ref(),
+        1,
+        &[
+            ("a", "b"),
+            ("b", "c"),
+            ("c", "d"),
+            ("a", "c"),
+            ("b", "d"),
+            ("a", "d"),
+        ],
+    );
+
+    runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("reach-epoch-2").unwrap(),
+            vec![relation_input(
+                &edges,
+                "reach-edges",
+                3,
+                4,
+                edges_rows_batch(&[("e2", "b", "c", -1)]),
+            )],
+        )
+        .unwrap();
+    assert_reachability_page(runtime.as_ref(), 2, &[("a", "b"), ("c", "d")]);
+
+    runtime
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("reach-epoch-3").unwrap(),
+            vec![relation_input(
+                &edges,
+                "reach-edges",
+                4,
+                5,
+                edges_rows_batch(&[("e2", "b", "c", 1)]),
+            )],
+        )
+        .unwrap();
+    assert_reachability_page(
+        runtime.as_ref(),
+        3,
+        &[
+            ("a", "b"),
+            ("b", "c"),
+            ("c", "d"),
+            ("a", "c"),
+            ("b", "d"),
+            ("a", "d"),
+        ],
+    );
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    assert_reachability_page(
+        restored.as_ref(),
+        3,
+        &[
+            ("a", "b"),
+            ("b", "c"),
+            ("c", "d"),
+            ("a", "c"),
+            ("b", "d"),
+            ("a", "d"),
+        ],
+    );
+    restored
+        .apply_changes(
+            4,
+            EpochIdempotencyKey::new("reach-epoch-4").unwrap(),
+            vec![relation_input(
+                &edges,
+                "reach-edges",
+                5,
+                6,
+                edges_rows_batch(&[("e4", "d", "e", 1)]),
+            )],
+        )
+        .unwrap();
+    assert_reachability_page(
+        restored.as_ref(),
+        4,
+        &[
+            ("a", "b"),
+            ("b", "c"),
+            ("c", "d"),
+            ("a", "c"),
+            ("b", "d"),
+            ("a", "d"),
+            ("d", "e"),
+            ("c", "e"),
+            ("b", "e"),
+            ("a", "e"),
+        ],
+    );
+
+    for (sql, fragment) in [
+        (
+            "with recursive reach as (select src, dst from edges union all select r.src, e.dst from reach r join edges e on r.dst = e.src) select src, dst from reach",
+            "UNION ALL",
+        ),
+        (
+            "with recursive reach as (select src, count(*) from edges group by src union distinct select r.src, count(*) from reach r join edges e on r.dst = e.src group by r.src) select src, count from reach",
+            "must not use DISTINCT or GROUP BY",
+        ),
+        (
+            "with recursive reach as (select src, dst from edges union distinct select r2.src, e.dst from reach r2 join reach r1 on r1.dst = r2.src join edges e on r2.dst = e.src) select src, dst from reach",
+            "exactly one JOIN",
+        ),
+    ] {
+        let error = lower_supported_sql_to_logical_plan(
+            sql,
+            std::slice::from_ref(&edges),
+            &output_schema,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains(fragment),
+            "expected fail-closed for {fragment}, got: {error}"
+        );
+    }
+}
+
+fn cross_join_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "pair_matches".to_string(),
+        relation_name: "pair_matches".to_string(),
+        relation_version: "2026-08-13.v1".to_string(),
+        schema_fingerprint: "cross-join-v1".to_string(),
+        columns: vec![
+            ColumnSchema {
+                name: "user_id".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "account_id".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "score".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "tier".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+        ],
+        primary_key: vec![
+            "user_id".to_string(),
+            "account_id".to_string(),
+            "score".to_string(),
+            "tier".to_string(),
+        ],
+    }
+}
+
+fn assert_cross_join_page(
+    runtime: &(dyn StandingProgramRuntime + Send),
+    epoch: u64,
+    expected: &[(&str, &str, i64, &str)],
+) {
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".into(),
+                program_id: "program-purchases".into(),
+                view_id: "pair_matches".into(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(epoch),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let users = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let accounts = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let scores = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let tiers = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mut actual = (0..batch.num_rows())
+        .map(|index| {
+            (
+                users.value(index),
+                accounts.value(index),
+                scores.value(index),
+                tiers.value(index),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut expected = expected.to_vec();
+    actual.sort();
+    expected.sort();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn cross_join_materializes_all_pairs_exactly_across_retract_and_restart() {
+    let scores = generic_adapter_catalog(scores_catalog());
+    let accounts = generic_adapter_catalog(accounts_catalog());
+    let catalogs = vec![scores.clone(), accounts.clone()];
+    let input_schemas = catalogs
+        .iter()
+        .map(|catalog| catalog_input_relation_schema(catalog).unwrap())
+        .collect::<Vec<_>>();
+    let output_schema = cross_join_output_schema();
+    let sql = "select s.user_id, a.account_id, s.score, a.tier from scores s cross join accounts a";
+    let identity = standing_identity_with_view(sql, "pair_matches");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &catalogs,
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("cross-epoch-1").unwrap(),
+            vec![
+                relation_input(
+                    &scores,
+                    "cross-scores",
+                    0,
+                    2,
+                    scores_rows_batch(&[("alice", 10, 1), ("bob", 5, 1)]),
+                ),
+                relation_input(
+                    &accounts,
+                    "cross-accounts",
+                    0,
+                    1,
+                    accounts_rows_batch(&[("a1", 100, "gold", 1)]),
+                ),
+            ],
+        )
+        .unwrap();
+    assert_cross_join_page(
+        runtime.as_ref(),
+        1,
+        &[("alice", "a1", 10, "gold"), ("bob", "a1", 5, "gold")],
+    );
+
+    runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("cross-epoch-2").unwrap(),
+            vec![relation_input(
+                &accounts,
+                "cross-accounts",
+                1,
+                2,
+                accounts_rows_batch(&[("a2", 50, "silver", 1)]),
+            )],
+        )
+        .unwrap();
+    assert_cross_join_page(
+        runtime.as_ref(),
+        2,
+        &[
+            ("alice", "a1", 10, "gold"),
+            ("bob", "a1", 5, "gold"),
+            ("alice", "a2", 10, "silver"),
+            ("bob", "a2", 5, "silver"),
+        ],
+    );
+
+    runtime
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("cross-epoch-3").unwrap(),
+            vec![relation_input(
+                &scores,
+                "cross-scores",
+                2,
+                3,
+                scores_rows_batch(&[("bob", 5, -1)]),
+            )],
+        )
+        .unwrap();
+    assert_cross_join_page(
+        runtime.as_ref(),
+        3,
+        &[("alice", "a1", 10, "gold"), ("alice", "a2", 10, "silver")],
+    );
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    assert_cross_join_page(
+        restored.as_ref(),
+        3,
+        &[("alice", "a1", 10, "gold"), ("alice", "a2", 10, "silver")],
+    );
+    restored
+        .apply_changes(
+            4,
+            EpochIdempotencyKey::new("cross-epoch-4").unwrap(),
+            vec![relation_input(
+                &accounts,
+                "cross-accounts",
+                2,
+                3,
+                accounts_rows_batch(&[("a1", 100, "gold", -1)]),
+            )],
+        )
+        .unwrap();
+    assert_cross_join_page(restored.as_ref(), 4, &[("alice", "a2", 10, "silver")]);
+
+    for sql in [
+        "select s.user_id, a.account_id from scores s cross join accounts a on s.user_id = a.account_id",
+        "select s.user_id, a.account_id, s.score from scores s cross join accounts a where s.score > 5",
+        "select s.user_id, s.score from scores s cross join accounts a",
+        "select s.user_id, a.account_id, s.score, count(*) from scores s cross join accounts a group by s.user_id, a.account_id, s.score",
+    ] {
+        let error = lower_supported_sql_to_logical_plan(
+            sql,
+            &catalogs,
+            &cross_join_output_schema(),
+        )
+        .unwrap_err();
+        assert!(
+            !error.to_string().contains("admitted"),
+            "expected fail-closed for {sql}, got: {error}"
+        );
+    }
+}
+
+#[test]
+fn phase8_admission_fails_closed_on_unsafe_shapes() {
+    let edges = edges_catalog();
+    let scores = scores_catalog();
+    let accounts = accounts_catalog();
+    let output = recursive_reachability_output_schema();
+    let interval_output = interval_join_output_schema();
+    let probe_result = lower_supported_sql_to_logical_plan(
+        "select s.user_id, a.account_id, s.score, a.tier from scores s cross join accounts a group by s.user_id, a.account_id, s.score, a.tier",
+        &[generic_adapter_catalog(scores.clone()), generic_adapter_catalog(accounts.clone())],
+        &cross_join_output_schema(),
+    );
+    println!("PROBE chain GROUP BY => {probe_result:?}");
+    for (sql, catalogs, output_schema, fragment) in [
+        (
+            "with recursive reach as (select src, delta from edges union distinct select r.src, e.dst from reach r join edges e on r.dst = e.src) select src, dst from reach",
+            vec![edges.clone()],
+            output.clone(),
+            "weight column",
+        ),
+        (
+            "with recursive reach as (select src, dst from edges union distinct select r.src, e.dst from reach r join edges e on r.dst = e.missing_col) select src, dst from reach",
+            vec![edges.clone()],
+            output.clone(),
+            "not registered",
+        ),
+        (
+            "with recursive reach as (select src, code from codes union distinct select r.src, e.code from reach r join codes e on r.src = e.code) select src, code from reach",
+            vec![mixed_join_type_catalog()],
+            mixed_join_type_output_schema(),
+            "identical physical types",
+        ),
+        (
+            "with recursive reach as (select src, dst from edges where dst > 5 union distinct select r.src, e.dst from reach r join edges e on r.dst = e.src) select src, dst from reach",
+            vec![edges.clone()],
+            output.clone(),
+            "integer literals require an Int64 column",
+        ),
+        (
+            "with recursive reach as (select src, dst from edges union distinct select r.src, e.dst from reach r join edges e on r.dst = e.src) select src as s, dst from reach",
+            vec![edges.clone()],
+            output.clone(),
+            "must not use aliases",
+        ),
+        (
+            "with recursive reach as (select distinct src, dst from edges union distinct select r.src, e.dst from reach r join edges e on r.dst = e.src) select src, dst from reach",
+            vec![edges.clone()],
+            output.clone(),
+            "must not use DISTINCT or GROUP BY",
+        ),
+        (
+            "with recursive reach as (select src, dst from edges union distinct select r.src, e.dst from reach r join edges e on r.dst = e.src) select src, dst from reach",
+            vec![scores.clone()],
+            output.clone(),
+            "requires generic",
+        ),
+        (
+            "select user_id, ceil(score) as c from scores",
+            vec![scores.clone()],
+            scores_projection_output_schema(),
+            "CEIL/FLOOR require a float64 argument",
+        ),
+        (
+            "select s.user_id, a.account_id, s.score, a.tier from scores s cross join accounts a group by s.user_id, a.account_id, s.score, a.tier",
+            vec![generic_adapter_catalog(scores.clone()), generic_adapter_catalog(accounts.clone())],
+            cross_join_output_schema(),
+            "INNER or narrow LEFT/RIGHT JOIN",
+        ),
+    ] {
+        let error = lower_supported_sql_to_logical_plan(sql, &catalogs, &output_schema)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(fragment),
+            "expected `{fragment}` in error for {sql}, got: {error}"
+        );
+    }
+
+    // The interval join output must not silently drop a weight-2 collapse:
+    // one left row overlapping two right rows now yields two distinct rows.
+    let rides = interval_join_rides_catalog();
+    let vehicles = interval_join_vehicles_catalog();
+    let catalogs = vec![rides.clone(), vehicles.clone()];
+    let input_schemas = catalogs
+        .iter()
+        .map(|catalog| catalog_input_relation_schema(catalog).unwrap())
+        .collect::<Vec<_>>();
+    let sql = "select r.ride_id, r.booking_start, r.booking_end_time from rides r join vehicles v on r.booking_start < v.capacity_end and v.capacity_start_time < r.booking_end_time";
+    let identity = standing_identity_with_view(sql, "interval_matches");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &catalogs,
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&interval_output),
+    )
+    .unwrap();
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("multi-match-epoch-1").unwrap(),
+            vec![
+                relation_input(
+                    &rides,
+                    "mm-rides",
+                    0,
+                    1,
+                    interval_rides_rows_batch(&[("r1", 10, 20, 1)]),
+                ),
+                relation_input(
+                    &vehicles,
+                    "mm-vehicles",
+                    0,
+                    2,
+                    interval_vehicles_rows_batch(&[("v1", 15, 25, 1), ("v4", 18, 22, 1)]),
+                ),
+            ],
+        )
+        .unwrap();
+    assert_interval_join_page(
+        runtime.as_ref(),
+        1,
+        &[("r1", 10, 20, "v1"), ("r1", 10, 20, "v4")],
+    );
+    let checkpoint = runtime.checkpoint().unwrap();
+    let restored = restore_standing_runtime(checkpoint).unwrap();
+    assert_interval_join_page(
+        restored.as_ref(),
+        1,
+        &[("r1", 10, 20, "v1"), ("r1", 10, 20, "v4")],
+    );
+}
+
+fn mixed_join_type_catalog() -> VelorixRelationCatalogV1 {
+    let relation_schema = VelorixRelationSchemaV1 {
+        relation_id: "codes".to_string(),
+        relation_name: "codes".to_string(),
+        relation_version: "2026-08-13.v1".to_string(),
+        columns: vec![
+            RelationColumnV1 {
+                column_id: "id".to_string(),
+                name: "id".to_string(),
+                logical_type: VelorixLogicalTypeV1::Utf8,
+                physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+                nullable: false,
+                ordinal: 0,
+                semantic_role: RelationSemanticRoleV1::PrimaryKey,
+            },
+            RelationColumnV1 {
+                column_id: "src".to_string(),
+                name: "src".to_string(),
+                logical_type: VelorixLogicalTypeV1::Utf8,
+                physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+                nullable: false,
+                ordinal: 1,
+                semantic_role: RelationSemanticRoleV1::Value,
+            },
+            RelationColumnV1 {
+                column_id: "code".to_string(),
+                name: "code".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 2,
+                semantic_role: RelationSemanticRoleV1::Value,
+            },
+            RelationColumnV1 {
+                column_id: "delta".to_string(),
+                name: "delta".to_string(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 3,
+                semantic_role: RelationSemanticRoleV1::Weight,
+            },
+        ],
+        primary_key_column_ids: vec!["id".to_string()],
+        weight_column_id: "delta".to_string(),
+        allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+        event_time_column_id: None,
+    };
+    let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
+    VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
+        schema_version: RELATION_SCHEMA_VERSION_V1,
+        relation_schema,
+        schema_fingerprint: schema_fingerprint.clone(),
+        datafusion_registration: DataFusionRegistrationV1 {
+            name: "codes".to_string(),
+            mode: DataFusionRegistrationModeV1::Table,
+        },
+        incremental_relation: IncrementalRelationBindingV1 {
+            relation_id: "codes".to_string(),
+            schema_fingerprint,
+        },
+        incremental_adapter: IncrementalAdapterBindingV1 {
+            adapter_id: CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.to_string(),
+        },
+    }
+}
+
+fn mixed_join_type_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "mixed_codes".to_string(),
+        relation_name: "mixed_codes".to_string(),
+        relation_version: "2026-08-13.v1".to_string(),
+        schema_fingerprint: "mixed-codes-v1".to_string(),
+        columns: vec![
+            ColumnSchema {
+                name: "src".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "code".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["src".to_string(), "code".to_string()],
+    }
 }

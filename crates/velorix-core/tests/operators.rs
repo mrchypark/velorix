@@ -135,6 +135,40 @@ fn operators_keyed_equi_join_compacts_side_state_after_insert_retract_churn() {
 }
 
 #[test]
+fn operators_keyed_equi_join_rejects_weight_product_overflow_without_mutating_state() {
+    let mut join = KeyedEquiJoin::new(join_values);
+    let right = DeltaBatch::from_records([record("acct:1", json!({ "balance": 30 }), i64::MAX)]);
+    join.apply_right(&right).unwrap();
+
+    let result = join.apply_left(&DeltaBatch::from_records([record(
+        "acct:1",
+        json!({ "name": "Ada" }),
+        2,
+    )]));
+
+    assert_eq!(result, Err(OperatorError::WeightOverflow));
+    assert!(join.left_state().records().is_empty());
+    assert_eq!(join.right_state().records(), right.records());
+}
+
+#[test]
+fn operators_keyed_equi_join_rejects_side_weight_overflow_without_mutating_state() {
+    let mut join = KeyedEquiJoin::new(join_values);
+    let initial = DeltaBatch::from_records([record("acct:1", json!({ "name": "Ada" }), i64::MAX)]);
+    join.apply_left(&initial).unwrap();
+
+    let result = join.apply_left(&DeltaBatch::from_records([record(
+        "acct:1",
+        json!({ "name": "Ada" }),
+        1,
+    )]));
+
+    assert_eq!(result, Err(OperatorError::WeightOverflow));
+    assert_eq!(join.left_state().records(), initial.records());
+    assert!(join.right_state().records().is_empty());
+}
+
+#[test]
 fn operators_keyed_equi_join_left_retractions_emit_joined_retractions() {
     let mut join = KeyedEquiJoin::new(join_values);
     let right_insert = DeltaBatch::from_records([record("acct:1", json!({ "balance": 30 }), 1)]);

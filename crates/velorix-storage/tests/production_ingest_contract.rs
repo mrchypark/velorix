@@ -51,23 +51,6 @@ fn production_sources_do_not_call_bootstrap_ingest_apis() {
 }
 
 #[test]
-fn production_source_scan_includes_top_level_benchmarks() {
-    let workspace = workspace_root();
-    let sources = production_source_scan_sources(&workspace);
-
-    for benchmark in top_level_rust_files(&workspace.join("benches")) {
-        assert!(
-            sources.iter().any(|source| source == &benchmark),
-            "production ingest source contract should scan {}",
-            benchmark
-                .strip_prefix(&workspace)
-                .unwrap_or(&benchmark)
-                .display()
-        );
-    }
-}
-
-#[test]
 fn production_source_scan_includes_top_level_e2e_tests() {
     let workspace = workspace_root();
     let sources = production_source_scan_sources(&workspace);
@@ -85,7 +68,7 @@ fn production_source_scan_includes_top_level_e2e_tests() {
 fn production_like_ingest_harnesses_use_process_local_coordinator() {
     let workspace = workspace_root();
     {
-        let source = workspace.join("benches/local_incremental.rs");
+        let source = workspace.join("crates/velorix-runtime/benches/local_incremental.rs");
         let contents = fs::read_to_string(&source).expect("read production-like ingest harness");
         assert!(
             contents.contains("IngestAdmissionCoordinator::new(")
@@ -121,7 +104,7 @@ fn production_like_ingest_harnesses_use_process_local_coordinator() {
 fn production_like_authority_harnesses_use_checked_object_store_constructors() {
     let workspace = workspace_root();
     {
-        let source = workspace.join("benches/local_incremental.rs");
+        let source = workspace.join("crates/velorix-runtime/benches/local_incremental.rs");
         let contents = fs::read_to_string(&source).expect("read production-like authority harness");
         for required in [
             "probe_authoritative_object_store_capabilities(",
@@ -438,7 +421,6 @@ fn workspace_root() -> PathBuf {
 
 fn production_source_scan_sources(workspace: &Path) -> Vec<PathBuf> {
     let mut sources = rust_sources_under(&workspace.join("crates"));
-    sources.extend(top_level_rust_files(&workspace.join("benches")));
     sources.extend(rust_sources_under(&workspace.join("tests")));
     sources.sort();
     sources
@@ -611,19 +593,6 @@ fn function_body<'a>(contents: &'a str, signature: &str) -> Option<&'a str> {
 fn rust_sources_under(root: &Path) -> Vec<PathBuf> {
     let mut sources = Vec::new();
     collect_rust_sources(root, &mut sources);
-    sources
-}
-
-fn top_level_rust_files(root: &Path) -> Vec<PathBuf> {
-    let mut sources = Vec::new();
-    let entries = fs::read_dir(root).expect("read benchmark directory");
-    for entry in entries {
-        let path = entry.expect("read benchmark directory entry").path();
-        if path.is_file() && path.extension().is_some_and(|extension| extension == "rs") {
-            sources.push(path);
-        }
-    }
-    sources.sort();
     sources
 }
 

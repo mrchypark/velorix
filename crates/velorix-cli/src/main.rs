@@ -4,6 +4,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
+    io::{self, Read},
     path::Path,
     path::PathBuf,
     sync::Arc,
@@ -35,6 +36,7 @@ use velorix_control::storage_admin::{
     GarbageCollectionPlan, GarbageCollectionPolicy, GarbageCollectionRunV1, IngestBatchDescriptor,
     InputRange, LatestCandidateMarker, StateObjectWrite,
 };
+use velorix_core::relation::{VelorixRelationCatalogV1, VelorixRelationSchemaV1};
 use velorix_k8s::{
     crd::ObjectStoreAuthorityRef,
     ingest_writer::DeployedIngestWriterRuntime,
@@ -163,6 +165,15 @@ struct Cli {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Generate a validated POST /v1/relations request from a relation schema.
+    RelationCatalog {
+        /// VelorixRelationSchemaV1 JSON file, or - for stdin.
+        #[arg(long)]
+        schema: PathBuf,
+        /// Explicit incremental adapter ID.
+        #[arg(long)]
+        adapter_id: String,
+    },
     CheckpointInspectLocal {
         #[arg(long)]
         object_store_dir: PathBuf,
@@ -328,6 +339,10 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Some(Command::RelationCatalog { schema, adapter_id }) => {
+            let request = relation_catalog_request(&schema, adapter_id)?;
+            println!("{}", serde_json::to_string(&request)?);
+        }
         Some(Command::CheckpointInspectLocal {
             object_store_dir,
             json,
@@ -633,6 +648,32 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct RelationCatalogRequest {
+    catalog: VelorixRelationCatalogV1,
+}
+
+fn relation_catalog_request(
+    schema_path: &Path,
+    adapter_id: String,
+) -> anyhow::Result<RelationCatalogRequest> {
+    let bytes = if schema_path == Path::new("-") {
+        let mut bytes = Vec::new();
+        io::stdin()
+            .read_to_end(&mut bytes)
+            .context("failed to read relation schema from stdin")?;
+        bytes
+    } else {
+        fs::read(schema_path)
+            .with_context(|| format!("failed to read relation schema {}", schema_path.display()))?
+    };
+    let schema: VelorixRelationSchemaV1 =
+        serde_json::from_slice(&bytes).context("failed to parse VelorixRelationSchemaV1 JSON")?;
+    let catalog = VelorixRelationCatalogV1::from_relation_schema(schema, adapter_id)
+        .context("relation schema or adapter is not supported for ingest")?;
+    Ok(RelationCatalogRequest { catalog })
 }
 
 #[derive(Debug, Default)]
@@ -1217,13 +1258,13 @@ fn validate_critique_release_evidence_kind_specific_fields(
                 );
             }
         }
-        "hiqlite_total_voter_loss_restore_drill" | "hiqlite_no_pvc_three_voter_backup_restore" => {
-            if require_json_u64(path, artifact, "/voter_count")? != 3 {
-                bail!(
-                    "{} Hiqlite restore drill requires voter_count=3",
-                    path.display()
-                );
-            }
+        "hiqlite_total_voter_loss_restore_drill" | "hiqlite_no_pvc_three_voter_backup_restore"
+            if require_json_u64(path, artifact, "/voter_count")? != 3 =>
+        {
+            bail!(
+                "{} Hiqlite restore drill requires voter_count=3",
+                path.display()
+            );
         }
         "query_output_isolation"
             if require_json_str(path, artifact, "/query_authority")?
@@ -1525,6 +1566,97 @@ mod tests {
 
     fn evidence_uri(name: &str) -> String {
         format!("s3://release-evidence/{name}?sha256={}", "c".repeat(64))
+    }
+
+    fn valid_relation_schema() -> serde_json::Value {
+        json!({
+            "relation_id": "measurements",
+            "relation_name": "measurements",
+            "relation_version": "v1",
+            "columns": [
+                {
+                    "column_id": "sensor_id",
+                    "name": "sensor_id",
+                    "logical_type": {"kind": "utf8"},
+                    "physical_arrow_type": {"kind": "utf8"},
+                    "nullable": false,
+                    "ordinal": 0,
+                    "semantic_role": "primary_key"
+                },
+                {
+                    "column_id": "reading",
+                    "name": "reading",
+                    "logical_type": {"kind": "int64"},
+                    "physical_arrow_type": {"kind": "int64"},
+                    "nullable": false,
+                    "ordinal": 1,
+                    "semantic_role": "value"
+                },
+                {
+                    "column_id": "weight",
+                    "name": "weight",
+                    "logical_type": {"kind": "int64"},
+                    "physical_arrow_type": {"kind": "int64"},
+                    "nullable": false,
+                    "ordinal": 2,
+                    "semantic_role": "weight"
+                }
+            ],
+            "primary_key_column_ids": ["sensor_id"],
+            "weight_column_id": "weight",
+            "allowed_operations": ["insert", "delete"],
+            "event_time_column_id": null
+        })
+    }
+
+    #[test]
+    fn relation_catalog_command_builds_a_valid_api_request() {
+        let path = write_artifact("relation-schema", valid_relation_schema());
+        let request = relation_catalog_request(
+            &path,
+            velorix_core::relation::CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.to_string(),
+        )
+        .expect("build relation catalog request");
+
+        request.catalog.validate_ingest_adapter_scope().unwrap();
+        assert_eq!(
+            request.catalog.schema_fingerprint,
+            request.catalog.incremental_relation.schema_fingerprint
+        );
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(
+            value["catalog"]["relation_schema"]["relation_id"],
+            "measurements"
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn relation_catalog_command_rejects_unknown_fields_and_adapters() {
+        let mut schema = valid_relation_schema();
+        schema["unexpected"] = json!(true);
+        let unknown_field_path = write_artifact("relation-schema-unknown-field", schema);
+        assert!(relation_catalog_request(
+            &unknown_field_path,
+            velorix_core::relation::CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.to_string()
+        )
+        .is_err());
+
+        let valid_path = write_artifact("relation-schema-unknown-adapter", valid_relation_schema());
+        assert!(relation_catalog_request(&valid_path, "unknown-adapter".to_string()).is_err());
+        fs::remove_file(unknown_field_path).unwrap();
+        fs::remove_file(valid_path).unwrap();
+    }
+
+    #[test]
+    fn relation_catalog_command_requires_an_explicit_adapter() {
+        let error =
+            Cli::try_parse_from(["velorix-cli", "relation-catalog", "--schema", "schema.json"])
+                .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
     }
 
     fn add_release_identity(

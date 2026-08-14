@@ -32,7 +32,7 @@ pub(super) struct PreparedStandingRuntimeApplySummary {
     compaction_scheduled: usize,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(super) struct StandingRuntimeCheckpointWriteSummary {
     pub(super) output_delta_writes: usize,
     pub(super) state_payload_writes: usize,
@@ -40,12 +40,21 @@ pub(super) struct StandingRuntimeCheckpointWriteSummary {
     pub(super) checkpoint_pointer_writes: usize,
     pub(super) latest_cache_writes: usize,
     pub(super) compaction_scheduled: usize,
+    pub(super) output_refs: Vec<String>,
 }
 
 pub(super) struct StandingRuntimeCheckpointPersistContext {
     pub(super) previous_record: Option<StandingRuntimeCheckpointRecord>,
     pub(super) replay_checkpoints_to_merge: Vec<ReplayCheckpoint>,
     pub(super) owner: Option<StandingRuntimeOwnerToken>,
+    pub(super) published_relation: Option<PublishedRelationBindingV1>,
+    pub(super) direct_view_inputs: Vec<StandingRuntimeDirectViewInputV1>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct StandingRuntimeDirectViewInputV1 {
+    pub(super) published_relation: PublishedRelationBindingV1,
+    pub(super) cursor: CausalViewCursorV1,
 }
 
 impl StandingRuntimeCheckpointPersistContext {
@@ -58,7 +67,25 @@ impl StandingRuntimeCheckpointPersistContext {
             previous_record,
             replay_checkpoints_to_merge,
             owner,
+            published_relation: None,
+            direct_view_inputs: Vec::new(),
         }
+    }
+
+    pub(super) fn with_published_relation(
+        mut self,
+        published_relation: Option<PublishedRelationBindingV1>,
+    ) -> Self {
+        self.published_relation = published_relation;
+        self
+    }
+
+    pub(super) fn with_direct_view_inputs(
+        mut self,
+        direct_view_inputs: Vec<StandingRuntimeDirectViewInputV1>,
+    ) -> Self {
+        self.direct_view_inputs = direct_view_inputs;
+        self
     }
 }
 
@@ -102,6 +129,8 @@ pub(super) struct IngestEpochViewConvergenceRecord {
     logical_epoch: u64,
     checkpoint_key: String,
     checkpoint_content_hash: String,
+    pub(super) output_publication_protocol_id: String,
+    pub(super) output_refs: Vec<String>,
     replay_checkpoints: Vec<ReplayCheckpoint>,
 }
 
@@ -336,6 +365,14 @@ pub(super) async fn append_prepared_ingest_epoch_batches(
             async move {
                 let outcome = append_ingest_envelope(&state, prepared.envelope.clone()).await?;
                 let (_status, outcome, descriptor) = ingest_outcome_parts(outcome)?;
+                commit_ingest_range(
+                    &state,
+                    &prepared.request,
+                    &prepared.catalog,
+                    prepared.end_offset_exclusive,
+                    &prepared.envelope,
+                )
+                .await?;
                 Ok::<_, ApiError>(PreparedIngestAppendOutcome {
                     index,
                     appended: outcome == "appended",
@@ -404,6 +441,11 @@ pub(super) async fn materialize_prepared_ingest_epoch_for_ack_mode(
             )
             .await?;
             timer.mark("materialize");
+            // Producer checkpoints are durable now; pull every pending
+            // producer commit into dependent consumer views before the
+            // materialized acknowledgement returns.
+            drain_published_view_dependencies(state).await?;
+            timer.mark("materialize_view_dependencies");
             Ok(materialization_response("completed", summary))
         }
     }
@@ -950,6 +992,7 @@ pub(super) async fn persist_ingest_epoch_view_convergence(
     epoch_manifest: &PersistedIngestEpochManifest,
     view_id: &str,
     checkpoint: &RuntimeCheckpoint,
+    output_refs: Vec<String>,
     replay_checkpoints: Vec<ReplayCheckpoint>,
 ) -> Result<(), ApiError> {
     let key = ObjectKey::ingest_epoch_view_convergence(
@@ -968,8 +1011,8 @@ pub(super) async fn persist_ingest_epoch_view_convergence(
     )
     .map_err(ApiError::bad_request)?;
     let record = IngestEpochViewConvergenceRecord {
-        schema_version: 1,
-        record_kind: "ingest_epoch_view_convergence_v1".to_string(),
+        schema_version: 2,
+        record_kind: "ingest_epoch_view_convergence_v2".to_string(),
         epoch_manifest_id: epoch_manifest.epoch_manifest_id.clone(),
         tenant_id: checkpoint.identity.tenant_id.clone(),
         program_id: checkpoint.identity.program_id.clone(),
@@ -977,6 +1020,8 @@ pub(super) async fn persist_ingest_epoch_view_convergence(
         logical_epoch: checkpoint.logical_epoch,
         checkpoint_key: checkpoint_key.as_str().to_string(),
         checkpoint_content_hash: checkpoint.state_root.content_hash.clone(),
+        output_publication_protocol_id: OUTPUT_PUBLICATION_PROTOCOL_VERSION_V1.to_string(),
+        output_refs,
         replay_checkpoints,
     };
     let bytes =
@@ -1042,34 +1087,42 @@ pub(super) async fn read_ingest_epoch_view_convergence(
         view_id,
         key.as_str(),
     )?;
-    let pointer = state
-        .meta_store
-        .as_ref()
-        .ok_or_else(|| {
-            ApiError::service_unavailable(
-                "ingest epoch convergence requires authoritative checkpoint metadata",
+    let checkpoint = if let Some(meta_store) = state.meta_store.as_ref() {
+        let pointer = meta_store
+            .read_standing_runtime_checkpoint(
+                &record.tenant_id,
+                &record.program_id,
+                &record.view_id,
             )
-        })?
-        .read_standing_runtime_checkpoint(&record.tenant_id, &record.program_id, &record.view_id)
-        .await
-        .map_err(meta_error_to_api)?
-        .ok_or_else(|| {
-            ApiError::service_unavailable(format!(
-                "standing runtime checkpoint metadata is unavailable for `{}/{}/{}`",
-                record.tenant_id, record.program_id, record.view_id
-            ))
-        })?;
-    if pointer.checkpoint_key != record.checkpoint_key {
+            .await
+            .map_err(meta_error_to_api)?
+            .ok_or_else(|| {
+                ApiError::service_unavailable(format!(
+                    "standing runtime checkpoint metadata is unavailable for `{}/{}/{}`",
+                    record.tenant_id, record.program_id, record.view_id
+                ))
+            })?;
+        read_standing_runtime_checkpoint_record_from_pointer(state, identity, view_id, &pointer)
+            .await?
+    } else {
+        read_latest_standing_runtime_checkpoint(state, identity, view_id)
+            .await?
+            .ok_or_else(|| {
+                ApiError::service_unavailable(format!(
+                    "standing runtime local checkpoint is unavailable for `{}/{}/{}`",
+                    record.tenant_id, record.program_id, record.view_id
+                ))
+            })?
+    };
+    if checkpoint.checkpoint_key != record.checkpoint_key {
         return Err(ApiError::bad_request(format!(
             "ingest epoch view convergence checkpoint pointer mismatch at {}",
             key.as_str()
         )));
     }
-    let checkpoint =
-        read_standing_runtime_checkpoint_record_from_pointer(state, identity, view_id, &pointer)
-            .await?;
     if checkpoint.checkpoint.logical_epoch != record.logical_epoch
         || checkpoint.checkpoint.state_root.content_hash != record.checkpoint_content_hash
+        || checkpoint.checkpoint.output_manifest_refs != record.output_refs
     {
         return Err(ApiError::bad_request(format!(
             "ingest epoch view convergence checkpoint mismatch at {}",
@@ -1086,12 +1139,13 @@ pub(super) fn validate_ingest_epoch_view_convergence_record(
     view_id: &str,
     key: &str,
 ) -> Result<(), ApiError> {
-    if record.schema_version != 1
-        || record.record_kind != "ingest_epoch_view_convergence_v1"
+    if record.schema_version != 2
+        || record.record_kind != "ingest_epoch_view_convergence_v2"
         || record.epoch_manifest_id != epoch_manifest.epoch_manifest_id
         || record.tenant_id != identity.tenant_id
         || record.program_id != identity.program_id
         || record.view_id != view_id
+        || record.output_publication_protocol_id != OUTPUT_PUBLICATION_PROTOCOL_VERSION_V1
     {
         return Err(ApiError::bad_request(format!(
             "ingest epoch view convergence body/key mismatch at {key}"
@@ -1476,6 +1530,7 @@ pub(super) async fn apply_standing_runtime_prepared_ingests(
                         epoch_manifest,
                         &active.spec.view_id,
                         &latest_checkpoint.checkpoint,
+                        latest_checkpoint.checkpoint.output_manifest_refs.clone(),
                         epoch_replay_checkpoints,
                     )
                     .await?;
@@ -1561,7 +1616,8 @@ pub(super) async fn apply_standing_runtime_prepared_ingests(
                 previous_checkpoint,
                 epoch_replay_checkpoints.clone(),
                 owner,
-            ),
+            )
+            .with_published_relation(published_relation_binding_for_active_view(&active)?),
             timer.as_deref_mut(),
         )
         .await
@@ -1593,6 +1649,7 @@ pub(super) async fn apply_standing_runtime_prepared_ingests(
                 epoch_manifest,
                 &active.spec.view_id,
                 &apply_result.checkpoint,
+                checkpoint_write_summary.output_refs.clone(),
                 epoch_replay_checkpoints,
             )
             .await?;
@@ -1631,6 +1688,7 @@ pub(super) fn relation_input_batch_from_prepared_ingest(
     prepared: &PreparedIngestBatch,
 ) -> RelationInputBatch {
     RelationInputBatch {
+        encoding: RelationInputEncodingV1::SourceRelationV1,
         relation_id: prepared.request.relation_id.clone(),
         relation_version: prepared.request.relation_version.clone(),
         stream_id: prepared.request.stream_id.clone(),
@@ -1742,11 +1800,33 @@ pub(super) async fn apply_standing_runtime_changes_and_checkpoint_many(
             .map_err(|_| ApiError::internal("standing runtime lock poisoned"))?;
         let logical_epoch =
             next_standing_runtime_logical_epoch(runtime.as_ref(), lower_bound_epoch)?;
-        let commit = runtime
-            .apply_changes(logical_epoch, idempotency_key, input_batches)
-            .map_err(ApiError::bad_request)?;
+        let before = runtime.checkpoint().map_err(ApiError::bad_request)?;
+        let commit = match runtime.apply_changes(logical_epoch, idempotency_key, input_batches) {
+            Ok(commit) => commit,
+            Err(error) => {
+                *runtime = velorix_runtime::materialized_view_runtime::restore_standing_runtime(
+                    before,
+                )
+                .map_err(|restore| {
+                    ApiError::internal(format!(
+                        "standing runtime apply failed with {error}; rollback failed with {restore}"
+                    ))
+                })?;
+                return Err(ApiError::bad_request(error));
+            }
+        };
         let checkpoint = runtime.checkpoint().map_err(ApiError::bad_request)?;
-        validate_standing_runtime_budget(&commit.output_deltas, &checkpoint, budget_limits)?;
+        if let Err(error) =
+            validate_standing_runtime_budget(&commit.output_deltas, &checkpoint, budget_limits)
+        {
+            *runtime = velorix_runtime::materialized_view_runtime::restore_standing_runtime(before)
+                .map_err(|restore| {
+                    ApiError::internal(format!(
+                        "standing runtime budget rejected the epoch with {error}; rollback failed with {restore}"
+                    ))
+                })?;
+            return Err(error);
+        }
         Ok(StandingRuntimeApplyResult {
             checkpoint,
             output_deltas: commit.output_deltas,
@@ -1796,30 +1876,9 @@ pub(super) async fn reserve_ingest_range(
         .meta_store
         .as_ref()
         .ok_or_else(|| ApiError::internal("metadata store is not configured"))?;
-    let header = IngestEnvelope::decode(envelope.clone())
-        .map_err(ApiError::bad_request)?
-        .header()
-        .clone();
-    let batch_key = ObjectKey::ingest_batch(
-        &request.stream_id,
-        request.partition_id,
-        request.start_offset_inclusive,
-        end_offset_exclusive,
-    )
-    .map_err(ApiError::bad_request)?;
+    let reservation = ingest_range_reservation(request, catalog, end_offset_exclusive, envelope)?;
     let outcome = meta_store
-        .reserve_ingest_range(IngestRangeReservation {
-            stream_id: request.stream_id.clone(),
-            partition_id: request.partition_id,
-            start_offset_inclusive: request.start_offset_inclusive,
-            end_offset_exclusive,
-            batch_key: batch_key.as_str().to_string(),
-            payload_digest: header.payload_digest,
-            relation_id: request.relation_id.clone(),
-            relation_version: request.relation_version.clone(),
-            schema_fingerprint: catalog.schema_fingerprint.as_str().to_string(),
-            writer_epoch: 0,
-        })
+        .reserve_ingest_range(reservation)
         .await
         .map_err(meta_error_to_api)?;
 
@@ -1833,6 +1892,64 @@ pub(super) async fn reserve_ingest_range(
             end_offset_exclusive
         ))),
     }
+}
+
+async fn commit_ingest_range(
+    state: &ApiState,
+    request: &IngestRowsRequest,
+    catalog: &VelorixRelationCatalogV1,
+    end_offset_exclusive: u64,
+    envelope: &bytes::Bytes,
+) -> Result<(), ApiError> {
+    let Some(meta_store) = state.meta_store.as_ref() else {
+        return Ok(());
+    };
+    let reservation = ingest_range_reservation(request, catalog, end_offset_exclusive, envelope)?;
+    match meta_store
+        .commit_ingest_range(reservation)
+        .await
+        .map_err(meta_error_to_api)?
+    {
+        CommitIngestRangeOutcome::Committed | CommitIngestRangeOutcome::Duplicate => Ok(()),
+        CommitIngestRangeOutcome::Conflict => Err(ApiError::conflict(format!(
+            "ingest commit conflict from metadata service for stream={} partition={} offsets={}-{}",
+            request.stream_id,
+            request.partition_id,
+            request.start_offset_inclusive,
+            end_offset_exclusive
+        ))),
+    }
+}
+
+fn ingest_range_reservation(
+    request: &IngestRowsRequest,
+    catalog: &VelorixRelationCatalogV1,
+    end_offset_exclusive: u64,
+    envelope: &bytes::Bytes,
+) -> Result<IngestRangeReservation, ApiError> {
+    let header = IngestEnvelope::decode(envelope.clone())
+        .map_err(ApiError::bad_request)?
+        .header()
+        .clone();
+    let batch_key = ObjectKey::ingest_batch(
+        &request.stream_id,
+        request.partition_id,
+        request.start_offset_inclusive,
+        end_offset_exclusive,
+    )
+    .map_err(ApiError::bad_request)?;
+    Ok(IngestRangeReservation {
+        stream_id: request.stream_id.clone(),
+        partition_id: request.partition_id,
+        start_offset_inclusive: request.start_offset_inclusive,
+        end_offset_exclusive,
+        batch_key: batch_key.as_str().to_string(),
+        payload_digest: header.payload_digest,
+        relation_id: request.relation_id.clone(),
+        relation_version: request.relation_version.clone(),
+        schema_fingerprint: catalog.schema_fingerprint.as_str().to_string(),
+        writer_epoch: 0,
+    })
 }
 
 pub(super) async fn append_ingest_envelope(

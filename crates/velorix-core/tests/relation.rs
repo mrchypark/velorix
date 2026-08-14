@@ -19,7 +19,8 @@ use velorix_core::relation::{
     IncrementalAdapterBindingV1, IncrementalInputAdapterError, IncrementalRelationBindingV1,
     RelationColumnV1, RelationOperationV1, RelationSchemaError, RelationSemanticRoleV1,
     SchemaFingerprintV1, VelorixLogicalTypeV1, VelorixRelationCatalogV1, VelorixRelationSchemaV1,
-    CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID, CATALOG_ROW_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID,
+    VelorixRelationSourceV1, CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID,
+    CATALOG_ROW_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID,
     CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID, ORDERS_SUM_COUNT_ADAPTER_ID,
     ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID, ORDERS_SUM_COUNT_RELATION_ID,
     ORDERS_SUM_COUNT_RELATION_VERSION, RELATION_SCHEMA_VERSION_V1,
@@ -191,6 +192,7 @@ fn relation_catalog_validation_requires_cataloged_schema_fingerprint() {
     let schema = orders_relation_schema();
     let fingerprint = SchemaFingerprintV1::for_relation_schema(&schema).unwrap();
     let mut catalog = VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
         schema_version: RELATION_SCHEMA_VERSION_V1,
         relation_schema: schema,
         schema_fingerprint: SchemaFingerprintV1::new(format!("sha256:{}", "0".repeat(64))),
@@ -526,6 +528,24 @@ fn generic_catalog_incremental_input_rejects_non_finite_float64_primary_key() {
         error.to_string().contains("finite"),
         "unexpected error: {error}"
     );
+}
+
+#[test]
+fn generic_catalog_incremental_input_normalizes_negative_zero_float64_primary_key() {
+    let catalog = float_key_account_balance_relation_catalog();
+    let batch = float_key_account_balance_input_batch(&[-0.0, 0.0], &[500, 500], &[1, -1]);
+
+    let delta = arrow_record_batches_to_single_key_sum_count_delta_batch(
+        &catalog,
+        "account_balances",
+        "2026-05-13.v1",
+        catalog.schema_fingerprint.as_str(),
+        &[batch],
+    )
+    .unwrap();
+
+    assert_eq!(delta.records()[0].key, delta.records()[1].key);
+    assert!(delta.net_rows().unwrap().is_empty());
 }
 
 #[test]
@@ -1358,6 +1378,7 @@ fn orders_relation_catalog() -> VelorixRelationCatalogV1 {
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
 
     VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
         schema_version: RELATION_SCHEMA_VERSION_V1,
         relation_schema,
         schema_fingerprint: schema_fingerprint.clone(),
@@ -1417,6 +1438,7 @@ fn account_balance_relation_catalog() -> VelorixRelationCatalogV1 {
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
 
     VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
         schema_version: RELATION_SCHEMA_VERSION_V1,
         relation_schema,
         schema_fingerprint: schema_fingerprint.clone(),
@@ -1485,6 +1507,7 @@ fn generic_activity_relation_catalog() -> VelorixRelationCatalogV1 {
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
 
     VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
         schema_version: RELATION_SCHEMA_VERSION_V1,
         relation_schema,
         schema_fingerprint: schema_fingerprint.clone(),
@@ -1553,6 +1576,7 @@ fn account_balance_by_currency_relation_catalog() -> VelorixRelationCatalogV1 {
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
 
     VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
         schema_version: RELATION_SCHEMA_VERSION_V1,
         relation_schema,
         schema_fingerprint: schema_fingerprint.clone(),
@@ -1656,6 +1680,7 @@ fn expanded_scalar_key_relation_catalog() -> VelorixRelationCatalogV1 {
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
 
     VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
         schema_version: RELATION_SCHEMA_VERSION_V1,
         relation_schema,
         schema_fingerprint: schema_fingerprint.clone(),
@@ -1741,6 +1766,7 @@ fn nested_key_relation_catalog() -> VelorixRelationCatalogV1 {
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
 
     VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
         schema_version: RELATION_SCHEMA_VERSION_V1,
         relation_schema,
         schema_fingerprint: schema_fingerprint.clone(),
@@ -1912,6 +1938,7 @@ fn daily_balance_relation_catalog() -> VelorixRelationCatalogV1 {
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
 
     VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
         schema_version: RELATION_SCHEMA_VERSION_V1,
         relation_schema,
         schema_fingerprint: schema_fingerprint.clone(),
@@ -1971,6 +1998,7 @@ fn timestamped_balance_relation_catalog() -> VelorixRelationCatalogV1 {
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
 
     VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
         schema_version: RELATION_SCHEMA_VERSION_V1,
         relation_schema,
         schema_fingerprint: schema_fingerprint.clone(),
@@ -2030,6 +2058,7 @@ fn customer_balance_relation_catalog() -> VelorixRelationCatalogV1 {
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
 
     VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
         schema_version: RELATION_SCHEMA_VERSION_V1,
         relation_schema,
         schema_fingerprint: schema_fingerprint.clone(),

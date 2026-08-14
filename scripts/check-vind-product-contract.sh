@@ -4009,10 +4009,12 @@ checks["legacy persisted source-scan surfaces are removed"] = (
     in architecture_critique
 )
 
-checks["public 1.0 rejects advanced view and partial backfill surfaces"] = (
+checks["public 1.0 gate split: event-time public, analytic experimental, partial backfill rejected"] = (
     "experimental_advanced_view_features: false" in api
     and "fn validate_public_view_feature_admission" in api
-    and "advanced view SQL is experimental and disabled for the public 1.0 API" in api
+    and "fn validate_public_runtime_plan_admission" in api
+    and "PublicViewFeaturePolicyV1" in api
+    and "analytic window SQL is experimental and disabled for the public 1.0 API" in api
     and "VELORIX_EXPERIMENTAL_ADVANCED_VIEW_FEATURES" not in api
     and "VELORIX_EXPERIMENTAL_ADVANCED_VIEW_FEATURES" not in materialized_view_roadmap
     and "VELORIX_EXPERIMENTAL_ADVANCED_VIEW_FEATURES" not in (repo_root / "scripts" / "smoke-vind-rest-row-number.sh").read_text(encoding="utf-8")
@@ -4031,7 +4033,7 @@ checks["public 1.0 rejects advanced view and partial backfill surfaces"] = (
     and '"background_tasks": state.background_task_status()' not in api
     and '"output_compaction": {' not in api
     and "Verification commands for this internal experimental-only evidence" in materialized_view_roadmap
-    and "not make window SQL part of the public 1.0 contract" in materialized_view_roadmap
+    and "Event-time window SQL\n(TUMBLE/HOP/SESSION) is part of the public 1.0 contract" in materialized_view_roadmap
     and "Operator-triggered full replay may be used to make a\nlate-created view queryable"
     in materialized_view_roadmap
     and "Public 1.0 does not expose request-scope, range, predicate, or\nbackground backfill"

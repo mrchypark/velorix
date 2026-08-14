@@ -62,6 +62,16 @@ cargo check -p velorix-storage --lib
 cargo check --workspace --all-targets
 ```
 
-Useful smoke scripts live under `scripts/`. Product scenarios should exercise
-the REST API directly: create relation, ingest rows, create view, query the view,
-restart, and query again.
+Repository-wide operational and smoke tools live under `scripts/`. Product
+scenarios should exercise the REST API directly: create relation, ingest rows,
+create view, query the view, restart, and query again.
+
+Rust benchmarks live with their owning crate under `crates/*/benches/`. Run the
+local incremental runtime gate with:
+
+```bash
+cargo bench -p velorix-runtime --bench local_incremental
+```
+
+See [How to use Velorix locally](docs/how-to.md) for a complete REST workflow,
+including durable restart recovery.

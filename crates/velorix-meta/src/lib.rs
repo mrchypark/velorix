@@ -14,6 +14,7 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 use tonic::{metadata::MetadataValue, transport::Channel, Request, Response, Status};
 use velorix_core::relation::{RelationSchemaError, VelorixRelationCatalogV1};
+use velorix_core::standing_program::RuntimeCheckpointInputCoverageV1;
 use velorix_storage::{
     log::{
         DurableIngestAdmissionRecordV1, IngestAdmissionCoordinator,
@@ -28,6 +29,22 @@ use velorix_storage::{
 pub mod proto {
     tonic::include_proto!("velorix.meta.v1");
 }
+
+mod source_cut;
+mod view_bootstrap;
+
+pub use source_cut::{
+    CaptureIngestSourceCutRequest, IngestSourceCutV1, IngestSourcePartitionCutV1,
+    IngestSourceRelationCutV1, IngestSourceRelationIdentityV1, INGEST_SOURCE_CUT_SCHEMA_VERSION_V1,
+    INGEST_SOURCE_IDENTITY_GENERATION_V1,
+};
+pub use view_bootstrap::{
+    BeginViewBootstrapOutcome, BeginViewBootstrapRequest, BeginViewDependencyEdgeV1,
+    FixViewBootstrapActivationCutOutcome, FixViewBootstrapActivationCutRequest,
+    PromoteViewBootstrapOutcome, PromoteViewBootstrapRequest, ViewBootstrapControlV1,
+    ViewBootstrapLifecycleV1, INITIAL_VIEW_BOOTSTRAP_GENERATION,
+    VIEW_BOOTSTRAP_CONTROL_SCHEMA_VERSION_V1,
+};
 
 pub const STANDING_RUNTIME_FENCING_CAPABILITY_SCHEMA_VERSION: u32 = 2;
 pub const STANDING_RUNTIME_OWNER_SCOPE_KIND_TENANT_PROGRAM_VIEW: &str = "tenant_program_view";
@@ -48,6 +65,7 @@ pub const STANDING_RUNTIME_LEASE_EXPIRY_SEMANTICS_BACKEND_WALL_CLOCK_TTL: &str =
     "backend_wall_clock_ttl";
 pub const STANDING_RUNTIME_OUTPUT_MANIFEST_REF_PREFIX: &str = "standing-runtime-output-manifest:";
 pub const STANDING_RUNTIME_OUTPUT_DELTA_REF_PREFIX: &str = "standing-runtime-output-delta:";
+pub const STANDING_RUNTIME_OUTPUT_COMMIT_REF_PREFIX: &str = "standing-runtime-output-commit:";
 pub const MAX_STANDING_RUNTIME_OWNER_TTL_MS: u64 = 300_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -59,6 +77,13 @@ pub enum StoreRelationCatalogOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReserveIngestRangeOutcome {
     Reserved,
+    Duplicate,
+    Conflict,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CommitIngestRangeOutcome {
+    Committed,
     Duplicate,
     Conflict,
 }
@@ -122,6 +147,18 @@ pub struct StandingRuntimeCheckpointPointer {
     pub manifest_hash: String,
     #[serde(default)]
     pub output_manifest_refs: Vec<String>,
+    #[serde(default)]
+    pub bootstrap_generation: u64,
+    #[serde(default)]
+    pub plan_hash: String,
+    #[serde(default)]
+    pub coverage_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_coverage: Option<RuntimeCheckpointInputCoverageV1>,
+    #[serde(default)]
+    pub previous_checkpoint_key: String,
+    #[serde(default)]
+    pub previous_manifest_hash: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -212,6 +249,16 @@ pub enum MetaStoreError {
     StandingRuntimeCheckpointScopeMismatch,
     #[error("standing runtime owner token does not match the current unexpired owner")]
     StandingRuntimeOwnerMismatch,
+    #[error("duplicate source-cut relation {relation_id}/{relation_version}")]
+    DuplicateSourceCutRelation {
+        relation_id: String,
+        relation_version: String,
+    },
+    #[error("overlapping source-cut ranges for {stream_id}/p={partition_id}")]
+    OverlappingSourceCutRange {
+        stream_id: String,
+        partition_id: u32,
+    },
     #[error("metadata capability `{0}` is not supported by this backend")]
     UnsupportedCapability(&'static str),
     #[error("remote metadata service error: {0}")]
@@ -220,6 +267,8 @@ pub enum MetaStoreError {
     UnexpectedOutcome(String),
     #[error("object-store metadata store error: {0}")]
     Oss(String),
+    #[error("standing runtime checkpoint logical epoch must increase: previous={previous}, candidate={candidate}")]
+    NonMonotonicCheckpointEpoch { previous: u64, candidate: u64 },
     #[error("hiqlite metadata store error: {0}")]
     Hiqlite(String),
 }
@@ -244,6 +293,70 @@ pub trait MetaStore: Send + Sync + 'static {
         reservation: IngestRangeReservation,
     ) -> Result<ReserveIngestRangeOutcome, MetaStoreError>;
 
+    async fn commit_ingest_range(
+        &self,
+        reservation: IngestRangeReservation,
+    ) -> Result<CommitIngestRangeOutcome, MetaStoreError> {
+        reservation.validate()?;
+        Err(MetaStoreError::UnsupportedCapability(
+            "committed_ingest_source_cut",
+        ))
+    }
+
+    async fn capture_ingest_source_cut(
+        &self,
+        request: CaptureIngestSourceCutRequest,
+    ) -> Result<IngestSourceCutV1, MetaStoreError> {
+        request.validate()?;
+        Err(MetaStoreError::UnsupportedCapability(
+            "committed_ingest_source_cut",
+        ))
+    }
+
+    async fn begin_view_bootstrap(
+        &self,
+        request: BeginViewBootstrapRequest,
+    ) -> Result<BeginViewBootstrapOutcome, MetaStoreError> {
+        request.validate()?;
+        Err(MetaStoreError::UnsupportedCapability(
+            "authoritative_view_bootstrap",
+        ))
+    }
+
+    async fn read_view_bootstrap(
+        &self,
+        tenant_id: &str,
+        program_id: &str,
+        view_id: &str,
+    ) -> Result<Option<ViewBootstrapControlV1>, MetaStoreError> {
+        require_non_empty("tenant_id", tenant_id)?;
+        require_non_empty("program_id", program_id)?;
+        require_non_empty("view_id", view_id)?;
+        Err(MetaStoreError::UnsupportedCapability(
+            "authoritative_view_bootstrap",
+        ))
+    }
+
+    async fn fix_view_bootstrap_activation_cut(
+        &self,
+        request: FixViewBootstrapActivationCutRequest,
+    ) -> Result<FixViewBootstrapActivationCutOutcome, MetaStoreError> {
+        request.validate()?;
+        Err(MetaStoreError::UnsupportedCapability(
+            "authoritative_view_bootstrap_activation",
+        ))
+    }
+
+    async fn promote_view_bootstrap(
+        &self,
+        request: PromoteViewBootstrapRequest,
+    ) -> Result<PromoteViewBootstrapOutcome, MetaStoreError> {
+        request.validate()?;
+        Err(MetaStoreError::UnsupportedCapability(
+            "authoritative_view_bootstrap_activation",
+        ))
+    }
+
     async fn acquire_standing_runtime_owner(
         &self,
         request: AcquireStandingRuntimeOwnerRequest,
@@ -267,6 +380,17 @@ pub trait MetaStore: Send + Sync + 'static {
         program_id: &str,
         view_id: &str,
     ) -> Result<Option<StandingRuntimeCheckpointPointer>, MetaStoreError>;
+
+    /// Current view-on-view dependency graph revision for a tenant.
+    ///
+    /// Required: a default `Ok(0)` here silently turns every missing
+    /// forwarding override into a "no graph tracking" claim, which corrupts
+    /// the admission-time revision CAS for view-on-view chains. Every concrete
+    /// store and every forwarding wrapper must implement this explicitly.
+    async fn read_view_dependency_graph_revision(
+        &self,
+        tenant_id: &str,
+    ) -> Result<u64, MetaStoreError>;
 }
 
 #[async_trait]
@@ -295,11 +419,66 @@ where
             .await
     }
 
+    async fn fix_view_bootstrap_activation_cut(
+        &self,
+        request: FixViewBootstrapActivationCutRequest,
+    ) -> Result<FixViewBootstrapActivationCutOutcome, MetaStoreError> {
+        (**self).fix_view_bootstrap_activation_cut(request).await
+    }
+
+    async fn promote_view_bootstrap(
+        &self,
+        request: PromoteViewBootstrapRequest,
+    ) -> Result<PromoteViewBootstrapOutcome, MetaStoreError> {
+        (**self).promote_view_bootstrap(request).await
+    }
+
     async fn reserve_ingest_range(
         &self,
         reservation: IngestRangeReservation,
     ) -> Result<ReserveIngestRangeOutcome, MetaStoreError> {
         (**self).reserve_ingest_range(reservation).await
+    }
+
+    async fn commit_ingest_range(
+        &self,
+        reservation: IngestRangeReservation,
+    ) -> Result<CommitIngestRangeOutcome, MetaStoreError> {
+        (**self).commit_ingest_range(reservation).await
+    }
+
+    async fn capture_ingest_source_cut(
+        &self,
+        request: CaptureIngestSourceCutRequest,
+    ) -> Result<IngestSourceCutV1, MetaStoreError> {
+        (**self).capture_ingest_source_cut(request).await
+    }
+
+    async fn begin_view_bootstrap(
+        &self,
+        request: BeginViewBootstrapRequest,
+    ) -> Result<BeginViewBootstrapOutcome, MetaStoreError> {
+        (**self).begin_view_bootstrap(request).await
+    }
+
+    async fn read_view_bootstrap(
+        &self,
+        tenant_id: &str,
+        program_id: &str,
+        view_id: &str,
+    ) -> Result<Option<ViewBootstrapControlV1>, MetaStoreError> {
+        (**self)
+            .read_view_bootstrap(tenant_id, program_id, view_id)
+            .await
+    }
+
+    async fn read_view_dependency_graph_revision(
+        &self,
+        tenant_id: &str,
+    ) -> Result<u64, MetaStoreError> {
+        (**self)
+            .read_view_dependency_graph_revision(tenant_id)
+            .await
     }
 
     async fn acquire_standing_runtime_owner(
@@ -348,6 +527,10 @@ pub struct InMemoryMetaStore {
 struct InMemoryMetaState {
     relation_catalogs: HashMap<(String, String), VelorixRelationCatalogV1>,
     ingest_reservations: HashMap<(String, u32), Vec<IngestRangeReservation>>,
+    committed_ingest_batch_keys: BTreeSet<String>,
+    ingest_catalog_epoch: u64,
+    view_bootstraps: HashMap<(String, String, String), ViewBootstrapControlV1>,
+    view_dependency_graph_revisions: HashMap<String, u64>,
     standing_runtime_owners: HashMap<(String, String, String), StandingRuntimeOwnerClaim>,
     standing_runtime_checkpoints:
         HashMap<(String, String, String), StandingRuntimeCheckpointPointer>,
@@ -427,6 +610,21 @@ impl MetaStore for InMemoryMetaStore {
         reservation.validate()?;
         let key = (reservation.stream_id.clone(), reservation.partition_id);
         let mut guard = self.inner.write().await;
+        let below_sealed_base = guard.view_bootstraps.values().any(|control| {
+            control.bootstrap_cut.relations.iter().any(|relation| {
+                relation.relation.relation_id == reservation.relation_id
+                    && relation.relation.relation_version == reservation.relation_version
+                    && relation.relation.schema_fingerprint == reservation.schema_fingerprint
+                    && relation.partitions.iter().any(|partition| {
+                        partition.stream_id == reservation.stream_id
+                            && partition.partition_id == reservation.partition_id
+                            && reservation.start_offset_inclusive < partition.base_offset_inclusive
+                    })
+            })
+        });
+        if below_sealed_base {
+            return Ok(ReserveIngestRangeOutcome::Conflict);
+        }
         let reservations = guard.ingest_reservations.entry(key).or_default();
 
         if reservations.iter().any(|existing| existing == &reservation) {
@@ -441,7 +639,247 @@ impl MetaStore for InMemoryMetaStore {
 
         reservations.push(reservation);
         reservations.sort_by_key(|entry| entry.start_offset_inclusive);
+        guard.ingest_catalog_epoch = guard
+            .ingest_catalog_epoch
+            .checked_add(1)
+            .ok_or(MetaStoreError::TimestampOverflow)?;
         Ok(ReserveIngestRangeOutcome::Reserved)
+    }
+
+    async fn commit_ingest_range(
+        &self,
+        reservation: IngestRangeReservation,
+    ) -> Result<CommitIngestRangeOutcome, MetaStoreError> {
+        reservation.validate()?;
+        let key = (reservation.stream_id.clone(), reservation.partition_id);
+        let mut guard = self.inner.write().await;
+        if !guard
+            .ingest_reservations
+            .get(&key)
+            .is_some_and(|reservations| reservations.contains(&reservation))
+        {
+            return Ok(CommitIngestRangeOutcome::Conflict);
+        }
+        if !guard
+            .committed_ingest_batch_keys
+            .insert(reservation.batch_key)
+        {
+            return Ok(CommitIngestRangeOutcome::Duplicate);
+        }
+        Ok(CommitIngestRangeOutcome::Committed)
+    }
+
+    async fn capture_ingest_source_cut(
+        &self,
+        request: CaptureIngestSourceCutRequest,
+    ) -> Result<IngestSourceCutV1, MetaStoreError> {
+        request.validate()?;
+        let guard = self.inner.read().await;
+        source_cut::build_ingest_source_cut(
+            &request,
+            guard.ingest_catalog_epoch,
+            guard.ingest_reservations.values().flatten().cloned(),
+            &guard.committed_ingest_batch_keys,
+        )
+    }
+
+    async fn begin_view_bootstrap(
+        &self,
+        request: BeginViewBootstrapRequest,
+    ) -> Result<BeginViewBootstrapOutcome, MetaStoreError> {
+        request.validate()?;
+        let key = (
+            request.tenant_id.clone(),
+            request.program_id.clone(),
+            request.view_id.clone(),
+        );
+        let mut guard = self.inner.write().await;
+        if let Some(existing) = guard.view_bootstraps.get(&key) {
+            return if request.matches(existing) {
+                Ok(BeginViewBootstrapOutcome::Duplicate(existing.clone()))
+            } else {
+                Ok(BeginViewBootstrapOutcome::Conflict)
+            };
+        }
+        // View-on-view admissions bump the tenant graph revision atomically
+        // with the bootstrap record; a stale expected revision means another
+        // admission moved the graph after this request's cycle check.
+        if !request.view_inputs.is_empty() {
+            let revision = guard
+                .view_dependency_graph_revisions
+                .get(&request.tenant_id)
+                .copied()
+                .unwrap_or(0);
+            if revision != request.expected_graph_revision {
+                return Ok(BeginViewBootstrapOutcome::Conflict);
+            }
+            guard
+                .view_dependency_graph_revisions
+                .insert(request.tenant_id.clone(), revision + 1);
+        }
+        let cut_request = CaptureIngestSourceCutRequest {
+            relations: request.relations.clone(),
+        };
+        let cut = source_cut::build_ingest_source_cut(
+            &cut_request,
+            guard.ingest_catalog_epoch,
+            guard.ingest_reservations.values().flatten().cloned(),
+            &guard.committed_ingest_batch_keys,
+        )?;
+        let control = view_bootstrap::bootstrap_control(request, cut);
+        guard.view_bootstraps.insert(key, control.clone());
+        Ok(BeginViewBootstrapOutcome::Created(control))
+    }
+
+    async fn read_view_dependency_graph_revision(
+        &self,
+        tenant_id: &str,
+    ) -> Result<u64, MetaStoreError> {
+        require_non_empty("tenant_id", tenant_id)?;
+        Ok(self
+            .inner
+            .read()
+            .await
+            .view_dependency_graph_revisions
+            .get(tenant_id)
+            .copied()
+            .unwrap_or(0))
+    }
+
+    async fn read_view_bootstrap(
+        &self,
+        tenant_id: &str,
+        program_id: &str,
+        view_id: &str,
+    ) -> Result<Option<ViewBootstrapControlV1>, MetaStoreError> {
+        require_non_empty("tenant_id", tenant_id)?;
+        require_non_empty("program_id", program_id)?;
+        require_non_empty("view_id", view_id)?;
+        Ok(self
+            .inner
+            .read()
+            .await
+            .view_bootstraps
+            .get(&(
+                tenant_id.to_string(),
+                program_id.to_string(),
+                view_id.to_string(),
+            ))
+            .cloned())
+    }
+
+    async fn fix_view_bootstrap_activation_cut(
+        &self,
+        request: FixViewBootstrapActivationCutRequest,
+    ) -> Result<FixViewBootstrapActivationCutOutcome, MetaStoreError> {
+        request.validate()?;
+        let key = (
+            request.tenant_id.clone(),
+            request.program_id.clone(),
+            request.view_id.clone(),
+        );
+        let mut guard = self.inner.write().await;
+        validate_current_standing_runtime_owner(
+            guard.standing_runtime_owners.get(&key),
+            &request.owner,
+            unix_time_ms()?,
+        )?;
+        let Some(mut control) = guard.view_bootstraps.get(&key).cloned() else {
+            return Ok(FixViewBootstrapActivationCutOutcome::Conflict);
+        };
+        if control.bootstrap_generation != request.bootstrap_generation
+            || control.plan_hash != request.plan_hash
+            || request.owner.tenant_id != request.tenant_id
+            || request.owner.program_id != request.program_id
+            || request.owner.view_id != request.view_id
+        {
+            return Ok(FixViewBootstrapActivationCutOutcome::Conflict);
+        }
+        if control.activation_cut.is_some() {
+            return Ok(FixViewBootstrapActivationCutOutcome::Duplicate(control));
+        }
+        if control.lifecycle != ViewBootstrapLifecycleV1::Bootstrapping {
+            return Ok(FixViewBootstrapActivationCutOutcome::Conflict);
+        }
+        let Some(checkpoint) = guard.standing_runtime_checkpoints.get(&key) else {
+            return Ok(FixViewBootstrapActivationCutOutcome::Conflict);
+        };
+        if checkpoint.bootstrap_generation != control.bootstrap_generation
+            || checkpoint.plan_hash != control.plan_hash
+            || !view_bootstrap::checkpoint_covers_source_cut(checkpoint, &control.bootstrap_cut)
+        {
+            return Ok(FixViewBootstrapActivationCutOutcome::Conflict);
+        }
+        let cut_request = CaptureIngestSourceCutRequest {
+            relations: control
+                .bootstrap_cut
+                .relations
+                .iter()
+                .map(|relation| relation.relation.clone())
+                .collect(),
+        };
+        let activation_cut = source_cut::build_ingest_source_cut(
+            &cut_request,
+            guard.ingest_catalog_epoch,
+            guard.ingest_reservations.values().flatten().cloned(),
+            &guard.committed_ingest_batch_keys,
+        )?;
+        if !view_bootstrap::source_cut_covers(&activation_cut, &control.bootstrap_cut) {
+            return Ok(FixViewBootstrapActivationCutOutcome::Conflict);
+        }
+        control.activation_cut = Some(activation_cut);
+        guard.view_bootstraps.insert(key, control.clone());
+        Ok(FixViewBootstrapActivationCutOutcome::Fixed(control))
+    }
+
+    async fn promote_view_bootstrap(
+        &self,
+        request: PromoteViewBootstrapRequest,
+    ) -> Result<PromoteViewBootstrapOutcome, MetaStoreError> {
+        request.validate()?;
+        let key = (
+            request.tenant_id.clone(),
+            request.program_id.clone(),
+            request.view_id.clone(),
+        );
+        let mut guard = self.inner.write().await;
+        validate_current_standing_runtime_owner(
+            guard.standing_runtime_owners.get(&key),
+            &request.owner,
+            unix_time_ms()?,
+        )?;
+        let Some(mut control) = guard.view_bootstraps.get(&key).cloned() else {
+            return Ok(PromoteViewBootstrapOutcome::Conflict);
+        };
+        if control.bootstrap_generation != request.bootstrap_generation
+            || control.plan_hash != request.plan_hash
+            || request.owner.tenant_id != request.tenant_id
+            || request.owner.program_id != request.program_id
+            || request.owner.view_id != request.view_id
+        {
+            return Ok(PromoteViewBootstrapOutcome::Conflict);
+        }
+        if control.lifecycle == ViewBootstrapLifecycleV1::Active {
+            return if control.active_checkpoint.as_ref() == Some(&request.checkpoint) {
+                Ok(PromoteViewBootstrapOutcome::Duplicate(control))
+            } else {
+                Ok(PromoteViewBootstrapOutcome::Conflict)
+            };
+        }
+        let Some(activation_cut) = control.activation_cut.as_ref() else {
+            return Ok(PromoteViewBootstrapOutcome::Conflict);
+        };
+        if guard.standing_runtime_checkpoints.get(&key) != Some(&request.checkpoint)
+            || request.checkpoint.bootstrap_generation != control.bootstrap_generation
+            || request.checkpoint.plan_hash != control.plan_hash
+            || !view_bootstrap::checkpoint_covers_source_cut(&request.checkpoint, activation_cut)
+        {
+            return Ok(PromoteViewBootstrapOutcome::Conflict);
+        }
+        control.lifecycle = ViewBootstrapLifecycleV1::Active;
+        control.active_checkpoint = Some(request.checkpoint);
+        guard.view_bootstraps.insert(key, control.clone());
+        Ok(PromoteViewBootstrapOutcome::Promoted(control))
     }
 
     async fn acquire_standing_runtime_owner(
@@ -680,6 +1118,39 @@ impl MetaStore for OssMetaStore {
         }
     }
 
+    async fn commit_ingest_range(
+        &self,
+        reservation: IngestRangeReservation,
+    ) -> Result<CommitIngestRangeOutcome, MetaStoreError> {
+        reservation.validate()?;
+        let committed = self
+            .ingest_admission
+            .list_committed()
+            .await
+            .map_err(|error| MetaStoreError::Oss(error.to_string()))?;
+        if committed.iter().any(|entry| {
+            entry.stream_id == reservation.stream_id
+                && entry.partition_id == reservation.partition_id
+                && entry.start_offset_inclusive == reservation.start_offset_inclusive
+                && entry.end_offset_exclusive == reservation.end_offset_exclusive
+                && entry.object_key.as_str() == reservation.batch_key
+        }) {
+            Ok(CommitIngestRangeOutcome::Duplicate)
+        } else {
+            Ok(CommitIngestRangeOutcome::Conflict)
+        }
+    }
+
+    async fn capture_ingest_source_cut(
+        &self,
+        request: CaptureIngestSourceCutRequest,
+    ) -> Result<IngestSourceCutV1, MetaStoreError> {
+        request.validate()?;
+        Err(MetaStoreError::UnsupportedCapability(
+            "committed_ingest_source_cut",
+        ))
+    }
+
     async fn acquire_standing_runtime_owner(
         &self,
         request: AcquireStandingRuntimeOwnerRequest,
@@ -721,6 +1192,16 @@ impl MetaStore for OssMetaStore {
         validate_standing_runtime_scope(tenant_id, program_id, view_id)?;
         Err(MetaStoreError::UnsupportedCapability(
             "linearizable_standing_runtime_checkpoint_publish",
+        ))
+    }
+
+    async fn read_view_dependency_graph_revision(
+        &self,
+        tenant_id: &str,
+    ) -> Result<u64, MetaStoreError> {
+        require_non_empty("tenant_id", tenant_id)?;
+        Err(MetaStoreError::UnsupportedCapability(
+            "authoritative_view_bootstrap",
         ))
     }
 }
@@ -785,6 +1266,37 @@ impl PublishStandingRuntimeCheckpointRequest {
             {
                 return Err(MetaStoreError::StandingRuntimeCheckpointScopeMismatch);
             }
+            if &self.candidate == expected {
+                return Ok(());
+            }
+            if self.candidate.logical_epoch <= expected.logical_epoch {
+                return Err(MetaStoreError::NonMonotonicCheckpointEpoch {
+                    previous: expected.logical_epoch,
+                    candidate: self.candidate.logical_epoch,
+                });
+            }
+            if self.candidate.previous_checkpoint_key != expected.checkpoint_key
+                || self.candidate.previous_manifest_hash != expected.manifest_hash
+            {
+                return Err(MetaStoreError::Serialization(
+                    "standing runtime checkpoint predecessor commitment mismatch".to_string(),
+                ));
+            }
+            if expected.bootstrap_generation != 0
+                && (self.candidate.bootstrap_generation != expected.bootstrap_generation
+                    || self.candidate.plan_hash != expected.plan_hash)
+            {
+                return Err(MetaStoreError::Serialization(
+                    "standing runtime checkpoint generation or plan changed within one pointer lineage"
+                        .to_string(),
+                ));
+            }
+        } else if !self.candidate.previous_checkpoint_key.is_empty()
+            || !self.candidate.previous_manifest_hash.is_empty()
+        {
+            return Err(MetaStoreError::Serialization(
+                "initial standing runtime checkpoint has a predecessor commitment".to_string(),
+            ));
         }
         Ok(())
     }
@@ -822,6 +1334,58 @@ impl StandingRuntimeCheckpointPointer {
         require_non_empty("checkpoint_key", &self.checkpoint_key)?;
         require_non_empty("content_hash", &self.content_hash)?;
         require_non_empty("manifest_hash", &self.manifest_hash)?;
+        if self.previous_checkpoint_key.is_empty() != self.previous_manifest_hash.is_empty() {
+            return Err(MetaStoreError::Serialization(
+                "standing runtime checkpoint has a partial predecessor commitment".to_string(),
+            ));
+        }
+        if !self.previous_manifest_hash.is_empty()
+            && !self.previous_manifest_hash.starts_with("sha256:")
+        {
+            return Err(MetaStoreError::Serialization(
+                "standing runtime checkpoint predecessor manifest hash is invalid".to_string(),
+            ));
+        }
+        if !self.previous_checkpoint_key.is_empty() {
+            let (_, previous_parts) =
+                ObjectKey::parse_standing_runtime_checkpoint(self.previous_checkpoint_key.clone())
+                    .map_err(|error| MetaStoreError::Serialization(error.to_string()))?;
+            if previous_parts.tenant_id != self.tenant_id
+                || previous_parts.program_id != self.program_id
+                || previous_parts.view_id != self.view_id
+                || previous_parts.logical_epoch >= self.logical_epoch
+            {
+                return Err(MetaStoreError::Serialization(
+                    "standing runtime checkpoint predecessor scope or epoch mismatch".to_string(),
+                ));
+            }
+        }
+        match &self.input_coverage {
+            Some(coverage) => {
+                if self.bootstrap_generation == 0
+                    || self.bootstrap_generation != coverage.view_generation
+                    || self.plan_hash != coverage.plan_hash
+                    || self.coverage_hash
+                        != coverage
+                            .stable_hash()
+                            .map_err(|error| MetaStoreError::Serialization(error.to_string()))?
+                {
+                    return Err(MetaStoreError::Serialization(
+                        "standing runtime checkpoint coverage commitment mismatch".to_string(),
+                    ));
+                }
+            }
+            None => {
+                if self.bootstrap_generation != 0
+                    || !self.plan_hash.is_empty()
+                    || !self.coverage_hash.is_empty()
+                {
+                    return Err(MetaStoreError::Serialization(
+                        "standing runtime checkpoint has partial coverage commitment".to_string(),
+                    ));
+                }
+            }
+        }
         let (_, parts) = ObjectKey::parse_standing_runtime_checkpoint(self.checkpoint_key.clone())
             .map_err(|error| MetaStoreError::Serialization(error.to_string()))?;
         if parts.tenant_id != self.tenant_id
@@ -860,8 +1424,11 @@ impl StandingRuntimeCheckpointPointer {
                         self.tenant_id, self.program_id, self.view_id
                     )));
                 }
-            } else if let Some(output_delta_key) =
-                output_manifest_ref.strip_prefix(STANDING_RUNTIME_OUTPUT_DELTA_REF_PREFIX)
+            } else if let Some(output_delta_key) = output_manifest_ref
+                .strip_prefix(STANDING_RUNTIME_OUTPUT_DELTA_REF_PREFIX)
+                .or_else(|| {
+                    output_manifest_ref.strip_prefix(STANDING_RUNTIME_OUTPUT_COMMIT_REF_PREFIX)
+                })
             {
                 let (_, output_parts) =
                     ObjectKey::parse_standing_runtime_output_delta(output_delta_key.to_string())
@@ -1195,6 +1762,149 @@ where
         }))
     }
 
+    async fn commit_ingest_range(
+        &self,
+        request: Request<proto::ReserveIngestRangeRequest>,
+    ) -> Result<Response<proto::CommitIngestRangeResponse>, Status> {
+        self.authorize(&request)?;
+        let outcome = self
+            .store
+            .commit_ingest_range(ingest_range_reservation_from_proto(request.into_inner()))
+            .await
+            .map_err(meta_status)?;
+        Ok(Response::new(proto::CommitIngestRangeResponse {
+            outcome: commit_ingest_range_outcome(&outcome).to_string(),
+        }))
+    }
+
+    async fn capture_ingest_source_cut(
+        &self,
+        request: Request<proto::CaptureIngestSourceCutRequest>,
+    ) -> Result<Response<proto::CaptureIngestSourceCutResponse>, Status> {
+        self.authorize(&request)?;
+        let request = serde_json::from_slice(&request.into_inner().request_json)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let source_cut = self
+            .store
+            .capture_ingest_source_cut(request)
+            .await
+            .map_err(meta_status)?;
+        let source_cut_json =
+            serde_json::to_vec(&source_cut).map_err(|error| Status::internal(error.to_string()))?;
+        Ok(Response::new(proto::CaptureIngestSourceCutResponse {
+            source_cut_json,
+        }))
+    }
+
+    async fn begin_view_bootstrap(
+        &self,
+        request: Request<proto::BeginViewBootstrapRequest>,
+    ) -> Result<Response<proto::BeginViewBootstrapResponse>, Status> {
+        self.authorize(&request)?;
+        let request = serde_json::from_slice(&request.into_inner().request_json)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let outcome = self
+            .store
+            .begin_view_bootstrap(request)
+            .await
+            .map_err(meta_status)?;
+        let (outcome, control) = match outcome {
+            BeginViewBootstrapOutcome::Created(control) => ("created", Some(control)),
+            BeginViewBootstrapOutcome::Duplicate(control) => ("duplicate", Some(control)),
+            BeginViewBootstrapOutcome::Conflict => ("conflict", None),
+        };
+        let control_json = control
+            .map(|control| serde_json::to_vec(&control))
+            .transpose()
+            .map_err(|error| Status::internal(error.to_string()))?
+            .unwrap_or_default();
+        Ok(Response::new(proto::BeginViewBootstrapResponse {
+            outcome: outcome.to_string(),
+            control_json,
+        }))
+    }
+
+    async fn read_view_bootstrap(
+        &self,
+        request: Request<proto::ReadViewBootstrapRequest>,
+    ) -> Result<Response<proto::ReadViewBootstrapResponse>, Status> {
+        self.authorize(&request)?;
+        let request = request.into_inner();
+        let control = self
+            .store
+            .read_view_bootstrap(&request.tenant_id, &request.program_id, &request.view_id)
+            .await
+            .map_err(meta_status)?;
+        let found = control.is_some();
+        let control_json = control
+            .map(|control| serde_json::to_vec(&control))
+            .transpose()
+            .map_err(|error| Status::internal(error.to_string()))?
+            .unwrap_or_default();
+        Ok(Response::new(proto::ReadViewBootstrapResponse {
+            found,
+            control_json,
+        }))
+    }
+
+    async fn fix_view_bootstrap_activation_cut(
+        &self,
+        request: Request<proto::FixViewBootstrapActivationCutRequest>,
+    ) -> Result<Response<proto::FixViewBootstrapActivationCutResponse>, Status> {
+        self.authorize(&request)?;
+        let request = serde_json::from_slice(&request.into_inner().request_json)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let outcome = self
+            .store
+            .fix_view_bootstrap_activation_cut(request)
+            .await
+            .map_err(meta_status)?;
+        let (outcome, control) = match outcome {
+            FixViewBootstrapActivationCutOutcome::Fixed(control) => ("fixed", Some(control)),
+            FixViewBootstrapActivationCutOutcome::Duplicate(control) => {
+                ("duplicate", Some(control))
+            }
+            FixViewBootstrapActivationCutOutcome::Conflict => ("conflict", None),
+        };
+        Ok(Response::new(
+            proto::FixViewBootstrapActivationCutResponse {
+                outcome: outcome.to_string(),
+                control_json: control
+                    .map(|control| serde_json::to_vec(&control))
+                    .transpose()
+                    .map_err(|error| Status::internal(error.to_string()))?
+                    .unwrap_or_default(),
+            },
+        ))
+    }
+
+    async fn promote_view_bootstrap(
+        &self,
+        request: Request<proto::PromoteViewBootstrapRequest>,
+    ) -> Result<Response<proto::PromoteViewBootstrapResponse>, Status> {
+        self.authorize(&request)?;
+        let request = serde_json::from_slice(&request.into_inner().request_json)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let outcome = self
+            .store
+            .promote_view_bootstrap(request)
+            .await
+            .map_err(meta_status)?;
+        let (outcome, control) = match outcome {
+            PromoteViewBootstrapOutcome::Promoted(control) => ("promoted", Some(control)),
+            PromoteViewBootstrapOutcome::Duplicate(control) => ("duplicate", Some(control)),
+            PromoteViewBootstrapOutcome::Conflict => ("conflict", None),
+        };
+        Ok(Response::new(proto::PromoteViewBootstrapResponse {
+            outcome: outcome.to_string(),
+            control_json: control
+                .map(|control| serde_json::to_vec(&control))
+                .transpose()
+                .map_err(|error| Status::internal(error.to_string()))?
+                .unwrap_or_default(),
+        }))
+    }
+
     async fn store_relation_catalog(
         &self,
         request: Request<proto::StoreRelationCatalogRequest>,
@@ -1238,21 +1948,9 @@ where
         request: Request<proto::ReserveIngestRangeRequest>,
     ) -> Result<Response<proto::ReserveIngestRangeResponse>, Status> {
         self.authorize(&request)?;
-        let request = request.into_inner();
         let outcome = self
             .store
-            .reserve_ingest_range(IngestRangeReservation {
-                stream_id: request.stream_id,
-                partition_id: request.partition_id,
-                start_offset_inclusive: request.start_offset_inclusive,
-                end_offset_exclusive: request.end_offset_exclusive,
-                batch_key: request.batch_key,
-                payload_digest: request.payload_digest,
-                relation_id: request.relation_id,
-                relation_version: request.relation_version,
-                schema_fingerprint: request.schema_fingerprint,
-                writer_epoch: request.writer_epoch,
-            })
+            .reserve_ingest_range(ingest_range_reservation_from_proto(request.into_inner()))
             .await
             .map_err(meta_status)?;
 
@@ -1315,13 +2013,18 @@ where
         let owner = request
             .owner
             .ok_or_else(|| Status::invalid_argument("standing runtime owner token is required"))?;
+        let expected_previous = request
+            .expected_previous
+            .map(standing_runtime_checkpoint_pointer_from_proto)
+            .transpose()
+            .map_err(meta_status)?;
+        let candidate =
+            standing_runtime_checkpoint_pointer_from_proto(candidate).map_err(meta_status)?;
         let outcome = self
             .store
             .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
-                expected_previous: request
-                    .expected_previous
-                    .map(standing_runtime_checkpoint_pointer_from_proto),
-                candidate: standing_runtime_checkpoint_pointer_from_proto(candidate),
+                expected_previous,
+                candidate,
                 owner: standing_runtime_owner_token_from_proto(owner),
             })
             .await
@@ -1357,6 +2060,22 @@ where
             },
         ))
     }
+
+    async fn read_view_dependency_graph_revision(
+        &self,
+        request: Request<proto::ReadViewDependencyGraphRevisionRequest>,
+    ) -> Result<Response<proto::ReadViewDependencyGraphRevisionResponse>, Status> {
+        self.authorize(&request)?;
+        let request = request.into_inner();
+        let revision = self
+            .store
+            .read_view_dependency_graph_revision(&request.tenant_id)
+            .await
+            .map_err(meta_status)?;
+        Ok(Response::new(
+            proto::ReadViewDependencyGraphRevisionResponse { revision },
+        ))
+    }
 }
 
 fn store_relation_catalog_outcome(outcome: &StoreRelationCatalogOutcome) -> &'static str {
@@ -1371,6 +2090,48 @@ fn reserve_ingest_range_outcome(outcome: &ReserveIngestRangeOutcome) -> &'static
         ReserveIngestRangeOutcome::Reserved => "reserved",
         ReserveIngestRangeOutcome::Duplicate => "duplicate",
         ReserveIngestRangeOutcome::Conflict => "conflict",
+    }
+}
+
+fn commit_ingest_range_outcome(outcome: &CommitIngestRangeOutcome) -> &'static str {
+    match outcome {
+        CommitIngestRangeOutcome::Committed => "committed",
+        CommitIngestRangeOutcome::Duplicate => "duplicate",
+        CommitIngestRangeOutcome::Conflict => "conflict",
+    }
+}
+
+fn ingest_range_reservation_from_proto(
+    request: proto::ReserveIngestRangeRequest,
+) -> IngestRangeReservation {
+    IngestRangeReservation {
+        stream_id: request.stream_id,
+        partition_id: request.partition_id,
+        start_offset_inclusive: request.start_offset_inclusive,
+        end_offset_exclusive: request.end_offset_exclusive,
+        batch_key: request.batch_key,
+        payload_digest: request.payload_digest,
+        relation_id: request.relation_id,
+        relation_version: request.relation_version,
+        schema_fingerprint: request.schema_fingerprint,
+        writer_epoch: request.writer_epoch,
+    }
+}
+
+fn ingest_range_reservation_to_proto(
+    reservation: IngestRangeReservation,
+) -> proto::ReserveIngestRangeRequest {
+    proto::ReserveIngestRangeRequest {
+        stream_id: reservation.stream_id,
+        partition_id: reservation.partition_id,
+        start_offset_inclusive: reservation.start_offset_inclusive,
+        end_offset_exclusive: reservation.end_offset_exclusive,
+        batch_key: reservation.batch_key,
+        payload_digest: reservation.payload_digest,
+        relation_id: reservation.relation_id,
+        relation_version: reservation.relation_version,
+        schema_fingerprint: reservation.schema_fingerprint,
+        writer_epoch: reservation.writer_epoch,
     }
 }
 
@@ -1518,8 +2279,16 @@ fn standing_runtime_owner_token_from_proto(
 
 fn standing_runtime_checkpoint_pointer_from_proto(
     pointer: proto::StandingRuntimeCheckpointPointer,
-) -> StandingRuntimeCheckpointPointer {
-    StandingRuntimeCheckpointPointer {
+) -> Result<StandingRuntimeCheckpointPointer, MetaStoreError> {
+    let input_coverage = if pointer.input_coverage_json.is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::from_slice(&pointer.input_coverage_json)
+                .map_err(|error| MetaStoreError::Serialization(error.to_string()))?,
+        )
+    };
+    Ok(StandingRuntimeCheckpointPointer {
         tenant_id: pointer.tenant_id,
         program_id: pointer.program_id,
         view_id: pointer.view_id,
@@ -1528,7 +2297,13 @@ fn standing_runtime_checkpoint_pointer_from_proto(
         content_hash: pointer.content_hash,
         manifest_hash: pointer.manifest_hash,
         output_manifest_refs: pointer.output_manifest_refs,
-    }
+        bootstrap_generation: pointer.bootstrap_generation,
+        plan_hash: pointer.plan_hash,
+        coverage_hash: pointer.coverage_hash,
+        input_coverage,
+        previous_checkpoint_key: pointer.previous_checkpoint_key,
+        previous_manifest_hash: pointer.previous_manifest_hash,
+    })
 }
 
 fn standing_runtime_checkpoint_pointer_to_proto(
@@ -1543,6 +2318,15 @@ fn standing_runtime_checkpoint_pointer_to_proto(
         content_hash: pointer.content_hash,
         manifest_hash: pointer.manifest_hash,
         output_manifest_refs: pointer.output_manifest_refs,
+        bootstrap_generation: pointer.bootstrap_generation,
+        plan_hash: pointer.plan_hash,
+        coverage_hash: pointer.coverage_hash,
+        input_coverage_json: pointer
+            .input_coverage
+            .and_then(|coverage| serde_json::to_vec(&coverage).ok())
+            .unwrap_or_default(),
+        previous_checkpoint_key: pointer.previous_checkpoint_key,
+        previous_manifest_hash: pointer.previous_manifest_hash,
     }
 }
 
@@ -1558,8 +2342,11 @@ fn meta_status(error: MetaStoreError) -> Status {
         | MetaStoreError::IntegerOutOfRange { .. }
         | MetaStoreError::TimestampOverflow
         | MetaStoreError::Serialization(_)
+        | MetaStoreError::NonMonotonicCheckpointEpoch { .. }
         | MetaStoreError::StandingRuntimeCheckpointScopeMismatch
         | MetaStoreError::StandingRuntimeOwnerMismatch
+        | MetaStoreError::DuplicateSourceCutRelation { .. }
+        | MetaStoreError::OverlappingSourceCutRange { .. }
         | MetaStoreError::UnexpectedOutcome(_) => Status::invalid_argument(error.to_string()),
         MetaStoreError::UnsupportedCapability(_) => Status::failed_precondition(error.to_string()),
         MetaStoreError::Remote(_) | MetaStoreError::Oss(_) | MetaStoreError::Hiqlite(_) => {
@@ -1625,6 +2412,7 @@ impl HiqliteMetaStore {
                     relation_version TEXT NOT NULL,
                     schema_fingerprint TEXT NOT NULL,
                     writer_epoch INTEGER NOT NULL,
+                    committed INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (
                         stream_id,
                         partition_id,
@@ -1636,6 +2424,22 @@ impl HiqliteMetaStore {
             )
             .await
             .map_err(hiqlite_error)?;
+        if !self
+            .hiqlite_table_has_column(
+                "PRAGMA table_info(velorix_ingest_reservations)",
+                "committed",
+            )
+            .await?
+        {
+            self.client
+                .execute(
+                    "ALTER TABLE velorix_ingest_reservations
+                        ADD COLUMN committed INTEGER NOT NULL DEFAULT 0",
+                    vec![],
+                )
+                .await
+                .map_err(hiqlite_error)?;
+        }
         self.client
             .execute(
                 "CREATE INDEX IF NOT EXISTS velorix_ingest_reservations_range_idx
@@ -1651,6 +2455,134 @@ impl HiqliteMetaStore {
             .map_err(hiqlite_error)?;
         self.client
             .execute(
+                "CREATE TABLE IF NOT EXISTS velorix_view_bootstrap_controls (
+                    tenant_id TEXT NOT NULL,
+                    program_id TEXT NOT NULL,
+                    view_id TEXT NOT NULL,
+                    schema_version INTEGER NOT NULL,
+                    bootstrap_generation INTEGER NOT NULL,
+                    plan_hash TEXT NOT NULL,
+                    view_spec_json BLOB NOT NULL,
+                    lifecycle TEXT NOT NULL,
+                    input_catalog_epoch INTEGER NOT NULL,
+                    activation_cut_json TEXT NOT NULL DEFAULT '',
+                    active_checkpoint_json TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (tenant_id, program_id, view_id)
+                )",
+                vec![],
+            )
+            .await
+            .map_err(hiqlite_error)?;
+        for (column, definition) in [
+            ("activation_cut_json", "TEXT NOT NULL DEFAULT ''"),
+            ("active_checkpoint_json", "TEXT NOT NULL DEFAULT ''"),
+        ] {
+            if !self
+                .hiqlite_table_has_column(
+                    "PRAGMA table_info(velorix_view_bootstrap_controls)",
+                    column,
+                )
+                .await?
+            {
+                self.client
+                    .execute(
+                        format!(
+                            "ALTER TABLE velorix_view_bootstrap_controls ADD COLUMN {column} {definition}"
+                        ),
+                        vec![],
+                    )
+                    .await
+                    .map_err(hiqlite_error)?;
+            }
+        }
+        self.client
+            .execute(
+                "CREATE TABLE IF NOT EXISTS velorix_view_bootstrap_inputs (
+                    tenant_id TEXT NOT NULL,
+                    program_id TEXT NOT NULL,
+                    view_id TEXT NOT NULL,
+                    bootstrap_generation INTEGER NOT NULL,
+                    relation_ordinal INTEGER NOT NULL,
+                    relation_id TEXT NOT NULL,
+                    relation_version TEXT NOT NULL,
+                    schema_fingerprint TEXT NOT NULL,
+                    PRIMARY KEY (
+                        tenant_id,
+                        program_id,
+                        view_id,
+                        bootstrap_generation,
+                        relation_ordinal
+                    )
+                )",
+                vec![],
+            )
+            .await
+            .map_err(hiqlite_error)?;
+        self.client
+            .execute(
+                "CREATE TABLE IF NOT EXISTS velorix_view_bootstrap_view_inputs (
+                    tenant_id TEXT NOT NULL,
+                    program_id TEXT NOT NULL,
+                    view_id TEXT NOT NULL,
+                    bootstrap_generation INTEGER NOT NULL,
+                    edge_ordinal INTEGER NOT NULL,
+                    edge_json TEXT NOT NULL,
+                    PRIMARY KEY (
+                        tenant_id,
+                        program_id,
+                        view_id,
+                        bootstrap_generation,
+                        edge_ordinal
+                    )
+                )",
+                vec![],
+            )
+            .await
+            .map_err(hiqlite_error)?;
+        self.client
+            .execute(
+                "CREATE TABLE IF NOT EXISTS velorix_view_dependency_graph_heads (
+                    tenant_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    PRIMARY KEY (tenant_id)
+                )",
+                vec![],
+            )
+            .await
+            .map_err(hiqlite_error)?;
+        self.client
+            .execute(
+                "CREATE TABLE IF NOT EXISTS velorix_view_bootstrap_reservations (
+                    tenant_id TEXT NOT NULL,
+                    program_id TEXT NOT NULL,
+                    view_id TEXT NOT NULL,
+                    bootstrap_generation INTEGER NOT NULL,
+                    admission_epoch INTEGER NOT NULL,
+                    stream_id TEXT NOT NULL,
+                    partition_id INTEGER NOT NULL,
+                    start_offset_inclusive INTEGER NOT NULL,
+                    end_offset_exclusive INTEGER NOT NULL,
+                    batch_key TEXT NOT NULL,
+                    payload_digest TEXT NOT NULL,
+                    relation_id TEXT NOT NULL,
+                    relation_version TEXT NOT NULL,
+                    schema_fingerprint TEXT NOT NULL,
+                    writer_epoch INTEGER NOT NULL,
+                    committed INTEGER NOT NULL,
+                    PRIMARY KEY (
+                        tenant_id,
+                        program_id,
+                        view_id,
+                        bootstrap_generation,
+                        admission_epoch
+                    )
+                )",
+                vec![],
+            )
+            .await
+            .map_err(hiqlite_error)?;
+        self.client
+            .execute(
                 "CREATE TABLE IF NOT EXISTS velorix_standing_runtime_checkpoints (
                     tenant_id TEXT NOT NULL,
                     program_id TEXT NOT NULL,
@@ -1660,6 +2592,12 @@ impl HiqliteMetaStore {
                     content_hash TEXT NOT NULL,
                     manifest_hash TEXT NOT NULL DEFAULT '',
                     output_manifest_refs_json TEXT NOT NULL DEFAULT '[]',
+                    bootstrap_generation INTEGER NOT NULL DEFAULT 0,
+                    plan_hash TEXT NOT NULL DEFAULT '',
+                    coverage_hash TEXT NOT NULL DEFAULT '',
+                    input_coverage_json TEXT NOT NULL DEFAULT '',
+                    previous_checkpoint_key TEXT NOT NULL DEFAULT '',
+                    previous_manifest_hash TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY (tenant_id, program_id, view_id)
                 )",
                 vec![],
@@ -1681,6 +2619,32 @@ impl HiqliteMetaStore {
                 )
                 .await
                 .map_err(hiqlite_error)?;
+        }
+        for (column, definition) in [
+            ("bootstrap_generation", "INTEGER NOT NULL DEFAULT 0"),
+            ("plan_hash", "TEXT NOT NULL DEFAULT ''"),
+            ("coverage_hash", "TEXT NOT NULL DEFAULT ''"),
+            ("input_coverage_json", "TEXT NOT NULL DEFAULT ''"),
+            ("previous_checkpoint_key", "TEXT NOT NULL DEFAULT ''"),
+            ("previous_manifest_hash", "TEXT NOT NULL DEFAULT ''"),
+        ] {
+            if !self
+                .hiqlite_table_has_column(
+                    "PRAGMA table_info(velorix_standing_runtime_checkpoints)",
+                    column,
+                )
+                .await?
+            {
+                self.client
+                    .execute(
+                        format!(
+                            "ALTER TABLE velorix_standing_runtime_checkpoints ADD COLUMN {column} {definition}"
+                        ),
+                        vec![],
+                    )
+                    .await
+                    .map_err(hiqlite_error)?;
+            }
         }
         if !self
             .hiqlite_table_has_column(
@@ -1812,6 +2776,188 @@ impl HiqliteMetaStore {
             .map(StandingRuntimeOwnerClaimRow::into_claim)
             .transpose()
     }
+
+    async fn read_view_bootstrap_record(
+        &self,
+        tenant_id: &str,
+        program_id: &str,
+        view_id: &str,
+    ) -> Result<Option<ViewBootstrapControlV1>, MetaStoreError> {
+        validate_standing_runtime_scope(tenant_id, program_id, view_id)?;
+        let params = || {
+            vec![
+                hiqlite::Param::from(tenant_id.to_string()),
+                hiqlite::Param::from(program_id.to_string()),
+                hiqlite::Param::from(view_id.to_string()),
+            ]
+        };
+        let mut controls = self
+            .with_schema_repair(|| async {
+                self.client
+                    .query_consistent_map::<ViewBootstrapControlRow, _>(
+                        "SELECT tenant_id, program_id, view_id, schema_version,
+                            bootstrap_generation, plan_hash, view_spec_json, lifecycle,
+                            input_catalog_epoch, activation_cut_json, active_checkpoint_json
+                        FROM velorix_view_bootstrap_controls
+                        WHERE tenant_id = $1 AND program_id = $2 AND view_id = $3",
+                        params(),
+                    )
+                    .await
+                    .map_err(hiqlite_error)
+            })
+            .await?;
+        let Some(control) = controls.pop() else {
+            return Ok(None);
+        };
+        let generation = u64::try_from(control.bootstrap_generation).map_err(|_| {
+            MetaStoreError::Serialization(format!(
+                "view bootstrap generation is negative: {}",
+                control.bootstrap_generation
+            ))
+        })?;
+        let schema_version = u32::try_from(control.schema_version).map_err(|_| {
+            MetaStoreError::Serialization(format!(
+                "view bootstrap schema version is invalid: {}",
+                control.schema_version
+            ))
+        })?;
+        if schema_version != VIEW_BOOTSTRAP_CONTROL_SCHEMA_VERSION_V1 {
+            return Err(MetaStoreError::Serialization(format!(
+                "unsupported view bootstrap schema version: {schema_version}"
+            )));
+        }
+        let input_catalog_epoch = u64::try_from(control.input_catalog_epoch).map_err(|_| {
+            MetaStoreError::Serialization(format!(
+                "view bootstrap input catalog epoch is negative: {}",
+                control.input_catalog_epoch
+            ))
+        })?;
+        let lifecycle = match control.lifecycle.as_str() {
+            "bootstrapping" => ViewBootstrapLifecycleV1::Bootstrapping,
+            "active" => ViewBootstrapLifecycleV1::Active,
+            other => {
+                return Err(MetaStoreError::Serialization(format!(
+                    "unsupported view bootstrap lifecycle: {other}"
+                )))
+            }
+        };
+        let inputs = self
+            .client
+            .query_consistent_map::<ViewBootstrapInputRow, _>(
+                "SELECT relation_id, relation_version, schema_fingerprint
+                FROM velorix_view_bootstrap_inputs
+                WHERE tenant_id = $1 AND program_id = $2 AND view_id = $3
+                  AND bootstrap_generation = $4
+                ORDER BY relation_ordinal",
+                vec![
+                    hiqlite::Param::from(tenant_id.to_string()),
+                    hiqlite::Param::from(program_id.to_string()),
+                    hiqlite::Param::from(view_id.to_string()),
+                    hiqlite::Param::from(control.bootstrap_generation),
+                ],
+            )
+            .await
+            .map_err(hiqlite_error)?;
+        let relations = inputs
+            .into_iter()
+            .map(|input| IngestSourceRelationIdentityV1 {
+                relation_id: input.relation_id,
+                relation_version: input.relation_version,
+                relation_generation: INGEST_SOURCE_IDENTITY_GENERATION_V1,
+                schema_fingerprint: input.schema_fingerprint,
+            })
+            .collect::<Vec<_>>();
+        let view_input_rows = self
+            .client
+            .query_consistent_map::<ViewBootstrapViewInputRow, _>(
+                "SELECT edge_json
+                FROM velorix_view_bootstrap_view_inputs
+                WHERE tenant_id = $1 AND program_id = $2 AND view_id = $3
+                  AND bootstrap_generation = $4
+                ORDER BY edge_ordinal",
+                vec![
+                    hiqlite::Param::from(tenant_id.to_string()),
+                    hiqlite::Param::from(program_id.to_string()),
+                    hiqlite::Param::from(view_id.to_string()),
+                    hiqlite::Param::from(control.bootstrap_generation),
+                ],
+            )
+            .await
+            .map_err(hiqlite_error)?;
+        let view_inputs = view_input_rows
+            .into_iter()
+            .map(|row| {
+                serde_json::from_slice(&row.edge_json).map_err(|error| {
+                    MetaStoreError::Serialization(format!(
+                        "could not deserialize view bootstrap view input: {error}"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let snapshots = self
+            .client
+            .query_consistent_map::<SourceCutReservationRow, _>(
+                "SELECT admission_epoch, stream_id, partition_id,
+                    start_offset_inclusive, end_offset_exclusive, batch_key,
+                    payload_digest, relation_id, relation_version, schema_fingerprint,
+                    writer_epoch, committed
+                FROM velorix_view_bootstrap_reservations
+                WHERE tenant_id = $1 AND program_id = $2 AND view_id = $3
+                  AND bootstrap_generation = $4
+                ORDER BY admission_epoch",
+                vec![
+                    hiqlite::Param::from(tenant_id.to_string()),
+                    hiqlite::Param::from(program_id.to_string()),
+                    hiqlite::Param::from(view_id.to_string()),
+                    hiqlite::Param::from(control.bootstrap_generation),
+                ],
+            )
+            .await
+            .map_err(hiqlite_error)?;
+        let committed_batch_keys = snapshots
+            .iter()
+            .filter(|row| row.committed)
+            .map(|row| row.reservation.batch_key.clone())
+            .collect::<BTreeSet<_>>();
+        let bootstrap_cut = source_cut::build_ingest_source_cut(
+            &CaptureIngestSourceCutRequest { relations },
+            input_catalog_epoch,
+            snapshots
+                .into_iter()
+                .map(|row| row.reservation.into_reservation()),
+            &committed_batch_keys,
+        )?;
+        let activation_cut = if control.activation_cut_json.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::from_str(&control.activation_cut_json)
+                    .map_err(|error| MetaStoreError::Serialization(error.to_string()))?,
+            )
+        };
+        let active_checkpoint = if control.active_checkpoint_json.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::from_str(&control.active_checkpoint_json)
+                    .map_err(|error| MetaStoreError::Serialization(error.to_string()))?,
+            )
+        };
+        Ok(Some(ViewBootstrapControlV1 {
+            schema_version,
+            tenant_id: control.tenant_id,
+            program_id: control.program_id,
+            view_id: control.view_id,
+            bootstrap_generation: generation,
+            plan_hash: control.plan_hash,
+            view_spec_json: control.view_spec_json,
+            lifecycle,
+            bootstrap_cut,
+            activation_cut,
+            active_checkpoint,
+            view_inputs,
+        }))
+    }
 }
 
 #[cfg(feature = "hiqlite-backend")]
@@ -1930,6 +3076,18 @@ impl MetaStore for HiqliteMetaStore {
                               AND partition_id = $2
                               AND start_offset_inclusive < $4
                               AND $3 < end_offset_exclusive
+                        )
+                          AND NOT EXISTS (
+                            SELECT 1
+                            FROM velorix_view_bootstrap_reservations sealed
+                            WHERE sealed.stream_id = $1
+                              AND sealed.partition_id = $2
+                              AND sealed.relation_id = $7
+                              AND sealed.relation_version = $8
+                              AND sealed.schema_fingerprint = $9
+                            GROUP BY sealed.tenant_id, sealed.program_id, sealed.view_id,
+                                sealed.bootstrap_generation
+                            HAVING $3 < MIN(sealed.start_offset_inclusive)
                         )",
                         vec![
                             hiqlite::Param::from(reservation.stream_id.clone()),
@@ -1990,6 +3148,612 @@ impl MetaStore for HiqliteMetaStore {
             Ok(ReserveIngestRangeOutcome::Duplicate)
         } else {
             Ok(ReserveIngestRangeOutcome::Conflict)
+        }
+    }
+
+    async fn commit_ingest_range(
+        &self,
+        reservation: IngestRangeReservation,
+    ) -> Result<CommitIngestRangeOutcome, MetaStoreError> {
+        reservation.validate()?;
+        let start = i64_from_u64("start_offset_inclusive", reservation.start_offset_inclusive)?;
+        let end = i64_from_u64("end_offset_exclusive", reservation.end_offset_exclusive)?;
+        let writer_epoch = i64_from_u64("writer_epoch", reservation.writer_epoch)?;
+        let changed = self
+            .with_schema_repair(|| async {
+                self.client
+                    .execute(
+                        "UPDATE velorix_ingest_reservations
+                        SET committed = 1
+                        WHERE stream_id = $1
+                          AND partition_id = $2
+                          AND start_offset_inclusive = $3
+                          AND end_offset_exclusive = $4
+                          AND batch_key = $5
+                          AND payload_digest = $6
+                          AND relation_id = $7
+                          AND relation_version = $8
+                          AND schema_fingerprint = $9
+                          AND writer_epoch = $10
+                          AND committed = 0",
+                        vec![
+                            hiqlite::Param::from(reservation.stream_id.clone()),
+                            hiqlite::Param::from(reservation.partition_id),
+                            hiqlite::Param::from(start),
+                            hiqlite::Param::from(end),
+                            hiqlite::Param::from(reservation.batch_key.clone()),
+                            hiqlite::Param::from(reservation.payload_digest.clone()),
+                            hiqlite::Param::from(reservation.relation_id.clone()),
+                            hiqlite::Param::from(reservation.relation_version.clone()),
+                            hiqlite::Param::from(reservation.schema_fingerprint.clone()),
+                            hiqlite::Param::from(writer_epoch),
+                        ],
+                    )
+                    .await
+                    .map_err(hiqlite_error)
+            })
+            .await?;
+        if changed == 1 {
+            return Ok(CommitIngestRangeOutcome::Committed);
+        }
+
+        let rows = self
+            .with_schema_repair(|| async {
+                self.client
+                    .query_consistent_map::<SourceCutReservationRow, _>(
+                        "SELECT
+                            rowid AS admission_epoch,
+                            stream_id,
+                            partition_id,
+                            start_offset_inclusive,
+                            end_offset_exclusive,
+                            batch_key,
+                            payload_digest,
+                            relation_id,
+                            relation_version,
+                            schema_fingerprint,
+                            writer_epoch,
+                            committed
+                        FROM velorix_ingest_reservations
+                        WHERE stream_id = $1
+                          AND partition_id = $2
+                          AND start_offset_inclusive = $3
+                          AND end_offset_exclusive = $4",
+                        vec![
+                            hiqlite::Param::from(reservation.stream_id.clone()),
+                            hiqlite::Param::from(reservation.partition_id),
+                            hiqlite::Param::from(start),
+                            hiqlite::Param::from(end),
+                        ],
+                    )
+                    .await
+                    .map_err(hiqlite_error)
+            })
+            .await?;
+        if rows
+            .into_iter()
+            .any(|row| row.committed && row.reservation.into_reservation() == reservation)
+        {
+            Ok(CommitIngestRangeOutcome::Duplicate)
+        } else {
+            Ok(CommitIngestRangeOutcome::Conflict)
+        }
+    }
+
+    async fn capture_ingest_source_cut(
+        &self,
+        request: CaptureIngestSourceCutRequest,
+    ) -> Result<IngestSourceCutV1, MetaStoreError> {
+        request.validate()?;
+        let rows = self
+            .with_schema_repair(|| async {
+                self.client
+                    .query_consistent_map::<SourceCutReservationRow, _>(
+                        "SELECT
+                            rowid AS admission_epoch,
+                            stream_id,
+                            partition_id,
+                            start_offset_inclusive,
+                            end_offset_exclusive,
+                            batch_key,
+                            payload_digest,
+                            relation_id,
+                            relation_version,
+                            schema_fingerprint,
+                            writer_epoch,
+                            committed
+                        FROM velorix_ingest_reservations
+                        ORDER BY rowid",
+                        vec![],
+                    )
+                    .await
+                    .map_err(hiqlite_error)
+            })
+            .await?;
+        let input_catalog_epoch = rows
+            .iter()
+            .map(|row| row.admission_epoch)
+            .max()
+            .unwrap_or_default();
+        let input_catalog_epoch = u64::try_from(input_catalog_epoch).map_err(|_| {
+            MetaStoreError::Serialization(format!(
+                "ingest admission catalog epoch is negative: {input_catalog_epoch}"
+            ))
+        })?;
+        let committed_batch_keys = rows
+            .iter()
+            .filter(|row| row.committed)
+            .map(|row| row.reservation.batch_key.clone())
+            .collect();
+        source_cut::build_ingest_source_cut(
+            &request,
+            input_catalog_epoch,
+            rows.into_iter()
+                .map(|row| row.reservation.into_reservation()),
+            &committed_batch_keys,
+        )
+    }
+
+    async fn begin_view_bootstrap(
+        &self,
+        request: BeginViewBootstrapRequest,
+    ) -> Result<BeginViewBootstrapOutcome, MetaStoreError> {
+        request.validate()?;
+        let generation = i64_from_u64("bootstrap_generation", INITIAL_VIEW_BOOTSTRAP_GENERATION)?;
+        let schema_version = i64::from(VIEW_BOOTSTRAP_CONTROL_SCHEMA_VERSION_V1);
+        let mut statements: Vec<(&'static str, Vec<hiqlite::Param>)> = vec![(
+            "INSERT OR IGNORE INTO velorix_view_bootstrap_controls (
+                tenant_id, program_id, view_id, schema_version,
+                bootstrap_generation, plan_hash, view_spec_json, lifecycle,
+                input_catalog_epoch
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, 'bootstrapping',
+                COALESCE((SELECT MAX(rowid) FROM velorix_ingest_reservations), 0)
+            )",
+            vec![
+                hiqlite::Param::from(request.tenant_id.clone()),
+                hiqlite::Param::from(request.program_id.clone()),
+                hiqlite::Param::from(request.view_id.clone()),
+                hiqlite::Param::from(schema_version),
+                hiqlite::Param::from(generation),
+                hiqlite::Param::from(request.plan_hash.clone()),
+                hiqlite::Param::from(request.view_spec_json.clone()),
+            ],
+        )];
+        for (ordinal, relation) in request.relations.iter().enumerate() {
+            let ordinal = i64::try_from(ordinal).map_err(|_| {
+                MetaStoreError::Serialization(
+                    "view bootstrap relation ordinal exceeds i64".to_string(),
+                )
+            })?;
+            statements.push((
+                "INSERT INTO velorix_view_bootstrap_inputs (
+                    tenant_id, program_id, view_id, bootstrap_generation,
+                    relation_ordinal, relation_id, relation_version, schema_fingerprint
+                )
+                SELECT $1, $2, $3, $4, $5, $6, $7, $8
+                WHERE changes() = 1",
+                vec![
+                    hiqlite::Param::from(request.tenant_id.clone()),
+                    hiqlite::Param::from(request.program_id.clone()),
+                    hiqlite::Param::from(request.view_id.clone()),
+                    hiqlite::Param::from(generation),
+                    hiqlite::Param::from(ordinal),
+                    hiqlite::Param::from(relation.relation_id.clone()),
+                    hiqlite::Param::from(relation.relation_version.clone()),
+                    hiqlite::Param::from(relation.schema_fingerprint.clone()),
+                ],
+            ));
+        }
+        for (ordinal, edge) in request.view_inputs.iter().enumerate() {
+            let ordinal = i64::try_from(ordinal).map_err(|_| {
+                MetaStoreError::Serialization(
+                    "view bootstrap view-input ordinal exceeds i64".to_string(),
+                )
+            })?;
+            let edge_json = serde_json::to_vec(edge).map_err(|error| {
+                MetaStoreError::Serialization(format!(
+                    "could not serialize view bootstrap view input: {error}"
+                ))
+            })?;
+            statements.push((
+                "INSERT INTO velorix_view_bootstrap_view_inputs (
+                    tenant_id, program_id, view_id, bootstrap_generation,
+                    edge_ordinal, edge_json
+                )
+                SELECT $1, $2, $3, $4, $5, $6
+                WHERE changes() = 1",
+                vec![
+                    hiqlite::Param::from(request.tenant_id.clone()),
+                    hiqlite::Param::from(request.program_id.clone()),
+                    hiqlite::Param::from(request.view_id.clone()),
+                    hiqlite::Param::from(generation),
+                    hiqlite::Param::from(ordinal),
+                    hiqlite::Param::from(edge_json),
+                ],
+            ));
+        }
+        statements.push((
+            "INSERT INTO velorix_view_bootstrap_reservations (
+                tenant_id, program_id, view_id, bootstrap_generation,
+                admission_epoch, stream_id, partition_id, start_offset_inclusive,
+                end_offset_exclusive, batch_key, payload_digest, relation_id,
+                relation_version, schema_fingerprint, writer_epoch, committed
+            )
+            SELECT $1, $2, $3, $4, reservations.rowid,
+                reservations.stream_id, reservations.partition_id,
+                reservations.start_offset_inclusive, reservations.end_offset_exclusive,
+                reservations.batch_key, reservations.payload_digest,
+                reservations.relation_id, reservations.relation_version,
+                reservations.schema_fingerprint, reservations.writer_epoch,
+                reservations.committed
+            FROM velorix_ingest_reservations reservations
+            JOIN velorix_view_bootstrap_inputs inputs
+              ON inputs.tenant_id = $1
+             AND inputs.program_id = $2
+             AND inputs.view_id = $3
+             AND inputs.bootstrap_generation = $4
+             AND inputs.relation_id = reservations.relation_id
+             AND inputs.relation_version = reservations.relation_version
+             AND inputs.schema_fingerprint = reservations.schema_fingerprint
+            WHERE changes() = 1
+              AND reservations.rowid <= (
+                SELECT input_catalog_epoch
+                FROM velorix_view_bootstrap_controls
+                WHERE tenant_id = $1 AND program_id = $2 AND view_id = $3
+              )",
+            vec![
+                hiqlite::Param::from(request.tenant_id.clone()),
+                hiqlite::Param::from(request.program_id.clone()),
+                hiqlite::Param::from(request.view_id.clone()),
+                hiqlite::Param::from(generation),
+            ],
+        ));
+        if !request.view_inputs.is_empty() {
+            let expected_revision =
+                i64::try_from(request.expected_graph_revision).map_err(|_| {
+                    MetaStoreError::Serialization("expected graph revision exceeds i64".to_string())
+                })?;
+            statements.push((
+                "INSERT OR IGNORE INTO velorix_view_dependency_graph_heads
+                    (tenant_id, revision)
+                 VALUES ($1, 1)",
+                vec![hiqlite::Param::from(request.tenant_id.clone())],
+            ));
+            statements.push((
+                "UPDATE velorix_view_dependency_graph_heads
+                 SET revision = revision + 1
+                 WHERE tenant_id = $1 AND revision = $2",
+                vec![
+                    hiqlite::Param::from(request.tenant_id.clone()),
+                    hiqlite::Param::from(expected_revision),
+                ],
+            ));
+        }
+        let results = self
+            .with_schema_repair(|| {
+                let statements = statements.clone();
+                async { self.client.txn(statements).await.map_err(hiqlite_error) }
+            })
+            .await?;
+        let created = hiqlite_txn_changed_rows(results, 0)? == 1;
+        if !request.view_inputs.is_empty() {
+            // The graph gate succeeds when exactly one of {INSERT OR IGNORE,
+            // revision CAS UPDATE} changed a row: first admission inserts the
+            // head, later admissions bump it from the expected revision. A
+            // stale expected revision changes nothing and fails the gate.
+            let inserted_head = hiqlite_txn_changed_rows(results, statements.len() - 2)?;
+            let bumped_revision = hiqlite_txn_changed_rows(results, statements.len() - 1)?;
+            if inserted_head + bumped_revision != 1 {
+                return Ok(BeginViewBootstrapOutcome::Conflict);
+            }
+        }
+        let control = self
+            .read_view_bootstrap_record(&request.tenant_id, &request.program_id, &request.view_id)
+            .await?
+            .ok_or_else(|| {
+                MetaStoreError::Serialization(
+                    "view bootstrap transaction did not publish a control record".to_string(),
+                )
+            })?;
+        if !request.matches(&control) {
+            return Ok(BeginViewBootstrapOutcome::Conflict);
+        }
+        if created {
+            Ok(BeginViewBootstrapOutcome::Created(control))
+        } else {
+            Ok(BeginViewBootstrapOutcome::Duplicate(control))
+        }
+    }
+
+    async fn read_view_bootstrap(
+        &self,
+        tenant_id: &str,
+        program_id: &str,
+        view_id: &str,
+    ) -> Result<Option<ViewBootstrapControlV1>, MetaStoreError> {
+        self.read_view_bootstrap_record(tenant_id, program_id, view_id)
+            .await
+    }
+
+    async fn fix_view_bootstrap_activation_cut(
+        &self,
+        request: FixViewBootstrapActivationCutRequest,
+    ) -> Result<FixViewBootstrapActivationCutOutcome, MetaStoreError> {
+        request.validate()?;
+        if request.owner.tenant_id != request.tenant_id
+            || request.owner.program_id != request.program_id
+            || request.owner.view_id != request.view_id
+        {
+            return Ok(FixViewBootstrapActivationCutOutcome::Conflict);
+        }
+        let Some(control) = self
+            .read_view_bootstrap_record(&request.tenant_id, &request.program_id, &request.view_id)
+            .await?
+        else {
+            return Ok(FixViewBootstrapActivationCutOutcome::Conflict);
+        };
+        if control.bootstrap_generation != request.bootstrap_generation
+            || control.plan_hash != request.plan_hash
+        {
+            return Ok(FixViewBootstrapActivationCutOutcome::Conflict);
+        }
+        if control.activation_cut.is_some() {
+            return Ok(FixViewBootstrapActivationCutOutcome::Duplicate(control));
+        }
+        let Some(checkpoint) = self
+            .read_standing_runtime_checkpoint(
+                &request.tenant_id,
+                &request.program_id,
+                &request.view_id,
+            )
+            .await?
+        else {
+            return Ok(FixViewBootstrapActivationCutOutcome::Conflict);
+        };
+        if checkpoint.bootstrap_generation != control.bootstrap_generation
+            || checkpoint.plan_hash != control.plan_hash
+            || !view_bootstrap::checkpoint_covers_source_cut(&checkpoint, &control.bootstrap_cut)
+        {
+            return Ok(FixViewBootstrapActivationCutOutcome::Conflict);
+        }
+        let activation_cut = self
+            .capture_ingest_source_cut(CaptureIngestSourceCutRequest {
+                relations: control
+                    .bootstrap_cut
+                    .relations
+                    .iter()
+                    .map(|relation| relation.relation.clone())
+                    .collect(),
+            })
+            .await?;
+        if !view_bootstrap::source_cut_covers(&activation_cut, &control.bootstrap_cut) {
+            return Ok(FixViewBootstrapActivationCutOutcome::Conflict);
+        }
+        let activation_cut_json = serde_json::to_string(&activation_cut)
+            .map_err(|error| MetaStoreError::Serialization(error.to_string()))?;
+        let owner_epoch = i64_from_u64("owner_epoch", request.owner.owner_epoch)?;
+        let generation = i64_from_u64("bootstrap_generation", request.bootstrap_generation)?;
+        let checkpoint_epoch = i64_from_u64("logical_epoch", checkpoint.logical_epoch)?;
+        let txn = self
+            .with_schema_repair(|| async {
+                self.client
+                    .txn_with_raft_serialized_timestamp([
+                        (
+                            "SELECT 1 AS authorized FROM velorix_standing_runtime_owners owner
+                             WHERE owner.tenant_id = $1 AND owner.program_id = $2
+                               AND owner.view_id = $3 AND owner.owner_id = $4
+                               AND owner.owner_epoch = $5 AND owner.expires_at_unix_ms > $6",
+                            vec![
+                                hiqlite::Param::from(request.owner.tenant_id.clone()),
+                                hiqlite::Param::from(request.owner.program_id.clone()),
+                                hiqlite::Param::from(request.owner.view_id.clone()),
+                                hiqlite::Param::from(request.owner.owner_id.clone()),
+                                hiqlite::Param::from(owner_epoch),
+                                hiqlite::Param::raft_serialized_unix_ms(),
+                            ],
+                        ),
+                        (
+                            "UPDATE velorix_view_bootstrap_controls SET activation_cut_json = $1
+                             WHERE tenant_id = $2 AND program_id = $3 AND view_id = $4
+                               AND bootstrap_generation = $5 AND plan_hash = $6
+                               AND lifecycle = 'bootstrapping' AND activation_cut_json = ''
+                               AND EXISTS (
+                                 SELECT 1 FROM velorix_standing_runtime_checkpoints checkpoint
+                                  WHERE checkpoint.tenant_id = $2 AND checkpoint.program_id = $3
+                                    AND checkpoint.view_id = $4 AND checkpoint.checkpoint_key = $7
+                                    AND checkpoint.logical_epoch = $8 AND checkpoint.content_hash = $9
+                                    AND checkpoint.manifest_hash = $10
+                                    AND checkpoint.bootstrap_generation = $5
+                                    AND checkpoint.plan_hash = $6 AND checkpoint.coverage_hash = $11
+                               ) AND $12 = 1",
+                            vec![
+                                hiqlite::Param::from(activation_cut_json.clone()),
+                                hiqlite::Param::from(request.tenant_id.clone()),
+                                hiqlite::Param::from(request.program_id.clone()),
+                                hiqlite::Param::from(request.view_id.clone()),
+                                hiqlite::Param::from(generation),
+                                hiqlite::Param::from(request.plan_hash.clone()),
+                                hiqlite::Param::from(checkpoint.checkpoint_key.clone()),
+                                hiqlite::Param::from(checkpoint_epoch),
+                                hiqlite::Param::from(checkpoint.content_hash.clone()),
+                                hiqlite::Param::from(checkpoint.manifest_hash.clone()),
+                                hiqlite::Param::from(checkpoint.coverage_hash.clone()),
+                                hiqlite::Param::StmtOutputIndexed(0, 0),
+                            ],
+                        ),
+                    ])
+                    .await
+                    .map_err(hiqlite_error)
+            })
+            .await?;
+        let raft_timestamp = txn.timestamp;
+        let changed = hiqlite_txn_changed_rows_or_zero_for_missing_stmt_output(txn.result, 1)?;
+        let current = self
+            .read_view_bootstrap_record(&request.tenant_id, &request.program_id, &request.view_id)
+            .await?
+            .ok_or_else(|| MetaStoreError::Serialization("view bootstrap disappeared".into()))?;
+        if changed == 1 {
+            return Ok(FixViewBootstrapActivationCutOutcome::Fixed(current));
+        }
+        validate_current_standing_runtime_owner(
+            self.read_standing_runtime_owner_record(
+                &request.owner.tenant_id,
+                &request.owner.program_id,
+                &request.owner.view_id,
+            )
+            .await?
+            .as_ref(),
+            &request.owner,
+            u64::try_from(raft_timestamp.unix_ms).map_err(|_| MetaStoreError::TimestampOverflow)?,
+        )?;
+        if current.activation_cut.is_some() {
+            Ok(FixViewBootstrapActivationCutOutcome::Duplicate(current))
+        } else {
+            Ok(FixViewBootstrapActivationCutOutcome::Conflict)
+        }
+    }
+
+    async fn promote_view_bootstrap(
+        &self,
+        request: PromoteViewBootstrapRequest,
+    ) -> Result<PromoteViewBootstrapOutcome, MetaStoreError> {
+        request.validate()?;
+        if request.owner.tenant_id != request.tenant_id
+            || request.owner.program_id != request.program_id
+            || request.owner.view_id != request.view_id
+        {
+            return Ok(PromoteViewBootstrapOutcome::Conflict);
+        }
+        let Some(control) = self
+            .read_view_bootstrap_record(&request.tenant_id, &request.program_id, &request.view_id)
+            .await?
+        else {
+            return Ok(PromoteViewBootstrapOutcome::Conflict);
+        };
+        if control.bootstrap_generation != request.bootstrap_generation
+            || control.plan_hash != request.plan_hash
+        {
+            return Ok(PromoteViewBootstrapOutcome::Conflict);
+        }
+        if control.lifecycle == ViewBootstrapLifecycleV1::Active {
+            return if control.active_checkpoint.as_ref() == Some(&request.checkpoint) {
+                Ok(PromoteViewBootstrapOutcome::Duplicate(control))
+            } else {
+                Ok(PromoteViewBootstrapOutcome::Conflict)
+            };
+        }
+        let Some(activation_cut) = control.activation_cut.as_ref() else {
+            return Ok(PromoteViewBootstrapOutcome::Conflict);
+        };
+        let Some(authoritative_checkpoint) = self
+            .read_standing_runtime_checkpoint(
+                &request.tenant_id,
+                &request.program_id,
+                &request.view_id,
+            )
+            .await?
+        else {
+            return Ok(PromoteViewBootstrapOutcome::Conflict);
+        };
+        if authoritative_checkpoint != request.checkpoint
+            || authoritative_checkpoint.bootstrap_generation != request.bootstrap_generation
+            || authoritative_checkpoint.plan_hash != request.plan_hash
+            || !view_bootstrap::checkpoint_covers_source_cut(
+                &authoritative_checkpoint,
+                activation_cut,
+            )
+        {
+            return Ok(PromoteViewBootstrapOutcome::Conflict);
+        }
+        let checkpoint_json = serde_json::to_string(&authoritative_checkpoint)
+            .map_err(|error| MetaStoreError::Serialization(error.to_string()))?;
+        let activation_cut_json = serde_json::to_string(activation_cut)
+            .map_err(|error| MetaStoreError::Serialization(error.to_string()))?;
+        let owner_epoch = i64_from_u64("owner_epoch", request.owner.owner_epoch)?;
+        let generation = i64_from_u64("bootstrap_generation", request.bootstrap_generation)?;
+        let checkpoint_epoch =
+            i64_from_u64("logical_epoch", authoritative_checkpoint.logical_epoch)?;
+        let txn = self
+            .with_schema_repair(|| async {
+                self.client
+                    .txn_with_raft_serialized_timestamp([
+                        (
+                            "SELECT 1 AS authorized FROM velorix_standing_runtime_owners owner
+                             WHERE owner.tenant_id = $1 AND owner.program_id = $2
+                               AND owner.view_id = $3 AND owner.owner_id = $4
+                               AND owner.owner_epoch = $5 AND owner.expires_at_unix_ms > $6",
+                            vec![
+                                hiqlite::Param::from(request.owner.tenant_id.clone()),
+                                hiqlite::Param::from(request.owner.program_id.clone()),
+                                hiqlite::Param::from(request.owner.view_id.clone()),
+                                hiqlite::Param::from(request.owner.owner_id.clone()),
+                                hiqlite::Param::from(owner_epoch),
+                                hiqlite::Param::raft_serialized_unix_ms(),
+                            ],
+                        ),
+                        (
+                            "UPDATE velorix_view_bootstrap_controls
+                             SET lifecycle = 'active', active_checkpoint_json = $1
+                             WHERE tenant_id = $2 AND program_id = $3 AND view_id = $4
+                               AND bootstrap_generation = $5 AND plan_hash = $6
+                               AND lifecycle = 'bootstrapping' AND activation_cut_json = $7
+                               AND EXISTS (
+                                 SELECT 1 FROM velorix_standing_runtime_checkpoints checkpoint
+                                  WHERE checkpoint.tenant_id = $2 AND checkpoint.program_id = $3
+                                    AND checkpoint.view_id = $4 AND checkpoint.checkpoint_key = $8
+                                    AND checkpoint.logical_epoch = $9 AND checkpoint.content_hash = $10
+                                    AND checkpoint.manifest_hash = $11
+                                    AND checkpoint.bootstrap_generation = $5
+                                    AND checkpoint.plan_hash = $6 AND checkpoint.coverage_hash = $12
+                               ) AND $13 = 1",
+                            vec![
+                                hiqlite::Param::from(checkpoint_json.clone()),
+                                hiqlite::Param::from(request.tenant_id.clone()),
+                                hiqlite::Param::from(request.program_id.clone()),
+                                hiqlite::Param::from(request.view_id.clone()),
+                                hiqlite::Param::from(generation),
+                                hiqlite::Param::from(request.plan_hash.clone()),
+                                hiqlite::Param::from(activation_cut_json.clone()),
+                                hiqlite::Param::from(authoritative_checkpoint.checkpoint_key.clone()),
+                                hiqlite::Param::from(checkpoint_epoch),
+                                hiqlite::Param::from(authoritative_checkpoint.content_hash.clone()),
+                                hiqlite::Param::from(authoritative_checkpoint.manifest_hash.clone()),
+                                hiqlite::Param::from(authoritative_checkpoint.coverage_hash.clone()),
+                                hiqlite::Param::StmtOutputIndexed(0, 0),
+                            ],
+                        ),
+                    ])
+                    .await
+                    .map_err(hiqlite_error)
+            })
+            .await?;
+        let raft_timestamp = txn.timestamp;
+        let changed = hiqlite_txn_changed_rows_or_zero_for_missing_stmt_output(txn.result, 1)?;
+        let current = self
+            .read_view_bootstrap_record(&request.tenant_id, &request.program_id, &request.view_id)
+            .await?
+            .ok_or_else(|| MetaStoreError::Serialization("view bootstrap disappeared".into()))?;
+        if changed == 1 {
+            return Ok(PromoteViewBootstrapOutcome::Promoted(current));
+        }
+        validate_current_standing_runtime_owner(
+            self.read_standing_runtime_owner_record(
+                &request.owner.tenant_id,
+                &request.owner.program_id,
+                &request.owner.view_id,
+            )
+            .await?
+            .as_ref(),
+            &request.owner,
+            u64::try_from(raft_timestamp.unix_ms).map_err(|_| MetaStoreError::TimestampOverflow)?,
+        )?;
+        if current.lifecycle == ViewBootstrapLifecycleV1::Active
+            && current.active_checkpoint.as_ref() == Some(&request.checkpoint)
+        {
+            Ok(PromoteViewBootstrapOutcome::Duplicate(current))
+        } else {
+            Ok(PromoteViewBootstrapOutcome::Conflict)
         }
     }
 
@@ -2123,6 +3887,18 @@ impl MetaStore for HiqliteMetaStore {
         let candidate_epoch = i64_from_u64("logical_epoch", request.candidate.logical_epoch)?;
         let candidate_output_manifest_refs_json =
             standing_runtime_output_manifest_refs_json(&request.candidate.output_manifest_refs)?;
+        let candidate_bootstrap_generation = i64_from_u64(
+            "bootstrap_generation",
+            request.candidate.bootstrap_generation,
+        )?;
+        let candidate_input_coverage_json = request
+            .candidate
+            .input_coverage
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| MetaStoreError::Serialization(error.to_string()))?
+            .unwrap_or_default();
         let owner_epoch = i64_from_u64("owner_epoch", request.owner.owner_epoch)?;
         let (changed, raft_timestamp) = if let Some(expected) = &request.expected_previous {
             let expected_epoch =
@@ -2161,15 +3937,21 @@ impl MetaStore for HiqliteMetaStore {
                                 logical_epoch = $2,
                                 content_hash = $3,
                                 manifest_hash = $4,
-                                output_manifest_refs_json = $5
-                            WHERE tenant_id = $6
-                              AND program_id = $7
-                              AND view_id = $8
-                              AND checkpoint_key = $9
-                              AND logical_epoch = $10
-                              AND content_hash = $11
-                              AND manifest_hash = $12
-                              AND $13 = 1",
+                                output_manifest_refs_json = $5,
+                                bootstrap_generation = $6,
+                                plan_hash = $7,
+                                coverage_hash = $8,
+                                input_coverage_json = $9,
+                                previous_checkpoint_key = $10,
+                                previous_manifest_hash = $11
+                            WHERE tenant_id = $12
+                              AND program_id = $13
+                              AND view_id = $14
+                              AND checkpoint_key = $15
+                              AND logical_epoch = $16
+                              AND content_hash = $17
+                              AND manifest_hash = $18
+                              AND $19 = 1",
                                 vec![
                                     hiqlite::Param::from(request.candidate.checkpoint_key.clone()),
                                     hiqlite::Param::from(candidate_epoch),
@@ -2177,6 +3959,16 @@ impl MetaStore for HiqliteMetaStore {
                                     hiqlite::Param::from(request.candidate.manifest_hash.clone()),
                                     hiqlite::Param::from(
                                         candidate_output_manifest_refs_json.clone(),
+                                    ),
+                                    hiqlite::Param::from(candidate_bootstrap_generation),
+                                    hiqlite::Param::from(request.candidate.plan_hash.clone()),
+                                    hiqlite::Param::from(request.candidate.coverage_hash.clone()),
+                                    hiqlite::Param::from(candidate_input_coverage_json.clone()),
+                                    hiqlite::Param::from(
+                                        request.candidate.previous_checkpoint_key.clone(),
+                                    ),
+                                    hiqlite::Param::from(
+                                        request.candidate.previous_manifest_hash.clone(),
                                     ),
                                     hiqlite::Param::from(request.candidate.tenant_id.clone()),
                                     hiqlite::Param::from(request.candidate.program_id.clone()),
@@ -2235,10 +4027,16 @@ impl MetaStore for HiqliteMetaStore {
                             logical_epoch,
                             content_hash,
                             manifest_hash,
-                            output_manifest_refs_json
+                            output_manifest_refs_json,
+                            bootstrap_generation,
+                            plan_hash,
+                            coverage_hash,
+                            input_coverage_json,
+                            previous_checkpoint_key,
+                            previous_manifest_hash
                         )
-                        SELECT $1, $2, $3, $4, $5, $6, $7, $8
-                        WHERE $9 = 1",
+                        SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14
+                        WHERE $15 = 1",
                                 vec![
                                     hiqlite::Param::from(request.candidate.tenant_id.clone()),
                                     hiqlite::Param::from(request.candidate.program_id.clone()),
@@ -2249,6 +4047,16 @@ impl MetaStore for HiqliteMetaStore {
                                     hiqlite::Param::from(request.candidate.manifest_hash.clone()),
                                     hiqlite::Param::from(
                                         candidate_output_manifest_refs_json.clone(),
+                                    ),
+                                    hiqlite::Param::from(candidate_bootstrap_generation),
+                                    hiqlite::Param::from(request.candidate.plan_hash.clone()),
+                                    hiqlite::Param::from(request.candidate.coverage_hash.clone()),
+                                    hiqlite::Param::from(candidate_input_coverage_json.clone()),
+                                    hiqlite::Param::from(
+                                        request.candidate.previous_checkpoint_key.clone(),
+                                    ),
+                                    hiqlite::Param::from(
+                                        request.candidate.previous_manifest_hash.clone(),
                                     ),
                                     hiqlite::Param::StmtOutputIndexed(0, 0),
                                 ],
@@ -2313,7 +4121,13 @@ impl MetaStore for HiqliteMetaStore {
                             logical_epoch,
                             content_hash,
                             manifest_hash,
-                            output_manifest_refs_json
+                            output_manifest_refs_json,
+                            bootstrap_generation,
+                            plan_hash,
+                            coverage_hash,
+                            input_coverage_json,
+                            previous_checkpoint_key,
+                            previous_manifest_hash
                         FROM velorix_standing_runtime_checkpoints
                         WHERE tenant_id = $1
                           AND program_id = $2
@@ -2332,6 +4146,46 @@ impl MetaStore for HiqliteMetaStore {
             .next()
             .map(StandingRuntimeCheckpointPointerRow::into_pointer)
             .transpose()
+    }
+
+    async fn read_view_dependency_graph_revision(
+        &self,
+        tenant_id: &str,
+    ) -> Result<u64, MetaStoreError> {
+        require_non_empty("tenant_id", tenant_id)?;
+        let rows = self
+            .with_schema_repair(|| async {
+                self.client
+                    .query_consistent_map::<GraphHeadRow, _>(
+                        "SELECT revision FROM velorix_view_dependency_graph_heads
+                         WHERE tenant_id = $1",
+                        vec![hiqlite::Param::from(tenant_id.to_string())],
+                    )
+                    .await
+                    .map_err(hiqlite_error)
+            })
+            .await?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(0);
+        };
+        let revision = i64::try_from(row.revision)
+            .map_err(|_| MetaStoreError::Serialization("graph revision is negative".to_string()))?;
+        u64::try_from(revision)
+            .map_err(|_| MetaStoreError::Serialization("graph revision is negative".to_string()))
+    }
+}
+
+#[cfg(feature = "hiqlite-backend")]
+struct GraphHeadRow {
+    revision: i64,
+}
+
+#[cfg(feature = "hiqlite-backend")]
+impl From<&mut hiqlite::Row<'_>> for GraphHeadRow {
+    fn from(row: &mut hiqlite::Row<'_>) -> Self {
+        Self {
+            revision: row.get("revision"),
+        }
     }
 }
 
@@ -2378,6 +4232,35 @@ struct IngestReservationRow {
 }
 
 #[cfg(feature = "hiqlite-backend")]
+struct SourceCutReservationRow {
+    admission_epoch: i64,
+    reservation: IngestReservationRow,
+    committed: bool,
+}
+
+#[cfg(feature = "hiqlite-backend")]
+struct ViewBootstrapControlRow {
+    tenant_id: String,
+    program_id: String,
+    view_id: String,
+    schema_version: i64,
+    bootstrap_generation: i64,
+    plan_hash: String,
+    view_spec_json: Vec<u8>,
+    lifecycle: String,
+    input_catalog_epoch: i64,
+    activation_cut_json: String,
+    active_checkpoint_json: String,
+}
+
+#[cfg(feature = "hiqlite-backend")]
+struct ViewBootstrapInputRow {
+    relation_id: String,
+    relation_version: String,
+    schema_fingerprint: String,
+}
+
+#[cfg(feature = "hiqlite-backend")]
 struct StandingRuntimeCheckpointPointerRow {
     tenant_id: String,
     program_id: String,
@@ -2387,6 +4270,12 @@ struct StandingRuntimeCheckpointPointerRow {
     content_hash: String,
     manifest_hash: String,
     output_manifest_refs_json: String,
+    bootstrap_generation: i64,
+    plan_hash: String,
+    coverage_hash: String,
+    input_coverage_json: String,
+    previous_checkpoint_key: String,
+    previous_manifest_hash: String,
 }
 
 #[cfg(feature = "hiqlite-backend")]
@@ -2459,6 +4348,24 @@ impl StandingRuntimeCheckpointPointerRow {
             output_manifest_refs: standing_runtime_output_manifest_refs_from_json(
                 &self.output_manifest_refs_json,
             )?,
+            bootstrap_generation: u64::try_from(self.bootstrap_generation).map_err(|_| {
+                MetaStoreError::Serialization(format!(
+                    "standing runtime checkpoint bootstrap_generation is negative: {}",
+                    self.bootstrap_generation
+                ))
+            })?,
+            plan_hash: self.plan_hash,
+            coverage_hash: self.coverage_hash,
+            input_coverage: if self.input_coverage_json.is_empty() {
+                None
+            } else {
+                Some(
+                    serde_json::from_str(&self.input_coverage_json)
+                        .map_err(|error| MetaStoreError::Serialization(error.to_string()))?,
+                )
+            },
+            previous_checkpoint_key: self.previous_checkpoint_key,
+            previous_manifest_hash: self.previous_manifest_hash,
         };
         pointer.validate()?;
         Ok(pointer)
@@ -2477,6 +4384,12 @@ impl From<&mut hiqlite::Row<'_>> for StandingRuntimeCheckpointPointerRow {
             content_hash: row.get("content_hash"),
             manifest_hash: row.get("manifest_hash"),
             output_manifest_refs_json: row.get("output_manifest_refs_json"),
+            bootstrap_generation: row.get("bootstrap_generation"),
+            plan_hash: row.get("plan_hash"),
+            coverage_hash: row.get("coverage_hash"),
+            input_coverage_json: row.get("input_coverage_json"),
+            previous_checkpoint_key: row.get("previous_checkpoint_key"),
+            previous_manifest_hash: row.get("previous_manifest_hash"),
         }
     }
 }
@@ -2525,6 +4438,62 @@ impl From<&mut hiqlite::Row<'_>> for IngestReservationRow {
             relation_version: row.get("relation_version"),
             schema_fingerprint: row.get("schema_fingerprint"),
             writer_epoch: row.get("writer_epoch"),
+        }
+    }
+}
+
+#[cfg(feature = "hiqlite-backend")]
+impl From<&mut hiqlite::Row<'_>> for SourceCutReservationRow {
+    fn from(row: &mut hiqlite::Row<'_>) -> Self {
+        let committed: i64 = row.get("committed");
+        Self {
+            admission_epoch: row.get("admission_epoch"),
+            reservation: IngestReservationRow::from(&mut *row),
+            committed: committed != 0,
+        }
+    }
+}
+
+#[cfg(feature = "hiqlite-backend")]
+impl From<&mut hiqlite::Row<'_>> for ViewBootstrapControlRow {
+    fn from(row: &mut hiqlite::Row<'_>) -> Self {
+        Self {
+            tenant_id: row.get("tenant_id"),
+            program_id: row.get("program_id"),
+            view_id: row.get("view_id"),
+            schema_version: row.get("schema_version"),
+            bootstrap_generation: row.get("bootstrap_generation"),
+            plan_hash: row.get("plan_hash"),
+            view_spec_json: row.get("view_spec_json"),
+            lifecycle: row.get("lifecycle"),
+            input_catalog_epoch: row.get("input_catalog_epoch"),
+            activation_cut_json: row.get("activation_cut_json"),
+            active_checkpoint_json: row.get("active_checkpoint_json"),
+        }
+    }
+}
+
+#[cfg(feature = "hiqlite-backend")]
+impl From<&mut hiqlite::Row<'_>> for ViewBootstrapInputRow {
+    fn from(row: &mut hiqlite::Row<'_>) -> Self {
+        Self {
+            relation_id: row.get("relation_id"),
+            relation_version: row.get("relation_version"),
+            schema_fingerprint: row.get("schema_fingerprint"),
+        }
+    }
+}
+
+#[cfg(feature = "hiqlite-backend")]
+struct ViewBootstrapViewInputRow {
+    edge_json: Vec<u8>,
+}
+
+#[cfg(feature = "hiqlite-backend")]
+impl From<&mut hiqlite::Row<'_>> for ViewBootstrapViewInputRow {
+    fn from(row: &mut hiqlite::Row<'_>) -> Self {
+        Self {
+            edge_json: row.get("edge_json"),
         }
     }
 }
@@ -2719,18 +4688,7 @@ impl MetaStore for GrpcMetaStore {
             .client
             .lock()
             .await
-            .reserve_ingest_range(self.request(proto::ReserveIngestRangeRequest {
-                stream_id: reservation.stream_id,
-                partition_id: reservation.partition_id,
-                start_offset_inclusive: reservation.start_offset_inclusive,
-                end_offset_exclusive: reservation.end_offset_exclusive,
-                batch_key: reservation.batch_key,
-                payload_digest: reservation.payload_digest,
-                relation_id: reservation.relation_id,
-                relation_version: reservation.relation_version,
-                schema_fingerprint: reservation.schema_fingerprint,
-                writer_epoch: reservation.writer_epoch,
-            }))
+            .reserve_ingest_range(self.request(ingest_range_reservation_to_proto(reservation)))
             .await
             .map_err(|error| MetaStoreError::Remote(error.to_string()))?
             .into_inner();
@@ -2739,6 +4697,163 @@ impl MetaStore for GrpcMetaStore {
             "reserved" => Ok(ReserveIngestRangeOutcome::Reserved),
             "duplicate" => Ok(ReserveIngestRangeOutcome::Duplicate),
             "conflict" => Ok(ReserveIngestRangeOutcome::Conflict),
+            other => Err(MetaStoreError::UnexpectedOutcome(other.to_string())),
+        }
+    }
+
+    async fn commit_ingest_range(
+        &self,
+        reservation: IngestRangeReservation,
+    ) -> Result<CommitIngestRangeOutcome, MetaStoreError> {
+        let response = self
+            .client
+            .lock()
+            .await
+            .commit_ingest_range(self.request(ingest_range_reservation_to_proto(reservation)))
+            .await
+            .map_err(|error| MetaStoreError::Remote(error.to_string()))?
+            .into_inner();
+        match response.outcome.as_str() {
+            "committed" => Ok(CommitIngestRangeOutcome::Committed),
+            "duplicate" => Ok(CommitIngestRangeOutcome::Duplicate),
+            "conflict" => Ok(CommitIngestRangeOutcome::Conflict),
+            other => Err(MetaStoreError::UnexpectedOutcome(other.to_string())),
+        }
+    }
+
+    async fn capture_ingest_source_cut(
+        &self,
+        request: CaptureIngestSourceCutRequest,
+    ) -> Result<IngestSourceCutV1, MetaStoreError> {
+        let request_json = serde_json::to_vec(&request)
+            .map_err(|error| MetaStoreError::Serialization(error.to_string()))?;
+        let response = self
+            .client
+            .lock()
+            .await
+            .capture_ingest_source_cut(
+                self.request(proto::CaptureIngestSourceCutRequest { request_json }),
+            )
+            .await
+            .map_err(|error| MetaStoreError::Remote(error.to_string()))?
+            .into_inner();
+        serde_json::from_slice(&response.source_cut_json)
+            .map_err(|error| MetaStoreError::Serialization(error.to_string()))
+    }
+
+    async fn begin_view_bootstrap(
+        &self,
+        request: BeginViewBootstrapRequest,
+    ) -> Result<BeginViewBootstrapOutcome, MetaStoreError> {
+        let request_json = serde_json::to_vec(&request)
+            .map_err(|error| MetaStoreError::Serialization(error.to_string()))?;
+        let response = self
+            .client
+            .lock()
+            .await
+            .begin_view_bootstrap(self.request(proto::BeginViewBootstrapRequest { request_json }))
+            .await
+            .map_err(|error| MetaStoreError::Remote(error.to_string()))?
+            .into_inner();
+        match response.outcome.as_str() {
+            "created" | "duplicate" => {
+                let control = serde_json::from_slice(&response.control_json)
+                    .map_err(|error| MetaStoreError::Serialization(error.to_string()))?;
+                if response.outcome == "created" {
+                    Ok(BeginViewBootstrapOutcome::Created(control))
+                } else {
+                    Ok(BeginViewBootstrapOutcome::Duplicate(control))
+                }
+            }
+            "conflict" => Ok(BeginViewBootstrapOutcome::Conflict),
+            other => Err(MetaStoreError::UnexpectedOutcome(other.to_string())),
+        }
+    }
+
+    async fn read_view_bootstrap(
+        &self,
+        tenant_id: &str,
+        program_id: &str,
+        view_id: &str,
+    ) -> Result<Option<ViewBootstrapControlV1>, MetaStoreError> {
+        let response = self
+            .client
+            .lock()
+            .await
+            .read_view_bootstrap(self.request(proto::ReadViewBootstrapRequest {
+                tenant_id: tenant_id.to_string(),
+                program_id: program_id.to_string(),
+                view_id: view_id.to_string(),
+            }))
+            .await
+            .map_err(|error| MetaStoreError::Remote(error.to_string()))?
+            .into_inner();
+        if !response.found {
+            return Ok(None);
+        }
+        serde_json::from_slice(&response.control_json)
+            .map(Some)
+            .map_err(|error| MetaStoreError::Serialization(error.to_string()))
+    }
+
+    async fn fix_view_bootstrap_activation_cut(
+        &self,
+        request: FixViewBootstrapActivationCutRequest,
+    ) -> Result<FixViewBootstrapActivationCutOutcome, MetaStoreError> {
+        let request_json = serde_json::to_vec(&request)
+            .map_err(|error| MetaStoreError::Serialization(error.to_string()))?;
+        let response = self
+            .client
+            .lock()
+            .await
+            .fix_view_bootstrap_activation_cut(
+                self.request(proto::FixViewBootstrapActivationCutRequest { request_json }),
+            )
+            .await
+            .map_err(|error| MetaStoreError::Remote(error.to_string()))?
+            .into_inner();
+        match response.outcome.as_str() {
+            "fixed" | "duplicate" => {
+                let control = serde_json::from_slice(&response.control_json)
+                    .map_err(|error| MetaStoreError::Serialization(error.to_string()))?;
+                if response.outcome == "fixed" {
+                    Ok(FixViewBootstrapActivationCutOutcome::Fixed(control))
+                } else {
+                    Ok(FixViewBootstrapActivationCutOutcome::Duplicate(control))
+                }
+            }
+            "conflict" => Ok(FixViewBootstrapActivationCutOutcome::Conflict),
+            other => Err(MetaStoreError::UnexpectedOutcome(other.to_string())),
+        }
+    }
+
+    async fn promote_view_bootstrap(
+        &self,
+        request: PromoteViewBootstrapRequest,
+    ) -> Result<PromoteViewBootstrapOutcome, MetaStoreError> {
+        let request_json = serde_json::to_vec(&request)
+            .map_err(|error| MetaStoreError::Serialization(error.to_string()))?;
+        let response = self
+            .client
+            .lock()
+            .await
+            .promote_view_bootstrap(
+                self.request(proto::PromoteViewBootstrapRequest { request_json }),
+            )
+            .await
+            .map_err(|error| MetaStoreError::Remote(error.to_string()))?
+            .into_inner();
+        match response.outcome.as_str() {
+            "promoted" | "duplicate" => {
+                let control = serde_json::from_slice(&response.control_json)
+                    .map_err(|error| MetaStoreError::Serialization(error.to_string()))?;
+                if response.outcome == "promoted" {
+                    Ok(PromoteViewBootstrapOutcome::Promoted(control))
+                } else {
+                    Ok(PromoteViewBootstrapOutcome::Duplicate(control))
+                }
+            }
+            "conflict" => Ok(PromoteViewBootstrapOutcome::Conflict),
             other => Err(MetaStoreError::UnexpectedOutcome(other.to_string())),
         }
     }
@@ -2881,7 +4996,27 @@ impl MetaStore for GrpcMetaStore {
             .ok_or_else(|| MetaStoreError::UnexpectedOutcome("missing pointer".to_string()))?;
         Ok(Some(standing_runtime_checkpoint_pointer_from_proto(
             pointer,
-        )))
+        )?))
+    }
+
+    async fn read_view_dependency_graph_revision(
+        &self,
+        tenant_id: &str,
+    ) -> Result<u64, MetaStoreError> {
+        require_non_empty("tenant_id", tenant_id)?;
+        let response = self
+            .client
+            .lock()
+            .await
+            .read_view_dependency_graph_revision(self.request(
+                proto::ReadViewDependencyGraphRevisionRequest {
+                    tenant_id: tenant_id.to_string(),
+                },
+            ))
+            .await
+            .map_err(|error| MetaStoreError::Remote(error.to_string()))?
+            .into_inner();
+        Ok(response.revision)
     }
 }
 
@@ -3071,6 +5206,10 @@ mod hiqlite_capability_tests {
                     "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                         .to_string(),
                 output_manifest_refs: Vec::new(),
+                bootstrap_generation: 0,
+                plan_hash: String::new(),
+                coverage_hash: String::new(),
+                input_coverage: None,
             },
             owner: StandingRuntimeOwnerToken {
                 tenant_id: "other".to_string(),

@@ -219,6 +219,13 @@ fn benchmark_gate_can_require_specific_workload_names() {
             "slatedb_state_reopen",
             "gc_dry_run_planning",
             "gc_execution_evidence",
+            "aggregate_composite_high_cardinality",
+            "aggregate_composite_hot_key_skew",
+            "inner_join_one_to_one",
+            "inner_join_one_to_many",
+            "inner_join_many_to_many",
+            "inner_join_hot_key_skew",
+            "inner_join_unmatched",
         ])
         .unwrap();
 }
@@ -557,6 +564,13 @@ fn local_workload_metrics() -> Vec<BenchmarkWorkloadMetricsV1> {
             }),
             scan_bytes: 0,
         },
+        in_memory_scale_metric("aggregate_composite_high_cardinality"),
+        in_memory_scale_metric("aggregate_composite_hot_key_skew"),
+        in_memory_scale_metric("inner_join_one_to_one"),
+        in_memory_scale_metric("inner_join_one_to_many"),
+        in_memory_scale_metric("inner_join_many_to_many"),
+        in_memory_scale_metric("inner_join_hot_key_skew"),
+        in_memory_scale_metric("inner_join_unmatched"),
         BenchmarkWorkloadMetricsV1 {
             name: "gc_execution_evidence".to_string(),
             p50_ms: 4.0,
@@ -572,6 +586,23 @@ fn local_workload_metrics() -> Vec<BenchmarkWorkloadMetricsV1> {
             scan_bytes: 0,
         },
     ]
+}
+
+fn in_memory_scale_metric(name: &str) -> BenchmarkWorkloadMetricsV1 {
+    BenchmarkWorkloadMetricsV1 {
+        name: name.to_string(),
+        p50_ms: 2.0,
+        p95_ms: 3.0,
+        object_requests: Some(ObjectRequestMetricsV1 {
+            put_count: 0,
+            get_count: 0,
+            list_count: 0,
+            range_read_count: 0,
+            bytes_written: 0,
+            bytes_read: 0,
+        }),
+        scan_bytes: 0,
+    }
 }
 
 fn materialized_output_metric(name: &str) -> BenchmarkWorkloadMetricsV1 {

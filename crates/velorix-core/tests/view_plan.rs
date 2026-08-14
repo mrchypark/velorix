@@ -1,30 +1,304 @@
 use serde_json::json;
 use velorix_core::{
+    operator_contract::{
+        AcceptedChangelogV1, ChangelogModeV1, NullabilityV1, StateBoundednessV1,
+        UniquenessGuaranteeV1,
+    },
     relation::{
         ArrowPhysicalTypeV1, DataFusionRegistrationModeV1, DataFusionRegistrationV1,
         IncrementalAdapterBindingV1, IncrementalRelationBindingV1, RelationColumnV1,
         RelationOperationV1, RelationSemanticRoleV1, SchemaFingerprintV1, VelorixLogicalTypeV1,
-        VelorixRelationCatalogV1, VelorixRelationSchemaV1, CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID,
+        VelorixRelationCatalogV1, VelorixRelationSchemaV1, VelorixRelationSourceV1,
+        CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID,
         CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID, RELATION_SCHEMA_VERSION_V1,
     },
     view_contract::{ColumnSchema, RelationSchema, SqlDataType},
     view_plan::{
+        logical_view_plan_hash, lower_join_chain_to_binary_dag,
         lower_supported_filter_project_sql_to_logical_plan,
         lower_supported_join_view_sql_to_logical_plan,
         lower_supported_latest_by_key_sql_to_logical_plan, lower_supported_sql_to_logical_plan,
+        lower_supported_three_input_inner_join_count_sql_to_logical_plan_with_policy,
         lower_supported_tumbling_window_sql_to_logical_plan,
-        lower_supported_view_sql_to_logical_plan, validate_logical_view_plan,
-        validate_supported_analytic_row_number_sql, validate_supported_filter_project_sql,
-        validate_supported_join_view_sql, validate_supported_latest_by_key_sql,
-        validate_supported_tumbling_window_sql, validate_supported_view_sql,
-        AggregateOutputPredicateExpr, JoinPredicateExpr, LogicalPlanAggregateFunctionV1,
+        lower_supported_view_sql_to_logical_plan, supported_join_view_plan_key_pairs,
+        validate_logical_view_plan, validate_supported_analytic_row_number_sql,
+        validate_supported_filter_project_sql, validate_supported_join_view_sql,
+        validate_supported_latest_by_key_sql, validate_supported_tumbling_window_sql,
+        validate_supported_view_sql, AggregateOutputPredicateExpr, JoinPredicateExpr,
+        LogicalPlanAggregateFunctionV1, LogicalPlanBinaryJoinStepV1, LogicalPlanColumnRef,
+        LogicalPlanCompositeJoinEqualityV1, LogicalPlanJoinKeyPairV1,
         LogicalPlanLatestByKeyFunctionV1, LogicalPlanStateKindV1, PredicateOp, RowPredicateExpr,
-        SupportedAggregateInputRelationSide, SupportedAnalyticWindowFunction,
-        SupportedEventTimeWindowKind, SupportedJoinKind, SupportedProjectionExpr,
-        VelorixLogicalViewExecutionV1, VelorixLogicalViewPlanNodeV1, ViewPlanError,
-        LOGICAL_VIEW_PLAN_HASH_PREFIX, LOGICAL_VIEW_PLAN_VERSION_V1,
+        SupportedAggregateInputRelationSide, SupportedAggregateOutputIdentity,
+        SupportedAnalyticWindowFunction, SupportedCompositeJoinEqualityV1,
+        SupportedEventTimeWindowKind, SupportedJoinKeyDomainV1, SupportedJoinKeyPairV1,
+        SupportedJoinKind, SupportedProjectionExpr, SupportedSemiAntiJoinKindV1,
+        VelorixLogicalViewExecutionV1, VelorixLogicalViewPlanNodeV1, VelorixLogicalViewPlanV1,
+        ViewPlanError, COMPOSITE_PK_POSITIONAL_JSON_ARRAY_JOIN_KEY_CODEC_V1,
+        INCREMENTAL_BAG_SEMANTICS_VERSION_V1, INCREMENTAL_KEY_SEMANTICS_VERSION_V1,
+        LEFT_JOIN_INPUT_INSTANCE_ID_V1, LOGICAL_VIEW_PLAN_HASH_PREFIX,
+        LOGICAL_VIEW_PLAN_VERSION_V1, LOGICAL_VIEW_PLAN_VERSION_V2,
+        NON_PRIMARY_NON_NULL_SCALAR_JOIN_KEY_CODEC_V1, RIGHT_JOIN_INPUT_INSTANCE_ID_V1,
+        SELF_JOIN_ATOMIC_FANOUT_PROTOCOL_V1, THREE_INPUT_LEGACY_SQL_ENCOUNTER_JOIN_ORDER_V1,
+        THREE_INPUT_ROOT_FIXED_RIGHT_RELATION_ID_JOIN_ORDER_V1,
     },
 };
+
+#[test]
+fn correlated_exists_and_not_exists_lower_to_generic_semi_anti_join_nodes() {
+    let catalogs = vec![scores_catalog(), accounts_catalog()];
+    let output = scores_projection_output_schema();
+    let exists = lower_supported_sql_to_logical_plan(
+        "select s.user_id, s.score from scores s where exists (select 1 from accounts a where a.account_id = s.user_id)",
+        &catalogs,
+        &output,
+    )
+    .unwrap();
+    assert!(exists
+        .nodes
+        .iter()
+        .any(|node| matches!(node, VelorixLogicalViewPlanNodeV1::SemiEquiJoin { .. })));
+    assert!(matches!(
+        exists.execution,
+        VelorixLogicalViewExecutionV1::TwoInputSemiAntiJoinProject { .. }
+    ));
+
+    let not_exists = lower_supported_sql_to_logical_plan(
+        "select s.user_id, s.score from scores s where not exists (select 1 from accounts a where a.account_id = s.user_id)",
+        &catalogs,
+        &output,
+    )
+    .unwrap();
+    assert!(not_exists
+        .nodes
+        .iter()
+        .any(|node| matches!(node, VelorixLogicalViewPlanNodeV1::AntiEquiJoin { .. })));
+}
+
+#[test]
+fn correlated_exists_v1_fails_closed_outside_identical_non_null_scalar_equality() {
+    let catalogs = vec![scores_catalog(), accounts_catalog()];
+    let output = scores_projection_output_schema();
+    // Residual predicates on the correlated subquery are not supported yet.
+    assert!(lower_supported_sql_to_logical_plan(
+        "select s.user_id, s.score from scores s where exists (select 1 from accounts a where a.account_id = s.user_id and a.limit > 0)",
+        &catalogs,
+        &output,
+    )
+    .is_err());
+    // Projecting a column (not a literal) from the subquery is rejected.
+    assert!(lower_supported_sql_to_logical_plan(
+        "select s.user_id, s.score from scores s where exists (select a.limit from accounts a where a.account_id = s.user_id)",
+        &catalogs,
+        &output,
+    )
+    .is_err());
+    // Phase 7.4: non-primary-key equality on identical non-null scalar
+    // columns is now admitted and lowers to a semi-join.
+    let lowered = lower_supported_sql_to_logical_plan(
+        "select s.user_id, s.score from scores s where exists (select 1 from accounts a where a.limit = s.score)",
+        &catalogs,
+        &output,
+    )
+    .expect("non-PK correlation must lower");
+    let VelorixLogicalViewExecutionV1::TwoInputSemiAntiJoinProject { plan } = &lowered.execution
+    else {
+        panic!("expected semi/anti join plan");
+    };
+    assert_eq!(plan.left_join_key_column_id, "score");
+    assert_eq!(plan.right_join_key_column_id, "limit");
+}
+
+#[test]
+fn n_way_join_chain_lowers_to_a_left_deep_binary_dag() {
+    let key = |relation_id: &str| LogicalPlanColumnRef {
+        relation_id: relation_id.to_string(),
+        input_instance_id: None,
+        column_id: "id".to_string(),
+    };
+    let (nodes, output) = lower_join_chain_to_binary_dag(
+        "scan_orders",
+        &[
+            LogicalPlanBinaryJoinStepV1 {
+                node_id: "join_orders_customers".into(),
+                right_input: "scan_customers".into(),
+                left_key: key("orders"),
+                right_key: key("customers"),
+                composite_equality: None,
+                join_kind: SupportedJoinKind::Inner,
+            },
+            LogicalPlanBinaryJoinStepV1 {
+                node_id: "join_orders_customers_products".into(),
+                right_input: "scan_products".into(),
+                left_key: key("orders"),
+                right_key: key("products"),
+                composite_equality: None,
+                join_kind: SupportedJoinKind::Inner,
+            },
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(output, "join_orders_customers_products");
+    assert!(matches!(
+        &nodes[0],
+        VelorixLogicalViewPlanNodeV1::InnerEquiJoin { left, right, .. }
+            if left == "scan_orders" && right == "scan_customers"
+    ));
+    assert!(matches!(
+        &nodes[1],
+        VelorixLogicalViewPlanNodeV1::InnerEquiJoin { left, right, .. }
+            if left == "join_orders_customers" && right == "scan_products"
+    ));
+}
+
+#[test]
+fn three_input_composite_pk_sql_lowers_to_validated_binary_dag() {
+    let catalogs = three_input_composite_join_catalogs();
+    let output = three_input_join_count_output_schema();
+    let sql = "select s.tenant_id, s.user_id, count(*) as count from scores s join accounts a on s.tenant_id = a.account_tenant_id and s.user_id = a.account_id join profiles p on s.tenant_id = p.account_tenant_id and s.user_id = p.account_id group by s.tenant_id, s.user_id";
+    let plan = lower_supported_sql_to_logical_plan(sql, &catalogs, &output).unwrap();
+    let VelorixLogicalViewExecutionV1::ThreeInputInnerJoinCount { plan: supported } =
+        &plan.execution
+    else {
+        panic!("expected three-input execution");
+    };
+    assert_eq!(
+        supported.ordered_input_relation_ids,
+        ["scores", "accounts", "profiles"]
+    );
+    assert_eq!(supported.schema_version, 2);
+    assert_eq!(
+        supported.join_order_policy_id,
+        THREE_INPUT_ROOT_FIXED_RIGHT_RELATION_ID_JOIN_ORDER_V1
+    );
+    assert_eq!(
+        supported.root_primary_key_column_ids,
+        ["tenant_id", "user_id"]
+    );
+    assert_eq!(
+        supported.root_to_input_pk_permutations,
+        [vec![0, 1], vec![1, 0], vec![1, 0]]
+    );
+    assert_eq!(
+        plan.execution_implementation
+            .as_ref()
+            .unwrap()
+            .join_key_codec_id
+            .as_deref(),
+        Some(COMPOSITE_PK_POSITIONAL_JSON_ARRAY_JOIN_KEY_CODEC_V1)
+    );
+    assert_eq!(
+        plan.nodes
+            .iter()
+            .filter(|node| matches!(node, VelorixLogicalViewPlanNodeV1::InnerEquiJoin { .. }))
+            .count(),
+        2
+    );
+
+    let mut missing_step = plan.clone();
+    missing_step.nodes.retain(|node| {
+        !matches!(node, VelorixLogicalViewPlanNodeV1::InnerEquiJoin { node_id, .. } if node_id == "join_2")
+    });
+    assert!(validate_logical_view_plan(&missing_step).is_err());
+
+    let wider = format!("{sql} having count(*) > 0");
+    assert!(lower_supported_sql_to_logical_plan(&wider, &catalogs, &output).is_err());
+
+    let reordered_sql = "select s.tenant_id, s.user_id, count(*) as count from scores s join profiles p on s.tenant_id = p.account_tenant_id and s.user_id = p.account_id join accounts a on s.tenant_id = a.account_tenant_id and s.user_id = a.account_id group by s.tenant_id, s.user_id";
+    let reordered = lower_supported_sql_to_logical_plan(reordered_sql, &catalogs, &output).unwrap();
+    assert_eq!(reordered.execution, plan.execution);
+    assert_eq!(reordered.nodes, plan.nodes);
+    assert_eq!(reordered.operator_dag_contract, plan.operator_dag_contract);
+    assert_eq!(reordered.state_requirements, plan.state_requirements);
+    assert_eq!(
+        reordered.execution_implementation,
+        plan.execution_implementation
+    );
+    assert_ne!(reordered.plan_hash, plan.plan_hash);
+
+    let legacy = lower_supported_three_input_inner_join_count_sql_to_logical_plan_with_policy(
+        sql,
+        &catalogs,
+        &output,
+        THREE_INPUT_LEGACY_SQL_ENCOUNTER_JOIN_ORDER_V1,
+    )
+    .unwrap();
+    let VelorixLogicalViewExecutionV1::ThreeInputInnerJoinCount { plan: legacy_plan } =
+        &legacy.execution
+    else {
+        panic!("expected legacy three-input execution");
+    };
+    assert_eq!(legacy_plan.schema_version, 1);
+    assert!(legacy_plan.join_order_policy_id.is_empty());
+    let legacy_json = serde_json::to_value(&legacy).unwrap();
+    assert!(legacy_json["execution"]["plan"]
+        .get("join_order_policy_id")
+        .is_none());
+    let decoded: VelorixLogicalViewPlanV1 = serde_json::from_value(legacy_json).unwrap();
+    validate_logical_view_plan(&decoded).unwrap();
+
+    assert!(
+        lower_supported_three_input_inner_join_count_sql_to_logical_plan_with_policy(
+            sql,
+            &catalogs,
+            &output,
+            "unknown-three-input-policy",
+        )
+        .is_err()
+    );
+    let mut tampered_policy = plan.clone();
+    let VelorixLogicalViewExecutionV1::ThreeInputInnerJoinCount { plan } =
+        &mut tampered_policy.execution
+    else {
+        unreachable!()
+    };
+    plan.join_order_policy_id = "unknown-three-input-policy".into();
+    assert!(validate_logical_view_plan(&tampered_policy).is_err());
+}
+
+#[test]
+fn composite_join_equality_has_one_canonical_versioned_representation() {
+    let key = |relation_id: &str, column_id: &str| LogicalPlanColumnRef {
+        relation_id: relation_id.to_string(),
+        input_instance_id: None,
+        column_id: column_id.to_string(),
+    };
+    let equality = LogicalPlanCompositeJoinEqualityV1 {
+        schema_version: 1,
+        additional_pairs: vec![LogicalPlanJoinKeyPairV1 {
+            left_key: key("orders", "tenant_id"),
+            right_key: key("customers", "tenant_id"),
+        }],
+    };
+    let (nodes, _) = lower_join_chain_to_binary_dag(
+        "scan_orders",
+        &[LogicalPlanBinaryJoinStepV1 {
+            node_id: "join_orders_customers".into(),
+            right_input: "scan_customers".into(),
+            left_key: key("orders", "account_id"),
+            right_key: key("customers", "account_id"),
+            composite_equality: Some(equality.clone()),
+            join_kind: SupportedJoinKind::Inner,
+        }],
+    )
+    .unwrap();
+
+    let VelorixLogicalViewPlanNodeV1::InnerEquiJoin {
+        left_key,
+        right_key,
+        composite_equality,
+        ..
+    } = &nodes[0]
+    else {
+        panic!("expected inner join");
+    };
+    assert_eq!(left_key.column_id, "account_id");
+    assert_eq!(right_key.column_id, "account_id");
+    assert_eq!(composite_equality.as_ref(), Some(&equality));
+    let bytes = serde_json::to_vec(&nodes).unwrap();
+    let decoded: Vec<VelorixLogicalViewPlanNodeV1> = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(serde_json::to_vec(&decoded).unwrap(), bytes);
+}
 
 #[test]
 fn single_key_sum_count_sql_lowers_to_hashed_logical_view_plan() {
@@ -38,7 +312,15 @@ fn single_key_sum_count_sql_lowers_to_hashed_logical_view_plan() {
     )
     .unwrap();
 
-    assert_eq!(plan.plan_version, LOGICAL_VIEW_PLAN_VERSION_V1);
+    assert_eq!(plan.plan_version, LOGICAL_VIEW_PLAN_VERSION_V2);
+    assert_eq!(
+        plan.key_semantics_version,
+        INCREMENTAL_KEY_SEMANTICS_VERSION_V1
+    );
+    assert_eq!(
+        plan.bag_semantics_version,
+        INCREMENTAL_BAG_SEMANTICS_VERSION_V1
+    );
     assert!(plan
         .plan_hash
         .as_ref()
@@ -64,6 +346,217 @@ fn single_key_sum_count_sql_lowers_to_hashed_logical_view_plan() {
         .iter()
         .any(|node| matches!(node, VelorixLogicalViewPlanNodeV1::Output { .. })));
     validate_logical_view_plan(&plan).unwrap();
+}
+
+#[test]
+fn aggregate_sql_admits_composite_columns_and_deterministic_scalar_group_keys() {
+    let catalog = scores_with_category_catalog();
+
+    let composite = validate_supported_view_sql(
+        "select user_id, category, sum(score) as sum, count(*) as count from scores group by user_id, category",
+        &catalog,
+    )
+    .unwrap();
+    let Some(SupportedAggregateOutputIdentity::GroupKey {
+        group_keys: composite_keys,
+    }) = &composite.aggregate_output_identity
+    else {
+        panic!("expected explicit composite group identity");
+    };
+    assert_eq!(composite_keys.len(), 2);
+    assert_eq!(
+        composite_keys[1].input_column_id.as_deref(),
+        Some("category")
+    );
+
+    let computed = validate_supported_view_sql(
+        "select user_id, score / 10 as bucket, sum(score) as sum, count(*) as count from scores group by user_id, bucket",
+        &catalog,
+    )
+    .unwrap();
+    let Some(SupportedAggregateOutputIdentity::GroupKey {
+        group_keys: computed_keys,
+    }) = &computed.aggregate_output_identity
+    else {
+        panic!("expected explicit computed group identity");
+    };
+    assert_eq!(computed_keys.len(), 2);
+    assert!(matches!(
+        computed_keys[1].expression,
+        Some(SupportedProjectionExpr::BinaryInt64 { .. })
+    ));
+
+    let error = validate_supported_view_sql(
+        "select user_id, random() as bucket, sum(score) as sum from scores group by user_id, bucket",
+        &catalog,
+    )
+    .unwrap_err();
+    assert!(matches!(error, ViewPlanError::UnsupportedShape { .. }));
+    for sql in [
+        "select user_id as first_key, user_id as second_key, sum(score) as sum from scores group by first_key, second_key",
+        "select user_id, score + 1 as category, sum(score) as sum from scores group by user_id, category",
+    ] {
+        let error = validate_supported_view_sql(sql, &catalog).unwrap_err();
+        assert!(matches!(error, ViewPlanError::UnsupportedShape { .. }));
+    }
+
+    let output_schema = RelationSchema {
+        relation_id: "scores_by_user_bucket".to_string(),
+        relation_name: "scores_by_user_bucket".to_string(),
+        relation_version: "2026-08-10.v1".to_string(),
+        schema_fingerprint:
+            "sha256:1000000000000000000000000000000000000000000000000000000000000001".to_string(),
+        columns: vec![
+            ColumnSchema {
+                name: "user_id".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "bucket".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "sum".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "count".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["user_id".to_string(), "bucket".to_string()],
+    };
+    let logical = lower_supported_view_sql_to_logical_plan(
+        "select user_id, score / 10 as bucket, sum(score) as sum, count(*) as count from scores group by user_id, bucket",
+        &catalog,
+        &output_schema,
+    )
+    .unwrap();
+    assert!(logical.nodes.iter().any(|node| matches!(
+        node,
+        VelorixLogicalViewPlanNodeV1::Project {
+            computed_columns,
+            ..
+        } if computed_columns.len() == 1
+    )));
+    validate_logical_view_plan(&logical).unwrap();
+}
+
+#[test]
+fn global_count_lowers_with_explicit_singleton_output_identity() {
+    let catalog = scores_catalog();
+    let output_schema = RelationSchema {
+        relation_id: "score_count".to_string(),
+        relation_name: "score_count".to_string(),
+        relation_version: "2026-08-10.v1".to_string(),
+        schema_fingerprint:
+            "sha256:4000000000000000000000000000000000000000000000000000000000000004".to_string(),
+        columns: vec![ColumnSchema {
+            name: "count".to_string(),
+            data_type: SqlDataType::Int64,
+            nullable: false,
+        }],
+        primary_key: Vec::new(),
+    };
+    let logical = lower_supported_view_sql_to_logical_plan(
+        "select count(*) as count from scores",
+        &catalog,
+        &output_schema,
+    )
+    .unwrap();
+    let VelorixLogicalViewExecutionV1::SingleKeySumCount { plan } = &logical.execution else {
+        panic!("expected aggregate execution");
+    };
+    assert_eq!(
+        plan.aggregate_output_identity,
+        Some(SupportedAggregateOutputIdentity::Singleton)
+    );
+    assert!(logical.nodes.iter().any(|node| matches!(
+        node,
+        VelorixLogicalViewPlanNodeV1::Aggregate { group_keys, .. } if group_keys.is_empty()
+    )));
+    let aggregate_contract = logical
+        .operator_dag_contract
+        .operators
+        .iter()
+        .find(|operator| operator.operator.kind == "aggregate")
+        .unwrap();
+    assert_eq!(
+        aggregate_contract.outputs[0].uniqueness,
+        UniquenessGuaranteeV1::Singleton
+    );
+    assert!(aggregate_contract.outputs[0].candidate_keys.is_empty());
+    validate_logical_view_plan(&logical).unwrap();
+
+    for sql in [
+        "select sum(score) as sum from scores",
+        "select count(*) as count from scores group by grouping sets (())",
+    ] {
+        let result = validate_supported_view_sql(sql, &catalog);
+        assert!(
+            matches!(&result, Err(ViewPlanError::UnsupportedShape { .. })),
+            "expected fail-closed admission for `{sql}`, got {result:?}"
+        );
+    }
+}
+
+#[test]
+fn aggregate_group_key_arity_is_structured_and_hash_visible() {
+    let catalog = scores_catalog();
+    let output_schema = scores_output_schema();
+    let one_key = lower_supported_view_sql_to_logical_plan(
+        "select user_id, sum(score) as sum, count(*) as count from scores group by user_id",
+        &catalog,
+        &output_schema,
+    )
+    .unwrap();
+    let one_key_hash = logical_view_plan_hash(&one_key).unwrap();
+    assert_eq!(
+        one_key_hash,
+        "velorix-logical-view-plan-sha256-v1:sha256:efbb4bbb1db5d038885bff59de0d959fb24e5e7c8efa6c295f04ba3a03feae8f"
+    );
+
+    let mut zero_keys = one_key.clone();
+    let mut multiple_keys = one_key.clone();
+    for node in &mut zero_keys.nodes {
+        if let VelorixLogicalViewPlanNodeV1::Aggregate { group_keys, .. } = node {
+            group_keys.clear();
+        }
+    }
+    for node in &mut multiple_keys.nodes {
+        if let VelorixLogicalViewPlanNodeV1::Aggregate { group_keys, .. } = node {
+            group_keys.push(LogicalPlanColumnRef {
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                input_instance_id: None,
+                column_id: "score".to_string(),
+            });
+        }
+    }
+
+    let key_arity = |plan: &VelorixLogicalViewPlanV1| {
+        plan.nodes
+            .iter()
+            .find_map(|node| match node {
+                VelorixLogicalViewPlanNodeV1::Aggregate { group_keys, .. } => {
+                    Some(group_keys.len())
+                }
+                _ => None,
+            })
+            .unwrap()
+    };
+    assert_eq!(key_arity(&zero_keys), 0);
+    assert_eq!(key_arity(&one_key), 1);
+    assert_eq!(key_arity(&multiple_keys), 2);
+
+    let zero_key_hash = logical_view_plan_hash(&zero_keys).unwrap();
+    let multiple_key_hash = logical_view_plan_hash(&multiple_keys).unwrap();
+    assert_ne!(zero_key_hash, one_key_hash);
+    assert_ne!(multiple_key_hash, one_key_hash);
+    assert_ne!(zero_key_hash, multiple_key_hash);
 }
 
 #[test]
@@ -1126,6 +1619,111 @@ fn filter_project_sql_accepts_derived_table_source_filters() {
         .expect("derived table and outer WHERE filters should lower to runtime predicate");
     assert_eq!(predicate_expr.leaf_predicates().len(), 2);
     validate_logical_view_plan(&plan).unwrap();
+}
+
+#[test]
+fn subquery_admission_uses_existing_relational_nodes_or_fails_closed() {
+    let catalog = scores_catalog();
+    let output_schema = scores_projection_output_schema();
+    let plan = lower_supported_sql_to_logical_plan(
+        "select user_id, score from (select * from scores where score > 0) s where s.user_id <> 'bob'",
+        std::slice::from_ref(&catalog),
+        &output_schema,
+    )
+    .unwrap();
+    assert!(plan.nodes.iter().all(|node| matches!(
+        node,
+        VelorixLogicalViewPlanNodeV1::RelationScan { .. }
+            | VelorixLogicalViewPlanNodeV1::Filter { .. }
+            | VelorixLogicalViewPlanNodeV1::Project { .. }
+            | VelorixLogicalViewPlanNodeV1::Output { .. }
+    )));
+    validate_logical_view_plan(&plan).unwrap();
+
+    for sql in [
+        "select user_id, score from scores where score > (select max(score) from scores)",
+        "select s.user_id, s.score from scores s where exists (select 1 from scores t where t.user_id = s.user_id)",
+        "select user_id, score from (select user_id, max(score) as score from scores group by user_id) s",
+    ] {
+        assert!(matches!(
+            lower_supported_sql_to_logical_plan(
+                sql,
+                std::slice::from_ref(&catalog),
+                &output_schema,
+            ),
+            Err(ViewPlanError::UnsupportedShape { .. })
+        ));
+    }
+}
+
+#[test]
+fn nullable_in_and_not_in_forms_fail_closed() {
+    let catalog = scores_catalog();
+    let output_schema = scores_projection_output_schema();
+    for sql in [
+        "select user_id, score from scores where score in (1, null)",
+        "select user_id, score from scores where score not in (1, null)",
+    ] {
+        let error = lower_supported_sql_to_logical_plan(
+            sql,
+            std::slice::from_ref(&catalog),
+            &output_schema,
+        )
+        .unwrap_err();
+        assert!(matches!(error, ViewPlanError::UnsupportedShape { .. }));
+        assert!(error.to_string().contains("null-aware predicate semantics"));
+    }
+
+    let mut nullable_scores = scores_catalog();
+    nullable_scores.relation_schema.columns[1].nullable = true;
+    let fingerprint =
+        SchemaFingerprintV1::for_relation_schema(&nullable_scores.relation_schema).unwrap();
+    nullable_scores.schema_fingerprint = fingerprint.clone();
+    nullable_scores.incremental_relation.schema_fingerprint = fingerprint;
+    let mut nullable_output = scores_projection_output_schema();
+    nullable_output.columns[1].nullable = true;
+    for sql in [
+        "select user_id, score from scores where score in (1, 2)",
+        "select user_id, score from scores where score not in (1, 2)",
+    ] {
+        let error = lower_supported_sql_to_logical_plan(
+            sql,
+            std::slice::from_ref(&nullable_scores),
+            &nullable_output,
+        )
+        .unwrap_err();
+        assert!(matches!(error, ViewPlanError::UnsupportedShape { .. }));
+        assert!(error.to_string().contains("null-aware predicate semantics"));
+    }
+
+    let mut nullable_accounts = accounts_catalog();
+    nullable_accounts.relation_schema.columns[1].nullable = true;
+    let fingerprint =
+        SchemaFingerprintV1::for_relation_schema(&nullable_accounts.relation_schema).unwrap();
+    nullable_accounts.schema_fingerprint = fingerprint.clone();
+    nullable_accounts.incremental_relation.schema_fingerprint = fingerprint;
+    // Phase 7.3: nullable IN is admitted (NULL probe never matches in the
+    // semi-join), while nullable NOT IN stays fail-closed until null-aware
+    // anti-join semantics exist.
+    let in_plan = lower_supported_sql_to_logical_plan(
+        "select s.user_id, s.score from scores s where s.score in (select a.limit from accounts a)",
+        &[catalog.clone(), nullable_accounts.clone()],
+        &output_schema,
+    )
+    .expect("nullable IN must decorrelate to a semi-join");
+    let VelorixLogicalViewExecutionV1::TwoInputSemiAntiJoinProject { plan } = &in_plan.execution
+    else {
+        panic!("expected semi-join plan for nullable IN");
+    };
+    assert_eq!(plan.join_kind, SupportedSemiAntiJoinKindV1::Semi);
+    assert!(matches!(
+        lower_supported_sql_to_logical_plan(
+            "select s.user_id, s.score from scores s where s.score not in (select a.limit from accounts a)",
+            &[catalog.clone(), nullable_accounts.clone()],
+            &output_schema,
+        ),
+        Err(ViewPlanError::UnsupportedShape { .. })
+    ));
 }
 
 #[test]
@@ -2267,7 +2865,7 @@ fn two_input_join_sql_lowers_to_hashed_logical_view_plan() {
     )
     .unwrap();
 
-    assert_eq!(plan.plan_version, LOGICAL_VIEW_PLAN_VERSION_V1);
+    assert_eq!(plan.plan_version, LOGICAL_VIEW_PLAN_VERSION_V2);
     assert!(matches!(
         plan.execution,
         VelorixLogicalViewExecutionV1::TwoInputJoinSumCount { .. }
@@ -2284,7 +2882,510 @@ fn two_input_join_sql_lowers_to_hashed_logical_view_plan() {
         .nodes
         .iter()
         .any(|node| matches!(node, VelorixLogicalViewPlanNodeV1::Output { .. })));
+    let implementation = plan.execution_implementation.as_ref().unwrap();
+    assert_eq!(
+        implementation.implementation_id,
+        "velorix-keyed-aggregate-join-specialization-v1"
+    );
+    assert!(implementation
+        .physical_operator_dag_hash
+        .starts_with("velorix-physical-operator-dag-sha256-v1:sha256:"));
+    assert_eq!(implementation.contract_version, 2);
+    assert_eq!(
+        implementation.output_codec_id,
+        "velorix-materialized-output-v1"
+    );
+    assert_eq!(
+        implementation.output_publication_protocol_id,
+        "velorix-durable-output-publication-v1"
+    );
     validate_logical_view_plan(&plan).unwrap();
+}
+
+#[test]
+fn composite_primary_key_inner_join_lowers_every_key_component() {
+    let (scores, accounts) = composite_join_catalogs();
+    let sql = "select a.account_tenant_id as tenant_id, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.user_id = a.account_id and s.tenant_id = a.account_tenant_id group by a.account_tenant_id";
+    let plan = lower_supported_join_view_sql_to_logical_plan(
+        sql,
+        &[scores.clone(), accounts.clone()],
+        &composite_join_output_schema(),
+    )
+    .unwrap();
+    let VelorixLogicalViewExecutionV1::TwoInputJoinSumCount { plan: supported } = &plan.execution
+    else {
+        panic!("expected join runtime execution");
+    };
+    assert_eq!(supported.left_join_key_column_id, "tenant_id");
+    assert_eq!(supported.right_join_key_column_id, "account_tenant_id");
+    assert_eq!(
+        supported.composite_equality,
+        Some(SupportedCompositeJoinEqualityV1 {
+            schema_version: 1,
+            additional_pairs: vec![SupportedJoinKeyPairV1 {
+                left_column_id: "user_id".into(),
+                right_column_id: "account_id".into(),
+            }],
+        })
+    );
+    let join = plan
+        .nodes
+        .iter()
+        .find(|node| matches!(node, VelorixLogicalViewPlanNodeV1::InnerEquiJoin { .. }))
+        .unwrap();
+    let VelorixLogicalViewPlanNodeV1::InnerEquiJoin {
+        composite_equality, ..
+    } = join
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        composite_equality.as_ref().unwrap().additional_pairs.len(),
+        1
+    );
+    assert_eq!(
+        plan.execution_implementation
+            .as_ref()
+            .unwrap()
+            .join_key_codec_id
+            .as_deref(),
+        Some(COMPOSITE_PK_POSITIONAL_JSON_ARRAY_JOIN_KEY_CODEC_V1)
+    );
+    validate_logical_view_plan(&plan).unwrap();
+
+    let reordered_sql = "select a.account_tenant_id as tenant_id, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.tenant_id = a.account_tenant_id and s.user_id = a.account_id group by a.account_tenant_id";
+    let reordered = lower_supported_join_view_sql_to_logical_plan(
+        reordered_sql,
+        &[scores.clone(), accounts.clone()],
+        &composite_join_output_schema(),
+    )
+    .unwrap();
+    let plan_json: serde_json::Value = serde_json::to_value(&plan).unwrap();
+    let reordered_json: serde_json::Value = serde_json::to_value(&reordered).unwrap();
+    assert_eq!(plan_json["execution"], reordered_json["execution"]);
+    assert_eq!(plan_json["nodes"], reordered_json["nodes"]);
+
+    let error = validate_supported_join_view_sql(
+        "select a.account_tenant_id as tenant_id, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.tenant_id = a.account_tenant_id group by a.account_tenant_id",
+        &[scores.clone(), accounts.clone()],
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("partial primary-key equality"));
+
+    let mut incompatible_accounts = accounts;
+    let tenant = incompatible_accounts
+        .relation_schema
+        .columns
+        .iter_mut()
+        .find(|column| column.column_id == "account_tenant_id")
+        .unwrap();
+    tenant.logical_type = VelorixLogicalTypeV1::Int64;
+    tenant.physical_arrow_type = ArrowPhysicalTypeV1::Int64;
+    let fingerprint =
+        SchemaFingerprintV1::for_relation_schema(&incompatible_accounts.relation_schema).unwrap();
+    incompatible_accounts.schema_fingerprint = fingerprint.clone();
+    incompatible_accounts
+        .incremental_relation
+        .schema_fingerprint = fingerprint;
+    let error =
+        validate_supported_join_view_sql(sql, &[scores, incompatible_accounts]).unwrap_err();
+    assert!(error.to_string().contains("identical physical Arrow types"));
+}
+
+#[test]
+fn non_primary_scalar_join_admits_duplicate_key_state_and_rejects_unsafe_keys() {
+    let scores = generic_adapter_catalog(scores_catalog());
+    let accounts = generic_adapter_catalog(accounts_catalog());
+    let sql = "select a.limit as bucket, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.score = a.limit group by a.limit";
+    let plan = lower_supported_join_view_sql_to_logical_plan(
+        sql,
+        &[scores.clone(), accounts.clone()],
+        &non_primary_join_output_schema(),
+    )
+    .unwrap();
+    let VelorixLogicalViewExecutionV1::TwoInputJoinSumCount { plan: supported } = &plan.execution
+    else {
+        panic!("expected join runtime execution");
+    };
+    assert_eq!(supported.left_join_key_column_id, "score");
+    assert_eq!(supported.right_join_key_column_id, "limit");
+    assert_eq!(supported.composite_equality, None);
+    assert_eq!(
+        supported.join_key_domain,
+        Some(SupportedJoinKeyDomainV1::NonPrimaryNonNullScalarV1)
+    );
+    assert_eq!(
+        plan.execution_implementation
+            .as_ref()
+            .unwrap()
+            .join_key_codec_id
+            .as_deref(),
+        Some(NON_PRIMARY_NON_NULL_SCALAR_JOIN_KEY_CODEC_V1)
+    );
+    validate_logical_view_plan(&plan).unwrap();
+
+    let mut nullable_accounts = accounts.clone();
+    nullable_accounts
+        .relation_schema
+        .columns
+        .iter_mut()
+        .find(|column| column.column_id == "limit")
+        .unwrap()
+        .nullable = true;
+    let fingerprint =
+        SchemaFingerprintV1::for_relation_schema(&nullable_accounts.relation_schema).unwrap();
+    nullable_accounts.schema_fingerprint = fingerprint.clone();
+    nullable_accounts.incremental_relation.schema_fingerprint = fingerprint;
+    let error =
+        validate_supported_join_view_sql(sql, &[scores.clone(), nullable_accounts]).unwrap_err();
+    assert!(error.to_string().contains("must be non-null"));
+
+    let error = validate_supported_join_view_sql(
+        "select a.limit as bucket, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.delta = a.delta group by a.limit",
+        &[scores, accounts],
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("weight column"));
+
+    let mut nested_scores = scores_with_category_catalog();
+    let category = nested_scores
+        .relation_schema
+        .columns
+        .iter_mut()
+        .find(|column| column.column_id == "category")
+        .unwrap();
+    category.logical_type = VelorixLogicalTypeV1::Array {
+        element_type: Box::new(VelorixLogicalTypeV1::Utf8),
+    };
+    category.physical_arrow_type = ArrowPhysicalTypeV1::List {
+        element_type: Box::new(ArrowPhysicalTypeV1::Utf8),
+    };
+    category.nullable = false;
+    let fingerprint =
+        SchemaFingerprintV1::for_relation_schema(&nested_scores.relation_schema).unwrap();
+    nested_scores.schema_fingerprint = fingerprint.clone();
+    nested_scores.incremental_relation.schema_fingerprint = fingerprint;
+    let mut nested_accounts = generic_adapter_catalog(accounts_catalog());
+    let tier = nested_accounts
+        .relation_schema
+        .columns
+        .iter_mut()
+        .find(|column| column.column_id == "tier")
+        .unwrap();
+    tier.logical_type = VelorixLogicalTypeV1::Array {
+        element_type: Box::new(VelorixLogicalTypeV1::Utf8),
+    };
+    tier.physical_arrow_type = ArrowPhysicalTypeV1::List {
+        element_type: Box::new(ArrowPhysicalTypeV1::Utf8),
+    };
+    let fingerprint =
+        SchemaFingerprintV1::for_relation_schema(&nested_accounts.relation_schema).unwrap();
+    nested_accounts.schema_fingerprint = fingerprint.clone();
+    nested_accounts.incremental_relation.schema_fingerprint = fingerprint;
+    let error = validate_supported_join_view_sql(
+        "select a.tier as bucket, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.category = a.tier group by a.tier",
+        &[nested_scores, nested_accounts],
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("scalar primary-key atom types"));
+}
+
+#[test]
+fn self_join_uses_canonical_scan_instances_independent_of_sql_aliases() {
+    let scores = generic_adapter_catalog(scores_catalog());
+    let output = self_join_count_output_schema();
+    let lower = |sql: &str| {
+        lower_supported_sql_to_logical_plan(sql, std::slice::from_ref(&scores), &output).unwrap()
+    };
+    let first = lower("select count(*) as count from scores l join scores r on l.score = r.score");
+    let renamed =
+        lower("select count(*) as count from scores x join scores y on x.score = y.score");
+    assert_eq!(first.input_relations.len(), 1);
+    assert_eq!(first.nodes, renamed.nodes);
+    assert_eq!(first.execution, renamed.execution);
+    assert_eq!(
+        first.execution_implementation,
+        renamed.execution_implementation
+    );
+
+    let VelorixLogicalViewExecutionV1::TwoInputJoinSumCount { plan } = &first.execution else {
+        panic!("expected self-join execution");
+    };
+    assert_eq!(
+        plan.left_input_instance_id.as_deref(),
+        Some(LEFT_JOIN_INPUT_INSTANCE_ID_V1)
+    );
+    assert_eq!(
+        plan.right_input_instance_id.as_deref(),
+        Some(RIGHT_JOIN_INPUT_INSTANCE_ID_V1)
+    );
+    assert_eq!(
+        plan.aggregate_output_identity,
+        Some(SupportedAggregateOutputIdentity::Singleton)
+    );
+    assert_eq!(
+        first
+            .execution_implementation
+            .as_ref()
+            .unwrap()
+            .input_fanout_protocol_id
+            .as_deref(),
+        Some(SELF_JOIN_ATOMIC_FANOUT_PROTOCOL_V1)
+    );
+    let (left_key, right_key) = first
+        .nodes
+        .iter()
+        .find_map(|node| match node {
+            VelorixLogicalViewPlanNodeV1::InnerEquiJoin {
+                left_key,
+                right_key,
+                ..
+            } => Some((left_key, right_key)),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(left_key.relation_id, right_key.relation_id);
+    assert_eq!(
+        left_key.input_instance_id.as_deref(),
+        Some(LEFT_JOIN_INPUT_INSTANCE_ID_V1)
+    );
+    assert_eq!(
+        right_key.input_instance_id.as_deref(),
+        Some(RIGHT_JOIN_INPUT_INSTANCE_ID_V1)
+    );
+    validate_logical_view_plan(&first).unwrap();
+
+    let mut missing_instance = first;
+    let join = missing_instance
+        .nodes
+        .iter_mut()
+        .find(|node| matches!(node, VelorixLogicalViewPlanNodeV1::InnerEquiJoin { .. }))
+        .unwrap();
+    let VelorixLogicalViewPlanNodeV1::InnerEquiJoin { left_key, .. } = join else {
+        unreachable!()
+    };
+    left_key.input_instance_id = None;
+    assert!(validate_logical_view_plan(&missing_instance).is_err());
+}
+
+#[test]
+fn self_join_fails_closed_outside_the_atomic_global_count_slice() {
+    let scores = generic_adapter_catalog(scores_catalog());
+    for sql in [
+        "select count(*) as count from scores join scores on scores.score = scores.score",
+        "select count(*) as count from scores l join scores r on l.score = r.score where l.score > 0",
+        "select l.score, count(*) as count from scores l join scores r on l.score = r.score group by l.score",
+        "select sum(l.score) as sum from scores l join scores r on l.score = r.score",
+        "select count(*) as count from scores l join scores r on l.user_id = r.user_id",
+    ] {
+        assert!(validate_supported_join_view_sql(sql, std::slice::from_ref(&scores)).is_err(), "{sql}");
+    }
+}
+
+#[test]
+fn legacy_scalar_join_plan_round_trips_without_changing_bytes_or_identity() {
+    let plan = lower_supported_join_view_sql_to_logical_plan(
+        "select a.account_id, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.user_id = a.account_id group by a.account_id",
+        &[scores_catalog(), accounts_catalog()],
+        &join_output_schema(),
+    )
+    .unwrap();
+    let bytes = serde_json::to_vec(&plan).unwrap();
+    assert!(!String::from_utf8_lossy(&bytes).contains("composite_equality"));
+    assert!(!String::from_utf8_lossy(&bytes).contains("join_key_domain"));
+    assert!(!String::from_utf8_lossy(&bytes).contains("join_key_codec_id"));
+
+    let decoded: VelorixLogicalViewPlanV1 = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(serde_json::to_vec(&decoded).unwrap(), bytes);
+    assert_eq!(decoded.plan_hash, plan.plan_hash);
+    assert_eq!(
+        decoded.execution_implementation,
+        plan.execution_implementation
+    );
+    assert_eq!(
+        logical_view_plan_hash(&decoded).unwrap(),
+        plan.plan_hash.unwrap()
+    );
+    validate_logical_view_plan(&decoded).unwrap();
+}
+
+#[test]
+fn supported_composite_join_keys_reject_noncanonical_or_ambiguous_shapes() {
+    let mut plan = validate_supported_join_view_sql(
+        "select a.account_id, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.user_id = a.account_id group by a.account_id",
+        &[scores_catalog(), accounts_catalog()],
+    )
+    .unwrap();
+    plan.left_join_key_column_id = "account_id".into();
+    plan.right_join_key_column_id = "account_id".into();
+    plan.composite_equality = Some(SupportedCompositeJoinEqualityV1 {
+        schema_version: 1,
+        additional_pairs: vec![SupportedJoinKeyPairV1 {
+            left_column_id: "tenant_id".into(),
+            right_column_id: "tenant_id".into(),
+        }],
+    });
+    assert_eq!(
+        supported_join_view_plan_key_pairs(&plan).unwrap(),
+        vec![
+            SupportedJoinKeyPairV1 {
+                left_column_id: "account_id".into(),
+                right_column_id: "account_id".into(),
+            },
+            SupportedJoinKeyPairV1 {
+                left_column_id: "tenant_id".into(),
+                right_column_id: "tenant_id".into(),
+            },
+        ]
+    );
+
+    let mut malformed = plan.clone();
+    malformed
+        .composite_equality
+        .as_mut()
+        .unwrap()
+        .schema_version = 2;
+    assert!(supported_join_view_plan_key_pairs(&malformed).is_err());
+
+    let mut malformed = plan.clone();
+    malformed
+        .composite_equality
+        .as_mut()
+        .unwrap()
+        .additional_pairs
+        .clear();
+    assert!(supported_join_view_plan_key_pairs(&malformed).is_err());
+
+    let mut malformed = plan.clone();
+    malformed.left_join_key_column_id = "tenant_id".into();
+    assert!(supported_join_view_plan_key_pairs(&malformed).is_err());
+
+    let mut malformed = plan;
+    malformed
+        .composite_equality
+        .as_mut()
+        .unwrap()
+        .additional_pairs[0]
+        .left_column_id = "account_id".into();
+    assert!(supported_join_view_plan_key_pairs(&malformed).is_err());
+}
+
+#[test]
+fn logical_composite_join_keys_reject_unknown_versions_and_wrong_direction() {
+    let base = lower_supported_join_view_sql_to_logical_plan(
+        "select a.account_id, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.user_id = a.account_id group by a.account_id",
+        &[scores_catalog(), accounts_catalog()],
+        &join_output_schema(),
+    )
+    .unwrap();
+
+    let mutate_join = |plan: &mut VelorixLogicalViewPlanV1,
+                       equality: LogicalPlanCompositeJoinEqualityV1| {
+        let join = plan
+            .nodes
+            .iter_mut()
+            .find(|node| matches!(node, VelorixLogicalViewPlanNodeV1::InnerEquiJoin { .. }))
+            .unwrap();
+        let VelorixLogicalViewPlanNodeV1::InnerEquiJoin {
+            composite_equality, ..
+        } = join
+        else {
+            unreachable!()
+        };
+        *composite_equality = Some(equality);
+    };
+
+    let mut unknown_version = base.clone();
+    mutate_join(
+        &mut unknown_version,
+        LogicalPlanCompositeJoinEqualityV1 {
+            schema_version: 2,
+            additional_pairs: vec![LogicalPlanJoinKeyPairV1 {
+                left_key: LogicalPlanColumnRef {
+                    relation_id: "scores".into(),
+                    input_instance_id: None,
+                    column_id: "z".into(),
+                },
+                right_key: LogicalPlanColumnRef {
+                    relation_id: "accounts".into(),
+                    input_instance_id: None,
+                    column_id: "z".into(),
+                },
+            }],
+        },
+    );
+    assert!(validate_logical_view_plan(&unknown_version).is_err());
+
+    let mut wrong_direction = base;
+    mutate_join(
+        &mut wrong_direction,
+        LogicalPlanCompositeJoinEqualityV1 {
+            schema_version: 1,
+            additional_pairs: vec![LogicalPlanJoinKeyPairV1 {
+                left_key: LogicalPlanColumnRef {
+                    relation_id: "accounts".into(),
+                    input_instance_id: None,
+                    column_id: "z".into(),
+                },
+                right_key: LogicalPlanColumnRef {
+                    relation_id: "scores".into(),
+                    input_instance_id: None,
+                    column_id: "z".into(),
+                },
+            }],
+        },
+    );
+    assert!(validate_logical_view_plan(&wrong_direction).is_err());
+}
+
+#[test]
+fn join_execution_specialization_is_persisted_and_tamper_evident() {
+    let scores = scores_catalog();
+    let accounts = accounts_catalog();
+    let left = lower_supported_join_view_sql_to_logical_plan(
+        "select s.user_id as account_id, sum(s.score) as sum, count(*) as count from scores s left join accounts a on s.user_id = a.account_id group by s.user_id",
+        &[scores.clone(), accounts.clone()],
+        &join_output_schema(),
+    )
+    .unwrap();
+    assert_eq!(
+        left.execution_implementation
+            .as_ref()
+            .unwrap()
+            .implementation_id,
+        "velorix-narrow-left-join-specialization-v1"
+    );
+
+    let general = lower_supported_join_view_sql_to_logical_plan(
+        "select a.account_id, sum(s.score) as sum, count(*) as count, min(s.score) as min_score, max(s.score) as max_score, avg(s.score) as avg_score from scores s join accounts a on s.user_id = a.account_id group by a.account_id",
+        &[scores, accounts],
+        &join_stats_output_schema(),
+    )
+    .unwrap();
+    assert_eq!(
+        general
+            .execution_implementation
+            .as_ref()
+            .unwrap()
+            .implementation_id,
+        "velorix-general-aggregate-join-specialization-v1"
+    );
+
+    let mut tampered = general.clone();
+    tampered
+        .execution_implementation
+        .as_mut()
+        .unwrap()
+        .implementation_id = "velorix-generic-dag-v1".to_string();
+    assert!(validate_logical_view_plan(&tampered).is_err());
+
+    let mut tampered_publication = general;
+    tampered_publication
+        .execution_implementation
+        .as_mut()
+        .unwrap()
+        .output_publication_protocol_id = "velorix-durable-output-publication-v2".to_string();
+    assert!(validate_logical_view_plan(&tampered_publication).is_err());
 }
 
 #[test]
@@ -2640,7 +3741,173 @@ fn left_join_sql_accepts_left_pk_grouped_left_only_aggregates() {
     assert!(supported.aggregate_outputs.iter().all(|aggregate| {
         aggregate.input_relation_side != Some(SupportedAggregateInputRelationSide::Right)
     }));
+    let join = plan
+        .operator_dag_contract
+        .operators
+        .iter()
+        .find(|operator| operator.operator.kind == "left_equi_join")
+        .expect("LEFT JOIN must derive an operator contract");
+    assert_eq!(join.outputs[0].changelog, ChangelogModeV1::GeneralRetract);
+    assert!(join.outputs[0].candidate_keys.is_empty());
+    assert_eq!(
+        join.outputs[0].uniqueness,
+        UniquenessGuaranteeV1::NotGuaranteed
+    );
+    assert!(join.outputs[0]
+        .schema
+        .columns
+        .iter()
+        .filter(|column| column
+            .column_id
+            .starts_with(&format!("{}.", accounts.relation_schema.relation_id)))
+        .all(|column| column.nullability == NullabilityV1::Nullable));
+    let aggregate = plan
+        .operator_dag_contract
+        .operators
+        .iter()
+        .find(|operator| operator.operator.kind == "aggregate")
+        .expect("LEFT JOIN aggregate must derive an operator contract");
+    assert_eq!(
+        aggregate.inputs[0].accepted_changelog,
+        AcceptedChangelogV1::GeneralRetract
+    );
     validate_logical_view_plan(&plan).unwrap();
+}
+
+#[test]
+fn unbounded_left_join_rejects_an_append_only_downstream_edge() {
+    let scores = scores_catalog();
+    let accounts = accounts_catalog();
+    let output_schema = join_stats_output_schema();
+    let catalogs = [scores, accounts];
+    let mut plan = lower_supported_join_view_sql_to_logical_plan(
+        "select s.user_id as account_id, sum(s.score) as sum, count(*) as count, min(s.score) as min_score, max(s.score) as max_score, avg(s.score) as avg_score from scores s left join accounts a on s.user_id = a.account_id group by s.user_id",
+        &catalogs,
+        &output_schema,
+    )
+    .unwrap();
+
+    let join = plan
+        .operator_dag_contract
+        .operators
+        .iter()
+        .find(|operator| operator.operator.kind == "left_equi_join")
+        .unwrap();
+    assert_eq!(join.outputs[0].changelog, ChangelogModeV1::GeneralRetract);
+    assert!(matches!(
+        join.state.as_ref().unwrap().boundedness,
+        StateBoundednessV1::Unbounded
+    ));
+
+    let aggregate = plan
+        .operator_dag_contract
+        .operators
+        .iter_mut()
+        .find(|operator| operator.operator.kind == "aggregate")
+        .unwrap();
+    aggregate.inputs[0].accepted_changelog = AcceptedChangelogV1::AppendOnly;
+
+    let error = validate_logical_view_plan(&plan).unwrap_err();
+    assert!(error.to_string().contains("incompatible operator edge"));
+    assert!(error.to_string().contains("changelog"));
+}
+
+#[test]
+fn right_join_sql_swaps_operands_and_lowers_to_the_left_join_runtime() {
+    let scores = scores_catalog();
+    let accounts = accounts_catalog();
+    let output_schema = join_output_schema();
+    let catalogs = [scores.clone(), accounts.clone()];
+
+    let plan = lower_supported_join_view_sql_to_logical_plan(
+        "select a.account_id, sum(a.limit) as sum, count(*) as count from scores s right join accounts a on s.user_id = a.account_id group by a.account_id",
+        &catalogs,
+        &output_schema,
+    )
+    .unwrap();
+
+    let VelorixLogicalViewExecutionV1::TwoInputJoinSumCount { plan: supported } = &plan.execution
+    else {
+        panic!("expected join runtime execution");
+    };
+    assert_eq!(supported.join_kind, SupportedJoinKind::Left);
+    assert_eq!(
+        supported.left_input_relation_id,
+        accounts.relation_schema.relation_id
+    );
+    assert_eq!(
+        supported.right_input_relation_id,
+        scores.relation_schema.relation_id
+    );
+    assert_eq!(
+        supported.group_key_relation_id,
+        accounts.relation_schema.relation_id
+    );
+    assert!(supported.predicate_expr.is_none(), "{supported:?}");
+    assert!(supported.aggregate_outputs.iter().all(|aggregate| {
+        aggregate.input_relation_side != Some(SupportedAggregateInputRelationSide::Right)
+    }));
+    assert!(plan.nodes.iter().any(|node| matches!(
+        node,
+        VelorixLogicalViewPlanNodeV1::LeftEquiJoin { left, right, .. }
+            if left == "scan_left" && right == "scan_right"
+    )));
+    validate_logical_view_plan(&plan).unwrap();
+}
+
+#[test]
+fn full_join_sql_requires_and_lowers_a_coalesced_output_key() {
+    let scores = scores_catalog();
+    let accounts = accounts_catalog();
+    let mut output_schema = join_output_schema();
+    output_schema.columns[1].nullable = true;
+    let catalogs = [scores.clone(), accounts.clone()];
+    let sql = "select coalesce(s.user_id, a.account_id) as account_id, sum(s.score) as sum, count(*) as count from scores s full outer join accounts a on s.user_id = a.account_id group by coalesce(s.user_id, a.account_id)";
+
+    let plan =
+        lower_supported_join_view_sql_to_logical_plan(sql, &catalogs, &output_schema).unwrap();
+    let VelorixLogicalViewExecutionV1::TwoInputJoinSumCount { plan: supported } = &plan.execution
+    else {
+        panic!("expected join runtime execution");
+    };
+    assert_eq!(supported.join_kind, SupportedJoinKind::Full);
+    assert_eq!(supported.output_key_column_id, "account_id");
+    assert_eq!(
+        plan.execution_implementation
+            .as_ref()
+            .unwrap()
+            .implementation_id,
+        "velorix-full-join-specialization-v1"
+    );
+    assert!(plan.nodes.iter().any(|node| matches!(
+        node,
+        VelorixLogicalViewPlanNodeV1::FullEquiJoin { output_key, .. }
+            if output_key.relation_id == output_schema.relation_id
+                && output_key.column_id == "account_id"
+    )));
+    let full_join = plan
+        .operator_dag_contract
+        .operators
+        .iter()
+        .find(|operator| operator.operator.kind == "full_equi_join")
+        .unwrap();
+    assert_eq!(
+        full_join.outputs[0].changelog,
+        ChangelogModeV1::GeneralRetract
+    );
+    assert!(full_join.outputs[0].schema.columns.iter().any(|column| {
+        column.column_id == format!("{}.account_id", output_schema.relation_id)
+            && column.nullability == NullabilityV1::NonNull
+    }));
+    validate_logical_view_plan(&plan).unwrap();
+
+    let error = lower_supported_join_view_sql_to_logical_plan(
+        "select s.user_id as account_id, sum(s.score) as sum, count(*) as count from scores s full outer join accounts a on s.user_id = a.account_id group by s.user_id",
+        &catalogs,
+        &output_schema,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("COALESCE"));
 }
 
 #[test]
@@ -2680,6 +3947,78 @@ fn left_join_sql_accepts_left_only_aggregate_filter_predicates() {
 }
 
 #[test]
+fn left_join_sql_accepts_right_aggregate_inputs_and_post_join_filters() {
+    let scores = scores_catalog();
+    let accounts = accounts_catalog();
+    let catalogs = [scores, accounts];
+
+    for (sql, output_schema) in [
+        (
+            "select s.user_id as account_id, sum(s.score) as sum, count(*) as count, count(a.limit) as count_limit, count(distinct a.limit) as distinct_limits, sum(a.limit) as limit_sum, min(a.limit) as min_limit, max(a.limit) as max_limit, avg(a.limit) as avg_limit from scores s left join accounts a on s.user_id = a.account_id group by s.user_id",
+            join_right_stats_output_schema(),
+        ),
+        (
+            "select s.user_id as account_id, sum(s.score) as sum, count(*) as count from scores s left join accounts a on s.user_id = a.account_id where a.limit > 60 group by s.user_id",
+            join_output_schema(),
+        ),
+        (
+            "select s.user_id as account_id, sum(s.score) as sum, count(*) as count from scores s left join accounts a on s.user_id = a.account_id where a.limit is null group by s.user_id",
+            join_output_schema(),
+        ),
+        (
+            "select s.user_id as account_id, sum(s.score) as sum, count(*) as count, min(s.score) as min_score, max(a.limit) filter (where a.limit > 60) as max_score, avg(s.score) as avg_score from scores s left join accounts a on s.user_id = a.account_id group by s.user_id",
+            join_stats_output_schema(),
+        ),
+        (
+            "select s.user_id as account_id, sum(s.score) filter (where s.score > a.limit) as sum, count(*) as count from scores s left join accounts a on s.user_id = a.account_id group by s.user_id",
+            join_output_schema(),
+        ),
+    ] {
+        let plan = lower_supported_join_view_sql_to_logical_plan(sql, &catalogs, &output_schema)
+            .unwrap();
+        let VelorixLogicalViewExecutionV1::TwoInputJoinSumCount { plan: supported } =
+            &plan.execution
+        else {
+            panic!("expected join runtime execution");
+        };
+        assert!(supported.right_value_column_ids.iter().any(|id| id == "limit"));
+        if supported.predicate_expr.as_ref().is_some_and(|expr| {
+            expr.leaf_predicates()
+                .iter()
+                .any(|predicate| predicate.relation_id == supported.right_input_relation_id)
+        }) {
+            assert!(plan.nodes.iter().any(|node| matches!(
+                node,
+                VelorixLogicalViewPlanNodeV1::Filter { node_id, input, .. }
+                    if node_id == "filter_left_join_post_right" && input == "left_equi_join"
+            )));
+            assert!(!plan.nodes.iter().any(|node| matches!(
+                node,
+                VelorixLogicalViewPlanNodeV1::Filter { node_id, .. }
+                    if node_id.starts_with("filter_join_right")
+            )));
+        }
+        if supported.aggregate_outputs.iter().any(|aggregate| {
+            aggregate.input_relation_side == Some(SupportedAggregateInputRelationSide::Right)
+        }) {
+            let join = plan
+                .operator_dag_contract
+                .operators
+                .iter()
+                .find(|operator| operator.operator.kind == "left_equi_join")
+                .unwrap();
+            assert!(join.outputs[0]
+                .schema
+                .columns
+                .iter()
+                .any(|column| column.column_id == "accounts.limit"
+                    && column.nullability == NullabilityV1::Nullable));
+        }
+        validate_logical_view_plan(&plan).unwrap();
+    }
+}
+
+#[test]
 fn left_join_sql_keeps_right_dependent_shapes_fail_closed() {
     let scores = scores_catalog();
     let accounts = accounts_catalog();
@@ -2687,11 +4026,8 @@ fn left_join_sql_keeps_right_dependent_shapes_fail_closed() {
     let catalogs = [scores, accounts];
     let cases = [
         "select a.account_id, sum(s.score) as sum, count(*) as count from scores s left join accounts a on s.user_id = a.account_id group by a.account_id",
-        "select s.user_id as account_id, sum(a.limit) as sum, count(*) as count from scores s left join accounts a on s.user_id = a.account_id group by s.user_id",
-        "select s.user_id as account_id, sum(s.score) as sum, count(*) as count from scores s left join accounts a on s.user_id = a.account_id where a.limit > 0 group by s.user_id",
         "select s.user_id as account_id, sum(s.score) as sum, count(*) as count from scores s left join accounts a on s.user_id = a.account_id and a.limit > 0 group by s.user_id",
-        "select s.user_id as account_id, sum(s.score) filter (where a.limit > 0) as sum, count(*) as count from scores s left join accounts a on s.user_id = a.account_id group by s.user_id",
-        "select s.user_id as account_id, sum(s.score) filter (where s.score > a.limit) as sum, count(*) as count from scores s left join accounts a on s.user_id = a.account_id group by s.user_id",
+        "select s.user_id as account_id, sum(s.score) as sum, count(*) as count from scores s left join (select * from accounts where limit > 0) a on s.user_id = a.account_id group by s.user_id",
     ];
 
     for sql in cases {
@@ -3653,7 +4989,7 @@ fn latest_by_key_sql_lowers_to_project_and_latest_nodes() {
     )
     .unwrap();
 
-    assert_eq!(plan.plan_version, LOGICAL_VIEW_PLAN_VERSION_V1);
+    assert_eq!(plan.plan_version, LOGICAL_VIEW_PLAN_VERSION_V2);
     let VelorixLogicalViewExecutionV1::LatestByKey { plan: supported } = &plan.execution else {
         panic!("expected latest-by-key runtime execution");
     };
@@ -4268,6 +5604,196 @@ fn logical_view_plan_validation_rejects_tampered_hash() {
     let error = validate_logical_view_plan(&plan).unwrap_err();
     assert!(matches!(error, ViewPlanError::InvalidLogicalPlan { .. }));
     assert!(error.to_string().contains("hash mismatch"));
+}
+
+#[test]
+fn logical_view_plan_validation_rejects_tampered_operator_capability() {
+    let catalog = scores_catalog();
+    let output_schema = scores_output_schema();
+    let mut plan = lower_supported_view_sql_to_logical_plan(
+        "select user_id, sum(score) as sum, count(*) as count from scores group by user_id",
+        &catalog,
+        &output_schema,
+    )
+    .unwrap();
+
+    plan.operator_dag_contract.operators[0].outputs[0].changelog = ChangelogModeV1::AppendOnly;
+
+    let error = validate_logical_view_plan(&plan).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("operator DAG contract does not match"));
+}
+
+#[test]
+fn logical_view_plan_admission_rejects_incompatible_changelog_edge() {
+    let catalog = scores_catalog();
+    let output_schema = scores_output_schema();
+    let mut plan = lower_supported_view_sql_to_logical_plan(
+        "select user_id, sum(score) as sum, count(*) as count from scores group by user_id",
+        &catalog,
+        &output_schema,
+    )
+    .unwrap();
+    let aggregate = plan
+        .operator_dag_contract
+        .operators
+        .iter_mut()
+        .find(|operator| operator.operator.kind == "aggregate")
+        .unwrap();
+    aggregate.inputs[0].accepted_changelog = AcceptedChangelogV1::AppendOnly;
+
+    let error = validate_logical_view_plan(&plan).unwrap_err();
+    assert!(error.to_string().contains("incompatible operator edge"));
+    assert!(error.to_string().contains("changelog"));
+}
+
+#[test]
+fn admitted_stateful_operators_expose_boundedness_classification() {
+    let scores = scores_catalog();
+    let aggregate = lower_supported_view_sql_to_logical_plan(
+        "select user_id, sum(score) as sum, count(*) as count from scores group by user_id order by sum desc limit 1",
+        &scores,
+        &scores_output_schema(),
+    )
+    .unwrap();
+    let join = lower_supported_join_view_sql_to_logical_plan(
+        "select a.account_id, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.user_id = a.account_id group by a.account_id",
+        &[scores, accounts_catalog()],
+        &join_output_schema(),
+    )
+    .unwrap();
+    let purchases = purchases_event_time_catalog();
+    let window = lower_supported_tumbling_window_sql_to_logical_plan(
+        "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end",
+        &purchases,
+        &purchases_window_output_schema(),
+    )
+    .unwrap();
+
+    let states = aggregate
+        .operator_dag_contract
+        .operators
+        .iter()
+        .chain(&join.operator_dag_contract.operators)
+        .chain(&window.operator_dag_contract.operators)
+        .filter_map(|operator| {
+            operator
+                .state
+                .as_ref()
+                .map(|state| (operator.operator.kind.as_str(), &state.boundedness))
+        })
+        .collect::<Vec<_>>();
+    assert!(states.iter().any(|(kind, boundedness)| {
+        *kind == "top_k" && matches!(boundedness, StateBoundednessV1::Unbounded)
+    }));
+    assert!(states.iter().any(|(kind, boundedness)| {
+        *kind == "inner_equi_join" && matches!(boundedness, StateBoundednessV1::Unbounded)
+    }));
+    assert!(states.iter().any(|(kind, boundedness)| {
+        *kind == "tumbling_window"
+            && matches!(boundedness, StateBoundednessV1::WatermarkBounded { .. })
+    }));
+    assert!(states.iter().all(|(_, boundedness)| matches!(
+        boundedness,
+        StateBoundednessV1::StaticallyBounded { .. }
+            | StateBoundednessV1::RetentionBounded { .. }
+            | StateBoundednessV1::WatermarkBounded { .. }
+            | StateBoundednessV1::Unbounded
+    )));
+}
+
+#[test]
+fn logical_view_plan_validation_rejects_missing_operator_edge() {
+    let catalog = scores_catalog();
+    let output_schema = scores_output_schema();
+    let mut plan = lower_supported_view_sql_to_logical_plan(
+        "select user_id, sum(score) as sum, count(*) as count from scores group by user_id",
+        &catalog,
+        &output_schema,
+    )
+    .unwrap();
+
+    plan.operator_dag_contract.edges.pop();
+
+    let error = validate_logical_view_plan(&plan).unwrap_err();
+    assert!(error.to_string().contains("every input port"));
+}
+
+#[test]
+fn logical_view_plan_validation_rejects_disconnected_logical_node() {
+    let catalog = scores_catalog();
+    let output_schema = scores_output_schema();
+    let mut plan = lower_supported_view_sql_to_logical_plan(
+        "select user_id, sum(score) as sum, count(*) as count from scores group by user_id",
+        &catalog,
+        &output_schema,
+    )
+    .unwrap();
+
+    plan.nodes.insert(
+        1,
+        VelorixLogicalViewPlanNodeV1::RelationScan {
+            node_id: "orphan_scan".to_string(),
+            relation: plan.input_relations[0].clone(),
+        },
+    );
+
+    let error = validate_logical_view_plan(&plan).unwrap_err();
+    assert!(error.to_string().contains("outside the output path"));
+}
+
+#[test]
+fn logical_view_plan_wire_rejects_legacy_plan_without_operator_contract() {
+    let catalog = scores_catalog();
+    let output_schema = scores_output_schema();
+    let plan = lower_supported_view_sql_to_logical_plan(
+        "select user_id, sum(score) as sum, count(*) as count from scores group by user_id",
+        &catalog,
+        &output_schema,
+    )
+    .unwrap();
+    let mut legacy_version = plan.clone();
+    legacy_version.plan_version = LOGICAL_VIEW_PLAN_VERSION_V1;
+    assert!(validate_logical_view_plan(&legacy_version)
+        .unwrap_err()
+        .to_string()
+        .contains("plan version"));
+
+    let mut json = serde_json::to_value(&plan).unwrap();
+    json.as_object_mut()
+        .unwrap()
+        .remove("operator_dag_contract");
+
+    let error = serde_json::from_value::<velorix_core::view_plan::VelorixLogicalViewPlanV1>(json)
+        .unwrap_err();
+    assert!(error.to_string().contains("operator_dag_contract"));
+}
+
+#[test]
+fn logical_view_plan_validation_rejects_unknown_semantics_versions() {
+    let catalog = scores_catalog();
+    let output_schema = scores_output_schema();
+    let plan = lower_supported_view_sql_to_logical_plan(
+        "select user_id, sum(score) as sum, count(*) as count from scores group by user_id",
+        &catalog,
+        &output_schema,
+    )
+    .unwrap();
+
+    let mut unknown_key = plan.clone();
+    unknown_key.key_semantics_version = "unknown-key-semantics".to_string();
+    assert!(validate_logical_view_plan(&unknown_key)
+        .unwrap_err()
+        .to_string()
+        .contains("key semantics version"));
+
+    let mut unknown_bag = plan;
+    unknown_bag.bag_semantics_version = "unknown-bag-semantics".to_string();
+    assert!(validate_logical_view_plan(&unknown_bag)
+        .unwrap_err()
+        .to_string()
+        .contains("bag semantics version"));
 }
 
 #[test]
@@ -5394,7 +6920,7 @@ fn tumbling_event_time_aggregate_sql_lowers_to_hashed_logical_view_plan() {
     let plan =
         lower_supported_tumbling_window_sql_to_logical_plan(sql, &catalog, &output_schema).unwrap();
 
-    assert_eq!(plan.plan_version, LOGICAL_VIEW_PLAN_VERSION_V1);
+    assert_eq!(plan.plan_version, LOGICAL_VIEW_PLAN_VERSION_V2);
     assert!(plan
         .plan_hash
         .as_ref()
@@ -8940,16 +10466,12 @@ fn unsupported_join_sql_families_fail_closed_without_logical_plan_fallback() {
     let catalogs = [scores, accounts];
     let cases = [
         (
-            "select a.account_id, sum(s.score) as sum, count(*) as count from scores s right join accounts a on s.user_id = a.account_id group by a.account_id",
-            "only INNER or narrow LEFT JOIN",
-        ),
-        (
             "select a.account_id, sum(s.score) as sum, count(*) as count from scores s full join accounts a on s.user_id = a.account_id group by a.account_id",
-            "only INNER or narrow LEFT JOIN",
+            "FULL JOIN first projection must be COALESCE(left_key, right_key)",
         ),
         (
             "select a.account_id, sum(s.score) as sum, count(*) as count from scores s cross join accounts a group by a.account_id",
-            "only INNER or narrow LEFT JOIN",
+            "only INNER or narrow LEFT/RIGHT JOIN",
         ),
         (
             "select user_id, sum(score) as sum, count(*) as count from scores natural join accounts group by user_id",
@@ -8981,8 +10503,10 @@ fn unsupported_join_sql_families_fail_closed_without_logical_plan_fallback() {
 
     assert!(matches!(error, ViewPlanError::UnsupportedShape { .. }));
     assert!(
-        error.to_string().contains("one or two input relations"),
-        "expected three-table join to fail closed before fallback for SQL `{sql}`, got `{error}`"
+        error
+            .to_string()
+            .contains("three-input JOIN requires a composite primary key on every input"),
+        "expected unsupported three-table join to fail closed in bounded admission for SQL `{sql}`, got `{error}`"
     );
 }
 
@@ -9028,6 +10552,7 @@ fn scores_catalog() -> VelorixRelationCatalogV1 {
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
 
     VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
         schema_version: RELATION_SCHEMA_VERSION_V1,
         relation_schema,
         schema_fingerprint: schema_fingerprint.clone(),
@@ -9043,6 +10568,29 @@ fn scores_catalog() -> VelorixRelationCatalogV1 {
             adapter_id: CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID.to_string(),
         },
     }
+}
+
+fn scores_with_category_catalog() -> VelorixRelationCatalogV1 {
+    let mut catalog = scores_catalog();
+    catalog.relation_schema.columns[2].ordinal = 3;
+    catalog.relation_schema.columns.insert(
+        2,
+        RelationColumnV1 {
+            column_id: "category".to_string(),
+            name: "category".to_string(),
+            logical_type: VelorixLogicalTypeV1::Utf8,
+            physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+            nullable: true,
+            ordinal: 2,
+            semantic_role: RelationSemanticRoleV1::Metadata,
+        },
+    );
+    let schema_fingerprint =
+        SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema).unwrap();
+    catalog.schema_fingerprint = schema_fingerprint.clone();
+    catalog.incremental_relation.schema_fingerprint = schema_fingerprint;
+    catalog.incremental_adapter.adapter_id = CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.to_string();
+    catalog
 }
 
 fn scores_with_adjustment_catalog() -> VelorixRelationCatalogV1 {
@@ -9111,6 +10659,7 @@ fn purchases_catalog_without_value_role() -> VelorixRelationCatalogV1 {
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
 
     VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
         schema_version: RELATION_SCHEMA_VERSION_V1,
         relation_schema,
         schema_fingerprint: schema_fingerprint.clone(),
@@ -9204,6 +10753,7 @@ fn accounts_catalog() -> VelorixRelationCatalogV1 {
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
 
     VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
         schema_version: RELATION_SCHEMA_VERSION_V1,
         relation_schema,
         schema_fingerprint: schema_fingerprint.clone(),
@@ -9289,6 +10839,172 @@ fn accounts_catalog_with_user_id_key() -> VelorixRelationCatalogV1 {
     catalog
 }
 
+fn composite_join_catalogs() -> (VelorixRelationCatalogV1, VelorixRelationCatalogV1) {
+    let add_tenant_key = |mut catalog: VelorixRelationCatalogV1| {
+        let weight_index = catalog
+            .relation_schema
+            .columns
+            .iter()
+            .position(|column| column.column_id == catalog.relation_schema.weight_column_id)
+            .unwrap();
+        catalog.relation_schema.columns.insert(
+            weight_index,
+            RelationColumnV1 {
+                column_id: "tenant_id".into(),
+                name: "tenant_id".into(),
+                logical_type: VelorixLogicalTypeV1::Utf8,
+                physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+                nullable: false,
+                ordinal: 0,
+                semantic_role: RelationSemanticRoleV1::PrimaryKey,
+            },
+        );
+        for (ordinal, column) in catalog.relation_schema.columns.iter_mut().enumerate() {
+            column.ordinal = ordinal as u32;
+        }
+        catalog
+            .relation_schema
+            .primary_key_column_ids
+            .insert(0, "tenant_id".into());
+        let fingerprint = SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema)
+            .expect("composite join catalog should fingerprint");
+        catalog.schema_fingerprint = fingerprint.clone();
+        catalog.incremental_relation.schema_fingerprint = fingerprint;
+        generic_adapter_catalog(catalog)
+    };
+    let scores = add_tenant_key(scores_catalog());
+    let mut accounts = add_tenant_key(accounts_catalog());
+    let tenant = accounts
+        .relation_schema
+        .columns
+        .iter_mut()
+        .find(|column| column.column_id == "tenant_id")
+        .unwrap();
+    tenant.column_id = "account_tenant_id".into();
+    tenant.name = "account_tenant_id".into();
+    accounts.relation_schema.primary_key_column_ids =
+        vec!["account_id".into(), "account_tenant_id".into()];
+    let fingerprint = SchemaFingerprintV1::for_relation_schema(&accounts.relation_schema)
+        .expect("renamed composite join catalog should fingerprint");
+    accounts.schema_fingerprint = fingerprint.clone();
+    accounts.incremental_relation.schema_fingerprint = fingerprint;
+    (scores, accounts)
+}
+
+fn three_input_composite_join_catalogs() -> Vec<VelorixRelationCatalogV1> {
+    let (scores, accounts) = composite_join_catalogs();
+    let mut profiles = accounts.clone();
+    profiles.relation_schema.relation_id = "profiles".into();
+    profiles.relation_schema.relation_name = "profiles".into();
+    profiles.datafusion_registration.name = "profiles".into();
+    profiles.incremental_relation.relation_id = "profiles".into();
+    let fingerprint = SchemaFingerprintV1::for_relation_schema(&profiles.relation_schema)
+        .expect("profile composite catalog should fingerprint");
+    profiles.schema_fingerprint = fingerprint.clone();
+    profiles.incremental_relation.schema_fingerprint = fingerprint;
+    vec![scores, accounts, profiles]
+}
+
+fn composite_join_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "tenant_scores".into(),
+        relation_name: "tenant_scores".into(),
+        relation_version: "2026-08-10.v1".into(),
+        schema_fingerprint:
+            "sha256:00000000000000000000000000000000000000000000000000000000000000c2".into(),
+        columns: vec![
+            ColumnSchema {
+                name: "tenant_id".into(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "sum".into(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "count".into(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["tenant_id".into()],
+    }
+}
+
+fn three_input_join_count_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "three_input_counts".into(),
+        relation_name: "three_input_counts".into(),
+        relation_version: "2026-08-10.v1".into(),
+        schema_fingerprint:
+            "sha256:00000000000000000000000000000000000000000000000000000000000000c5".into(),
+        columns: vec![
+            ColumnSchema {
+                name: "tenant_id".into(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "user_id".into(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "count".into(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["tenant_id".into(), "user_id".into()],
+    }
+}
+
+fn non_primary_join_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "scores_by_bucket".into(),
+        relation_name: "scores_by_bucket".into(),
+        relation_version: "2026-08-10.v1".into(),
+        schema_fingerprint:
+            "sha256:00000000000000000000000000000000000000000000000000000000000000c3".into(),
+        columns: vec![
+            ColumnSchema {
+                name: "bucket".into(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "sum".into(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "count".into(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["bucket".into()],
+    }
+}
+
+fn self_join_count_output_schema() -> RelationSchema {
+    RelationSchema {
+        relation_id: "self_join_count".into(),
+        relation_name: "self_join_count".into(),
+        relation_version: "2026-08-10.v1".into(),
+        schema_fingerprint:
+            "sha256:00000000000000000000000000000000000000000000000000000000000000c4".into(),
+        columns: vec![ColumnSchema {
+            name: "count".into(),
+            data_type: SqlDataType::Int64,
+            nullable: false,
+        }],
+        primary_key: Vec::new(),
+    }
+}
+
 fn device_status_catalog() -> VelorixRelationCatalogV1 {
     let relation_schema = VelorixRelationSchemaV1 {
         relation_id: "device_status".to_string(),
@@ -9340,6 +11056,7 @@ fn device_status_catalog() -> VelorixRelationCatalogV1 {
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
 
     VelorixRelationCatalogV1 {
+        relation_source: VelorixRelationSourceV1::SourceRelation,
         schema_version: RELATION_SCHEMA_VERSION_V1,
         relation_schema,
         schema_fingerprint: schema_fingerprint.clone(),
@@ -9355,4 +11072,101 @@ fn device_status_catalog() -> VelorixRelationCatalogV1 {
             adapter_id: CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID.to_string(),
         },
     }
+}
+
+#[test]
+fn aggregate_cte_with_outer_filter_inlines_to_plain_aggregate_plan() {
+    let catalog = scores_catalog();
+    let output = scores_projected_stats_output_schema();
+    // Outer filter on the aggregate output merges into HAVING.
+    let sql = "with x as (select user_id, sum(score) as total from scores group by user_id) select user_id, total from x where total > 10";
+    let plan = lower_supported_sql_to_logical_plan(sql, std::slice::from_ref(&catalog), &output)
+        .expect("aggregate CTE with output filter must inline");
+    let VelorixLogicalViewExecutionV1::SingleKeySumCount { plan } = &plan.execution else {
+        panic!("expected aggregate plan");
+    };
+    assert!(
+        plan.having_expr.is_some(),
+        "aggregate filter must become HAVING"
+    );
+    assert!(plan.predicate_expr.is_none(), "no inner WHERE expected");
+
+    // Outer filter on the group key merges into the inner WHERE.
+    let sql = "with x as (select user_id, sum(score) as total from scores group by user_id) select user_id, total from x where user_id = 'alice'";
+    let plan = lower_supported_sql_to_logical_plan(sql, std::slice::from_ref(&catalog), &output)
+        .expect("aggregate CTE with key filter must inline");
+    let VelorixLogicalViewExecutionV1::SingleKeySumCount { plan } = &plan.execution else {
+        panic!("expected aggregate plan");
+    };
+    assert!(
+        plan.predicate_expr.is_some(),
+        "key filter must become inner WHERE"
+    );
+    assert!(plan.having_expr.is_none(), "no HAVING expected");
+
+    // Mixed key OR aggregate filter cannot be split: fail closed.
+    let sql = "with x as (select user_id, sum(score) as total from scores group by user_id) select user_id, total from x where user_id = 'alice' or total > 10";
+    assert!(
+        lower_supported_sql_to_logical_plan(sql, std::slice::from_ref(&catalog), &output).is_err(),
+        "mixed OR filter must fail closed"
+    );
+
+    // A raw non-key, non-aggregate CTE column cannot be projected.
+    let sql = "with x as (select user_id, score, sum(score) as total from scores group by user_id) select user_id, total from x";
+    assert!(
+        lower_supported_sql_to_logical_plan(sql, std::slice::from_ref(&catalog), &output).is_err(),
+        "raw non-key column projection must fail closed"
+    );
+}
+
+#[test]
+fn in_subquery_decorrelates_to_semi_anti_join() {
+    let catalogs = vec![scores_catalog(), accounts_catalog()];
+    let output = scores_projection_output_schema();
+    // IN on the primary key lowers to a semi-join.
+    let lowered = lower_supported_sql_to_logical_plan(
+        "select s.user_id, s.score from scores s where s.user_id in (select a.account_id from accounts a)",
+        &catalogs,
+        &output,
+    )
+    .expect("IN subquery must decorrelate to semi-join");
+    let VelorixLogicalViewExecutionV1::TwoInputSemiAntiJoinProject { plan } = &lowered.execution
+    else {
+        panic!("expected semi/anti join plan for IN");
+    };
+    assert_eq!(plan.join_kind, SupportedSemiAntiJoinKindV1::Semi);
+    assert_eq!(plan.left_join_key_column_id, "user_id");
+    assert_eq!(plan.right_join_key_column_id, "account_id");
+
+    // NOT IN on non-null columns lowers to an anti-join.
+    let lowered = lower_supported_sql_to_logical_plan(
+        "select s.user_id, s.score from scores s where s.user_id not in (select a.account_id from accounts a)",
+        &catalogs,
+        &output,
+    )
+    .expect("NOT IN on non-null columns must decorrelate to anti-join");
+    let VelorixLogicalViewExecutionV1::TwoInputSemiAntiJoinProject { plan } = &lowered.execution
+    else {
+        panic!("expected semi/anti join plan for NOT IN");
+    };
+    assert_eq!(plan.join_kind, SupportedSemiAntiJoinKindV1::Anti);
+
+    // Non-column probe expressions are rejected.
+    assert!(
+        lower_supported_sql_to_logical_plan(
+            "select s.user_id, s.score from scores s where s.score + 1 in (select a.limit from accounts a)",
+            &catalogs,
+            &output,
+        )
+        .is_err()
+    );
+    // Inner WHERE / multi-column projections are rejected.
+    assert!(
+        lower_supported_sql_to_logical_plan(
+            "select s.user_id, s.score from scores s where s.user_id in (select a.account_id from accounts a where a.limit > 0)",
+            &catalogs,
+            &output,
+        )
+        .is_err()
+    );
 }

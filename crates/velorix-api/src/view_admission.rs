@@ -5,11 +5,19 @@ pub(super) async fn create_view(
     Json(request): Json<CreateViewRequest>,
 ) -> Result<(StatusCode, Json<ViewResponse>), ApiError> {
     validate_public_view_feature_admission(&state, &request)?;
-    let catalogs = read_relation_catalogs_for_view_request(&state, &request).await?;
+    let resolved_inputs = resolve_standing_inputs_for_view_request(&state, &request).await?;
+    validate_resolved_input_scope(&resolved_inputs)?;
+    let catalogs = resolved_inputs
+        .iter()
+        .map(|input| input.catalog())
+        .collect::<Result<Vec<_>, ApiError>>()?;
     let spec = view_spec_from_request(&state, &request, &catalogs)?;
     validate_materialized_runtime_spec_admission(&spec)?;
     state.validate_standing_runtime_fencing_or_evict().await?;
-    let runtime_binding = materialized_view_runtime_binding_for_spec(&catalogs, &spec)?;
+    let input_bindings =
+        input_bindings_for_resolved_inputs(&state, "default", &resolved_inputs).await?;
+    let mut runtime_binding =
+        materialized_view_runtime_binding_for_spec(&catalogs, &spec, &input_bindings)?;
     validate_public_runtime_plan_admission(
         &state,
         runtime_binding.logical_plan.as_ref().ok_or_else(|| {
@@ -27,6 +35,21 @@ pub(super) async fn create_view(
         &spec.output_relations,
     )
     .await?;
+    // Serialize view-on-view admissions in-process so concurrent creates
+    // cannot both pass the acyclic check against the same graph snapshot; the
+    // authoritative meta-store graph revision CAS extends the fence across
+    // processes.
+    let _graph_guard = state.view_dependency_graph_mutex.lock().await;
+    let candidate_edges = dependency_edges_from_input_bindings(
+        &runtime_binding.standing_program_identity.tenant_id,
+        &runtime_binding.standing_program_identity.program_id,
+        &spec.view_id,
+        &input_bindings,
+    )?;
+    let existing_edges = view_dependency_edges_from_active_views(&state).await?;
+    for candidate in &candidate_edges {
+        validate_view_dependency_graph_with_candidate(&existing_edges, candidate)?;
+    }
     let pending_runtime = build_standing_runtime_for_runtime_binding(
         &state,
         &spec,
@@ -36,6 +59,15 @@ pub(super) async fn create_view(
         &spec.output_relations,
     )?;
     let execution_mode = MaterializedViewExecutionMode::StandingRuntime;
+    let bootstrap =
+        begin_authoritative_view_bootstrap(&state, &spec, &runtime_binding, &input_bindings)
+            .await?;
+    runtime_binding.published_relations = published_relation_bindings_for_spec(
+        &spec,
+        &runtime_binding,
+        bootstrap.bootstrap_generation,
+    )?;
+    runtime_binding.input_bindings = input_bindings;
     let requires_backfill = standing_runtime_create_requires_backfill(&state, &spec).await?;
     let lifecycle = lifecycle_for_create_view_execution(&execution_mode, requires_backfill);
     let outcome = if let Some(runtime) = pending_runtime {
@@ -64,6 +96,15 @@ pub(super) async fn create_view(
         )
         .await?
     };
+    if view_has_published_view_inputs(&runtime_binding) {
+        bootstrap_consumer_view_after_registration(
+            &state,
+            &spec,
+            &runtime_binding,
+            &resolved_inputs,
+        )
+        .await?;
+    }
     let (status, outcome_text) = match outcome {
         RegisterMaterializedViewOutcome::Created => (StatusCode::CREATED, "created"),
         RegisterMaterializedViewOutcome::Duplicate => (StatusCode::OK, "duplicate"),
@@ -83,24 +124,289 @@ pub(super) async fn create_view(
     ))
 }
 
+fn view_has_published_view_inputs(runtime: &MaterializedViewRuntimeBinding) -> bool {
+    runtime
+        .input_bindings
+        .iter()
+        .any(|binding| matches!(binding, StandingInputBindingV1::PublishedView { .. }))
+}
+
+async fn bootstrap_consumer_view_after_registration(
+    state: &ApiState,
+    spec: &StandingViewSpec,
+    runtime: &MaterializedViewRuntimeBinding,
+    resolved_inputs: &[ResolvedAdmissionInputV1],
+) -> Result<(), ApiError> {
+    let active = state
+        .view_registry()?
+        .read_active(&spec.view_id)
+        .await
+        .map_err(materialized_view_registry_error_to_api)?;
+    let Some(identity) = active_standing_runtime_identity(&active) else {
+        return Err(ApiError::bad_request(format!(
+            "consumer view `{}` has no standing runtime identity",
+            spec.view_id
+        )));
+    };
+    for resolved in resolved_inputs {
+        let ResolvedAdmissionInputV1::PublishedView { binding, .. } = resolved else {
+            continue;
+        };
+        let binding = binding.clone();
+        let input_binding = runtime
+            .input_bindings
+            .iter()
+            .find_map(|candidate| match candidate {
+                StandingInputBindingV1::PublishedView {
+                    edge_id,
+                    producer_tenant_id,
+                    producer_program_id,
+                    published_relation,
+                    bootstrap_cursor,
+                    ..
+                } if published_relation == &binding => Some((
+                    edge_id,
+                    producer_tenant_id,
+                    producer_program_id,
+                    published_relation,
+                    bootstrap_cursor,
+                )),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "consumer view `{}` is missing its persisted published-view input binding",
+                    spec.view_id
+                ))
+            })?;
+        let (
+            edge_id,
+            producer_tenant_id,
+            producer_program_id,
+            published_relation,
+            bootstrap_cursor,
+        ) = input_binding;
+        let edge = view_dependency_edge_from_binding(
+            producer_tenant_id,
+            &identity.program_id,
+            &spec.view_id,
+            1,
+            &published_relation.relation.relation_id,
+            &published_relation.relation.relation_version,
+            producer_program_id,
+            published_relation,
+        )
+        .map_err(ApiError::bad_request)?;
+        if &edge.edge_id != edge_id {
+            return Err(ApiError::bad_request(format!(
+                "consumer view `{}` dependency edge mismatch",
+                spec.view_id
+            )));
+        }
+        // Duplicate CREATE requests must resume, not reapply: if the consumer
+        // already has a checkpoint with this edge's cursor, the baseline was
+        // applied and only catch-up is needed. A checkpoint without the edge
+        // cursor is corrupt and fails closed.
+        let latest =
+            read_latest_standing_runtime_checkpoint(state, identity, &spec.view_id).await?;
+        let baseline_pending = match &latest {
+            Some(record) => match consumer_edge_cursor(record, edge_id)? {
+                Some(_) => false,
+                None => {
+                    return Err(ApiError::bad_request(format!(
+                        "consumer view `{}` has a checkpoint without the dependency cursor for edge `{edge_id}`",
+                        spec.view_id
+                    )));
+                }
+            },
+            None => true,
+        };
+        if baseline_pending {
+            bootstrap_consumer_from_published_snapshot(
+                state,
+                &active,
+                &ConsumerViewDependencyInputV1 {
+                    edge,
+                    binding: published_relation.clone(),
+                    bootstrap_cursor: bootstrap_cursor.clone(),
+                },
+            )
+            .await?;
+        }
+    }
+    drain_published_view_dependencies(state).await?;
+    activate_authoritative_view_bootstrap(state, identity, &spec.view_id).await?;
+    state
+        .view_registry()?
+        .update_standing_runtime_lifecycle(
+            &spec.view_id,
+            &active.spec_hash,
+            MaterializedViewLifecycleStatus::standing_runtime(),
+        )
+        .await
+        .map_err(materialized_view_registry_error_to_api)?;
+    Ok(())
+}
+
+async fn begin_authoritative_view_bootstrap(
+    state: &ApiState,
+    spec: &StandingViewSpec,
+    runtime: &MaterializedViewRuntimeBinding,
+    input_bindings: &[StandingInputBindingV1],
+) -> Result<ViewBootstrapControlV1, ApiError> {
+    let meta_store = state.view_bootstrap_meta_store.as_ref().ok_or_else(|| {
+        ApiError::service_unavailable(
+            "materialized view admission requires authoritative bootstrap metadata",
+        )
+    })?;
+    let plan_hash = runtime
+        .logical_plan
+        .as_ref()
+        .and_then(|plan| plan.plan_hash.clone())
+        .ok_or_else(|| {
+            ApiError::bad_request("materialized view logical plan is missing plan_hash")
+        })?;
+    let view_spec_json =
+        serde_json::to_vec(spec).map_err(|error| ApiError::internal(error.to_string()))?;
+    let view_inputs = input_bindings
+        .iter()
+        .filter_map(|binding| match binding {
+            StandingInputBindingV1::PublishedView {
+                edge_id,
+                producer_program_id,
+                published_relation,
+                bootstrap_cursor,
+                ..
+            } => Some(BeginViewDependencyEdgeV1 {
+                edge_id: edge_id.clone(),
+                producer_program_id: producer_program_id.clone(),
+                producer_view_id: published_relation.producer_view_id.clone(),
+                producer_generation: published_relation.producer_view_generation,
+                producer_plan_hash: published_relation.producer_plan_hash.clone(),
+                input_relation_id: published_relation.relation.relation_id.clone(),
+                input_relation_version: published_relation.relation.relation_version.clone(),
+                output_stream_id: published_relation.output_stream_id.clone(),
+                output_schema_hash: published_relation.output_schema_hash.clone(),
+                key_descriptor_hash: published_relation.key_descriptor_hash.clone(),
+                delta_codec_identity: published_relation.delta_codec_identity.clone(),
+                frontier_kind: published_relation.frontier_kind.clone(),
+                bootstrap_cursor: bootstrap_cursor.clone(),
+            }),
+            StandingInputBindingV1::Source { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    let expected_graph_revision = if view_inputs.is_empty() {
+        0
+    } else {
+        meta_store
+            .read_view_dependency_graph_revision(&runtime.standing_program_identity.tenant_id)
+            .await
+            .map_err(meta_error_to_api)?
+    };
+    let request = BeginViewBootstrapRequest {
+        tenant_id: runtime.standing_program_identity.tenant_id.clone(),
+        program_id: runtime.standing_program_identity.program_id.clone(),
+        view_id: spec.view_id.clone(),
+        plan_hash,
+        view_spec_json,
+        relations: spec
+            .input_relations
+            .iter()
+            .filter(|relation| {
+                !view_inputs
+                    .iter()
+                    .any(|edge| edge.input_relation_id == relation.relation_id)
+            })
+            .map(|relation| IngestSourceRelationIdentityV1 {
+                relation_id: relation.relation_id.clone(),
+                relation_version: relation.relation_version.clone(),
+                relation_generation: INGEST_SOURCE_IDENTITY_GENERATION_V1,
+                schema_fingerprint: relation.schema_fingerprint.clone(),
+            })
+            .collect(),
+        view_inputs,
+        expected_graph_revision,
+    };
+    match meta_store
+        .begin_view_bootstrap(request)
+        .await
+        .map_err(meta_error_to_api)?
+    {
+        BeginViewBootstrapOutcome::Created(control)
+        | BeginViewBootstrapOutcome::Duplicate(control) => Ok(control),
+        BeginViewBootstrapOutcome::Conflict => Err(ApiError::conflict(format!(
+            "authoritative view bootstrap conflict for `{}` (expected graph revision {expected_graph_revision})",
+            spec.view_id
+        ))),
+    }
+}
+
+/// Per-capability SQL feature admission mode (Phase 5 gate split). Capabilities
+/// that are a stable public contract use `Enabled`; capabilities that still
+/// need design artifacts stay `Experimental` and reject on the public path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum FeatureAdmissionModeV1 {
+    Enabled,
+    Experimental,
+}
+
+/// Public view feature policy. The legacy single boolean maps to
+/// `{event_time_windows: Enabled, analytic_windows: Enabled}` when set, and to
+/// the Phase 5 public defaults (event-time enabled, analytic experimental)
+/// when unset.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PublicViewFeaturePolicyV1 {
+    pub event_time_windows: FeatureAdmissionModeV1,
+    pub analytic_windows: FeatureAdmissionModeV1,
+}
+
+impl Default for PublicViewFeaturePolicyV1 {
+    fn default() -> Self {
+        Self {
+            event_time_windows: FeatureAdmissionModeV1::Enabled,
+            analytic_windows: FeatureAdmissionModeV1::Experimental,
+        }
+    }
+}
+
+impl From<bool> for PublicViewFeaturePolicyV1 {
+    fn from(experimental: bool) -> Self {
+        if experimental {
+            Self {
+                event_time_windows: FeatureAdmissionModeV1::Enabled,
+                analytic_windows: FeatureAdmissionModeV1::Enabled,
+            }
+        } else {
+            Self::default()
+        }
+    }
+}
+
 pub(super) fn validate_public_view_feature_admission(
     state: &ApiState,
     request: &CreateViewRequest,
 ) -> Result<(), ApiError> {
-    if state.experimental_advanced_view_features {
-        return Ok(());
-    }
+    let policy = state.public_view_feature_policy;
     let sql = request.sql.to_ascii_lowercase();
-    if contains_sql_function_call(&sql, "tumble")
-        || contains_sql_function_call(&sql, "hop")
-        || contains_sql_function_call(&sql, "session")
-        || contains_sql_function_call(&sql, "row_number")
-        || contains_sql_function_call(&sql, "rank")
-        || contains_sql_function_call(&sql, "dense_rank")
-        || contains_sql_keyword(&sql, "over")
+    let event_time_enabled = policy.event_time_windows == FeatureAdmissionModeV1::Enabled;
+    let analytic_enabled = policy.analytic_windows == FeatureAdmissionModeV1::Enabled;
+    if !event_time_enabled
+        && (contains_sql_function_call(&sql, "tumble")
+            || contains_sql_function_call(&sql, "hop")
+            || contains_sql_function_call(&sql, "session"))
     {
         return Err(ApiError::bad_request(
-            "advanced view SQL is experimental and disabled for the public 1.0 API",
+            "event-time window SQL is experimental and disabled for the public 1.0 API",
+        ));
+    }
+    if !analytic_enabled
+        && (contains_sql_function_call(&sql, "row_number")
+            || contains_sql_function_call(&sql, "rank")
+            || contains_sql_function_call(&sql, "dense_rank")
+            || contains_sql_keyword(&sql, "over"))
+    {
+        return Err(ApiError::bad_request(
+            "analytic window SQL is experimental and disabled for the public 1.0 API",
         ));
     }
     Ok(())
@@ -110,9 +416,9 @@ pub(super) fn validate_public_runtime_plan_admission(
     state: &ApiState,
     plan: &VelorixLogicalViewPlanV1,
 ) -> Result<(), ApiError> {
-    if state.experimental_advanced_view_features {
-        return Ok(());
-    }
+    let policy = state.public_view_feature_policy;
+    let event_time_enabled = policy.event_time_windows == FeatureAdmissionModeV1::Enabled;
+    let analytic_enabled = policy.analytic_windows == FeatureAdmissionModeV1::Enabled;
     if plan.input_relations.len() > PUBLIC_1_0_MAX_JOIN_INPUT_RELATIONS {
         return Err(ApiError::bad_request(format!(
             "materialized view uses {} input relations; public 1.0 supports at most {}",
@@ -121,12 +427,20 @@ pub(super) fn validate_public_runtime_plan_admission(
         )));
     }
     match &plan.execution {
-        VelorixLogicalViewExecutionV1::AnalyticRowNumber { .. }
-        | VelorixLogicalViewExecutionV1::TumblingEventTimeAggregate { .. } => {
+        VelorixLogicalViewExecutionV1::AnalyticRowNumber { .. } if !analytic_enabled => {
             Err(ApiError::bad_request(
-                "advanced view execution is experimental and disabled for the public 1.0 API",
+                "analytic window execution is experimental and disabled for the public 1.0 API",
             ))
         }
+        VelorixLogicalViewExecutionV1::TumblingEventTimeAggregate { .. } if !event_time_enabled => {
+            Err(ApiError::bad_request(
+                "event-time window execution is experimental and disabled for the public 1.0 API",
+            ))
+        }
+        VelorixLogicalViewExecutionV1::AnalyticRowNumber { .. }
+        | VelorixLogicalViewExecutionV1::TumblingEventTimeAggregate { .. }
+        | VelorixLogicalViewExecutionV1::ScalarAggregateFilter { .. }
+        | VelorixLogicalViewExecutionV1::AnalyticWindowFrames { .. } => Ok(()),
         VelorixLogicalViewExecutionV1::SingleKeySumCount { plan } => {
             validate_public_top_k_limit(plan.top_k.as_ref())
         }
@@ -139,6 +453,11 @@ pub(super) fn validate_public_runtime_plan_admission(
         VelorixLogicalViewExecutionV1::TwoInputJoinSumCount { plan } => {
             validate_public_top_k_limit(plan.top_k.as_ref())
         }
+        VelorixLogicalViewExecutionV1::ThreeInputInnerJoinCount { .. } => Ok(()),
+        VelorixLogicalViewExecutionV1::TwoInputSemiAntiJoinProject { .. } => Ok(()),
+        VelorixLogicalViewExecutionV1::IntervalJoin { .. } => Ok(()),
+        VelorixLogicalViewExecutionV1::RecursiveFixpointV1 { .. } => Ok(()),
+        VelorixLogicalViewExecutionV1::CrossJoin { .. } => Ok(()),
     }
 }
 
@@ -204,8 +523,10 @@ pub(super) async fn register_materialized_view_execution(
 pub(super) fn materialized_view_runtime_binding_for_spec(
     catalogs: &[VelorixRelationCatalogV1],
     spec: &StandingViewSpec,
+    input_bindings: &[StandingInputBindingV1],
 ) -> Result<MaterializedViewRuntimeBinding, ApiError> {
-    let identity = standing_program_identity_from_materialized_view_runtime(catalogs, spec)?;
+    let identity =
+        standing_program_identity_from_materialized_view_runtime(catalogs, spec, input_bindings)?;
     let output_schema = only_output_relation_for_runtime_binding(spec)?;
     let logical_plan = lower_materialized_view_runtime_sql_to_logical_plan(
         spec.sql.as_str(),
@@ -217,7 +538,52 @@ pub(super) fn materialized_view_runtime_binding_for_spec(
         runtime_version: "builtin-v1".to_string(),
         standing_program_identity: identity,
         logical_plan: Some(logical_plan),
+        published_relations: Vec::new(),
+        input_bindings: input_bindings.to_vec(),
     })
+}
+
+pub(super) fn published_relation_bindings_for_spec(
+    spec: &StandingViewSpec,
+    runtime: &MaterializedViewRuntimeBinding,
+    producer_view_generation: u64,
+) -> Result<Vec<velorix_core::view_contract::PublishedRelationBindingV1>, ApiError> {
+    let plan_hash = runtime
+        .logical_plan
+        .as_ref()
+        .and_then(|plan| plan.plan_hash.as_deref())
+        .ok_or_else(|| {
+            ApiError::bad_request("materialized view logical plan is missing plan_hash")
+        })?;
+    spec.output_relations
+        .iter()
+        .map(|relation| {
+            published_relation_binding_v1(
+                &spec.view_id,
+                producer_view_generation,
+                plan_hash,
+                relation,
+            )
+            .map_err(ApiError::bad_request)
+        })
+        .collect()
+}
+
+pub(super) fn published_relation_binding_for_active_view(
+    active: &ActiveMaterializedView,
+) -> Result<Option<PublishedRelationBindingV1>, ApiError> {
+    let Some(runtime) = active.runtime.as_ref() else {
+        return Ok(None);
+    };
+    match runtime.published_relations.as_slice() {
+        [] => Ok(None),
+        [binding] => Ok(Some(binding.clone())),
+        bindings => Err(ApiError::internal(format!(
+            "active standing view `{}` has {} published relation bindings; exactly one is supported",
+            active.spec.view_id,
+            bindings.len()
+        ))),
+    }
 }
 
 pub(super) fn only_output_relation_for_runtime_binding(
@@ -249,12 +615,26 @@ pub(super) fn lower_materialized_view_runtime_sql_to_logical_plan(
 pub(super) fn standing_program_identity_from_materialized_view_runtime(
     catalogs: &[VelorixRelationCatalogV1],
     spec: &StandingViewSpec,
+    input_bindings: &[StandingInputBindingV1],
 ) -> Result<StandingProgramIdentity, ApiError> {
     let input_schema_bytes = serde_json::to_vec(&spec.input_relations)
         .map_err(|source| ApiError::internal(source.to_string()))?;
     let output_schema_bytes = serde_json::to_vec(&spec.output_relations)
         .map_err(|source| ApiError::internal(source.to_string()))?;
-    let input_catalog_hash = if catalogs.len() == 1 {
+    let input_catalog_hash = if input_bindings
+        .iter()
+        .any(|binding| matches!(binding, StandingInputBindingV1::PublishedView { .. }))
+    {
+        // View-on-view inputs are fenced by the full producer binding: a
+        // generation, plan, schema, key, codec, or frontier change must
+        // produce a different program identity and fail closed on restore.
+        let mut binding_hashes = input_bindings
+            .iter()
+            .map(|binding| binding.input_catalog_hash().map_err(ApiError::bad_request))
+            .collect::<Result<Vec<_>, ApiError>>()?;
+        binding_hashes.sort();
+        stable_bytes_hash(binding_hashes.join("\u{1f}").as_bytes())
+    } else if catalogs.len() == 1 {
         catalogs[0].schema_fingerprint.as_str().to_string()
     } else {
         stable_bytes_hash(&input_schema_bytes)
@@ -271,7 +651,11 @@ pub(super) fn standing_program_identity_from_materialized_view_runtime(
             name: MATERIALIZED_VIEW_RUNTIME_NAME.to_string(),
             version: "builtin-v1".to_string(),
         }],
-        runtime_capabilities: vec!["materialized_view_runtime".to_string()],
+        runtime_capabilities: vec![
+            "materialized_view_runtime".to_string(),
+            INCREMENTAL_KEY_SEMANTICS_VERSION_V1.to_string(),
+            INCREMENTAL_BAG_SEMANTICS_VERSION_V1.to_string(),
+        ],
         runtime_compatibility: "velorix-materialized-view-runtime-v1".to_string(),
         checkpoint_codec_identity: "velorix-materialized-view-state-v1".to_string(),
         native_code_policy: NativeCodePolicy::DisabledNoExternalDependencies,
@@ -414,7 +798,11 @@ pub(super) async fn restore_or_build_standing_runtime_for_runtime_binding(
         .logical_plan
         .as_ref()
         .ok_or_else(|| ApiError::bad_request("standing runtime binding is missing logical plan"))?;
-    let catalogs = read_relation_catalogs_for_input_schemas(state, expected_input_schemas).await?;
+    let catalogs = if runtime_binding.input_bindings.is_empty() {
+        read_relation_catalogs_for_input_schemas(state, expected_input_schemas).await?
+    } else {
+        catalogs_for_input_bindings(state, runtime_binding).await?
+    };
 
     let (runtime, replay_plan) = if let Some(record) =
         read_latest_standing_runtime_checkpoint(state, identity, &spec.view_id).await?
@@ -445,6 +833,18 @@ pub(super) async fn restore_or_build_standing_runtime_for_runtime_binding(
                 .map_err(ApiError::internal)?,
                 replay_plan,
             )
+        } else if runtime_binding
+            .input_bindings
+            .iter()
+            .any(|binding| matches!(binding, StandingInputBindingV1::PublishedView { .. }))
+        {
+            // A published-input consumer checkpoint without its state payload
+            // cannot be rebuilt from an empty runtime: history would silently
+            // be skipped while the causal cut says otherwise. Fail closed.
+            return Err(ApiError::bad_request(format!(
+                "consumer view `{}` checkpoint is missing its state payload; rebuild the view explicitly before serving queries",
+                spec.view_id
+            )));
         } else {
             let factory = Arc::clone(&factory);
             let identity = identity.clone();
@@ -509,6 +909,40 @@ pub(super) async fn restore_or_build_standing_runtime_for_runtime_binding(
         expected_output_schemas,
     )?;
     Ok(Some((runtime, replay_plan)))
+}
+
+/// Resolves the runtime catalogs for a view's persisted input bindings:
+/// registered source relations or published-view-output descriptors derived
+/// from the producer's immutable binding.
+pub(super) async fn catalogs_for_input_bindings(
+    state: &ApiState,
+    runtime_binding: &MaterializedViewRuntimeBinding,
+) -> Result<Vec<VelorixRelationCatalogV1>, ApiError> {
+    let mut catalogs = Vec::with_capacity(runtime_binding.input_bindings.len());
+    for binding in &runtime_binding.input_bindings {
+        match binding {
+            StandingInputBindingV1::Source { relation, .. } => {
+                catalogs.push(
+                    read_relation_catalog(state, &relation.relation_id, &relation.relation_version)
+                        .await?,
+                );
+            }
+            StandingInputBindingV1::PublishedView {
+                published_relation, ..
+            } => {
+                catalogs.push(
+                    catalog_from_published_relation_binding(published_relation)
+                        .map_err(ApiError::bad_request)?,
+                );
+            }
+        }
+    }
+    if catalogs.is_empty() {
+        return Err(ApiError::bad_request(
+            "standing runtime binding has no resolvable input catalogs",
+        ));
+    }
+    Ok(catalogs)
 }
 
 pub(super) fn validate_runtime_schemas(

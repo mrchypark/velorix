@@ -25,9 +25,11 @@ pub(super) fn materialized_delta_to_record_batch(
     state: &DeltaBatch,
     aggregate_outputs: Option<&[SupportedAggregateOutput]>,
 ) -> Result<RecordBatch, StandingProgramRuntimeError> {
-    let [key_column, aggregate_columns @ ..] = output_schema.columns.as_slice() else {
+    let key_count = output_schema.primary_key.len();
+    if output_schema.columns.len() < key_count {
         return Err(invalid_runtime_state());
-    };
+    }
+    let (key_columns, aggregate_columns) = output_schema.columns.split_at(key_count);
     let default_outputs;
     let aggregate_outputs = if let Some(aggregate_outputs) = aggregate_outputs {
         aggregate_outputs
@@ -39,40 +41,61 @@ pub(super) fn materialized_delta_to_record_batch(
         return Err(invalid_runtime_state());
     }
     let rows = state.net_rows().map_err(|_| invalid_runtime_state())?;
-    let mut keys = Vec::new();
+    let mut key_values = vec![Vec::new(); key_count];
     let mut aggregate_values = vec![Vec::new(); aggregate_outputs.len()];
     for row in rows {
         if row.weight != 1 {
-            return Err(invalid_runtime_state());
+            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: Box::leak(format!("generic_page_weight:{}", row.weight).into_boxed_str()),
+            });
         }
         let value = row
             .value
             .as_json()
             .as_object()
             .ok_or_else(invalid_runtime_state)?;
-        keys.push(row.key.as_json().clone());
+        if key_count == 1 {
+            key_values[0].push(row.key.as_json().clone());
+        } else {
+            let key = row
+                .key
+                .as_json()
+                .as_object()
+                .ok_or_else(invalid_runtime_state)?;
+            for (index, column) in key_columns.iter().enumerate() {
+                key_values[index].push(
+                    key.get(column.name.as_str())
+                        .cloned()
+                        .ok_or_else(invalid_runtime_state)?,
+                );
+            }
+        }
         for (index, aggregate) in aggregate_outputs.iter().enumerate() {
             aggregate_values[index].push(project_aggregate_value(value, aggregate)?);
         }
     }
 
     let mut fields = Vec::with_capacity(output_schema.columns.len());
-    fields.push(Field::new(
-        key_column.name.as_str(),
-        arrow_data_type(&key_column.data_type)?,
-        false,
-    ));
+    for column in key_columns {
+        fields.push(Field::new(
+            column.name.as_str(),
+            arrow_data_type(&column.data_type)?,
+            column.nullable,
+        ));
+    }
     for column in aggregate_columns {
         fields.push(Field::new(
             column.name.as_str(),
             arrow_data_type(&column.data_type)?,
-            false,
+            column.nullable,
         ));
     }
     let mut arrays = Vec::with_capacity(output_schema.columns.len());
-    arrays.push(key_array(&key_column.data_type, &keys)?);
+    for (column, values) in key_columns.iter().zip(key_values.iter()) {
+        arrays.push(output_column_value_array(column, values)?);
+    }
     for (column, values) in aggregate_columns.iter().zip(aggregate_values.iter()) {
-        arrays.push(output_value_array(&column.data_type, values)?);
+        arrays.push(output_column_value_array(column, values)?);
     }
     RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).map_err(|_| invalid_runtime_state())
 }
@@ -145,7 +168,9 @@ pub(super) fn materialized_tumbling_delta_to_record_batch(
     let mut aggregate_values = vec![Vec::new(); aggregate_columns.len()];
     for row in rows {
         if row.weight != 1 {
-            return Err(invalid_runtime_state());
+            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: Box::leak(format!("generic_page_weight:{}", row.weight).into_boxed_str()),
+            });
         }
         let key_values = row
             .key
@@ -180,7 +205,7 @@ pub(super) fn materialized_tumbling_delta_to_record_batch(
         fields.push(Field::new(
             column.name.as_str(),
             arrow_data_type(&column.data_type)?,
-            false,
+            column.nullable,
         ));
     }
     let mut arrays = Vec::with_capacity(output_schema.columns.len());
@@ -194,7 +219,7 @@ pub(super) fn materialized_tumbling_delta_to_record_batch(
         &window_ends,
     )?);
     for (column, values) in aggregate_columns.iter().zip(aggregate_values.iter()) {
-        arrays.push(output_value_array(&column.data_type, values)?);
+        arrays.push(output_column_value_array(column, values)?);
     }
     RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).map_err(|_| invalid_runtime_state())
 }
@@ -259,7 +284,9 @@ pub(super) fn materialized_generic_delta_to_record_batch(
     let mut column_values = vec![Vec::new(); value_columns.len()];
     for row in rows {
         if row.weight != 1 {
-            return Err(invalid_runtime_state());
+            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: Box::leak(format!("generic_page_weight:{}", row.weight).into_boxed_str()),
+            });
         }
         keys.push(row.key.as_json().clone());
         if !value_columns.is_empty() {
@@ -489,6 +516,35 @@ fn output_column_value_array(
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         ))),
+        SqlDataType::Date => Ok(Arc::new(Date32Array::from(
+            values
+                .iter()
+                .map(|value| {
+                    if value.is_null() {
+                        return Ok(None);
+                    }
+                    value
+                        .as_i64()
+                        .and_then(|value| i32::try_from(value).ok())
+                        .map(Some)
+                        .ok_or_else(invalid_runtime_state)
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        ))),
+        SqlDataType::Timestamp { timezone } => Ok(Arc::new(
+            TimestampNanosecondArray::from(
+                values
+                    .iter()
+                    .map(|value| {
+                        if value.is_null() {
+                            return Ok(None);
+                        }
+                        value.as_i64().map(Some).ok_or_else(invalid_runtime_state)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+            .with_timezone_opt(timezone.clone()),
+        )),
         SqlDataType::Decimal { precision, scale } => Ok(Arc::new(
             Decimal128Array::from(
                 values

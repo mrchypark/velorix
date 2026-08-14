@@ -10,7 +10,8 @@ use thiserror::Error;
 use velorix_core::{
     standing_program::StandingProgramIdentity,
     view_contract::{
-        validate_materialized_standing_view_spec, view_spec_hash, StandingViewSpec,
+        validate_materialized_standing_view_spec, validate_published_relation_binding_v1,
+        view_spec_hash, PublishedRelationBindingV1, StandingInputBindingV1, StandingViewSpec,
         ViewContractError,
     },
     view_plan::VelorixLogicalViewPlanV1,
@@ -106,7 +107,7 @@ impl MaterializedViewLifecycleStatus {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ActiveMaterializedViewRecord {
     pub schema_version: u16,
@@ -134,7 +135,7 @@ struct ActiveMaterializedViewRecordInput<'a> {
     lifecycle: Option<MaterializedViewLifecycleStatus>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ActiveMaterializedView {
     pub spec_hash: String,
     pub spec: StandingViewSpec,
@@ -159,7 +160,7 @@ pub struct MaterializedViewArtifactBinding {
     pub standing_program_identity: Option<StandingProgramIdentity>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MaterializedViewRuntimeBinding {
     pub runtime_kind: String,
@@ -167,6 +168,12 @@ pub struct MaterializedViewRuntimeBinding {
     pub standing_program_identity: StandingProgramIdentity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logical_plan: Option<VelorixLogicalViewPlanV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub published_relations: Vec<PublishedRelationBindingV1>,
+    /// Durable input-edge bindings: direct source relations and published-view
+    /// outputs, each fenced to the producer generation captured at admission.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_bindings: Vec<StandingInputBindingV1>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -863,6 +870,49 @@ impl MaterializedViewRegistry {
                 view_id: view_id.to_string(),
                 reason: InvalidExecutionModeReason::StandingRuntimeMissingRuntimeBinding,
             });
+        }
+
+        if let Some(runtime) = runtime {
+            for published in &runtime.published_relations {
+                validate_published_relation_binding_v1(published)?;
+                if published.producer_view_id != view_id
+                    || !runtime
+                        .standing_program_identity
+                        .view_ids
+                        .contains(&published.relation.relation_id)
+                {
+                    return Err(MaterializedViewRegistryError::Validation(
+                        ViewContractError::InvalidField {
+                            field: "published_relation.producer_binding",
+                        },
+                    ));
+                }
+            }
+            for binding in &runtime.input_bindings {
+                binding
+                    .validate()
+                    .map_err(MaterializedViewRegistryError::Validation)?;
+                if let StandingInputBindingV1::PublishedView {
+                    edge_id,
+                    published_relation,
+                    ..
+                } = binding
+                {
+                    let expected_edge_id = velorix_core::view_contract::view_dependency_edge_id(
+                        &runtime.standing_program_identity.tenant_id,
+                        &published_relation.producer_view_id,
+                        published_relation,
+                    )
+                    .map_err(MaterializedViewRegistryError::Validation)?;
+                    if expected_edge_id != *edge_id {
+                        return Err(MaterializedViewRegistryError::Validation(
+                            ViewContractError::InvalidField {
+                                field: "input_binding.published_view.edge_id",
+                            },
+                        ));
+                    }
+                }
+            }
         }
 
         Ok(())

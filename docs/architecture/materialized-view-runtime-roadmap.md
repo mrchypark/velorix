@@ -154,6 +154,12 @@ The query path must read the materialized output table/page index. It must not
 reconstruct query results by scanning source relation batches or by rebuilding
 rows from live operator accumulator state.
 
+Late-created views additionally follow the persisted snapshot/tail bootstrap
+barrier defined in
+[Incremental Processing Semantics V1](incremental-processing-semantics-v1.md#view-bootstrap-frontier).
+The current boolean backfill-required scan is compatibility scaffolding and is
+not sufficient completion evidence for concurrent view creation and ingest.
+
 ## Durable State Model
 
 Hiqlite should store small metadata:
@@ -229,6 +235,71 @@ Current implementation evidence:
   `arg_max(value, ordering)` shape, including boolean latest state.
 - Two-relation inner primary-key equi-join views lower into `InnerEquiJoin`
   plus aggregate state for the supported sum/count family.
+- A narrow one-relation self-join lowers to two canonically identified scans
+  (`scan_left` and `scan_right`) and one `InnerEquiJoin`. Its atomic fanout
+  runtime supports one non-primary, non-null scalar equality feeding global
+  `COUNT(*)`; wider self-join SQL fails closed.
+- A bounded three-relation family lowers to three scans and exactly two
+  left-deep `InnerEquiJoin` nodes. It accepts complete, type-identical,
+  non-null composite-PK equalities and root-PK-grouped `COUNT(*)` only. Runtime
+  execution is the existing `NativeOperatorGraph` with two binary joins,
+  project, and aggregate; restore re-derives and fully matches the logical plan
+  and rejects torn graph/output/frontier/idempotency epochs.
+- Three-input join order is a durable planner policy. New schema-v2 plans keep
+  the output-key root fixed and order the two non-root roles by stable relation
+  ID. Field-absent schema-v1 plans retain legacy SQL encounter-order semantics.
+  Restore re-lowers with the stored policy, not the current default, and
+  rejects unknown policy IDs; different SQL hashes remain different programs.
+- Phase 2 join-distribution evidence now runs five deterministic non-primary
+  inner-join profiles through production SQL admission and native incremental
+  execution: one-to-one, one-to-many, many-to-many, 80% hot-key skew, and
+  fully unmatched inputs. Each sample checks an independently derived per-key
+  `SUM`/`COUNT` oracle and checkpoint-visible left/right multiset cardinality.
+  The release benchmark, result validator, and archived PR-smoke gate pass;
+  its five-sample p95 values are descriptive workload evidence, not an SLO.
+- Phase 3A fixes outer joins as dynamic SQL-bag tables whose signed output
+  is the consolidated difference between committed snapshots. First/last match
+  transitions retract or restore null-extended rows, the non-preserved schema
+  is nullable, unproved keys are dropped, and both input bags are checkpointed.
+  Left/right and the bounded scalar-PK full-join family now prove this
+  definition across the completed payload/key-update matrix; broader
+  outer-join shapes remain deliberately fail-closed.
+- Unbounded outer-join output cannot cross an append-only/final consumer edge:
+  the capability validator rejects the changelog mismatch. V1 has no implicit
+  finalization escape hatch; any later bounded or watermark-based exception
+  must be represented by an explicit closing operator and output guarantee.
+- Left-join match multiplicity is derived from the checkpoint-authoritative
+  right multiset for each touched key. Partial match deletion remains matched;
+  only deletion of the final occurrence restores the null-extended row, with no
+  independently cached counter that can drift during recovery.
+- Admitted grouped left joins can now retain nullable right-side values as
+  aggregate and filter inputs. Right-referencing top-level `WHERE` predicates
+  run after the join, empty/all-NULL right aggregates publish SQL NULL, counts
+  preserve SQL NULL rules, and extended state restores exactly. Raw joined-row
+  projection and provenance-sensitive right source filters remain fail-closed.
+- SQL `RIGHT JOIN` has no independent logical or runtime operator. Admission
+  swaps operands and key direction into the same canonical `LeftEquiJoin`; the
+  checkpoint persists `join_kind = left` and the swapped relation identities,
+  and restore reproduces unmatched preserved-side rows through that path.
+- Bounded `FULL OUTER JOIN` admits one scalar primary-key equality only, with
+  an explicit `COALESCE(left_key, right_key)` output/group key. It lowers to
+  `FullEquiJoin`, retains both input bags, publishes symmetric null-extended
+  rows, and retracts/restores them exactly at each side's zero/nonzero match
+  boundary. Native exact-delta, public SQL, checkpoint/restart, and independent
+  common-DAG equivalence tests cover duplicate multiplication and partial/final
+  deletes. Residual `ON`, composite/non-primary keys, and source-filter
+  rewrites remain fail-closed.
+- The Phase 3A row matrix now covers checked duplicate multiplication, a real
+  nullable payload, same-epoch key changes represented as old-key retract plus
+  new-key insert, and partial/final deletes from either side. Native and public
+  checkpoints restore simultaneous left-only/right-only state before later
+  match transitions, then continue through another restore and tail changes.
+- Phase 3A benchmark coverage includes a 97.5%-unmatched FULL JOIN snapshot
+  workload and a transition workload that moves 1,024 unmatched occurrences
+  into 512 matches by replacing the complete right key set. Both run five
+  samples through production SQL admission/native execution and verify the
+  complete materialized snapshot per sample; their local-debug latency is
+  descriptive evidence rather than an SLO.
 - Single-relation aggregates, latest-by-key, and two-relation joins now apply
   live epoch changes through one private plan-executor boundary while preserving
   their existing checkpoint and output publication formats.
@@ -291,13 +362,24 @@ Current implementation evidence:
   - relation registration, multi-relation join view registration, ingest on both
     input relations, query, restart restore, and post-restart query for the
     supported two-relation join family
+  - public REST creation of the narrow self-join, durable plan/instance identity,
+    singleton counts `10`, `5`, and `0`, service restart, forced checkpoint
+    publication failure, authoritative-pointer recovery, durable-tail replay,
+    and duplicate-offset idempotency
+  - public REST creation of the bounded three-input composite-PK join, durable
+    two-join DAG identity, multiplicity `24`, publisher-manifest query, service
+    restart, post-restart retract to `18`, and duplicate-offset idempotency
 - A source guard test covers active product runtime source and fails if external
   compiler, JAR, pipeline-manager, DBSP/Feldera, or PVC-dependent execution
   references re-enter the runtime path.
 
 Verification commands for this internal experimental-only evidence. These
-commands do not make window SQL part of the public 1.0 contract; the product
-API admission path rejects window SQL.
+commands do not make analytic ranking SQL part of the public 1.0 contract;
+the product API admission path rejects it. Event-time window SQL
+(TUMBLE/HOP/SESSION) is part of the public 1.0 contract (see the Event-Time
+Semantics section of supported-sql.md and `PublicViewFeaturePolicyV1`);
+late rows default to strict rejection, and window closure is governed by
+the finalization frontier F = W - allowance.
 
 ```bash
 cargo test -p velorix-api --lib
@@ -320,6 +402,14 @@ cargo test -p velorix-core --test view_plan single_key_aggregate_sql_lowers_havi
 cargo test -p velorix-core --test view_plan two_input_join_sql_lowers_having_to_post_aggregate_filter
 cargo test -p velorix-api rest_aggregate_having_view_materializes_outputs
 cargo test -p velorix-api rest_two_relation_join_having_view_materializes_outputs
+cargo test -p velorix-core --test view_plan self_join_uses_canonical_scan_instances_independent_of_sql_aliases
+cargo test -p velorix-runtime --test materialized_view_runtime runtime_materializes_atomic_self_join_fanout_across_retract_and_restart
+cargo test -p velorix-api rest_self_join_atomic_fanout_survives_restart_replay_and_final_retract
+cargo test -p velorix-core --test view_plan three_input_composite_pk_sql_lowers_to_validated_binary_dag
+cargo test -p velorix-runtime --test materialized_view_runtime runtime_materializes_three_input_composite_pk_join_through_binary_dag
+cargo test -p velorix-runtime --test materialized_view_runtime three_input_join_epoch_rolls_back_on_overflow_and_restore_rejects_torn_checkpoint
+cargo test -p velorix-runtime --test materialized_view_runtime three_input_join_order_policy_preserves_results_state_and_legacy_restore
+cargo test -p velorix-api rest_three_input_composite_pk_join_uses_binary_dag_and_survives_restart
 cargo test -p velorix-runtime --test materialized_view_runtime runtime_rejects_non_contiguous_input_offsets_without_advancing_frontier
 cargo test -p velorix-runtime --test no_external_runtime_dependencies
 cargo test -p velorix-core --test view_plan
@@ -465,9 +555,11 @@ and output publication paths can prove deterministic results across restart.
 - custom trigger policies
 - arbitrary SQL
 - CTE shapes beyond the currently admitted identity source-filter forms
-- nested subqueries
+- nested or undecorrelated subqueries beyond the bounded complete-PK-correlated
+  `EXISTS`/`NOT EXISTS` forms
 - set operations
-- outer, semi, and anti joins
+- join shapes beyond the currently admitted inner, bounded outer, and bounded
+  complete-PK-correlated semi/anti families
 - non-equi joins
 - UDFs
 - arbitrary JSON, map, or struct expression evaluation
@@ -585,6 +677,47 @@ These fields are diagnostic evidence, not correctness authority. Durable
 correctness still comes from the ingest log, signed output deltas, checkpoint
 state records, and Hiqlite checkpoint pointer authority.
 
+## Incremental View Dependencies
+
+View-on-view work uses the existing native runtime and recovery model. Admission
+now persists `PublishedRelationBindingV1` for each output in the active runtime
+record. The binding fixes the producer generation, logical-plan hash, public
+relation schema, key descriptor, schema/key hashes, output stream, signed-delta
+codec, and producer-commit frontier kind. Public relation schemas never acquire
+a hidden delta-weight column.
+
+This metadata is only the first verified slice; it does not yet make view output
+consumable. The remaining dependency path must use direct typed signed deltas,
+consumer cursors, and one authoritative `CausalCutV1` over direct source and view
+inputs. Durable producer commit records are now implemented: every new published
+epoch, including an empty delta, seals the binding identity, checkpoint/state,
+direct-source coverage, consolidated delta, and a canonical commit digest behind
+the authoritative checkpoint pointer. Legacy delta records remain readable. The
+transitional direct-source coverage seal has been replaced in new producer
+commits by a domain-separated `CausalCutV1` digest. The checkpoint cut
+canonically records separate direct source frontiers and direct view cursors;
+the old `producer_input_coverage_hash` commit field no longer exists. Bootstrap
+input coverage remains temporarily co-encoded and must exactly match the cut's
+source portion, so it cannot become a second progress truth. `CausalCutV1` is
+the recovery authority; `input_coverage` is only a bootstrap-compatibility
+mirror.
+
+The commit object is never authority by existence alone. Publication authority
+is the single metadata-pointer chain through its checkpoint reference, so an
+orphan written before a failed pointer CAS must be ignored. A follow-up strict
+review accepted this producer-commit slice on that bounded basis and retained
+canonical mixed source/view `CausalCutV1` plus fail-closed orphan recovery as the
+next correctness boundary. That implementation and its local recovery evidence
+now pass, and a strict follow-up review returned bounded `GO` with no P0/P1 for
+the cut replacement itself. Production cursor resolution/consumption is still
+unimplemented and remains the next fail-closed boundary.
+
+A tenant DAG revision must bind edges to immutable generations. Producer deltas
+may be garbage-collected only after every live dependent's durable cursor, and a
+missing segment fails closed rather than triggering an implicit snapshot
+recomputation. See the Phase 4 ledger in the gap-closure plan for checkable
+evidence.
+
 ## Acceptance Criteria
 
 The local-development runtime milestone is satisfied when these checks pass:
@@ -610,6 +743,10 @@ The local-development runtime milestone is satisfied when these checks pass:
   PVCs
 
 ## Implementation Order
+
+The completed foundation below is followed by the checkable, capability-focused
+[Incremental SQL Gap-Closure Plan](incremental-sql-gap-plan.md). Use that plan for
+new SQL breadth work and keep this section as the historical construction order.
 
 1. Define `VelorixLogicalViewPlanV1`.
 2. Add deterministic plan hashing and plan validation.

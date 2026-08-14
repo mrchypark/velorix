@@ -1,0 +1,345 @@
+{
+  "schema_version": 1,
+  "relations": [
+    {
+      "name": "orders",
+      "columns": [
+        { "name": "order_id", "type": "utf8", "nullable": false },
+        { "name": "customer_id", "type": "utf8", "nullable": false },
+        { "name": "product_id", "type": "utf8", "nullable": false },
+        { "name": "amount", "type": "int64", "nullable": false },
+        { "name": "event_time", "type": "timestamp_rfc3339", "nullable": false }
+      ],
+      "primary_key": ["order_id"],
+      "event_time": "event_time"
+    },
+    {
+      "name": "customers",
+      "columns": [
+        { "name": "customer_id", "type": "utf8", "nullable": false },
+        { "name": "region", "type": "utf8", "nullable": false }
+      ],
+      "primary_key": ["customer_id"],
+      "event_time": null
+    },
+    {
+      "name": "products",
+      "columns": [
+        { "name": "product_id", "type": "utf8", "nullable": false },
+        { "name": "category", "type": "utf8", "nullable": false }
+      ],
+      "primary_key": ["product_id"],
+      "event_time": null
+    }
+  ],
+  "workloads": [
+    {
+      "id": "filter_project",
+      "sql": [
+        "SELECT order_id, amount * 2 AS doubled FROM orders WHERE amount >= 50"
+      ],
+      "expected_final": [
+        { "order_id": "o2", "doubled": 120 },
+        { "order_id": "o3", "doubled": 140 }
+      ]
+    },
+    {
+      "id": "aggregate",
+      "sql": [
+        "SELECT customer_id, SUM(amount) AS total, COUNT(*) AS order_count, MIN(amount) AS minimum, MAX(amount) AS maximum, AVG(amount) AS average FROM orders GROUP BY customer_id"
+      ],
+      "expected_final": [
+        { "customer_id": "c1", "total": 85, "order_count": 2, "minimum": 25, "maximum": 60, "average": 42.5 },
+        { "customer_id": "c2", "total": 100, "order_count": 2, "minimum": 30, "maximum": 70, "average": 50.0 }
+      ]
+    },
+    {
+      "id": "distinct_aggregate",
+      "sql": [
+        "SELECT customer_id, COUNT(DISTINCT product_id) AS product_count FROM orders GROUP BY customer_id"
+      ],
+      "expected_final": [
+        { "customer_id": "c1", "product_count": 2 },
+        { "customer_id": "c2", "product_count": 2 }
+      ]
+    },
+    {
+      "id": "inner_join",
+      "sql": [
+        "SELECT c.region, SUM(o.amount) AS total FROM customers c JOIN orders o ON c.customer_id = o.customer_id GROUP BY c.region"
+      ],
+      "expected_final": [
+        { "region": "north", "total": 85 },
+        { "region": "south", "total": 100 }
+      ]
+    },
+    {
+      "id": "left_join",
+      "sql": [
+        "SELECT c.customer_id, COUNT(o.order_id) AS order_count FROM customers c LEFT JOIN orders o ON c.customer_id = o.customer_id GROUP BY c.customer_id"
+      ],
+      "expected_final": [
+        { "customer_id": "c1", "order_count": 2 },
+        { "customer_id": "c2", "order_count": 2 }
+      ]
+    },
+    {
+      "id": "top_k",
+      "sql": [
+        "SELECT customer_id, SUM(amount) AS total FROM orders GROUP BY customer_id ORDER BY total DESC, customer_id ASC LIMIT 1"
+      ],
+      "expected_final": [
+        { "customer_id": "c2", "total": 100 }
+      ]
+    },
+    {
+      "id": "fixed_window",
+      "sql": [
+        "SELECT customer_id, window_start, SUM(amount) AS total FROM TUMBLE(orders, DESCRIPTOR(event_time), INTERVAL '2' MINUTE) GROUP BY customer_id, window_start"
+      ],
+      "expected_final": [
+        { "customer_id": "c1", "window_start": "2026-08-09T00:00:00Z", "total": 60 },
+        { "customer_id": "c2", "window_start": "2026-08-09T00:02:00Z", "total": 100 },
+        { "customer_id": "c1", "window_start": "2026-08-09T00:04:00Z", "total": 25 }
+      ]
+    },
+    {
+      "id": "ranking",
+      "sql": [
+        "SELECT customer_id, order_id, ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY amount DESC, order_id ASC) AS rank FROM orders"
+      ],
+      "expected_final": [
+        { "customer_id": "c1", "order_id": "o2", "rank": 1 },
+        { "customer_id": "c1", "order_id": "o5", "rank": 2 },
+        { "customer_id": "c2", "order_id": "o3", "rank": 1 },
+        { "customer_id": "c2", "order_id": "o4", "rank": 2 }
+      ]
+    },
+    {
+      "id": "chained_view",
+      "sql": [
+        "CREATE MATERIALIZED VIEW customer_totals AS SELECT customer_id, SUM(amount) AS total FROM orders GROUP BY customer_id",
+        "CREATE MATERIALIZED VIEW region_totals AS SELECT c.region, SUM(t.total) AS total FROM customers c JOIN customer_totals t ON c.customer_id = t.customer_id GROUP BY c.region"
+      ],
+      "expected_final": [
+        { "region": "north", "total": 85 },
+        { "region": "south", "total": 100 }
+      ]
+    }
+  ],
+  "scale_workloads": [
+    {
+      "id": "aggregate_composite_high_cardinality",
+      "sql": "SELECT customer_id, category, SUM(amount) AS total, COUNT(*) AS order_count FROM scale_orders GROUP BY customer_id, category",
+      "distribution": "high_cardinality",
+      "total_rows": 4096,
+      "batch_rows": 512,
+      "distinct_groups": 4096,
+      "hot_group_basis_points": 0
+    },
+    {
+      "id": "aggregate_composite_hot_key_skew",
+      "sql": "SELECT customer_id, category, SUM(amount) AS total, COUNT(*) AS order_count FROM scale_orders GROUP BY customer_id, category",
+      "distribution": "hot_key_skew",
+      "total_rows": 4096,
+      "batch_rows": 512,
+      "distinct_groups": 256,
+      "hot_group_basis_points": 9000
+    }
+  ],
+  "join_scale_workloads": [
+    {
+      "id": "inner_join_one_to_one",
+      "sql": "SELECT r.join_key AS bucket, SUM(l.payload) AS sum, COUNT(*) AS count FROM join_left l JOIN join_right r ON l.join_key = r.join_key WHERE r.payload >= 0 GROUP BY r.join_key",
+      "distribution": "one_to_one",
+      "key_count": 512,
+      "left_rows": 512,
+      "right_rows": 512,
+      "hot_key_basis_points": 0,
+      "expected_groups": 512,
+      "expected_matches": 512,
+      "expected_max_group_matches": 1,
+      "samples": 5
+    },
+    {
+      "id": "inner_join_one_to_many",
+      "sql": "SELECT r.join_key AS bucket, SUM(l.payload) AS sum, COUNT(*) AS count FROM join_left l JOIN join_right r ON l.join_key = r.join_key WHERE r.payload >= 0 GROUP BY r.join_key",
+      "distribution": "one_to_many",
+      "key_count": 256,
+      "left_rows": 256,
+      "right_rows": 1024,
+      "hot_key_basis_points": 0,
+      "expected_groups": 256,
+      "expected_matches": 1024,
+      "expected_max_group_matches": 4,
+      "samples": 5
+    },
+    {
+      "id": "inner_join_many_to_many",
+      "sql": "SELECT r.join_key AS bucket, SUM(l.payload) AS sum, COUNT(*) AS count FROM join_left l JOIN join_right r ON l.join_key = r.join_key WHERE r.payload >= 0 GROUP BY r.join_key",
+      "distribution": "many_to_many",
+      "key_count": 128,
+      "left_rows": 512,
+      "right_rows": 1024,
+      "hot_key_basis_points": 0,
+      "expected_groups": 128,
+      "expected_matches": 4096,
+      "expected_max_group_matches": 32,
+      "samples": 5
+    },
+    {
+      "id": "inner_join_hot_key_skew",
+      "sql": "SELECT r.join_key AS bucket, SUM(l.payload) AS sum, COUNT(*) AS count FROM join_left l JOIN join_right r ON l.join_key = r.join_key WHERE r.payload >= 0 GROUP BY r.join_key",
+      "distribution": "hot_key_skew",
+      "key_count": 128,
+      "left_rows": 512,
+      "right_rows": 512,
+      "hot_key_basis_points": 8000,
+      "expected_groups": 104,
+      "expected_matches": 167384,
+      "expected_max_group_matches": 167281,
+      "samples": 5
+    },
+    {
+      "id": "inner_join_unmatched",
+      "sql": "SELECT r.join_key AS bucket, SUM(l.payload) AS sum, COUNT(*) AS count FROM join_left l JOIN join_right r ON l.join_key = r.join_key WHERE r.payload >= 0 GROUP BY r.join_key",
+      "distribution": "unmatched",
+      "key_count": 512,
+      "left_rows": 512,
+      "right_rows": 512,
+      "hot_key_basis_points": 0,
+      "expected_groups": 0,
+      "expected_matches": 0,
+      "expected_max_group_matches": 0,
+      "samples": 5
+    }
+  ],
+  "suites": {
+    "conformance": {
+      "workload_ids": ["filter_project", "aggregate", "distinct_aggregate", "inner_join", "left_join", "top_k", "fixed_window", "ranking", "chained_view"],
+      "phase_names": ["initial_load", "insert", "update", "delete"],
+      "semantic_equivalence_required": false
+    },
+    "recovery": {
+      "workload_ids": ["filter_project", "aggregate", "distinct_aggregate", "inner_join", "left_join", "top_k", "fixed_window", "ranking", "chained_view"],
+      "phase_names": ["checkpoint_restart", "replay_tail"],
+      "semantic_equivalence_required": false
+    },
+    "performance": {
+      "workload_ids": ["filter_project", "aggregate", "distinct_aggregate", "inner_join", "left_join", "top_k", "fixed_window", "ranking", "chained_view"],
+      "scale_workload_ids": ["aggregate_composite_high_cardinality", "aggregate_composite_hot_key_skew"],
+      "join_scale_workload_ids": ["inner_join_one_to_one", "inner_join_one_to_many", "inner_join_many_to_many", "inner_join_hot_key_skew", "inner_join_unmatched"],
+      "phase_names": ["initial_load", "insert", "update", "delete"],
+      "semantic_equivalence_required": true
+    }
+  },
+  "phases": [
+    {
+      "name": "initial_load",
+      "events": [
+        { "change_id": "c-001", "relation": "customers", "op": "insert", "before": null, "after": { "customer_id": "c1", "region": "north" } },
+        { "change_id": "c-002", "relation": "customers", "op": "insert", "before": null, "after": { "customer_id": "c2", "region": "south" } },
+        { "change_id": "p-001", "relation": "products", "op": "insert", "before": null, "after": { "product_id": "p1", "category": "hardware" } },
+        { "change_id": "p-002", "relation": "products", "op": "insert", "before": null, "after": { "product_id": "p2", "category": "software" } },
+        { "change_id": "o-001", "relation": "orders", "op": "insert", "before": null, "after": { "order_id": "o1", "customer_id": "c1", "product_id": "p1", "amount": 100, "event_time": "2026-08-09T00:00:00Z" } },
+        { "change_id": "o-002", "relation": "orders", "op": "insert", "before": null, "after": { "order_id": "o2", "customer_id": "c1", "product_id": "p2", "amount": 40, "event_time": "2026-08-09T00:01:00Z" } },
+        { "change_id": "o-003", "relation": "orders", "op": "insert", "before": null, "after": { "order_id": "o3", "customer_id": "c2", "product_id": "p1", "amount": 70, "event_time": "2026-08-09T00:02:00Z" } }
+      ],
+      "expected": {
+        "customers": [
+          { "customer_id": "c1", "region": "north" },
+          { "customer_id": "c2", "region": "south" }
+        ],
+        "orders": [
+          { "order_id": "o1", "customer_id": "c1", "product_id": "p1", "amount": 100, "event_time": "2026-08-09T00:00:00Z" },
+          { "order_id": "o2", "customer_id": "c1", "product_id": "p2", "amount": 40, "event_time": "2026-08-09T00:01:00Z" },
+          { "order_id": "o3", "customer_id": "c2", "product_id": "p1", "amount": 70, "event_time": "2026-08-09T00:02:00Z" }
+        ],
+        "products": [
+          { "product_id": "p1", "category": "hardware" },
+          { "product_id": "p2", "category": "software" }
+        ]
+      }
+    },
+    {
+      "name": "insert",
+      "events": [
+        { "change_id": "o-004", "relation": "orders", "op": "insert", "before": null, "after": { "order_id": "o4", "customer_id": "c2", "product_id": "p2", "amount": 30, "event_time": "2026-08-09T00:03:00Z" } }
+      ],
+      "expected": {
+        "orders": [
+          { "order_id": "o1", "customer_id": "c1", "product_id": "p1", "amount": 100, "event_time": "2026-08-09T00:00:00Z" },
+          { "order_id": "o2", "customer_id": "c1", "product_id": "p2", "amount": 40, "event_time": "2026-08-09T00:01:00Z" },
+          { "order_id": "o3", "customer_id": "c2", "product_id": "p1", "amount": 70, "event_time": "2026-08-09T00:02:00Z" },
+          { "order_id": "o4", "customer_id": "c2", "product_id": "p2", "amount": 30, "event_time": "2026-08-09T00:03:00Z" }
+        ]
+      }
+    },
+    {
+      "name": "update",
+      "events": [
+        {
+          "change_id": "o-005",
+          "relation": "orders",
+          "op": "update",
+          "before": { "order_id": "o2", "customer_id": "c1", "product_id": "p2", "amount": 40, "event_time": "2026-08-09T00:01:00Z" },
+          "after": { "order_id": "o2", "customer_id": "c1", "product_id": "p2", "amount": 60, "event_time": "2026-08-09T00:01:00Z" }
+        }
+      ],
+      "expected": {
+        "orders": [
+          { "order_id": "o1", "customer_id": "c1", "product_id": "p1", "amount": 100, "event_time": "2026-08-09T00:00:00Z" },
+          { "order_id": "o2", "customer_id": "c1", "product_id": "p2", "amount": 60, "event_time": "2026-08-09T00:01:00Z" },
+          { "order_id": "o3", "customer_id": "c2", "product_id": "p1", "amount": 70, "event_time": "2026-08-09T00:02:00Z" },
+          { "order_id": "o4", "customer_id": "c2", "product_id": "p2", "amount": 30, "event_time": "2026-08-09T00:03:00Z" }
+        ]
+      }
+    },
+    {
+      "name": "delete",
+      "events": [
+        { "change_id": "o-006", "relation": "orders", "op": "delete", "before": { "order_id": "o1", "customer_id": "c1", "product_id": "p1", "amount": 100, "event_time": "2026-08-09T00:00:00Z" }, "after": null }
+      ],
+      "expected": {
+        "orders": [
+          { "order_id": "o2", "customer_id": "c1", "product_id": "p2", "amount": 60, "event_time": "2026-08-09T00:01:00Z" },
+          { "order_id": "o3", "customer_id": "c2", "product_id": "p1", "amount": 70, "event_time": "2026-08-09T00:02:00Z" },
+          { "order_id": "o4", "customer_id": "c2", "product_id": "p2", "amount": 30, "event_time": "2026-08-09T00:03:00Z" }
+        ]
+      }
+    },
+    {
+      "name": "checkpoint_restart",
+      "events": [],
+      "expected": {
+        "customers": [
+          { "customer_id": "c1", "region": "north" },
+          { "customer_id": "c2", "region": "south" }
+        ],
+        "orders": [
+          { "order_id": "o2", "customer_id": "c1", "product_id": "p2", "amount": 60, "event_time": "2026-08-09T00:01:00Z" },
+          { "order_id": "o3", "customer_id": "c2", "product_id": "p1", "amount": 70, "event_time": "2026-08-09T00:02:00Z" },
+          { "order_id": "o4", "customer_id": "c2", "product_id": "p2", "amount": 30, "event_time": "2026-08-09T00:03:00Z" }
+        ],
+        "products": [
+          { "product_id": "p1", "category": "hardware" },
+          { "product_id": "p2", "category": "software" }
+        ]
+      }
+    },
+    {
+      "name": "replay_tail",
+      "events": [
+        { "change_id": "o-007", "relation": "orders", "op": "insert", "before": null, "after": { "order_id": "o5", "customer_id": "c1", "product_id": "p1", "amount": 25, "event_time": "2026-08-09T00:04:00Z" } }
+      ],
+      "expected": {
+        "orders": [
+          { "order_id": "o2", "customer_id": "c1", "product_id": "p2", "amount": 60, "event_time": "2026-08-09T00:01:00Z" },
+          { "order_id": "o3", "customer_id": "c2", "product_id": "p1", "amount": 70, "event_time": "2026-08-09T00:02:00Z" },
+          { "order_id": "o4", "customer_id": "c2", "product_id": "p2", "amount": 30, "event_time": "2026-08-09T00:03:00Z" },
+          { "order_id": "o5", "customer_id": "c1", "product_id": "p1", "amount": 25, "event_time": "2026-08-09T00:04:00Z" }
+        ]
+      }
+    }
+  ]
+}
