@@ -53,6 +53,15 @@ pub struct IngestLog {
 struct DurableIngestAdmission {
     log: IngestLog,
     reserve_before_committed_overlap: bool,
+    /// In-process cache of committed batch descriptors. The committed log is
+    /// append-only and every admission goes through the per-partition lock, so
+    /// the cache stays consistent within this coordinator. It is loaded lazily
+    /// (first conflict check lists and decodes the committed namespace once)
+    /// and extended on every successful append, turning the previously
+    /// O(committed batches) rescan per ingest into an in-memory scan. The
+    /// authoritative cross-process fences (exact-key GET, range-admission
+    /// index CAS, metadata reservation cut) are unchanged.
+    committed_cache: Arc<Mutex<Option<Vec<IngestBatchDescriptor>>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -373,6 +382,7 @@ impl DurableIngestAdmission {
         Self {
             log,
             reserve_before_committed_overlap,
+            committed_cache: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -457,7 +467,11 @@ impl DurableIngestAdmission {
             &descriptor,
         )
         .await?;
-        self.log.append_validated_batch(batch).await
+        let outcome = self.log.append_validated_batch(batch).await?;
+        if matches!(outcome, AppendValidatedEnvelopeOutcome::Appended { .. }) {
+            self.cache_committed(&descriptor);
+        }
+        Ok(outcome)
     }
 
     async fn reserve_then_append_validated_batch(
@@ -490,7 +504,11 @@ impl DurableIngestAdmission {
             &descriptor,
         )
         .await?;
-        self.log.append_validated_batch(batch).await
+        let outcome = self.log.append_validated_batch(batch).await?;
+        if matches!(outcome, AppendValidatedEnvelopeOutcome::Appended { .. }) {
+            self.cache_committed(&descriptor);
+        }
+        Ok(outcome)
     }
 
     async fn reserve_then_materialize_admission_record(
@@ -549,7 +567,11 @@ impl DurableIngestAdmission {
             &descriptor,
         )
         .await?;
-        self.log.append_validated_batch(batch).await
+        let outcome = self.log.append_validated_batch(batch).await?;
+        if matches!(outcome, AppendValidatedEnvelopeOutcome::Appended { .. }) {
+            self.cache_committed(&descriptor);
+        }
+        Ok(outcome)
     }
 
     async fn reserve_then_materialize_admission(
@@ -595,20 +617,51 @@ impl DurableIngestAdmission {
         &self,
         descriptor: &IngestBatchDescriptor,
     ) -> Result<Option<AppendValidatedEnvelopeOutcome>, IngestLogError> {
-        for committed in self.log.list_committed().await? {
+        for committed in self.committed_descriptors().await?.iter() {
             if committed.object_key == descriptor.object_key {
                 continue;
             }
-            if ranges_overlap(&committed, descriptor) {
+            if ranges_overlap(committed, descriptor) {
                 return Ok(Some(AppendValidatedEnvelopeOutcome::Conflict {
                     descriptor: descriptor.clone(),
-                    object_key: committed.object_key,
+                    object_key: committed.object_key.clone(),
                     reason: "range_overlap_committed",
                 }));
             }
         }
 
         Ok(None)
+    }
+
+    /// Cached view of the committed ingest namespace. The committed log is
+    /// append-only under the per-partition admission lock, so the cache is
+    /// loaded once and extended on each successful append; it must only be
+    /// used from within this coordinator.
+    async fn committed_descriptors(
+        &self,
+    ) -> Result<Arc<Vec<IngestBatchDescriptor>>, IngestLogError> {
+        {
+            let cache = self.committed_cache.lock().unwrap();
+            if let Some(committed) = cache.as_ref() {
+                return Ok(Arc::new(committed.clone()));
+            }
+        }
+        let loaded = self.log.list_committed().await?;
+        let mut cache = self.committed_cache.lock().unwrap();
+        if cache.is_none() {
+            *cache = Some(loaded.clone());
+        }
+        Ok(Arc::new(loaded))
+    }
+
+    /// Extends the in-process committed cache after a successful append so
+    /// subsequent conflict scans do not rescan the object store.
+    fn cache_committed(&self, descriptor: &IngestBatchDescriptor) {
+        if let Ok(mut cache) = self.committed_cache.lock() {
+            if let Some(committed) = cache.as_mut() {
+                committed.push(descriptor.clone());
+            }
+        }
     }
 
     async fn indexed_or_committed_overlap_conflict(
