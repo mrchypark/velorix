@@ -22589,8 +22589,7 @@ fn temporal_join_output_schema() -> RelationSchema {
   // Admission + core test verified in velorix-core/tests/view_plan.rs (probe_temporal_join_admission).
   // Runtime epoch advancement + checkpoint roundtrip verified in this test:
 #[test]
-fn temporal_join_advances_epoch_and_roundtrips_checkpoint() {
-    // Minimal test: verify admission + runtime creation + checkpoint on empty state
+fn temporal_join_materializes_asof_match_and_retracts() {
     let rides = temporal_join_rides_catalog();
     let prices = temporal_join_prices_catalog();
     let catalogs = vec![rides.clone(), prices.clone()];
@@ -22601,7 +22600,7 @@ fn temporal_join_advances_epoch_and_roundtrips_checkpoint() {
     let output_schema = temporal_join_output_schema();
     let sql = "select l.ride_id, l.booking_start, l.event_time, p.price, p.event_time as price_event_time from rides l join prices p on p.event_time <= l.event_time";
     let identity = standing_identity_with_view(sql, "enriched");
-    let runtime = create_standing_runtime_with_sql_and_catalogs(
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
         &catalogs,
         sql,
@@ -22609,9 +22608,181 @@ fn temporal_join_advances_epoch_and_roundtrips_checkpoint() {
         std::slice::from_ref(&output_schema),
     )
     .unwrap();
-    assert_eq!(runtime.logical_epoch(), 0);
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("tj-1").unwrap(),
+            vec![relation_input(
+                &prices,
+                "tj-prices",
+                0,
+                3,
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("vehicle_id", DataType::Utf8, false),
+                        Field::new("price", DataType::Int64, false),
+                        Field::new("event_time", DataType::Int64, false),
+                        Field::new("delta", DataType::Int64, false),
+                    ])),
+                    vec![
+                        Arc::new(StringArray::from(vec!["p1", "p1", "p1"])) as _,
+                        Arc::new(Int64Array::from(vec![1000, 2000, 3000])) as _,
+                        Arc::new(Int64Array::from(vec![100, 200, 300])) as _,
+                        Arc::new(Int64Array::from(vec![1, 1, 1])) as _,
+                    ],
+                )
+                .unwrap(),
+            )],
+        )
+        .unwrap();
+    runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("tj-2").unwrap(),
+            vec![relation_input(
+                &rides,
+                "tj-rides",
+                0,
+                1,
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("ride_id", DataType::Utf8, false),
+                        Field::new("booking_start", DataType::Int64, false),
+                        Field::new("event_time", DataType::Int64, false),
+                        Field::new("delta", DataType::Int64, false),
+                    ])),
+                    vec![
+                        Arc::new(StringArray::from(vec!["r1"])) as _,
+                        Arc::new(Int64Array::from(vec![10])) as _,
+                        Arc::new(Int64Array::from(vec![250])) as _,
+                        Arc::new(Int64Array::from(vec![1])) as _,
+                    ],
+                )
+                .unwrap(),
+            )],
+        )
+        .unwrap();
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".into(),
+                program_id: "program-purchases".into(),
+                view_id: "enriched".into(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(2),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(
+        batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        2000
+    );
+    assert_eq!(
+        batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        200
+    );
+    runtime
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("tj-3").unwrap(),
+            vec![relation_input(
+                &prices,
+                "tj-prices",
+                3,
+                4,
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("vehicle_id", DataType::Utf8, false),
+                        Field::new("price", DataType::Int64, false),
+                        Field::new("event_time", DataType::Int64, false),
+                        Field::new("delta", DataType::Int64, false),
+                    ])),
+                    vec![
+                        Arc::new(StringArray::from(vec!["p1"])) as _,
+                        Arc::new(Int64Array::from(vec![2000])) as _,
+                        Arc::new(Int64Array::from(vec![200])) as _,
+                        Arc::new(Int64Array::from(vec![-1])) as _,
+                    ],
+                )
+                .unwrap(),
+            )],
+        )
+        .unwrap();
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".into(),
+                program_id: "program-purchases".into(),
+                view_id: "enriched".into(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(3),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(
+        batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        1000
+    );
+    assert_eq!(
+        batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        100
+    );
     let checkpoint = runtime.checkpoint().unwrap();
-    assert_eq!(checkpoint.logical_epoch, 0);
-    let restored = restore_standing_runtime(checkpoint).unwrap();
-    assert_eq!(restored.logical_epoch(), 0);
+    assert_eq!(checkpoint.logical_epoch, 3);
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    let page = restored
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".into(),
+                program_id: "program-purchases".into(),
+                view_id: "enriched".into(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(3),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(
+        batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        1000
+    );
 }
