@@ -22601,7 +22601,7 @@ fn temporal_join_advances_epoch_and_roundtrips_checkpoint() {
     let output_schema = temporal_join_output_schema();
     let sql = "select l.ride_id, l.booking_start, l.event_time, p.price, p.event_time as price_event_time from rides l join prices p on p.event_time <= l.event_time";
     let identity = standing_identity_with_view(sql, "enriched");
-    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+    let runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
         &catalogs,
         sql,
@@ -22612,6 +22612,6 @@ fn temporal_join_advances_epoch_and_roundtrips_checkpoint() {
     assert_eq!(runtime.logical_epoch(), 0);
     let checkpoint = runtime.checkpoint().unwrap();
     assert_eq!(checkpoint.logical_epoch, 0);
-    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    let restored = restore_standing_runtime(checkpoint).unwrap();
     assert_eq!(restored.logical_epoch(), 0);
 }

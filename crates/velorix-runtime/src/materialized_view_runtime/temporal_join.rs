@@ -185,74 +185,6 @@ impl TemporalJoinRuntime {
         entry.event_time_ns = event_time;
         Ok(())
     }
-
-    fn find_most_recent_right<'a>(
-        right_index: &'a BTreeMap<(String, i64), TemporalRow>,
-        join_key: &str,
-        left_event_time: i64,
-    ) -> Option<&'a TemporalRow> {
-        // Search for the first entry with key == join_key and -event_time >= -left_event_time
-        // (i.e., event_time <= left_event_time)
-        let probe = (join_key.to_string(), -left_event_time);
-        right_index
-            .range(..=probe)
-            .rev()
-            .find(|((key, _neg_time), _row)| key == join_key)
-            .map(|((_, _), row)| row)
-    }
-
-    fn match_left_row(
-        &self,
-        left: &TemporalRow,
-    ) -> Result<Option<Value>, StandingProgramRuntimeError> {
-        let left_event_time = left.event_time_ns;
-        // For pure temporal join: find most recent right row by event_time
-        let mut best_right: Option<&TemporalRow> = None;
-        for ((_key, _neg_time), right_row) in self
-            .right_index
-            .range(..=(String::new(), -left_event_time))
-            .rev()
-        {
-            if right_row.event_time_ns <= left_event_time
-                && (best_right.is_none()
-                    || right_row.event_time_ns > best_right.unwrap().event_time_ns)
-                {
-                    best_right = Some(right_row);
-                }
-        }
-        let Some(right) = best_right else {
-            return Ok(None);
-        };
-        let mut output = serde_json::Map::new();
-        for item in &self.plan.output_columns {
-            let value = match item.side {
-                TemporalJoinSideV1::Left => left.values.get(&item.column_id),
-                TemporalJoinSideV1::Right => right.values.get(&item.column_id),
-            };
-            output.insert(
-                item.output_name.clone(),
-                value.cloned().unwrap_or(Value::Null),
-            );
-        }
-        Ok(Some(Value::Object(output)))
-    }
-
-    fn recompute_output(&self) -> Result<DeltaBatch, StandingProgramRuntimeError> {
-        let mut records = Vec::new();
-        for left in self.left_rows.values() {
-            if left.weight <= 0 {
-                continue;
-            }
-            if let Some(row) = self.match_left_row(left)? {
-                records.push(DeltaRecord::new(
-                    DeltaKey::from_json(row.clone()),
-                    DeltaValue::from_json(Value::Object(serde_json::Map::new())),
-                    1,
-                ));
-            }
-        }
-        Ok(DeltaBatch::from_records(records))
-    }
 }
 
 impl StandingProgramRuntime for TemporalJoinRuntime {
@@ -634,9 +566,9 @@ fn recompute_from_staged(
             if right_row.event_time_ns <= left_event_time
                 && (best_right.is_none()
                     || right_row.event_time_ns > best_right.unwrap().event_time_ns)
-                {
-                    best_right = Some(right_row);
-                }
+            {
+                best_right = Some(right_row);
+            }
         }
         if let Some(right_row) = best_right {
             let mut output = serde_json::Map::new();
