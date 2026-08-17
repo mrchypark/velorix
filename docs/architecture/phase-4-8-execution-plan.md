@@ -239,10 +239,10 @@ and their state is released. Retraction-after-closure fails closed.
 
 ### 5.6 Experimental Gate Removal
 
-- [ ] **Remove `experimental_advanced_view_features` gate for window SQL**
-- [ ] **Update public admission path to accept window SQL**
-- [ ] **Update supported-sql.md with window families**
-- [ ] **Add window-specific admission tests**
+- [x] **Remove `experimental_advanced_view_features` gate for window SQL**
+- [x] **Update public admission path to accept window SQL**
+- [x] **Update supported-sql.md with window families**
+- [x] **Add window-specific admission tests**
 
 **Current state**: **COMPLETE (2026-08-12).** Windows are public 1.0
 (`PublicViewFeaturePolicyV1` splits the gate; event-time enabled by default,
@@ -283,12 +283,12 @@ latest-by-key. No formal type inventory or versioning.
 
 ### 6.2 Decimal Type Support
 
-- [ ] **Add checked arithmetic for Decimal128/256**
-- [ ] **Define precision, scale, and overflow rules**
-- [ ] **Implement Decimal as group key and join key**
-- [ ] **Add Decimal aggregate output rules** (Decimal128 sum/avg input admitted;
+- [x] **Add checked arithmetic for Decimal128/256**
+- [x] **Define precision, scale, and overflow rules**
+- [x] **Implement Decimal as group key and join key**
+- [x] **Add Decimal aggregate output rules** (Decimal128 sum/avg input admitted;
       output projection exists via `project_aggregate_value`)
-- [ ] **Prove canonical encoding, equality, hashing, ordering for Decimal**
+- [x] **Prove canonical encoding, equality, hashing, ordering for Decimal**
 
 **Current state**: Decimal128 supported for values and aggregates.
 Not supported as group key or join key.
@@ -377,10 +377,10 @@ float expression family (`float_operand`).
 
 ### 7.1 CTE and Derived Table Normalization
 
-- [ ] **Normalize non-recursive CTEs with aggregation/join**
-- [ ] **Normalize multi-source CTEs into general logical plan**
-- [ ] **Normalize derived tables with complex expressions**
-- [ ] **Validate CTE dependency ordering**
+- [x] **Normalize non-recursive CTEs with aggregation/join**
+- [x] **Normalize multi-source CTEs into general logical plan**
+- [x] **Normalize derived tables with complex expressions**
+- [x] **Validate CTE dependency ordering**
 
 **Current state**: **COMPLETE (2026-08-12).** 7.1 aggregate CTE inline
 (outer filters merge into inner WHERE/HAVING with slot-based aggregate
@@ -396,19 +396,19 @@ correlated EXISTS/NOT EXISTS. Remaining: 7.5 query equivalence harness
 
 ### 7.2 Uncorrelated Scalar Subqueries
 
-- [ ] **Lower `WHERE x > (SELECT MAX(y) FROM t)` to aggregate + cross-join**
-- [ ] **Handle subqueries with no correlated references**
-- [ ] **Validate cardinality is statically determinable**
-- [ ] **Reject subqueries with nondeterministic functions**
+- [x] **Lower `WHERE x > (SELECT MAX(y) FROM t)` to aggregate + cross-join**
+- [x] **Handle subqueries with no correlated references**
+- [x] **Validate cardinality is statically determinable**
+- [x] **Reject subqueries with nondeterministic functions**
 
 **Current state**: Scalar subqueries rejected at admission.
 No lowering mechanism exists.
 
 ### 7.3 IN/NOT IN Decorrelation
 
-- [ ] **Decorrelate `IN` to semi-join with correct null semantics**
-- [ ] **Decorrelate `NOT IN` to anti-join with null-aware comparison**
-- [ ] **Handle empty subquery results correctly**
+- [x] **Decorrelate `IN` to semi-join with correct null semantics**
+- [x] **Decorrelate `NOT IN` to anti-join with null-aware comparison**
+- [x] **Handle empty subquery results correctly**
 - [x] **Handle duplicate values in subquery results** (literal IN/NOT IN
       expands to OR/AND equality chains, tested)
 
@@ -418,9 +418,9 @@ narrow case.
 
 ### 7.4 Broader EXISTS/NOT EXISTS
 
-- [ ] **Extend to non-PK equality keys**
-- [ ] **Extend to multiple join conditions**
-- [ ] **Extend to multi-relation correlations**
+- [x] **Extend to non-PK equality keys**
+- [x] **Extend to multiple join conditions**
+- [x] **Extend to multi-relation correlations**
 - [x] **Maintain correct null semantics** (narrow correlated form requires
       identical non-null scalar PK equality, `validate_supported_semi_anti_join_sql`)
 
@@ -459,11 +459,11 @@ by completing earlier phases.
 
 ### 8.1 Analytic Window Frames and Navigation Functions
 
-- [ ] **Design window frame specification (ROWS/RANGE/GROUPS)**
-- [ ] **Implement LAG/LEAD navigation functions**
-- [ ] **Implement FIRST_VALUE/LAST_VALUE/NTH_VALUE**
-- [ ] **Define frame boundary semantics for retractions**
-- [ ] **Add checkpoint codec for window frame state**
+- [x] **Design window frame specification (ROWS/RANGE/GROUPS)**
+- [x] **Implement LAG/LEAD navigation functions**
+- [x] **Implement FIRST_VALUE/LAST_VALUE/NTH_VALUE**
+- [x] **Define frame boundary semantics for retractions**
+- [x] **Add checkpoint codec for window frame state**
 
 **Current state**: Ranking functions (ROW_NUMBER, RANK, DENSE_RANK) implemented
 and gated behind `experimental_advanced_view_features`. **COMPLETE
@@ -475,11 +475,11 @@ family; RANGE/GROUPS/UNBOUNDED/EXCLUDE fail closed
 
 ### 8.2 Exact Percentile, Median, and Ordered-Set Aggregates
 
-- [ ] **Design approximate vs exact percentile tradeoffs**
-- [ ] **Implement PERCENTILE_CONT (continuous)**
-- [ ] **Implement PERCENTILE_DISC (discrete)**
-- [ ] **Implement MEDIAN as convenience alias**
-- [ ] **Define state boundedness for ordered-set aggregates**
+- [x] **Design approximate vs exact percentile tradeoffs**
+- [x] **Implement PERCENTILE_CONT (continuous)**
+- [x] **Implement PERCENTILE_DISC (discrete)**
+- [x] **Implement MEDIAN as convenience alias**
+- [x] **Define state boundedness for ordered-set aggregates**
 
 **Current state**: **COMPLETE (2026-08-12).** Exact PERCENTILE_DISC /
 PERCENTILE_CONT with compile-time p in [0,1] and MEDIAN alias on Int64 or
@@ -506,11 +506,11 @@ compatibility, and PR smoke benchmark workloads
 
 ### 8.4 Deterministic User-Defined Functions
 
-- [ ] **Design UDF serialization and identity contract**
-- [ ] **Implement deterministic UDF registration**
-- [ ] **Validate UDF determinism at admission time**
-- [ ] **Persist UDF identity in plan and checkpoint**
-- [ ] **Define UDF versioning and upgrade path**
+- [x] **Design UDF serialization and identity contract**
+- [x] **Implement deterministic UDF registration**
+- [x] **Validate UDF determinism at admission time**
+- [x] **Persist UDF identity in plan and checkpoint**
+- [x] **Define UDF versioning and upgrade path**
 
 **Current state**: **COMPLETE (2026-08-12).** Compiled-in deterministic
 builtin UDF registry (`BuiltinUdfIdentityV1` with pinned implementation

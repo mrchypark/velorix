@@ -11170,3 +11170,32 @@ fn in_subquery_decorrelates_to_semi_anti_join() {
         .is_err()
     );
 }
+
+/// Phase 6.7 exit gate: verify admitted type representations round-trip
+/// through SQL admission without lossy implicit conversion.
+#[test]
+fn exit_gate_no_lossy_implicit_conversion_across_type_surfaces() {
+    let catalog = scores_catalog();
+    // String typed projection roundtrip
+    let plan = validate_supported_filter_project_sql(
+        "select user_id, upper(user_id) as name from scores",
+        &catalog,
+    ).unwrap();
+    assert!(plan.value_columns.is_empty());
+    assert_eq!(plan.typed_value_columns.len(), 1);
+    assert_eq!(plan.typed_value_columns[0].output_column_id, "name");
+    // Float typed projection roundtrip
+    let plan = validate_supported_filter_project_sql(
+        "select user_id, score * 1.0 as score_f from scores",
+        &catalog,
+    ).unwrap();
+    assert!(plan.value_columns.is_empty());
+    assert_eq!(plan.typed_value_columns.len(), 1);
+    // Mixed: int column + typed float
+    let plan = validate_supported_filter_project_sql(
+        "select user_id, score, score * 1.5 as weighted from scores",
+        &catalog,
+    ).unwrap();
+    assert_eq!(plan.value_columns.len(), 1);
+    assert_eq!(plan.typed_value_columns.len(), 1);
+}
