@@ -272,10 +272,10 @@ plus the retraction/restart tests in 5.5 and
 
 ### 6.1 Type Inventory and Requirements
 
-- [ ] **Inventory scalar and aggregate state requirements by type**
-- [ ] **Document type-specific overflow and NaN handling rules**
-- [ ] **Define type promotion and coercion rules**
-- [ ] **Version expression encoding in checkpoint state**
+- [x] **Inventory scalar and aggregate state requirements by type**
+- [x] **Document type-specific overflow and NaN handling rules**
+- [x] **Define type promotion and coercion rules**
+- [x] **Version expression encoding in checkpoint state**
 
 **Current state**: Int64 fully implemented; Decimal128 supported for values and
 aggregates (not as group/join key); Utf8/Float64 pass through filter/project and
@@ -446,7 +446,7 @@ of one runtime and re-verifies delta and page equality.
 
 ### 7.6 Exit Gate
 
-- [ ] The selected subquery corpus lowers to existing operators and remains exact
+- [x] The selected subquery corpus lowers to existing operators and remains exact
   after retractions and restart. (Admission invariant enforced today:
   `subquery_admission_uses_existing_relational_nodes_or_fails_closed`)
 
