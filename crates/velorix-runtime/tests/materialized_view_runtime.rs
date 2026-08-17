@@ -22759,7 +22759,7 @@ fn temporal_join_materializes_asof_match_and_retracts() {
     );
     let checkpoint = runtime.checkpoint().unwrap();
     assert_eq!(checkpoint.logical_epoch, 3);
-    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    let restored = restore_standing_runtime(checkpoint).unwrap();
     let page = restored
         .materialized_view_page(
             ScopedViewId {
