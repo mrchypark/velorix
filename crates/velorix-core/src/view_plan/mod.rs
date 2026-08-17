@@ -3241,7 +3241,9 @@ fn derive_execution_implementation(
             "velorix-recursive-fixpoint-specialization-v1"
         }
         VelorixLogicalViewExecutionV1::CrossJoin { .. } => "velorix-cross-join-specialization-v1",
-        VelorixLogicalViewExecutionV1::TemporalJoin { .. } => "velorix-temporal-join-specialization-v1",
+        VelorixLogicalViewExecutionV1::TemporalJoin { .. } => {
+            "velorix-temporal-join-specialization-v1"
+        }
     };
     let physical_bytes = serde_json::to_vec(&(
         &plan.nodes,
@@ -18628,17 +18630,20 @@ fn validate_supported_temporal_join_sql_inner(
     let right_ref = qualified_column_ref(right.as_ref())?;
     // Determine which side is left/right table and which is event_time column
     // Determine which qualifier is which: left side <= right side (r.event_time <= l.event_time)
-    let (r_event_col, l_event_col) = if identifier_eq(left_ref.qualifier.as_str(), right_table.alias.as_str())
-        && identifier_eq(right_ref.qualifier.as_str(), left_table.alias.as_str())
-    {
-        (left_ref.column.as_str(), right_ref.column.as_str())
-    } else if identifier_eq(left_ref.qualifier.as_str(), left_table.alias.as_str())
-        && identifier_eq(right_ref.qualifier.as_str(), right_table.alias.as_str())
-    {
-        (right_ref.column.as_str(), left_ref.column.as_str())
-    } else {
-        return unsupported("temporal join ON must compare right.event_time with left.event_time");
-    };
+    let (r_event_col, l_event_col) =
+        if identifier_eq(left_ref.qualifier.as_str(), right_table.alias.as_str())
+            && identifier_eq(right_ref.qualifier.as_str(), left_table.alias.as_str())
+        {
+            (left_ref.column.as_str(), right_ref.column.as_str())
+        } else if identifier_eq(left_ref.qualifier.as_str(), left_table.alias.as_str())
+            && identifier_eq(right_ref.qualifier.as_str(), right_table.alias.as_str())
+        {
+            (right_ref.column.as_str(), left_ref.column.as_str())
+        } else {
+            return unsupported(
+                "temporal join ON must compare right.event_time with left.event_time",
+            );
+        };
     let left_event_time_col = catalog_column_by_id(left_catalog, l_event_col)?;
     let right_event_time_col = catalog_column_by_id(right_catalog, r_event_col)?;
     if !matches!(
@@ -18666,7 +18671,9 @@ fn validate_supported_temporal_join_sql_inner(
         } else if identifier_eq(reference.qualifier.as_str(), right_alias) {
             (TemporalJoinSideV1::Right, right_catalog)
         } else {
-            return unsupported("temporal join projections must reference one of the two joined tables");
+            return unsupported(
+                "temporal join projections must reference one of the two joined tables",
+            );
         };
         let column = qualified_ref_catalog_column(&reference, catalog)?;
         let output_name = alias_item.unwrap_or(column.name.as_str()).to_string();

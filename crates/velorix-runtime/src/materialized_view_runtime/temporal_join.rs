@@ -11,11 +11,10 @@
 //! the correct predecessor. Output is the full projected row.
 
 use super::*;
-use velorix_core::view_plan::{
-    SupportedTemporalJoinPlanV1, TemporalJoinSideV1,
-    validate_supported_temporal_join_sql,
-};
 use crate::materialized_view_runtime::semi_anti_join::catalog_for_relation_id;
+use velorix_core::view_plan::{
+    validate_supported_temporal_join_sql, SupportedTemporalJoinPlanV1, TemporalJoinSideV1,
+};
 
 pub struct TemporalJoinRuntime {
     identity: StandingProgramIdentity,
@@ -66,9 +65,11 @@ impl TemporalJoinRuntime {
             }
         })?;
         validate_temporal_join_contract(&catalogs, &input_schemas, &plan)?;
-        let compiled = validate_supported_temporal_join_sql(view_sql.as_str(), &catalogs)
-            .map_err(|_| StandingProgramRuntimeError::InvalidProgramIdentity {
-                field: "temporal_join_plan",
+        let compiled =
+            validate_supported_temporal_join_sql(view_sql.as_str(), &catalogs).map_err(|_| {
+                StandingProgramRuntimeError::InvalidProgramIdentity {
+                    field: "temporal_join_plan",
+                }
             })?;
         if compiled != plan {
             return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
@@ -116,11 +117,7 @@ impl TemporalJoinRuntime {
     }
 
     fn materialized_batch(&self) -> Result<RecordBatch, StandingProgramRuntimeError> {
-        materialized_delta_to_record_batch(
-            &self.output_schema,
-            &self.published_output,
-            Some(&[]),
-        )
+        materialized_delta_to_record_batch(&self.output_schema, &self.published_output, Some(&[]))
     }
 
     fn materialized_page_batch(
@@ -142,23 +139,32 @@ impl TemporalJoinRuntime {
         key_column: &str,
         time_column: &str,
     ) -> Result<(), StandingProgramRuntimeError> {
-        let key = record.key.as_json().as_object()
+        let key = record
+            .key
+            .as_json()
+            .as_object()
             .and_then(|obj| obj.get(key_column))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .unwrap_or_default();
-        let event_time = record.value.as_json().as_object()
+        let event_time = record
+            .value
+            .as_json()
+            .as_object()
             .and_then(|obj| obj.get(time_column))
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
         let map_key = (key.clone(), -event_time);
-        right_index.entry(map_key.clone()).or_insert_with(|| TemporalRow {
-            values: BTreeMap::new(),
-            event_time_ns: event_time,
-            weight: 0,
-        });
+        right_index
+            .entry(map_key.clone())
+            .or_insert_with(|| TemporalRow {
+                values: BTreeMap::new(),
+                event_time_ns: event_time,
+                weight: 0,
+            });
         let entry = right_index.get_mut(&map_key).unwrap();
-        entry.weight = entry.weight
+        entry.weight = entry
+            .weight
             .checked_add(record.weight)
             .ok_or_else(invalid_runtime_state)?;
         if entry.weight < 0 {
@@ -168,7 +174,10 @@ impl TemporalJoinRuntime {
             right_index.remove(&map_key);
             return Ok(());
         }
-        entry.values = record.value.as_json().as_object()
+        entry.values = record
+            .value
+            .as_json()
+            .as_object()
             .ok_or_else(invalid_runtime_state)?
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
@@ -185,7 +194,8 @@ impl TemporalJoinRuntime {
         // Search for the first entry with key == join_key and -event_time >= -left_event_time
         // (i.e., event_time <= left_event_time)
         let probe = (join_key.to_string(), -left_event_time);
-        right_index.range(..=probe)
+        right_index
+            .range(..=probe)
             .rev()
             .find(|((key, _neg_time), _row)| key == join_key)
             .map(|((_, _), row)| row)
@@ -198,12 +208,17 @@ impl TemporalJoinRuntime {
         let left_event_time = left.event_time_ns;
         // For pure temporal join: find most recent right row by event_time
         let mut best_right: Option<&TemporalRow> = None;
-        for ((_key, _neg_time), right_row) in self.right_index.range(..=(String::new(), -left_event_time)).rev() {
-            if right_row.event_time_ns <= left_event_time {
-                if best_right.is_none() || right_row.event_time_ns > best_right.unwrap().event_time_ns {
+        for ((_key, _neg_time), right_row) in self
+            .right_index
+            .range(..=(String::new(), -left_event_time))
+            .rev()
+        {
+            if right_row.event_time_ns <= left_event_time
+                && (best_right.is_none()
+                    || right_row.event_time_ns > best_right.unwrap().event_time_ns)
+                {
                     best_right = Some(right_row);
                 }
-            }
         }
         let Some(right) = best_right else {
             return Ok(None);
@@ -246,7 +261,10 @@ impl StandingProgramRuntime for TemporalJoinRuntime {
     }
 
     fn input_schemas(&self) -> Vec<RelationSchema> {
-        vec![self.left_input_schema.clone(), self.right_input_schema.clone()]
+        vec![
+            self.left_input_schema.clone(),
+            self.right_input_schema.clone(),
+        ]
     }
 
     fn output_schemas(&self) -> Vec<RelationSchema> {
@@ -299,8 +317,14 @@ impl StandingProgramRuntime for TemporalJoinRuntime {
 
         for input in &input_changes {
             if input.relation_id == self.plan.left_input_relation_id {
-                validate_input_matches_schema(input, &self.left_input_schema, "temporal_join_input")?;
-                let delta = if let Some(empty_delta) = published_input_empty_delta(input, &self.left_catalog)? {
+                validate_input_matches_schema(
+                    input,
+                    &self.left_input_schema,
+                    "temporal_join_input",
+                )?;
+                let delta = if let Some(empty_delta) =
+                    published_input_empty_delta(input, &self.left_catalog)?
+                {
                     empty_delta
                 } else {
                     let mut columns = BTreeSet::new();
@@ -314,33 +338,64 @@ impl StandingProgramRuntime for TemporalJoinRuntime {
                         std::slice::from_ref(&self.plan.left_join_column_id),
                         &columns.into_iter().collect::<Vec<_>>(),
                         &input.batches,
-                    ).map_err(|_| StandingProgramRuntimeError::InvalidProgramIdentity {
-                        field: "temporal_join_input_batch",
+                    )
+                    .map_err(|_| {
+                        StandingProgramRuntimeError::InvalidProgramIdentity {
+                            field: "temporal_join_input_batch",
+                        }
                     })?
                 };
                 for record in delta.net_rows().map_err(|_| invalid_runtime_state())? {
-                    let key = record.key.as_json().as_object()
+                    let key = record
+                        .key
+                        .as_json()
+                        .as_object()
                         .and_then(|obj| obj.get(&self.plan.left_join_column_id))
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string())
                         .unwrap_or_default();
-                    let event_time = record.value.as_json().as_object()
+                    let event_time = record
+                        .value
+                        .as_json()
+                        .as_object()
                         .and_then(|obj| obj.get(&self.plan.left_event_time_column_id))
                         .and_then(|v| v.as_i64())
                         .unwrap_or(0);
                     let entry = next_left.entry(key.clone()).or_insert_with(|| TemporalRow {
-                        values: BTreeMap::new(), event_time_ns: event_time, weight: 0,
+                        values: BTreeMap::new(),
+                        event_time_ns: event_time,
+                        weight: 0,
                     });
-                    entry.weight = entry.weight.checked_add(record.weight).ok_or_else(invalid_runtime_state)?;
-                    if entry.weight < 0 { return Err(invalid_runtime_state()); }
-                    if entry.weight == 0 { next_left.remove(&key); continue; }
-                    entry.values = record.value.as_json().as_object().ok_or_else(invalid_runtime_state)?
-                        .iter().map(|(k,v)| (k.clone(), v.clone())).collect();
+                    entry.weight = entry
+                        .weight
+                        .checked_add(record.weight)
+                        .ok_or_else(invalid_runtime_state)?;
+                    if entry.weight < 0 {
+                        return Err(invalid_runtime_state());
+                    }
+                    if entry.weight == 0 {
+                        next_left.remove(&key);
+                        continue;
+                    }
+                    entry.values = record
+                        .value
+                        .as_json()
+                        .as_object()
+                        .ok_or_else(invalid_runtime_state)?
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
                     entry.event_time_ns = event_time;
                 }
             } else if input.relation_id == self.plan.right_input_relation_id {
-                validate_input_matches_schema(input, &self.right_input_schema, "temporal_join_input")?;
-                let delta = if let Some(empty_delta) = published_input_empty_delta(input, &self.right_catalog)? {
+                validate_input_matches_schema(
+                    input,
+                    &self.right_input_schema,
+                    "temporal_join_input",
+                )?;
+                let delta = if let Some(empty_delta) =
+                    published_input_empty_delta(input, &self.right_catalog)?
+                {
                     empty_delta
                 } else {
                     let mut columns = BTreeSet::new();
@@ -354,12 +409,20 @@ impl StandingProgramRuntime for TemporalJoinRuntime {
                         std::slice::from_ref(&self.plan.right_join_column_id),
                         &columns.into_iter().collect::<Vec<_>>(),
                         &input.batches,
-                    ).map_err(|_| StandingProgramRuntimeError::InvalidProgramIdentity {
-                        field: "temporal_join_input_batch",
+                    )
+                    .map_err(|_| {
+                        StandingProgramRuntimeError::InvalidProgramIdentity {
+                            field: "temporal_join_input_batch",
+                        }
                     })?
                 };
                 for record in delta.net_rows().map_err(|_| invalid_runtime_state())? {
-                    Self::apply_right_side(&mut next_right, &record, &self.plan.right_join_column_id, &self.plan.right_event_time_column_id)?;
+                    Self::apply_right_side(
+                        &mut next_right,
+                        &record,
+                        &self.plan.right_join_column_id,
+                        &self.plan.right_event_time_column_id,
+                    )?;
                 }
             } else {
                 return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
@@ -371,14 +434,18 @@ impl StandingProgramRuntime for TemporalJoinRuntime {
         }
 
         let next_output = recompute_from_staged(&next_left, &next_right, &self.plan)?;
-        let prev_inv = self.published_output.inverse().map_err(|_| invalid_runtime_state())?;
+        let prev_inv = self
+            .published_output
+            .inverse()
+            .map_err(|_| invalid_runtime_state())?;
         let output_delta = prev_inv.combine(&next_output);
         self.left_rows = next_left;
         self.right_index = next_right;
         self.published_output = next_output;
         self.input_frontiers = next_frontiers.clone();
         self.input_event_time_frontiers = next_event_time_frontiers.clone();
-        self.applied_epochs.insert(idempotency_key_text, logical_epoch);
+        self.applied_epochs
+            .insert(idempotency_key_text, logical_epoch);
         retain_recent_applied_epochs(&mut self.applied_epochs);
         self.logical_epoch = logical_epoch;
 
@@ -409,7 +476,9 @@ impl StandingProgramRuntime for TemporalJoinRuntime {
             || view.program_id != self.identity.program_id
             || !self.identity.view_ids.iter().any(|id| id == &view.view_id)
         {
-            return Err(StandingProgramRuntimeError::UnknownView { view_id: view.view_id });
+            return Err(StandingProgramRuntimeError::UnknownView {
+                view_id: view.view_id,
+            });
         }
         let (batch, next_page_token) = self.materialized_page_batch(page)?;
         Ok(MaterializedViewPage {
@@ -436,10 +505,19 @@ impl StandingProgramRuntime for TemporalJoinRuntime {
             input_frontiers: self.input_frontiers.clone(),
             input_event_time_frontiers: self.input_event_time_frontiers.clone(),
             left_rows: self.left_rows.clone(),
-            right_index: self.right_index.iter().map(|(k,v)| (k.clone(), v.clone())).collect(),
+            right_index: self
+                .right_index
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
             published_output: self.published_output.clone(),
-            applied_epochs: self.applied_epochs.iter()
-                .map(|(k,v)| GenericAppliedEpoch { idempotency_key: k.clone(), logical_epoch: *v })
+            applied_epochs: self
+                .applied_epochs
+                .iter()
+                .map(|(k, v)| GenericAppliedEpoch {
+                    idempotency_key: k.clone(),
+                    logical_epoch: *v,
+                })
                 .collect(),
             logical_epoch: self.logical_epoch,
         };
@@ -450,12 +528,21 @@ impl StandingProgramRuntime for TemporalJoinRuntime {
             logical_epoch: self.logical_epoch,
             input_frontiers: self.input_frontiers.clone(),
             input_event_time_frontiers: self.input_event_time_frontiers.clone(),
-            output_frontiers: self.identity.view_ids.iter()
-                .map(|view_id| ViewFrontier { view_id: view_id.clone(), committed_epoch: self.logical_epoch })
+            output_frontiers: self
+                .identity
+                .view_ids
+                .iter()
+                .map(|view_id| ViewFrontier {
+                    view_id: view_id.clone(),
+                    committed_epoch: self.logical_epoch,
+                })
                 .collect(),
             checkpoint_codec_identity: self.identity.checkpoint_codec_identity.clone(),
             state_root: DurableStateRoot {
-                object_key: format!("v1/state/materialized-view-runtime/{}/checkpoint", self.identity.program_id),
+                object_key: format!(
+                    "v1/state/materialized-view-runtime/{}/checkpoint",
+                    self.identity.program_id
+                ),
                 content_hash,
             },
             state_payload: Some(RuntimeCheckpointStatePayload {
@@ -489,7 +576,10 @@ impl StandingProgramRuntime for TemporalJoinRuntime {
         }
         validate_temporal_join_contract(
             &[payload.left_catalog.clone(), payload.right_catalog.clone()],
-            &[payload.left_input_schema.clone(), payload.right_input_schema.clone()],
+            &[
+                payload.left_input_schema.clone(),
+                payload.right_input_schema.clone(),
+            ],
             &payload.plan,
         )?;
         if payload.logical_epoch != checkpoint.logical_epoch
@@ -500,8 +590,11 @@ impl StandingProgramRuntime for TemporalJoinRuntime {
         }
         validate_view_sql_hash(&checkpoint.identity, payload.view_sql.as_str())?;
         validate_published_output(&payload.published_output)?;
-        let mut applied_epochs = payload.applied_epochs.into_iter()
-            .map(|e| (e.idempotency_key, e.logical_epoch)).collect();
+        let mut applied_epochs = payload
+            .applied_epochs
+            .into_iter()
+            .map(|e| (e.idempotency_key, e.logical_epoch))
+            .collect();
         retain_recent_applied_epochs(&mut applied_epochs);
         Ok(Self {
             identity: checkpoint.identity,
@@ -538,11 +631,12 @@ fn recompute_from_staged(
         // For pure temporal join: scan ALL right rows to find most recent by event_time
         let mut best_right: Option<&TemporalRow> = None;
         for ((_key, _neg_time), right_row) in right.iter() {
-            if right_row.event_time_ns <= left_event_time {
-                if best_right.is_none() || right_row.event_time_ns > best_right.unwrap().event_time_ns {
+            if right_row.event_time_ns <= left_event_time
+                && (best_right.is_none()
+                    || right_row.event_time_ns > best_right.unwrap().event_time_ns)
+                {
                     best_right = Some(right_row);
                 }
-            }
         }
         if let Some(right_row) = best_right {
             let mut output = serde_json::Map::new();
@@ -551,7 +645,10 @@ fn recompute_from_staged(
                     TemporalJoinSideV1::Left => left_row.values.get(&item.column_id),
                     TemporalJoinSideV1::Right => right_row.values.get(&item.column_id),
                 };
-                output.insert(item.output_name.clone(), value.cloned().unwrap_or(Value::Null));
+                output.insert(
+                    item.output_name.clone(),
+                    value.cloned().unwrap_or(Value::Null),
+                );
             }
             records.push(DeltaRecord::new(
                 DeltaKey::from_json(Value::Object(output.clone())),

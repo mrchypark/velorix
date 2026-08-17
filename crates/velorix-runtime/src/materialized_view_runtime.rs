@@ -101,10 +101,10 @@ mod interval_join;
 mod latest_by_key;
 mod output;
 mod recursive_fixpoint;
-mod temporal_join;
 mod scalar_aggregate_filter;
 mod semi_anti_join;
 mod single_key_aggregate;
+mod temporal_join;
 mod three_input_join;
 mod two_input_join;
 
@@ -115,9 +115,9 @@ pub use filter_project::FilterProjectRuntime;
 pub use interval_join::IntervalJoinRuntime;
 pub use latest_by_key::LatestByKeyRuntime;
 pub use recursive_fixpoint::RecursiveFixpointRuntime;
-pub use temporal_join::TemporalJoinRuntime;
 pub use semi_anti_join::TwoInputSemiAntiJoinRuntime;
 pub use single_key_aggregate::SingleKeySumCountRuntime;
+pub use temporal_join::TemporalJoinRuntime;
 pub use three_input_join::ThreeInputInnerJoinCountRuntime;
 pub use two_input_join::TwoInputJoinRuntime;
 

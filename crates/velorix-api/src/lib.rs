@@ -121,17 +121,18 @@ use velorix_core::{
         supported_join_view_plan_is_self_join, supported_join_view_plan_is_singleton,
         supported_view_plan_aggregate_outputs, supported_view_plan_group_keys,
         validate_catalog_backed_sum_count_view_sql, validate_supported_analytic_row_number_sql,
-        validate_supported_cross_join_sql, validate_supported_filter_project_sql, validate_supported_temporal_join_sql,
+        validate_supported_cross_join_sql, validate_supported_filter_project_sql,
         validate_supported_interval_join_sql, validate_supported_join_view_sql,
         validate_supported_latest_by_key_sql, validate_supported_recursive_cte_sql,
-        validate_supported_semi_anti_join_sql, validate_supported_three_input_inner_join_count_sql,
-        validate_supported_tumbling_window_sql, CrossJoinSideV1, LogicalPlanAggregateFunctionV1, TemporalJoinSideV1, SupportedTemporalJoinPlanV1,
+        validate_supported_semi_anti_join_sql, validate_supported_temporal_join_sql,
+        validate_supported_three_input_inner_join_count_sql,
+        validate_supported_tumbling_window_sql, CrossJoinSideV1, LogicalPlanAggregateFunctionV1,
         SupportedAggregateInputRelationSide, SupportedAggregateOutput,
         SupportedAnalyticRowNumberPlan, SupportedCrossJoinPlanV1, SupportedFilterProjectPlan,
         SupportedIntervalJoinPlanV1, SupportedJoinViewPlan, SupportedLatestByKeyPlan,
-        SupportedProjectionExpr, SupportedRecursiveFixpointPlanV1,
+        SupportedProjectionExpr, SupportedRecursiveFixpointPlanV1, SupportedTemporalJoinPlanV1,
         SupportedThreeInputInnerJoinCountPlanV1, SupportedTumblingWindowPlan, SupportedViewPlan,
-        VelorixLogicalViewExecutionV1, VelorixLogicalViewPlanV1, ViewPlanError,
+        TemporalJoinSideV1, VelorixLogicalViewExecutionV1, VelorixLogicalViewPlanV1, ViewPlanError,
         INCREMENTAL_BAG_SEMANTICS_VERSION_V1, INCREMENTAL_KEY_SEMANTICS_VERSION_V1,
         OUTPUT_PUBLICATION_PROTOCOL_VERSION_V1,
     },
@@ -6248,13 +6249,19 @@ fn temporal_join_output_schema(
             nullable: false,
         });
     }
-    let primary_key = columns.iter().map(|column| column.name.clone()).collect::<Vec<_>>();
+    let primary_key = columns
+        .iter()
+        .map(|column| column.name.clone())
+        .collect::<Vec<_>>();
     Ok(RelationSchema {
         relation_id: view_id.to_string(),
         relation_name: view_id.to_string(),
         relation_version: "2026-08-14.v1".to_string(),
         schema_fingerprint: materialized_output_schema_fingerprint(
-            view_id, "v1", &columns, &primary_key,
+            view_id,
+            "v1",
+            &columns,
+            &primary_key,
         )?,
         columns,
         primary_key,
