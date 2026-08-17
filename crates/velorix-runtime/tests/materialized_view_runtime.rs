@@ -22352,10 +22352,7 @@ fn mutually_recursive_cte_materializes_bidirectional_closure() {
                 "mut-edges",
                 0,
                 2,
-                edges_rows_batch(&[
-                    ("e1", "a", "b", 1),
-                    ("e2", "b", "c", 1),
-                ]),
+                edges_rows_batch(&[("e1", "a", "b", 1), ("e2", "b", "c", 1)]),
             )],
         )
         .unwrap();
@@ -22363,7 +22360,15 @@ fn mutually_recursive_cte_materializes_bidirectional_closure() {
     assert_reachability_page(
         runtime.as_ref(),
         1,
-        &[("a", "b"), ("a", "c"), ("b", "a"), ("b", "b"), ("b", "c"), ("c", "b"), ("c", "c")],
+        &[
+            ("a", "b"),
+            ("a", "c"),
+            ("b", "a"),
+            ("b", "b"),
+            ("b", "c"),
+            ("c", "b"),
+            ("c", "c"),
+        ],
     );
 
     // Insert c->a (creates a cycle)
@@ -22396,5 +22401,9 @@ fn mutually_recursive_cte_materializes_bidirectional_closure() {
         )
         .unwrap();
     let batch = &page.batches[0];
-    assert!(batch.num_rows() >= 6, "bidirectional closure must include cross-CTE pairs, got {}", batch.num_rows());
+    assert!(
+        batch.num_rows() >= 6,
+        "bidirectional closure must include cross-CTE pairs, got {}",
+        batch.num_rows()
+    );
 }

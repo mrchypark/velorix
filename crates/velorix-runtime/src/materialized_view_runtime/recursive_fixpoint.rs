@@ -213,14 +213,20 @@ impl RecursiveFixpointRuntime {
         let mut derived: BTreeMap<String, Value> = BTreeMap::new();
         // Seed with first CTE's anchor rows
         for base in base_multiset.values() {
-            if let Some(row) = self.anchor_row(base, &self.plan.anchor_base_predicate, &self.plan.anchor_projection)? {
+            if let Some(row) = self.anchor_row(
+                base,
+                &self.plan.anchor_base_predicate,
+                &self.plan.anchor_projection,
+            )? {
                 derived.insert(canonical_json(&row), row);
             }
         }
         // Seed with second CTE's anchor rows (for mutually recursive CTEs)
         if let Some(ref cte2) = self.plan.second_cte {
             for base in base_multiset.values() {
-                if let Some(row) = self.anchor_row(base, &cte2.anchor_base_predicate, &cte2.anchor_projection)? {
+                if let Some(row) =
+                    self.anchor_row(base, &cte2.anchor_base_predicate, &cte2.anchor_projection)?
+                {
                     derived.insert(canonical_json(&row), row);
                 }
             }
@@ -264,7 +270,9 @@ impl RecursiveFixpointRuntime {
                                 field: "recursive_fixpoint_resource_contract",
                             });
                         }
-                        let Some(candidate2) = self.recursive_candidate_with_config(row, base, cte2)? else {
+                        let Some(candidate2) =
+                            self.recursive_candidate_with_config(row, base, cte2)?
+                        else {
                             continue;
                         };
                         let key2 = canonical_json(&candidate2);

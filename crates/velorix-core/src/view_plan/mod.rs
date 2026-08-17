@@ -17731,7 +17731,7 @@ pub fn validate_supported_recursive_cte_sql(
         return unsupported("recursive CTE requires WITH RECURSIVE");
     }
     let cte_count = with.cte_tables.len();
-    if cte_count < 1 || cte_count > 2 {
+    if !(1..=2).contains(&cte_count) {
         return unsupported("recursive CTE requires one or two CTEs");
     }
     let cte = &with.cte_tables[0];
@@ -18044,7 +18044,10 @@ pub fn validate_supported_recursive_cte_sql(
             return unsupported("recursive CTE anchor must not contain joins");
         }
         let anchor2_table = registered_table_ref(&anchor2_from.relation, "anchor2")?;
-        if !identifier_eq(anchor2_table.name.as_str(), catalog.relation_schema.relation_id.as_str()) {
+        if !identifier_eq(
+            anchor2_table.name.as_str(),
+            catalog.relation_schema.relation_id.as_str(),
+        ) {
             return unsupported("recursive CTE anchor must reference the registered relation");
         }
         // Parse second CTE's anchor projection (same column names as first CTE)
@@ -18056,12 +18059,17 @@ pub fn validate_supported_recursive_cte_sql(
                 SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.as_str())),
                 _ => return unsupported("recursive CTE anchor projections must be direct columns"),
             };
-            let Some(column) = expression_filter_project_column(expr, catalog, Some(anchor2_alias), None)
+            let Some(column) =
+                expression_filter_project_column(expr, catalog, Some(anchor2_alias), None)
             else {
-                return unsupported("recursive CTE anchor projections must be direct base relation columns");
+                return unsupported(
+                    "recursive CTE anchor projections must be direct base relation columns",
+                );
             };
             if column.column_id == catalog.relation_schema.weight_column_id {
-                return unsupported("recursive CTE anchor projections must not reference the weight column");
+                return unsupported(
+                    "recursive CTE anchor projections must not reference the weight column",
+                );
             }
             anchor2_projection.push(column.column_id.clone());
         }
@@ -18080,24 +18088,34 @@ pub fn validate_supported_recursive_cte_sql(
         let [join2] = recursive2_from.joins.as_slice() else {
             return unsupported("recursive term requires exactly one JOIN");
         };
-        if !matches!(join2.join_operator, JoinOperator::Inner(_) | JoinOperator::Join(_)) {
+        if !matches!(
+            join2.join_operator,
+            JoinOperator::Inner(_) | JoinOperator::Join(_)
+        ) {
             return unsupported("recursive term currently supports INNER JOIN only");
         }
         let left2_table = registered_table_ref(&recursive2_from.relation, "recursive2")?;
         let right2_table = registered_table_ref(&join2.relation, "recursive2")?;
-        let left2_is_recursive = identifier_eq(left2_table.name.as_str(), cte2.alias.name.value.as_str())
-            || identifier_eq(left2_table.name.as_str(), recursion_alias.as_str());
-        let right2_is_recursive = identifier_eq(right2_table.name.as_str(), cte2.alias.name.value.as_str())
-            || identifier_eq(right2_table.name.as_str(), recursion_alias.as_str());
+        let left2_is_recursive =
+            identifier_eq(left2_table.name.as_str(), cte2.alias.name.value.as_str())
+                || identifier_eq(left2_table.name.as_str(), recursion_alias.as_str());
+        let right2_is_recursive =
+            identifier_eq(right2_table.name.as_str(), cte2.alias.name.value.as_str())
+                || identifier_eq(right2_table.name.as_str(), recursion_alias.as_str());
         if left2_is_recursive == right2_is_recursive {
-            return unsupported("recursive term must reference the recursion relation exactly once");
+            return unsupported(
+                "recursive term must reference the recursion relation exactly once",
+            );
         }
         let (recursive2_table, base2_table) = if left2_is_recursive {
             (left2_table, right2_table)
         } else {
             (right2_table, left2_table)
         };
-        if !identifier_eq(base2_table.name.as_str(), catalog.relation_schema.relation_id.as_str()) {
+        if !identifier_eq(
+            base2_table.name.as_str(),
+            catalog.relation_schema.relation_id.as_str(),
+        ) {
             return unsupported("recursive term must join with the registered relation");
         }
         let constraint2 = match &join2.join_operator {
@@ -18111,7 +18129,12 @@ pub fn validate_supported_recursive_cte_sql(
         let [equality2] = conjuncts2.as_slice() else {
             return unsupported("recursive term ON predicate must be a single equality");
         };
-        let Expr::BinaryOp { left: left2, op: op2, right: right2 } = equality2 else {
+        let Expr::BinaryOp {
+            left: left2,
+            op: op2,
+            right: right2,
+        } = equality2
+        else {
             return unsupported("recursive term ON predicate must be a single equality");
         };
         if op2 != &BinaryOperator::Eq {
@@ -18119,18 +18142,29 @@ pub fn validate_supported_recursive_cte_sql(
         }
         let left2_ref = qualified_column_ref(left2.as_ref())?;
         let right2_ref = qualified_column_ref(right2.as_ref())?;
-        let (recursive2_column, base2_column) = if identifier_eq(left2_ref.qualifier.as_str(), recursive2_table.alias.as_str())
-            && identifier_eq(right2_ref.qualifier.as_str(), base2_table.alias.as_str())
-        {
-            (left2_ref.column.as_str(), right2_ref.column.as_str())
-        } else if identifier_eq(left2_ref.qualifier.as_str(), base2_table.alias.as_str())
-            && identifier_eq(right2_ref.qualifier.as_str(), recursive2_table.alias.as_str())
-        {
-            (right2_ref.column.as_str(), left2_ref.column.as_str())
-        } else {
-            return unsupported("recursive term ON must compare recursion relation with base relation");
-        };
-        let base2_join_column = catalog.relation_schema.columns.iter()
+        let (recursive2_column, base2_column) =
+            if identifier_eq(
+                left2_ref.qualifier.as_str(),
+                recursive2_table.alias.as_str(),
+            ) && identifier_eq(right2_ref.qualifier.as_str(), base2_table.alias.as_str())
+            {
+                (left2_ref.column.as_str(), right2_ref.column.as_str())
+            } else if identifier_eq(left2_ref.qualifier.as_str(), base2_table.alias.as_str())
+                && identifier_eq(
+                    right2_ref.qualifier.as_str(),
+                    recursive2_table.alias.as_str(),
+                )
+            {
+                (right2_ref.column.as_str(), left2_ref.column.as_str())
+            } else {
+                return unsupported(
+                    "recursive term ON must compare recursion relation with base relation",
+                );
+            };
+        let base2_join_column = catalog
+            .relation_schema
+            .columns
+            .iter()
             .find(|column| column_identifier_eq(column, base2_column))
             .ok_or_else(|| ViewPlanError::UnsupportedShape {
                 reason: "recursive term join base column is not registered".to_string(),
@@ -18139,10 +18173,16 @@ pub fn validate_supported_recursive_cte_sql(
             return unsupported("recursive term join must not reference the weight column");
         }
         // Verify the recursion column is in the anchor
-        if !recursion_column_names.iter().any(|name| identifier_eq(name, recursive2_column)) {
-            return unsupported("recursive term ON must reference a recursion relation column from the anchor");
+        if !recursion_column_names
+            .iter()
+            .any(|name| identifier_eq(name, recursive2_column))
+        {
+            return unsupported(
+                "recursive term ON must reference a recursion relation column from the anchor",
+            );
         }
-        let anchor2_index = recursion_column_names.iter()
+        let anchor2_index = recursion_column_names
+            .iter()
             .position(|name| identifier_eq(name, recursive2_column))
             .ok_or_else(|| ViewPlanError::UnsupportedShape {
                 reason: "recursive term ON recursion column is not in the anchor".to_string(),
@@ -18161,25 +18201,52 @@ pub fn validate_supported_recursive_cte_sql(
                 SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.as_str())),
                 _ => return unsupported("recursive term projections must be direct columns"),
             };
-            let (source, column_name) = if let Some(column) =
-                expression_filter_project_column(expr, catalog, Some(base2_table.alias.as_str()), None)
-            {
+            let (source, column_name) = if let Some(column) = expression_filter_project_column(
+                expr,
+                catalog,
+                Some(base2_table.alias.as_str()),
+                None,
+            ) {
                 if column.column_id == catalog.relation_schema.weight_column_id {
-                    return unsupported("recursive term projections must not reference the weight column");
+                    return unsupported(
+                        "recursive term projections must not reference the weight column",
+                    );
                 }
-                (RecursiveProjectionItemV1::Base { column_id: column.column_id.clone() }, column.name.clone())
+                (
+                    RecursiveProjectionItemV1::Base {
+                        column_id: column.column_id.clone(),
+                    },
+                    column.name.clone(),
+                )
             } else {
                 let reference = qualified_column_ref(expr)?;
-                if !identifier_eq(reference.qualifier.as_str(), recursive2_table.alias.as_str()) {
-                    return unsupported("recursive term projections must reference the recursion or base relation");
+                if !identifier_eq(
+                    reference.qualifier.as_str(),
+                    recursive2_table.alias.as_str(),
+                ) {
+                    return unsupported(
+                        "recursive term projections must reference the recursion or base relation",
+                    );
                 }
-                (RecursiveProjectionItemV1::Recursive { column_id: reference.column.clone() }, reference.column.clone())
+                (
+                    RecursiveProjectionItemV1::Recursive {
+                        column_id: reference.column.clone(),
+                    },
+                    reference.column.clone(),
+                )
             };
-            let expected_name = recursion_column_names.get(index).ok_or_else(|| ViewPlanError::UnsupportedShape {
-                reason: "recursive term projection arity must match the anchor".to_string(),
+            let expected_name = recursion_column_names.get(index).ok_or_else(|| {
+                ViewPlanError::UnsupportedShape {
+                    reason: "recursive term projection arity must match the anchor".to_string(),
+                }
             })?;
-            if !identifier_eq(alias.unwrap_or(column_name.as_str()), expected_name.as_str()) {
-                return unsupported("recursive term projection column names must positionally match the anchor");
+            if !identifier_eq(
+                alias.unwrap_or(column_name.as_str()),
+                expected_name.as_str(),
+            ) {
+                return unsupported(
+                    "recursive term projection column names must positionally match the anchor",
+                );
             }
             recursive2_projection.push(source);
         }
