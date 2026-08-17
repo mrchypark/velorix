@@ -21467,6 +21467,17 @@ fn query_equivalence_harness_proves_identical_plans_deltas_and_checkpoints() {
         "IN-subquery vs EXISTS-subquery",
     );
 
+    // Additional Tier 1: filter-project with AND vs nested WHERE
+    let and_filter = "select user_id, score from scores where score > 5 and user_id is not null";
+    let or_neq = "select user_id, score from scores where not (score <= 5 or user_id is null)";
+    assert_equivalent_lowering(
+        and_filter,
+        or_neq,
+        std::slice::from_ref(&scores),
+        &output,
+        "AND-filter vs NOT-OR-filter",
+    );
+
     // Tier 2: dual-runtime execution equivalence across an adversarial
     // corpus (inserts, retractions, net-zero batches, side switches).
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
