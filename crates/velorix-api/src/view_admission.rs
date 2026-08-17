@@ -458,6 +458,7 @@ pub(super) fn validate_public_runtime_plan_admission(
         VelorixLogicalViewExecutionV1::IntervalJoin { .. } => Ok(()),
         VelorixLogicalViewExecutionV1::RecursiveFixpointV1 { .. } => Ok(()),
         VelorixLogicalViewExecutionV1::CrossJoin { .. } => Ok(()),
+        VelorixLogicalViewExecutionV1::TemporalJoin { .. } => Ok(()),
     }
 }
 

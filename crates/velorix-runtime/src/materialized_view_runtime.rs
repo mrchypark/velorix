@@ -101,6 +101,7 @@ mod interval_join;
 mod latest_by_key;
 mod output;
 mod recursive_fixpoint;
+mod temporal_join;
 mod scalar_aggregate_filter;
 mod semi_anti_join;
 mod single_key_aggregate;
@@ -114,6 +115,7 @@ pub use filter_project::FilterProjectRuntime;
 pub use interval_join::IntervalJoinRuntime;
 pub use latest_by_key::LatestByKeyRuntime;
 pub use recursive_fixpoint::RecursiveFixpointRuntime;
+pub use temporal_join::TemporalJoinRuntime;
 pub use semi_anti_join::TwoInputSemiAntiJoinRuntime;
 pub use single_key_aggregate::SingleKeySumCountRuntime;
 pub use three_input_join::ThreeInputInnerJoinCountRuntime;
@@ -362,6 +364,24 @@ pub fn create_standing_runtime_with_logical_plan_and_catalogs(
             .map(|runtime| Box::new(runtime) as Box<dyn StandingProgramRuntime + Send>)
             .map_err(|error| error.to_string())
         }
+        VelorixLogicalViewExecutionV1::TemporalJoin { plan } => {
+            if catalogs.len() != 2 {
+                return Err(
+                    "temporal join runtime requires exactly two relation catalogs".to_string(),
+                );
+            }
+            TemporalJoinRuntime::new_with_logical_plan(
+                identity.clone(),
+                catalogs.to_vec(),
+                input_schemas.to_vec(),
+                output_schema.clone(),
+                sql,
+                *plan.clone(),
+                logical_plan,
+            )
+            .map(|runtime| Box::new(runtime) as Box<dyn StandingProgramRuntime + Send>)
+            .map_err(|error| error.to_string())
+        }
         VelorixLogicalViewExecutionV1::RecursiveFixpointV1 { plan } => {
             let [catalog] = catalogs else {
                 return Err(
@@ -555,6 +575,11 @@ pub fn restore_standing_runtime(
     }
     if checkpoint_has_interval_join_payload(&checkpoint) {
         return IntervalJoinRuntime::restore(checkpoint)
+            .map(|runtime| Box::new(runtime) as Box<dyn StandingProgramRuntime + Send>)
+            .map_err(|error| error.to_string());
+    }
+    if checkpoint_has_temporal_join_payload(&checkpoint) {
+        return TemporalJoinRuntime::restore(checkpoint)
             .map(|runtime| Box::new(runtime) as Box<dyn StandingProgramRuntime + Send>)
             .map_err(|error| error.to_string());
     }
@@ -8902,6 +8927,21 @@ fn checkpoint_has_cross_join_payload(checkpoint: &RuntimeCheckpoint) -> bool {
         })
         .as_deref()
         == Some(cross_join::CROSS_JOIN_RUNTIME_KIND)
+}
+
+fn checkpoint_has_temporal_join_payload(checkpoint: &RuntimeCheckpoint) -> bool {
+    checkpoint
+        .state_payload
+        .as_ref()
+        .and_then(|payload| serde_json::from_str::<Value>(&payload.payload).ok())
+        .and_then(|payload| {
+            payload
+                .get("runtime_kind")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .as_deref()
+        == Some(temporal_join::TEMPORAL_JOIN_RUNTIME_KIND)
 }
 
 fn checkpoint_has_recursive_fixpoint_payload(checkpoint: &RuntimeCheckpoint) -> bool {

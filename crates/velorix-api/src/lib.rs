@@ -121,11 +121,11 @@ use velorix_core::{
         supported_join_view_plan_is_self_join, supported_join_view_plan_is_singleton,
         supported_view_plan_aggregate_outputs, supported_view_plan_group_keys,
         validate_catalog_backed_sum_count_view_sql, validate_supported_analytic_row_number_sql,
-        validate_supported_cross_join_sql, validate_supported_filter_project_sql,
+        validate_supported_cross_join_sql, validate_supported_filter_project_sql, validate_supported_temporal_join_sql,
         validate_supported_interval_join_sql, validate_supported_join_view_sql,
         validate_supported_latest_by_key_sql, validate_supported_recursive_cte_sql,
         validate_supported_semi_anti_join_sql, validate_supported_three_input_inner_join_count_sql,
-        validate_supported_tumbling_window_sql, CrossJoinSideV1, LogicalPlanAggregateFunctionV1,
+        validate_supported_tumbling_window_sql, CrossJoinSideV1, LogicalPlanAggregateFunctionV1, TemporalJoinSideV1, SupportedTemporalJoinPlanV1,
         SupportedAggregateInputRelationSide, SupportedAggregateOutput,
         SupportedAnalyticRowNumberPlan, SupportedCrossJoinPlanV1, SupportedFilterProjectPlan,
         SupportedIntervalJoinPlanV1, SupportedJoinViewPlan, SupportedLatestByKeyPlan,
@@ -621,6 +621,10 @@ impl StandingProgramRuntimeFactory for MaterializedViewRuntimeFactory {
                 }
                 if let Ok(plan) = validate_supported_cross_join_sql(sql, catalogs) {
                     return cross_join_output_schema(view_id, catalogs, &plan)
+                        .map(|schema| Some(vec![schema]));
+                }
+                if let Ok(plan) = validate_supported_temporal_join_sql(sql, catalogs) {
+                    return temporal_join_output_schema(view_id, catalogs, &plan)
                         .map(|schema| Some(vec![schema]));
                 }
                 if let Ok(plan) = validate_supported_semi_anti_join_sql(sql, catalogs) {
@@ -6207,6 +6211,50 @@ fn recursive_fixpoint_output_schema(
             "v1",
             &columns,
             &primary_key,
+        )?,
+        columns,
+        primary_key,
+    })
+}
+
+fn temporal_join_output_schema(
+    view_id: &str,
+    catalogs: &[VelorixRelationCatalogV1],
+    plan: &SupportedTemporalJoinPlanV1,
+) -> Result<RelationSchema, ApiError> {
+    let left_catalog = catalogs
+        .iter()
+        .find(|catalog| catalog.relation_schema.relation_id == plan.left_input_relation_id)
+        .ok_or_else(|| ApiError::bad_request("temporal join left catalog is missing"))?;
+    let right_catalog = catalogs
+        .iter()
+        .find(|catalog| catalog.relation_schema.relation_id == plan.right_input_relation_id)
+        .ok_or_else(|| ApiError::bad_request("temporal join right catalog is missing"))?;
+    let mut columns = Vec::new();
+    for item in &plan.output_columns {
+        let catalog = match item.side {
+            TemporalJoinSideV1::Left => left_catalog,
+            TemporalJoinSideV1::Right => right_catalog,
+        };
+        let input_column = catalog
+            .relation_schema
+            .columns
+            .iter()
+            .find(|candidate| candidate.column_id == item.column_id)
+            .ok_or_else(|| ApiError::bad_request("temporal join output column is missing"))?;
+        columns.push(ColumnSchema {
+            name: item.output_name.clone(),
+            data_type: sql_type_from_catalog_column(input_column)?,
+            nullable: false,
+        });
+    }
+    let primary_key = columns.iter().map(|column| column.name.clone()).collect::<Vec<_>>();
+    Ok(RelationSchema {
+        relation_id: view_id.to_string(),
+        relation_name: view_id.to_string(),
+        relation_version: "2026-08-14.v1".to_string(),
+        schema_fingerprint: materialized_output_schema_fingerprint(
+            view_id, "v1", &columns, &primary_key,
         )?,
         columns,
         primary_key,

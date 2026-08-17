@@ -24,7 +24,7 @@ use velorix_core::{
         validate_logical_view_plan, validate_supported_analytic_row_number_sql,
         validate_supported_filter_project_sql, validate_supported_join_view_sql,
         validate_supported_latest_by_key_sql, validate_supported_tumbling_window_sql,
-        validate_supported_view_sql, AggregateOutputPredicateExpr, JoinPredicateExpr,
+        validate_supported_view_sql, validate_supported_temporal_join_sql, AggregateOutputPredicateExpr, JoinPredicateExpr,
         LogicalPlanAggregateFunctionV1, LogicalPlanBinaryJoinStepV1, LogicalPlanColumnRef,
         LogicalPlanCompositeJoinEqualityV1, LogicalPlanJoinKeyPairV1,
         LogicalPlanLatestByKeyFunctionV1, LogicalPlanStateKindV1, PredicateOp, RowPredicateExpr,
@@ -11216,4 +11216,42 @@ fn age_days_expression_roundtrips_through_admission() {
     assert_eq!(plan.typed_value_columns[0].output_column_id, "diff");
     let program = &plan.typed_value_columns[0].program;
     assert_eq!(program.encoding_version, 1);
+}
+
+#[test]
+fn probe_temporal_join_admission() {
+    // Build two simple catalogs with event_time columns
+    use velorix_core::relation::*;
+    let mk_catalog = |id: &str| {
+        let schema = VelorixRelationSchemaV1 {
+            relation_id: id.to_string(), relation_name: id.to_string(),
+            relation_version: "2026-08-14.v1".to_string(),
+            columns: vec![
+                RelationColumnV1 { column_id: "id".to_string(), name: "id".to_string(), logical_type: VelorixLogicalTypeV1::Utf8, physical_arrow_type: ArrowPhysicalTypeV1::Utf8, nullable: false, ordinal: 0, semantic_role: RelationSemanticRoleV1::PrimaryKey },
+                RelationColumnV1 { column_id: "value".to_string(), name: "value".to_string(), logical_type: VelorixLogicalTypeV1::Int64, physical_arrow_type: ArrowPhysicalTypeV1::Int64, nullable: false, ordinal: 1, semantic_role: RelationSemanticRoleV1::Value },
+                RelationColumnV1 { column_id: "event_time".to_string(), name: "event_time".to_string(), logical_type: VelorixLogicalTypeV1::Int64, physical_arrow_type: ArrowPhysicalTypeV1::Int64, nullable: false, ordinal: 2, semantic_role: RelationSemanticRoleV1::EventTime },
+                RelationColumnV1 { column_id: "delta".to_string(), name: "delta".to_string(), logical_type: VelorixLogicalTypeV1::Int64, physical_arrow_type: ArrowPhysicalTypeV1::Int64, nullable: false, ordinal: 3, semantic_role: RelationSemanticRoleV1::Weight },
+            ],
+            primary_key_column_ids: vec!["id".to_string()],
+            weight_column_id: "delta".to_string(),
+            allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+            event_time_column_id: Some("event_time".to_string()),
+        };
+        let fp = SchemaFingerprintV1::for_relation_schema(&schema).unwrap();
+        VelorixRelationCatalogV1 {
+            relation_source: VelorixRelationSourceV1::SourceRelation,
+            schema_version: RELATION_SCHEMA_VERSION_V1, relation_schema: schema,
+            schema_fingerprint: fp.clone(),
+            datafusion_registration: DataFusionRegistrationV1 { name: id.to_string(), mode: DataFusionRegistrationModeV1::Table },
+            incremental_relation: IncrementalRelationBindingV1 { relation_id: id.to_string(), schema_fingerprint: fp },
+            incremental_adapter: IncrementalAdapterBindingV1 { adapter_id: CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.to_string() },
+        }
+    };
+    let a = mk_catalog("left_t");
+    let b = mk_catalog("right_t");
+    let catalogs = vec![a, b];
+    let sql = "select l.id, l.value, l.event_time, r.value, r.event_time as r_time from left_t l join right_t r on r.event_time <= l.event_time";
+    let result = validate_supported_temporal_join_sql(sql, &catalogs);
+    println!("temporal join result: {:?}", result);
+    assert!(result.is_ok(), "temporal join should admit: {:?}", result);
 }

@@ -516,6 +516,9 @@ pub enum VelorixLogicalViewExecutionV1 {
     CrossJoin {
         plan: Box<SupportedCrossJoinPlanV1>,
     },
+    TemporalJoin {
+        plan: Box<SupportedTemporalJoinPlanV1>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -1491,14 +1494,22 @@ pub fn lower_supported_sql_to_logical_plan(
                             ) {
                                 Ok(plan) => Ok(plan),
                                 Err(ViewPlanError::UnsupportedShape { .. }) => {
-                                    match lower_supported_interval_join_sql_to_logical_plan(
+                                    match lower_supported_temporal_join_sql_to_logical_plan(
                                         sql, catalogs, output_schema,
                                     ) {
                                         Ok(plan) => Ok(plan),
                                         Err(ViewPlanError::UnsupportedShape { .. }) => {
-                                            lower_supported_join_view_sql_to_logical_plan(
+                                            match lower_supported_interval_join_sql_to_logical_plan(
                                                 sql, catalogs, output_schema,
-                                            )
+                                            ) {
+                                                Ok(plan) => Ok(plan),
+                                                Err(ViewPlanError::UnsupportedShape { .. }) => {
+                                                    lower_supported_join_view_sql_to_logical_plan(
+                                                        sql, catalogs, output_schema,
+                                                    )
+                                                }
+                                                Err(error) => Err(error),
+                                            }
                                         }
                                         Err(error) => Err(error),
                                     }
@@ -3230,6 +3241,7 @@ fn derive_execution_implementation(
             "velorix-recursive-fixpoint-specialization-v1"
         }
         VelorixLogicalViewExecutionV1::CrossJoin { .. } => "velorix-cross-join-specialization-v1",
+        VelorixLogicalViewExecutionV1::TemporalJoin { .. } => "velorix-temporal-join-specialization-v1",
     };
     let physical_bytes = serde_json::to_vec(&(
         &plan.nodes,
@@ -18510,6 +18522,179 @@ pub struct CrossJoinResourceContractV1 {
     pub max_pairs_per_epoch: u64,
 }
 
+/// Phase 8.3: as-of join plan. Matches each left row with the most recent
+/// right row by event time <= left's event time. Output is the full
+/// projected row (left + right columns).
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupportedTemporalJoinPlanV1 {
+    pub schema_version: u32,
+    pub left_input_relation_id: String,
+    pub right_input_relation_id: String,
+    pub left_join_column_id: String,
+    pub right_join_column_id: String,
+    pub left_event_time_column_id: String,
+    pub right_event_time_column_id: String,
+    pub output_columns: Vec<TemporalJoinOutputColumnV1>,
+    pub resource_contract: TemporalJoinResourceContractV1,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TemporalJoinOutputColumnV1 {
+    pub side: TemporalJoinSideV1,
+    pub column_id: String,
+    pub output_name: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TemporalJoinSideV1 {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TemporalJoinResourceContractV1 {
+    pub max_rows_per_side: u64,
+    pub max_output_rows_per_epoch: u64,
+}
+
+/// Phase 8.3: validates `SELECT ... FROM left JOIN right ON
+/// r.event_time <= l.event_time` for as-of joins. Admission requires
+/// INNER JOIN with `<=` predicate on event time columns, a plain
+/// projection of direct columns, and no WHERE, GROUP BY, DISTINCT,
+/// or aggregates.
+pub fn validate_supported_temporal_join_sql(
+    sql: &str,
+    catalogs: &[VelorixRelationCatalogV1],
+) -> Result<SupportedTemporalJoinPlanV1, ViewPlanError> {
+    validate_supported_temporal_join_sql_inner(sql, catalogs)
+}
+
+fn validate_supported_temporal_join_sql_inner(
+    sql: &str,
+    catalogs: &[VelorixRelationCatalogV1],
+) -> Result<SupportedTemporalJoinPlanV1, ViewPlanError> {
+    let [left_catalog, right_catalog] = catalogs else {
+        return unsupported("temporal join SQL requires exactly two input relations");
+    };
+    for catalog in catalogs {
+        catalog.validate()?;
+    }
+    let query = parse_single_query(sql)?;
+    validate_query_level_clauses(&query, false)?;
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return unsupported("temporal join requires a single SELECT");
+    };
+    validate_plain_select_clauses(select)?;
+    if select.distinct.is_some() || !group_by_is_empty(&select.group_by) {
+        return unsupported("temporal join does not support DISTINCT or GROUP BY");
+    }
+    let [left_from] = select.from.as_slice() else {
+        return unsupported("temporal join requires exactly one FROM join");
+    };
+    let left_table = registered_table_ref(&left_from.relation, "left")?;
+    if left_table.name != left_catalog.relation_schema.relation_id {
+        return unsupported("temporal join left relation must be the first registered relation");
+    }
+    let [right_join] = left_from.joins.as_slice() else {
+        return unsupported("temporal join requires exactly one JOIN");
+    };
+    let constraint = match &right_join.join_operator {
+        JoinOperator::Inner(c) | JoinOperator::Join(c) => c,
+        _ => return unsupported("temporal join requires INNER JOIN"),
+    };
+    let right_table = registered_table_ref(&right_join.relation, "right")?;
+    if right_table.name != right_catalog.relation_schema.relation_id {
+        return unsupported("temporal join right relation must be the second registered relation");
+    }
+    let JoinConstraint::On(on_expr) = constraint else {
+        return unsupported("temporal join requires an ON predicate");
+    };
+    // Expect exactly one conjunct: r.event_time <= l.event_time
+    let conjuncts = split_and_conjuncts(on_expr);
+    let [conjunct] = conjuncts.as_slice() else {
+        return unsupported("temporal join ON must be a single predicate");
+    };
+    let Expr::BinaryOp { left, op, right } = conjunct else {
+        return unsupported("temporal join ON must be a comparison");
+    };
+    if !matches!(op, BinaryOperator::LtEq) {
+        return unsupported("temporal join ON must use <= (less than or equal)");
+    }
+    let left_ref = qualified_column_ref(left.as_ref())?;
+    let right_ref = qualified_column_ref(right.as_ref())?;
+    // Determine which side is left/right table and which is event_time column
+    // Determine which qualifier is which: left side <= right side (r.event_time <= l.event_time)
+    let (r_event_col, l_event_col) = if identifier_eq(left_ref.qualifier.as_str(), right_table.alias.as_str())
+        && identifier_eq(right_ref.qualifier.as_str(), left_table.alias.as_str())
+    {
+        (left_ref.column.as_str(), right_ref.column.as_str())
+    } else if identifier_eq(left_ref.qualifier.as_str(), left_table.alias.as_str())
+        && identifier_eq(right_ref.qualifier.as_str(), right_table.alias.as_str())
+    {
+        (right_ref.column.as_str(), left_ref.column.as_str())
+    } else {
+        return unsupported("temporal join ON must compare right.event_time with left.event_time");
+    };
+    let left_event_time_col = catalog_column_by_id(left_catalog, l_event_col)?;
+    let right_event_time_col = catalog_column_by_id(right_catalog, r_event_col)?;
+    if !matches!(
+        left_event_time_col.physical_arrow_type,
+        ArrowPhysicalTypeV1::Int64 | ArrowPhysicalTypeV1::TimestampNanosecond { .. }
+    ) {
+        return unsupported("temporal join event time columns must be Int64 nanoseconds");
+    }
+    // Projection: all direct columns from both sides
+    if select.selection.is_some() {
+        return unsupported("temporal join WHERE is not supported yet");
+    }
+    let mut output_columns = Vec::new();
+    let left_alias = left_table.alias.as_str();
+    let right_alias = right_table.alias.as_str();
+    for item in &select.projection {
+        let (expr, alias_item) = match item {
+            SelectItem::UnnamedExpr(expr) => (expr, None),
+            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.as_str())),
+            _ => return unsupported("temporal join projections must be direct columns"),
+        };
+        let reference = qualified_column_ref(expr)?;
+        let (side, catalog) = if identifier_eq(reference.qualifier.as_str(), left_alias) {
+            (TemporalJoinSideV1::Left, left_catalog)
+        } else if identifier_eq(reference.qualifier.as_str(), right_alias) {
+            (TemporalJoinSideV1::Right, right_catalog)
+        } else {
+            return unsupported("temporal join projections must reference one of the two joined tables");
+        };
+        let column = qualified_ref_catalog_column(&reference, catalog)?;
+        let output_name = alias_item.unwrap_or(column.name.as_str()).to_string();
+        output_columns.push(TemporalJoinOutputColumnV1 {
+            side,
+            column_id: column.column_id.clone(),
+            output_name,
+        });
+    }
+    if output_columns.is_empty() {
+        return unsupported("temporal join requires at least one projected column");
+    }
+    Ok(SupportedTemporalJoinPlanV1 {
+        schema_version: 1,
+        left_input_relation_id: left_catalog.relation_schema.relation_id.clone(),
+        right_input_relation_id: right_catalog.relation_schema.relation_id.clone(),
+        left_join_column_id: catalog_primary_key_column(left_catalog)?.column_id.clone(),
+        right_join_column_id: catalog_primary_key_column(right_catalog)?.column_id.clone(),
+        left_event_time_column_id: left_event_time_col.column_id.clone(),
+        right_event_time_column_id: right_event_time_col.column_id.clone(),
+        output_columns,
+        resource_contract: TemporalJoinResourceContractV1 {
+            max_rows_per_side: 1_000_000,
+            max_output_rows_per_epoch: 1_000_000,
+        },
+    })
+}
+
 /// Phase 8.3: validates `SELECT ... FROM left CROSS JOIN right` over two
 /// registered relations. Admission requires a bare CROSS JOIN (no ON/USING),
 /// a plain projection of direct columns that includes both primary keys,
@@ -18689,6 +18874,58 @@ pub fn lower_supported_cross_join_sql_to_logical_plan(
         output_codec_version: LOGICAL_VIEW_OUTPUT_CODEC_VERSION_V1.to_string(),
         execution_implementation: None,
         execution: VelorixLogicalViewExecutionV1::CrossJoin {
+            plan: Box::new(supported),
+        },
+    })
+}
+
+pub fn lower_supported_temporal_join_sql_to_logical_plan(
+    sql: &str,
+    catalogs: &[VelorixRelationCatalogV1],
+    output_schema: &RelationSchema,
+) -> Result<VelorixLogicalViewPlanV1, ViewPlanError> {
+    let supported = validate_supported_temporal_join_sql(sql, catalogs)?;
+    let output_relation = logical_relation_from_schema(output_schema);
+    let left_catalog = catalog_for_relation_in_slice(catalogs, &supported.left_input_relation_id)?;
+    let right_catalog =
+        catalog_for_relation_in_slice(catalogs, &supported.right_input_relation_id)?;
+    finalize_logical_plan(VelorixLogicalViewPlanV1 {
+        plan_version: LOGICAL_VIEW_PLAN_VERSION_V2,
+        plan_hash: None,
+        view_sql: sql.to_string(),
+        capability_version: LOGICAL_VIEW_PLAN_CAPABILITY_VERSION_V2.to_string(),
+        key_semantics_version: INCREMENTAL_KEY_SEMANTICS_VERSION_V1.to_string(),
+        bag_semantics_version: INCREMENTAL_BAG_SEMANTICS_VERSION_V1.to_string(),
+        input_relations: catalogs.iter().map(logical_relation_from_catalog).collect(),
+        output_relation: output_relation.clone(),
+        nodes: vec![
+            VelorixLogicalViewPlanNodeV1::RelationScan {
+                node_id: "temporal_left_scan".to_string(),
+                relation: logical_relation_from_catalog(left_catalog),
+            },
+            VelorixLogicalViewPlanNodeV1::RelationScan {
+                node_id: "temporal_right_scan".to_string(),
+                relation: logical_relation_from_catalog(right_catalog),
+            },
+            VelorixLogicalViewPlanNodeV1::InnerEquiJoin {
+                node_id: "temporal_join".to_string(),
+                left: "temporal_left_scan".to_string(),
+                right: "temporal_right_scan".to_string(),
+                left_key: column_ref(&supported.left_input_relation_id, "temporal_key_left"),
+                right_key: column_ref(&supported.right_input_relation_id, "temporal_key_right"),
+                composite_equality: None,
+            },
+            VelorixLogicalViewPlanNodeV1::Output {
+                node_id: "output_materialized_view".to_string(),
+                input: "temporal_join".to_string(),
+                relation: output_relation,
+            },
+        ],
+        operator_dag_contract: empty_operator_dag_contract(),
+        state_requirements: Vec::new(),
+        output_codec_version: LOGICAL_VIEW_OUTPUT_CODEC_VERSION_V1.to_string(),
+        execution_implementation: None,
+        execution: VelorixLogicalViewExecutionV1::TemporalJoin {
             plan: Box::new(supported),
         },
     })
