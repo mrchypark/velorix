@@ -315,8 +315,8 @@ and the Phase 6.6 type-family matrix.
 
 - [x] **Add EXTRACT expression (year, month, day, etc.)**
 - [x] **Add DATE_TRUNC expression**
-- [ ] **Add AGE expression** (deferred: requires month-length arithmetic; see
-      phase-4-8-execution-plan contract boundaries)
+- [x] **Add AGE expression** (implemented as AGE_DAYS: day-difference avoiding
+      month-length complexity; full year/month/day decomposition deferred)
 - [x] **Add date/time arithmetic (date + interval)**
 - [x] **Add temporal comparison predicates** (event-time columns bound as Int64
       nanoseconds/Date32/TimestampNanosecond are comparable in predicates and
