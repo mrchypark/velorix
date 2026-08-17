@@ -525,17 +525,17 @@ closed at admission and restore (`builtin_udf_typed_projection_materializes_and_
 - [x] **Implement recursive CTE admission and validation**
 - [x] **Add checkpoint codec for fixpoint state**
 - [x] **Define retraction semantics for recursive results**
+- [x] **Implement mutually recursive CTEs (two CTEs referencing each other)**
 
-**Current state**: `WITH RECURSIVE` (UNION DISTINCT only, exactly one
-self-reference, positive anchor/recursive term over one registered relation,
-one equi-join between the recursion relation and the base, optional
-conjunctive base-column predicates) admitted through
-`SupportedRecursiveFixpointPlanV1`; runtime recomputes the closure per epoch
-from the updated base multiset with canonical iteration and bounded work
-units, diffs the derived set, and restores from
-`RecursiveFixpointCheckpointPayloadV2`. Mutually recursive CTEs remain
-explicitly rejected. Evidence:
-`recursive_cte_materializes_closure_exactly_across_retract_restart_and_fail_closed`.
+**Current state**: Single and mutually recursive CTEs fully implemented.
+`WITH RECURSIVE` (UNION DISTINCT only, positive anchor/recursive term over
+one registered relation, optional conjunctive base-column predicates) admitted
+through `SupportedRecursiveFixpointPlanV1` with optional `SecondCTEConfigV1`
+for mutual recursion. Runtime maintains a merged derived set from both CTEs'
+anchor rows and evaluates both recursive terms in a single fixpoint loop.
+Evidence:
+`recursive_cte_materializes_closure_exactly_across_retract_restart_and_fail_closed`,
+`mutually_recursive_cte_materializes_bidirectional_closure`.
 
 ### 8.6 Pre-Implementation Requirements
 
