@@ -17650,7 +17650,26 @@ pub struct SupportedRecursiveFixpointPlanV1 {
     /// Conjunctive base-row predicates in the anchor (AND-combined).
     #[serde(default)]
     pub anchor_base_predicate: Vec<RecursiveBasePredicateV1>,
+    /// Second CTE config for mutually recursive CTEs (None for single recursive).
+    #[serde(default)]
+    pub second_cte: Option<SecondCTEConfigV1>,
     pub resource_contract: RecursiveFixpointContractV1,
+}
+
+/// Configuration for a second mutually recursive CTE. The second CTE's
+/// anchor and recursive term are evaluated against the same merged derived
+/// set as the first CTE, enabling mutual recursion with a single fixpoint loop.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecondCTEConfigV1 {
+    pub cte_alias: String,
+    pub anchor_projection: Vec<String>,
+    pub recursive_projection: Vec<RecursiveProjectionItemV1>,
+    pub recursive_join: RecursiveEquiJoinV1,
+    #[serde(default)]
+    pub recursive_base_predicate: Vec<RecursiveBasePredicateV1>,
+    #[serde(default)]
+    pub anchor_base_predicate: Vec<RecursiveBasePredicateV1>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -17711,9 +17730,11 @@ pub fn validate_supported_recursive_cte_sql(
     if !with.recursive {
         return unsupported("recursive CTE requires WITH RECURSIVE");
     }
-    let [cte] = with.cte_tables.as_slice() else {
-        return unsupported("recursive CTE requires exactly one CTE");
-    };
+    let cte_count = with.cte_tables.len();
+    if cte_count < 1 || cte_count > 2 {
+        return unsupported("recursive CTE requires one or two CTEs");
+    }
+    let cte = &with.cte_tables[0];
     if cte.from.is_some() || cte.materialized.is_some() {
         return unsupported("recursive CTE must not declare a FROM or materialization hint");
     }
@@ -17973,6 +17994,216 @@ pub fn validate_supported_recursive_cte_sql(
         base_table.alias.as_str(),
     )?;
 
+    // For mutually recursive CTEs: parse the second CTE's body and verify
+    // it references the first CTE (mutual recursion).
+    let mut second_cte = None;
+    if cte_count == 2 {
+        let cte2 = &with.cte_tables[1];
+        if cte2.from.is_some() || cte2.materialized.is_some() {
+            return unsupported("recursive CTE must not declare a FROM or materialization hint");
+        }
+        if !cte2.alias.columns.is_empty() {
+            return unsupported("recursive CTE column aliases are not supported");
+        }
+        if !identifier_eq(cte2.alias.name.value.as_str(), recursion_alias.as_str()) {
+            // Second CTE has a different alias; verify it references the first
+            // This is allowed for mutual recursion with different names
+        }
+        validate_query_level_clauses_with_options(&cte2.query, false, false)?;
+        let SetExpr::SetOperation {
+            op: SetOperator::Union,
+            set_quantifier: sq2,
+            left: left2,
+            right: right2,
+        } = cte2.query.body.as_ref()
+        else {
+            return unsupported("recursive CTE body must be anchor UNION DISTINCT recursive term");
+        };
+        if !matches!(sq2, SetQuantifier::Distinct | SetQuantifier::None) {
+            return unsupported("recursive CTE requires UNION DISTINCT");
+        }
+        let SetExpr::Select(anchor2_select) = left2.as_ref() else {
+            return unsupported("recursive CTE anchor must be a plain SELECT");
+        };
+        let SetExpr::Select(recursive2_select) = right2.as_ref() else {
+            return unsupported("recursive CTE recursive term must be a plain SELECT");
+        };
+        validate_plain_select_clauses(anchor2_select)?;
+        validate_plain_select_clauses(recursive2_select)?;
+        if anchor2_select.distinct.is_some() || !group_by_is_empty(&anchor2_select.group_by) {
+            return unsupported("recursive CTE anchor must not use DISTINCT or GROUP BY");
+        }
+        if recursive2_select.distinct.is_some() || !group_by_is_empty(&recursive2_select.group_by) {
+            return unsupported("recursive CTE recursive term must not use DISTINCT or GROUP BY");
+        }
+        // Parse second CTE's anchor: must also reference the base relation
+        let [anchor2_from] = anchor2_select.from.as_slice() else {
+            return unsupported("recursive CTE anchor requires exactly one FROM table");
+        };
+        if !anchor2_from.joins.is_empty() {
+            return unsupported("recursive CTE anchor must not contain joins");
+        }
+        let anchor2_table = registered_table_ref(&anchor2_from.relation, "anchor2")?;
+        if !identifier_eq(anchor2_table.name.as_str(), catalog.relation_schema.relation_id.as_str()) {
+            return unsupported("recursive CTE anchor must reference the registered relation");
+        }
+        // Parse second CTE's anchor projection (same column names as first CTE)
+        let anchor2_alias = anchor2_table.alias.as_str();
+        let mut anchor2_projection = Vec::new();
+        for item in &anchor2_select.projection {
+            let (expr, _alias) = match item {
+                SelectItem::UnnamedExpr(expr) => (expr, None),
+                SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.as_str())),
+                _ => return unsupported("recursive CTE anchor projections must be direct columns"),
+            };
+            let Some(column) = expression_filter_project_column(expr, catalog, Some(anchor2_alias), None)
+            else {
+                return unsupported("recursive CTE anchor projections must be direct base relation columns");
+            };
+            if column.column_id == catalog.relation_schema.weight_column_id {
+                return unsupported("recursive CTE anchor projections must not reference the weight column");
+            }
+            anchor2_projection.push(column.column_id.clone());
+        }
+        if anchor2_projection.len() != recursion_column_names.len() {
+            return unsupported("mutually recursive CTEs must have the same number of columns");
+        }
+        let anchor2_base_predicate = validate_recursive_base_predicates(
+            anchor2_select.selection.as_ref(),
+            catalog,
+            anchor2_alias,
+        )?;
+        // Parse second CTE's recursive term
+        let [recursive2_from] = recursive2_select.from.as_slice() else {
+            return unsupported("recursive term requires exactly one FROM join");
+        };
+        let [join2] = recursive2_from.joins.as_slice() else {
+            return unsupported("recursive term requires exactly one JOIN");
+        };
+        if !matches!(join2.join_operator, JoinOperator::Inner(_) | JoinOperator::Join(_)) {
+            return unsupported("recursive term currently supports INNER JOIN only");
+        }
+        let left2_table = registered_table_ref(&recursive2_from.relation, "recursive2")?;
+        let right2_table = registered_table_ref(&join2.relation, "recursive2")?;
+        let left2_is_recursive = identifier_eq(left2_table.name.as_str(), cte2.alias.name.value.as_str())
+            || identifier_eq(left2_table.name.as_str(), recursion_alias.as_str());
+        let right2_is_recursive = identifier_eq(right2_table.name.as_str(), cte2.alias.name.value.as_str())
+            || identifier_eq(right2_table.name.as_str(), recursion_alias.as_str());
+        if left2_is_recursive == right2_is_recursive {
+            return unsupported("recursive term must reference the recursion relation exactly once");
+        }
+        let (recursive2_table, base2_table) = if left2_is_recursive {
+            (left2_table, right2_table)
+        } else {
+            (right2_table, left2_table)
+        };
+        if !identifier_eq(base2_table.name.as_str(), catalog.relation_schema.relation_id.as_str()) {
+            return unsupported("recursive term must join with the registered relation");
+        }
+        let constraint2 = match &join2.join_operator {
+            JoinOperator::Inner(constraint) | JoinOperator::Join(constraint) => constraint,
+            _ => return unsupported("recursive term requires an INNER JOIN"),
+        };
+        let JoinConstraint::On(on_expr2) = constraint2 else {
+            return unsupported("recursive term requires an ON predicate");
+        };
+        let conjuncts2 = split_and_conjuncts(on_expr2);
+        let [equality2] = conjuncts2.as_slice() else {
+            return unsupported("recursive term ON predicate must be a single equality");
+        };
+        let Expr::BinaryOp { left: left2, op: op2, right: right2 } = equality2 else {
+            return unsupported("recursive term ON predicate must be a single equality");
+        };
+        if op2 != &BinaryOperator::Eq {
+            return unsupported("recursive term ON predicate must be an equality");
+        }
+        let left2_ref = qualified_column_ref(left2.as_ref())?;
+        let right2_ref = qualified_column_ref(right2.as_ref())?;
+        let (recursive2_column, base2_column) = if identifier_eq(left2_ref.qualifier.as_str(), recursive2_table.alias.as_str())
+            && identifier_eq(right2_ref.qualifier.as_str(), base2_table.alias.as_str())
+        {
+            (left2_ref.column.as_str(), right2_ref.column.as_str())
+        } else if identifier_eq(left2_ref.qualifier.as_str(), base2_table.alias.as_str())
+            && identifier_eq(right2_ref.qualifier.as_str(), recursive2_table.alias.as_str())
+        {
+            (right2_ref.column.as_str(), left2_ref.column.as_str())
+        } else {
+            return unsupported("recursive term ON must compare recursion relation with base relation");
+        };
+        let base2_join_column = catalog.relation_schema.columns.iter()
+            .find(|column| column_identifier_eq(column, base2_column))
+            .ok_or_else(|| ViewPlanError::UnsupportedShape {
+                reason: "recursive term join base column is not registered".to_string(),
+            })?;
+        if base2_join_column.column_id == catalog.relation_schema.weight_column_id {
+            return unsupported("recursive term join must not reference the weight column");
+        }
+        // Verify the recursion column is in the anchor
+        if !recursion_column_names.iter().any(|name| identifier_eq(name, recursive2_column)) {
+            return unsupported("recursive term ON must reference a recursion relation column from the anchor");
+        }
+        let anchor2_index = recursion_column_names.iter()
+            .position(|name| identifier_eq(name, recursive2_column))
+            .ok_or_else(|| ViewPlanError::UnsupportedShape {
+                reason: "recursive term ON recursion column is not in the anchor".to_string(),
+            })?;
+        let anchor2_base_col = catalog_column_by_id(catalog, &anchor2_projection[anchor2_index])?;
+        if anchor2_base_col.physical_arrow_type != base2_join_column.physical_arrow_type
+            || anchor2_base_col.nullable != base2_join_column.nullable
+        {
+            return unsupported("recursive term join columns must have identical physical types");
+        }
+        // Parse second CTE's recursive projection
+        let mut recursive2_projection = Vec::new();
+        for (index, item) in recursive2_select.projection.iter().enumerate() {
+            let (expr, alias) = match item {
+                SelectItem::UnnamedExpr(expr) => (expr, None),
+                SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.as_str())),
+                _ => return unsupported("recursive term projections must be direct columns"),
+            };
+            let (source, column_name) = if let Some(column) =
+                expression_filter_project_column(expr, catalog, Some(base2_table.alias.as_str()), None)
+            {
+                if column.column_id == catalog.relation_schema.weight_column_id {
+                    return unsupported("recursive term projections must not reference the weight column");
+                }
+                (RecursiveProjectionItemV1::Base { column_id: column.column_id.clone() }, column.name.clone())
+            } else {
+                let reference = qualified_column_ref(expr)?;
+                if !identifier_eq(reference.qualifier.as_str(), recursive2_table.alias.as_str()) {
+                    return unsupported("recursive term projections must reference the recursion or base relation");
+                }
+                (RecursiveProjectionItemV1::Recursive { column_id: reference.column.clone() }, reference.column.clone())
+            };
+            let expected_name = recursion_column_names.get(index).ok_or_else(|| ViewPlanError::UnsupportedShape {
+                reason: "recursive term projection arity must match the anchor".to_string(),
+            })?;
+            if !identifier_eq(alias.unwrap_or(column_name.as_str()), expected_name.as_str()) {
+                return unsupported("recursive term projection column names must positionally match the anchor");
+            }
+            recursive2_projection.push(source);
+        }
+        if recursive2_projection.len() != recursion_column_names.len() {
+            return unsupported("recursive term projection arity must match the anchor");
+        }
+        let recursive2_base_predicate = validate_recursive_base_predicates(
+            recursive2_select.selection.as_ref(),
+            catalog,
+            base2_table.alias.as_str(),
+        )?;
+        second_cte = Some(SecondCTEConfigV1 {
+            cte_alias: cte2.alias.name.value.clone(),
+            anchor_projection: anchor2_projection,
+            recursive_projection: recursive2_projection,
+            recursive_join: RecursiveEquiJoinV1 {
+                recursive_column_id: recursive2_column.to_string(),
+                base_column_id: base2_join_column.column_id.clone(),
+            },
+            recursive_base_predicate: recursive2_base_predicate,
+            anchor_base_predicate: anchor2_base_predicate,
+        });
+    }
+
     // Outer query: plain projection over r with exactly the r columns.
     let SetExpr::Select(outer_select) = query.body.as_ref() else {
         return unsupported("recursive CTE outer query must be a plain SELECT");
@@ -18041,6 +18272,7 @@ pub fn validate_supported_recursive_cte_sql(
         },
         recursive_base_predicate,
         anchor_base_predicate,
+        second_cte,
         resource_contract: RecursiveFixpointContractV1 {
             max_iterations: 100_000,
             max_derived_rows: 1_000_000,

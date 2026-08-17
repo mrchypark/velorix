@@ -75,7 +75,7 @@ use velorix_core::{
         SupportedAnalyticWindowFunction, SupportedCrossJoinPlanV1, SupportedEventTimeWindowKind,
         SupportedFilterProjectPlan, SupportedIntervalJoinPlanV1, SupportedJoinKeyDomainV1,
         SupportedJoinKind, SupportedJoinViewPlan, SupportedLatestByKeyPlan,
-        SupportedProjectionBinaryOp, SupportedProjectionExpr, SupportedRecursiveFixpointPlanV1,
+        SupportedProjectionBinaryOp, SupportedProjectionExpr, SecondCTEConfigV1, SupportedRecursiveFixpointPlanV1,
         SupportedScalarAggregateFilterPlanV1, SupportedSemiAntiJoinKindV1,
         SupportedSemiAntiJoinProjectPlanV1, SupportedThreeInputInnerJoinCountPlanV1,
         SupportedTopKPlan, SupportedTumblingWindowPlan, SupportedViewPlan, TypedExprKindV1,

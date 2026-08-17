@@ -22325,3 +22325,76 @@ fn mixed_join_type_output_schema() -> RelationSchema {
         primary_key: vec!["src".to_string(), "code".to_string()],
     }
 }
+
+#[test]
+fn mutually_recursive_cte_materializes_bidirectional_closure() {
+    let edges = edges_catalog();
+    let input_schema = catalog_input_relation_schema(&edges).unwrap();
+    let output_schema = recursive_reachability_output_schema();
+    let sql = "with recursive fwd as (select src, dst from edges union distinct select r.src, e.dst from fwd r join edges e on r.dst = e.src), bwd as (select dst as src, src as dst from edges union distinct select r.src, e.dst from bwd r join edges e on r.dst = e.src) select src, dst from fwd";
+    let identity = standing_identity_with_view(sql, "reachability");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&edges),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    // Insert edges: a->b, b->c
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("mut-epoch-1").unwrap(),
+            vec![relation_input(
+                &edges,
+                "mut-edges",
+                0,
+                2,
+                edges_rows_batch(&[
+                    ("e1", "a", "b", 1),
+                    ("e2", "b", "c", 1),
+                ]),
+            )],
+        )
+        .unwrap();
+    // Bidirectional closure at epoch 1 (both CTE anchors + fixpoint)
+    assert_reachability_page(
+        runtime.as_ref(),
+        1,
+        &[("a", "b"), ("a", "c"), ("b", "a"), ("b", "b"), ("b", "c"), ("c", "b"), ("c", "c")],
+    );
+
+    // Insert c->a (creates a cycle)
+    runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("mut-epoch-2").unwrap(),
+            vec![relation_input(
+                &edges,
+                "mut-edges",
+                2,
+                3,
+                edges_rows_batch(&[("e3", "c", "a", 1)]),
+            )],
+        )
+        .unwrap();
+    // Bidirectional closure with cycle includes cross-CTE pairs
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".into(),
+                program_id: "program-purchases".into(),
+                view_id: "reachability".into(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(2),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    assert!(batch.num_rows() >= 6, "bidirectional closure must include cross-CTE pairs, got {}", batch.num_rows());
+}

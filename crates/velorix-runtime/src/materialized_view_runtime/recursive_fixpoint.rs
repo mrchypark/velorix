@@ -108,12 +108,13 @@ impl RecursiveFixpointRuntime {
         &self,
         base: &RecursiveBaseRow,
         predicate: &[RecursiveBasePredicateV1],
+        projection: &[String],
     ) -> Result<Option<Value>, StandingProgramRuntimeError> {
         if !recursive_base_predicates_match(base, predicate)? {
             return Ok(None);
         }
         let mut row = serde_json::Map::new();
-        for (index, column_id) in self.plan.anchor_projection.iter().enumerate() {
+        for (index, column_id) in projection.iter().enumerate() {
             let value = base
                 .values
                 .get(column_id)
@@ -164,14 +165,64 @@ impl RecursiveFixpointRuntime {
         Ok(Some(Value::Object(row)))
     }
 
+    /// Evaluate a recursive candidate using a specific CTE config
+    /// (for mutually recursive CTEs).
+    fn recursive_candidate_with_config(
+        &self,
+        derived: &Value,
+        base: &RecursiveBaseRow,
+        config: &SecondCTEConfigV1,
+    ) -> Result<Option<Value>, StandingProgramRuntimeError> {
+        if !recursive_base_predicates_match(base, &config.recursive_base_predicate)? {
+            return Ok(None);
+        }
+        let derived_object = derived.as_object().ok_or_else(invalid_runtime_state)?;
+        let base_join = base
+            .values
+            .get(&config.recursive_join.base_column_id)
+            .ok_or_else(invalid_runtime_state)?;
+        let derived_join = derived_object
+            .get(&config.recursive_join.recursive_column_id)
+            .ok_or_else(invalid_runtime_state)?;
+        if derived_join != base_join {
+            return Ok(None);
+        }
+        let mut row = serde_json::Map::new();
+        for (index, item) in config.recursive_projection.iter().enumerate() {
+            let value = match item {
+                RecursiveProjectionItemV1::Recursive { column_id } => derived_object
+                    .get(column_id)
+                    .ok_or_else(invalid_runtime_state)?,
+                RecursiveProjectionItemV1::Base { column_id } => base
+                    .values
+                    .get(column_id)
+                    .ok_or_else(invalid_runtime_state)?,
+            };
+            row.insert(
+                self.plan.recursion_column_names[index].clone(),
+                value.clone(),
+            );
+        }
+        Ok(Some(Value::Object(row)))
+    }
+
     fn recompute_closure_from(
         &self,
         base_multiset: &BTreeMap<String, RecursiveBaseRow>,
     ) -> Result<BTreeMap<String, Value>, StandingProgramRuntimeError> {
         let mut derived: BTreeMap<String, Value> = BTreeMap::new();
+        // Seed with first CTE's anchor rows
         for base in base_multiset.values() {
-            if let Some(row) = self.anchor_row(base, &self.plan.anchor_base_predicate)? {
+            if let Some(row) = self.anchor_row(base, &self.plan.anchor_base_predicate, &self.plan.anchor_projection)? {
                 derived.insert(canonical_json(&row), row);
+            }
+        }
+        // Seed with second CTE's anchor rows (for mutually recursive CTEs)
+        if let Some(ref cte2) = self.plan.second_cte {
+            for base in base_multiset.values() {
+                if let Some(row) = self.anchor_row(base, &cte2.anchor_base_predicate, &cte2.anchor_projection)? {
+                    derived.insert(canonical_json(&row), row);
+                }
             }
         }
         if derived.len() as u64 > self.plan.resource_contract.max_derived_rows {
@@ -187,6 +238,7 @@ impl RecursiveFixpointRuntime {
                     if base.weight <= 0 {
                         continue;
                     }
+                    // Evaluate first CTE's recursive term
                     work_units = work_units
                         .checked_add(1)
                         .ok_or_else(invalid_runtime_state)?;
@@ -201,6 +253,24 @@ impl RecursiveFixpointRuntime {
                     let key = canonical_json(&candidate);
                     if !derived.contains_key(&key) {
                         frontier.push((key, candidate));
+                    }
+                    // Evaluate second CTE's recursive term (for mutually recursive CTEs)
+                    if let Some(ref cte2) = self.plan.second_cte {
+                        work_units = work_units
+                            .checked_add(1)
+                            .ok_or_else(invalid_runtime_state)?;
+                        if work_units > self.plan.resource_contract.max_work_units_per_epoch {
+                            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                                field: "recursive_fixpoint_resource_contract",
+                            });
+                        }
+                        let Some(candidate2) = self.recursive_candidate_with_config(row, base, cte2)? else {
+                            continue;
+                        };
+                        let key2 = canonical_json(&candidate2);
+                        if !derived.contains_key(&key2) {
+                            frontier.push((key2, candidate2));
+                        }
                     }
                 }
             }
