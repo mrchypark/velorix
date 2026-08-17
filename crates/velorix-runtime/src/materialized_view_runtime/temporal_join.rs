@@ -260,6 +260,15 @@ impl StandingProgramRuntime for TemporalJoinRuntime {
                     empty_delta
                 } else {
                     let mut columns = BTreeSet::new();
+                    // Include all columns needed by the output projection
+                    for item in &self.plan.output_columns {
+                        match item.side {
+                            TemporalJoinSideV1::Left => {
+                                columns.insert(item.column_id.clone());
+                            }
+                            TemporalJoinSideV1::Right => {}
+                        }
+                    }
                     columns.insert(self.plan.left_join_column_id.to_string());
                     columns.insert(self.plan.left_event_time_column_id.to_string());
                     arrow_record_batches_to_key_multi_value_delta_batch(
@@ -331,6 +340,15 @@ impl StandingProgramRuntime for TemporalJoinRuntime {
                     empty_delta
                 } else {
                     let mut columns = BTreeSet::new();
+                    // Include all columns needed by the output projection
+                    for item in &self.plan.output_columns {
+                        match item.side {
+                            TemporalJoinSideV1::Left => {}
+                            TemporalJoinSideV1::Right => {
+                                columns.insert(item.column_id.clone());
+                            }
+                        }
+                    }
                     columns.insert(self.plan.right_join_column_id.to_string());
                     columns.insert(self.plan.right_event_time_column_id.to_string());
                     arrow_record_batches_to_key_multi_value_delta_batch(

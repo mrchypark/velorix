@@ -18584,6 +18584,15 @@ fn validate_supported_temporal_join_sql_inner(
     };
     for catalog in catalogs {
         catalog.validate()?;
+        let adapter = crate::relation::supported_incremental_adapter_spec(
+            &catalog.incremental_adapter.adapter_id,
+        )
+        .ok_or(RelationSchemaError::InvalidRelationSchema {
+            field: "incremental_adapter.adapter_id",
+        })?;
+        if !matches!(adapter, SupportedIncrementalAdapterSpec::Generic) {
+            return unsupported("temporal join SQL requires generic (+-1 weight) inputs");
+        }
     }
     let query = parse_single_query(sql)?;
     validate_query_level_clauses(&query, false)?;
@@ -18724,6 +18733,9 @@ pub fn validate_supported_cross_join_sql(
         })?;
         if !matches!(adapter, SupportedIncrementalAdapterSpec::Generic) {
             return unsupported("cross join SQL requires generic (+-1 weight) inputs; scalar sum/count adapter weights are not supported yet");
+        }
+        if catalog.relation_schema.primary_key_column_ids.len() > 1 {
+            return unsupported("cross join does not support composite primary keys");
         }
     }
     let query = parse_single_query(sql)?;
