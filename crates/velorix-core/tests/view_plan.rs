@@ -11202,3 +11202,18 @@ fn exit_gate_no_lossy_implicit_conversion_across_type_surfaces() {
     assert_eq!(plan.value_columns.len(), 1);
     assert_eq!(plan.typed_value_columns.len(), 1);
 }
+
+/// Phase 6.4: AGE_DAYS expression admission and type checking.
+#[test]
+fn age_days_expression_roundtrips_through_admission() {
+    let catalog = scores_catalog();
+    let plan = validate_supported_filter_project_sql(
+        "select user_id, age_days(score, score) as diff from scores",
+        &catalog,
+    )
+    .unwrap();
+    assert_eq!(plan.typed_value_columns.len(), 1);
+    assert_eq!(plan.typed_value_columns[0].output_column_id, "diff");
+    let program = &plan.typed_value_columns[0].program;
+    assert_eq!(program.encoding_version, 1);
+}

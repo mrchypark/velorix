@@ -183,6 +183,9 @@ pub enum BuiltinScalarFunctionV1 {
     SubtractFloat64,
     MultiplyFloat64,
     DivideFloat64,
+    /// Temporal difference in days (Int64). Returns (ts1 - ts2) / 86_400_000_000_000
+    /// where ts values are nanoseconds. Avoids month-length complexity.
+    AgeDays,
 }
 
 impl TypedExprProgramV1 {
@@ -389,6 +392,7 @@ fn validate_call_arity(
         | BuiltinScalarFunctionV1::SubtractFloat64
         | BuiltinScalarFunctionV1::MultiplyFloat64
         | BuiltinScalarFunctionV1::DivideFloat64 => 2..=2,
+        BuiltinScalarFunctionV1::AgeDays => 2..=2,
     };
     if !expected.contains(&args.len()) {
         return Err(TypedExprError::Invalid(format!(

@@ -16003,6 +16003,7 @@ fn is_typed_function_name(name: &str) -> bool {
             | "round"
             | "greatest"
             | "least"
+            | "age_days"
     )
 }
 
@@ -16022,6 +16023,7 @@ fn typed_function_for_name(name: &str) -> Option<BuiltinScalarFunctionV1> {
         "round" => Some(BuiltinScalarFunctionV1::RoundFloat64),
         "greatest" => Some(BuiltinScalarFunctionV1::GreatestFloat64),
         "least" => Some(BuiltinScalarFunctionV1::LeastFloat64),
+        "age_days" => Some(BuiltinScalarFunctionV1::AgeDays),
         _ => None,
     }
 }
@@ -16145,6 +16147,15 @@ fn typed_call_result_type(
                 ));
             }
             Ok(RuntimeScalarTypeV1::Float64)
+        }
+        BuiltinScalarFunctionV1::AgeDays => {
+            if !args.iter().all(|arg| {
+                arg.result_type == RuntimeScalarTypeV1::Int64
+                    || arg.result_type == RuntimeScalarTypeV1::TimestampNanosecond
+            }) {
+                return unsupported("AGE_DAYS requires int64 or timestamp_nanosecond arguments");
+            }
+            Ok(RuntimeScalarTypeV1::Int64)
         }
     }
 }

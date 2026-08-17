@@ -351,6 +351,37 @@ fn evaluate_call(
                 None => Ok(RuntimeScalarValue::Null(RuntimeScalarTypeV1::Float64)),
             }
         }
+        BuiltinScalarFunctionV1::AgeDays => {
+            let ts1 = match &args[0] {
+                RuntimeScalarValue::Int64(value) => *value,
+                RuntimeScalarValue::TimestampNanosecond(value) => *value,
+                RuntimeScalarValue::Null(_) => {
+                    return Ok(RuntimeScalarValue::Null(RuntimeScalarTypeV1::Int64))
+                }
+                other => {
+                    return Err(ExpressionEvaluationError::Failed(format!(
+                        "AGE_DAYS requires int64 or timestamp_nanosecond, got {:?}",
+                        other.data_type()
+                    )))
+                }
+            };
+            let ts2 = match &args[1] {
+                RuntimeScalarValue::Int64(value) => *value,
+                RuntimeScalarValue::TimestampNanosecond(value) => *value,
+                RuntimeScalarValue::Null(_) => {
+                    return Ok(RuntimeScalarValue::Null(RuntimeScalarTypeV1::Int64))
+                }
+                other => {
+                    return Err(ExpressionEvaluationError::Failed(format!(
+                        "AGE_DAYS requires int64 or timestamp_nanosecond, got {:?}",
+                        other.data_type()
+                    )))
+                }
+            };
+            let diff_ns = ts1.saturating_sub(ts2);
+            let days = diff_ns / (86_400 * 1_000_000_000);
+            Ok(RuntimeScalarValue::Int64(days))
+        }
     }
 }
 
