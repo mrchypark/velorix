@@ -166,11 +166,18 @@ impl ScalarAggregateFilterRuntime {
                 }
                 Value::from(self.scalar_state.avg_sums as f64 / self.scalar_state.avg_counts as f64)
             }
-            LogicalPlanAggregateFunctionV1::Min | LogicalPlanAggregateFunctionV1::Max => self
+            LogicalPlanAggregateFunctionV1::Min => self
                 .scalar_state
                 .values
                 .values()
                 .next()
+                .map(|entry| entry.value.clone())
+                .unwrap_or(Value::Null),
+            LogicalPlanAggregateFunctionV1::Max => self
+                .scalar_state
+                .values
+                .values()
+                .next_back()
                 .map(|entry| entry.value.clone())
                 .unwrap_or(Value::Null),
             LogicalPlanAggregateFunctionV1::CountDistinct => {
@@ -191,7 +198,15 @@ impl ScalarAggregateFilterRuntime {
             // UNKNOWN in SQL; WHERE removes the row.
             return false;
         }
-        let ordering = canonical_json(outer_value).cmp(&canonical_json(scalar));
+        // Use numeric comparison when both are numbers, otherwise fall back
+        // to canonical JSON string ordering for other types.
+        let ordering = if let (Some(outer_num), Some(scalar_num)) =
+            (outer_value.as_i64(), scalar.as_i64())
+        {
+            outer_num.cmp(&scalar_num)
+        } else {
+            canonical_json(outer_value).cmp(&canonical_json(scalar))
+        };
         match self.plan.comparison_op {
             ScalarSubqueryComparisonOp::Eq => ordering == std::cmp::Ordering::Equal,
             ScalarSubqueryComparisonOp::NotEq => ordering != std::cmp::Ordering::Equal,
@@ -651,9 +666,7 @@ impl ScalarAggregateFilterRuntime {
                     .get(column_id)
                     .cloned()
                     .ok_or_else(|| StandingProgramRuntimeError::InvalidProgramIdentity {
-                        field: Box::leak(
-                            format!("scalar_missing_scalar:{column_id}").into_boxed_str(),
-                        ),
+                        field: "scalar_missing_scalar_value",
                     })?
             } else {
                 record.value.as_json().clone()
@@ -699,6 +712,12 @@ impl ScalarAggregateFilterRuntime {
                                 .checked_mul(record.weight)
                                 .ok_or_else(invalid_runtime_state)?,
                         )
+                        .ok_or_else(invalid_runtime_state)?;
+                    // SUM also needs to track count for non-NULL row detection
+                    self.scalar_state.count = self
+                        .scalar_state
+                        .count
+                        .checked_add(record.weight)
                         .ok_or_else(invalid_runtime_state)?;
                 }
                 LogicalPlanAggregateFunctionV1::Avg => {
@@ -806,10 +825,7 @@ impl ScalarAggregateFilterRuntime {
                     .get(column.input_column_id.as_str())
                     .cloned()
                     .ok_or_else(|| StandingProgramRuntimeError::InvalidProgramIdentity {
-                        field: Box::leak(
-                            format!("scalar_missing_value:{}", column.input_column_id)
-                                .into_boxed_str(),
-                        ),
+                        field: "scalar_missing_projection_value",
                     })?
             };
             output.insert(column.output_column_id.clone(), value);
