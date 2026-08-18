@@ -146,14 +146,18 @@ impl TemporalJoinRuntime {
             .and_then(|obj| obj.get(key_column))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
-            .unwrap_or_default();
+            .ok_or(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "temporal_join_right_key",
+            })?;
         let event_time = record
             .value
             .as_json()
             .as_object()
             .and_then(|obj| obj.get(time_column))
             .and_then(|v| v.as_i64())
-            .unwrap_or(0);
+            .ok_or(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "temporal_join_right_event_time",
+            })?;
         let map_key = (key.clone(), -event_time);
         right_index
             .entry(map_key.clone())
@@ -288,20 +292,24 @@ impl StandingProgramRuntime for TemporalJoinRuntime {
                 };
                 for record in delta.net_rows().map_err(|_| invalid_runtime_state())? {
                     let key = record
-                        .key
+                        .value
                         .as_json()
                         .as_object()
                         .and_then(|obj| obj.get(&self.plan.left_join_column_id))
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string())
-                        .unwrap_or_default();
+                        .ok_or(StandingProgramRuntimeError::InvalidProgramIdentity {
+                            field: "temporal_join_left_key",
+                        })?;
                     let event_time = record
                         .value
                         .as_json()
                         .as_object()
                         .and_then(|obj| obj.get(&self.plan.left_event_time_column_id))
                         .and_then(|v| v.as_i64())
-                        .unwrap_or(0);
+                        .ok_or(StandingProgramRuntimeError::InvalidProgramIdentity {
+                            field: "temporal_join_left_event_time",
+                        })?;
                     let entry = next_left.entry(key.clone()).or_insert_with(|| TemporalRow {
                         values: BTreeMap::new(),
                         event_time_ns: event_time,
@@ -383,7 +391,25 @@ impl StandingProgramRuntime for TemporalJoinRuntime {
             advance_input_event_time_frontier(&mut next_event_time_frontiers, input)?;
         }
 
+        if next_left.len() as u64 > self.plan.resource_contract.max_rows_per_side {
+            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "temporal_join_resource_contract",
+            });
+        }
+        if next_right.len() as u64 > self.plan.resource_contract.max_rows_per_side {
+            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "temporal_join_resource_contract",
+            });
+        }
+
         let next_output = recompute_from_staged(&next_left, &next_right, &self.plan)?;
+        if next_output.net_rows().map_err(|_| invalid_runtime_state())?.len() as u64
+            > self.plan.resource_contract.max_output_rows_per_epoch
+        {
+            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "temporal_join_resource_contract",
+            });
+        }
         let prev_inv = self
             .published_output
             .inverse()
@@ -582,18 +608,17 @@ fn recompute_from_staged(
             .values
             .get(&plan.left_join_column_id)
             .and_then(|v| v.as_str())
-            .unwrap_or("")
+            .ok_or(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "temporal_join_staged_key",
+            })?
             .to_string();
         // Filter right rows by join key AND find most recent by event_time
         let probe = (left_join_key.clone(), -left_event_time);
-        let mut best_right: Option<(&TemporalRow, i64)> = None;
-        for ((key, _neg_time), right_row) in right.range(probe.clone()..) {
-            if *key != left_join_key {
-                break;
-            }
-            best_right = Some((right_row, right_row.weight));
-            break;
-        }
+        let best_right: Option<(&TemporalRow, i64)> = right
+            .range(probe..)
+            .next()
+            .filter(|((key, _), _)| *key == left_join_key)
+            .map(|((_, _), row)| (row, row.weight));
         if let Some((right_row, right_weight)) = best_right {
             let mut output = serde_json::Map::new();
             for item in &plan.output_columns {
@@ -609,7 +634,7 @@ fn recompute_from_staged(
             let weight = left_row
                 .weight
                 .checked_mul(right_weight)
-                .unwrap_or(1);
+                .ok_or_else(invalid_runtime_state)?;
             records.push(DeltaRecord::new(
                 DeltaKey::from_json(Value::Object(output.clone())),
                 DeltaValue::from_json(Value::Object(serde_json::Map::new())),

@@ -664,7 +664,7 @@ impl ScalarAggregateFilterRuntime {
                     .as_json()
                     .get(column_id)
                     .cloned()
-                    .ok_or_else(|| StandingProgramRuntimeError::InvalidProgramIdentity {
+                    .ok_or(StandingProgramRuntimeError::InvalidProgramIdentity {
                         field: "scalar_missing_scalar_value",
                     })?
             } else {
@@ -823,7 +823,7 @@ impl ScalarAggregateFilterRuntime {
                 row.values
                     .get(column.input_column_id.as_str())
                     .cloned()
-                    .ok_or_else(|| StandingProgramRuntimeError::InvalidProgramIdentity {
+                    .ok_or(StandingProgramRuntimeError::InvalidProgramIdentity {
                         field: "scalar_missing_projection_value",
                     })?
             };
