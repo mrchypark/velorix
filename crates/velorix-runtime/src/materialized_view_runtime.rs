@@ -615,7 +615,7 @@ pub fn restore_standing_runtime(
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
- struct GenericCheckpointPayload {
+struct GenericCheckpointPayload {
     schema_version: u32,
     runtime_kind: String,
     catalog: VelorixRelationCatalogV1,
