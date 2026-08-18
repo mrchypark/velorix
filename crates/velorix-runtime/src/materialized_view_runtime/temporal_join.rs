@@ -140,7 +140,7 @@ impl TemporalJoinRuntime {
         time_column: &str,
     ) -> Result<(), StandingProgramRuntimeError> {
         let key = record
-            .key
+            .value
             .as_json()
             .as_object()
             .and_then(|obj| obj.get(key_column))
@@ -573,22 +573,28 @@ fn recompute_from_staged(
     plan: &SupportedTemporalJoinPlanV1,
 ) -> Result<DeltaBatch, StandingProgramRuntimeError> {
     let mut records = Vec::new();
-    for left_row in left.values() {
+    for (_left_key, left_row) in left.iter() {
         if left_row.weight <= 0 {
             continue;
         }
         let left_event_time = left_row.event_time_ns;
-        // For pure temporal join: scan ALL right rows to find most recent by event_time
-        let mut best_right: Option<&TemporalRow> = None;
-        for ((_key, _neg_time), right_row) in right.iter() {
-            if right_row.event_time_ns <= left_event_time
-                && (best_right.is_none()
-                    || right_row.event_time_ns > best_right.unwrap().event_time_ns)
-            {
-                best_right = Some(right_row);
+        let left_join_key = left_row
+            .values
+            .get(&plan.left_join_column_id)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        // Filter right rows by join key AND find most recent by event_time
+        let probe = (left_join_key.clone(), -left_event_time);
+        let mut best_right: Option<(&TemporalRow, i64)> = None;
+        for ((key, _neg_time), right_row) in right.range(probe.clone()..) {
+            if *key != left_join_key {
+                break;
             }
+            best_right = Some((right_row, right_row.weight));
+            break;
         }
-        if let Some(right_row) = best_right {
+        if let Some((right_row, right_weight)) = best_right {
             let mut output = serde_json::Map::new();
             for item in &plan.output_columns {
                 let value = match item.side {
@@ -600,10 +606,14 @@ fn recompute_from_staged(
                     value.cloned().unwrap_or(Value::Null),
                 );
             }
+            let weight = left_row
+                .weight
+                .checked_mul(right_weight)
+                .unwrap_or(1);
             records.push(DeltaRecord::new(
                 DeltaKey::from_json(Value::Object(output.clone())),
                 DeltaValue::from_json(Value::Object(serde_json::Map::new())),
-                1,
+                weight,
             ));
         }
     }

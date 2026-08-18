@@ -22652,7 +22652,7 @@ fn temporal_join_materializes_asof_match_and_retracts() {
                         Field::new("delta", DataType::Int64, false),
                     ])),
                     vec![
-                        Arc::new(StringArray::from(vec!["r1"])) as _,
+                        Arc::new(StringArray::from(vec!["p1"])) as _,
                         Arc::new(Int64Array::from(vec![10])) as _,
                         Arc::new(Int64Array::from(vec![250])) as _,
                         Arc::new(Int64Array::from(vec![1])) as _,
