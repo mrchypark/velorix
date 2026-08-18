@@ -22585,9 +22585,9 @@ fn temporal_join_output_schema() -> RelationSchema {
             "price_event_time".to_string(),
         ],
     }
-} // TODO: temporal join page rendering pending composite-key output fix.
-  // Admission + core test verified in velorix-core/tests/view_plan.rs (probe_temporal_join_admission).
-  // Runtime epoch advancement + checkpoint roundtrip verified in this test:
+} // Page rendering works: all-output-columns-as-PK schema is correctly handled
+  // by materialized_delta_to_record_batch when aggregate_outputs is empty.
+  // Admission verified in velorix-core/tests/view_plan.rs (probe_temporal_join_admission).
 #[test]
 fn temporal_join_materializes_asof_match_and_retracts() {
     let rides = temporal_join_rides_catalog();
@@ -22778,6 +22778,403 @@ fn temporal_join_materializes_asof_match_and_retracts() {
     assert_eq!(batch.num_rows(), 1);
     assert_eq!(
         batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        1000
+    );
+}
+
+#[test]
+fn temporal_join_multiple_left_rows_same_key_different_times() {
+    let rides = temporal_join_rides_catalog();
+    let prices = temporal_join_prices_catalog();
+    let catalogs = vec![rides.clone(), prices.clone()];
+    let input_schemas: Vec<RelationSchema> = catalogs
+        .iter()
+        .map(|c| catalog_input_relation_schema(c).unwrap())
+        .collect();
+    let output_schema = temporal_join_output_schema();
+    let sql = "select l.ride_id, l.booking_start, l.event_time, p.price, p.event_time as price_event_time from rides l join prices p on p.event_time <= l.event_time";
+    let identity = standing_identity_with_view(sql, "enriched");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &catalogs,
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("mj-1").unwrap(),
+            vec![relation_input(
+                &prices,
+                "mj-prices",
+                0,
+                3,
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("vehicle_id", DataType::Utf8, false),
+                        Field::new("price", DataType::Int64, false),
+                        Field::new("event_time", DataType::Int64, false),
+                        Field::new("delta", DataType::Int64, false),
+                    ])),
+                    vec![
+                        Arc::new(StringArray::from(vec!["p1", "p1"])) as _,
+                        Arc::new(Int64Array::from(vec![1000, 2000])) as _,
+                        Arc::new(Int64Array::from(vec![100, 200])) as _,
+                        Arc::new(Int64Array::from(vec![1, 1])) as _,
+                    ],
+                )
+                .unwrap(),
+            )],
+        )
+        .unwrap();
+    runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("mj-2").unwrap(),
+            vec![relation_input(
+                &rides,
+                "mj-rides",
+                0,
+                2,
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("ride_id", DataType::Utf8, false),
+                        Field::new("booking_start", DataType::Int64, false),
+                        Field::new("event_time", DataType::Int64, false),
+                        Field::new("delta", DataType::Int64, false),
+                    ])),
+                    vec![
+                        Arc::new(StringArray::from(vec!["p1", "p1"])) as _,
+                        Arc::new(Int64Array::from(vec![10, 20])) as _,
+                        Arc::new(Int64Array::from(vec![150, 250])) as _,
+                        Arc::new(Int64Array::from(vec![1, 1])) as _,
+                    ],
+                )
+                .unwrap(),
+            )],
+        )
+        .unwrap();
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".into(),
+                program_id: "program-purchases".into(),
+                view_id: "enriched".into(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(2),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    assert_eq!(batch.num_rows(), 2);
+    let prices: Vec<i64> = (0..2)
+        .map(|i| {
+            batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(i)
+        })
+        .collect();
+    assert!(prices.contains(&1000));
+    assert!(prices.contains(&2000));
+}
+
+#[test]
+fn temporal_join_left_retraction_removes_output() {
+    let rides = temporal_join_rides_catalog();
+    let prices = temporal_join_prices_catalog();
+    let catalogs = vec![rides.clone(), prices.clone()];
+    let input_schemas: Vec<RelationSchema> = catalogs
+        .iter()
+        .map(|c| catalog_input_relation_schema(c).unwrap())
+        .collect();
+    let output_schema = temporal_join_output_schema();
+    let sql = "select l.ride_id, l.booking_start, l.event_time, p.price, p.event_time as price_event_time from rides l join prices p on p.event_time <= l.event_time";
+    let identity = standing_identity_with_view(sql, "enriched");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &catalogs,
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("lr-1").unwrap(),
+            vec![relation_input(
+                &prices,
+                "lr-prices",
+                0,
+                1,
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("vehicle_id", DataType::Utf8, false),
+                        Field::new("price", DataType::Int64, false),
+                        Field::new("event_time", DataType::Int64, false),
+                        Field::new("delta", DataType::Int64, false),
+                    ])),
+                    vec![
+                        Arc::new(StringArray::from(vec!["p1"])) as _,
+                        Arc::new(Int64Array::from(vec![1000])) as _,
+                        Arc::new(Int64Array::from(vec![100])) as _,
+                        Arc::new(Int64Array::from(vec![1])) as _,
+                    ],
+                )
+                .unwrap(),
+            )],
+        )
+        .unwrap();
+    runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("lr-2").unwrap(),
+            vec![relation_input(
+                &rides,
+                "lr-rides",
+                0,
+                1,
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("ride_id", DataType::Utf8, false),
+                        Field::new("booking_start", DataType::Int64, false),
+                        Field::new("event_time", DataType::Int64, false),
+                        Field::new("delta", DataType::Int64, false),
+                    ])),
+                    vec![
+                        Arc::new(StringArray::from(vec!["p1"])) as _,
+                        Arc::new(Int64Array::from(vec![10])) as _,
+                        Arc::new(Int64Array::from(vec![250])) as _,
+                        Arc::new(Int64Array::from(vec![1])) as _,
+                    ],
+                )
+                .unwrap(),
+            )],
+        )
+        .unwrap();
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".into(),
+                program_id: "program-purchases".into(),
+                view_id: "enriched".into(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(2),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(page.batches[0].num_rows(), 1);
+    runtime
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("lr-3").unwrap(),
+            vec![relation_input(
+                &rides,
+                "lr-rides",
+                1,
+                2,
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("ride_id", DataType::Utf8, false),
+                        Field::new("booking_start", DataType::Int64, false),
+                        Field::new("event_time", DataType::Int64, false),
+                        Field::new("delta", DataType::Int64, false),
+                    ])),
+                    vec![
+                        Arc::new(StringArray::from(vec!["p1"])) as _,
+                        Arc::new(Int64Array::from(vec![10])) as _,
+                        Arc::new(Int64Array::from(vec![250])) as _,
+                        Arc::new(Int64Array::from(vec![-1])) as _,
+                    ],
+                )
+                .unwrap(),
+            )],
+        )
+        .unwrap();
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".into(),
+                program_id: "program-purchases".into(),
+                view_id: "enriched".into(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(3),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(page.batches[0].num_rows(), 0);
+}
+
+#[test]
+fn temporal_join_no_matching_right_row() {
+    let rides = temporal_join_rides_catalog();
+    let prices = temporal_join_prices_catalog();
+    let catalogs = vec![rides.clone(), prices.clone()];
+    let input_schemas: Vec<RelationSchema> = catalogs
+        .iter()
+        .map(|c| catalog_input_relation_schema(c).unwrap())
+        .collect();
+    let output_schema = temporal_join_output_schema();
+    let sql = "select l.ride_id, l.booking_start, l.event_time, p.price, p.event_time as price_event_time from rides l join prices p on p.event_time <= l.event_time";
+    let identity = standing_identity_with_view(sql, "enriched");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &catalogs,
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("nr-1").unwrap(),
+            vec![relation_input(
+                &rides,
+                "nr-rides",
+                0,
+                1,
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("ride_id", DataType::Utf8, false),
+                        Field::new("booking_start", DataType::Int64, false),
+                        Field::new("event_time", DataType::Int64, false),
+                        Field::new("delta", DataType::Int64, false),
+                    ])),
+                    vec![
+                        Arc::new(StringArray::from(vec!["p1"])) as _,
+                        Arc::new(Int64Array::from(vec![10])) as _,
+                        Arc::new(Int64Array::from(vec![50])) as _,
+                        Arc::new(Int64Array::from(vec![1])) as _,
+                    ],
+                )
+                .unwrap(),
+            )],
+        )
+        .unwrap();
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".into(),
+                program_id: "program-purchases".into(),
+                view_id: "enriched".into(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(1),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(page.batches[0].num_rows(), 0);
+}
+
+#[test]
+fn temporal_join_simultaneous_left_and_right_same_epoch() {
+    let rides = temporal_join_rides_catalog();
+    let prices = temporal_join_prices_catalog();
+    let catalogs = vec![rides.clone(), prices.clone()];
+    let input_schemas: Vec<RelationSchema> = catalogs
+        .iter()
+        .map(|c| catalog_input_relation_schema(c).unwrap())
+        .collect();
+    let output_schema = temporal_join_output_schema();
+    let sql = "select l.ride_id, l.booking_start, l.event_time, p.price, p.event_time as price_event_time from rides l join prices p on p.event_time <= l.event_time";
+    let identity = standing_identity_with_view(sql, "enriched");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &catalogs,
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("sr-1").unwrap(),
+            vec![
+                relation_input(
+                    &prices,
+                    "sr-prices",
+                    0,
+                    1,
+                    RecordBatch::try_new(
+                        Arc::new(Schema::new(vec![
+                            Field::new("vehicle_id", DataType::Utf8, false),
+                            Field::new("price", DataType::Int64, false),
+                            Field::new("event_time", DataType::Int64, false),
+                            Field::new("delta", DataType::Int64, false),
+                        ])),
+                        vec![
+                            Arc::new(StringArray::from(vec!["p1"])) as _,
+                            Arc::new(Int64Array::from(vec![1000])) as _,
+                            Arc::new(Int64Array::from(vec![100])) as _,
+                            Arc::new(Int64Array::from(vec![1])) as _,
+                        ],
+                    )
+                    .unwrap(),
+                ),
+                relation_input(
+                    &rides,
+                    "sr-rides",
+                    0,
+                    1,
+                    RecordBatch::try_new(
+                        Arc::new(Schema::new(vec![
+                            Field::new("ride_id", DataType::Utf8, false),
+                            Field::new("booking_start", DataType::Int64, false),
+                            Field::new("event_time", DataType::Int64, false),
+                            Field::new("delta", DataType::Int64, false),
+                        ])),
+                        vec![
+                            Arc::new(StringArray::from(vec!["p1"])) as _,
+                            Arc::new(Int64Array::from(vec![10])) as _,
+                            Arc::new(Int64Array::from(vec![250])) as _,
+                            Arc::new(Int64Array::from(vec![1])) as _,
+                        ],
+                    )
+                    .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".into(),
+                program_id: "program-purchases".into(),
+                view_id: "enriched".into(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(1),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(page.batches[0].num_rows(), 1);
+    assert_eq!(
+        page.batches[0]
             .column(3)
             .as_any()
             .downcast_ref::<Int64Array>()

@@ -28,9 +28,16 @@ pub struct TemporalJoinRuntime {
     logical_plan: VelorixLogicalViewPlanV1,
     /// Right-side rows indexed by (join_key, -event_time_ns) for
     /// reverse-chronological iteration per join key.
+    ///
+    /// NOTE: no automatic eviction — ASOF join semantics require retaining
+    /// all historical right rows per join key until resource contract limits
+    /// are reached. A future watermark-per-join-key design could enable safe
+    /// eviction when all left rows for a key have been processed.
     right_index: BTreeMap<(String, i64), TemporalRow>,
-    /// Left-side rows by key for retraction support.
-    left_rows: BTreeMap<String, TemporalRow>,
+    /// Left-side rows by join key, then by event_time for bag semantics.
+    /// Multiple left rows with the same join key but different event times
+    /// are independently matched against right-side rows.
+    left_rows: BTreeMap<String, BTreeMap<i64, TemporalRow>>,
     published_output: DeltaBatch,
     input_frontiers: Vec<RelationFrontier>,
     input_event_time_frontiers: Vec<InputEventTimeFrontier>,
@@ -310,7 +317,8 @@ impl StandingProgramRuntime for TemporalJoinRuntime {
                         .ok_or(StandingProgramRuntimeError::InvalidProgramIdentity {
                             field: "temporal_join_left_event_time",
                         })?;
-                    let entry = next_left.entry(key.clone()).or_insert_with(|| TemporalRow {
+                    let by_time = next_left.entry(key.clone()).or_default();
+                    let entry = by_time.entry(event_time).or_insert_with(|| TemporalRow {
                         values: BTreeMap::new(),
                         event_time_ns: event_time,
                         weight: 0,
@@ -323,7 +331,10 @@ impl StandingProgramRuntime for TemporalJoinRuntime {
                         return Err(invalid_runtime_state());
                     }
                     if entry.weight == 0 {
-                        next_left.remove(&key);
+                        by_time.remove(&event_time);
+                        if by_time.is_empty() {
+                            next_left.remove(&key);
+                        }
                         continue;
                     }
                     entry.values = record
@@ -334,7 +345,6 @@ impl StandingProgramRuntime for TemporalJoinRuntime {
                         .iter()
                         .map(|(k, v)| (k.clone(), v.clone()))
                         .collect();
-                    entry.event_time_ns = event_time;
                 }
             } else if input.relation_id == self.plan.right_input_relation_id {
                 validate_input_matches_schema(
@@ -391,7 +401,9 @@ impl StandingProgramRuntime for TemporalJoinRuntime {
             advance_input_event_time_frontier(&mut next_event_time_frontiers, input)?;
         }
 
-        if next_left.len() as u64 > self.plan.resource_contract.max_rows_per_side {
+        if next_left.values().map(|m| m.len() as u64).sum::<u64>()
+            > self.plan.resource_contract.max_rows_per_side
+        {
             return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
                 field: "temporal_join_resource_contract",
             });
@@ -594,52 +606,46 @@ impl StandingProgramRuntime for TemporalJoinRuntime {
 }
 
 fn recompute_from_staged(
-    left: &BTreeMap<String, TemporalRow>,
+    left: &BTreeMap<String, BTreeMap<i64, TemporalRow>>,
     right: &BTreeMap<(String, i64), TemporalRow>,
     plan: &SupportedTemporalJoinPlanV1,
 ) -> Result<DeltaBatch, StandingProgramRuntimeError> {
     let mut records = Vec::new();
-    for (_left_key, left_row) in left.iter() {
-        if left_row.weight <= 0 {
-            continue;
-        }
-        let left_event_time = left_row.event_time_ns;
-        let left_join_key = left_row
-            .values
-            .get(&plan.left_join_column_id)
-            .and_then(|v| v.as_str())
-            .ok_or(StandingProgramRuntimeError::InvalidProgramIdentity {
-                field: "temporal_join_staged_key",
-            })?
-            .to_string();
-        // Filter right rows by join key AND find most recent by event_time
-        let probe = (left_join_key.clone(), -left_event_time);
-        let best_right: Option<(&TemporalRow, i64)> = right
-            .range(probe..)
-            .next()
-            .filter(|((key, _), _)| *key == left_join_key)
-            .map(|((_, _), row)| (row, row.weight));
-        if let Some((right_row, right_weight)) = best_right {
-            let mut output = serde_json::Map::new();
-            for item in &plan.output_columns {
-                let value = match item.side {
-                    TemporalJoinSideV1::Left => left_row.values.get(&item.column_id),
-                    TemporalJoinSideV1::Right => right_row.values.get(&item.column_id),
-                };
-                output.insert(
-                    item.output_name.clone(),
-                    value.cloned().unwrap_or(Value::Null),
-                );
+    for (join_key, by_time) in left {
+        for left_row in by_time.values() {
+            if left_row.weight <= 0 {
+                continue;
             }
-            let weight = left_row
-                .weight
-                .checked_mul(right_weight)
-                .ok_or_else(invalid_runtime_state)?;
-            records.push(DeltaRecord::new(
-                DeltaKey::from_json(Value::Object(output.clone())),
-                DeltaValue::from_json(Value::Object(serde_json::Map::new())),
-                weight,
-            ));
+            let left_event_time = left_row.event_time_ns;
+            // Filter right rows by join key AND find most recent by event_time
+            let probe = (join_key.clone(), -left_event_time);
+            let best_right: Option<(&TemporalRow, i64)> = right
+                .range(probe..)
+                .next()
+                .filter(|((key, _), _)| key == join_key)
+                .map(|((_, _), row)| (row, row.weight));
+            if let Some((right_row, right_weight)) = best_right {
+                let mut output = serde_json::Map::new();
+                for item in &plan.output_columns {
+                    let value = match item.side {
+                        TemporalJoinSideV1::Left => left_row.values.get(&item.column_id),
+                        TemporalJoinSideV1::Right => right_row.values.get(&item.column_id),
+                    };
+                    output.insert(
+                        item.output_name.clone(),
+                        value.cloned().unwrap_or(Value::Null),
+                    );
+                }
+                let weight = left_row
+                    .weight
+                    .checked_mul(right_weight)
+                    .ok_or_else(invalid_runtime_state)?;
+                records.push(DeltaRecord::new(
+                    DeltaKey::from_json(Value::Object(output.clone())),
+                    DeltaValue::from_json(Value::Object(serde_json::Map::new())),
+                    weight,
+                ));
+            }
         }
     }
     Ok(DeltaBatch::from_records(records))
@@ -660,7 +666,7 @@ struct TemporalJoinCheckpointPayloadV2 {
     logical_plan: VelorixLogicalViewPlanV1,
     input_frontiers: Vec<RelationFrontier>,
     input_event_time_frontiers: Vec<InputEventTimeFrontier>,
-    left_rows: BTreeMap<String, TemporalRow>,
+    left_rows: BTreeMap<String, BTreeMap<i64, TemporalRow>>,
     right_index: Vec<((String, i64), TemporalRow)>,
     published_output: DeltaBatch,
     applied_epochs: Vec<GenericAppliedEpoch>,
