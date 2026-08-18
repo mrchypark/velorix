@@ -713,7 +713,7 @@ pub fn evaluate_udf(
             if values[1] > values[2] {
                 return Err(ExpressionEvaluationError::Failed(
                     "vx_clamp: lower bound exceeds upper bound".to_string(),
-                ))
+                ));
             }
             Ok(RuntimeScalarValue::Int64(
                 values[0].clamp(values[1], values[2]),

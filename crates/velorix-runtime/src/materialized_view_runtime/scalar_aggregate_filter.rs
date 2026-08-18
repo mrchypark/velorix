@@ -200,13 +200,12 @@ impl ScalarAggregateFilterRuntime {
         }
         // Use numeric comparison when both are numbers, otherwise fall back
         // to canonical JSON string ordering for other types.
-        let ordering = if let (Some(outer_num), Some(scalar_num)) =
-            (outer_value.as_i64(), scalar.as_i64())
-        {
-            outer_num.cmp(&scalar_num)
-        } else {
-            canonical_json(outer_value).cmp(&canonical_json(scalar))
-        };
+        let ordering =
+            if let (Some(outer_num), Some(scalar_num)) = (outer_value.as_i64(), scalar.as_i64()) {
+                outer_num.cmp(&scalar_num)
+            } else {
+                canonical_json(outer_value).cmp(&canonical_json(scalar))
+            };
         match self.plan.comparison_op {
             ScalarSubqueryComparisonOp::Eq => ordering == std::cmp::Ordering::Equal,
             ScalarSubqueryComparisonOp::NotEq => ordering != std::cmp::Ordering::Equal,
