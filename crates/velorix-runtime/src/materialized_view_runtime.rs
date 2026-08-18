@@ -131,6 +131,7 @@ use output::{
 
 const CHECKPOINT_PAYLOAD_SCHEMA_VERSION: u32 = 1;
 const FILTER_PROJECT_RUNTIME_KIND: &str = "filter_project";
+const SINGLE_KEY_SUM_COUNT_RUNTIME_KIND: &str = "single_key_sum_count";
 const ANALYTIC_ROW_NUMBER_RUNTIME_KIND: &str = "analytic_row_number";
 const JOIN_RUNTIME_KIND: &str = "two_input_join_sum_count";
 const JOIN_COMMON_DAG_REFERENCE_RUNTIME_KIND: &str = "two_input_join_common_dag_reference_v1";
@@ -593,15 +594,30 @@ pub fn restore_standing_runtime(
             .map(|runtime| Box::new(runtime) as Box<dyn StandingProgramRuntime + Send>)
             .map_err(|error| error.to_string());
     }
-    SingleKeySumCountRuntime::restore(checkpoint)
-        .map(|runtime| Box::new(runtime) as Box<dyn StandingProgramRuntime + Send>)
-        .map_err(|error| error.to_string())
+    if checkpoint_has_single_key_sum_count_payload(&checkpoint) {
+        return SingleKeySumCountRuntime::restore(checkpoint)
+            .map(|runtime| Box::new(runtime) as Box<dyn StandingProgramRuntime + Send>)
+            .map_err(|error| error.to_string());
+    }
+    // P0-8: reject unknown checkpoint kinds instead of falling through
+    // to a default runtime which could silently produce wrong results
+    let kind = checkpoint
+        .state_payload
+        .as_ref()
+        .and_then(|p| serde_json::from_str::<serde_json::Value>(&p.payload).ok())
+        .and_then(|v| v.get("runtime_kind").cloned())
+        .and_then(|v| v.as_str().map(String::from));
+    Err(format!(
+        "unrecognized checkpoint runtime kind `{}`: cannot safely restore",
+        kind.unwrap_or_else(|| "unknown".to_string())
+    ))
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct GenericCheckpointPayload {
+ struct GenericCheckpointPayload {
     schema_version: u32,
+    runtime_kind: String,
     catalog: VelorixRelationCatalogV1,
     input_schema: RelationSchema,
     output_schema: RelationSchema,
@@ -9002,6 +9018,21 @@ fn checkpoint_has_common_dag_reference_join_payload(checkpoint: &RuntimeCheckpoi
         })
         .as_deref()
         == Some(JOIN_COMMON_DAG_REFERENCE_RUNTIME_KIND)
+}
+
+fn checkpoint_has_single_key_sum_count_payload(checkpoint: &RuntimeCheckpoint) -> bool {
+    checkpoint
+        .state_payload
+        .as_ref()
+        .and_then(|payload| serde_json::from_str::<Value>(&payload.payload).ok())
+        .and_then(|payload| {
+            payload
+                .get("runtime_kind")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .as_deref()
+        == Some(SINGLE_KEY_SUM_COUNT_RUNTIME_KIND)
 }
 
 fn checkpoint_has_filter_project_payload(checkpoint: &RuntimeCheckpoint) -> bool {

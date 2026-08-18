@@ -130,6 +130,7 @@ impl SingleKeySumCountRuntime {
     fn checkpoint_payload(&self) -> Result<String, StandingProgramRuntimeError> {
         let payload = GenericCheckpointPayload {
             schema_version: CHECKPOINT_PAYLOAD_SCHEMA_VERSION,
+            runtime_kind: SINGLE_KEY_SUM_COUNT_RUNTIME_KIND.to_string(),
             catalog: self.catalog.clone(),
             input_schema: self.input_schema.clone(),
             output_schema: self.output_schema.clone(),
