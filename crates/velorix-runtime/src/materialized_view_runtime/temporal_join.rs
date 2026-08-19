@@ -9,6 +9,10 @@
 //! for O(log K) per-event lookup. Left-side rows are matched on insert;
 //! late left rows that arrive after a right row with later timestamp match
 //! the correct predecessor. Output is the full projected row.
+//!
+//! Checkpoint: JSON-serialized state includes full catalogs, schemas, and
+//! all staged rows. For very large state (>100K rows), consider switching
+//! to a binary checkpoint format or checkpoint-only-delta approach.
 
 use super::*;
 use crate::materialized_view_runtime::semi_anti_join::catalog_for_relation_id;
@@ -165,6 +169,11 @@ impl TemporalJoinRuntime {
             .ok_or(StandingProgramRuntimeError::InvalidProgramIdentity {
                 field: "temporal_join_right_event_time",
             })?;
+        if event_time == i64::MIN {
+            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "temporal_join_event_time_overflow",
+            });
+        }
         let map_key = (key.clone(), -event_time);
         right_index
             .entry(map_key.clone())
@@ -321,6 +330,11 @@ impl StandingProgramRuntime for TemporalJoinRuntime {
                         .ok_or(StandingProgramRuntimeError::InvalidProgramIdentity {
                             field: "temporal_join_left_event_time",
                         })?;
+                    if event_time == i64::MIN {
+                        return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                            field: "temporal_join_event_time_overflow",
+                        });
+                    }
                     let by_time = next_left.entry(key.clone()).or_default();
                     let entry = by_time.entry(event_time).or_insert_with(|| TemporalRow {
                         values: BTreeMap::new(),
