@@ -185,15 +185,19 @@ impl TemporalJoinRuntime {
             right_index.remove(&map_key);
             return Ok(());
         }
-        entry.values = record
-            .value
-            .as_json()
-            .as_object()
-            .ok_or_else(invalid_runtime_state)?
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        entry.event_time_ns = event_time;
+        // Only overwrite values on initial insert (weight was 0 before
+        // adding record.weight). Retractions only change weight.
+        if entry.weight == record.weight {
+            entry.values = record
+                .value
+                .as_json()
+                .as_object()
+                .ok_or_else(invalid_runtime_state)?
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            entry.event_time_ns = event_time;
+        }
         Ok(())
     }
 }
@@ -337,14 +341,20 @@ impl StandingProgramRuntime for TemporalJoinRuntime {
                         }
                         continue;
                     }
-                    entry.values = record
-                        .value
-                        .as_json()
-                        .as_object()
-                        .ok_or_else(invalid_runtime_state)?
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect();
+                    // Only overwrite values on initial insert (weight was 0
+                    // before adding record.weight). Subsequent weight changes
+                    // (retraction/addition) for the same (key, event_time)
+                    // must not overwrite the original column values.
+                    if entry.weight == record.weight {
+                        entry.values = record
+                            .value
+                            .as_json()
+                            .as_object()
+                            .ok_or_else(invalid_runtime_state)?
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect();
+                    }
                 }
             } else if input.relation_id == self.plan.right_input_relation_id {
                 validate_input_matches_schema(
@@ -702,6 +712,34 @@ fn evict_right_index(
         }
         for key in to_remove {
             right_index.remove(&key);
+        }
+    }
+    // Remove right rows for orphaned keys (no current left rows) where the
+    // most recent right row is below the watermark — no future left row can
+    // match it because all future left rows have event_time >= watermark.
+    let mut orphaned_keys: Vec<String> = Vec::new();
+    for ((key, _), _) in right_index.iter() {
+        if !left_rows.contains_key(key) {
+            orphaned_keys.push(key.clone());
+        }
+    }
+    for join_key in orphaned_keys {
+        let most_recent = right_index
+            .range((join_key.clone(), i64::MIN)..)
+            .take_while(|((k, _), _)| k == &join_key)
+            .map(|((_, neg_time), _)| -*neg_time)
+            .max();
+        if let Some(et) = most_recent {
+            if et <= watermark {
+                let keys_to_remove: Vec<_> = right_index
+                    .range((join_key.clone(), i64::MIN)..)
+                    .take_while(|((k, _), _)| k == &join_key)
+                    .map(|((k, nt), _)| (k.clone(), *nt))
+                    .collect();
+                for key in keys_to_remove {
+                    right_index.remove(&key);
+                }
+            }
         }
     }
 }
