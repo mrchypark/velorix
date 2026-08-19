@@ -491,13 +491,16 @@ CONT linear interpolation at p*(N-1), exact across retract and restart
 
 - [x] **Design CROSS JOIN semantics for incremental systems**
 - [x] **Implement interval-based joins (overlap predicates)**
-- [ ] **Implement temporal join (as-of, temporal containment)** (deferred by
-      design review: watermark-gated match invalidation is a separate design
-      item; see phase-8-interval-join-design.md scope)
+- [x] **Implement temporal join (as-of, temporal containment)** (admission,
+      runtime, checkpoint/restore, watermark-based right-side eviction, bag
+      semantics for multiple left rows per join key; resource contract
+      enforcement)
 - [x] **Define state boundedness for non-equi joins**
 - [x] **Add retraction semantics for non-equi matches**
 
-**Current state**: Interval overlap INNER JOIN complete
+**Current state**: Temporal ASOF join complete
+(`temporal_join_materializes_asof_match_and_retracts` + 5 additional
+tests); Interval overlap INNER JOIN complete
 (`interval_join_materializes_overlap_retraction_and_restart`); CROSS JOIN
 complete (`cross_join_materializes_all_pairs_exactly_across_retract_and_restart`)
 with full recompute-diff exact retractions, resource contracts, checkpoint

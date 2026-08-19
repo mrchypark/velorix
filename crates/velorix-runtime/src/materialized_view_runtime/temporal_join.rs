@@ -29,10 +29,10 @@ pub struct TemporalJoinRuntime {
     /// Right-side rows indexed by (join_key, -event_time_ns) for
     /// reverse-chronological iteration per join key.
     ///
-    /// NOTE: no automatic eviction — ASOF join semantics require retaining
-    /// all historical right rows per join key until resource contract limits
-    /// are reached. A future watermark-per-join-key design could enable safe
-    /// eviction when all left rows for a key have been processed.
+    /// Eviction: after each epoch, for each join key we keep only the most
+    /// recent right row with event_time <= left_watermark. Older rows for
+    /// that key are superseded because all future left rows have event_time
+    /// >= watermark, so they will always match the newer row first.
     right_index: BTreeMap<(String, i64), TemporalRow>,
     /// Left-side rows by join key, then by event_time for bag semantics.
     /// Multiple left rows with the same join key but different event times
@@ -401,6 +401,8 @@ impl StandingProgramRuntime for TemporalJoinRuntime {
             advance_input_event_time_frontier(&mut next_event_time_frontiers, input)?;
         }
 
+        evict_right_index(&mut next_right, &next_left, &next_event_time_frontiers);
+
         if next_left.values().map(|m| m.len() as u64).sum::<u64>()
             > self.plan.resource_contract.max_rows_per_side
         {
@@ -649,6 +651,59 @@ fn recompute_from_staged(
         }
     }
     Ok(DeltaBatch::from_records(records))
+}
+
+/// Evict superseded right-side rows using the left input event time watermark.
+///
+/// For each join key, a right row at event_time R is superseded when:
+/// 1. There exists a newer right row at R' > R for the same key
+/// 2. R < L_min (below the minimum left event time for this key)
+/// 3. R' <= watermark (all future left rows have et >= watermark >= R')
+///
+/// This means all current AND future left rows will match R' instead of R.
+fn evict_right_index(
+    right_index: &mut BTreeMap<(String, i64), TemporalRow>,
+    left_rows: &BTreeMap<String, BTreeMap<i64, TemporalRow>>,
+    left_event_time_frontiers: &[InputEventTimeFrontier],
+) {
+    let watermark = match left_event_time_frontiers.iter().map(|f| f.watermark_ns).min() {
+        Some(w) if w > 0 => w,
+        _ => return,
+    };
+    let mut keys_to_check: BTreeSet<String> = BTreeSet::new();
+    for ((key, _), _) in right_index.iter() {
+        keys_to_check.insert(key.clone());
+    }
+    for join_key in keys_to_check {
+        let l_min = left_rows
+            .get(&join_key)
+            .and_then(|by_time| by_time.keys().next())
+            .copied();
+        if l_min.is_none() {
+            continue;
+        }
+        let l_min = l_min.unwrap();
+        let mut to_remove = Vec::new();
+        let mut prev_neg_time: Option<i64> = None;
+        for ((k, neg_time), _) in right_index.range((join_key.clone(), i64::MIN)..) {
+            if *k != join_key {
+                break;
+            }
+            let event_time = -*neg_time;
+            if event_time <= watermark {
+                if let Some(prev) = prev_neg_time {
+                    let prev_event_time = -prev;
+                    if event_time < l_min && prev_event_time <= l_min {
+                        to_remove.push((k.clone(), *neg_time));
+                    }
+                }
+                prev_neg_time = Some(*neg_time);
+            }
+        }
+        for key in to_remove {
+            right_index.remove(&key);
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

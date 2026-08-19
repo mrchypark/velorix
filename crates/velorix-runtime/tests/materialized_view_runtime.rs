@@ -23183,3 +23183,165 @@ fn temporal_join_simultaneous_left_and_right_same_epoch() {
         1000
     );
 }
+
+fn relation_input_with_watermark(
+    catalog: &VelorixRelationCatalogV1,
+    stream_id: &str,
+    start_offset_inclusive: u64,
+    end_offset_exclusive: u64,
+    batch: RecordBatch,
+    watermark_ns: i64,
+    max_observed_event_time_ns: i64,
+) -> RelationInputBatch {
+    RelationInputBatch {
+        encoding: RelationInputEncodingV1::SourceRelationV1,
+        relation_id: catalog.relation_schema.relation_id.clone(),
+        relation_version: catalog.relation_schema.relation_version.clone(),
+        stream_id: stream_id.into(),
+        partition_id: 0,
+        schema_fingerprint: catalog.schema_fingerprint.to_string(),
+        start_offset_inclusive,
+        end_offset_exclusive,
+        event_time_watermark: Some(InputEventTimeWatermark {
+            stream_id: stream_id.into(),
+            partition_id: 0,
+            event_time_column_id: "event_time".into(),
+            watermark_ns,
+            max_observed_event_time_ns,
+        }),
+        batches: vec![batch],
+    }
+}
+
+#[test]
+fn temporal_join_right_eviction_removes_superseded_rows() {
+    let rides = temporal_join_rides_catalog();
+    let prices = temporal_join_prices_catalog();
+    let catalogs = vec![rides.clone(), prices.clone()];
+    let input_schemas: Vec<RelationSchema> = catalogs
+        .iter()
+        .map(|c| catalog_input_relation_schema(c).unwrap())
+        .collect();
+    let output_schema = temporal_join_output_schema();
+    let sql = "select l.ride_id, l.booking_start, l.event_time, p.price, p.event_time as price_event_time from rides l join prices p on p.event_time <= l.event_time";
+    let identity = standing_identity_with_view(sql, "enriched");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &catalogs,
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("ev-1").unwrap(),
+            vec![relation_input(
+                &prices,
+                "ev-prices",
+                0,
+                3,
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("vehicle_id", DataType::Utf8, false),
+                        Field::new("price", DataType::Int64, false),
+                        Field::new("event_time", DataType::Int64, false),
+                        Field::new("delta", DataType::Int64, false),
+                    ])),
+                    vec![
+                        Arc::new(StringArray::from(vec!["p1", "p1", "p1"])) as _,
+                        Arc::new(Int64Array::from(vec![1000, 2000, 3000])) as _,
+                        Arc::new(Int64Array::from(vec![100, 200, 300])) as _,
+                        Arc::new(Int64Array::from(vec![1, 1, 1])) as _,
+                    ],
+                )
+                .unwrap(),
+            )],
+        )
+        .unwrap();
+    runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("ev-2").unwrap(),
+            vec![relation_input(
+                &rides,
+                "ev-rides",
+                0,
+                1,
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("ride_id", DataType::Utf8, false),
+                        Field::new("booking_start", DataType::Int64, false),
+                        Field::new("event_time", DataType::Int64, false),
+                        Field::new("delta", DataType::Int64, false),
+                    ])),
+                    vec![
+                        Arc::new(StringArray::from(vec!["p1"])) as _,
+                        Arc::new(Int64Array::from(vec![10])) as _,
+                        Arc::new(Int64Array::from(vec![250])) as _,
+                        Arc::new(Int64Array::from(vec![1])) as _,
+                    ],
+                )
+                .unwrap(),
+            )],
+        )
+        .unwrap();
+    runtime
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("ev-3").unwrap(),
+            vec![relation_input_with_watermark(
+                &rides,
+                "ev-rides",
+                1,
+                2,
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("ride_id", DataType::Utf8, false),
+                        Field::new("booking_start", DataType::Int64, false),
+                        Field::new("event_time", DataType::Int64, false),
+                        Field::new("delta", DataType::Int64, false),
+                    ])),
+                    vec![
+                        Arc::new(StringArray::from(vec!["p1"])) as _,
+                        Arc::new(Int64Array::from(vec![20])) as _,
+                        Arc::new(Int64Array::from(vec![400])) as _,
+                        Arc::new(Int64Array::from(vec![1])) as _,
+                    ],
+                )
+                .unwrap(),
+                350,
+                400,
+            )],
+        )
+        .unwrap();
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".into(),
+                program_id: "program-purchases".into(),
+                view_id: "enriched".into(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(3),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    assert_eq!(batch.num_rows(), 2);
+    let prices_col: Vec<i64> = (0..2)
+        .map(|i| {
+            batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(i)
+        })
+        .collect();
+    assert!(prices_col.contains(&2000));
+    assert!(prices_col.contains(&3000));
+}
