@@ -192,7 +192,10 @@ impl CrossJoinRuntime {
                 records.push(DeltaRecord::new(
                     DeltaKey::from_json(Value::Object(output)),
                     DeltaValue::from_json(Value::Object(serde_json::Map::new())),
-                    1,
+                    left_row
+                        .weight
+                        .checked_mul(right_row.weight)
+                        .ok_or_else(invalid_runtime_state)?,
                 ));
                 if records.len() as u64 > self.plan.resource_contract.max_pairs_per_epoch {
                     return Err(StandingProgramRuntimeError::InvalidProgramIdentity {

@@ -11,6 +11,20 @@
 
 use super::*;
 
+/// Typed value comparison: i64, f64, then canonical JSON string fallback.
+/// Used for MIN/MAX extrema and WHERE clause comparison.
+fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
+    if let (Some(a_i64), Some(b_i64)) = (a.as_i64(), b.as_i64()) {
+        return a_i64.cmp(&b_i64);
+    }
+    if let (Some(a_f64), Some(b_f64)) = (a.as_f64(), b.as_f64()) {
+        return a_f64
+            .partial_cmp(&b_f64)
+            .unwrap_or(std::cmp::Ordering::Equal);
+    }
+    canonical_json(a).cmp(&canonical_json(b))
+}
+
 pub struct ScalarAggregateFilterRuntime {
     identity: StandingProgramIdentity,
     outer_catalog: VelorixRelationCatalogV1,
@@ -170,14 +184,16 @@ impl ScalarAggregateFilterRuntime {
                 .scalar_state
                 .values
                 .values()
-                .next()
+                .filter(|e| e.weight > 0)
+                .min_by(|a, b| compare_values(&a.value, &b.value))
                 .map(|entry| entry.value.clone())
                 .unwrap_or(Value::Null),
             LogicalPlanAggregateFunctionV1::Max => self
                 .scalar_state
                 .values
                 .values()
-                .next_back()
+                .filter(|e| e.weight > 0)
+                .max_by(|a, b| compare_values(&a.value, &b.value))
                 .map(|entry| entry.value.clone())
                 .unwrap_or(Value::Null),
             LogicalPlanAggregateFunctionV1::CountDistinct => {
@@ -198,14 +214,7 @@ impl ScalarAggregateFilterRuntime {
             // UNKNOWN in SQL; WHERE removes the row.
             return false;
         }
-        // Use numeric comparison when both are numbers, otherwise fall back
-        // to canonical JSON string ordering for other types.
-        let ordering =
-            if let (Some(outer_num), Some(scalar_num)) = (outer_value.as_i64(), scalar.as_i64()) {
-                outer_num.cmp(&scalar_num)
-            } else {
-                canonical_json(outer_value).cmp(&canonical_json(scalar))
-            };
+        let ordering = compare_values(outer_value, scalar);
         match self.plan.comparison_op {
             ScalarSubqueryComparisonOp::Eq => ordering == std::cmp::Ordering::Equal,
             ScalarSubqueryComparisonOp::NotEq => ordering != std::cmp::Ordering::Equal,
@@ -276,6 +285,9 @@ impl StandingProgramRuntime for ScalarAggregateFilterRuntime {
         let mut next_event_time_frontiers = self.input_event_time_frontiers.clone();
         // Phase 7.2 contract: both inputs are applied atomically before the
         // end-of-epoch scalar and output are computed.
+        // Save state for rollback on resource contract failure.
+        let outer_rows_before = self.outer_rows.clone();
+        let scalar_state_before = self.scalar_state.clone();
         let scalar_before = self.current_scalar()?;
         for input in &input_changes {
             if input.relation_id == self.plan.outer_input_relation_id {
@@ -290,6 +302,16 @@ impl StandingProgramRuntime for ScalarAggregateFilterRuntime {
             advance_input_frontier(&mut next_frontiers, input)?;
             advance_input_event_time_frontier(&mut next_event_time_frontiers, input)?;
         }
+        if u64::try_from(self.outer_rows.len()).unwrap_or(u64::MAX)
+            > self.plan.resource_contract.max_outer_rows
+        {
+            // Rollback state mutation on resource contract failure.
+            self.outer_rows = outer_rows_before;
+            self.scalar_state = scalar_state_before;
+            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "scalar_aggregate_filter_resource_contract",
+            });
+        }
         let scalar_after = self.current_scalar()?;
         let scalar_changed = scalar_before != scalar_after;
         let next_output = if scalar_changed {
@@ -297,13 +319,6 @@ impl StandingProgramRuntime for ScalarAggregateFilterRuntime {
         } else {
             self.apply_outer_deltas_only()?
         };
-        if u64::try_from(self.outer_rows.len()).unwrap_or(u64::MAX)
-            > self.plan.resource_contract.max_outer_rows
-        {
-            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
-                field: "scalar_aggregate_filter_resource_contract",
-            });
-        }
         let output_delta = self
             .published_output
             .inverse()
@@ -699,6 +714,9 @@ impl ScalarAggregateFilterRuntime {
                             .count
                             .checked_add(record.weight)
                             .ok_or_else(invalid_runtime_state)?;
+                        if self.scalar_state.count < 0 {
+                            return Err(invalid_runtime_state());
+                        }
                     }
                 }
                 LogicalPlanAggregateFunctionV1::Sum => {
@@ -718,6 +736,9 @@ impl ScalarAggregateFilterRuntime {
                         .count
                         .checked_add(record.weight)
                         .ok_or_else(invalid_runtime_state)?;
+                    if self.scalar_state.count < 0 {
+                        return Err(invalid_runtime_state());
+                    }
                 }
                 LogicalPlanAggregateFunctionV1::Avg => {
                     let amount = value.as_i64().ok_or_else(invalid_runtime_state)?;
@@ -842,7 +863,7 @@ impl ScalarAggregateFilterRuntime {
         Ok(DeltaRecord::new(
             DeltaKey::from_json(output_key),
             DeltaValue::from_json(Value::Object(output)),
-            1,
+            row.weight,
         ))
     }
 }
