@@ -322,7 +322,6 @@ fn openapi_ingest_materialization_schema() -> Value {
             "state_payload_writes": { "type": "integer", "minimum": 0 },
             "checkpoint_record_writes": { "type": "integer", "minimum": 0 },
             "checkpoint_pointer_writes": { "type": "integer", "minimum": 0 },
-            "latest_cache_writes": { "type": "integer", "minimum": 0 },
             "checkpoint_publication_writes": { "type": "integer", "minimum": 0 }
         }
     })

@@ -27,7 +27,6 @@ pub(super) struct PreparedStandingRuntimeApplySummary {
     state_payload_writes: usize,
     checkpoint_record_writes: usize,
     checkpoint_pointer_writes: usize,
-    latest_cache_writes: usize,
     convergence_writes: usize,
     compaction_scheduled: usize,
 }
@@ -38,7 +37,6 @@ pub(super) struct StandingRuntimeCheckpointWriteSummary {
     pub(super) state_payload_writes: usize,
     pub(super) checkpoint_record_writes: usize,
     pub(super) checkpoint_pointer_writes: usize,
-    pub(super) latest_cache_writes: usize,
     pub(super) compaction_scheduled: usize,
     pub(super) output_refs: Vec<String>,
 }
@@ -205,6 +203,16 @@ pub(super) async fn ingest_relation_rows(
     .await
 }
 
+/// Ingest an epoch of batches atomically.
+///
+/// This endpoint processes all batches in the request as a single atomic transaction.
+/// If any batch fails (validation, append, or commit), the entire epoch fails and
+/// no batches are persisted. The caller receives an error response indicating the
+/// failure reason.
+///
+/// On success, all batches are durably persisted and the response includes
+/// per-batch details. On failure, the caller should retry the entire epoch
+/// with the same idempotency key to ensure exactly-once semantics.
 pub(super) async fn ingest_epoch(
     State(state): State<ApiState>,
     Json(request): Json<IngestEpochRequest>,
@@ -349,6 +357,11 @@ pub(super) async fn ingest_epoch(
     ))
 }
 
+/// Append prepared ingest batches atomically.
+///
+/// All batches are appended concurrently but the operation is atomic:
+/// if any batch fails, the entire operation fails and no batches are committed.
+/// This ensures that the epoch is either fully committed or fully rolled back.
 pub(super) async fn append_prepared_ingest_epoch_batches(
     state: &ApiState,
     prepared_batches: &[PreparedIngestBatch],
@@ -394,7 +407,6 @@ pub(super) async fn append_prepared_ingest_epoch_batches(
                             state_payload_writes: 0,
                             checkpoint_record_writes: 0,
                             checkpoint_pointer_writes: 0,
-                            latest_cache_writes: 0,
                             checkpoint_publication_writes: 0,
                         },
                         timings: IngestTimingResponse {
@@ -469,7 +481,6 @@ pub(super) fn materialization_response(
         state_payload_writes: summary.state_payload_writes,
         checkpoint_record_writes: summary.checkpoint_record_writes,
         checkpoint_pointer_writes: summary.checkpoint_pointer_writes,
-        latest_cache_writes: summary.latest_cache_writes,
         checkpoint_publication_writes: summary.convergence_writes,
     }
 }
@@ -1637,7 +1648,6 @@ pub(super) async fn apply_standing_runtime_prepared_ingests(
         summary.state_payload_writes += checkpoint_write_summary.state_payload_writes;
         summary.checkpoint_record_writes += checkpoint_write_summary.checkpoint_record_writes;
         summary.checkpoint_pointer_writes += checkpoint_write_summary.checkpoint_pointer_writes;
-        summary.latest_cache_writes += checkpoint_write_summary.latest_cache_writes;
         summary.compaction_scheduled += checkpoint_write_summary.compaction_scheduled;
         record_materialized_through(
             &mut summary.materialized_through,

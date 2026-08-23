@@ -1496,13 +1496,13 @@ async fn standing_runtime_checkpoint_pointer_conflict_keeps_winning_checkpoint_a
 }
 
 #[tokio::test]
-async fn standing_runtime_latest_cache_failure_after_pointer_publish_recovers_from_metadata() {
+async fn standing_runtime_checkpoint_publish_uses_metadata_as_authoritative() {
     let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let failing_store = Arc::new(ArmedPrefixFailingObjectStore::new(Arc::clone(&inner)));
+    let store = Arc::clone(&inner);
     let meta_store = Arc::new(InMemoryMetaStore::default());
     let state = test_api_state_with_store(
-        Arc::clone(&failing_store) as Arc<dyn ObjectStore>,
-        "api-test-latest-cache-failure",
+        store,
+        "api-test-metadata-authoritative",
         false,
     )
     .await
@@ -1524,14 +1524,7 @@ async fn standing_runtime_latest_cache_failure_after_pointer_publish_recovers_fr
     .await
     .unwrap();
 
-    let next = advanced_test_runtime_checkpoint(&checkpoint, 1, "latest-cache-failure");
-    let latest_key = ObjectKey::standing_runtime_latest_checkpoint(
-        &checkpoint.identity.tenant_id,
-        &checkpoint.identity.program_id,
-        "purchases_by_user",
-    )
-    .unwrap();
-    failing_store.arm(latest_key.as_str());
+    let next = advanced_test_runtime_checkpoint(&checkpoint, 1, "metadata-authoritative");
     persist_standing_runtime_checkpoint(
         &state,
         "purchases_by_user",
@@ -1541,11 +1534,11 @@ async fn standing_runtime_latest_cache_failure_after_pointer_publish_recovers_fr
         None,
     )
     .await
-    .expect("metadata pointer publication is authoritative even when latest cache write fails");
+    .expect("metadata pointer publication should succeed");
 
     let restarted = test_api_state_with_store(
-        Arc::clone(&failing_store) as Arc<dyn ObjectStore>,
-        "api-test-latest-cache-failure-restarted",
+        inner,
+        "api-test-metadata-authoritative-restarted",
         false,
     )
     .await
@@ -2631,7 +2624,7 @@ async fn standing_runtime_checkpoint_read_ignores_object_store_when_meta_pointer
 }
 
 #[tokio::test]
-async fn standing_runtime_checkpoint_read_uses_meta_pointer_when_latest_cache_is_stale() {
+async fn standing_runtime_checkpoint_read_always_uses_meta_pointer() {
     let meta_store = Arc::new(InMemoryMetaStore::default());
     let state = test_api_state().await.with_meta_store(meta_store);
     let checkpoint = test_runtime_checkpoint(Vec::new());
@@ -2651,20 +2644,6 @@ async fn standing_runtime_checkpoint_read_uses_meta_pointer_when_latest_cache_is
     )
     .await
     .unwrap();
-    let latest_key = ObjectKey::standing_runtime_latest_checkpoint(
-        &checkpoint.identity.tenant_id,
-        &checkpoint.identity.program_id,
-        "purchases_by_user",
-    )
-    .unwrap();
-    let stale_latest_bytes = state
-        .store
-        .get(&Path::from(latest_key.as_str()))
-        .await
-        .unwrap()
-        .bytes()
-        .await
-        .unwrap();
 
     let mut next = test_runtime_checkpoint(Vec::new());
     next.logical_epoch = checkpoint.logical_epoch + 1;
@@ -2694,14 +2673,6 @@ async fn standing_runtime_checkpoint_read_uses_meta_pointer_when_latest_cache_is
     )
     .await
     .unwrap();
-    state
-        .store
-        .put(
-            &Path::from(latest_key.as_str()),
-            stale_latest_bytes.clone().into(),
-        )
-        .await
-        .unwrap();
 
     let restored =
         read_latest_standing_runtime_checkpoint(&state, &next.identity, "purchases_by_user")
@@ -6404,9 +6375,9 @@ async fn direct_apply_uses_prepared_current_batch_without_replaying_ingest_objec
         .filter(|path| path.starts_with("v1/standing-runtime-checkpoints/"))
         .collect::<Vec<_>>();
     assert_eq!(
-        checkpoint_list_prefixes,
-        Vec::<String>::new(),
-        "direct apply should read latest checkpoint cache instead of listing checkpoint epochs"
+        checkpoint_list_prefixes.len(),
+        1,
+        "direct apply without meta_store falls back to listing checkpoint epochs"
     );
 }
 
@@ -8030,7 +8001,6 @@ async fn rest_ingest_optimization_modes_report_timings_and_materialize_correctly
         first_ingest.1["materialization"]["checkpoint_pointer_writes"],
         0
     );
-    assert_eq!(first_ingest.1["materialization"]["latest_cache_writes"], 1);
     assert_eq!(
         first_ingest.1["materialization"]["checkpoint_publication_writes"],
         1
@@ -8201,7 +8171,6 @@ async fn rest_ingest_optimization_modes_report_timings_and_materialize_correctly
         epoch_ingest.1["materialization"]["checkpoint_pointer_writes"],
         0
     );
-    assert_eq!(epoch_ingest.1["materialization"]["latest_cache_writes"], 1);
     assert_eq!(
         epoch_ingest.1["materialization"]["checkpoint_publication_writes"],
         1

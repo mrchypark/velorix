@@ -236,21 +236,34 @@ impl StandingProgramRuntime for FilterProjectRuntime {
         }
         let output_delta = combined;
         let previous_output = self.published_output.clone();
-        self.full_output =
-            apply_filter_project_full_output_delta(&self.full_output, &output_delta, &self.plan)?;
+        // Stage changes: clone state before mutation
+        let mut staged_full_output = self.full_output.clone();
+        staged_full_output =
+            apply_filter_project_full_output_delta(&staged_full_output, &output_delta, &self.plan)?;
         let next_published_output =
-            filter_project_published_output_from_full_output(self.full_output.clone(), &self.plan)?;
+            filter_project_published_output_from_full_output(staged_full_output.clone(), &self.plan)?;
         let next_published_output = apply_filter_project_top_k_to_published_output(
             next_published_output,
             self.plan.top_k.as_ref(),
             &self.plan,
         )?;
-        self.published_output =
+        let staged_published_output =
             strip_filter_project_hidden_order_value(next_published_output, &self.plan)?;
+        // Validate output before commit
         let visible_delta = previous_output
-            .inverse()
-            .map_err(|_| invalid_runtime_state())?
-            .combine(&self.published_output);
+            .diff(&staged_published_output)
+            .map_err(|_| invalid_runtime_state())?;
+        let output_batches = vec![ViewOutputBatch {
+            view_id: self.identity.view_ids[0].clone(),
+            schema_fingerprint: self.output_schema_fingerprint(),
+            batches: vec![materialized_generic_delta_to_record_batch(
+                &self.output_schema,
+                &staged_published_output,
+            )?],
+        }];
+        // Commit staged state
+        self.full_output = staged_full_output;
+        self.published_output = staged_published_output;
         self.input_frontiers = input_frontiers.clone();
         self.input_event_time_frontiers = input_event_time_frontiers.clone();
         self.applied_epochs
@@ -268,11 +281,7 @@ impl StandingProgramRuntime for FilterProjectRuntime {
                 schema_fingerprint: self.output_schema_fingerprint(),
                 delta: visible_delta,
             }],
-            output_batches: vec![ViewOutputBatch {
-                view_id: self.identity.view_ids[0].clone(),
-                schema_fingerprint: self.output_schema_fingerprint(),
-                batches: vec![self.materialized_batch()?],
-            }],
+            output_batches,
         })
     }
 

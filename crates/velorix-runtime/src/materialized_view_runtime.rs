@@ -1281,7 +1281,7 @@ impl NativeDeltaOperator for NativePlannedJoinPublisherOperator {
         let visible =
             apply_top_k_to_published_output(visible, self.plan.top_k.as_ref(), &aggregate_outputs)
                 .map_err(|error| NativeOperatorError::InvalidGraph(error.to_string()))?;
-        let delta = self.published_state.inverse()?.combine(&visible);
+        let delta = self.published_state.diff(&visible)?;
         self.full_state = next_full;
         self.published_state = visible;
         Ok(DeltaBatch::from_records(delta.net_rows()?))

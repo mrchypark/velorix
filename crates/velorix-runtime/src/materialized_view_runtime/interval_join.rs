@@ -394,9 +394,19 @@ impl StandingProgramRuntime for IntervalJoinRuntime {
         let next_output = self.recompute_all_matches(&next_left, &next_right)?;
         let output_delta = self
             .published_output
-            .inverse()
-            .map_err(|_| invalid_runtime_state())?
-            .combine(&next_output);
+            .diff(&next_output)
+            .map_err(|_| invalid_runtime_state())?;
+        // Validate output before commit
+        let output_batches = vec![ViewOutputBatch {
+            view_id: self.identity.view_ids[0].clone(),
+            schema_fingerprint: self.output_schema_fingerprint(),
+            batches: vec![materialized_delta_to_record_batch(
+                &self.output_schema,
+                &next_output,
+                Some(&[]),
+            )?],
+        }];
+        // Commit staged state
         self.left_intervals = next_left;
         self.right_intervals = next_right;
         self.published_output = next_output;
@@ -417,11 +427,7 @@ impl StandingProgramRuntime for IntervalJoinRuntime {
                 schema_fingerprint: self.output_schema_fingerprint(),
                 delta: output_delta,
             }],
-            output_batches: vec![ViewOutputBatch {
-                view_id: self.identity.view_ids[0].clone(),
-                schema_fingerprint: self.output_schema_fingerprint(),
-                batches: vec![self.materialized_batch()?],
-            }],
+            output_batches,
         })
     }
 

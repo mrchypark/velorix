@@ -1465,7 +1465,7 @@ impl NativeDeltaOperator for NativeTopKOperator {
         require_port(port_id, "input")?;
         let next_input = DeltaBatch::from_records(self.input_state.combine(input).net_rows()?);
         let next_output = self.selected_output_from(&next_input)?;
-        let delta = self.output_state.inverse()?.combine(&next_output);
+        let delta = self.output_state.diff(&next_output)?;
         self.input_state = next_input;
         self.output_state = next_output;
         Ok(DeltaBatch::from_records(delta.net_rows()?))

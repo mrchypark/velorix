@@ -7109,6 +7109,7 @@ dependencies = [
  "bytes",
  "datafusion",
  "futures",
+ "hex",
  "object_store 0.14.1",
  "serde",
  "serde_json",
