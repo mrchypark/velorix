@@ -1824,7 +1824,6 @@ struct IngestMaterializationResponse {
     state_payload_writes: usize,
     checkpoint_record_writes: usize,
     checkpoint_pointer_writes: usize,
-    latest_cache_writes: usize,
     checkpoint_publication_writes: usize,
 }
 
@@ -2072,7 +2071,7 @@ async fn readyz(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> 
             },
             "checkpoint_coalescing": "one checkpoint publish per affected active view per committed epoch",
             "latency_diagnostics": "ingest responses include total_us, avg_batch_us, avg_row_us, rows_per_second, workload shape, and write coalescing counters; detailed stage timings belong in traces/metrics",
-            "materialization_write_counters": ["output_delta_writes", "state_payload_writes", "checkpoint_record_writes", "checkpoint_pointer_writes", "latest_cache_writes", "checkpoint_publication_writes"]
+            "materialization_write_counters": ["output_delta_writes", "state_payload_writes", "checkpoint_record_writes", "checkpoint_pointer_writes", "checkpoint_publication_writes"]
         },
         "admin_auth": {
             "configured": state.admin_bearer_token.is_some(),
@@ -2200,7 +2199,8 @@ async fn create_relation_catalog(
             .store_relation_catalog(catalog.clone())
             .await
             .map_err(meta_error_to_api)?;
-        let _ = materialize_relation_catalog_to_object_store(&state, &catalog).await;
+        // S3 mirror is required for consistency - propagate failure
+        materialize_relation_catalog_to_object_store(&state, &catalog).await?;
         match outcome {
             StoreRelationCatalogOutcome::Created => CreateRelationCatalogOutcome::Created,
             StoreRelationCatalogOutcome::Duplicate => CreateRelationCatalogOutcome::Duplicate,

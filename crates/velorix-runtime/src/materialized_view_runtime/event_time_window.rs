@@ -249,9 +249,19 @@ impl StandingProgramRuntime for TumblingEventTimeAggregateRuntime {
             &self.plan.aggregate_outputs,
         )?;
         let output_delta = previous_output
-            .inverse()
-            .map_err(|_| invalid_runtime_state())?
-            .combine(&self.published_output);
+            .diff(&self.published_output)
+            .map_err(|_| invalid_runtime_state())?;
+        // Validate output before commit
+        let output_batches = vec![ViewOutputBatch {
+            view_id: self.identity.view_ids[0].clone(),
+            schema_fingerprint: self.output_schema_fingerprint(),
+            batches: vec![materialized_tumbling_delta_to_record_batch(
+                &self.output_schema,
+                &self.published_output,
+                &self.plan.aggregate_outputs,
+            )?],
+        }];
+        // Commit staged state
         self.input_frontiers = next_frontiers.clone();
         self.input_event_time_frontiers = next_event_time_frontiers.clone();
         self.applied_epochs
@@ -269,11 +279,7 @@ impl StandingProgramRuntime for TumblingEventTimeAggregateRuntime {
                 schema_fingerprint: self.output_schema_fingerprint(),
                 delta: output_delta,
             }],
-            output_batches: vec![ViewOutputBatch {
-                view_id: self.identity.view_ids[0].clone(),
-                schema_fingerprint: self.output_schema_fingerprint(),
-                batches: vec![self.materialized_batch()?],
-            }],
+            output_batches,
         })
     }
 

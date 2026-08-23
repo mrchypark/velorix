@@ -71,7 +71,6 @@ pub(super) async fn persist_standing_runtime_checkpoint(
         state_payload_writes: 1,
         checkpoint_record_writes: 1,
         checkpoint_pointer_writes: usize::from(state.meta_store.is_some()),
-        latest_cache_writes: 1,
         compaction_scheduled: 0,
         output_refs: Vec::new(),
     };
@@ -117,12 +116,6 @@ pub(super) async fn persist_standing_runtime_checkpoint(
     } else {
         expected_previous.clone()
     };
-    let latest_key = ObjectKey::standing_runtime_latest_checkpoint(
-        &checkpoint.identity.tenant_id,
-        &checkpoint.identity.program_id,
-        view_id,
-    )
-    .map_err(ApiError::bad_request)?;
     let replay_checkpoints = merged_standing_runtime_replay_checkpoints(
         previous_record.as_ref(),
         replay_checkpoints_to_merge,
@@ -185,21 +178,6 @@ pub(super) async fn persist_standing_runtime_checkpoint(
         view_id,
         Some(candidate),
     )?;
-    let latest_write = state
-        .store
-        .put(
-            &ObjectPath::from(latest_key.as_str()),
-            bytes::Bytes::from(bytes).into(),
-        )
-        .await;
-    if let Err(error) = latest_write {
-        if state.meta_store.is_none() {
-            return Err(ApiError::internal(error));
-        }
-    }
-    if let Some(timer) = timer.as_mut() {
-        timer.mark("checkpoint_latest_cache");
-    }
     if maybe_spawn_background_view_output_compaction_after_checkpoint(
         state,
         view_id,
@@ -379,15 +357,50 @@ async fn resolve_authoritative_view_cursor_within_budget(
                 ))
             })?,
         None => {
-            let latest_key = ObjectKey::standing_runtime_latest_checkpoint(
-                tenant_id,
-                producer_program_id,
-                producer_view_id,
-            )
-            .map_err(ApiError::bad_request)?;
+            eprintln!(
+                "WARNING: No meta_store configured, falling back to S3 LIST scan for view cursor resolution \
+                 (tenant={}, program={}, view={})",
+                tenant_id, producer_program_id, producer_view_id
+            );
+            let prefix = ObjectPath::from(format!(
+                "v1/standing-runtime-checkpoints/{}/{}/{}/epochs",
+                tenant_id, producer_program_id, producer_view_id
+            ));
+            let mut stream = state.store.list(Some(&prefix));
+            let mut latest_checkpoint: Option<(String, StandingRuntimeCheckpointKeyParts)> = None;
+            while let Some(meta) = stream.try_next().await.map_err(ApiError::internal)? {
+                let location = meta.location.to_string();
+                if location.ends_with(".checkpoint.json") {
+                    let (_, parts) =
+                        ObjectKey::parse_standing_runtime_checkpoint(location.clone())
+                            .map_err(ApiError::bad_request)?;
+                    latest_checkpoint = Some(match latest_checkpoint {
+                        Some((current, current_parts))
+                            if current_parts.logical_epoch > parts.logical_epoch =>
+                        {
+                            (current, current_parts)
+                        }
+                        Some((_current, current_parts))
+                            if current_parts.logical_epoch == parts.logical_epoch =>
+                        {
+                            return Err(ApiError::bad_request(format!(
+                                "multiple standing runtime checkpoints for `{}/{}/{}` epoch {}",
+                                tenant_id, producer_program_id, producer_view_id, parts.logical_epoch
+                            )));
+                        }
+                        _ => (location, parts),
+                    });
+                }
+            }
+            let Some((latest_checkpoint_path, _)) = latest_checkpoint else {
+                return Err(ApiError::bad_request(format!(
+                    "view cursor edge `{}` has no producer checkpoint",
+                    cursor.input_edge
+                )));
+            };
             let bytes = state
                 .store
-                .get(&ObjectPath::from(latest_key.as_str()))
+                .get(&ObjectPath::from(latest_checkpoint_path.clone()))
                 .await
                 .map_err(ApiError::internal)?
                 .bytes()
@@ -1265,24 +1278,32 @@ pub(super) async fn rehydrate_empty_meta_checkpoint_pointer_and_retry_publish(
         )
         .await
         .map_err(meta_error_to_api)?;
-    if current.is_some() {
-        return Err(standing_runtime_checkpoint_publish_conflict(&candidate));
-    }
-    validate_checkpoint_pointer_object_exists_for_meta_rehydration(state, previous).await?;
-
-    match meta_store
-        .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
-            expected_previous: None,
-            candidate: previous.clone(),
-            owner: owner.clone(),
-        })
-        .await
-        .map_err(meta_error_to_api)?
-    {
-        PublishStandingRuntimeCheckpointOutcome::Published
-        | PublishStandingRuntimeCheckpointOutcome::Duplicate => {}
-        PublishStandingRuntimeCheckpointOutcome::Conflict => {
+    match current {
+        Some(ref current_pointer) if current_pointer == previous => {
+            // Previous was already published by a prior interrupted rehydration.
+            // Skip publishing previous and proceed directly to publishing candidate.
+        }
+        Some(_) => {
             return Err(standing_runtime_checkpoint_publish_conflict(&candidate));
+        }
+        None => {
+            validate_checkpoint_pointer_object_exists_for_meta_rehydration(state, previous)
+                .await?;
+            match meta_store
+                .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
+                    expected_previous: None,
+                    candidate: previous.clone(),
+                    owner: owner.clone(),
+                })
+                .await
+                .map_err(meta_error_to_api)?
+            {
+                PublishStandingRuntimeCheckpointOutcome::Published
+                | PublishStandingRuntimeCheckpointOutcome::Duplicate => {}
+                PublishStandingRuntimeCheckpointOutcome::Conflict => {
+                    return Err(standing_runtime_checkpoint_publish_conflict(&candidate));
+                }
+            }
         }
     }
 
@@ -1431,12 +1452,6 @@ pub(super) async fn read_latest_standing_runtime_checkpoint(
     identity: &StandingProgramIdentity,
     view_id: &str,
 ) -> Result<Option<StandingRuntimeCheckpointRecord>, ApiError> {
-    let latest_key = ObjectKey::standing_runtime_latest_checkpoint(
-        &identity.tenant_id,
-        &identity.program_id,
-        view_id,
-    )
-    .map_err(ApiError::bad_request)?;
     if let Some(meta_store) = &state.meta_store {
         if let Some(pointer) = meta_store
             .read_standing_runtime_checkpoint(&identity.tenant_id, &identity.program_id, view_id)
@@ -1451,18 +1466,11 @@ pub(super) async fn read_latest_standing_runtime_checkpoint(
         }
         return Ok(None);
     }
-    match read_standing_runtime_checkpoint_record_from_latest_cache(
-        state,
-        identity,
-        view_id,
-        &latest_key,
-    )
-    .await
-    {
-        Ok(Some(record)) => return Ok(Some(record)),
-        Ok(None) => {}
-        Err(error) => return Err(error),
-    }
+    eprintln!(
+        "WARNING: No meta_store configured, falling back to S3 LIST scan for checkpoint read \
+         (tenant={}, program={}, view={})",
+        identity.tenant_id, identity.program_id, view_id
+    );
     let prefix = ObjectPath::from(format!(
         "v1/standing-runtime-checkpoints/{}/{}/{view_id}/epochs",
         identity.tenant_id, identity.program_id
@@ -1562,31 +1570,6 @@ pub(super) async fn read_latest_standing_runtime_checkpoint(
     validate_standing_runtime_checkpoint_output_manifest_records(state, &record).await?;
     validate_standing_runtime_checkpoint_replay_frontiers(&record)?;
 
-    Ok(Some(record))
-}
-
-pub(super) async fn read_standing_runtime_checkpoint_record_from_latest_cache(
-    state: &ApiState,
-    identity: &StandingProgramIdentity,
-    view_id: &str,
-    latest_key: &ObjectKey,
-) -> Result<Option<StandingRuntimeCheckpointRecord>, ApiError> {
-    let bytes = match state
-        .store
-        .get(&ObjectPath::from(latest_key.as_str()))
-        .await
-    {
-        Ok(object) => object.bytes().await.map_err(ApiError::internal)?,
-        Err(object_store::Error::NotFound { .. }) => return Ok(None),
-        Err(error) => return Err(ApiError::internal(error)),
-    };
-    let mut record = standing_runtime_checkpoint_record_from_slice(&bytes)
-        .map_err(|source| ApiError::bad_request(source.to_string()))?;
-    let pointer = standing_runtime_checkpoint_pointer_from_record(&record);
-    validate_standing_runtime_checkpoint_record(identity, view_id, &pointer, &record)?;
-    hydrate_standing_runtime_checkpoint_state_payload(state, &mut record).await?;
-    validate_standing_runtime_checkpoint_output_manifest_records(state, &record).await?;
-    validate_standing_runtime_checkpoint_replay_frontiers(&record)?;
     Ok(Some(record))
 }
 

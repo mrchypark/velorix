@@ -268,12 +268,22 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
             )?;
             let output_delta = self
                 .published_output
-                .inverse()
-                .map_err(|_| invalid_runtime_state())?
-                .combine(&visible_output);
+                .diff(&visible_output)
+                .map_err(|_| invalid_runtime_state())?;
             self.engine
                 .push_changes(logical_epoch, &DeltaBatch::default())
                 .map_err(|_| invalid_runtime_state())?;
+            // Validate output before commit
+            let output_batches = vec![ViewOutputBatch {
+                view_id: self.identity.view_ids[0].clone(),
+                schema_fingerprint: self.output_schema_fingerprint(),
+                batches: vec![materialized_delta_to_record_batch(
+                    &self.output_schema,
+                    &visible_output,
+                    Some(&aggregate_outputs),
+                )?],
+            }];
+            // Commit staged state
             self.filtered_aggregate_state = next_state;
             self.published_output = visible_output;
             self.input_frontiers = input_frontiers.clone();
@@ -292,11 +302,7 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
                     schema_fingerprint: self.output_schema_fingerprint(),
                     delta: output_delta,
                 }],
-                output_batches: vec![ViewOutputBatch {
-                    view_id: self.identity.view_ids[0].clone(),
-                    schema_fingerprint: self.output_schema_fingerprint(),
-                    batches: vec![self.materialized_batch()?],
-                }],
+                output_batches,
             });
         }
         let mut executor = LogicalPlanExecutor::SingleKeyAggregate {
@@ -320,7 +326,7 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
             Some(&aggregate_outputs),
         )?;
         let output_delta = project_aggregate_delta_outputs(output_delta, &aggregate_outputs)?;
-        let output_delta = if self.plan.top_k.is_some() {
+        let _output_delta = if self.plan.top_k.is_some() {
             let previous_output = self.published_output.clone();
             let full_output = filter_output_delta_for_having(
                 &self.engine.materialized_state(),
@@ -330,42 +336,75 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
                 Some(&aggregate_outputs),
             )?;
             let full_output = project_aggregate_delta_outputs(full_output, &aggregate_outputs)?;
-            self.published_output = apply_top_k_to_published_output(
+            let staged_output = apply_top_k_to_published_output(
                 full_output,
                 self.plan.top_k.as_ref(),
                 &aggregate_outputs,
             )?;
-            previous_output
-                .inverse()
-                .map_err(|_| invalid_runtime_state())?
-                .combine(&self.published_output)
+            // Validate output before commit
+            let output_batches = vec![ViewOutputBatch {
+                view_id: self.identity.view_ids[0].clone(),
+                schema_fingerprint: self.output_schema_fingerprint(),
+                batches: vec![materialized_delta_to_record_batch(
+                    &self.output_schema,
+                    &staged_output,
+                    Some(&aggregate_outputs),
+                )?],
+            }];
+            // Commit staged state
+            self.published_output = staged_output;
+            self.input_frontiers = executor_commit.input_frontiers.clone();
+            self.input_event_time_frontiers = executor_commit.input_event_time_frontiers.clone();
+            self.applied_epochs
+                .insert(idempotency_key_text, logical_epoch);
+            retain_recent_applied_epochs(&mut self.applied_epochs);
+            return Ok(EpochCommit {
+                logical_epoch,
+                idempotency_key,
+                input_frontiers: executor_commit.input_frontiers,
+                input_event_time_frontiers: executor_commit.input_event_time_frontiers,
+                output_deltas: vec![ViewOutputDelta {
+                    view_id: self.identity.view_ids[0].clone(),
+                    schema_fingerprint: self.output_schema_fingerprint(),
+                    delta: previous_output
+                        .diff(&self.published_output)
+                        .map_err(|_| invalid_runtime_state())?,
+                }],
+                output_batches,
+            });
         } else {
-            self.published_output =
+            let staged_output =
                 apply_published_output_delta(&self.published_output, &output_delta)?;
-            output_delta
+            // Validate output before commit
+            let output_batches = vec![ViewOutputBatch {
+                view_id: self.identity.view_ids[0].clone(),
+                schema_fingerprint: self.output_schema_fingerprint(),
+                batches: vec![materialized_delta_to_record_batch(
+                    &self.output_schema,
+                    &staged_output,
+                    Some(&aggregate_outputs),
+                )?],
+            }];
+            // Commit staged state
+            self.published_output = staged_output;
+            self.input_frontiers = executor_commit.input_frontiers.clone();
+            self.input_event_time_frontiers = executor_commit.input_event_time_frontiers.clone();
+            self.applied_epochs
+                .insert(idempotency_key_text, logical_epoch);
+            retain_recent_applied_epochs(&mut self.applied_epochs);
+            return Ok(EpochCommit {
+                logical_epoch,
+                idempotency_key,
+                input_frontiers: executor_commit.input_frontiers,
+                input_event_time_frontiers: executor_commit.input_event_time_frontiers,
+                output_deltas: vec![ViewOutputDelta {
+                    view_id: self.identity.view_ids[0].clone(),
+                    schema_fingerprint: self.output_schema_fingerprint(),
+                    delta: output_delta,
+                }],
+                output_batches,
+            });
         };
-        self.input_frontiers = executor_commit.input_frontiers.clone();
-        self.input_event_time_frontiers = executor_commit.input_event_time_frontiers.clone();
-        self.applied_epochs
-            .insert(idempotency_key_text, logical_epoch);
-        retain_recent_applied_epochs(&mut self.applied_epochs);
-
-        Ok(EpochCommit {
-            logical_epoch,
-            idempotency_key,
-            input_frontiers: executor_commit.input_frontiers,
-            input_event_time_frontiers: executor_commit.input_event_time_frontiers,
-            output_deltas: vec![ViewOutputDelta {
-                view_id: self.identity.view_ids[0].clone(),
-                schema_fingerprint: self.output_schema_fingerprint(),
-                delta: output_delta,
-            }],
-            output_batches: vec![ViewOutputBatch {
-                view_id: self.identity.view_ids[0].clone(),
-                schema_fingerprint: self.output_schema_fingerprint(),
-                batches: vec![self.materialized_batch()?],
-            }],
-        })
     }
 
     fn materialized_view_page(

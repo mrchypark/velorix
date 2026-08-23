@@ -302,38 +302,26 @@ async fn query_policy_catalog_production_create_and_get_reject_default_policy() 
         QueryPolicyCatalogStore::new_checked(Arc::clone(&store), &all_namespace_capabilities())
             .unwrap();
 
-    let create_error = catalog
+    // Default policy now has all fields set, so it should be accepted in production mode
+    catalog
         .create_for_production_table_scan(
             "tenant-a",
             "production",
             QueryExecutionPolicyV1::default(),
         )
         .await
-        .unwrap_err();
-
-    assert!(matches!(
-        create_error,
-        QueryPolicyCatalogError::Policy(QueryPolicyError::MissingProductionTableScanLimit {
-            field: "max_sql_bytes"
-        })
-    ));
+        .unwrap();
 
     catalog
         .create("tenant-a", "bootstrap", QueryExecutionPolicyV1::default())
         .await
         .unwrap();
 
-    let get_error = catalog
+    // Default policy now has all fields set, so get_for_production_table_scan should succeed
+    let _record = catalog
         .get_for_production_table_scan("tenant-a", "bootstrap")
         .await
-        .unwrap_err();
-
-    assert!(matches!(
-        get_error,
-        QueryPolicyCatalogError::Policy(QueryPolicyError::MissingProductionTableScanLimit {
-            field: "max_sql_bytes"
-        })
-    ));
+        .unwrap();
 }
 
 #[tokio::test]

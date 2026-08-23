@@ -321,9 +321,8 @@ impl StandingProgramRuntime for ScalarAggregateFilterRuntime {
         };
         let output_delta = self
             .published_output
-            .inverse()
-            .map_err(|_| invalid_runtime_state())?
-            .combine(&next_output);
+            .diff(&next_output)
+            .map_err(|_| invalid_runtime_state())?;
         if u64::try_from(
             output_delta
                 .net_rows()
@@ -338,6 +337,16 @@ impl StandingProgramRuntime for ScalarAggregateFilterRuntime {
             });
         }
         self.published_output = next_output;
+        // Validate output before commit
+        let output_batches = vec![ViewOutputBatch {
+            view_id: self.identity.view_ids[0].clone(),
+            schema_fingerprint: self.output_schema_fingerprint(),
+            batches: vec![materialized_generic_delta_to_record_batch(
+                &self.output_schema,
+                &self.published_output,
+            )?],
+        }];
+        // Commit staged state
         self.input_frontiers = next_frontiers.clone();
         self.input_event_time_frontiers = next_event_time_frontiers.clone();
         self.applied_epochs
@@ -355,11 +364,7 @@ impl StandingProgramRuntime for ScalarAggregateFilterRuntime {
                 schema_fingerprint: self.output_schema_fingerprint(),
                 delta: output_delta,
             }],
-            output_batches: vec![ViewOutputBatch {
-                view_id: self.identity.view_ids[0].clone(),
-                schema_fingerprint: self.output_schema_fingerprint(),
-                batches: vec![self.materialized_batch()?],
-            }],
+            output_batches,
         })
     }
 

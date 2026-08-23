@@ -3,7 +3,7 @@ use std::num::NonZeroUsize;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueryExecutionPolicyV1 {
     pub max_sql_bytes: Option<usize>,
@@ -19,6 +19,26 @@ pub struct QueryExecutionPolicyV1 {
     pub spill_limit_bytes: Option<u64>,
     pub batch_size: Option<NonZeroUsize>,
     pub target_partitions: Option<NonZeroUsize>,
+}
+
+impl Default for QueryExecutionPolicyV1 {
+    fn default() -> Self {
+        Self {
+            max_sql_bytes: Some(1024 * 1024), // 1 MB
+            planning_timeout_ms: Some(5_000),  // 5 seconds
+            execution_timeout_ms: Some(30_000), // 30 seconds
+            max_output_rows: Some(10_000),
+            max_output_bytes: Some(64 * 1024 * 1024), // 64 MB
+            max_scan_files: Some(100),
+            max_scan_bytes: Some(1024 * 1024 * 1024), // 1 GB
+            max_object_requests: Some(1000),
+            max_concurrent_queries: None, // No concurrency limit by default
+            memory_limit_bytes: Some(512 * 1024 * 1024), // 512 MB
+            spill_limit_bytes: Some(1024 * 1024 * 1024), // 1 GB
+            batch_size: NonZeroUsize::new(8192),
+            target_partitions: NonZeroUsize::new(4),
+        }
+    }
 }
 
 pub type QueryPolicy = QueryExecutionPolicyV1;

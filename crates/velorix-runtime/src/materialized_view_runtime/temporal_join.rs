@@ -448,11 +448,21 @@ impl StandingProgramRuntime for TemporalJoinRuntime {
                 field: "temporal_join_resource_contract",
             });
         }
-        let prev_inv = self
+        let output_delta = self
             .published_output
-            .inverse()
+            .diff(&next_output)
             .map_err(|_| invalid_runtime_state())?;
-        let output_delta = prev_inv.combine(&next_output);
+        // Validate output before commit
+        let output_batches = vec![ViewOutputBatch {
+            view_id: self.identity.view_ids[0].clone(),
+            schema_fingerprint: self.output_schema_fingerprint(),
+            batches: vec![materialized_delta_to_record_batch(
+                &self.output_schema,
+                &next_output,
+                Some(&[]),
+            )?],
+        }];
+        // Commit staged state
         self.left_rows = next_left;
         self.right_index = next_right;
         self.published_output = next_output;
@@ -473,11 +483,7 @@ impl StandingProgramRuntime for TemporalJoinRuntime {
                 schema_fingerprint: self.output_schema_fingerprint(),
                 delta: output_delta,
             }],
-            output_batches: vec![ViewOutputBatch {
-                view_id: self.identity.view_ids[0].clone(),
-                schema_fingerprint: self.output_schema_fingerprint(),
-                batches: vec![self.materialized_batch()?],
-            }],
+            output_batches,
         })
     }
 

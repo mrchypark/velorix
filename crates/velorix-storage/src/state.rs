@@ -594,8 +594,7 @@ impl CheckpointPublisher {
             .try_collect::<Vec<_>>()
             .await?;
 
-        let mut manifests = Vec::with_capacity(objects.len());
-        for object in objects {
+        let results = futures::future::join_all(objects.iter().map(|object| async {
             let object_key = ObjectKey::parse(object.location.to_string())?;
             let bytes = self.store.get(&object.location).await?.bytes().await?;
             let manifest = serde_json::from_slice::<CheckpointManifest>(&bytes)?;
@@ -607,7 +606,13 @@ impl CheckpointPublisher {
                     body_key,
                 });
             }
-            manifests.push(manifest);
+            Ok::<_, CheckpointPublishError>(manifest)
+        }))
+        .await;
+
+        let mut manifests = Vec::with_capacity(results.len());
+        for result in results {
+            manifests.push(result?);
         }
         manifests.sort_by_key(|manifest| manifest.checkpoint_version);
         Self::validate_manifest_lineage(&manifests)?;
@@ -2606,17 +2611,27 @@ impl CheckpointPublisher {
         &self,
         manifest: &CheckpointManifest,
     ) -> Result<(), CheckpointPublishError> {
-        for output_object in &manifest.output_objects {
-            let path = Path::from(output_object.object_key.as_str());
-            match self.store.head(&path).await {
-                Ok(_) => {}
-                Err(object_store::Error::NotFound { .. }) => {
-                    return Err(CheckpointPublishError::MissingOutputObject(
-                        output_object.object_key.clone(),
-                    ));
-                }
-                Err(err) => return Err(err.into()),
-            }
+        let results = futures::future::join_all(
+            manifest
+                .output_objects
+                .iter()
+                .map(|output_object| async {
+                    let path = Path::from(output_object.object_key.as_str());
+                    match self.store.head(&path).await {
+                        Ok(_) => Ok(()),
+                        Err(object_store::Error::NotFound { .. }) => {
+                            Err(CheckpointPublishError::MissingOutputObject(
+                                output_object.object_key.clone(),
+                            ))
+                        }
+                        Err(err) => Err(err.into()),
+                    }
+                }),
+        )
+        .await;
+
+        for result in results {
+            result?;
         }
 
         Ok(())
@@ -2628,30 +2643,46 @@ impl CheckpointPublisher {
         owner_claim: &PartitionOwnerClaim,
     ) -> Result<(), CheckpointPublishError> {
         let mut checked = HashSet::new();
+        let mut all_partitions = HashSet::new();
 
         for input_range in &manifest.input_ranges {
             if checked.insert((input_range.stream_id.as_str(), input_range.partition_id)) {
-                self.validate_production_owner_claim_current(
+                self.validate_matching_ownership_epoch_record_visible(
                     &input_range.stream_id,
                     input_range.partition_id,
                     owner_claim,
                 )
                 .await?;
+                self.validate_no_newer_visible_ownership_epoch_record(
+                    &input_range.stream_id,
+                    input_range.partition_id,
+                    owner_claim,
+                )
+                .await?;
+                all_partitions.insert(input_range.partition_id);
             }
         }
 
         for output_object in &manifest.output_objects {
             if checked.insert((output_object.stream_id.as_str(), output_object.partition_id)) {
-                self.validate_production_owner_claim_current(
+                self.validate_matching_ownership_epoch_record_visible(
                     &output_object.stream_id,
                     output_object.partition_id,
                     owner_claim,
                 )
                 .await?;
+                self.validate_no_newer_visible_ownership_epoch_record(
+                    &output_object.stream_id,
+                    output_object.partition_id,
+                    owner_claim,
+                )
+                .await?;
+                all_partitions.insert(output_object.partition_id);
             }
         }
 
-        Ok(())
+        self.validate_owner_claim_current(all_partitions, owner_claim)
+            .await
     }
 
     async fn validate_production_owner_claim_current(

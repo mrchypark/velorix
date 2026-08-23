@@ -446,6 +446,17 @@ impl StandingProgramRuntime for RecursiveFixpointRuntime {
                 .collect::<Vec<_>>(),
         );
         let output_delta = self.output_delta_for_derived(&next_derived)?;
+        // Validate output before commit
+        let output_batches = vec![ViewOutputBatch {
+            view_id: self.identity.view_ids[0].clone(),
+            schema_fingerprint: self.output_schema_fingerprint(),
+            batches: vec![materialized_delta_to_record_batch(
+                &self.output_schema,
+                &next_output,
+                Some(&[]),
+            )?],
+        }];
+        // Commit staged state
         self.base_multiset = next_base;
         self.derived_set = next_derived;
         self.published_output = next_output;
@@ -466,11 +477,7 @@ impl StandingProgramRuntime for RecursiveFixpointRuntime {
                 schema_fingerprint: self.output_schema_fingerprint(),
                 delta: output_delta,
             }],
-            output_batches: vec![ViewOutputBatch {
-                view_id: self.identity.view_ids[0].clone(),
-                schema_fingerprint: self.output_schema_fingerprint(),
-                batches: vec![self.materialized_batch()?],
-            }],
+            output_batches,
         })
     }
 

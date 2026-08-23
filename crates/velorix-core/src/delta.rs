@@ -95,6 +95,15 @@ impl DeltaBatch {
         Ok(Self { records })
     }
 
+    pub fn diff(&self, other: &Self) -> Result<Self, DeltaError> {
+        let mut records = Vec::with_capacity(self.records.len() + other.records.len());
+        for record in &self.records {
+            records.push(record.inverse()?);
+        }
+        records.extend(other.records.iter().cloned());
+        Ok(Self { records })
+    }
+
     pub fn net_rows(&self) -> Result<Vec<DeltaRecord>, DeltaError> {
         let mut net: BTreeMap<(String, String), (DeltaKey, DeltaValue, i128)> = BTreeMap::new();
 

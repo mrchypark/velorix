@@ -748,7 +748,7 @@ pub(super) async fn read_validated_producer_commits_after_cursor(
 
 /// Reads the latest durable checkpoint record for a standing runtime scope,
 /// consulting the authoritative meta-store pointer when present and the
-/// object-store latest cache otherwise.
+/// object-store LIST scan otherwise.
 async fn latest_checkpoint_record_for_scope(
     state: &ApiState,
     tenant_id: &str,
@@ -769,17 +769,51 @@ async fn latest_checkpoint_record_for_scope(
         }
         return Ok(None);
     }
-    let latest_key = ObjectKey::standing_runtime_latest_checkpoint(tenant_id, program_id, view_id)
-        .map_err(ApiError::bad_request)?;
-    let bytes = match state
-        .store
-        .get(&ObjectPath::from(latest_key.as_str()))
-        .await
-    {
-        Ok(object) => object.bytes().await.map_err(ApiError::internal)?,
-        Err(object_store::Error::NotFound { .. }) => return Ok(None),
-        Err(error) => return Err(ApiError::internal(error)),
+    eprintln!(
+        "WARNING: No meta_store configured, falling back to S3 LIST scan for checkpoint read \
+         (tenant={}, program={}, view={})",
+        tenant_id, program_id, view_id
+    );
+    let prefix = ObjectPath::from(format!(
+        "v1/standing-runtime-checkpoints/{}/{}/{}/epochs",
+        tenant_id, program_id, view_id
+    ));
+    let mut stream = state.store.list(Some(&prefix));
+    let mut latest_checkpoint: Option<(String, StandingRuntimeCheckpointKeyParts)> = None;
+    while let Some(meta) = stream.try_next().await.map_err(ApiError::internal)? {
+        let location = meta.location.to_string();
+        if location.ends_with(".checkpoint.json") {
+            let (_, parts) = ObjectKey::parse_standing_runtime_checkpoint(location.clone())
+                .map_err(ApiError::bad_request)?;
+            latest_checkpoint = Some(match latest_checkpoint {
+                Some((current, current_parts))
+                    if current_parts.logical_epoch > parts.logical_epoch =>
+                {
+                    (current, current_parts)
+                }
+                Some((_current, current_parts))
+                    if current_parts.logical_epoch == parts.logical_epoch =>
+                {
+                    return Err(ApiError::bad_request(format!(
+                        "multiple standing runtime checkpoints for `{}/{}/{}` epoch {}",
+                        tenant_id, program_id, view_id, parts.logical_epoch
+                    )));
+                }
+                _ => (location, parts),
+            });
+        }
+    }
+    let Some((latest_checkpoint_path, _)) = latest_checkpoint else {
+        return Ok(None);
     };
+    let bytes = state
+        .store
+        .get(&ObjectPath::from(latest_checkpoint_path.clone()))
+        .await
+        .map_err(ApiError::internal)?
+        .bytes()
+        .await
+        .map_err(ApiError::internal)?;
     let mut record = standing_runtime_checkpoint_record_from_slice(&bytes)
         .map_err(|source| ApiError::bad_request(source.to_string()))?;
     hydrate_standing_runtime_checkpoint_state_payload(state, &mut record).await?;
