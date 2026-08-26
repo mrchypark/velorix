@@ -309,6 +309,8 @@ impl StandingProgramRuntime for AnalyticWindowFrameRuntime {
 
         let mut next_frontiers = self.input_frontiers.clone();
         let mut next_event_time_frontiers = self.input_event_time_frontiers.clone();
+        // Clone rows for staged mutation — if any step fails, self.rows is restored.
+        let original_rows = self.rows.clone();
         for input in &input_changes {
             validate_input_matches_schema(input, &self.input_schema, "analytic_frame_input")?;
             let delta =
@@ -348,6 +350,7 @@ impl StandingProgramRuntime for AnalyticWindowFrameRuntime {
                     .checked_add(record.weight)
                     .ok_or_else(invalid_runtime_state)?;
                 if entry.weight < 0 {
+                    self.rows = original_rows;
                     return Err(invalid_runtime_state());
                 }
                 if entry.weight == 0 {
@@ -375,7 +378,13 @@ impl StandingProgramRuntime for AnalyticWindowFrameRuntime {
             advance_input_frontier(&mut next_frontiers, input)?;
             advance_input_event_time_frontier(&mut next_event_time_frontiers, input)?;
         }
-        let next_output = self.recompute_all_outputs()?;
+        let next_output = match self.recompute_all_outputs() {
+            Ok(output) => output,
+            Err(e) => {
+                self.rows = original_rows;
+                return Err(e);
+            }
+        };
         let output_delta = self
             .published_output
             .diff(&next_output)
