@@ -359,9 +359,14 @@ pub(super) async fn ingest_epoch(
 
 /// Append prepared ingest batches atomically.
 ///
-/// All batches are appended concurrently but the operation is atomic:
-/// if any batch fails, the entire operation fails and no batches are committed.
-/// This ensures that the epoch is either fully committed or fully rolled back.
+/// All batches are appended concurrently in two phases:
+/// Phase 1: Object PUT for all batches (concurrent)
+/// Phase 2: Range commit for all batches (concurrent, only if phase 1
+///          fully succeeds)
+///
+/// If any batch fails in phase 1, no range commits are performed and
+/// the epoch remains invisible to readers. The content-addressed object
+/// PUTs are idempotent and will be cleaned up by GC if unused.
 pub(super) async fn append_prepared_ingest_epoch_batches(
     state: &ApiState,
     prepared_batches: &[PreparedIngestBatch],
@@ -371,65 +376,86 @@ pub(super) async fn append_prepared_ingest_epoch_batches(
     let concurrency = prepared_batches
         .len()
         .clamp(1, MAX_CONCURRENT_EPOCH_APPENDS);
-    let mut outcomes = futures::stream::iter(prepared_batches.iter().cloned().enumerate())
+
+    // Phase 1: Concurrent object PUTs for all batches
+    let append_results: Vec<_> = futures::stream::iter(prepared_batches.iter().cloned().enumerate())
         .map(|(index, prepared)| {
             let state = state.clone();
-            let ingest_epoch = ingest_epoch.to_string();
             async move {
                 let outcome = append_ingest_envelope(&state, prepared.envelope.clone()).await?;
-                let (_status, outcome, descriptor) = ingest_outcome_parts(outcome)?;
-                commit_ingest_range(
-                    &state,
-                    &prepared.request,
-                    &prepared.catalog,
-                    prepared.end_offset_exclusive,
-                    &prepared.envelope,
-                )
-                .await?;
-                Ok::<_, ApiError>(PreparedIngestAppendOutcome {
+                let (_status, outcome_str, descriptor) = ingest_outcome_parts(outcome)?;
+                Ok::<_, ApiError>((
                     index,
-                    appended: outcome == "appended",
-                    response: IngestResponse {
-                        outcome: outcome.to_string(),
-                        descriptor: ingest_descriptor_response(&descriptor),
-                        epoch_manifest_id: ingest_epoch.clone(),
-                        ingest_epoch,
-                        materialized_through: None,
-                        ack_mode,
-                        materialization: IngestMaterializationResponse {
-                            status: "epoch_scoped".to_string(),
-                            active_views: 0,
-                            applied_batches: 0,
-                            materialized_through: None,
-                            checkpoint_writes: 0,
-                            applied_batches_per_checkpoint_write: None,
-                            output_delta_writes: 0,
-                            state_payload_writes: 0,
-                            checkpoint_record_writes: 0,
-                            checkpoint_pointer_writes: 0,
-                            checkpoint_publication_writes: 0,
-                        },
-                        timings: IngestTimingResponse {
-                            total_ms: 0,
-                            total_us: 0,
-                            avg_batch_us: None,
-                            avg_row_us: None,
-                            rows_per_second: None,
-                            batch_count: 1,
-                            row_count: prepared.request.rows.len(),
-                        },
-                    },
-                })
+                    prepared,
+                    outcome_str.to_string(),
+                    descriptor,
+                ))
             }
         })
         .buffer_unordered(concurrency)
         .try_collect::<Vec<_>>()
         .await?;
-    outcomes.sort_by_key(|outcome| outcome.index);
-    let appended = outcomes.iter().filter(|outcome| outcome.appended).count();
+
+    // Phase 2: Concurrent range commits (only if all PUTs succeeded)
+    let owned_epoch = ingest_epoch.to_string();
+    let mut commit_results = futures::stream::iter(append_results.into_iter().map(|item| {
+        let (index, prepared, outcome_str, descriptor) = item;
+        let state = state.clone();
+        let ingest_epoch = owned_epoch.clone();
+        async move {
+            commit_ingest_range(
+                &state,
+                &prepared.request,
+                &prepared.catalog,
+                prepared.end_offset_exclusive,
+                &prepared.envelope,
+            )
+            .await?;
+            Ok::<_, ApiError>(PreparedIngestAppendOutcome {
+                index,
+                appended: outcome_str == "appended",
+                response: IngestResponse {
+                    outcome: outcome_str.to_string(),
+                    descriptor: ingest_descriptor_response(&descriptor),
+                    epoch_manifest_id: ingest_epoch.clone(),
+                    ingest_epoch,
+                    materialized_through: None,
+                    ack_mode,
+                    materialization: IngestMaterializationResponse {
+                        status: "epoch_scoped".to_string(),
+                        active_views: 0,
+                        applied_batches: 0,
+                        materialized_through: None,
+                        checkpoint_writes: 0,
+                        applied_batches_per_checkpoint_write: None,
+                        output_delta_writes: 0,
+                        state_payload_writes: 0,
+                        checkpoint_record_writes: 0,
+                        checkpoint_pointer_writes: 0,
+                        checkpoint_publication_writes: 0,
+                    },
+                    timings: IngestTimingResponse {
+                        total_ms: 0,
+                        total_us: 0,
+                        avg_batch_us: None,
+                        avg_row_us: None,
+                        rows_per_second: None,
+                        batch_count: 1,
+                        row_count: prepared.request.rows.len(),
+                    },
+                },
+            })
+        }
+    }))
+    .buffer_unordered(concurrency)
+    .try_collect::<Vec<_>>()
+    .await?;
+
+    commit_results.sort_by_key(|outcome| outcome.index);
+    let appended = commit_results.iter().filter(|outcome| outcome.appended).count();
     Ok((
         appended,
-        outcomes
+        commit_results
             .into_iter()
             .map(|outcome| outcome.response)
             .collect(),
