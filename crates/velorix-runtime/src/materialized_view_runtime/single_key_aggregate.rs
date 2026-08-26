@@ -326,7 +326,7 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
             Some(&aggregate_outputs),
         )?;
         let output_delta = project_aggregate_delta_outputs(output_delta, &aggregate_outputs)?;
-        let _output_delta = if self.plan.top_k.is_some() {
+        if self.plan.top_k.is_some() {
             let previous_output = self.published_output.clone();
             let full_output = filter_output_delta_for_having(
                 &self.engine.materialized_state(),
@@ -358,7 +358,7 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
             self.applied_epochs
                 .insert(idempotency_key_text, logical_epoch);
             retain_recent_applied_epochs(&mut self.applied_epochs);
-            return Ok(EpochCommit {
+            Ok(EpochCommit {
                 logical_epoch,
                 idempotency_key,
                 input_frontiers: executor_commit.input_frontiers,
@@ -371,7 +371,7 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
                         .map_err(|_| invalid_runtime_state())?,
                 }],
                 output_batches,
-            });
+            })
         } else {
             let staged_output =
                 apply_published_output_delta(&self.published_output, &output_delta)?;
@@ -392,7 +392,7 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
             self.applied_epochs
                 .insert(idempotency_key_text, logical_epoch);
             retain_recent_applied_epochs(&mut self.applied_epochs);
-            return Ok(EpochCommit {
+            Ok(EpochCommit {
                 logical_epoch,
                 idempotency_key,
                 input_frontiers: executor_commit.input_frontiers,
@@ -403,8 +403,8 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
                     delta: output_delta,
                 }],
                 output_batches,
-            });
-        };
+            })
+        }
     }
 
     fn materialized_view_page(

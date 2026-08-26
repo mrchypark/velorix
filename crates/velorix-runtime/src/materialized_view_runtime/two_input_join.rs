@@ -651,7 +651,7 @@ impl StandingProgramRuntime for TwoInputJoinRuntime {
             &self.output_schema,
             Some(&supported_join_view_plan_aggregate_outputs(&self.plan)),
         )?;
-        let _output_delta = if self.plan.top_k.is_some() {
+        if self.plan.top_k.is_some() {
             let previous_output = self.published_output.clone();
             let aggregate_outputs = supported_join_view_plan_aggregate_outputs(&self.plan);
             let full_output = filter_output_delta_for_having(
@@ -683,7 +683,7 @@ impl StandingProgramRuntime for TwoInputJoinRuntime {
             self.applied_epochs
                 .insert(idempotency_key_text, logical_epoch);
             retain_recent_applied_epochs(&mut self.applied_epochs);
-            return Ok(EpochCommit {
+            Ok(EpochCommit {
                 logical_epoch,
                 idempotency_key,
                 input_frontiers: executor_commit.input_frontiers,
@@ -696,7 +696,7 @@ impl StandingProgramRuntime for TwoInputJoinRuntime {
                         .map_err(|_| invalid_runtime_state())?,
                 }],
                 output_batches,
-            });
+            })
         } else {
             let aggregate_outputs = supported_join_view_plan_aggregate_outputs(&self.plan);
             let staged_output =
@@ -718,7 +718,7 @@ impl StandingProgramRuntime for TwoInputJoinRuntime {
             self.applied_epochs
                 .insert(idempotency_key_text, logical_epoch);
             retain_recent_applied_epochs(&mut self.applied_epochs);
-            return Ok(EpochCommit {
+            Ok(EpochCommit {
                 logical_epoch,
                 idempotency_key,
                 input_frontiers: executor_commit.input_frontiers,
@@ -729,8 +729,8 @@ impl StandingProgramRuntime for TwoInputJoinRuntime {
                     delta: output_delta,
                 }],
                 output_batches,
-            });
-        };
+            })
+        }
     }
 
     fn materialized_view_page(

@@ -708,7 +708,7 @@ fn evict_right_index(
         _ => return,
     };
     let mut keys_to_check: BTreeSet<String> = BTreeSet::new();
-    for ((key, _), _) in right_index.iter() {
+    for (key, _) in right_index.keys() {
         keys_to_check.insert(key.clone());
     }
     for join_key in keys_to_check {
@@ -745,7 +745,7 @@ fn evict_right_index(
     // most recent right row is below the watermark — no future left row can
     // match it because all future left rows have event_time >= watermark.
     let mut orphaned_keys: Vec<String> = Vec::new();
-    for ((key, _), _) in right_index.iter() {
+    for (key, _) in right_index.keys() {
         if !left_rows.contains_key(key) {
             orphaned_keys.push(key.clone());
         }
