@@ -767,10 +767,7 @@ fn evict_right_index(
             time_map.retain(|_, rows| !rows.is_empty());
         }
         // Remove empty join keys
-        if right_index
-            .get(&join_key)
-            .is_some_and(|m| m.is_empty())
-        {
+        if right_index.get(&join_key).is_some_and(|m| m.is_empty()) {
             right_index.remove(&join_key);
         }
     }

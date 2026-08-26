@@ -378,23 +378,19 @@ pub(super) async fn append_prepared_ingest_epoch_batches(
         .clamp(1, MAX_CONCURRENT_EPOCH_APPENDS);
 
     // Phase 1: Concurrent object PUTs for all batches
-    let append_results: Vec<_> = futures::stream::iter(prepared_batches.iter().cloned().enumerate())
-        .map(|(index, prepared)| {
-            let state = state.clone();
-            async move {
-                let outcome = append_ingest_envelope(&state, prepared.envelope.clone()).await?;
-                let (_status, outcome_str, descriptor) = ingest_outcome_parts(outcome)?;
-                Ok::<_, ApiError>((
-                    index,
-                    prepared,
-                    outcome_str.to_string(),
-                    descriptor,
-                ))
-            }
-        })
-        .buffer_unordered(concurrency)
-        .try_collect::<Vec<_>>()
-        .await?;
+    let append_results: Vec<_> =
+        futures::stream::iter(prepared_batches.iter().cloned().enumerate())
+            .map(|(index, prepared)| {
+                let state = state.clone();
+                async move {
+                    let outcome = append_ingest_envelope(&state, prepared.envelope.clone()).await?;
+                    let (_status, outcome_str, descriptor) = ingest_outcome_parts(outcome)?;
+                    Ok::<_, ApiError>((index, prepared, outcome_str.to_string(), descriptor))
+                }
+            })
+            .buffer_unordered(concurrency)
+            .try_collect::<Vec<_>>()
+            .await?;
 
     // Phase 2: Concurrent range commits (only if all PUTs succeeded)
     let owned_epoch = ingest_epoch.to_string();
@@ -452,7 +448,10 @@ pub(super) async fn append_prepared_ingest_epoch_batches(
     .await?;
 
     commit_results.sort_by_key(|outcome| outcome.index);
-    let appended = commit_results.iter().filter(|outcome| outcome.appended).count();
+    let appended = commit_results
+        .iter()
+        .filter(|outcome| outcome.appended)
+        .count();
     Ok((
         appended,
         commit_results
