@@ -240,8 +240,10 @@ impl StandingProgramRuntime for FilterProjectRuntime {
         let mut staged_full_output = self.full_output.clone();
         staged_full_output =
             apply_filter_project_full_output_delta(&staged_full_output, &output_delta, &self.plan)?;
-        let next_published_output =
-            filter_project_published_output_from_full_output(staged_full_output.clone(), &self.plan)?;
+        let next_published_output = filter_project_published_output_from_full_output(
+            staged_full_output.clone(),
+            &self.plan,
+        )?;
         let next_published_output = apply_filter_project_top_k_to_published_output(
             next_published_output,
             self.plan.top_k.as_ref(),

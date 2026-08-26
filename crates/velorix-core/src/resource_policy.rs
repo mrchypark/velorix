@@ -24,8 +24,8 @@ pub struct QueryExecutionPolicyV1 {
 impl Default for QueryExecutionPolicyV1 {
     fn default() -> Self {
         Self {
-            max_sql_bytes: Some(1024 * 1024), // 1 MB
-            planning_timeout_ms: Some(5_000),  // 5 seconds
+            max_sql_bytes: Some(1024 * 1024),   // 1 MB
+            planning_timeout_ms: Some(5_000),   // 5 seconds
             execution_timeout_ms: Some(30_000), // 30 seconds
             max_output_rows: Some(10_000),
             max_output_bytes: Some(64 * 1024 * 1024), // 64 MB

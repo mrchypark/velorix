@@ -88,8 +88,9 @@ pub fn plan_reconcile(desired: &VelorixView, facts: &ObservedControlPlaneFacts) 
 
     match facts.worker.as_ref() {
         Some(worker) if worker.owner_id == lease.owner_id && worker.owner_epoch == lease_epoch => {
-            plan.actions
-                .push(ReconcileAction::RenewLease { owner_id: lease.owner_id.clone() });
+            plan.actions.push(ReconcileAction::RenewLease {
+                owner_id: lease.owner_id.clone(),
+            });
         }
         Some(worker) => {
             plan.actions.push(ReconcileAction::StopWorker {

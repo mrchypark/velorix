@@ -4103,7 +4103,8 @@ checks["checkpoint recovery repair and GC blocker remains evidence-bound"] = (
     and "repair_ingest_epoch_runtime_failure" in api
     and "standing_runtime_checkpoint_read_ignores_object_store_when_meta_pointer_is_empty_after_recovery"
     in api
-    and "standing_runtime_checkpoint_read_uses_meta_pointer_when_latest_cache_is_stale" in api
+    and "standing_runtime_checkpoint_read_always_uses_meta_pointer"
+    in api
     and "standing_runtime_checkpoint_read_keeps_old_meta_pointer_when_new_checkpoint_is_orphaned"
     in api
     and "standing_runtime_checkpoint_read_fails_closed_when_output_delta_object_is_corrupt"

@@ -371,9 +371,8 @@ async fn resolve_authoritative_view_cursor_within_budget(
             while let Some(meta) = stream.try_next().await.map_err(ApiError::internal)? {
                 let location = meta.location.to_string();
                 if location.ends_with(".checkpoint.json") {
-                    let (_, parts) =
-                        ObjectKey::parse_standing_runtime_checkpoint(location.clone())
-                            .map_err(ApiError::bad_request)?;
+                    let (_, parts) = ObjectKey::parse_standing_runtime_checkpoint(location.clone())
+                        .map_err(ApiError::bad_request)?;
                     latest_checkpoint = Some(match latest_checkpoint {
                         Some((current, current_parts))
                             if current_parts.logical_epoch > parts.logical_epoch =>
@@ -385,7 +384,10 @@ async fn resolve_authoritative_view_cursor_within_budget(
                         {
                             return Err(ApiError::bad_request(format!(
                                 "multiple standing runtime checkpoints for `{}/{}/{}` epoch {}",
-                                tenant_id, producer_program_id, producer_view_id, parts.logical_epoch
+                                tenant_id,
+                                producer_program_id,
+                                producer_view_id,
+                                parts.logical_epoch
                             )));
                         }
                         _ => (location, parts),
@@ -1287,8 +1289,7 @@ pub(super) async fn rehydrate_empty_meta_checkpoint_pointer_and_retry_publish(
             return Err(standing_runtime_checkpoint_publish_conflict(&candidate));
         }
         None => {
-            validate_checkpoint_pointer_object_exists_for_meta_rehydration(state, previous)
-                .await?;
+            validate_checkpoint_pointer_object_exists_for_meta_rehydration(state, previous).await?;
             match meta_store
                 .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
                     expected_previous: None,

@@ -441,7 +441,10 @@ impl StandingProgramRuntime for TemporalJoinRuntime {
         }
 
         let next_output = recompute_from_staged(&next_left, &next_right, &self.plan)?;
-        if next_output.net_rows().map_err(|_| invalid_runtime_state())?.len() as u64
+        if next_output
+            .net_rows()
+            .map_err(|_| invalid_runtime_state())?
+            .len() as u64
             > self.plan.resource_contract.max_output_rows_per_epoch
         {
             return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
@@ -696,7 +699,11 @@ fn evict_right_index(
     left_rows: &BTreeMap<String, BTreeMap<i64, TemporalRow>>,
     left_event_time_frontiers: &[InputEventTimeFrontier],
 ) {
-    let watermark = match left_event_time_frontiers.iter().map(|f| f.watermark_ns).min() {
+    let watermark = match left_event_time_frontiers
+        .iter()
+        .map(|f| f.watermark_ns)
+        .min()
+    {
         Some(w) if w > 0 => w,
         _ => return,
     };

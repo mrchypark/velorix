@@ -1500,13 +1500,9 @@ async fn standing_runtime_checkpoint_publish_uses_metadata_as_authoritative() {
     let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let store = Arc::clone(&inner);
     let meta_store = Arc::new(InMemoryMetaStore::default());
-    let state = test_api_state_with_store(
-        store,
-        "api-test-metadata-authoritative",
-        false,
-    )
-    .await
-    .with_meta_store(Arc::clone(&meta_store) as Arc<dyn MetaStore>);
+    let state = test_api_state_with_store(store, "api-test-metadata-authoritative", false)
+        .await
+        .with_meta_store(Arc::clone(&meta_store) as Arc<dyn MetaStore>);
     let checkpoint = test_runtime_checkpoint(Vec::new());
     let owner = state
         .acquire_standing_runtime_owner(&checkpoint.identity, "purchases_by_user")
@@ -1536,13 +1532,10 @@ async fn standing_runtime_checkpoint_publish_uses_metadata_as_authoritative() {
     .await
     .expect("metadata pointer publication should succeed");
 
-    let restarted = test_api_state_with_store(
-        inner,
-        "api-test-metadata-authoritative-restarted",
-        false,
-    )
-    .await
-    .with_meta_store(meta_store as Arc<dyn MetaStore>);
+    let restarted =
+        test_api_state_with_store(inner, "api-test-metadata-authoritative-restarted", false)
+            .await
+            .with_meta_store(meta_store as Arc<dyn MetaStore>);
     let authoritative = read_latest_standing_runtime_checkpoint(
         &restarted,
         &checkpoint.identity,

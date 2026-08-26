@@ -2142,7 +2142,7 @@ where
                     facts_from_observations(Some(grant), None, worker_after_stops.clone())
                 };
                 let next_plan = plan_reconcile(desired, &next_facts);
-                 append_non_acquire_commands(&next_plan, output);
+                append_non_acquire_commands(&next_plan, output);
                 output.plan = next_plan;
                 output.facts = next_facts;
             }

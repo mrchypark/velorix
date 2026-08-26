@@ -2638,24 +2638,20 @@ impl CheckpointPublisher {
         &self,
         manifest: &CheckpointManifest,
     ) -> Result<(), CheckpointPublishError> {
-        let results = futures::future::join_all(
-            manifest
-                .output_objects
-                .iter()
-                .map(|output_object| async {
-                    let path = Path::from(output_object.object_key.as_str());
-                    match self.store.head(&path).await {
-                        Ok(_) => Ok(()),
-                        Err(object_store::Error::NotFound { .. }) => {
-                            Err(CheckpointPublishError::MissingOutputObject(
-                                output_object.object_key.clone(),
-                            ))
-                        }
-                        Err(err) => Err(err.into()),
+        let results =
+            futures::future::join_all(manifest.output_objects.iter().map(|output_object| async {
+                let path = Path::from(output_object.object_key.as_str());
+                match self.store.head(&path).await {
+                    Ok(_) => Ok(()),
+                    Err(object_store::Error::NotFound { .. }) => {
+                        Err(CheckpointPublishError::MissingOutputObject(
+                            output_object.object_key.clone(),
+                        ))
                     }
-                }),
-        )
-        .await;
+                    Err(err) => Err(err.into()),
+                }
+            }))
+            .await;
 
         for result in results {
             result?;

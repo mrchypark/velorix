@@ -401,9 +401,10 @@ fn builtin_call_spec(
             (vec![vec![TimestampNanosecond, Utf8]], TimestampNanosecond)
         }
         BuiltinScalarFunctionV1::TimestampAddNanoseconds
-        | BuiltinScalarFunctionV1::TimestampSubtractNanoseconds => {
-            (vec![vec![TimestampNanosecond], vec![Int64]], TimestampNanosecond)
-        }
+        | BuiltinScalarFunctionV1::TimestampSubtractNanoseconds => (
+            vec![vec![TimestampNanosecond], vec![Int64]],
+            TimestampNanosecond,
+        ),
         BuiltinScalarFunctionV1::DateAddDays => (vec![vec![Date32], vec![Int64]], Date32),
         BuiltinScalarFunctionV1::AbsFloat64
         | BuiltinScalarFunctionV1::CeilFloat64
@@ -415,9 +416,7 @@ fn builtin_call_spec(
         BuiltinScalarFunctionV1::AddFloat64
         | BuiltinScalarFunctionV1::SubtractFloat64
         | BuiltinScalarFunctionV1::MultiplyFloat64
-        | BuiltinScalarFunctionV1::DivideFloat64 => {
-            (vec![vec![Float64, Int64]], Float64)
-        }
+        | BuiltinScalarFunctionV1::DivideFloat64 => (vec![vec![Float64, Int64]], Float64),
         BuiltinScalarFunctionV1::AgeDays => (vec![vec![Int64, TimestampNanosecond]], Int64),
     }
 }

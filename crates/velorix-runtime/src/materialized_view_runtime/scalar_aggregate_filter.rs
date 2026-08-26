@@ -679,14 +679,11 @@ impl ScalarAggregateFilterRuntime {
         };
         for record in delta.net_rows().map_err(|_| invalid_runtime_state())? {
             let value = if record.value.as_json().is_object() {
-                record
-                    .value
-                    .as_json()
-                    .get(column_id)
-                    .cloned()
-                    .ok_or(StandingProgramRuntimeError::InvalidProgramIdentity {
+                record.value.as_json().get(column_id).cloned().ok_or(
+                    StandingProgramRuntimeError::InvalidProgramIdentity {
                         field: "scalar_missing_scalar_value",
-                    })?
+                    },
+                )?
             } else {
                 record.value.as_json().clone()
             };
