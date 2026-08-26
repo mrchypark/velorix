@@ -725,7 +725,8 @@ pub(super) fn event_time_column_max_value(
                 .column_by_name(&column.name)
                 .and_then(|column| column.as_any().downcast_ref::<Date32Array>())
                 .ok_or_else(|| ApiError::bad_request("event-time column must be Date32"))?;
-            max_i32_array_value(&column.name, array).map(i64::from)
+            max_i32_array_value(&column.name, array)
+                .map(|days| i64::from(days) * 86_400_000_000_000)
         }
         ArrowPhysicalTypeV1::TimestampNanosecond { .. } => {
             let array = batch

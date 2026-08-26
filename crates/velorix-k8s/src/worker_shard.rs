@@ -2146,6 +2146,17 @@ where
                 output.plan = next_plan;
                 output.facts = next_facts;
             }
+            ReconcileAction::RenewLease { owner_id } => {
+                let request = LeaseAcquireRequest {
+                    key: key.clone(),
+                    owner_id,
+                    now_unix_ms: input.now_unix_ms,
+                    ttl_ms: input.ttl_ms,
+                };
+                if let Err(err) = lease_client.acquire_or_renew(request).await {
+                    output.command_error = Some(err.to_string());
+                }
+            }
         }
     }
 
@@ -2156,6 +2167,7 @@ fn append_non_acquire_commands(plan: &ReconcilePlan, output: &mut WorkerShardRec
     for action in &plan.actions {
         match action {
             ReconcileAction::AcquireLease { .. } => {}
+            ReconcileAction::RenewLease { .. } => {}
             ReconcileAction::StopWorker {
                 owner_id,
                 owner_epoch,

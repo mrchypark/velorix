@@ -2744,7 +2744,8 @@ fn validate_event_time_watermark_against_catalog_and_batches(
     };
     let actual_max = match &column.physical_arrow_type {
         ArrowPhysicalTypeV1::Int64 => max_int64_column(batches, &column.name),
-        ArrowPhysicalTypeV1::Date32 => max_date32_column(batches, &column.name).map(i64::from),
+        ArrowPhysicalTypeV1::Date32 => max_date32_column(batches, &column.name)
+            .map(|days| i64::from(days) * 86_400_000_000_000),
         ArrowPhysicalTypeV1::TimestampNanosecond { .. } => {
             max_timestamp_column(batches, &column.name)
         }

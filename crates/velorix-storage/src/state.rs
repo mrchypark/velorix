@@ -964,9 +964,23 @@ impl CheckpointPublisher {
             marker_updated_at_now(),
         );
         let marker_key = ObjectKey::checkpoint_latest_candidate_marker();
+        let marker_path = Path::from(marker_key.as_str());
+
+        if let Ok(response) = self.store.get(&marker_path).await {
+            if let Ok(existing_bytes) = response.bytes().await {
+                if let Ok(existing) =
+                    serde_json::from_slice::<LatestCandidateMarker>(&existing_bytes)
+                {
+                    if existing.checkpoint_version >= marker.checkpoint_version {
+                        return Ok(Some(marker));
+                    }
+                }
+            }
+        }
+
         self.store
             .put(
-                &Path::from(marker_key.as_str()),
+                &marker_path,
                 Bytes::from(serde_json::to_vec(&marker)?).into(),
             )
             .await?;
@@ -1983,12 +1997,25 @@ impl CheckpointPublisher {
     ) {
         let marker =
             LatestCandidateMarker::for_manifest(manifest, manifest_bytes, marker_updated_at_now());
-        let Ok(bytes) = serde_json::to_vec(&marker) else {
-            return;
-        };
 
         let marker_key = ObjectKey::checkpoint_latest_candidate_marker();
         let marker_path = Path::from(marker_key.as_str());
+
+        if let Ok(response) = self.store.get(&marker_path).await {
+            if let Ok(existing_bytes) = response.bytes().await {
+                if let Ok(existing) =
+                    serde_json::from_slice::<LatestCandidateMarker>(&existing_bytes)
+                {
+                    if existing.checkpoint_version >= marker.checkpoint_version {
+                        return;
+                    }
+                }
+            }
+        }
+
+        let Ok(bytes) = serde_json::to_vec(&marker) else {
+            return;
+        };
         let _ = self
             .store
             .put(&marker_path, Bytes::from(bytes).into())

@@ -34,6 +34,7 @@ pub struct ReconcilePlan {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReconcileAction {
     AcquireLease { owner_id: String },
+    RenewLease { owner_id: String },
     StopWorker { owner_id: String, owner_epoch: u64 },
     StartWorker { owner_id: String, owner_epoch: u64 },
 }
@@ -86,7 +87,10 @@ pub fn plan_reconcile(desired: &VelorixView, facts: &ObservedControlPlaneFacts) 
     }
 
     match facts.worker.as_ref() {
-        Some(worker) if worker.owner_id == lease.owner_id && worker.owner_epoch == lease_epoch => {}
+        Some(worker) if worker.owner_id == lease.owner_id && worker.owner_epoch == lease_epoch => {
+            plan.actions
+                .push(ReconcileAction::RenewLease { owner_id: lease.owner_id.clone() });
+        }
         Some(worker) => {
             plan.actions.push(ReconcileAction::StopWorker {
                 owner_id: worker.owner_id.clone(),
