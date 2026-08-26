@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use arrow::record_batch::RecordBatch;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -627,6 +629,8 @@ pub trait StandingProgramRuntime {
 pub enum StandingProgramRuntimeError {
     #[error("invalid standing program identity field: {field}")]
     InvalidProgramIdentity { field: &'static str },
+    #[error("invalid standing program identity field: {field}")]
+    InvalidProgramIdentityDynamic { field: Cow<'static, str> },
     #[error("unsupported native code policy: {reason}")]
     UnsupportedNativeCodePolicy { reason: String },
     #[error("standing program identity mismatch: expected={expected_program_id}, actual={actual_program_id}")]

@@ -138,7 +138,6 @@ impl AggregateValueMode {
                 let v = value.as_json();
                 v.as_i64()
                     .map(i128::from)
-                    .or_else(|| v.as_f64().map(|f| f as i128))
                     .ok_or(OperatorError::NonIntegerAggregateValue)
             }
             Self::Decimal128 { precision, scale } => {

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use arrow::{
@@ -45,8 +46,8 @@ pub(super) fn materialized_delta_to_record_batch(
     let mut aggregate_values = vec![Vec::new(); aggregate_outputs.len()];
     for row in rows {
         if row.weight != 1 {
-            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
-                field: Box::leak(format!("generic_page_weight:{}", row.weight).into_boxed_str()),
+            return Err(StandingProgramRuntimeError::InvalidProgramIdentityDynamic {
+                field: Cow::Owned(format!("generic_page_weight:{}", row.weight)),
             });
         }
         let value = row
@@ -168,8 +169,8 @@ pub(super) fn materialized_tumbling_delta_to_record_batch(
     let mut aggregate_values = vec![Vec::new(); aggregate_columns.len()];
     for row in rows {
         if row.weight != 1 {
-            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
-                field: Box::leak(format!("generic_page_weight:{}", row.weight).into_boxed_str()),
+            return Err(StandingProgramRuntimeError::InvalidProgramIdentityDynamic {
+                field: Cow::Owned(format!("generic_page_weight:{}", row.weight)),
             });
         }
         let key_values = row
@@ -284,8 +285,8 @@ pub(super) fn materialized_generic_delta_to_record_batch(
     let mut column_values = vec![Vec::new(); value_columns.len()];
     for row in rows {
         if row.weight != 1 {
-            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
-                field: Box::leak(format!("generic_page_weight:{}", row.weight).into_boxed_str()),
+            return Err(StandingProgramRuntimeError::InvalidProgramIdentityDynamic {
+                field: Cow::Owned(format!("generic_page_weight:{}", row.weight)),
             });
         }
         keys.push(row.key.as_json().clone());
