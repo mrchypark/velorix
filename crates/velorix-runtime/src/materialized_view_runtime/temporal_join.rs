@@ -5,10 +5,11 @@
 //! ON r.event_time <= l.event_time`. This is common for order enrichment
 //! (match each order with the latest price snapshot).
 //!
-//! State: BTreeMap of right-side rows keyed by (join_key, -event_time_ns)
-//! for O(log K) per-event lookup. Left-side rows are matched on insert;
-//! late left rows that arrive after a right row with later timestamp match
-//! the correct predecessor. Output is the full projected row.
+//! State: BTreeMap of right-side rows keyed by join_key, then by
+//! event_time, with bag semantics (multiple rows per key+time).
+//! Left-side rows are matched on insert; late left rows that arrive
+//! after a right row with later timestamp match the correct predecessor.
+//! Output is the full projected row.
 //!
 //! Checkpoint: JSON-serialized state includes full catalogs, schemas, and
 //! all staged rows. For very large state (>100K rows), consider switching
@@ -30,14 +31,11 @@ pub struct TemporalJoinRuntime {
     view_sql: String,
     plan: SupportedTemporalJoinPlanV1,
     logical_plan: VelorixLogicalViewPlanV1,
-    /// Right-side rows indexed by (join_key, -event_time_ns) for
-    /// reverse-chronological iteration per join key.
-    ///
-    /// Eviction: after each epoch, for each join key we keep only the most
-    /// recent right row with event_time <= left_watermark. Older rows for
-    /// that key are superseded because all future left rows have event_time
-    /// >= watermark, so they will always match the newer row first.
-    right_index: BTreeMap<(String, i64), TemporalRow>,
+    /// Right-side rows indexed by join_key -> event_time -> rows.
+    /// Bag semantics: multiple rows with the same join_key and event_time
+    /// are stored independently. Eviction keeps at least the most recent
+    /// event_time per join key.
+    right_index: BTreeMap<String, BTreeMap<i64, Vec<TemporalRow>>>,
     /// Left-side rows by join key, then by event_time for bag semantics.
     /// Multiple left rows with the same join key but different event times
     /// are independently matched against right-side rows.
@@ -145,7 +143,7 @@ impl TemporalJoinRuntime {
     }
 
     fn apply_right_side(
-        right_index: &mut BTreeMap<(String, i64), TemporalRow>,
+        right_index: &mut BTreeMap<String, BTreeMap<i64, Vec<TemporalRow>>>,
         record: &DeltaRecord,
         key_column: &str,
         time_column: &str,
@@ -174,38 +172,51 @@ impl TemporalJoinRuntime {
                 field: "temporal_join_event_time_overflow",
             });
         }
-        let map_key = (key.clone(), -event_time);
-        right_index
-            .entry(map_key.clone())
-            .or_insert_with(|| TemporalRow {
-                values: BTreeMap::new(),
-                event_time_ns: event_time,
-                weight: 0,
-            });
-        let entry = right_index.get_mut(&map_key).unwrap();
-        entry.weight = entry
-            .weight
-            .checked_add(record.weight)
-            .ok_or_else(invalid_runtime_state)?;
-        if entry.weight < 0 {
-            return Err(invalid_runtime_state());
-        }
-        if entry.weight == 0 {
-            right_index.remove(&map_key);
-            return Ok(());
-        }
-        // Only overwrite values on initial insert (weight was 0 before
-        // adding record.weight). Retractions only change weight.
-        if entry.weight == record.weight {
-            entry.values = record
-                .value
-                .as_json()
-                .as_object()
-                .ok_or_else(invalid_runtime_state)?
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            entry.event_time_ns = event_time;
+        let values: BTreeMap<String, Value> = record
+            .value
+            .as_json()
+            .as_object()
+            .ok_or_else(invalid_runtime_state)?
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let time_map = right_index.entry(key.clone()).or_default();
+        let rows = time_map.entry(event_time).or_default();
+        if record.weight > 0 {
+            // Insert: check if a row with identical values already exists (bag dedup)
+            if let Some(existing) = rows.iter_mut().find(|r| r.values == values) {
+                existing.weight = existing
+                    .weight
+                    .checked_add(record.weight)
+                    .ok_or_else(invalid_runtime_state)?;
+            } else {
+                rows.push(TemporalRow {
+                    values,
+                    event_time_ns: event_time,
+                    weight: record.weight,
+                });
+            }
+        } else if record.weight < 0 {
+            // Retract: find a row with matching values and decrement weight
+            if let Some(existing) = rows.iter_mut().find(|r| r.values == values) {
+                existing.weight = existing
+                    .weight
+                    .checked_add(record.weight)
+                    .ok_or_else(invalid_runtime_state)?;
+                if existing.weight < 0 {
+                    return Err(invalid_runtime_state());
+                }
+            } else {
+                return Err(invalid_runtime_state());
+            }
+            // Remove zero-weight rows
+            rows.retain(|r| r.weight != 0);
+            if rows.is_empty() {
+                time_map.remove(&event_time);
+            }
+            if time_map.is_empty() {
+                right_index.remove(&key);
+            }
         }
         Ok(())
     }
@@ -528,11 +539,7 @@ impl StandingProgramRuntime for TemporalJoinRuntime {
             input_frontiers: self.input_frontiers.clone(),
             input_event_time_frontiers: self.input_event_time_frontiers.clone(),
             left_rows: self.left_rows.clone(),
-            right_index: self
-                .right_index
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
+            right_index: self.right_index.clone(),
             published_output: self.published_output.clone(),
             applied_epochs: self
                 .applied_epochs
@@ -629,7 +636,7 @@ impl StandingProgramRuntime for TemporalJoinRuntime {
             view_sql: payload.view_sql,
             plan: payload.plan,
             logical_plan: payload.logical_plan,
-            right_index: payload.right_index.into_iter().collect(),
+            right_index: payload.right_index,
             left_rows: payload.left_rows,
             published_output: payload.published_output,
             input_frontiers: checkpoint.input_frontiers,
@@ -642,7 +649,7 @@ impl StandingProgramRuntime for TemporalJoinRuntime {
 
 fn recompute_from_staged(
     left: &BTreeMap<String, BTreeMap<i64, TemporalRow>>,
-    right: &BTreeMap<(String, i64), TemporalRow>,
+    right: &BTreeMap<String, BTreeMap<i64, Vec<TemporalRow>>>,
     plan: &SupportedTemporalJoinPlanV1,
 ) -> Result<DeltaBatch, StandingProgramRuntimeError> {
     let mut records = Vec::new();
@@ -652,34 +659,46 @@ fn recompute_from_staged(
                 continue;
             }
             let left_event_time = left_row.event_time_ns;
-            // Filter right rows by join key AND find most recent by event_time
-            let probe = (join_key.clone(), -left_event_time);
-            let best_right: Option<(&TemporalRow, i64)> = right
-                .range(probe..)
-                .next()
-                .filter(|((key, _), _)| key == join_key)
-                .map(|((_, _), row)| (row, row.weight));
-            if let Some((right_row, right_weight)) = best_right {
-                let mut output = serde_json::Map::new();
-                for item in &plan.output_columns {
-                    let value = match item.side {
-                        TemporalJoinSideV1::Left => left_row.values.get(&item.column_id),
-                        TemporalJoinSideV1::Right => right_row.values.get(&item.column_id),
-                    };
-                    output.insert(
-                        item.output_name.clone(),
-                        value.cloned().unwrap_or(Value::Null),
-                    );
+            // Find the most recent right event_time <= left_event_time for this key
+            if let Some(time_map) = right.get(join_key) {
+                // BTreeMap iter in ascending order; find floor (largest <= left_event_time)
+                let floor_time = time_map
+                    .range(..=left_event_time)
+                    .next_back()
+                    .map(|(t, _)| *t);
+                if let Some(rt) = floor_time {
+                    if let Some(rows) = time_map.get(&rt) {
+                        for right_row in rows {
+                            if right_row.weight <= 0 {
+                                continue;
+                            }
+                            let mut output = serde_json::Map::new();
+                            for item in &plan.output_columns {
+                                let value = match item.side {
+                                    TemporalJoinSideV1::Left => {
+                                        left_row.values.get(&item.column_id)
+                                    }
+                                    TemporalJoinSideV1::Right => {
+                                        right_row.values.get(&item.column_id)
+                                    }
+                                };
+                                output.insert(
+                                    item.output_name.clone(),
+                                    value.cloned().unwrap_or(Value::Null),
+                                );
+                            }
+                            let weight = left_row
+                                .weight
+                                .checked_mul(right_row.weight)
+                                .ok_or_else(invalid_runtime_state)?;
+                            records.push(DeltaRecord::new(
+                                DeltaKey::from_json(Value::Object(output)),
+                                DeltaValue::from_json(Value::Object(serde_json::Map::new())),
+                                weight,
+                            ));
+                        }
+                    }
                 }
-                let weight = left_row
-                    .weight
-                    .checked_mul(right_weight)
-                    .ok_or_else(invalid_runtime_state)?;
-                records.push(DeltaRecord::new(
-                    DeltaKey::from_json(Value::Object(output.clone())),
-                    DeltaValue::from_json(Value::Object(serde_json::Map::new())),
-                    weight,
-                ));
             }
         }
     }
@@ -691,11 +710,13 @@ fn recompute_from_staged(
 /// For each join key, a right row at event_time R is superseded when:
 /// 1. There exists a newer right row at R' > R for the same key
 /// 2. R < L_min (below the minimum left event time for this key)
-/// 3. R' <= watermark (all future left rows have et >= watermark >= R')
+/// 3. R' <= L_min (the newer row is also below L_min, so no future left
+///    row will ever match R instead of R')
 ///
-/// This means all current AND future left rows will match R' instead of R.
+/// This means we only evict old rows that are fully shadowed by a newer
+/// row that is also below all current/future left event times.
 fn evict_right_index(
-    right_index: &mut BTreeMap<(String, i64), TemporalRow>,
+    right_index: &mut BTreeMap<String, BTreeMap<i64, Vec<TemporalRow>>>,
     left_rows: &BTreeMap<String, BTreeMap<i64, TemporalRow>>,
     left_event_time_frontiers: &[InputEventTimeFrontier],
 ) {
@@ -707,64 +728,65 @@ fn evict_right_index(
         Some(w) if w > 0 => w,
         _ => return,
     };
-    let mut keys_to_check: BTreeSet<String> = BTreeSet::new();
-    for (key, _) in right_index.keys() {
-        keys_to_check.insert(key.clone());
-    }
-    for join_key in keys_to_check {
-        let l_min = left_rows
-            .get(&join_key)
-            .and_then(|by_time| by_time.keys().next())
-            .copied();
-        if l_min.is_none() {
-            continue;
-        }
-        let l_min = l_min.unwrap();
-        let mut to_remove = Vec::new();
-        let mut prev_neg_time: Option<i64> = None;
-        for ((k, neg_time), _) in right_index.range((join_key.clone(), i64::MIN)..) {
-            if *k != join_key {
-                break;
-            }
-            let event_time = -*neg_time;
-            if event_time <= watermark {
-                if let Some(prev) = prev_neg_time {
-                    let prev_event_time = -prev;
-                    if event_time < l_min && prev_event_time <= l_min {
-                        to_remove.push((k.clone(), *neg_time));
+    let join_keys: Vec<String> = right_index.keys().cloned().collect();
+    for join_key in join_keys {
+        if let Some(time_map) = right_index.get_mut(&join_key) {
+            let l_min = left_rows
+                .get(&join_key)
+                .and_then(|by_time| by_time.keys().next())
+                .copied();
+            if let Some(lm) = l_min {
+                // Collect event times below watermark
+                let below_wm: Vec<i64> = time_map
+                    .keys()
+                    .copied()
+                    .filter(|&et| et <= watermark)
+                    .collect();
+                if below_wm.is_empty() {
+                    continue;
+                }
+                // Find the maximum event time overall for this key
+                let max_et = time_map.keys().copied().max().unwrap();
+                // Only evict times below l_min if the max time is also <= l_min
+                // (fully shadowed). If max_et > l_min, some of those old times
+                // may still be floor predecessors for left rows with et between
+                // the old time and l_min.
+                if max_et <= lm {
+                    let mut to_remove = Vec::new();
+                    for &et in &below_wm {
+                        if et < lm {
+                            to_remove.push(et);
+                        }
+                    }
+                    for et in to_remove {
+                        time_map.remove(&et);
                     }
                 }
-                prev_neg_time = Some(*neg_time);
             }
+            // Remove empty time buckets
+            time_map.retain(|_, rows| !rows.is_empty());
         }
-        for key in to_remove {
-            right_index.remove(&key);
-        }
-    }
-    // Remove right rows for orphaned keys (no current left rows) where the
-    // most recent right row is below the watermark — no future left row can
-    // match it because all future left rows have event_time >= watermark.
-    let mut orphaned_keys: Vec<String> = Vec::new();
-    for (key, _) in right_index.keys() {
-        if !left_rows.contains_key(key) {
-            orphaned_keys.push(key.clone());
+        // Remove empty join keys
+        if right_index
+            .get(&join_key)
+            .is_some_and(|m| m.is_empty())
+        {
+            right_index.remove(&join_key);
         }
     }
+    // Remove orphaned keys (no current left rows) where the most recent
+    // right time is below the watermark
+    let orphaned_keys: Vec<String> = right_index
+        .keys()
+        .filter(|k| !left_rows.contains_key(*k))
+        .cloned()
+        .collect();
     for join_key in orphaned_keys {
-        let most_recent = right_index
-            .range((join_key.clone(), i64::MIN)..)
-            .take_while(|((k, _), _)| k == &join_key)
-            .map(|((_, neg_time), _)| -*neg_time)
-            .max();
-        if let Some(et) = most_recent {
-            if et <= watermark {
-                let keys_to_remove: Vec<_> = right_index
-                    .range((join_key.clone(), i64::MIN)..)
-                    .take_while(|((k, _), _)| k == &join_key)
-                    .map(|((k, nt), _)| (k.clone(), *nt))
-                    .collect();
-                for key in keys_to_remove {
-                    right_index.remove(&key);
+        if let Some(time_map) = right_index.get(&join_key) {
+            let most_recent = time_map.keys().copied().max();
+            if let Some(et) = most_recent {
+                if et <= watermark {
+                    right_index.remove(&join_key);
                 }
             }
         }
@@ -787,7 +809,7 @@ struct TemporalJoinCheckpointPayloadV2 {
     input_frontiers: Vec<RelationFrontier>,
     input_event_time_frontiers: Vec<InputEventTimeFrontier>,
     left_rows: BTreeMap<String, BTreeMap<i64, TemporalRow>>,
-    right_index: Vec<((String, i64), TemporalRow)>,
+    right_index: BTreeMap<String, BTreeMap<i64, Vec<TemporalRow>>>,
     published_output: DeltaBatch,
     applied_epochs: Vec<GenericAppliedEpoch>,
     logical_epoch: LogicalEpoch,
