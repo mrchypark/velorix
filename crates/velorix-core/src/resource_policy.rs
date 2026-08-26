@@ -32,7 +32,7 @@ impl Default for QueryExecutionPolicyV1 {
             max_scan_files: Some(100),
             max_scan_bytes: Some(1024 * 1024 * 1024), // 1 GB
             max_object_requests: Some(1000),
-            max_concurrent_queries: None, // No concurrency limit by default
+            max_concurrent_queries: None, // Production: set to 16-64 with shared limiter
             memory_limit_bytes: Some(512 * 1024 * 1024), // 512 MB
             spill_limit_bytes: Some(1024 * 1024 * 1024), // 1 GB
             batch_size: NonZeroUsize::new(8192),
