@@ -2924,8 +2924,7 @@ fn parse_hex_binary(raw: &str) -> Result<Vec<u8>, String> {
         return Err("hex string must contain an even number of digits".to_string());
     }
     let mut bytes = Vec::with_capacity(hex.len() / 2);
-    #[allow(clippy::chunks_exact_to_as_chunks)]
-    for chunk in hex.as_bytes().chunks_exact(2) {
+    for chunk in hex.as_bytes().as_chunks::<2>().0 {
         let high = hex_digit_value(chunk[0])?;
         let low = hex_digit_value(chunk[1])?;
         bytes.push((high << 4) | low);
