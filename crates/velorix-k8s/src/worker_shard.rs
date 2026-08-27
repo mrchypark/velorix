@@ -3,8 +3,13 @@ use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc, time::Dura
 use async_trait::async_trait;
 use futures::{FutureExt, Stream, StreamExt};
 use k8s_openapi::{
-    api::core::v1::{Container, EnvVar, Pod, PodSpec},
+    api::core::v1::{
+        Container, EnvVar, Pod, PodSpec, Probe, ResourceRequirements, SecurityContext,
+        TCPSocketAction,
+    },
+    apimachinery::pkg::api::resource::Quantity,
     apimachinery::pkg::apis::meta::v1::ObjectMeta,
+    apimachinery::pkg::util::intstr::IntOrString,
 };
 use kube::{
     api::{Api, DeleteParams, ListParams, PostParams},
@@ -326,10 +331,60 @@ impl WorkerShardPodTemplate {
                         env_var("VELORIX_WORKER_OWNER_ID", owner_id),
                         env_var("VELORIX_WORKER_OWNER_EPOCH", &owner_epoch.to_string()),
                     ]),
+                    resources: Some(ResourceRequirements {
+                        requests: Some(
+                            [
+                                ("cpu".to_string(), Quantity("500m".to_string())),
+                                ("memory".to_string(), Quantity("512Mi".to_string())),
+                            ]
+                            .into(),
+                        ),
+                        limits: Some(
+                            [
+                                ("cpu".to_string(), Quantity("2".to_string())),
+                                ("memory".to_string(), Quantity("2Gi".to_string())),
+                            ]
+                            .into(),
+                        ),
+                        ..Default::default()
+                    }),
+                    liveness_probe: Some(Probe {
+                        tcp_socket: Some(TCPSocketAction {
+                            port: IntOrString::Int(9090),
+                            ..Default::default()
+                        }),
+                        initial_delay_seconds: Some(10),
+                        period_seconds: Some(15),
+                        ..Default::default()
+                    }),
+                    readiness_probe: Some(Probe {
+                        tcp_socket: Some(TCPSocketAction {
+                            port: IntOrString::Int(9090),
+                            ..Default::default()
+                        }),
+                        initial_delay_seconds: Some(5),
+                        period_seconds: Some(10),
+                        ..Default::default()
+                    }),
+                    security_context: Some(SecurityContext {
+                        run_as_non_root: Some(true),
+                        read_only_root_filesystem: Some(true),
+                        allow_privilege_escalation: Some(false),
+                        ..Default::default()
+                    }),
                     ..Container::default()
                 }],
                 restart_policy: Some("Never".to_string()),
                 service_account_name: self.service_account_name.clone(),
+                security_context: Some(k8s_openapi::api::core::v1::PodSecurityContext {
+                    run_as_non_root: Some(true),
+                    seccomp_profile: Some(k8s_openapi::api::core::v1::SeccompProfile {
+                        type_: "RuntimeDefault".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                termination_grace_period_seconds: Some(60),
                 ..PodSpec::default()
             }),
             status: None,
@@ -353,10 +408,60 @@ impl WorkerShardPodTemplate {
                     command: self.command.clone(),
                     args: self.args.clone(),
                     env: Some(env_for_identity(identity)),
+                    resources: Some(ResourceRequirements {
+                        requests: Some(
+                            [
+                                ("cpu".to_string(), Quantity("500m".to_string())),
+                                ("memory".to_string(), Quantity("512Mi".to_string())),
+                            ]
+                            .into(),
+                        ),
+                        limits: Some(
+                            [
+                                ("cpu".to_string(), Quantity("2".to_string())),
+                                ("memory".to_string(), Quantity("2Gi".to_string())),
+                            ]
+                            .into(),
+                        ),
+                        ..Default::default()
+                    }),
+                    liveness_probe: Some(Probe {
+                        tcp_socket: Some(TCPSocketAction {
+                            port: IntOrString::Int(9090),
+                            ..Default::default()
+                        }),
+                        initial_delay_seconds: Some(10),
+                        period_seconds: Some(15),
+                        ..Default::default()
+                    }),
+                    readiness_probe: Some(Probe {
+                        tcp_socket: Some(TCPSocketAction {
+                            port: IntOrString::Int(9090),
+                            ..Default::default()
+                        }),
+                        initial_delay_seconds: Some(5),
+                        period_seconds: Some(10),
+                        ..Default::default()
+                    }),
+                    security_context: Some(SecurityContext {
+                        run_as_non_root: Some(true),
+                        read_only_root_filesystem: Some(true),
+                        allow_privilege_escalation: Some(false),
+                        ..Default::default()
+                    }),
                     ..Container::default()
                 }],
                 restart_policy: Some("Never".to_string()),
                 service_account_name: self.service_account_name.clone(),
+                security_context: Some(k8s_openapi::api::core::v1::PodSecurityContext {
+                    run_as_non_root: Some(true),
+                    seccomp_profile: Some(k8s_openapi::api::core::v1::SeccompProfile {
+                        type_: "RuntimeDefault".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                termination_grace_period_seconds: Some(60),
                 ..PodSpec::default()
             }),
             status: None,
