@@ -119,9 +119,6 @@ pub(super) fn materialized_delta_page_batch(
     let mut rows = published_output
         .net_rows()
         .map_err(|_| invalid_runtime_state())?;
-    rows.sort_by(|left, right| {
-        canonical_json(left.key.as_json()).cmp(&canonical_json(right.key.as_json()))
-    });
     if let Some(page_token) = &page.page_token {
         rows.retain(|row| canonical_json(row.key.as_json()) > *page_token);
     }
@@ -243,9 +240,6 @@ pub(super) fn materialized_tumbling_delta_page_batch(
     let mut rows = published_output
         .net_rows()
         .map_err(|_| invalid_runtime_state())?;
-    rows.sort_by(|left, right| {
-        canonical_json(left.key.as_json()).cmp(&canonical_json(right.key.as_json()))
-    });
     if let Some(page_token) = &page.page_token {
         rows.retain(|row| canonical_json(row.key.as_json()) > *page_token);
     }
@@ -345,9 +339,6 @@ pub(super) fn materialized_generic_delta_page_batch(
     let mut rows = published_output
         .net_rows()
         .map_err(|_| invalid_runtime_state())?;
-    rows.sort_by(|left, right| {
-        canonical_json(left.key.as_json()).cmp(&canonical_json(right.key.as_json()))
-    });
     if let Some(page_token) = &page.page_token {
         rows.retain(|row| canonical_json(row.key.as_json()) > *page_token);
     }
