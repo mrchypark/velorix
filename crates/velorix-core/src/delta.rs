@@ -12,6 +12,72 @@ pub enum DeltaError {
     WeightOverflow,
 }
 
+/// Memcomparable binary key for ordered BTreeMap operations.
+/// Replaces canonical JSON strings for O(1) comparison without parsing.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct TypedBinaryKey(Vec<u8>);
+
+impl TypedBinaryKey {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// Encode a JSON value into a memcomparable binary format that preserves
+/// the same sort order as canonical JSON strings (lexicographic).
+///
+/// This is equivalent to canonical_json() but produces bytes instead of strings,
+/// enabling O(1) comparison in BTreeMap without parsing.
+fn encode_json_ordered(value: &Value, buf: &mut Vec<u8>) {
+    match value {
+        Value::Null => buf.extend_from_slice(b"null"),
+        Value::Bool(false) => buf.extend_from_slice(b"false"),
+        Value::Bool(true) => buf.extend_from_slice(b"true"),
+        Value::Number(n) => {
+            buf.extend_from_slice(n.to_string().as_bytes());
+        }
+        Value::String(s) => {
+            buf.push(b'"');
+            buf.extend_from_slice(s.as_bytes());
+            buf.push(b'"');
+        }
+        Value::Array(arr) => {
+            buf.push(b'[');
+            for (i, item) in arr.iter().enumerate() {
+                if i > 0 {
+                    buf.push(b',');
+                }
+                encode_json_ordered(item, buf);
+            }
+            buf.push(b']');
+        }
+        Value::Object(map) => {
+            buf.push(b'{');
+            let mut fields: Vec<_> = map.iter().collect();
+            fields.sort_by_key(|(k, _)| (*k).clone());
+            for (i, (key, value)) in fields.iter().enumerate() {
+                if i > 0 {
+                    buf.push(b',');
+                }
+                buf.push(b'"');
+                buf.extend_from_slice(key.as_bytes());
+                buf.push(b'"');
+                buf.push(b':');
+                encode_json_ordered(value, buf);
+            }
+            buf.push(b'}');
+        }
+    }
+}
+
+/// Encode a key-value pair into a single ordered binary key.
+pub fn encode_kv_ordered(key: &Value, value: &Value) -> TypedBinaryKey {
+    let mut buf = Vec::with_capacity(64);
+    encode_json_ordered(key, &mut buf);
+    encode_json_ordered(value, &mut buf);
+    TypedBinaryKey(buf)
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DeltaKey(Value);
 
@@ -105,14 +171,12 @@ impl DeltaBatch {
     }
 
     pub fn net_rows(&self) -> Result<Vec<DeltaRecord>, DeltaError> {
-        let mut net: BTreeMap<(String, String), (DeltaKey, DeltaValue, i128)> = BTreeMap::new();
+        let mut net: BTreeMap<TypedBinaryKey, (DeltaKey, DeltaValue, i128)> = BTreeMap::new();
 
         for record in &self.records {
+            let binary_key = encode_kv_ordered(&record.key.0, &record.value.0);
             let entry = net
-                .entry((
-                    canonical_json(&record.key.0),
-                    canonical_json(&record.value.0),
-                ))
+                .entry(binary_key)
                 .or_insert_with(|| (record.key.clone(), record.value.clone(), 0));
 
             entry.2 = entry
@@ -142,6 +206,7 @@ impl DeltaBatch {
 ///
 /// Object fields are sorted here instead of relying on serde_json map iteration
 /// order, which keeps checkpoint-facing net output stable across input order.
+#[allow(dead_code)]
 fn canonical_json(value: &Value) -> String {
     match value {
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
