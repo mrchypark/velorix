@@ -491,6 +491,30 @@ impl CheckpointPublisher {
         }
     }
 
+    /// Read the latest candidate marker from object store.
+    /// Returns None if the marker doesn't exist or is invalid.
+    pub async fn read_latest_candidate_marker(
+        &self,
+    ) -> Option<LatestCandidateMarker> {
+        let marker_key = ObjectKey::checkpoint_latest_candidate_marker();
+        let marker_path = Path::from(marker_key.as_str());
+        let bytes = self.store.get(&marker_path).await.ok()?.bytes().await.ok()?;
+        serde_json::from_slice::<LatestCandidateMarker>(&bytes).ok()
+    }
+
+    /// Read a single checkpoint manifest by version, without LIST scan.
+    pub async fn read_manifest_by_version(
+        &self,
+        checkpoint_version: u64,
+    ) -> Result<CheckpointManifest, CheckpointPublishError> {
+        let manifest_key = ObjectKey::checkpoint_manifest(checkpoint_version);
+        let manifest_path = Path::from(manifest_key.as_str());
+        let bytes = self.store.get(&manifest_path).await?.bytes().await?;
+        let manifest = serde_json::from_slice::<CheckpointManifest>(&bytes)?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
     /// Publishes one checkpoint manifest for a single owner claim.
     ///
     /// This is a non-atomic storage-side stale-owner detection and structural

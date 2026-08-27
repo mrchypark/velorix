@@ -205,6 +205,43 @@ impl RelationCatalogSnapshotProvider {
         stream: &VelorixStream,
     ) -> Result<Option<CheckpointRef>, StreamWatchError> {
         let publisher = self.checkpoint_publisher()?;
+
+        // Fast path: read the latest candidate marker and check if it matches.
+        // This avoids a full LIST+GET scan of all checkpoint manifests.
+        if let Some(marker) = publisher.read_latest_candidate_marker().await {
+            if let Ok(manifest) = publisher
+                .read_manifest_by_version(marker.checkpoint_version)
+                .await
+            {
+                if manifest
+                    .input_ranges
+                    .iter()
+                    .any(|range| range.stream_id == stream.spec.stream_id)
+                    && checkpoint_manifest_proves_relation_identity(&manifest, &stream.spec.relation)
+                {
+                    return match publisher
+                        .read_checkpoint_lifecycle_record(manifest.checkpoint_version)
+                        .await
+                    {
+                        Ok(record)
+                            if record.manifest_digest == digest_manifest(&manifest)? =>
+                        {
+                            Ok(Some(CheckpointRef {
+                                checkpoint_version: manifest.checkpoint_version,
+                                manifest_digest: record.manifest_digest,
+                            }))
+                        }
+                        Ok(_) => Ok(None),
+                        Err(CheckpointPublishError::ObjectStore(
+                            object_store::Error::NotFound { .. },
+                        )) => Ok(None),
+                        Err(error) => Err(snapshot_error(error)),
+                    };
+                }
+            }
+        }
+
+        // Slow path: full LIST+GET scan of all checkpoint manifests.
         let selected_manifest = publisher
             .list_published_manifests()
             .await
