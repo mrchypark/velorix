@@ -282,6 +282,9 @@ async fn in_memory_lease_grant_can_drive_bootstrap_fenced_publication() {
         output_objects: vec![output_ref],
         parent_checkpoint: None,
         created_at: "2026-05-04T00:00:00Z".to_string(),
+        relation_id: None,
+        relation_version: None,
+        schema_fingerprint: None,
     };
 
     publisher

@@ -14,6 +14,15 @@ pub struct CheckpointManifest {
     pub output_objects: Vec<OutputObjectRef>,
     pub parent_checkpoint: Option<u64>,
     pub created_at: String,
+    /// Relation identity commitment (v2+). When present, proves which
+    /// relation this checkpoint belongs to. Required for K8s stream
+    /// checkpoint validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relation_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_fingerprint: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -490,6 +499,9 @@ mod tests {
             )],
             parent_checkpoint: Some(0),
             created_at: "2026-05-03T00:00:00Z".to_string(),
+            relation_id: None,
+            relation_version: None,
+            schema_fingerprint: None,
         }
     }
 

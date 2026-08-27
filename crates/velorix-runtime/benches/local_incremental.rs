@@ -200,6 +200,9 @@ async fn run() -> BenchResult<()> {
             output_objects: vec![],
             parent_checkpoint: None,
             created_at: "2026-05-03T00:00:00Z".to_string(),
+        })            relation_id: None,
+        })            relation_version: None,
+        })            schema_fingerprint: None,
         })
         .await?;
     let checkpoint_elapsed = checkpoint_started.elapsed();
@@ -243,6 +246,9 @@ async fn run() -> BenchResult<()> {
                 output_objects: vec![],
                 parent_checkpoint: None,
                 created_at: "2026-05-03T00:00:00Z".to_string(),
+            })            relation_id: None,
+            })            relation_version: None,
+            })            schema_fingerprint: None,
             })
             .await?;
         checkpoint_samples.push(started.elapsed());
@@ -487,6 +493,9 @@ async fn gc_dry_run_planning(
             output_objects: vec![retained_output_ref],
             parent_checkpoint: Some(CHECKPOINT_VERSION),
             created_at: "2026-05-03T00:01:00Z".to_string(),
+        })            relation_id: None,
+        })            relation_version: None,
+        })            schema_fingerprint: None,
         })
         .await?;
 

@@ -617,6 +617,9 @@ fn manifest(checkpoint_version: u64, state_ref: StateObjectRef) -> CheckpointMan
         output_objects: vec![],
         parent_checkpoint: checkpoint_version.checked_sub(1),
         created_at: "2026-05-03T00:00:00Z".to_string(),
+    relation_id: None,
+    relation_version: None,
+    schema_fingerprint: None,
     }
 }
 
@@ -2102,6 +2105,9 @@ async fn checkpoint_publish_rejects_invalid_manifest_before_writing() {
         output_objects: vec![],
         parent_checkpoint: None,
         created_at: "2026-05-03T00:00:00Z".to_string(),
+        relation_id: None,
+        relation_version: None,
+        schema_fingerprint: None,
     };
 
     let err = publisher
@@ -4002,6 +4008,9 @@ async fn checkpoint_publish_rejects_fenced_manifest_with_unclaimed_input_partiti
         output_objects: vec![],
         parent_checkpoint: None,
         created_at: "2026-05-03T00:00:00Z".to_string(),
+        relation_id: None,
+        relation_version: None,
+        schema_fingerprint: None,
     };
 
     let err = publisher

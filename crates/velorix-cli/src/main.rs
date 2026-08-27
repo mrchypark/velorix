@@ -7949,6 +7949,9 @@ async fn seed_s3_compatible_gc_fixture(
             output_objects: vec![],
             parent_checkpoint: None,
             created_at: "2026-05-31T00:00:00Z".to_string(),
+            relation_id: None,
+            relation_version: None,
+            schema_fingerprint: None,
         })
         .await
         .context("failed to publish release GC seed manifest for checkpoint 0")?;
@@ -7979,6 +7982,9 @@ async fn seed_s3_compatible_gc_fixture(
             output_objects: vec![],
             parent_checkpoint: Some(0),
             created_at: "2026-05-31T00:01:00Z".to_string(),
+            relation_id: None,
+            relation_version: None,
+            schema_fingerprint: None,
         })
         .await
         .context("failed to publish release GC seed manifest for checkpoint 1")?;

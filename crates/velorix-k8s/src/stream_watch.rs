@@ -241,12 +241,24 @@ impl RelationCatalogSnapshotProvider {
 }
 
 fn checkpoint_manifest_proves_relation_identity(
-    _manifest: &CheckpointManifest,
-    _relation: &RelationVersionRef,
+    manifest: &CheckpointManifest,
+    relation: &RelationVersionRef,
 ) -> bool {
-    // CheckpointManifest v1 has no relation id/version/fingerprint fields. A matching
-    // input stream alone is not enough evidence for Kubernetes relation-scoped status.
-    false
+    // CheckpointManifest v2+ includes relation_id, relation_version, and
+    // schema_fingerprint fields. When present, they prove which relation
+    // this checkpoint belongs to.
+    match (
+        &manifest.relation_id,
+        &manifest.relation_version,
+        &manifest.schema_fingerprint,
+    ) {
+        (Some(id), Some(version), Some(fingerprint)) => {
+            id == &relation.relation_id
+                && version.parse::<u64>().ok() == Some(relation.relation_version)
+                && fingerprint == &relation.schema_fingerprint
+        }
+        _ => false,
+    }
 }
 
 fn snapshot_error(error: CheckpointPublishError) -> StreamWatchError {
