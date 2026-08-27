@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 
 /// Simulates a runtime row with column values (like CrossJoinRow).
 #[derive(Clone)]
+#[allow(dead_code)]
 struct SimRow {
     values: BTreeMap<String, Value>,
     weight: i64,
@@ -78,8 +79,10 @@ fn benchmark_clone_cost() {
     let iters = 100;
 
     println!("\n=== Clone Cost Benchmark ({} cols per row) ===", cols);
-    println!("{:>8} {:>12} {:>12} {:>12} {:>12} {:>12}",
-        "rows", "deep_ns", "arc_ns", "make_mut0", "make_mut1", "ratio");
+    println!(
+        "{:>8} {:>12} {:>12} {:>12} {:>12} {:>12}",
+        "rows", "deep_ns", "arc_ns", "make_mut0", "make_mut1", "ratio"
+    );
     println!("{}", "-".repeat(80));
 
     for &n in &sizes {
@@ -92,8 +95,10 @@ fn benchmark_clone_cost() {
         let mm1_ns = bench_make_mut_with_change(&arc_state, iters);
         let ratio = deep_ns as f64 / arc_ns as f64;
 
-        println!("{:>8} {:>12} {:>12} {:>12} {:>12} {:>12.1}x",
-            n, deep_ns, arc_ns, mm0_ns, mm1_ns, ratio);
+        println!(
+            "{:>8} {:>12} {:>12} {:>12} {:>12} {:>12.1}x",
+            n, deep_ns, arc_ns, mm0_ns, mm1_ns, ratio
+        );
     }
 
     println!("\n=== Temporal Join Right Index Clone ===");
@@ -119,8 +124,10 @@ fn benchmark_clone_cost() {
         let arc_ns = bench_clone_arc(&arc_index, iters);
         let ratio = deep_ns as f64 / arc_ns as f64;
 
-        println!("  {} rows: deep={}ns arc={}ns ratio={:.1}x",
-            n, deep_ns, arc_ns, ratio);
+        println!(
+            "  {} rows: deep={}ns arc={}ns ratio={:.1}x",
+            n, deep_ns, arc_ns, ratio
+        );
     }
 }
 

@@ -493,12 +493,17 @@ impl CheckpointPublisher {
 
     /// Read the latest candidate marker from object store.
     /// Returns None if the marker doesn't exist or is invalid.
-    pub async fn read_latest_candidate_marker(
-        &self,
-    ) -> Option<LatestCandidateMarker> {
+    pub async fn read_latest_candidate_marker(&self) -> Option<LatestCandidateMarker> {
         let marker_key = ObjectKey::checkpoint_latest_candidate_marker();
         let marker_path = Path::from(marker_key.as_str());
-        let bytes = self.store.get(&marker_path).await.ok()?.bytes().await.ok()?;
+        let bytes = self
+            .store
+            .get(&marker_path)
+            .await
+            .ok()?
+            .bytes()
+            .await
+            .ok()?;
         serde_json::from_slice::<LatestCandidateMarker>(&bytes).ok()
     }
 

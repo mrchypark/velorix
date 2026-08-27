@@ -217,15 +217,16 @@ impl RelationCatalogSnapshotProvider {
                     .input_ranges
                     .iter()
                     .any(|range| range.stream_id == stream.spec.stream_id)
-                    && checkpoint_manifest_proves_relation_identity(&manifest, &stream.spec.relation)
+                    && checkpoint_manifest_proves_relation_identity(
+                        &manifest,
+                        &stream.spec.relation,
+                    )
                 {
                     return match publisher
                         .read_checkpoint_lifecycle_record(manifest.checkpoint_version)
                         .await
                     {
-                        Ok(record)
-                            if record.manifest_digest == digest_manifest(&manifest)? =>
-                        {
+                        Ok(record) if record.manifest_digest == digest_manifest(&manifest)? => {
                             Ok(Some(CheckpointRef {
                                 checkpoint_version: manifest.checkpoint_version,
                                 manifest_digest: record.manifest_digest,
