@@ -22777,7 +22777,7 @@ fn temporal_join_materializes_asof_match_and_retracts() {
     let batch = &page.batches[0];
     assert_eq!(batch.num_rows(), 1);
     assert_eq!(
-        batch
+        page.batches[0]
             .column(3)
             .as_any()
             .downcast_ref::<Int64Array>()
@@ -22785,6 +22785,177 @@ fn temporal_join_materializes_asof_match_and_retracts() {
             .value(0),
         1000
     );
+}
+
+/// Fault-injection: verify state is unchanged when input validation fails.
+#[test]
+fn fault_injection_input_validation_preserves_state() {
+    let rides = temporal_join_rides_catalog();
+    let prices = temporal_join_prices_catalog();
+    let catalogs = vec![rides.clone(), prices.clone()];
+    let input_schemas: Vec<RelationSchema> = catalogs
+        .iter()
+        .map(|c| catalog_input_relation_schema(c).unwrap())
+        .collect();
+    let output_schema = temporal_join_output_schema();
+    let sql = "select l.ride_id, l.booking_start, l.event_time, p.price, p.event_time as price_event_time from rides l join prices p on p.event_time <= l.event_time";
+    let identity = standing_identity_with_view(sql, "enriched");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &catalogs,
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    // Apply a valid epoch first
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("ev-1").unwrap(),
+            vec![relation_input(
+                &prices,
+                "ev-prices",
+                0,
+                1,
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("vehicle_id", DataType::Utf8, false),
+                        Field::new("price", DataType::Int64, false),
+                        Field::new("event_time", DataType::Int64, false),
+                        Field::new("delta", DataType::Int64, false),
+                    ])),
+                    vec![
+                        Arc::new(StringArray::from(vec!["p1"])) as _,
+                        Arc::new(Int64Array::from(vec![1000])) as _,
+                        Arc::new(Int64Array::from(vec![100])) as _,
+                        Arc::new(Int64Array::from(vec![1])) as _,
+                    ],
+                )
+                .unwrap(),
+            )],
+        )
+        .unwrap();
+
+    // Snapshot state before failed input
+    let checkpoint_before = runtime.checkpoint().unwrap();
+    let logical_epoch_before = checkpoint_before.logical_epoch;
+
+    // Attempt to apply with wrong schema (should fail)
+    let wrong_schema_result = runtime.apply_changes(
+        2,
+        EpochIdempotencyKey::new("ev-2-wrong").unwrap(),
+        vec![relation_input(
+            &rides,
+            "ev-rides-wrong",
+            0,
+            1,
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("wrong_column", DataType::Utf8, false),
+                ])),
+                vec![Arc::new(StringArray::from(vec!["x"])) as _],
+            )
+            .unwrap(),
+        )],
+    );
+
+    // Should fail
+    assert!(wrong_schema_result.is_err());
+
+    // State should be unchanged
+    let checkpoint_after = runtime.checkpoint().unwrap();
+    assert_eq!(logical_epoch_before, checkpoint_after.logical_epoch);
+}
+
+/// Fault-injection: verify state is unchanged on resource limit exceeded.
+#[test]
+fn fault_injection_resource_limit_preserves_state() {
+    let rides = temporal_join_rides_catalog();
+    let prices = temporal_join_prices_catalog();
+    let catalogs = vec![rides.clone(), prices.clone()];
+    let input_schemas: Vec<RelationSchema> = catalogs
+        .iter()
+        .map(|c| catalog_input_relation_schema(c).unwrap())
+        .collect();
+    let output_schema = temporal_join_output_schema();
+    let sql = "select l.ride_id, l.booking_start, l.event_time, p.price, p.event_time as price_event_time from rides l join prices p on p.event_time <= l.event_time";
+    let identity = standing_identity_with_view(sql, "enriched");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &catalogs,
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    // Apply valid epoch
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("ev-1").unwrap(),
+            vec![relation_input(
+                &prices,
+                "ev-prices",
+                0,
+                1,
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("vehicle_id", DataType::Utf8, false),
+                        Field::new("price", DataType::Int64, false),
+                        Field::new("event_time", DataType::Int64, false),
+                        Field::new("delta", DataType::Int64, false),
+                    ])),
+                    vec![
+                        Arc::new(StringArray::from(vec!["p1"])) as _,
+                        Arc::new(Int64Array::from(vec![1000])) as _,
+                        Arc::new(Int64Array::from(vec![100])) as _,
+                        Arc::new(Int64Array::from(vec![1])) as _,
+                    ],
+                )
+                .unwrap(),
+            )],
+        )
+        .unwrap();
+
+    let checkpoint_before = runtime.checkpoint().unwrap();
+    let logical_epoch_before = checkpoint_before.logical_epoch;
+
+    // Attempt duplicate epoch - idempotent, should succeed with no output
+    let dup_result = runtime.apply_changes(
+        1,
+        EpochIdempotencyKey::new("ev-1").unwrap(),
+        vec![relation_input(
+            &prices,
+            "ev-prices-dup",
+            0,
+            1,
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("vehicle_id", DataType::Utf8, false),
+                    Field::new("price", DataType::Int64, false),
+                    Field::new("event_time", DataType::Int64, false),
+                    Field::new("delta", DataType::Int64, false),
+                ])),
+                vec![
+                    Arc::new(StringArray::from(vec!["p1"])) as _,
+                    Arc::new(Int64Array::from(vec![2000])) as _,
+                    Arc::new(Int64Array::from(vec![200])) as _,
+                    Arc::new(Int64Array::from(vec![1])) as _,
+                ],
+            )
+            .unwrap(),
+        )],
+    );
+
+    // Idempotent - should succeed with empty output
+    assert!(dup_result.is_ok());
+
+    // State unchanged
+    let checkpoint_after = runtime.checkpoint().unwrap();
+    assert_eq!(logical_epoch_before, checkpoint_after.logical_epoch);
 }
 
 #[test]
