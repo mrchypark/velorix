@@ -22852,9 +22852,11 @@ fn fault_injection_input_validation_preserves_state() {
             0,
             1,
             RecordBatch::try_new(
-                Arc::new(Schema::new(vec![
-                    Field::new("wrong_column", DataType::Utf8, false),
-                ])),
+                Arc::new(Schema::new(vec![Field::new(
+                    "wrong_column",
+                    DataType::Utf8,
+                    false,
+                )])),
                 vec![Arc::new(StringArray::from(vec!["x"])) as _],
             )
             .unwrap(),

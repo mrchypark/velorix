@@ -617,9 +617,9 @@ fn manifest(checkpoint_version: u64, state_ref: StateObjectRef) -> CheckpointMan
         output_objects: vec![],
         parent_checkpoint: checkpoint_version.checked_sub(1),
         created_at: "2026-05-03T00:00:00Z".to_string(),
-    relation_id: None,
-    relation_version: None,
-    schema_fingerprint: None,
+        relation_id: None,
+        relation_version: None,
+        schema_fingerprint: None,
     }
 }
 

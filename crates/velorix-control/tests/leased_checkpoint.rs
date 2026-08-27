@@ -235,9 +235,9 @@ fn manifest(
         output_objects,
         parent_checkpoint: checkpoint_version.checked_sub(1),
         created_at: "2026-05-04T00:00:00Z".to_string(),
-    relation_id: None,
-    relation_version: None,
-    schema_fingerprint: None,
+        relation_id: None,
+        relation_version: None,
+        schema_fingerprint: None,
     }
 }
 

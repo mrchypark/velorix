@@ -322,9 +322,9 @@ fn manifest_for(state_ref: StateObjectRef) -> CheckpointManifest {
         output_objects: vec![],
         parent_checkpoint: None,
         created_at: "2026-05-04T00:00:00Z".to_string(),
-    relation_id: None,
-    relation_version: None,
-    schema_fingerprint: None,
+        relation_id: None,
+        relation_version: None,
+        schema_fingerprint: None,
     }
 }
 

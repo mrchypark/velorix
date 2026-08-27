@@ -650,9 +650,9 @@ fn gc_manifest(
         output_objects: vec![],
         parent_checkpoint,
         created_at: "2026-05-18T00:00:00Z".to_string(),
-    relation_id: None,
-    relation_version: None,
-    schema_fingerprint: None,
+        relation_id: None,
+        relation_version: None,
+        schema_fingerprint: None,
     }
 }
 
