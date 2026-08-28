@@ -14,23 +14,16 @@ pub enum DeltaError {
 
 /// Memcomparable binary key for ordered BTreeMap operations.
 ///
-/// Stores key and value encodings as separate byte sequences to prevent
-/// collision between different (key, value) pairs that would produce
-/// identical bytes when concatenated without a boundary marker.
-///
-/// Ordering: compare key bytes first, then value bytes. This ensures
-/// `(a, b) < (c, d)` iff `a < c` or (`a == c` and `b < d`).
+/// Stores key and value encodings as a single byte sequence with proper
+/// JSON string escaping to prevent collision between different (key, value)
+/// pairs. The single-buffer approach minimizes memory overhead while the
+/// escaping ensures injective encoding.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
-pub struct TypedBinaryKey {
-    key_bytes: Vec<u8>,
-    value_bytes: Vec<u8>,
-}
+pub struct TypedBinaryKey(Vec<u8>);
 
 impl Ord for TypedBinaryKey {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.key_bytes
-            .cmp(&other.key_bytes)
-            .then_with(|| self.value_bytes.cmp(&other.value_bytes))
+        self.0.cmp(&other.0)
     }
 }
 
@@ -42,7 +35,7 @@ impl PartialOrd for TypedBinaryKey {
 
 impl TypedBinaryKey {
     pub fn as_bytes(&self) -> &[u8] {
-        &self.key_bytes
+        &self.0
     }
 }
 
@@ -108,17 +101,13 @@ fn encode_json_ordered(value: &Value, buf: &mut Vec<u8>) {
 
 /// Encode a key-value pair into an ordered binary key.
 ///
-/// Key and value are stored as separate byte sequences within the
-/// TypedBinaryKey to prevent collision between different pairs.
+/// Uses proper JSON string escaping to ensure injective encoding —
+/// different (key, value) pairs always produce different byte sequences.
 pub fn encode_kv_ordered(key: &Value, value: &Value) -> TypedBinaryKey {
-    let mut key_buf = Vec::with_capacity(64);
-    encode_json_ordered(key, &mut key_buf);
-    let mut value_buf = Vec::with_capacity(64);
-    encode_json_ordered(value, &mut value_buf);
-    TypedBinaryKey {
-        key_bytes: key_buf,
-        value_bytes: value_buf,
-    }
+    let mut buf = Vec::with_capacity(64);
+    encode_json_ordered(key, &mut buf);
+    encode_json_ordered(value, &mut buf);
+    TypedBinaryKey(buf)
 }
 
 /// Encode only the key part for pagination ordering.
@@ -126,12 +115,9 @@ pub fn encode_kv_ordered(key: &Value, value: &Value) -> TypedBinaryKey {
 /// Pagination uses key-only ordering so page tokens (which are
 /// canonical JSON strings of keys only) align with the binary ordering.
 pub fn encode_key_ordered(key: &Value) -> TypedBinaryKey {
-    let mut key_buf = Vec::with_capacity(64);
-    encode_json_ordered(key, &mut key_buf);
-    TypedBinaryKey {
-        key_bytes: key_buf,
-        value_bytes: Vec::new(),
-    }
+    let mut buf = Vec::with_capacity(64);
+    encode_json_ordered(key, &mut buf);
+    TypedBinaryKey(buf)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
