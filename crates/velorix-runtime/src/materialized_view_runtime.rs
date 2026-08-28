@@ -524,6 +524,11 @@ fn looks_like_tumbling_window_output(
 pub fn restore_standing_runtime(
     checkpoint: RuntimeCheckpoint,
 ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
+    // Validate checkpoint payload size to prevent excessive memory allocation
+    // during recovery. This bounds recovery time and RSS.
+    if let Some(payload) = &checkpoint.state_payload {
+        checkpoint_common::validate_checkpoint_size(&payload.payload).map_err(|e| e.to_string())?;
+    }
     if checkpoint_has_filter_project_payload(&checkpoint) {
         return FilterProjectRuntime::restore(checkpoint)
             .map(|runtime| Box::new(runtime) as Box<dyn StandingProgramRuntime + Send>)

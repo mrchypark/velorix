@@ -2,6 +2,21 @@ use super::*;
 
 const MAX_RETAINED_IDEMPOTENCY_KEYS: usize = 1_024;
 
+/// Maximum allowed checkpoint payload size in bytes (16 MiB).
+/// Checkpoints exceeding this limit are rejected during restore to prevent
+/// excessive memory allocation and recovery time.
+pub const MAX_CHECKPOINT_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+
+/// Validate that a checkpoint payload does not exceed the size limit.
+pub fn validate_checkpoint_size(payload: &str) -> Result<(), StandingProgramRuntimeError> {
+    if payload.len() > MAX_CHECKPOINT_PAYLOAD_BYTES {
+        return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+            field: "checkpoint_payload_size_exceeded",
+        });
+    }
+    Ok(())
+}
+
 /// Keeps checkpointed idempotency history to 1,024 entries while retaining the most recent epochs.
 ///
 /// Idempotency keys older than this window may be applied again once evicted; callers must
