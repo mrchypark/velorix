@@ -47,3 +47,10 @@ Rust incremental compilation helps locally but CI runs with `CARGO_INCREMENTAL=0
 **Nightly Benchmark Gate** runs on schedule (not per-push) and validates
 performance invariants (rows/s, bytes/row, S3 operation counts, RSS, spill).
 Failures here indicate performance regressions, not correctness issues.
+
+**Branch Protection:** `main` must have required status checks enabled:
+- `cargo fmt --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- workspace test
+- benchmark PR smoke
+Without branch protection, broken commits can be merged directly to main.

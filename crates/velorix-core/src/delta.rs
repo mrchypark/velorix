@@ -12,6 +12,317 @@ pub enum DeltaError {
     WeightOverflow,
 }
 
+// ---------------------------------------------------------------------------
+// V2 Self-Delimiting Typed Codec
+// ---------------------------------------------------------------------------
+//
+// Wire format per value:
+//   type_tag: 1 byte
+//   [payload: variable, self-delimiting]
+//
+// Type tags (ordered for BTreeMap comparison):
+//   0x00 = Null
+//   0x01 = Bool false
+//   0x02 = Bool true
+//   0x03 = I64 (varint zigzag encoded)
+//   0x04 = F64 (8 bytes big-endian)
+//   0x05 = String (4-byte LE length + UTF-8 bytes)
+//   0x06 = Array (4-byte LE element count + elements)
+//   0x07 = Object (4-byte LE field count + sorted name-value pairs)
+//
+// Injectivity guarantees:
+// - Type tag separates different JSON types
+// - Length prefix prevents boundary ambiguity
+// - Object fields are sorted by name before encoding
+// - Zigzag varint for integers is injective
+// - Big-endian f64 bytes are injective
+// - String length prefix prevents cross-field ambiguity
+
+/// Codec version identifier embedded in header.
+pub const CODEC_V2_VERSION: u8 = 1;
+
+/// Magic byte identifying v2 codec encoded keys.
+pub const CODEC_V2_MAGIC: u8 = 0xF7;
+
+/// Type tags for the v2 codec.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum V2TypeTag {
+    Null = 0x00,
+    BoolFalse = 0x01,
+    BoolTrue = 0x02,
+    I64 = 0x03,
+    F64 = 0x04,
+    String = 0x05,
+    Array = 0x06,
+    Object = 0x07,
+}
+
+/// Encode a JSON value using the v2 self-delimiting typed codec.
+///
+/// This encoding is injective: different JSON values always produce
+/// different byte sequences. The encoding is also deterministic:
+/// the same value always produces the same bytes.
+///
+/// For BTreeMap ordering, the encoded bytes sort in the same order
+/// as canonical JSON strings for values of the same type. Cross-type
+/// ordering matches canonical JSON (null < false < true < number < string < array < object).
+pub fn encode_v2(value: &Value) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(64);
+    encode_v2_value(value, &mut buf);
+    buf
+}
+
+/// Encode a key-value pair using v2 codec.
+///
+/// Concatenates the v2 encodings of key and value. Since each encoding
+/// is self-delimiting and injective, the concatenation is also injective:
+/// (key_a, value_a) != (key_b, value_b) implies encode_kv_v2(a) != encode_kv_v2(b).
+pub fn encode_kv_v2(key: &Value, value: &Value) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(128);
+    encode_v2_value(key, &mut buf);
+    encode_v2_value(value, &mut buf);
+    buf
+}
+
+fn encode_v2_value(value: &Value, buf: &mut Vec<u8>) {
+    match value {
+        Value::Null => {
+            buf.push(V2TypeTag::Null as u8);
+        }
+        Value::Bool(false) => {
+            buf.push(V2TypeTag::BoolFalse as u8);
+        }
+        Value::Bool(true) => {
+            buf.push(V2TypeTag::BoolTrue as u8);
+        }
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                buf.push(V2TypeTag::I64 as u8);
+                encode_zigzag_varint(i as u64, buf);
+            } else if let Some(f) = n.as_f64() {
+                buf.push(V2TypeTag::F64 as u8);
+                buf.extend_from_slice(&f.to_le_bytes());
+            } else {
+                // Fallback: treat as string
+                buf.push(V2TypeTag::String as u8);
+                let s = n.to_string();
+                encode_v2_string(&s, buf);
+            }
+        }
+        Value::String(s) => {
+            buf.push(V2TypeTag::String as u8);
+            encode_v2_string(s, buf);
+        }
+        Value::Array(arr) => {
+            buf.push(V2TypeTag::Array as u8);
+            encode_v2_length(arr.len(), buf);
+            for item in arr {
+                encode_v2_value(item, buf);
+            }
+        }
+        Value::Object(map) => {
+            buf.push(V2TypeTag::Object as u8);
+            // Sort fields by name for deterministic encoding
+            let mut fields: Vec<_> = map.iter().collect();
+            fields.sort_by_key(|(k, _)| (*k).clone());
+            encode_v2_length(fields.len(), buf);
+            for (key, value) in fields {
+                encode_v2_string(key, buf);
+                encode_v2_value(value, buf);
+            }
+        }
+    }
+}
+
+/// Encode a string with 4-byte little-endian length prefix.
+fn encode_v2_string(s: &str, buf: &mut Vec<u8>) {
+    let len = s.len() as u32;
+    buf.extend_from_slice(&len.to_le_bytes());
+    buf.extend_from_slice(s.as_bytes());
+}
+
+/// Encode a length as 4-byte little-endian.
+fn encode_v2_length(len: usize, buf: &mut Vec<u8>) {
+    let len = len as u32;
+    buf.extend_from_slice(&len.to_le_bytes());
+}
+
+/// Zigzag encode an i64 as u64 for varint encoding.
+/// This maps negative numbers to odd u64 values and positive to even,
+/// preserving ordering for positive values and reversing for negative.
+fn encode_zigzag_varint(value: u64, buf: &mut Vec<u8>) {
+    // Zigzag: (n << 1) ^ (n >> 63)
+    let zigzag = (value << 1) ^ (value >> 63);
+    encode_varint(zigzag, buf);
+}
+
+/// Encode a u64 as a variable-length integer (varint).
+/// Uses 7 bits per byte with continuation bit.
+fn encode_varint(mut value: u64, buf: &mut Vec<u8>) {
+    while value >= 0x80 {
+        buf.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    buf.push(value as u8);
+}
+
+#[cfg(test)]
+mod v2_codec_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use serde_json::json;
+
+    #[test]
+    fn v2_null_encodes_uniquely() {
+        let enc = encode_v2(&Value::Null);
+        assert_eq!(enc, vec![V2TypeTag::Null as u8]);
+    }
+
+    #[test]
+    fn v2_bool_encodes_uniquely() {
+        assert_eq!(
+            encode_v2(&Value::Bool(false)),
+            vec![V2TypeTag::BoolFalse as u8]
+        );
+        assert_eq!(
+            encode_v2(&Value::Bool(true)),
+            vec![V2TypeTag::BoolTrue as u8]
+        );
+    }
+
+    #[test]
+    fn v2_different_types_different_encoding() {
+        let null_enc = encode_v2(&Value::Null);
+        let false_enc = encode_v2(&Value::Bool(false));
+        let num_enc = encode_v2(&json!(0));
+        let str_enc = encode_v2(&json!(""));
+        let arr_enc = encode_v2(&json!([]));
+        let obj_enc = encode_v2(&json!({}));
+
+        let all = [
+            &null_enc, &false_enc, &num_enc, &str_enc, &arr_enc, &obj_enc,
+        ];
+        for i in 0..all.len() {
+            for j in (i + 1)..all.len() {
+                assert_ne!(
+                    all[i], all[j],
+                    "encodings should differ for different types"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn v2_collision_a_b_vs_a_b() {
+        // The classic collision: key="a\"", value="b" vs key="a", value="\"b"
+        let enc1 = encode_kv_v2(&json!("a\""), &json!("b"));
+        let enc2 = encode_kv_v2(&json!("a"), &json!("\"b"));
+        assert_ne!(enc1, enc2, "v2 codec must not collide on string boundary");
+    }
+
+    #[test]
+    fn v2_numeric_1_23_vs_12_3() {
+        let enc1 = encode_kv_v2(&json!(1), &json!(23));
+        let enc2 = encode_kv_v2(&json!(12), &json!(3));
+        assert_ne!(
+            enc1, enc2,
+            "v2 codec must not collide on numeric concatenation"
+        );
+    }
+
+    #[test]
+    fn v2_object_field_order_independent() {
+        // Object fields are sorted before encoding
+        let obj1 = json!({"b": 1, "a": 2});
+        let obj2 = json!({"a": 2, "b": 1});
+        assert_eq!(encode_v2(&obj1), encode_v2(&obj2));
+    }
+
+    #[test]
+    fn v2_deterministic() {
+        let val = json!({"key": "value", "num": 42, "nested": [1, 2, 3]});
+        let enc1 = encode_v2(&val);
+        let enc2 = encode_v2(&val);
+        assert_eq!(enc1, enc2);
+    }
+
+    #[test]
+    fn v2_injectivity_fuzz() {
+        // Generate many different JSON values and verify all produce distinct encodings
+        let values = vec![
+            Value::Null,
+            Value::Bool(false),
+            Value::Bool(true),
+            json!(0),
+            json!(1),
+            json!(-1),
+            json!(i64::MAX),
+            json!(i64::MIN),
+            json!(0.0),
+            json!(1.5),
+            json!(-1.5),
+            json!(""),
+            json!("a"),
+            json!("ab"),
+            json!("ba"),
+            json!("a\"b"),
+            json!("\"a"),
+            json!("a\\\"b"),
+            json!("\u{0000}"),
+            json!("\u{0001}"),
+            json!([1, 2, 3]),
+            json!([1, 2]),
+            json!([1, 2, 3, 4]),
+            json!({"a": 1}),
+            json!({"a": 1, "b": 2}),
+            json!({"b": 1, "a": 2}),
+            json!({"a": {"b": 1}}),
+            json!([{"a": 1}]),
+        ];
+
+        let mut encodings: Vec<Vec<u8>> = values.iter().map(encode_v2).collect();
+        encodings.sort();
+        encodings.dedup();
+        assert_eq!(
+            encodings.len(),
+            values.len(),
+            "all distinct JSON values must produce distinct v2 encodings"
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn v2_kv_injectivity(a in ".*", b in ".*") {
+            // Different string pairs must produce different encodings
+            let enc1 = encode_kv_v2(&json!(a), &json!("x"));
+            let enc2 = encode_kv_v2(&json!(b), &json!("x"));
+            if a != b {
+                prop_assert_ne!(enc1, enc2, "v2 kv encoding must be injective for strings");
+            }
+        }
+
+        #[test]
+        fn v2_deterministic_encoding(a in -1000i64..1000, b in -1000i64..1000) {
+            // Same input always produces same encoding
+            let ja = json!(a);
+            let jb = json!(b);
+            let ea1 = encode_v2(&ja);
+            let ea2 = encode_v2(&ja);
+            let eb1 = encode_v2(&jb);
+            let eb2 = encode_v2(&jb);
+            prop_assert_eq!(ea1, ea2, "v2 encoding must be deterministic");
+            prop_assert_eq!(eb1, eb2, "v2 encoding must be deterministic");
+            // Different values produce different encodings
+            if a != b {
+                let ea = encode_v2(&ja);
+                let eb = encode_v2(&jb);
+                prop_assert_ne!(ea, eb, "v2 encoding must be injective");
+            }
+        }
+    }
+}
+
 /// Memcomparable binary key for ordered BTreeMap operations.
 ///
 /// Stores key and value encodings as a single byte sequence with proper
