@@ -23,3 +23,27 @@ view shapes must fail closed during admission with a clear error.
 Do not expand Velorix-owned SQL support by silently adding fake fallbacks. If a
 SQL family is unsupported, return an admission error and implement the internal
 runtime capability deliberately.
+
+## CI and Pre-Push Workflow
+
+CI runs on GitHub Actions (`CI` workflow) and enforces `-D warnings` on clippy
+and `cargo fmt --check`. Pushing a broken commit blocks the branch until fixed.
+
+**Before pushing, always run locally:**
+
+1. `cargo fmt` — fix formatting
+2. `cargo clippy --workspace --all-targets -- -D warnings` — must pass clean
+3. `cargo test -p velorix-runtime --lib` — quick sanity (3 tests, ~1s)
+4. `cargo test -p velorix-runtime --test materialized_view_runtime` — full
+   runtime integration (223 tests, ~30s on local)
+
+If any of these fail, fix before pushing. Do not rely on CI to catch issues
+after the fact.
+
+**CI timing:** The CI workflow takes ~5-20 minutes depending on cache state.
+Full workspace build from cold cache is ~3 minutes; tests add ~1-2 minutes.
+Rust incremental compilation helps locally but CI runs with `CARGO_INCREMENTAL=0`.
+
+**Nightly Benchmark Gate** runs on schedule (not per-push) and validates
+performance invariants (rows/s, bytes/row, S3 operation counts, RSS, spill).
+Failures here indicate performance regressions, not correctness issues.
