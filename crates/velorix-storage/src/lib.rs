@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bounded_concurrency;
 pub mod capability;
 pub mod checkpoint_index;
 pub mod gc;

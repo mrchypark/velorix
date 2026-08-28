@@ -4,7 +4,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use object_store::{path::Path, ObjectStore, ObjectStoreExt, PutMode};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -623,7 +623,7 @@ impl CheckpointPublisher {
             .try_collect::<Vec<_>>()
             .await?;
 
-        let results = futures::future::join_all(objects.iter().map(|object| async {
+        let results = futures::stream::iter(objects.iter().map(|object| async {
             let object_key = ObjectKey::parse(object.location.to_string())?;
             let bytes = self.store.get(&object.location).await?.bytes().await?;
             let manifest = serde_json::from_slice::<CheckpointManifest>(&bytes)?;
@@ -637,6 +637,8 @@ impl CheckpointPublisher {
             }
             Ok::<_, CheckpointPublishError>(manifest)
         }))
+        .buffer_unordered(crate::bounded_concurrency::DEFAULT_CONCURRENCY)
+        .collect::<Vec<_>>()
         .await;
 
         let mut manifests = Vec::with_capacity(results.len());
@@ -2668,7 +2670,7 @@ impl CheckpointPublisher {
         manifest: &CheckpointManifest,
     ) -> Result<(), CheckpointPublishError> {
         let results =
-            futures::future::join_all(manifest.output_objects.iter().map(|output_object| async {
+            futures::stream::iter(manifest.output_objects.iter().map(|output_object| async {
                 let path = Path::from(output_object.object_key.as_str());
                 match self.store.head(&path).await {
                     Ok(_) => Ok(()),
@@ -2680,6 +2682,8 @@ impl CheckpointPublisher {
                     Err(err) => Err(err.into()),
                 }
             }))
+            .buffer_unordered(crate::bounded_concurrency::DEFAULT_CONCURRENCY)
+            .collect::<Vec<_>>()
             .await;
 
         for result in results {
