@@ -25,6 +25,52 @@ pub struct CheckpointManifest {
     pub schema_fingerprint: Option<String>,
 }
 
+/// A checkpoint manifest that has been validated.
+///
+/// This type guarantees that `validate()` has been called and succeeded.
+/// Only validated manifests should be used in publish operations.
+/// This prevents accidentally publishing unvalidated manifests.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidatedCheckpointManifest {
+    manifest: CheckpointManifest,
+}
+
+impl ValidatedCheckpointManifest {
+    /// Validate and wrap a checkpoint manifest.
+    ///
+    /// Returns `Err` if the manifest fails any validation check.
+    pub fn try_new(manifest: CheckpointManifest) -> Result<Self, ManifestError> {
+        manifest.validate()?;
+        Ok(Self { manifest })
+    }
+
+    /// Get a reference to the inner manifest.
+    pub fn inner(&self) -> &CheckpointManifest {
+        &self.manifest
+    }
+
+    /// Consume and return the inner manifest.
+    pub fn into_inner(self) -> CheckpointManifest {
+        self.manifest
+    }
+
+    /// Validate owner claim against this manifest.
+    pub fn validate_owner_claim(
+        &self,
+        owner_claim: &PartitionOwnerClaim,
+    ) -> Result<(), ManifestError> {
+        self.manifest.validate_owner_claim(owner_claim)
+    }
+}
+
+impl std::ops::Deref for ValidatedCheckpointManifest {
+    type Target = CheckpointManifest;
+
+    fn deref(&self) -> &Self::Target {
+        &self.manifest
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PartitionOwnerClaim {
     pub owner_id: String,
