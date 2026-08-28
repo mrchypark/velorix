@@ -359,14 +359,15 @@ pub(super) async fn ingest_epoch(
 
 /// Append prepared ingest batches atomically.
 ///
-/// All batches are appended concurrently in two phases:
+/// All batches are appended in two phases:
 /// Phase 1: Object PUT for all batches (concurrent)
-/// Phase 2: Range commit for all batches (concurrent, only if phase 1
+/// Phase 2: Range commit for all batches (atomic, only if phase 1
 ///          fully succeeds)
 ///
-/// If any batch fails in phase 1, no range commits are performed and
-/// the epoch remains invisible to readers. The content-addressed object
-/// PUTs are idempotent and will be cleaned up by GC if unused.
+/// Phase 2 commits all ranges atomically via `commit_ingest_ranges`.
+/// If any range commit fails, no ranges become visible and the epoch
+/// remains invisible to readers. The content-addressed object PUTs
+/// are idempotent and will be cleaned up by GC if unused.
 pub(super) async fn append_prepared_ingest_epoch_batches(
     state: &ApiState,
     prepared_batches: &[PreparedIngestBatch],
@@ -392,60 +393,88 @@ pub(super) async fn append_prepared_ingest_epoch_batches(
             .try_collect::<Vec<_>>()
             .await?;
 
-    // Phase 2: Concurrent range commits (only if all PUTs succeeded)
+    // Phase 2: Atomic range commits (only if all PUTs succeeded)
+    // All ranges are committed atomically — if any fails, none become visible.
     let owned_epoch = ingest_epoch.to_string();
-    let mut commit_results = futures::stream::iter(append_results.into_iter().map(|item| {
-        let (index, prepared, outcome_str, descriptor) = item;
-        let state = state.clone();
-        let ingest_epoch = owned_epoch.clone();
-        async move {
-            commit_ingest_range(
-                &state,
-                &prepared.request,
-                &prepared.catalog,
-                prepared.end_offset_exclusive,
-                &prepared.envelope,
-            )
-            .await?;
-            Ok::<_, ApiError>(PreparedIngestAppendOutcome {
-                index,
-                appended: outcome_str == "appended",
-                response: IngestResponse {
-                    outcome: outcome_str.to_string(),
-                    descriptor: ingest_descriptor_response(&descriptor),
-                    epoch_manifest_id: ingest_epoch.clone(),
-                    ingest_epoch,
-                    materialized_through: None,
-                    ack_mode,
-                    materialization: IngestMaterializationResponse {
-                        status: "epoch_scoped".to_string(),
-                        active_views: 0,
-                        applied_batches: 0,
+    let mut reservations = Vec::with_capacity(append_results.len());
+    for (index, prepared, outcome_str, descriptor) in &append_results {
+        let reservation = ingest_range_reservation(
+            &prepared.request,
+            &prepared.catalog,
+            prepared.end_offset_exclusive,
+            &prepared.envelope,
+        )?;
+        reservations.push((
+            *index,
+            prepared,
+            reservation,
+            outcome_str.clone(),
+            descriptor.clone(),
+        ));
+    }
+    let range_reservations: Vec<_> = reservations
+        .iter()
+        .map(|(_, _, r, _, _)| r.clone())
+        .collect();
+    let commit_outcomes = if let Some(meta_store) = state.meta_store.as_ref() {
+        meta_store
+            .commit_ingest_ranges(range_reservations)
+            .await
+            .map_err(meta_error_to_api)?
+    } else {
+        reservations
+            .iter()
+            .map(|_| CommitIngestRangeOutcome::Committed)
+            .collect()
+    };
+    let mut commit_results = Vec::with_capacity(reservations.len());
+    for (i, (index, _prepared, _reservation, outcome_str, descriptor)) in
+        reservations.into_iter().enumerate()
+    {
+        match &commit_outcomes[i] {
+            CommitIngestRangeOutcome::Committed | CommitIngestRangeOutcome::Duplicate => {
+                commit_results.push(PreparedIngestAppendOutcome {
+                    index,
+                    appended: outcome_str == "appended",
+                    response: IngestResponse {
+                        outcome: outcome_str,
+                        descriptor: ingest_descriptor_response(&descriptor),
+                        epoch_manifest_id: owned_epoch.clone(),
+                        ingest_epoch: owned_epoch.clone(),
                         materialized_through: None,
-                        checkpoint_writes: 0,
-                        applied_batches_per_checkpoint_write: None,
-                        output_delta_writes: 0,
-                        state_payload_writes: 0,
-                        checkpoint_record_writes: 0,
-                        checkpoint_pointer_writes: 0,
-                        checkpoint_publication_writes: 0,
+                        ack_mode,
+                        materialization: IngestMaterializationResponse {
+                            status: "epoch_scoped".to_string(),
+                            active_views: 0,
+                            applied_batches: 0,
+                            materialized_through: None,
+                            checkpoint_writes: 0,
+                            applied_batches_per_checkpoint_write: None,
+                            output_delta_writes: 0,
+                            state_payload_writes: 0,
+                            checkpoint_record_writes: 0,
+                            checkpoint_pointer_writes: 0,
+                            checkpoint_publication_writes: 0,
+                        },
+                        timings: IngestTimingResponse {
+                            total_ms: 0,
+                            total_us: 0,
+                            avg_batch_us: None,
+                            avg_row_us: None,
+                            rows_per_second: None,
+                            batch_count: 1,
+                            row_count: 0,
+                        },
                     },
-                    timings: IngestTimingResponse {
-                        total_ms: 0,
-                        total_us: 0,
-                        avg_batch_us: None,
-                        avg_row_us: None,
-                        rows_per_second: None,
-                        batch_count: 1,
-                        row_count: prepared.request.rows.len(),
-                    },
-                },
-            })
+                });
+            }
+            CommitIngestRangeOutcome::Conflict => {
+                return Err(ApiError::conflict(format!(
+                    "atomic epoch range commit conflict at index {index}"
+                )));
+            }
         }
-    }))
-    .buffer_unordered(concurrency)
-    .try_collect::<Vec<_>>()
-    .await?;
+    }
 
     commit_results.sort_by_key(|outcome| outcome.index);
     let appended = commit_results
@@ -1930,6 +1959,7 @@ pub(super) async fn reserve_ingest_range(
     }
 }
 
+#[allow(dead_code)]
 async fn commit_ingest_range(
     state: &ApiState,
     request: &IngestRowsRequest,

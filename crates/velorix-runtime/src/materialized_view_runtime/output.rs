@@ -120,7 +120,11 @@ pub(super) fn materialized_delta_page_batch(
         .net_rows()
         .map_err(|_| invalid_runtime_state())?;
     if let Some(page_token) = &page.page_token {
-        rows.retain(|row| canonical_json(row.key.as_json()) > *page_token);
+        // Since rows from net_rows() are already sorted by BTreeMap key order,
+        // we can use binary search to find the starting position instead of
+        // scanning from the beginning.
+        let start = rows.partition_point(|row| canonical_json(row.key.as_json()) <= *page_token);
+        rows = rows[start..].to_vec();
     }
 
     let limit = page.max_rows.unwrap_or(rows.len());
@@ -241,7 +245,8 @@ pub(super) fn materialized_tumbling_delta_page_batch(
         .net_rows()
         .map_err(|_| invalid_runtime_state())?;
     if let Some(page_token) = &page.page_token {
-        rows.retain(|row| canonical_json(row.key.as_json()) > *page_token);
+        let start = rows.partition_point(|row| canonical_json(row.key.as_json()) <= *page_token);
+        rows = rows[start..].to_vec();
     }
 
     let limit = page.max_rows.unwrap_or(rows.len());
@@ -340,7 +345,8 @@ pub(super) fn materialized_generic_delta_page_batch(
         .net_rows()
         .map_err(|_| invalid_runtime_state())?;
     if let Some(page_token) = &page.page_token {
-        rows.retain(|row| canonical_json(row.key.as_json()) > *page_token);
+        let start = rows.partition_point(|row| canonical_json(row.key.as_json()) <= *page_token);
+        rows = rows[start..].to_vec();
     }
 
     let limit = page.max_rows.unwrap_or(rows.len());

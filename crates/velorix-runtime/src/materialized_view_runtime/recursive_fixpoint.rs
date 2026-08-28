@@ -237,9 +237,17 @@ impl RecursiveFixpointRuntime {
             });
         }
         let mut work_units: u64 = 0;
+        // Semi-naive evaluation: track the frontier (newly added rows)
+        // and only join those against the base relation.
+        let mut frontier_keys: Vec<String> = derived.keys().cloned().collect();
         for iteration in 0..self.plan.resource_contract.max_iterations {
-            let mut frontier = Vec::new();
-            for row in derived.values() {
+            let mut new_frontier = Vec::new();
+            let mut new_keys = BTreeSet::new();
+            // Only iterate over frontier rows (added in previous iteration)
+            for frontier_key in &frontier_keys {
+                let Some(row) = derived.get(frontier_key) else {
+                    continue;
+                };
                 for base in base_multiset.values() {
                     if base.weight <= 0 {
                         continue;
@@ -257,8 +265,9 @@ impl RecursiveFixpointRuntime {
                         continue;
                     };
                     let key = canonical_json(&candidate);
-                    if !derived.contains_key(&key) {
-                        frontier.push((key, candidate));
+                    if !derived.contains_key(&key) && !new_keys.contains(&key) {
+                        new_keys.insert(key.clone());
+                        new_frontier.push((key, candidate));
                     }
                     // Evaluate second CTE's recursive term (for mutually recursive CTEs)
                     if let Some(ref cte2) = self.plan.second_cte {
@@ -276,13 +285,14 @@ impl RecursiveFixpointRuntime {
                             continue;
                         };
                         let key2 = canonical_json(&candidate2);
-                        if !derived.contains_key(&key2) {
-                            frontier.push((key2, candidate2));
+                        if !derived.contains_key(&key2) && !new_keys.contains(&key2) {
+                            new_keys.insert(key2.clone());
+                            new_frontier.push((key2, candidate2));
                         }
                     }
                 }
             }
-            if frontier.is_empty() {
+            if new_frontier.is_empty() {
                 break;
             }
             if iteration + 1 >= self.plan.resource_contract.max_iterations {
@@ -290,8 +300,11 @@ impl RecursiveFixpointRuntime {
                     field: "recursive_fixpoint_resource_contract",
                 });
             }
-            for (key, row) in frontier {
-                derived.insert(key, row);
+            // Collect the new frontier keys for the next iteration
+            frontier_keys.clear();
+            for (key, row) in new_frontier {
+                derived.insert(key.clone(), row);
+                frontier_keys.push(key);
                 if derived.len() as u64 > self.plan.resource_contract.max_derived_rows {
                     return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
                         field: "recursive_fixpoint_resource_contract",

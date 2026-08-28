@@ -133,9 +133,7 @@ impl AnalyticWindowFrameRuntime {
                 ordering.then_with(|| compare_row_number_values(key_column, &left.key, &right.key))
             });
             for (index, row) in rows.iter().enumerate() {
-                let frame_start = index.saturating_sub(self.plan.frame_preceding as usize);
-                let frame_end = (index + self.plan.frame_following as usize + 1).min(rows.len());
-                let Some(value) = self.navigation_value(row, &rows[frame_start..frame_end], index)
+                let Some(value) = self.navigation_value_with_sorted_partition(row, &rows, index)
                 else {
                     continue;
                 };
@@ -161,13 +159,13 @@ impl AnalyticWindowFrameRuntime {
         Ok(DeltaBatch::from_records(records))
     }
 
-    /// Computes the navigation function result for the current row over its
-    /// (bounded) frame window. Returns `None` when the value is out of
-    /// range (LAG/LEAD beyond the partition, NTH_VALUE beyond the frame).
-    fn navigation_value(
+    /// Computes the navigation function result for the current row using the
+    /// already-sorted partition. This avoids the O(P^2 log P) cost of
+    /// re-collecting and re-sorting the partition for each LAG/LEAD call.
+    fn navigation_value_with_sorted_partition(
         &self,
-        current: &AnalyticFrameRow,
-        frame: &[&AnalyticFrameRow],
+        _current: &AnalyticFrameRow,
+        sorted_partition: &[&AnalyticFrameRow],
         index: usize,
     ) -> Option<Value> {
         let value_of =
@@ -177,81 +175,22 @@ impl AnalyticWindowFrameRuntime {
                 if index < *offset as usize {
                     return None;
                 }
-                // The frame may be narrower than the offset; LAG reads
-                // within the partition order regardless of the frame bounds.
                 let target = index - *offset as usize;
-                self.rows.values().find(|row| {
-                    row.key == current.key && self.partition_rank(row, target).is_some()
-                })?;
-                let partition = current.partition_value.clone();
-                let mut partition_rows = self
-                    .rows
-                    .values()
-                    .filter(|row| row.partition_value == partition)
-                    .collect::<Vec<_>>();
-                partition_rows.sort_by(|left, right| {
-                    let ordering = compare_row_number_values(
-                        self.order_column().expect("validated"),
-                        &left.order_value,
-                        &right.order_value,
-                    );
-                    let ordering = if self.plan.order_descending {
-                        ordering.reverse()
-                    } else {
-                        ordering
-                    };
-                    ordering.then_with(|| {
-                        compare_row_number_values(
-                            self.key_column().expect("validated"),
-                            &left.key,
-                            &right.key,
-                        )
-                    })
-                });
-                value_of(partition_rows.get(target)?)
+                value_of(sorted_partition.get(target)?)
             }
             WindowNavigationFunctionV1::Lead { offset, .. } => {
-                let partition = current.partition_value.clone();
-                let mut partition_rows = self
-                    .rows
-                    .values()
-                    .filter(|row| row.partition_value == partition)
-                    .collect::<Vec<_>>();
-                partition_rows.sort_by(|left, right| {
-                    let ordering = compare_row_number_values(
-                        self.order_column().expect("validated"),
-                        &left.order_value,
-                        &right.order_value,
-                    );
-                    let ordering = if self.plan.order_descending {
-                        ordering.reverse()
-                    } else {
-                        ordering
-                    };
-                    ordering.then_with(|| {
-                        compare_row_number_values(
-                            self.key_column().expect("validated"),
-                            &left.key,
-                            &right.key,
-                        )
-                    })
-                });
-                value_of(partition_rows.get(index + *offset as usize)?)
+                let target = index + *offset as usize;
+                value_of(sorted_partition.get(target)?)
             }
-            WindowNavigationFunctionV1::FirstValue { .. } => value_of(frame.first()?),
-            WindowNavigationFunctionV1::LastValue { .. } => value_of(frame.last()?),
+            WindowNavigationFunctionV1::FirstValue { .. } => value_of(sorted_partition.first()?),
+            WindowNavigationFunctionV1::LastValue { .. } => value_of(sorted_partition.last()?),
             WindowNavigationFunctionV1::NthValue { n, .. } => {
-                if *n == 0 || *n > frame.len() as u64 {
+                if *n == 0 || *n > sorted_partition.len() as u64 {
                     return None;
                 }
-                value_of(frame.get(*n as usize - 1)?)
+                value_of(sorted_partition.get(*n as usize - 1)?)
             }
         }
-    }
-
-    fn partition_rank(&self, row: &AnalyticFrameRow, target: usize) -> Option<usize> {
-        let _ = (row, target);
-        Some(target)
     }
 }
 
@@ -385,11 +324,14 @@ impl StandingProgramRuntime for AnalyticWindowFrameRuntime {
                 return Err(e);
             }
         };
-        let output_delta = self
-            .published_output
-            .diff(&next_output)
-            .map_err(|_| invalid_runtime_state())?;
-        // Validate output before commit
+        let output_delta = match self.published_output.diff(&next_output) {
+            Ok(delta) => delta,
+            Err(_) => {
+                self.rows = original_rows;
+                return Err(invalid_runtime_state());
+            }
+        };
+        // Validate output before commit — use next_output (local), not self.published_output
         let output_batches = vec![ViewOutputBatch {
             view_id: self.identity.view_ids[0].clone(),
             schema_fingerprint: self.output_schema_fingerprint(),
@@ -398,7 +340,7 @@ impl StandingProgramRuntime for AnalyticWindowFrameRuntime {
                 &next_output,
             )?],
         }];
-        // Commit staged state
+        // Commit staged state — only after all validations pass
         self.published_output = next_output;
         self.input_frontiers = next_frontiers.clone();
         self.input_event_time_frontiers = next_event_time_frontiers.clone();

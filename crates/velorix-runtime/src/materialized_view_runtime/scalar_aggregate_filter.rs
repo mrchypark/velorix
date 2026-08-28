@@ -319,33 +319,42 @@ impl StandingProgramRuntime for ScalarAggregateFilterRuntime {
         } else {
             self.apply_outer_deltas_only()?
         };
-        let output_delta = self
-            .published_output
-            .diff(&next_output)
-            .map_err(|_| invalid_runtime_state())?;
-        if u64::try_from(
-            output_delta
-                .net_rows()
-                .map_err(|_| invalid_runtime_state())?
-                .len(),
-        )
-        .unwrap_or(u64::MAX)
+        let output_delta = match self.published_output.diff(&next_output) {
+            Ok(delta) => delta,
+            Err(_) => {
+                self.outer_rows = outer_rows_before;
+                self.scalar_state = scalar_state_before;
+                return Err(invalid_runtime_state());
+            }
+        };
+        let delta_len = match output_delta.net_rows() {
+            Ok(rows) => rows.len(),
+            Err(_) => {
+                self.outer_rows = outer_rows_before;
+                self.scalar_state = scalar_state_before;
+                return Err(invalid_runtime_state());
+            }
+        };
+        if u64::try_from(delta_len).unwrap_or(u64::MAX)
             > self.plan.resource_contract.max_output_delta_rows
         {
+            self.outer_rows = outer_rows_before;
+            self.scalar_state = scalar_state_before;
             return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
                 field: "scalar_aggregate_filter_resource_contract",
             });
         }
-        self.published_output = next_output;
-        // Validate output before commit
+        // Validate output before commit — use next_output (local), not self.published_output
         let output_batches = vec![ViewOutputBatch {
             view_id: self.identity.view_ids[0].clone(),
             schema_fingerprint: self.output_schema_fingerprint(),
             batches: vec![materialized_generic_delta_to_record_batch(
                 &self.output_schema,
-                &self.published_output,
+                &next_output,
             )?],
         }];
+        // Commit staged state — only after all validations pass
+        self.published_output = next_output;
         // Commit staged state
         self.input_frontiers = next_frontiers.clone();
         self.input_event_time_frontiers = next_event_time_frontiers.clone();

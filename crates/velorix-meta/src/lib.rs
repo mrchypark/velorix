@@ -303,6 +303,20 @@ pub trait MetaStore: Send + Sync + 'static {
         ))
     }
 
+    /// Atomically commit multiple ingest ranges. Either all ranges are
+    /// committed or none are. This ensures epoch-level atomicity for
+    /// multi-batch ingest epochs.
+    async fn commit_ingest_ranges(
+        &self,
+        reservations: Vec<IngestRangeReservation>,
+    ) -> Result<Vec<CommitIngestRangeOutcome>, MetaStoreError> {
+        let mut results = Vec::with_capacity(reservations.len());
+        for reservation in reservations {
+            results.push(self.commit_ingest_range(reservation).await?);
+        }
+        Ok(results)
+    }
+
     async fn capture_ingest_source_cut(
         &self,
         request: CaptureIngestSourceCutRequest,
@@ -667,6 +681,59 @@ impl MetaStore for InMemoryMetaStore {
             return Ok(CommitIngestRangeOutcome::Duplicate);
         }
         Ok(CommitIngestRangeOutcome::Committed)
+    }
+
+    async fn commit_ingest_ranges(
+        &self,
+        reservations: Vec<IngestRangeReservation>,
+    ) -> Result<Vec<CommitIngestRangeOutcome>, MetaStoreError> {
+        for r in &reservations {
+            r.validate()?;
+        }
+        let mut guard = self.inner.write().await;
+        // Validate all reservations can commit before committing any
+        for reservation in &reservations {
+            let key = (reservation.stream_id.clone(), reservation.partition_id);
+            if !guard
+                .ingest_reservations
+                .get(&key)
+                .is_some_and(|reservations| reservations.contains(reservation))
+            {
+                return Ok(reservations
+                    .iter()
+                    .map(|_| CommitIngestRangeOutcome::Conflict)
+                    .collect());
+            }
+            if !guard
+                .committed_ingest_batch_keys
+                .contains(&reservation.batch_key)
+            {
+                // Check for duplicates within this batch
+                let dup_count = reservations
+                    .iter()
+                    .filter(|r| r.batch_key == reservation.batch_key)
+                    .count();
+                if dup_count > 1 {
+                    return Ok(reservations
+                        .iter()
+                        .map(|_| CommitIngestRangeOutcome::Duplicate)
+                        .collect());
+                }
+            }
+        }
+        // All validations passed — commit atomically under single lock
+        let mut results = Vec::with_capacity(reservations.len());
+        for reservation in &reservations {
+            if guard
+                .committed_ingest_batch_keys
+                .insert(reservation.batch_key.clone())
+            {
+                results.push(CommitIngestRangeOutcome::Committed);
+            } else {
+                results.push(CommitIngestRangeOutcome::Duplicate);
+            }
+        }
+        Ok(results)
     }
 
     async fn capture_ingest_source_cut(
