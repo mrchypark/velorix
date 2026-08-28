@@ -623,19 +623,22 @@ impl CheckpointPublisher {
             .try_collect::<Vec<_>>()
             .await?;
 
-        let results = futures::stream::iter(objects.iter().map(|object| async {
-            let object_key = ObjectKey::parse(object.location.to_string())?;
-            let bytes = self.store.get(&object.location).await?.bytes().await?;
-            let manifest = serde_json::from_slice::<CheckpointManifest>(&bytes)?;
-            manifest.validate()?;
-            let body_key = manifest.object_key();
-            if object_key != body_key {
-                return Err(CheckpointPublishError::ManifestKeyMismatch {
-                    object_key,
-                    body_key,
-                });
+        let results = futures::stream::iter(objects.into_iter().map(|object| {
+            let store = self.store.clone();
+            async move {
+                let object_key = ObjectKey::parse(object.location.to_string())?;
+                let bytes = store.get(&object.location).await?.bytes().await?;
+                let manifest = serde_json::from_slice::<CheckpointManifest>(&bytes)?;
+                manifest.validate()?;
+                let body_key = manifest.object_key();
+                if object_key != body_key {
+                    return Err(CheckpointPublishError::ManifestKeyMismatch {
+                        object_key,
+                        body_key,
+                    });
+                }
+                Ok::<_, CheckpointPublishError>(manifest)
             }
-            Ok::<_, CheckpointPublishError>(manifest)
         }))
         .buffer_unordered(crate::bounded_concurrency::DEFAULT_CONCURRENCY)
         .collect::<Vec<_>>()
@@ -2669,22 +2672,23 @@ impl CheckpointPublisher {
         &self,
         manifest: &CheckpointManifest,
     ) -> Result<(), CheckpointPublishError> {
-        let results =
-            futures::stream::iter(manifest.output_objects.iter().map(|output_object| async {
-                let path = Path::from(output_object.object_key.as_str());
-                match self.store.head(&path).await {
+        let results = futures::stream::iter(manifest.output_objects.iter().map(|output_object| {
+            let store = self.store.clone();
+            let object_key = output_object.object_key.clone();
+            async move {
+                let path = Path::from(object_key.as_str());
+                match store.head(&path).await {
                     Ok(_) => Ok(()),
                     Err(object_store::Error::NotFound { .. }) => {
-                        Err(CheckpointPublishError::MissingOutputObject(
-                            output_object.object_key.clone(),
-                        ))
+                        Err(CheckpointPublishError::MissingOutputObject(object_key))
                     }
                     Err(err) => Err(err.into()),
                 }
-            }))
-            .buffer_unordered(crate::bounded_concurrency::DEFAULT_CONCURRENCY)
-            .collect::<Vec<_>>()
-            .await;
+            }
+        }))
+        .buffer_unordered(crate::bounded_concurrency::DEFAULT_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
 
         for result in results {
             result?;
