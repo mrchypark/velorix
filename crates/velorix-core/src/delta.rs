@@ -217,7 +217,9 @@ impl DeltaBatch {
 
         for record in &self.records {
             // Consolidate by (key, value) pair. Records with the same key
-            // but different values are separate entries.
+            // but different values are separate entries. This preserves
+            // delta semantics where different values represent different
+            // versions or states of the same logical key.
             let binary_key = encode_kv_ordered(&record.key.0, &record.value.0);
             let entry = net
                 .entry(binary_key)

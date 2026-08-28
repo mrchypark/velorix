@@ -20,6 +20,7 @@ use velorix_core::{
 use super::{
     canonical_json, fixed_sum_count_outputs, invalid_runtime_state, project_aggregate_value,
 };
+use velorix_core::delta::encode_kv_ordered;
 
 pub(super) fn materialized_delta_to_record_batch(
     output_schema: &RelationSchema,
@@ -120,10 +121,16 @@ pub(super) fn materialized_delta_page_batch(
         .net_rows()
         .map_err(|_| invalid_runtime_state())?;
     if let Some(page_token) = &page.page_token {
-        // Since rows from net_rows() are already sorted by BTreeMap key order,
-        // we can use binary search to find the starting position instead of
-        // scanning from the beginning.
-        let start = rows.partition_point(|row| canonical_json(row.key.as_json()) <= *page_token);
+        // Use the same encoding as net_rows() for consistent ordering.
+        // page_token is canonical_json(key), which sorts identically to
+        // encode_kv_ordered(key, Null) for key comparison purposes.
+        let token_key = encode_kv_ordered(
+            &serde_json::from_str::<serde_json::Value>(page_token)
+                .map_err(|_| invalid_runtime_state())?,
+            &Value::Null,
+        );
+        let start = rows
+            .partition_point(|row| encode_kv_ordered(row.key.as_json(), &Value::Null) <= token_key);
         rows = rows[start..].to_vec();
     }
 
@@ -245,7 +252,13 @@ pub(super) fn materialized_tumbling_delta_page_batch(
         .net_rows()
         .map_err(|_| invalid_runtime_state())?;
     if let Some(page_token) = &page.page_token {
-        let start = rows.partition_point(|row| canonical_json(row.key.as_json()) <= *page_token);
+        let token_key = encode_kv_ordered(
+            &serde_json::from_str::<serde_json::Value>(page_token)
+                .map_err(|_| invalid_runtime_state())?,
+            &Value::Null,
+        );
+        let start = rows
+            .partition_point(|row| encode_kv_ordered(row.key.as_json(), &Value::Null) <= token_key);
         rows = rows[start..].to_vec();
     }
 
@@ -345,7 +358,13 @@ pub(super) fn materialized_generic_delta_page_batch(
         .net_rows()
         .map_err(|_| invalid_runtime_state())?;
     if let Some(page_token) = &page.page_token {
-        let start = rows.partition_point(|row| canonical_json(row.key.as_json()) <= *page_token);
+        let token_key = encode_kv_ordered(
+            &serde_json::from_str::<serde_json::Value>(page_token)
+                .map_err(|_| invalid_runtime_state())?,
+            &Value::Null,
+        );
+        let start = rows
+            .partition_point(|row| encode_kv_ordered(row.key.as_json(), &Value::Null) <= token_key);
         rows = rows[start..].to_vec();
     }
 

@@ -324,6 +324,7 @@ impl StandingProgramRuntime for AnalyticWindowFrameRuntime {
             advance_input_frontier(&mut next_frontiers, input)?;
             advance_input_event_time_frontier(&mut next_event_time_frontiers, input)?;
         }
+        // All subsequent operations may fail. Rollback rows on any error.
         let next_output = match self.recompute_all_outputs() {
             Ok(output) => output,
             Err(e) => {
@@ -338,15 +339,20 @@ impl StandingProgramRuntime for AnalyticWindowFrameRuntime {
                 return Err(invalid_runtime_state());
             }
         };
-        // Validate output before commit — use next_output (local), not self.published_output
-        let output_batches = vec![ViewOutputBatch {
-            view_id: self.identity.view_ids[0].clone(),
-            schema_fingerprint: self.output_schema_fingerprint(),
-            batches: vec![materialized_generic_delta_to_record_batch(
-                &self.output_schema,
-                &next_output,
-            )?],
-        }];
+        // Validate output before commit — use next_output (local), not self.published_output.
+        // Rollback rows if serialization fails.
+        let output_batches =
+            match materialized_generic_delta_to_record_batch(&self.output_schema, &next_output) {
+                Ok(batch) => vec![ViewOutputBatch {
+                    view_id: self.identity.view_ids[0].clone(),
+                    schema_fingerprint: self.output_schema_fingerprint(),
+                    batches: vec![batch],
+                }],
+                Err(e) => {
+                    self.rows = original_rows;
+                    return Err(e);
+                }
+            };
         // Commit staged state — only after all validations pass
         self.published_output = next_output;
         self.input_frontiers = next_frontiers.clone();

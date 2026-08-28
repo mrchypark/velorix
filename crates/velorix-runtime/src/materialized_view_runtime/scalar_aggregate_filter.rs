@@ -344,15 +344,21 @@ impl StandingProgramRuntime for ScalarAggregateFilterRuntime {
                 field: "scalar_aggregate_filter_resource_contract",
             });
         }
-        // Validate output before commit — use next_output (local), not self.published_output
-        let output_batches = vec![ViewOutputBatch {
-            view_id: self.identity.view_ids[0].clone(),
-            schema_fingerprint: self.output_schema_fingerprint(),
-            batches: vec![materialized_generic_delta_to_record_batch(
-                &self.output_schema,
-                &next_output,
-            )?],
-        }];
+        // Validate output before commit — use next_output (local), not self.published_output.
+        // Rollback state if serialization fails.
+        let output_batches =
+            match materialized_generic_delta_to_record_batch(&self.output_schema, &next_output) {
+                Ok(batch) => vec![ViewOutputBatch {
+                    view_id: self.identity.view_ids[0].clone(),
+                    schema_fingerprint: self.output_schema_fingerprint(),
+                    batches: vec![batch],
+                }],
+                Err(e) => {
+                    self.outer_rows = outer_rows_before;
+                    self.scalar_state = scalar_state_before;
+                    return Err(e);
+                }
+            };
         // Commit staged state — only after all validations pass
         self.published_output = next_output;
         // Commit staged state

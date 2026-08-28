@@ -461,7 +461,12 @@ impl StandingProgramRuntime for TemporalJoinRuntime {
                 field: "temporal_join_resource_contract",
             });
         }
-        if next_right.len() as u64 > self.plan.resource_contract.max_rows_per_side {
+        if next_right
+            .values()
+            .map(|m| m.values().map(|rows| rows.len() as u64).sum::<u64>())
+            .sum::<u64>()
+            > self.plan.resource_contract.max_rows_per_side
+        {
             return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
                 field: "temporal_join_resource_contract",
             });
