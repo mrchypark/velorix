@@ -133,7 +133,11 @@ impl AnalyticWindowFrameRuntime {
                 ordering.then_with(|| compare_row_number_values(key_column, &left.key, &right.key))
             });
             for (index, row) in rows.iter().enumerate() {
-                let Some(value) = self.navigation_value_with_sorted_partition(row, &rows, index)
+                let frame_start = index.saturating_sub(self.plan.frame_preceding as usize);
+                let frame_end = (index + self.plan.frame_following as usize + 1).min(rows.len());
+                let frame_slice = &rows[frame_start..frame_end];
+                let Some(value) =
+                    self.navigation_value_with_sorted_partition(row, &rows, index, frame_slice)
                 else {
                     continue;
                 };
@@ -160,13 +164,15 @@ impl AnalyticWindowFrameRuntime {
     }
 
     /// Computes the navigation function result for the current row using the
-    /// already-sorted partition. This avoids the O(P^2 log P) cost of
-    /// re-collecting and re-sorting the partition for each LAG/LEAD call.
+    /// already-sorted partition. LAG/LEAD use the full partition for global
+    /// position lookup. FIRST_VALUE/LAST_VALUE/NTH_VALUE use the bounded
+    /// frame slice to respect ROWS BETWEEN semantics.
     fn navigation_value_with_sorted_partition(
         &self,
         _current: &AnalyticFrameRow,
         sorted_partition: &[&AnalyticFrameRow],
         index: usize,
+        frame: &[&AnalyticFrameRow],
     ) -> Option<Value> {
         let value_of =
             |row: &AnalyticFrameRow| row.values.get(frame_value_column_id(&self.plan)).cloned();
@@ -182,13 +188,14 @@ impl AnalyticWindowFrameRuntime {
                 let target = index + *offset as usize;
                 value_of(sorted_partition.get(target)?)
             }
-            WindowNavigationFunctionV1::FirstValue { .. } => value_of(sorted_partition.first()?),
-            WindowNavigationFunctionV1::LastValue { .. } => value_of(sorted_partition.last()?),
+            // FIRST_VALUE/LAST_VALUE/NTH_VALUE operate within the bounded frame
+            WindowNavigationFunctionV1::FirstValue { .. } => value_of(frame.first()?),
+            WindowNavigationFunctionV1::LastValue { .. } => value_of(frame.last()?),
             WindowNavigationFunctionV1::NthValue { n, .. } => {
-                if *n == 0 || *n > sorted_partition.len() as u64 {
+                if *n == 0 || *n > frame.len() as u64 {
                     return None;
                 }
-                value_of(sorted_partition.get(*n as usize - 1)?)
+                value_of(frame.get(*n as usize - 1)?)
             }
         }
     }

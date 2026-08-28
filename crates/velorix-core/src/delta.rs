@@ -13,13 +13,36 @@ pub enum DeltaError {
 }
 
 /// Memcomparable binary key for ordered BTreeMap operations.
-/// Replaces canonical JSON strings for O(1) comparison without parsing.
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct TypedBinaryKey(Vec<u8>);
+///
+/// Stores key and value encodings as separate byte sequences to prevent
+/// collision between different (key, value) pairs that would produce
+/// identical bytes when concatenated without a boundary marker.
+///
+/// Ordering: compare key bytes first, then value bytes. This ensures
+/// `(a, b) < (c, d)` iff `a < c` or (`a == c` and `b < d`).
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct TypedBinaryKey {
+    key_bytes: Vec<u8>,
+    value_bytes: Vec<u8>,
+}
+
+impl Ord for TypedBinaryKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key_bytes
+            .cmp(&other.key_bytes)
+            .then_with(|| self.value_bytes.cmp(&other.value_bytes))
+    }
+}
+
+impl PartialOrd for TypedBinaryKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 impl TypedBinaryKey {
     pub fn as_bytes(&self) -> &[u8] {
-        &self.0
+        &self.key_bytes
     }
 }
 
@@ -38,7 +61,20 @@ fn encode_json_ordered(value: &Value, buf: &mut Vec<u8>) {
         }
         Value::String(s) => {
             buf.push(b'"');
-            buf.extend_from_slice(s.as_bytes());
+            // Escape characters that could cause boundary ambiguity
+            for byte in s.as_bytes() {
+                match byte {
+                    b'"' => buf.extend_from_slice(b"\\\""),
+                    b'\\' => buf.extend_from_slice(b"\\\\"),
+                    b'\n' => buf.extend_from_slice(b"\\n"),
+                    b'\r' => buf.extend_from_slice(b"\\r"),
+                    b'\t' => buf.extend_from_slice(b"\\t"),
+                    b if b.is_ascii_control() => {
+                        buf.extend_from_slice(format!("\\u{:04x}", b).as_bytes());
+                    }
+                    b => buf.push(*b),
+                }
+            }
             buf.push(b'"');
         }
         Value::Array(arr) => {
@@ -70,12 +106,32 @@ fn encode_json_ordered(value: &Value, buf: &mut Vec<u8>) {
     }
 }
 
-/// Encode a key-value pair into a single ordered binary key.
+/// Encode a key-value pair into an ordered binary key.
+///
+/// Key and value are stored as separate byte sequences within the
+/// TypedBinaryKey to prevent collision between different pairs.
 pub fn encode_kv_ordered(key: &Value, value: &Value) -> TypedBinaryKey {
-    let mut buf = Vec::with_capacity(64);
-    encode_json_ordered(key, &mut buf);
-    encode_json_ordered(value, &mut buf);
-    TypedBinaryKey(buf)
+    let mut key_buf = Vec::with_capacity(64);
+    encode_json_ordered(key, &mut key_buf);
+    let mut value_buf = Vec::with_capacity(64);
+    encode_json_ordered(value, &mut value_buf);
+    TypedBinaryKey {
+        key_bytes: key_buf,
+        value_bytes: value_buf,
+    }
+}
+
+/// Encode only the key part for pagination ordering.
+///
+/// Pagination uses key-only ordering so page tokens (which are
+/// canonical JSON strings of keys only) align with the binary ordering.
+pub fn encode_key_ordered(key: &Value) -> TypedBinaryKey {
+    let mut key_buf = Vec::with_capacity(64);
+    encode_json_ordered(key, &mut key_buf);
+    TypedBinaryKey {
+        key_bytes: key_buf,
+        value_bytes: Vec::new(),
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -174,6 +230,8 @@ impl DeltaBatch {
         let mut net: BTreeMap<TypedBinaryKey, (DeltaKey, DeltaValue, i128)> = BTreeMap::new();
 
         for record in &self.records {
+            // Consolidate by (key, value) pair. Records with the same key
+            // but different values are separate entries.
             let binary_key = encode_kv_ordered(&record.key.0, &record.value.0);
             let entry = net
                 .entry(binary_key)

@@ -614,7 +614,7 @@ impl StandingProgramRuntime for TemporalJoinRuntime {
             });
         }
         let payload: TemporalJoinCheckpointPayloadV2 =
-            serde_json::from_str(&state_payload.payload).map_err(|_| invalid_checkpoint())?;
+            deserialize_checkpoint_payload(&state_payload.payload)?;
         if payload.schema_version != CHECKPOINT_PAYLOAD_SCHEMA_VERSION
             || payload.runtime_kind != TEMPORAL_JOIN_RUNTIME_KIND
         {
@@ -725,14 +725,15 @@ fn recompute_from_staged(
 
 /// Evict superseded right-side rows using the left input event time watermark.
 ///
-/// For each join key, a right row at event_time R is superseded when:
-/// 1. There exists a newer right row at R' > R for the same key
-/// 2. R < L_min (below the minimum left event time for this key)
-/// 3. R' <= L_min (the newer row is also below L_min, so no future left
-///    row will ever match R instead of R')
+/// For each join key with existing left rows:
+/// - Compute the floor predecessor: max(right_time <= l_min)
+/// - Preserve the floor predecessor (it's the match for the current left row)
+/// - Remove right times strictly below the floor (fully shadowed)
+/// - Preserve right times above l_min (may match future left rows)
 ///
-/// This means we only evict old rows that are fully shadowed by a newer
-/// row that is also below all current/future left event times.
+/// For orphan keys (no current left rows):
+/// - Preserve the most recent right row as floor predecessor for future left rows
+/// - Remove older right times that are fully shadowed
 fn evict_right_index(
     right_index: &mut BTreeMap<String, BTreeMap<i64, Vec<TemporalRow>>>,
     left_rows: &BTreeMap<String, BTreeMap<i64, Vec<TemporalRow>>>,
@@ -754,6 +755,8 @@ fn evict_right_index(
                 .and_then(|by_time| by_time.keys().next())
                 .copied();
             if let Some(lm) = l_min {
+                // Compute floor predecessor: max(right_time <= l_min)
+                let floor = time_map.range(..=lm).next_back().map(|(t, _)| *t);
                 // Collect event times below watermark
                 let below_wm: Vec<i64> = time_map
                     .keys()
@@ -763,16 +766,13 @@ fn evict_right_index(
                 if below_wm.is_empty() {
                     continue;
                 }
-                // Find the maximum event time overall for this key
-                let max_et = time_map.keys().copied().max().unwrap();
-                // Only evict times below l_min if the max time is also <= l_min
-                // (fully shadowed). If max_et > l_min, some of those old times
-                // may still be floor predecessors for left rows with et between
-                // the old time and l_min.
-                if max_et <= lm {
+                // Evict right times that are strictly below the floor predecessor.
+                // The floor itself must be preserved as it matches the current left row.
+                // Times above l_min are preserved for future left rows.
+                if let Some(floor_time) = floor {
                     let mut to_remove = Vec::new();
                     for &et in &below_wm {
-                        if et < lm {
+                        if et < floor_time {
                             to_remove.push(et);
                         }
                     }
@@ -847,6 +847,51 @@ struct TemporalJoinCheckpointPayloadV2 {
 }
 
 pub(super) const TEMPORAL_JOIN_RUNTIME_KIND: &str = "temporal_join_v1";
+
+/// Legacy V2 left_rows type: BTreeMap<join_key, BTreeMap<event_time, TemporalRow>>
+type LegacyLeftRows = BTreeMap<String, BTreeMap<i64, TemporalRow>>;
+
+/// Migrate old left_rows format (single TemporalRow per key+time) to new
+/// format (Vec<TemporalRow> per key+time for bag semantics).
+fn migrate_left_rows(old: LegacyLeftRows) -> BTreeMap<String, BTreeMap<i64, Vec<TemporalRow>>> {
+    old.into_iter()
+        .map(|(key, by_time)| {
+            let new_by_time = by_time
+                .into_iter()
+                .map(|(time, row)| (time, vec![row]))
+                .collect();
+            (key, new_by_time)
+        })
+        .collect()
+}
+
+/// Deserialize checkpoint payload, handling migration from old format.
+/// Old format had `left_rows: BTreeMap<String, BTreeMap<i64, TemporalRow>>`.
+/// New format has `left_rows: BTreeMap<String, BTreeMap<i64, Vec<TemporalRow>>>`.
+fn deserialize_checkpoint_payload(
+    json: &str,
+) -> Result<TemporalJoinCheckpointPayloadV2, StandingProgramRuntimeError> {
+    // Try new format first
+    if let Ok(payload) = serde_json::from_str::<TemporalJoinCheckpointPayloadV2>(json) {
+        return Ok(payload);
+    }
+    // Try old format by extracting left_rows separately
+    let mut value: serde_json::Value =
+        serde_json::from_str(json).map_err(|_| invalid_checkpoint())?;
+    let obj = value.as_object_mut().ok_or_else(invalid_checkpoint)?;
+
+    // Extract and migrate old left_rows if present
+    if let Some(left_rows_val) = obj.remove("left_rows") {
+        let old_left_rows: LegacyLeftRows =
+            serde_json::from_value(left_rows_val).map_err(|_| invalid_checkpoint())?;
+        let new_left_rows = migrate_left_rows(old_left_rows);
+        let new_left_rows_val =
+            serde_json::to_value(&new_left_rows).map_err(|_| invalid_checkpoint())?;
+        obj.insert("left_rows".to_string(), new_left_rows_val);
+    }
+
+    serde_json::from_value(value).map_err(|_| invalid_checkpoint())
+}
 
 fn validate_temporal_join_contract(
     catalogs: &[VelorixRelationCatalogV1],

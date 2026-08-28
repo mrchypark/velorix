@@ -306,15 +306,17 @@ pub trait MetaStore: Send + Sync + 'static {
     /// Atomically commit multiple ingest ranges. Either all ranges are
     /// committed or none are. This ensures epoch-level atomicity for
     /// multi-batch ingest epochs.
+    ///
+    /// Implementations MUST guarantee all-or-nothing semantics. The default
+    /// returns UnsupportedCapability because a sequential fallback does NOT
+    /// provide atomicity — callers must not rely on it.
     async fn commit_ingest_ranges(
         &self,
-        reservations: Vec<IngestRangeReservation>,
+        _reservations: Vec<IngestRangeReservation>,
     ) -> Result<Vec<CommitIngestRangeOutcome>, MetaStoreError> {
-        let mut results = Vec::with_capacity(reservations.len());
-        for reservation in reservations {
-            results.push(self.commit_ingest_range(reservation).await?);
-        }
-        Ok(results)
+        Err(MetaStoreError::UnsupportedCapability(
+            "commit_ingest_ranges_atomic",
+        ))
     }
 
     async fn capture_ingest_source_cut(
@@ -459,6 +461,13 @@ where
         reservation: IngestRangeReservation,
     ) -> Result<CommitIngestRangeOutcome, MetaStoreError> {
         (**self).commit_ingest_range(reservation).await
+    }
+
+    async fn commit_ingest_ranges(
+        &self,
+        reservations: Vec<IngestRangeReservation>,
+    ) -> Result<Vec<CommitIngestRangeOutcome>, MetaStoreError> {
+        (**self).commit_ingest_ranges(reservations).await
     }
 
     async fn capture_ingest_source_cut(

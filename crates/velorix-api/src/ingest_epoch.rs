@@ -417,18 +417,46 @@ pub(super) async fn append_prepared_ingest_epoch_batches(
         .map(|(_, _, r, _, _)| r.clone())
         .collect();
     let commit_outcomes = if let Some(meta_store) = state.meta_store.as_ref() {
-        meta_store
-            .commit_ingest_ranges(range_reservations)
+        match meta_store
+            .commit_ingest_ranges(range_reservations.clone())
             .await
-            .map_err(meta_error_to_api)?
+        {
+            Ok(outcomes) => outcomes,
+            Err(MetaStoreError::UnsupportedCapability(_)) => {
+                // Backend doesn't support atomic batch commit — fall back
+                // to sequential with early abort (best-effort atomicity)
+                let mut outcomes = Vec::new();
+                for reservation in &range_reservations {
+                    match meta_store.commit_ingest_range(reservation.clone()).await {
+                        Ok(outcome) => outcomes.push(outcome),
+                        Err(_) => {
+                            // On first failure, mark remaining as Conflict
+                            outcomes.push(CommitIngestRangeOutcome::Conflict);
+                            let remaining = range_reservations.len() - outcomes.len();
+                            for _ in 0..remaining {
+                                outcomes.push(CommitIngestRangeOutcome::Conflict);
+                            }
+                            break;
+                        }
+                    }
+                }
+                outcomes
+            }
+            Err(e) => return Err(meta_error_to_api(e)),
+        }
     } else {
         reservations
             .iter()
             .map(|_| CommitIngestRangeOutcome::Committed)
             .collect()
     };
+    if commit_outcomes.len() != reservations.len() {
+        return Err(ApiError::internal(
+            "commit_ingest_ranges returned mismatched outcome count",
+        ));
+    }
     let mut commit_results = Vec::with_capacity(reservations.len());
-    for (i, (index, _prepared, _reservation, outcome_str, descriptor)) in
+    for (i, (index, prepared, _reservation, outcome_str, descriptor)) in
         reservations.into_iter().enumerate()
     {
         match &commit_outcomes[i] {
@@ -463,7 +491,7 @@ pub(super) async fn append_prepared_ingest_epoch_batches(
                             avg_row_us: None,
                             rows_per_second: None,
                             batch_count: 1,
-                            row_count: 0,
+                            row_count: prepared.request.rows.len(),
                         },
                     },
                 });
