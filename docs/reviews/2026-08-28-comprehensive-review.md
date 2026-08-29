@@ -43,7 +43,7 @@ Review SHA: `c86c5299e5f0a158f68c29fd1daaecb18442623e`
 - [x] EpochOverlay write-set/COW (lazy per-key COW)
 - [x] RecursiveFrontier semi-naive evaluation (all/delta/next_delta)
 - [x] JoinIndex per-key indexed state (equi-join)
-- [ ] window/Top-K index
+- [x] WindowPartitionState per-partition sorted Top-K/window
 
 ### Phase 4 (Typed/vectorized)
 - [ ] Arrow RecordBatch operator
