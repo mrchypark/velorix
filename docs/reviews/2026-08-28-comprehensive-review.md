@@ -26,16 +26,18 @@ Review SHA: `c86c5299e5f0a158f68c29fd1daaecb18442623e`
 - [ ] state replay 계획
 
 ### Phase 1 (낮은 위험, 큰 효과)
+- [x] S3 bounded concurrency (buffer_unordered)
+- [x] manifest validation typed contract (ValidatedCheckpointManifest)
+- [x] checkpoint size limit (16 MiB)
 - [ ] cache deep clone 제거 (`Vec<T>` → `Arc<[T]>`)
-- [ ] S3 bounded concurrency (semaphore + byte budget)
 - [ ] upload receipt 전달 (중복 HEAD 제거)
 - [ ] 256행 page → compressed byte-size chunk
 
 ### Phase 2 (S3 비용 구조)
+- [x] compact metadata index (PartitionAdmissionHead)
+- [x] content-addressed output chunk (ObjectKey::output_chunk)
 - [ ] partition/owner head with CAS
-- [ ] compact metadata index
 - [ ] hot path LIST 금지
-- [ ] content-addressed output chunk
 
 ### Phase 3 (Incremental engine)
 - [ ] mutation journal (graph/state full clone 제거)
@@ -49,7 +51,7 @@ Review SHA: `c86c5299e5f0a158f68c29fd1daaecb18442623e`
 - [ ] JSON API boundary화
 
 ### Phase 5 (Recovery/GC)
-- [ ] replay byte limit
+- [x] replay byte limit (checkpoint size limit)
 - [ ] manifest tree/catalog
 - [ ] reachability GC
 - [ ] checkpoint compaction
