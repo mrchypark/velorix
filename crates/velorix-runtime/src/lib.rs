@@ -11,3 +11,4 @@ pub mod materialized_view_runtime;
 pub mod query_policy_catalog;
 pub mod recursive_frontier;
 pub mod runtime_contract;
+pub mod window_partition_state;
