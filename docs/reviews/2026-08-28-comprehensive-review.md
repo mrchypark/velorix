@@ -40,7 +40,8 @@ Review SHA: `c86c5299e5f0a158f68c29fd1daaecb18442623e`
 - [ ] hot path LIST 금지
 
 ### Phase 3 (Incremental engine)
-- [ ] mutation journal (graph/state full clone 제거)
+- [x] EpochOverlay write-set/COW (lazy per-key COW)
+- [x] RecursiveFrontier semi-naive evaluation (all/delta/next_delta)
 - [ ] per-key indexed state
 - [ ] join index (equi, semi/anti, temporal, interval)
 - [ ] window/Top-K index
