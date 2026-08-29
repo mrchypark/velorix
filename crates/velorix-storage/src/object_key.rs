@@ -73,6 +73,22 @@ pub struct StandingRuntimeOutputPageKeyParts {
     pub page_content_hash: String,
 }
 
+/// Content-addressed output chunk key.
+///
+/// Chunks are addressed by their content hash (SHA-256), enabling
+/// deduplication across epochs. Unchanged chunks between checkpoints
+/// are reused without re-uploading.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutputChunkKeyParts {
+    pub chunk_hash: String,
+}
+
+impl OutputChunkKeyParts {
+    pub fn object_key(&self) -> Result<ObjectKey, ObjectKeyError> {
+        ObjectKey::output_chunk(&self.chunk_hash)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StandingRuntimeOutputDeltaKeyParts {
     pub tenant_id: String,
@@ -409,6 +425,17 @@ impl ObjectKey {
 
         Ok(Self(format!(
             "v1/standing-runtime-output-deltas/{tenant_id}/{program_id}/{view_id}/epochs/{logical_epoch:0CHECKPOINT_WIDTH$}/sha256/{hash}.output-delta.json"
+        )))
+    }
+
+    /// Content-addressed output chunk key.
+    ///
+    /// Chunks are addressed by content hash, enabling deduplication.
+    /// Unchanged chunks between checkpoints are reused.
+    pub fn output_chunk(chunk_hash: &str) -> Result<Self, ObjectKeyError> {
+        let hash = parse_sha256_hash_segment(chunk_hash)?;
+        Ok(Self(format!(
+            "v1/output-chunks/sha256/{hash}.chunk.arrow-ipc"
         )))
     }
 

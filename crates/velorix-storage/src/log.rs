@@ -191,6 +191,50 @@ pub struct ReplayCheckpoint {
     pub end_offset_exclusive: u64,
 }
 
+/// Compact admission head per partition.
+///
+/// Instead of reconstructing admission state from the full transition
+/// history on every append, this structure stores the current state
+/// directly. One object per (stream, partition) pair.
+///
+/// This reduces the admission cost from O(H) where H is the number of
+/// historical transitions, to O(1) for the common case (single GET).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartitionAdmissionHead {
+    pub schema_version: u32,
+    pub stream_id: String,
+    pub partition_id: u32,
+    pub generation: u64,
+    pub state_digest: String,
+    pub active_admissions: Vec<DurableIngestAdmissionRecordV1>,
+    pub committed_high_watermark: u64,
+    pub last_transition_id: String,
+    pub updated_at: String,
+}
+
+impl PartitionAdmissionHead {
+    pub fn new(stream_id: String, partition_id: u32) -> Self {
+        Self {
+            schema_version: 1,
+            stream_id,
+            partition_id,
+            generation: 0,
+            state_digest: String::new(),
+            active_admissions: Vec::new(),
+            committed_high_watermark: 0,
+            last_transition_id: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    pub fn object_key(&self) -> Result<String, IngestLogError> {
+        Ok(format!(
+            "v1/ingest-admission-head/{}/p={}",
+            self.stream_id, self.partition_id
+        ))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AppendValidatedEnvelopeOutcome {
     Appended {
