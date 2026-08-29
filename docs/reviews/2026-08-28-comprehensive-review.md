@@ -42,8 +42,7 @@ Review SHA: `c86c5299e5f0a158f68c29fd1daaecb18442623e`
 ### Phase 3 (Incremental engine)
 - [x] EpochOverlay write-set/COW (lazy per-key COW)
 - [x] RecursiveFrontier semi-naive evaluation (all/delta/next_delta)
-- [ ] per-key indexed state
-- [ ] join index (equi, semi/anti, temporal, interval)
+- [x] JoinIndex per-key indexed state (equi-join)
 - [ ] window/Top-K index
 
 ### Phase 4 (Typed/vectorized)
