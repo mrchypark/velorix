@@ -52,8 +52,8 @@ Review SHA: `c86c5299e5f0a158f68c29fd1daaecb18442623e`
 
 ### Phase 5 (Recovery/GC)
 - [x] replay byte limit (checkpoint size limit)
+- [x] reachability GC (ReachabilityGraph)
 - [ ] manifest tree/catalog
-- [ ] reachability GC
 - [ ] checkpoint compaction
 
 ## 합격 기준
