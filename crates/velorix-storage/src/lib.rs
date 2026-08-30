@@ -12,6 +12,7 @@ pub mod manifest;
 pub mod materialized_view_registry;
 pub mod object_key;
 pub mod ownership;
+pub mod reachability_gc;
 pub mod relation_catalog_registry;
 pub mod state;
 pub mod state_store;
