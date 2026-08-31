@@ -217,6 +217,7 @@ impl StandingProgramRuntime for AnalyticRowNumberRuntime {
         }
 
         let previous_state = self.state.clone();
+        let mut next_state = self.state.clone();
         let mut affected_partitions = BTreeMap::<String, Value>::new();
         let mut input_frontiers = self.input_frontiers.clone();
         let mut input_event_time_frontiers = self.input_event_time_frontiers.clone();
@@ -244,8 +245,7 @@ impl StandingProgramRuntime for AnalyticRowNumberRuntime {
                 };
             let delta =
                 filter_delta_batch_for_analytic_row_number_plan(&delta, &self.plan, &self.catalog)?;
-            self.state
-                .apply_delta(&delta, &self.plan, &self.catalog, &mut affected_partitions)?;
+            next_state.apply_delta(&delta, &self.plan, &self.catalog, &mut affected_partitions)?;
             advance_input_frontier(&mut input_frontiers, &input)?;
             advance_input_event_time_frontier(&mut input_event_time_frontiers, &input)?;
         }
@@ -254,27 +254,26 @@ impl StandingProgramRuntime for AnalyticRowNumberRuntime {
         for partition in affected_partitions.values() {
             let old_output =
                 previous_state.partition_output(&self.catalog, &self.plan, partition)?;
-            let new_output = self
-                .state
-                .partition_output(&self.catalog, &self.plan, partition)?;
+            let new_output = next_state.partition_output(&self.catalog, &self.plan, partition)?;
             output_delta = output_delta.combine(
                 &old_output
                     .diff(&new_output)
                     .map_err(|_| invalid_runtime_state())?,
             );
         }
-        self.published_output =
-            apply_published_output_delta(&self.published_output, &output_delta)?;
+        let next_output = apply_published_output_delta(&self.published_output, &output_delta)?;
         // Validate output before commit
         let output_batches = vec![ViewOutputBatch {
             view_id: self.identity.view_ids[0].clone(),
             schema_fingerprint: self.output_schema_fingerprint(),
             batches: vec![materialized_generic_delta_to_record_batch(
                 &self.output_schema,
-                &self.published_output,
+                &next_output,
             )?],
         }];
         // Commit staged state
+        self.state = next_state;
+        self.published_output = next_output;
         self.input_frontiers = input_frontiers.clone();
         self.input_event_time_frontiers = input_event_time_frontiers.clone();
         self.applied_epochs
