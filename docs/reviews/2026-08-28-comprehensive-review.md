@@ -46,8 +46,8 @@ Review SHA: `c86c5299e5f0a158f68c29fd1daaecb18442623e`
 - [x] WindowPartitionState per-partition sorted Top-K/window
 
 ### Phase 4 (Typed/vectorized)
-- [ ] Arrow RecordBatch operator
-- [ ] compiled expression
+- [x] Arrow RecordBatch operator (ArrowBatchOperator)
+- [x] compiled expression (CompiledExpr)
 - [ ] JSON API boundary화
 
 ### Phase 5 (Recovery/GC)
