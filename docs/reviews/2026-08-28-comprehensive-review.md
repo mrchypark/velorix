@@ -48,7 +48,7 @@ Review SHA: `c86c5299e5f0a158f68c29fd1daaecb18442623e`
 ### Phase 4 (Typed/vectorized)
 - [x] Arrow RecordBatch operator (ArrowBatchOperator)
 - [x] compiled expression (CompiledExpr)
-- [ ] JSON API boundary화
+- [x] JSON API boundary화 (json_api_boundary)
 
 ### Phase 5 (Recovery/GC)
 - [x] replay byte limit (checkpoint size limit)
