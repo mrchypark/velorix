@@ -61,7 +61,7 @@ struct DurableIngestAdmission {
     /// O(committed batches) rescan per ingest into an in-memory scan. The
     /// authoritative cross-process fences (exact-key GET, range-admission
     /// index CAS, metadata reservation cut) are unchanged.
-    committed_cache: Arc<Mutex<Option<Vec<IngestBatchDescriptor>>>>,
+    committed_cache: Arc<Mutex<Option<Arc<[IngestBatchDescriptor]>>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -687,13 +687,15 @@ impl DurableIngestAdmission {
         {
             let cache = self.committed_cache.lock().unwrap();
             if let Some(committed) = cache.as_ref() {
-                return Ok(Arc::new(committed.clone()));
+                // Convert Arc<[T]> back to Arc<Vec<T>> for callers
+                let vec: Vec<IngestBatchDescriptor> = committed.iter().cloned().collect();
+                return Ok(Arc::new(vec));
             }
         }
         let loaded = self.log.list_committed().await?;
         let mut cache = self.committed_cache.lock().unwrap();
         if cache.is_none() {
-            *cache = Some(loaded.clone());
+            *cache = Some(loaded.as_slice().into());
         }
         Ok(Arc::new(loaded))
     }
@@ -702,8 +704,12 @@ impl DurableIngestAdmission {
     /// subsequent conflict scans do not rescan the object store.
     fn cache_committed(&self, descriptor: &IngestBatchDescriptor) {
         if let Ok(mut cache) = self.committed_cache.lock() {
-            if let Some(committed) = cache.as_mut() {
-                committed.push(descriptor.clone());
+            if let Some(committed) = cache.as_ref() {
+                let new_len = committed.len() + 1;
+                let mut new_vec = Vec::with_capacity(new_len);
+                new_vec.extend_from_slice(committed);
+                new_vec.push(descriptor.clone());
+                *cache = Some(new_vec.into_boxed_slice().into());
             }
         }
     }
