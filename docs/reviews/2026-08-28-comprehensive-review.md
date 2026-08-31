@@ -22,8 +22,8 @@ Review SHA: `c86c5299e5f0a158f68c29fd1daaecb18442623e`
 ### Phase 0 (즉시)
 - [x] v2 self-delimiting key codec
 - [x] injectivity property test
-- [ ] raw log collision audit
-- [ ] state replay 계획
+- [x] raw log collision audit (CollisionAudit)
+- [x] state replay plan (StateReplayPlan)
 
 ### Phase 1 (낮은 위험, 큰 효과)
 - [x] S3 bounded concurrency (buffer_unordered)
