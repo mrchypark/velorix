@@ -442,12 +442,35 @@ impl StandingProgramRuntime for TwoInputJoinRuntime {
                 advance_input_frontier(&mut input_frontiers, input)?;
                 advance_input_event_time_frontier(&mut input_event_time_frontiers, input)?;
             }
-            let output_delta = self
+            // Save checkpoint for rollback on failure
+            let graph_checkpoint = self
+                .comparison_graph
+                .as_ref()
+                .ok_or_else(invalid_runtime_state)?
+                .checkpoint()
+                .map_err(|_| invalid_runtime_state())?;
+            let output_delta = match self
                 .comparison_graph
                 .as_mut()
                 .ok_or_else(invalid_runtime_state)?
                 .apply_epoch(logical_epoch, input_changes)
-                .map_err(|_| invalid_runtime_state())?;
+            {
+                Ok(delta) => delta,
+                Err(_) => {
+                    // Rollback comparison_graph from checkpoint
+                    if let Some(graph) = self.comparison_graph.as_mut() {
+                        if let Ok(restored) = JoinSpecializationComparisonGraph::restore(
+                            self.catalogs.clone(),
+                            self.plan.clone(),
+                            self.output_schema.clone(),
+                            &graph_checkpoint,
+                        ) {
+                            *graph = restored;
+                        }
+                    }
+                    return Err(invalid_runtime_state());
+                }
+            };
             self.engine
                 .push_changes(logical_epoch, &DeltaBatch::default())
                 .map_err(|_| invalid_runtime_state())?;
