@@ -29,14 +29,14 @@ Review SHA: `c86c5299e5f0a158f68c29fd1daaecb18442623e`
 - [x] S3 bounded concurrency (buffer_unordered)
 - [x] manifest validation typed contract (ValidatedCheckpointManifest)
 - [x] checkpoint size limit (16 MiB)
-- [ ] cache deep clone 제거 (`Vec<T>` → `Arc<[T]>`)
-- [ ] upload receipt 전달 (중복 HEAD 제거)
+- [x] cache deep clone 제거 (`Vec<T>` → `Arc<[T]>`)
+- [x] upload receipt 전달 (UploadReceipt + UploadReceiptBatch)
 - [ ] 256행 page → compressed byte-size chunk
 
 ### Phase 2 (S3 비용 구조)
 - [x] compact metadata index (PartitionAdmissionHead)
 - [x] content-addressed output chunk (ObjectKey::output_chunk)
-- [ ] partition/owner head with CAS
+- [x] partition/owner head with CAS (PartitionHead + OwnerHead)
 - [ ] hot path LIST 금지
 
 ### Phase 3 (Incremental engine)
