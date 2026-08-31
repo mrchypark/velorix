@@ -4,6 +4,7 @@
 
 pub mod bounded_concurrency;
 pub mod capability;
+pub mod checkpoint_compaction;
 pub mod checkpoint_index;
 pub mod gc;
 pub mod ingest_envelope;

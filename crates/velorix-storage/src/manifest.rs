@@ -71,6 +71,79 @@ impl std::ops::Deref for ValidatedCheckpointManifest {
     }
 }
 
+/// A checkpoint manifest segment.
+///
+/// Tree-shaped manifests split large manifests into segments.
+/// A root manifest references segment manifests, enabling:
+/// - Incremental compaction (only changed segments re-uploaded)
+/// - Deduplication (unchanged segments shared across checkpoints)
+/// - Bounded memory (manifests loaded segment-by-segment)
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointManifestSegment {
+    pub segment_id: u32,
+    pub segment_kind: SegmentKind,
+    pub content_hash: String,
+    pub byte_size: u64,
+    pub row_count: u64,
+    pub min_key: Option<String>,
+    pub max_key: Option<String>,
+    pub object_key: ObjectKey,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SegmentKind {
+    State,
+    Output,
+    Delta,
+}
+
+/// A tree-shaped checkpoint manifest.
+///
+/// The root manifest references segments. Segments are content-addressed
+/// and can be shared across checkpoints. Only changed segments need to
+/// be re-uploaded during compaction.
+///
+/// ```text
+/// Root Manifest
+///   ├── Segment 0 (state, sha256:abc...)
+///   ├── Segment 1 (state, sha256:def...)  ← unchanged from previous checkpoint
+///   ├── Segment 2 (output, sha256:ghi...)
+///   └── Segment 3 (delta, sha256:jkl...)
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TreeCheckpointManifest {
+    pub schema_version: u32,
+    pub checkpoint_version: u64,
+    pub parent_checkpoint: Option<u64>,
+    pub created_at: String,
+    pub segments: Vec<CheckpointManifestSegment>,
+    pub total_state_bytes: u64,
+    pub total_output_bytes: u64,
+    pub relation_id: Option<String>,
+    pub relation_version: Option<String>,
+    pub schema_fingerprint: Option<String>,
+}
+
+impl TreeCheckpointManifest {
+    /// Get segments of a specific kind.
+    pub fn segments_by_kind(&self, kind: SegmentKind) -> Vec<&CheckpointManifestSegment> {
+        self.segments
+            .iter()
+            .filter(|s| s.segment_kind == kind)
+            .collect()
+    }
+
+    /// Get the total number of segments.
+    pub fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+
+    /// Check if a segment with the given content hash exists.
+    pub fn has_segment(&self, content_hash: &str) -> bool {
+        self.segments.iter().any(|s| s.content_hash == content_hash)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PartitionOwnerClaim {
     pub owner_id: String,
