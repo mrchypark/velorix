@@ -2,7 +2,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod arrow_batch_operator;
 pub mod benchmark_gate;
+pub mod compiled_expression;
 pub mod epoch_overlay;
 pub mod frontier_conformance;
 pub mod incremental_sql_comparison;
