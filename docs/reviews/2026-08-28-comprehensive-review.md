@@ -31,13 +31,13 @@ Review SHA: `c86c5299e5f0a158f68c29fd1daaecb18442623e`
 - [x] checkpoint size limit (16 MiB)
 - [x] cache deep clone 제거 (`Vec<T>` → `Arc<[T]>`)
 - [x] upload receipt 전달 (UploadReceipt + UploadReceiptBatch)
-- [ ] 256행 page → compressed byte-size chunk
+- [x] compressed byte-size chunk (CompressedChunk + CompressedChunkManifest)
 
 ### Phase 2 (S3 비용 구조)
 - [x] compact metadata index (PartitionAdmissionHead)
 - [x] content-addressed output chunk (ObjectKey::output_chunk)
 - [x] partition/owner head with CAS (PartitionHead + OwnerHead)
-- [ ] hot path LIST 금지
+- [x] hot path LIST 금지 (HotPathMetrics + HotPathAware trait)
 
 ### Phase 3 (Incremental engine)
 - [x] EpochOverlay write-set/COW (lazy per-key COW)
