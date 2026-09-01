@@ -466,7 +466,10 @@ pub(super) async fn append_prepared_ingest_epoch_batches(
                     appended: outcome_str == "appended",
                     response: IngestResponse {
                         outcome: outcome_str,
-                        descriptor: ingest_descriptor_response(&descriptor),
+                        descriptor: ingest_descriptor_response(
+                            &descriptor,
+                            &prepared.request.relation_id,
+                        ),
                         epoch_manifest_id: owned_epoch.clone(),
                         ingest_epoch: owned_epoch.clone(),
                         materialized_through: None,

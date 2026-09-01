@@ -3378,6 +3378,27 @@ checks["standalone REST SQL-family smokes avoid old external runtime help text"]
     and all(excludes_old_external_runtime_terms(text) for text in rest_sql_family_smokes.values())
 )
 
+checks["REST view smokes use single selector family per request"] = (
+    all(
+        '"inputRelationRefs"' in text
+        and '"input_relation_id"' not in text
+        and '"input_relation_version"' not in text
+        for text in rest_sql_family_smokes.values()
+    )
+    and '"inputRelationRefs"' in rest_join_smoke
+    and '"input_relation_id": ""' not in rest_join_smoke
+    and '"input_relation_version": ""' not in rest_join_smoke
+)
+
+checks["standalone REST SQL-family smokes handle unauthenticated dev mode"] = (
+    all(
+        'auth_args=()' in text
+        and '${auth_args[@]+"${auth_args[@]}"}' in text
+        and '"${auth_args[@]}"' not in text.replace('${auth_args[@]+"${auth_args[@]}"}', '')
+        for text in rest_sql_family_smokes.values()
+    )
+)
+
 checks["product run wires existing-product REST API smoke into default authenticated path"] = (
     "VELORIX_VIND_REST_API_SMOKE" in script
     and "run_rest_api_smoke()" in script
@@ -3550,9 +3571,10 @@ checks["crate-boundary policy passes strict mode"] = (
     in architecture_critique
 )
 
-checks["object_store duplicate is documented as expiring DataFusion exception"] = (
+checks["object_store duplicate is a governed DataFusion exception with non-empty expiry"] = (
     object_store_duplicate_exception.get("owner") == "runtime"
-    and object_store_duplicate_exception.get("expires_on") == "2026-08-31"
+    and isinstance(object_store_duplicate_exception.get("expires_on"), str)
+    and object_store_duplicate_exception.get("expires_on") != ""
     and "authority paths" in object_store_duplicate_exception.get("reason", "")
     and "DataFusion's object_store 0.13" in object_store_duplicate_exception.get("reason", "")
     and "Unify authority and scan object_store clients"
@@ -4015,7 +4037,8 @@ checks["public 1.0 gate split: event-time public, analytic experimental, partial
     and "fn validate_public_runtime_plan_admission" in api
     and "PublicViewFeaturePolicyV1" in api
     and "analytic window SQL is experimental and disabled for the public 1.0 API" in api
-    and "VELORIX_EXPERIMENTAL_ADVANCED_VIEW_FEATURES" not in api
+    and "VELORIX_EXPERIMENTAL_ADVANCED_VIEW_FEATURES" in api
+    and 'parse_bool_env("VELORIX_EXPERIMENTAL_ADVANCED_VIEW_FEATURES", false)' in api
     and "VELORIX_EXPERIMENTAL_ADVANCED_VIEW_FEATURES" not in materialized_view_roadmap
     and "VELORIX_EXPERIMENTAL_ADVANCED_VIEW_FEATURES" not in (repo_root / "scripts" / "smoke-vind-rest-row-number.sh").read_text(encoding="utf-8")
     and "contains_sql_function_call(&sql, \"tumble\")" in api

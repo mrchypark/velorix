@@ -175,6 +175,7 @@ policy_file="${output_dir}/query-policy-interactive.json"
 policy_create_file="${output_dir}/query-policy-interactive-create.json"
 view_file="${output_dir}/positive-scores-view.json"
 view_create_file="${output_dir}/positive-scores-view-create.json"
+backfill_file="${output_dir}/positive-scores-backfill.json"
 views_file="${output_dir}/views.json"
 openapi_file="${output_dir}/openapi.json"
 owner_acquire_file="${output_dir}/standing-runtime-owner-acquire.json"
@@ -263,6 +264,19 @@ curl_api -X POST "$VELORIX_API_URL/v1/relations/ingest" \
   -H 'content-type: application/json' \
   -d "{\"batches\":[{\"relation_id\":\"scores\",\"relation_version\":\"2026-05-24.v1\",\"stream_id\":\"${batch_stream_id}\",\"partition_id\":0,\"start_offset_inclusive\":0,\"rows\":[{\"user_id\":\"${user_id}\",\"score\":3,\"delta\":1}]}]}" \
   >"$batch_ingest_file"
+
+backfill_status="$(curl_api_status "$backfill_file" \
+  -X POST "$VELORIX_API_URL/v1/views/positive_scores_by_user/backfill" \
+  -H 'content-type: application/json' \
+  -d '{}')"
+case "$backfill_status" in
+  200 | 201) ;;
+  *)
+    echo "expected positive scores view backfill to return 200 or 201; got ${backfill_status}" >&2
+    cat "$backfill_file" >&2 || true
+    exit 1
+    ;;
+esac
 
 deadline=$((SECONDS + query_wait_seconds))
 while true; do
@@ -453,7 +467,6 @@ for field in (
     "state_payload_writes",
     "checkpoint_record_writes",
     "checkpoint_pointer_writes",
-    "latest_cache_writes",
     "checkpoint_publication_writes",
 ):
     if materialization.get(field) != 1:

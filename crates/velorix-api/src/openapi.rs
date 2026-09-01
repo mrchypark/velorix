@@ -357,6 +357,7 @@ fn openapi_ingest_descriptor_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
+            "relation_id": { "type": "string" },
             "stream_id": { "type": "string" },
             "partition_id": { "type": "integer", "minimum": 0 },
             "start_offset_inclusive": { "type": "integer", "minimum": 0 },

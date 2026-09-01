@@ -75,7 +75,7 @@ if ! curl -fsS --max-time 3 "$base_url/healthz" >"$healthz_file" 2>"${output_dir
   exit 75
 fi
 
-if ! curl -fsS --max-time 5 "${auth_args[@]}" "$base_url/v1/openapi.json" >"$openapi_precheck_file" 2>"${output_dir}/openapi-auth-precheck.stderr"; then
+if ! curl -fsS --max-time 5 ${auth_args[@]+"${auth_args[@]}"} "$base_url/v1/openapi.json" >"$openapi_precheck_file" 2>"${output_dir}/openapi-auth-precheck.stderr"; then
   echo "authenticated REST API is not reachable: ${base_url}/v1/openapi.json" >&2
   echo "set BASE_URL and, if required, VELORIX_API_AUTH_HEADER" >&2
   cat "${output_dir}/openapi-auth-precheck.stderr" >&2 || true
@@ -83,13 +83,13 @@ if ! curl -fsS --max-time 5 "${auth_args[@]}" "$base_url/v1/openapi.json" >"$ope
 fi
 
 curl_api() {
-  curl -fsS --max-time 15 "${auth_args[@]}" "$@"
+  curl -fsS --max-time 15 ${auth_args[@]+"${auth_args[@]}"} "$@"
 }
 
 curl_api_status() {
   local output_file="$1"
   shift
-  curl -sS --max-time 15 -o "$output_file" -w '%{http_code}' "${auth_args[@]}" "$@"
+  curl -sS --max-time 15 -o "$output_file" -w '%{http_code}' ${auth_args[@]+"${auth_args[@]}"} "$@"
 }
 
 run_id="$(date -u +%Y%m%dT%H%M%SZ)_$$"
@@ -106,6 +106,7 @@ ingest_request_file="${output_dir}/scores-ingest-request.json"
 ingest_file="${output_dir}/scores-ingest.json"
 view_request_file="${output_dir}/avg-view-request.json"
 view_file="${output_dir}/avg-view.json"
+backfill_file="${output_dir}/avg-backfill.json"
 view_query_file="${output_dir}/avg-view-query.json"
 
 python3 - \
@@ -201,8 +202,6 @@ files = {
     view_request_path: {
         "view_id": view_id,
         "urlPath": api_path,
-        "input_relation_id": relation_id,
-        "input_relation_version": relation_version,
         "inputRelationRefs": [
             {"relation_id": relation_id, "relation_version": relation_version}
         ],
@@ -323,6 +322,19 @@ PY
     cat "$view_file" >&2 || true
     printf '\n' >&2
     echo "wrote AVG REST smoke blocker evidence to ${summary_file}" >&2
+    exit 1
+    ;;
+esac
+
+backfill_status="$(curl_api_status "$backfill_file" \
+  -X POST "$base_url/v1/views/${view_id}/backfill" \
+  -H 'content-type: application/json' \
+  -d '{}')"
+case "$backfill_status" in
+  200 | 201) ;;
+  *)
+    echo "expected AVG view backfill to return 200 or 201; got ${backfill_status}" >&2
+    cat "$backfill_file" >&2 || true
     exit 1
     ;;
 esac

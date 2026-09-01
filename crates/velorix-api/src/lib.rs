@@ -896,7 +896,6 @@ impl ApiState {
         self
     }
 
-    #[cfg(test)]
     pub fn with_experimental_advanced_view_features(mut self, enabled: bool) -> Self {
         self.experimental_advanced_view_features = enabled;
         self.public_view_feature_policy = PublicViewFeaturePolicyV1::from(enabled);
@@ -1533,7 +1532,8 @@ pub async fn run_from_env() -> anyhow::Result<()> {
         )
         .with_standing_runtime_fencing_mode(config.standing_runtime_fencing)
         .with_standing_runtime_owner_ttl_ms(config.standing_runtime_owner_ttl_ms)
-        .with_output_compaction_interval_epochs(config.output_compaction_interval_epochs);
+        .with_output_compaction_interval_epochs(config.output_compaction_interval_epochs)
+        .with_experimental_advanced_view_features(config.experimental_advanced_view_features);
     if let Some(token) = config.api_bearer_token {
         state = state
             .with_api_bearer_token(token)
@@ -1918,6 +1918,7 @@ struct RepairIngestEpochRuntimeFailureResponse {
 
 #[derive(Clone, Debug, Serialize)]
 struct IngestDescriptorResponse {
+    relation_id: String,
     stream_id: String,
     partition_id: u32,
     start_offset_inclusive: u64,
@@ -7211,8 +7212,12 @@ fn ingest_outcome_parts(
     }
 }
 
-fn ingest_descriptor_response(descriptor: &IngestBatchDescriptor) -> IngestDescriptorResponse {
+fn ingest_descriptor_response(
+    descriptor: &IngestBatchDescriptor,
+    relation_id: &str,
+) -> IngestDescriptorResponse {
     IngestDescriptorResponse {
+        relation_id: relation_id.to_string(),
         stream_id: descriptor.stream_id.clone(),
         partition_id: descriptor.partition_id,
         start_offset_inclusive: descriptor.start_offset_inclusive,
@@ -7675,6 +7680,7 @@ struct ApiConfig {
     output_compaction_interval_epochs: u64,
     standing_runtime_fencing: StandingRuntimeFencingMode,
     standing_runtime_owner_ttl_ms: u64,
+    experimental_advanced_view_features: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -7770,6 +7776,8 @@ impl ApiConfig {
         )?;
         let standing_runtime_owner_ttl_ms =
             parse_positive_u64_env("VELORIX_STANDING_RUNTIME_OWNER_TTL_MS", 30_000)?;
+        let experimental_advanced_view_features =
+            parse_bool_env("VELORIX_EXPERIMENTAL_ADVANCED_VIEW_FEATURES", false)?;
         Ok(Self {
             bind,
             tls,
@@ -7797,6 +7805,7 @@ impl ApiConfig {
             output_compaction_interval_epochs,
             standing_runtime_fencing,
             standing_runtime_owner_ttl_ms,
+            experimental_advanced_view_features,
         })
     }
 

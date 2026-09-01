@@ -566,6 +566,10 @@ pub(super) async fn run_active_view_backfill_step(
     if view_query_availability(&active.lifecycle) {
         let progress = committed_backfill_progress(state, &active).await?;
         if progress.remaining_batches == 0 {
+            if let Some(identity) = active_standing_runtime_identity(&active) {
+                activate_authoritative_view_bootstrap(state, identity, &active.spec.view_id)
+                    .await?;
+            }
             return Ok(ActiveViewBackfillStepOutcome {
                 active,
                 replay: StandingRuntimeBackfillReplayOutcome::default(),

@@ -172,6 +172,7 @@ readings_relation_file="${output_dir}/readings-relation.json"
 devices_relation_file="${output_dir}/devices-relation.json"
 view_request_file="${output_dir}/join-view-request.json"
 view_file="${output_dir}/join-view.json"
+backfill_file="${output_dir}/join-backfill.json"
 relations_ingest_file="${output_dir}/relations-ingest.json"
 view_query_file="${output_dir}/join-view-query.json"
 
@@ -296,8 +297,6 @@ files = {
     view_request_path: {
         "view_id": view_id,
         "urlPath": api_path,
-        "input_relation_id": "",
-        "input_relation_version": "",
         "inputRelationRefs": [
             {"relation_id": readings_relation_id, "relation_version": relation_version},
             {"relation_id": devices_relation_id, "relation_version": relation_version},
@@ -469,6 +468,19 @@ curl_api -X POST "$VELORIX_API_URL/v1/relations/ingest" \
   -H 'content-type: application/json' \
   -d @"$output_dir/relations-ingest-request.json" \
   >"$relations_ingest_file"
+
+backfill_status="$(curl_api_status "$backfill_file" \
+  -X POST "$VELORIX_API_URL/v1/views/${view_id}/backfill" \
+  -H 'content-type: application/json' \
+  -d '{}')"
+case "$backfill_status" in
+  200 | 201) ;;
+  *)
+    echo "expected join view backfill to return 200 or 201; got ${backfill_status}" >&2
+    cat "$backfill_file" >&2 || true
+    exit 1
+    ;;
+esac
 
 deadline=$((SECONDS + query_wait_seconds))
 while true; do

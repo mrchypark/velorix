@@ -11297,3 +11297,123 @@ fn probe_temporal_join_admission() {
     println!("temporal join result: {:?}", result);
     assert!(result.is_ok(), "temporal join should admit: {:?}", result);
 }
+
+#[test]
+fn count_distinct_utf8_input_uses_numeric_runtime_value_column() {
+    let catalog = scores_with_category_catalog();
+    let output_schema = RelationSchema {
+        relation_id: "scores_by_user_category_count".to_string(),
+        relation_name: "scores_by_user_category_count".to_string(),
+        relation_version: "2026-05-24.v1".to_string(),
+        schema_fingerprint:
+            "sha256:000000000000000000000000000000000000000000000000000000000000000b".to_string(),
+        columns: vec![
+            ColumnSchema {
+                name: "user_id".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "category_count".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["user_id".to_string()],
+    };
+
+    let plan = lower_supported_sql_to_logical_plan(
+        "select user_id, count(distinct category) as category_count from scores group by user_id",
+        std::slice::from_ref(&catalog),
+        &output_schema,
+    )
+    .unwrap();
+
+    let VelorixLogicalViewExecutionV1::SingleKeySumCount { plan: supported } = &plan.execution
+    else {
+        panic!("expected single-key runtime execution");
+    };
+    assert_eq!(
+        supported.aggregate_outputs[0].function,
+        LogicalPlanAggregateFunctionV1::CountDistinct
+    );
+    assert_eq!(
+        supported.aggregate_outputs[0].input_column_id.as_deref(),
+        Some("category")
+    );
+    let runtime_value_column = catalog
+        .relation_schema
+        .columns
+        .iter()
+        .find(|c| c.column_id == supported.sum_value_column_id)
+        .expect("runtime value column must exist in catalog");
+    assert!(
+        matches!(
+            runtime_value_column.physical_arrow_type,
+            ArrowPhysicalTypeV1::Int64 | ArrowPhysicalTypeV1::Decimal128 { .. }
+        ),
+        "runtime value column must be numeric, got {:?}",
+        runtime_value_column.physical_arrow_type
+    );
+    validate_logical_view_plan(&plan).unwrap();
+}
+
+#[test]
+fn count_utf8_input_uses_numeric_runtime_value_column() {
+    let catalog = scores_with_category_catalog();
+    let output_schema = RelationSchema {
+        relation_id: "scores_by_user_category_count".to_string(),
+        relation_name: "scores_by_user_category_count".to_string(),
+        relation_version: "2026-05-24.v1".to_string(),
+        schema_fingerprint:
+            "sha256:000000000000000000000000000000000000000000000000000000000000000c".to_string(),
+        columns: vec![
+            ColumnSchema {
+                name: "user_id".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "category_count".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["user_id".to_string()],
+    };
+
+    let plan = lower_supported_sql_to_logical_plan(
+        "select user_id, count(category) as category_count from scores group by user_id",
+        std::slice::from_ref(&catalog),
+        &output_schema,
+    )
+    .unwrap();
+
+    let VelorixLogicalViewExecutionV1::SingleKeySumCount { plan: supported } = &plan.execution
+    else {
+        panic!("expected single-key runtime execution");
+    };
+    assert_eq!(
+        supported.aggregate_outputs[0].function,
+        LogicalPlanAggregateFunctionV1::Count
+    );
+    assert_eq!(
+        supported.aggregate_outputs[0].input_column_id.as_deref(),
+        Some("category")
+    );
+    let runtime_value_column = catalog
+        .relation_schema
+        .columns
+        .iter()
+        .find(|c| c.column_id == supported.sum_value_column_id)
+        .expect("runtime value column must exist in catalog");
+    assert!(
+        matches!(
+            runtime_value_column.physical_arrow_type,
+            ArrowPhysicalTypeV1::Int64 | ArrowPhysicalTypeV1::Decimal128 { .. }
+        ),
+        "runtime value column must be numeric, got {:?}",
+        runtime_value_column.physical_arrow_type
+    );
+    validate_logical_view_plan(&plan).unwrap();
+}

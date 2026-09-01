@@ -8010,6 +8010,7 @@ async fn rest_ingest_optimization_modes_report_timings_and_materialize_correctly
         .is_some());
     assert!(first_ingest.1["timings"]["total_us"].as_u64().unwrap() > 0);
     assert!(first_ingest.1["timings"].get("stages").is_none());
+    assert_eq!(first_ingest.1["descriptor"]["relation_id"], "scores");
 
     let active = inspection_state
         .view_registry()
@@ -8179,6 +8180,10 @@ async fn rest_ingest_optimization_modes_report_timings_and_materialize_correctly
         .as_u64()
         .is_some());
     assert!(epoch_ingest.1["timings"].get("stages").is_none());
+    let epoch_batches = epoch_ingest.1["batches"].as_array().unwrap();
+    assert_eq!(epoch_batches.len(), 2);
+    assert_eq!(epoch_batches[0]["descriptor"]["relation_id"], "scores");
+    assert_eq!(epoch_batches[1]["descriptor"]["relation_id"], "scores");
 
     let rejected_ack_mode = call_json(
         &router,
@@ -12142,6 +12147,103 @@ async fn rest_view_query_fails_closed_without_published_checkpoint_output() {
         .as_str()
         .unwrap_or_default()
         .contains("MATERIALIZATION_LAG"));
+}
+
+#[tokio::test]
+async fn rest_select_star_backfill_activates_authoritative_bootstrap_when_ingest_already_caught_up()
+{
+    let state = test_api_state_with_store(
+        Arc::new(InMemory::new()),
+        "api-test-select-star-backfill-activation-owner",
+        false,
+    )
+    .await;
+    let router = app(state);
+
+    let relation_response = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations",
+        json!({
+            "catalog": test_scores_catalog(),
+            "default_orders_sum_count": false
+        }),
+    )
+    .await;
+    assert_eq!(relation_response.0, StatusCode::CREATED);
+
+    let view_request = CreateViewRequest {
+        view_id: "select_star_scores_backfill".to_string(),
+        url_path: None,
+        output_relation_id: None,
+        input_relation_id: "scores".to_string(),
+        input_relation_version: "2026-05-24.v1".to_string(),
+        input_relation_refs: Vec::new(),
+        input_relations: Vec::new(),
+        sql: "select * from scores where score >= 10".to_string(),
+        source_kind: SqlSourceKind::StandingView,
+        output_relation_ids: Vec::new(),
+        sql_template: None,
+        description: Some("select-star backfill activation regression".to_string()),
+        request: Vec::new(),
+        response_schema: None,
+        response_formats: vec!["json".to_string()],
+        query_policy_id: None,
+    };
+    let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+    assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+    let ingest_response = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations/scores/ingest",
+        json!({
+            "relation_version": "2026-05-24.v1",
+            "stream_id": "select-star-backfill-stream",
+            "partition_id": 0,
+            "start_offset_inclusive": 0,
+            "rows": [
+                {"user_id": "alice", "score": 10, "delta": 1},
+                {"user_id": "bob", "score": 9, "delta": 1},
+                {"user_id": "carol", "score": 42, "delta": 1}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(
+        ingest_response.0,
+        StatusCode::CREATED,
+        "{ingest_response:?}"
+    );
+
+    for _ in 0..2 {
+        let backfill_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/select_star_scores_backfill/backfill",
+            json!({}),
+        )
+        .await;
+        assert_eq!(backfill_response.0, StatusCode::OK, "{backfill_response:?}");
+        assert_eq!(backfill_response.1["applied_batches"], 0);
+        assert_eq!(backfill_response.1["remaining_batches"], 0);
+
+        let query_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/select_star_scores_backfill/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(query_response.0, StatusCode::OK, "{query_response:?}");
+        assert_eq!(
+            query_response.1["rows"],
+            json!([
+                {"user_id": "alice", "score": 10},
+                {"user_id": "carol", "score": 42}
+            ])
+        );
+    }
 }
 
 #[tokio::test]
@@ -17914,5 +18016,127 @@ async fn view_on_view_chain_rejects_cycles_at_admission() {
     assert!(
         self_cycle.0.is_client_error(),
         "self-referencing view admission must fail closed: {self_cycle:?}"
+    );
+}
+
+#[test]
+fn parse_bool_env_defaults_to_false_when_unset() {
+    // Ensure the env var is not set for this test.
+    std::env::remove_var("VELORIX_TEST_PARSE_BOOL_UNSET");
+    let result = parse_bool_env("VELORIX_TEST_PARSE_BOOL_UNSET", false);
+    assert!(!result.unwrap());
+}
+
+#[test]
+fn parse_bool_env_defaults_to_true_when_unset() {
+    std::env::remove_var("VELORIX_TEST_PARSE_BOOL_UNSET_DEFAULT_TRUE");
+    let result = parse_bool_env("VELORIX_TEST_PARSE_BOOL_UNSET_DEFAULT_TRUE", true);
+    assert!(result.unwrap());
+}
+
+#[test]
+fn parse_bool_env_accepts_one_as_true() {
+    std::env::set_var("VELORIX_TEST_PARSE_BOOL_ONE", "1");
+    let result = parse_bool_env("VELORIX_TEST_PARSE_BOOL_ONE", false);
+    assert!(result.unwrap());
+    std::env::remove_var("VELORIX_TEST_PARSE_BOOL_ONE");
+}
+
+#[test]
+fn parse_bool_env_accepts_true_literal() {
+    std::env::set_var("VELORIX_TEST_PARSE_BOOL_TRUE", "true");
+    let result = parse_bool_env("VELORIX_TEST_PARSE_BOOL_TRUE", false);
+    assert!(result.unwrap());
+    std::env::remove_var("VELORIX_TEST_PARSE_BOOL_TRUE");
+}
+
+#[test]
+fn parse_bool_env_accepts_zero_as_false() {
+    std::env::set_var("VELORIX_TEST_PARSE_BOOL_ZERO", "0");
+    let result = parse_bool_env("VELORIX_TEST_PARSE_BOOL_ZERO", true);
+    assert!(!result.unwrap());
+    std::env::remove_var("VELORIX_TEST_PARSE_BOOL_ZERO");
+}
+
+#[test]
+fn parse_bool_env_accepts_false_literal() {
+    std::env::set_var("VELORIX_TEST_PARSE_BOOL_FALSE", "false");
+    let result = parse_bool_env("VELORIX_TEST_PARSE_BOOL_FALSE", true);
+    assert!(!result.unwrap());
+    std::env::remove_var("VELORIX_TEST_PARSE_BOOL_FALSE");
+}
+
+#[test]
+fn parse_bool_env_rejects_invalid_value() {
+    std::env::set_var("VELORIX_TEST_PARSE_BOOL_INVALID", "yes");
+    let result = parse_bool_env("VELORIX_TEST_PARSE_BOOL_INVALID", false);
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("VELORIX_TEST_PARSE_BOOL_INVALID"),
+        "error should name the env var: {err}"
+    );
+    assert!(
+        err.contains("yes"),
+        "error should show the invalid value: {err}"
+    );
+    std::env::remove_var("VELORIX_TEST_PARSE_BOOL_INVALID");
+}
+
+#[test]
+fn experimental_advanced_view_features_default_false_wires_policy() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let state = rt.block_on(test_public_api_state_with_store(
+        store,
+        "api-test-default-owner",
+        false,
+    ));
+    assert!(
+        !state.experimental_advanced_view_features,
+        "default must be false/fail-closed"
+    );
+    assert_eq!(
+        state.public_view_feature_policy.analytic_windows,
+        FeatureAdmissionModeV1::Experimental,
+        "default policy must keep analytic windows experimental"
+    );
+}
+
+#[test]
+fn experimental_advanced_view_features_enabled_true_wires_policy() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let state = rt
+        .block_on(test_public_api_state_with_store(
+            store,
+            "api-test-enabled-owner",
+            false,
+        ))
+        .with_experimental_advanced_view_features(true);
+    assert!(state.experimental_advanced_view_features);
+    assert_eq!(
+        state.public_view_feature_policy.analytic_windows,
+        FeatureAdmissionModeV1::Enabled,
+        "enabled flag must promote analytic windows to Enabled"
+    );
+}
+
+#[test]
+fn experimental_advanced_view_features_explicit_false_wires_policy() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let state = rt
+        .block_on(test_public_api_state_with_store(
+            store,
+            "api-test-explicit-false-owner",
+            false,
+        ))
+        .with_experimental_advanced_view_features(false);
+    assert!(!state.experimental_advanced_view_features);
+    assert_eq!(
+        state.public_view_feature_policy.analytic_windows,
+        FeatureAdmissionModeV1::Experimental,
+        "explicit false must keep analytic windows experimental"
     );
 }

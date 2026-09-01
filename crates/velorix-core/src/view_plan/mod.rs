@@ -12972,14 +12972,20 @@ fn count_only_runtime_value_column<'a>(
 ) -> Result<&'a RelationColumnV1, ViewPlanError> {
     if let [output] = aggregate_outputs {
         if let Some(input_column_id) = &output.input_column_id {
-            return catalog
+            let input_column = catalog
                 .relation_schema
                 .columns
                 .iter()
                 .find(|column| column.column_id == *input_column_id)
                 .ok_or_else(|| ViewPlanError::UnsupportedShape {
                     reason: "count input column is missing from relation catalog".to_string(),
-                });
+                })?;
+            if matches!(
+                input_column.physical_arrow_type,
+                ArrowPhysicalTypeV1::Int64 | ArrowPhysicalTypeV1::Decimal128 { .. }
+            ) {
+                return Ok(input_column);
+            }
         }
     }
     catalog

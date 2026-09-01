@@ -65,7 +65,7 @@ async fn hiqlite_activation_cas_fences_expired_owner_pointer_change_and_concurre
     );
 
     let owner_a = acquire_owner(&store, "owner-a", 1_000).await;
-    let pointer_1 = checkpoint_pointer(1, "a", &control.bootstrap_cut, &control.plan_hash);
+    let pointer_1 = checkpoint_pointer(1, "a", &control.bootstrap_cut, &control.plan_hash, "", "");
     assert_eq!(
         store
             .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
@@ -103,7 +103,14 @@ async fn hiqlite_activation_cas_fences_expired_owner_pointer_change_and_concurre
         .unwrap()
         .activation_cut
         .unwrap();
-    let pointer_2 = checkpoint_pointer(2, "b", &activation_cut, &control.plan_hash);
+    let pointer_2 = checkpoint_pointer(
+        2,
+        "b",
+        &activation_cut,
+        &control.plan_hash,
+        &pointer_1.checkpoint_key,
+        &pointer_1.manifest_hash,
+    );
     assert_eq!(
         store
             .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
@@ -188,6 +195,7 @@ async fn hiqlite_activation_cas_fences_expired_owner_pointer_change_and_concurre
     client.shutdown().await.unwrap();
 }
 
+#[allow(clippy::field_reassign_with_default)]
 async fn start_store() -> (TempDir, HiqliteMetaStore, hiqlite::Client) {
     let dir = TempDir::new().unwrap();
     let raft_addr = free_addr();
@@ -253,6 +261,8 @@ fn bootstrap_request() -> BeginViewBootstrapRequest {
         plan_hash: "sha256:plan".to_string(),
         view_spec_json: br#"{"view_id":"orders-view"}"#.to_vec(),
         relations: vec![relation()],
+        view_inputs: Vec::new(),
+        expected_graph_revision: 0,
     }
 }
 
@@ -291,6 +301,8 @@ fn checkpoint_pointer(
     hash_seed: &str,
     cut: &IngestSourceCutV1,
     plan_hash: &str,
+    previous_checkpoint_key: &str,
+    previous_manifest_hash: &str,
 ) -> StandingRuntimeCheckpointPointer {
     let coverage = RuntimeCheckpointInputCoverageV1 {
         schema_version: RUNTIME_CHECKPOINT_INPUT_COVERAGE_SCHEMA_VERSION_V1,
@@ -336,6 +348,8 @@ fn checkpoint_pointer(
         plan_hash: plan_hash.to_string(),
         coverage_hash: coverage.stable_hash().unwrap(),
         input_coverage: Some(coverage),
+        previous_checkpoint_key: previous_checkpoint_key.to_string(),
+        previous_manifest_hash: previous_manifest_hash.to_string(),
     }
 }
 

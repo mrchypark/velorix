@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "msrv": {
-    "minimum_rust_version": "1.93.1",
+    "minimum_rust_version": "1.98.0",
     "policy": "CI and package updates keep the workspace buildable on the declared MSRV; the current floor follows DataFusion 54.1.0, kube 4.2.0, and the internal materialized view runtime."
   },
   "package_reviews": [
@@ -84,7 +84,7 @@
       "kind": "duplicate",
       "crate": "foldhash",
       "owner": "runtime",
-      "expires_on": "2026-08-31",
+      "expires_on": "2026-09-30",
       "reason": "Duplicate versions are introduced by hashbrown and DataFusion transitive dependencies while upstream graphs converge.",
       "replacement_plan": "Upgrade hashbrown/DataFusion dependency ranges when upstream graphs converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
@@ -93,7 +93,7 @@
       "kind": "duplicate",
       "crate": "getrandom",
       "owner": "runtime",
-      "expires_on": "2026-08-31",
+      "expires_on": "2026-09-30",
       "reason": "Duplicate versions are introduced by current random/crypto dependency families while upstream graphs converge.",
       "replacement_plan": "Upgrade random/crypto dependency families when upstream ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
@@ -102,7 +102,7 @@
       "kind": "duplicate",
       "crate": "hashbrown",
       "owner": "runtime",
-      "expires_on": "2026-08-31",
+      "expires_on": "2026-09-30",
       "reason": "Duplicate versions are introduced by DataFusion, kube-runtime, and related transitive dependency families while upstream graphs converge.",
       "replacement_plan": "Upgrade DataFusion, kube-runtime, and related dependency families when their ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
@@ -111,7 +111,7 @@
       "kind": "duplicate",
       "crate": "heck",
       "owner": "runtime",
-      "expires_on": "2026-08-31",
+      "expires_on": "2026-09-30",
       "reason": "Duplicate versions are introduced by code-generation transitive dependencies while upstream graphs converge.",
       "replacement_plan": "Upgrade code-generation dependencies when upstream ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
@@ -120,7 +120,7 @@
       "kind": "duplicate",
       "crate": "object_store",
       "owner": "runtime",
-      "expires_on": "2026-08-31",
+      "expires_on": "2026-09-30",
       "reason": "Velorix intentionally carries object_store 0.14 for authority paths and DataFusion's object_store 0.13 for scan paths until the version boundary can be unified.",
       "replacement_plan": "Unify authority and scan object_store clients when DataFusion and Velorix authority paths can share one compatible version.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
@@ -129,7 +129,7 @@
       "kind": "duplicate",
       "crate": "quick-xml",
       "owner": "runtime",
-      "expires_on": "2026-08-31",
+      "expires_on": "2026-09-30",
       "reason": "object_store 0.14 uses fixed quick-xml 0.41, while the pinned Hiqlite -> cryptr -> s3-simple dependency path still carries quick-xml 0.39.",
       "replacement_plan": "Upgrade the Hiqlite/cryptr S3 dependency when its upstream range moves to quick-xml 0.41 or newer.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
@@ -138,7 +138,7 @@
       "kind": "duplicate",
       "crate": "rand",
       "owner": "runtime",
-      "expires_on": "2026-08-31",
+      "expires_on": "2026-09-30",
       "reason": "Duplicate versions are introduced by current random/crypto dependency families while upstream graphs converge.",
       "replacement_plan": "Upgrade random/crypto dependency families when upstream ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
@@ -147,7 +147,7 @@
       "kind": "duplicate",
       "crate": "rand_core",
       "owner": "runtime",
-      "expires_on": "2026-08-31",
+      "expires_on": "2026-09-30",
       "reason": "Duplicate versions are introduced by current random/crypto dependency families while upstream graphs converge.",
       "replacement_plan": "Upgrade random/crypto dependency families when upstream ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
@@ -156,7 +156,7 @@
       "kind": "duplicate",
       "crate": "thiserror",
       "owner": "runtime",
-      "expires_on": "2026-08-31",
+      "expires_on": "2026-09-30",
       "reason": "Duplicate versions are introduced by mixed upstream crates while their dependency ranges converge.",
       "replacement_plan": "Upgrade mixed upstream crates when their dependency ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
@@ -165,7 +165,7 @@
       "kind": "duplicate",
       "crate": "thiserror-impl",
       "owner": "runtime",
-      "expires_on": "2026-08-31",
+      "expires_on": "2026-09-30",
       "reason": "Duplicate versions follow the thiserror duplicate and will converge with upstream dependency ranges.",
       "replacement_plan": "Upgrade alongside thiserror when upstream dependency ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
@@ -174,7 +174,7 @@
       "kind": "duplicate",
       "crate": "winnow",
       "owner": "runtime",
-      "expires_on": "2026-08-31",
+      "expires_on": "2026-09-30",
       "reason": "Duplicate versions are introduced by SlateDB/figment/toml transitive dependencies while upstream graphs converge.",
       "replacement_plan": "Upgrade SlateDB/figment/toml dependency ranges when upstream graphs converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
@@ -183,7 +183,7 @@
       "kind": "duplicate",
       "crate": "aws-lc-sys",
       "owner": "metadata",
-      "expires_on": "2026-08-31",
+      "expires_on": "2026-09-30",
       "reason": "The pinned mrchypark/hiqlite metadata backend and existing TLS/S3 dependency graph introduce multiple aws-lc-sys lines while upstream crypto dependencies converge.",
       "replacement_plan": "Upgrade hiqlite and TLS/S3 dependencies, or switch to upstream hiqlite, when the aws-lc-sys dependency ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
@@ -192,7 +192,7 @@
       "kind": "duplicate",
       "crate": "base64",
       "owner": "metadata",
-      "expires_on": "2026-08-31",
+      "expires_on": "2026-09-30",
       "reason": "The pinned mrchypark/hiqlite metadata backend and existing HTTP/TLS dependency graph introduce base64 versions from multiple upstream stacks.",
       "replacement_plan": "Upgrade hiqlite and HTTP/TLS dependencies when upstream base64 dependency ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
@@ -201,7 +201,7 @@
       "kind": "duplicate",
       "crate": "chacha20",
       "owner": "metadata",
-      "expires_on": "2026-08-31",
+      "expires_on": "2026-09-30",
       "reason": "The pinned mrchypark/hiqlite metadata backend introduces crypto transitive dependencies that differ from existing crypto-family versions.",
       "replacement_plan": "Upgrade hiqlite and crypto dependencies when upstream crypto-family ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
@@ -210,7 +210,7 @@
       "kind": "duplicate",
       "crate": "sha2",
       "owner": "metadata",
-      "expires_on": "2026-08-31",
+      "expires_on": "2026-09-30",
       "reason": "The pinned mrchypark/hiqlite metadata backend introduces a sha2 line alongside existing hashing dependencies.",
       "replacement_plan": "Upgrade hiqlite and hashing dependencies when upstream sha2 ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
@@ -219,7 +219,7 @@
       "kind": "duplicate",
       "crate": "untrusted",
       "owner": "metadata",
-      "expires_on": "2026-08-31",
+      "expires_on": "2026-09-30",
       "reason": "The pinned mrchypark/hiqlite metadata backend and existing rustls/ring graph introduce multiple untrusted versions while TLS dependencies converge.",
       "replacement_plan": "Upgrade hiqlite and TLS dependencies when upstream untrusted ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
@@ -228,7 +228,7 @@
       "kind": "duplicate",
       "crate": "block-buffer",
       "owner": "metadata",
-      "expires_on": "2026-08-31",
+      "expires_on": "2026-09-30",
       "reason": "Current hashing and crypto transitive families select multiple block-buffer versions.",
       "replacement_plan": "Upgrade the hashing and crypto dependency families when their block-buffer ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
@@ -237,7 +237,7 @@
       "kind": "duplicate",
       "crate": "const-oid",
       "owner": "metadata",
-      "expires_on": "2026-08-31",
+      "expires_on": "2026-09-30",
       "reason": "The pinned metadata and signing dependency families select multiple const-oid versions.",
       "replacement_plan": "Upgrade the metadata and signing dependency families when their const-oid ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
@@ -246,7 +246,7 @@
       "kind": "duplicate",
       "crate": "crypto-common",
       "owner": "metadata",
-      "expires_on": "2026-08-31",
+      "expires_on": "2026-09-30",
       "reason": "Current hashing and crypto transitive families select multiple crypto-common versions.",
       "replacement_plan": "Upgrade the hashing and crypto dependency families when their crypto-common ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
@@ -255,7 +255,7 @@
       "kind": "duplicate",
       "crate": "derive_more",
       "owner": "metadata",
-      "expires_on": "2026-08-31",
+      "expires_on": "2026-09-30",
       "reason": "Current metadata and signing dependency families select multiple derive_more versions.",
       "replacement_plan": "Upgrade the metadata and signing dependency families when their derive_more ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
@@ -264,7 +264,7 @@
       "kind": "duplicate",
       "crate": "derive_more-impl",
       "owner": "metadata",
-      "expires_on": "2026-08-31",
+      "expires_on": "2026-09-30",
       "reason": "The derive_more duplicate brings matching derive_more-impl versions.",
       "replacement_plan": "Remove alongside the derive_more duplicate when upstream ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
@@ -273,7 +273,7 @@
       "kind": "duplicate",
       "crate": "digest",
       "owner": "metadata",
-      "expires_on": "2026-08-31",
+      "expires_on": "2026-09-30",
       "reason": "Current hashing and crypto transitive families select multiple digest versions.",
       "replacement_plan": "Upgrade the hashing and crypto dependency families when their digest ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
@@ -282,7 +282,7 @@
       "kind": "duplicate",
       "crate": "rand_chacha",
       "owner": "metadata",
-      "expires_on": "2026-08-31",
+      "expires_on": "2026-09-30",
       "reason": "Current random and crypto transitive families select multiple rand_chacha versions.",
       "replacement_plan": "Upgrade the random and crypto dependency families when their rand_chacha ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
@@ -291,7 +291,7 @@
       "kind": "duplicate",
       "crate": "itertools",
       "owner": "runtime",
-      "expires_on": "2026-08-31",
+      "expires_on": "2026-09-30",
       "reason": "DataFusion and object_store 0.14 currently select adjacent itertools release lines.",
       "replacement_plan": "Unify when the DataFusion and object_store dependency ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
@@ -300,7 +300,7 @@
       "kind": "duplicate",
       "crate": "spin",
       "owner": "metadata",
-      "expires_on": "2026-08-31",
+      "expires_on": "2026-09-30",
       "reason": "Hiqlite and SlateDB-related dependency families select supported but distinct spin release lines.",
       "replacement_plan": "Upgrade the metadata and storage dependency families when their spin ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
@@ -309,7 +309,7 @@
       "kind": "duplicate",
       "crate": "syn",
       "owner": "runtime",
-      "expires_on": "2026-08-31",
+      "expires_on": "2026-09-30",
       "reason": "Current derive macro families span syn 2 and syn 3 while upstream migrations are incomplete.",
       "replacement_plan": "Upgrade remaining derive macro dependencies when they support a shared syn line.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
@@ -318,7 +318,7 @@
       "kind": "duplicate",
       "crate": "phf",
       "owner": "metadata",
-      "expires_on": "2026-08-31",
+      "expires_on": "2026-09-30",
       "reason": "The pinned mrchypark/hiqlite full client feature set must match the server stream API and introduces server-side transitive dependencies that carry phf alongside existing parsers.",
       "replacement_plan": "Upgrade hiqlite and parser/HTTP dependencies when upstream phf dependency ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
@@ -327,7 +327,7 @@
       "kind": "duplicate",
       "crate": "phf_shared",
       "owner": "metadata",
-      "expires_on": "2026-08-31",
+      "expires_on": "2026-09-30",
       "reason": "The pinned mrchypark/hiqlite full client feature set must match the server stream API and follows the phf duplicate introduced by server-compatible features.",
       "replacement_plan": "Upgrade alongside phf when upstream dependency ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
@@ -336,7 +336,7 @@
       "kind": "duplicate",
       "crate": "serde_spanned",
       "owner": "metadata",
-      "expires_on": "2026-08-31",
+      "expires_on": "2026-09-30",
       "reason": "The pinned mrchypark/hiqlite full client feature set must match the server stream API and introduces toml 1.x dependencies alongside existing toml 0.8 users.",
       "replacement_plan": "Upgrade hiqlite and toml/figment users when their dependency ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
@@ -345,7 +345,7 @@
       "kind": "duplicate",
       "crate": "toml",
       "owner": "metadata",
-      "expires_on": "2026-08-31",
+      "expires_on": "2026-09-30",
       "reason": "The pinned mrchypark/hiqlite full client feature set must match the server stream API and introduces toml 1.x alongside existing toml 0.8 users.",
       "replacement_plan": "Upgrade hiqlite and toml/figment users when their dependency ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
@@ -354,7 +354,7 @@
       "kind": "duplicate",
       "crate": "toml_datetime",
       "owner": "metadata",
-      "expires_on": "2026-08-31",
+      "expires_on": "2026-09-30",
       "reason": "The pinned mrchypark/hiqlite full client feature set must match the server stream API and follows the toml duplicate introduced by server-compatible features.",
       "replacement_plan": "Upgrade alongside toml when upstream dependency ranges converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
@@ -363,7 +363,7 @@
       "kind": "unmaintained",
       "crate": "bincode",
       "owner": "metadata",
-      "expires_on": "2026-08-31",
+      "expires_on": "2026-09-30",
       "reason": "The Hiqlite metadata backend currently introduces a bincode advisory while the metadata backend is still using a local checkout bridge.",
       "replacement_plan": "Upgrade hiqlite or switch to upstream hiqlite main/release when its dependency graph removes the bincode advisory.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
@@ -372,7 +372,7 @@
       "kind": "unmaintained",
       "crate": "paste",
       "owner": "runtime",
-      "expires_on": "2026-08-31",
+      "expires_on": "2026-09-30",
       "reason": "Temporary allowance for a transitive unmaintained advisory while upstream replacement options are tracked.",
       "replacement_plan": "Remove the transitive paste dependency through upstream package upgrades or replace the dependent package before expiry.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
@@ -381,7 +381,7 @@
       "kind": "advisory",
       "crate": "quick-xml:RUSTSEC-2026-0194",
       "owner": "storage",
-      "expires_on": "2026-08-31",
+      "expires_on": "2026-09-30",
       "reason": "The authority path is fixed on quick-xml 0.41, but the pinned Hiqlite -> cryptr -> s3-simple dependency path still selects quick-xml 0.39.",
       "replacement_plan": "Upgrade the Hiqlite/cryptr S3 dependency to quick-xml 0.41 or newer, then remove the deny.toml exception.",
       "promotion_rule": "deny_after_expiry_or_renew_with_security_approval_and_updated_plan"
@@ -390,7 +390,7 @@
       "kind": "advisory",
       "crate": "quick-xml:RUSTSEC-2026-0195",
       "owner": "storage",
-      "expires_on": "2026-08-31",
+      "expires_on": "2026-09-30",
       "reason": "The authority path is fixed on quick-xml 0.41, but the pinned Hiqlite -> cryptr -> s3-simple dependency path still selects quick-xml 0.39.",
       "replacement_plan": "Upgrade the Hiqlite/cryptr S3 dependency to quick-xml 0.41 or newer, then remove the deny.toml exception.",
       "promotion_rule": "deny_after_expiry_or_renew_with_security_approval_and_updated_plan"

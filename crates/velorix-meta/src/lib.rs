@@ -3512,14 +3512,14 @@ impl MetaStore for HiqliteMetaStore {
                 async { self.client.txn(statements).await.map_err(hiqlite_error) }
             })
             .await?;
-        let created = hiqlite_txn_changed_rows(results, 0)? == 1;
+        let created = hiqlite_txn_changed_rows(&results, 0)? == 1;
         if !request.view_inputs.is_empty() {
             // The graph gate succeeds when exactly one of {INSERT OR IGNORE,
             // revision CAS UPDATE} changed a row: first admission inserts the
             // head, later admissions bump it from the expected revision. A
             // stale expected revision changes nothing and fails the gate.
-            let inserted_head = hiqlite_txn_changed_rows(results, statements.len() - 2)?;
-            let bumped_revision = hiqlite_txn_changed_rows(results, statements.len() - 1)?;
+            let inserted_head = hiqlite_txn_changed_rows(&results, statements.len() - 2)?;
+            let bumped_revision = hiqlite_txn_changed_rows(&results, statements.len() - 1)?;
             if inserted_head + bumped_revision != 1 {
                 return Ok(BeginViewBootstrapOutcome::Conflict);
             }
@@ -3895,7 +3895,7 @@ impl MetaStore for HiqliteMetaStore {
             .await?;
         let results = txn.result.map_err(hiqlite_error)?;
         let raft_timestamp = txn.timestamp;
-        let changed = hiqlite_txn_changed_rows(results, 0)?;
+        let changed = hiqlite_txn_changed_rows(&results, 0)?;
         if changed == 0 {
             let current = self
                 .read_standing_runtime_owner_record(
@@ -4244,8 +4244,7 @@ impl MetaStore for HiqliteMetaStore {
         let Some(row) = rows.into_iter().next() else {
             return Ok(0);
         };
-        let revision = i64::try_from(row.revision)
-            .map_err(|_| MetaStoreError::Serialization("graph revision is negative".to_string()))?;
+        let revision = row.revision;
         u64::try_from(revision)
             .map_err(|_| MetaStoreError::Serialization("graph revision is negative".to_string()))
     }
@@ -4596,14 +4595,16 @@ fn i64_from_u64(field: &'static str, value: u64) -> Result<i64, MetaStoreError> 
 
 #[cfg(feature = "hiqlite-backend")]
 fn hiqlite_txn_changed_rows(
-    results: Vec<Result<usize, hiqlite::Error>>,
+    results: &[Result<usize, hiqlite::Error>],
     changed_result_index: usize,
 ) -> Result<usize, MetaStoreError> {
     let mut changed = None;
-    for (index, result) in results.into_iter().enumerate() {
-        let rows = result.map_err(hiqlite_error)?;
+    for (index, result) in results.iter().enumerate() {
+        let rows = result
+            .as_ref()
+            .map_err(|e| MetaStoreError::Hiqlite(e.to_string()))?;
         if index == changed_result_index {
-            changed = Some(rows);
+            changed = Some(*rows);
         }
     }
     changed.ok_or_else(|| {
@@ -4619,7 +4620,7 @@ fn hiqlite_txn_changed_rows_or_zero_for_missing_stmt_output(
     changed_result_index: usize,
 ) -> Result<usize, MetaStoreError> {
     match result {
-        Ok(results) => hiqlite_txn_changed_rows(results, changed_result_index),
+        Ok(results) => hiqlite_txn_changed_rows(&results, changed_result_index),
         Err(error) if hiqlite_error_is_missing_stmt_output(&error) => Ok(0),
         Err(error) => Err(hiqlite_error(error)),
     }
@@ -5286,6 +5287,8 @@ mod hiqlite_capability_tests {
                 plan_hash: String::new(),
                 coverage_hash: String::new(),
                 input_coverage: None,
+                previous_checkpoint_key: String::new(),
+                previous_manifest_hash: String::new(),
             },
             owner: StandingRuntimeOwnerToken {
                 tenant_id: "other".to_string(),

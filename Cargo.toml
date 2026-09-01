@@ -12,6 +12,9 @@ members = [
 ]
 resolver = "2"
 
+[workspace.package]
+rust-version = "1.98.0"
+
 [workspace.dependencies]
 anyhow = "1"
 arrow = { version = "58.4.0", default-features = false }
