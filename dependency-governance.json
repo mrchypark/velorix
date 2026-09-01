@@ -75,7 +75,7 @@
       "kind": "duplicate",
       "crate": "cpufeatures",
       "owner": "runtime",
-      "expires_on": "2026-08-31",
+      "expires_on": "2026-09-30",
       "reason": "Duplicate versions are introduced by sha2 and DataFusion/object_store transitive dependencies while upstream graphs converge.",
       "replacement_plan": "Upgrade sha2/DataFusion/object_store dependency ranges when upstream graphs converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
