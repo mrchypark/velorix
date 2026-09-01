@@ -62,6 +62,8 @@ struct DurableIngestAdmission {
     /// authoritative cross-process fences (exact-key GET, range-admission
     /// index CAS, metadata reservation cut) are unchanged.
     committed_cache: Arc<Mutex<Option<Arc<[IngestBatchDescriptor]>>>>,
+    /// Hot path metrics for detecting LIST on data paths.
+    pub hot_path_metrics: crate::hot_path_metrics::HotPathMetrics,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -427,6 +429,7 @@ impl DurableIngestAdmission {
             log,
             reserve_before_committed_overlap,
             committed_cache: Arc::new(Mutex::new(None)),
+            hot_path_metrics: crate::hot_path_metrics::HotPathMetrics::new(),
         }
     }
 
@@ -692,6 +695,9 @@ impl DurableIngestAdmission {
                 return Ok(Arc::new(vec));
             }
         }
+        // Cache miss: LIST on hot path (admission conflict check)
+        self.hot_path_metrics
+            .record_list("ingest_committed_cache_miss", true);
         let loaded = self.log.list_committed().await?;
         let mut cache = self.committed_cache.lock().unwrap();
         if cache.is_none() {

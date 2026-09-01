@@ -29,6 +29,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 ///
 /// Hot paths are: ingest, query serving, checkpoint publish.
 /// LIST operations on these paths indicate potential cost scaling issues.
+#[derive(Debug)]
 pub struct HotPathMetrics {
     /// Total LIST operations observed.
     pub list_count: AtomicU64,
@@ -38,6 +39,17 @@ pub struct HotPathMetrics {
     pub put_count: AtomicU64,
     /// LIST operations that occurred on hot paths (violations).
     pub hot_path_violations: AtomicU64,
+}
+
+impl Clone for HotPathMetrics {
+    fn clone(&self) -> Self {
+        Self {
+            list_count: AtomicU64::new(self.list_count.load(Ordering::Relaxed)),
+            get_count: AtomicU64::new(self.get_count.load(Ordering::Relaxed)),
+            put_count: AtomicU64::new(self.put_count.load(Ordering::Relaxed)),
+            hot_path_violations: AtomicU64::new(self.hot_path_violations.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 impl HotPathMetrics {
