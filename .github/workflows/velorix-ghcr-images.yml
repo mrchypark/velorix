@@ -1,4 +1,4 @@
-name: IED GHCR Images
+name: Velorix GHCR Container Images
 
 on:
   push:
@@ -7,13 +7,13 @@ on:
   workflow_dispatch:
     inputs:
       source-ref:
-        description: Velorix commit to build (IED deployment is pinned to this exact commit).
+        description: Velorix commit to build for the pinned deployment.
         required: false
         default: 1ffbca70dfb627fd894f3c1e34cabc46777d51a7
         type: string
 
 env:
-  IED_SOURCE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.source-ref || '1ffbca70dfb627fd894f3c1e34cabc46777d51a7' }}
+  VELORIX_SOURCE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.source-ref || '1ffbca70dfb627fd894f3c1e34cabc46777d51a7' }}
 
 permissions:
   contents: read
@@ -37,7 +37,7 @@ jobs:
       - name: Checkout Velorix source
         uses: actions/checkout@v4
         with:
-          ref: ${{ env.IED_SOURCE_REF }}
+          ref: ${{ env.VELORIX_SOURCE_REF }}
 
       - name: Checkout locked Hiqlite source
         uses: actions/checkout@v4
@@ -46,14 +46,14 @@ jobs:
           ref: 26c6d22a72d7bd0a1e2de073fc4c076ddad4e588
           path: hiqlite
 
-      - name: Assert exact IED source revision
+      - name: Assert exact deployment source revision
         run: test "$(git rev-parse HEAD)" = "1ffbca70dfb627fd894f3c1e34cabc46777d51a7"
 
       - name: Prepare pinned Rust 1.98 Dockerfile
         run: |
           sed \
             -e 's|FROM rust:1\.95\.0-bookworm@sha256:[^ ]* AS builder|FROM rust:1.98.0-bookworm@sha256:4e4a7e7939c17991ab35f2b8c2e67593980f771d28f6b1254b1850f860fd0c7f AS builder|' \
-            "${{ matrix.dockerfile }}" > "Dockerfile.ied.${{ matrix.name }}"
+            "${{ matrix.dockerfile }}" > "Dockerfile.velorix.${{ matrix.name }}"
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
@@ -65,14 +65,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push immutable IED image
+      - name: Build and push immutable container image
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: Dockerfile.ied.${{ matrix.name }}
+          file: Dockerfile.velorix.${{ matrix.name }}
           build-contexts: |
             velorix-hiqlite-source=./hiqlite
           platforms: linux/amd64
           push: true
           provenance: false
-          tags: ghcr.io/mrchypark/velorix-${{ matrix.name }}:${{ env.IED_SOURCE_REF }}
+          tags: ghcr.io/mrchypark/velorix-${{ matrix.name }}:${{ env.VELORIX_SOURCE_REF }}
