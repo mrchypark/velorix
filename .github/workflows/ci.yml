@@ -119,7 +119,8 @@ jobs:
       - name: Check dependencies
         run: |
           mkdir -p target/dependency-governance
-          cargo deny -f json check -W unmaintained 2> target/dependency-governance/cargo-deny.jsonl
+          cargo metadata --format-version 1 --locked --all-features > target/dependency-governance/cargo-metadata.json
+          cargo deny --color never --locked --metadata-path target/dependency-governance/cargo-metadata.json -f json check -W unmaintained 2> target/dependency-governance/cargo-deny.jsonl
 
       - name: Validate dependency governance manifest
         run: |

@@ -326,7 +326,8 @@ if [ "$skip_docker_build" = "1" ]; then
 fi
 
 step "Checking dependency governance with cargo-deny"
-cargo deny -f json check -W unmaintained 2>"$cargo_deny_jsonl"
+cargo metadata --format-version 1 --locked --all-features >"${dependency_dir}/cargo-metadata.json"
+cargo deny --color never --locked --metadata-path "${dependency_dir}/cargo-metadata.json" -f json check -W unmaintained 2>"$cargo_deny_jsonl"
 cargo run -p velorix-cli -- dependency-governance-validate \
   --manifest dependency-governance.json \
   --cargo-deny-json "$cargo_deny_jsonl" \
