@@ -1,6 +1,9 @@
 name: IED GHCR Images
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       source-ref:
@@ -8,6 +11,9 @@ on:
         required: false
         default: 1ffbca70dfb627fd894f3c1e34cabc46777d51a7
         type: string
+
+env:
+  IED_SOURCE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.source-ref || '1ffbca70dfb627fd894f3c1e34cabc46777d51a7' }}
 
 permissions:
   contents: read
@@ -31,7 +37,7 @@ jobs:
       - name: Checkout Velorix source
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.source-ref }}
+          ref: ${{ env.IED_SOURCE_REF }}
 
       - name: Checkout locked Hiqlite source
         uses: actions/checkout@v4
@@ -69,4 +75,4 @@ jobs:
           platforms: linux/amd64
           push: true
           provenance: false
-          tags: ghcr.io/mrchypark/velorix-${{ matrix.name }}:${{ inputs.source-ref }}
+          tags: ghcr.io/mrchypark/velorix-${{ matrix.name }}:${{ env.IED_SOURCE_REF }}
