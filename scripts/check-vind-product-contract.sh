@@ -37,6 +37,17 @@ no_external_runtime_artifacts_path="${repo_root}/scripts/check-no-external-runti
 hiqlite_backup_restore_evidence_path="${repo_root}/scripts/check-hiqlite-backup-restore-evidence.sh"
 s3_checkpoint_fault_matrix_runner_path="${repo_root}/scripts/run-s3-checkpoint-fault-matrix.sh"
 
+schedule_heredoc_end="$(awk '
+  /wait_for_kubernetes_scheduling_ready\(\)/ { in_probe = 1 }
+  in_probe && /^PY$/ { print NR; exit }
+' "$script_path")"
+storage_class_helper_line="$(rg -n '^validate_managed_storage_class\(\)' "$script_path" | cut -d: -f1)"
+if [ -z "$schedule_heredoc_end" ] || [ -z "$storage_class_helper_line" ] \
+  || [ "$storage_class_helper_line" -le "$schedule_heredoc_end" ]; then
+  echo "managed storage-class helper must be a shell function after the scheduling heredoc" >&2
+  exit 1
+fi
+
 python3 - "$script_path" "$first_e2e_path" "$cli_path" "$meta_cargo_path" "$doc_path" "$release_copy_path" "$attest_path" "$durability_attest_path" "$backend_time_attest_path" "$backend_time_release_preflight_path" "$backend_time_release_env_path" "$external_rustfs_path" "$external_s3_path" "$durability_assess_path" "$attach_rest_path" "$rest_api_smoke_path" "$rest_join_smoke_path" "$stress_chaos_soak_path" "$product_completion_report_path" "$refresh_deployed_images_path" "$product_ingress_attest_path" "$product_ingress_apply_path" "$product_ingress_attach_path" "$product_ingress_complete_path" "$object_store_durability_attach_path" "$object_store_durability_complete_path" "$product_complete_path" "$failover_evidence_writer_path" "$complete_input_preflight_path" "$next_product_step_path" "$crate_boundary_policy_path" "$no_external_runtime_artifacts_path" "$hiqlite_backup_restore_evidence_path" "$s3_checkpoint_fault_matrix_runner_path" <<'PY'
 import json
 import os
@@ -3528,6 +3539,27 @@ checks["GHCR deployment images include the supported Hiqlite server and record d
     and "steps.build.outputs.digest" in ghcr_workflow
     and "source_ref=" in ghcr_workflow
     and "actions/upload-artifact@v4" in ghcr_workflow
+    and "VELORIX_SOURCE_REF: ${{ github.sha }}" in ghcr_workflow
+    and 'test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"' in ghcr_workflow
+)
+
+checks["managed persistence remains opt-in and renders generic PVC-backed authorities"] = (
+    'managed_persistence="${VELORIX_MANAGED_PERSISTENCE:-0}"' in script
+    and 'managed_hiqlite_storage_size="${VELORIX_MANAGED_HIQLITE_STORAGE_SIZE:-10Gi}"' in script
+    and 'managed_rustfs_storage_size="${VELORIX_MANAGED_RUSTFS_STORAGE_SIZE:-10Gi}"' in script
+    and 'hiqlite_data_volume_claim_templates_yaml' in script
+    and 'kind: PersistentVolumeClaim' in script
+    and 'claimName: velorix-rustfs-data' in script
+    and 'volumeClaimTemplates:' in script
+    and 'managed PVC storage sizes must be positive Kubernetes quantities' in script
+    and 'if [ "$managed_persistence" = "1" ]; then' in script
+    and 'emptyDir: {}' in script
+    and 'rustfs_strategy_yaml' in script
+    and 'type: Recreate' in script
+    and 'VELORIX_MANAGED_PERSISTENCE=1 rejects VELORIX_VIND_CLEANUP=1' in script
+    and 'validate_managed_storage_class' in script
+    and 'get storageclass "$managed_storage_class"' in script
+    and 'Kubernetes DNS subdomain' in script
 )
 
 checks["external immutable images pull without changing local-load defaults"] = (

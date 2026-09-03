@@ -34,6 +34,10 @@ build_meta_image="${VELORIX_BUILD_META_IMAGE:-1}"
 meta_mode="${VELORIX_META_MODE:-development}"
 meta_backend="${VELORIX_META_BACKEND:-memory}"
 hiqlite_deploy="${VELORIX_HIQLITE_DEPLOY:-0}"
+managed_persistence="${VELORIX_MANAGED_PERSISTENCE:-0}"
+managed_storage_class="${VELORIX_MANAGED_STORAGE_CLASS:-}"
+managed_hiqlite_storage_size="${VELORIX_MANAGED_HIQLITE_STORAGE_SIZE:-10Gi}"
+managed_rustfs_storage_size="${VELORIX_MANAGED_RUSTFS_STORAGE_SIZE:-10Gi}"
 hiqlite_image="${VELORIX_HIQLITE_IMAGE:-velorix-hiqlite:product-${run_id}}"
 hiqlite_image_digest="${VELORIX_HIQLITE_IMAGE_DIGEST:-}"
 build_hiqlite_image="${VELORIX_BUILD_HIQLITE_IMAGE:-1}"
@@ -233,6 +237,10 @@ Main overrides:
   VELORIX_META_MODE=development
   VELORIX_META_BACKEND=memory
   VELORIX_HIQLITE_DEPLOY=0  # set 1 with VELORIX_META_BACKEND=hiqlite to deploy a no-PVC 3-voter authority
+  VELORIX_MANAGED_PERSISTENCE=0  # set 1 only for an existing cluster with provisioned PVC storage
+  VELORIX_MANAGED_STORAGE_CLASS=<optional existing StorageClass>
+  VELORIX_MANAGED_HIQLITE_STORAGE_SIZE=10Gi
+  VELORIX_MANAGED_RUSTFS_STORAGE_SIZE=10Gi
   VELORIX_HIQLITE_IMAGE=velorix-hiqlite:product
   VELORIX_HIQLITE_IMAGE_DIGEST=<optional sha256 digest for managed hiqlite attestation>
   VELORIX_BUILD_HIQLITE_IMAGE=1
@@ -999,6 +1007,69 @@ service_account_image_pull_secrets_yaml() {
   fi
 }
 
+managed_storage_class_yaml() {
+  if [ -n "$managed_storage_class" ]; then
+    printf '%s\n' "      storageClassName: ${managed_storage_class}"
+  fi
+}
+
+hiqlite_data_volume_claim_templates_yaml() {
+  if [ "$managed_persistence" = "1" ]; then
+    printf '%s\n' \
+      '  volumeClaimTemplates:' \
+      '    - metadata:' \
+      '        name: data' \
+      '      spec:' \
+      '        accessModes: ["ReadWriteOnce"]' \
+      '        resources:' \
+      '          requests:' \
+      "            storage: ${managed_hiqlite_storage_size}"
+    if [ -n "$managed_storage_class" ]; then
+      printf '%s\n' "        storageClassName: ${managed_storage_class}"
+    fi
+  fi
+}
+
+hiqlite_data_volume_yaml() {
+  if [ "$managed_persistence" = "0" ]; then
+    printf '%s\n' '        - name: data' '          emptyDir: {}'
+  fi
+}
+
+rustfs_pvc_yaml() {
+  if [ "$managed_persistence" = "1" ]; then
+    printf '%s\n' \
+      'apiVersion: v1' \
+      'kind: PersistentVolumeClaim' \
+      'metadata:' \
+      '  name: velorix-rustfs-data' \
+      "  namespace: ${namespace}" \
+      'spec:' \
+      '  accessModes: ["ReadWriteOnce"]' \
+      '  resources:' \
+      '    requests:' \
+      "      storage: ${managed_rustfs_storage_size}"
+    if [ -n "$managed_storage_class" ]; then
+      printf '%s\n' "  storageClassName: ${managed_storage_class}"
+    fi
+    printf '%s\n' '---'
+  fi
+}
+
+rustfs_data_volume_yaml() {
+  if [ "$managed_persistence" = "1" ]; then
+    printf '%s\n' '        - name: data' '          persistentVolumeClaim:' '            claimName: velorix-rustfs-data'
+  else
+    printf '%s\n' '        - name: data' '          emptyDir: {}'
+  fi
+}
+
+rustfs_strategy_yaml() {
+  if [ "$managed_persistence" = "1" ]; then
+    printf '%s\n' '  strategy:' '    type: Recreate'
+  fi
+}
+
 case "$meta_enabled" in
   0 | 1) ;;
   *)
@@ -1225,6 +1296,28 @@ case "$no_pvc_namespace_validate" in
     exit 64
     ;;
 esac
+
+case "$managed_persistence" in
+  0 | 1) ;;
+  *)
+    echo "VELORIX_MANAGED_PERSISTENCE must be 0 or 1" >&2
+    exit 64
+    ;;
+esac
+for managed_size in "$managed_hiqlite_storage_size" "$managed_rustfs_storage_size"; do
+  if [[ ! "$managed_size" =~ ^[1-9][0-9]*([KMGTPE]i)?$ ]]; then
+    echo "managed PVC storage sizes must be positive Kubernetes quantities such as 10Gi" >&2
+    exit 64
+  fi
+done
+if [ -n "$managed_storage_class" ] && { [ "${#managed_storage_class}" -gt 253 ] || [[ ! "$managed_storage_class" =~ ^([a-z0-9]([-a-z0-9]*[a-z0-9])?)(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$ ]]; }; then
+  echo "VELORIX_MANAGED_STORAGE_CLASS must be a lowercase Kubernetes DNS subdomain" >&2
+  exit 64
+fi
+if [ "$managed_persistence" = "1" ] && [ "$cleanup" = "1" ]; then
+  echo "VELORIX_MANAGED_PERSISTENCE=1 rejects VELORIX_VIND_CLEANUP=1 to avoid deleting a persistent deployment without explicit acknowledgement" >&2
+  exit 64
+fi
 
 case "$final_owner_aware_attach" in
   0 | 1) ;;
@@ -1831,6 +1924,7 @@ blocking_taints = {
     "node.kubernetes.io/pid-pressure",
     "node.kubernetes.io/unreachable",
 }
+
 for node in items:
     status = node.get("status") or {}
     spec = node.get("spec") or {}
@@ -1858,6 +1952,16 @@ PY
     fi
     sleep 2
   done
+}
+
+validate_managed_storage_class() {
+  if [ "$managed_persistence" != "1" ] || [ -z "$managed_storage_class" ]; then
+    return 0
+  fi
+  if ! kubectl --context "$context" get storageclass "$managed_storage_class" >/dev/null 2>&1; then
+    echo "VELORIX_MANAGED_STORAGE_CLASS=${managed_storage_class} is unavailable in the selected Kubernetes context" >&2
+    exit 66
+  fi
 }
 
 validate_local_vcluster_context() {
@@ -2503,6 +2607,10 @@ create_vcluster_with_retry() {
 }
 
 validate_no_pvc_namespace() {
+  if [ "$managed_persistence" = "1" ]; then
+    no_pvc_namespace_validated=0
+    return 0
+  fi
   if [ "$no_pvc_namespace_validate" != "1" ]; then
     return 0
   fi
@@ -6073,6 +6181,7 @@ fi
 if ! wait_for_kubernetes_scheduling_ready 2>"${output_dir}/vcluster-scheduling-ready.log"; then
   cat "${output_dir}/vcluster-scheduling-ready.log" >&2 || true
 fi
+validate_managed_storage_class
 check_kubernetes_scheduling_health "before-image-build"
 
 docker_build_args=()
@@ -6464,7 +6573,7 @@ spec:
         velorix.dev/hiqlite-api-secret-sha256: "${hiqlite_api_secret_hash}"
         velorix.dev/hiqlite-raft-secret-sha256: "${hiqlite_raft_secret_hash}"
         velorix.dev/s3-credentials-sha256: "${s3_credentials_hash}"
-        velorix.dev/no-pvc: "true"
+        velorix.dev/managed-persistence: "${managed_persistence}"
     spec:
       serviceAccountName: velorix-hiqlite
       automountServiceAccountToken: false
@@ -6554,8 +6663,8 @@ $(image_pull_secrets_yaml)
         - name: config
           configMap:
             name: velorix-hiqlite-config
-        - name: data
-          emptyDir: {}
+$(hiqlite_data_volume_yaml)
+$(hiqlite_data_volume_claim_templates_yaml)
 EOF
 
   kubectl --context "$context" apply -f "${output_dir}/velorix-hiqlite.yaml"
@@ -6568,6 +6677,10 @@ EOF
   if [ -z "$hiqlite_image_digest" ]; then
     echo "managed Hiqlite authority attestation requires VELORIX_HIQLITE_IMAGE_DIGEST or a locally inspectable image" >&2
     exit 64
+  fi
+  if [ "$managed_persistence" = "1" ]; then
+    echo "managed PVC persistence is storage-local only; no backup durability attestation is generated" >&2
+    return 0
   fi
   hiqlite_source_revision="local-source-no-git"
   if git -C "$hiqlite_local_source_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -6628,6 +6741,7 @@ PY
 
 if [ "$object_store_mode" = "rustfs" ]; then
 cat >"${output_dir}/rustfs.yaml" <<EOF
+$(rustfs_pvc_yaml)
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -6635,6 +6749,7 @@ metadata:
   namespace: ${namespace}
 spec:
   replicas: 1
+$(rustfs_strategy_yaml)
   selector:
     matchLabels:
       app: rustfs
@@ -6682,8 +6797,7 @@ spec:
             - name: data
               mountPath: /data
       volumes:
-        - name: data
-          emptyDir: {}
+$(rustfs_data_volume_yaml)
 ---
 apiVersion: v1
 kind: Service

@@ -5,15 +5,9 @@ on:
     branches:
       - main
   workflow_dispatch:
-    inputs:
-      source-ref:
-        description: Velorix commit to build for the pinned deployment.
-        required: false
-        default: 1ffbca70dfb627fd894f3c1e34cabc46777d51a7
-        type: string
 
 env:
-  VELORIX_SOURCE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.source-ref || '1ffbca70dfb627fd894f3c1e34cabc46777d51a7' }}
+  VELORIX_SOURCE_REF: ${{ github.sha }}
 
 permissions:
   contents: read
@@ -49,7 +43,7 @@ jobs:
           path: hiqlite
 
       - name: Assert exact deployment source revision
-        run: test "$(git rev-parse HEAD)" = "1ffbca70dfb627fd894f3c1e34cabc46777d51a7"
+        run: test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
 
       - name: Prepare pinned Rust 1.98 Dockerfile
         run: |
