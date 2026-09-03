@@ -109,6 +109,8 @@ remaining_release_readiness_runner_path = (
 )
 with open(script_path, "r", encoding="utf-8") as f:
     script = f.read()
+with open(repo_root / ".github" / "workflows" / "velorix-ghcr-images.yml", "r", encoding="utf-8") as f:
+    ghcr_workflow = f.read()
 with open(first_e2e_path, "r", encoding="utf-8") as f:
     first_e2e = f.read()
 with open(cli_path, "r", encoding="utf-8") as f:
@@ -3516,6 +3518,48 @@ checks["product ingress apply helper creates no-PVC Kubernetes ingress"] = (
     and "networking.k8s.io/v1" in product_ingress_apply
     and '"kind": "Ingress"' in product_ingress_apply
     and "PersistentVolumeClaim" not in product_ingress_apply
+)
+
+checks["GHCR deployment images include the supported Hiqlite server and record digest evidence"] = (
+    "- name: hiqlite" in ghcr_workflow
+    and "dockerfile: Dockerfile.hiqlite" in ghcr_workflow
+    and "velorix-hiqlite" in ghcr_workflow
+    and "rust:1.98.0-bookworm" in ghcr_workflow
+    and "steps.build.outputs.digest" in ghcr_workflow
+    and "source_ref=" in ghcr_workflow
+    and "actions/upload-artifact@v4" in ghcr_workflow
+)
+
+checks["external immutable images pull without changing local-load defaults"] = (
+    'image_pull_secret="${VELORIX_IMAGE_PULL_SECRET:-}"' in script
+    and 'ingest_writer_image_digest="${VELORIX_INGEST_WRITER_IMAGE_DIGEST:-}"' in script
+    and 'api_image_pull_policy="Never"' in script
+    and 'meta_image_pull_policy="Never"' in script
+    and 'hiqlite_image_pull_policy="Never"' in script
+    and 'ingest_writer_image_pull_policy="Never"' in script
+    and 'image_load_mode" = "none"' in script
+    and 'imagePullPolicy: ${api_image_pull_policy}' in script
+    and 'imagePullPolicy: ${meta_image_pull_policy}' in script
+    and 'imagePullPolicy: ${hiqlite_image_pull_policy}' in script
+    and 'imagePullPolicy: ${ingest_writer_image_pull_policy}' in script
+    and 'imagePullSecrets:' in script
+    and 'immutable_image_reference' in script
+)
+
+checks["metadata deployment explicitly selects the executable local topology"] = (
+    'meta_mode="${VELORIX_META_MODE:-development}"' in script
+    and 'meta_backend="${VELORIX_META_BACKEND:-memory}"' in script
+    and 'hiqlite_deploy="${VELORIX_HIQLITE_DEPLOY:-0}"' in script
+    and '- name: VELORIX_META_MODE' in script
+    and 'value: "${meta_mode}"' in script
+    and 'VELORIX_META_TRANSPORT_SECURITY_ATTESTATION' not in script
+)
+
+checks["local runner rejects production metadata mode before Kubernetes mutation"] = (
+    'if [ "$meta_mode" = "production" ] || [ "$meta_mode" = "prod" ]; then' in script
+    and "VELORIX_META_MODE=production is unsupported by this local runner until validated transport configuration exists" in script
+    and script.index("VELORIX_META_MODE=production is unsupported by this local runner")
+    < script.rindex("preflight_docker_daemon")
 )
 
 checks["deployed image digest refresh is annotation and pod-status bound"] = (

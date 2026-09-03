@@ -31,13 +31,16 @@ meta_enabled="${VELORIX_META_ENABLED:-1}"
 meta_image="${VELORIX_META_IMAGE:-velorix-meta:product-${run_id}}"
 meta_image_digest="${VELORIX_META_IMAGE_DIGEST:-}"
 build_meta_image="${VELORIX_BUILD_META_IMAGE:-1}"
+meta_mode="${VELORIX_META_MODE:-development}"
 meta_backend="${VELORIX_META_BACKEND:-memory}"
 hiqlite_deploy="${VELORIX_HIQLITE_DEPLOY:-0}"
 hiqlite_image="${VELORIX_HIQLITE_IMAGE:-velorix-hiqlite:product-${run_id}}"
 hiqlite_image_digest="${VELORIX_HIQLITE_IMAGE_DIGEST:-}"
 build_hiqlite_image="${VELORIX_BUILD_HIQLITE_IMAGE:-1}"
 ingest_writer_image="${VELORIX_INGEST_WRITER_IMAGE:-velorix-ingest-writer:product-${run_id}}"
+ingest_writer_image_digest="${VELORIX_INGEST_WRITER_IMAGE_DIGEST:-}"
 build_ingest_writer_image="${VELORIX_BUILD_INGEST_WRITER_IMAGE:-1}"
+image_pull_secret="${VELORIX_IMAGE_PULL_SECRET:-}"
 docker_build_no_cache="${VELORIX_DOCKER_BUILD_NO_CACHE:-0}"
 hiqlite_local_source_dir="${VELORIX_HIQLITE_LOCAL_SOURCE_DIR:-${repo_root}/../hiqlite}"
 load_existing_images="${VELORIX_LOAD_EXISTING_IMAGES:-0}"
@@ -227,6 +230,7 @@ Main overrides:
   VELORIX_META_ENABLED=1
   VELORIX_META_IMAGE=velorix-meta:product
   VELORIX_BUILD_META_IMAGE=1
+  VELORIX_META_MODE=development
   VELORIX_META_BACKEND=memory
   VELORIX_HIQLITE_DEPLOY=0  # set 1 with VELORIX_META_BACKEND=hiqlite to deploy a no-PVC 3-voter authority
   VELORIX_HIQLITE_IMAGE=velorix-hiqlite:product
@@ -234,8 +238,10 @@ Main overrides:
   VELORIX_BUILD_HIQLITE_IMAGE=1
   VELORIX_HIQLITE_AUTHORITY_ATTESTATION_FILE=<optional JSON for external hiqlite authority evidence>
   VELORIX_INGEST_WRITER_IMAGE=velorix-ingest-writer:product
+  VELORIX_INGEST_WRITER_IMAGE_DIGEST=<required sha256 digest when externally pulling the ingest-writer image>
   VELORIX_BUILD_INGEST_WRITER_IMAGE=1
   VELORIX_LOAD_EXISTING_IMAGES=0  # set 1 with BUILD_*_IMAGE=0 to load local images into the selected product cluster
+  VELORIX_IMAGE_PULL_SECRET=<optional namespace-scoped imagePullSecret for immutable external images>
   VELORIX_INGEST_WRITER_SMOKE=1
   VELORIX_OBJECT_STORE_MODE=rustfs  # or external-s3
   VELORIX_EXTERNAL_S3_VALIDATE=1
@@ -960,6 +966,39 @@ raise SystemExit(1)
 PY
 }
 
+immutable_image_reference() {
+  local image="$1"
+  local digest="$2"
+  if [ -z "$digest" ] && [[ "$image" == *@sha256:* ]]; then
+    digest="${image##*@}"
+  fi
+  if [[ ! "$digest" =~ ^sha256:[0-9a-fA-F]{64}$ ]]; then
+    echo "external image digest must be sha256:<64 hex characters>" >&2
+    exit 64
+  fi
+  if [[ "$image" == *@sha256:* ]]; then
+    if [[ "$image" != *"@${digest}" ]]; then
+      echo "external image reference digest must match its supplied digest" >&2
+      exit 64
+    fi
+    printf '%s\n' "$image"
+  else
+    printf '%s@%s\n' "$image" "$digest"
+  fi
+}
+
+image_pull_secrets_yaml() {
+  if [ -n "$image_pull_secret" ]; then
+    printf '%s\n' "      imagePullSecrets:" "        - name: ${image_pull_secret}"
+  fi
+}
+
+service_account_image_pull_secrets_yaml() {
+  if [ -n "$image_pull_secret" ]; then
+    printf '%s\n' "imagePullSecrets:" "  - name: ${image_pull_secret}"
+  fi
+}
+
 case "$meta_enabled" in
   0 | 1) ;;
   *)
@@ -1007,6 +1046,46 @@ case "$load_existing_images" in
     exit 64
     ;;
 esac
+
+if [ -n "$image_pull_secret" ] && [[ ! "$image_pull_secret" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
+  echo "VELORIX_IMAGE_PULL_SECRET must be a lowercase DNS label" >&2
+  exit 64
+fi
+
+api_image_pull_policy="Never"
+meta_image_pull_policy="Never"
+hiqlite_image_pull_policy="Never"
+ingest_writer_image_pull_policy="Never"
+if [ "$image_load_mode" = "none" ]; then
+  if [ "$build_api_image" = "0" ]; then
+    if [ -z "$api_image_digest" ] && [[ "$api_image" == *@sha256:* ]]; then
+      api_image_digest="${api_image##*@}"
+    fi
+    api_image="$(immutable_image_reference "$api_image" "$api_image_digest")"
+    api_image_pull_policy="IfNotPresent"
+  fi
+  if [ "$meta_enabled" = "1" ] && [ "$build_meta_image" = "0" ]; then
+    if [ -z "$meta_image_digest" ] && [[ "$meta_image" == *@sha256:* ]]; then
+      meta_image_digest="${meta_image##*@}"
+    fi
+    meta_image="$(immutable_image_reference "$meta_image" "$meta_image_digest")"
+    meta_image_pull_policy="IfNotPresent"
+  fi
+  if [ "$hiqlite_deploy" = "1" ] && [ "$build_hiqlite_image" = "0" ]; then
+    if [ -z "$hiqlite_image_digest" ] && [[ "$hiqlite_image" == *@sha256:* ]]; then
+      hiqlite_image_digest="${hiqlite_image##*@}"
+    fi
+    hiqlite_image="$(immutable_image_reference "$hiqlite_image" "$hiqlite_image_digest")"
+    hiqlite_image_pull_policy="IfNotPresent"
+  fi
+  if [ "$ingest_writer_smoke" = "1" ] && [ "$build_ingest_writer_image" = "0" ]; then
+    if [ -z "$ingest_writer_image_digest" ] && [[ "$ingest_writer_image" == *@sha256:* ]]; then
+      ingest_writer_image_digest="${ingest_writer_image##*@}"
+    fi
+    ingest_writer_image="$(immutable_image_reference "$ingest_writer_image" "$ingest_writer_image_digest")"
+    ingest_writer_image_pull_policy="IfNotPresent"
+  fi
+fi
 
 case "$product_smoke" in
   0 | 1) ;;
@@ -1361,6 +1440,17 @@ case "$meta_backend" in
     ;;
 esac
 
+case "$meta_mode" in
+  production | prod | development | dev) ;;
+  *)
+    echo "VELORIX_META_MODE must be production or development" >&2
+    exit 64
+    ;;
+esac
+if [ "$meta_mode" = "production" ] || [ "$meta_mode" = "prod" ]; then
+  echo "VELORIX_META_MODE=production is unsupported by this local runner until validated transport configuration exists" >&2
+  exit 64
+fi
 case "$hiqlite_deploy" in
   0 | 1) ;;
   *)
@@ -2846,6 +2936,7 @@ spec:
         app: velorix-meta-smoke
         velorix.dev/run-id: "${run_id}"
     spec:
+$(image_pull_secrets_yaml)
       securityContext:
         seccompProfile:
           type: RuntimeDefault
@@ -2853,7 +2944,7 @@ spec:
       containers:
         - name: smoke
           image: ${meta_image}
-          imagePullPolicy: Never
+          imagePullPolicy: ${meta_image_pull_policy}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -3057,7 +3148,7 @@ spec:
       containers:
         - name: ingest-writer
           image: ${ingest_writer_image}
-          imagePullPolicy: Never
+          imagePullPolicy: ${ingest_writer_image_pull_policy}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -3262,7 +3353,7 @@ spec:
       containers:
         - name: ingest-writer
           image: ${ingest_writer_image}
-          imagePullPolicy: Never
+          imagePullPolicy: ${ingest_writer_image_pull_policy}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -3520,7 +3611,7 @@ spec:
       containers:
         - name: ingest-writer
           image: ${ingest_writer_image}
-          imagePullPolicy: Never
+          imagePullPolicy: ${ingest_writer_image_pull_policy}
           args:
             - probe-ingest-admission-crash-restart
             - --payload-file
@@ -3703,7 +3794,7 @@ spec:
       containers:
         - name: ingest-writer
           image: ${ingest_writer_image}
-          imagePullPolicy: Never
+          imagePullPolicy: ${ingest_writer_image_pull_policy}
           args:
             - probe-lease-loss-during-reservation
             - --payload-file
@@ -3898,7 +3989,7 @@ spec:
       containers:
         - name: ingest-writer
           image: ${ingest_writer_image}
-          imagePullPolicy: Never
+          imagePullPolicy: ${ingest_writer_image_pull_policy}
           args:
             - probe-kubernetes-lease-acquire
             - --namespace
@@ -3977,7 +4068,7 @@ spec:
       containers:
         - name: ingest-writer
           image: ${ingest_writer_image}
-          imagePullPolicy: Never
+          imagePullPolicy: ${ingest_writer_image_pull_policy}
           args:
             - lease-guarded-append
             - --payload-file
@@ -5988,11 +6079,16 @@ docker_build_args=()
 if [ "$docker_build_no_cache" = "1" ]; then
   docker_build_args+=(--no-cache)
 fi
-if [ ! -f "${hiqlite_local_source_dir}/hiqlite/Cargo.toml" ]; then
-  echo "VELORIX_HIQLITE_LOCAL_SOURCE_DIR must point to a hiqlite checkout containing hiqlite/Cargo.toml: ${hiqlite_local_source_dir}" >&2
-  exit 64
+if [ "$build_api_image" = "1" ] || \
+  { [ "$meta_enabled" = "1" ] && [ "$build_meta_image" = "1" ]; } || \
+  { [ "$hiqlite_deploy" = "1" ] && [ "$build_hiqlite_image" = "1" ]; } || \
+  { [ "$ingest_writer_smoke" = "1" ] && [ "$build_ingest_writer_image" = "1" ]; }; then
+  if [ ! -f "${hiqlite_local_source_dir}/hiqlite/Cargo.toml" ]; then
+    echo "VELORIX_HIQLITE_LOCAL_SOURCE_DIR must point to a hiqlite checkout containing hiqlite/Cargo.toml: ${hiqlite_local_source_dir}" >&2
+    exit 64
+  fi
+  docker_build_args+=(--build-context "velorix-hiqlite-source=${hiqlite_local_source_dir}")
 fi
-docker_build_args+=(--build-context "velorix-hiqlite-source=${hiqlite_local_source_dir}")
 
 if [ "$build_api_image" = "1" ]; then
   echo "building ${api_image}"
@@ -6078,6 +6174,7 @@ metadata:
     app: velorix-ingest-writer
     velorix.dev/run-id: "${run_id}"
 automountServiceAccountToken: false
+$(service_account_image_pull_secrets_yaml)
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -6087,6 +6184,7 @@ metadata:
   labels:
     app: velorix-ingest-writer
     velorix.dev/run-id: "${run_id}"
+$(service_account_image_pull_secrets_yaml)
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -6271,6 +6369,7 @@ metadata:
     app: velorix-hiqlite
     velorix.dev/run-id: "${run_id}"
 automountServiceAccountToken: false
+$(service_account_image_pull_secrets_yaml)
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -6369,6 +6468,7 @@ spec:
     spec:
       serviceAccountName: velorix-hiqlite
       automountServiceAccountToken: false
+$(image_pull_secrets_yaml)
       securityContext:
         seccompProfile:
           type: RuntimeDefault
@@ -6377,7 +6477,7 @@ spec:
       containers:
         - name: hiqlite
           image: ${hiqlite_image}
-          imagePullPolicy: Never
+          imagePullPolicy: ${hiqlite_image_pull_policy}
           args: ["serve", "-c", "/etc/hiqlite/hiqlite.toml"]
           securityContext:
             allowPrivilegeEscalation: false
@@ -6697,13 +6797,14 @@ spec:
         velorix.dev/s3-credentials-sha256: "${s3_credentials_hash}"
         velorix.dev/hiqlite-secret-sha256: "${hiqlite_api_secret_hash}"
     spec:
+$(image_pull_secrets_yaml)
       securityContext:
         seccompProfile:
           type: RuntimeDefault
       containers:
         - name: meta
           image: ${meta_image}
-          imagePullPolicy: Never
+          imagePullPolicy: ${meta_image_pull_policy}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -6714,6 +6815,8 @@ spec:
               drop:
                 - ALL
           env:
+            - name: VELORIX_META_MODE
+              value: "${meta_mode}"
             - name: VELORIX_META_BIND
               value: "0.0.0.0:9090"
             - name: VELORIX_META_BACKEND
@@ -6894,13 +6997,14 @@ spec:
         velorix.dev/meta-token-sha256: "${meta_bearer_token_hash}"
         velorix.dev/s3-credentials-sha256: "${s3_credentials_hash}"
     spec:
+$(image_pull_secrets_yaml)
       securityContext:
         seccompProfile:
           type: RuntimeDefault
       containers:
         - name: api
           image: ${api_image}
-          imagePullPolicy: Never
+          imagePullPolicy: ${api_image_pull_policy}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

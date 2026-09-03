@@ -33,6 +33,8 @@ jobs:
             dockerfile: Dockerfile.meta
           - name: ingest-writer
             dockerfile: Dockerfile.ingest-writer
+          - name: hiqlite
+            dockerfile: Dockerfile.hiqlite
     steps:
       - name: Checkout Velorix source
         uses: actions/checkout@v4
@@ -66,6 +68,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push immutable container image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -76,3 +79,20 @@ jobs:
           push: true
           provenance: false
           tags: ghcr.io/mrchypark/velorix-${{ matrix.name }}:${{ env.VELORIX_SOURCE_REF }}
+
+      - name: Record immutable image digest
+        run: |
+          image="ghcr.io/mrchypark/velorix-${{ matrix.name }}:${{ env.VELORIX_SOURCE_REF }}@${{ steps.build.outputs.digest }}"
+          printf 'source_ref=%s\nimage=%s\n' "${{ env.VELORIX_SOURCE_REF }}" "$image" > image-digest-${{ matrix.name }}.txt
+          {
+            echo "### ${{ matrix.name }} image"
+            echo "- source ref: \`${{ env.VELORIX_SOURCE_REF }}\`"
+            echo "- immutable image: \`$image\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload immutable image digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: velorix-${{ matrix.name }}-image-digest
+          path: image-digest-${{ matrix.name }}.txt
+          if-no-files-found: error
