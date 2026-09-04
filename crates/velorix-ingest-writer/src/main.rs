@@ -242,6 +242,18 @@ struct IngestWriterAppendDescriptorV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct IngestIdentity {
+    stream_id: String,
+    partition_id: u32,
+    start_offset_inclusive: u64,
+    end_offset_exclusive: u64,
+    payload_digest: String,
+    relation_id: String,
+    relation_version: String,
+    schema_fingerprint: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct LeaseHandoffProbeRequest {
     key: PartitionLeaseKey,
     owner_a: String,
@@ -1206,9 +1218,12 @@ async fn run_lease_guarded_append_probe(
         bail!("lease-guarded append probe requires --writer-id");
     }
     let expected_outcome = request.expected_outcome.trim();
-    if !matches!(expected_outcome, "appended" | "stale-owner-rejected") {
+    if !matches!(
+        expected_outcome,
+        "appended" | "duplicate" | "appended-or-duplicate" | "stale-owner-rejected"
+    ) {
         bail!(
-            "lease-guarded append probe expected-outcome must be appended or stale-owner-rejected"
+            "lease-guarded append probe expected-outcome must be appended, duplicate, appended-or-duplicate, or stale-owner-rejected"
         );
     }
     if !request.acquire_lease && request.expected_owner_epoch.is_none() {
@@ -1260,15 +1275,11 @@ async fn run_lease_guarded_append_probe(
         .as_ref()
         .map(|grant| grant.owner_epoch)
         .or(request.expected_owner_epoch);
-    let current_matches_owner = current_owner
-        .as_ref()
-        .map(|grant| {
-            grant.owner_id == request.owner_id
-                && expected_owner_epoch
-                    .map(|epoch| grant.owner_epoch == epoch)
-                    .unwrap_or(true)
-        })
-        .unwrap_or(false);
+    let current_matches_owner = current_lease_matches_owner(
+        current_owner.as_ref(),
+        &request.owner_id,
+        expected_owner_epoch,
+    );
     if !current_matches_owner {
         if expected_outcome != "stale-owner-rejected" {
             bail!(
@@ -1322,6 +1333,7 @@ async fn run_lease_guarded_append_probe(
         .ok_or_else(|| {
             anyhow::anyhow!("lease commit guard did not provide an admission binding")
         })?;
+    let expected_identity = ingest_identity_from_payload(request.payload.clone())?;
     let append_artifact = run_ingest_writer_append_with_commit_guard(
         Arc::clone(&store),
         IngestWriterAppendRequest {
@@ -1334,18 +1346,32 @@ async fn run_lease_guarded_append_probe(
         Some(&commit_guard),
     )
     .await?;
-    if append_artifact.outcome != "appended" {
+    if !lease_guarded_append_outcome_matches(expected_outcome, &append_artifact.outcome) {
         bail!(
-            "lease-guarded append expected a fresh append outcome, got {}",
-            append_artifact.outcome
+            "lease-guarded append expected outcome {expected_outcome}, got {}",
+            append_artifact.outcome,
         );
     }
-    let admission_commit_guard_binding = read_admission_commit_guard_binding(
-        Arc::clone(&store),
-        &append_artifact.descriptor,
-        &expected_commit_guard_binding,
-    )
-    .await?;
+    let admission_commit_guard_binding = match append_artifact.outcome.as_str() {
+        "appended" => {
+            read_admission_commit_guard_binding(
+                Arc::clone(&store),
+                &append_artifact.descriptor,
+                &expected_commit_guard_binding,
+            )
+            .await?
+        }
+        "duplicate" => {
+            verify_duplicate_admission_evidence(
+                Arc::clone(&store),
+                &append_artifact.descriptor,
+                &expected_identity,
+                &lease_identity,
+            )
+            .await?
+        }
+        outcome => bail!("lease-guarded append returned unsupported outcome {outcome}"),
+    };
     let post_append_current_owner = lease_client
         .current(&request.lease_key, unix_ms()?)
         .await
@@ -1367,7 +1393,7 @@ async fn run_lease_guarded_append_probe(
         evidence_kind: "ingest_writer_lease_guarded_append_probe".to_string(),
         status: "pass".to_string(),
         expected_outcome: expected_outcome.to_string(),
-        outcome: "appended".to_string(),
+        outcome: append_artifact.outcome,
         authority_store_id: request.authority_store_id,
         authority_namespace: request.authority_namespace,
         operator_id: request.operator_id,
@@ -1403,6 +1429,24 @@ async fn read_admission_record_and_commit_guard_binding(
     descriptor: &IngestWriterAppendDescriptorV1,
     expected: &IngestCommitGuardBindingV1,
 ) -> anyhow::Result<(DurableIngestAdmissionRecordV1, IngestCommitGuardBindingV1)> {
+    let (record, actual) =
+        read_admission_record_and_commit_guard_binding_unchecked(store, descriptor).await?;
+    if &actual != expected {
+        bail!(
+            "durable admission record `{}` commit_guard_binding mismatch: expected {:?}, got {:?}",
+            record.admission_record_key,
+            expected,
+            actual
+        );
+    }
+
+    Ok((record, actual))
+}
+
+async fn read_admission_record_and_commit_guard_binding_unchecked(
+    store: Arc<dyn ObjectStore>,
+    descriptor: &IngestWriterAppendDescriptorV1,
+) -> anyhow::Result<(DurableIngestAdmissionRecordV1, IngestCommitGuardBindingV1)> {
     let admission_record_key = ObjectKey::ingest_admission_record(
         &descriptor.stream_id,
         descriptor.partition_id,
@@ -1429,16 +1473,105 @@ async fn read_admission_record_and_commit_guard_binding(
             admission_record_key
         );
     };
-    if &actual != expected {
+    Ok((record, actual))
+}
+
+async fn verify_duplicate_admission_evidence(
+    store: Arc<dyn ObjectStore>,
+    descriptor: &IngestWriterAppendDescriptorV1,
+    expected: &IngestIdentity,
+    lease_identity: &str,
+) -> anyhow::Result<IngestCommitGuardBindingV1> {
+    let (record, binding) =
+        read_admission_record_and_commit_guard_binding_unchecked(store, descriptor).await?;
+    let expected_admission_key = ObjectKey::ingest_admission_record(
+        &expected.stream_id,
+        expected.partition_id,
+        expected.start_offset_inclusive,
+        expected.end_offset_exclusive,
+    )?;
+    let expected_batch_key = ObjectKey::ingest_batch(
+        &expected.stream_id,
+        expected.partition_id,
+        expected.start_offset_inclusive,
+        expected.end_offset_exclusive,
+    )?;
+    for (field, expected, actual) in [
+        (
+            "stream_id",
+            expected.stream_id.clone(),
+            record.stream_id.clone(),
+        ),
+        (
+            "partition_id",
+            expected.partition_id.to_string(),
+            record.partition_id.to_string(),
+        ),
+        (
+            "start_offset_inclusive",
+            expected.start_offset_inclusive.to_string(),
+            record.start_offset_inclusive.to_string(),
+        ),
+        (
+            "end_offset_exclusive",
+            expected.end_offset_exclusive.to_string(),
+            record.end_offset_exclusive.to_string(),
+        ),
+        (
+            "payload_digest",
+            expected.payload_digest.clone(),
+            record.payload_digest.clone(),
+        ),
+        (
+            "relation_id",
+            expected.relation_id.clone(),
+            record.relation_id.clone(),
+        ),
+        (
+            "relation_version",
+            expected.relation_version.clone(),
+            record.relation_version.clone(),
+        ),
+        (
+            "schema_fingerprint",
+            expected.schema_fingerprint.clone(),
+            record.schema_fingerprint.clone(),
+        ),
+        (
+            "batch_key",
+            expected_batch_key.as_str().to_string(),
+            record.batch_key.as_str().to_string(),
+        ),
+        (
+            "admission_record_key",
+            expected_admission_key.as_str().to_string(),
+            record.admission_record_key.as_str().to_string(),
+        ),
+        (
+            "descriptor_object_key",
+            expected_batch_key.as_str().to_string(),
+            descriptor.object_key.clone(),
+        ),
+    ] {
+        if expected != actual {
+            bail!(
+                "ingest-writer duplicate admission evidence mismatch for {field}: expected={expected}, actual={actual}"
+            );
+        }
+    }
+    if binding.schema_version != 1
+        || binding.binding_kind != "kubernetes_partition_lease"
+        || binding.subject != lease_identity
+        || binding.owner_id.trim().is_empty()
+        || binding.owner_epoch == 0
+    {
         bail!(
-            "durable admission record `{}` commit_guard_binding mismatch: expected {:?}, got {:?}",
-            admission_record_key,
-            expected,
-            actual
+            "ingest-writer duplicate admission evidence has invalid original Kubernetes lease binding: {:?}",
+            binding
         );
     }
 
-    Ok((record, actual))
+    Ok(binding)
 }
 
 async fn object_store_key_exists(
@@ -1825,7 +1958,7 @@ async fn run_ingest_writer_append_with_commit_guard(
             store_id: request.authority_store_id.clone(),
             namespace: request.authority_namespace.clone(),
         },
-        store,
+        Arc::clone(&store),
         "ingest-writer-append",
         format!("v1/ingest-writer-capability-probes/{probe_id}"),
     )
@@ -1836,6 +1969,7 @@ async fn run_ingest_writer_append_with_commit_guard(
         .await
         .map_err(anyhow::Error::from)?;
     let startup_report = runtime.startup_report().clone();
+    let expected_identity = ingest_identity_from_payload(request.payload.clone())?;
     let outcome = match commit_guard {
         Some(commit_guard) => {
             runtime
@@ -1849,6 +1983,10 @@ async fn run_ingest_writer_append_with_commit_guard(
         }
     }
     .map_err(anyhow::Error::from)?;
+    if let AppendValidatedEnvelopeOutcome::Duplicate { descriptor } = &outcome {
+        verify_committed_duplicate_identity(Arc::clone(&store), &expected_identity, descriptor)
+            .await?;
+    }
     let (outcome, descriptor) = ingest_writer_append_outcome_parts(outcome)?;
 
     Ok(IngestWriterAppendArtifactV1 {
@@ -1864,6 +2002,115 @@ async fn run_ingest_writer_append_with_commit_guard(
         outcome,
         descriptor,
     })
+}
+
+fn lease_guarded_append_outcome_matches(expected_outcome: &str, actual_outcome: &str) -> bool {
+    matches!(
+        (expected_outcome, actual_outcome),
+        ("appended", "appended")
+            | ("duplicate", "duplicate")
+            | ("appended-or-duplicate", "appended" | "duplicate")
+    )
+}
+
+fn current_lease_matches_owner(
+    current_owner: Option<&PartitionLeaseGrant>,
+    owner_id: &str,
+    expected_owner_epoch: Option<u64>,
+) -> bool {
+    current_owner
+        .map(|grant| {
+            grant.owner_id == owner_id
+                && expected_owner_epoch
+                    .map(|epoch| grant.owner_epoch == epoch)
+                    .unwrap_or(true)
+        })
+        .unwrap_or(false)
+}
+
+fn ingest_identity_from_payload(payload: Bytes) -> anyhow::Result<IngestIdentity> {
+    let envelope = IngestEnvelope::decode(payload).map_err(anyhow::Error::from)?;
+    let header = envelope.header();
+    Ok(IngestIdentity {
+        stream_id: header.stream_id.clone(),
+        partition_id: header.partition_id,
+        start_offset_inclusive: header.start_offset_inclusive,
+        end_offset_exclusive: header.end_offset_exclusive,
+        payload_digest: header.payload_digest.clone(),
+        relation_id: header.relation_id.clone(),
+        relation_version: header.relation_version.clone(),
+        schema_fingerprint: header.schema_fingerprint.clone(),
+    })
+}
+
+async fn verify_committed_duplicate_identity(
+    store: Arc<dyn ObjectStore>,
+    expected: &IngestIdentity,
+    descriptor: &IngestBatchDescriptor,
+) -> anyhow::Result<()> {
+    let existing = store
+        .get(&ObjectStorePath::from(descriptor.object_key.as_str()))
+        .await
+        .with_context(|| {
+            format!(
+                "failed to read committed duplicate batch {}",
+                descriptor.object_key.as_str()
+            )
+        })?
+        .bytes()
+        .await?;
+    let actual = ingest_identity_from_payload(existing)?;
+
+    for (field, expected, actual) in [
+        (
+            "stream_id",
+            expected.stream_id.clone(),
+            actual.stream_id.clone(),
+        ),
+        (
+            "partition_id",
+            expected.partition_id.to_string(),
+            actual.partition_id.to_string(),
+        ),
+        (
+            "start_offset_inclusive",
+            expected.start_offset_inclusive.to_string(),
+            actual.start_offset_inclusive.to_string(),
+        ),
+        (
+            "end_offset_exclusive",
+            expected.end_offset_exclusive.to_string(),
+            actual.end_offset_exclusive.to_string(),
+        ),
+        (
+            "payload_digest",
+            expected.payload_digest.clone(),
+            actual.payload_digest.clone(),
+        ),
+        (
+            "relation_id",
+            expected.relation_id.clone(),
+            actual.relation_id.clone(),
+        ),
+        (
+            "relation_version",
+            expected.relation_version.clone(),
+            actual.relation_version.clone(),
+        ),
+        (
+            "schema_fingerprint",
+            expected.schema_fingerprint.clone(),
+            actual.schema_fingerprint.clone(),
+        ),
+    ] {
+        if expected != actual {
+            bail!(
+                "ingest-writer duplicate committed identity mismatch for {field}: expected={expected}, actual={actual}"
+            );
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_ingest_writer_authority_store_id(authority_store_id: &str) -> anyhow::Result<()> {
@@ -2146,6 +2393,214 @@ mod tests {
             error.to_string().contains("must not be local/dev"),
             "{error}"
         );
+    }
+
+    #[tokio::test]
+    async fn duplicate_retry_succeeds_only_for_the_identical_committed_identity() {
+        let schema_fingerprint = format!("sha256:{}", "1".repeat(64));
+        let committed_payload = encode_default_scores_payload(
+            &schema_fingerprint,
+            "scores",
+            0,
+            10,
+            r#"[{"user_id":"u1","score":7,"delta":1}]"#,
+        )
+        .unwrap();
+        let retry_payload = committed_payload.clone();
+        let conflicting_payload = encode_default_scores_payload(
+            &schema_fingerprint,
+            "scores",
+            0,
+            10,
+            r#"[{"user_id":"u1","score":8,"delta":1}]"#,
+        )
+        .unwrap();
+        let descriptor = IngestBatch::from_validated_envelope(committed_payload.clone())
+            .unwrap()
+            .descriptor();
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        store
+            .put(
+                &ObjectStorePath::from(descriptor.object_key.as_str()),
+                committed_payload.into(),
+            )
+            .await
+            .unwrap();
+
+        verify_committed_duplicate_identity(
+            Arc::clone(&store),
+            &ingest_identity_from_payload(retry_payload).unwrap(),
+            &descriptor,
+        )
+        .await
+        .unwrap();
+
+        let error = verify_committed_duplicate_identity(
+            store,
+            &ingest_identity_from_payload(conflicting_payload).unwrap(),
+            &descriptor,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("payload_digest"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn guarded_duplicate_retry_accepts_a_handoff_only_with_original_immutable_evidence() {
+        let schema_fingerprint = format!("sha256:{}", "2".repeat(64));
+        let payload = encode_default_scores_payload(
+            &schema_fingerprint,
+            "scores",
+            0,
+            20,
+            r#"[{"user_id":"u1","score":7,"delta":1}]"#,
+        )
+        .unwrap();
+        let conflicting_payload = encode_default_scores_payload(
+            &schema_fingerprint,
+            "scores",
+            0,
+            20,
+            r#"[{"user_id":"u1","score":8,"delta":1}]"#,
+        )
+        .unwrap();
+        let conflicting_range_payload = encode_default_scores_payload(
+            &schema_fingerprint,
+            "scores",
+            0,
+            21,
+            r#"[{"user_id":"u1","score":7,"delta":1}]"#,
+        )
+        .unwrap();
+        let identity = ingest_identity_from_payload(payload.clone()).unwrap();
+        let batch_descriptor = IngestBatch::from_validated_envelope(payload.clone())
+            .unwrap()
+            .descriptor();
+        let descriptor = ingest_writer_descriptor(&batch_descriptor);
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        store
+            .put(
+                &ObjectStorePath::from(batch_descriptor.object_key.as_str()),
+                payload.into(),
+            )
+            .await
+            .unwrap();
+
+        let lease_identity = "velorix-product/scores/p=0";
+        let mut original_admission = DurableIngestAdmissionRecordV1::for_external_admission(
+            identity.stream_id.clone(),
+            identity.partition_id,
+            identity.start_offset_inclusive,
+            identity.end_offset_exclusive,
+            identity.payload_digest.clone(),
+            identity.relation_id.clone(),
+            identity.relation_version.clone(),
+            identity.schema_fingerprint.clone(),
+        )
+        .unwrap();
+        original_admission.commit_guard_binding = Some(IngestCommitGuardBindingV1::new(
+            "kubernetes_partition_lease",
+            lease_identity,
+            "owner-a",
+            1,
+        ));
+        store
+            .put(
+                &ObjectStorePath::from(original_admission.admission_record_key.as_str()),
+                Bytes::from(serde_json::to_vec(&original_admission).unwrap()).into(),
+            )
+            .await
+            .unwrap();
+
+        // Owner B at epoch 2 may acknowledge the immutable owner-A commit after handoff.
+        let original_binding = verify_duplicate_admission_evidence(
+            Arc::clone(&store),
+            &descriptor,
+            &identity,
+            lease_identity,
+        )
+        .await
+        .unwrap();
+        assert_eq!(original_binding.owner_id, "owner-a");
+        assert_eq!(original_binding.owner_epoch, 1);
+        assert!(lease_guarded_append_outcome_matches(
+            "appended-or-duplicate",
+            "duplicate"
+        ));
+
+        let error = verify_duplicate_admission_evidence(
+            Arc::clone(&store),
+            &descriptor,
+            &ingest_identity_from_payload(conflicting_payload).unwrap(),
+            lease_identity,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("payload_digest"), "{error}");
+
+        let error = verify_duplicate_admission_evidence(
+            store,
+            &descriptor,
+            &ingest_identity_from_payload(conflicting_range_payload).unwrap(),
+            lease_identity,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("start_offset_inclusive"),
+            "{error}"
+        );
+        let owner_b_grant = PartitionLeaseGrant {
+            key: PartitionLeaseKey {
+                namespace: "velorix-product".to_string(),
+                view_id: "scores-view".to_string(),
+                stream_id: "scores".to_string(),
+                partition_id: 0,
+            },
+            owner_id: "owner-b".to_string(),
+            owner_epoch: 2,
+            expires_at_unix_ms: 1_700_000_060_000,
+        };
+        assert!(current_lease_matches_owner(
+            Some(&owner_b_grant),
+            "owner-b",
+            Some(2)
+        ));
+        assert!(!current_lease_matches_owner(
+            Some(&owner_b_grant),
+            "owner-a",
+            Some(1)
+        ));
+        assert!(!lease_guarded_append_outcome_matches(
+            "stale-owner-rejected",
+            "duplicate"
+        ));
+    }
+
+    #[test]
+    fn entrypoint_and_expected_outcomes_allow_a_lost_response_retry() {
+        let entrypoint = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/velorix-ingest-writer-entrypoint.sh"
+        ));
+
+        assert!(entrypoint.contains("--expected-outcome appended-or-duplicate"));
+        assert!(lease_guarded_append_outcome_matches(
+            "appended-or-duplicate",
+            "appended"
+        ));
+        assert!(lease_guarded_append_outcome_matches(
+            "appended-or-duplicate",
+            "duplicate"
+        ));
+        assert!(!lease_guarded_append_outcome_matches(
+            "appended-or-duplicate",
+            "conflict"
+        ));
+        assert!(!lease_guarded_append_outcome_matches(
+            "appended",
+            "duplicate"
+        ));
     }
 
     #[test]

@@ -3520,11 +3520,30 @@ checks["product ingress apply helper creates no-PVC Kubernetes ingress"] = (
     and "PersistentVolumeClaim" not in product_ingress_apply
 )
 
-checks["GHCR deployment images include the supported Hiqlite server and record digest evidence"] = (
+required_rust_builder = (
+    "FROM rust:1.98.0-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922 AS builder"
+)
+required_dockerfiles = (
+    "Dockerfile.api",
+    "Dockerfile.meta",
+    "Dockerfile.ingest-writer",
+    "Dockerfile.hiqlite",
+    "Dockerfile.all-in-one",
+)
+
+checks["GHCR deployment images use committed digest-pinned Rust builders and record digest evidence"] = (
     "- name: hiqlite" in ghcr_workflow
     and "dockerfile: Dockerfile.hiqlite" in ghcr_workflow
     and "velorix-hiqlite" in ghcr_workflow
-    and "rust:1.98.0-bookworm" in ghcr_workflow
+    and all(
+        required_rust_builder
+        in (repo_root / dockerfile).read_text(encoding="utf-8")
+        for dockerfile in required_dockerfiles
+    )
+    and "file: ${{ matrix.dockerfile }}" in ghcr_workflow
+    and "Dockerfile.velorix." not in ghcr_workflow
+    and "sed" not in ghcr_workflow
+    and "1.95.0-bookworm" not in ghcr_workflow
     and "steps.build.outputs.digest" in ghcr_workflow
     and "source_ref=" in ghcr_workflow
     and "actions/upload-artifact@v4" in ghcr_workflow

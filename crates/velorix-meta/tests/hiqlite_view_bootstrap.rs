@@ -9,14 +9,215 @@ use velorix_core::standing_program::{
 };
 use velorix_meta::{
     AcquireStandingRuntimeOwnerOutcome, AcquireStandingRuntimeOwnerRequest,
-    BeginViewBootstrapOutcome, BeginViewBootstrapRequest, CommitIngestRangeOutcome,
-    FixViewBootstrapActivationCutOutcome, FixViewBootstrapActivationCutRequest, HiqliteMetaStore,
-    IngestRangeReservation, IngestSourceCutV1, IngestSourceRelationIdentityV1, MetaStore,
-    PromoteViewBootstrapOutcome, PromoteViewBootstrapRequest,
-    PublishStandingRuntimeCheckpointOutcome, PublishStandingRuntimeCheckpointRequest,
-    ReserveIngestRangeOutcome, StandingRuntimeCheckpointPointer, StandingRuntimeOwnerToken,
-    ViewBootstrapLifecycleV1,
+    BeginViewBootstrapOutcome, BeginViewBootstrapRequest, BeginViewDependencyEdgeV1,
+    CommitIngestRangeOutcome, FixViewBootstrapActivationCutOutcome,
+    FixViewBootstrapActivationCutRequest, HiqliteMetaStore, IngestRangeReservation,
+    IngestSourceCutV1, IngestSourceRelationIdentityV1, MetaStore, PromoteViewBootstrapOutcome,
+    PromoteViewBootstrapRequest, PublishStandingRuntimeCheckpointOutcome,
+    PublishStandingRuntimeCheckpointRequest, ReserveIngestRangeOutcome,
+    StandingRuntimeCheckpointPointer, StandingRuntimeOwnerToken, ViewBootstrapLifecycleV1,
 };
+
+#[tokio::test]
+async fn hiqlite_view_input_bootstrap_retries_do_not_advance_graph_revision() {
+    let (_dir, store, client) = start_store().await;
+    let request = view_input_bootstrap_request("dependent-view", 0);
+
+    assert!(matches!(
+        store.begin_view_bootstrap(request.clone()).await.unwrap(),
+        BeginViewBootstrapOutcome::Created(_)
+    ));
+    assert_eq!(
+        store
+            .read_view_dependency_graph_revision("default")
+            .await
+            .unwrap(),
+        1
+    );
+
+    assert!(matches!(
+        store.begin_view_bootstrap(request.clone()).await.unwrap(),
+        BeginViewBootstrapOutcome::Duplicate(_)
+    ));
+    let mut retry_at_current_revision = request;
+    retry_at_current_revision.expected_graph_revision = 1;
+    assert!(matches!(
+        store
+            .begin_view_bootstrap(retry_at_current_revision)
+            .await
+            .unwrap(),
+        BeginViewBootstrapOutcome::Duplicate(_)
+    ));
+    assert_eq!(
+        store
+            .read_view_dependency_graph_revision("default")
+            .await
+            .unwrap(),
+        1
+    );
+
+    assert!(matches!(
+        store
+            .begin_view_bootstrap(view_input_bootstrap_request("next-dependent-view", 1))
+            .await
+            .unwrap(),
+        BeginViewBootstrapOutcome::Created(_)
+    ));
+    assert_eq!(
+        store
+            .read_view_dependency_graph_revision("default")
+            .await
+            .unwrap(),
+        2
+    );
+
+    assert_eq!(
+        store
+            .begin_view_bootstrap(view_input_bootstrap_request("stale-dependent-view", 0))
+            .await
+            .unwrap(),
+        BeginViewBootstrapOutcome::Conflict
+    );
+    assert!(store
+        .read_view_bootstrap("default", "stale-dependent-view", "stale-dependent-view")
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        store
+            .read_view_dependency_graph_revision("default")
+            .await
+            .unwrap(),
+        2
+    );
+
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn hiqlite_view_input_bootstrap_reads_legacy_blob_edge_json() {
+    let (_dir, store, client) = start_store().await;
+    let request = view_input_bootstrap_request("legacy-blob-dependent-view", 0);
+    assert!(matches!(
+        store.begin_view_bootstrap(request.clone()).await.unwrap(),
+        BeginViewBootstrapOutcome::Created(_)
+    ));
+
+    // Previous releases bound `serde_json::to_vec` directly, leaving valid
+    // JSON in a SQLite BLOB even though the column is declared TEXT.
+    let legacy_edge_json = serde_json::to_vec(&request.view_inputs[0]).unwrap();
+    client
+        .execute(
+            "UPDATE velorix_view_bootstrap_view_inputs SET edge_json = $1
+             WHERE tenant_id = $2 AND program_id = $3 AND view_id = $4",
+            vec![
+                hiqlite::Param::from(legacy_edge_json),
+                hiqlite::Param::from("default"),
+                hiqlite::Param::from("legacy-blob-dependent-view"),
+                hiqlite::Param::from("legacy-blob-dependent-view"),
+            ],
+        )
+        .await
+        .unwrap();
+    let mut rows = client
+        .query_consistent(
+            "SELECT typeof(edge_json) AS storage_type
+             FROM velorix_view_bootstrap_view_inputs
+             WHERE tenant_id = $1 AND program_id = $2 AND view_id = $3",
+            vec![
+                hiqlite::Param::from("default"),
+                hiqlite::Param::from("legacy-blob-dependent-view"),
+                hiqlite::Param::from("legacy-blob-dependent-view"),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.pop().unwrap().get::<String>("storage_type"), "blob");
+
+    assert!(matches!(
+        store.begin_view_bootstrap(request).await.unwrap(),
+        BeginViewBootstrapOutcome::Duplicate(_)
+    ));
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn hiqlite_concurrent_view_input_bootstraps_allow_one_graph_cas_winner() {
+    let (_dir, store, client) = start_store().await;
+    let store = Arc::new(store);
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let mut workers = Vec::new();
+    for view_id in ["race-dependent-a", "race-dependent-b"] {
+        let store = Arc::clone(&store);
+        let barrier = Arc::clone(&barrier);
+        let request = view_input_bootstrap_request(view_id, 0);
+        workers.push(tokio::spawn(async move {
+            barrier.wait().await;
+            store.begin_view_bootstrap(request).await.unwrap()
+        }));
+    }
+    barrier.wait().await;
+    let outcomes = [
+        workers.remove(0).await.unwrap(),
+        workers.remove(0).await.unwrap(),
+    ];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, BeginViewBootstrapOutcome::Created(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, BeginViewBootstrapOutcome::Conflict))
+            .count(),
+        1
+    );
+    assert_eq!(
+        store
+            .read_view_dependency_graph_revision("default")
+            .await
+            .unwrap(),
+        1
+    );
+
+    let mut controls = 0;
+    for view_id in ["race-dependent-a", "race-dependent-b"] {
+        if store
+            .read_view_bootstrap("default", view_id, view_id)
+            .await
+            .unwrap()
+            .is_some()
+        {
+            controls += 1;
+        }
+    }
+    assert_eq!(controls, 1);
+    let mut rows = client
+        .query_consistent(
+            "SELECT program_id FROM velorix_view_bootstrap_view_inputs
+             WHERE tenant_id = $1 AND program_id IN ($2, $3)",
+            vec![
+                hiqlite::Param::from("default"),
+                hiqlite::Param::from("race-dependent-a"),
+                hiqlite::Param::from("race-dependent-b"),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let persisted_edge_program = rows.pop().unwrap().get::<String>("program_id");
+    assert!(store
+        .read_view_bootstrap("default", &persisted_edge_program, &persisted_edge_program)
+        .await
+        .unwrap()
+        .is_some());
+
+    drop(store);
+    client.shutdown().await.unwrap();
+}
 
 #[tokio::test]
 async fn hiqlite_activation_cas_fences_expired_owner_pointer_change_and_concurrent_workers() {
@@ -263,6 +464,45 @@ fn bootstrap_request() -> BeginViewBootstrapRequest {
         relations: vec![relation()],
         view_inputs: Vec::new(),
         expected_graph_revision: 0,
+    }
+}
+
+fn view_input_bootstrap_request(
+    view_id: &str,
+    expected_graph_revision: u64,
+) -> BeginViewBootstrapRequest {
+    BeginViewBootstrapRequest {
+        tenant_id: "default".to_string(),
+        program_id: view_id.to_string(),
+        view_id: view_id.to_string(),
+        plan_hash: "sha256:dependent-plan".to_string(),
+        view_spec_json: format!(r#"{{"view_id":"{view_id}"}}"#).into_bytes(),
+        relations: vec![relation()],
+        view_inputs: vec![BeginViewDependencyEdgeV1 {
+            edge_id: "producer-to-dependent".to_string(),
+            producer_program_id: "producer".to_string(),
+            producer_view_id: "producer".to_string(),
+            producer_generation: 1,
+            producer_plan_hash: "sha256:producer-plan".to_string(),
+            input_relation_id: "producer-output".to_string(),
+            input_relation_version: "v1".to_string(),
+            output_stream_id: "producer-output/v1".to_string(),
+            output_schema_hash: "sha256:output-schema".to_string(),
+            key_descriptor_hash: "sha256:key-descriptor".to_string(),
+            delta_codec_identity: "velorix-published-delta-v1".to_string(),
+            frontier_kind: "producer_commit_epoch".to_string(),
+            bootstrap_cursor: velorix_core::standing_program::CausalViewCursorV1 {
+                input_edge: "producer-to-dependent".to_string(),
+                producer_tenant_id: "default".to_string(),
+                producer_program_id: "producer".to_string(),
+                producer_view_id: "producer".to_string(),
+                producer_generation: 1,
+                output_stream: "producer-output/v1".to_string(),
+                output_epoch: 3,
+                commit_digest: format!("sha256:{}", "a".repeat(64)),
+            },
+        }],
+        expected_graph_revision,
     }
 }
 

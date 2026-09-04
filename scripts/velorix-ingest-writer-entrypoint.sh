@@ -78,5 +78,5 @@ exec velorix-ingest-writer lease-guarded-append \
   --owner-id "$VELORIX_INGEST_WRITER_LEASE_OWNER_ID" \
   --ttl-ms "$lease_ttl_ms" \
   --acquire-lease \
-  --expected-outcome appended \
+  --expected-outcome appended-or-duplicate \
   --json

@@ -45,12 +45,6 @@ jobs:
       - name: Assert exact deployment source revision
         run: test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
 
-      - name: Prepare pinned Rust 1.98 Dockerfile
-        run: |
-          sed \
-            -e 's|FROM rust:1\.95\.0-bookworm@sha256:[^ ]* AS builder|FROM rust:1.98.0-bookworm@sha256:4e4a7e7939c17991ab35f2b8c2e67593980f771d28f6b1254b1850f860fd0c7f AS builder|' \
-            "${{ matrix.dockerfile }}" > "Dockerfile.velorix.${{ matrix.name }}"
-
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -66,7 +60,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: Dockerfile.velorix.${{ matrix.name }}
+          file: ${{ matrix.dockerfile }}
           build-contexts: |
             velorix-hiqlite-source=./hiqlite
           platforms: linux/amd64

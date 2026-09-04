@@ -2946,7 +2946,7 @@ impl HiqliteMetaStore {
         let view_input_rows = self
             .client
             .query_consistent_map::<ViewBootstrapViewInputRow, _>(
-                "SELECT edge_json
+                "SELECT CAST(edge_json AS BLOB) AS edge_json
                 FROM velorix_view_bootstrap_view_inputs
                 WHERE tenant_id = $1 AND program_id = $2 AND view_id = $3
                   AND bootstrap_generation = $4
@@ -3377,8 +3377,44 @@ impl MetaStore for HiqliteMetaStore {
         request.validate()?;
         let generation = i64_from_u64("bootstrap_generation", INITIAL_VIEW_BOOTSTRAP_GENERATION)?;
         let schema_version = i64::from(VIEW_BOOTSTRAP_CONTROL_SCHEMA_VERSION_V1);
-        let mut statements: Vec<(&'static str, Vec<hiqlite::Param>)> = vec![(
-            "INSERT OR IGNORE INTO velorix_view_bootstrap_controls (
+        let expected_graph_revision = if request.view_inputs.is_empty() {
+            None
+        } else {
+            Some(i64_from_u64(
+                "expected_graph_revision",
+                request.expected_graph_revision,
+            )?)
+        };
+        let control_statement = if let Some(expected_graph_revision) = expected_graph_revision {
+            (
+                "INSERT OR IGNORE INTO velorix_view_bootstrap_controls (
+                    tenant_id, program_id, view_id, schema_version,
+                    bootstrap_generation, plan_hash, view_spec_json, lifecycle,
+                    input_catalog_epoch
+                ) SELECT
+                    $1, $2, $3, $4, $5, $6, $7, 'bootstrapping',
+                    COALESCE((SELECT MAX(rowid) FROM velorix_ingest_reservations), 0)
+                WHERE ($8 = 0 AND NOT EXISTS (
+                    SELECT 1 FROM velorix_view_dependency_graph_heads
+                    WHERE tenant_id = $1
+                )) OR EXISTS (
+                    SELECT 1 FROM velorix_view_dependency_graph_heads
+                    WHERE tenant_id = $1 AND revision = $8
+                )",
+                vec![
+                    hiqlite::Param::from(request.tenant_id.clone()),
+                    hiqlite::Param::from(request.program_id.clone()),
+                    hiqlite::Param::from(request.view_id.clone()),
+                    hiqlite::Param::from(schema_version),
+                    hiqlite::Param::from(generation),
+                    hiqlite::Param::from(request.plan_hash.clone()),
+                    hiqlite::Param::from(request.view_spec_json.clone()),
+                    hiqlite::Param::from(expected_graph_revision),
+                ],
+            )
+        } else {
+            (
+                "INSERT OR IGNORE INTO velorix_view_bootstrap_controls (
                 tenant_id, program_id, view_id, schema_version,
                 bootstrap_generation, plan_hash, view_spec_json, lifecycle,
                 input_catalog_epoch
@@ -3386,16 +3422,33 @@ impl MetaStore for HiqliteMetaStore {
                 $1, $2, $3, $4, $5, $6, $7, 'bootstrapping',
                 COALESCE((SELECT MAX(rowid) FROM velorix_ingest_reservations), 0)
             )",
-            vec![
-                hiqlite::Param::from(request.tenant_id.clone()),
-                hiqlite::Param::from(request.program_id.clone()),
-                hiqlite::Param::from(request.view_id.clone()),
-                hiqlite::Param::from(schema_version),
-                hiqlite::Param::from(generation),
-                hiqlite::Param::from(request.plan_hash.clone()),
-                hiqlite::Param::from(request.view_spec_json.clone()),
-            ],
-        )];
+                vec![
+                    hiqlite::Param::from(request.tenant_id.clone()),
+                    hiqlite::Param::from(request.program_id.clone()),
+                    hiqlite::Param::from(request.view_id.clone()),
+                    hiqlite::Param::from(schema_version),
+                    hiqlite::Param::from(generation),
+                    hiqlite::Param::from(request.plan_hash.clone()),
+                    hiqlite::Param::from(request.view_spec_json.clone()),
+                ],
+            )
+        };
+        let mut statements: Vec<(&'static str, Vec<hiqlite::Param>)> = vec![control_statement];
+        if let Some(expected_graph_revision) = expected_graph_revision {
+            // Keep the graph CAS immediately after the control insert: `changes()`
+            // is then true only for a newly created control, never a duplicate.
+            statements.push((
+                "INSERT INTO velorix_view_dependency_graph_heads (tenant_id, revision)
+                 SELECT $1, CASE WHEN $2 = 0 THEN 1 ELSE $2 END
+                 WHERE changes() = 1
+                 ON CONFLICT (tenant_id) DO UPDATE SET revision = revision + 1
+                 WHERE revision = $2",
+                vec![
+                    hiqlite::Param::from(request.tenant_id.clone()),
+                    hiqlite::Param::from(expected_graph_revision),
+                ],
+            ));
+        }
         for (ordinal, relation) in request.relations.iter().enumerate() {
             let ordinal = i64::try_from(ordinal).map_err(|_| {
                 MetaStoreError::Serialization(
@@ -3485,27 +3538,6 @@ impl MetaStore for HiqliteMetaStore {
                 hiqlite::Param::from(generation),
             ],
         ));
-        if !request.view_inputs.is_empty() {
-            let expected_revision =
-                i64::try_from(request.expected_graph_revision).map_err(|_| {
-                    MetaStoreError::Serialization("expected graph revision exceeds i64".to_string())
-                })?;
-            statements.push((
-                "INSERT OR IGNORE INTO velorix_view_dependency_graph_heads
-                    (tenant_id, revision)
-                 VALUES ($1, 1)",
-                vec![hiqlite::Param::from(request.tenant_id.clone())],
-            ));
-            statements.push((
-                "UPDATE velorix_view_dependency_graph_heads
-                 SET revision = revision + 1
-                 WHERE tenant_id = $1 AND revision = $2",
-                vec![
-                    hiqlite::Param::from(request.tenant_id.clone()),
-                    hiqlite::Param::from(expected_revision),
-                ],
-            ));
-        }
         let results = self
             .with_schema_repair(|| {
                 let statements = statements.clone();
@@ -3513,25 +3545,18 @@ impl MetaStore for HiqliteMetaStore {
             })
             .await?;
         let created = hiqlite_txn_changed_rows(&results, 0)? == 1;
-        if !request.view_inputs.is_empty() {
-            // The graph gate succeeds when exactly one of {INSERT OR IGNORE,
-            // revision CAS UPDATE} changed a row: first admission inserts the
-            // head, later admissions bump it from the expected revision. A
-            // stale expected revision changes nothing and fails the gate.
-            let inserted_head = hiqlite_txn_changed_rows(&results, statements.len() - 2)?;
-            let bumped_revision = hiqlite_txn_changed_rows(&results, statements.len() - 1)?;
-            if inserted_head + bumped_revision != 1 {
-                return Ok(BeginViewBootstrapOutcome::Conflict);
-            }
+        if created
+            && expected_graph_revision.is_some()
+            && hiqlite_txn_changed_rows(&results, 1)? != 1
+        {
+            return Ok(BeginViewBootstrapOutcome::Conflict);
         }
-        let control = self
+        let Some(control) = self
             .read_view_bootstrap_record(&request.tenant_id, &request.program_id, &request.view_id)
             .await?
-            .ok_or_else(|| {
-                MetaStoreError::Serialization(
-                    "view bootstrap transaction did not publish a control record".to_string(),
-                )
-            })?;
+        else {
+            return Ok(BeginViewBootstrapOutcome::Conflict);
+        };
         if !request.matches(&control) {
             return Ok(BeginViewBootstrapOutcome::Conflict);
         }
