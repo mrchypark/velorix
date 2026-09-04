@@ -32,16 +32,17 @@ use velorix_meta::{
     validate_bearer_token, AcquireRelationPartitionAuthorityOutcome,
     AcquireRelationPartitionAuthorityRequest, AcquireStandingRuntimeOwnerOutcome,
     BeginViewBootstrapOutcome, BeginViewBootstrapRequest, CaptureIngestSourceCutRequest,
-    CommitIngestRangeOutcome, FixViewBootstrapActivationCutOutcome,
-    FixViewBootstrapActivationCutRequest, GrpcMetaStore, InMemoryMetaStore, IngestRangeReservation,
-    IngestSourceRelationIdentityV1, MetaGrpcService, MetaStore, OssMetaStore,
-    PartitionAuthorityKey, PartitionCheckpointPointer, PromoteViewBootstrapOutcome,
-    PromoteViewBootstrapRequest, PublishIngestReservationOutcome, PublishIngestReservationRequest,
-    PublishPartitionCheckpointPointerOutcome, PublishPartitionCheckpointPointerRequest,
-    PublishRelationIngestReservationRequest, PublishStandingRuntimeCheckpointOutcome,
-    RelationPartitionAuthorityKey, ReserveAuthoritativeIngestRangeRequest,
-    ReserveIngestRangeOutcome, ReserveRelationAuthoritativeIngestRangeRequest,
-    StandingRuntimeCheckpointPointer, StandingRuntimeOwnerToken, StoreRelationCatalogOutcome,
+    CaptureRelationIngestSourceCutRequest, CommitIngestRangeOutcome,
+    FixViewBootstrapActivationCutOutcome, FixViewBootstrapActivationCutRequest, GrpcMetaStore,
+    InMemoryMetaStore, IngestRangeReservation, IngestSourceRelationIdentityV1, MetaGrpcService,
+    MetaStore, OssMetaStore, PartitionAuthorityKey, PartitionCheckpointPointer,
+    PromoteViewBootstrapOutcome, PromoteViewBootstrapRequest, PublishIngestReservationOutcome,
+    PublishIngestReservationRequest, PublishPartitionCheckpointPointerOutcome,
+    PublishPartitionCheckpointPointerRequest, PublishRelationIngestReservationRequest,
+    PublishStandingRuntimeCheckpointOutcome, RelationPartitionAuthorityKey,
+    ReserveAuthoritativeIngestRangeRequest, ReserveIngestRangeOutcome,
+    ReserveRelationAuthoritativeIngestRangeRequest, StandingRuntimeCheckpointPointer,
+    StandingRuntimeOwnerToken, StoreRelationCatalogOutcome,
 };
 
 mod common;
@@ -904,6 +905,32 @@ async fn grpc_relation_authority_round_trips_scope_fencing_and_publication() {
             .unwrap(),
         ReserveIngestRangeOutcome::Conflict
     );
+    let mut hole = reservation.clone();
+    hole.start_offset_inclusive = 10;
+    hole.end_offset_exclusive = 20;
+    hole.batch_key = "batches/relation-hole".into();
+    store
+        .reserve_relation_authoritative_ingest_range(
+            ReserveRelationAuthoritativeIngestRangeRequest {
+                reservation: hole,
+                authority: authority.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    let mut third = reservation.clone();
+    third.start_offset_inclusive = 20;
+    third.end_offset_exclusive = 30;
+    third.batch_key = "batches/relation-third".into();
+    store
+        .reserve_relation_authoritative_ingest_range(
+            ReserveRelationAuthoritativeIngestRangeRequest {
+                reservation: third.clone(),
+                authority: authority.clone(),
+            },
+        )
+        .await
+        .unwrap();
     let request = PublishRelationIngestReservationRequest {
         reservation: reservation.clone(),
         authority: authority.clone(),
@@ -926,18 +953,45 @@ async fn grpc_relation_authority_round_trips_scope_fencing_and_publication() {
             .unwrap(),
         PublishIngestReservationOutcome::Duplicate
     );
+    let third_request = PublishRelationIngestReservationRequest {
+        reservation: third,
+        authority: authority.clone(),
+        request_id: "relation-publication-third".into(),
+        request_digest: "sha256:request-third".into(),
+        object_key: "objects/relation-third".into(),
+        object_digest: "sha256:object-third".into(),
+    };
+    assert_eq!(
+        store
+            .publish_relation_ingest_reservation(third_request)
+            .await
+            .unwrap(),
+        PublishIngestReservationOutcome::Committed
+    );
     let publication = store
         .read_relation_authoritative_ingest_publication("relation-publication")
         .await
         .unwrap()
         .unwrap();
     assert_eq!(publication.object_key, "objects/relation");
+    let publications = store
+        .list_relation_authoritative_ingest_publications(&key)
+        .await
+        .unwrap();
+    assert_eq!(publications.len(), 2);
+    assert_eq!(publications[0], publication);
+    assert_eq!(publications[1].request_id, "relation-publication-third");
+    let cut = store
+        .capture_relation_ingest_source_cut(CaptureRelationIngestSourceCutRequest {
+            authority: key.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(cut.partitions[0].committed_offset_exclusive, 10);
+    assert_eq!(cut.partitions[0].publications.len(), 1);
     assert_eq!(
-        store
-            .list_relation_authoritative_ingest_publications(&key)
-            .await
-            .unwrap(),
-        vec![publication]
+        cut.partitions[0].publications[0].object_key,
+        "objects/relation"
     );
     backend.set_partition_authority_clock_for_test(200).await;
     let takeover = store

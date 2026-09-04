@@ -36,9 +36,11 @@ mod source_cut;
 mod view_bootstrap;
 
 pub use source_cut::{
-    CaptureIngestSourceCutRequest, IngestSourceCutV1, IngestSourcePartitionCutV1,
-    IngestSourceRelationCutV1, IngestSourceRelationIdentityV1, INGEST_SOURCE_CUT_SCHEMA_VERSION_V1,
-    INGEST_SOURCE_IDENTITY_GENERATION_V1,
+    CaptureIngestSourceCutRequest, CaptureRelationIngestSourceCutRequest, IngestSourceCutV1,
+    IngestSourcePartitionCutV1, IngestSourceRelationCutV1, IngestSourceRelationIdentityV1,
+    RelationIngestPartitionCutV1, RelationIngestPublicationRefV1, RelationIngestSourceCutV1,
+    INGEST_SOURCE_CUT_SCHEMA_VERSION_V1, INGEST_SOURCE_IDENTITY_GENERATION_V1,
+    RELATION_INGEST_SOURCE_CUT_SCHEMA_VERSION_V1,
 };
 pub use view_bootstrap::{
     BeginViewBootstrapOutcome, BeginViewBootstrapRequest, BeginViewDependencyEdgeV1,
@@ -136,6 +138,28 @@ pub struct MetaStoreCapabilities {
     pub standing_runtime_fencing: StandingRuntimeFencingCapability,
     #[serde(default)]
     pub partition_authority: PartitionAuthorityCapability,
+    #[serde(default)]
+    pub relation_ingest: RelationIngestCapability,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelationIngestCapability {
+    pub backend_name: String,
+    pub relation_scoped_authority: bool,
+    pub committed_publication_source_cut: bool,
+    pub durable_across_restart: bool,
+}
+
+impl Default for RelationIngestCapability {
+    fn default() -> Self {
+        Self {
+            backend_name: "unsupported".to_string(),
+            relation_scoped_authority: false,
+            committed_publication_source_cut: false,
+            durable_across_restart: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -578,6 +602,22 @@ pub trait MetaStore: Send + Sync + 'static {
         ))
     }
 
+    async fn read_relation_ingest_capability(
+        &self,
+    ) -> Result<RelationIngestCapability, MetaStoreError> {
+        Ok(RelationIngestCapability::default())
+    }
+
+    async fn capture_relation_ingest_source_cut(
+        &self,
+        request: CaptureRelationIngestSourceCutRequest,
+    ) -> Result<RelationIngestSourceCutV1, MetaStoreError> {
+        request.validate()?;
+        Err(MetaStoreError::UnsupportedCapability(
+            "relation_committed_ingest_source_cut",
+        ))
+    }
+
     async fn begin_view_bootstrap(
         &self,
         request: BeginViewBootstrapRequest,
@@ -860,6 +900,19 @@ where
         (**self).capture_ingest_source_cut(request).await
     }
 
+    async fn read_relation_ingest_capability(
+        &self,
+    ) -> Result<RelationIngestCapability, MetaStoreError> {
+        (**self).read_relation_ingest_capability().await
+    }
+
+    async fn capture_relation_ingest_source_cut(
+        &self,
+        request: CaptureRelationIngestSourceCutRequest,
+    ) -> Result<RelationIngestSourceCutV1, MetaStoreError> {
+        (**self).capture_relation_ingest_source_cut(request).await
+    }
+
     async fn begin_view_bootstrap(
         &self,
         request: BeginViewBootstrapRequest,
@@ -1077,6 +1130,12 @@ impl MetaStore for InMemoryMetaStore {
                 },
             ),
             partition_authority: in_memory_partition_authority_capability(),
+            relation_ingest: RelationIngestCapability {
+                backend_name: "in-memory".into(),
+                relation_scoped_authority: true,
+                committed_publication_source_cut: true,
+                durable_across_restart: false,
+            },
         })
     }
 
@@ -1907,6 +1966,32 @@ impl MetaStore for InMemoryMetaStore {
             .cloned())
     }
 
+    async fn read_relation_ingest_capability(
+        &self,
+    ) -> Result<RelationIngestCapability, MetaStoreError> {
+        Ok(RelationIngestCapability {
+            backend_name: "in-memory".into(),
+            relation_scoped_authority: true,
+            committed_publication_source_cut: true,
+            durable_across_restart: false,
+        })
+    }
+
+    async fn capture_relation_ingest_source_cut(
+        &self,
+        request: CaptureRelationIngestSourceCutRequest,
+    ) -> Result<RelationIngestSourceCutV1, MetaStoreError> {
+        request.validate()?;
+        let guard = self.inner.read().await;
+        source_cut::build_relation_ingest_source_cut(
+            &request,
+            guard
+                .relation_authoritative_ingest_publications
+                .values()
+                .cloned(),
+        )
+    }
+
     async fn reserve_relation_authoritative_ingest_range(
         &self,
         request: ReserveRelationAuthoritativeIngestRangeRequest,
@@ -2170,6 +2255,7 @@ impl MetaStore for OssMetaStore {
                 },
             ),
             partition_authority: PartitionAuthorityCapability::unsupported("oss"),
+            relation_ingest: RelationIngestCapability::default(),
         })
     }
 
@@ -2812,6 +2898,7 @@ fn validate_current_relation_partition_authority(
     Ok(())
 }
 
+#[cfg(feature = "hiqlite-backend")]
 fn relation_publication_matches_request(
     publication: &RelationAuthoritativeIngestPublication,
     request: &PublishRelationIngestReservationRequest,
@@ -3097,6 +3184,9 @@ where
             partition_authority: Some(partition_authority_capability_to_proto(
                 capabilities.partition_authority,
             )),
+            relation_ingest: Some(relation_ingest_capability_to_proto(
+                capabilities.relation_ingest,
+            )),
         }))
     }
 
@@ -3329,6 +3419,31 @@ where
         Ok(Response::new(proto::CaptureIngestSourceCutResponse {
             source_cut_json,
         }))
+    }
+
+    async fn capture_relation_ingest_source_cut(
+        &self,
+        request: Request<proto::CaptureRelationIngestSourceCutRequest>,
+    ) -> Result<Response<proto::CaptureRelationIngestSourceCutResponse>, Status> {
+        self.authorize(&request)?;
+        let authority = request
+            .into_inner()
+            .authority
+            .ok_or_else(|| Status::invalid_argument("relation authority key is required"))
+            .and_then(|key| {
+                relation_partition_authority_key_from_proto(key).map_err(partition_authority_status)
+            })?;
+        let source_cut = self
+            .store
+            .capture_relation_ingest_source_cut(CaptureRelationIngestSourceCutRequest { authority })
+            .await
+            .map_err(meta_status)?;
+        Ok(Response::new(
+            proto::CaptureRelationIngestSourceCutResponse {
+                source_cut_json: serde_json::to_vec(&source_cut)
+                    .map_err(|error| Status::internal(error.to_string()))?,
+            },
+        ))
     }
 
     async fn begin_view_bootstrap(
@@ -3972,6 +4087,28 @@ fn partition_authority_capability_to_proto(
         fenced_checkpoint_pointer_publish: capability.fenced_checkpoint_pointer_publish,
         durable_across_restart: capability.durable_across_restart,
         production_safe: capability.production_safe,
+    }
+}
+
+fn relation_ingest_capability_to_proto(
+    capability: RelationIngestCapability,
+) -> proto::RelationIngestCapability {
+    proto::RelationIngestCapability {
+        backend_name: capability.backend_name,
+        relation_scoped_authority: capability.relation_scoped_authority,
+        committed_publication_source_cut: capability.committed_publication_source_cut,
+        durable_across_restart: capability.durable_across_restart,
+    }
+}
+
+fn relation_ingest_capability_from_proto(
+    capability: proto::RelationIngestCapability,
+) -> RelationIngestCapability {
+    RelationIngestCapability {
+        backend_name: capability.backend_name,
+        relation_scoped_authority: capability.relation_scoped_authority,
+        committed_publication_source_cut: capability.committed_publication_source_cut,
+        durable_across_restart: capability.durable_across_restart,
     }
 }
 
@@ -5582,6 +5719,28 @@ impl MetaStore for HiqliteMetaStore {
         Ok(token.filter(|token| token.expires_at_unix_ms > u64::try_from(now).unwrap_or(0)))
     }
 
+    async fn read_relation_ingest_capability(
+        &self,
+    ) -> Result<RelationIngestCapability, MetaStoreError> {
+        Ok(RelationIngestCapability {
+            backend_name: "hiqlite".to_string(),
+            relation_scoped_authority: true,
+            committed_publication_source_cut: true,
+            durable_across_restart: true,
+        })
+    }
+
+    async fn capture_relation_ingest_source_cut(
+        &self,
+        request: CaptureRelationIngestSourceCutRequest,
+    ) -> Result<RelationIngestSourceCutV1, MetaStoreError> {
+        request.validate()?;
+        let publications = self
+            .list_relation_authoritative_ingest_publications(&request.authority)
+            .await?;
+        source_cut::build_relation_ingest_source_cut(&request, publications)
+    }
+
     async fn reserve_relation_authoritative_ingest_range(
         &self,
         request: ReserveRelationAuthoritativeIngestRangeRequest,
@@ -5725,6 +5884,12 @@ impl MetaStore for HiqliteMetaStore {
                 fenced_checkpoint_pointer_publish: true,
                 durable_across_restart: true,
                 production_safe: true,
+            },
+            relation_ingest: RelationIngestCapability {
+                backend_name: "hiqlite".to_string(),
+                relation_scoped_authority: true,
+                committed_publication_source_cut: true,
+                durable_across_restart: true,
             },
         })
     }
@@ -8420,6 +8585,10 @@ impl MetaStore for GrpcMetaStore {
                 .partition_authority
                 .map(partition_authority_capability_from_proto)
                 .unwrap_or_else(|| PartitionAuthorityCapability::unsupported("grpc")),
+            relation_ingest: response
+                .relation_ingest
+                .map(relation_ingest_capability_from_proto)
+                .unwrap_or_default(),
         })
     }
 
@@ -8604,6 +8773,25 @@ impl MetaStore for GrpcMetaStore {
             .capture_ingest_source_cut(
                 self.request(proto::CaptureIngestSourceCutRequest { request_json }),
             )
+            .await
+            .map_err(|error| MetaStoreError::Remote(error.to_string()))?
+            .into_inner();
+        serde_json::from_slice(&response.source_cut_json)
+            .map_err(|error| MetaStoreError::Serialization(error.to_string()))
+    }
+
+    async fn capture_relation_ingest_source_cut(
+        &self,
+        request: CaptureRelationIngestSourceCutRequest,
+    ) -> Result<RelationIngestSourceCutV1, MetaStoreError> {
+        request.validate()?;
+        let response = self
+            .client()
+            .capture_relation_ingest_source_cut(self.request(
+                proto::CaptureRelationIngestSourceCutRequest {
+                    authority: Some(relation_partition_authority_key_to_proto(request.authority)),
+                },
+            ))
             .await
             .map_err(|error| MetaStoreError::Remote(error.to_string()))?
             .into_inner();

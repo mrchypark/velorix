@@ -2,10 +2,113 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{require_non_empty, IngestRangeReservation, MetaStoreError};
+use crate::{
+    require_non_empty, IngestRangeReservation, MetaStoreError,
+    RelationAuthoritativeIngestPublication, RelationPartitionAuthorityKey,
+};
 
 pub const INGEST_SOURCE_CUT_SCHEMA_VERSION_V1: u32 = 1;
 pub const INGEST_SOURCE_IDENTITY_GENERATION_V1: u64 = 1;
+pub const RELATION_INGEST_SOURCE_CUT_SCHEMA_VERSION_V1: u32 = 1;
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelationIngestPublicationRefV1 {
+    pub request_id: String,
+    pub start_offset_inclusive: u64,
+    pub end_offset_exclusive: u64,
+    pub batch_key: String,
+    pub payload_digest: String,
+    pub object_key: String,
+    pub object_digest: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelationIngestPartitionCutV1 {
+    pub stream_id: String,
+    pub partition_id: u32,
+    pub base_offset_inclusive: u64,
+    pub committed_offset_exclusive: u64,
+    pub publications: Vec<RelationIngestPublicationRefV1>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelationIngestSourceCutV1 {
+    pub schema_version: u32,
+    pub namespace: String,
+    pub relation_id: String,
+    pub partitions: Vec<RelationIngestPartitionCutV1>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CaptureRelationIngestSourceCutRequest {
+    pub authority: RelationPartitionAuthorityKey,
+}
+
+impl CaptureRelationIngestSourceCutRequest {
+    pub(crate) fn validate(&self) -> Result<(), MetaStoreError> {
+        self.authority.validate()
+    }
+}
+
+pub(crate) fn build_relation_ingest_source_cut(
+    request: &CaptureRelationIngestSourceCutRequest,
+    publications: impl IntoIterator<Item = RelationAuthoritativeIngestPublication>,
+) -> Result<RelationIngestSourceCutV1, MetaStoreError> {
+    request.validate()?;
+    let mut publications = publications
+        .into_iter()
+        .filter(|publication| publication.authority_key == request.authority)
+        .collect::<Vec<_>>();
+    publications.sort_by_key(|publication| {
+        (
+            publication.reservation.start_offset_inclusive,
+            publication.reservation.end_offset_exclusive,
+            publication.request_id.clone(),
+        )
+    });
+    let Some(first) = publications.first() else {
+        return Ok(RelationIngestSourceCutV1 {
+            schema_version: RELATION_INGEST_SOURCE_CUT_SCHEMA_VERSION_V1,
+            namespace: request.authority.namespace.clone(),
+            relation_id: request.authority.relation_id.clone(),
+            partitions: Vec::new(),
+        });
+    };
+    let mut frontier = first.reservation.start_offset_inclusive;
+    let base = frontier;
+    let mut refs = Vec::new();
+    for publication in &publications {
+        let reservation = &publication.reservation;
+        if reservation.start_offset_inclusive != frontier {
+            break;
+        }
+        frontier = reservation.end_offset_exclusive;
+        refs.push(RelationIngestPublicationRefV1 {
+            request_id: publication.request_id.clone(),
+            start_offset_inclusive: reservation.start_offset_inclusive,
+            end_offset_exclusive: reservation.end_offset_exclusive,
+            batch_key: reservation.batch_key.clone(),
+            payload_digest: reservation.payload_digest.clone(),
+            object_key: publication.object_key.clone(),
+            object_digest: publication.object_digest.clone(),
+        });
+    }
+    Ok(RelationIngestSourceCutV1 {
+        schema_version: RELATION_INGEST_SOURCE_CUT_SCHEMA_VERSION_V1,
+        namespace: request.authority.namespace.clone(),
+        relation_id: request.authority.relation_id.clone(),
+        partitions: vec![RelationIngestPartitionCutV1 {
+            stream_id: request.authority.stream_id.clone(),
+            partition_id: request.authority.partition_id,
+            base_offset_inclusive: base,
+            committed_offset_exclusive: frontier,
+            publications: refs,
+        }],
+    })
+}
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

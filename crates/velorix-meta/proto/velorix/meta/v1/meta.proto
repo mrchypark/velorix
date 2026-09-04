@@ -13,6 +13,7 @@ service VelorixMeta {
   rpc ReadAuthoritativeIngestPublication(ReadAuthoritativeIngestPublicationRequest) returns (ReadAuthoritativeIngestPublicationResponse);
   rpc ListAuthoritativeIngestPublications(ListAuthoritativeIngestPublicationsRequest) returns (ListAuthoritativeIngestPublicationsResponse);
   rpc CaptureIngestSourceCut(CaptureIngestSourceCutRequest) returns (CaptureIngestSourceCutResponse);
+  rpc CaptureRelationIngestSourceCut(CaptureRelationIngestSourceCutRequest) returns (CaptureRelationIngestSourceCutResponse);
   rpc BeginViewBootstrap(BeginViewBootstrapRequest) returns (BeginViewBootstrapResponse);
   rpc ReadViewBootstrap(ReadViewBootstrapRequest) returns (ReadViewBootstrapResponse);
   rpc FixViewBootstrapActivationCut(FixViewBootstrapActivationCutRequest) returns (FixViewBootstrapActivationCutResponse);
@@ -73,6 +74,14 @@ message StandingRuntimeFencingCapability {
 message ReadMetaStoreCapabilitiesResponse {
   StandingRuntimeFencingCapability standing_runtime_fencing = 1;
   PartitionAuthorityCapability partition_authority = 2;
+  RelationIngestCapability relation_ingest = 3;
+}
+
+message RelationIngestCapability {
+  string backend_name = 1;
+  bool relation_scoped_authority = 2;
+  bool committed_publication_source_cut = 3;
+  bool durable_across_restart = 4;
 }
 
 message PartitionAuthorityCapability {
@@ -270,6 +279,14 @@ message ReadRelationAuthoritativeIngestPublicationResponse {
 message ListRelationAuthoritativeIngestPublicationsRequest { RelationPartitionAuthorityKey key = 1; }
 message ListRelationAuthoritativeIngestPublicationsResponse {
   repeated RelationAuthoritativeIngestPublication publications = 1;
+}
+
+message CaptureRelationIngestSourceCutRequest {
+  RelationPartitionAuthorityKey authority = 1;
+}
+
+message CaptureRelationIngestSourceCutResponse {
+  bytes source_cut_json = 1;
 }
 
 message AuthoritativeIngestPublication {

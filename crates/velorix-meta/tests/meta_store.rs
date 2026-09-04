@@ -12,19 +12,19 @@ use velorix_meta::{
     AcquireRelationPartitionAuthorityOutcome, AcquireRelationPartitionAuthorityRequest,
     AcquireStandingRuntimeOwnerOutcome, AcquireStandingRuntimeOwnerRequest,
     BeginViewBootstrapOutcome, BeginViewBootstrapRequest, CaptureIngestSourceCutRequest,
-    CommitIngestRangeOutcome, FixViewBootstrapActivationCutOutcome,
-    FixViewBootstrapActivationCutRequest, InMemoryMetaStore, IngestRangeReservation,
-    IngestSourceCutV1, IngestSourceRelationIdentityV1, MetaStore, MetaStoreCapabilities,
-    OssMetaStore, PartitionAuthorityKey, PartitionAuthorityToken, PartitionCheckpointPointer,
-    PromoteViewBootstrapOutcome, PromoteViewBootstrapRequest, PublishIngestReservationOutcome,
-    PublishIngestReservationRequest, PublishPartitionCheckpointPointerOutcome,
-    PublishPartitionCheckpointPointerRequest, PublishRelationIngestReservationRequest,
-    PublishStandingRuntimeCheckpointOutcome, PublishStandingRuntimeCheckpointRequest,
-    RelationPartitionAuthorityKey, RelationPartitionAuthorityToken,
-    ReserveAuthoritativeIngestRangeRequest, ReserveIngestRangeOutcome,
-    ReserveRelationAuthoritativeIngestRangeRequest, StandingRuntimeCheckpointPointer,
-    StandingRuntimeOwnerToken, StoreRelationCatalogOutcome, ViewBootstrapLifecycleV1,
-    STANDING_RUNTIME_BACKEND_TIME_SOURCE_PROCESS_CLOCK,
+    CaptureRelationIngestSourceCutRequest, CommitIngestRangeOutcome,
+    FixViewBootstrapActivationCutOutcome, FixViewBootstrapActivationCutRequest, InMemoryMetaStore,
+    IngestRangeReservation, IngestSourceCutV1, IngestSourceRelationIdentityV1, MetaStore,
+    MetaStoreCapabilities, OssMetaStore, PartitionAuthorityKey, PartitionAuthorityToken,
+    PartitionCheckpointPointer, PromoteViewBootstrapOutcome, PromoteViewBootstrapRequest,
+    PublishIngestReservationOutcome, PublishIngestReservationRequest,
+    PublishPartitionCheckpointPointerOutcome, PublishPartitionCheckpointPointerRequest,
+    PublishRelationIngestReservationRequest, PublishStandingRuntimeCheckpointOutcome,
+    PublishStandingRuntimeCheckpointRequest, RelationPartitionAuthorityKey,
+    RelationPartitionAuthorityToken, ReserveAuthoritativeIngestRangeRequest,
+    ReserveIngestRangeOutcome, ReserveRelationAuthoritativeIngestRangeRequest,
+    StandingRuntimeCheckpointPointer, StandingRuntimeOwnerToken, StoreRelationCatalogOutcome,
+    ViewBootstrapLifecycleV1, STANDING_RUNTIME_BACKEND_TIME_SOURCE_PROCESS_CLOCK,
     STANDING_RUNTIME_BACKEND_TIME_SOURCE_UNAVAILABLE,
 };
 
@@ -324,6 +324,84 @@ async fn relation_reservation_scopes_namespace_and_rejects_legacy_batch_collisio
             .unwrap(),
         ReserveIngestRangeOutcome::Conflict
     );
+}
+
+#[tokio::test]
+async fn relation_source_cut_uses_committed_publications_only_and_stops_at_holes() {
+    let store = InMemoryMetaStore::default();
+    let key = relation_authority_key("orders");
+    let authority = match store
+        .acquire_relation_partition_authority(AcquireRelationPartitionAuthorityRequest {
+            key: key.clone(),
+            owner_id: "writer".into(),
+            current_token: None,
+            ttl_ms: 100,
+        })
+        .await
+        .unwrap()
+    {
+        AcquireRelationPartitionAuthorityOutcome::Acquired(token) => token,
+        other => panic!("unexpected authority outcome: {other:?}"),
+    };
+    let first = relation_reservation(0, 10, "cut-a");
+    let hole = relation_reservation(10, 20, "cut-hole");
+    let third = relation_reservation(20, 30, "cut-c");
+    for reservation in [first.clone(), hole, third.clone()] {
+        store
+            .reserve_relation_authoritative_ingest_range(
+                ReserveRelationAuthoritativeIngestRangeRequest {
+                    reservation,
+                    authority: authority.clone(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+    for (reservation, id) in [(first, "cut-a"), (third, "cut-c")] {
+        assert_eq!(
+            store
+                .publish_relation_ingest_reservation(PublishRelationIngestReservationRequest {
+                    reservation,
+                    authority: authority.clone(),
+                    request_id: id.into(),
+                    request_digest: format!("sha256:{id}"),
+                    object_key: format!("objects/{id}"),
+                    object_digest: format!("sha256:object-{id}"),
+                })
+                .await
+                .unwrap(),
+            PublishIngestReservationOutcome::Committed
+        );
+    }
+    let cut = store
+        .capture_relation_ingest_source_cut(CaptureRelationIngestSourceCutRequest {
+            authority: key.clone(),
+        })
+        .await
+        .unwrap();
+    let partition = &cut.partitions[0];
+    assert_eq!(partition.base_offset_inclusive, 0);
+    assert_eq!(partition.committed_offset_exclusive, 10);
+    assert_eq!(
+        partition
+            .publications
+            .iter()
+            .map(|publication| publication.request_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["cut-a"]
+    );
+    assert_eq!(partition.publications[0].object_key, "objects/cut-a");
+    assert!(store
+        .capture_relation_ingest_source_cut(CaptureRelationIngestSourceCutRequest {
+            authority: RelationPartitionAuthorityKey {
+                namespace: "other".into(),
+                ..key
+            },
+        })
+        .await
+        .unwrap()
+        .partitions
+        .is_empty());
 }
 
 #[tokio::test]

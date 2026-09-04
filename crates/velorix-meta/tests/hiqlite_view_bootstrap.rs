@@ -12,10 +12,10 @@ use velorix_meta::{
     AcquireRelationPartitionAuthorityOutcome, AcquireRelationPartitionAuthorityRequest,
     AcquireStandingRuntimeOwnerOutcome, AcquireStandingRuntimeOwnerRequest,
     BeginViewBootstrapOutcome, BeginViewBootstrapRequest, BeginViewDependencyEdgeV1,
-    CommitIngestRangeOutcome, FixViewBootstrapActivationCutOutcome,
-    FixViewBootstrapActivationCutRequest, HiqliteMetaStore, IngestRangeReservation,
-    IngestSourceCutV1, IngestSourceRelationIdentityV1, MetaStore, MetaStoreError,
-    PartitionAuthorityKey, PartitionAuthorityToken, PromoteViewBootstrapOutcome,
+    CaptureRelationIngestSourceCutRequest, CommitIngestRangeOutcome,
+    FixViewBootstrapActivationCutOutcome, FixViewBootstrapActivationCutRequest, HiqliteMetaStore,
+    IngestRangeReservation, IngestSourceCutV1, IngestSourceRelationIdentityV1, MetaStore,
+    MetaStoreError, PartitionAuthorityKey, PartitionAuthorityToken, PromoteViewBootstrapOutcome,
     PromoteViewBootstrapRequest, PublishIngestReservationOutcome, PublishIngestReservationRequest,
     PublishPartitionCheckpointPointerOutcome, PublishPartitionCheckpointPointerRequest,
     PublishRelationIngestReservationRequest, PublishStandingRuntimeCheckpointOutcome,
@@ -260,11 +260,21 @@ async fn hiqlite_relation_authority_is_persistent_and_fenced() {
             .unwrap(),
         ReserveIngestRangeOutcome::Conflict
     );
-    let second = relation_reservation(10, 20, "batch-b", "orders");
+    let hole = relation_reservation(10, 20, "batch-hole", "orders");
     store
         .reserve_relation_authoritative_ingest_range(
             ReserveRelationAuthoritativeIngestRangeRequest {
-                reservation: second.clone(),
+                reservation: hole,
+                authority: authority.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    let third = relation_reservation(20, 30, "batch-b", "orders");
+    store
+        .reserve_relation_authoritative_ingest_range(
+            ReserveRelationAuthoritativeIngestRangeRequest {
+                reservation: third.clone(),
                 authority: authority.clone(),
             },
         )
@@ -279,7 +289,7 @@ async fn hiqlite_relation_authority_is_persistent_and_fenced() {
         object_digest: "sha256:obj-a".into(),
     };
     let second_request = PublishRelationIngestReservationRequest {
-        reservation: second,
+        reservation: third,
         authority: authority.clone(),
         request_id: "relation-b".into(),
         request_digest: "sha256:req-b".into(),
@@ -316,15 +326,29 @@ async fn hiqlite_relation_authority_is_persistent_and_fenced() {
         .publish_relation_ingest_reservation(second_request)
         .await
         .unwrap();
+    let publications = store
+        .list_relation_authoritative_ingest_publications(&key)
+        .await
+        .unwrap();
     assert_eq!(
-        store
-            .list_relation_authoritative_ingest_publications(&key)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|publication| publication.request_id)
+        publications
+            .iter()
+            .map(|publication| publication.request_id.as_str())
             .collect::<Vec<_>>(),
         vec!["relation-a", "relation-b"]
+    );
+    let cut = store
+        .capture_relation_ingest_source_cut(CaptureRelationIngestSourceCutRequest {
+            authority: key.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(cut.partitions[0].committed_offset_exclusive, 10);
+    assert_eq!(cut.partitions[0].publications.len(), 1);
+    assert_eq!(cut.partitions[0].publications[0].request_id, "relation-a");
+    assert_eq!(
+        cut.partitions[0].publications[0].object_digest,
+        "sha256:obj-a"
     );
     client
         .execute(
@@ -400,6 +424,20 @@ async fn hiqlite_relation_authority_is_persistent_and_fenced() {
             .unwrap()
             .len(),
         2
+    );
+    assert_eq!(
+        restarted
+            .capture_relation_ingest_source_cut(CaptureRelationIngestSourceCutRequest {
+                authority: RelationPartitionAuthorityKey {
+                    namespace: "default".into(),
+                    relation_id: "orders".into(),
+                    stream_id: "orders-stream".into(),
+                    partition_id: 0,
+                },
+            })
+            .await
+            .unwrap(),
+        cut
     );
     restarted_client.shutdown().await.unwrap();
 }
