@@ -79,6 +79,33 @@ The local product path is no-PVC and jarless. Evidence is written under
 - `rest-api-smoke.json`: authenticated REST relation-scoped ingest, public
   relation batch ingest, view, and query smoke.
 
+## Feature-gated authoritative relation ingest
+
+The API has an opt-in authoritative relation-ingest path. Enable it only with a
+metadata service that advertises the required relation-ingest capability:
+
+```sh
+VELORIX_API_AUTHORITATIVE_RELATION_INGEST=1
+VELORIX_RELATION_INGEST_OWNER_ID=<stable-deployment-owner-id>
+```
+
+The owner ID must be stable for the logical publisher and must not be a
+per-request random value. Startup fails closed when metadata capability checks
+or the owner ID requirement fail. In this mode, one relation batch is the only
+accepted unit of publication: relation-scoped authority precedes range
+reservation, bounded staging write, and metadata publication. The runtime then
+applies the published batch. Checkpoint persistence stores validated input
+coverage. At restart recovery, the replay frontier and checkpoints drive a fresh
+capture and validation of the relation source cut from Meta. Multi-batch
+requests fail closed; atomic multi-batch publication is not implemented. With
+the feature gate off, the legacy ingestion path remains unchanged.
+
+This is implementation and focused-test coverage, not proof that a current
+live Kubernetes deployment exercises the feature. The no-PVC recovery contract
+still requires a replacement pod to use durable remote object storage plus
+metadata; local storage is only suitable for same-host restart. Do not add PVC
+state, Cloud Build, or an alternate source-query path to bypass those bounds.
+
 Bearer-token auth evidence must include
 `data_plane_token_rejected_on_admin_route=true`. The product ingress wrappers
 read the same product auth env:

@@ -1,6 +1,6 @@
 # Supported materialized-view SQL
 
-**Status: 2026-09-05 (HEAD `4954d57`).** This is the canonical contract for
+**Status: 2026-09-05 (HEAD `6fcbcab`).** This is the canonical contract for
 `POST /v1/views`.
 It is deliberately narrower than parser acceptance and than SQL accepted by a
 read-only query over an already materialized output. A view is admitted only
@@ -19,6 +19,25 @@ clear 4xx admission error; there is no source-recomputation fallback.
 
 A late-created view is `backfill_required` until its backfill completes. That
 state is materialization progress, not an alternate query implementation.
+
+## Authoritative relation-ingest operational mode
+
+The SQL capability table below is unchanged by authoritative relation ingest.
+When `VELORIX_API_AUTHORITATIVE_RELATION_INGEST=1`, the API requires a metadata
+service with the relation-ingest capability and a non-empty, stable
+`VELORIX_RELATION_INGEST_OWNER_ID`. For each accepted relation batch, the
+feature-gated path obtains relation-scoped authority, reserves the range,
+writes a bounded staging object, and publishes it through metadata. The native
+runtime then applies the published relation batch. During checkpoint
+persistence, validated input coverage is persisted. On restart recovery, the
+replay frontier and checkpoints drive a fresh capture and validation of the
+relation source cut from Meta.
+
+This authoritative mode intentionally accepts exactly one relation batch per
+request. A multi-batch request fails closed; atomic multi-batch publication is
+not claimed. With the gate off, the legacy object-store admission path remains
+in effect. This is implementation and focused-test evidence, not evidence of a
+current live K8s deployment.
 
 ## Admission matrix
 
@@ -83,7 +102,7 @@ digest-pinned image references; SHA-named tags remain mutable and provenance is
 disabled, so neither tag spelling nor workflow completion alone is immutable
 provenance evidence. Those delivery controls are not evidence that an internal
 runtime is a public SQL capability; this matrix and its named tests are the
-capability authority.
+capability authority. Do not add a Cloud Build path.
 
 ## Focused validation
 

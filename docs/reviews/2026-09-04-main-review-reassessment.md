@@ -1,6 +1,6 @@
 # Reassessment of the 2026-09-03 main-branch review
 
-**Reassessed 2026-09-05 at HEAD `4954d57`.** The supplied review was a static
+**Reassessed 2026-09-05 at HEAD `6fcbcab`.** The supplied review was a static
 assessment of `1ffbca70`. This is a source-and-test reassessment, not a claim
 that live object storage, a cluster, scale benchmarks, or disaster recovery was
 run here. Status: **fixed** means committed code plus focused repository
@@ -14,7 +14,7 @@ longer current; and **false** means current evidence contradicts it.
 | ---: | --- | --- | --- | --- |
 | 1 | Product image builders use a Rust version below the declared MSRV. | Fixed | P0 resolved | `642b848` and `6e3ec95` align/pin builder and workspace toolchains; `4954d57` keeps the contract checker portable. Actual image builds remain CI evidence. |
 | 2 | Lease expiry uses caller-local time and lease loss can leave a worker able to commit. | Partial | P0 | `1fd32e5`, `891cb7f`, `f91dcb7`, and `e6b075b` improve authority/server-time fencing, but worker-shard caller-clock use and non-durable fencing remain. Best-effort local cleanup is not inherited-worker or commit-boundary self-fencing; retain skew, renewal-loss, and crash tests. |
-| 3 | Checkpoint fencing is check-then-write rather than a final authoritative CAS. | Partial | P0 | `3ef542c` and `5177a80` add authority/checkpoint pieces, but the product writer, storage, read, and GC paths are not yet proven as one connected atomic-publication protocol. Retain competing-owner, orphan-GC, and live recovery tests. |
+| 3 | Checkpoint fencing is check-then-write rather than a final authoritative CAS. | Partial | P0 | `4f1d794`, `95a2de6`, `95a8205`, `0f38141`, and `6fcbcab` connect relation-scoped authority, range reservation, bounded staging, Meta publication, runtime apply, and checkpoint-persistence of validated input coverage. At restart recovery, the replay frontier/checkpoints drive fresh Meta relation-source-cut capture and validation. Authoritative mode fail-closes multi-batch requests and retains the legacy path while off. Latest live K8s deployment, competing-owner, orphan-GC, and recovery evidence remain open. |
 | 4 | Specialized runtimes can leave an epoch partially applied after a later failure. | Partial | P0 | `618821b`, `700448f`, `122ae2b`, and `fc020f8` improve selected families. The common-DAG comparison path is differential-only, non-public, and two-input; it does not establish product atomicity. Family-wide failpoint coverage and remaining runtime atomicity are open. |
 | 5 | Invalid JSON values can become Arrow NULL instead of an admission error. | Fixed | P0 resolved | `61842c5` rejects invalid JSON/Arrow values; malformed-input regression coverage is required whenever conversion types expand. |
 | 6 | A durable duplicate ingest retry is reported as failure. | Fixed | P0 resolved | `642b848` accepts and verifies duplicate/appended-or-duplicate outcomes; `9044723` publishes ranges under authority. Lost-response testing remains release evidence. |
@@ -38,7 +38,7 @@ longer current; and **false** means current evidence contradicts it.
 | 24 | Window/join null and retraction semantics need hardening. | Partial | P1 | Atomic epoch work reduces one failure mode, but property/failpoint coverage across navigation, retractions, and multiplicity remains necessary. |
 | 25 | Collision audit does not record/report collisions. | Fixed | P1 resolved | `5be704f` bounds and persists collision audits. Keep adversarial collision and retention tests in the release gate. |
 | 26 | Binary key encoding claims ordering properties it may not provide. | Confirmed | P1 | No reviewed post-baseline change separates equality, ordering, and display codecs or supplies ordering-property evidence. |
-| 27 | Source-cut construction scans broad reservation history. | Partial | P1 | New partition-authority/range-publication work narrows authority handling, but no query-plan/scale evidence proves a bounded source-cut read. |
+| 27 | Source-cut construction scans broad reservation history. | Partial | P1 | `95a8205` adds relation-publication source cuts. `6fcbcab` persists validated input coverage at checkpoints; restart recovery uses replay frontier/checkpoints for fresh Meta source-cut capture and validation. A scale proof that source-cut reads remain bounded under long history is still absent. |
 | 28 | Duplicate view bootstrap can advance graph revision incorrectly. | Fixed | P1 resolved | `642b848` adds idempotent control-path changes and bootstrap tests. Cross-process contention remains an important release test. |
 | 29 | CI lacks required distributed, image, and scale safety evidence. | Partial | P1 | Current workflows and image controls improved, but live storage, ownership handoff, crash injection, and scale evidence must remain mandatory/verified in the hosting configuration. |
 
@@ -53,18 +53,25 @@ query-time DataFusion syntax never independently creates a public view feature.
 The intended product recovery architecture remains jarless and no-PVC. A
 replacement pod must use durable remote object storage plus metadata; local
 storage supports only same-host restart and cannot be treated as replacement-pod
-durability. That is an architecture and product constraint, not a completed
-production claim. Production/adversarial proof—including authoritative metadata
-loss, delayed visibility, retry, owner handoff, and recovery equivalence—remains
-required. Do not add PVC state, package-loaded runtimes, or a source-query
-fallback to paper over missing evidence.
+durability. The feature-gated authoritative relation-ingest path now connects
+relation-scoped authority, range reservation, staged objects, publication, and
+runtime apply for one relation batch. Checkpoint persistence subsequently
+persists validated input coverage. At restart recovery, the replay
+frontier/checkpoints drive fresh Meta relation-source-cut capture and
+validation. It requires metadata capability validation and a stable configured
+owner. The gate-off legacy path remains available.
+This is not a completed production claim: production/adversarial proof,
+including current live K8s deployment, metadata loss, delayed visibility, retry,
+owner handoff, and recovery equivalence, remains required. Do not add PVC state,
+package-loaded runtimes, or a source-query fallback to paper over missing
+evidence.
 
 GitHub Actions supplies repository gates. The GHCR workflow records
 digest-pinned references, while SHA-named tags remain mutable and provenance is
 disabled. Treat workflow results and tag spelling as delivery metadata, not
 immutable provenance or a substitute for the runtime SQL matrix and outstanding
-adversarial tests. This document intentionally contains no environment,
-endpoint, or cluster identifier.
+adversarial tests. Do not add a Cloud Build path. This document intentionally
+contains no environment, endpoint, or cluster identifier.
 
 ## Focused validation commands
 
@@ -80,7 +87,7 @@ cargo test -p velorix-api --lib
 ## Evidence sources
 
 - Task-supplied historical review dated 2026-09-03.
-- Current baseline: `git log 1ffbca70..4954d57` and the committed source/tests.
+- Current baseline: `git log 1ffbca70..6fcbcab` and the committed source/tests.
 - Public admission: `crates/velorix-api/src/view_admission.rs` and `lib.rs`.
 - Runtime: `crates/velorix-runtime/src/materialized_view_runtime/` and its
   integration test.
