@@ -522,6 +522,13 @@ impl PartitionAuthoritySession {
         let cadence = Duration::from_millis((session.ttl.as_millis() as u64 / 3).max(1));
         let task = tokio::spawn(async move {
             loop {
+                if session
+                    .ensure_local_safety("renewal scheduling resume")
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
                 tokio::select! {
                     _ = tokio::time::sleep(cadence) => {},
                     changed = cancellation.changed() => {
@@ -530,7 +537,6 @@ impl PartitionAuthoritySession {
                     }
                 }
                 if session.renew_once().await.is_err() {
-                    session.fence();
                     return;
                 }
             }
@@ -553,6 +559,14 @@ impl PartitionAuthoritySession {
     }
 
     async fn renew_once(&self) -> Result<(), String> {
+        let result = self.renew_once_inner().await;
+        if result.is_err() {
+            self.fence();
+        }
+        result
+    }
+
+    async fn renew_once_inner(&self) -> Result<(), String> {
         self.ensure_local_safety("renewal").await?;
         let current = self.token.read().await.clone();
         let renewal_started = Instant::now();
@@ -664,16 +678,6 @@ impl IngestCommitGuard for PartitionAuthoritySession {
                 phase.as_str()
             ));
         }
-        let now_unix_ms = match unix_ms() {
-            Ok(value) => value,
-            Err(error) => {
-                self.fence();
-                return Err(format!(
-                    "failed to read local clock during authority verification at {}: {error}",
-                    phase.as_str()
-                ));
-            }
-        };
         if current.as_ref() != Some(&expected) {
             self.fence();
             return Err(format!(
@@ -681,17 +685,9 @@ impl IngestCommitGuard for PartitionAuthoritySession {
                 phase.as_str()
             ));
         }
-        if current
-            .as_ref()
-            .map(|token| token.expires_at_unix_ms <= now_unix_ms)
-            .unwrap_or(true)
-        {
-            self.fence();
-            return Err(format!(
-                "partition authority record is expired or unavailable at {}",
-                phase.as_str()
-            ));
-        }
+        // Meta filters expired authority records using its authoritative clock.
+        // A writer's wall clock is deliberately not consulted here: it may be
+        // skewed in either direction and must not grant or revoke authority.
         Ok(())
     }
 
@@ -2730,6 +2726,33 @@ fn sanitize_probe_id(value: &str) -> String {
 mod tests {
     use super::*;
 
+    fn test_partition_authority_session_for_token(
+        meta_store: Arc<dyn MetaStore>,
+        key: PartitionAuthorityKey,
+        owner_id: &str,
+        token: PartitionAuthorityToken,
+    ) -> PartitionAuthoritySession {
+        let (cancellation, _) = watch::channel(false);
+        PartitionAuthoritySession {
+            meta_store,
+            key: key.clone(),
+            owner_id: owner_id.to_string(),
+            admission_binding: IngestCommitGuardBindingV1::new(
+                "meta_partition_authority",
+                partition_authority_identity(&key),
+                owner_id,
+                token.owner_epoch,
+            ),
+            token: Arc::new(RwLock::new(token)),
+            fenced: Arc::new(AtomicBool::new(false)),
+            safety_deadline: Arc::new(RwLock::new(Instant::now() + Duration::from_secs(60))),
+            cancellation,
+            renewal_task: Arc::new(Mutex::new(None)),
+            ttl: Duration::from_secs(60),
+            rpc_timeout: Duration::from_secs(1),
+        }
+    }
+
     async fn test_partition_authority_session() -> PartitionAuthoritySession {
         let store = Arc::new(velorix_meta::InMemoryMetaStore::default());
         let key = PartitionAuthorityKey {
@@ -2829,19 +2852,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn renewal_safety_deadline_fences_without_a_watch() {
+    async fn renewal_scheduling_pause_fences_with_nonzero_rpc_timeout() {
         let session = test_partition_authority_session().await;
-        // A tiny TTL makes the independent renewal loop hit its local
-        // fail-closed deadline; no Kubernetes watch participates.
         let session = PartitionAuthoritySession {
-            ttl: Duration::from_millis(3),
-            rpc_timeout: Duration::ZERO,
+            ttl: Duration::from_secs(60),
+            rpc_timeout: Duration::from_millis(10),
             ..session
         };
+        // Model a writer that was not scheduled until after its monotonic
+        // safety window elapsed. The renewal task must fence before issuing a
+        // renewal RPC, regardless of the nonzero RPC timeout.
+        *session.safety_deadline.write().await = Instant::now() - Duration::from_millis(1);
         session
             .start_renewal(session.cancellation.subscribe())
             .await;
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        tokio::task::yield_now().await;
         assert!(session.fenced.load(Ordering::SeqCst));
         session.shutdown().await;
     }
@@ -2959,6 +2984,214 @@ mod tests {
         assert_eq!(
             store.read_partition_checkpoint_pointer(&key).await.unwrap(),
             before
+        );
+    }
+
+    #[tokio::test]
+    async fn meta_server_time_ignores_writer_clock_skew_in_both_directions() {
+        const FIVE_MINUTES_MS: u64 = 5 * 60 * 1_000;
+        let writer_now = unix_ms().unwrap();
+
+        for (label, server_now) in [
+            (
+                "writer_clock_plus_five_minutes",
+                writer_now - FIVE_MINUTES_MS,
+            ),
+            (
+                "writer_clock_minus_five_minutes",
+                writer_now + FIVE_MINUTES_MS,
+            ),
+        ] {
+            let store = Arc::new(velorix_meta::InMemoryMetaStore::default());
+            store
+                .set_partition_authority_clock_for_test(server_now)
+                .await;
+            let key = PartitionAuthorityKey {
+                namespace: format!("tenant-{label}"),
+                view_id: "scores-view".to_string(),
+                stream_id: "scores".to_string(),
+                partition_id: 0,
+            };
+            let AcquirePartitionAuthorityOutcome::Acquired(token) = store
+                .acquire_partition_authority(AcquirePartitionAuthorityRequest {
+                    key: key.clone(),
+                    owner_id: "writer-a".to_string(),
+                    current_token: None,
+                    ttl_ms: 60_000,
+                })
+                .await
+                .unwrap()
+            else {
+                panic!("{label} should acquire authority");
+            };
+            let session = test_partition_authority_session_for_token(
+                Arc::clone(&store) as Arc<dyn MetaStore>,
+                key,
+                "writer-a",
+                token,
+            );
+            let descriptor = test_partition_descriptor();
+
+            for phase in [
+                IngestCommitGuardPhase::BeforeAdmission,
+                IngestCommitGuardPhase::BeforeCommit,
+            ] {
+                session.verify(phase, &descriptor).await.unwrap();
+            }
+            assert!(
+                !session.fenced.load(Ordering::SeqCst),
+                "{label} must not fence a Meta-current authority token"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_clock_behind_fences_both_phases_after_meta_expiry_without_takeover() {
+        const FIVE_MINUTES_MS: u64 = 5 * 60 * 1_000;
+        const TTL_MS: u64 = 60_000;
+        let writer_now = unix_ms().unwrap();
+        let meta_now = writer_now + FIVE_MINUTES_MS;
+        let store = Arc::new(velorix_meta::InMemoryMetaStore::default());
+        store.set_partition_authority_clock_for_test(meta_now).await;
+        let key = PartitionAuthorityKey {
+            namespace: "tenant-writer-behind".to_string(),
+            view_id: "scores-view".to_string(),
+            stream_id: "scores".to_string(),
+            partition_id: 0,
+        };
+        let AcquirePartitionAuthorityOutcome::Acquired(token) = store
+            .acquire_partition_authority(AcquirePartitionAuthorityRequest {
+                key: key.clone(),
+                owner_id: "writer-a".to_string(),
+                current_token: None,
+                ttl_ms: TTL_MS,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("writer A should acquire authority");
+        };
+        store
+            .set_partition_authority_clock_for_test(meta_now + TTL_MS)
+            .await;
+        assert!(
+            store
+                .read_partition_authority(&key)
+                .await
+                .unwrap()
+                .is_none(),
+            "the Meta clock alone must expire the token without an owner handoff"
+        );
+
+        let descriptor = test_partition_descriptor();
+        for phase in [
+            IngestCommitGuardPhase::BeforeAdmission,
+            IngestCommitGuardPhase::BeforeCommit,
+        ] {
+            let session = test_partition_authority_session_for_token(
+                Arc::clone(&store) as Arc<dyn MetaStore>,
+                key.clone(),
+                "writer-a",
+                token.clone(),
+            );
+            let error = session.verify(phase, &descriptor).await.unwrap_err();
+            assert!(error.contains("stale"), "{error}");
+            assert!(
+                session.fenced.load(Ordering::SeqCst),
+                "writer-behind must fence at {} after Meta expiry",
+                phase.as_str()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn renewal_loss_fences_writer_and_blocks_admission_commit_and_checkpoint_publication() {
+        let store = Arc::new(velorix_meta::InMemoryMetaStore::default());
+        store.set_partition_authority_clock_for_test(10).await;
+        let key = PartitionAuthorityKey {
+            namespace: "tenant-a".to_string(),
+            view_id: "scores-view".to_string(),
+            stream_id: "scores".to_string(),
+            partition_id: 0,
+        };
+        let AcquirePartitionAuthorityOutcome::Acquired(token_a) = store
+            .acquire_partition_authority(AcquirePartitionAuthorityRequest {
+                key: key.clone(),
+                owner_id: "writer-a".to_string(),
+                current_token: None,
+                ttl_ms: 10,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("writer A should acquire");
+        };
+        let session = test_partition_authority_session_for_token(
+            Arc::clone(&store) as Arc<dyn MetaStore>,
+            key.clone(),
+            "writer-a",
+            token_a.clone(),
+        );
+
+        store.set_partition_authority_clock_for_test(20).await;
+        let AcquirePartitionAuthorityOutcome::Acquired(token_b) = store
+            .acquire_partition_authority(AcquirePartitionAuthorityRequest {
+                key: key.clone(),
+                owner_id: "writer-b".to_string(),
+                current_token: None,
+                ttl_ms: 60_000,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("writer B should acquire after Meta expiry");
+        };
+        assert!(token_b.owner_epoch > token_a.owner_epoch);
+
+        let renewal_error = session.renew_once().await.unwrap_err();
+        assert!(renewal_error.contains("lost ownership"), "{renewal_error}");
+        assert!(session.fenced.load(Ordering::SeqCst));
+
+        let descriptor = test_partition_descriptor();
+        for phase in [
+            IngestCommitGuardPhase::BeforeAdmission,
+            IngestCommitGuardPhase::BeforeCommit,
+        ] {
+            let error = session.verify(phase, &descriptor).await.unwrap_err();
+            assert!(error.contains("fenced"), "{error}");
+        }
+
+        let before = store.read_partition_checkpoint_pointer(&key).await.unwrap();
+        let stale_publish = store
+            .publish_partition_checkpoint_pointer(PublishPartitionCheckpointPointerRequest {
+                expected_previous: before.clone(),
+                candidate: PartitionCheckpointPointer {
+                    key: key.clone(),
+                    checkpoint_key: "v1/checkpoints/stale-writer-a".to_string(),
+                },
+                authority: token_a,
+            })
+            .await;
+        assert!(stale_publish.is_err());
+        assert_eq!(
+            store.read_partition_checkpoint_pointer(&key).await.unwrap(),
+            before
+        );
+
+        let owner_b_publish = store
+            .publish_partition_checkpoint_pointer(PublishPartitionCheckpointPointerRequest {
+                expected_previous: None,
+                candidate: PartitionCheckpointPointer {
+                    key,
+                    checkpoint_key: "v1/checkpoints/owner-b".to_string(),
+                },
+                authority: token_b,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            owner_b_publish,
+            velorix_meta::PublishPartitionCheckpointPointerOutcome::Published
         );
     }
 
