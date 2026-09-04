@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use arrow::{
@@ -34,6 +35,7 @@ use crate::{
 };
 
 const INGEST_PREFIX: &str = "v1/ingest";
+const INGEST_STAGING_PREFIX: &str = "v1/ingest-staging/";
 const INGEST_ADMISSION_RECORD_KIND_V1: &str = "ingest_range_admission_v1";
 const INGEST_ADMISSION_EXPIRY_DECISION_RECORD_KIND_V1: &str =
     "ingest_admission_orphan_expiry_decision_v1";
@@ -93,6 +95,81 @@ pub struct IngestBatchDescriptor {
     pub start_offset_inclusive: u64,
     pub end_offset_exclusive: u64,
     pub object_key: ObjectKey,
+}
+
+/// An immutable object staged before ingest admission.
+///
+/// The digest is part of the record supplied by the caller and is checked
+/// against the bytes on construction and on every read. A staging record is
+/// never a committed ingest descriptor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IngestStagingRecord {
+    pub object_key: ObjectKey,
+    pub payload_digest: String,
+    pub payload: Bytes,
+}
+
+impl IngestStagingRecord {
+    pub fn new(object_key: ObjectKey, payload: Bytes) -> Result<Self, IngestLogError> {
+        let payload_digest = digest_bytes(&payload);
+        Self::with_digest(object_key, payload, payload_digest)
+    }
+
+    pub fn with_digest(
+        object_key: ObjectKey,
+        payload: Bytes,
+        payload_digest: impl Into<String>,
+    ) -> Result<Self, IngestLogError> {
+        ObjectKey::parse_ingest_staging(object_key.as_str())?;
+        let payload_digest = payload_digest.into();
+        validate_staging_digest(&payload_digest)?;
+        let actual_digest = digest_bytes(&payload);
+        if payload_digest != actual_digest {
+            return Err(IngestLogError::IngestStagingDigestMismatch {
+                object_key,
+                expected_digest: payload_digest,
+                actual_digest,
+            });
+        }
+
+        Ok(Self {
+            object_key,
+            payload_digest,
+            payload,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IngestStagingWriteOutcome {
+    Created(IngestStagingRecord),
+    Duplicate(IngestStagingRecord),
+    Conflict {
+        object_key: ObjectKey,
+        existing_digest: String,
+        requested_digest: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IngestStagingCleanupPolicy {
+    pub min_age: Duration,
+    pub limit: usize,
+}
+
+impl IngestStagingCleanupPolicy {
+    pub const fn new(min_age: Duration, limit: usize) -> Self {
+        Self { min_age, limit }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IngestStagingCandidate {
+    pub object_key: ObjectKey,
+    pub size: u64,
+    pub last_modified_unix_nanos: i64,
+    pub e_tag: Option<String>,
+    pub version: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -299,6 +376,31 @@ pub enum IngestLogError {
     ObjectKey(#[from] ObjectKeyError),
     #[error("ingest batch object `{0}` already exists")]
     AlreadyExists(ObjectKey),
+    #[error("invalid ingest staging digest `{digest}`; expected sha256:<64 hex chars>")]
+    InvalidIngestStagingDigest { digest: String },
+    #[error(
+        "ingest staging object `{object_key}` digest mismatch: expected {expected_digest}, actual {actual_digest}"
+    )]
+    IngestStagingDigestMismatch {
+        object_key: ObjectKey,
+        expected_digest: String,
+        actual_digest: String,
+    },
+    #[error("ingest staging object `{0}` was not found")]
+    MissingIngestStagingObject(ObjectKey),
+    #[error("ingest staging object `{object_key}` requires conditional create, but the object store does not support PutMode::Create: {reason}")]
+    IngestStagingConditionalCreateUnsupported {
+        object_key: ObjectKey,
+        reason: String,
+    },
+    #[error(
+        "ingest staging object `{object_key}` already exists with a different digest: existing={existing_digest}, requested={requested_digest}"
+    )]
+    IngestStagingConflict {
+        object_key: ObjectKey,
+        existing_digest: String,
+        requested_digest: String,
+    },
     #[error("malformed ingest batch key `{key}`: {source}")]
     MalformedIngestKey { key: String, source: ObjectKeyError },
     #[error("malformed durable ingest admission record `{key}`: {reason}")]
@@ -1679,6 +1781,170 @@ impl IngestLog {
             .map(|reconstruction| reconstruction.active_records)
     }
 
+    /// Create an immutable ingest staging object. A retry with the same key
+    /// and digest is reported as a duplicate; a retry with a different digest
+    /// is a conflict and never overwrites the existing bytes.
+    pub async fn write_ingest_staging(
+        &self,
+        object_key: impl AsRef<str>,
+        payload: Bytes,
+        payload_digest: impl Into<String>,
+    ) -> Result<IngestStagingWriteOutcome, IngestLogError> {
+        let (object_key, _) = ObjectKey::parse_ingest_staging(object_key.as_ref().to_string())?;
+        let record = IngestStagingRecord::with_digest(object_key, payload, payload_digest)?;
+        self.stage_ingest_record(&record).await
+    }
+
+    /// Alias for [`Self::write_ingest_staging`] using staging terminology.
+    pub async fn stage_write(
+        &self,
+        object_key: impl AsRef<str>,
+        payload: Bytes,
+        payload_digest: impl Into<String>,
+    ) -> Result<IngestStagingWriteOutcome, IngestLogError> {
+        self.write_ingest_staging(object_key, payload, payload_digest)
+            .await
+    }
+
+    /// Writes a previously validated staging record.
+    pub async fn stage_ingest_record(
+        &self,
+        record: &IngestStagingRecord,
+    ) -> Result<IngestStagingWriteOutcome, IngestLogError> {
+        ObjectKey::parse_ingest_staging(record.object_key.as_str())?;
+        validate_staging_digest(&record.payload_digest)?;
+        let actual_digest = digest_bytes(&record.payload);
+        if actual_digest != record.payload_digest {
+            return Err(IngestLogError::IngestStagingDigestMismatch {
+                object_key: record.object_key.clone(),
+                expected_digest: record.payload_digest.clone(),
+                actual_digest,
+            });
+        }
+        let path = Path::from(record.object_key.as_str());
+        let result = self
+            .store
+            .put_opts(&path, record.payload.clone().into(), PutMode::Create.into())
+            .await;
+
+        match result {
+            Ok(_) => Ok(IngestStagingWriteOutcome::Created(record.clone())),
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                let existing = self.store.get(&path).await?.bytes().await?;
+                let existing_digest = digest_bytes(&existing);
+                if existing_digest == record.payload_digest {
+                    Ok(IngestStagingWriteOutcome::Duplicate(IngestStagingRecord {
+                        object_key: record.object_key.clone(),
+                        payload_digest: existing_digest,
+                        payload: existing,
+                    }))
+                } else {
+                    Ok(IngestStagingWriteOutcome::Conflict {
+                        object_key: record.object_key.clone(),
+                        existing_digest,
+                        requested_digest: record.payload_digest.clone(),
+                    })
+                }
+            }
+            Err(object_store::Error::NotSupported { source }) => {
+                Err(IngestLogError::IngestStagingConditionalCreateUnsupported {
+                    object_key: record.object_key.clone(),
+                    reason: source.to_string(),
+                })
+            }
+            Err(object_store::Error::NotImplemented {
+                operation,
+                implementer,
+            }) => Err(IngestLogError::IngestStagingConditionalCreateUnsupported {
+                object_key: record.object_key.clone(),
+                reason: format!("{operation} is not implemented by {implementer}"),
+            }),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Reads an immutable staging object only when its bytes match the caller
+    /// supplied digest. Missing objects and mismatches fail closed.
+    pub async fn read_ingest_staging(
+        &self,
+        object_key: impl AsRef<str>,
+        expected_digest: impl AsRef<str>,
+    ) -> Result<Bytes, IngestLogError> {
+        let (object_key, _) = ObjectKey::parse_ingest_staging(object_key.as_ref().to_string())?;
+        let expected_digest = expected_digest.as_ref();
+        validate_staging_digest(expected_digest)?;
+        let bytes = match self.store.get(&Path::from(object_key.as_str())).await {
+            Ok(object) => object.bytes().await?,
+            Err(object_store::Error::NotFound { .. }) => {
+                return Err(IngestLogError::MissingIngestStagingObject(object_key));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let actual_digest = digest_bytes(&bytes);
+        if actual_digest != expected_digest {
+            return Err(IngestLogError::IngestStagingDigestMismatch {
+                object_key,
+                expected_digest: expected_digest.to_string(),
+                actual_digest,
+            });
+        }
+
+        Ok(bytes)
+    }
+
+    /// Alias for [`Self::read_ingest_staging`].
+    pub async fn read_staging(
+        &self,
+        object_key: impl AsRef<str>,
+        expected_digest: impl AsRef<str>,
+    ) -> Result<Bytes, IngestLogError> {
+        self.read_ingest_staging(object_key, expected_digest).await
+    }
+
+    /// Lists at most `policy.limit` old staging objects. This is deliberately
+    /// a candidate API: without authoritative committed references the
+    /// storage layer cannot decide that an object is safe to delete.
+    pub async fn list_ingest_staging_candidates(
+        &self,
+        policy: IngestStagingCleanupPolicy,
+    ) -> Result<Vec<IngestStagingCandidate>, IngestLogError> {
+        if policy.limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let now = unix_now_nanos();
+        let min_age_nanos = i128::try_from(policy.min_age.as_nanos()).unwrap_or(i128::MAX);
+        let cutoff = now.saturating_sub(min_age_nanos);
+        let mut candidates = Vec::new();
+        let mut objects = self.store.list(Some(&Path::from(INGEST_STAGING_PREFIX)));
+        while let Some(object) = objects.try_next().await? {
+            let last_modified_unix_nanos = object_last_modified_nanos(&object);
+            if i128::from(last_modified_unix_nanos) > cutoff {
+                continue;
+            }
+            let (object_key, _) = ObjectKey::parse_ingest_staging(object.location.to_string())?;
+            let candidate = IngestStagingCandidate {
+                object_key,
+                size: object.size,
+                last_modified_unix_nanos,
+                e_tag: object.e_tag,
+                version: object.version,
+            };
+
+            candidates.push(candidate);
+            candidates.sort_by(|left, right| {
+                left.last_modified_unix_nanos
+                    .cmp(&right.last_modified_unix_nanos)
+                    .then_with(|| left.object_key.cmp(&right.object_key))
+            });
+            if candidates.len() > policy.limit {
+                candidates.pop();
+            }
+        }
+
+        Ok(candidates)
+    }
+
     pub async fn append(&self, batch: &IngestBatch) -> Result<(), IngestLogError> {
         let path = Path::from(batch.object_key().as_str());
         let result = self
@@ -1867,7 +2133,7 @@ impl IngestLog {
     pub async fn list_committed(&self) -> Result<Vec<IngestBatchDescriptor>, IngestLogError> {
         let mut objects = self
             .store
-            .list(Some(&Path::from(INGEST_PREFIX)))
+            .list(Some(&Path::from(format!("{INGEST_PREFIX}/"))))
             .try_collect::<Vec<_>>()
             .await?;
 
@@ -3048,6 +3314,31 @@ fn is_sha256_digest(value: &str) -> bool {
 
 fn digest_bytes(bytes: &Bytes) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+fn validate_staging_digest(digest: &str) -> Result<(), IngestLogError> {
+    if is_sha256_digest(digest) {
+        Ok(())
+    } else {
+        Err(IngestLogError::InvalidIngestStagingDigest {
+            digest: digest.to_string(),
+        })
+    }
+}
+
+fn unix_now_nanos() -> i128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| i128::try_from(duration.as_nanos()).unwrap_or(i128::MAX))
+        .unwrap_or(0)
+}
+
+fn object_last_modified_nanos(object: &object_store::ObjectMeta) -> i64 {
+    object
+        .last_modified
+        .timestamp()
+        .saturating_mul(1_000_000_000)
+        .saturating_add(i64::from(object.last_modified.timestamp_subsec_nanos()))
 }
 
 impl IngestBatch {

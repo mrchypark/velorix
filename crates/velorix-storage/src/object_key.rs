@@ -19,6 +19,23 @@ pub struct IngestBatchKeyParts {
     pub end_offset_exclusive: u64,
 }
 
+/// The parsed components of an immutable ingest staging object key.
+///
+/// Staging is deliberately a separate namespace from `v1/ingest`: objects in
+/// this namespace are not committed input and must not be considered by log
+/// listing or replay.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IngestStagingKeyParts {
+    pub stream_id: String,
+    pub partition_id: u32,
+    pub start_offset_inclusive: u64,
+    pub end_offset_exclusive: u64,
+    pub staging_id: String,
+}
+
+/// Backwards-friendly descriptive alias for [`IngestStagingKeyParts`].
+pub type IngestStagingObjectKeyParts = IngestStagingKeyParts;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutputObjectKeyParts {
     pub stream_id: String,
@@ -128,6 +145,42 @@ impl ObjectKey {
         Ok(Self(format!(
             "v1/ingest/{stream_id}/p={partition_id:0PARTITION_WIDTH$}/{start_offset_inclusive:0OFFSET_WIDTH$}-{end_offset_exclusive:0OFFSET_WIDTH$}.batch"
         )))
+    }
+
+    /// Builds a deterministic key for an immutable, pre-admission ingest
+    /// object. Staging has its own namespace so a staged object can never be
+    /// mistaken for a committed batch by the ingest log.
+    pub fn ingest_staging(
+        stream_id: &str,
+        partition_id: u32,
+        start_offset_inclusive: u64,
+        end_offset_exclusive: u64,
+        staging_id: &str,
+    ) -> Result<Self, ObjectKeyError> {
+        validate_segment("stream_id", stream_id)?;
+        validate_segment("staging_id", staging_id)?;
+        validate_offset_range(start_offset_inclusive, end_offset_exclusive)?;
+
+        Ok(Self(format!(
+            "v1/ingest-staging/{stream_id}/p={partition_id:0PARTITION_WIDTH$}/{start_offset_inclusive:0OFFSET_WIDTH$}-{end_offset_exclusive:0OFFSET_WIDTH$}/{staging_id}.stage"
+        )))
+    }
+
+    /// Descriptive alias for [`Self::ingest_staging`].
+    pub fn ingest_staging_object(
+        stream_id: &str,
+        partition_id: u32,
+        start_offset_inclusive: u64,
+        end_offset_exclusive: u64,
+        staging_id: &str,
+    ) -> Result<Self, ObjectKeyError> {
+        Self::ingest_staging(
+            stream_id,
+            partition_id,
+            start_offset_inclusive,
+            end_offset_exclusive,
+            staging_id,
+        )
     }
 
     pub fn ingest_admission_record(
@@ -475,6 +528,22 @@ impl ObjectKey {
         Ok((key, parts))
     }
 
+    pub fn parse_ingest_staging(
+        value: impl Into<String>,
+    ) -> Result<(Self, IngestStagingKeyParts), ObjectKeyError> {
+        let value = value.into();
+        let key = Self::parse(value.clone())?;
+        let parts = parse_ingest_staging_layout(&value)?;
+
+        Ok((key, parts))
+    }
+
+    pub fn parse_ingest_staging_object(
+        value: impl Into<String>,
+    ) -> Result<(Self, IngestStagingKeyParts), ObjectKeyError> {
+        Self::parse_ingest_staging(value)
+    }
+
     pub fn parse_output_object(
         value: impl Into<String>,
     ) -> Result<(Self, OutputObjectKeyParts), ObjectKeyError> {
@@ -556,6 +625,12 @@ impl fmt::Display for ObjectKey {
     }
 }
 
+impl AsRef<str> for ObjectKey {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
 impl<'de> Deserialize<'de> for ObjectKey {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -572,6 +647,9 @@ fn validate_known_layout(value: &str) -> Result<(), ObjectKeyError> {
     match segments.as_slice() {
         ["v1", "ingest", stream_id, partition, range] => {
             parse_ingest_batch_parts(value, stream_id, partition, range)?;
+        }
+        ["v1", "ingest-staging", stream_id, partition, range, staging_file] => {
+            parse_ingest_staging_parts(value, stream_id, partition, range, staging_file)?;
         }
         ["v1", "ingest-admission", stream_id, partition, "ranges", admission_file] => {
             validate_segment("stream_id", stream_id)?;
@@ -794,6 +872,17 @@ fn parse_ingest_batch_layout(value: &str) -> Result<IngestBatchKeyParts, ObjectK
     parse_ingest_batch_parts(value, stream_id, partition, range)
 }
 
+fn parse_ingest_staging_layout(value: &str) -> Result<IngestStagingKeyParts, ObjectKeyError> {
+    let segments: Vec<_> = value.split('/').collect();
+
+    let ["v1", "ingest-staging", stream_id, partition, range, staging_file] = segments.as_slice()
+    else {
+        return Err(ObjectKeyError::InvalidExternalKey(value.to_string()));
+    };
+
+    parse_ingest_staging_parts(value, stream_id, partition, range, staging_file)
+}
+
 fn parse_output_object_layout(value: &str) -> Result<OutputObjectKeyParts, ObjectKeyError> {
     let segments: Vec<_> = value.split('/').collect();
 
@@ -943,6 +1032,30 @@ fn parse_ingest_batch_parts(
         partition_id,
         start_offset_inclusive,
         end_offset_exclusive,
+    })
+}
+
+fn parse_ingest_staging_parts(
+    value: &str,
+    stream_id: &str,
+    partition: &str,
+    range: &str,
+    staging_file: &str,
+) -> Result<IngestStagingKeyParts, ObjectKeyError> {
+    validate_segment("stream_id", stream_id)?;
+    let partition_id = parse_prefixed_u32("partition_id", partition, "p=", PARTITION_WIDTH)?;
+    let (start_offset_inclusive, end_offset_exclusive) = parse_offset_range(value, range)?;
+    let staging_id = staging_file
+        .strip_suffix(".stage")
+        .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
+    validate_segment("staging_id", staging_id)?;
+
+    Ok(IngestStagingKeyParts {
+        stream_id: stream_id.to_string(),
+        partition_id,
+        start_offset_inclusive,
+        end_offset_exclusive,
+        staging_id: staging_id.to_string(),
     })
 }
 
@@ -1279,6 +1392,37 @@ mod tests {
         );
         assert_eq!(key, restarted);
         assert_eq!(key.to_string(), key.as_str());
+    }
+
+    #[test]
+    fn ingest_staging_key_is_immutable_namespace_and_parseable() {
+        let key = ObjectKey::ingest_staging("orders", 7, 42, 100, "attempt-a").unwrap();
+        assert_eq!(
+            key.as_str(),
+            "v1/ingest-staging/orders/p=0000000007/00000000000000000042-00000000000000000100/attempt-a.stage"
+        );
+        let (parsed, parts) = ObjectKey::parse_ingest_staging(key.as_str()).unwrap();
+        assert_eq!(parsed, key);
+        assert_eq!(parts.stream_id, "orders");
+        assert_eq!(parts.partition_id, 7);
+        assert_eq!(parts.start_offset_inclusive, 42);
+        assert_eq!(parts.end_offset_exclusive, 100);
+        assert_eq!(parts.staging_id, "attempt-a");
+        assert!(ObjectKey::parse("v1/ingest-staging/orders/p=0000000007/00000000000000000042-00000000000000000100/attempt-a.txt").is_err());
+    }
+
+    #[test]
+    fn ingest_staging_parser_rejects_traversal_empty_and_malformed_keys() {
+        for invalid in [
+            "v1/ingest-staging/../p=0000000000/00000000000000000000-00000000000000000001/a.stage",
+            "v1/ingest-staging/orders!/p=0000000000/00000000000000000000-00000000000000000001/a.stage",
+            "v1/ingest-staging/orders/p=0000000000//a.stage",
+            "v1/ingest-staging/orders/p=0000000000/00000000000000000000-00000000000000000001/.stage",
+            "v1/ingest-staging/orders/p=0000000000/00000000000000000000-00000000000000000001/../a.stage",
+            "v1/ingest-staging/orders/p=0000000000/00000000000000000000-00000000000000000001/a.stage/extra",
+        ] {
+            assert!(ObjectKey::parse_ingest_staging(invalid).is_err(), "accepted {invalid}");
+        }
     }
 
     #[test]
