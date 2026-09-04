@@ -8,15 +8,228 @@ use velorix_core::standing_program::{
     RuntimeCheckpointRelationCoverageV1, RUNTIME_CHECKPOINT_INPUT_COVERAGE_SCHEMA_VERSION_V1,
 };
 use velorix_meta::{
+    AcquirePartitionAuthorityOutcome, AcquirePartitionAuthorityRequest,
     AcquireStandingRuntimeOwnerOutcome, AcquireStandingRuntimeOwnerRequest,
     BeginViewBootstrapOutcome, BeginViewBootstrapRequest, BeginViewDependencyEdgeV1,
     CommitIngestRangeOutcome, FixViewBootstrapActivationCutOutcome,
     FixViewBootstrapActivationCutRequest, HiqliteMetaStore, IngestRangeReservation,
-    IngestSourceCutV1, IngestSourceRelationIdentityV1, MetaStore, PromoteViewBootstrapOutcome,
+    IngestSourceCutV1, IngestSourceRelationIdentityV1, MetaStore, MetaStoreError,
+    PartitionAuthorityKey, PartitionAuthorityToken, PromoteViewBootstrapOutcome,
     PromoteViewBootstrapRequest, PublishStandingRuntimeCheckpointOutcome,
     PublishStandingRuntimeCheckpointRequest, ReserveIngestRangeOutcome,
     StandingRuntimeCheckpointPointer, StandingRuntimeOwnerToken, ViewBootstrapLifecycleV1,
 };
+
+#[tokio::test]
+async fn hiqlite_partition_authority_acquire_retry_renew_takeover_and_read() {
+    let (_dir, store, client) = start_store().await;
+    let request = partition_authority_request("worker-a", None);
+    let first = match store
+        .acquire_partition_authority(request.clone())
+        .await
+        .unwrap()
+    {
+        AcquirePartitionAuthorityOutcome::Acquired(token) => token,
+        other => panic!("unexpected first authority outcome: {other:?}"),
+    };
+    assert_eq!(first.owner_epoch, 1);
+    assert_eq!(
+        store.acquire_partition_authority(request).await.unwrap(),
+        AcquirePartitionAuthorityOutcome::Acquired(first.clone())
+    );
+    let renewed = match store
+        .acquire_partition_authority(partition_authority_request("worker-a", Some(first.clone())))
+        .await
+        .unwrap()
+    {
+        AcquirePartitionAuthorityOutcome::Renewed(token) => token,
+        other => panic!("unexpected renewal outcome: {other:?}"),
+    };
+    assert_eq!(renewed.owner_epoch, 1);
+    let mut stale_renewal = partition_authority_request("worker-a", Some(first));
+    stale_renewal.ttl_ms += 1;
+    assert!(matches!(
+        store
+            .acquire_partition_authority(stale_renewal)
+            .await
+            .unwrap(),
+        AcquirePartitionAuthorityOutcome::Conflict(_)
+    ));
+    client.execute(
+        "UPDATE velorix_partition_authorities SET expires_at_unix_ms = 0 WHERE namespace = $1 AND view_id = $2 AND stream_id = $3 AND partition_id = $4",
+        vec![hiqlite::Param::from("default"), hiqlite::Param::from("view"), hiqlite::Param::from("orders"), hiqlite::Param::from(0_i64)],
+    ).await.unwrap();
+    let takeover = match store
+        .acquire_partition_authority(partition_authority_request("worker-b", None))
+        .await
+        .unwrap()
+    {
+        AcquirePartitionAuthorityOutcome::Acquired(token) => token,
+        other => panic!("unexpected takeover outcome: {other:?}"),
+    };
+    assert_eq!(takeover.owner_epoch, 2);
+    assert_eq!(
+        store
+            .read_partition_authority(&partition_authority_key())
+            .await
+            .unwrap(),
+        Some(takeover)
+    );
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn hiqlite_partition_authority_concurrent_claim_has_one_winner() {
+    let (_dir, store, client) = start_store().await;
+    let store = Arc::new(store);
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let mut workers = Vec::new();
+    for owner_id in ["worker-a", "worker-b"] {
+        let store = Arc::clone(&store);
+        let barrier = Arc::clone(&barrier);
+        workers.push(tokio::spawn(async move {
+            barrier.wait().await;
+            store
+                .acquire_partition_authority(partition_authority_request(owner_id, None))
+                .await
+                .unwrap()
+        }));
+    }
+    barrier.wait().await;
+    let outcomes = [
+        workers.remove(0).await.unwrap(),
+        workers.remove(0).await.unwrap(),
+    ];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, AcquirePartitionAuthorityOutcome::Acquired(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, AcquirePartitionAuthorityOutcome::Conflict(_)))
+            .count(),
+        1
+    );
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn hiqlite_partition_authority_epoch_overflow_fails_closed_without_mutation() {
+    let (_dir, store, client) = start_store().await;
+    client.execute(
+        "INSERT INTO velorix_partition_authorities (namespace, view_id, stream_id, partition_id, owner_id, owner_epoch, expires_at_unix_ms, last_request_id, last_outcome) VALUES ($1, $2, $3, $4, $5, $6, $7, '', '')",
+        vec![hiqlite::Param::from("default"), hiqlite::Param::from("view"), hiqlite::Param::from("orders"), hiqlite::Param::from(1_i64), hiqlite::Param::from("worker-a"), hiqlite::Param::from(i64::MAX), hiqlite::Param::from(i64::MAX)],
+    ).await.unwrap();
+    let live_max = PartitionAuthorityToken {
+        key: PartitionAuthorityKey {
+            partition_id: 1,
+            ..partition_authority_key()
+        },
+        owner_id: "worker-a".to_string(),
+        owner_epoch: i64::MAX as u64,
+        expires_at_unix_ms: i64::MAX as u64,
+    };
+    let mut renew_max = partition_authority_request("worker-a", Some(live_max));
+    renew_max.key.partition_id = 1;
+    assert!(
+        matches!(store.acquire_partition_authority(renew_max).await.unwrap(), AcquirePartitionAuthorityOutcome::Renewed(token) if token.owner_epoch == i64::MAX as u64)
+    );
+    client.execute(
+        "INSERT INTO velorix_partition_authorities (namespace, view_id, stream_id, partition_id, owner_id, owner_epoch, expires_at_unix_ms, last_request_id, last_outcome) VALUES ($1, $2, $3, $4, $5, $6, 0, '', '')",
+        vec![hiqlite::Param::from("default"), hiqlite::Param::from("view"), hiqlite::Param::from("orders"), hiqlite::Param::from(0_i64), hiqlite::Param::from("worker-a"), hiqlite::Param::from(i64::MAX)],
+    ).await.unwrap();
+    assert!(matches!(
+        store
+            .acquire_partition_authority(partition_authority_request("worker-b", None))
+            .await,
+        Err(MetaStoreError::AuthorityEpochOverflow)
+    ));
+    let mut rows = client.query_consistent("SELECT owner_id, owner_epoch, expires_at_unix_ms FROM velorix_partition_authorities WHERE namespace = $1 AND view_id = $2 AND stream_id = $3 AND partition_id = $4", vec![hiqlite::Param::from("default"), hiqlite::Param::from("view"), hiqlite::Param::from("orders"), hiqlite::Param::from(0_i64)]).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<String>("owner_id"), "worker-a");
+    assert_eq!(rows[0].get::<i64>("owner_epoch"), i64::MAX);
+    assert_eq!(rows[0].get::<i64>("expires_at_unix_ms"), 0);
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn hiqlite_partition_authority_max_minus_one_takeover_never_wraps() {
+    let (_dir, store, client) = start_store().await;
+    client.execute(
+        "INSERT INTO velorix_partition_authorities (namespace, view_id, stream_id, partition_id, owner_id, owner_epoch, expires_at_unix_ms, last_request_id, last_outcome) VALUES ($1, $2, $3, 2, 'old', $4, 0, '', '')",
+        vec![hiqlite::Param::from("default"), hiqlite::Param::from("view"), hiqlite::Param::from("orders"), hiqlite::Param::from(i64::MAX - 1)],
+    ).await.unwrap();
+    let store = Arc::new(store);
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let mut workers = Vec::new();
+    for owner_id in ["worker-a", "worker-b"] {
+        let store = Arc::clone(&store);
+        let barrier = Arc::clone(&barrier);
+        workers.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let mut request = partition_authority_request(owner_id, None);
+            request.key.partition_id = 2;
+            store.acquire_partition_authority(request).await
+        }));
+    }
+    barrier.wait().await;
+    let outcomes = [
+        workers.remove(0).await.unwrap(),
+        workers.remove(0).await.unwrap(),
+    ];
+    assert_eq!(outcomes.iter().filter(|outcome| matches!(outcome, Ok(AcquirePartitionAuthorityOutcome::Acquired(token)) if token.owner_epoch == i64::MAX as u64)).count(), 1);
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(
+                outcome,
+                Ok(AcquirePartitionAuthorityOutcome::Conflict(_))
+                    | Err(MetaStoreError::AuthorityEpochOverflow)
+            ))
+            .count(),
+        1
+    );
+    let mut rows = client.query_consistent("SELECT owner_epoch FROM velorix_partition_authorities WHERE namespace = $1 AND view_id = $2 AND stream_id = $3 AND partition_id = 2", vec![hiqlite::Param::from("default"), hiqlite::Param::from("view"), hiqlite::Param::from("orders")]).await.unwrap();
+    assert_eq!(rows[0].get::<i64>("owner_epoch"), i64::MAX);
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn hiqlite_partition_authority_reopen_repairs_legacy_tables_and_replays_status() {
+    let (_dir, _store, client) = start_store().await;
+    client
+        .execute("DROP TABLE velorix_partition_authority_requests", vec![])
+        .await
+        .unwrap();
+    client
+        .execute("DROP TABLE velorix_partition_authorities", vec![])
+        .await
+        .unwrap();
+    client.execute("CREATE TABLE velorix_partition_authorities (namespace TEXT NOT NULL, view_id TEXT NOT NULL, stream_id TEXT NOT NULL, partition_id INTEGER NOT NULL, owner_id TEXT NOT NULL, owner_epoch INTEGER NOT NULL, expires_at_unix_ms INTEGER NOT NULL, PRIMARY KEY(namespace, view_id, stream_id, partition_id))", vec![]).await.unwrap();
+    client.execute("CREATE TABLE velorix_partition_authority_requests (request_id TEXT NOT NULL PRIMARY KEY)", vec![]).await.unwrap();
+    let store = HiqliteMetaStore::new(client.clone()).await.unwrap();
+    let request = partition_authority_request("worker-a", None);
+    let first = store
+        .acquire_partition_authority(request.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        store.acquire_partition_authority(request).await.unwrap(),
+        first
+    );
+    client
+        .query_consistent(
+            "SELECT outcome, expires_at_unix_ms FROM velorix_partition_authority_requests LIMIT 0",
+            vec![],
+        )
+        .await
+        .unwrap();
+    client.shutdown().await.unwrap();
+}
 
 #[tokio::test]
 async fn hiqlite_view_input_bootstrap_retries_do_not_advance_graph_revision() {
@@ -428,6 +641,27 @@ async fn start_store() -> (TempDir, HiqliteMetaStore, hiqlite::Client) {
 fn free_addr() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.local_addr().unwrap().to_string()
+}
+
+fn partition_authority_key() -> PartitionAuthorityKey {
+    PartitionAuthorityKey {
+        namespace: "default".to_string(),
+        view_id: "view".to_string(),
+        stream_id: "orders".to_string(),
+        partition_id: 0,
+    }
+}
+
+fn partition_authority_request(
+    owner_id: &str,
+    current_token: Option<PartitionAuthorityToken>,
+) -> AcquirePartitionAuthorityRequest {
+    AcquirePartitionAuthorityRequest {
+        key: partition_authority_key(),
+        owner_id: owner_id.to_string(),
+        current_token,
+        ttl_ms: 60_000,
+    }
 }
 
 fn relation() -> IngestSourceRelationIdentityV1 {

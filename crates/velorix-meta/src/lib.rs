@@ -10,6 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use object_store::ObjectStore;
+#[cfg(feature = "hiqlite-backend")]
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tonic::{metadata::MetadataValue, transport::Channel, Request, Response, Status};
@@ -336,6 +338,8 @@ pub enum MetaStoreError {
     IntegerOutOfRange { field: &'static str, value: u64 },
     #[error("metadata timestamp overflow")]
     TimestampOverflow,
+    #[error("partition authority epoch cannot advance beyond i64::MAX")]
+    AuthorityEpochOverflow,
     #[error("metadata serialization error: {0}")]
     Serialization(String),
     #[error("standing runtime checkpoint pointer scope mismatch")]
@@ -519,6 +523,9 @@ pub trait MetaStore: Send + Sync + 'static {
         &self,
         key: &PartitionAuthorityKey,
     ) -> Result<Option<PartitionAuthorityToken>, MetaStoreError> {
+        // This is an advisory liveness observation. It may be stale as soon as
+        // returned; any future checkpoint publication must revalidate token
+        // and expiry inside its own Raft transaction.
         key.validate()?;
         Err(MetaStoreError::UnsupportedCapability("partition_authority"))
     }
@@ -1184,7 +1191,7 @@ impl MetaStore for InMemoryMetaStore {
                 let owner_epoch = current
                     .owner_epoch
                     .checked_add(1)
-                    .ok_or(MetaStoreError::TimestampOverflow)?;
+                    .ok_or(MetaStoreError::AuthorityEpochOverflow)?;
                 let claim = StandingRuntimeOwnerClaim {
                     tenant_id: request.tenant_id,
                     program_id: request.program_id,
@@ -2809,6 +2816,7 @@ fn meta_status(error: MetaStoreError) -> Status {
         | MetaStoreError::InvalidDuration { .. }
         | MetaStoreError::IntegerOutOfRange { .. }
         | MetaStoreError::TimestampOverflow
+        | MetaStoreError::AuthorityEpochOverflow
         | MetaStoreError::Serialization(_)
         | MetaStoreError::NonMonotonicCheckpointEpoch { .. }
         | MetaStoreError::StandingRuntimeCheckpointScopeMismatch
@@ -3178,6 +3186,118 @@ impl HiqliteMetaStore {
             )
             .await
             .map_err(hiqlite_error)?;
+        self.client
+            .execute(
+                "CREATE TABLE IF NOT EXISTS velorix_partition_authorities (
+                    namespace TEXT NOT NULL,
+                    view_id TEXT NOT NULL,
+                    stream_id TEXT NOT NULL,
+                    partition_id INTEGER NOT NULL,
+                    owner_id TEXT NOT NULL,
+                    owner_epoch INTEGER NOT NULL,
+                    expires_at_unix_ms INTEGER NOT NULL,
+                    last_request_id TEXT NOT NULL,
+                    last_outcome TEXT NOT NULL,
+                    PRIMARY KEY (namespace, view_id, stream_id, partition_id)
+                )",
+                vec![],
+            )
+            .await
+            .map_err(hiqlite_error)?;
+        self.client
+            .execute(
+                "CREATE TABLE IF NOT EXISTS velorix_partition_authority_requests (
+                    request_id TEXT NOT NULL PRIMARY KEY,
+                    request_digest TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    namespace TEXT NOT NULL,
+                    view_id TEXT NOT NULL,
+                    stream_id TEXT NOT NULL,
+                    partition_id INTEGER NOT NULL,
+                    owner_id TEXT NOT NULL,
+                    owner_epoch INTEGER NOT NULL DEFAULT 0,
+                    expires_at_unix_ms INTEGER NOT NULL DEFAULT 0
+                )",
+                vec![],
+            )
+            .await
+            .map_err(hiqlite_error)?;
+        for (table, column, definition) in [
+            (
+                "velorix_partition_authorities",
+                "last_request_id",
+                "TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "velorix_partition_authorities",
+                "last_outcome",
+                "TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "velorix_partition_authority_requests",
+                "request_digest",
+                "TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "velorix_partition_authority_requests",
+                "outcome",
+                "TEXT NOT NULL DEFAULT 'pending'",
+            ),
+            (
+                "velorix_partition_authority_requests",
+                "namespace",
+                "TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "velorix_partition_authority_requests",
+                "view_id",
+                "TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "velorix_partition_authority_requests",
+                "stream_id",
+                "TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "velorix_partition_authority_requests",
+                "partition_id",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "velorix_partition_authority_requests",
+                "owner_id",
+                "TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "velorix_partition_authority_requests",
+                "owner_epoch",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "velorix_partition_authority_requests",
+                "expires_at_unix_ms",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+        ] {
+            let pragma_sql = match table {
+                "velorix_partition_authorities" => {
+                    "PRAGMA table_info(velorix_partition_authorities)"
+                }
+                "velorix_partition_authority_requests" => {
+                    "PRAGMA table_info(velorix_partition_authority_requests)"
+                }
+                _ => unreachable!("partition authority migration table is fixed"),
+            };
+            if !self.hiqlite_table_has_column(pragma_sql, column).await? {
+                self.client
+                    .execute(
+                        format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+                        vec![],
+                    )
+                    .await
+                    .map_err(hiqlite_error)?;
+            }
+        }
         Ok(())
     }
 
@@ -3428,6 +3548,64 @@ impl HiqliteMetaStore {
             active_checkpoint,
             view_inputs,
         }))
+    }
+
+    async fn read_partition_authority_record(
+        &self,
+        key: &PartitionAuthorityKey,
+    ) -> Result<Option<PartitionAuthorityToken>, MetaStoreError> {
+        let partition_id = i64::from(key.partition_id);
+        let rows = self
+            .with_schema_repair(|| async {
+                self.client
+                    .query_consistent_map::<PartitionAuthorityRow, _>(
+                        "SELECT namespace, view_id, stream_id, partition_id, owner_id,
+                                owner_epoch, expires_at_unix_ms
+                         FROM velorix_partition_authorities
+                         WHERE namespace = $1 AND view_id = $2 AND stream_id = $3
+                           AND partition_id = $4",
+                        vec![
+                            hiqlite::Param::from(key.namespace.clone()),
+                            hiqlite::Param::from(key.view_id.clone()),
+                            hiqlite::Param::from(key.stream_id.clone()),
+                            hiqlite::Param::from(partition_id),
+                        ],
+                    )
+                    .await
+                    .map_err(hiqlite_error)
+            })
+            .await?;
+        rows.into_iter()
+            .next()
+            .map(PartitionAuthorityRow::into_token)
+            .transpose()
+    }
+
+    async fn read_partition_authority_request(
+        &self,
+        request_id: &str,
+        request_digest: &str,
+    ) -> Result<PartitionAuthorityRequestRow, MetaStoreError> {
+        let rows = self
+            .with_schema_repair(|| async {
+                self.client
+                    .query_consistent_map::<PartitionAuthorityRequestRow, _>(
+                        "SELECT request_digest, outcome, namespace, view_id, stream_id,
+                                partition_id, owner_id, owner_epoch, expires_at_unix_ms
+                         FROM velorix_partition_authority_requests
+                         WHERE request_id = $1 AND request_digest = $2",
+                        vec![
+                            hiqlite::Param::from(request_id.to_string()),
+                            hiqlite::Param::from(request_digest.to_string()),
+                        ],
+                    )
+                    .await
+                    .map_err(hiqlite_error)
+            })
+            .await?;
+        rows.into_iter().next().ok_or_else(|| {
+            MetaStoreError::Serialization("partition authority request status disappeared".into())
+        })
     }
 }
 
@@ -4376,6 +4554,69 @@ impl MetaStore for HiqliteMetaStore {
             .filter(|claim| claim.expires_at_unix_ms > now))
     }
 
+    async fn read_partition_authority_capability(
+        &self,
+    ) -> Result<PartitionAuthorityCapability, MetaStoreError> {
+        Ok(PartitionAuthorityCapability {
+            backend_name: "hiqlite".to_string(),
+            partition_scoped_authority: true,
+            backend_owned_time: true,
+            fenced_checkpoint_pointer_publish: false,
+            durable_across_restart: true,
+            production_safe: false,
+        })
+    }
+
+    async fn acquire_partition_authority(
+        &self,
+        request: AcquirePartitionAuthorityRequest,
+    ) -> Result<AcquirePartitionAuthorityOutcome, MetaStoreError> {
+        request.validate()?;
+        let (request_id, request_digest) = partition_authority_request_identity(&request);
+        let partition_id = i64::from(request.key.partition_id);
+        let ttl_ms = i64_from_u64("ttl_ms", request.ttl_ms)?;
+        let (token_epoch, token_expiry) = request
+            .current_token
+            .as_ref()
+            .map(|token| {
+                Ok::<_, MetaStoreError>((
+                    i64_from_u64("current_token.owner_epoch", token.owner_epoch)?,
+                    i64_from_u64("current_token.expires_at_unix_ms", token.expires_at_unix_ms)?,
+                ))
+            })
+            .transpose()?
+            .unwrap_or((0, 0));
+        self.with_schema_repair(|| async {
+            self.client.txn_with_raft_serialized_timestamp([
+                ("INSERT OR IGNORE INTO velorix_partition_authority_requests (request_id, request_digest, outcome, namespace, view_id, stream_id, partition_id, owner_id) VALUES ($1, $2, 'pending', $3, $4, $5, $6, $7)", vec![hiqlite::Param::from(request_id.clone()), hiqlite::Param::from(request_digest.clone()), hiqlite::Param::from(request.key.namespace.clone()), hiqlite::Param::from(request.key.view_id.clone()), hiqlite::Param::from(request.key.stream_id.clone()), hiqlite::Param::from(partition_id), hiqlite::Param::from(request.owner_id.clone())]),
+                ("INSERT INTO velorix_partition_authorities (namespace, view_id, stream_id, partition_id, owner_id, owner_epoch, expires_at_unix_ms, last_request_id, last_outcome) SELECT $1, $2, $3, $4, $5, 1, $6 + $7, $8, 'acquired' WHERE EXISTS (SELECT 1 FROM velorix_partition_authority_requests WHERE request_id = $8 AND request_digest = $9 AND outcome = 'pending') ON CONFLICT(namespace, view_id, stream_id, partition_id) DO UPDATE SET owner_id = excluded.owner_id, owner_epoch = velorix_partition_authorities.owner_epoch + 1, expires_at_unix_ms = excluded.expires_at_unix_ms, last_request_id = excluded.last_request_id, last_outcome = excluded.last_outcome WHERE velorix_partition_authorities.expires_at_unix_ms <= $6 AND velorix_partition_authorities.owner_epoch < 9223372036854775807", vec![hiqlite::Param::from(request.key.namespace.clone()), hiqlite::Param::from(request.key.view_id.clone()), hiqlite::Param::from(request.key.stream_id.clone()), hiqlite::Param::from(partition_id), hiqlite::Param::from(request.owner_id.clone()), hiqlite::Param::raft_serialized_unix_ms(), hiqlite::Param::from(ttl_ms), hiqlite::Param::from(request_id.clone()), hiqlite::Param::from(request_digest.clone())]),
+                ("UPDATE velorix_partition_authorities SET expires_at_unix_ms = $1 + $2, last_request_id = $3, last_outcome = 'renewed' WHERE namespace = $4 AND view_id = $5 AND stream_id = $6 AND partition_id = $7 AND owner_id = $8 AND owner_epoch = $9 AND expires_at_unix_ms = $10 AND expires_at_unix_ms > $1 AND EXISTS (SELECT 1 FROM velorix_partition_authority_requests WHERE request_id = $3 AND request_digest = $11 AND outcome = 'pending')", vec![hiqlite::Param::raft_serialized_unix_ms(), hiqlite::Param::from(ttl_ms), hiqlite::Param::from(request_id.clone()), hiqlite::Param::from(request.key.namespace.clone()), hiqlite::Param::from(request.key.view_id.clone()), hiqlite::Param::from(request.key.stream_id.clone()), hiqlite::Param::from(partition_id), hiqlite::Param::from(request.owner_id.clone()), hiqlite::Param::from(token_epoch), hiqlite::Param::from(token_expiry), hiqlite::Param::from(request_digest.clone())]),
+                (
+                    "UPDATE velorix_partition_authority_requests SET outcome = CASE WHEN EXISTS (SELECT 1 FROM velorix_partition_authorities WHERE namespace = $1 AND view_id = $2 AND stream_id = $3 AND partition_id = $4 AND owner_epoch = 9223372036854775807 AND expires_at_unix_ms <= $5) THEN 'epoch_overflow' ELSE COALESCE((SELECT last_outcome FROM velorix_partition_authorities WHERE namespace = $1 AND view_id = $2 AND stream_id = $3 AND partition_id = $4 AND last_request_id = $6), 'conflict') END, owner_epoch = COALESCE((SELECT owner_epoch FROM velorix_partition_authorities WHERE namespace = $1 AND view_id = $2 AND stream_id = $3 AND partition_id = $4), 0), owner_id = COALESCE((SELECT owner_id FROM velorix_partition_authorities WHERE namespace = $1 AND view_id = $2 AND stream_id = $3 AND partition_id = $4), owner_id), expires_at_unix_ms = COALESCE((SELECT expires_at_unix_ms FROM velorix_partition_authorities WHERE namespace = $1 AND view_id = $2 AND stream_id = $3 AND partition_id = $4), 0) WHERE request_id = $6 AND request_digest = $7 AND outcome = 'pending'",
+                    vec![hiqlite::Param::from(request.key.namespace.clone()), hiqlite::Param::from(request.key.view_id.clone()), hiqlite::Param::from(request.key.stream_id.clone()), hiqlite::Param::from(partition_id), hiqlite::Param::raft_serialized_unix_ms(), hiqlite::Param::from(request_id.clone()), hiqlite::Param::from(request_digest.clone())],
+                ),
+            ]).await.map(|_| ()).map_err(hiqlite_error)
+        }).await?;
+        self.read_partition_authority_request(&request_id, &request_digest)
+            .await?
+            .into_outcome()
+    }
+
+    async fn read_partition_authority(
+        &self,
+        key: &PartitionAuthorityKey,
+    ) -> Result<Option<PartitionAuthorityToken>, MetaStoreError> {
+        key.validate()?;
+        let txn = self.with_schema_repair(|| async { self.client.txn_with_raft_serialized_timestamp([("UPDATE velorix_partition_authorities SET expires_at_unix_ms = expires_at_unix_ms WHERE 0", vec![])]).await.map_err(hiqlite_error) }).await?;
+        txn.result.map_err(hiqlite_error)?;
+        let now =
+            u64::try_from(txn.timestamp.unix_ms).map_err(|_| MetaStoreError::TimestampOverflow)?;
+        Ok(self
+            .read_partition_authority_record(key)
+            .await?
+            .filter(|token| token.expires_at_unix_ms > now))
+    }
+
     async fn publish_standing_runtime_checkpoint(
         &self,
         request: PublishStandingRuntimeCheckpointRequest,
@@ -4785,6 +5026,113 @@ struct StandingRuntimeOwnerClaimRow {
 }
 
 #[cfg(feature = "hiqlite-backend")]
+struct PartitionAuthorityRow {
+    namespace: String,
+    view_id: String,
+    stream_id: String,
+    partition_id: i64,
+    owner_id: String,
+    owner_epoch: i64,
+    expires_at_unix_ms: i64,
+}
+
+#[cfg(feature = "hiqlite-backend")]
+impl PartitionAuthorityRow {
+    fn into_token(self) -> Result<PartitionAuthorityToken, MetaStoreError> {
+        Ok(PartitionAuthorityToken {
+            key: PartitionAuthorityKey {
+                namespace: self.namespace,
+                view_id: self.view_id,
+                stream_id: self.stream_id,
+                partition_id: u32::try_from(self.partition_id).map_err(|_| {
+                    MetaStoreError::Serialization(
+                        "partition authority partition_id is invalid".into(),
+                    )
+                })?,
+            },
+            owner_id: self.owner_id,
+            owner_epoch: u64::try_from(self.owner_epoch).map_err(|_| {
+                MetaStoreError::Serialization("partition authority owner_epoch is invalid".into())
+            })?,
+            expires_at_unix_ms: u64::try_from(self.expires_at_unix_ms).map_err(|_| {
+                MetaStoreError::Serialization("partition authority expiry is invalid".into())
+            })?,
+        })
+    }
+}
+
+#[cfg(feature = "hiqlite-backend")]
+impl From<&mut hiqlite::Row<'_>> for PartitionAuthorityRow {
+    fn from(row: &mut hiqlite::Row<'_>) -> Self {
+        Self {
+            namespace: row.get("namespace"),
+            view_id: row.get("view_id"),
+            stream_id: row.get("stream_id"),
+            partition_id: row.get("partition_id"),
+            owner_id: row.get("owner_id"),
+            owner_epoch: row.get("owner_epoch"),
+            expires_at_unix_ms: row.get("expires_at_unix_ms"),
+        }
+    }
+}
+
+#[cfg(feature = "hiqlite-backend")]
+struct PartitionAuthorityRequestRow {
+    request_digest: String,
+    outcome: String,
+    namespace: String,
+    view_id: String,
+    stream_id: String,
+    partition_id: i64,
+    owner_id: String,
+    owner_epoch: i64,
+    expires_at_unix_ms: i64,
+}
+
+#[cfg(feature = "hiqlite-backend")]
+impl PartitionAuthorityRequestRow {
+    fn into_outcome(self) -> Result<AcquirePartitionAuthorityOutcome, MetaStoreError> {
+        let _ = self.request_digest;
+        let token = PartitionAuthorityRow {
+            namespace: self.namespace,
+            view_id: self.view_id,
+            stream_id: self.stream_id,
+            partition_id: self.partition_id,
+            owner_id: self.owner_id,
+            owner_epoch: self.owner_epoch,
+            expires_at_unix_ms: self.expires_at_unix_ms,
+        }
+        .into_token()?;
+        match self.outcome.as_str() {
+            "acquired" => Ok(AcquirePartitionAuthorityOutcome::Acquired(token)),
+            "renewed" => Ok(AcquirePartitionAuthorityOutcome::Renewed(token)),
+            "conflict" => Ok(AcquirePartitionAuthorityOutcome::Conflict(token)),
+            "epoch_overflow" => Err(MetaStoreError::AuthorityEpochOverflow),
+            other => Err(MetaStoreError::Serialization(format!(
+                "invalid partition authority request outcome: {other}"
+            ))),
+        }
+    }
+}
+
+#[cfg(feature = "hiqlite-backend")]
+impl From<&mut hiqlite::Row<'_>> for PartitionAuthorityRequestRow {
+    fn from(row: &mut hiqlite::Row<'_>) -> Self {
+        Self {
+            request_digest: row.get("request_digest"),
+            outcome: row.get("outcome"),
+            namespace: row.get("namespace"),
+            view_id: row.get("view_id"),
+            stream_id: row.get("stream_id"),
+            partition_id: row.get("partition_id"),
+            owner_id: row.get("owner_id"),
+            owner_epoch: row.get("owner_epoch"),
+            expires_at_unix_ms: row.get("expires_at_unix_ms"),
+        }
+    }
+}
+
+#[cfg(feature = "hiqlite-backend")]
 impl StandingRuntimeOwnerClaimRow {
     fn into_claim(self) -> Result<StandingRuntimeOwnerClaim, MetaStoreError> {
         let owner_epoch = u64::try_from(self.owner_epoch).map_err(|_| {
@@ -4893,6 +5241,46 @@ impl From<&mut hiqlite::Row<'_>> for StandingRuntimeCheckpointPointerRow {
 #[cfg(feature = "hiqlite-backend")]
 fn standing_runtime_output_manifest_refs_json(refs: &[String]) -> Result<String, MetaStoreError> {
     serde_json::to_string(refs).map_err(|source| MetaStoreError::Serialization(source.to_string()))
+}
+
+#[cfg(feature = "hiqlite-backend")]
+fn partition_authority_request_identity(
+    request: &AcquirePartitionAuthorityRequest,
+) -> (String, String) {
+    // Length-prefixing gives a canonical unambiguous encoding without exposing
+    // a request-id field in the public contract.
+    let mut canonical = String::new();
+    for value in [
+        &request.key.namespace,
+        &request.key.view_id,
+        &request.key.stream_id,
+        &request.owner_id,
+    ] {
+        canonical.push_str(&value.len().to_string());
+        canonical.push(':');
+        canonical.push_str(value);
+        canonical.push('|');
+    }
+    canonical.push_str(&request.key.partition_id.to_string());
+    canonical.push('|');
+    canonical.push_str(&request.ttl_ms.to_string());
+    canonical.push('|');
+    match &request.current_token {
+        Some(token) => {
+            canonical.push_str("some|");
+            canonical.push_str(&token.owner_epoch.to_string());
+            canonical.push('|');
+            canonical.push_str(&token.expires_at_unix_ms.to_string());
+        }
+        None => canonical.push_str("none"),
+    }
+    let digest = Sha256::digest(canonical.as_bytes());
+    let hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let request_id = format!("sha256:{hex}");
+    (request_id.clone(), request_id)
 }
 
 #[cfg(feature = "hiqlite-backend")]
