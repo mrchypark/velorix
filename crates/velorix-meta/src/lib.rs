@@ -3169,7 +3169,7 @@ fn partition_authority_remote_error(error: tonic::Status) -> MetaStoreError {
 
 #[derive(Clone)]
 pub struct GrpcMetaStore {
-    client: Arc<tokio::sync::Mutex<proto::velorix_meta_client::VelorixMetaClient<Channel>>>,
+    client: proto::velorix_meta_client::VelorixMetaClient<Channel>,
     bearer_token: Option<MetadataValue<tonic::metadata::Ascii>>,
 }
 
@@ -6049,7 +6049,7 @@ impl GrpcMetaStore {
                 .map_err(|error| MetaStoreError::Remote(error.to_string()))?;
 
         Ok(Self {
-            client: Arc::new(tokio::sync::Mutex::new(client)),
+            client,
             bearer_token: None,
         })
     }
@@ -6085,15 +6085,17 @@ impl GrpcMetaStore {
         }
         request
     }
+
+    fn client(&self) -> proto::velorix_meta_client::VelorixMetaClient<Channel> {
+        self.client.clone()
+    }
 }
 
 #[async_trait]
 impl MetaStore for GrpcMetaStore {
     async fn read_meta_store_capabilities(&self) -> Result<MetaStoreCapabilities, MetaStoreError> {
         let response = self
-            .client
-            .lock()
-            .await
+            .client()
             .read_meta_store_capabilities(self.request(proto::ReadMetaStoreCapabilitiesRequest {}))
             .await
             .map_err(|error| MetaStoreError::Remote(error.to_string()))?
@@ -6123,9 +6125,7 @@ impl MetaStore for GrpcMetaStore {
         let catalog_json = serde_json::to_vec(&catalog)
             .map_err(|error| MetaStoreError::Serialization(error.to_string()))?;
         let response = self
-            .client
-            .lock()
-            .await
+            .client()
             .store_relation_catalog(
                 self.request(proto::StoreRelationCatalogRequest { catalog_json }),
             )
@@ -6146,9 +6146,7 @@ impl MetaStore for GrpcMetaStore {
         relation_version: &str,
     ) -> Result<VelorixRelationCatalogV1, MetaStoreError> {
         let response = self
-            .client
-            .lock()
-            .await
+            .client()
             .read_relation_catalog(self.request(proto::ReadRelationCatalogRequest {
                 relation_id: relation_id.to_string(),
                 relation_version: relation_version.to_string(),
@@ -6172,9 +6170,7 @@ impl MetaStore for GrpcMetaStore {
         reservation: IngestRangeReservation,
     ) -> Result<ReserveIngestRangeOutcome, MetaStoreError> {
         let response = self
-            .client
-            .lock()
-            .await
+            .client()
             .reserve_ingest_range(self.request(ingest_range_reservation_to_proto(reservation)))
             .await
             .map_err(|error| MetaStoreError::Remote(error.to_string()))?
@@ -6193,9 +6189,7 @@ impl MetaStore for GrpcMetaStore {
         reservation: IngestRangeReservation,
     ) -> Result<CommitIngestRangeOutcome, MetaStoreError> {
         let response = self
-            .client
-            .lock()
-            .await
+            .client()
             .commit_ingest_range(self.request(ingest_range_reservation_to_proto(reservation)))
             .await
             .map_err(|error| MetaStoreError::Remote(error.to_string()))?
@@ -6215,9 +6209,7 @@ impl MetaStore for GrpcMetaStore {
         let request_json = serde_json::to_vec(&request)
             .map_err(|error| MetaStoreError::Serialization(error.to_string()))?;
         let response = self
-            .client
-            .lock()
-            .await
+            .client()
             .capture_ingest_source_cut(
                 self.request(proto::CaptureIngestSourceCutRequest { request_json }),
             )
@@ -6235,9 +6227,7 @@ impl MetaStore for GrpcMetaStore {
         let request_json = serde_json::to_vec(&request)
             .map_err(|error| MetaStoreError::Serialization(error.to_string()))?;
         let response = self
-            .client
-            .lock()
-            .await
+            .client()
             .begin_view_bootstrap(self.request(proto::BeginViewBootstrapRequest { request_json }))
             .await
             .map_err(|error| MetaStoreError::Remote(error.to_string()))?
@@ -6264,9 +6254,7 @@ impl MetaStore for GrpcMetaStore {
         view_id: &str,
     ) -> Result<Option<ViewBootstrapControlV1>, MetaStoreError> {
         let response = self
-            .client
-            .lock()
-            .await
+            .client()
             .read_view_bootstrap(self.request(proto::ReadViewBootstrapRequest {
                 tenant_id: tenant_id.to_string(),
                 program_id: program_id.to_string(),
@@ -6290,9 +6278,7 @@ impl MetaStore for GrpcMetaStore {
         let request_json = serde_json::to_vec(&request)
             .map_err(|error| MetaStoreError::Serialization(error.to_string()))?;
         let response = self
-            .client
-            .lock()
-            .await
+            .client()
             .fix_view_bootstrap_activation_cut(
                 self.request(proto::FixViewBootstrapActivationCutRequest { request_json }),
             )
@@ -6321,9 +6307,7 @@ impl MetaStore for GrpcMetaStore {
         let request_json = serde_json::to_vec(&request)
             .map_err(|error| MetaStoreError::Serialization(error.to_string()))?;
         let response = self
-            .client
-            .lock()
-            .await
+            .client()
             .promote_view_bootstrap(
                 self.request(proto::PromoteViewBootstrapRequest { request_json }),
             )
@@ -6350,9 +6334,7 @@ impl MetaStore for GrpcMetaStore {
         request: AcquireStandingRuntimeOwnerRequest,
     ) -> Result<AcquireStandingRuntimeOwnerOutcome, MetaStoreError> {
         let response = self
-            .client
-            .lock()
-            .await
+            .client()
             .acquire_standing_runtime_owner(self.request(
                 proto::AcquireStandingRuntimeOwnerRequest {
                     tenant_id: request.tenant_id,
@@ -6389,9 +6371,7 @@ impl MetaStore for GrpcMetaStore {
         view_id: &str,
     ) -> Result<Option<StandingRuntimeOwnerClaim>, MetaStoreError> {
         let response = self
-            .client
-            .lock()
-            .await
+            .client()
             .read_standing_runtime_owner(self.request(proto::ReadStandingRuntimeOwnerRequest {
                 tenant_id: tenant_id.to_string(),
                 program_id: program_id.to_string(),
@@ -6419,9 +6399,7 @@ impl MetaStore for GrpcMetaStore {
         request: PublishStandingRuntimeCheckpointRequest,
     ) -> Result<PublishStandingRuntimeCheckpointOutcome, MetaStoreError> {
         let response = self
-            .client
-            .lock()
-            .await
+            .client()
             .publish_standing_runtime_checkpoint(
                 self.request(proto::PublishStandingRuntimeCheckpointRequest {
                     expected_previous: request
@@ -6457,9 +6435,7 @@ impl MetaStore for GrpcMetaStore {
         view_id: &str,
     ) -> Result<Option<StandingRuntimeCheckpointPointer>, MetaStoreError> {
         let response = self
-            .client
-            .lock()
-            .await
+            .client()
             .read_standing_runtime_checkpoint(self.request(
                 proto::ReadStandingRuntimeCheckpointRequest {
                     tenant_id: tenant_id.to_string(),
@@ -6490,9 +6466,7 @@ impl MetaStore for GrpcMetaStore {
         &self,
     ) -> Result<PartitionAuthorityCapability, MetaStoreError> {
         let response = self
-            .client
-            .lock()
-            .await
+            .client()
             .read_partition_authority_capability(
                 self.request(proto::ReadPartitionAuthorityCapabilityRequest {}),
             )
@@ -6513,9 +6487,7 @@ impl MetaStore for GrpcMetaStore {
     ) -> Result<AcquirePartitionAuthorityOutcome, MetaStoreError> {
         request.validate()?;
         let response = self
-            .client
-            .lock()
-            .await
+            .client()
             .acquire_partition_authority(
                 self.request(proto::AcquirePartitionAuthorityRequest {
                     key: Some(partition_authority_key_to_proto(request.key)),
@@ -6549,9 +6521,7 @@ impl MetaStore for GrpcMetaStore {
     ) -> Result<Option<PartitionAuthorityToken>, MetaStoreError> {
         key.validate()?;
         let response = self
-            .client
-            .lock()
-            .await
+            .client()
             .read_partition_authority(self.request(proto::ReadPartitionAuthorityRequest {
                 key: Some(partition_authority_key_to_proto(key.clone())),
             }))
@@ -6576,9 +6546,7 @@ impl MetaStore for GrpcMetaStore {
     ) -> Result<PublishPartitionCheckpointPointerOutcome, MetaStoreError> {
         request.validate()?;
         let response = self
-            .client
-            .lock()
-            .await
+            .client()
             .publish_partition_checkpoint_pointer(
                 self.request(proto::PublishPartitionCheckpointPointerRequest {
                     expected_previous: request
@@ -6605,9 +6573,7 @@ impl MetaStore for GrpcMetaStore {
     ) -> Result<Option<PartitionCheckpointPointer>, MetaStoreError> {
         key.validate()?;
         let response = self
-            .client
-            .lock()
-            .await
+            .client()
             .read_partition_checkpoint_pointer(self.request(
                 proto::ReadPartitionCheckpointPointerRequest {
                     key: Some(partition_authority_key_to_proto(key.clone())),
@@ -6634,9 +6600,7 @@ impl MetaStore for GrpcMetaStore {
     ) -> Result<u64, MetaStoreError> {
         require_non_empty("tenant_id", tenant_id)?;
         let response = self
-            .client
-            .lock()
-            .await
+            .client()
             .read_view_dependency_graph_revision(self.request(
                 proto::ReadViewDependencyGraphRevisionRequest {
                     tenant_id: tenant_id.to_string(),

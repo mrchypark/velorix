@@ -1,4 +1,10 @@
-use std::sync::Arc;
+use std::{
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Barrier,
+    },
+    time::Duration,
+};
 
 use object_store::memory::InMemory as InMemoryObjectStore;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -334,6 +340,26 @@ async fn grpc_meta_store_round_trips_through_service_endpoint() {
     assert!(!capability.multi_writer_fencing_safe);
     assert!(!capability.bounded_wall_clock_failover);
     assert!(!capability.production_multi_writer_safe);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_meta_store_allows_independent_rpcs_to_enter_concurrently() {
+    let (endpoint, entered) = spawn_barrier_meta_service().await;
+    let store = Arc::new(GrpcMetaStore::connect(endpoint).await.unwrap());
+
+    let first_store = Arc::clone(&store);
+    let first = tokio::spawn(async move { first_store.read_meta_store_capabilities().await });
+    let second_store = Arc::clone(&store);
+    let second = tokio::spawn(async move { second_store.read_meta_store_capabilities().await });
+
+    let (first, second) = tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::join!(first, second)
+    })
+    .await
+    .expect("independent RPCs should not be serialized by the client");
+    first.unwrap().unwrap();
+    second.unwrap().unwrap();
+    assert_eq!(entered.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -766,6 +792,34 @@ where
     });
 
     format!("http://{addr}")
+}
+
+async fn spawn_barrier_meta_service() -> (String, Arc<AtomicUsize>) {
+    let entered = Arc::new(AtomicUsize::new(0));
+    let barrier = Arc::new(Barrier::new(2));
+    let interceptor_entered = Arc::clone(&entered);
+    let interceptor_barrier = Arc::clone(&barrier);
+    let interceptor = move |request: Request<()>| {
+        interceptor_entered.fetch_add(1, Ordering::SeqCst);
+        interceptor_barrier.wait();
+        Ok(request)
+    };
+    let service = VelorixMetaServer::with_interceptor(
+        MetaGrpcService::new(InMemoryMetaStore::default()),
+        interceptor,
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(service)
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+
+    (format!("http://{addr}"), entered)
 }
 
 async fn spawn_authenticated_meta_service(token: &'static str) -> String {
