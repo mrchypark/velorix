@@ -15,7 +15,8 @@ use velorix_meta::{
     FixViewBootstrapActivationCutRequest, HiqliteMetaStore, IngestRangeReservation,
     IngestSourceCutV1, IngestSourceRelationIdentityV1, MetaStore, MetaStoreError,
     PartitionAuthorityKey, PartitionAuthorityToken, PromoteViewBootstrapOutcome,
-    PromoteViewBootstrapRequest, PublishStandingRuntimeCheckpointOutcome,
+    PromoteViewBootstrapRequest, PublishPartitionCheckpointPointerOutcome,
+    PublishPartitionCheckpointPointerRequest, PublishStandingRuntimeCheckpointOutcome,
     PublishStandingRuntimeCheckpointRequest, ReserveIngestRangeOutcome,
     StandingRuntimeCheckpointPointer, StandingRuntimeOwnerToken, ViewBootstrapLifecycleV1,
 };
@@ -118,6 +119,72 @@ async fn hiqlite_partition_authority_concurrent_claim_has_one_winner() {
 }
 
 #[tokio::test]
+async fn hiqlite_partition_checkpoint_publish_is_fenced_and_idempotent() {
+    let (_dir, store, client) = start_store().await;
+    let authority = match store
+        .acquire_partition_authority(partition_authority_request("worker-a", None))
+        .await
+        .unwrap()
+    {
+        AcquirePartitionAuthorityOutcome::Acquired(token) => token,
+        other => panic!("unexpected authority outcome: {other:?}"),
+    };
+    let candidate = velorix_meta::PartitionCheckpointPointer {
+        key: partition_authority_key(),
+        checkpoint_key: "checkpoints/one".to_string(),
+    };
+    let request = PublishPartitionCheckpointPointerRequest {
+        expected_previous: None,
+        candidate: candidate.clone(),
+        authority: authority.clone(),
+    };
+    assert_eq!(
+        store
+            .publish_partition_checkpoint_pointer(request.clone())
+            .await
+            .unwrap(),
+        PublishPartitionCheckpointPointerOutcome::Published
+    );
+    assert_eq!(
+        store
+            .publish_partition_checkpoint_pointer(request)
+            .await
+            .unwrap(),
+        PublishPartitionCheckpointPointerOutcome::Published
+    );
+    let duplicate = PublishPartitionCheckpointPointerRequest {
+        expected_previous: Some(candidate.clone()),
+        candidate: candidate.clone(),
+        authority: authority.clone(),
+    };
+    assert_eq!(
+        store
+            .publish_partition_checkpoint_pointer(duplicate)
+            .await
+            .unwrap(),
+        PublishPartitionCheckpointPointerOutcome::Duplicate
+    );
+    client.execute("UPDATE velorix_partition_authorities SET expires_at_unix_ms = 0 WHERE namespace = $1 AND view_id = $2 AND stream_id = $3 AND partition_id = $4", vec![hiqlite::Param::from("default"), hiqlite::Param::from("view"), hiqlite::Param::from("orders"), hiqlite::Param::from(0_i64)]).await.unwrap();
+    let stale = PublishPartitionCheckpointPointerRequest {
+        expected_previous: None,
+        candidate: velorix_meta::PartitionCheckpointPointer {
+            key: candidate.key,
+            checkpoint_key: "checkpoints/two".to_string(),
+        },
+        authority,
+    };
+    let stale_result = store.publish_partition_checkpoint_pointer(stale).await;
+    assert!(
+        matches!(
+            stale_result,
+            Err(MetaStoreError::PartitionAuthorityInvalidToken)
+        ),
+        "{stale_result:?}"
+    );
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn hiqlite_partition_authority_epoch_overflow_fails_closed_without_mutation() {
     let (_dir, store, client) = start_store().await;
     client.execute(
@@ -209,9 +276,24 @@ async fn hiqlite_partition_authority_reopen_repairs_legacy_tables_and_replays_st
         .execute("DROP TABLE velorix_partition_authorities", vec![])
         .await
         .unwrap();
+    client
+        .execute("DROP TABLE velorix_partition_checkpoint_requests", vec![])
+        .await
+        .unwrap();
+    client
+        .execute("DROP TABLE velorix_partition_checkpoint_pointers", vec![])
+        .await
+        .unwrap();
     client.execute("CREATE TABLE velorix_partition_authorities (namespace TEXT NOT NULL, view_id TEXT NOT NULL, stream_id TEXT NOT NULL, partition_id INTEGER NOT NULL, owner_id TEXT NOT NULL, owner_epoch INTEGER NOT NULL, expires_at_unix_ms INTEGER NOT NULL, PRIMARY KEY(namespace, view_id, stream_id, partition_id))", vec![]).await.unwrap();
     client.execute("CREATE TABLE velorix_partition_authority_requests (request_id TEXT NOT NULL PRIMARY KEY)", vec![]).await.unwrap();
     let store = HiqliteMetaStore::new(client.clone()).await.unwrap();
+    assert_eq!(
+        store
+            .read_partition_checkpoint_pointer(&partition_authority_key())
+            .await
+            .unwrap(),
+        None
+    );
     let request = partition_authority_request("worker-a", None);
     let first = store
         .acquire_partition_authority(request.clone())
@@ -220,6 +302,40 @@ async fn hiqlite_partition_authority_reopen_repairs_legacy_tables_and_replays_st
     assert_eq!(
         store.acquire_partition_authority(request).await.unwrap(),
         first
+    );
+    let authority = match first {
+        AcquirePartitionAuthorityOutcome::Acquired(token) => token,
+        other => panic!("unexpected repaired authority outcome: {other:?}"),
+    };
+    let pointer = velorix_meta::PartitionCheckpointPointer {
+        key: partition_authority_key(),
+        checkpoint_key: "checkpoints/repaired".to_string(),
+    };
+    let publish = PublishPartitionCheckpointPointerRequest {
+        expected_previous: None,
+        candidate: pointer.clone(),
+        authority,
+    };
+    assert_eq!(
+        store
+            .publish_partition_checkpoint_pointer(publish.clone())
+            .await
+            .unwrap(),
+        PublishPartitionCheckpointPointerOutcome::Published
+    );
+    assert_eq!(
+        store
+            .publish_partition_checkpoint_pointer(publish)
+            .await
+            .unwrap(),
+        PublishPartitionCheckpointPointerOutcome::Published
+    );
+    assert_eq!(
+        store
+            .read_partition_checkpoint_pointer(&partition_authority_key())
+            .await
+            .unwrap(),
+        Some(pointer)
     );
     client
         .query_consistent(

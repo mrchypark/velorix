@@ -3298,6 +3298,91 @@ impl HiqliteMetaStore {
                     .map_err(hiqlite_error)?;
             }
         }
+        self.client
+            .execute(
+                "CREATE TABLE IF NOT EXISTS velorix_partition_checkpoint_pointers (
+                    namespace TEXT NOT NULL, view_id TEXT NOT NULL, stream_id TEXT NOT NULL,
+                    partition_id INTEGER NOT NULL, checkpoint_key TEXT NOT NULL,
+                    last_request_id TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (namespace, view_id, stream_id, partition_id)
+                )",
+                vec![],
+            )
+            .await
+            .map_err(hiqlite_error)?;
+        self.client
+            .execute(
+                "CREATE TABLE IF NOT EXISTS velorix_partition_checkpoint_requests (
+                    request_id TEXT NOT NULL PRIMARY KEY, request_digest TEXT NOT NULL,
+                    outcome TEXT NOT NULL, namespace TEXT NOT NULL, view_id TEXT NOT NULL,
+                    stream_id TEXT NOT NULL, partition_id INTEGER NOT NULL,
+                    checkpoint_key TEXT NOT NULL DEFAULT ''
+                )",
+                vec![],
+            )
+            .await
+            .map_err(hiqlite_error)?;
+        for (table, column, definition) in [
+            (
+                "velorix_partition_checkpoint_pointers",
+                "last_request_id",
+                "TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "velorix_partition_checkpoint_requests",
+                "request_digest",
+                "TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "velorix_partition_checkpoint_requests",
+                "outcome",
+                "TEXT NOT NULL DEFAULT 'pending'",
+            ),
+            (
+                "velorix_partition_checkpoint_requests",
+                "namespace",
+                "TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "velorix_partition_checkpoint_requests",
+                "view_id",
+                "TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "velorix_partition_checkpoint_requests",
+                "stream_id",
+                "TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "velorix_partition_checkpoint_requests",
+                "partition_id",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "velorix_partition_checkpoint_requests",
+                "checkpoint_key",
+                "TEXT NOT NULL DEFAULT ''",
+            ),
+        ] {
+            let pragma_sql = match table {
+                "velorix_partition_checkpoint_pointers" => {
+                    "PRAGMA table_info(velorix_partition_checkpoint_pointers)"
+                }
+                "velorix_partition_checkpoint_requests" => {
+                    "PRAGMA table_info(velorix_partition_checkpoint_requests)"
+                }
+                _ => unreachable!("partition checkpoint migration table is fixed"),
+            };
+            if !self.hiqlite_table_has_column(pragma_sql, column).await? {
+                self.client
+                    .execute(
+                        format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+                        vec![],
+                    )
+                    .await
+                    .map_err(hiqlite_error)?;
+            }
+        }
         Ok(())
     }
 
@@ -4561,9 +4646,9 @@ impl MetaStore for HiqliteMetaStore {
             backend_name: "hiqlite".to_string(),
             partition_scoped_authority: true,
             backend_owned_time: true,
-            fenced_checkpoint_pointer_publish: false,
+            fenced_checkpoint_pointer_publish: true,
             durable_across_restart: true,
-            production_safe: false,
+            production_safe: true,
         })
     }
 
@@ -4615,6 +4700,99 @@ impl MetaStore for HiqliteMetaStore {
             .read_partition_authority_record(key)
             .await?
             .filter(|token| token.expires_at_unix_ms > now))
+    }
+
+    async fn publish_partition_checkpoint_pointer(
+        &self,
+        request: PublishPartitionCheckpointPointerRequest,
+    ) -> Result<PublishPartitionCheckpointPointerOutcome, MetaStoreError> {
+        request.validate()?;
+        // A changed durable token is never eligible for a replayed duplicate.
+        // The transaction below remains the authoritative live-expiry check.
+        if self
+            .read_partition_authority_record(&request.authority.key)
+            .await?
+            .as_ref()
+            != Some(&request.authority)
+        {
+            return Err(MetaStoreError::PartitionAuthorityInvalidToken);
+        }
+        let (request_id, request_digest) = partition_checkpoint_request_identity(&request);
+        let key = &request.candidate.key;
+        let partition_id = i64::from(key.partition_id);
+        let authority_epoch = i64_from_u64("authority.owner_epoch", request.authority.owner_epoch)?;
+        let authority_expiry = i64_from_u64(
+            "authority.expires_at_unix_ms",
+            request.authority.expires_at_unix_ms,
+        )?;
+        let mut statements = vec![
+            (
+                "INSERT OR IGNORE INTO velorix_partition_checkpoint_requests (request_id, request_digest, outcome, namespace, view_id, stream_id, partition_id) VALUES ($1, $2, 'pending', $3, $4, $5, $6)",
+                vec![hiqlite::Param::from(request_id.clone()), hiqlite::Param::from(request_digest.clone()), hiqlite::Param::from(key.namespace.clone()), hiqlite::Param::from(key.view_id.clone()), hiqlite::Param::from(key.stream_id.clone()), hiqlite::Param::from(partition_id)],
+            ),
+            (
+                "SELECT 1 AS authorized FROM velorix_partition_authorities WHERE namespace = $1 AND view_id = $2 AND stream_id = $3 AND partition_id = $4 AND owner_id = $5 AND owner_epoch = $6 AND expires_at_unix_ms = $7 AND expires_at_unix_ms > $8",
+                vec![hiqlite::Param::from(key.namespace.clone()), hiqlite::Param::from(key.view_id.clone()), hiqlite::Param::from(key.stream_id.clone()), hiqlite::Param::from(partition_id), hiqlite::Param::from(request.authority.owner_id.clone()), hiqlite::Param::from(authority_epoch), hiqlite::Param::from(authority_expiry), hiqlite::Param::raft_serialized_unix_ms()],
+            ),
+        ];
+        if let Some(expected) = &request.expected_previous {
+            statements.push((
+                "UPDATE velorix_partition_checkpoint_pointers SET checkpoint_key = $1, last_request_id = $2 WHERE namespace = $3 AND view_id = $4 AND stream_id = $5 AND partition_id = $6 AND checkpoint_key = $7 AND checkpoint_key <> $1 AND $8 = 1 AND EXISTS (SELECT 1 FROM velorix_partition_checkpoint_requests WHERE request_id = $2 AND request_digest = $9 AND outcome = 'pending')",
+                vec![hiqlite::Param::from(request.candidate.checkpoint_key.clone()), hiqlite::Param::from(request_id.clone()), hiqlite::Param::from(key.namespace.clone()), hiqlite::Param::from(key.view_id.clone()), hiqlite::Param::from(key.stream_id.clone()), hiqlite::Param::from(partition_id), hiqlite::Param::from(expected.checkpoint_key.clone()), hiqlite::Param::StmtOutputIndexed(1, 0), hiqlite::Param::from(request_digest.clone())],
+            ));
+        } else {
+            statements.push((
+                "INSERT OR IGNORE INTO velorix_partition_checkpoint_pointers (namespace, view_id, stream_id, partition_id, checkpoint_key, last_request_id) SELECT $1, $2, $3, $4, $5, $6 WHERE $7 = 1 AND EXISTS (SELECT 1 FROM velorix_partition_checkpoint_requests WHERE request_id = $6 AND request_digest = $8 AND outcome = 'pending')",
+                vec![hiqlite::Param::from(key.namespace.clone()), hiqlite::Param::from(key.view_id.clone()), hiqlite::Param::from(key.stream_id.clone()), hiqlite::Param::from(partition_id), hiqlite::Param::from(request.candidate.checkpoint_key.clone()), hiqlite::Param::from(request_id.clone()), hiqlite::Param::StmtOutputIndexed(1, 0), hiqlite::Param::from(request_digest.clone())],
+            ));
+        }
+        statements.push((
+            "UPDATE velorix_partition_checkpoint_requests SET outcome = CASE WHEN NOT EXISTS (SELECT 1 FROM velorix_partition_authorities WHERE namespace = $1 AND view_id = $2 AND stream_id = $3 AND partition_id = $4 AND owner_id = $5 AND owner_epoch = $6 AND expires_at_unix_ms = $7 AND expires_at_unix_ms > $8) THEN 'invalid_authority' WHEN EXISTS (SELECT 1 FROM velorix_partition_checkpoint_pointers WHERE namespace = $1 AND view_id = $2 AND stream_id = $3 AND partition_id = $4 AND last_request_id = $9) THEN 'published' WHEN EXISTS (SELECT 1 FROM velorix_partition_checkpoint_pointers WHERE namespace = $1 AND view_id = $2 AND stream_id = $3 AND partition_id = $4 AND checkpoint_key = $10) THEN 'duplicate' ELSE 'conflict' END, checkpoint_key = COALESCE((SELECT checkpoint_key FROM velorix_partition_checkpoint_pointers WHERE namespace = $1 AND view_id = $2 AND stream_id = $3 AND partition_id = $4), '') WHERE request_id = $9 AND request_digest = $11 AND outcome = 'pending'",
+            vec![hiqlite::Param::from(key.namespace.clone()), hiqlite::Param::from(key.view_id.clone()), hiqlite::Param::from(key.stream_id.clone()), hiqlite::Param::from(partition_id), hiqlite::Param::from(request.authority.owner_id.clone()), hiqlite::Param::from(authority_epoch), hiqlite::Param::from(authority_expiry), hiqlite::Param::raft_serialized_unix_ms(), hiqlite::Param::from(request_id.clone()), hiqlite::Param::from(request.candidate.checkpoint_key.clone()), hiqlite::Param::from(request_digest.clone())],
+        ));
+        self.with_schema_repair(|| async {
+            self.client
+                .txn_with_raft_serialized_timestamp(statements.clone())
+                .await
+                .map(|_| ())
+                .map_err(hiqlite_error)
+        })
+        .await?;
+        let rows = self.client.query_consistent_map::<PartitionCheckpointRequestRow, _>("SELECT outcome FROM velorix_partition_checkpoint_requests WHERE request_id = $1 AND request_digest = $2", vec![hiqlite::Param::from(request_id), hiqlite::Param::from(request_digest)]).await.map_err(hiqlite_error)?;
+        match rows.first().map(|row| row.outcome.as_str()) {
+            Some("published") => Ok(PublishPartitionCheckpointPointerOutcome::Published),
+            Some("duplicate") => Ok(PublishPartitionCheckpointPointerOutcome::Duplicate),
+            Some("conflict") => Ok(PublishPartitionCheckpointPointerOutcome::Conflict),
+            Some("invalid_authority") => Err(MetaStoreError::PartitionAuthorityInvalidToken),
+            Some(other) => Err(MetaStoreError::Serialization(format!(
+                "invalid partition checkpoint request outcome: {other}"
+            ))),
+            None => Err(MetaStoreError::Serialization(
+                "partition checkpoint request status disappeared".into(),
+            )),
+        }
+    }
+
+    async fn read_partition_checkpoint_pointer(
+        &self,
+        key: &PartitionAuthorityKey,
+    ) -> Result<Option<PartitionCheckpointPointer>, MetaStoreError> {
+        key.validate()?;
+        let rows = self
+            .with_schema_repair(|| async {
+                self.client
+                    .query_consistent_map::<PartitionCheckpointPointerRow, _>(
+                        "SELECT namespace, view_id, stream_id, partition_id, checkpoint_key FROM velorix_partition_checkpoint_pointers WHERE namespace = $1 AND view_id = $2 AND stream_id = $3 AND partition_id = $4",
+                        vec![hiqlite::Param::from(key.namespace.clone()), hiqlite::Param::from(key.view_id.clone()), hiqlite::Param::from(key.stream_id.clone()), hiqlite::Param::from(i64::from(key.partition_id))],
+                    )
+                    .await
+                    .map_err(hiqlite_error)
+            })
+            .await?;
+        rows.into_iter()
+            .next()
+            .map(PartitionCheckpointPointerRow::into_pointer)
+            .transpose()
     }
 
     async fn publish_standing_runtime_checkpoint(
@@ -5090,6 +5268,57 @@ struct PartitionAuthorityRequestRow {
 }
 
 #[cfg(feature = "hiqlite-backend")]
+struct PartitionCheckpointRequestRow {
+    outcome: String,
+}
+#[cfg(feature = "hiqlite-backend")]
+impl From<&mut hiqlite::Row<'_>> for PartitionCheckpointRequestRow {
+    fn from(row: &mut hiqlite::Row<'_>) -> Self {
+        Self {
+            outcome: row.get("outcome"),
+        }
+    }
+}
+#[cfg(feature = "hiqlite-backend")]
+struct PartitionCheckpointPointerRow {
+    namespace: String,
+    view_id: String,
+    stream_id: String,
+    partition_id: i64,
+    checkpoint_key: String,
+}
+#[cfg(feature = "hiqlite-backend")]
+impl PartitionCheckpointPointerRow {
+    fn into_pointer(self) -> Result<PartitionCheckpointPointer, MetaStoreError> {
+        Ok(PartitionCheckpointPointer {
+            key: PartitionAuthorityKey {
+                namespace: self.namespace,
+                view_id: self.view_id,
+                stream_id: self.stream_id,
+                partition_id: u32::try_from(self.partition_id).map_err(|_| {
+                    MetaStoreError::Serialization(
+                        "partition checkpoint partition_id is invalid".into(),
+                    )
+                })?,
+            },
+            checkpoint_key: self.checkpoint_key,
+        })
+    }
+}
+#[cfg(feature = "hiqlite-backend")]
+impl From<&mut hiqlite::Row<'_>> for PartitionCheckpointPointerRow {
+    fn from(row: &mut hiqlite::Row<'_>) -> Self {
+        Self {
+            namespace: row.get("namespace"),
+            view_id: row.get("view_id"),
+            stream_id: row.get("stream_id"),
+            partition_id: row.get("partition_id"),
+            checkpoint_key: row.get("checkpoint_key"),
+        }
+    }
+}
+
+#[cfg(feature = "hiqlite-backend")]
 impl PartitionAuthorityRequestRow {
     fn into_outcome(self) -> Result<AcquirePartitionAuthorityOutcome, MetaStoreError> {
         let _ = self.request_digest;
@@ -5281,6 +5510,41 @@ fn partition_authority_request_identity(
         .collect::<String>();
     let request_id = format!("sha256:{hex}");
     (request_id.clone(), request_id)
+}
+
+#[cfg(feature = "hiqlite-backend")]
+fn partition_checkpoint_request_identity(
+    request: &PublishPartitionCheckpointPointerRequest,
+) -> (String, String) {
+    let mut canonical = String::from("publish_partition_checkpoint|");
+    for value in [
+        &request.candidate.key.namespace,
+        &request.candidate.key.view_id,
+        &request.candidate.key.stream_id,
+        &request.authority.owner_id,
+        &request.candidate.checkpoint_key,
+    ] {
+        canonical.push_str(&format!("{}:{value}|", value.len()));
+    }
+    canonical.push_str(&format!(
+        "{}|{}|{}|",
+        request.candidate.key.partition_id,
+        request.authority.owner_epoch,
+        request.authority.expires_at_unix_ms
+    ));
+    match &request.expected_previous {
+        Some(pointer) => canonical.push_str(&format!(
+            "some:{}:{}",
+            pointer.key.partition_id, pointer.checkpoint_key
+        )),
+        None => canonical.push_str("none"),
+    }
+    let hex = Sha256::digest(canonical.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let id = format!("sha256:{hex}");
+    (id.clone(), id)
 }
 
 #[cfg(feature = "hiqlite-backend")]
