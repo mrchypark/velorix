@@ -2234,6 +2234,9 @@ where
             standing_runtime_fencing: Some(standing_runtime_fencing_capability_to_proto(
                 capabilities.standing_runtime_fencing,
             )),
+            partition_authority: Some(partition_authority_capability_to_proto(
+                capabilities.partition_authority,
+            )),
         }))
     }
 
@@ -2551,6 +2554,110 @@ where
             proto::ReadViewDependencyGraphRevisionResponse { revision },
         ))
     }
+
+    async fn read_partition_authority_capability(
+        &self,
+        request: Request<proto::ReadPartitionAuthorityCapabilityRequest>,
+    ) -> Result<Response<proto::ReadPartitionAuthorityCapabilityResponse>, Status> {
+        self.authorize(&request)?;
+        let capability = self
+            .store
+            .read_partition_authority_capability()
+            .await
+            .map_err(partition_authority_status)?;
+        Ok(Response::new(
+            proto::ReadPartitionAuthorityCapabilityResponse {
+                capability: Some(partition_authority_capability_to_proto(capability)),
+            },
+        ))
+    }
+
+    async fn acquire_partition_authority(
+        &self,
+        request: Request<proto::AcquirePartitionAuthorityRequest>,
+    ) -> Result<Response<proto::AcquirePartitionAuthorityResponse>, Status> {
+        self.authorize(&request)?;
+        let request = acquire_partition_authority_request_from_proto(request.into_inner())
+            .map_err(partition_authority_status)?;
+        let outcome = self
+            .store
+            .acquire_partition_authority(request)
+            .await
+            .map_err(partition_authority_status)?;
+        Ok(Response::new(proto::AcquirePartitionAuthorityResponse {
+            outcome: acquire_partition_authority_outcome(&outcome).to_string(),
+            token: Some(partition_authority_token_to_proto(
+                acquire_partition_authority_token(outcome),
+            )),
+        }))
+    }
+
+    async fn read_partition_authority(
+        &self,
+        request: Request<proto::ReadPartitionAuthorityRequest>,
+    ) -> Result<Response<proto::ReadPartitionAuthorityResponse>, Status> {
+        self.authorize(&request)?;
+        let key = request
+            .into_inner()
+            .key
+            .ok_or_else(|| Status::invalid_argument("partition authority key is required"))
+            .and_then(|key| {
+                partition_authority_key_from_proto(key).map_err(partition_authority_status)
+            })?;
+        let token = self
+            .store
+            .read_partition_authority(&key)
+            .await
+            .map_err(partition_authority_status)?;
+        Ok(Response::new(proto::ReadPartitionAuthorityResponse {
+            found: token.is_some(),
+            token: token.map(partition_authority_token_to_proto),
+        }))
+    }
+
+    async fn publish_partition_checkpoint_pointer(
+        &self,
+        request: Request<proto::PublishPartitionCheckpointPointerRequest>,
+    ) -> Result<Response<proto::PublishPartitionCheckpointPointerResponse>, Status> {
+        self.authorize(&request)?;
+        let request = publish_partition_checkpoint_pointer_request_from_proto(request.into_inner())
+            .map_err(partition_authority_status)?;
+        let outcome = self
+            .store
+            .publish_partition_checkpoint_pointer(request)
+            .await
+            .map_err(partition_authority_status)?;
+        Ok(Response::new(
+            proto::PublishPartitionCheckpointPointerResponse {
+                outcome: publish_partition_checkpoint_pointer_outcome(&outcome).to_string(),
+            },
+        ))
+    }
+
+    async fn read_partition_checkpoint_pointer(
+        &self,
+        request: Request<proto::ReadPartitionCheckpointPointerRequest>,
+    ) -> Result<Response<proto::ReadPartitionCheckpointPointerResponse>, Status> {
+        self.authorize(&request)?;
+        let key = request
+            .into_inner()
+            .key
+            .ok_or_else(|| Status::invalid_argument("partition checkpoint key is required"))
+            .and_then(|key| {
+                partition_authority_key_from_proto(key).map_err(partition_authority_status)
+            })?;
+        let pointer = self
+            .store
+            .read_partition_checkpoint_pointer(&key)
+            .await
+            .map_err(partition_authority_status)?;
+        Ok(Response::new(
+            proto::ReadPartitionCheckpointPointerResponse {
+                found: pointer.is_some(),
+                pointer: pointer.map(partition_checkpoint_pointer_to_proto),
+            },
+        ))
+    }
 }
 
 fn store_relation_catalog_outcome(outcome: &StoreRelationCatalogOutcome) -> &'static str {
@@ -2667,6 +2774,190 @@ fn standing_runtime_fencing_capability_from_proto(
         failover_time_bound_ms: capability.failover_time_bound_ms,
         multi_writer_fencing_safe: capability.multi_writer_fencing_safe,
         production_bounded_failover_safe: capability.production_bounded_failover_safe,
+    }
+}
+
+fn partition_authority_capability_to_proto(
+    capability: PartitionAuthorityCapability,
+) -> proto::PartitionAuthorityCapability {
+    proto::PartitionAuthorityCapability {
+        backend_name: capability.backend_name,
+        partition_scoped_authority: capability.partition_scoped_authority,
+        backend_owned_time: capability.backend_owned_time,
+        fenced_checkpoint_pointer_publish: capability.fenced_checkpoint_pointer_publish,
+        durable_across_restart: capability.durable_across_restart,
+        production_safe: capability.production_safe,
+    }
+}
+
+fn partition_authority_capability_from_proto(
+    capability: proto::PartitionAuthorityCapability,
+) -> PartitionAuthorityCapability {
+    let production_safe = capability.production_safe
+        && capability.partition_scoped_authority
+        && capability.backend_owned_time
+        && capability.fenced_checkpoint_pointer_publish
+        && capability.durable_across_restart;
+    PartitionAuthorityCapability {
+        backend_name: capability.backend_name,
+        partition_scoped_authority: capability.partition_scoped_authority,
+        backend_owned_time: capability.backend_owned_time,
+        fenced_checkpoint_pointer_publish: capability.fenced_checkpoint_pointer_publish,
+        durable_across_restart: capability.durable_across_restart,
+        production_safe,
+    }
+}
+
+fn partition_authority_key_to_proto(key: PartitionAuthorityKey) -> proto::PartitionAuthorityKey {
+    proto::PartitionAuthorityKey {
+        namespace: key.namespace,
+        view_id: key.view_id,
+        stream_id: key.stream_id,
+        partition_id: key.partition_id,
+    }
+}
+
+fn partition_authority_key_from_proto(
+    key: proto::PartitionAuthorityKey,
+) -> Result<PartitionAuthorityKey, MetaStoreError> {
+    let key = PartitionAuthorityKey {
+        namespace: key.namespace,
+        view_id: key.view_id,
+        stream_id: key.stream_id,
+        partition_id: key.partition_id,
+    };
+    key.validate()?;
+    Ok(key)
+}
+
+fn partition_authority_token_to_proto(
+    token: PartitionAuthorityToken,
+) -> proto::PartitionAuthorityToken {
+    proto::PartitionAuthorityToken {
+        key: Some(partition_authority_key_to_proto(token.key)),
+        owner_id: token.owner_id,
+        owner_epoch: token.owner_epoch,
+        expires_at_unix_ms: token.expires_at_unix_ms,
+    }
+}
+
+fn partition_authority_token_from_proto(
+    token: proto::PartitionAuthorityToken,
+) -> Result<PartitionAuthorityToken, MetaStoreError> {
+    let key = token
+        .key
+        .ok_or_else(|| {
+            MetaStoreError::Serialization("partition authority token key is required".into())
+        })
+        .and_then(partition_authority_key_from_proto)?;
+    let token = PartitionAuthorityToken {
+        key,
+        owner_id: token.owner_id,
+        owner_epoch: token.owner_epoch,
+        expires_at_unix_ms: token.expires_at_unix_ms,
+    };
+    token.validate()?;
+    Ok(token)
+}
+
+fn partition_checkpoint_pointer_to_proto(
+    pointer: PartitionCheckpointPointer,
+) -> proto::PartitionCheckpointPointer {
+    proto::PartitionCheckpointPointer {
+        key: Some(partition_authority_key_to_proto(pointer.key)),
+        checkpoint_key: pointer.checkpoint_key,
+    }
+}
+
+fn partition_checkpoint_pointer_from_proto(
+    pointer: proto::PartitionCheckpointPointer,
+) -> Result<PartitionCheckpointPointer, MetaStoreError> {
+    let key = pointer
+        .key
+        .ok_or_else(|| MetaStoreError::Serialization("partition checkpoint key is required".into()))
+        .and_then(partition_authority_key_from_proto)?;
+    let pointer = PartitionCheckpointPointer {
+        key,
+        checkpoint_key: pointer.checkpoint_key,
+    };
+    pointer.validate()?;
+    Ok(pointer)
+}
+
+fn acquire_partition_authority_request_from_proto(
+    request: proto::AcquirePartitionAuthorityRequest,
+) -> Result<AcquirePartitionAuthorityRequest, MetaStoreError> {
+    let key = request
+        .key
+        .ok_or_else(|| MetaStoreError::Serialization("partition authority key is required".into()))
+        .and_then(partition_authority_key_from_proto)?;
+    let request = AcquirePartitionAuthorityRequest {
+        key,
+        owner_id: request.owner_id,
+        current_token: request
+            .current_token
+            .map(partition_authority_token_from_proto)
+            .transpose()?,
+        ttl_ms: request.ttl_ms,
+    };
+    request.validate()?;
+    Ok(request)
+}
+
+fn acquire_partition_authority_outcome(outcome: &AcquirePartitionAuthorityOutcome) -> &'static str {
+    match outcome {
+        AcquirePartitionAuthorityOutcome::Acquired(_) => "acquired",
+        AcquirePartitionAuthorityOutcome::Renewed(_) => "renewed",
+        AcquirePartitionAuthorityOutcome::Conflict(_) => "conflict",
+    }
+}
+
+fn acquire_partition_authority_token(
+    outcome: AcquirePartitionAuthorityOutcome,
+) -> PartitionAuthorityToken {
+    match outcome {
+        AcquirePartitionAuthorityOutcome::Acquired(token)
+        | AcquirePartitionAuthorityOutcome::Renewed(token)
+        | AcquirePartitionAuthorityOutcome::Conflict(token) => token,
+    }
+}
+
+fn publish_partition_checkpoint_pointer_request_from_proto(
+    request: proto::PublishPartitionCheckpointPointerRequest,
+) -> Result<PublishPartitionCheckpointPointerRequest, MetaStoreError> {
+    let candidate = request
+        .candidate
+        .ok_or_else(|| {
+            MetaStoreError::Serialization(
+                "candidate partition checkpoint pointer is required".into(),
+            )
+        })
+        .and_then(partition_checkpoint_pointer_from_proto)?;
+    let authority = request
+        .authority
+        .ok_or_else(|| {
+            MetaStoreError::Serialization("partition authority token is required".into())
+        })
+        .and_then(partition_authority_token_from_proto)?;
+    let request = PublishPartitionCheckpointPointerRequest {
+        expected_previous: request
+            .expected_previous
+            .map(partition_checkpoint_pointer_from_proto)
+            .transpose()?,
+        candidate,
+        authority,
+    };
+    request.validate()?;
+    Ok(request)
+}
+
+fn publish_partition_checkpoint_pointer_outcome(
+    outcome: &PublishPartitionCheckpointPointerOutcome,
+) -> &'static str {
+    match outcome {
+        PublishPartitionCheckpointPointerOutcome::Published => "published",
+        PublishPartitionCheckpointPointerOutcome::Duplicate => "duplicate",
+        PublishPartitionCheckpointPointerOutcome::Conflict => "conflict",
     }
 }
 
@@ -2831,6 +3122,48 @@ fn meta_status(error: MetaStoreError) -> Status {
         MetaStoreError::Remote(_) | MetaStoreError::Oss(_) | MetaStoreError::Hiqlite(_) => {
             Status::unavailable(error.to_string())
         }
+    }
+}
+
+fn partition_authority_status(error: MetaStoreError) -> Status {
+    match error {
+        MetaStoreError::EmptyField { .. }
+        | MetaStoreError::InvalidDuration { .. }
+        | MetaStoreError::IntegerOutOfRange { .. }
+        | MetaStoreError::Serialization(_)
+        | MetaStoreError::PartitionCheckpointScopeMismatch
+        | MetaStoreError::PartitionAuthorityTokenScopeMismatch => {
+            Status::invalid_argument(error.to_string())
+        }
+        MetaStoreError::PartitionAuthorityInvalidToken => {
+            Status::failed_precondition(error.to_string())
+        }
+        MetaStoreError::UnsupportedCapability(_) => Status::unimplemented(error.to_string()),
+        MetaStoreError::AuthorityEpochOverflow => Status::aborted(error.to_string()),
+        MetaStoreError::RelationSchema(_)
+        | MetaStoreError::RelationCatalogConflict { .. }
+        | MetaStoreError::RelationCatalogNotFound { .. }
+        | MetaStoreError::EmptyIngestRange { .. }
+        | MetaStoreError::InvalidBearerToken { .. }
+        | MetaStoreError::TimestampOverflow
+        | MetaStoreError::StandingRuntimeCheckpointScopeMismatch
+        | MetaStoreError::StandingRuntimeOwnerMismatch
+        | MetaStoreError::DuplicateSourceCutRelation { .. }
+        | MetaStoreError::OverlappingSourceCutRange { .. }
+        | MetaStoreError::NonMonotonicCheckpointEpoch { .. }
+        | MetaStoreError::Remote(_)
+        | MetaStoreError::Oss(_)
+        | MetaStoreError::Hiqlite(_)
+        | MetaStoreError::UnexpectedOutcome(_) => Status::internal(error.to_string()),
+    }
+}
+
+fn partition_authority_remote_error(error: tonic::Status) -> MetaStoreError {
+    match error.code() {
+        tonic::Code::Unimplemented => MetaStoreError::UnsupportedCapability("partition_authority"),
+        tonic::Code::FailedPrecondition => MetaStoreError::PartitionAuthorityInvalidToken,
+        tonic::Code::Aborted => MetaStoreError::UnexpectedOutcome(error.message().to_string()),
+        _ => MetaStoreError::Remote(error.to_string()),
     }
 }
 
@@ -5776,9 +6109,10 @@ impl MetaStore for GrpcMetaStore {
 
         Ok(MetaStoreCapabilities {
             standing_runtime_fencing,
-            // The current wire contract has no partition-authority capability
-            // field; fail closed until the server advertises it explicitly.
-            partition_authority: PartitionAuthorityCapability::unsupported("grpc"),
+            partition_authority: response
+                .partition_authority
+                .map(partition_authority_capability_from_proto)
+                .unwrap_or_else(|| PartitionAuthorityCapability::unsupported("grpc")),
         })
     }
 
@@ -6150,6 +6484,148 @@ impl MetaStore for GrpcMetaStore {
         Ok(Some(standing_runtime_checkpoint_pointer_from_proto(
             pointer,
         )?))
+    }
+
+    async fn read_partition_authority_capability(
+        &self,
+    ) -> Result<PartitionAuthorityCapability, MetaStoreError> {
+        let response = self
+            .client
+            .lock()
+            .await
+            .read_partition_authority_capability(
+                self.request(proto::ReadPartitionAuthorityCapabilityRequest {}),
+            )
+            .await
+            .map_err(partition_authority_remote_error)?
+            .into_inner();
+        response
+            .capability
+            .map(partition_authority_capability_from_proto)
+            .ok_or_else(|| {
+                MetaStoreError::UnexpectedOutcome("missing partition authority capability".into())
+            })
+    }
+
+    async fn acquire_partition_authority(
+        &self,
+        request: AcquirePartitionAuthorityRequest,
+    ) -> Result<AcquirePartitionAuthorityOutcome, MetaStoreError> {
+        request.validate()?;
+        let response = self
+            .client
+            .lock()
+            .await
+            .acquire_partition_authority(
+                self.request(proto::AcquirePartitionAuthorityRequest {
+                    key: Some(partition_authority_key_to_proto(request.key)),
+                    owner_id: request.owner_id,
+                    current_token: request
+                        .current_token
+                        .map(partition_authority_token_to_proto),
+                    ttl_ms: request.ttl_ms,
+                }),
+            )
+            .await
+            .map_err(partition_authority_remote_error)?
+            .into_inner();
+        let token = response
+            .token
+            .ok_or_else(|| {
+                MetaStoreError::UnexpectedOutcome("missing partition authority token".into())
+            })
+            .and_then(partition_authority_token_from_proto)?;
+        match response.outcome.as_str() {
+            "acquired" => Ok(AcquirePartitionAuthorityOutcome::Acquired(token)),
+            "renewed" => Ok(AcquirePartitionAuthorityOutcome::Renewed(token)),
+            "conflict" => Ok(AcquirePartitionAuthorityOutcome::Conflict(token)),
+            other => Err(MetaStoreError::UnexpectedOutcome(other.to_string())),
+        }
+    }
+
+    async fn read_partition_authority(
+        &self,
+        key: &PartitionAuthorityKey,
+    ) -> Result<Option<PartitionAuthorityToken>, MetaStoreError> {
+        key.validate()?;
+        let response = self
+            .client
+            .lock()
+            .await
+            .read_partition_authority(self.request(proto::ReadPartitionAuthorityRequest {
+                key: Some(partition_authority_key_to_proto(key.clone())),
+            }))
+            .await
+            .map_err(partition_authority_remote_error)?
+            .into_inner();
+        match (response.found, response.token) {
+            (true, Some(token)) => partition_authority_token_from_proto(token).map(Some),
+            (false, None) => Ok(None),
+            (true, None) => Err(MetaStoreError::UnexpectedOutcome(
+                "missing partition authority token".into(),
+            )),
+            (false, Some(_)) => Err(MetaStoreError::UnexpectedOutcome(
+                "partition authority response has a token without found".into(),
+            )),
+        }
+    }
+
+    async fn publish_partition_checkpoint_pointer(
+        &self,
+        request: PublishPartitionCheckpointPointerRequest,
+    ) -> Result<PublishPartitionCheckpointPointerOutcome, MetaStoreError> {
+        request.validate()?;
+        let response = self
+            .client
+            .lock()
+            .await
+            .publish_partition_checkpoint_pointer(
+                self.request(proto::PublishPartitionCheckpointPointerRequest {
+                    expected_previous: request
+                        .expected_previous
+                        .map(partition_checkpoint_pointer_to_proto),
+                    candidate: Some(partition_checkpoint_pointer_to_proto(request.candidate)),
+                    authority: Some(partition_authority_token_to_proto(request.authority)),
+                }),
+            )
+            .await
+            .map_err(partition_authority_remote_error)?
+            .into_inner();
+        match response.outcome.as_str() {
+            "published" => Ok(PublishPartitionCheckpointPointerOutcome::Published),
+            "duplicate" => Ok(PublishPartitionCheckpointPointerOutcome::Duplicate),
+            "conflict" => Ok(PublishPartitionCheckpointPointerOutcome::Conflict),
+            other => Err(MetaStoreError::UnexpectedOutcome(other.to_string())),
+        }
+    }
+
+    async fn read_partition_checkpoint_pointer(
+        &self,
+        key: &PartitionAuthorityKey,
+    ) -> Result<Option<PartitionCheckpointPointer>, MetaStoreError> {
+        key.validate()?;
+        let response = self
+            .client
+            .lock()
+            .await
+            .read_partition_checkpoint_pointer(self.request(
+                proto::ReadPartitionCheckpointPointerRequest {
+                    key: Some(partition_authority_key_to_proto(key.clone())),
+                },
+            ))
+            .await
+            .map_err(partition_authority_remote_error)?
+            .into_inner();
+        match (response.found, response.pointer) {
+            (true, Some(pointer)) => partition_checkpoint_pointer_from_proto(pointer).map(Some),
+            (false, None) => Ok(None),
+            (true, None) => Err(MetaStoreError::UnexpectedOutcome(
+                "missing partition checkpoint pointer".into(),
+            )),
+            (false, Some(_)) => Err(MetaStoreError::UnexpectedOutcome(
+                "partition checkpoint response has a pointer without found".into(),
+            )),
+        }
     }
 
     async fn read_view_dependency_graph_revision(

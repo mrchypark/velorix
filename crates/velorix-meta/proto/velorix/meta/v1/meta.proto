@@ -18,6 +18,11 @@ service VelorixMeta {
   rpc PublishStandingRuntimeCheckpoint(PublishStandingRuntimeCheckpointRequest) returns (PublishStandingRuntimeCheckpointResponse);
   rpc ReadStandingRuntimeCheckpoint(ReadStandingRuntimeCheckpointRequest) returns (ReadStandingRuntimeCheckpointResponse);
   rpc ReadViewDependencyGraphRevision(ReadViewDependencyGraphRevisionRequest) returns (ReadViewDependencyGraphRevisionResponse);
+  rpc ReadPartitionAuthorityCapability(ReadPartitionAuthorityCapabilityRequest) returns (ReadPartitionAuthorityCapabilityResponse);
+  rpc AcquirePartitionAuthority(AcquirePartitionAuthorityRequest) returns (AcquirePartitionAuthorityResponse);
+  rpc ReadPartitionAuthority(ReadPartitionAuthorityRequest) returns (ReadPartitionAuthorityResponse);
+  rpc PublishPartitionCheckpointPointer(PublishPartitionCheckpointPointerRequest) returns (PublishPartitionCheckpointPointerResponse);
+  rpc ReadPartitionCheckpointPointer(ReadPartitionCheckpointPointerRequest) returns (ReadPartitionCheckpointPointerResponse);
 }
 
 message ReadViewDependencyGraphRevisionRequest {
@@ -57,6 +62,81 @@ message StandingRuntimeFencingCapability {
 
 message ReadMetaStoreCapabilitiesResponse {
   StandingRuntimeFencingCapability standing_runtime_fencing = 1;
+  PartitionAuthorityCapability partition_authority = 2;
+}
+
+message PartitionAuthorityCapability {
+  string backend_name = 1;
+  bool partition_scoped_authority = 2;
+  bool backend_owned_time = 3;
+  bool fenced_checkpoint_pointer_publish = 4;
+  bool durable_across_restart = 5;
+  bool production_safe = 6;
+}
+
+message PartitionAuthorityKey {
+  string namespace = 1;
+  string view_id = 2;
+  string stream_id = 3;
+  uint32 partition_id = 4;
+}
+
+message PartitionAuthorityToken {
+  PartitionAuthorityKey key = 1;
+  string owner_id = 2;
+  uint64 owner_epoch = 3;
+  uint64 expires_at_unix_ms = 4;
+}
+
+message PartitionCheckpointPointer {
+  PartitionAuthorityKey key = 1;
+  string checkpoint_key = 2;
+}
+
+message ReadPartitionAuthorityCapabilityRequest {}
+
+message ReadPartitionAuthorityCapabilityResponse {
+  PartitionAuthorityCapability capability = 1;
+}
+
+message AcquirePartitionAuthorityRequest {
+  PartitionAuthorityKey key = 1;
+  string owner_id = 2;
+  PartitionAuthorityToken current_token = 3;
+  uint64 ttl_ms = 4;
+}
+
+message AcquirePartitionAuthorityResponse {
+  string outcome = 1;
+  PartitionAuthorityToken token = 2;
+}
+
+message ReadPartitionAuthorityRequest {
+  PartitionAuthorityKey key = 1;
+}
+
+message ReadPartitionAuthorityResponse {
+  bool found = 1;
+  PartitionAuthorityToken token = 2;
+}
+
+message PublishPartitionCheckpointPointerRequest {
+  PartitionCheckpointPointer expected_previous = 1;
+  PartitionCheckpointPointer candidate = 2;
+  PartitionAuthorityToken authority = 3;
+}
+
+message PublishPartitionCheckpointPointerResponse {
+  string outcome = 1;
+}
+
+message ReadPartitionCheckpointPointerRequest {
+  PartitionAuthorityKey key = 1;
+}
+
+message ReadPartitionCheckpointPointerResponse {
+  bool found = 1;
+  PartitionCheckpointPointer pointer = 2;
 }
 
 message StoreRelationCatalogRequest {

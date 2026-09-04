@@ -1,3 +1,6 @@
+use std::sync::Arc;
+
+use object_store::memory::InMemory as InMemoryObjectStore;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{metadata::MetadataValue, transport::Server, Request};
 use velorix_core::standing_program::{
@@ -20,7 +23,9 @@ use velorix_meta::{
     BeginViewBootstrapRequest, CaptureIngestSourceCutRequest, CommitIngestRangeOutcome,
     FixViewBootstrapActivationCutOutcome, FixViewBootstrapActivationCutRequest, GrpcMetaStore,
     InMemoryMetaStore, IngestRangeReservation, IngestSourceRelationIdentityV1, MetaGrpcService,
-    MetaStore, PromoteViewBootstrapOutcome, PromoteViewBootstrapRequest,
+    MetaStore, OssMetaStore, PartitionAuthorityKey, PartitionCheckpointPointer,
+    PromoteViewBootstrapOutcome, PromoteViewBootstrapRequest,
+    PublishPartitionCheckpointPointerOutcome, PublishPartitionCheckpointPointerRequest,
     PublishStandingRuntimeCheckpointOutcome, ReserveIngestRangeOutcome,
     StandingRuntimeCheckpointPointer, StandingRuntimeOwnerToken, StoreRelationCatalogOutcome,
 };
@@ -586,8 +591,169 @@ async fn grpc_service_rejects_mismatched_standing_runtime_checkpoint_scope() {
     assert_eq!(error.code(), tonic::Code::InvalidArgument);
 }
 
+#[tokio::test]
+async fn grpc_partition_authority_round_trips_acquire_renew_and_fenced_pointer_publish() {
+    let backend = InMemoryMetaStore::default();
+    backend.set_partition_authority_clock_for_test(100).await;
+    let endpoint = spawn_meta_service_for(backend.clone()).await;
+    let store = GrpcMetaStore::connect(endpoint).await.unwrap();
+    let key = PartitionAuthorityKey {
+        namespace: "tenant-a".to_string(),
+        view_id: "view-a".to_string(),
+        stream_id: "orders".to_string(),
+        partition_id: 3,
+    };
+
+    let acquired = match store
+        .acquire_partition_authority(velorix_meta::AcquirePartitionAuthorityRequest {
+            key: key.clone(),
+            owner_id: "writer-a".to_string(),
+            current_token: None,
+            ttl_ms: 10,
+        })
+        .await
+        .unwrap()
+    {
+        velorix_meta::AcquirePartitionAuthorityOutcome::Acquired(token) => token,
+        outcome => panic!("expected acquire, got {outcome:?}"),
+    };
+    assert!(matches!(
+        store
+            .acquire_partition_authority(velorix_meta::AcquirePartitionAuthorityRequest {
+                key: key.clone(),
+                owner_id: "writer-a".to_string(),
+                current_token: None,
+                ttl_ms: 10,
+            })
+            .await
+            .unwrap(),
+        velorix_meta::AcquirePartitionAuthorityOutcome::Conflict(_)
+    ));
+    let renewed = match store
+        .acquire_partition_authority(velorix_meta::AcquirePartitionAuthorityRequest {
+            key: key.clone(),
+            owner_id: "writer-a".to_string(),
+            current_token: Some(acquired.clone()),
+            ttl_ms: 20,
+        })
+        .await
+        .unwrap()
+    {
+        velorix_meta::AcquirePartitionAuthorityOutcome::Renewed(token) => token,
+        outcome => panic!("expected renew, got {outcome:?}"),
+    };
+    assert_eq!(
+        store.read_partition_authority(&key).await.unwrap(),
+        Some(renewed.clone())
+    );
+
+    let first = PartitionCheckpointPointer {
+        key: key.clone(),
+        checkpoint_key: "checkpoints/first".to_string(),
+    };
+    assert_eq!(
+        store
+            .publish_partition_checkpoint_pointer(PublishPartitionCheckpointPointerRequest {
+                expected_previous: None,
+                candidate: first.clone(),
+                authority: renewed.clone(),
+            })
+            .await
+            .unwrap(),
+        PublishPartitionCheckpointPointerOutcome::Published
+    );
+    assert_eq!(
+        store
+            .publish_partition_checkpoint_pointer(PublishPartitionCheckpointPointerRequest {
+                expected_previous: None,
+                candidate: first.clone(),
+                authority: renewed.clone(),
+            })
+            .await
+            .unwrap(),
+        PublishPartitionCheckpointPointerOutcome::Duplicate
+    );
+    assert_eq!(
+        store
+            .publish_partition_checkpoint_pointer(PublishPartitionCheckpointPointerRequest {
+                expected_previous: None,
+                candidate: PartitionCheckpointPointer {
+                    key: key.clone(),
+                    checkpoint_key: "checkpoints/conflict".to_string(),
+                },
+                authority: renewed.clone(),
+            })
+            .await
+            .unwrap(),
+        PublishPartitionCheckpointPointerOutcome::Conflict
+    );
+    assert_eq!(
+        store.read_partition_checkpoint_pointer(&key).await.unwrap(),
+        Some(first)
+    );
+
+    backend.set_partition_authority_clock_for_test(121).await;
+    let takeover = match store
+        .acquire_partition_authority(velorix_meta::AcquirePartitionAuthorityRequest {
+            key: key.clone(),
+            owner_id: "writer-b".to_string(),
+            current_token: None,
+            ttl_ms: 10,
+        })
+        .await
+        .unwrap()
+    {
+        velorix_meta::AcquirePartitionAuthorityOutcome::Acquired(token) => token,
+        outcome => panic!("expected takeover, got {outcome:?}"),
+    };
+    assert_ne!(takeover.owner_epoch, renewed.owner_epoch);
+    let stale = store
+        .publish_partition_checkpoint_pointer(PublishPartitionCheckpointPointerRequest {
+            expected_previous: None,
+            candidate: PartitionCheckpointPointer {
+                key,
+                checkpoint_key: "checkpoints/stale".to_string(),
+            },
+            authority: renewed,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        stale,
+        velorix_meta::MetaStoreError::PartitionAuthorityInvalidToken
+    ));
+    assert!(
+        store
+            .read_partition_authority_capability()
+            .await
+            .unwrap()
+            .partition_scoped_authority
+    );
+}
+
+#[tokio::test]
+async fn grpc_partition_authority_unsupported_backend_fails_closed() {
+    let endpoint =
+        spawn_meta_service_for(OssMetaStore::new(Arc::new(InMemoryObjectStore::new()))).await;
+    let store = GrpcMetaStore::connect(endpoint).await.unwrap();
+
+    assert!(matches!(
+        store.read_partition_authority_capability().await,
+        Err(velorix_meta::MetaStoreError::UnsupportedCapability(
+            "partition_authority"
+        ))
+    ));
+}
+
 async fn spawn_meta_service() -> String {
-    let service = MetaGrpcService::new(InMemoryMetaStore::default());
+    spawn_meta_service_for(InMemoryMetaStore::default()).await
+}
+
+async fn spawn_meta_service_for<S>(store: S) -> String
+where
+    S: MetaStore,
+{
+    let service = MetaGrpcService::new(store);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
