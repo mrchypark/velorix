@@ -46,6 +46,7 @@ required_env VELORIX_INGEST_WRITER_LEASE_VIEW_ID
 required_env VELORIX_INGEST_WRITER_LEASE_STREAM_ID
 required_env VELORIX_INGEST_WRITER_LEASE_PARTITION_ID
 required_env VELORIX_INGEST_WRITER_LEASE_OWNER_ID
+required_env VELORIX_META_GRPC_ENDPOINT
 required_env VELORIX_S3_COMPAT
 required_env AWS_ENDPOINT_URL
 required_env AWS_ACCESS_KEY_ID
@@ -65,6 +66,9 @@ fi
 
 lease_ttl_ms="${VELORIX_INGEST_WRITER_LEASE_TTL_MS:-60000}"
 
+# lease-guarded-append obtains and renews its production authority from Meta.
+# The Kubernetes lease-shaped inputs below only name the partition; they are not
+# used as a write authority. Never print the Meta endpoint or bearer token.
 exec velorix-ingest-writer lease-guarded-append \
   --payload-file "$VELORIX_INGEST_WRITER_PAYLOAD_FILE" \
   --authority-store-id "$VELORIX_INGEST_WRITER_AUTHORITY_STORE_ID" \

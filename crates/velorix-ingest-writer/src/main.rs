@@ -7,7 +7,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{bail, Context};
@@ -25,6 +25,10 @@ use object_store::{
     ObjectStoreExt,
 };
 use serde::{Deserialize, Serialize};
+use tokio::{
+    sync::{watch, Mutex, RwLock},
+    task::JoinHandle,
+};
 use velorix_control::lease::{
     LeaseAcquireRequest, PartitionLeaseClient, PartitionLeaseGrant, PartitionLeaseKey,
 };
@@ -33,6 +37,10 @@ use velorix_k8s::{
     ingest_writer::DeployedIngestWriterRuntime,
     lease::{partition_lease_identity, KubeLeaseApi, KubernetesPartitionLeaseClient},
     startup::{validate_operator_authority, OperatorAuthorityStartupComponents},
+};
+use velorix_meta::{
+    AcquirePartitionAuthorityOutcome, AcquirePartitionAuthorityRequest, GrpcMetaStore, MetaStore,
+    PartitionAuthorityKey, PartitionAuthorityToken,
 };
 use velorix_storage::{
     ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
@@ -374,53 +382,354 @@ struct LeaseGuardedAppendProbeArtifactV1 {
     descriptor: IngestWriterAppendDescriptorV1,
 }
 
+/// A fail-closed, Meta-backed authority session for one ingest partition.
+///
+/// Kubernetes leases are deliberately not consulted here: they may help a
+/// scheduler decide where to run a writer, but only Meta owns the authority
+/// epoch and expiry used to admit durable ingest work.
 #[derive(Clone)]
-struct KubernetesLeaseCommitGuard {
-    lease_client: KubernetesPartitionLeaseClient<KubeLeaseApi>,
-    lease_key: PartitionLeaseKey,
+struct PartitionAuthoritySession {
+    meta_store: Arc<dyn MetaStore>,
+    key: PartitionAuthorityKey,
     owner_id: String,
-    owner_epoch: u64,
+    token: Arc<RwLock<PartitionAuthorityToken>>,
+    admission_binding: IngestCommitGuardBindingV1,
+    fenced: Arc<AtomicBool>,
+    safety_deadline: Arc<RwLock<Instant>>,
+    cancellation: watch::Sender<bool>,
+    renewal_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    ttl: Duration,
+    rpc_timeout: Duration,
+}
+
+impl PartitionAuthoritySession {
+    async fn acquire(
+        meta_store: Arc<dyn MetaStore>,
+        key: PartitionAuthorityKey,
+        owner_id: String,
+        ttl_ms: u64,
+    ) -> anyhow::Result<Self> {
+        if ttl_ms < 3 {
+            bail!("partition authority ttl-ms must be at least 3");
+        }
+        if owner_id.trim().is_empty() {
+            bail!("partition authority requires a non-empty owner id");
+        }
+        if key.namespace.trim().is_empty()
+            || key.view_id.trim().is_empty()
+            || key.stream_id.trim().is_empty()
+        {
+            bail!("partition authority namespace, view-id, and stream-id must be non-empty");
+        }
+
+        let rpc_timeout = Duration::from_millis((ttl_ms / 3).clamp(1, 5_000));
+        let capability_started = Instant::now();
+        let capability = tokio::time::timeout(
+            rpc_timeout,
+            meta_store.read_partition_authority_capability(),
+        )
+        .await
+        .context("metadata capability check timed out")??;
+        if Instant::now() >= authority_safety_deadline(capability_started, ttl_ms) {
+            bail!("partition authority capability check exceeded local safety deadline");
+        }
+        if !capability.production_safe {
+            bail!(
+                "Meta partition authority backend `{}` is not production_safe",
+                capability.backend_name
+            );
+        }
+
+        let acquire_started = Instant::now();
+        let acquire_deadline = authority_safety_deadline(acquire_started, ttl_ms);
+        let token = tokio::time::timeout(
+            rpc_timeout,
+            meta_store.acquire_partition_authority(AcquirePartitionAuthorityRequest {
+                key: key.clone(),
+                owner_id: owner_id.clone(),
+                current_token: None,
+                ttl_ms,
+            }),
+        )
+        .await
+        .context("partition authority acquire timed out")??;
+        if Instant::now() >= acquire_deadline {
+            bail!("partition authority acquire response arrived after local safety deadline");
+        }
+        let token = match token {
+            AcquirePartitionAuthorityOutcome::Acquired(token) => token,
+            AcquirePartitionAuthorityOutcome::Renewed(_) => {
+                bail!("partition authority acquire unexpectedly returned a renewal")
+            }
+            AcquirePartitionAuthorityOutcome::Conflict(current) => {
+                bail!(
+                    "partition authority is held by {}#{} for {}/{}/{}/p{}",
+                    current.owner_id,
+                    current.owner_epoch,
+                    current.key.namespace,
+                    current.key.view_id,
+                    current.key.stream_id,
+                    current.key.partition_id
+                )
+            }
+        };
+        validate_partition_authority_token(&token, &key, &owner_id)?;
+        let admission_binding = IngestCommitGuardBindingV1::new(
+            "meta_partition_authority",
+            partition_authority_identity(&token.key),
+            token.owner_id.clone(),
+            token.owner_epoch,
+        );
+
+        let (cancellation, receiver) = watch::channel(false);
+        let session = Self {
+            meta_store,
+            key,
+            owner_id,
+            token: Arc::new(RwLock::new(token)),
+            admission_binding,
+            fenced: Arc::new(AtomicBool::new(false)),
+            safety_deadline: Arc::new(RwLock::new(acquire_deadline)),
+            cancellation,
+            renewal_task: Arc::new(Mutex::new(None)),
+            ttl: Duration::from_millis(ttl_ms),
+            rpc_timeout,
+        };
+        session.start_renewal(receiver).await;
+        Ok(session)
+    }
+
+    async fn start_renewal(&self, mut cancellation: watch::Receiver<bool>) {
+        let session = self.clone();
+        let cadence = Duration::from_millis((session.ttl.as_millis() as u64 / 3).max(1));
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(cadence) => {},
+                    changed = cancellation.changed() => {
+                        if changed.is_err() || *cancellation.borrow() { return; }
+                        continue;
+                    }
+                }
+                if session.renew_once().await.is_err() {
+                    session.fence();
+                    return;
+                }
+            }
+        });
+        *self.renewal_task.lock().await = Some(task);
+    }
+
+    fn fence(&self) {
+        self.fenced.store(true, Ordering::SeqCst);
+        let _ = self.cancellation.send(true);
+    }
+
+    async fn shutdown(&self) {
+        self.fence();
+        if let Some(task) = self.renewal_task.lock().await.take() {
+            let _ = task.await;
+        }
+        // Release is intentionally deferred: expiry is owned by Meta and a
+        // shutdown must never turn a release failure into continued authority.
+    }
+
+    async fn renew_once(&self) -> Result<(), String> {
+        self.ensure_local_safety("renewal").await?;
+        let current = self.token.read().await.clone();
+        let renewal_started = Instant::now();
+        let renewal_deadline =
+            authority_safety_deadline(renewal_started, self.ttl.as_millis() as u64);
+        let outcome = tokio::time::timeout(
+            self.rpc_timeout,
+            self.meta_store
+                .acquire_partition_authority(AcquirePartitionAuthorityRequest {
+                    key: self.key.clone(),
+                    owner_id: self.owner_id.clone(),
+                    current_token: Some(current.clone()),
+                    ttl_ms: self.ttl.as_millis() as u64,
+                }),
+        )
+        .await
+        .map_err(|_| "partition authority renewal timed out".to_string())?
+        .map_err(|error| format!("partition authority renewal failed: {error}"))?;
+        if Instant::now() >= renewal_deadline {
+            return Err(
+                "partition authority renewal response arrived after local safety deadline"
+                    .to_string(),
+            );
+        }
+        let renewed = match outcome {
+            AcquirePartitionAuthorityOutcome::Renewed(token) => token,
+            AcquirePartitionAuthorityOutcome::Acquired(_) => {
+                return Err(
+                    "partition authority renewal unexpectedly acquired a new epoch".to_string(),
+                )
+            }
+            AcquirePartitionAuthorityOutcome::Conflict(_) => {
+                return Err("partition authority renewal lost ownership".to_string())
+            }
+        };
+        validate_partition_authority_token(&renewed, &self.key, &self.owner_id)
+            .map_err(|error| error.to_string())?;
+        if renewed.owner_epoch != current.owner_epoch {
+            return Err("partition authority renewal changed its owner epoch".to_string());
+        }
+        *self.token.write().await = renewed;
+        *self.safety_deadline.write().await = renewal_deadline;
+        Ok(())
+    }
+
+    async fn ensure_local_safety(&self, operation: &str) -> Result<(), String> {
+        if self.fenced.load(Ordering::SeqCst) {
+            return Err(format!(
+                "partition authority session is fenced before {operation}"
+            ));
+        }
+        if Instant::now() >= *self.safety_deadline.read().await {
+            self.fence();
+            return Err(format!(
+                "partition authority local safety deadline elapsed before {operation}"
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
-impl IngestCommitGuard for KubernetesLeaseCommitGuard {
+impl IngestCommitGuard for PartitionAuthoritySession {
     async fn verify(
         &self,
         phase: IngestCommitGuardPhase,
         descriptor: &IngestBatchDescriptor,
     ) -> Result<(), String> {
-        if self.lease_key.stream_id != descriptor.stream_id
-            || self.lease_key.partition_id != descriptor.partition_id
+        self.ensure_local_safety(phase.as_str()).await?;
+        if self.key.stream_id != descriptor.stream_id
+            || self.key.partition_id != descriptor.partition_id
         {
+            self.fence();
             return Err(format!(
-                "lease key {}/p{} does not match descriptor {}/p{}",
-                self.lease_key.stream_id,
-                self.lease_key.partition_id,
+                "partition authority key {}/p{} does not match descriptor {}/p{}",
+                self.key.stream_id,
+                self.key.partition_id,
                 descriptor.stream_id,
                 descriptor.partition_id
             ));
         }
-        verify_kubernetes_lease_holder(
-            &self.lease_client,
-            &self.lease_key,
-            &self.owner_id,
-            self.owner_epoch,
-            phase,
+        let expected = self.token.read().await.clone();
+        let current = tokio::time::timeout(
+            self.rpc_timeout,
+            self.meta_store.read_partition_authority(&self.key),
         )
-        .await
+        .await;
+        let current = match current {
+            Ok(Ok(current)) => current,
+            Ok(Err(error)) => {
+                self.fence();
+                return Err(format!(
+                    "partition authority verification failed at {}: {error}",
+                    phase.as_str()
+                ));
+            }
+            Err(_) => {
+                self.fence();
+                return Err(format!(
+                    "partition authority verification timed out at {}",
+                    phase.as_str()
+                ));
+            }
+        };
+        if Instant::now() >= *self.safety_deadline.read().await {
+            self.fence();
+            return Err(format!(
+                "partition authority local safety deadline elapsed during {}",
+                phase.as_str()
+            ));
+        }
+        let now_unix_ms = match unix_ms() {
+            Ok(value) => value,
+            Err(error) => {
+                self.fence();
+                return Err(format!(
+                    "failed to read local clock during authority verification at {}: {error}",
+                    phase.as_str()
+                ));
+            }
+        };
+        if current.as_ref() != Some(&expected) {
+            self.fence();
+            return Err(format!(
+                "partition authority token is stale at {}",
+                phase.as_str()
+            ));
+        }
+        if current
+            .as_ref()
+            .map(|token| token.expires_at_unix_ms <= now_unix_ms)
+            .unwrap_or(true)
+        {
+            self.fence();
+            return Err(format!(
+                "partition authority record is expired or unavailable at {}",
+                phase.as_str()
+            ));
+        }
+        Ok(())
     }
 
     fn admission_binding(
         &self,
         _descriptor: &IngestBatchDescriptor,
     ) -> Option<IngestCommitGuardBindingV1> {
-        Some(IngestCommitGuardBindingV1::new(
-            "kubernetes_partition_lease",
-            partition_lease_identity(&self.lease_key),
-            self.owner_id.clone(),
-            self.owner_epoch,
-        ))
+        Some(self.admission_binding.clone())
     }
+}
+
+fn authority_safety_deadline(rpc_started: Instant, ttl_ms: u64) -> Instant {
+    // Meta controls the true expiry. This shorter monotonic deadline is only a
+    // conservative local fail-closed bound while waiting for a renewal.
+    rpc_started + Duration::from_millis((ttl_ms / 3).saturating_mul(2).max(1))
+}
+
+fn partition_authority_identity(key: &PartitionAuthorityKey) -> String {
+    format!(
+        "{}/{}/{}/p{}",
+        key.namespace, key.view_id, key.stream_id, key.partition_id
+    )
+}
+
+fn validate_partition_authority_token(
+    token: &PartitionAuthorityToken,
+    key: &PartitionAuthorityKey,
+    owner_id: &str,
+) -> anyhow::Result<()> {
+    if token.key != *key
+        || token.owner_id != owner_id
+        || token.owner_epoch == 0
+        || token.expires_at_unix_ms == 0
+    {
+        bail!("metadata returned a malformed or mismatched partition authority token");
+    }
+    Ok(())
+}
+
+async fn grpc_meta_store_from_env() -> anyhow::Result<Arc<dyn MetaStore>> {
+    let endpoint = env::var("VELORIX_META_GRPC_ENDPOINT")
+        .context("VELORIX_META_GRPC_ENDPOINT is required for lease-guarded append")?;
+    if endpoint.trim().is_empty() {
+        bail!("VELORIX_META_GRPC_ENDPOINT is required for lease-guarded append");
+    }
+    let store: Arc<dyn MetaStore> = match env::var("VELORIX_META_BEARER_TOKEN") {
+        Ok(token) if !token.trim().is_empty() => {
+            Arc::new(GrpcMetaStore::connect_with_bearer_token(&endpoint, token).await?)
+        }
+        Ok(_) => bail!("VELORIX_META_BEARER_TOKEN must not be empty when set"),
+        Err(env::VarError::NotPresent) => Arc::new(GrpcMetaStore::connect(&endpoint).await?),
+        Err(error) => {
+            return Err(anyhow::Error::from(error).context("invalid VELORIX_META_BEARER_TOKEN"))
+        }
+    };
+    Ok(store)
 }
 
 #[derive(Clone)]
@@ -1207,7 +1516,7 @@ async fn run_lease_guarded_append_probe(
     request: LeaseGuardedAppendProbeRequest,
 ) -> anyhow::Result<LeaseGuardedAppendProbeArtifactV1> {
     validate_ingest_writer_authority_store_id(&request.authority_store_id)?;
-    validate_kubernetes_lease_probe_request(&request.lease_key, &request.owner_id, request.ttl_ms)?;
+    validate_partition_authority_request(&request.lease_key, &request.owner_id, request.ttl_ms)?;
     if request.authority_namespace.trim().is_empty() {
         bail!("lease-guarded append probe requires --authority-namespace");
     }
@@ -1220,14 +1529,14 @@ async fn run_lease_guarded_append_probe(
     let expected_outcome = request.expected_outcome.trim();
     if !matches!(
         expected_outcome,
-        "appended" | "duplicate" | "appended-or-duplicate" | "stale-owner-rejected"
+        "appended" | "duplicate" | "appended-or-duplicate"
     ) {
         bail!(
-            "lease-guarded append probe expected-outcome must be appended, duplicate, appended-or-duplicate, or stale-owner-rejected"
+            "lease-guarded append probe expected-outcome must be appended, duplicate, or appended-or-duplicate"
         );
     }
-    if !request.acquire_lease && request.expected_owner_epoch.is_none() {
-        bail!("lease-guarded append requires --acquire-lease or --expected-owner-epoch");
+    if !request.acquire_lease {
+        bail!("lease-guarded append requires --acquire-lease for Meta authority");
     }
 
     let descriptor = ingest_writer_descriptor(
@@ -1237,104 +1546,47 @@ async fn run_lease_guarded_append_probe(
         || request.lease_key.partition_id != descriptor.partition_id
     {
         bail!(
-            "lease-guarded append lease key must match payload stream/partition: lease={}/p{} payload={}/p{}",
+            "lease-guarded append authority key must match payload stream/partition: authority={}/p{} payload={}/p{}",
             request.lease_key.stream_id,
             request.lease_key.partition_id,
             descriptor.stream_id,
             descriptor.partition_id
         );
     }
-    let client = Client::try_default()
-        .await
-        .with_context(|| "failed to create Kubernetes client from runtime environment")?;
-    let lease_client = KubernetesPartitionLeaseClient::new(KubeLeaseApi::new(client));
-    let lease_identity = partition_lease_identity(&request.lease_key);
-    let acquired_grant = if request.acquire_lease {
-        Some(
-            lease_client
-                .acquire_or_renew(LeaseAcquireRequest {
-                    key: request.lease_key.clone(),
-                    owner_id: request.owner_id.clone(),
-                    now_unix_ms: unix_ms()?,
-                    ttl_ms: request.ttl_ms,
-                })
-                .await
-                .map_err(anyhow::Error::from)
-                .with_context(|| "failed to acquire Kubernetes lease before guarded append")?,
-        )
-    } else {
-        None
+    let key = PartitionAuthorityKey {
+        namespace: request.lease_key.namespace.clone(),
+        view_id: request.lease_key.view_id.clone(),
+        stream_id: request.lease_key.stream_id.clone(),
+        partition_id: request.lease_key.partition_id,
     };
-    let current_owner = lease_client
-        .current(&request.lease_key, unix_ms()?)
-        .await
-        .map_err(anyhow::Error::from)
-        .with_context(|| "failed to read current Kubernetes lease holder before guarded append")?;
-
-    let expected_owner_epoch = acquired_grant
-        .as_ref()
-        .map(|grant| grant.owner_epoch)
-        .or(request.expected_owner_epoch);
-    let current_matches_owner = current_lease_matches_owner(
-        current_owner.as_ref(),
-        &request.owner_id,
-        expected_owner_epoch,
-    );
-    if !current_matches_owner {
-        if expected_outcome != "stale-owner-rejected" {
+    let lease_identity = partition_authority_identity(&key);
+    let commit_guard = PartitionAuthoritySession::acquire(
+        grpc_meta_store_from_env().await?,
+        key,
+        request.owner_id.clone(),
+        request.ttl_ms,
+    )
+    .await?;
+    let token = commit_guard.token.read().await.clone();
+    if let Some(expected_epoch) = request.expected_owner_epoch {
+        if expected_epoch != token.owner_epoch {
+            commit_guard.shutdown().await;
             bail!(
-                "lease-guarded append expected owner {}, but current owner was {:?}",
-                request.owner_id,
-                current_owner.as_ref().map(|grant| &grant.owner_id)
+                "Meta authority epoch mismatch: expected {expected_epoch}, acquired {}",
+                token.owner_epoch
             );
         }
-        return Ok(LeaseGuardedAppendProbeArtifactV1 {
-            schema_version: 1,
-            evidence_kind: "ingest_writer_lease_guarded_append_probe".to_string(),
-            status: "pass".to_string(),
-            expected_outcome: expected_outcome.to_string(),
-            outcome: "stale-owner-rejected".to_string(),
-            authority_store_id: request.authority_store_id,
-            authority_namespace: request.authority_namespace,
-            operator_id: request.operator_id,
-            writer_id: request.writer_id,
-            lease_identity,
-            owner_id: request.owner_id,
-            expected_owner_epoch,
-            acquired_grant: acquired_grant.as_ref().map(lease_grant_evidence),
-            current_owner: current_owner.as_ref().map(lease_grant_evidence),
-            post_append_current_owner: None,
-            commit_guard_enforced: false,
-            admission_commit_guard_bound: false,
-            admission_commit_guard_binding: None,
-            lease_held_through_append: false,
-            stale_owner_rejected: true,
-            append_completed: false,
-            descriptor,
-        });
     }
-
-    if expected_outcome == "stale-owner-rejected" {
-        bail!("lease-guarded append expected stale-owner rejection, but owner still holds lease");
-    }
-
-    let commit_owner_epoch = expected_owner_epoch
-        .ok_or_else(|| anyhow::anyhow!("lease-guarded append requires an owner epoch"))?;
-    let commit_guard = KubernetesLeaseCommitGuard {
-        lease_client: lease_client.clone(),
-        lease_key: request.lease_key.clone(),
-        owner_id: request.owner_id.clone(),
-        owner_epoch: commit_owner_epoch,
-    };
+    let expected_owner_epoch = Some(token.owner_epoch);
     let expected_commit_guard_binding = commit_guard
         .admission_binding(
             &IngestBatch::from_validated_envelope(request.payload.clone())?.descriptor(),
         )
         .ok_or_else(|| {
-            anyhow::anyhow!("lease commit guard did not provide an admission binding")
+            anyhow::anyhow!("Meta authority commit guard did not provide an admission binding")
         })?;
     let expected_identity = ingest_identity_from_payload(request.payload.clone())?;
-    let append_artifact = run_ingest_writer_append_with_commit_guard(
+    let append_result = run_ingest_writer_append_with_commit_guard(
         Arc::clone(&store),
         IngestWriterAppendRequest {
             authority_store_id: request.authority_store_id.clone(),
@@ -1345,7 +1597,9 @@ async fn run_lease_guarded_append_probe(
         },
         Some(&commit_guard),
     )
-    .await?;
+    .await;
+    commit_guard.shutdown().await;
+    let append_artifact = append_result?;
     if !lease_guarded_append_outcome_matches(expected_outcome, &append_artifact.outcome) {
         bail!(
             "lease-guarded append expected outcome {expected_outcome}, got {}",
@@ -1372,22 +1626,6 @@ async fn run_lease_guarded_append_probe(
         }
         outcome => bail!("lease-guarded append returned unsupported outcome {outcome}"),
     };
-    let post_append_current_owner = lease_client
-        .current(&request.lease_key, unix_ms()?)
-        .await
-        .map_err(anyhow::Error::from)
-        .with_context(|| "failed to read current Kubernetes lease holder after guarded append")?;
-    if post_append_current_owner
-        .as_ref()
-        .map(|grant| grant.owner_id == request.owner_id && grant.owner_epoch == commit_owner_epoch)
-        != Some(true)
-    {
-        bail!(
-            "lease-guarded append owner lost lease before post-append verification: current={:?}",
-            post_append_current_owner
-        );
-    }
-
     Ok(LeaseGuardedAppendProbeArtifactV1 {
         schema_version: 1,
         evidence_kind: "ingest_writer_lease_guarded_append_probe".to_string(),
@@ -1401,9 +1639,9 @@ async fn run_lease_guarded_append_probe(
         lease_identity,
         owner_id: request.owner_id,
         expected_owner_epoch,
-        acquired_grant: acquired_grant.as_ref().map(lease_grant_evidence),
-        current_owner: current_owner.as_ref().map(lease_grant_evidence),
-        post_append_current_owner: post_append_current_owner.as_ref().map(lease_grant_evidence),
+        acquired_grant: Some(partition_authority_grant_evidence(&token)),
+        current_owner: Some(partition_authority_grant_evidence(&token)),
+        post_append_current_owner: Some(partition_authority_grant_evidence(&token)),
         commit_guard_enforced: true,
         admission_commit_guard_bound: true,
         admission_commit_guard_binding: Some(admission_commit_guard_binding),
@@ -1560,13 +1798,13 @@ async fn verify_duplicate_admission_evidence(
         }
     }
     if binding.schema_version != 1
-        || binding.binding_kind != "kubernetes_partition_lease"
+        || binding.binding_kind != "meta_partition_authority"
         || binding.subject != lease_identity
         || binding.owner_id.trim().is_empty()
         || binding.owner_epoch == 0
     {
         bail!(
-            "ingest-writer duplicate admission evidence has invalid original Kubernetes lease binding: {:?}",
+            "ingest-writer duplicate admission evidence has invalid original Meta authority binding: {:?}",
             binding
         );
     }
@@ -1606,6 +1844,34 @@ fn validate_kubernetes_lease_probe_request(
         bail!("Kubernetes lease probe requires ttl-ms greater than zero");
     }
     Ok(())
+}
+
+fn validate_partition_authority_request(
+    key: &PartitionLeaseKey,
+    owner_id: &str,
+    ttl_ms: u64,
+) -> anyhow::Result<()> {
+    if key.namespace.trim().is_empty()
+        || key.view_id.trim().is_empty()
+        || key.stream_id.trim().is_empty()
+    {
+        bail!("Meta partition authority requires namespace, view-id, and stream-id");
+    }
+    if owner_id.trim().is_empty() {
+        bail!("Meta partition authority requires a non-empty owner id");
+    }
+    if ttl_ms < 3 {
+        bail!("Meta partition authority requires ttl-ms of at least 3");
+    }
+    Ok(())
+}
+
+fn partition_authority_grant_evidence(token: &PartitionAuthorityToken) -> LeaseGrantEvidenceV1 {
+    LeaseGrantEvidenceV1 {
+        owner_id: token.owner_id.clone(),
+        owner_epoch: token.owner_epoch,
+        expires_at_unix_ms: token.expires_at_unix_ms,
+    }
 }
 
 async fn startup_components_for_probe(
@@ -2013,21 +2279,6 @@ fn lease_guarded_append_outcome_matches(expected_outcome: &str, actual_outcome: 
     )
 }
 
-fn current_lease_matches_owner(
-    current_owner: Option<&PartitionLeaseGrant>,
-    owner_id: &str,
-    expected_owner_epoch: Option<u64>,
-) -> bool {
-    current_owner
-        .map(|grant| {
-            grant.owner_id == owner_id
-                && expected_owner_epoch
-                    .map(|epoch| grant.owner_epoch == epoch)
-                    .unwrap_or(true)
-        })
-        .unwrap_or(false)
-}
-
 fn ingest_identity_from_payload(payload: Bytes) -> anyhow::Result<IngestIdentity> {
     let envelope = IngestEnvelope::decode(payload).map_err(anyhow::Error::from)?;
     let header = envelope.header();
@@ -2304,6 +2555,155 @@ fn sanitize_probe_id(value: &str) -> String {
 mod tests {
     use super::*;
 
+    async fn test_partition_authority_session() -> PartitionAuthoritySession {
+        let store = Arc::new(velorix_meta::InMemoryMetaStore::default());
+        let key = PartitionAuthorityKey {
+            namespace: "tenant-a".to_string(),
+            view_id: "scores-view".to_string(),
+            stream_id: "scores".to_string(),
+            partition_id: 0,
+        };
+        let outcome = store
+            .acquire_partition_authority(AcquirePartitionAuthorityRequest {
+                key: key.clone(),
+                owner_id: "writer-a".to_string(),
+                current_token: None,
+                ttl_ms: 60_000,
+            })
+            .await
+            .unwrap();
+        let AcquirePartitionAuthorityOutcome::Acquired(token) = outcome else {
+            panic!("test store must acquire an authority token");
+        };
+        let (cancellation, _) = watch::channel(false);
+        PartitionAuthoritySession {
+            meta_store: store,
+            key,
+            owner_id: "writer-a".to_string(),
+            token: Arc::new(RwLock::new(token)),
+            admission_binding: IngestCommitGuardBindingV1::new(
+                "meta_partition_authority",
+                "tenant-a/scores-view/scores/p0",
+                "writer-a",
+                1,
+            ),
+            fenced: Arc::new(AtomicBool::new(false)),
+            safety_deadline: Arc::new(RwLock::new(Instant::now() + Duration::from_secs(60))),
+            cancellation,
+            renewal_task: Arc::new(Mutex::new(None)),
+            ttl: Duration::from_secs(60),
+            rpc_timeout: Duration::from_secs(1),
+        }
+    }
+
+    fn test_partition_descriptor() -> IngestBatchDescriptor {
+        IngestBatch::from_validated_envelope(
+            encode_default_scores_payload(
+                &format!("sha256:{}", "a".repeat(64)),
+                "scores",
+                0,
+                0,
+                r#"[{"user_id":"u1","score":1,"delta":1}]"#,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .descriptor()
+    }
+
+    #[tokio::test]
+    async fn meta_authority_fence_rejects_admission_and_commit_with_exact_binding() {
+        let session = test_partition_authority_session().await;
+        let descriptor = test_partition_descriptor();
+        let binding = session.admission_binding(&descriptor).unwrap();
+        assert_eq!(binding.binding_kind, "meta_partition_authority");
+        assert_eq!(binding.subject, "tenant-a/scores-view/scores/p0");
+        assert_eq!(binding.owner_id, "writer-a");
+        assert_eq!(binding.owner_epoch, 1);
+
+        session.fence();
+        for phase in [
+            IngestCommitGuardPhase::BeforeAdmission,
+            IngestCommitGuardPhase::BeforeCommit,
+        ] {
+            let error = session.verify(phase, &descriptor).await.unwrap_err();
+            assert!(error.contains("fenced"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn meta_authority_stale_token_and_local_deadline_fence_without_watch() {
+        let session = test_partition_authority_session().await;
+        let descriptor = test_partition_descriptor();
+        session.token.write().await.owner_epoch = 9;
+        let error = session
+            .verify(IngestCommitGuardPhase::BeforeAdmission, &descriptor)
+            .await
+            .unwrap_err();
+        assert!(error.contains("stale"), "{error}");
+        assert!(session.fenced.load(Ordering::SeqCst));
+
+        let session = test_partition_authority_session().await;
+        *session.safety_deadline.write().await = Instant::now();
+        let error = session
+            .verify(IngestCommitGuardPhase::BeforeCommit, &descriptor)
+            .await
+            .unwrap_err();
+        assert!(error.contains("deadline"), "{error}");
+        assert!(session.fenced.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn renewal_safety_deadline_fences_without_a_watch() {
+        let session = test_partition_authority_session().await;
+        // A tiny TTL makes the independent renewal loop hit its local
+        // fail-closed deadline; no Kubernetes watch participates.
+        let session = PartitionAuthoritySession {
+            ttl: Duration::from_millis(3),
+            rpc_timeout: Duration::ZERO,
+            ..session
+        };
+        session
+            .start_renewal(session.cancellation.subscribe())
+            .await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(session.fenced.load(Ordering::SeqCst));
+        session.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn delayed_success_cannot_extend_an_rpc_start_deadline() {
+        let started = Instant::now();
+        let deadline = authority_safety_deadline(started, 30);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(Instant::now() >= deadline);
+
+        // The session uses the deadline derived above, rather than deriving a
+        // fresh TTL from a delayed Meta success response.
+        let session = test_partition_authority_session().await;
+        *session.safety_deadline.write().await = deadline;
+        let error = session
+            .ensure_local_safety("delayed_success")
+            .await
+            .unwrap_err();
+        assert!(error.contains("deadline"), "{error}");
+        assert!(session.fenced.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn admission_binding_is_available_while_renewal_token_lock_is_held() {
+        let session = test_partition_authority_session().await;
+        let expected = session
+            .admission_binding(&test_partition_descriptor())
+            .unwrap();
+        let token_lock = session.token.write().await;
+        let binding = session
+            .admission_binding(&test_partition_descriptor())
+            .unwrap();
+        assert_eq!(binding, expected);
+        drop(token_lock);
+    }
+
     #[test]
     fn default_scores_payload_encodes_expected_envelope() {
         let payload = encode_default_scores_payload(
@@ -2486,7 +2886,7 @@ mod tests {
             .await
             .unwrap();
 
-        let lease_identity = "velorix-product/scores/p=0";
+        let lease_identity = "velorix-product/scores-view/scores/p0";
         let mut original_admission = DurableIngestAdmissionRecordV1::for_external_admission(
             identity.stream_id.clone(),
             identity.partition_id,
@@ -2499,7 +2899,7 @@ mod tests {
         )
         .unwrap();
         original_admission.commit_guard_binding = Some(IngestCommitGuardBindingV1::new(
-            "kubernetes_partition_lease",
+            "meta_partition_authority",
             lease_identity,
             "owner-a",
             1,
@@ -2550,31 +2950,6 @@ mod tests {
             error.to_string().contains("start_offset_inclusive"),
             "{error}"
         );
-        let owner_b_grant = PartitionLeaseGrant {
-            key: PartitionLeaseKey {
-                namespace: "velorix-product".to_string(),
-                view_id: "scores-view".to_string(),
-                stream_id: "scores".to_string(),
-                partition_id: 0,
-            },
-            owner_id: "owner-b".to_string(),
-            owner_epoch: 2,
-            expires_at_unix_ms: 1_700_000_060_000,
-        };
-        assert!(current_lease_matches_owner(
-            Some(&owner_b_grant),
-            "owner-b",
-            Some(2)
-        ));
-        assert!(!current_lease_matches_owner(
-            Some(&owner_b_grant),
-            "owner-a",
-            Some(1)
-        ));
-        assert!(!lease_guarded_append_outcome_matches(
-            "stale-owner-rejected",
-            "duplicate"
-        ));
     }
 
     #[test]

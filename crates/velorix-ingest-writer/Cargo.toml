@@ -15,7 +15,8 @@ kube = { workspace = true, features = ["client", "ring", "rustls-tls"] }
 object_store = { workspace = true, features = ["aws"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
 velorix-control = { path = "../velorix-control" }
 velorix-k8s = { path = "../velorix-k8s" }
+velorix-meta = { path = "../velorix-meta" }
 velorix-storage = { path = "../velorix-storage" }
